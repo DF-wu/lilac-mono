@@ -1,6 +1,12 @@
 import { z } from "zod";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
+import {
+  serverToolFailure,
+  type ServerToolFailure,
+  type ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
 import { defineServerTool } from "../types";
+import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
 import {
   MCP_CONFIG_VERSION,
@@ -73,22 +79,20 @@ function safeReloadOutcomes(outcomes: readonly McpReloadOutcome[]): readonly Mcp
   }));
 }
 
-class McpToolFailure extends TaggedError("McpToolFailure")<{
-  readonly message: string;
-}> {}
-
-function resultToMcpToolValue<T, E extends Error>(result: ResultType<T, E>): T {
-  return result.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      // ServerTool reports failures through the host's exception channel; never throw the TaggedError.
-      throw new Error(error.message);
-    },
-  })();
+function mcpFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
+  return serverToolFailure({
+    kind,
+    code: `mcp_${kind}`,
+    message,
+    retryable: kind === "unavailable" || kind === "timeout",
+  });
 }
 
-function signalMcpFailureToToolHost(message: string): never {
-  return resultToMcpToolValue(Result.err(new McpToolFailure({ message })));
+function mapMcpFailure(kind: ServerToolFailure["kind"]): (error: Error) => ServerToolFailure {
+  return (error) => {
+    if (Panic.is(error)) return preserveToolPanic(error);
+    return mcpFailure(kind, error.message);
+  };
 }
 
 export class McpManagement implements ServerTool {
@@ -166,93 +170,108 @@ export class McpManagement implements ServerTool {
     return this.serverTool.list();
   }
 
-  async call(callableId: string, rawInput: Record<string, unknown>): Promise<unknown> {
+  async call(callableId: string, rawInput: Record<string, unknown>): Promise<ServerToolResult> {
     return this.serverTool.call(callableId, rawInput);
   }
 
-  private async callList() {
-    const snapshot = resultToMcpToolValue(await readMcpConfigFile(this.params.configPath));
-    return {
-      servers: Object.values(snapshot.config.servers)
-        .sort((left, right) => left.id.localeCompare(right.id))
-        .map((server) => ({
-          serverId: server.id,
-          transport: server.transportConfig.transport,
-          authentication:
-            server.transportConfig.transport === "http"
-              ? (server.transportConfig.auth?.grant ?? "none")
-              : "none",
-        })),
-    };
+  private async callList(): Promise<ServerToolResult> {
+    return (await readMcpConfigFile(this.params.configPath))
+      .mapError(mapMcpFailure("unavailable"))
+      .map((snapshot) => ({
+        servers: Object.values(snapshot.config.servers)
+          .sort((left, right) => left.id.localeCompare(right.id))
+          .map((server) => ({
+            serverId: server.id,
+            transport: server.transportConfig.transport,
+            authentication:
+              server.transportConfig.transport === "http"
+                ? (server.transportConfig.auth?.grant ?? "none")
+                : "none",
+          })),
+      }));
   }
 
-  private async callAdd(input: z.output<typeof mcpAddInputSchema>) {
+  private async callAdd(input: z.output<typeof mcpAddInputSchema>): Promise<ServerToolResult> {
     const { serverId, ...transport } = input;
     const parsed = parseMcpConfigDocument({
       configVersion: MCP_CONFIG_VERSION,
       servers: { [serverId]: transport },
     });
     if (!parsed.ok) {
-      return signalMcpFailureToToolHost(
-        `Could not normalize MCP server input: ${parsed.issues.join("; ")}`,
+      return Result.err(
+        mcpFailure("usage", `Could not normalize MCP server input: ${parsed.issues.join("; ")}`),
       );
     }
     const server = parsed.config.servers[serverId];
     if (!server)
-      return signalMcpFailureToToolHost(
-        `Could not normalize MCP server ${JSON.stringify(serverId)}`,
+      return Result.err(
+        mcpFailure("internal", `Could not normalize MCP server ${JSON.stringify(serverId)}`),
       );
 
     return await this.enqueueManagementOperation(async () => {
-      const mutation = resultToMcpToolValue(
-        await mutateMcpConfigFile({
-          configPath: this.params.configPath,
-          mutation: { type: "upsert", server },
-        }),
+      return Result.gen(
+        async function* (this: McpManagement) {
+          const mutation = yield* (
+            await mutateMcpConfigFile({
+              configPath: this.params.configPath,
+              mutation: { type: "upsert", server },
+            })
+          ).mapError(mapMcpFailure("unavailable"));
+          yield* Result.await(this.waitUntilRegistryInitialized());
+          yield* this.reconcileProviders(mutation.config);
+          const reload = safeReloadOutcomes(
+            yield* (await this.params.registry.reload(serverId)).mapError(
+              mapMcpFailure("unavailable"),
+            ),
+          );
+          let mutationResult: "replaced" | "added" | "unchanged" = "unchanged";
+          if (mutation.changed) {
+            mutationResult = mutation.previousConfig.servers[serverId] ? "replaced" : "added";
+          }
+          return Result.ok({
+            mutation: {
+              type: "upsert" as const,
+              serverId,
+              changed: mutation.changed,
+              result: mutationResult,
+            },
+            reload,
+          });
+        }.bind(this),
       );
-      await this.waitUntilRegistryInitialized();
-      this.params.providers.reconcile(mutation.config);
-      const reload = safeReloadOutcomes(
-        resultToMcpToolValue(await this.params.registry.reload(serverId)),
-      );
-      let mutationResult: "replaced" | "added" | "unchanged" = "unchanged";
-      if (mutation.changed) {
-        mutationResult = mutation.previousConfig.servers[serverId] ? "replaced" : "added";
-      }
-      return {
-        mutation: {
-          type: "upsert" as const,
-          serverId,
-          changed: mutation.changed,
-          result: mutationResult,
-        },
-        reload,
-      };
     });
   }
 
-  private async callRemove({ serverId }: z.output<typeof serverIdInputSchema>) {
+  private async callRemove({
+    serverId,
+  }: z.output<typeof serverIdInputSchema>): Promise<ServerToolResult> {
     return await this.enqueueManagementOperation(async () => {
-      const mutation = resultToMcpToolValue(
-        await mutateMcpConfigFile({
-          configPath: this.params.configPath,
-          mutation: { type: "remove", serverId },
-        }),
+      return Result.gen(
+        async function* (this: McpManagement) {
+          const mutation = yield* (
+            await mutateMcpConfigFile({
+              configPath: this.params.configPath,
+              mutation: { type: "remove", serverId },
+            })
+          ).mapError(mapMcpFailure("unavailable"));
+          yield* Result.await(this.waitUntilRegistryInitialized());
+          yield* this.reconcileProviders(mutation.config);
+          const reload = safeReloadOutcomes(
+            yield* (await this.params.registry.reload(serverId)).mapError(
+              mapMcpFailure("unavailable"),
+            ),
+          );
+          return Result.ok({
+            mutation: {
+              type: "remove" as const,
+              serverId,
+              changed: mutation.changed,
+              result: mutation.changed ? ("removed" as const) : ("not_found" as const),
+            },
+            reload,
+          });
+        }.bind(this),
       );
-      await this.waitUntilRegistryInitialized();
-      this.params.providers.reconcile(mutation.config);
-      const reload = safeReloadOutcomes(
-        resultToMcpToolValue(await this.params.registry.reload(serverId)),
-      );
-      return {
-        mutation: {
-          type: "remove" as const,
-          serverId,
-          changed: mutation.changed,
-          result: mutation.changed ? ("removed" as const) : ("not_found" as const),
-        },
-        reload,
-      };
     });
   }
 
@@ -263,66 +282,104 @@ export class McpManagement implements ServerTool {
       .map(safeStatus);
     const configStatus = this.params.registry.getConfigStatus?.() ?? { status: "valid" as const };
     const callback = this.params.callback?.getStatus();
-    return {
+    return Result.ok({
       config: safeConfigStatus(configStatus),
       statuses,
       ...(callback ? { callback } : {}),
-    };
+    });
   }
 
-  private async callAuth({ serverId }: z.output<typeof serverIdInputSchema>) {
+  private async callAuth({
+    serverId,
+  }: z.output<typeof serverIdInputSchema>): Promise<ServerToolResult> {
     const callback = this.params.callback;
     if (!callback) {
-      return signalMcpFailureToToolHost(
-        "MCP OAuth callback listener is not configured. Restart Lilac Core, then retry mcp.auth.",
+      return Result.err(
+        mcpFailure(
+          "unavailable",
+          "MCP OAuth callback listener is not configured. Restart Lilac Core, then retry mcp.auth.",
+        ),
       );
     }
     const callbackStatus = callback.start();
     if (callbackStatus.status === "unavailable") {
-      return signalMcpFailureToToolHost(
-        `MCP OAuth callback listener is unavailable on ${callbackStatus.hostname}:${callbackStatus.port}. Ensure the port is free, then retry mcp.auth.`,
+      return Result.err(
+        mcpFailure(
+          "unavailable",
+          `MCP OAuth callback listener is unavailable on ${callbackStatus.hostname}:${callbackStatus.port}. Ensure the port is free, then retry mcp.auth.`,
+        ),
       );
     }
-    const result = await this.params.providers.startAuthorization(serverId);
-    return result.status === "authorized"
-      ? { status: result.status }
-      : {
-          status: result.status,
-          authorizationUrl: result.authorizationUrl,
-          callbackUrl: result.callbackUrl,
-        };
+    return (
+      await Result.tryPromise({
+        try: () => this.params.providers.startAuthorization(serverId),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return mcpFailure("unavailable", cause instanceof Error ? cause.message : String(cause));
+        },
+      })
+    ).map((result) =>
+      result.status === "authorized"
+        ? { status: result.status }
+        : {
+            status: result.status,
+            authorizationUrl: result.authorizationUrl,
+            callbackUrl: result.callbackUrl,
+          },
+    );
   }
 
-  private async callReload({ serverId }: z.output<typeof optionalServerIdInputSchema>) {
+  private async callReload({
+    serverId,
+  }: z.output<typeof optionalServerIdInputSchema>): Promise<ServerToolResult> {
     return await this.enqueueManagementOperation(async () => {
-      await this.waitUntilRegistryInitialized();
-      const read = await readMcpConfigFile(this.params.configPath);
-      const snapshot = read.match({
-        err: () => null,
-        ok: (value) => value,
-      });
-      if (snapshot) {
-        this.params.providers.reconcile(snapshot.config);
-      }
-      const reload = resultToMcpToolValue(await this.params.registry.reload(serverId));
-      return { reload: safeReloadOutcomes(reload) };
+      return Result.gen(
+        async function* (this: McpManagement) {
+          yield* Result.await(this.waitUntilRegistryInitialized());
+          const read = await readMcpConfigFile(this.params.configPath);
+          yield* read.match<ResultType<void, ServerToolFailure>>({
+            err: () => Result.ok(undefined),
+            ok: (snapshot) => this.reconcileProviders(snapshot.config),
+          });
+          const reload = yield* (await this.params.registry.reload(serverId)).mapError(
+            mapMcpFailure("unavailable"),
+          );
+          return Result.ok({ reload: safeReloadOutcomes(reload) });
+        }.bind(this),
+      );
     });
   }
 
-  private enqueueManagementOperation<T>(operation: () => Promise<T>): Promise<T> {
+  private enqueueManagementOperation<T>(
+    operation: () => Promise<ResultType<T, ServerToolFailure>>,
+  ): Promise<ResultType<T, ServerToolFailure>> {
     const result = this.mutationQueue.then(operation);
     this.mutationQueue = Promise.allSettled([result]).then(() => undefined);
     return result;
   }
 
-  private async waitUntilRegistryInitialized(): Promise<void> {
+  private reconcileProviders(
+    config: Parameters<McpManagementProviders["reconcile"]>[0],
+  ): ResultType<void, ServerToolFailure> {
+    return Result.try({
+      try: () => this.params.providers.reconcile(config),
+      catch: (cause) => {
+        if (Panic.is(cause)) return preserveToolPanic(cause);
+        return mcpFailure(
+          "unavailable",
+          cause instanceof Error ? cause.message : "MCP provider reconciliation failed",
+        );
+      },
+    });
+  }
+
+  private async waitUntilRegistryInitialized(): Promise<ResultType<void, ServerToolFailure>> {
     const waitUntilInitialized = this.params.registry.waitUntilInitialized;
     if (!waitUntilInitialized)
-      return signalMcpFailureToToolHost("MCP registry initialization barrier is unavailable");
+      return Result.err(
+        mcpFailure("unavailable", "MCP registry initialization barrier is unavailable"),
+      );
     const initialized = await waitUntilInitialized.call(this.params.registry);
-    initialized.match({
-      ok: () => () => undefined,
-      err: (error) => () => signalMcpFailureToToolHost(error.message),
-    })();
+    return initialized.mapError(mapMcpFailure("unavailable"));
   }
 }

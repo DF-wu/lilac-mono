@@ -57,6 +57,7 @@ describe("tool result output normalizer", () => {
     expect(normalized.type).toBe("text");
     if (normalized.type !== "text") return;
     expect(normalized.value).toContain("[tool result overflow]");
+    expect(normalized.value).toContain("Use grep with this URI as path");
     expect(normalized.value).not.toContain("01234");
     expect(normalized.value).not.toContain("fghij");
     const uri = normalized.value.match(/tool-result:\/\/[0-9a-f-]+/u)?.[0];

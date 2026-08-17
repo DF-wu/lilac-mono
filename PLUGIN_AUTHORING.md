@@ -38,7 +38,11 @@ Entrypoints default-export a `LilacToolPlugin` from `@stanley2058/lilac-plugin-r
 ```ts
 import { z } from "zod";
 import { tool } from "ai";
-import { defineServerTool } from "@stanley2058/lilac-plugin-runtime";
+import { Result } from "better-result";
+import {
+  defineServerTool,
+  serverToolFailure,
+} from "@stanley2058/lilac-plugin-runtime";
 import type {
   Level1ToolSpec,
   LilacToolPlugin,
@@ -70,7 +74,7 @@ const level2Tool = defineServerTool({
         text: z.string().describe("Text to echo"),
       }),
       primaryPositional: "text",
-      run: ({ text }) => ({ text }),
+      run: ({ text }) => Result.ok({ text }),
     }),
   }),
 });
@@ -103,6 +107,48 @@ request options (`signal`, `context`, and `messages`). Use `validation: "zod"` o
 callable must preserve a raw `ZodError`; the default produces guided `ToolInputValidationError`
 messages. Static or dynamic catalog overrides can hide a callable or adjust its current
 description without changing its callable ID.
+
+Every external Level 2 `run` callback must return a `better-result` `Result`, synchronously or
+through a promise. Core accepts the full `better-result` Result protocol structurally so Results
+created by a plugin-local dependency installation work across the plugin boundary. Return
+`Result.ok(value)` when the callable completed successfully. For an expected failure, return
+`Result.err(serverToolFailure({ ... }))` with all required `ServerToolFailure` fields:
+
+```ts
+return Result.err(
+  serverToolFailure({
+    kind: "unavailable",
+    code: "upstream_unavailable",
+    message: "The upstream service is unavailable",
+    retryable: true,
+    details: { service: "example" },
+  }),
+);
+```
+
+`kind` is one of `internal`, `usage`, `denied`, `not_found`, `conflict`, `unavailable`, `timeout`,
+or `cancelled`; `code` is a stable machine-readable identifier, `message` is safe caller-facing
+text, `retryable` states whether retrying may succeed, and optional `details` must be JSON. Raw
+values and plain `{ status: ... }` wire-shaped objects without the full Result protocol are invalid
+returns. Throwing is a callable defect, not an expected failure path; do not throw failures that
+belong in `Result.err`.
+
+This Result contract is a clean break with no compatibility path for older raw-return callables.
+Update and rebuild every external Level 2 plugin before loading it. Report and diagnostic
+callables retain their success semantics: if the callable successfully produced its report, return
+`Result.ok(report)` even when the report contains warnings, validation findings, an unhealthy
+status, or another negative diagnostic conclusion. Use `Result.err` only when the callable itself
+could not complete as expected.
+
+The Level 2 `/call` wire response is exactly one of:
+
+```ts
+{ status: "ok", value }
+{ status: "error", error: ServerToolFailure }
+```
+
+Plugins return `Result`; Core owns this wire projection. Plugin authors must not construct the wire
+envelope themselves.
 
 ## Lifecycle
 

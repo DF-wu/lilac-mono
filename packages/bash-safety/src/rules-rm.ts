@@ -4,12 +4,12 @@ import { normalize, resolve } from "node:path";
 
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { hasRecursiveForceFlags } from "./analyze/rm-flags";
+import { hasRecursiveFlag } from "./analyze/rm-flags";
 
 const REASON_RM_RF =
-  "rm -rf outside cwd is blocked. Use explicit paths within the current directory, or delete manually.";
+  "recursive rm outside cwd is blocked. Use explicit paths within the current directory, or delete manually.";
 const REASON_RM_RF_ROOT_HOME =
-  "rm -rf targeting root or home directory is extremely dangerous and always blocked.";
+  "recursive rm targeting root or home directory is extremely dangerous and always blocked.";
 
 export interface AnalyzeRmOptions {
   cwd?: string;
@@ -86,7 +86,7 @@ export function analyzeRm(tokens: string[], options: AnalyzeRmOptions = {}): str
     homeDir: getHomeDirForRmPolicy(),
   };
 
-  if (!hasRecursiveForceFlags(tokens)) {
+  if (!hasRecursiveFlag(tokens)) {
     return null;
   }
 

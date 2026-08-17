@@ -1,11 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { Panic, Result } from "better-result";
+import type { ServerToolResult } from "@stanley2058/lilac-plugin-runtime";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
-import { Surface as ProductionSurface } from "../src/tool-server/tools/surface";
+import { Surface as RawProductionSurface } from "../src/tool-server/tools/surface";
 import {
+  SurfaceOperationPartiallyCompleted,
+  SurfaceOperationUnsupported,
+  SurfaceRateLimited,
   SurfaceUnavailable,
   type SurfaceAdapter,
-  type SurfaceOperationResult,
 } from "../src/surface/adapter";
 import { BUILTIN_SURFACE_PROTOCOLS } from "../src/surface/builtin-surface-protocols";
 import {
@@ -14,11 +17,6 @@ import {
 } from "../src/surface/github/github-adapter";
 import { createDescriptorBoundSurfaceAdapter } from "../src/surface/produced-ref-guard";
 import { SurfaceRuntimeRegistry } from "../src/surface/runtime-descriptor";
-import {
-  SurfaceRefInvalid,
-  SurfaceToolTargetInvalid,
-  type SurfaceProtocolRouting,
-} from "../src/surface/protocol";
 import { GITHUB_AGENT_COMMENT_MARKER } from "../src/github/github-comment-marker";
 import {
   DiscordSearchService,
@@ -51,81 +49,6 @@ function createGithubTestAdapter(api: GithubSurfaceApi) {
   return createDescriptorBoundSurfaceAdapter("github", new GithubAdapter({ api }));
 }
 
-const TEST_TELEGRAM_PROTOCOL: SurfaceProtocolRouting<"telegram"> = {
-  platform: "telegram",
-  displayName: "Telegram",
-  ownsRequestId: (requestId) => requestId.startsWith("telegram:"),
-  refs: {
-    createSessionRef: (channelId) => ({ platform: "telegram", channelId }),
-    createMessageRef: (sessionRef, messageId) => ({ ...sessionRef, messageId }),
-    resolveRequestMessageRef: ({ requestId, sessionRef }) => {
-      const prefix = `telegram:${sessionRef.channelId}:`;
-      return requestId.startsWith(prefix)
-        ? {
-            kind: "target",
-            ref: {
-              platform: "telegram",
-              channelId: sessionRef.channelId,
-              messageId: requestId.slice(prefix.length),
-            },
-          }
-        : { kind: "none" };
-    },
-    decodeMessageRef: ({ ref, expectedSessionId }) => {
-      if (ref.platform !== "telegram" || ref.channelId !== expectedSessionId) {
-        return Result.err(
-          new SurfaceRefInvalid({
-            reason: ref.platform === "telegram" ? "session-mismatch" : "platform-mismatch",
-            expectedPlatform: "telegram",
-            expectedSessionId,
-            message: "Telegram message reference does not match the selected session",
-          }),
-        );
-      }
-      return Result.ok({
-        platform: "telegram",
-        channelId: ref.channelId,
-        messageId: ref.messageId,
-      });
-    },
-  },
-  toolTargets: {
-    helpFallbackPriority: 30,
-    inferRequestTarget: (requestId) => {
-      if (!requestId?.startsWith("telegram:")) return null;
-      const separator = requestId.lastIndexOf(":");
-      if (separator <= "telegram:".length) return null;
-      return {
-        sessionId: requestId.slice("telegram:".length, separator),
-        messageId: requestId.slice(separator + 1),
-      };
-    },
-    describeSessionIds: () => ({
-      sessionIdFormats: {
-        client: "telegram",
-        accepted: [{ format: "<chat_id>[:<thread_id>]", meaning: "Telegram chat or topic" }],
-        notes: [],
-      },
-    }),
-    resolveSession: async ({ selector, getConfig }) => {
-      const config = await getConfig();
-      const topicSeparator = selector.indexOf(":");
-      const chatId = topicSeparator < 0 ? selector : selector.slice(0, topicSeparator);
-      if (!config.surface.telegram.allowedChatIds.includes(chatId)) {
-        return Result.err(
-          new SurfaceToolTargetInvalid({
-            message: `Not allowed: Telegram sessionId '${selector}'`,
-          }),
-        );
-      }
-      return Result.ok({
-        sessionRef: { platform: "telegram", channelId: selector },
-        config,
-      });
-    },
-  },
-};
-
 function createTestAdapterResolver(
   descriptors: Parameters<typeof SurfaceRuntimeRegistry.create>[0],
 ) {
@@ -140,35 +63,52 @@ const DEFAULT_GITHUB_TEST_ADAPTER = createDescriptorBoundSurfaceAdapter(
 );
 
 type TestSurfaceParams = Omit<
-  ConstructorParameters<typeof ProductionSurface>[0],
+  ConstructorParameters<typeof RawProductionSurface>[0],
   "adapterResolver"
 > & {
   readonly adapter: SurfaceAdapter;
   readonly githubAdapter?: SurfaceAdapter;
-  readonly telegramAdapter?: SurfaceAdapter;
 };
+
+class ProductionSurface {
+  protected readonly raw: RawProductionSurface;
+
+  constructor(params: ConstructorParameters<typeof RawProductionSurface>[0]) {
+    this.raw = new RawProductionSurface(params);
+  }
+
+  list() {
+    return this.raw.list();
+  }
+
+  callResult(...args: Parameters<RawProductionSurface["call"]>): Promise<ServerToolResult> {
+    return this.raw.call(...args);
+  }
+
+  async call(...args: Parameters<RawProductionSurface["call"]>): Promise<unknown> {
+    const outcome = (await this.callResult(...args)).match<
+      { readonly value: unknown } | { readonly error: { readonly message: string } }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in outcome) throw new Error(outcome.error.message);
+    return outcome.value;
+  }
+}
 
 class Surface extends ProductionSurface {
   constructor(params: TestSurfaceParams) {
-    const {
-      adapter: _adapter,
-      githubAdapter: _githubAdapter,
-      telegramAdapter: _telegramAdapter,
-      ...surfaceParams
-    } = params;
-    const descriptors: Array<Parameters<typeof SurfaceRuntimeRegistry.create>[0][number]> = [
-      { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter: params.adapter },
-      {
-        protocol: BUILTIN_SURFACE_PROTOCOLS.github,
-        adapter: params.githubAdapter ?? DEFAULT_GITHUB_TEST_ADAPTER,
-      },
-    ];
-    if (params.telegramAdapter) {
-      descriptors.push({ protocol: TEST_TELEGRAM_PROTOCOL, adapter: params.telegramAdapter });
-    }
+    const { adapter: _adapter, githubAdapter: _githubAdapter, ...surfaceParams } = params;
     super({
       ...surfaceParams,
-      adapterResolver: createTestAdapterResolver(descriptors),
+      adapterResolver: createTestAdapterResolver([
+        { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter: params.adapter },
+        {
+          protocol: BUILTIN_SURFACE_PROTOCOLS.github,
+          adapter: params.githubAdapter ?? DEFAULT_GITHUB_TEST_ADAPTER,
+        },
+      ]),
     });
   }
 }
@@ -227,11 +167,7 @@ class FakeAdapter extends SurfaceAdapterTestBase {
     return Result.ok({ stop: async () => Result.ok(undefined) });
   }
 
-  async sendMsg(
-    sessionRef: SessionRef,
-    content: ContentOpts,
-    opts?: SendOpts,
-  ): Promise<SurfaceOperationResult<MsgRef>> {
+  async sendMsg(sessionRef: SessionRef, content: ContentOpts, opts?: SendOpts) {
     this.sendCalls.push({ sessionRef, content, opts });
     return Result.ok({
       platform: "discord",
@@ -259,11 +195,11 @@ class FakeAdapter extends SurfaceAdapterTestBase {
     return Result.ok(msgs.slice(0, limit));
   }
 
-  async editMsg(_msgRef: MsgRef, _content: ContentOpts): Promise<SurfaceOperationResult<void>> {
+  async editMsg() {
     return Result.ok(undefined);
   }
 
-  async deleteMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
+  async deleteMsg() {
     return Result.ok(undefined);
   }
 
@@ -330,240 +266,7 @@ class FakeAdapter extends SurfaceAdapterTestBase {
   }
 }
 
-class FakeTelegramToolAdapter extends FakeAdapter {
-  readonly editCalls: Array<{ msgRef: MsgRef; content: ContentOpts }> = [];
-  readonly deleteCalls: MsgRef[] = [];
-
-  override async getSelf(): Promise<SurfaceSelf> {
-    return { platform: "telegram", userId: "bot", userName: "lilac" };
-  }
-
-  override async sendMsg(
-    sessionRef: SessionRef,
-    content: ContentOpts,
-    opts?: SendOpts,
-  ): Promise<SurfaceOperationResult<MsgRef>> {
-    this.sendCalls.push({ sessionRef, content, opts });
-    return Result.ok({
-      platform: "telegram",
-      channelId: sessionRef.channelId,
-      messageId: "sent",
-    });
-  }
-
-  override async editMsg(
-    msgRef: MsgRef,
-    content: ContentOpts,
-  ): Promise<SurfaceOperationResult<void>> {
-    this.editCalls.push({ msgRef, content });
-    return Result.ok(undefined);
-  }
-
-  override async deleteMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
-    this.deleteCalls.push(msgRef);
-    return Result.ok(undefined);
-  }
-}
-
 describe("tool-server surface", () => {
-  it("routes Telegram message tools through the Telegram adapter", async () => {
-    const baseCfg = testConfig({});
-    const cfg: CoreConfig = {
-      ...baseCfg,
-      surface: {
-        ...baseCfg.surface,
-        telegram: {
-          ...baseCfg.surface.telegram,
-          enabled: true,
-          allowedChatIds: ["1001"],
-          allowedUserIds: [],
-        },
-      },
-    };
-    const session = { platform: "telegram", channelId: "1001" } as const;
-    const message: SurfaceMessage = {
-      ref: { ...session, messageId: "42" },
-      session,
-      userId: "7",
-      userName: "Ada",
-      text: "hello from Telegram",
-      ts: 100,
-    };
-    const discordAdapter = new FakeAdapter([], {});
-    const telegramAdapter = new FakeTelegramToolAdapter(
-      [
-        { ref: session, kind: "dm", title: "Allowed" },
-        { ref: { platform: "telegram", channelId: "2002" }, kind: "dm", title: "Denied" },
-      ],
-      { "1001": [message] },
-    );
-    const tool = new Surface({
-      adapter: discordAdapter,
-      telegramAdapter,
-      config: cfg,
-    });
-    const ctx = {
-      requestClient: "telegram",
-      sessionId: "1001",
-      requestId: "telegram:1001:42",
-      requestInitiator: { platform: "telegram" as const, userId: "7" },
-      requestInitiatorSessionId: "1001",
-      safetyMode: "restricted" as const,
-    } as RequestContext;
-
-    expect(await tool.call("surface.sessions.list", {}, { context: ctx })).toEqual([
-      { channelId: "1001", kind: "dm", title: "Allowed" },
-    ]);
-    const listed = (await tool.call("surface.messages.list", {}, { context: ctx })) as {
-      messages: Array<{ messageId: string; richText: string }>;
-    };
-    expect(listed.messages).toMatchObject([{ messageId: "42", richText: "hello from Telegram" }]);
-    const read = (await tool.call("surface.messages.read", {}, { context: ctx })) as {
-      message: { messageId: string; richText: string } | null;
-    };
-    expect(read.message).toMatchObject({ messageId: "42", richText: "hello from Telegram" });
-
-    await tool.call("surface.messages.send", { text: "reply", silent: true }, { context: ctx });
-    expect(telegramAdapter.sendCalls.at(-1)).toMatchObject({
-      sessionRef: session,
-      content: { text: "reply" },
-      opts: { silent: true },
-    });
-    await tool.call("surface.messages.edit", { messageId: "42", text: "edited" }, { context: ctx });
-    await tool.call("surface.messages.delete", { messageId: "42" }, { context: ctx });
-    await tool.call("surface.reactions.add", { reaction: "👍" }, { context: ctx });
-    await tool.call("surface.reactions.remove", { reaction: "👍" }, { context: ctx });
-
-    expect(telegramAdapter.editCalls.at(-1)?.msgRef).toEqual({ ...session, messageId: "42" });
-    expect(telegramAdapter.deleteCalls.at(-1)).toEqual({ ...session, messageId: "42" });
-    expect(telegramAdapter.addReactionCalls.at(-1)).toEqual({
-      msgRef: { ...session, messageId: "42" },
-      reaction: "👍",
-    });
-    expect(telegramAdapter.removeReactionCalls.at(-1)).toEqual({
-      msgRef: { ...session, messageId: "42" },
-      reaction: "👍",
-    });
-  });
-
-  it("infers Telegram topic refs and rejects disallowed or cross-surface targets", async () => {
-    const baseCfg = testConfig({});
-    const cfg: CoreConfig = {
-      ...baseCfg,
-      surface: {
-        ...baseCfg.surface,
-        telegram: {
-          ...baseCfg.surface.telegram,
-          enabled: true,
-          allowedChatIds: ["-100123"],
-          allowedUserIds: [],
-        },
-      },
-    };
-    const discordAdapter = new FakeAdapter([], {});
-    const telegramAdapter = new FakeTelegramToolAdapter([], {});
-    const tool = new Surface({
-      adapter: discordAdapter,
-      telegramAdapter,
-      config: cfg,
-    });
-    const ctx = {
-      requestClient: "telegram",
-      requestId: "telegram:-100123:7:42",
-      requestInitiator: { platform: "telegram" as const, userId: "7" },
-      requestInitiatorSessionId: "-100123:7",
-      safetyMode: "restricted" as const,
-    } as RequestContext;
-
-    await tool.call("surface.reactions.add", { reaction: "👀" }, { context: ctx });
-    expect(telegramAdapter.addReactionCalls.at(-1)?.msgRef).toEqual({
-      platform: "telegram",
-      channelId: "-100123:7",
-      messageId: "42",
-    });
-    await expect(
-      tool.call(
-        "surface.messages.send",
-        { sessionId: "-100999", text: "denied" },
-        { context: ctx },
-      ),
-    ).rejects.toThrow("outside request origin '-100123:7'");
-    await expect(
-      tool.call("surface.messages.send", { client: "discord", text: "cross" }, { context: ctx }),
-    ).rejects.toThrow("Client mismatch");
-  });
-
-  it("fails closed when Telegram was not injected into the adapter registry", async () => {
-    const adapter = new FakeAdapter([], {});
-    const baseCfg = testConfig({});
-    const cfg: CoreConfig = {
-      ...baseCfg,
-      surface: {
-        ...baseCfg.surface,
-        telegram: {
-          ...baseCfg.surface.telegram,
-          enabled: true,
-          allowedChatIds: ["1001"],
-        },
-      },
-    };
-    const tool = new Surface({ adapter, config: cfg });
-    const ctx = { requestClient: "telegram", sessionId: "1001" } as RequestContext;
-
-    await expect(
-      tool.call("surface.messages.send", { text: "unavailable" }, { context: ctx }),
-    ).rejects.toThrow("has no registered executable adapter");
-  });
-
-  it("uses the server-issued Telegram origin for workflow surface defaults and checks", async () => {
-    const baseCfg = testConfig({});
-    const cfg: CoreConfig = {
-      ...baseCfg,
-      surface: {
-        ...baseCfg.surface,
-        telegram: {
-          ...baseCfg.surface.telegram,
-          enabled: true,
-          allowedChatIds: ["-100123"],
-        },
-      },
-    };
-    const adapter = new FakeAdapter([], {});
-    const telegramAdapter = new FakeTelegramToolAdapter([], {});
-    const tool = new Surface({
-      adapter,
-      telegramAdapter,
-      config: cfg,
-    });
-    const context = {
-      requestClient: "unknown",
-      sessionId: "workflow:run-1:operation-1",
-      requestInitiator: { platform: "telegram" as const, userId: "user-7" },
-      requestInitiatorSessionId: "-100123:7",
-      safetyMode: "restricted" as const,
-    } satisfies RequestContext;
-
-    await tool.call("surface.messages.send", { text: "origin-default" }, { context });
-    expect(telegramAdapter.sendCalls.at(-1)?.sessionRef).toEqual({
-      platform: "telegram",
-      channelId: "-100123:7",
-    });
-    await expect(
-      tool.call(
-        "surface.messages.send",
-        { sessionId: "-100123:8", text: "cross-topic" },
-        { context },
-      ),
-    ).rejects.toThrow("outside request origin '-100123:7'");
-    await expect(
-      tool.call(
-        "surface.messages.send",
-        { client: "discord", sessionId: "123", text: "cross-surface" },
-        { context },
-      ),
-    ).rejects.toThrow("Client mismatch");
-  });
-
   it("marks surface.messages.search as deprecated and hidden", async () => {
     const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
 
@@ -752,26 +455,44 @@ describe("tool-server surface", () => {
   it("uses a registered request context as authoritative and rejects an explicit conflict", async () => {
     const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
 
-    await expect(
-      tool.call(
-        "surface.messages.read",
-        { client: "discord", sessionId: "channel-1", messageId: "message-1" },
-        { context: { requestClient: "github" } },
-      ),
-    ).rejects.toThrow(
-      "Client mismatch: context requestClient is 'github' but input client is 'discord'",
+    const result = await tool.callResult(
+      "surface.messages.read",
+      { client: "discord", sessionId: "channel-1", messageId: "message-1" },
+      { context: { requestClient: "github" } },
     );
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error).toMatchObject({
+        kind: "conflict",
+        message: "Client mismatch: context requestClient is 'github' but input client is 'discord'",
+      });
+    }
   });
 
   it("distinguishes unregistered wire clients from malformed context values", async () => {
     const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
 
-    await expect(tool.call("surface.sessions.list", { client: "slack" })).rejects.toThrow(
-      "client 'slack' is recognized but has no registered executable adapter",
+    const unregistered = await tool.callResult("surface.sessions.list", { client: "slack" });
+    expect(unregistered.status).toBe("error");
+    if (unregistered.status === "error") {
+      expect(unregistered.error.kind).toBe("unavailable");
+      expect(unregistered.error.message).toContain(
+        "client 'slack' is recognized but has no registered executable adapter",
+      );
+    }
+
+    const malformed = await tool.callResult(
+      "surface.sessions.list",
+      {},
+      { context: { requestClient: "desktop" } },
     );
-    await expect(
-      tool.call("surface.sessions.list", {}, { context: { requestClient: "desktop" } }),
-    ).rejects.toThrow("context requestClient 'desktop' is not a valid surface wire value");
+    expect(malformed.status).toBe("error");
+    if (malformed.status === "error") {
+      expect(malformed.error).toMatchObject({ kind: "usage" });
+      expect(malformed.error.message).toContain(
+        "context requestClient 'desktop' is not a valid surface wire value",
+      );
+    }
   });
 
   it("does not route an unregistered wire client target operation through Discord", async () => {
@@ -2627,6 +2348,56 @@ describe("tool-server surface", () => {
     expect(linked).toEqual([]);
   });
 
+  it("preserves Panic from best-effort transcript linkage", async () => {
+    const panic = new Panic({ message: "transcript linkage invariant" });
+    const transcriptStore: TranscriptStore = {
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
+      linkSurfaceMessagesToRequest() {
+        throw panic;
+      },
+      getTranscriptBySurfaceMessage() {
+        return Result.ok(null);
+      },
+      close() {},
+    };
+    const tool = new Surface({
+      adapter: new FakeAdapter([], {}),
+      transcriptStore,
+      config: testConfig({
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: ["123456789012345678"],
+            allowedGuildIds: [],
+            botName: "lilac",
+          },
+        },
+      }),
+    });
+
+    const [settled] = await Promise.allSettled([
+      tool.call(
+        "surface.messages.send",
+        {
+          client: "discord",
+          sessionId: "123456789012345678",
+          text: "hello",
+        },
+        {
+          context: {
+            requestId: "heartbeat:panic-link",
+            sessionId: "__heartbeat__",
+            requestClient: "unknown",
+          },
+        },
+      ),
+    ]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+  });
+
   it("lists recent visible agent writes with thin previews", async () => {
     const cfg = testConfig({
       surface: {
@@ -2998,13 +2769,15 @@ describe("tool-server surface", () => {
     const adapter = createDescriptorBoundSurfaceAdapter("discord", rawAdapter);
     const tool = new Surface({ adapter, config: cfg });
 
-    await expect(
+    const [settled] = await Promise.allSettled([
       tool.call("surface.messages.send", {
         sessionId: "ops",
         text: "hi",
         client: "discord",
       }),
-    ).rejects.toBe(panic);
+    ]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
     expect(rawAdapter.sendCalls).toEqual([]);
   });
 
@@ -3059,6 +2832,130 @@ describe("tool-server surface", () => {
     await expect(tool.call("surface.sessions.list", { client: "github" })).rejects.toThrow(
       "GitHub session discovery is not supported; use GitHub issue/PR discovery",
     );
+  });
+
+  it("maps unsupported operations to nonretryable usage failures", async () => {
+    const adapter: SurfaceAdapter = new FakeAdapter([], {});
+    adapter.listSessions = async () =>
+      Result.err(
+        new SurfaceOperationUnsupported({
+          platform: "discord",
+          operation: "list-sessions",
+          message: "session discovery is unsupported",
+        }),
+      );
+    const tool = new Surface({ adapter, config: testConfig({}) });
+
+    const result = await tool.callResult("surface.sessions.list", { client: "discord" });
+    expect(result).toMatchObject({
+      status: "error",
+      error: {
+        kind: "usage",
+        code: "surface_operation_unsupported",
+        retryable: false,
+      },
+    });
+  });
+
+  it("rejects unexpected adapter defects", async () => {
+    const defect = new TypeError("invalid adapter state");
+    const adapter: SurfaceAdapter = new FakeAdapter([], {});
+    adapter.listSessions = async () => {
+      throw defect;
+    };
+    const tool = new Surface({ adapter, config: testConfig({}) });
+
+    const [settled] = await Promise.allSettled([
+      tool.callResult("surface.sessions.list", { client: "discord" }),
+    ]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") {
+      expect(Panic.is(settled.reason)).toBe(true);
+      expect(settled.reason).toMatchObject({ cause: defect });
+    }
+  });
+
+  it("preserves rate-limit retry metadata and unavailable retryability", async () => {
+    const adapter: SurfaceAdapter = new FakeAdapter([], {});
+    adapter.listSessions = async () =>
+      Result.err(
+        new SurfaceRateLimited({
+          platform: "discord",
+          operation: "list-sessions",
+          retryAfterMs: 2_500,
+          message: "surface rate limited",
+        }),
+      );
+    const tool = new Surface({ adapter, config: testConfig({}) });
+
+    const rateLimited = await tool.callResult("surface.sessions.list", { client: "discord" });
+    expect(rateLimited).toMatchObject({
+      status: "error",
+      error: {
+        kind: "unavailable",
+        code: "surface_rate_limited",
+        retryable: true,
+        details: { retryAfterMs: 2_500 },
+      },
+    });
+
+    adapter.listSessions = async () =>
+      Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "list-sessions",
+          message: "surface unavailable",
+        }),
+      );
+    const unavailable = await tool.callResult("surface.sessions.list", { client: "discord" });
+    expect(unavailable).toMatchObject({
+      status: "error",
+      error: { kind: "unavailable", code: "surface_unavailable", retryable: true },
+    });
+  });
+
+  it("preserves a safely projected created ref after partial completion", async () => {
+    const adapter: SurfaceAdapter = new FakeAdapter([], {});
+    const channelId = "123456789012345678";
+    adapter.sendMsg = async () =>
+      Result.err(
+        new SurfaceOperationPartiallyCompleted({
+          platform: "discord",
+          operation: "send-message",
+          created: { platform: "discord", channelId, messageId: "created-message" },
+          message: "message was created before follow-up work failed",
+        }),
+      );
+    const tool = new Surface({
+      adapter,
+      config: testConfig({
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: [channelId],
+            allowedGuildIds: [],
+            botName: "lilac",
+          },
+        },
+      }),
+    });
+
+    const result = await tool.callResult("surface.messages.send", {
+      client: "discord",
+      sessionId: channelId,
+      text: "hello",
+    });
+    expect(result).toMatchObject({
+      status: "error",
+      error: {
+        kind: "conflict",
+        code: "surface_operation_partially_completed",
+        retryable: false,
+        details: {
+          created: { platform: "discord", channelId, messageId: "created-message" },
+        },
+      },
+    });
   });
 
   it("returns the GitHub adapter's stable unsupported participant output", async () => {
@@ -3388,7 +3285,7 @@ describe("tool-server surface", () => {
 
     const githubApi: GithubSurfaceApi = {
       getIssue: async () => ({
-        id: 12,
+        id: 1,
         title: "t",
         body: "b",
         user: { login: "alice", id: 1 },

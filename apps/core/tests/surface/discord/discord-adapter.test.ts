@@ -42,6 +42,7 @@ import type { ContentOpts } from "../../../src/surface/types";
 import { toBusDiscordCommandInvokedData } from "../../../src/surface/discord/discord-command-projection";
 import { DiscordSurfaceStore } from "../../../src/surface/store/discord-surface-store";
 import { composeRequestMessages } from "../../../src/surface/bridge/request-composition";
+import type { CustomCommandManager } from "../../../src/custom-commands/manager";
 
 describe("Discord command actor projection", () => {
   it("omits an anonymous actor instead of emitting an incomplete actor", () => {
@@ -293,6 +294,120 @@ describe("DiscordAdapter nested refs", () => {
     if (result.status === "ok") throw new Error("expected nested-ref failure");
     expect(result.error).toBeInstanceOf(SurfaceSessionMismatch);
     expect(result.error).toMatchObject({ refRole: "resume.created[0]" });
+  });
+});
+
+describe("DiscordAdapter typing", () => {
+  it("returns before the initial typing request settles", async () => {
+    const config = testConfigWithStatusMessage();
+    const typingStarted = Promise.withResolvers<void>();
+    const typingRelease = Promise.withResolvers<void>();
+    const adapter = createTestDiscordAdapter({ config });
+    Object.assign(adapter, {
+      client: {
+        channels: {
+          fetch: async () => ({
+            sendTyping: () => {
+              typingStarted.resolve();
+              return typingRelease.promise;
+            },
+          }),
+        },
+      },
+      cfg: config,
+    });
+
+    const started = await adapter.startTyping({ platform: "discord", channelId: "c1" });
+    expect(started.status).toBe("ok");
+    if (started.status === "error") throw started.error;
+    await typingStarted.promise;
+
+    expect(await started.value.stop()).toEqual(Result.ok(undefined));
+    typingRelease.resolve();
+    await typingRelease.promise;
+  });
+
+  it("reports a detached typing Panic to the fatal supervisor", async () => {
+    const config = testConfigWithStatusMessage();
+    const panic = new Panic({ message: "typing defect" });
+    const reported = Promise.withResolvers<Panic>();
+    const adapter = new DiscordAdapter({
+      config,
+      reportFatalPanic: (cause) => reported.resolve(cause),
+    });
+    Object.assign(adapter, {
+      client: {
+        channels: {
+          fetch: async () => {
+            throw panic;
+          },
+        },
+      },
+      cfg: config,
+    });
+
+    const started = await adapter.startTyping({ platform: "discord", channelId: "c1" });
+    expect(started.status).toBe("ok");
+    expect(await reported.promise).toBe(panic);
+  });
+});
+
+describe("DiscordAdapter custom command acknowledgement", () => {
+  it("emits the command while the visual preview is still pending", async () => {
+    const config = testConfigWithStatusMessage();
+    const previewRelease = Promise.withResolvers<void>();
+    const commandEmitted = Promise.withResolvers<void>();
+    const sequence: string[] = [];
+    const customCommands = {
+      get: () => ({ def: { name: "test", args: [] } }),
+      parseSlash: () =>
+        Result.ok({
+          command: { def: { name: "test", args: [] } },
+          args: [],
+          prompt: null,
+          text: "/lilac:test",
+          source: "discord-slash",
+        }),
+      formatPreview: () => "/lilac:test",
+    } as unknown as CustomCommandManager;
+    const adapter = createTestDiscordAdapter({ config, customCommands });
+    Object.assign(adapter, {
+      client: {},
+      cfg: config,
+      self: { platform: "discord", userId: "bot", userName: "lilac" },
+    });
+    await adapter.subscribe((event) => {
+      if (event.type !== "adapter.command.invoked") return;
+      sequence.push("command");
+      commandEmitted.resolve();
+    });
+    const interaction = {
+      commandName: "lilac",
+      channelId: "c1",
+      guildId: null,
+      channel: null,
+      member: null,
+      id: "interaction-1",
+      user: { id: "user-1", username: "user", globalName: null },
+      options: {
+        getSubcommand: () => "test",
+        getString: () => null,
+      },
+      reply: () => {
+        sequence.push("preview");
+        return previewRelease.promise;
+      },
+    };
+    const onChatInputCommand = Reflect.get(adapter, "onChatInputCommand") as (
+      interaction: unknown,
+    ) => Promise<void>;
+
+    await onChatInputCommand.call(adapter, interaction);
+    await commandEmitted.promise;
+    expect(sequence).toEqual(["preview", "command"]);
+
+    previewRelease.resolve();
+    await previewRelease.promise;
   });
 });
 
@@ -1153,7 +1268,7 @@ describe("DiscordAdapter detached event supervision", () => {
 });
 
 describe("DiscordAdapter.refreshCoreConfig", () => {
-  it("keeps paused recovery preparation provider-mutation free until normal output preparation", async () => {
+  it("keeps output preparation on the current config snapshot until an explicit refresh", async () => {
     const previousConfig = testConfigWithStatusMessage("previous presence");
     const changedConfig = testConfigWithStatusMessage("changed presence");
     let cfg = previousConfig;
@@ -1226,15 +1341,19 @@ describe("DiscordAdapter.refreshCoreConfig", () => {
     ).toBe("visible");
     await expect(prepared.value.abort("restore_rollback")).resolves.toEqual(Result.ok(undefined));
     expect({ configReads, channelFetches, providerMutations }).toEqual({
-      configReads: 1,
+      configReads: 0,
       channelFetches: 0,
       providerMutations: [],
     });
 
     const normal = await adapter.startOutput({ platform: "discord", channelId: "c1" });
     expect(normal.status).toBe("ok");
-    expect(configReads).toBe(2);
+    expect(configReads).toBe(0);
     expect(channelFetches).toBe(0);
+    expect(providerMutations).toEqual([]);
+
+    await adapter.refreshCoreConfig();
+    expect(configReads).toBe(1);
     expect(providerMutations).toEqual([
       {
         operation: "setPresence",

@@ -1,13 +1,16 @@
 import { z } from "zod";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 
 import type {
   ServerTool,
   ServerToolCallOptions,
+  ServerToolFailure,
   ServerToolHelpEntry,
   ServerToolPrimaryPositional,
+  ServerToolResult,
 } from "./types";
-import { parseToolInput, parseToolInputPreservingZodError } from "./validation-error-message";
+import { serverToolFailure } from "./types";
+import { decodeToolInput, type ToolInputValidationError } from "./validation-error-message";
 import { zodObjectToCliLines } from "./zod-cli";
 
 export type ServerToolValidationMode = "guided" | "zod";
@@ -42,7 +45,7 @@ export type ServerToolCallableDefinition<
   run(
     input: z.output<TSchema>,
     opts: ServerToolCallOptions<P> | undefined,
-  ): TResult | Promise<TResult>;
+  ): ServerToolResult<TResult> | Promise<ServerToolResult<TResult>>;
 };
 
 export type ServerToolCallable<P extends string = string> = {
@@ -57,7 +60,7 @@ export type ServerToolCallable<P extends string = string> = {
     callableId: string,
     input: Record<string, unknown>,
     opts: ServerToolCallOptions<P> | undefined,
-  ): Promise<unknown>;
+  ): Promise<ServerToolResult>;
 };
 
 export type ServerToolCallableBuilder<P extends string = string> = <
@@ -95,50 +98,43 @@ function createCallable<P extends string>(): ServerToolCallableBuilder<P> {
       cli: definition.cli,
       catalog: definition.catalog,
       async invoke(callableId, input: Record<string, unknown>, opts) {
-        const decoded =
-          validation === "guided"
-            ? parseToolInput({ callableId, input, schema: definition.inputSchema })
-            : parseToolInputPreservingZodError({
-                callableId,
-                input,
-                schema: definition.inputSchema,
-              });
-        return definition.run(decoded, opts);
+        const decoded = decodeToolInput({ callableId, input, schema: definition.inputSchema });
+        const invoke = decoded.match<() => Promise<ServerToolResult<TResult>>>({
+          ok: (value) => () => Promise.resolve(definition.run(value, opts)),
+          err: (error) => () => Promise.resolve(Result.err(validationFailure(validation, error))),
+        });
+        return invoke();
       },
     };
   };
 }
 
-class ServerToolCallableNotFound extends TaggedError("ServerToolCallableNotFound")<{
-  readonly callableId: string;
-  readonly message: string;
-}> {}
+function validationFailure(
+  validation: ServerToolValidationMode,
+  error: ToolInputValidationError,
+): ServerToolFailure {
+  return serverToolFailure({
+    kind: "usage",
+    code: "invalid_input",
+    message: validation === "guided" ? error.message : error.cause.message,
+    retryable: false,
+  });
+}
 
 function lookupServerToolCallable<P extends string>(
   callables: ReadonlyMap<string, ServerToolCallable<P>>,
   callableId: string,
-): ResultType<ServerToolCallable<P>, ServerToolCallableNotFound> {
+): ResultType<ServerToolCallable<P>, ServerToolFailure> {
   const entry = callables.get(callableId);
   if (entry) return Result.ok(entry);
   return Result.err(
-    new ServerToolCallableNotFound({
-      callableId,
+    serverToolFailure({
+      kind: "not_found",
+      code: "unknown_callable",
       message: `Invalid callable ID '${callableId}'`,
+      retryable: false,
     }),
   );
-}
-
-function adaptServerToolDispatchResultToHost<TValue>(
-  result: ResultType<TValue, ServerToolCallableNotFound>,
-): TValue {
-  const resolved = result.match<
-    { readonly value: TValue } | { readonly error: ServerToolCallableNotFound }
-  >({
-    ok: (value) => ({ value }),
-    err: (error) => ({ error }),
-  });
-  if ("error" in resolved) throw new Error(resolved.error.message);
-  return resolved.value;
 }
 
 function createHelpEntry<P extends string>(
@@ -196,10 +192,13 @@ export function defineServerTool<P extends string = string>(
       return entries;
     },
     async call(callableId, input, opts) {
-      const entry = adaptServerToolDispatchResultToHost(
-        lookupServerToolCallable(callables, callableId),
-      );
-      return entry.invoke(callableId, input, opts);
+      const invoke = lookupServerToolCallable(callables, callableId).match<
+        () => Promise<ServerToolResult>
+      >({
+        ok: (entry) => () => entry.invoke(callableId, input, opts),
+        err: (error) => () => Promise.resolve(Result.err(error)),
+      });
+      return invoke();
     },
   };
 }

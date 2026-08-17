@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { analyzeBashCommand } from "@stanley2058/lilac-bash-safety";
+import { serverToolExitCode, type ServerToolFailure } from "@stanley2058/lilac-plugin-runtime";
 import {
   env,
   isRecord,
@@ -827,7 +828,7 @@ describe("executeRestrictedBash", () => {
       }
       if (url.endsWith("/call")) {
         capturedCallInput = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
-        return Response.json({ isError: false, output: { ok: true } });
+        return Response.json({ status: "ok", value: { ok: true } });
       }
       return new Response("not found", { status: 404 });
     });
@@ -849,10 +850,71 @@ describe("executeRestrictedBash", () => {
       );
 
       expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe('{"ok":true}\n');
+      expect(result.stderr).toBe("");
       expect(capturedCallInput).toEqual({
         callableId: "attachment.add_files",
         input: { paths: ["a.png", "b.png"] },
       });
+    } finally {
+      restoreFetch();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("treats nested --output as a CLI option and honors compact and pretty JSON", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+    );
+    const capturedInputs: unknown[] = [];
+    const restoreFetch = installMockFetch(async (_input, init) => {
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      capturedInputs.push(body);
+      if (body?.callableId === "demo.string") {
+        return Response.json({ status: "ok", value: "plain text" });
+      }
+      return Response.json({ status: "ok", value: { ok: true, nested: { count: 2 } } });
+    });
+
+    try {
+      const compact = await executeRestrictedBash(
+        {
+          command: "tools demo.echo --value=hello --output=json",
+          cwd: workspace,
+        },
+        { workspaceRoot: workspace },
+      );
+      const pretty = await executeRestrictedBash(
+        {
+          command: "tools demo.echo --value=hello --output=json-pretty",
+          cwd: workspace,
+        },
+        { workspaceRoot: workspace },
+      );
+      const stringValue = await executeRestrictedBash(
+        {
+          command: "tools demo.string --output=json",
+          cwd: workspace,
+        },
+        { workspaceRoot: workspace },
+      );
+
+      expect(compact).toMatchObject({
+        stdout: '{"ok":true,"nested":{"count":2}}\n',
+        stderr: "",
+        exitCode: 0,
+      });
+      expect(pretty).toMatchObject({
+        stdout: '{\n  "ok": true,\n  "nested": {\n    "count": 2\n  }\n}\n',
+        stderr: "",
+        exitCode: 0,
+      });
+      expect(stringValue).toMatchObject({ stdout: '"plain text"\n', stderr: "", exitCode: 0 });
+      expect(capturedInputs).toEqual([
+        { callableId: "demo.echo", input: { value: "hello" } },
+        { callableId: "demo.echo", input: { value: "hello" } },
+        { callableId: "demo.string", input: {} },
+      ]);
     } finally {
       restoreFetch();
       await fs.rm(workspace, { recursive: true, force: true });
@@ -872,7 +934,7 @@ describe("executeRestrictedBash", () => {
       }
       if (url.endsWith("/call")) {
         capturedCallInput = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
-        return Response.json({ isError: false, output: { ok: true } });
+        return Response.json({ status: "ok", value: { ok: true } });
       }
       return new Response("not found", { status: 404 });
     });
@@ -921,7 +983,7 @@ describe("executeRestrictedBash", () => {
       }
       if (url.endsWith("/call")) {
         capturedCallInput = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
-        return Response.json({ isError: false, output: { ok: true } });
+        return Response.json({ status: "ok", value: { ok: true } });
       }
       return new Response("not found", { status: 404 });
     });
@@ -966,7 +1028,7 @@ describe("executeRestrictedBash", () => {
       }
       if (url.endsWith("/call")) {
         calledTool = true;
-        return Response.json({ isError: false, output: { ok: true } });
+        return Response.json({ status: "ok", value: { ok: true } });
       }
       return new Response("not found", { status: 404 });
     });
@@ -987,7 +1049,7 @@ describe("executeRestrictedBash", () => {
         },
       );
 
-      expect(result.exitCode).toBe(1);
+      expect(result.exitCode).toBe(serverToolExitCode.usage);
       expect(result.stderr).toContain(
         "Bare --session-id was parsed as boolean true; if you meant to pass a value, use --session-id=<value>.",
       );
@@ -1011,7 +1073,7 @@ describe("executeRestrictedBash", () => {
       }
       if (url.endsWith("/call")) {
         calledTool = true;
-        return Response.json({ isError: false, output: { ok: true } });
+        return Response.json({ status: "ok", value: { ok: true } });
       }
       return new Response("not found", { status: 404 });
     });
@@ -1032,11 +1094,314 @@ describe("executeRestrictedBash", () => {
         },
       );
 
-      expect(result.exitCode).toBe(1);
+      expect(result.exitCode).toBe(serverToolExitCode.usage);
       expect(result.stderr).toContain("accepts at most one positional argument");
       expect(calledTool).toBe(false);
     } finally {
       restoreFetch();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("writes nested tool failures as JSON to stderr with the shared exit code", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+    );
+    const failure: ServerToolFailure = {
+      kind: "denied",
+      code: "CALLABLE_FORBIDDEN",
+      message: "This callable is not allowed",
+      retryable: false,
+      details: { callableId: "surface.messages.send" },
+    };
+    const restoreFetch = installMockFetch(async () =>
+      Response.json({ status: "error", error: failure }),
+    );
+
+    try {
+      const result = await executeRestrictedBash(
+        { command: "tools surface.messages.send --input='{}'", cwd: workspace },
+        { workspaceRoot: workspace },
+      );
+
+      expect(result.stdout).toBe("");
+      expect(result.exitCode).toBe(serverToolExitCode[failure.kind]);
+      expect(JSON.parse(result.stderr)).toEqual({ status: "error", error: failure });
+
+      const pretty = await executeRestrictedBash(
+        {
+          command: "tools surface.messages.send --input='{}' --output=json-pretty",
+          cwd: workspace,
+        },
+        { workspaceRoot: workspace },
+      );
+      expect(pretty.stdout).toBe("");
+      expect(pretty.stderr).toBe(
+        `${JSON.stringify({ status: "error", error: failure }, null, 2)}\n`,
+      );
+    } finally {
+      restoreFetch();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects legacy nested tool responses as structured protocol failures", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+    );
+    const restoreFetch = installMockFetch(async () =>
+      Response.json({ isError: false, output: { legacy: true } }),
+    );
+
+    try {
+      const result = await executeRestrictedBash(
+        { command: "tools example.call --input='{}'", cwd: workspace },
+        { workspaceRoot: workspace },
+      );
+      const envelope = JSON.parse(result.stderr);
+
+      expect(result.stdout).toBe("");
+      expect(result.exitCode).toBe(serverToolExitCode.internal);
+      expect(envelope).toMatchObject({
+        status: "error",
+        error: { kind: "internal", code: "TOOL_SERVER_INVALID_RESPONSE", retryable: false },
+      });
+    } finally {
+      restoreFetch();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects nested tool failures with an empty code", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+    );
+    const restoreFetch = installMockFetch(async () =>
+      Response.json({
+        status: "error",
+        error: {
+          kind: "denied",
+          code: "",
+          message: "Missing failure code",
+          retryable: false,
+        },
+      }),
+    );
+
+    try {
+      const result = await executeRestrictedBash(
+        { command: "tools example.call --input='{}'", cwd: workspace },
+        { workspaceRoot: workspace },
+      );
+
+      expect(result.exitCode).toBe(serverToolExitCode.internal);
+      expect(JSON.parse(result.stderr)).toMatchObject({
+        status: "error",
+        error: { kind: "internal", code: "TOOL_SERVER_INVALID_RESPONSE" },
+      });
+    } finally {
+      restoreFetch();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("maps nested tool network failures to retryable structured unavailable failures", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+    );
+    const restoreFetch = installMockFetch(async () => {
+      throw new Error("backend unavailable");
+    });
+
+    try {
+      const result = await executeRestrictedBash(
+        { command: "tools --list", cwd: workspace },
+        { workspaceRoot: workspace },
+      );
+      const envelope = JSON.parse(result.stderr);
+
+      expect(result.stdout).toBe("");
+      expect(result.exitCode).toBe(serverToolExitCode.unavailable);
+      expect(envelope).toMatchObject({
+        status: "error",
+        error: { kind: "unavailable", code: "TOOL_SERVER_NETWORK_ERROR", retryable: true },
+      });
+    } finally {
+      restoreFetch();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("maps malformed JSON and every HTTP status class to structured local failures", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+    );
+    let responseStatus: number | undefined;
+    const restoreFetch = installMockFetch(async () =>
+      responseStatus === undefined
+        ? new Response("{invalid", { status: 200 })
+        : new Response("failed", { status: responseStatus }),
+    );
+
+    try {
+      const malformed = await executeRestrictedBash(
+        { command: "tools --list", cwd: workspace },
+        { workspaceRoot: workspace },
+      );
+      expect(malformed.exitCode).toBe(serverToolExitCode.internal);
+      expect(JSON.parse(malformed.stderr)).toMatchObject({
+        status: "error",
+        error: { kind: "internal", code: "TOOL_SERVER_INVALID_JSON", retryable: false },
+      });
+
+      const cases = [
+        [400, "usage", false],
+        [422, "usage", false],
+        [401, "denied", false],
+        [403, "denied", false],
+        [404, "not_found", false],
+        [408, "timeout", true],
+        [504, "timeout", true],
+        [409, "conflict", false],
+        [429, "unavailable", true],
+        [503, "unavailable", true],
+        [418, "internal", false],
+      ] as const;
+      for (const [status, kind, retryable] of cases) {
+        responseStatus = status;
+        const result = await executeRestrictedBash(
+          { command: "tools --list", cwd: workspace },
+          { workspaceRoot: workspace },
+        );
+
+        expect(result.exitCode).toBe(serverToolExitCode[kind]);
+        expect(JSON.parse(result.stderr)).toMatchObject({
+          status: "error",
+          error: {
+            kind,
+            code: "TOOL_SERVER_HTTP_ERROR",
+            retryable,
+            details: { status },
+          },
+        });
+      }
+    } finally {
+      restoreFetch();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("returns cancelled envelopes for aborted nested fetch and response reads", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+    );
+    try {
+      for (const phase of ["fetch", "read"] as const) {
+        const started = Promise.withResolvers<void>();
+        const restoreFetch = installMockFetch(async (_input, init) => {
+          const pending = () =>
+            new Promise<never>((_resolve, reject) => {
+              const signal = init?.signal;
+              const abort = () => reject(signal?.reason ?? new Error("aborted"));
+              if (signal?.aborted) abort();
+              else signal?.addEventListener("abort", abort, { once: true });
+            });
+          if (phase === "fetch") {
+            started.resolve();
+            return await pending();
+          }
+          const response = new Response("unused");
+          response.text = async () => {
+            started.resolve();
+            return await pending();
+          };
+          return response;
+        });
+        const controller = new AbortController();
+        try {
+          const execution = executeRestrictedBash(
+            { command: "tools --list", cwd: workspace },
+            { workspaceRoot: workspace, abortSignal: controller.signal },
+          );
+          await started.promise;
+          controller.abort();
+          const result = await execution;
+
+          expect(result.stdout).toBe("");
+          expect(result.exitCode).toBe(serverToolExitCode.cancelled);
+          expect(result.executionError).toMatchObject({ type: "aborted" });
+          expect(JSON.parse(result.stderr)).toMatchObject({
+            status: "error",
+            error: {
+              kind: "cancelled",
+              code: "TOOL_SERVER_REQUEST_CANCELLED",
+              retryable: false,
+            },
+          });
+        } finally {
+          restoreFetch();
+        }
+      }
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it("returns timeout envelopes for nested fetch and response reads at the wall deadline", async () => {
+    const workspace = await fs.mkdtemp(
+      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+    );
+    try {
+      for (const phase of ["fetch", "read"] as const) {
+        const started = Promise.withResolvers<void>();
+        const restoreFetch = installMockFetch(async (_input, init) => {
+          const pending = () =>
+            new Promise<never>((_resolve, reject) => {
+              const signal = init?.signal;
+              const abort = () => reject(signal?.reason ?? new Error("aborted"));
+              if (signal?.aborted) abort();
+              else signal?.addEventListener("abort", abort, { once: true });
+            });
+          if (phase === "fetch") {
+            started.resolve();
+            return await pending();
+          }
+          const response = new Response("unused");
+          response.text = async () => {
+            started.resolve();
+            return await pending();
+          };
+          return response;
+        });
+        try {
+          // test-wait-justification: verifies nested requests preserve the restricted wall deadline
+          const execution = executeRestrictedBash(
+            { command: "tools --list", cwd: workspace, timeoutMs: 20 },
+            { workspaceRoot: workspace },
+          );
+          await started.promise;
+          const result = await execution;
+
+          expect(result.stdout).toBe("");
+          expect(result.exitCode).toBe(serverToolExitCode.timeout);
+          expect(result.executionError).toMatchObject({
+            type: "timeout",
+            timeoutMs: 20,
+            timeoutKind: "wall_clock",
+          });
+          expect(JSON.parse(result.stderr)).toMatchObject({
+            status: "error",
+            error: {
+              kind: "timeout",
+              code: "TOOL_SERVER_REQUEST_TIMEOUT",
+              retryable: true,
+            },
+          });
+        } finally {
+          restoreFetch();
+        }
+      }
+    } finally {
       await fs.rm(workspace, { recursive: true, force: true });
     }
   });
@@ -1618,6 +1983,125 @@ done`;
     const result = analyzeBashCommand("git reset --hard");
     expect(result).not.toBeNull();
     expect(result?.reason).toContain("git reset --hard");
+  });
+
+  it("integrates recursive rm and active Git metadata containment", () => {
+    const repositoryRoot = path.resolve(import.meta.dir, "../../../..");
+    const blocked = [
+      "rm -r /",
+      "rm --recurs .",
+      "rm -r ../outside",
+      "rm -r .git",
+      "rmdir .git",
+      "mv .git metadata-backup",
+      "printf corrupt > .git/config",
+      "cp source .git/config",
+      "truncate -s 0 .git/config",
+      "printf corrupt | tee .git/config",
+      "install source .git/hooks/pre-commit",
+      "ln -s source .git/hooks/pre-commit",
+      "dd if=source of=.git/index",
+    ];
+    const allowed = [
+      "rm -r packages",
+      "rm -r /tmp/cache",
+      'rm -r "$target"',
+      "cat .git/config",
+      "cp .git/config backup",
+      "truncate -s 0 output",
+      "printf ok | tee output",
+      "install source output",
+      "ln -s source output",
+      "dd if=source of=output",
+    ];
+
+    for (const command of blocked) {
+      expect(analyzeBashCommand(command, { cwd: repositoryRoot }), command).not.toBeNull();
+    }
+    for (const command of allowed) {
+      expect(analyzeBashCommand(command, { cwd: repositoryRoot }), command).toBeNull();
+    }
+  });
+
+  it("integrates device, Git grammar, and wrapper safety passes", () => {
+    const blocked = [
+      "dd if=/dev/zero of=/dev/sda",
+      "mkfs.ext4 /dev/sda1",
+      "shred important.bin",
+      "git checkout -fq main",
+      "git switch --disc main",
+      "git push --mir origin",
+      "git push -d origin old",
+      "git push origin :old",
+      "git push origin +main:main",
+      "git push --force --force-with-lease origin main",
+      "git branch -df old",
+      "git branch --forc old",
+      "git tag --del v1",
+      "git reflog delete HEAD@{0}",
+      "git worktree remove -fv ../old-tree",
+      "watch -n 2 git reset --hard",
+      "watch -q 3 git reset --hard",
+      "watch --equexit=3 git reset --hard",
+      "watch --shotsdir /tmp git reset --hard",
+      "watch --inter 2 git reset --hard",
+      "watch --equ=3 git reset --hard",
+      "watch --shot=/tmp git reset --hard",
+      "bash -c -- 'git reset --hard'",
+    ];
+    const allowed = [
+      "dd if=/dev/zero of=disk.img",
+      "mkfs.ext4 disk.img",
+      'shred "$target"',
+      "git checkout main",
+      "git switch main",
+      "git push --force-with-lease origin main",
+      "git push origin main:main",
+      'git push origin "+$refspec"',
+      "git branch -d merged",
+      "git tag --list",
+      "git reflog show",
+      "git worktree remove ../clean-tree",
+      "watch git status",
+      "watch -q3 git status",
+      "watch --shotsdir=/tmp git status",
+      "watch --inter=2 git status",
+      "watch --equ 3 git status",
+      "watch --shot /tmp git status",
+      "bash -c -- 'git status'",
+    ];
+
+    for (const command of blocked) expect(analyzeBashCommand(command), command).not.toBeNull();
+    for (const command of allowed) expect(analyzeBashCommand(command), command).toBeNull();
+  });
+
+  it("integrates malformed static fallback without broadening dynamic operands", () => {
+    const options = { cwd: "/tmp/lilac-project" };
+    const blocked = [
+      "rm -r ../outside &&",
+      "dd if=/dev/zero of=/dev/sda &&",
+      "mkfs.xfs /dev/sda1 &&",
+      "shred important.bin &&",
+      "git push origin :old &&",
+      "git push -d origin old &&",
+      "git push origin +main:main &&",
+    ];
+    const allowed = [
+      "rm -r build &&",
+      'rm -r "$target" &&',
+      'dd if=/dev/zero of="$target" &&',
+      'shred "$target" &&',
+      "git push --force-with-lease origin main &&",
+      "git push origin main:main &&",
+      'git push origin "+$refspec" &&',
+    ];
+
+    for (const command of blocked) {
+      expect(analyzeBashCommand(command, options), command).not.toBeNull();
+    }
+    for (const command of allowed) {
+      expect(analyzeBashCommand(command, options), command).toBeNull();
+    }
   });
 
   it("blocks rm -rf against root", () => {

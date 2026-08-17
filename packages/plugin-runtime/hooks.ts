@@ -26,6 +26,7 @@ import {
   ToolPluginCapabilityError,
   type ToolPluginHookName,
 } from "./errors";
+import { decodeServerToolResult } from "./server-tool-result";
 import type {
   Level1ToolBuildContext,
   Level1ToolFailureSummary,
@@ -34,6 +35,7 @@ import type {
   PluginSource,
   ServerTool,
   ServerToolListResult,
+  ServerToolResult,
   ToolPluginCreateContext,
   ToolPluginInstance,
 } from "./types";
@@ -451,10 +453,12 @@ export function invokeLevel2Call(params: {
   callableId: string;
   input: Record<string, unknown>;
   opts?: Parameters<ServerTool["call"]>[2];
-}): Promise<ResultType<unknown, ToolPluginInvocationError | ToolPluginCapabilityError>> {
+}): Promise<ResultType<ServerToolResult, ToolPluginInvocationError | ToolPluginCapabilityError>> {
   const capability = resolveServerToolCapability(params);
   const invoke = capability.match<
-    () => Promise<ResultType<unknown, ToolPluginInvocationError | ToolPluginCapabilityError>>
+    () => Promise<
+      ResultType<ServerToolResult, ToolPluginInvocationError | ToolPluginCapabilityError>
+    >
   >({
     err: (error) => async () => Result.err(error),
     ok: (value) => () =>
@@ -466,6 +470,7 @@ export function invokeLevel2Call(params: {
           itemId: value.id,
         },
         () => value.call.call(params.tool, params.callableId, params.input, params.opts),
+        (result) => decodeServerToolResult(params.pluginId, result),
       ),
   });
   return invoke();

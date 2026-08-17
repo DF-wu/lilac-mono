@@ -2261,10 +2261,14 @@ describe("permanent architecture governance", () => {
       ),
     );
     for (const required of [
+      "apps/core:src/tool-server/create-tool-server.ts#normalizeSuccessfulToolValue:plugin",
       "apps/core:src/surface/bridge/bus-agent-runner/raw.ts#parseRequestControlFromRaw:projection",
       "apps/core:src/workflow/workflow-action-resolver.ts#decodeWorkflowActionOutboxEvent:persistence",
+      "apps/tool-bridge:client.ts#projectBridgeFailure:wire",
       "apps/mini-lilac-server:src/server.ts#decodeMiniLilacHttpRequest:request",
       "packages/fs:src/remote-runner-protocol.ts#decodeJson:wire",
+      "packages/plugin-runtime:server-tool-result.ts#decodeServerToolResult:plugin",
+      "packages/plugin-runtime:server-tool-result.ts#transform.<callback@1>@2:plugin",
       "packages/utils:custom-commands.ts#decodeCustomCommandResult:plugin",
     ]) {
       expect(decoders).toContain(required);
@@ -2295,6 +2299,63 @@ describe("permanent architecture governance", () => {
       expect(registrations).toContain(identity);
       expect(approvals).toContain(identity);
     }
+
+    for (const stale of [
+      "apps/core:src/tool-server/tools/mcp.ts#resultToMcpToolValue.err.<callback>",
+      "apps/core:src/tool-server/tools/attachment.ts#adaptAttachmentResultToToolHost.err.<callback>",
+      "apps/core:src/tool-server/tools/programmatic-workflow.ts#adaptWorkflowToolResultToHost.err.<callback>",
+      "apps/core:src/tool-server/create-tool-server.ts#isToolInputValidationCause",
+      "packages/plugin-runtime:define-server-tool.ts#adaptServerToolDispatchResultToHost",
+    ]) {
+      expect([...registrations].some((registration) => registration.startsWith(stale))).toBeFalse();
+      expect([...approvals].some((approval) => approval.startsWith(stale))).toBeFalse();
+    }
+  });
+
+  test("retains Level-2 operational Result boundaries", () => {
+    const registrations = new Set(
+      architectureManifest.workspaces.flatMap((workspace) =>
+        workspace.operationalResultApis.map(
+          ({ module, exportName }) => `${workspace.name}:${module}#${exportName}`,
+        ),
+      ),
+    );
+
+    for (const required of [
+      "packages/plugin-runtime:types.ts#ServerTool.call",
+      "apps/core:src/tool-server/create-tool-server.ts#normalizeSuccessfulToolValue",
+      "packages/plugin-runtime:server-tool-result.ts#decodeServerToolResult",
+      "packages/plugin-runtime:define-server-tool.ts#createCallable.<callback>.invoke",
+      "packages/plugin-runtime:define-server-tool.ts#lookupServerToolCallable",
+      "packages/plugin-runtime:define-server-tool.ts#defineServerTool.call",
+      "packages/plugin-runtime:hooks.ts#invokeLevel2Call",
+      "apps/core:src/tool-server/tools/attachment.ts#Attachment.call",
+      "apps/core:src/tool-server/tools/codex.ts#Codex.call",
+      "apps/core:src/tool-server/tools/content-inspect.ts#ContentInspect.call",
+      "apps/core:src/tool-server/tools/conversation-thread.ts#ConversationThread.call",
+      "apps/core:src/tool-server/tools/discovery.ts#Discovery.call",
+      "apps/core:src/tool-server/tools/generate.ts#Generate.call",
+      "apps/core:src/tool-server/tools/mcp.ts#McpManagement.call",
+      "apps/core:src/tool-server/tools/onboarding.ts#Onboarding.call",
+      "apps/core:src/tool-server/tools/programmatic-workflow.ts#ProgrammaticWorkflow.call",
+      "apps/core:src/tool-server/tools/skills.ts#Skills.call",
+      "apps/core:src/tool-server/tools/ssh.ts#SSH.call",
+      "apps/core:src/tool-server/tools/surface.ts#Surface.call",
+      "apps/core:src/tool-server/tools/web.ts#Web.call",
+    ]) {
+      expect(registrations).toContain(required);
+    }
+
+    const core = architectureManifest.workspaces.find(({ name }) => name === "apps/core");
+    expect(core?.compatibilityOutputs).toContainEqual({
+      sink: {
+        kind: "local",
+        module: "src/tool-server/create-tool-server.ts",
+        exportName: "createToolServer.post.<callback@2>@2",
+      },
+      category: "http",
+      reason: "Projects Level-2 Results to the established strict Core tool-server wire envelope.",
+    });
   });
 
   test("rejects missing and broad exact-registration zones", () => {

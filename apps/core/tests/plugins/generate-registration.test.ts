@@ -55,9 +55,10 @@ describe("generate plugin registration", () => {
 
       // Then
       expect(entries?.map((entry) => entry.callableId)).toContain("generate.video");
-      await expect(
-        generate?.call("generate.image", { prompt: "must fail before HTTP" }),
-      ).rejects.toThrow(MISSING_BASE_URL_ERROR);
+      const result = await generate?.call("generate.image", { prompt: "must fail before HTTP" });
+      expect(result?.match({ ok: () => "", err: (error) => error.message })).toContain(
+        MISSING_BASE_URL_ERROR,
+      );
       expect(requestCount).toBe(0);
     } finally {
       await manager.destroy();

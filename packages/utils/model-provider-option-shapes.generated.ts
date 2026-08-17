@@ -165,6 +165,7 @@ export const MODEL_PROVIDER_OPTION_SHAPES = {
           },
         },
       },
+      compactionTrigger: null,
       contextManagement: {
         kind: "array",
         element: {

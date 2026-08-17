@@ -395,6 +395,7 @@ function createFakeDiscordClient(opts?: {
   failEdit?: boolean;
   editFailure?: unknown;
   failEditWithFiles?: boolean;
+  sendFailure?: unknown;
   failReplyAt?: number;
   replyFailure?: unknown;
   failResumeFetch?: boolean;
@@ -535,7 +536,10 @@ function createFakeDiscordClient(opts?: {
   };
 
   const channel = {
-    send: async (options: unknown) => createMessage({ operation: "send", options }),
+    send: async (options: unknown) => {
+      if (opts?.sendFailure) throw opts.sendFailure;
+      return createMessage({ operation: "send", options });
+    },
     messages: {
       fetch: async (messageId: string) => {
         if (opts?.resumeFetchFailure) throw opts.resumeFetchFailure;
@@ -663,6 +667,46 @@ function makeAttachment(index: number): SurfaceAttachment {
   };
 }
 
+describe("Discord initial output", () => {
+  it("sends substantive content directly with reply, cancel, and creation correlation", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    let createdMessageId: string | undefined;
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      opts: {
+        requestId: "discord:chan:request",
+        replyTo: { platform: "discord", channelId: "chan", messageId: "source" },
+        onMessageCreated: (ref) => {
+          createdMessageId = ref.messageId;
+        },
+      },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await expect(out.push({ type: "text.delta", delta: "hello" })).resolves.toEqual(
+      Result.ok("visible"),
+    );
+
+    expect(operations).toHaveLength(1);
+    const first = operations[0]?.options as {
+      content?: string;
+      embeds?: unknown[];
+      reply?: { messageReference?: string };
+      components?: unknown[];
+    };
+    expect(first.content).toBeUndefined();
+    expect(first.embeds).toHaveLength(1);
+    expect(first.reply).toEqual({ messageReference: "source" });
+    expect(first.components).toHaveLength(1);
+    expect(createdMessageId).toBe("m_1");
+    await out.finish();
+  });
+});
+
 describe("Discord recovery hydration", () => {
   it("applies restored state without provider calls before the first live part", async () => {
     const { client, createdMessageIds, operations } = createFakeDiscordClient();
@@ -691,7 +735,9 @@ describe("Discord recovery hydration", () => {
       Result.ok("visible"),
     );
     expect(createdMessageIds).toEqual(["m_1"]);
-    expect(operations.map((operation) => operation.kind)).toEqual(["send", "edit"]);
+    expect(operations.map((operation) => operation.kind)).toEqual(["send"]);
+    expect(hasEmbeds(operations[0]?.options)).toBe(true);
+    expect(contentFromOptions(operations[0]?.options)).not.toBe("*Replying...*");
   });
 });
 
@@ -915,6 +961,28 @@ describe("preview reanchor behavior", () => {
 });
 
 describe("output operation failures", () => {
+  it("returns a classified failure when the first substantive send fails", async () => {
+    const { client, createdMessageIds } = createFakeDiscordClient({ sendFailure: { status: 503 } });
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    const result = await out.push({ type: "text.delta", delta: "hello" });
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected first-send failure");
+    expect(result.error).toMatchObject({
+      _tag: "SurfaceUnavailable",
+      operation: "push-output",
+    });
+    expect(createdMessageIds).toEqual([]);
+  });
+
   it("raises a Panic when final output rejects with an impossible non-Error value", async () => {
     const { client } = createFakeDiscordClient({
       failReplyAt: 1,

@@ -4,7 +4,13 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { createHash } from "node:crypto";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { preserveToolPanic } from "../../tools/tool-result-adapters";
+import {
+  serverToolFailure,
+  type ServerToolFailure,
+  type ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
 
 import {
   env,
@@ -12,13 +18,13 @@ import {
   ensurePromptWorkspace,
   findWorkspaceRootResult,
   getCoreConfig,
+  isRecord,
   resolveCoreConfigPath,
   resolvePromptDir,
   seedCoreConfig,
 } from "@stanley2058/lilac-utils";
 import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
-import { parseToolInputPreservingZodError as parseToolInput } from "../validation-error-message";
 import { chromium } from "playwright";
 
 import {
@@ -35,36 +41,20 @@ import {
   writeGithubUserTokenSecret,
 } from "../../github/github-user-token";
 
-class OnboardingToolFailure extends TaggedError("OnboardingToolFailure")<{
-  readonly message: string;
-}> {}
-
-function adaptOnboardingResultToToolHost<TValue>(
-  result: ResultType<TValue, OnboardingToolFailure>,
-): TValue {
-  return result.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      throw new Error(error.message);
-    },
-  })();
+function onboardingFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
+  return serverToolFailure({
+    kind,
+    code: `onboarding_${kind}`,
+    message,
+    retryable: kind === "unavailable" || kind === "timeout",
+  });
 }
 
-function signalOnboardingFailureToToolHost(message: string): never {
-  return adaptOnboardingResultToToolHost(Result.err(new OnboardingToolFailure({ message })));
-}
-
-function requireWorkspaceRoot(): string {
-  const root = findWorkspaceRootResult();
-  return root.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      switch (error._tag) {
-        case "WorkspaceRootNotFound":
-          return signalOnboardingFailureToToolHost(error.message);
-      }
-    },
-  })();
+function requireWorkspaceRoot(): ResultType<string, ServerToolFailure> {
+  return findWorkspaceRootResult().mapError((error) => {
+    if (Panic.is(error)) return preserveToolPanic(error);
+    return onboardingFailure("not_found", error.message);
+  });
 }
 
 const githubBashEnvDocs = {
@@ -251,7 +241,8 @@ async function pathExecutable(p: string): Promise<boolean> {
   try {
     await fs.access(p, fsConstants.X_OK);
     return true;
-  } catch {
+  } catch (cause) {
+    if (Panic.is(cause)) return preserveToolPanic(cause);
     return false;
   }
 }
@@ -285,40 +276,57 @@ async function findSystemChromiumExecutable(): Promise<string | null> {
 function isRootUser(): boolean {
   try {
     return typeof process.getuid === "function" && process.getuid() === 0;
-  } catch {
+  } catch (cause) {
+    if (Panic.is(cause)) return preserveToolPanic(cause);
     return false;
   }
 }
 
 async function ensurePlaywrightChromiumInstalled(options: {
   withDeps: boolean;
-}): Promise<{ installed: boolean; executablePath: string }> {
+}): Promise<ResultType<{ installed: boolean; executablePath: string }, ServerToolFailure>> {
   const pwPath = chromium.executablePath();
   const exists = await Bun.file(pwPath).exists();
   if (exists) {
-    return { installed: false, executablePath: pwPath };
+    return Result.ok({ installed: false, executablePath: pwPath });
   }
 
   if (options.withDeps && !isRootUser()) {
-    return signalOnboardingFailureToToolHost(
-      "Playwright --with-deps requires root. Re-run as root or omit withDeps.",
+    return Result.err(
+      onboardingFailure(
+        "denied",
+        "Playwright --with-deps requires root. Re-run as root or omit withDeps.",
+      ),
     );
   }
 
-  if (options.withDeps) {
-    await $`bunx playwright install chromium --with-deps`;
-  } else {
-    await $`bunx playwright install chromium`;
-  }
+  const installed = await Result.tryPromise({
+    try: () =>
+      options.withDeps
+        ? $`bunx playwright install chromium --with-deps`.then(() => undefined)
+        : $`bunx playwright install chromium`.then(() => undefined),
+    catch: (cause) => {
+      if (Panic.is(cause)) return preserveToolPanic(cause);
+      return onboardingFailure("unavailable", errorMessage(cause));
+    },
+  });
+  const installFailure = installed.match({
+    ok: () => undefined,
+    err: (failure) => failure,
+  });
+  if (installFailure) return Result.err(installFailure);
 
   const nowExists = await Bun.file(pwPath).exists();
   if (!nowExists) {
-    return signalOnboardingFailureToToolHost(
-      `Playwright install completed, but chromium still missing at ${pwPath}`,
+    return Result.err(
+      onboardingFailure(
+        "unavailable",
+        `Playwright install completed, but chromium still missing at ${pwPath}`,
+      ),
     );
   }
 
-  return { installed: true, executablePath: pwPath };
+  return Result.ok({ installed: true, executablePath: pwPath });
 }
 
 function scheduleRestart(): { ok: true; scheduled: true } {
@@ -326,7 +334,8 @@ function scheduleRestart(): { ok: true; scheduled: true } {
   setTimeout(() => {
     try {
       process.kill(process.pid, "SIGTERM");
-    } catch {
+    } catch (cause) {
+      if (Panic.is(cause)) return preserveToolPanic(cause);
       process.exit(0);
     }
   }, 250);
@@ -398,7 +407,8 @@ async function ensureDir0700(p: string): Promise<void> {
   await fs.mkdir(p, { recursive: true });
   try {
     await fs.chmod(p, 0o700);
-  } catch {
+  } catch (cause) {
+    if (Panic.is(cause)) return preserveToolPanic(cause);
     // Best-effort.
   }
 }
@@ -481,12 +491,36 @@ async function runCommand(params: {
   return { code, stdout, stderr };
 }
 
-async function downloadToFile(url: string, filePath: string): Promise<void> {
-  const res = await fetch(url);
-  if (!res.ok) {
-    return signalOnboardingFailureToToolHost(`Download failed (${res.status}): ${url}`);
-  }
-  await Bun.write(filePath, res);
+async function downloadToFile(
+  url: string,
+  filePath: string,
+): Promise<ResultType<void, ServerToolFailure>> {
+  return Result.gen(async function* () {
+    const res = yield* Result.await(
+      Result.tryPromise({
+        try: () => fetch(url),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return onboardingFailure("unavailable", errorMessage(cause));
+        },
+      }),
+    );
+    if (!res.ok) {
+      return Result.err(
+        onboardingFailure("unavailable", `Download failed (${res.status}): ${url}`),
+      );
+    }
+    yield* Result.await(
+      Result.tryPromise({
+        try: () => Bun.write(filePath, res).then(() => undefined),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return onboardingFailure("unavailable", errorMessage(cause));
+        },
+      }),
+    );
+    return Result.ok(undefined);
+  });
 }
 
 async function sha256Hex(filePath: string): Promise<string> {
@@ -556,19 +590,41 @@ export function decodeGithubReleaseResponse(
   );
 }
 
-async function fetchGithubLatestRelease(repo: string): Promise<GithubRelease> {
-  const res = await fetch(`https://api.github.com/repos/${repo}/releases/latest`);
-  if (!res.ok) {
-    return signalOnboardingFailureToToolHost(
-      `GitHub releases/latest failed (${res.status} ${res.statusText}) for ${repo}`,
+async function fetchGithubLatestRelease(
+  repo: string,
+): Promise<ResultType<GithubRelease, ServerToolFailure>> {
+  return Result.gen(async function* () {
+    const res = yield* Result.await(
+      Result.tryPromise({
+        try: () => fetch(`https://api.github.com/repos/${repo}/releases/latest`),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return onboardingFailure("unavailable", errorMessage(cause));
+        },
+      }),
     );
-  }
-  const raw: unknown = await res.json();
-  const decoded = decodeGithubReleaseResponse(raw);
-  return decoded.match({
-    ok: (value) => () => value,
-    err: (error) => () => signalOnboardingFailureToToolHost(`${error.message} for ${repo}`),
-  })();
+    if (!res.ok) {
+      return Result.err(
+        onboardingFailure(
+          "unavailable",
+          `GitHub releases/latest failed (${res.status} ${res.statusText}) for ${repo}`,
+        ),
+      );
+    }
+    const raw = yield* Result.await(
+      Result.tryPromise({
+        try: async () => (await res.json()) as unknown,
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return onboardingFailure("unavailable", errorMessage(cause));
+        },
+      }),
+    );
+    return decodeGithubReleaseResponse(raw).mapError((error) => {
+      if (Panic.is(error)) return preserveToolPanic(error);
+      return onboardingFailure("unavailable", `${error.message} for ${repo}`);
+    });
+  });
 }
 
 function stripLeadingV(tag: string): string {
@@ -589,123 +645,143 @@ async function installGithubTarGzBinary(params: {
   tmpDir: string;
   overwrite: boolean;
   network: boolean;
-}): Promise<{
-  status: DefaultInstallStatus;
-  details?: Record<string, unknown>;
-}> {
-  const existed = await Bun.file(params.destPath).exists();
-  if (existed && !params.overwrite) {
-    return { status: "already_present" };
-  }
+}): Promise<
+  ResultType<{ status: DefaultInstallStatus; details?: Record<string, unknown> }, ServerToolFailure>
+> {
+  return Result.gen(async function* () {
+    const existed = await Bun.file(params.destPath).exists();
+    if (existed && !params.overwrite) {
+      return Result.ok({ status: "already_present" as const });
+    }
 
-  if (!params.network) {
-    return {
-      status: "skipped",
-      details: { reason: "network disabled" },
-    };
-  }
+    if (!params.network) {
+      return Result.ok({
+        status: "skipped" as const,
+        details: { reason: "network disabled" },
+      });
+    }
 
-  if (process.platform !== "linux") {
-    return {
-      status: "skipped",
-      details: { reason: "unsupported platform", platform: process.platform },
-    };
-  }
+    if (process.platform !== "linux") {
+      return Result.ok({
+        status: "skipped" as const,
+        details: { reason: "unsupported platform", platform: process.platform },
+      });
+    }
 
-  const tarBin = Bun.which("tar");
-  if (!tarBin) {
-    return signalOnboardingFailureToToolHost(
-      "Missing dependency: tar (required to extract GitHub releases)",
+    const tarBin = Bun.which("tar");
+    if (!tarBin) {
+      return Result.err(
+        onboardingFailure(
+          "unavailable",
+          "Missing dependency: tar (required to extract GitHub releases)",
+        ),
+      );
+    }
+
+    const release = yield* Result.await(fetchGithubLatestRelease(params.repo));
+    const version = stripLeadingV(release.tag_name);
+    const arch = platformArchLabel();
+
+    const tarName = params.tarAssetName(version, arch);
+    const checksumName = params.checksumAssetName(version);
+
+    const tarAsset = release.assets.find((a) => a.name === tarName);
+    if (!tarAsset) {
+      return Result.err(
+        onboardingFailure(
+          "not_found",
+          `Asset not found in ${params.repo} ${release.tag_name}: ${tarName}`,
+        ),
+      );
+    }
+
+    const checksumAsset = release.assets.find((a) => a.name === checksumName);
+    if (!checksumAsset) {
+      return Result.err(
+        onboardingFailure(
+          "not_found",
+          `Checksums asset not found in ${params.repo} ${release.tag_name}: ${checksumName}`,
+        ),
+      );
+    }
+
+    await fs.mkdir(params.tmpDir, { recursive: true });
+
+    const tarPath = path.join(params.tmpDir, `${params.repo.replaceAll("/", "-")}-${tarName}`);
+    const checksumsPath = path.join(
+      params.tmpDir,
+      `${params.repo.replaceAll("/", "-")}-${checksumName}`,
     );
-  }
 
-  const release = await fetchGithubLatestRelease(params.repo);
-  const version = stripLeadingV(release.tag_name);
-  const arch = platformArchLabel();
+    yield* Result.await(downloadToFile(tarAsset.browser_download_url, tarPath));
+    yield* Result.await(downloadToFile(checksumAsset.browser_download_url, checksumsPath));
 
-  const tarName = params.tarAssetName(version, arch);
-  const checksumName = params.checksumAssetName(version);
+    const checksumRaw = await Bun.file(checksumsPath).text();
+    const byName = parseChecksumsText(checksumRaw);
+    const expected = byName.get(tarName);
+    if (!expected) {
+      return Result.err(
+        onboardingFailure("unavailable", `No checksum entry for ${tarName} in ${checksumName}`),
+      );
+    }
 
-  const tarAsset = release.assets.find((a) => a.name === tarName);
-  if (!tarAsset) {
-    return signalOnboardingFailureToToolHost(
-      `Asset not found in ${params.repo} ${release.tag_name}: ${tarName}`,
+    const got = await sha256Hex(tarPath);
+    if (got.toLowerCase() !== expected.toLowerCase()) {
+      return Result.err(
+        onboardingFailure(
+          "denied",
+          `Checksum mismatch for ${tarName}: expected ${expected}, got ${got}`,
+        ),
+      );
+    }
+
+    const extractDir = path.join(
+      params.tmpDir,
+      `extract-${params.repo.replaceAll("/", "-")}-${Date.now()}`,
     );
-  }
+    await fs.mkdir(extractDir, { recursive: true });
 
-  const checksumAsset = release.assets.find((a) => a.name === checksumName);
-  if (!checksumAsset) {
-    return signalOnboardingFailureToToolHost(
-      `Checksums asset not found in ${params.repo} ${release.tag_name}: ${checksumName}`,
-    );
-  }
+    const untar = await runCommand({
+      cmd: [tarBin, "-xzf", tarPath, "-C", extractDir],
+    });
+    if (untar.code !== 0) {
+      return Result.err(
+        onboardingFailure("unavailable", `tar failed: ${untar.stderr || untar.stdout}`),
+      );
+    }
 
-  await fs.mkdir(params.tmpDir, { recursive: true });
+    const extracted = await params.findExtractedPath(extractDir);
+    if (!extracted) {
+      return Result.err(
+        onboardingFailure("not_found", `Failed to locate extracted binary from ${tarName}`),
+      );
+    }
 
-  const tarPath = path.join(params.tmpDir, `${params.repo.replaceAll("/", "-")}-${tarName}`);
-  const checksumsPath = path.join(
-    params.tmpDir,
-    `${params.repo.replaceAll("/", "-")}-${checksumName}`,
-  );
+    await fs.mkdir(path.dirname(params.destPath), { recursive: true });
+    await fs.copyFile(extracted, params.destPath);
+    await fs.chmod(params.destPath, 0o755);
 
-  await downloadToFile(tarAsset.browser_download_url, tarPath);
-  await downloadToFile(checksumAsset.browser_download_url, checksumsPath);
-
-  const checksumRaw = await Bun.file(checksumsPath).text();
-  const byName = parseChecksumsText(checksumRaw);
-  const expected = byName.get(tarName);
-  if (!expected) {
-    return signalOnboardingFailureToToolHost(`No checksum entry for ${tarName} in ${checksumName}`);
-  }
-
-  const got = await sha256Hex(tarPath);
-  if (got.toLowerCase() !== expected.toLowerCase()) {
-    return signalOnboardingFailureToToolHost(
-      `Checksum mismatch for ${tarName}: expected ${expected}, got ${got}`,
-    );
-  }
-
-  const extractDir = path.join(
-    params.tmpDir,
-    `extract-${params.repo.replaceAll("/", "-")}-${Date.now()}`,
-  );
-  await fs.mkdir(extractDir, { recursive: true });
-
-  const untar = await runCommand({
-    cmd: [tarBin, "-xzf", tarPath, "-C", extractDir],
+    return Result.ok({
+      status: "installed" as const,
+      details: {
+        repo: params.repo,
+        tag: release.tag_name,
+        version,
+        arch,
+        tarName,
+        extracted,
+        destPath: params.destPath,
+        replaced: existed,
+      },
+    });
   });
-  if (untar.code !== 0) {
-    return signalOnboardingFailureToToolHost(`tar failed: ${untar.stderr || untar.stdout}`);
-  }
-
-  const extracted = await params.findExtractedPath(extractDir);
-  if (!extracted) {
-    return signalOnboardingFailureToToolHost(`Failed to locate extracted binary from ${tarName}`);
-  }
-
-  await fs.mkdir(path.dirname(params.destPath), { recursive: true });
-  await fs.copyFile(extracted, params.destPath);
-  await fs.chmod(params.destPath, 0o755);
-
-  return {
-    status: "installed",
-    details: {
-      repo: params.repo,
-      tag: release.tag_name,
-      version,
-      arch,
-      tarName,
-      extracted,
-      destPath: params.destPath,
-      replaced: existed,
-    },
-  };
 }
 
 async function hasAnySkillMdUnder(dir: string): Promise<boolean> {
   try {
     await fs.access(dir);
-  } catch {
+  } catch (cause) {
+    if (Panic.is(cause)) return preserveToolPanic(cause);
     return false;
   }
   const glob = new Bun.Glob(path.join(dir, "**", "SKILL.md"));
@@ -717,6 +793,18 @@ async function hasAnySkillMdUnder(dir: string): Promise<boolean> {
 
 export class Onboarding implements ServerTool {
   id = "onboarding";
+
+  constructor(
+    private readonly dependencies: {
+      fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+      getGithubViewerLogin: typeof getGithubViewerLoginOrNull;
+      getGithubInstallationToken: typeof getGithubInstallationTokenOrThrow;
+    } = {
+      fetch,
+      getGithubViewerLogin: getGithubViewerLoginOrNull,
+      getGithubInstallationToken: getGithubInstallationTokenOrThrow,
+    },
+  ) {}
 
   private readonly tool = defineServerTool({
     id: this.id,
@@ -840,884 +928,1098 @@ export class Onboarding implements ServerTool {
     return this.tool.list();
   }
 
-  async call(callableId: string, rawInput: Record<string, unknown>, opts?: ServerToolCallOptions) {
+  async call(
+    callableId: string,
+    rawInput: Record<string, unknown>,
+    opts?: ServerToolCallOptions,
+  ): Promise<ServerToolResult> {
     return this.tool.call(callableId, rawInput, opts);
   }
 
-  private async runCallable(callableId: string, rawInput: Record<string, unknown>) {
-    if (callableId === "onboarding.vcs_env") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: vcsEnvInputSchema });
-      const dataDir = input.dataDir ?? env.dataDir;
-      const paths = resolveVcsPaths(dataDir);
-
-      return {
-        ok: true as const,
-        dataDir: paths.dataDir,
-        gitConfigGlobal: paths.gitConfigGlobal,
-        gnupgHome: paths.gnupgHome,
-        xdgConfigHome: paths.xdgConfigHome,
-      };
-    }
-
-    if (callableId === "onboarding.gnupg") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: gnupgInputSchema });
-      const dataDir = input.dataDir ?? env.dataDir;
-      const paths = resolveVcsPaths(dataDir);
-      await ensureVcsDirs(paths);
-      const vcsEnv = buildVcsEnv(paths);
-
-      const gpgBin = Bun.which("gpg");
-      if (!gpgBin) {
-        return signalOnboardingFailureToToolHost(
-          "Missing dependency: gpg (install gnupg). Required for commit signing.",
-        );
-      }
-
-      if (input.mode === "clear") {
-        await fs.rm(paths.gnupgHome, { recursive: true, force: true });
-        await ensureDir0700(paths.gnupgHome);
-        return { ok: true as const, dataDir: paths.dataDir, cleared: true as const };
-      }
-
-      const list = await runGpg({
-        args: ["--list-secret-keys", "--with-colons"],
-        env: vcsEnv,
+  private async runCallable(
+    callableId: string,
+    rawInput: Record<string, unknown>,
+  ): Promise<ServerToolResult> {
+    const captureOperation = <T>(
+      operation: () => Promise<T>,
+      kind: ServerToolFailure["kind"] = "unavailable",
+      fallbackMessage?: string,
+    ): Promise<ResultType<T, ServerToolFailure>> =>
+      Result.tryPromise({
+        try: operation,
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          const error = isRecord(cause) ? cause : {};
+          const code = typeof error.code === "string" ? error.code : undefined;
+          const name = typeof error.name === "string" ? error.name : undefined;
+          let classifiedKind = kind;
+          if (code === "EACCES" || code === "EPERM") classifiedKind = "denied";
+          else if (code === "ENOENT") classifiedKind = "not_found";
+          else if (name === "AbortError") classifiedKind = "cancelled";
+          else if (name === "TimeoutError" || name === "timeout" || code === "ETIMEDOUT") {
+            classifiedKind = "timeout";
+          }
+          return onboardingFailure(
+            classifiedKind,
+            cause instanceof Error ? cause.message : (fallbackMessage ?? errorMessage(cause)),
+          );
+        },
       });
-      const existingFpr = list.code === 0 ? parseFirstGpgFingerprint(list.stdout) : null;
 
-      if (input.mode === "status") {
-        return {
-          ok: true as const,
-          dataDir: paths.dataDir,
-          gnupgHome: paths.gnupgHome,
-          hasSecretKey: Boolean(existingFpr),
-          fingerprint: existingFpr ?? undefined,
-        };
-      }
+    return Result.gen(
+      async function* (this: Onboarding) {
+        if (callableId === "onboarding.vcs_env") {
+          const input = rawInput as z.output<typeof vcsEnvInputSchema>;
+          const dataDir = input.dataDir ?? env.dataDir;
+          const paths = resolveVcsPaths(dataDir);
 
-      if (input.mode === "generate") {
-        if (existingFpr) {
-          return {
+          return Result.ok({
             ok: true as const,
             dataDir: paths.dataDir,
-            generated: false as const,
-            fingerprint: existingFpr,
-            status: "already_present" as const,
-          };
+            gitConfigGlobal: paths.gitConfigGlobal,
+            gnupgHome: paths.gnupgHome,
+            xdgConfigHome: paths.xdgConfigHome,
+          });
         }
 
-        const userName = input.userName ?? "lilac-agent[bot]";
-        const userEmail = input.userEmail ?? "lilac-agent[bot]@users.noreply.github.com";
-        const comment = input.uidComment ? ` (${input.uidComment})` : "";
-        const uid = `${userName}${comment} <${userEmail}>`;
+        if (callableId === "onboarding.gnupg") {
+          const input = rawInput as z.output<typeof gnupgInputSchema>;
+          const dataDir = input.dataDir ?? env.dataDir;
+          const paths = resolveVcsPaths(dataDir);
+          yield* Result.await(captureOperation(() => ensureVcsDirs(paths)));
+          const vcsEnv = buildVcsEnv(paths);
 
-        // Ensure loopback pinentry works even if gpg decides to ask.
-        await fs.writeFile(
-          path.join(paths.gnupgHome, "gpg-agent.conf"),
-          "allow-loopback-pinentry\n",
-          "utf8",
-        );
+          const gpgBin = Bun.which("gpg");
+          if (!gpgBin) {
+            return Result.err(
+              onboardingFailure(
+                "unavailable",
+                "Missing dependency: gpg (install gnupg). Required for commit signing.",
+              ),
+            );
+          }
 
-        const gen = await runGpg({
-          args: [
-            "--batch",
-            "--pinentry-mode",
-            "loopback",
-            "--passphrase",
-            "",
-            "--quick-generate-key",
-            uid,
-            "default",
-            "default",
-            "never",
-          ],
-          env: vcsEnv,
-        });
-        if (gen.code !== 0) {
-          return signalOnboardingFailureToToolHost(
-            gen.stderr || gen.stdout || "gpg key generation failed",
-          );
-        }
+          if (input.mode === "clear") {
+            yield* Result.await(
+              captureOperation(async () => {
+                await fs.rm(paths.gnupgHome, { recursive: true, force: true });
+                await ensureDir0700(paths.gnupgHome);
+              }),
+            );
+            return Result.ok({ ok: true as const, dataDir: paths.dataDir, cleared: true as const });
+          }
 
-        const after = await runGpg({
-          args: ["--list-secret-keys", "--with-colons"],
-          env: vcsEnv,
-        });
-        const fingerprint = after.code === 0 ? parseFirstGpgFingerprint(after.stdout) : null;
-        if (!fingerprint) {
-          return signalOnboardingFailureToToolHost(
-            "gpg key generation succeeded, but no secret key fingerprint was found",
-          );
-        }
-
-        return {
-          ok: true as const,
-          dataDir: paths.dataDir,
-          generated: true as const,
-          fingerprint,
-          status: "generated" as const,
-        };
-      }
-
-      if (input.mode === "export_public") {
-        const fingerprint = input.fingerprint ?? existingFpr;
-        if (!fingerprint) {
-          return signalOnboardingFailureToToolHost("No secret key found to export");
-        }
-
-        const exp = await runGpg({
-          args: ["--armor", "--export", fingerprint],
-          env: vcsEnv,
-        });
-        if (exp.code !== 0) {
-          return signalOnboardingFailureToToolHost(exp.stderr || exp.stdout || "gpg export failed");
-        }
-
-        return {
-          ok: true as const,
-          dataDir: paths.dataDir,
-          fingerprint,
-          publicKeyArmored: exp.stdout,
-        };
-      }
-
-      const _exhaustive: never = input.mode;
-      return _exhaustive;
-    }
-
-    if (callableId === "onboarding.git_identity") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: gitIdentityInputSchema });
-      const dataDir = input.dataDir ?? env.dataDir;
-      const paths = resolveVcsPaths(dataDir);
-      await ensureVcsDirs(paths);
-      const vcsEnv = buildVcsEnv(paths);
-
-      const get = async (key: string): Promise<string | undefined> => {
-        const res = await runGit({ args: ["config", "--global", "--get", key], env: vcsEnv });
-        if (res.code !== 0) return undefined;
-        const v = res.stdout.trim();
-        return v.length > 0 ? v : undefined;
-      };
-
-      const unsetAll = async (key: string) => {
-        const res = await runGit({ args: ["config", "--global", "--unset-all", key], env: vcsEnv });
-        // git config --unset-all returns non-zero if the key is missing.
-        return res.code === 0;
-      };
-
-      if (input.mode === "status") {
-        const userName = await get("user.name");
-        const userEmail = await get("user.email");
-        const signingKey = await get("user.signingkey");
-        const commitSign = await get("commit.gpgsign");
-        const tagSign = await get("tag.gpgsign");
-        const gpgProgram = await get("gpg.program");
-
-        return {
-          ok: true as const,
-          dataDir: paths.dataDir,
-          gitConfigGlobal: paths.gitConfigGlobal,
-          userName,
-          userEmail,
-          signingKey,
-          commitGpgSign: commitSign,
-          tagGpgSign: tagSign,
-          gpgProgram,
-        };
-      }
-
-      if (input.mode === "clear") {
-        const cleared: Record<string, boolean> = {
-          "user.name": await unsetAll("user.name"),
-          "user.email": await unsetAll("user.email"),
-          "user.signingkey": await unsetAll("user.signingkey"),
-          "commit.gpgsign": await unsetAll("commit.gpgsign"),
-          "tag.gpgsign": await unsetAll("tag.gpgsign"),
-          "gpg.program": await unsetAll("gpg.program"),
-        };
-        return { ok: true as const, dataDir: paths.dataDir, cleared };
-      }
-
-      if (input.mode === "configure") {
-        if (!input.userName)
-          return signalOnboardingFailureToToolHost("Missing required input: userName");
-        if (!input.userEmail)
-          return signalOnboardingFailureToToolHost("Missing required input: userEmail");
-
-        const set = async (key: string, value: string) => {
-          const res = await runGit({
-            args: ["config", "--global", key, value],
+          const list = await runGpg({
+            args: ["--list-secret-keys", "--with-colons"],
             env: vcsEnv,
           });
-          if (res.code !== 0) {
-            return signalOnboardingFailureToToolHost(
-              res.stderr || res.stdout || `git config failed: ${key}`,
-            );
-          }
-        };
+          const existingFpr = list.code === 0 ? parseFirstGpgFingerprint(list.stdout) : null;
 
-        await set("user.name", input.userName);
-        await set("user.email", input.userEmail);
-
-        if (input.enableSigning) {
-          const signingKey = input.signingKey;
-          if (!signingKey) {
-            return signalOnboardingFailureToToolHost(
-              "Missing required input: signingKey (required when enableSigning=true)",
-            );
+          if (input.mode === "status") {
+            return Result.ok({
+              ok: true as const,
+              dataDir: paths.dataDir,
+              gnupgHome: paths.gnupgHome,
+              hasSecretKey: Boolean(existingFpr),
+              fingerprint: existingFpr ?? undefined,
+            });
           }
 
-          await set("gpg.program", "gpg");
-          await set("user.signingkey", signingKey);
-          await set("commit.gpgsign", "true");
-          await set("tag.gpgsign", "true");
-        } else {
-          await unsetAll("user.signingkey");
-          await unsetAll("commit.gpgsign");
-          await unsetAll("tag.gpgsign");
-          await unsetAll("gpg.program");
+          if (input.mode === "generate") {
+            if (existingFpr) {
+              return Result.ok({
+                ok: true as const,
+                dataDir: paths.dataDir,
+                generated: false as const,
+                fingerprint: existingFpr,
+                status: "already_present" as const,
+              });
+            }
+
+            const userName = input.userName ?? "lilac-agent[bot]";
+            const userEmail = input.userEmail ?? "lilac-agent[bot]@users.noreply.github.com";
+            const comment = input.uidComment ? ` (${input.uidComment})` : "";
+            const uid = `${userName}${comment} <${userEmail}>`;
+
+            // Ensure loopback pinentry works even if gpg decides to ask.
+            yield* Result.await(
+              captureOperation(() =>
+                fs.writeFile(
+                  path.join(paths.gnupgHome, "gpg-agent.conf"),
+                  "allow-loopback-pinentry\n",
+                  "utf8",
+                ),
+              ),
+            );
+
+            const gen = await runGpg({
+              args: [
+                "--batch",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+                "--quick-generate-key",
+                uid,
+                "default",
+                "default",
+                "never",
+              ],
+              env: vcsEnv,
+            });
+            if (gen.code !== 0) {
+              return Result.err(
+                onboardingFailure(
+                  "unavailable",
+                  gen.stderr || gen.stdout || "gpg key generation failed",
+                ),
+              );
+            }
+
+            const after = await runGpg({
+              args: ["--list-secret-keys", "--with-colons"],
+              env: vcsEnv,
+            });
+            const fingerprint = after.code === 0 ? parseFirstGpgFingerprint(after.stdout) : null;
+            if (!fingerprint) {
+              return Result.err(
+                onboardingFailure(
+                  "internal",
+                  "gpg key generation succeeded, but no secret key fingerprint was found",
+                ),
+              );
+            }
+
+            return Result.ok({
+              ok: true as const,
+              dataDir: paths.dataDir,
+              generated: true as const,
+              fingerprint,
+              status: "generated" as const,
+            });
+          }
+
+          if (input.mode === "export_public") {
+            const fingerprint = input.fingerprint ?? existingFpr;
+            if (!fingerprint) {
+              return Result.err(onboardingFailure("not_found", "No secret key found to export"));
+            }
+
+            const exp = await runGpg({
+              args: ["--armor", "--export", fingerprint],
+              env: vcsEnv,
+            });
+            if (exp.code !== 0) {
+              return Result.err(
+                onboardingFailure("unavailable", exp.stderr || exp.stdout || "gpg export failed"),
+              );
+            }
+
+            return Result.ok({
+              ok: true as const,
+              dataDir: paths.dataDir,
+              fingerprint,
+              publicKeyArmored: exp.stdout,
+            });
+          }
+
+          const _exhaustive: never = input.mode;
+          return Result.err(onboardingFailure("internal", String(_exhaustive)));
         }
 
-        return { ok: true as const, dataDir: paths.dataDir, configured: true as const };
-      }
+        if (callableId === "onboarding.git_identity") {
+          const input = rawInput as z.output<typeof gitIdentityInputSchema>;
+          const dataDir = input.dataDir ?? env.dataDir;
+          const paths = resolveVcsPaths(dataDir);
+          yield* Result.await(captureOperation(() => ensureVcsDirs(paths)));
+          const vcsEnv = buildVcsEnv(paths);
 
-      if (input.mode === "test") {
-        await fs.mkdir(paths.tmpDir, { recursive: true });
-        const repoDir = await fs.mkdtemp(path.join(paths.tmpDir, "git-test-"));
-
-        const init = await runGit({ args: ["init"], cwd: repoDir, env: vcsEnv });
-        if (init.code !== 0) {
-          return signalOnboardingFailureToToolHost(init.stderr || init.stdout || "git init failed");
-        }
-
-        await fs.writeFile(path.join(repoDir, "README.md"), "test\n", "utf8");
-        const add = await runGit({ args: ["add", "README.md"], cwd: repoDir, env: vcsEnv });
-        if (add.code !== 0) {
-          return signalOnboardingFailureToToolHost(add.stderr || add.stdout || "git add failed");
-        }
-
-        const commit = await runGit({
-          args: ["commit", "-m", "test commit"],
-          cwd: repoDir,
-          env: vcsEnv,
-        });
-        const ok = commit.code === 0;
-
-        return {
-          ok: true as const,
-          dataDir: paths.dataDir,
-          repoDir,
-          committed: ok,
-          exitCode: commit.code,
-          stdout: commit.stdout,
-          stderr: commit.stderr,
-        };
-      }
-
-      const _exhaustive: never = input.mode;
-      return _exhaustive;
-    }
-
-    if (callableId === "onboarding.bootstrap") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: bootstrapInputSchema });
-      const dataDir = input.dataDir ?? env.dataDir;
-
-      const ensuredDirs: string[] = [];
-      for (const sub of ["prompts", "skills", "secret", "workspace"]) {
-        const p = path.join(dataDir, sub);
-        await fs.mkdir(p, { recursive: true });
-        ensuredDirs.push(p);
-      }
-
-      const config = await seedCoreConfig({
-        dataDir,
-        overwrite: input.overwriteConfig,
-      });
-
-      const prompts = await ensurePromptWorkspace({
-        dataDir,
-        overwrite: input.overwritePrompts,
-      });
-
-      return {
-        ok: true as const,
-        dataDir,
-        ensuredDirs,
-        config,
-        prompts,
-      };
-    }
-
-    if (callableId === "onboarding.playwright") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: playwrightInputSchema });
-
-      const systemPath = await findSystemChromiumExecutable();
-      if (systemPath) {
-        return {
-          ok: true as const,
-          strategy: "system" as const,
-          executablePath: systemPath,
-          installed: false,
-          notes: [
-            "Using system chromium.",
-            "If Playwright fails to launch, try onboarding.playwright withDeps=true as root or use Playwright-managed chromium.",
-          ],
-        };
-      }
-
-      const pw = await ensurePlaywrightChromiumInstalled({
-        withDeps: input.withDeps,
-      });
-
-      return {
-        ok: true as const,
-        strategy: "playwright" as const,
-        executablePath: pw.executablePath,
-        installed: pw.installed,
-        notes: ["System chromium not found; using Playwright-managed chromium."],
-      };
-    }
-
-    if (callableId === "onboarding.defaults") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: defaultsInputSchema });
-      const dataDir = input.dataDir ?? env.dataDir;
-
-      const paths = resolveDefaultInstallPaths(dataDir);
-      const installEnv = buildInstallEnv(paths);
-      const bunBin = Bun.which("bun") ?? "bun";
-
-      await fs.mkdir(paths.binDir, { recursive: true });
-      await fs.mkdir(paths.bunGlobalDir, { recursive: true });
-      await fs.mkdir(paths.bunCacheDir, { recursive: true });
-      await fs.mkdir(paths.npmPrefix, { recursive: true });
-      await fs.mkdir(paths.xdgConfigHome, { recursive: true });
-      await fs.mkdir(paths.tmpDir, { recursive: true });
-      await fs.mkdir(paths.lilacSkillsDir, { recursive: true });
-
-      const steps: DefaultInstallStep[] = [];
-
-      const runStep = async (id: string, fn: () => Promise<Omit<DefaultInstallStep, "id">>) => {
-        try {
-          steps.push({ id, ...(await fn()) });
-        } catch (e) {
-          const msg = errorMessage(e);
-          if (input.strict) return signalOnboardingFailureToToolHost(msg);
-          steps.push({ id, status: "failed", error: msg });
-        }
-      };
-
-      await runStep("skills.mcporter", async () => {
-        const src = path.join(
-          requireWorkspaceRoot(),
-          "packages",
-          "utils",
-          "skill-templates",
-          "mcporter",
-          "SKILL.md",
-        );
-        const dst = path.join(paths.lilacSkillsDir, "mcporter", "SKILL.md");
-        const { copied, overwritten } = await copyFileIfNeeded({
-          from: src,
-          to: dst,
-          overwrite: input.overwriteSkills,
-        });
-        return {
-          status: copied ? "installed" : "already_present",
-          details: { src, dst, overwritten },
-        };
-      });
-
-      await runStep("skills.gog", async () => {
-        const src = path.join(
-          requireWorkspaceRoot(),
-          "packages",
-          "utils",
-          "skill-templates",
-          "gog",
-          "SKILL.md",
-        );
-        const dst = path.join(paths.lilacSkillsDir, "gog", "SKILL.md");
-        const { copied, overwritten } = await copyFileIfNeeded({
-          from: src,
-          to: dst,
-          overwrite: input.overwriteSkills,
-        });
-        return {
-          status: copied ? "installed" : "already_present",
-          details: { src, dst, overwritten },
-        };
-      });
-
-      await runStep("cli.mcporter", async () => {
-        const dest = path.join(paths.binDir, "mcporter");
-        if (await Bun.file(dest).exists()) return { status: "already_present" };
-        if (!input.network) {
-          return { status: "skipped", details: { reason: "network disabled" } };
-        }
-
-        const res = await runCommand({
-          cmd: [bunBin, "install", "--global", "mcporter"],
-          env: installEnv,
-        });
-        if (res.code !== 0) {
-          return signalOnboardingFailureToToolHost(
-            res.stderr || res.stdout || "bun install failed",
-          );
-        }
-
-        const installed = await Bun.file(dest).exists();
-        if (!installed) {
-          return {
-            status: "failed",
-            error: `bun install succeeded but ${dest} not found`,
+          const get = async (key: string): Promise<string | undefined> => {
+            const res = await runGit({ args: ["config", "--global", "--get", key], env: vcsEnv });
+            if (res.code !== 0) return undefined;
+            const v = res.stdout.trim();
+            return v.length > 0 ? v : undefined;
           };
-        }
 
-        return { status: "installed", details: { dest } };
-      });
-
-      await runStep("cli.agent-browser", async () => {
-        const dest = path.join(paths.binDir, "agent-browser");
-        if (await Bun.file(dest).exists()) return { status: "already_present" };
-        if (!input.network) {
-          return { status: "skipped", details: { reason: "network disabled" } };
-        }
-
-        const res = await runCommand({
-          cmd: [bunBin, "install", "--global", "agent-browser"],
-          env: installEnv,
-        });
-        if (res.code !== 0) {
-          return signalOnboardingFailureToToolHost(
-            res.stderr || res.stdout || "bun install failed",
-          );
-        }
-
-        const installed = await Bun.file(dest).exists();
-        if (!installed) {
-          return {
-            status: "failed",
-            error: `bun install succeeded but ${dest} not found`,
+          const unsetAll = async (key: string) => {
+            const res = await runGit({
+              args: ["config", "--global", "--unset-all", key],
+              env: vcsEnv,
+            });
+            // git config --unset-all returns non-zero if the key is missing.
+            return res.code === 0;
           };
-        }
 
-        return { status: "installed", details: { dest } };
-      });
+          if (input.mode === "status") {
+            const userName = await get("user.name");
+            const userEmail = await get("user.email");
+            const signingKey = await get("user.signingkey");
+            const commitSign = await get("commit.gpgsign");
+            const tagSign = await get("tag.gpgsign");
+            const gpgProgram = await get("gpg.program");
 
-      await runStep("skill.agent-browser", async () => {
-        const opencodeSkillsDir = path.join(paths.xdgConfigHome, "opencode", "skills");
-        if (await hasAnySkillMdUnder(opencodeSkillsDir)) {
-          return { status: "already_present", details: { opencodeSkillsDir } };
-        }
-        if (!input.network) {
-          return { status: "skipped", details: { reason: "network disabled" } };
-        }
+            return Result.ok({
+              ok: true as const,
+              dataDir: paths.dataDir,
+              gitConfigGlobal: paths.gitConfigGlobal,
+              userName,
+              userEmail,
+              signingKey,
+              commitGpgSign: commitSign,
+              tagGpgSign: tagSign,
+              gpgProgram,
+            });
+          }
 
-        const res = await runCommand({
-          cmd: [
-            bunBin,
-            "x",
-            "skills",
-            "add",
-            "vercel-labs/agent-browser",
-            "-a",
-            "opencode",
-            "-g",
-            "-y",
-          ],
-          env: installEnv,
-        });
-        if (res.code !== 0) {
-          return signalOnboardingFailureToToolHost(
-            res.stderr || res.stdout || "`skills add` failed",
-          );
-        }
+          if (input.mode === "clear") {
+            const cleared: Record<string, boolean> = {
+              "user.name": await unsetAll("user.name"),
+              "user.email": await unsetAll("user.email"),
+              "user.signingkey": await unsetAll("user.signingkey"),
+              "commit.gpgsign": await unsetAll("commit.gpgsign"),
+              "tag.gpgsign": await unsetAll("tag.gpgsign"),
+              "gpg.program": await unsetAll("gpg.program"),
+            };
+            return Result.ok({ ok: true as const, dataDir: paths.dataDir, cleared });
+          }
 
-        const installedNow = await hasAnySkillMdUnder(opencodeSkillsDir);
-        return {
-          status: installedNow ? "installed" : "failed",
-          details: { opencodeSkillsDir },
-          error: installedNow ? undefined : "skill install ran but no SKILL.md found",
-        };
-      });
+          if (input.mode === "configure") {
+            if (!input.userName)
+              return Result.err(onboardingFailure("usage", "Missing required input: userName"));
+            if (!input.userEmail)
+              return Result.err(onboardingFailure("usage", "Missing required input: userEmail"));
 
-      await runStep("cli.gh", async () => {
-        const dest = path.join(paths.binDir, "gh");
-        const result = await installGithubTarGzBinary({
-          repo: "cli/cli",
-          destPath: dest,
-          tarAssetName: (version, arch) => `gh_${version}_linux_${arch}.tar.gz`,
-          checksumAssetName: (version) => `gh_${version}_checksums.txt`,
-          findExtractedPath: async (extractDir) =>
-            findFirstFile({
-              absolutePattern: path.join(extractDir, "**", "bin", "gh"),
-            }),
-          tmpDir: paths.tmpDir,
-          overwrite: false,
-          network: input.network,
-        });
-        return { status: result.status, details: result.details };
-      });
-
-      await runStep("cli.gog", async () => {
-        const dest = path.join(paths.binDir, "gog");
-        const result = await installGithubTarGzBinary({
-          repo: "steipete/gogcli",
-          destPath: dest,
-          tarAssetName: (version, arch) => `gogcli_${version}_linux_${arch}.tar.gz`,
-          checksumAssetName: () => "checksums.txt",
-          findExtractedPath: async (extractDir) =>
-            findFirstFile({
-              absolutePattern: path.join(extractDir, "**", "gog"),
-            }),
-          tmpDir: paths.tmpDir,
-          overwrite: false,
-          network: input.network,
-        });
-        return { status: result.status, details: result.details };
-      });
-
-      return {
-        ok: true as const,
-        dataDir: paths.dataDir,
-        env: {
-          BUN_INSTALL_GLOBAL_DIR: installEnv.BUN_INSTALL_GLOBAL_DIR,
-          BUN_INSTALL_BIN: installEnv.BUN_INSTALL_BIN,
-          BUN_INSTALL_CACHE_DIR: installEnv.BUN_INSTALL_CACHE_DIR,
-          NPM_CONFIG_PREFIX: installEnv.NPM_CONFIG_PREFIX,
-          XDG_CONFIG_HOME: installEnv.XDG_CONFIG_HOME,
-        },
-        steps,
-      };
-    }
-
-    if (callableId === "onboarding.github_user_token") {
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: githubUserTokenInputSchema,
-      });
-      const dataDir = input.dataDir ?? env.dataDir;
-
-      const normalizeHost = (h: string | undefined) =>
-        (() => {
-          const trimmed = h?.trim();
-          if (!trimmed) return undefined;
-          const cleaned = trimmed.replace(/^https?:\/\//, "").replace(/\/+$/, "");
-          return cleaned.length > 0 ? cleaned : undefined;
-        })();
-
-      if (input.mode === "status") {
-        const secret = await readGithubUserTokenSecret(dataDir);
-        const apiBaseUrl = secret
-          ? deriveApiBaseUrl({
-              host: secret.host,
-              apiBaseUrl: secret.apiBaseUrl,
-            })
-          : undefined;
-        return {
-          ok: true as const,
-          dataDir,
-          configured: Boolean(secret),
-          bashEnvVars: githubBashEnvDocs,
-          ...(secret
-            ? {
-                host: secret.host,
-                apiBaseUrl,
-                login: secret.login,
+            const set = async (
+              key: string,
+              value: string,
+            ): Promise<ResultType<void, ServerToolFailure>> => {
+              const res = await runGit({
+                args: ["config", "--global", key, value],
+                env: vcsEnv,
+              });
+              if (res.code !== 0) {
+                return Result.err(
+                  onboardingFailure(
+                    "unavailable",
+                    res.stderr || res.stdout || `git config failed: ${key}`,
+                  ),
+                );
               }
-            : {}),
-        };
-      }
+              return Result.ok(undefined);
+            };
 
-      if (input.mode === "clear") {
-        await clearGithubUserTokenSecret(dataDir);
-        return { ok: true as const, dataDir, cleared: true as const };
-      }
+            yield* Result.await(set("user.name", input.userName));
+            yield* Result.await(set("user.email", input.userEmail));
 
-      if (input.mode === "configure") {
-        if (!input.token) {
-          return signalOnboardingFailureToToolHost("Missing required input: token");
+            if (input.enableSigning) {
+              const signingKey = input.signingKey;
+              if (!signingKey) {
+                return Result.err(
+                  onboardingFailure(
+                    "usage",
+                    "Missing required input: signingKey (required when enableSigning=true)",
+                  ),
+                );
+              }
+
+              yield* Result.await(set("gpg.program", "gpg"));
+              yield* Result.await(set("user.signingkey", signingKey));
+              yield* Result.await(set("commit.gpgsign", "true"));
+              yield* Result.await(set("tag.gpgsign", "true"));
+            } else {
+              await unsetAll("user.signingkey");
+              await unsetAll("commit.gpgsign");
+              await unsetAll("tag.gpgsign");
+              await unsetAll("gpg.program");
+            }
+
+            return Result.ok({
+              ok: true as const,
+              dataDir: paths.dataDir,
+              configured: true as const,
+            });
+          }
+
+          if (input.mode === "test") {
+            yield* Result.await(
+              captureOperation(() => fs.mkdir(paths.tmpDir, { recursive: true })),
+            );
+            const repoDir = yield* Result.await(
+              captureOperation(() => fs.mkdtemp(path.join(paths.tmpDir, "git-test-"))),
+            );
+
+            const init = await runGit({ args: ["init"], cwd: repoDir, env: vcsEnv });
+            if (init.code !== 0) {
+              return Result.err(
+                onboardingFailure("unavailable", init.stderr || init.stdout || "git init failed"),
+              );
+            }
+
+            yield* Result.await(
+              captureOperation(() =>
+                fs.writeFile(path.join(repoDir, "README.md"), "test\n", "utf8"),
+              ),
+            );
+            const add = await runGit({ args: ["add", "README.md"], cwd: repoDir, env: vcsEnv });
+            if (add.code !== 0) {
+              return Result.err(
+                onboardingFailure("unavailable", add.stderr || add.stdout || "git add failed"),
+              );
+            }
+
+            const commit = await runGit({
+              args: ["commit", "-m", "test commit"],
+              cwd: repoDir,
+              env: vcsEnv,
+            });
+            const ok = commit.code === 0;
+
+            return Result.ok({
+              ok: true as const,
+              dataDir: paths.dataDir,
+              repoDir,
+              committed: ok,
+              exitCode: commit.code,
+              stdout: commit.stdout,
+              stderr: commit.stderr,
+            });
+          }
+
+          const _exhaustive: never = input.mode;
+          return Result.err(onboardingFailure("internal", String(_exhaustive)));
         }
 
-        const token = input.token.trim();
-        if (!token) {
-          return signalOnboardingFailureToToolHost("Input token is empty");
-        }
+        if (callableId === "onboarding.bootstrap") {
+          const input = rawInput as z.output<typeof bootstrapInputSchema>;
+          const dataDir = input.dataDir ?? env.dataDir;
 
-        const host = normalizeHost(input.host);
-        const apiBaseUrl = input.apiBaseUrl ?? deriveApiBaseUrl({ host });
-        const login = await getGithubViewerLoginOrNull({
-          apiBaseUrl,
-          token,
-        }).catch(() => null);
+          const ensuredDirs: string[] = [];
+          for (const sub of ["prompts", "skills", "secret", "workspace"]) {
+            const p = path.join(dataDir, sub);
+            yield* Result.await(captureOperation(() => fs.mkdir(p, { recursive: true })));
+            ensuredDirs.push(p);
+          }
 
-        const wrote = await writeGithubUserTokenSecret({
-          dataDir,
-          token,
-          host,
-          apiBaseUrl,
-          login: login ?? undefined,
-        });
-
-        return {
-          ok: true as const,
-          dataDir,
-          configured: true as const,
-          bashEnvVars: githubBashEnvDocs,
-          host,
-          apiBaseUrl,
-          login,
-          jsonPath: wrote.jsonPath,
-          overwritten: wrote.overwritten,
-        };
-      }
-
-      if (input.mode === "test") {
-        const secret = await readGithubUserTokenSecret(dataDir);
-        if (!secret) {
-          return signalOnboardingFailureToToolHost(
-            "GitHub user token not configured (run onboarding.github_user_token mode=configure)",
+          const config = yield* Result.await(
+            captureOperation(() =>
+              seedCoreConfig({
+                dataDir,
+                overwrite: input.overwriteConfig,
+              }),
+            ),
           );
-        }
 
-        const apiBaseUrl = deriveApiBaseUrl({
-          host: secret.host,
-          apiBaseUrl: secret.apiBaseUrl,
-        });
-        const login = await getGithubViewerLoginOrNull({
-          apiBaseUrl,
-          token: secret.token,
-        });
-        if (!login) {
-          return signalOnboardingFailureToToolHost(
-            `GitHub API test failed at ${apiBaseUrl}/user (invalid token or permissions)`,
+          const prompts = yield* Result.await(
+            captureOperation(() =>
+              ensurePromptWorkspace({
+                dataDir,
+                overwrite: input.overwritePrompts,
+              }),
+            ),
           );
-        }
 
-        if (secret.login !== login) {
-          await writeGithubUserTokenSecret({
+          return Result.ok({
+            ok: true as const,
             dataDir,
-            token: secret.token,
-            host: secret.host,
-            apiBaseUrl: secret.apiBaseUrl,
-            login,
+            ensuredDirs,
+            config,
+            prompts,
           });
         }
 
-        return {
-          ok: true as const,
-          dataDir,
-          bashEnvVars: githubBashEnvDocs,
-          host: secret.host,
-          apiBaseUrl,
-          login,
-        };
-      }
+        if (callableId === "onboarding.playwright") {
+          const input = rawInput as z.output<typeof playwrightInputSchema>;
 
-      const _exhaustive: never = input.mode;
-      return _exhaustive;
-    }
+          const systemPath = await findSystemChromiumExecutable();
+          if (systemPath) {
+            return Result.ok({
+              ok: true as const,
+              strategy: "system" as const,
+              executablePath: systemPath,
+              installed: false,
+              notes: [
+                "Using system chromium.",
+                "If Playwright fails to launch, try onboarding.playwright withDeps=true as root or use Playwright-managed chromium.",
+              ],
+            });
+          }
 
-    if (callableId === "onboarding.github_app") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: githubAppInputSchema });
-      const dataDir = input.dataDir ?? env.dataDir;
+          const pw = yield* Result.await(
+            ensurePlaywrightChromiumInstalled({
+              withDeps: input.withDeps,
+            }),
+          );
 
-      const normalizeHost = (h: string | undefined) =>
-        (() => {
-          const trimmed = h?.trim();
-          if (!trimmed) return undefined;
-          const cleaned = trimmed.replace(/^https?:\/\//, "").replace(/\/+$/, "");
-          return cleaned.length > 0 ? cleaned : undefined;
-        })();
+          return Result.ok({
+            ok: true as const,
+            strategy: "playwright" as const,
+            executablePath: pw.executablePath,
+            installed: pw.installed,
+            notes: ["System chromium not found; using Playwright-managed chromium."],
+          });
+        }
 
-      if (input.mode === "status") {
-        const secret = await readGithubAppSecret(dataDir);
-        const apiBaseUrl = secret
-          ? deriveApiBaseUrl({
+        if (callableId === "onboarding.defaults") {
+          const input = rawInput as z.output<typeof defaultsInputSchema>;
+          const dataDir = input.dataDir ?? env.dataDir;
+
+          const paths = resolveDefaultInstallPaths(dataDir);
+          const installEnv = buildInstallEnv(paths);
+          const bunBin = Bun.which("bun") ?? "bun";
+
+          yield* Result.await(
+            captureOperation(async () => {
+              await Promise.all(
+                [
+                  paths.binDir,
+                  paths.bunGlobalDir,
+                  paths.bunCacheDir,
+                  paths.npmPrefix,
+                  paths.xdgConfigHome,
+                  paths.tmpDir,
+                  paths.lilacSkillsDir,
+                ].map((directory) => fs.mkdir(directory, { recursive: true })),
+              );
+            }),
+          );
+
+          const steps: DefaultInstallStep[] = [];
+
+          const runStep = async (
+            id: string,
+            fn: () => Promise<ResultType<Omit<DefaultInstallStep, "id">, ServerToolFailure>>,
+          ): Promise<ResultType<void, ServerToolFailure>> => {
+            const attempted = (await captureOperation(fn)).andThen((result) => result);
+            return attempted.match({
+              ok: (step) => {
+                steps.push({ id, ...step });
+                return Result.ok(undefined);
+              },
+              err: (failure) => {
+                if (input.strict) return Result.err(failure);
+                steps.push({ id, status: "failed", error: failure.message });
+                return Result.ok(undefined);
+              },
+            });
+          };
+
+          yield* Result.await(
+            runStep("skills.mcporter", () =>
+              Result.gen(async function* () {
+                const workspaceRoot = yield* requireWorkspaceRoot();
+                const src = path.join(
+                  workspaceRoot,
+                  "packages",
+                  "utils",
+                  "skill-templates",
+                  "mcporter",
+                  "SKILL.md",
+                );
+                const dst = path.join(paths.lilacSkillsDir, "mcporter", "SKILL.md");
+                const { copied, overwritten } = await copyFileIfNeeded({
+                  from: src,
+                  to: dst,
+                  overwrite: input.overwriteSkills,
+                });
+                return Result.ok({
+                  status: copied ? ("installed" as const) : ("already_present" as const),
+                  details: { src, dst, overwritten },
+                });
+              }),
+            ),
+          );
+
+          yield* Result.await(
+            runStep("skills.gog", () =>
+              Result.gen(async function* () {
+                const workspaceRoot = yield* requireWorkspaceRoot();
+                const src = path.join(
+                  workspaceRoot,
+                  "packages",
+                  "utils",
+                  "skill-templates",
+                  "gog",
+                  "SKILL.md",
+                );
+                const dst = path.join(paths.lilacSkillsDir, "gog", "SKILL.md");
+                const { copied, overwritten } = await copyFileIfNeeded({
+                  from: src,
+                  to: dst,
+                  overwrite: input.overwriteSkills,
+                });
+                return Result.ok({
+                  status: copied ? ("installed" as const) : ("already_present" as const),
+                  details: { src, dst, overwritten },
+                });
+              }),
+            ),
+          );
+
+          yield* Result.await(
+            runStep("cli.mcporter", async () => {
+              const dest = path.join(paths.binDir, "mcporter");
+              if (await Bun.file(dest).exists()) return Result.ok({ status: "already_present" });
+              if (!input.network) {
+                return Result.ok({ status: "skipped", details: { reason: "network disabled" } });
+              }
+
+              const res = await runCommand({
+                cmd: [bunBin, "install", "--global", "mcporter"],
+                env: installEnv,
+              });
+              if (res.code !== 0) {
+                return Result.err(
+                  onboardingFailure(
+                    "unavailable",
+                    res.stderr || res.stdout || "bun install failed",
+                  ),
+                );
+              }
+
+              const installed = await Bun.file(dest).exists();
+              if (!installed) {
+                return Result.ok({
+                  status: "failed",
+                  error: `bun install succeeded but ${dest} not found`,
+                });
+              }
+
+              return Result.ok({ status: "installed", details: { dest } });
+            }),
+          );
+
+          yield* Result.await(
+            runStep("cli.agent-browser", async () => {
+              const dest = path.join(paths.binDir, "agent-browser");
+              if (await Bun.file(dest).exists()) return Result.ok({ status: "already_present" });
+              if (!input.network) {
+                return Result.ok({ status: "skipped", details: { reason: "network disabled" } });
+              }
+
+              const res = await runCommand({
+                cmd: [bunBin, "install", "--global", "agent-browser"],
+                env: installEnv,
+              });
+              if (res.code !== 0) {
+                return Result.err(
+                  onboardingFailure(
+                    "unavailable",
+                    res.stderr || res.stdout || "bun install failed",
+                  ),
+                );
+              }
+
+              const installed = await Bun.file(dest).exists();
+              if (!installed) {
+                return Result.ok({
+                  status: "failed",
+                  error: `bun install succeeded but ${dest} not found`,
+                });
+              }
+
+              return Result.ok({ status: "installed", details: { dest } });
+            }),
+          );
+
+          yield* Result.await(
+            runStep("skill.agent-browser", async () => {
+              const opencodeSkillsDir = path.join(paths.xdgConfigHome, "opencode", "skills");
+              if (await hasAnySkillMdUnder(opencodeSkillsDir)) {
+                return Result.ok({ status: "already_present", details: { opencodeSkillsDir } });
+              }
+              if (!input.network) {
+                return Result.ok({ status: "skipped", details: { reason: "network disabled" } });
+              }
+
+              const res = await runCommand({
+                cmd: [
+                  bunBin,
+                  "x",
+                  "skills",
+                  "add",
+                  "vercel-labs/agent-browser",
+                  "-a",
+                  "opencode",
+                  "-g",
+                  "-y",
+                ],
+                env: installEnv,
+              });
+              if (res.code !== 0) {
+                return Result.err(
+                  onboardingFailure(
+                    "unavailable",
+                    res.stderr || res.stdout || "`skills add` failed",
+                  ),
+                );
+              }
+
+              const installedNow = await hasAnySkillMdUnder(opencodeSkillsDir);
+              return Result.ok({
+                status: installedNow ? "installed" : "failed",
+                details: { opencodeSkillsDir },
+                error: installedNow ? undefined : "skill install ran but no SKILL.md found",
+              });
+            }),
+          );
+
+          yield* Result.await(
+            runStep("cli.gh", () =>
+              Result.gen(async function* () {
+                const dest = path.join(paths.binDir, "gh");
+                const result = yield* Result.await(
+                  installGithubTarGzBinary({
+                    repo: "cli/cli",
+                    destPath: dest,
+                    tarAssetName: (version, arch) => `gh_${version}_linux_${arch}.tar.gz`,
+                    checksumAssetName: (version) => `gh_${version}_checksums.txt`,
+                    findExtractedPath: async (extractDir) =>
+                      findFirstFile({
+                        absolutePattern: path.join(extractDir, "**", "bin", "gh"),
+                      }),
+                    tmpDir: paths.tmpDir,
+                    overwrite: false,
+                    network: input.network,
+                  }),
+                );
+                return Result.ok({ status: result.status, details: result.details });
+              }),
+            ),
+          );
+
+          yield* Result.await(
+            runStep("cli.gog", () =>
+              Result.gen(async function* () {
+                const dest = path.join(paths.binDir, "gog");
+                const result = yield* Result.await(
+                  installGithubTarGzBinary({
+                    repo: "steipete/gogcli",
+                    destPath: dest,
+                    tarAssetName: (version, arch) => `gogcli_${version}_linux_${arch}.tar.gz`,
+                    checksumAssetName: () => "checksums.txt",
+                    findExtractedPath: async (extractDir) =>
+                      findFirstFile({
+                        absolutePattern: path.join(extractDir, "**", "gog"),
+                      }),
+                    tmpDir: paths.tmpDir,
+                    overwrite: false,
+                    network: input.network,
+                  }),
+                );
+                return Result.ok({ status: result.status, details: result.details });
+              }),
+            ),
+          );
+
+          return Result.ok({
+            ok: true as const,
+            dataDir: paths.dataDir,
+            env: {
+              BUN_INSTALL_GLOBAL_DIR: installEnv.BUN_INSTALL_GLOBAL_DIR,
+              BUN_INSTALL_BIN: installEnv.BUN_INSTALL_BIN,
+              BUN_INSTALL_CACHE_DIR: installEnv.BUN_INSTALL_CACHE_DIR,
+              NPM_CONFIG_PREFIX: installEnv.NPM_CONFIG_PREFIX,
+              XDG_CONFIG_HOME: installEnv.XDG_CONFIG_HOME,
+            },
+            steps,
+          });
+        }
+
+        if (callableId === "onboarding.github_user_token") {
+          const input = rawInput as z.output<typeof githubUserTokenInputSchema>;
+          const dataDir = input.dataDir ?? env.dataDir;
+
+          const normalizeHost = (h: string | undefined) =>
+            (() => {
+              const trimmed = h?.trim();
+              if (!trimmed) return undefined;
+              const cleaned = trimmed.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+              return cleaned.length > 0 ? cleaned : undefined;
+            })();
+
+          if (input.mode === "status") {
+            const secret = yield* Result.await(
+              captureOperation(() => readGithubUserTokenSecret(dataDir)),
+            );
+            const apiBaseUrl = secret
+              ? deriveApiBaseUrl({
+                  host: secret.host,
+                  apiBaseUrl: secret.apiBaseUrl,
+                })
+              : undefined;
+            return Result.ok({
+              ok: true as const,
+              dataDir,
+              configured: Boolean(secret),
+              bashEnvVars: githubBashEnvDocs,
+              ...(secret
+                ? {
+                    host: secret.host,
+                    apiBaseUrl,
+                    login: secret.login,
+                  }
+                : {}),
+            });
+          }
+
+          if (input.mode === "clear") {
+            yield* Result.await(captureOperation(() => clearGithubUserTokenSecret(dataDir)));
+            return Result.ok({ ok: true as const, dataDir, cleared: true as const });
+          }
+
+          if (input.mode === "configure") {
+            if (!input.token) {
+              return Result.err(onboardingFailure("usage", "Missing required input: token"));
+            }
+
+            const token = input.token.trim();
+            if (!token) {
+              return Result.err(onboardingFailure("usage", "Input token is empty"));
+            }
+
+            const host = normalizeHost(input.host);
+            const apiBaseUrl = input.apiBaseUrl ?? deriveApiBaseUrl({ host });
+            const loginAttempt = await captureOperation(() =>
+              this.dependencies.getGithubViewerLogin({ apiBaseUrl, token }),
+            );
+            const login = loginAttempt.match({
+              ok: (value) => value,
+              err: () => null,
+            });
+
+            const wrote = yield* Result.await(
+              captureOperation(() =>
+                writeGithubUserTokenSecret({
+                  dataDir,
+                  token,
+                  host,
+                  apiBaseUrl,
+                  login: login ?? undefined,
+                }),
+              ),
+            );
+
+            return Result.ok({
+              ok: true as const,
+              dataDir,
+              configured: true as const,
+              bashEnvVars: githubBashEnvDocs,
+              host,
+              apiBaseUrl,
+              login,
+              jsonPath: wrote.jsonPath,
+              overwritten: wrote.overwritten,
+            });
+          }
+
+          if (input.mode === "test") {
+            const secret = yield* Result.await(
+              captureOperation(() => readGithubUserTokenSecret(dataDir)),
+            );
+            if (!secret) {
+              return Result.err(
+                onboardingFailure(
+                  "conflict",
+                  "GitHub user token not configured (run onboarding.github_user_token mode=configure)",
+                ),
+              );
+            }
+
+            const apiBaseUrl = deriveApiBaseUrl({
               host: secret.host,
               apiBaseUrl: secret.apiBaseUrl,
-            })
-          : undefined;
-        return {
-          ok: true as const,
-          dataDir,
-          configured: Boolean(secret),
-          bashEnvVars: githubBashEnvDocs,
-          ...(secret
-            ? {
-                appId: secret.appId,
-                installationId: secret.installationId,
-                host: secret.host,
-                apiBaseUrl,
-                privateKeyPath: secret.privateKeyPath,
-              }
-            : {}),
-        };
-      }
+            });
+            const login = yield* Result.await(
+              captureOperation(() =>
+                this.dependencies.getGithubViewerLogin({
+                  apiBaseUrl,
+                  token: secret.token,
+                }),
+              ),
+            );
+            if (!login) {
+              return Result.err(
+                onboardingFailure(
+                  "denied",
+                  `GitHub API test failed at ${apiBaseUrl}/user (invalid token or permissions)`,
+                ),
+              );
+            }
 
-      if (input.mode === "clear") {
-        await clearGithubAppSecret(dataDir);
-        return { ok: true as const, dataDir, cleared: true as const };
-      }
+            if (secret.login !== login) {
+              yield* Result.await(
+                captureOperation(() =>
+                  writeGithubUserTokenSecret({
+                    dataDir,
+                    token: secret.token,
+                    host: secret.host,
+                    apiBaseUrl: secret.apiBaseUrl,
+                    login,
+                  }),
+                ),
+              );
+            }
 
-      if (input.mode === "configure") {
-        if (!input.appId) {
-          return signalOnboardingFailureToToolHost("Missing required input: appId");
-        }
-        if (!input.installationId) {
-          return signalOnboardingFailureToToolHost("Missing required input: installationId");
+            return Result.ok({
+              ok: true as const,
+              dataDir,
+              bashEnvVars: githubBashEnvDocs,
+              host: secret.host,
+              apiBaseUrl,
+              login,
+            });
+          }
+
+          const _exhaustive: never = input.mode;
+          return Result.err(onboardingFailure("internal", String(_exhaustive)));
         }
 
-        let privateKeyPem = input.privateKeyPem ?? null;
-        if (!privateKeyPem && input.privateKeyPath) {
-          privateKeyPem = await Bun.file(input.privateKeyPath).text();
+        if (callableId === "onboarding.github_app") {
+          const input = rawInput as z.output<typeof githubAppInputSchema>;
+          const dataDir = input.dataDir ?? env.dataDir;
+
+          const normalizeHost = (h: string | undefined) =>
+            (() => {
+              const trimmed = h?.trim();
+              if (!trimmed) return undefined;
+              const cleaned = trimmed.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+              return cleaned.length > 0 ? cleaned : undefined;
+            })();
+
+          if (input.mode === "status") {
+            const secret = yield* Result.await(
+              captureOperation(() => readGithubAppSecret(dataDir)),
+            );
+            const apiBaseUrl = secret
+              ? deriveApiBaseUrl({
+                  host: secret.host,
+                  apiBaseUrl: secret.apiBaseUrl,
+                })
+              : undefined;
+            return Result.ok({
+              ok: true as const,
+              dataDir,
+              configured: Boolean(secret),
+              bashEnvVars: githubBashEnvDocs,
+              ...(secret
+                ? {
+                    appId: secret.appId,
+                    installationId: secret.installationId,
+                    host: secret.host,
+                    apiBaseUrl,
+                    privateKeyPath: secret.privateKeyPath,
+                  }
+                : {}),
+            });
+          }
+
+          if (input.mode === "clear") {
+            yield* Result.await(captureOperation(() => clearGithubAppSecret(dataDir)));
+            return Result.ok({ ok: true as const, dataDir, cleared: true as const });
+          }
+
+          if (input.mode === "configure") {
+            if (!input.appId) {
+              return Result.err(onboardingFailure("usage", "Missing required input: appId"));
+            }
+            if (!input.installationId) {
+              return Result.err(
+                onboardingFailure("usage", "Missing required input: installationId"),
+              );
+            }
+
+            let privateKeyPem = input.privateKeyPem ?? null;
+            if (!privateKeyPem && input.privateKeyPath) {
+              privateKeyPem = yield* Result.await(
+                captureOperation(
+                  () => Bun.file(input.privateKeyPath!).text(),
+                  "not_found",
+                  "Private key file could not be read",
+                ),
+              );
+            }
+            if (!privateKeyPem) {
+              return Result.err(
+                onboardingFailure(
+                  "usage",
+                  "Missing required input: privateKeyPem or privateKeyPath",
+                ),
+              );
+            }
+
+            const host = normalizeHost(input.host);
+            const apiBaseUrl = input.apiBaseUrl ?? deriveApiBaseUrl({ host });
+
+            const wrote = yield* Result.await(
+              captureOperation(() =>
+                writeGithubAppSecret({
+                  dataDir,
+                  appId: input.appId!,
+                  installationId: input.installationId!,
+                  host,
+                  apiBaseUrl,
+                  privateKeyPem,
+                }),
+              ),
+            );
+
+            return Result.ok({
+              ok: true as const,
+              dataDir,
+              configured: true as const,
+              bashEnvVars: githubBashEnvDocs,
+              appId: input.appId,
+              installationId: input.installationId,
+              host,
+              apiBaseUrl,
+              jsonPath: wrote.jsonPath,
+              pemPath: wrote.pemPath,
+              overwritten: wrote.overwritten,
+            });
+          }
+
+          if (input.mode === "test") {
+            const t = yield* Result.await(
+              captureOperation(
+                () => this.dependencies.getGithubInstallationToken({ dataDir }),
+                "unavailable",
+                "GitHub App token is unavailable",
+              ),
+            );
+            const res = yield* Result.await(
+              captureOperation(() =>
+                this.dependencies.fetch(`${t.apiBaseUrl}/installation/repositories?per_page=1`, {
+                  headers: {
+                    "User-Agent": "lilac-onboarding",
+                    Accept: "application/vnd.github+json",
+                    Authorization: `token ${t.token}`,
+                  },
+                }),
+              ),
+            );
+            if (!res.ok) {
+              return Result.err(
+                onboardingFailure(
+                  res.status === 401 || res.status === 403 ? "denied" : "unavailable",
+                  `GitHub API test failed (${res.status} ${res.statusText}) at ${t.apiBaseUrl}`,
+                ),
+              );
+            }
+
+            const body = yield* Result.await(
+              captureOperation(async () => (await res.json()) as unknown),
+            );
+            const repoCount = decodeGithubInstallationRepositoriesCount(body);
+
+            return Result.ok({
+              ok: true as const,
+              dataDir,
+              bashEnvVars: githubBashEnvDocs,
+              host: t.host,
+              apiBaseUrl: t.apiBaseUrl,
+              expiresAtMs: t.expiresAtMs,
+              repoCount,
+            });
+          }
+
+          const _exhaustive: never = input.mode;
+          return Result.err(onboardingFailure("internal", String(_exhaustive)));
         }
-        if (!privateKeyPem) {
-          return signalOnboardingFailureToToolHost(
-            "Missing required input: privateKeyPem or privateKeyPath",
+
+        if (callableId === "onboarding.reload_tools") {
+          const port = Number(env.toolServer.port ?? 8080);
+          const res = yield* Result.await(
+            captureOperation(() =>
+              this.dependencies.fetch(`http://127.0.0.1:${port}/reload`, {
+                method: "POST",
+              }),
+            ),
           );
+          if (!res.ok) {
+            return Result.err(
+              onboardingFailure(
+                "unavailable",
+                `POST /reload failed: ${res.status} ${res.statusText}`,
+              ),
+            );
+          }
+          return Result.ok({ ok: true as const });
         }
 
-        const host = normalizeHost(input.host);
-        const apiBaseUrl = input.apiBaseUrl ?? deriveApiBaseUrl({ host });
+        if (callableId === "onboarding.reload_config") {
+          const input = rawInput as z.output<typeof reloadConfigInputSchema>;
 
-        const wrote = await writeGithubAppSecret({
-          dataDir,
-          appId: input.appId,
-          installationId: input.installationId,
-          host,
-          apiBaseUrl,
-          privateKeyPem,
-        });
+          if (input.mode === "restart") {
+            return Result.ok(scheduleRestart());
+          }
 
-        return {
-          ok: true as const,
-          dataDir,
-          configured: true as const,
-          bashEnvVars: githubBashEnvDocs,
-          appId: input.appId,
-          installationId: input.installationId,
-          host,
-          apiBaseUrl,
-          jsonPath: wrote.jsonPath,
-          pemPath: wrote.pemPath,
-          overwritten: wrote.overwritten,
-        };
-      }
-
-      if (input.mode === "test") {
-        const t = await getGithubInstallationTokenOrThrow({ dataDir });
-        const res = await fetch(`${t.apiBaseUrl}/installation/repositories?per_page=1`, {
-          headers: {
-            "User-Agent": "lilac-onboarding",
-            Accept: "application/vnd.github+json",
-            Authorization: `token ${t.token}`,
-          },
-        });
-        if (!res.ok) {
-          return signalOnboardingFailureToToolHost(
-            `GitHub API test failed (${res.status} ${res.statusText}) at ${t.apiBaseUrl}`,
+          const cfg = yield* Result.await(
+            captureOperation(() => getCoreConfig({ forceReload: true })),
           );
+          return Result.ok({
+            ok: true as const,
+            mode: "cache" as const,
+            dataDir: env.dataDir,
+            coreConfigPath: resolveCoreConfigPath(),
+            promptDir: resolvePromptDir(),
+            discord: {
+              tokenEnv: cfg.surface.discord.tokenEnv,
+              botName: cfg.surface.discord.botName,
+            },
+          });
         }
 
-        const body: unknown = await res.json().catch(() => null);
-        const repoCount = decodeGithubInstallationRepositoriesCount(body);
+        if (callableId === "onboarding.restart") {
+          return Result.ok(scheduleRestart());
+        }
 
-        return {
-          ok: true as const,
-          dataDir,
-          bashEnvVars: githubBashEnvDocs,
-          host: t.host,
-          apiBaseUrl: t.apiBaseUrl,
-          expiresAtMs: t.expiresAtMs,
-          repoCount,
-        };
-      }
+        if (callableId === "onboarding.all") {
+          const input = rawInput as z.output<typeof allInputSchema>;
+          const dataDir = input.dataDir ?? env.dataDir;
 
-      const _exhaustive: never = input.mode;
-      return _exhaustive;
-    }
+          const bootstrap = yield* Result.await(
+            this.runCallable("onboarding.bootstrap", {
+              dataDir,
+              overwriteConfig: input.overwriteConfig,
+              overwritePrompts: input.overwritePrompts,
+            }),
+          );
 
-    if (callableId === "onboarding.reload_tools") {
-      const port = Number(env.toolServer.port ?? 8080);
-      const res = await fetch(`http://127.0.0.1:${port}/reload`, {
-        method: "POST",
-      });
-      if (!res.ok) {
-        return signalOnboardingFailureToToolHost(
-          `POST /reload failed: ${res.status} ${res.statusText}`,
-        );
-      }
-      return { ok: true as const };
-    }
+          const playwright = yield* Result.await(
+            this.runCallable("onboarding.playwright", {
+              withDeps: input.playwrightWithDeps,
+            }),
+          );
 
-    if (callableId === "onboarding.reload_config") {
-      const input = parseToolInput({
-        callableId,
-        input: rawInput,
-        schema: reloadConfigInputSchema,
-      });
+          const defaults = yield* Result.await(
+            this.runCallable("onboarding.defaults", {
+              dataDir,
+              overwriteSkills: input.overwriteSkills,
+              network: true,
+              strict: false,
+            }),
+          );
 
-      if (input.mode === "restart") {
-        return scheduleRestart();
-      }
+          const reloadConfig = yield* Result.await(
+            this.runCallable("onboarding.reload_config", {
+              mode: "cache",
+            }),
+          );
 
-      const cfg = await getCoreConfig({ forceReload: true });
-      return {
-        ok: true as const,
-        mode: "cache" as const,
-        dataDir: env.dataDir,
-        coreConfigPath: resolveCoreConfigPath(),
-        promptDir: resolvePromptDir(),
-        discord: {
-          tokenEnv: cfg.surface.discord.tokenEnv,
-          botName: cfg.surface.discord.botName,
-        },
-      };
-    }
+          const restart = input.restart ? scheduleRestart() : undefined;
 
-    if (callableId === "onboarding.restart") {
-      return scheduleRestart();
-    }
+          return Result.ok({
+            ok: true as const,
+            bootstrap,
+            playwright,
+            defaults,
+            reloadConfig,
+            restart,
+          });
+        }
 
-    if (callableId === "onboarding.all") {
-      const input = parseToolInput({ callableId, input: rawInput, schema: allInputSchema });
-      const dataDir = input.dataDir ?? env.dataDir;
-
-      const bootstrap = (await this.runCallable("onboarding.bootstrap", {
-        dataDir,
-        overwriteConfig: input.overwriteConfig,
-        overwritePrompts: input.overwritePrompts,
-      })) as unknown;
-
-      const playwright = (await this.runCallable("onboarding.playwright", {
-        withDeps: input.playwrightWithDeps,
-      })) as unknown;
-
-      const defaults = (await this.runCallable("onboarding.defaults", {
-        dataDir,
-        overwriteSkills: input.overwriteSkills,
-        network: true,
-        strict: false,
-      })) as unknown;
-
-      const reloadConfig = (await this.runCallable("onboarding.reload_config", {
-        mode: "cache",
-      })) as unknown;
-
-      const restart = input.restart ? scheduleRestart() : undefined;
-
-      return {
-        ok: true as const,
-        bootstrap,
-        playwright,
-        defaults,
-        reloadConfig,
-        restart,
-      };
-    }
-
-    return signalOnboardingFailureToToolHost(`Invalid callable ID '${callableId}'`);
+        return Result.err(onboardingFailure("usage", `Invalid callable ID '${callableId}'`));
+      }.bind(this),
+    );
   }
 }

@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, jest } from "bun:test";
 import { createLogger } from "@stanley2058/lilac-utils";
+import type { ServerToolResult } from "@stanley2058/lilac-plugin-runtime";
+import { Panic } from "better-result";
 
 import { Web, type WebDependencies } from "../../src/tool-server/tools/web";
 import {
@@ -32,6 +34,10 @@ afterEach(() => {
 
 function deferred<T = void>() {
   return Promise.withResolvers<T>();
+}
+
+async function toolValue<T = unknown>(pending: Promise<ServerToolResult<T>>): Promise<T> {
+  return (await pending).unwrap();
 }
 
 function startServer(handler: (request: Request) => Response | Promise<Response>) {
@@ -149,10 +155,7 @@ describe("web tool direct fetch", () => {
     );
     setTimeout(() => controller.abort(), 10);
 
-    await expect(pending).resolves.toMatchObject({
-      isError: true,
-      error: expect.stringMatching(/abort/i),
-    });
+    await expect(pending).rejects.toThrow(/abort/i);
   });
 
   it("rejects unsupported binary content types", async () => {
@@ -183,10 +186,7 @@ describe("web tool direct fetch", () => {
 
     await expect(
       tool.call("fetch", { url: `http://127.0.0.1:${server.port}/oversized`, mode: "auto" }),
-    ).resolves.toMatchObject({
-      isError: true,
-      error: expect.stringContaining("response too large"),
-    });
+    ).rejects.toThrow("response too large");
     expect(browser).not.toHaveBeenCalled();
   });
 
@@ -213,6 +213,34 @@ describe("web tool direct fetch", () => {
 });
 
 describe("web tool mode orchestration", () => {
+  it("rejects unexpected acquisition defects", async () => {
+    const defect = new TypeError("invalid direct acquisition state");
+    const tool = createTool({
+      mode: "fetch",
+      direct: async () => {
+        throw defect;
+      },
+    });
+
+    await expect(tool.call("fetch", { url: "https://example.com", mode: "fetch" })).rejects.toBe(
+      defect,
+    );
+  });
+
+  it("maps expected acquisition failures to semantic errors", async () => {
+    const tool = createTool({
+      mode: "fetch",
+      direct: async () => ({ isError: true, error: "upstream stopped", status: 408 }),
+    });
+
+    await expect(
+      tool.call("fetch", { url: "https://example.com", mode: "fetch" }),
+    ).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "timeout", code: "web_timeout", retryable: true },
+    });
+  });
+
   it("auto returns direct markdown without extra fallbacks", async () => {
     const browser = jest.fn(async (): Promise<PageContentResult> => {
       throw new Error("browser fallback should not run");
@@ -227,7 +255,7 @@ describe("web tool mode orchestration", () => {
     });
 
     await expect(
-      tool.call("fetch", { url: "https://example.com", mode: "auto" }),
+      toolValue(tool.call("fetch", { url: "https://example.com", mode: "auto" })),
     ).resolves.toMatchObject({
       isError: false,
       title: "Example",
@@ -262,7 +290,7 @@ describe("web tool mode orchestration", () => {
     });
 
     await expect(
-      tool.call("fetch", { url: "https://example.com", mode: "auto", format: "text" }),
+      toolValue(tool.call("fetch", { url: "https://example.com", mode: "auto", format: "text" })),
     ).resolves.toMatchObject({
       isError: false,
       title: "Rendered Example",
@@ -294,7 +322,7 @@ describe("web tool mode orchestration", () => {
     });
 
     await expect(
-      tool.call("fetch", { url: "https://example.com", mode: "auto" }),
+      toolValue(tool.call("fetch", { url: "https://example.com", mode: "auto" })),
     ).resolves.toMatchObject({
       isError: false,
       title: "Extracted Example",
@@ -323,7 +351,7 @@ describe("web tool mode orchestration", () => {
     });
 
     await expect(
-      tool.call("fetch", { url: "https://example.com", mode: "auto" }),
+      toolValue(tool.call("fetch", { url: "https://example.com", mode: "auto" })),
     ).resolves.toMatchObject({
       isError: false,
       title: "Rendered Example",
@@ -351,7 +379,9 @@ describe("web tool mode orchestration", () => {
       extract,
     });
 
-    await expect(tool.call("fetch", { url: "https://example.com" })).resolves.toMatchObject({
+    await expect(
+      toolValue(tool.call("fetch", { url: "https://example.com" })),
+    ).resolves.toMatchObject({
       isError: false,
       title: "Configured Extract",
       content: "Configured extract content",
@@ -374,7 +404,10 @@ describe("web tool mode orchestration", () => {
 
     await expect(
       tool.call("fetch", { url: "https://example.com", mode: "provider-only" }),
-    ).resolves.toEqual({ isError: true, error: "provider unavailable" });
+    ).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "unavailable", message: "provider unavailable" },
+    });
     expect(browser).not.toHaveBeenCalled();
   });
 
@@ -389,12 +422,36 @@ describe("web tool mode orchestration", () => {
     });
 
     await expect(
-      tool.call("fetch", { url: "https://example.com", mode: "extract" }),
+      toolValue(tool.call("fetch", { url: "https://example.com", mode: "extract" })),
     ).resolves.toMatchObject({ isError: false, title: "Browser", content: "Browser fallback" });
   });
 });
 
 describe("web provider extraction", () => {
+  it("preserves the terminal status category in an aggregated fallback failure", async () => {
+    const tool = createTool({
+      providers: [configuredProvider("tavily"), configuredProvider("exa")],
+      extract: async (providerId) => {
+        if (providerId === "tavily") {
+          throw Object.assign(new Error("primary provider failed"), { status: 503 });
+        }
+        throw Object.assign(new Error("access blocked"), { status: 403 });
+      },
+    });
+
+    await expect(
+      tool.call("fetch", { url: "https://example.com", mode: "provider-only" }),
+    ).resolves.toMatchObject({
+      status: "error",
+      error: {
+        kind: "denied",
+        code: "web_denied",
+        message:
+          "web.extract failed across fallback providers: tavily: primary provider failed | exa: access blocked",
+      },
+    });
+  });
+
   it("falls through unsupported html providers to Firecrawl", async () => {
     const calls: string[] = [];
     const tool = createTool({
@@ -414,11 +471,13 @@ describe("web provider extraction", () => {
     });
 
     await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-        mode: "provider-only",
-        format: "html",
-      }),
+      toolValue(
+        tool.call("fetch", {
+          url: "https://example.com",
+          mode: "provider-only",
+          format: "html",
+        }),
+      ),
     ).resolves.toMatchObject({
       isError: false,
       title: "Firecrawl HTML",
@@ -525,11 +584,13 @@ describe("web provider extraction", () => {
     });
 
     await expect(
-      tool.call("fetch", {
-        url: "https://example.com",
-        mode: "provider-only",
-        maxCharacters: 60_000,
-      }),
+      toolValue(
+        tool.call("fetch", {
+          url: "https://example.com",
+          mode: "provider-only",
+          maxCharacters: 60_000,
+        }),
+      ),
     ).resolves.toMatchObject({
       isError: false,
       length: 50_000,
@@ -608,7 +669,7 @@ describe("web provider extraction", () => {
       },
     });
     await expect(
-      retriable.call("fetch", { url: "https://example.com", mode: "provider-only" }),
+      toolValue(retriable.call("fetch", { url: "https://example.com", mode: "provider-only" })),
     ).resolves.toMatchObject({ isError: false, content: "Recovered from fallback provider." });
     expect(calls).toEqual(["tavily", "exa"]);
 
@@ -622,12 +683,67 @@ describe("web provider extraction", () => {
     });
     await expect(
       terminal.call("fetch", { url: "https://example.com", mode: "provider-only" }),
-    ).resolves.toEqual({ isError: true, error: "401 unauthorized" });
+    ).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "denied", message: "401 unauthorized" },
+    });
     expect(calls).toEqual(["tavily"]);
   });
 });
 
 describe("web search and permits", () => {
+  it("preserves the terminal status category in an aggregated fallback failure", async () => {
+    const tool = createTool({
+      providers: [
+        configuredProvider("tavily", async () => {
+          throw Object.assign(new Error("primary provider failed"), { status: 503 });
+        }),
+        configuredProvider("exa", async () => {
+          throw Object.assign(new Error("resource absent"), { status: 404 });
+        }),
+      ],
+    });
+
+    await expect(tool.call("search", { query: "fallback categories" })).resolves.toMatchObject({
+      status: "error",
+      error: {
+        kind: "not_found",
+        code: "web_not_found",
+        message:
+          "web.search failed across fallback providers: tavily: primary provider failed | exa: resource absent",
+      },
+    });
+  });
+
+  it("preserves Panic identity from search providers", async () => {
+    const panic = new Panic({ message: "search provider invariant" });
+    const tool = createTool({
+      providers: [
+        configuredProvider("exa", async () => {
+          throw panic;
+        }),
+      ],
+    });
+
+    const [settled] = await Promise.allSettled([tool.call("search", { query: "panic" })]);
+    expect(settled).toEqual({ status: "rejected", reason: panic });
+  });
+
+  it("preserves Panic from web config loading", async () => {
+    const panic = new Panic({ message: "web config invariant" });
+    const tool = createTool({
+      loadWebToolConfig: async () => {
+        throw panic;
+      },
+    });
+
+    const [settled] = await Promise.allSettled([
+      tool.call("fetch", { url: "https://example.com", mode: "fetch" }),
+    ]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+  });
+
   it("falls back to the next search provider only on retriable errors", async () => {
     const calls: string[] = [];
     const fallback = configuredProvider("exa", async () => {
@@ -650,7 +766,9 @@ describe("web search and permits", () => {
         fallback,
       ],
     });
-    await expect(retriable.call("search", { query: "fallback test" })).resolves.toHaveLength(1);
+    await expect(
+      toolValue(retriable.call("search", { query: "fallback test" })),
+    ).resolves.toHaveLength(1);
     expect(calls).toEqual(["tavily", "exa"]);
 
     calls.length = 0;
@@ -663,9 +781,9 @@ describe("web search and permits", () => {
         fallback,
       ],
     });
-    await expect(terminal.call("search", { query: "no retry" })).resolves.toEqual({
-      isError: true,
-      error: "401 unauthorized",
+    await expect(terminal.call("search", { query: "no retry" })).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "denied", message: "401 unauthorized" },
     });
     expect(calls).toEqual(["tavily"]);
   });
@@ -706,10 +824,10 @@ describe("web search and permits", () => {
       ],
     });
 
-    const first = tool.call("search", { query: "first" });
-    const second = tool.call("search", { query: "second" });
+    const first = toolValue(tool.call("search", { query: "first" }));
+    const second = toolValue(tool.call("search", { query: "second" }));
     await twoStarted.promise;
-    const third = tool.call("search", { query: "third" });
+    const third = toolValue(tool.call("search", { query: "third" }));
     await thirdAcquireStarted.promise;
     jest.advanceTimersByTime(3_000);
     await expect(third).resolves.toEqual([
@@ -744,14 +862,14 @@ describe("web search and permits", () => {
       ],
     });
 
-    const first = tool.call("search", { query: "first" });
+    const first = toolValue(tool.call("search", { query: "first" }));
     await firstStarted.promise;
     const controller = new AbortController();
     const second = tool.call("search", { query: "second" }, { signal: controller.signal });
     controller.abort();
     await expect(second).resolves.toMatchObject({
-      isError: true,
-      error: expect.stringMatching(/aborted/i),
+      status: "error",
+      error: { kind: "cancelled", message: expect.stringMatching(/aborted/i) },
     });
     expect(firecrawlCalls).toBe(1);
     expect(fallbackCalls).toBe(0);
@@ -794,10 +912,12 @@ describe("web search and permits", () => {
       },
     });
 
-    const pending = tool.call("fetch", {
-      url: "https://example.com",
-      mode: "provider-only",
-    });
+    const pending = toolValue(
+      tool.call("fetch", {
+        url: "https://example.com",
+        mode: "provider-only",
+      }),
+    );
     await acquireStarted.promise;
     jest.advanceTimersByTime(3_000);
     await expect(pending).resolves.toMatchObject({
@@ -851,8 +971,8 @@ describe("web search and permits", () => {
     controller.abort();
 
     await expect(pending).resolves.toMatchObject({
-      isError: true,
-      error: expect.stringMatching(/aborted/i),
+      status: "error",
+      error: { kind: "cancelled", message: expect.stringMatching(/aborted/i) },
     });
     expect(browser).not.toHaveBeenCalled();
     active.release();

@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@stanley2058/lilac-core": "workspace:*",
+    "@stanley2058/lilac-plugin-runtime": "workspace:*",
     "@stanley2058/lilac-utils": "workspace:*",
     "@stanley2058/simple-module-logger": "^0.0.4",
     "better-result": "catalog:",

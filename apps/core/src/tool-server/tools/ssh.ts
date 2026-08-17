@@ -1,13 +1,34 @@
 import { z } from "zod";
 import path from "node:path";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import {
+  serverToolFailure,
+  type ServerToolFailure,
+  type ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
 import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
-import { readConfiguredSshHosts, requireConfiguredSshHost } from "../../ssh/ssh-config";
+import { readConfiguredSshHosts, requireConfiguredSshHostResult } from "../../ssh/ssh-config";
+import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
 const DEFAULT_SSH_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 const DEFAULT_CONNECT_TIMEOUT_SECS = 10;
 const MAX_OUTPUT_CHARS = 200_000;
+
+function sshFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
+  return serverToolFailure({
+    kind,
+    code: `ssh_${kind}`,
+    message,
+    retryable: kind === "unavailable" || kind === "timeout",
+  });
+}
+
+async function requireSshHost(host: string): Promise<ResultType<void, ServerToolFailure>> {
+  return (await requireConfiguredSshHostResult(host)).mapError((error) =>
+    sshFailure(error._tag === "SshConfigReadError" ? "unavailable" : "not_found", error.message),
+  );
+}
 
 const sshProbeOutputSchema = z.strictObject({
   ok: z.literal(true),
@@ -122,6 +143,14 @@ async function readStreamText(stream: unknown): Promise<string> {
   return await new Response(body).text();
 }
 
+function preserveSshSettledPanics(results: readonly PromiseSettledResult<unknown>[]): void {
+  for (const result of results) {
+    if (result.status === "rejected" && Panic.is(result.reason)) {
+      preserveToolPanic(result.reason);
+    }
+  }
+}
+
 function inferTransportError(
   stderr: string,
 ): { type: "hostkey" | "auth" | "connect" | "unknown"; message: string } | undefined {
@@ -214,12 +243,12 @@ export class SSH implements ServerTool {
           catalog,
           run: async () => {
             const { configPath, hosts, exists, readError } = await readConfiguredSshHosts();
-            return {
+            return Result.ok({
               configPath,
               exists,
               hosts,
               readError,
-            };
+            });
           },
         }),
         "ssh.run": callable({
@@ -261,12 +290,23 @@ export class SSH implements ServerTool {
     callableId: string,
     input: Record<string, unknown>,
     opts?: ServerToolCallOptions,
-  ): Promise<unknown> {
+  ): Promise<ServerToolResult> {
     return await this.tool.call(callableId, input, opts);
   }
 
-  private async callRun(input: RunInput, signal: AbortSignal | undefined): Promise<unknown> {
-    await requireConfiguredSshHost(input.host);
+  private async callRun(
+    input: RunInput,
+    signal: AbortSignal | undefined,
+  ): Promise<ServerToolResult> {
+    const required = await requireSshHost(input.host);
+    const requirementFailure = required.match({
+      ok: () => undefined,
+      err: (failure) => failure,
+    });
+    if (requirementFailure) return Result.err(requirementFailure);
+    if (signal?.aborted) {
+      return Result.err(sshFailure("cancelled", "SSH command was cancelled"));
+    }
 
     const effectiveTimeoutMs = input.timeoutMs ?? DEFAULT_SSH_TIMEOUT_MS;
     const controller = new AbortController();
@@ -311,24 +351,42 @@ export class SSH implements ServerTool {
       // Important: provide stdin as a finite blob so the remote `bash -s`
       // reliably receives EOF and exits. In some environments, streaming
       // stdin can leave the channel open and hang after producing output.
-      const child = Bun.spawn(["ssh", ...sshArgs], {
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: new Blob([script]),
-        signal: controller.signal,
-        killSignal: "SIGTERM",
-        env: {
-          ...process.env,
-          // Ensure we don't implicitly change caller state.
-          // Users should configure their SSH environment explicitly.
+      const spawned = Result.try({
+        try: () =>
+          Bun.spawn(["ssh", ...sshArgs], {
+            stdout: "pipe",
+            stderr: "pipe",
+            stdin: new Blob([script]),
+            signal: controller.signal,
+            killSignal: "SIGTERM",
+            env: {
+              ...process.env,
+            },
+          }),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return sshFailure(
+            controller.signal.aborted ? "cancelled" : "unavailable",
+            cause instanceof Error ? cause.message : "Failed to start SSH",
+          );
         },
       });
+      const spawnOutcome = spawned.match<
+        | { readonly child: Bun.Subprocess<Blob, "pipe", "pipe"> }
+        | { readonly failure: ServerToolFailure }
+      >({
+        ok: (child) => ({ child }),
+        err: (failure) => ({ failure }),
+      });
+      if ("failure" in spawnOutcome) return Result.err(spawnOutcome.failure);
+      const child = spawnOutcome.child;
 
       const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
         readStreamText(child.stdout),
         readStreamText(child.stderr),
         child.exited,
       ]);
+      preserveSshSettledPanics([stdoutResult, stderrResult, exitResult]);
 
       const stdout = stdoutResult.status === "fulfilled" ? stdoutResult.value : "";
       const stderr = stderrResult.status === "fulfilled" ? stderrResult.value : "";
@@ -340,9 +398,13 @@ export class SSH implements ServerTool {
       const errTrunc = truncateText(stderr, MAX_OUTPUT_CHARS);
 
       const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
+      const processReadFailed =
+        stdoutResult.status === "rejected" ||
+        stderrResult.status === "rejected" ||
+        exitResult.status === "rejected";
 
-      return {
-        ok: exitCode === 0 && !timedOut,
+      const report = {
+        ok: exitCode === 0 && !timedOut && !processReadFailed,
         exitCode,
         durationMs,
         timedOut,
@@ -366,14 +428,34 @@ export class SSH implements ServerTool {
           stdinWrite: undefined,
         },
       };
+      if (timedOut) {
+        return Result.err(
+          sshFailure("timeout", `SSH command timed out after ${effectiveTimeoutMs}ms`),
+        );
+      }
+      if (signal?.aborted) {
+        return Result.err(sshFailure("cancelled", "SSH command was cancelled"));
+      }
+      return Result.ok(report);
     } finally {
       clearTimeout(timeout);
       if (signal) signal.removeEventListener("abort", onAbort);
     }
   }
 
-  private async callProbe(input: ProbeInput, signal: AbortSignal | undefined): Promise<unknown> {
-    await requireConfiguredSshHost(input.host);
+  private async callProbe(
+    input: ProbeInput,
+    signal: AbortSignal | undefined,
+  ): Promise<ServerToolResult> {
+    const required = await requireSshHost(input.host);
+    const requirementFailure = required.match({
+      ok: () => undefined,
+      err: (failure) => failure,
+    });
+    if (requirementFailure) return Result.err(requirementFailure);
+    if (signal?.aborted) {
+      return Result.err(sshFailure("cancelled", "SSH probe was cancelled"));
+    }
 
     const effectiveTimeoutMs = input.timeoutMs ?? DEFAULT_SSH_TIMEOUT_MS;
     const controller = new AbortController();
@@ -413,24 +495,60 @@ export class SSH implements ServerTool {
         "-s",
       ];
 
-      const script = await buildProbeScript(input);
-
-      const child = Bun.spawn(["ssh", ...sshArgs], {
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: new Blob([script]),
-        signal: controller.signal,
-        killSignal: "SIGTERM",
-        env: {
-          ...process.env,
+      const scriptResult = await Result.tryPromise({
+        try: () => buildProbeScript(input),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return sshFailure(
+            "unavailable",
+            cause instanceof Error ? cause.message : "SSH probe script is unavailable",
+          );
         },
       });
+      const scriptOutcome = scriptResult.match<
+        { readonly script: string } | { readonly failure: ServerToolFailure }
+      >({
+        ok: (script) => ({ script }),
+        err: (failure) => ({ failure }),
+      });
+      if ("failure" in scriptOutcome) return Result.err(scriptOutcome.failure);
+
+      const spawned = Result.try({
+        try: () =>
+          Bun.spawn(["ssh", ...sshArgs], {
+            stdout: "pipe",
+            stderr: "pipe",
+            stdin: new Blob([scriptOutcome.script]),
+            signal: controller.signal,
+            killSignal: "SIGTERM",
+            env: {
+              ...process.env,
+            },
+          }),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return sshFailure(
+            controller.signal.aborted ? "cancelled" : "unavailable",
+            cause instanceof Error ? cause.message : "Failed to start SSH probe",
+          );
+        },
+      });
+      const spawnOutcome = spawned.match<
+        | { readonly child: Bun.Subprocess<Blob, "pipe", "pipe"> }
+        | { readonly failure: ServerToolFailure }
+      >({
+        ok: (child) => ({ child }),
+        err: (failure) => ({ failure }),
+      });
+      if ("failure" in spawnOutcome) return Result.err(spawnOutcome.failure);
+      const child = spawnOutcome.child;
 
       const [stdoutResult, stderrResult, exitResult] = await Promise.allSettled([
         readStreamText(child.stdout),
         readStreamText(child.stderr),
         child.exited,
       ]);
+      preserveSshSettledPanics([stdoutResult, stderrResult, exitResult]);
 
       const stdout = stdoutResult.status === "fulfilled" ? stdoutResult.value : "";
       const stderr = stderrResult.status === "fulfilled" ? stderrResult.value : "";
@@ -442,11 +560,15 @@ export class SSH implements ServerTool {
       const errTrunc = truncateText(stderr, MAX_OUTPUT_CHARS);
 
       const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
+      const processReadFailed =
+        stdoutResult.status === "rejected" ||
+        stderrResult.status === "rejected" ||
+        exitResult.status === "rejected";
 
       let probe: SshProbeOutput | undefined;
       let parseError: string | undefined;
 
-      if (exitCode === 0 && !timedOut) {
+      if (exitCode === 0 && !timedOut && stdoutResult.status === "fulfilled") {
         const decodedProbe = decodeSshProbeOutput(stdout.trim());
         decodedProbe.match({
           ok: (value) => {
@@ -458,8 +580,8 @@ export class SSH implements ServerTool {
         });
       }
 
-      return {
-        ok: exitCode === 0 && !timedOut,
+      const report = {
+        ok: exitCode === 0 && !timedOut && !processReadFailed,
         exitCode,
         durationMs,
         timedOut,
@@ -485,6 +607,18 @@ export class SSH implements ServerTool {
           stdinWrite: undefined,
         },
       };
+      if (timedOut) {
+        return Result.err(
+          sshFailure("timeout", `SSH probe timed out after ${effectiveTimeoutMs}ms`),
+        );
+      }
+      if (signal?.aborted) {
+        return Result.err(sshFailure("cancelled", "SSH probe was cancelled"));
+      }
+      if (parseError) {
+        return Result.err(sshFailure("unavailable", parseError));
+      }
+      return Result.ok(report);
     } finally {
       clearTimeout(timeout);
       if (signal) signal.removeEventListener("abort", onAbort);

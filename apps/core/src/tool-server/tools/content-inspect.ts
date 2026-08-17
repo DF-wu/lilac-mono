@@ -18,25 +18,37 @@ import {
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import { extname } from "node:path";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
+import {
+  serverToolFailure,
+  type ServerToolFailure,
+  type ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
+import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
-class ContentInspectFailure extends TaggedError("ContentInspectFailure")<{
-  readonly message: string;
-}> {}
-
-function adaptContentInspectResultToToolHost<TValue>(
-  result: ResultType<TValue, ContentInspectFailure>,
-): TValue {
-  return result.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      throw new Error(error.message);
-    },
-  })();
+function contentInspectFailure(
+  kind: ServerToolFailure["kind"],
+  message: string,
+): ServerToolFailure {
+  return serverToolFailure({
+    kind,
+    code: `content_inspect_${kind}`,
+    message,
+    retryable: kind === "unavailable" || kind === "timeout",
+  });
 }
 
-function signalContentInspectFailureToToolHost(message: string): never {
-  return adaptContentInspectResultToToolHost(Result.err(new ContentInspectFailure({ message })));
+function contentInspectExternalFailure(error: unknown, signal?: AbortSignal): ServerToolFailure {
+  if (Panic.is(error)) preserveToolPanic(error);
+  const message = errorMessage(error);
+  const normalized = message.toLowerCase();
+  let category: ServerToolFailure["kind"] = "unavailable";
+  if (signal?.aborted || /\babort(?:ed)?\b/.test(normalized)) {
+    category = "cancelled";
+  } else if (/\b(?:timeout|timed out)\b/.test(normalized)) {
+    category = "timeout";
+  }
+  return contentInspectFailure(category, message);
 }
 
 const V2_CONTENT_INSPECT_DEFAULT_MODEL = "google/gemini-3.5-flash";
@@ -161,31 +173,28 @@ export class ContentInspect implements ServerTool {
     callableId: string,
     input: Record<string, unknown>,
     opts?: ServerToolCallOptions,
-  ): Promise<unknown> {
+  ): Promise<ServerToolResult> {
     return this.tool.call(callableId, input, opts);
   }
 
   private async inspect(
     payload: z.output<typeof contentInspectInputSchema>,
     opts: ServerToolCallOptions | undefined,
-  ) {
-    try {
-      const model = await resolveContentInspectModel(this.options.getConfig);
-      const text = await inspectContent(payload, {
-        abortSignal: opts?.signal,
-        model,
-      });
-      return {
-        isError: false,
-        text,
-      } as const;
-    } catch (e) {
-      logger.error("content.inspect failed", { ...extractAiErrorLogDetails(e) }, e);
-      return {
-        isError: true,
-        error: errorMessage(e),
-      } as const;
-    }
+  ): Promise<ServerToolResult> {
+    const modelResult = await Result.tryPromise({
+      try: () => resolveContentInspectModel(this.options.getConfig),
+      catch: (error) => contentInspectExternalFailure(error, opts?.signal),
+    });
+    return Result.gen(async function* () {
+      const model = yield* modelResult;
+      const text = yield* Result.await(
+        inspectContent(payload, {
+          abortSignal: opts?.signal,
+          model,
+        }),
+      );
+      return Result.ok({ isError: false, text } as const);
+    });
   }
 }
 
@@ -224,8 +233,7 @@ export const contentInspectInputSchema = z
     text: z.string().optional().describe("Plain text to summarize (can also be a website URL)."),
 
     url: z
-      .string()
-      .min(1)
+      .url()
       .optional()
       .describe("Remote URL for binary content (files/images) or a YouTube URL for video."),
 
@@ -357,74 +365,85 @@ async function resolveContentInspectModel(
 export async function inspectContent(
   input: z.infer<typeof contentInspectInputSchema>,
   { abortSignal, model }: { abortSignal?: AbortSignal; model?: string },
-) {
-  let messages: ModelMessage[];
+): Promise<ResultType<string, ServerToolFailure>> {
+  return Result.gen(async function* () {
+    let messages: ModelMessage[];
 
-  switch (input.type) {
-    case "text": {
-      const content: UserContent = [];
-      if (input.additionalInstructions) {
-        content.push({ type: "text", text: input.additionalInstructions });
+    switch (input.type) {
+      case "text": {
+        const content: UserContent = [];
+        if (input.additionalInstructions) {
+          content.push({ type: "text", text: input.additionalInstructions });
+        }
+        content.push({ type: "text", text: input.text });
+        messages = buildContentInspectMessages({ role: "user", content });
+        break;
       }
-      content.push({ type: "text", text: input.text });
-      messages = buildContentInspectMessages({ role: "user", content });
-      break;
-    }
-    case "binary": {
-      const source = await loadInspectSource(input, abortSignal);
+      case "binary": {
+        const source = yield* Result.await(loadInspectSource(input, abortSignal));
 
-      const content: UserContent = [];
+        const content: UserContent = [];
 
-      if (input.additionalInstructions) {
-        content.push({ type: "text", text: input.additionalInstructions });
-      }
+        if (input.additionalInstructions) {
+          content.push({ type: "text", text: input.additionalInstructions });
+        }
 
-      if (source.kind === "text") {
-        content.push({
-          type: "text",
-          text: [
-            `Source: ${source.source}`,
-            `Media type: ${source.mediaType}`,
-            "",
-            source.text,
-          ].join("\n"),
+        if (source.kind === "text") {
+          content.push({
+            type: "text",
+            text: [
+              `Source: ${source.source}`,
+              `Media type: ${source.mediaType}`,
+              "",
+              source.text,
+            ].join("\n"),
+          });
+        } else {
+          content.push({ type: "file", data: source.data, mediaType: source.mediaType });
+        }
+
+        messages = buildContentInspectMessages({
+          role: "user",
+          content,
         });
-      } else {
-        content.push({ type: "file", data: source.data, mediaType: source.mediaType });
+        break;
       }
-
-      messages = buildContentInspectMessages({
-        role: "user",
-        content,
-      });
-      break;
     }
-  }
 
-  const gateway = providers.vercel;
-  if (!gateway) signalContentInspectFailureToToolHost("AI-GATEWAY not configured");
+    const gateway = providers.vercel;
+    if (!gateway) {
+      return Result.err(contentInspectFailure("unavailable", "AI-GATEWAY not configured"));
+    }
 
-  const res = await generateText({
-    model: gateway(model ?? V2_CONTENT_INSPECT_DEFAULT_MODEL),
-    instructions: CONTENT_INSPECT_INSTRUCTIONS,
-    messages,
-    maxOutputTokens: input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-    abortSignal,
-    tools: {
-      google_search: google.tools.googleSearch({}),
-      url_context: google.tools.urlContext({}),
-    } as ToolSet,
-    providerOptions: {
-      google: {
-        thinkingConfig: {
-          thinkingLevel: "high",
-          includeThoughts: true,
-        },
-      } satisfies GoogleLanguageModelOptions,
-    },
-    stopWhen: isStepCount(10),
+    const generated = await Result.tryPromise({
+      try: () =>
+        generateText({
+          model: gateway(model ?? V2_CONTENT_INSPECT_DEFAULT_MODEL),
+          instructions: CONTENT_INSPECT_INSTRUCTIONS,
+          messages,
+          maxOutputTokens: input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+          abortSignal,
+          tools: {
+            google_search: google.tools.googleSearch({}),
+            url_context: google.tools.urlContext({}),
+          } as ToolSet,
+          providerOptions: {
+            google: {
+              thinkingConfig: {
+                thinkingLevel: "high",
+                includeThoughts: true,
+              },
+            } satisfies GoogleLanguageModelOptions,
+          },
+          stopWhen: isStepCount(10),
+        }),
+      catch: (error) => {
+        logger.error("content.inspect failed", { ...extractAiErrorLogDetails(error) }, error);
+        return contentInspectExternalFailure(error, abortSignal);
+      },
+    });
+    return Result.ok((yield* generated).text);
   });
-  return res.text;
 }
 
 function buildContentInspectMessages(input: UserModelMessage): ModelMessage[] {
@@ -434,125 +453,181 @@ function buildContentInspectMessages(input: UserModelMessage): ModelMessage[] {
 export async function loadInspectSource(
   input: Extract<z.infer<typeof contentInspectInputSchema>, { type: "binary" }>,
   abortSignal?: AbortSignal,
-): Promise<LoadedInspectSource> {
-  if (typeof input.url === "string") {
-    if (isYouTubeURL(input.url)) {
-      return {
-        kind: "file",
-        data: new URL(input.url),
-        mediaType: "video/mp4",
-        source: input.url,
-      };
-    }
+): Promise<ResultType<LoadedInspectSource, ServerToolFailure>> {
+  return Result.gen(async function* () {
+    if (typeof input.url === "string") {
+      if (isYouTubeURL(input.url)) {
+        return Result.ok({
+          kind: "file",
+          data: new URL(input.url),
+          mediaType: "video/mp4",
+          source: input.url,
+        } as const);
+      }
 
-    const res = await fetch(input.url, { signal: abortSignal });
-    if (!res.ok) {
-      signalContentInspectFailureToToolHost(
-        `Failed to fetch ${input.url}: ${res.status} ${res.statusText}`.trim(),
+      const res = yield* Result.await(
+        Result.tryPromise({
+          try: () => fetch(input.url!, { signal: abortSignal }),
+          catch: (error) => contentInspectExternalFailure(error, abortSignal),
+        }),
       );
-    }
-
-    const bytes = await readInspectResponseBytes(res);
-    const meta = await fileTypeFromBuffer(Buffer.from(bytes));
-    const declared = res.headers.get("content-type") ?? undefined;
-    const mediaType = resolveInspectMediaType({
-      detected: meta?.mime,
-      declared,
-      source: input.url,
-      bytes,
-    });
-    return sourceFromBytes({
-      bytes,
-      mediaType,
-      charset: charsetFromMediaType(declared),
-      source: input.url,
-    });
-  }
-
-  if (typeof input.path === "string") {
-    const file = Bun.file(input.path);
-    if (file.size > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
-      signalContentInspectFailureToToolHost(
-        `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes: ${input.path}`,
-      );
-    }
-    const bytes = await file.bytes();
-    const buf = Buffer.from(bytes);
-    const meta = await fileTypeFromBuffer(buf);
-    const declared = file.type;
-    const mediaType = resolveInspectMediaType({
-      detected: meta?.mime,
-      declared,
-      source: input.path,
-      bytes: buf,
-    });
-    return sourceFromBytes({
-      bytes: buf,
-      mediaType,
-      charset: charsetFromMediaType(declared),
-      source: input.path,
-    });
-  }
-
-  if (typeof input.base64 !== "string") {
-    signalContentInspectFailureToToolHost("Invalid binary input; expected base64 string");
-  }
-
-  const buf = Buffer.from(input.base64, "base64");
-  if (buf.byteLength > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
-    signalContentInspectFailureToToolHost(
-      `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
-    );
-  }
-  const meta = await fileTypeFromBuffer(buf);
-  const mediaType = resolveInspectMediaType({
-    detected: meta?.mime,
-    source: "base64 input",
-    bytes: buf,
-  });
-  return sourceFromBytes({ bytes: buf, mediaType, source: "base64 input" });
-}
-
-async function readInspectResponseBytes(response: Response): Promise<Uint8Array> {
-  const declaredLength = response.headers.get("content-length");
-  if (declaredLength !== null) {
-    const parsed = Number(declaredLength);
-    if (Number.isFinite(parsed) && parsed > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
-      await response.body?.cancel().catch(() => undefined);
-      signalContentInspectFailureToToolHost(
-        `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
-      );
-    }
-  }
-  if (!response.body) return new Uint8Array();
-
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      total += chunk.value.byteLength;
-      if (total > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
-        await reader.cancel();
-        signalContentInspectFailureToToolHost(
-          `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
+      if (!res.ok) {
+        let category: ServerToolFailure["kind"] = "unavailable";
+        if (res.status === 401 || res.status === 403) {
+          category = "denied";
+        } else if (res.status === 404) {
+          category = "not_found";
+        }
+        return Result.err(
+          contentInspectFailure(
+            category,
+            `Failed to fetch ${input.url}: ${res.status} ${res.statusText}`.trim(),
+          ),
         );
       }
-      chunks.push(chunk.value);
-    }
-  } finally {
-    reader.releaseLock();
-  }
 
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
+      const bytes = yield* Result.await(readInspectResponseBytes(res));
+      const meta = await fileTypeFromBuffer(Buffer.from(bytes));
+      const declared = res.headers.get("content-type") ?? undefined;
+      const mediaType = resolveInspectMediaType({
+        detected: meta?.mime,
+        declared,
+        source: input.url,
+        bytes,
+      });
+      return sourceFromBytes({
+        bytes,
+        mediaType,
+        charset: charsetFromMediaType(declared),
+        source: input.url,
+      });
+    }
+
+    if (typeof input.path === "string") {
+      const file = Bun.file(input.path);
+      if (file.size > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
+        return Result.err(
+          contentInspectFailure(
+            "usage",
+            `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes: ${input.path}`,
+          ),
+        );
+      }
+      const bytes = yield* Result.await(
+        Result.tryPromise({
+          try: () => file.bytes(),
+          catch: (error) => {
+            const external = contentInspectExternalFailure(error);
+            const message = external.message;
+            let category: ServerToolFailure["kind"] = "unavailable";
+            if (/ENOENT|not found|no such file/i.test(message)) {
+              category = "not_found";
+            } else if (/EACCES|EPERM|permission/i.test(message)) {
+              category = "denied";
+            }
+            return contentInspectFailure(category, message);
+          },
+        }),
+      );
+      const buf = Buffer.from(bytes);
+      const meta = await fileTypeFromBuffer(buf);
+      const declared = file.type;
+      const mediaType = resolveInspectMediaType({
+        detected: meta?.mime,
+        declared,
+        source: input.path,
+        bytes: buf,
+      });
+      return sourceFromBytes({
+        bytes: buf,
+        mediaType,
+        charset: charsetFromMediaType(declared),
+        source: input.path,
+      });
+    }
+
+    if (typeof input.base64 !== "string") {
+      return Result.err(
+        contentInspectFailure("usage", "Invalid binary input; expected base64 string"),
+      );
+    }
+
+    const buf = Buffer.from(input.base64, "base64");
+    if (buf.byteLength > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
+      return Result.err(
+        contentInspectFailure(
+          "usage",
+          `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
+        ),
+      );
+    }
+    const meta = await fileTypeFromBuffer(buf);
+    const mediaType = resolveInspectMediaType({
+      detected: meta?.mime,
+      source: "base64 input",
+      bytes: buf,
+    });
+    return sourceFromBytes({ bytes: buf, mediaType, source: "base64 input" });
+  });
+}
+
+async function readInspectResponseBytes(
+  response: Response,
+): Promise<ResultType<Uint8Array, ServerToolFailure>> {
+  return Result.gen(async function* () {
+    const declaredLength = response.headers.get("content-length");
+    if (declaredLength !== null) {
+      const parsed = Number(declaredLength);
+      if (Number.isFinite(parsed) && parsed > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
+        await response.body?.cancel().catch((error) => {
+          contentInspectExternalFailure(error);
+        });
+        return Result.err(
+          contentInspectFailure(
+            "usage",
+            `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
+          ),
+        );
+      }
+    }
+    if (!response.body) return Result.ok(new Uint8Array());
+
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const chunk = yield* Result.await(
+          Result.tryPromise({
+            try: () => reader.read(),
+            catch: (error) => contentInspectExternalFailure(error),
+          }),
+        );
+        if (chunk.done) break;
+        total += chunk.value.byteLength;
+        if (total > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
+          await reader.cancel();
+          return Result.err(
+            contentInspectFailure(
+              "usage",
+              `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
+            ),
+          );
+        }
+        chunks.push(chunk.value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return Result.ok(bytes);
+  });
 }
 
 function sourceFromBytes(input: {
@@ -560,29 +635,32 @@ function sourceFromBytes(input: {
   mediaType: string;
   charset?: string;
   source: string;
-}): LoadedInspectSource {
+}): ResultType<LoadedInspectSource, ServerToolFailure> {
   if (isTextLikeMediaType(input.mediaType)) {
-    return {
+    return decodeInspectText(input.bytes, input.charset).map((text) => ({
       kind: "text",
-      text: decodeInspectText(input.bytes, input.charset),
+      text,
       mediaType: input.mediaType,
       charset: input.charset,
       source: input.source,
-    };
+    }));
   }
 
   if (input.mediaType === "application/octet-stream") {
-    signalContentInspectFailureToToolHost(
-      `Unsupported or unknown file media type for ${input.source}; pass text via --text or use a supported image/PDF/video file.`,
+    return Result.err(
+      contentInspectFailure(
+        "usage",
+        `Unsupported or unknown file media type for ${input.source}; pass text via --text or use a supported image/PDF/video file.`,
+      ),
     );
   }
 
-  return {
+  return Result.ok({
     kind: "file",
     data: input.bytes,
     mediaType: input.mediaType,
     source: input.source,
-  };
+  });
 }
 
 export function resolveInspectMediaType(input: {
@@ -666,19 +744,23 @@ function looksLikeUtf8Text(bytes: Uint8Array): boolean {
       if (code < 32 && code !== 9 && code !== 10 && code !== 13) suspicious += 1;
     }
     return suspicious / text.length < 0.01;
-  } catch {
+  } catch (error) {
+    contentInspectExternalFailure(error);
     return false;
   }
 }
 
-function decodeInspectText(bytes: Uint8Array, charset: string | undefined): string {
+function decodeInspectText(
+  bytes: Uint8Array,
+  charset: string | undefined,
+): ResultType<string, ServerToolFailure> {
   const encoding = charset ?? "utf-8";
   try {
-    return new TextDecoder(encoding, { fatal: true }).decode(bytes);
-  } catch (e) {
-    const message = errorMessage(e);
-    return signalContentInspectFailureToToolHost(
-      `Failed to decode text content as ${encoding}: ${message}`,
+    return Result.ok(new TextDecoder(encoding, { fatal: true }).decode(bytes));
+  } catch (error) {
+    const message = contentInspectExternalFailure(error).message;
+    return Result.err(
+      contentInspectFailure("usage", `Failed to decode text content as ${encoding}: ${message}`),
     );
   }
 }

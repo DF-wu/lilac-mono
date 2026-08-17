@@ -5,7 +5,13 @@ import fs from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import type { ModelMessage } from "ai";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { isRecord } from "@stanley2058/lilac-utils";
+import { Panic, Result, type Result as ResultType } from "better-result";
+import {
+  serverToolFailure,
+  type ServerToolFailure,
+  type ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
 
 import {
   defineServerTool,
@@ -14,7 +20,7 @@ import {
   type ServerToolCallOptions,
 } from "../types";
 import {
-  requireToolServerHeaders,
+  decodeToolServerHeaders,
   type RequiredToolServerHeaders,
 } from "../../shared/tool-server-context";
 import {
@@ -24,30 +30,49 @@ import {
   inferMimeTypeFromFilename,
   looksLikeDataUrl,
   looksLikeHttpUrl,
-  resolveToolPathForRequestContext,
+  resolveToolPathForRequestContextResult,
   sanitizeExtension,
 } from "../../shared/attachment-utils";
 import { expandTilde } from "@stanley2058/lilac-fs";
+import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
-import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
-
-class AttachmentToolFailure extends TaggedError("AttachmentToolFailure")<{
-  readonly message: string;
-}> {}
-
-function adaptAttachmentResultToToolHost<TValue>(
-  result: ResultType<TValue, AttachmentToolFailure>,
-): TValue {
-  return result.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      throw new Error(error.message);
-    },
-  })();
+function attachmentFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
+  return serverToolFailure({
+    kind,
+    code: `attachment_${kind}`,
+    message,
+    retryable: kind === "unavailable" || kind === "timeout",
+  });
 }
 
-function signalAttachmentFailureToToolHost(message: string): never {
-  return adaptAttachmentResultToToolHost(Result.err(new AttachmentToolFailure({ message })));
+function attachmentFailureFromUnknown(cause: unknown, fallbackMessage: string): ServerToolFailure {
+  if (Panic.is(cause)) preserveToolPanic(cause);
+  const error = isRecord(cause) ? cause : {};
+  const name = typeof error.name === "string" ? error.name : undefined;
+  const code = typeof error.code === "string" ? error.code : undefined;
+  const message = typeof error.message === "string" ? error.message : fallbackMessage;
+  if (name === "AbortError") return attachmentFailure("cancelled", message);
+  if (name === "TimeoutError" || code === "ETIMEDOUT") {
+    return attachmentFailure("timeout", message);
+  }
+  if (code === "ENOENT") return attachmentFailure("not_found", message);
+  if (code === "EACCES" || code === "EPERM") {
+    return attachmentFailure("denied", message);
+  }
+  return attachmentFailure("unavailable", message);
+}
+
+function attachmentUrlForFailure(url: URL): string {
+  return `${url.origin}${url.pathname}`;
+}
+
+function resultBranch<TValue>(
+  result: ResultType<TValue, ServerToolFailure>,
+): { readonly value: TValue } | { readonly failure: ServerToolFailure } {
+  return result.match<{ readonly value: TValue } | { readonly failure: ServerToolFailure }>({
+    ok: (value) => ({ value }),
+    err: (failure) => ({ failure }),
+  });
 }
 
 const DEFAULT_OUTBOUND_MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -86,61 +111,110 @@ function normalizeAttachmentAddFilesInput(raw: unknown): unknown {
   };
 }
 
-function toHeaders(ctx: RequestContext | undefined): RequestHeaders {
-  return requireToolServerHeaders(ctx, "attachment");
+function toHeaders(ctx: RequestContext | undefined): ResultType<RequestHeaders, ServerToolFailure> {
+  return decodeToolServerHeaders(ctx, "attachment").mapError((error) =>
+    attachmentFailure("usage", error.message),
+  );
 }
 
-function asBuffer(data: unknown): Buffer {
-  if (Buffer.isBuffer(data)) return data;
-  if (data instanceof Uint8Array) return Buffer.from(data);
-  if (data instanceof ArrayBuffer) return Buffer.from(new Uint8Array(data));
+function asBuffer(data: unknown): ResultType<Buffer, ServerToolFailure> {
+  if (Buffer.isBuffer(data)) return Result.ok(data);
+  if (data instanceof Uint8Array) return Result.ok(Buffer.from(data));
+  if (data instanceof ArrayBuffer) return Result.ok(Buffer.from(new Uint8Array(data)));
 
   if (typeof data === "string") {
     if (looksLikeDataUrl(data)) {
-      return decodeDataUrl(data).bytes;
+      return Result.try({
+        try: () => decodeDataUrl(data).bytes,
+        catch: (cause) => {
+          const failure = attachmentFailureFromUnknown(cause, "Invalid attachment data URL");
+          return attachmentFailure("usage", failure.message);
+        },
+      });
     }
 
     // AI SDK DataContent string is defined as base64.
-    return Buffer.from(data, "base64");
+    return Result.ok(Buffer.from(data, "base64"));
   }
 
-  return signalAttachmentFailureToToolHost("Unsupported data content");
+  return Result.err(attachmentFailure("usage", "Unsupported data content"));
 }
 
-async function downloadToBuffer(input: unknown): Promise<{
-  bytes: Buffer;
-  sourceUrl?: string;
-  contentType?: string;
-}> {
+async function downloadToBuffer(
+  input: unknown,
+  signal: AbortSignal | undefined,
+): Promise<
+  ResultType<
+    {
+      bytes: Buffer;
+      sourceUrl?: string;
+      contentType?: string;
+    },
+    ServerToolFailure
+  >
+> {
   if (input instanceof URL) {
     if (!DISCORD_CDN_HOSTS.has(input.hostname)) {
-      signalAttachmentFailureToToolHost(
-        `Blocked attachment host '${input.hostname}'. Allowed: ${[...DISCORD_CDN_HOSTS].join(", ")}`,
+      return Result.err(
+        attachmentFailure(
+          "denied",
+          `Blocked attachment host '${input.hostname}'. Allowed: ${[...DISCORD_CDN_HOSTS].join(", ")}`,
+        ),
       );
     }
 
-    const res = await fetch(input.toString(), { redirect: "follow" });
-    if (!res.ok) {
-      signalAttachmentFailureToToolHost(`Failed to download attachment (${res.status}): ${input}`);
-    }
-    const ab = await res.arrayBuffer();
-    return {
-      bytes: Buffer.from(ab),
-      sourceUrl: input.toString(),
-      contentType: res.headers.get("content-type") ?? undefined,
-    };
+    const safeUrl = attachmentUrlForFailure(input);
+    const fetched = await Result.tryPromise({
+      try: () => fetch(input.toString(), { redirect: "follow", signal }),
+      catch: (cause) => {
+        const message = `Attachment download failed for ${safeUrl}`;
+        const failure = attachmentFailureFromUnknown(cause, message);
+        return attachmentFailure(failure.kind, message);
+      },
+    });
+    return fetched.andThenAsync(async (res) => {
+      if (!res.ok) {
+        let category: ServerToolFailure["kind"] = "unavailable";
+        if (res.status === 404) category = "not_found";
+        else if (res.status === 401 || res.status === 403) category = "denied";
+        else if (res.status === 408 || res.status === 504) category = "timeout";
+        else if (res.status === 409) category = "conflict";
+        return Result.err(
+          attachmentFailure(category, `Failed to download attachment (${res.status}): ${safeUrl}`),
+        );
+      }
+      return (
+        await Result.tryPromise({
+          try: () => res.arrayBuffer(),
+          catch: (cause) => {
+            const message = `Failed to read attachment response for ${safeUrl}`;
+            const failure = attachmentFailureFromUnknown(cause, message);
+            return attachmentFailure(failure.kind, message);
+          },
+        })
+      ).map((ab) => ({
+        bytes: Buffer.from(ab),
+        sourceUrl: input.toString(),
+        contentType: res.headers.get("content-type") ?? undefined,
+      }));
+    });
   }
 
   if (typeof input === "string" && looksLikeHttpUrl(input)) {
-    return await downloadToBuffer(new URL(input));
+    return await downloadToBuffer(new URL(input), signal);
   }
 
   if (typeof input === "string" && looksLikeDataUrl(input)) {
-    const decoded = decodeDataUrl(input);
-    return { bytes: decoded.bytes, contentType: decoded.mimeType };
+    return Result.try({
+      try: () => decodeDataUrl(input),
+      catch: (cause) => {
+        const failure = attachmentFailureFromUnknown(cause, "Invalid attachment data URL");
+        return attachmentFailure("usage", failure.message);
+      },
+    }).map((decoded) => ({ bytes: decoded.bytes, contentType: decoded.mimeType }));
   }
 
-  return { bytes: asBuffer(input) };
+  return asBuffer(input).map((bytes) => ({ bytes }));
 }
 
 const attachmentAddFilesInputSchema = z
@@ -271,11 +345,14 @@ export class Attachment implements ServerTool {
           run: (input, opts) => {
             const messages = opts?.messages as readonly ModelMessage[] | undefined;
             if (!messages) {
-              signalAttachmentFailureToToolHost(
-                "attachment.download requires request messages, but none were available for this request. (Tool server caches cmd.request messages; ensure the tool server is connected to the bus and started before the request.)",
+              return Result.err(
+                attachmentFailure(
+                  "unavailable",
+                  "attachment.download requires request messages, but none were available for this request. (Tool server caches cmd.request messages; ensure the tool server is connected to the bus and started before the request.)",
+                ),
               );
             }
-            return this.callDownload(input, messages, opts?.context);
+            return this.callDownload(input, messages, opts?.context, opts?.signal);
           },
         }),
       }),
@@ -298,15 +375,18 @@ export class Attachment implements ServerTool {
     callableId: string,
     input: Record<string, unknown>,
     opts?: ServerToolCallOptions,
-  ): Promise<unknown> {
+  ): Promise<ServerToolResult> {
     return await this.tool.call(callableId, input, opts);
   }
 
   private async callAddFiles(
     input: z.output<typeof attachmentAddFilesInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const headers = toHeaders(ctx);
+  ): Promise<ServerToolResult> {
+    const headersResult = toHeaders(ctx);
+    const headersBranch = resultBranch(headersResult);
+    if ("failure" in headersBranch) return Result.err(headersBranch.failure);
+    const headers = headersBranch.value;
 
     const cwd = ctx?.cwd ?? process.cwd();
 
@@ -316,33 +396,57 @@ export class Attachment implements ServerTool {
 
     for (let i = 0; i < input.paths.length; i++) {
       const p = input.paths[i]!;
-      const resolvedPath = resolveToolPathForRequestContext({
+      const resolvedPathResult = resolveToolPathForRequestContextResult({
         cwd,
         inputPath: p,
         context: ctx,
-      });
+      }).mapError((error) => attachmentFailure("denied", error.message));
+      const resolvedPathBranch = resultBranch(resolvedPathResult);
+      if ("failure" in resolvedPathBranch) return Result.err(resolvedPathBranch.failure);
+      const resolvedPath = resolvedPathBranch.value;
 
-      const st = await fs.stat(resolvedPath);
+      const stat = await Result.tryPromise({
+        try: () => fs.stat(resolvedPath),
+        catch: (cause) => attachmentFailureFromUnknown(cause, `Unable to read ${resolvedPath}`),
+      });
+      const statBranch = resultBranch(stat);
+      if ("failure" in statBranch) return Result.err(statBranch.failure);
+      const st = statBranch.value;
       if (!st.isFile()) {
-        signalAttachmentFailureToToolHost(
-          `Not a file: ${formatToolPathForRequestContext({ path: resolvedPath, context: ctx })}`,
+        return Result.err(
+          attachmentFailure(
+            "usage",
+            `Not a file: ${formatToolPathForRequestContext({ path: resolvedPath, context: ctx })}`,
+          ),
         );
       }
 
       if (st.size > DEFAULT_OUTBOUND_MAX_FILE_BYTES) {
-        signalAttachmentFailureToToolHost(
-          `Attachment too large (${st.size} bytes). Max is ${DEFAULT_OUTBOUND_MAX_FILE_BYTES} bytes: ${formatToolPathForRequestContext({ path: resolvedPath, context: ctx })}`,
+        return Result.err(
+          attachmentFailure(
+            "usage",
+            `Attachment too large (${st.size} bytes). Max is ${DEFAULT_OUTBOUND_MAX_FILE_BYTES} bytes: ${formatToolPathForRequestContext({ path: resolvedPath, context: ctx })}`,
+          ),
         );
       }
 
       totalBytes += st.size;
       if (totalBytes > DEFAULT_OUTBOUND_MAX_TOTAL_BYTES) {
-        signalAttachmentFailureToToolHost(
-          `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_OUTBOUND_MAX_TOTAL_BYTES} bytes.`,
+        return Result.err(
+          attachmentFailure(
+            "usage",
+            `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_OUTBOUND_MAX_TOTAL_BYTES} bytes.`,
+          ),
         );
       }
 
-      const bytes = await fs.readFile(resolvedPath);
+      const read = await Result.tryPromise({
+        try: () => fs.readFile(resolvedPath),
+        catch: (cause) => attachmentFailureFromUnknown(cause, `Unable to read ${resolvedPath}`),
+      });
+      const readBranch = resultBranch(read);
+      if ("failure" in readBranch) return Result.err(readBranch.failure);
+      const bytes = readBranch.value;
 
       const filename = (input.filenames && input.filenames[i]) || basename(resolvedPath);
 
@@ -355,41 +459,53 @@ export class Attachment implements ServerTool {
 
       const dataBase64 = Buffer.from(bytes).toString("base64");
 
-      adaptEventPublishResultToHost(
+      const published = (
         await this.params.bus.publish(
           lilacEventTypes.EvtAgentOutputResponseBinary,
           { mimeType, dataBase64, filename },
           { headers },
-        ),
-      );
+        )
+      ).mapError((error) => attachmentFailure("unavailable", error.message));
+      const publishedBranch = resultBranch(published);
+      if ("failure" in publishedBranch) return Result.err(publishedBranch.failure);
 
       out.push({ filename, mimeType, bytes: bytes.byteLength });
     }
 
-    return { ok: true as const, attachments: out };
+    return Result.ok({ ok: true as const, attachments: out });
   }
 
   private async callDownload(
     input: z.output<typeof attachmentDownloadInputSchema>,
     messages: readonly ModelMessage[],
     ctx: RequestContext | undefined,
-  ) {
-    const downloadDir =
+    signal: AbortSignal | undefined,
+  ): Promise<ServerToolResult> {
+    const downloadDirResult =
       ctx?.safetyMode === "restricted"
-        ? resolveToolPathForRequestContext({
+        ? resolveToolPathForRequestContextResult({
             cwd: ctx.cwd ?? "/tmp",
             inputPath: input.downloadDir ?? "/tmp",
             context: ctx,
-          })
-        : resolve(expandTilde(input.downloadDir ?? "~/Downloads"));
+          }).mapError((error) => attachmentFailure("denied", error.message))
+        : Result.ok(resolve(expandTilde(input.downloadDir ?? "~/Downloads")));
+    const downloadDirBranch = resultBranch(downloadDirResult);
+    if ("failure" in downloadDirBranch) return Result.err(downloadDirBranch.failure);
+    const downloadDir = downloadDirBranch.value;
 
     const attachments = collectUserAttachments(messages);
     const outputDownloadDir = formatToolPathForRequestContext({ path: downloadDir, context: ctx });
     if (attachments.length === 0) {
-      return { ok: true as const, downloadDir: outputDownloadDir, files: [] };
+      return Result.ok({ ok: true as const, downloadDir: outputDownloadDir, files: [] });
     }
 
-    await fs.mkdir(downloadDir, { recursive: true });
+    const madeDirectory = await Result.tryPromise({
+      try: () => fs.mkdir(downloadDir, { recursive: true }),
+      catch: (cause) =>
+        attachmentFailureFromUnknown(cause, `Unable to create download directory ${downloadDir}`),
+    });
+    const madeDirectoryBranch = resultBranch(madeDirectory);
+    if ("failure" in madeDirectoryBranch) return Result.err(madeDirectoryBranch.failure);
 
     const files: Array<{
       path: string;
@@ -404,18 +520,27 @@ export class Attachment implements ServerTool {
     let totalBytes = 0;
 
     for (const att of attachments) {
-      const downloaded = await downloadToBuffer(att.data);
+      const downloadedResult = await downloadToBuffer(att.data, signal);
+      const downloadedBranch = resultBranch(downloadedResult);
+      if ("failure" in downloadedBranch) return Result.err(downloadedBranch.failure);
+      const downloaded = downloadedBranch.value;
 
       if (downloaded.bytes.byteLength > DEFAULT_INBOUND_MAX_FILE_BYTES) {
-        signalAttachmentFailureToToolHost(
-          `Attachment too large (${downloaded.bytes.byteLength} bytes). Max is ${DEFAULT_INBOUND_MAX_FILE_BYTES} bytes.`,
+        return Result.err(
+          attachmentFailure(
+            "usage",
+            `Attachment too large (${downloaded.bytes.byteLength} bytes). Max is ${DEFAULT_INBOUND_MAX_FILE_BYTES} bytes.`,
+          ),
         );
       }
 
       totalBytes += downloaded.bytes.byteLength;
       if (totalBytes > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
-        signalAttachmentFailureToToolHost(
-          `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_INBOUND_MAX_TOTAL_BYTES} bytes.`,
+        return Result.err(
+          attachmentFailure(
+            "usage",
+            `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_INBOUND_MAX_TOTAL_BYTES} bytes.`,
+          ),
         );
       }
 
@@ -442,13 +567,23 @@ export class Attachment implements ServerTool {
       const ext = sanitizeExtension(extFromFileType || extFromFilename || extFromMime);
       const target = join(downloadDir, `${sha10}${ext}`);
 
-      const exists = await fs
-        .access(target)
-        .then(() => true)
-        .catch(() => false);
+      const exists = (
+        await Result.tryPromise({
+          try: () => fs.access(target),
+          catch: (cause) => attachmentFailureFromUnknown(cause, `Unable to access ${target}`),
+        })
+      ).match({
+        ok: () => true,
+        err: () => false,
+      });
 
       if (!exists) {
-        await fs.writeFile(target, downloaded.bytes);
+        const written = await Result.tryPromise({
+          try: () => fs.writeFile(target, downloaded.bytes),
+          catch: (cause) => attachmentFailureFromUnknown(cause, `Unable to write ${target}`),
+        });
+        const writtenBranch = resultBranch(written);
+        if ("failure" in writtenBranch) return Result.err(writtenBranch.failure);
       }
 
       files.push({
@@ -460,6 +595,6 @@ export class Attachment implements ServerTool {
       });
     }
 
-    return { ok: true as const, downloadDir: outputDownloadDir, files };
+    return Result.ok({ ok: true as const, downloadDir: outputDownloadDir, files });
   }
 }

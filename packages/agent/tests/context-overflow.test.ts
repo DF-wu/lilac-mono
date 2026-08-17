@@ -9,6 +9,15 @@ describe("isLikelyContextOverflowError", () => {
       true,
     );
     expect(isLikelyContextOverflowError("context_length_exceeded")).toBe(true);
+    expect(isLikelyContextOverflowError('{"type":"request_too_large"}')).toBe(true);
+    expect(
+      isLikelyContextOverflowError(
+        "Prompt has 5,958,968 tokens, but the configured context size is 256,000 tokens",
+      ),
+    ).toBe(true);
+    expect(
+      isLikelyContextOverflowError("Input token count 200001 exceeds the maximum of 200000"),
+    ).toBe(true);
   });
 
   it("matches nested Error causes", () => {
@@ -28,6 +37,19 @@ describe("isLikelyContextOverflowError", () => {
       isLikelyContextOverflowError({
         message: "upstream timeout",
         statusCode: 504,
+      }),
+    ).toBe(false);
+  });
+
+  it("excludes throttling before broad token wording", () => {
+    expect(isLikelyContextOverflowError("Rate limit: too many tokens submitted this minute")).toBe(
+      false,
+    );
+    expect(isLikelyContextOverflowError("Too many requests: too many tokens")).toBe(false);
+    expect(
+      isLikelyContextOverflowError({
+        message: "too many tokens",
+        cause: { type: "throttling_error" },
       }),
     ).toBe(false);
   });

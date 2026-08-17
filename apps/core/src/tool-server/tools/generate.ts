@@ -5,7 +5,13 @@ import {
   type ServerTool,
   type ServerToolCallOptions,
 } from "../types";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import {
+  serverToolFailure,
+  type ServerToolFailure,
+  type ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
+import { Panic, Result, type Result as ResultType } from "better-result";
+import { preserveToolPanic } from "../../tools/tool-result-adapters";
 import {
   experimental_generateVideo as generateVideo,
   generateImage,
@@ -24,23 +30,13 @@ import {
   resolveToolPathForRequestContext,
 } from "../../shared/attachment-utils";
 
-class GenerateToolFailure extends TaggedError("GenerateToolFailure")<{
-  readonly message: string;
-}> {}
-
-function adaptGenerateResultToToolHost<TValue>(
-  result: ResultType<TValue, GenerateToolFailure>,
-): TValue {
-  return result.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      throw new Error(error.message);
-    },
-  })();
-}
-
-function signalGenerateFailureToToolHost(message: string): never {
-  return adaptGenerateResultToToolHost(Result.err(new GenerateToolFailure({ message })));
+function generateFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
+  return serverToolFailure({
+    kind,
+    code: `generate_${kind}`,
+    message,
+    retryable: kind === "unavailable" || kind === "timeout",
+  });
 }
 
 type SupportedImageModelId =
@@ -87,10 +83,6 @@ type SupportedImageModelId =
    *   9:19.5, 20:9, 9:20
    */
   | "grok-imagine-image-pro";
-
-type GenerateOptions = {
-  readonly getConfig?: () => Promise<Pick<CoreConfig, "tools">>;
-};
 
 type SupportedVideoModelId =
   /**
@@ -168,6 +160,8 @@ const GROK_VIDEO_ALLOWED_ASPECT_RATIOS = [
 const GROK_VIDEO_ALLOWED_RESOLUTIONS = ["1280x720", "854x480", "640x480"] as const;
 const DEFAULT_VIDEO_MODEL_FALLBACK_ORDER: readonly SupportedVideoModelId[] = ["grok-imagine-video"];
 const DEFAULT_IMAGE_OUTPUT_BASENAME = "generated-image";
+const OPENAI_COMPATIBLE_IMAGE_CONFIG_ERROR =
+  "Image generation provider 'openai-compatible' requires OPENAI_COMPATIBLE_BASE_URL.";
 
 const optionalNonEmptyStringListInputSchema = z
   .union([z.string().min(1), z.array(z.string().min(1)).min(1)])
@@ -310,7 +304,7 @@ type GenerationProvider = "openai" | "openrouter" | "xai" | "vercel";
 type ModelDescriptor<TId extends string, TModel, TInput> = {
   id: TId;
   createModel: (providers: ReturnType<typeof getModelProviders>) => TModel | undefined;
-  validateInput: (input: TInput) => void;
+  validateInput: (input: TInput) => ResultType<void, ServerToolFailure>;
 };
 
 type ImageModelDescriptor = ModelDescriptor<
@@ -353,21 +347,27 @@ function isOneOf<const T extends readonly string[]>(allowed: T, value: string): 
 function validateGptImageInput(
   input: ImageGenerateInput,
   modelId: "gpt-image-2" | "gpt-5-image",
-): void {
+): ResultType<void, ServerToolFailure> {
   if (input.aspectRatio && !isOneOf(GPT_IMAGE_ALLOWED_ASPECT_RATIOS, input.aspectRatio)) {
-    return signalGenerateFailureToToolHost(
-      `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${GPT_IMAGE_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
+    return Result.err(
+      generateFailure(
+        "usage",
+        `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${GPT_IMAGE_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
+      ),
     );
   }
 
-  if (!input.size) return;
+  if (!input.size) return Result.ok(undefined);
 
   if (modelId === "gpt-5-image" || (input.inputImages?.length ?? 0) > 0) {
-    if (isOneOf(GPT_IMAGE_STANDARD_SIZES, input.size)) return;
+    if (isOneOf(GPT_IMAGE_STANDARD_SIZES, input.size)) return Result.ok(undefined);
 
     const context = modelId === "gpt-image-2" ? " image edits" : "";
-    return signalGenerateFailureToToolHost(
-      `Unsupported size '${input.size}' for ${modelId}${context}. Allowed: ${GPT_IMAGE_STANDARD_SIZES.join(" | ")}.`,
+    return Result.err(
+      generateFailure(
+        "usage",
+        `Unsupported size '${input.size}' for ${modelId}${context}. Allowed: ${GPT_IMAGE_STANDARD_SIZES.join(" | ")}.`,
+      ),
     );
   }
 
@@ -384,83 +384,95 @@ function validateGptImageInput(
     pixels < GPT_IMAGE_2_MIN_PIXELS ||
     pixels > GPT_IMAGE_2_MAX_PIXELS
   ) {
-    return signalGenerateFailureToToolHost(
-      `Unsupported size '${input.size}' for gpt-image-2. Both edges must be multiples of 16 and at most ${GPT_IMAGE_2_MAX_EDGE}px, the aspect ratio must not exceed 3:1, and total pixels must be ${GPT_IMAGE_2_MIN_PIXELS}-${GPT_IMAGE_2_MAX_PIXELS}.`,
+    return Result.err(
+      generateFailure(
+        "usage",
+        `Unsupported size '${input.size}' for gpt-image-2. Both edges must be multiples of 16 and at most ${GPT_IMAGE_2_MAX_EDGE}px, the aspect ratio must not exceed 3:1, and total pixels must be ${GPT_IMAGE_2_MIN_PIXELS}-${GPT_IMAGE_2_MAX_PIXELS}.`,
+      ),
     );
   }
+  return Result.ok(undefined);
 }
 
 function validateNanobananaInput(
   input: ImageGenerateInput,
   modelId: "nanobanana" | "nanobanana-2" | "nanobanana-2-lite" | "nanobanana-pro",
-): void {
+): ResultType<void, ServerToolFailure> {
   const allowedAspectRatios =
     modelId === "nanobanana-2" || modelId === "nanobanana-2-lite"
       ? NANOBANANA_2_ALLOWED_ASPECT_RATIOS
       : NANOBANANA_ALLOWED_ASPECT_RATIOS;
 
   if (input.aspectRatio && !isOneOf(allowedAspectRatios, input.aspectRatio)) {
-    return signalGenerateFailureToToolHost(
-      `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${allowedAspectRatios.join(", ")}.`,
+    return Result.err(
+      generateFailure(
+        "usage",
+        `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${allowedAspectRatios.join(", ")}.`,
+      ),
     );
   }
 
   if (modelId === "nanobanana-2-lite" && input.size) {
-    return signalGenerateFailureToToolHost(
-      "nanobanana-2-lite produces 1K output; use aspectRatio instead of size.",
+    return Result.err(
+      generateFailure(
+        "usage",
+        "nanobanana-2-lite produces 1K output; use aspectRatio instead of size.",
+      ),
     );
   }
 
   if (modelId === "nanobanana-2-lite" && input.maskImage) {
-    return signalGenerateFailureToToolHost("nanobanana-2-lite does not support maskImage.");
+    return Result.err(generateFailure("usage", "nanobanana-2-lite does not support maskImage."));
   }
+  return Result.ok(undefined);
 }
 
 export function validateImageGenerationInputForModel(
   modelId: SupportedImageModelId,
   input: ImageGenerateInput,
-): void {
+): ResultType<void, ServerToolFailure> {
   switch (modelId) {
     case "gpt-image-2":
     case "gpt-5-image":
-      validateGptImageInput(input, modelId);
-      return;
+      return validateGptImageInput(input, modelId);
     case "nanobanana":
     case "nanobanana-2":
     case "nanobanana-2-lite":
     case "nanobanana-pro":
-      validateNanobananaInput(input, modelId);
-      return;
+      return validateNanobananaInput(input, modelId);
     case "grok-imagine-image":
     case "grok-imagine-image-pro":
-      validateGrokImagineInput(input, modelId);
-      return;
+      return validateGrokImagineInput(input, modelId);
   }
 }
 
 function validateGrokImagineInput(
   input: ImageGenerateInput,
   modelId: "grok-imagine-image" | "grok-imagine-image-pro",
-): void {
+): ResultType<void, ServerToolFailure> {
   if (input.size) {
-    return signalGenerateFailureToToolHost(
-      `${modelId} does not support size. Use aspectRatio instead.`,
+    return Result.err(
+      generateFailure("usage", `${modelId} does not support size. Use aspectRatio instead.`),
     );
   }
 
   if (input.aspectRatio && !isOneOf(GROK_IMAGE_ALLOWED_ASPECT_RATIOS, input.aspectRatio)) {
-    return signalGenerateFailureToToolHost(
-      `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${GROK_IMAGE_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
+    return Result.err(
+      generateFailure(
+        "usage",
+        `Unsupported aspectRatio '${input.aspectRatio}' for ${modelId}. Allowed: ${GROK_IMAGE_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
+      ),
     );
   }
 
   if (input.maskImage) {
-    return signalGenerateFailureToToolHost(`${modelId} does not support maskImage.`);
+    return Result.err(generateFailure("usage", `${modelId} does not support maskImage.`));
   }
 
   if ((input.inputImages?.length ?? 0) > 1) {
-    return signalGenerateFailureToToolHost(`${modelId} supports only one input image.`);
+    return Result.err(generateFailure("usage", `${modelId} supports only one input image.`));
   }
+  return Result.ok(undefined);
 }
 
 const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
@@ -566,18 +578,25 @@ const IMAGE_MODEL_DESCRIPTORS: readonly ImageModelDescriptor[] = [
   },
 ];
 
-function validateGrokVideoInput(input: VideoGenerateInput): void {
+function validateGrokVideoInput(input: VideoGenerateInput): ResultType<void, ServerToolFailure> {
   if (input.aspectRatio && !isOneOf(GROK_VIDEO_ALLOWED_ASPECT_RATIOS, input.aspectRatio)) {
-    return signalGenerateFailureToToolHost(
-      `Unsupported aspectRatio '${input.aspectRatio}' for grok-imagine-video. Allowed: ${GROK_VIDEO_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
+    return Result.err(
+      generateFailure(
+        "usage",
+        `Unsupported aspectRatio '${input.aspectRatio}' for grok-imagine-video. Allowed: ${GROK_VIDEO_ALLOWED_ASPECT_RATIOS.join(", ")}.`,
+      ),
     );
   }
 
   if (input.resolution && !isOneOf(GROK_VIDEO_ALLOWED_RESOLUTIONS, input.resolution)) {
-    return signalGenerateFailureToToolHost(
-      `Unsupported resolution '${input.resolution}' for grok-imagine-video. Allowed: ${GROK_VIDEO_ALLOWED_RESOLUTIONS.join(", ")}.`,
+    return Result.err(
+      generateFailure(
+        "usage",
+        `Unsupported resolution '${input.resolution}' for grok-imagine-video. Allowed: ${GROK_VIDEO_ALLOWED_RESOLUTIONS.join(", ")}.`,
+      ),
     );
   }
+  return Result.ok(undefined);
 }
 
 const VIDEO_MODEL_DESCRIPTORS: readonly VideoModelDescriptor[] = [
@@ -636,9 +655,7 @@ function getAvailableImageModels(provider: "default" | "openai-compatible" = "de
   if (provider === "openai-compatible") {
     const compatibleProvider = providers["openai-compatible"];
     if (!env.providers.openaiCompatible.baseUrl?.trim() || !compatibleProvider) {
-      return signalGenerateFailureToToolHost(
-        "Image generation provider 'openai-compatible' requires OPENAI_COMPATIBLE_BASE_URL.",
-      );
+      return resolveAvailableModels([] as readonly ImageModelDescriptor[], providers);
     }
     return resolveAvailableModels(
       IMAGE_MODEL_DESCRIPTORS.map((descriptor) => ({
@@ -661,30 +678,36 @@ function pickModel<TId extends string, TModel>(
   requested: string | undefined,
   fallbackOrder: readonly TId[],
   modalityLabel: string,
-): { id: TId; model: TModel } {
+): ResultType<{ id: TId; model: TModel }, ServerToolFailure> {
   if (requested) {
     const model = available[requested as TId];
     if (!model) {
-      return signalGenerateFailureToToolHost(
-        `Requested model '${requested}' is not available for ${modalityLabel} generation (configured: ${Object.keys(available).join(", ") || "none"}).`,
+      return Result.err(
+        generateFailure(
+          "unavailable",
+          `Requested model '${requested}' is not available for ${modalityLabel} generation (configured: ${Object.keys(available).join(", ") || "none"}).`,
+        ),
       );
     }
 
-    return {
+    return Result.ok({
       id: requested as TId,
       model,
-    };
+    });
   }
 
   for (const id of fallbackOrder) {
     const model = available[id];
     if (model) {
-      return { id, model };
+      return Result.ok({ id, model });
     }
   }
 
-  return signalGenerateFailureToToolHost(
-    `No ${modalityLabel} generation models are configured. Configure at least one provider for ${modalityLabel} generation.`,
+  return Result.err(
+    generateFailure(
+      "unavailable",
+      `No ${modalityLabel} generation models are configured. Configure at least one provider for ${modalityLabel} generation.`,
+    ),
   );
 }
 
@@ -735,20 +758,47 @@ function looksLikeSvg(bytes: Buffer): boolean {
   return prefix.startsWith("<svg") || prefix.startsWith("<?xml");
 }
 
-async function readImageDataFromPath(path: string, displayPath = path): Promise<Buffer> {
-  const bytes = await fs.readFile(path);
-  const typeFromBytes = await fileTypeFromBuffer(bytes);
+async function readImageDataFromPath(
+  path: string,
+  displayPath = path,
+): Promise<ResultType<Buffer, ServerToolFailure>> {
+  const read = await Result.tryPromise({
+    try: () => fs.readFile(path),
+    catch: (cause) => {
+      if (Panic.is(cause)) return preserveToolPanic(cause);
+      return generateFailure(
+        typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT"
+          ? "not_found"
+          : "unavailable",
+        errorMessage(cause),
+      );
+    },
+  });
+  return Result.gen(async function* () {
+    const bytes = yield* read;
+    const typeFromBytes = yield* Result.await(
+      Result.tryPromise({
+        try: () => fileTypeFromBuffer(bytes),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return generateFailure("unavailable", errorMessage(cause));
+        },
+      }),
+    );
 
-  if (typeFromBytes?.mime?.startsWith("image/")) {
-    return bytes;
-  }
+    if (typeFromBytes?.mime?.startsWith("image/")) {
+      return Result.ok(bytes);
+    }
 
-  const mimeFromExtension = inferMimeTypeFromFilename(path);
-  if (mimeFromExtension === "image/svg+xml" && looksLikeSvg(bytes)) {
-    return bytes;
-  }
+    const mimeFromExtension = inferMimeTypeFromFilename(path);
+    if (mimeFromExtension === "image/svg+xml" && looksLikeSvg(bytes)) {
+      return Result.ok(bytes);
+    }
 
-  return signalGenerateFailureToToolHost(`Input file '${displayPath}' is not a valid image file.`);
+    return Result.err(
+      generateFailure("usage", `Input file '${displayPath}' is not a valid image file.`),
+    );
+  });
 }
 
 export async function resolveImageEditInputs(
@@ -759,42 +809,61 @@ export async function resolveImageEditInputs(
   },
   context?: RequestContext,
 ): Promise<
-  | {
-      images: DataContent[];
-      mask?: DataContent;
-    }
-  | undefined
+  ResultType<
+    | {
+        images: DataContent[];
+        mask?: DataContent;
+      }
+    | undefined,
+    ServerToolFailure
+  >
 > {
   if (!input.inputImages || input.inputImages.length === 0) {
-    return undefined;
+    return Result.ok(undefined);
   }
 
-  const images: DataContent[] = [];
+  return Result.gen(async function* () {
+    const images: DataContent[] = [];
+    for (const imagePath of input.inputImages ?? []) {
+      const resolved = yield* Result.try({
+        try: () => resolveToolPathForRequestContext({ cwd, inputPath: imagePath, context }),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return generateFailure("denied", errorMessage(cause));
+        },
+      });
+      images.push(
+        yield* Result.await(
+          readImageDataFromPath(
+            resolved,
+            formatToolPathForRequestContext({ path: resolved, context }),
+          ),
+        ),
+      );
+    }
 
-  for (const imagePath of input.inputImages) {
-    const resolved = resolveToolPathForRequestContext({ cwd, inputPath: imagePath, context });
-    images.push(
-      await readImageDataFromPath(
-        resolved,
-        formatToolPathForRequestContext({ path: resolved, context }),
+    if (!input.maskImage) return Result.ok({ images });
+
+    const resolvedMask = yield* Result.try({
+      try: () =>
+        resolveToolPathForRequestContext({
+          cwd,
+          inputPath: input.maskImage!,
+          context,
+        }),
+      catch: (cause) => {
+        if (Panic.is(cause)) return preserveToolPanic(cause);
+        return generateFailure("denied", errorMessage(cause));
+      },
+    });
+    const mask = yield* Result.await(
+      readImageDataFromPath(
+        resolvedMask,
+        formatToolPathForRequestContext({ path: resolvedMask, context }),
       ),
     );
-  }
-
-  if (!input.maskImage) {
-    return { images };
-  }
-
-  const resolvedMask = resolveToolPathForRequestContext({
-    cwd,
-    inputPath: input.maskImage,
-    context,
+    return Result.ok({ images, mask });
   });
-  const mask = await readImageDataFromPath(
-    resolvedMask,
-    formatToolPathForRequestContext({ path: resolvedMask, context }),
-  );
-  return { images, mask };
 }
 
 export async function buildImageGenerationPrompt(
@@ -805,25 +874,12 @@ export async function buildImageGenerationPrompt(
     maskImage?: string;
   },
   context?: RequestContext,
-): Promise<ImageGenerationPrompt> {
-  const editInputs = await resolveImageEditInputs(
-    cwd,
-    {
-      inputImages: input.inputImages,
-      maskImage: input.maskImage,
-    },
-    context,
+): Promise<ResultType<ImageGenerationPrompt, ServerToolFailure>> {
+  return (await resolveImageEditInputs(cwd, input, context)).map((editInputs) =>
+    editInputs
+      ? { text: input.prompt, images: editInputs.images, mask: editInputs.mask }
+      : input.prompt,
   );
-
-  if (!editInputs) {
-    return input.prompt;
-  }
-
-  return {
-    text: input.prompt,
-    images: editInputs.images,
-    mask: editInputs.mask,
-  };
 }
 
 export async function buildVideoGenerationPrompt(
@@ -833,27 +889,38 @@ export async function buildVideoGenerationPrompt(
     inputImage?: string;
   },
   context?: RequestContext,
-): Promise<GenerateVideoPrompt> {
+): Promise<ResultType<GenerateVideoPrompt, ServerToolFailure>> {
   if (!input.inputImage) {
-    return input.prompt;
+    return Result.ok(input.prompt);
   }
 
-  const resolvedImage = resolveToolPathForRequestContext({
-    cwd,
-    inputPath: input.inputImage,
-    context,
+  return Result.gen(async function* () {
+    const resolvedImage = yield* Result.try({
+      try: () =>
+        resolveToolPathForRequestContext({
+          cwd,
+          inputPath: input.inputImage!,
+          context,
+        }),
+      catch: (cause) => {
+        if (Panic.is(cause)) return preserveToolPanic(cause);
+        return generateFailure("denied", errorMessage(cause));
+      },
+    });
+    const image = yield* Result.await(
+      readImageDataFromPath(
+        resolvedImage,
+        formatToolPathForRequestContext({ path: resolvedImage, context }),
+      ),
+    );
+    return Result.ok({ text: input.prompt, image });
   });
-  const image = await readImageDataFromPath(
-    resolvedImage,
-    formatToolPathForRequestContext({ path: resolvedImage, context }),
-  );
-  return {
-    text: input.prompt,
-    image,
-  };
 }
 
-async function writeFileWithUniqueName(targetPath: string, bytes: Uint8Array): Promise<string> {
+async function writeFileWithUniqueName(
+  targetPath: string,
+  bytes: Uint8Array,
+): Promise<ResultType<string, ServerToolFailure>> {
   const ext = extname(targetPath);
   const base = ext ? targetPath.slice(0, -ext.length) : targetPath;
 
@@ -861,8 +928,9 @@ async function writeFileWithUniqueName(targetPath: string, bytes: Uint8Array): P
     const candidate = i === 0 ? targetPath : `${base} (${i})${ext}`;
     try {
       await fs.writeFile(candidate, bytes, { flag: "wx" });
-      return candidate;
+      return Result.ok(candidate);
     } catch (error) {
+      if (Panic.is(error)) return preserveToolPanic(error);
       const code =
         typeof error === "object" && error !== null && "code" in error
           ? (error.code as string | undefined)
@@ -870,11 +938,13 @@ async function writeFileWithUniqueName(targetPath: string, bytes: Uint8Array): P
       if (code === "EEXIST") {
         continue;
       }
-      return signalGenerateFailureToToolHost(errorMessage(error));
+      return Result.err(generateFailure("unavailable", errorMessage(error)));
     }
   }
 
-  return signalGenerateFailureToToolHost(`Failed to find an available filename for: ${targetPath}`);
+  return Result.err(
+    generateFailure("conflict", `Failed to find an available filename for: ${targetPath}`),
+  );
 }
 
 export function generateImageWithModel(
@@ -920,7 +990,11 @@ export function generateVideoWithModel(
 export class Generate implements ServerTool {
   id = "generate";
 
-  constructor(private readonly options: GenerateOptions = {}) {}
+  constructor(
+    private readonly options: {
+      readonly getConfig?: () => Pick<CoreConfig, "tools"> | Promise<Pick<CoreConfig, "tools">>;
+    } = {},
+  ) {}
 
   private readonly tool = defineServerTool({
     id: this.id,
@@ -986,121 +1060,203 @@ export class Generate implements ServerTool {
     callableId: string,
     input: Record<string, unknown>,
     opts?: ServerToolCallOptions,
-  ): Promise<unknown> {
+  ): Promise<ServerToolResult> {
     return this.tool.call(callableId, input, opts);
   }
 
   private async callGenerateImage(
     payload: ImageGenerateInput,
     opts?: ServerToolCallOptions,
-  ): Promise<unknown> {
-    const config = await this.options.getConfig?.();
-    const imageProvider = config?.tools.generate.image.provider ?? "default";
-    const availableModels = getAvailableImageModels(imageProvider);
-    const picked = pickModel(
-      availableModels.available,
-      payload.model,
-      DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
-      "image",
+  ): Promise<ServerToolResult> {
+    return Result.gen(
+      async function* (this: Generate) {
+        const config = await this.options.getConfig?.();
+        const imageProvider = config?.tools.generate.image.provider ?? "default";
+        if (
+          imageProvider === "openai-compatible" &&
+          !env.providers.openaiCompatible.baseUrl?.trim()
+        ) {
+          return Result.err(generateFailure("usage", OPENAI_COMPATIBLE_IMAGE_CONFIG_ERROR));
+        }
+        const availableModels = getAvailableImageModels(imageProvider);
+        const picked = yield* pickModel(
+          availableModels.available,
+          payload.model,
+          DEFAULT_IMAGE_MODEL_FALLBACK_ORDER,
+          "image",
+        );
+
+        const descriptor = availableModels.byId.get(picked.id);
+        if (!descriptor) {
+          return Result.err(
+            generateFailure("internal", `Model descriptor not found for '${picked.id}'.`),
+          );
+        }
+        yield* descriptor.validateInput(payload);
+
+        const cwd = opts?.context?.cwd ?? process.cwd();
+        const resolvedOutputDir = yield* Result.try({
+          try: () =>
+            resolveToolPathForRequestContext({
+              cwd,
+              inputPath:
+                payload.outputDir ?? (opts?.context?.safetyMode === "restricted" ? "/tmp" : "."),
+              context: opts?.context,
+            }),
+          catch: (cause) => {
+            if (Panic.is(cause)) return preserveToolPanic(cause);
+            return generateFailure("denied", errorMessage(cause));
+          },
+        });
+
+        const { size, aspectRatio } = resolveImageDimensions(picked.id, payload);
+        const prompt = yield* Result.await(buildImageGenerationPrompt(cwd, payload, opts?.context));
+
+        const res = yield* Result.await(
+          Result.tryPromise({
+            try: () =>
+              generateImageWithModel(picked.model, prompt, {
+                abortSignal: opts?.signal,
+                size,
+                aspectRatio,
+                maxRetries: imageProvider === "openai-compatible" ? 0 : undefined,
+              }),
+            catch: (cause) => {
+              if (Panic.is(cause)) return preserveToolPanic(cause);
+              return generateFailure(
+                opts?.signal?.aborted ? "cancelled" : "unavailable",
+                errorMessage(cause),
+              );
+            },
+          }),
+        );
+
+        const image = res.image;
+        const inferredExt = inferExtensionFromMimeType(image.mediaType) || ".png";
+        const targetWithExt = join(
+          resolvedOutputDir,
+          `${DEFAULT_IMAGE_OUTPUT_BASENAME}${inferredExt}`,
+        );
+
+        yield* Result.await(
+          Result.tryPromise({
+            try: () => fs.mkdir(dirname(targetWithExt), { recursive: true }),
+            catch: (cause) => {
+              if (Panic.is(cause)) return preserveToolPanic(cause);
+              return generateFailure("unavailable", errorMessage(cause));
+            },
+          }),
+        );
+        const outPath = yield* Result.await(
+          writeFileWithUniqueName(targetWithExt, image.uint8Array),
+        );
+
+        return Result.ok({
+          ok: true as const,
+          path: formatToolPathForRequestContext({ path: outPath, context: opts?.context }),
+          bytes: image.uint8Array.byteLength,
+          mimeType: image.mediaType,
+          model: picked.id,
+          warnings: res.warnings,
+        });
+      }.bind(this),
     );
-
-    const descriptor = availableModels.byId.get(picked.id);
-    if (!descriptor) {
-      return signalGenerateFailureToToolHost(`Model descriptor not found for '${picked.id}'.`);
-    }
-    descriptor.validateInput(payload);
-
-    const cwd = opts?.context?.cwd ?? process.cwd();
-    const resolvedOutputDir = resolveToolPathForRequestContext({
-      cwd,
-      inputPath: payload.outputDir ?? (opts?.context?.safetyMode === "restricted" ? "/tmp" : "."),
-      context: opts?.context,
-    });
-
-    const { size, aspectRatio } = resolveImageDimensions(picked.id, payload);
-    const prompt = await buildImageGenerationPrompt(cwd, payload, opts?.context);
-
-    const res = await generateImageWithModel(picked.model, prompt, {
-      abortSignal: opts?.signal,
-      size,
-      aspectRatio,
-      maxRetries: imageProvider === "openai-compatible" ? 0 : undefined,
-    });
-
-    const image = res.image;
-    const inferredExt = inferExtensionFromMimeType(image.mediaType) || ".png";
-    const targetWithExt = join(resolvedOutputDir, `${DEFAULT_IMAGE_OUTPUT_BASENAME}${inferredExt}`);
-
-    await fs.mkdir(dirname(targetWithExt), { recursive: true });
-    const outPath = await writeFileWithUniqueName(targetWithExt, image.uint8Array);
-
-    return {
-      ok: true as const,
-      path: formatToolPathForRequestContext({ path: outPath, context: opts?.context }),
-      bytes: image.uint8Array.byteLength,
-      mimeType: image.mediaType,
-      model: picked.id,
-      warnings: res.warnings,
-    };
   }
 
   private async callGenerateVideo(
     payload: VideoGenerateInput,
     opts?: ServerToolCallOptions,
-  ): Promise<unknown> {
-    const availableModels = getAvailableVideoModels();
-    const picked = pickModel(
-      availableModels.available,
-      payload.model,
-      DEFAULT_VIDEO_MODEL_FALLBACK_ORDER,
-      "video",
+  ): Promise<ServerToolResult> {
+    return Result.gen(
+      async function* (this: Generate) {
+        const availableModels = getAvailableVideoModels();
+        const picked = yield* pickModel(
+          availableModels.available,
+          payload.model,
+          DEFAULT_VIDEO_MODEL_FALLBACK_ORDER,
+          "video",
+        );
+
+        const descriptor = availableModels.byId.get(picked.id);
+        if (!descriptor) {
+          return Result.err(
+            generateFailure("internal", `Model descriptor not found for '${picked.id}'.`),
+          );
+        }
+        yield* descriptor.validateInput(payload);
+
+        const cwd = opts?.context?.cwd ?? process.cwd();
+        const resolvedTarget = yield* Result.try({
+          try: () =>
+            resolveToolPathForRequestContext({
+              cwd,
+              inputPath: payload.path,
+              context: opts?.context,
+            }),
+          catch: (cause) => {
+            if (Panic.is(cause)) return preserveToolPanic(cause);
+            return generateFailure("denied", errorMessage(cause));
+          },
+        });
+
+        const prompt = yield* Result.await(
+          buildVideoGenerationPrompt(
+            cwd,
+            {
+              prompt: payload.prompt,
+              inputImage: payload.inputImage,
+            },
+            opts?.context,
+          ),
+        );
+
+        const res = yield* Result.await(
+          Result.tryPromise({
+            try: () =>
+              generateVideoWithModel(picked.model, prompt, {
+                abortSignal: opts?.signal,
+                aspectRatio: payload.aspectRatio as `${number}:${number}` | undefined,
+                resolution: payload.resolution as `${number}x${number}` | undefined,
+                duration: payload.duration,
+              }),
+            catch: (cause) => {
+              if (Panic.is(cause)) return preserveToolPanic(cause);
+              return generateFailure(
+                opts?.signal?.aborted ? "cancelled" : "unavailable",
+                errorMessage(cause),
+              );
+            },
+          }),
+        );
+
+        const video = res.video;
+        const originalExt = extname(resolvedTarget);
+        const inferredExt = inferExtensionFromMimeType(video.mediaType) || ".mp4";
+        const targetWithExt =
+          originalExt.length > 0 ? resolvedTarget : `${resolvedTarget}${inferredExt}`;
+        yield* Result.await(
+          Result.tryPromise({
+            try: () => fs.mkdir(dirname(targetWithExt), { recursive: true }),
+            catch: (cause) => {
+              if (Panic.is(cause)) return preserveToolPanic(cause);
+              return generateFailure("unavailable", errorMessage(cause));
+            },
+          }),
+        );
+        const outPath = yield* Result.await(
+          writeFileWithUniqueName(targetWithExt, video.uint8Array),
+        );
+
+        return Result.ok({
+          ok: true as const,
+          path: formatToolPathForRequestContext({ path: outPath, context: opts?.context }),
+          bytes: video.uint8Array.byteLength,
+          mimeType: video.mediaType,
+          model: picked.id,
+          warnings: res.warnings,
+          providerMetadata: res.providerMetadata,
+        });
+      }.bind(this),
     );
-
-    const descriptor = availableModels.byId.get(picked.id);
-    if (!descriptor) {
-      return signalGenerateFailureToToolHost(`Model descriptor not found for '${picked.id}'.`);
-    }
-    descriptor.validateInput(payload);
-
-    const cwd = opts?.context?.cwd ?? process.cwd();
-    const resolvedTarget = resolveToolPathForRequestContext({
-      cwd,
-      inputPath: payload.path,
-      context: opts?.context,
-    });
-
-    const prompt = await buildVideoGenerationPrompt(
-      cwd,
-      {
-        prompt: payload.prompt,
-        inputImage: payload.inputImage,
-      },
-      opts?.context,
-    );
-
-    const res = await generateVideoWithModel(picked.model, prompt, {
-      abortSignal: opts?.signal,
-      aspectRatio: payload.aspectRatio as `${number}:${number}` | undefined,
-      resolution: payload.resolution as `${number}x${number}` | undefined,
-      duration: payload.duration,
-    });
-
-    const video = res.video;
-    const originalExt = extname(resolvedTarget);
-    const inferredExt = inferExtensionFromMimeType(video.mediaType) || ".mp4";
-    const targetWithExt =
-      originalExt.length > 0 ? resolvedTarget : `${resolvedTarget}${inferredExt}`;
-    await fs.mkdir(dirname(targetWithExt), { recursive: true });
-    const outPath = await writeFileWithUniqueName(targetWithExt, video.uint8Array);
-
-    return {
-      ok: true as const,
-      path: formatToolPathForRequestContext({ path: outPath, context: opts?.context }),
-      bytes: video.uint8Array.byteLength,
-      mimeType: video.mediaType,
-      model: picked.id,
-      warnings: res.warnings,
-      providerMetadata: res.providerMetadata,
-    };
   }
 }

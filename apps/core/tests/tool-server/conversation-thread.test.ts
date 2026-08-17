@@ -103,18 +103,26 @@ describe("ConversationThread.call", () => {
     const invocations: Invocation[] = [];
     const tool = new ConversationThread({ service: createService(invocations) });
 
-    await expect(
-      tool.call("conversation.thread.search", { query: "memory", limit: "2" }),
-    ).resolves.toBe(searchOutput);
-    await expect(
-      tool.call("conversation.thread.metadata", { threadIds: ["thread-1"] }),
-    ).resolves.toBe(metadataOutput);
-    await expect(
-      tool.call("conversation.thread.read", { threadId: "thread-1", offset: "1", limit: "2" }),
-    ).resolves.toBe(readOutput);
-    await expect(
-      tool.call("conversation.thread.runSummarization", { dryRun: true, limit: "3" }),
-    ).resolves.toBe(summarizationOutput);
+    const search = await tool.call("conversation.thread.search", { query: "memory", limit: "2" });
+    const metadata = await tool.call("conversation.thread.metadata", { threadIds: ["thread-1"] });
+    const read = await tool.call("conversation.thread.read", {
+      threadId: "thread-1",
+      offset: "1",
+      limit: "2",
+    });
+    const summarization = await tool.call("conversation.thread.runSummarization", {
+      dryRun: true,
+      limit: "3",
+    });
+
+    expect(search.status).toBe("ok");
+    expect(metadata.status).toBe("ok");
+    expect(read.status).toBe("ok");
+    expect(summarization.status).toBe("ok");
+    if (search.status === "ok") expect(search.value).toBe(searchOutput);
+    if (metadata.status === "ok") expect(metadata.value).toBe(metadataOutput);
+    if (read.status === "ok") expect(read.value).toBe(readOutput);
+    if (summarization.status === "ok") expect(summarization.value).toBe(summarizationOutput);
 
     expect(invocations).toEqual([
       { operation: "search", input: { query: "memory", limit: 2 } },
@@ -128,9 +136,14 @@ describe("ConversationThread.call", () => {
     const invocations: Invocation[] = [];
     const tool = new ConversationThread({ service: createService(invocations) });
 
-    await expect(tool.call("conversation.thread.missing", {})).rejects.toThrow(
-      "Invalid callable ID 'conversation.thread.missing'",
-    );
+    const result = await tool.call("conversation.thread.missing", {});
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error).toMatchObject({
+        kind: "not_found",
+        message: "Invalid callable ID 'conversation.thread.missing'",
+      });
+    }
     expect(invocations).toEqual([]);
   });
 
@@ -138,9 +151,12 @@ describe("ConversationThread.call", () => {
     const invocations: Invocation[] = [];
     const tool = new ConversationThread({ service: createService(invocations) });
 
-    await expect(tool.call("conversation.thread.search", { query: "" })).rejects.toThrow(
-      "conversation.thread.search has invalid input.",
-    );
+    const result = await tool.call("conversation.thread.search", { query: "" });
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error.kind).toBe("usage");
+      expect(result.error.message).toContain("conversation.thread.search has invalid input.");
+    }
     expect(invocations).toEqual([]);
   });
 
@@ -152,6 +168,10 @@ describe("ConversationThread.call", () => {
     };
     const tool = new ConversationThread({ service });
 
-    await expect(tool.call("conversation.thread.search", { query: "memory" })).rejects.toBe(panic);
+    const [settled] = await Promise.allSettled([
+      tool.call("conversation.thread.search", { query: "memory" }),
+    ]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
   });
 });
