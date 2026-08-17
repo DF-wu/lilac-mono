@@ -1,6 +1,6 @@
 # Docker Deployment
 
-Lilac runs `tini` as container PID 1 to reap orphaned children and forward signals. Its child is the root entrypoint, which performs startup setup and then replaces itself with Core as the unprivileged `lilac` user. The image does not run systemd, a user manager, or Bubblewrap, and it does not require writable cgroups, user namespaces, privileged mode, or unconfined security profiles. Core and its children write directly to the container's stdout and stderr.
+Lilac runs `tini` as container PID 1 to reap orphaned children and forward signals. Its child is the root entrypoint, which performs startup setup and then replaces itself with Core as the unprivileged image user (`lilac` by default). The image does not run systemd, a user manager, or Bubblewrap, and it does not require writable cgroups, user namespaces, privileged mode, or unconfined security profiles. Core and its children write directly to the container's stdout and stderr.
 
 ## Start And Verify
 
@@ -11,7 +11,7 @@ bun run docker:build --tag lilac:dev .
 bun run docker:verify-image
 ```
 
-The image smoke starts a network-disabled container with the normal entrypoint and an inert command. It verifies that `tini` is the root PID 1, reaps an orphan probe, keeps its service child running as `lilac`, and forwards SIGTERM to that child. It also checks direct Docker logs, Bun and the installed `tools` CLI, immutable application and CLI paths, writable `/data`, and the root-only operator token with its hash propagated to the service process.
+The image smoke starts a network-disabled container with the normal entrypoint and an inert command. It verifies the expected account, UID/GID, home, environment, and `PATH`; confirms that `tini` is the root PID 1, reaps an orphan probe, keeps its service child under the image user, and forwards SIGTERM to that child. It also checks direct Docker logs, Bun and the installed `tools` CLI, immutable application and CLI paths, writable `/data`, and the root-only operator token with its hash propagated to the service process.
 
 Start the Compose deployment and verify operator access against the running Core service:
 
@@ -26,7 +26,7 @@ docker compose logs -f lilac
 
 ## Operator Token
 
-The root entrypoint creates a fresh random operator token each time the container starts. It stores the token at `/run/lilac/operator-token` as `root:root` mode `0600`, exports only its SHA-256 hash to Core, and then replaces itself with Core under the `lilac` UID and GID. The token is therefore available to explicit root operator commands but is not readable by Core, agents, or other `lilac` processes.
+The root entrypoint creates a fresh random operator token each time the container starts. It stores the token at `/run/lilac/operator-token` as `root:root` mode `0600`, exports only its SHA-256 hash to Core, and then replaces itself with Core under the account recorded in the image's root-owned identity file. The token is therefore available to explicit root operator commands but is not readable by Core, agents, or other unprivileged service processes.
 
 Use the installed root-owned CLI for operator calls:
 
@@ -35,21 +35,21 @@ docker compose exec -T lilac /usr/local/bin/tools --operator --list
 docker compose exec -T lilac /usr/local/bin/tools --operator workflow.run.list --state=running
 ```
 
-Use the absolute path so root never resolves an agent-installed executable from `/data/bin`. Running with `--user lilac` intentionally cannot load the operator token. The application tree, CLI bundle, and `/usr/local/bin/bun` are root-owned and not writable by `lilac`.
+Use the absolute path so root never resolves an agent-installed executable from `/data/bin`. Running with `--user lilac` (or the configured `CONTAINER_USER`) intentionally cannot load the operator token. The application tree, CLI bundle, and `/usr/local/bin/bun` are root-owned and not writable by the service account.
 
 External plugins are trusted in-process Core code loaded from `/data/plugins`. The operator token is not a hostile-agent boundary if an agent can install or modify those plugins; use this topology only with trusted agents or separately restrict plugin management.
 
 ## Storage And UID
 
-Compose mounts persistent state at `/data` and optional agent configuration and SSH directories under `/home/lilac`. Configured MCP servers live in `/data/mcp-config.yaml`; MCP OAuth credentials persist under `/data/secret/mcp-oauth` and are deliberately retained when a server definition is removed. Keep secrets out of the image and source control, restrict deployment environment-file permissions, and recreate the container after rotating credentials:
+Compose mounts persistent state at `/data` and optional agent configuration and SSH directories under `/home/${CONTAINER_USER:-lilac}`. Configured MCP servers live in `/data/mcp-config.yaml`; MCP OAuth credentials persist under `/data/secret/mcp-oauth` and are deliberately retained when a server definition is removed. Keep secrets out of the image and source control, restrict deployment environment-file permissions, and recreate the container after rotating credentials:
 
 ```sh
 docker compose up -d --force-recreate lilac
 ```
 
-`CONTAINER_UID` is a build argument, not a runtime setting. It must be an available numeric UID from 1000 through 60000. Rebuild after changing it and ensure bind-mounted files are owned by or writable for that UID.
+`CONTAINER_USER` and `CONTAINER_UID` are build arguments, not runtime identity overrides. The user name must begin with a letter or underscore and contain only letters, digits, underscores, or hyphens. The UID must be an available number from 1000 through 60000; the image uses the same numeric GID. Rebuild after changing either value and ensure bind-mounted files are owned by or writable for that UID/GID. The entrypoint resets `LILAC_USER`, `LILAC_UID`, `LILAC_GID`, `HOME`, `USER`, and `LOGNAME` from the image's root-owned identity record, so runtime environment overrides cannot change the account used for privilege dropping.
 
-Filesystem-tool denylists and trusted Bash's direct static check reduce accidental reads of `/data/secret`; they are not isolation from trusted same-user execution. Core, trusted Bash, plugins, and MCP stdio children share the `lilac` UID and can access service-readable credentials. Use separate containers, users, or another OS security boundary when agent-executed code must not be able to read them.
+Filesystem-tool denylists and trusted Bash's direct static check reduce accidental reads of `/data/secret`; they are not isolation from trusted same-user execution. Core, trusted Bash, plugins, and MCP stdio children share the configured service UID and can access service-readable credentials. Use separate containers, users, or another OS security boundary when agent-executed code must not be able to read them.
 
 ## Claude Code Authentication And Storage
 
@@ -78,4 +78,4 @@ docker compose logs --tail=200 lilac
 docker compose exec -T lilac /usr/bin/id
 ```
 
-The service process and its subprocesses run as `lilac`; `docker compose exec` defaults to root so the operator CLI can read its token. Add `--user lilac` when diagnosing the service user's filesystem access.
+The service process and its subprocesses run as the configured image user (`lilac` by default); `docker compose exec` defaults to root so the operator CLI can read its token. Add `--user "${CONTAINER_USER:-lilac}"` when diagnosing the service user's filesystem access.

@@ -6,6 +6,7 @@ services:
       args:
         BASE_IMAGE: ${BASE_IMAGE:-ubuntu:24.04}
         NODE_MAJOR: ${NODE_MAJOR:-22}
+        CONTAINER_USER: ${CONTAINER_USER:-lilac}
         CONTAINER_UID: ${CONTAINER_UID:-1000}
         LILAC_BUILD_VERSION: ${LILAC_BUILD_VERSION:-dev}
         LILAC_BUILD_COMMIT: ${LILAC_BUILD_COMMIT:-dev}
@@ -36,8 +37,8 @@ services:
       - "8080:8080"
     volumes:
       - ./data:/data
-      - ./home/agents:/home/lilac/.agents
-      - ./home/.ssh:/home/lilac/.ssh
+      - ./home/agents:/home/${CONTAINER_USER:-lilac}/.agents
+      - ./home/.ssh:/home/${CONTAINER_USER:-lilac}/.ssh
     tmpfs:
       - /run:rw,nosuid,nodev,mode=755,size=64m
       - /tmp:rw,nosuid,nodev,mode=1777,size=1g

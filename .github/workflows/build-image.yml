@@ -51,11 +51,12 @@ jobs:
             type=raw,value=latest,enable=${{ matrix.variant.tag == 'catalina' }}
             type=sha,prefix=${{ matrix.variant.tag }}-,format=short
 
-      - name: Build and push
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          load: true
+          push: false
           build-args: |
             CONTAINER_USER=${{ matrix.variant.container_user }}
             CONTAINER_UID=${{ matrix.variant.container_uid }}
@@ -63,3 +64,18 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify image identity and runtime isolation
+        run: |
+          bash docker/verify-image.sh \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.variant.tag }}" \
+            "${{ matrix.variant.container_user }}" \
+            "${{ matrix.variant.container_uid }}"
+
+      - name: Push verified image tags
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && docker push "$tag"
+          done <<< "$IMAGE_TAGS"

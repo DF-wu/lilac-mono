@@ -52,16 +52,38 @@ jobs:
         run: bun run ci
 
   docker-image:
-    name: Docker image smoke
+    name: Docker image smoke (${{ matrix.variant.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: default
+            container_user: lilac
+            container_uid: 1000
+          - name: catalina
+            container_user: Catalina
+            container_uid: 3000
+          - name: claudia
+            container_user: Claudia
+            container_uid: 3000
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
       - name: Build image
-        run: docker build --tag lilac:ci .
+        run: |
+          docker build \
+            --build-arg "CONTAINER_USER=${{ matrix.variant.container_user }}" \
+            --build-arg "CONTAINER_UID=${{ matrix.variant.container_uid }}" \
+            --tag "lilac:ci-${{ matrix.variant.name }}" \
+            .
 
       - name: Verify image
-        run: bash docker/verify-image.sh lilac:ci
+        run: |
+          bash docker/verify-image.sh \
+            "lilac:ci-${{ matrix.variant.name }}" \
+            "${{ matrix.variant.container_user }}" \
+            "${{ matrix.variant.container_uid }}"
