@@ -3,6 +3,31 @@
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
 
+## Level-2 Result, Wire, And CLI Clean Break
+
+Level-2 callable settlement is a clean break with no compatibility layer. Every external Level-2
+callable must now return a `better-result` `Result`. The runtime accepts the full `better-result`
+Result protocol structurally so Results from plugin-local dependency installations work across the
+plugin boundary. Raw values and plain `{ status: ... }` wire-shaped objects without the full
+protocol remain invalid. Existing external plugins must be updated and rebuilt before loading.
+Expected failures are `Result.err(ServerToolFailure)` with `kind`, `code`, `message`, `retryable`,
+and optional JSON `details`. Throws are defects, not expected failures, and are handled by the fatal
+defect boundary rather than translated into plugin failures.
+
+The `/call` wire response is exactly `{ status: "ok", value }` or
+`{ status: "error", error }`, where `error` is the complete `ServerToolFailure`. There is no legacy
+raw-success response or legacy failure-envelope decoding.
+
+The `tools` CLI unwraps a successful wire response and writes the JSON value to stdout. A failure is
+written as `{ "status": "error", "error": ServerToolFailure }` JSON to stderr, not stdout. Failure
+exit codes are `1` internal, `2` usage, `3` denied, `4` not_found, `5` conflict, `6` unavailable,
+`7` timeout, and `8` cancelled. Successful calls exit `0`.
+
+This settlement change does not reinterpret report or diagnostic payloads. A callable that
+successfully produces a report remains `Result.ok(report)` even when the report records warnings,
+validation findings, unhealthy state, or another negative conclusion. `Result.err` means the
+callable itself failed to complete as expected.
+
 ## Core SQLite
 
 `discord-search.db` now records URL-free Discord attachment identity metadata in

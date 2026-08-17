@@ -7,6 +7,7 @@ import {
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import { analyzeGit } from "../rules-git";
+import { analyzeDestructiveFilesystemCommand } from "../rules-filesystem";
 import { analyzeRm } from "../rules-rm";
 import {
   DYNAMIC_EXPANSION_MARKER,
@@ -22,8 +23,8 @@ import {
 import { analyzeFind } from "./find";
 import { extractInterpreterCodeArg } from "./interpreters";
 import { analyzeParallel } from "./parallel";
-import { hasRecursiveForceFlags } from "./rm-flags";
-import { extractDashCArg } from "./shell-wrappers";
+import { hasRecursiveFlag, hasRecursiveForceFlags } from "./rm-flags";
+import { extractDashCArg, extractWatchCommand } from "./shell-wrappers";
 import { isTmpdirOverriddenToNonTemp } from "./tmpdir";
 import { analyzeXargs } from "./xargs";
 
@@ -244,6 +245,12 @@ export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions)
   const allowTmpdirVar =
     (options.allowTmpdirVar ?? true) && !isTmpdirOverriddenToNonTemp(envAssignments);
 
+  const filesystemResult = analyzeDestructiveFilesystemCommand(
+    stripped.slice(commandIndex),
+    commandEffectiveCwd,
+  );
+  if (filesystemResult) return filesystemResult;
+
   if (SHELL_WRAPPERS.has(normalizedHead)) {
     const dashCArg = extractDashCArg(stripped);
     if (dashCArg) {
@@ -290,6 +297,15 @@ export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions)
     return analyzeSegment(stripped.slice(1), { ...options, effectiveCwd: commandEffectiveCwd });
   }
 
+  if (normalizedHead === "watch") {
+    const child = extractWatchCommand(stripped.slice(commandIndex));
+    if (!child || child.length === 0) return null;
+    return (
+      analyzeSegment(child, { ...options, effectiveCwd: commandEffectiveCwd }) ??
+      options.analyzeNested(child.join(" "), commandEffectiveCwd)
+    );
+  }
+
   const isGit = basename.toLowerCase() === "git";
   const isRm = basename === "rm";
   const isFind = basename === "find";
@@ -311,12 +327,14 @@ export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions)
       return REASON_DYNAMIC_RM_TARGET;
     }
 
-    const rmResult = analyzeRm(staticTokens, {
-      cwd: cwdForRm,
-      originalCwd,
-      paranoid: options.paranoidRm,
-      allowTmpdirVar,
-    });
+    const rmResult = hasRecursiveFlag(stripped)
+      ? analyzeRm(staticTokens, {
+          cwd: cwdForRm,
+          originalCwd,
+          paranoid: options.paranoidRm,
+          allowTmpdirVar,
+        })
+      : null;
 
     if (rmResult) {
       return rmResult;

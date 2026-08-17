@@ -2096,14 +2096,21 @@ export async function createCoreRuntime(
                 const toolService = createConversationThreadToolService(service);
                 return {
                   ...toolService,
-                  runSummarization: (input) =>
-                    resolveConversationThreadSummarizationToolOperation(
+                  async runSummarization(input) {
+                    const result = await resolveConversationThreadSummarizationToolOperation(
                       summarizationRunner
                         ? summarizationRunner.runSummarization(input)
                         : captureSummarizationRuntimeOperation("in-process", () =>
                             service.runSummarization(input),
                           ),
-                    ),
+                    );
+                    return result.match({
+                      ok: (value) => () => value,
+                      err: (error) => () => {
+                        throw new Error(error.message);
+                      },
+                    })();
+                  },
                 };
               })()
             : undefined;

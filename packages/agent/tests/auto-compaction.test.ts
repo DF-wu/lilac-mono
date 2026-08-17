@@ -1,5 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
-import type { LanguageModel, ModelMessage } from "ai";
+import { jsonSchema, tool, type LanguageModel, type ModelMessage } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 
 import { ModelCapability } from "@stanley2058/lilac-utils";
@@ -1307,6 +1307,161 @@ describe("auto-compaction internals", () => {
     expect(agent.state.messages[0]?.content).toContain("<context-compaction>");
     expect(agent.state.messages.at(-2)?.content).toBe("next request");
     expect(JSON.stringify(agent.state.messages)).not.toContain("Continue if you have next steps");
+  });
+
+  it("compacts and resumes an ordinary length-truncated turn once", async () => {
+    const response = (text: string, finishReason: "length" | "stop") => ({
+      stream: simulateReadableStream({
+        chunks: [
+          { type: "text-start" as const, id: text },
+          { type: "text-delta" as const, id: text, delta: text },
+          { type: "text-end" as const, id: text },
+          {
+            type: "finish" as const,
+            finishReason: { unified: finishReason, raw: finishReason },
+            usage: zeroUsage(),
+          },
+        ],
+      }),
+    });
+    const mainModel = new MockLanguageModelV4({
+      doStream: [response("truncated answer", "length"), response("finished answer", "stop")],
+    });
+    let summaryCalls = 0;
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async () => {
+        summaryCalls += 1;
+        return summaryResponse("Length-truncated work is ready to continue.");
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: "older request" },
+        { role: "assistant", content: "older answer" },
+      ],
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+    });
+
+    try {
+      await agent.prompt("complete the work");
+    } finally {
+      detach();
+    }
+
+    expect(mainModel.doStreamCalls).toHaveLength(2);
+    expect(summaryCalls).toBeGreaterThan(0);
+    expect(agent.state.messages[0]?.content).toContain("<context-compaction>");
+    expect(JSON.stringify(agent.state.messages)).toContain("finished answer");
+  });
+
+  it("does not execute a length-truncated tool call and closes it before recovery", async () => {
+    const mainModel = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              {
+                type: "tool-call",
+                toolCallId: "truncated-call",
+                toolName: "write_file",
+                input: '{"path":"partial.txt"}',
+              },
+              {
+                type: "finish",
+                finishReason: { unified: "length", raw: "length" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        summaryResponse("recovered without running the truncated call"),
+      ],
+    });
+    let executions = 0;
+    let summaryInput = "";
+    const summaryModel = new MockLanguageModelV4({
+      doStream: async ({ prompt }) => {
+        summaryInput = JSON.stringify(prompt);
+        return summaryResponse("Truncated tool call was rejected.");
+      },
+    });
+    const firstTurnMessages: ModelMessage[][] = [];
+    const truncatedResultEvents: Array<{
+      type: "message_start" | "message_end";
+      message: ModelMessage;
+    }> = [];
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model: mainModel,
+      modelSpecifier: "test/main",
+      messages: [
+        { role: "user", content: "older request" },
+        { role: "assistant", content: "older answer" },
+      ],
+      tools: {
+        write_file: tool({
+          inputSchema: jsonSchema({ type: "object" }),
+          execute: () => {
+            executions += 1;
+            return "written";
+          },
+        }),
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "turn_end") firstTurnMessages.push(event.newMessages);
+      if (
+        (event.type === "message_start" || event.type === "message_end") &&
+        event.message.role === "tool" &&
+        event.message.content.some(
+          (part) => part.type === "tool-result" && part.toolCallId === "truncated-call",
+        )
+      ) {
+        truncatedResultEvents.push({ type: event.type, message: event.message });
+      }
+    });
+    const detach = await attachAutoCompaction(agent, {
+      model: "test/main",
+      modelCapability: new ModelCapability({ fetch: createRegistryFetch({}) }),
+      summaryModel,
+      resolveContextLimit: async () => ({ context: 10_000, output: 1_000 }),
+    });
+
+    try {
+      await agent.prompt("write the file");
+    } finally {
+      detach();
+    }
+
+    expect(executions).toBe(0);
+    expect(mainModel.doStreamCalls).toHaveLength(2);
+    expect(summaryInput).toContain("older request");
+    expect(JSON.stringify(mainModel.doStreamCalls[1]?.prompt)).toContain(
+      "was not executed because the model output was truncated",
+    );
+    expect(firstTurnMessages[0]?.at(-1)).toEqual({
+      role: "tool",
+      content: [
+        expect.objectContaining({
+          type: "tool-result",
+          toolCallId: "truncated-call",
+          output: expect.objectContaining({ type: "error-text" }),
+        }),
+      ],
+    });
+    expect(truncatedResultEvents.map((event) => event.type)).toEqual([
+      "message_start",
+      "message_end",
+    ]);
+    expect(truncatedResultEvents[1]?.message).toEqual(firstTurnMessages[0]?.at(-1));
   });
 
   it("does not let the estimate override known usage for usage-source providers", async () => {

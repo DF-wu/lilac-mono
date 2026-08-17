@@ -1,11 +1,18 @@
 import { z } from "zod";
-import type { Result as ResultType } from "better-result";
+import { isRecord } from "@stanley2058/lilac-utils";
+import { Panic, Result, type Result as ResultType } from "better-result";
+import {
+  serverToolFailure,
+  type ServerToolFailure,
+  type ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
 import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
 import type {
   ConversationThreadRunSummarizationResult,
   ConversationThreadToolService,
 } from "../../conversation/thread-service";
+import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
 const searchInputSchema = z.object({
   query: z
@@ -101,23 +108,78 @@ const CONVERSATION_THREAD_CALLABLE_IDS = {
   runSummarization: "conversation.thread.runSummarization",
 } as const;
 
-function adaptConversationThreadResultToToolHost<TValue>(
-  result: ResultType<TValue, { readonly message: string }>,
-): TValue {
-  return result.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      throw new Error(error.message);
-    },
-  })();
+function conversationThreadFailure(error: unknown): ServerToolFailure {
+  if (Panic.is(error)) preserveToolPanic(error);
+
+  const tagged = isRecord(error) ? error : {};
+  const tag = typeof tagged._tag === "string" ? tagged._tag : undefined;
+  const message =
+    typeof tagged.message === "string" ? tagged.message : "Conversation thread operation failed";
+  const normalized = message.toLowerCase();
+  switch (tag) {
+    case "ConversationThreadInvalidInput":
+      return conversationThreadServerFailure("usage", message);
+    case "ConversationThreadAccessDenied":
+      return conversationThreadServerFailure("denied", message);
+    case "ConversationThreadNotFound":
+      return conversationThreadServerFailure("not_found", message);
+    case "ConversationThreadSummarizationRemoteError":
+    case "ConversationThreadSummarizationTransportError":
+    case "ModelResolutionFailed":
+      return conversationThreadServerFailure("unavailable", message);
+    case "ConversationThreadSummarizationRuntimeError":
+    case "ConversationThreadOperationFailed":
+      return conversationThreadServerFailure("internal", message);
+    default:
+      if (/\b(?:abort(?:ed)?|cancelled)\b/.test(normalized)) {
+        return conversationThreadServerFailure("cancelled", message);
+      }
+      if (/\b(?:timeout|timed out)\b/.test(normalized)) {
+        return conversationThreadServerFailure("timeout", message);
+      }
+      if (/\bnot found\b/.test(normalized)) {
+        return conversationThreadServerFailure("not_found", message);
+      }
+      if (/\b(?:not allowed|permission denied|access denied)\b/.test(normalized)) {
+        return conversationThreadServerFailure("denied", message);
+      }
+      if (/\b(?:required|invalid|must be|must not)\b/.test(normalized)) {
+        return conversationThreadServerFailure("usage", message);
+      }
+      if (/\b(?:unavailable|connection|transport|provider)\b/.test(normalized)) {
+        return conversationThreadServerFailure("unavailable", message);
+      }
+      return conversationThreadServerFailure("internal", message);
+  }
+}
+
+function conversationThreadServerFailure(
+  kind: ServerToolFailure["kind"],
+  message: string,
+): ServerToolFailure {
+  return serverToolFailure({
+    kind,
+    code: `conversation_thread_${kind}`,
+    message,
+    retryable: kind === "unavailable" || kind === "timeout",
+  });
+}
+
+async function captureConversationThreadOperation<TValue>(
+  operation: () => Promise<TValue>,
+): Promise<ResultType<TValue, ServerToolFailure>> {
+  return Result.tryPromise({
+    try: operation,
+    catch: conversationThreadFailure,
+  });
 }
 
 export async function resolveConversationThreadSummarizationToolOperation(
   operation: Promise<
     ResultType<ConversationThreadRunSummarizationResult, { readonly message: string }>
   >,
-): Promise<ConversationThreadRunSummarizationResult> {
-  return adaptConversationThreadResultToToolHost(await operation);
+): Promise<ResultType<ConversationThreadRunSummarizationResult, ServerToolFailure>> {
+  return (await operation).mapError(conversationThreadFailure);
 }
 
 export class ConversationThread implements ServerTool {
@@ -137,7 +199,8 @@ export class ConversationThread implements ServerTool {
             "Search summarized conversation threads. Returns compact threadId, title, and brief by default; use verbose for metadata/diagnostics or conversation.thread.read to expand a result. Multi-query combines variants of one intent into one merged ranking.",
           inputSchema: searchInputSchema,
           primaryPositional: { field: "query", variadic: true },
-          run: (input) => this.params.service.search(input),
+          run: (input) =>
+            captureConversationThreadOperation(() => this.params.service.search(input)),
         }),
         [CONVERSATION_THREAD_CALLABLE_IDS.metadata]: callable({
           name: "Conversation Thread Metadata",
@@ -145,7 +208,8 @@ export class ConversationThread implements ServerTool {
             "Read conversation thread summary metadata by ids without loading transcript messages. Supports up to 20 threadIds for candidate comparison.",
           inputSchema: metadataInputSchema,
           primaryPositional: { field: "threadIds", variadic: true },
-          run: (input) => this.params.service.metadata(input),
+          run: (input) =>
+            captureConversationThreadOperation(() => this.params.service.metadata(input)),
         }),
         [CONVERSATION_THREAD_CALLABLE_IDS.read]: callable({
           name: "Conversation Thread Read",
@@ -153,14 +217,15 @@ export class ConversationThread implements ServerTool {
             "Read a conversation thread transcript by id with offset/limit pagination. Output messages use content for message text.",
           inputSchema: readInputSchema,
           primaryPositional: "threadId",
-          run: (input) => this.params.service.read(input),
+          run: (input) => captureConversationThreadOperation(() => this.params.service.read(input)),
         }),
         [CONVERSATION_THREAD_CALLABLE_IDS.runSummarization]: callable({
           name: "Conversation Thread Run Summarization",
           description: "Hidden admin runner for conversation thread refresh and summarization.",
           inputSchema: runSummarizationInputSchema,
           hidden: true,
-          run: (input) => this.params.service.runSummarization(input),
+          run: (input) =>
+            captureConversationThreadOperation(() => this.params.service.runSummarization(input)),
         }),
       }),
     });
@@ -186,7 +251,7 @@ export class ConversationThread implements ServerTool {
     callableId: string,
     input: Record<string, unknown>,
     opts?: ServerToolCallOptions,
-  ): Promise<unknown> {
+  ): Promise<ServerToolResult> {
     return this.tool.call(callableId, input, opts);
   }
 }

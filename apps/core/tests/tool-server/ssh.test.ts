@@ -1,6 +1,61 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { Panic } from "better-result";
 
 import { parseSshHostsFromConfigText } from "../../src/ssh/ssh-config";
+import { SSH } from "../../src/tool-server/tools/ssh";
+
+function textStream(text = ""): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      if (text) controller.enqueue(new TextEncoder().encode(text));
+      controller.close();
+    },
+  });
+}
+
+function rejectedStream(reason: unknown): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.error(reason);
+    },
+  });
+}
+
+function rejectedPromise<T>(reason: unknown): Promise<T> {
+  const promise = Promise.reject<T>(reason);
+  void promise.catch(() => undefined);
+  return promise;
+}
+
+function mockSshProcess(input: {
+  stdout?: ReadableStream<Uint8Array>;
+  stderr?: ReadableStream<Uint8Array>;
+  exited?: Promise<number>;
+}): Bun.Subprocess<Blob, "pipe", "pipe"> {
+  return {
+    stdout: input.stdout ?? textStream(),
+    stderr: input.stderr ?? textStream(),
+    exited: input.exited ?? Promise.resolve(0),
+  } as unknown as Bun.Subprocess<Blob, "pipe", "pipe">;
+}
+
+async function withConfiguredSshHost<T>(run: () => Promise<T>): Promise<T> {
+  const root = await mkdtemp(path.join(tmpdir(), "lilac-level2-ssh-config-"));
+  const configPath = path.join(root, "ssh-config");
+  const previousConfigPath = process.env.LILAC_SSH_CONFIG_PATH;
+  try {
+    await writeFile(configPath, "Host fakehost\n  HostName localhost\n", "utf8");
+    process.env.LILAC_SSH_CONFIG_PATH = configPath;
+    return await run();
+  } finally {
+    if (previousConfigPath === undefined) delete process.env.LILAC_SSH_CONFIG_PATH;
+    else process.env.LILAC_SSH_CONFIG_PATH = previousConfigPath;
+    await rm(root, { recursive: true, force: true });
+  }
+}
 
 describe("parseSshHostsFromConfigText", () => {
   it("parses simple Host aliases", () => {
@@ -38,5 +93,242 @@ Host alpha # trailing comment
 `;
 
     expect(parseSshHostsFromConfigText(text)).toEqual(["alpha"]);
+  });
+
+  it("returns missing configured hosts as a semantic failure", async () => {
+    const previousConfigPath = process.env.LILAC_SSH_CONFIG_PATH;
+    process.env.LILAC_SSH_CONFIG_PATH = path.join(tmpdir(), `missing-ssh-${crypto.randomUUID()}`);
+    try {
+      expect(await new SSH().call("ssh.run", { host: "missing", cmd: "true" })).toMatchObject({
+        status: "error",
+        error: { kind: "not_found", code: "ssh_not_found", retryable: false },
+      });
+    } finally {
+      if (previousConfigPath === undefined) delete process.env.LILAC_SSH_CONFIG_PATH;
+      else process.env.LILAC_SSH_CONFIG_PATH = previousConfigPath;
+    }
+  });
+
+  it("keeps a remote command nonzero exit as a successful report", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "lilac-level2-ssh-"));
+    const binDir = path.join(root, "bin");
+    const configPath = path.join(root, "ssh-config");
+    const sshPath = path.join(binDir, "ssh");
+    const previousPath = process.env.PATH;
+    const previousConfigPath = process.env.LILAC_SSH_CONFIG_PATH;
+    try {
+      await mkdir(binDir);
+      await writeFile(configPath, "Host fakehost\n  HostName localhost\n", "utf8");
+      await writeFile(
+        sshPath,
+        "#!/usr/bin/env bash\ncat >/dev/null\nprintf 'remote failed' >&2\nexit 7\n",
+        "utf8",
+      );
+      await chmod(sshPath, 0o755);
+      process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+      process.env.LILAC_SSH_CONFIG_PATH = configPath;
+
+      expect(await new SSH().call("ssh.run", { host: "fakehost", cmd: "exit 7" })).toMatchObject({
+        status: "ok",
+        value: { ok: false, exitCode: 7, timedOut: false, stderr: "remote failed" },
+      });
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousConfigPath === undefined) delete process.env.LILAC_SSH_CONFIG_PATH;
+      else process.env.LILAC_SSH_CONFIG_PATH = previousConfigPath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves Panic from command spawn", async () => {
+    await withConfiguredSshHost(async () => {
+      const panic = new Panic({ message: "ssh spawn invariant failed" });
+      const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+        throw panic;
+      });
+      try {
+        const [settled] = await Promise.allSettled([
+          new SSH().call("ssh.run", { host: "fakehost", cmd: "true" }),
+        ]);
+
+        expect(settled?.status).toBe("rejected");
+        if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+      } finally {
+        spawn.mockRestore();
+      }
+    });
+  });
+
+  it("preserves Panic from probe script loading", async () => {
+    await withConfiguredSshHost(async () => {
+      const panic = new Panic({ message: "ssh probe script invariant failed" });
+      const file = spyOn(Bun, "file").mockImplementation(() => {
+        throw panic;
+      });
+      try {
+        const [settled] = await Promise.allSettled([
+          new SSH().call("ssh.probe", { host: "fakehost" }),
+        ]);
+
+        expect(settled?.status).toBe("rejected");
+        if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+      } finally {
+        file.mockRestore();
+      }
+    });
+  });
+
+  it("preserves Panic from probe spawn", async () => {
+    await withConfiguredSshHost(async () => {
+      const panic = new Panic({ message: "ssh probe spawn invariant failed" });
+      const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+        throw panic;
+      });
+      try {
+        const [settled] = await Promise.allSettled([
+          new SSH().call("ssh.probe", { host: "fakehost" }),
+        ]);
+
+        expect(settled?.status).toBe("rejected");
+        if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+      } finally {
+        spawn.mockRestore();
+      }
+    });
+  });
+
+  for (const source of ["stream", "exit"] as const) {
+    it(`preserves Panic from rejected SSH ${source} settlement`, async () => {
+      await withConfiguredSshHost(async () => {
+        const panic = new Panic({ message: `ssh ${source} invariant failed` });
+        const child = mockSshProcess({
+          stdout: source === "stream" ? rejectedStream(panic) : textStream(),
+          exited: source === "exit" ? rejectedPromise(panic) : Promise.resolve(0),
+        });
+        const spawn = spyOn(Bun, "spawn").mockImplementation(() => child);
+        try {
+          const [settled] = await Promise.allSettled([
+            new SSH().call("ssh.run", { host: "fakehost", cmd: "true" }),
+          ]);
+
+          expect(settled?.status).toBe("rejected");
+          if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+        } finally {
+          spawn.mockRestore();
+        }
+      });
+    });
+  }
+
+  it("keeps ordinary stream and exit failures in a successful command report", async () => {
+    await withConfiguredSshHost(async () => {
+      const child = mockSshProcess({
+        stdout: rejectedStream(new Error("stdout unavailable")),
+        exited: rejectedPromise(new Error("exit unavailable")),
+      });
+      const spawn = spyOn(Bun, "spawn").mockImplementation(() => child);
+      try {
+        expect(await new SSH().call("ssh.run", { host: "fakehost", cmd: "true" })).toMatchObject({
+          status: "ok",
+          value: {
+            ok: false,
+            exitCode: -1,
+            errors: {
+              stdoutRead: "stdout read failed",
+              exitRead: "exit status read failed",
+            },
+          },
+        });
+      } finally {
+        spawn.mockRestore();
+      }
+    });
+  });
+
+  it("keeps an ordinary probe stream failure in a successful report", async () => {
+    await withConfiguredSshHost(async () => {
+      const child = mockSshProcess({ stdout: rejectedStream(new Error("stdout unavailable")) });
+      const spawn = spyOn(Bun, "spawn").mockImplementation(() => child);
+      try {
+        expect(await new SSH().call("ssh.probe", { host: "fakehost" })).toMatchObject({
+          status: "ok",
+          value: {
+            ok: false,
+            parseError: undefined,
+            errors: { stdoutRead: "Error: stdout unavailable" },
+          },
+        });
+      } finally {
+        spawn.mockRestore();
+      }
+    });
+  });
+
+  it("keeps an SSH transport failure as a successful report", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "lilac-level2-ssh-"));
+    const binDir = path.join(root, "bin");
+    const configPath = path.join(root, "ssh-config");
+    const sshPath = path.join(binDir, "ssh");
+    const previousPath = process.env.PATH;
+    const previousConfigPath = process.env.LILAC_SSH_CONFIG_PATH;
+    try {
+      await mkdir(binDir);
+      await writeFile(configPath, "Host fakehost\n  HostName localhost\n", "utf8");
+      await writeFile(
+        sshPath,
+        "#!/usr/bin/env bash\ncat >/dev/null\nprintf 'Permission denied' >&2\nexit 255\n",
+        "utf8",
+      );
+      await chmod(sshPath, 0o755);
+      process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+      process.env.LILAC_SSH_CONFIG_PATH = configPath;
+
+      expect(await new SSH().call("ssh.run", { host: "fakehost", cmd: "true" })).toMatchObject({
+        status: "ok",
+        value: {
+          ok: false,
+          exitCode: 255,
+          transportError: { type: "auth", message: "Permission denied" },
+        },
+      });
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousConfigPath === undefined) delete process.env.LILAC_SSH_CONFIG_PATH;
+      else process.env.LILAC_SSH_CONFIG_PATH = previousConfigPath;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns an explicit timeout as a semantic timeout failure", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "lilac-level2-ssh-"));
+    const binDir = path.join(root, "bin");
+    const configPath = path.join(root, "ssh-config");
+    const sshPath = path.join(binDir, "ssh");
+    const previousPath = process.env.PATH;
+    const previousConfigPath = process.env.LILAC_SSH_CONFIG_PATH;
+    try {
+      await mkdir(binDir);
+      await writeFile(configPath, "Host fakehost\n  HostName localhost\n", "utf8");
+      await writeFile(sshPath, "#!/usr/bin/env bash\ncat >/dev/null\nexec sleep 10\n", "utf8");
+      await chmod(sshPath, 0o755);
+      process.env.PATH = `${binDir}:${previousPath ?? ""}`;
+      process.env.LILAC_SSH_CONFIG_PATH = configPath;
+
+      expect(
+        await new SSH().call("ssh.run", {
+          host: "fakehost",
+          cmd: "true",
+          timeoutMs: 10,
+        }),
+      ).toMatchObject({
+        status: "error",
+        error: { kind: "timeout", code: "ssh_timeout", retryable: true },
+      });
+    } finally {
+      process.env.PATH = previousPath;
+      if (previousConfigPath === undefined) delete process.env.LILAC_SSH_CONFIG_PATH;
+      else process.env.LILAC_SSH_CONFIG_PATH = previousConfigPath;
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

@@ -18,8 +18,93 @@ import {
   decodeToolInput,
   ToolInputValidationError,
 } from "../src/tool-server/validation-error-message";
+import { BridgeFnResponse } from "../src/tool-server/schema";
+import { normalizeSuccessfulToolValue } from "../src/tool-server/create-tool-server";
 
 describe("tool-server boundaries", () => {
+  it("accepts only the strict typed /call response wire", () => {
+    expect(BridgeFnResponse.safeParse({ status: "ok", value: { count: 1 } }).success).toBe(true);
+    expect(
+      BridgeFnResponse.safeParse({
+        status: "error",
+        error: {
+          kind: "usage",
+          code: "invalid_input",
+          message: "Invalid input",
+          retryable: false,
+          details: { field: "path" },
+        },
+      }).success,
+    ).toBe(true);
+
+    for (const invalid of [
+      { isError: false, output: { legacy: true } },
+      { status: "ok", value: null, output: "extra" },
+      {
+        status: "error",
+        error: {
+          kind: "usage",
+          code: "invalid_input",
+          message: "Invalid input",
+          retryable: false,
+          extra: true,
+        },
+      },
+      { status: "error", error: "string-only failure" },
+    ]) {
+      expect(BridgeFnResponse.safeParse(invalid).success).toBe(false);
+    }
+  });
+
+  it("normalizes successful tool values with HTTP JSON semantics", () => {
+    const normalized = normalizeSuccessfulToolValue({
+      ok: true,
+      optional: undefined,
+      items: [undefined, { optional: undefined }],
+      date: new Date("2026-08-17T12:00:00.000Z"),
+      custom: {
+        toJSON() {
+          return { projected: true, optional: undefined };
+        },
+      },
+    });
+
+    expect(normalized.status).toBe("ok");
+    if (normalized.status === "error") throw normalized.error;
+    expect(normalized.value).toEqual({
+      ok: true,
+      items: [null, {}],
+      date: "2026-08-17T12:00:00.000Z",
+      custom: { projected: true },
+    });
+  });
+
+  it("rejects values that cannot enter the successful tool wire", () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const secret = "tool-output-projection-secret";
+    const invalid = [
+      undefined,
+      cyclic,
+      1n,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      {
+        toJSON() {
+          throw new Error(secret);
+        },
+      },
+    ];
+
+    for (const value of invalid) {
+      const normalized = normalizeSuccessfulToolValue(value);
+      expect(normalized.status).toBe("error");
+      if (normalized.status === "ok") throw new Error("expected invalid tool output");
+      expect(normalized.error.message).toBe("Plugin tool output violated the JSON wire contract");
+      expect(normalized.error.message).not.toContain(secret);
+    }
+  });
+
   it("returns a typed validation failure without retaining the raw tool payload", () => {
     const secret = "tool-input-secret";
     const decoded = decodeToolInput({

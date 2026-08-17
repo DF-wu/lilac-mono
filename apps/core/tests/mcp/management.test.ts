@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { Result, TaggedError } from "better-result";
+import { Panic, Result } from "better-result";
 
 import {
   McpOAuthCallbackService,
@@ -21,9 +21,18 @@ import {
 } from "../../src/mcp";
 import { createBuiltinMcpPlugin } from "../../src/plugins/builtin/server-tools";
 import { McpManagement } from "../../src/tool-server/tools/mcp";
-import { ToolInputValidationError } from "../../src/tool-server/validation-error-message";
 
 const temporaryDirectories: string[] = [];
+
+async function callValue(
+  tool: McpManagement,
+  callableId: string,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  const result = await tool.call(callableId, input);
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
+}
 
 async function readConfigValue(configPath: string) {
   const result = await readMcpConfigFile(configPath);
@@ -206,7 +215,7 @@ describe("MCP management calls", () => {
       },
     ];
 
-    const added = await setup.tool.call("mcp.add", {
+    const added = await callValue(setup.tool, "mcp.add", {
       serverId: "docs",
       transport: "http",
       url: "https://mcp.example.test/service",
@@ -227,31 +236,31 @@ describe("MCP management calls", () => {
       headers: {},
     });
 
-    expect(await setup.tool.call("mcp.list", {})).toEqual({
+    expect(await callValue(setup.tool, "mcp.list", {})).toEqual({
       servers: [{ serverId: "docs", transport: "http", authentication: "none" }],
     });
-    expect(await setup.tool.call("mcp.status", { serverId: "docs" })).toEqual({
+    expect(await callValue(setup.tool, "mcp.status", { serverId: "docs" })).toEqual({
       config: { status: "valid" },
       statuses: [{ serverId: "docs", transport: "http", status: "available", toolCount: 3 }],
       callback: { status: "listening", hostname: "localhost", port: 1456 },
     });
-    expect(await setup.tool.call("mcp.status", {})).toEqual({
+    expect(await callValue(setup.tool, "mcp.status", {})).toEqual({
       config: { status: "valid" },
       statuses: setup.registry.statuses,
       callback: { status: "listening", hostname: "localhost", port: 1456 },
     });
 
-    expect(await setup.tool.call("mcp.auth", { serverId: "docs" })).toEqual({
+    expect(await callValue(setup.tool, "mcp.auth", { serverId: "docs" })).toEqual({
       status: "authorization_required",
       authorizationUrl: "https://auth.example.test/authorize?state=one-time-state",
       callbackUrl: "http://localhost:1456/mcp/oauth/callback",
     });
     expect(setup.providers.authorizationCalls).toEqual(["docs"]);
 
-    expect(await setup.tool.call("mcp.reload", {})).toEqual({
+    expect(await callValue(setup.tool, "mcp.reload", {})).toEqual({
       reload: [{ serverId: "all", reconciliation: "unchanged", result: "retained" }],
     });
-    const removed = await setup.tool.call("mcp.remove", { serverId: "docs" });
+    const removed = await callValue(setup.tool, "mcp.remove", { serverId: "docs" });
     expect(removed).toEqual({
       mutation: { type: "remove", serverId: "docs", changed: true, result: "removed" },
       reload: [
@@ -280,7 +289,7 @@ describe("MCP management calls", () => {
     };
 
     await setup.tool.call("mcp.add", input);
-    const unchanged = await setup.tool.call("mcp.add", input);
+    const unchanged = await callValue(setup.tool, "mcp.add", input);
     expect(unchanged).toMatchObject({
       mutation: { changed: false, result: "unchanged" },
     });
@@ -320,6 +329,23 @@ describe("MCP management calls", () => {
       setup.providers.reconciledConfigs.map((config) => Object.keys(config.servers).sort()),
     ).toEqual([["alpha"], ["alpha", "beta"], ["beta"]]);
     expect(setup.registry.reloadCalls).toEqual(["alpha", "beta", "alpha"]);
+  });
+
+  it("preserves Panic from MCP management capture", async () => {
+    const setup = await createTool();
+    const panic = new Panic({ message: "MCP reconciliation invariant failed" });
+    setup.providers.reconcile = () => {
+      throw panic;
+    };
+
+    await expect(
+      setup.tool.call("mcp.add", {
+        serverId: "private",
+        transport: "http",
+        url: "https://mcp.example.test/service?token=must-not-leak",
+        headers: { Authorization: "Bearer must-not-leak" },
+      }),
+    ).rejects.toBeInstanceOf(Panic);
   });
 
   it("waits for deferred registry initialization before reconciling providers and reloading", async () => {
@@ -398,12 +424,12 @@ describe("MCP management calls", () => {
     expect(setup.providers.authorizationCalls).toEqual([]);
 
     portAvailable = true;
-    expect(await tool.call("mcp.auth", { serverId: "docs" })).toMatchObject({
+    expect(await callValue(tool, "mcp.auth", { serverId: "docs" })).toMatchObject({
       status: "authorization_required",
     });
     expect(bindAttempts).toBe(2);
     expect(setup.providers.authorizationCalls).toEqual(["docs"]);
-    expect(await tool.call("mcp.status", {})).toMatchObject({
+    expect(await callValue(tool, "mcp.status", {})).toMatchObject({
       callback: { status: "listening", hostname: "localhost", port: 1456 },
     });
 
@@ -425,9 +451,14 @@ describe("MCP management calls", () => {
       configPath: setup.configPath,
     });
 
-    await expect(tool.call("mcp.auth", { serverId: "docs" })).rejects.toThrow(
-      "MCP OAuth callback listener is unavailable on localhost:1456. Ensure the port is free, then retry mcp.auth.",
-    );
+    expect(await tool.call("mcp.auth", { serverId: "docs" })).toMatchObject({
+      status: "error",
+      error: {
+        kind: "unavailable",
+        message:
+          "MCP OAuth callback listener is unavailable on localhost:1456. Ensure the port is free, then retry mcp.auth.",
+      },
+    });
     expect(setup.providers.authorizationCalls).toEqual([]);
     expect(callback.getStatus()).toEqual({
       status: "unavailable",
@@ -440,34 +471,38 @@ describe("MCP management calls", () => {
   it("strictly rejects malformed and nested add inputs", async () => {
     const setup = await createTool();
 
-    await expect(
-      setup.tool.call("mcp.add", {
+    expect(
+      await setup.tool.call("mcp.add", {
         serverId: "docs",
         transport: "http",
         url: "not-a-url",
       }),
-    ).rejects.toBeInstanceOf(ToolInputValidationError);
-    await expect(
-      setup.tool.call("mcp.add", {
+    ).toMatchObject({ status: "error", error: { kind: "usage", code: "invalid_input" } });
+    expect(
+      await setup.tool.call("mcp.add", {
         serverId: "docs",
         transport: "stdio",
         command: "bun",
         url: "https://unexpected.example.test",
       }),
-    ).rejects.toBeInstanceOf(ToolInputValidationError);
-    await expect(
-      setup.tool.call("mcp.add", {
+    ).toMatchObject({ status: "error", error: { kind: "usage", code: "invalid_input" } });
+    expect(
+      await setup.tool.call("mcp.add", {
         serverId: "docs",
         server: {
           transport: "http",
           url: "https://mcp.example.test",
         },
       }),
-    ).rejects.toBeInstanceOf(ToolInputValidationError);
-    await expect(setup.tool.call("mcp.auth", {})).rejects.toBeInstanceOf(ToolInputValidationError);
-    await expect(setup.tool.call("mcp.list", { verbose: true })).rejects.toBeInstanceOf(
-      ToolInputValidationError,
-    );
+    ).toMatchObject({ status: "error", error: { kind: "usage", code: "invalid_input" } });
+    expect(await setup.tool.call("mcp.auth", {})).toMatchObject({
+      status: "error",
+      error: { kind: "usage", code: "invalid_input" },
+    });
+    expect(await setup.tool.call("mcp.list", { verbose: true })).toMatchObject({
+      status: "error",
+      error: { kind: "usage", code: "invalid_input" },
+    });
     expect(setup.providers.reconciledConfigs).toHaveLength(0);
     expect(setup.registry.reloadCalls).toHaveLength(0);
   });
@@ -480,23 +515,16 @@ describe("MCP management calls", () => {
       "utf8",
     );
 
-    let failure: unknown;
-    try {
-      await setup.tool.call("mcp.list", {});
-    } catch (error) {
-      failure = error;
-    }
-
-    expect(failure).toBeInstanceOf(Error);
-    expect(TaggedError.is(failure)).toBe(false);
-    expect(failure).not.toHaveProperty("status");
-    expect(failure).not.toHaveProperty("_tag");
-    expect(failure).not.toHaveProperty("cause");
-    expect(JSON.stringify(failure)).toBe("{}");
-    if (failure instanceof Error) {
-      expect(failure.message).toContain("Invalid MCP configuration");
-      expect(failure.message).not.toContain("cause");
-    }
+    const failure = await setup.tool.call("mcp.list", {});
+    expect(failure).toMatchObject({
+      status: "error",
+      error: {
+        kind: "unavailable",
+        code: "mcp_unavailable",
+        message: expect.stringContaining("Invalid MCP configuration"),
+      },
+    });
+    expect(JSON.stringify(failure)).not.toContain("cause");
   });
 
   it("retains the OAuth credential file when removing its server", async () => {
@@ -533,15 +561,15 @@ describe("MCP management calls", () => {
     const setup = await createTool();
     const secrets = ["header-secret", "url-query-secret", "callback-secret", "one-time-state"];
 
-    const added = await setup.tool.call("mcp.add", {
+    const added = await callValue(setup.tool, "mcp.add", {
       serverId: "private",
       transport: "http",
       url: "https://mcp.example.test/service?token=url-query-secret",
       headers: { Authorization: "Bearer header-secret" },
     });
     await setup.tool.call("mcp.auth", { serverId: "private" });
-    const list = await setup.tool.call("mcp.list", {});
-    const status = await setup.tool.call("mcp.status", {});
+    const list = await callValue(setup.tool, "mcp.list", {});
+    const status = await callValue(setup.tool, "mcp.status", {});
     const serializedSafeOutputs = JSON.stringify({ added, list, status });
 
     for (const secret of secrets) expect(serializedSafeOutputs).not.toContain(secret);
@@ -558,7 +586,7 @@ describe("MCP management calls", () => {
         "Invalid MCP configuration: servers.docs.transport is invalid. Fix the file, then run mcp.reload.",
     };
 
-    expect(await setup.tool.call("mcp.status", {})).toEqual({
+    expect(await callValue(setup.tool, "mcp.status", {})).toEqual({
       config: setup.registry.configStatus,
       statuses: [],
       callback: { status: "listening", hostname: "localhost", port: 1456 },

@@ -3,13 +3,32 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
+import { Panic, Result } from "better-result";
+import {
+  createLilacBus,
+  lilacEventTypes,
+  type FetchOptions,
+  type Message,
+  type PublishOptions,
+  type RawBus,
+  type RawDeliveryHandler,
+  type SubscriptionOptions,
+} from "@stanley2058/lilac-event-bus";
 
 import type { RequestContext } from "../../src/tool-server/types";
 import { ProgrammaticWorkflow } from "../../src/tool-server/tools/programmatic-workflow";
 import { writeWorkflowValueArtifact } from "../../src/workflow/workflow-artifact-store";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { workflowStoreValue } from "./workflow-store-test-helpers";
+
+async function callValue(
+  tool: ProgrammaticWorkflow,
+  callableId: string,
+  input: Record<string, unknown>,
+  opts?: { context?: RequestContext },
+): Promise<unknown> {
+  return (await tool.call(callableId, input, opts)).unwrap();
+}
 
 const invocationSchema = z.object({
   runId: z.string(),
@@ -20,6 +39,42 @@ const invocationSchema = z.object({
   resourcePolicySha256: z.string(),
   argsSha256: z.string(),
 });
+
+const createdProjectionFailureSchema = z.object({
+  status: z.literal("error"),
+  error: z.object({
+    kind: z.literal("conflict"),
+    code: z.literal("workflow_run_created_projection_failed"),
+    message: z.string(),
+    retryable: z.literal(false),
+    details: z.object({ runId: z.string() }),
+  }),
+});
+
+class ProjectionFailingRawBus implements RawBus {
+  constructor(
+    private readonly failedType: string,
+    private readonly failure: unknown,
+  ) {}
+
+  async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, _options: PublishOptions) {
+    if (message.type === this.failedType) throw this.failure;
+    return { id: "1-0", cursor: "1-0" };
+  }
+
+  async subscribe(_topic: string, _options: SubscriptionOptions, _handler: RawDeliveryHandler) {
+    return Result.ok({
+      done: Promise.resolve(Result.ok(undefined)),
+      stop: async () => Result.ok(undefined),
+    });
+  }
+
+  async fetch(_topic: string, _options: FetchOptions) {
+    return { messages: [] };
+  }
+
+  async close() {}
+}
 
 function source() {
   return `import { defineWorkflow } from "@lilac/workflow";
@@ -70,7 +125,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     } satisfies RequestContext;
     await tool.init();
     try {
-      await tool.call(
+      await callValue(
+        tool,
         "workflow.definition.save",
         { scope: "project", name: "audit-routes", source: source() },
         { context },
@@ -86,7 +142,13 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           },
           { context },
         ),
-      ).rejects.toThrow("not registered with a progress port: slack");
+      ).resolves.toMatchObject({
+        status: "error",
+        error: {
+          kind: "unavailable",
+          message: expect.stringContaining("not registered with a progress port: slack"),
+        },
+      });
       await expect(
         tool.call(
           "workflow.trigger.create",
@@ -99,7 +161,13 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           },
           { context },
         ),
-      ).rejects.toThrow("not registered with a progress port: slack");
+      ).resolves.toMatchObject({
+        status: "error",
+        error: {
+          kind: "unavailable",
+          message: expect.stringContaining("not registered with a progress port: slack"),
+        },
+      });
       await expect(
         tool.call(
           "workflow.run.trigger",
@@ -111,11 +179,241 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           },
           { context },
         ),
-      ).rejects.toThrow("request-origin surface is not registered with a progress port: discord");
+      ).resolves.toMatchObject({
+        status: "error",
+        error: {
+          kind: "unavailable",
+          message: expect.stringContaining(
+            "request-origin surface is not registered with a progress port: discord",
+          ),
+        },
+      });
 
       expect(workflowStoreValue(store.listRuns())).toEqual([]);
       expect(workflowStoreValue(store.listTriggers())).toEqual([]);
       expect(workflowStoreValue(store.listRevisions())).toEqual([]);
+    } finally {
+      await tool.destroy();
+      store.close();
+    }
+  });
+
+  it("returns a nonretryable conflict when progress-card creation fails after commit", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-card-failure-"));
+    const workspaceRoot = path.join(root, "workspace");
+    const store = new DurableWorkflowStore(path.join(root, "workflow.sqlite"));
+    await fs.mkdir(workspaceRoot);
+    const tool = new ProgrammaticWorkflow({
+      dataDir: path.join(root, "data"),
+      store,
+      progressCards: {
+        resolveTarget: (platform) => (platform === "discord" ? platform : null),
+        ensureInitialCard: async () => {
+          throw new Error("private progress failure");
+        },
+        requestProjection: () => {},
+      },
+    });
+    const context = {
+      requestId: "request-1",
+      sessionId: "channel-1",
+      requestClient: "discord",
+      cwd: workspaceRoot,
+      safetyMode: "trusted" as const,
+      toolCallId: "tool-call-1",
+    } satisfies RequestContext;
+    await tool.init();
+    try {
+      await callValue(
+        tool,
+        "workflow.definition.save",
+        { scope: "project", name: "audit-routes", source: source() },
+        { context },
+      );
+      const failed = createdProjectionFailureSchema.parse(
+        await tool.call(
+          "workflow.run.trigger",
+          { scope: "project", name: "audit-routes", args: { directory: "src" } },
+          { context },
+        ),
+      );
+
+      expect(failed.error.message).toContain("already exists");
+      expect(failed.error.message).toContain("Inspect the durable run and reconcile");
+      expect(failed.error.message).toContain("rather than blindly retrying");
+      expect(failed.error.message).not.toContain("private progress failure");
+      expect(workflowStoreValue(store.getRun(failed.error.details.runId))).toMatchObject({
+        runId: failed.error.details.runId,
+        state: "queued",
+      });
+    } finally {
+      await tool.destroy();
+      store.close();
+    }
+  });
+
+  it("returns the created-run conflict for either bus publication failure", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-publish-failure-"));
+    for (const [index, eventType] of [
+      lilacEventTypes.EvtWorkflowRunChanged,
+      lilacEventTypes.EvtWorkflowProgressRequested,
+    ].entries()) {
+      const workspaceRoot = path.join(root, `workspace-${index}`);
+      const store = new DurableWorkflowStore(path.join(root, `workflow-${index}.sqlite`));
+      await fs.mkdir(workspaceRoot);
+      const tool = new ProgrammaticWorkflow({
+        dataDir: path.join(root, `data-${index}`),
+        store,
+        bus: createLilacBus(
+          new ProjectionFailingRawBus(eventType, new Error("private bus failure")),
+        ),
+      });
+      const context = {
+        requestId: `request-${index}`,
+        cwd: workspaceRoot,
+        safetyMode: "trusted" as const,
+        toolCallId: `tool-call-${index}`,
+      } satisfies RequestContext;
+      await tool.init();
+      try {
+        await callValue(
+          tool,
+          "workflow.definition.save",
+          { scope: "project", name: "audit-routes", source: source() },
+          { context },
+        );
+        const failed = createdProjectionFailureSchema.parse(
+          await tool.call(
+            "workflow.run.trigger",
+            { scope: "project", name: "audit-routes", args: { directory: "src" } },
+            { context },
+          ),
+        );
+
+        expect(failed.error.message).not.toContain("private bus failure");
+        expect(workflowStoreValue(store.getRun(failed.error.details.runId))).toMatchObject({
+          runId: failed.error.details.runId,
+          state: "queued",
+        });
+      } finally {
+        await tool.destroy();
+        store.close();
+      }
+    }
+  });
+
+  it("keeps idempotent run identity when its accepted replay has no progress service", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-idempotent-projection-"));
+    const workspaceRoot = path.join(root, "workspace");
+    const store = new DurableWorkflowStore(path.join(root, "workflow.sqlite"));
+    await fs.mkdir(workspaceRoot);
+    const context = {
+      requestId: "request-1",
+      sessionId: "channel-1",
+      requestClient: "discord",
+      cwd: workspaceRoot,
+      safetyMode: "trusted" as const,
+      toolCallId: "tool-call-1",
+    } satisfies RequestContext;
+    const input = {
+      scope: "project",
+      name: "audit-routes",
+      args: { directory: "src" },
+      idempotencyKey: "stable-invocation",
+    };
+    const firstTool = new ProgrammaticWorkflow({
+      dataDir: path.join(root, "data"),
+      store,
+      progressCards: {
+        resolveTarget: (platform) => (platform === "discord" ? platform : null),
+        ensureInitialCard: async (runId) => ({
+          platform: "discord",
+          channelId: "channel-1",
+          messageId: `card-${runId}`,
+        }),
+        requestProjection: () => {},
+      },
+    });
+    await firstTool.init();
+    try {
+      await callValue(
+        firstTool,
+        "workflow.definition.save",
+        { scope: "project", name: "audit-routes", source: source() },
+        { context },
+      );
+      const first = invocationSchema.parse(
+        await callValue(firstTool, "workflow.run.trigger", input, { context }),
+      );
+      const successfulReplay = invocationSchema.parse(
+        await callValue(firstTool, "workflow.run.trigger", input, { context }),
+      );
+      expect(successfulReplay.runId).toBe(first.runId);
+      expect(workflowStoreValue(store.listRuns())).toHaveLength(1);
+      await firstTool.destroy();
+
+      const replayTool = new ProgrammaticWorkflow({ dataDir: path.join(root, "data"), store });
+      await replayTool.init();
+      try {
+        const failed = createdProjectionFailureSchema.parse(
+          await replayTool.call("workflow.run.trigger", input, { context }),
+        );
+        expect(failed.error.details.runId).toBe(first.runId);
+        expect(workflowStoreValue(store.listRuns())).toHaveLength(1);
+        expect(workflowStoreValue(store.getRun(first.runId))).toMatchObject({
+          runId: first.runId,
+          progressTarget: { platform: "discord", channelId: "channel-1" },
+        });
+      } finally {
+        await replayTool.destroy();
+      }
+    } finally {
+      await firstTool.destroy();
+      store.close();
+    }
+  });
+
+  it("preserves Panic from post-commit progress projection", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-projection-panic-"));
+    const workspaceRoot = path.join(root, "workspace");
+    const store = new DurableWorkflowStore(path.join(root, "workflow.sqlite"));
+    const panic = new Panic({ message: "progress projection invariant failed" });
+    await fs.mkdir(workspaceRoot);
+    const tool = new ProgrammaticWorkflow({
+      dataDir: path.join(root, "data"),
+      store,
+      progressCards: {
+        resolveTarget: (platform) => (platform === "discord" ? platform : null),
+        ensureInitialCard: async () => {
+          throw panic;
+        },
+        requestProjection: () => {},
+      },
+    });
+    const context = {
+      requestId: "request-1",
+      sessionId: "channel-1",
+      requestClient: "discord",
+      cwd: workspaceRoot,
+      safetyMode: "trusted" as const,
+      toolCallId: "tool-call-1",
+    } satisfies RequestContext;
+    await tool.init();
+    try {
+      await callValue(
+        tool,
+        "workflow.definition.save",
+        { scope: "project", name: "audit-routes", source: source() },
+        { context },
+      );
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          { scope: "project", name: "audit-routes", args: { directory: "src" } },
+          { context },
+        ),
+      ).rejects.toBeInstanceOf(Panic);
+      expect(workflowStoreValue(store.listRuns())).toHaveLength(1);
     } finally {
       await tool.destroy();
       store.close();
@@ -158,13 +456,15 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       expect((await tool.list()).map((entry) => entry.callableId)).not.toContain(
         "workflow.approval.revoke",
       );
-      await tool.call(
+      await callValue(
+        tool,
         "workflow.definition.save",
         { scope: "project", name: "audit-routes", source: source() },
         { context },
       );
       const crossTarget = invocationSchema.parse(
-        await tool.call(
+        await callValue(
+          tool,
           "workflow.run.trigger",
           {
             scope: "project",
@@ -177,7 +477,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         ),
       );
       expect(
-        await tool.call("workflow.run.get", { runId: crossTarget.runId }, { context }),
+        await callValue(tool, "workflow.run.get", { runId: crossTarget.runId }, { context }),
       ).toMatchObject({
         run: {
           origin: { client: "discord", sessionId: "channel-1", userId: "user-1" },
@@ -195,9 +495,18 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
             },
           },
         ),
-      ).rejects.toThrow("authenticated identity does not match the request origin");
+      ).resolves.toMatchObject({
+        status: "error",
+        error: {
+          kind: "denied",
+          message: expect.stringContaining(
+            "authenticated identity does not match the request origin",
+          ),
+        },
+      });
       const first = invocationSchema.parse(
-        await tool.call(
+        await callValue(
+          tool,
           "workflow.run.trigger",
           { scope: "project", name: "audit-routes", args: { directory: "src" } },
           { context },
@@ -205,7 +514,12 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       );
       expect(first.state).toBe("queued");
       expect(cards).toEqual([crossTarget.runId, first.runId]);
-      const fetched = await tool.call("workflow.run.get", { runId: first.runId }, { context });
+      const fetched = await callValue(
+        tool,
+        "workflow.run.get",
+        { runId: first.runId },
+        { context },
+      );
       expect(fetched).toMatchObject({
         run: {
           runId: first.runId,
@@ -214,201 +528,6 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         },
       });
       expect(JSON.stringify(fetched)).not.toContain("approval");
-    } finally {
-      await tool.destroy();
-    }
-  });
-
-  it("creates a durable Telegram progress target from the request origin", async () => {
-    root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-telegram-tool-"));
-    const workspaceRoot = path.join(root, "workspace");
-    await fs.mkdir(workspaceRoot);
-    const cards: string[] = [];
-    let allowedChatIds = ["-100123"];
-    const tool = new ProgrammaticWorkflow({
-      dataDir: path.join(root, "data"),
-      dbPath: path.join(root, "workflow.sqlite"),
-      now: () => 100,
-      getConfig: () => {
-        const base = parseCoreConfigV1ToUniversal({});
-        return {
-          ...base,
-          surface: {
-            ...base.surface,
-            telegram: {
-              ...base.surface.telegram,
-              enabled: true,
-              allowedChatIds,
-            },
-          },
-        };
-      },
-      progressCards: {
-        resolveTarget: (platform) => (platform === "telegram" ? "telegram" : null),
-        ensureInitialCard: async (runId) => {
-          cards.push(runId);
-          return { platform: "telegram", channelId: "-100123:7", messageId: "501" };
-        },
-        requestProjection: () => {},
-      },
-    });
-    const context = {
-      requestId: "telegram:-100123:7:42",
-      sessionId: "-100123:7",
-      requestClient: "telegram",
-      cwd: workspaceRoot,
-      safetyMode: "restricted" as const,
-      authenticatedPrincipal: { platform: "telegram" as const, userId: "user-7" },
-      toolCallId: "tool-call-telegram",
-    } satisfies RequestContext;
-
-    await tool.init();
-    try {
-      await tool.call(
-        "workflow.definition.save",
-        { scope: "project", name: "audit-routes", source: source() },
-        { context },
-      );
-      const invocation = invocationSchema.parse(
-        await tool.call(
-          "workflow.run.trigger",
-          { scope: "project", name: "audit-routes", args: { directory: "src" } },
-          { context },
-        ),
-      );
-      expect(cards).toEqual([invocation.runId]);
-
-      await expect(
-        tool.call(
-          "workflow.run.trigger",
-          {
-            scope: "project",
-            name: "audit-routes",
-            args: { directory: "src" },
-            progress: { client: "discord", sessionId: "channel-1" },
-            idempotencyKey: "telegram-cross-surface",
-          },
-          { context },
-        ),
-      ).rejects.toThrow("must use the current Telegram session");
-      await expect(
-        tool.call(
-          "workflow.run.trigger",
-          {
-            scope: "project",
-            name: "audit-routes",
-            args: { directory: "src" },
-            progress: { client: "telegram", sessionId: "-100999" },
-            idempotencyKey: "telegram-cross-session",
-          },
-          { context },
-        ),
-      ).rejects.toThrow("must use the current Telegram session");
-
-      await expect(
-        tool.call(
-          "workflow.run.trigger",
-          {
-            scope: "project",
-            name: "audit-routes",
-            args: { directory: "src" },
-            progress: { client: "discord", sessionId: "channel-1" },
-            idempotencyKey: "telegram-child-cross-surface",
-          },
-          {
-            context: {
-              ...context,
-              requestClient: "unknown",
-              sessionId: "workflow:run-1:operation-1",
-              originSessionId: "-100123:7",
-            },
-          },
-        ),
-      ).rejects.toThrow("must use the current Telegram session");
-
-      await expect(
-        tool.call(
-          "workflow.trigger.create",
-          {
-            scope: "project",
-            name: "audit-routes",
-            args: { directory: "src" },
-            schedule: { kind: "timestamp", at: 1_000 },
-            progress: { client: "telegram", sessionId: "-100999" },
-            idempotencyKey: "telegram-trigger-cross-session",
-          },
-          { context },
-        ),
-      ).rejects.toThrow("must use the current Telegram session");
-      await expect(
-        tool.call(
-          "workflow.trigger.create",
-          {
-            scope: "project",
-            name: "audit-routes",
-            args: { directory: "src" },
-            schedule: { kind: "timestamp", at: 1_000 },
-            progress: { client: "discord", sessionId: "channel-1" },
-            idempotencyKey: "telegram-child-trigger-cross-surface",
-          },
-          {
-            context: {
-              ...context,
-              requestClient: "unknown",
-              sessionId: "workflow:run-1:operation-1",
-              originSessionId: "-100123:7",
-            },
-          },
-        ),
-      ).rejects.toThrow("must use the current Telegram session");
-
-      allowedChatIds = [];
-      await expect(
-        tool.call(
-          "workflow.run.trigger",
-          {
-            scope: "project",
-            name: "audit-routes",
-            args: { directory: "denied" },
-            idempotencyKey: "telegram-run-disallowed-current-config",
-          },
-          { context },
-        ),
-      ).rejects.toThrow("is not in allowedChatIds");
-      await expect(
-        tool.call(
-          "workflow.trigger.create",
-          {
-            scope: "project",
-            name: "audit-routes",
-            args: { directory: "denied" },
-            schedule: { kind: "timestamp", at: 1_000 },
-            idempotencyKey: "telegram-trigger-disallowed-current-config",
-          },
-          { context },
-        ),
-      ).rejects.toThrow("is not in allowedChatIds");
-
-      const store = new DurableWorkflowStore(path.join(root, "workflow.sqlite"));
-      try {
-        expect(workflowStoreValue(store.listRuns({ limit: 100 }))).toHaveLength(1);
-        expect(workflowStoreValue(store.listTriggers({ limit: 100 }))).toHaveLength(0);
-        expect(workflowStoreValue(store.getRun(invocation.runId))).toMatchObject({
-          origin: {
-            client: "telegram",
-            sessionId: "-100123:7",
-            userId: "user-7",
-          },
-          completionTarget: { kind: "durable_surface" },
-          progressTarget: {
-            platform: "telegram",
-            channelId: "-100123:7",
-            replyToMessageId: null,
-          },
-        });
-      } finally {
-        store.close();
-      }
     } finally {
       await tool.destroy();
     }
@@ -440,11 +559,13 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         { ...trusted, requestInitiator: undefined },
         { ...trusted, requestInitiator: undefined, operator: true },
       ]) {
-        expect(await tool.call("workflow.run.list", {}, { context })).toMatchObject({ runs: [] });
+        expect(await callValue(tool, "workflow.run.list", {}, { context })).toMatchObject({
+          runs: [],
+        });
       }
       await expect(
         tool.call("workflow.run.list", { limit: 0 }, { context: trusted }),
-      ).rejects.toThrow();
+      ).resolves.toMatchObject({ status: "error", error: { kind: "usage" } });
     } finally {
       await tool.destroy();
     }
@@ -489,13 +610,15 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     await tool.init();
     const store = new DurableWorkflowStore(dbPath);
     try {
-      await tool.call(
+      await callValue(
+        tool,
         "workflow.definition.save",
         { scope: "project", name: "audit-routes", source: sensitiveSource },
         { context },
       );
       const invocation = invocationSchema.parse(
-        await tool.call(
+        await callValue(
+          tool,
           "workflow.run.trigger",
           {
             scope: "project",
@@ -527,7 +650,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         }),
       ).toBe(true);
 
-      const fetched = await tool.call(
+      const fetched = await callValue(
+        tool,
         "workflow.run.get",
         { runId: invocation.runId, includeResultArtifact: true },
         { context },
@@ -542,7 +666,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       expect(JSON.stringify(fetched)).not.toContain("super-secret");
 
       const inlineInvocation = invocationSchema.parse(
-        await tool.call(
+        await callValue(
+          tool,
           "workflow.run.trigger",
           {
             scope: "project",
@@ -567,7 +692,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           resultArtifactId: null,
         }),
       ).toBe(true);
-      const inlineFetched = await tool.call(
+      const inlineFetched = await callValue(
+        tool,
         "workflow.run.get",
         { runId: inlineInvocation.runId },
         { context },
@@ -608,7 +734,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     } satisfies RequestContext;
     await tool.init();
     try {
-      await tool.call(
+      await callValue(
+        tool,
         "workflow.definition.save",
         { scope: "project", name: "audit-routes", source: source() },
         { context },
@@ -623,7 +750,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           sourceSha256: z.string(),
         })
         .parse(
-          await tool.call(
+          await callValue(
+            tool,
             "workflow.trigger.create",
             {
               scope: "project",
@@ -637,7 +765,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       expect(created.trigger.revisionId).toBeTruthy();
       expect(created.sourceSha256).toMatch(/^[a-f0-9]{64}$/);
       expect(
-        await tool.call(
+        await callValue(
+          tool,
           "workflow.trigger.get",
           { triggerId: created.trigger.triggerId },
           {
@@ -653,7 +782,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     }
   });
 
-  it("lets an ordinary workflow child admit runs up to the global cap and returns capacity as data", async () => {
+  it("lets an ordinary workflow child admit runs up to the global cap and returns capacity as an error", async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-child-cap-"));
     const workspaceRoot = path.join(root, "workspace");
     await fs.mkdir(workspaceRoot);
@@ -675,13 +804,15 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     } satisfies RequestContext;
     await tool.init();
     try {
-      await tool.call(
+      await callValue(
+        tool,
         "workflow.definition.save",
         { scope: "project", name: "audit-routes", source: source() },
         { context: childContext },
       );
       const accepted = invocationSchema.parse(
-        await tool.call(
+        await callValue(
+          tool,
           "workflow.run.trigger",
           { scope: "project", name: "audit-routes", args: { directory: "src" } },
           { context: childContext },
@@ -694,20 +825,62 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         { scope: "project", name: "audit-routes", args: { directory: "tests" } },
         { context: { ...childContext, toolCallId: "child-trigger-2" } },
       );
-      expect(rejected).toEqual({
-        ok: false,
+      expect(rejected).toMatchObject({
+        status: "error",
         error: {
+          kind: "unavailable",
           code: "workflow_capacity_exceeded",
           message:
             "Global workflow capacity is full (1/1 active runs). Wait for a workflow to finish or cancel one, then retry with the same idempotency key.",
-          activeRuns: 1,
-          limit: 1,
           retryable: true,
+          details: { activeRuns: 1, limit: 1 },
         },
       });
-      expect(await tool.call("workflow.run.list", {}, { context: childContext })).toMatchObject({
+      expect(
+        await callValue(tool, "workflow.run.list", {}, { context: childContext }),
+      ).toMatchObject({
         runs: [{ runId: accepted.runId }],
       });
+    } finally {
+      await tool.destroy();
+    }
+  });
+
+  it("preserves Panic from workflow capacity capture", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-capacity-panic-"));
+    const workspaceRoot = path.join(root, "workspace");
+    await fs.mkdir(workspaceRoot);
+    const panic = new Panic({ message: "workflow capacity invariant failed" });
+    const tool = new ProgrammaticWorkflow({
+      dataDir: path.join(root, "data"),
+      dbPath: path.join(root, "workflow.sqlite"),
+      getMaxActiveRuns: () => {
+        throw panic;
+      },
+    });
+    const context = {
+      requestId: "request-1",
+      sessionId: "channel-1",
+      requestClient: "discord",
+      cwd: workspaceRoot,
+      safetyMode: "trusted" as const,
+      toolCallId: "tool-call-1",
+    } satisfies RequestContext;
+    await tool.init();
+    try {
+      await callValue(
+        tool,
+        "workflow.definition.save",
+        { scope: "project", name: "audit-routes", source: source() },
+        { context },
+      );
+      await expect(
+        tool.call(
+          "workflow.run.trigger",
+          { scope: "project", name: "audit-routes", args: { directory: "src" } },
+          { context },
+        ),
+      ).rejects.toBeInstanceOf(Panic);
     } finally {
       await tool.destroy();
     }

@@ -210,13 +210,14 @@ export type RefreshCodexOAuthTokensOptions = {
   fetch?: CodexOAuthFetch;
   writeTokens?: (tokens: CodexOAuthTokens) => Promise<void>;
   now?: () => number;
+  signal?: AbortSignal;
 };
 
 export async function refreshCodexOAuthTokens(
   current: CodexOAuthTokens,
   options: RefreshCodexOAuthTokensOptions = {},
 ): Promise<CodexOAuthTokens> {
-  const tokens = await refreshAccessToken(current.refresh, options.fetch);
+  const tokens = await refreshAccessToken(current.refresh, options.fetch, options.signal);
   const next: CodexOAuthTokens = {
     type: "oauth",
     refresh: tokens.refresh_token ?? current.refresh,
@@ -312,6 +313,26 @@ export type CreateCodexOAuthProviderOptions = {
   writeTokens?: (tokens: CodexOAuthTokens) => Promise<void>;
 };
 
+const CODEX_REFRESH_CALLER_ABORTED = Symbol("codex-refresh-caller-aborted");
+
+async function waitForCodexRefresh(
+  refresh: Promise<void>,
+  signal: AbortSignal,
+): Promise<void | typeof CODEX_REFRESH_CALLER_ABORTED> {
+  if (signal.aborted) return CODEX_REFRESH_CALLER_ABORTED;
+  let removeAbortListener = () => {};
+  const aborted = new Promise<typeof CODEX_REFRESH_CALLER_ABORTED>((resolve) => {
+    const onAbort = () => resolve(CODEX_REFRESH_CALLER_ABORTED);
+    removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([refresh, aborted]);
+  } finally {
+    removeAbortListener();
+  }
+}
+
 export function createCodexOAuthProvider(options: CreateCodexOAuthProviderOptions = {}) {
   let refreshInFlight: Promise<void> | null = null;
   const readTokens = options.readTokens ?? readCodexTokens;
@@ -395,7 +416,13 @@ export function createCodexOAuthProvider(options: CreateCodexOAuthProviderOption
             refreshInFlight = null;
           });
         }
-        await refreshInFlight;
+        const callerSignal = init?.signal ?? undefined;
+        if (!callerSignal) {
+          await refreshInFlight;
+        } else {
+          const outcome = await waitForCodexRefresh(refreshInFlight, callerSignal);
+          if (outcome === CODEX_REFRESH_CALLER_ABORTED) throw callerSignal.reason;
+        }
       };
 
       if (shouldRefreshCodexOAuthTokens(auth, now)) {

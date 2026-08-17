@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +18,41 @@ import {
 import type { RequestContext } from "../src/tool-server/types";
 import { Attachment } from "../src/tool-server/tools/attachment";
 import { resolveRestrictedSessionTmpDir } from "../src/shared/attachment-utils";
+import { Panic } from "better-result";
+
+type MockFetch = (
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+) => ReturnType<typeof fetch>;
+
+let restoreFetch: (() => void) | undefined;
+
+function installMockFetch(handler: MockFetch): void {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = Object.assign(handler, { preconnect: originalFetch.preconnect });
+  restoreFetch = () => {
+    globalThis.fetch = originalFetch;
+    restoreFetch = undefined;
+  };
+}
+
+afterEach(() => {
+  restoreFetch?.();
+});
+
+async function callValue(
+  tool: Attachment,
+  ...args: Parameters<Attachment["call"]>
+): Promise<unknown> {
+  const outcome = (await tool.call(...args)).match<
+    { readonly value: unknown } | { readonly error: { readonly message: string } }
+  >({
+    ok: (value) => ({ value }),
+    err: (error) => ({ error }),
+  });
+  if ("error" in outcome) throw new Error(outcome.error.message);
+  return outcome.value;
+}
 
 function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
   const topics = new Map<string, Array<Message<unknown>>>();
@@ -136,7 +171,8 @@ describe("tool-server attachment", () => {
         cwd: tmp,
       };
 
-      const res = await tool.call(
+      const res = await callValue(
+        tool,
         "attachment.add_files",
         {
           paths: p,
@@ -171,7 +207,8 @@ describe("tool-server attachment", () => {
         cwd: tmp,
       };
 
-      const res = await tool.call(
+      const res = await callValue(
+        tool,
         "attachment.add_files",
         {
           files: p,
@@ -208,7 +245,8 @@ describe("tool-server attachment", () => {
         safetyMode: "restricted",
       };
 
-      const res = await tool.call(
+      const res = await callValue(
+        tool,
         "attachment.add_files",
         {
           paths: "hello.txt",
@@ -237,15 +275,20 @@ describe("tool-server attachment", () => {
       safetyMode: "restricted",
     };
 
-    await expect(
-      tool.call(
-        "attachment.add_files",
-        {
-          paths: "secret.txt",
-        },
-        { context: ctx },
-      ),
-    ).rejects.toThrow("Restricted mode only allows file paths under /tmp");
+    const result = await tool.call(
+      "attachment.add_files",
+      {
+        paths: "secret.txt",
+      },
+      { context: ctx },
+    );
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error).toMatchObject({
+        kind: "denied",
+        message: "Restricted mode only allows file paths under /tmp.",
+      });
+    }
   });
 
   it("reports restricted attachment download paths as sandbox /tmp paths", async () => {
@@ -253,7 +296,8 @@ describe("tool-server attachment", () => {
     const bus = createLilacBus(raw);
     const tool = new Attachment({ bus });
 
-    const res = await tool.call(
+    const res = await callValue(
+      tool,
       "attachment.download",
       {},
       {
@@ -276,7 +320,79 @@ describe("tool-server attachment", () => {
     const bus = createLilacBus(raw);
     const tool = new Attachment({ bus });
 
-    await expect(
+    const result = await tool.call(
+      "attachment.download",
+      {},
+      {
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "file",
+                mediaType: "application/pdf",
+                filename: "external.pdf",
+                data: "https://example.com/external.pdf",
+              },
+            ],
+          },
+        ],
+      },
+    );
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error.kind).toBe("denied");
+      expect(result.error.message).toContain("Blocked attachment host 'example.com'");
+    }
+  });
+
+  it("redacts signed URL query strings from download failures", async () => {
+    installMockFetch(async () => new Response("unavailable", { status: 503 }));
+    const raw = createInMemoryRawBus();
+    const tool = new Attachment({ bus: createLilacBus(raw) });
+    const signedUrl =
+      "https://cdn.discordapp.com/attachments/1/2/report.pdf?ex=secret-expiry&sig=secret-signature";
+
+    const result = await tool.call(
+      "attachment.download",
+      {},
+      {
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "file",
+                mediaType: "application/pdf",
+                filename: "report.pdf",
+                data: signedUrl,
+              },
+            ],
+          },
+        ],
+      },
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error.message).toContain(
+        "https://cdn.discordapp.com/attachments/1/2/report.pdf",
+      );
+      expect(result.error.message).not.toContain("secret-expiry");
+      expect(result.error.message).not.toContain("secret-signature");
+      expect(result.error.message).not.toContain("?");
+    }
+  });
+
+  it("preserves Panic from attachment downloads", async () => {
+    const panic = new Panic({ message: "attachment fetch invariant" });
+    installMockFetch(async () => {
+      throw panic;
+    });
+    const raw = createInMemoryRawBus();
+    const tool = new Attachment({ bus: createLilacBus(raw) });
+
+    const [settled] = await Promise.allSettled([
       tool.call(
         "attachment.download",
         {},
@@ -288,14 +404,16 @@ describe("tool-server attachment", () => {
                 {
                   type: "file",
                   mediaType: "application/pdf",
-                  filename: "external.pdf",
-                  data: "https://example.com/external.pdf",
+                  filename: "report.pdf",
+                  data: "https://cdn.discordapp.com/attachments/1/2/report.pdf?sig=secret",
                 },
               ],
             },
           ],
         },
       ),
-    ).rejects.toThrow("Blocked attachment host 'example.com'");
+    ]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
   });
 });

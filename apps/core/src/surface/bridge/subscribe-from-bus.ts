@@ -1998,6 +1998,29 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     startupResources.subscription = outputSub;
     observeSubscriptionDone(outputSub, outReqTopic(requestId), logger);
 
+    if (env.perf.log) {
+      const setupMs = Date.now() - subStart;
+      const shouldWarn = setupMs >= env.perf.lagWarnMs;
+      const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
+      if (shouldWarn || shouldSample) {
+        if (shouldWarn) {
+          logger.warn("perf.subscription_setup", {
+            stage: "bus_to_adapter.output_subscribe",
+            requestId,
+            sessionId,
+            setupMs,
+          });
+        } else {
+          logger.info("perf.subscription_setup", {
+            stage: "bus_to_adapter.output_subscribe",
+            requestId,
+            sessionId,
+            setupMs,
+          });
+        }
+      }
+    }
+
     async function startTyping(): Promise<void> {
       if (typing || typingAttempted) return;
       typingAttempted = true;
@@ -2029,29 +2052,6 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       });
     }
     if (!input.paused) await startTyping();
-
-    if (env.perf.log) {
-      const setupMs = Date.now() - subStart;
-      const shouldWarn = setupMs >= env.perf.lagWarnMs;
-      const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
-      if (shouldWarn || shouldSample) {
-        if (shouldWarn) {
-          logger.warn("perf.subscription_setup", {
-            stage: "bus_to_adapter.output_subscribe",
-            requestId,
-            sessionId,
-            setupMs,
-          });
-        } else {
-          logger.info("perf.subscription_setup", {
-            stage: "bus_to_adapter.output_subscribe",
-            requestId,
-            sessionId,
-            setupMs,
-          });
-        }
-      }
-    }
 
     const cleanupRestoreResources = async (): Promise<
       ResultType<void, SurfaceRelayRestoreRollbackFailed>

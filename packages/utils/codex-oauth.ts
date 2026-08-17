@@ -12,6 +12,7 @@ export const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const CODEX_OAUTH_ISSUER = "https://auth.openai.com";
 export const CODEX_OAUTH_PORT = 1455;
 export const CODEX_OAUTH_REDIRECT_URI = `http://localhost:${CODEX_OAUTH_PORT}/auth/callback`;
+const CODEX_OAUTH_REFRESH_TIMEOUT_MS = 45_000;
 
 const codexOAuthTokensSchema = z
   .object({
@@ -769,19 +770,59 @@ export async function exchangeCodeForTokens(options: {
 export async function refreshAccessTokenResult(
   refreshToken: string,
   fetchFn: CodexOAuthFetch = fetch,
+  signal?: AbortSignal,
 ): Promise<ResultType<RefreshTokenResponse, CodexOAuthRequestFailed | CodexOAuthResponseInvalid>> {
+  const timeoutController = new AbortController();
+  const timeout = setTimeout(() => {
+    timeoutController.abort(
+      new DOMException("Codex OAuth token refresh timed out after 45 seconds", "TimeoutError"),
+    );
+  }, CODEX_OAUTH_REFRESH_TIMEOUT_MS);
+  const requestSignal = signal
+    ? AbortSignal.any([signal, timeoutController.signal])
+    : timeoutController.signal;
+  const abortedRefresh = Symbol("aborted-refresh");
+  const waitForRefresh = async <T>(request: Promise<T>): Promise<T | typeof abortedRefresh> => {
+    let removeAbortListener = () => {};
+    const aborted = new Promise<typeof abortedRefresh>((resolve) => {
+      const onAbort = () => resolve(abortedRefresh);
+      removeAbortListener = () => requestSignal.removeEventListener("abort", onAbort);
+      if (requestSignal.aborted) onAbort();
+      else requestSignal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([request, aborted]);
+    } finally {
+      removeAbortListener();
+    }
+  };
   let response: Response;
   try {
-    response = await fetchFn(`${CODEX_OAUTH_ISSUER}/oauth/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "refresh_token",
-        refresh_token: refreshToken,
-        client_id: CODEX_OAUTH_CLIENT_ID,
-      }).toString(),
-    });
+    const fetched = await waitForRefresh(
+      fetchFn(`${CODEX_OAUTH_ISSUER}/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: refreshToken,
+          client_id: CODEX_OAUTH_CLIENT_ID,
+        }).toString(),
+        signal: requestSignal,
+      }),
+    );
+    if (fetched === abortedRefresh) {
+      clearTimeout(timeout);
+      return Result.err(
+        new CodexOAuthRequestFailed({
+          operation: "refresh",
+          cause: requestSignal.reason,
+          message: "Token refresh request failed",
+        }),
+      );
+    }
+    response = fetched;
   } catch (cause) {
+    clearTimeout(timeout);
     if (isPanic(cause)) throw cause;
     return Result.err(
       new CodexOAuthRequestFailed({
@@ -792,6 +833,7 @@ export async function refreshAccessTokenResult(
     );
   }
   if (!response.ok) {
+    clearTimeout(timeout);
     return Result.err(
       new CodexOAuthRequestFailed({
         operation: "refresh",
@@ -803,8 +845,20 @@ export async function refreshAccessTokenResult(
 
   let payload: unknown;
   try {
-    payload = await response.json();
+    const decoded = await waitForRefresh(response.json());
+    if (decoded === abortedRefresh) {
+      clearTimeout(timeout);
+      return Result.err(
+        new CodexOAuthRequestFailed({
+          operation: "refresh",
+          cause: requestSignal.reason,
+          message: "Token refresh request failed",
+        }),
+      );
+    }
+    payload = decoded;
   } catch (cause) {
+    clearTimeout(timeout);
     if (isPanic(cause)) throw cause;
     return Result.err(
       new CodexOAuthResponseInvalid({
@@ -815,6 +869,7 @@ export async function refreshAccessTokenResult(
     );
   }
   const parsed = refreshTokenResponseSchema.safeParse(payload);
+  clearTimeout(timeout);
   return parsed.success
     ? Result.ok(parsed.data)
     : Result.err(
@@ -829,8 +884,9 @@ export async function refreshAccessTokenResult(
 export async function refreshAccessToken(
   refreshToken: string,
   fetchFn: CodexOAuthFetch = fetch,
+  signal?: AbortSignal,
 ): Promise<RefreshTokenResponse> {
-  const result = await refreshAccessTokenResult(refreshToken, fetchFn);
+  const result = await refreshAccessTokenResult(refreshToken, fetchFn, signal);
   const resolved = result.match<
     | { readonly value: RefreshTokenResponse }
     | { readonly error: CodexOAuthRequestFailed | CodexOAuthResponseInvalid }

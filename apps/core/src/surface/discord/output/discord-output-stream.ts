@@ -958,21 +958,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       refs: this.deps.opts?.resume?.created ?? [],
     });
     const resumed = resumedMessages.length > 0;
-
-    const first =
-      resumedMessages[0] ??
-      (await channel.send({
-        // content must be non-empty to avoid Discord errors when sending only embeds.
-        content: "*Replying...*",
-        reply:
-          this.deps.opts?.replyTo && this.deps.opts.replyTo.platform === "discord"
-            ? { messageReference: this.deps.opts.replyTo.messageId }
-            : undefined,
-        components: buildCancelComponents(true),
-        allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: false }),
-      }));
-
-    this.firstMsg = first;
+    const resumedFirst = resumedMessages[0];
     if (resumed) {
       const seen = new Set<string>();
       for (const m of resumedMessages) {
@@ -982,12 +968,8 @@ export class DiscordOutputStream implements SurfaceOutputStream {
         this.created.push(ref);
         this.trackTransientPreviewRef(ref);
       }
-      this.lastMsg = resumedMessages[resumedMessages.length - 1] ?? first;
-    } else {
-      const ref = asDiscordMsgRef(discordSessionRef.channelId, first.id);
-      this.created.push(ref);
-      this.trackTransientPreviewRef(ref);
-      this.notifyCreated(ref);
+      this.firstMsg = resumedFirst ?? null;
+      this.lastMsg = resumedMessages[resumedMessages.length - 1] ?? null;
     }
 
     // Special case: attachments-only output (no text and no tool lines).
@@ -999,6 +981,24 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       !this.hasReasoningStatus &&
       this.statsForNerdsLine === null
     ) {
+      const first =
+        resumedFirst ??
+        (await channel.send({
+          content: "*Replying...*",
+          reply:
+            this.deps.opts?.replyTo && this.deps.opts.replyTo.platform === "discord"
+              ? { messageReference: this.deps.opts.replyTo.messageId }
+              : undefined,
+          components: buildCancelComponents(true),
+          allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: false }),
+        }));
+      if (!resumed) {
+        const ref = asDiscordMsgRef(discordSessionRef.channelId, first.id);
+        this.created.push(ref);
+        this.trackTransientPreviewRef(ref);
+        this.notifyCreated(ref);
+      }
+      this.firstMsg = first;
       this.lastMsg = first;
       this.running = Promise.resolve();
       return;
@@ -1017,17 +1017,35 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     };
 
     this.usedEmbedPusher = true;
+    const firstMessageReady = Promise.withResolvers<void>();
     this.running = (async () => {
       const pushed = await startEmbedPusher({
         createFirst: async (emb) => {
-          // Replace the placeholder "Replying..." message with the first embed.
-          // This keeps the reply target as the *user's* original message (instead of
-          // creating a nested reply chain that replies to the placeholder).
-          await safeEdit(first, {
-            content: "",
+          if (resumedFirst) {
+            await safeEdit(resumedFirst, {
+              content: "",
+              embeds: [emb],
+              components: buildCancelComponents(true),
+            });
+            firstMessageReady.resolve();
+            return resumedFirst;
+          }
+
+          const first = await channel.send({
             embeds: [emb],
+            reply:
+              this.deps.opts?.replyTo && this.deps.opts.replyTo.platform === "discord"
+                ? { messageReference: this.deps.opts.replyTo.messageId }
+                : undefined,
             components: buildCancelComponents(true),
+            allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: false }),
           });
+          const ref = asDiscordMsgRef(discordSessionRef.channelId, first.id);
+          this.firstMsg = first;
+          this.created.push(ref);
+          this.trackTransientPreviewRef(ref);
+          this.notifyCreated(ref);
+          firstMessageReady.resolve();
           return first;
         },
         createReply: async (parent, emb) => {
@@ -1071,19 +1089,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       }
 
       this.lastMsg = res.lastMsg;
-
-      // IMPORTANT: never delete the message that carries files.
-      // We keep `first` as the stable anchor and rely on embed replies for the visible response.
-      // If no embeds were created, turn `first` into the final plain message.
-      if (res.discordMessageCreated.length === 0) {
-        const content = this.getStreamingDisplayText(false);
-        await safeEdit(first, {
-          content: content || "*<empty_string>*",
-          components: [],
-        });
-        this.lastMsg = first;
-      }
     })();
+    const runningSettlement = Promise.allSettled([this.running]);
+    void runningSettlement.then(([settled]) => {
+      if (!settled || settled.status === "fulfilled") return;
+      firstMessageReady.reject(settled.reason);
+    });
+    await firstMessageReady.promise;
   }
 
   async push(

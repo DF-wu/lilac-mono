@@ -6,6 +6,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Panic, Result, type Result as ResultType } from "better-result";
+import type { ServerToolResult } from "@stanley2058/lilac-plugin-runtime";
 import { z } from "zod";
 
 import {
@@ -37,6 +38,15 @@ import {
   ConversationThread,
   resolveConversationThreadSummarizationToolOperation,
 } from "../../src/tool-server/tools/conversation-thread";
+
+function serverToolValue<T>(result: ServerToolResult<T>): T {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
+}
 
 const tmpDirs: string[] = [];
 
@@ -1486,7 +1496,11 @@ describe("conversation thread store", () => {
     expect(dryRun.eligible).toBe(1);
     expect(dryRun.summarized).toBe(0);
     expect(
-      await resolveConversationThreadSummarizationToolOperation(Promise.resolve(Result.ok(dryRun))),
+      serverToolValue(
+        await resolveConversationThreadSummarizationToolOperation(
+          Promise.resolve(Result.ok(dryRun)),
+        ),
+      ),
     ).toBe(dryRun);
 
     const remoteFailure = new ConversationThreadSummarizationRemoteError({
@@ -1494,11 +1508,13 @@ describe("conversation thread store", () => {
       remoteMessage: "provider unavailable",
       message: "provider unavailable",
     });
-    const failedToolOperation = resolveConversationThreadSummarizationToolOperation(
+    const failedToolOperation = await resolveConversationThreadSummarizationToolOperation(
       Promise.resolve(Result.err(remoteFailure)),
     );
-    await expect(failedToolOperation).rejects.toThrow("provider unavailable");
-    await expect(failedToolOperation).rejects.not.toBe(remoteFailure);
+    expect(failedToolOperation).toMatchObject({
+      status: "error",
+      error: { message: "provider unavailable" },
+    });
 
     const panic = new Panic({ message: "summarization invariant failed" });
     await expect(
@@ -1508,9 +1524,11 @@ describe("conversation thread store", () => {
     const run = await service.runSummarization({ now: eligibleNow });
     expect(run.summarized).toBe(1);
 
-    const compactSearch = (await tool.call("conversation.thread.search", {
-      query: "vector retrieval",
-    })) as {
+    const compactSearch = serverToolValue(
+      await tool.call("conversation.thread.search", {
+        query: "vector retrieval",
+      }),
+    ) as {
       results: Array<{
         threadId: string;
         title: string;
@@ -1524,10 +1542,12 @@ describe("conversation thread store", () => {
     ]);
     expect(compactSearch.results[0]?.title).toBe("Memory search architecture");
 
-    const search = (await tool.call("conversation.thread.search", {
-      query: "vector retrieval",
-      verbose: true,
-    })) as {
+    const search = serverToolValue(
+      await tool.call("conversation.thread.search", {
+        query: "vector retrieval",
+        verbose: true,
+      }),
+    ) as {
       results: Array<{
         threadId: string;
         title: string;
@@ -1549,9 +1569,11 @@ describe("conversation thread store", () => {
       "Captures reusable architecture decisions for conversation retrieval.",
     ]);
 
-    const metadata = (await tool.call("conversation.thread.metadata", {
-      threadIds: [search.results[0]!.threadId, "missing-thread"],
-    })) as {
+    const metadata = serverToolValue(
+      await tool.call("conversation.thread.metadata", {
+        threadIds: [search.results[0]!.threadId, "missing-thread"],
+      }),
+    ) as {
       threads: Array<{
         threadId: string;
         title?: string;
@@ -1582,11 +1604,13 @@ describe("conversation thread store", () => {
     expect(metadata.threads[0]?.messageCount).toBe(2);
     expect(metadata.threads[0]?.messages).toBeUndefined();
 
-    const read = (await tool.call("conversation.thread.read", {
-      threadId: search.results[0]!.threadId,
-      offset: 1,
-      limit: 1,
-    })) as {
+    const read = serverToolValue(
+      await tool.call("conversation.thread.read", {
+        threadId: search.results[0]!.threadId,
+        offset: 1,
+        limit: 1,
+      }),
+    ) as {
       thread: {
         retrievalHints?: string[];
         aboutness?: { domains: string[] };
@@ -1619,14 +1643,24 @@ describe("conversation thread store", () => {
     );
     expect(entry?.hidden).toBe(true);
 
-    await expect(
-      tool.call("conversation.thread.read", {
+    expect(
+      await tool.call("conversation.thread.read", {
         offset: 0,
       }),
-    ).rejects.toThrow("conversation.thread.read has invalid input.");
-    await expect(tool.call("conversation.thread.metadata", {})).rejects.toThrow(
-      "conversation.thread.metadata has invalid input.",
-    );
+    ).toMatchObject({
+      status: "error",
+      error: {
+        kind: "usage",
+        message: expect.stringContaining("conversation.thread.read has invalid input."),
+      },
+    });
+    expect(await tool.call("conversation.thread.metadata", {})).toMatchObject({
+      status: "error",
+      error: {
+        kind: "usage",
+        message: expect.stringContaining("conversation.thread.metadata has invalid input."),
+      },
+    });
 
     searchStore.close();
     threadStore.close();

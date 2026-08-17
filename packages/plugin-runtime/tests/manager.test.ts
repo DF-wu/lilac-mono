@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { Panic } from "better-result";
+import { Panic, Result } from "better-result";
 
 import {
   ToolPluginManager,
@@ -48,7 +48,7 @@ function createServerTool(callableId: string): ServerTool {
       ];
     },
     async call() {
-      return { ok: true };
+      return Result.ok({ ok: true });
     },
   };
 }
@@ -340,7 +340,9 @@ export default { meta: { id: "demo-plugin" }, create() { return { level1: [level
       async list() {
         return [{ callableId: id, name: id, description: id, shortInput: [] }];
       },
-      async call() {},
+      async call() {
+        return Result.ok();
+      },
     });
     const value = manager({
       dataDir: "/tmp/plugin-runtime-cleanup-unused",
@@ -382,7 +384,9 @@ export default { meta: { id: "demo-plugin" }, create() { return { level1: [level
       async list() {
         return [{ callableId: id, name: id, description: id, shortInput: [] }];
       },
-      async call() {},
+      async call() {
+        return Result.ok();
+      },
     });
     const value = manager({
       dataDir: "/tmp/plugin-runtime-cleanup-panic-unused",
@@ -563,7 +567,7 @@ export default { meta: { id: "demo-plugin" }, create() { return { level1: [level
         read("tool.call");
         return async function (this: unknown) {
           callReceiverMatches = this === tool;
-          return { ok: true };
+          return Result.ok({ ok: true });
         };
       },
     };
@@ -651,7 +655,9 @@ export default { meta: { id: "demo-plugin" }, create() { return { level1: [level
           },
         ];
       },
-      async call() {},
+      async call() {
+        return Result.ok();
+      },
     };
     const value = manager({
       dataDir: "/tmp/plugin-runtime-init-dependent-list-unused",
@@ -683,7 +689,9 @@ export default { meta: { id: "demo-plugin" }, create() { return { level1: [level
       async list() {
         throw operationPanic;
       },
-      async call() {},
+      async call() {
+        return Result.ok();
+      },
     };
     const value = manager({
       dataDir: "/tmp/plugin-runtime-operation-panic-unused",

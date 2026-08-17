@@ -1,9 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import { streamText } from "ai";
 
 import { CODEX_BASE_INSTRUCTIONS } from "../codex-instructions";
 import type { CodexOAuthTokens } from "../codex-oauth";
 import {
   CodexRequestInvalid,
+  createCodexOAuthProvider,
   createCodexResponsesEventNormalizer,
   getModelProviders,
   normalizeCodexResponsesRequestRecord,
@@ -349,5 +351,131 @@ describe("refreshCodexOAuthTokens", () => {
       idToken: "old-id-token",
     });
     expect(writes).toEqual([refreshed]);
+  });
+
+  it("shares one provider refresh while one request aborts and the other completes", async () => {
+    const originalFetch = globalThis.fetch;
+    const refreshStarted = Promise.withResolvers<void>();
+    const releaseRefresh = Promise.withResolvers<Response>();
+    const secondReadStarted = Promise.withResolvers<void>();
+    const releaseSecondRead = Promise.withResolvers<void>();
+    let tokens: CodexOAuthTokens = {
+      type: "oauth",
+      access: "expired-access",
+      refresh: "refresh-token",
+      expires: 0,
+    };
+    let readCalls = 0;
+    let refreshCalls = 0;
+    let responseCalls = 0;
+    let refreshSignal: AbortSignal | undefined;
+
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.origin === "https://auth.openai.com") {
+        refreshCalls += 1;
+        refreshSignal = init?.signal ?? undefined;
+        refreshStarted.resolve();
+        return await releaseRefresh.promise;
+      }
+      if (url.pathname.endsWith("/backend-api/codex/responses")) {
+        responseCalls += 1;
+        return new Response(
+          [
+            `data: ${JSON.stringify({
+              type: "response.created",
+              response: { id: `resp_${responseCalls}`, created_at: 1, model: "gpt-5.6" },
+            })}\n\n`,
+            `data: ${JSON.stringify({
+              type: "response.completed",
+              response: {
+                id: `resp_${responseCalls}`,
+                incomplete_details: null,
+                usage: {
+                  input_tokens: 1,
+                  input_tokens_details: { cached_tokens: 0 },
+                  output_tokens: 0,
+                  output_tokens_details: { reasoning_tokens: 0 },
+                },
+              },
+            })}\n\n`,
+            "data: [DONE]\n\n",
+          ].join(""),
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      throw new Error(`Unexpected provider request: ${url}`);
+    }) as typeof globalThis.fetch;
+
+    try {
+      const provider = createCodexOAuthProvider({
+        readTokens: async () => {
+          readCalls += 1;
+          if (readCalls === 3) {
+            secondReadStarted.resolve();
+            await releaseSecondRead.promise;
+          }
+          return tokens;
+        },
+        writeTokens: async (next) => {
+          tokens = next;
+        },
+      });
+      const model = provider.responses("gpt-5.6");
+      const firstController = new AbortController();
+      const firstResult = streamText({
+        model,
+        prompt: "first request",
+        abortSignal: firstController.signal,
+        onError: () => {},
+      });
+      const firstPartsPromise = (async () => {
+        const parts = [];
+        try {
+          for await (const part of firstResult.stream) parts.push(part);
+          return { parts, error: undefined };
+        } catch (error) {
+          return { parts, error };
+        }
+      })();
+
+      await refreshStarted.promise;
+      const secondResult = streamText({ model, prompt: "second request" });
+      const secondPartsPromise = (async () => {
+        const parts = [];
+        for await (const part of secondResult.stream) parts.push(part);
+        return parts;
+      })();
+      await secondReadStarted.promise;
+      releaseSecondRead.resolve();
+
+      const abortReason = new DOMException("first caller stopped", "AbortError");
+      firstController.abort(abortReason);
+      const firstOutcome = await firstPartsPromise;
+
+      expect(refreshCalls).toBe(1);
+      expect(refreshSignal?.aborted).toBe(false);
+      expect(responseCalls).toBe(0);
+      expect(
+        firstOutcome.error === abortReason ||
+          firstOutcome.parts.some(
+            (part) =>
+              part.type === "abort" || (part.type === "error" && part.error === abortReason),
+          ),
+      ).toBe(true);
+
+      releaseRefresh.resolve(
+        Response.json({ access_token: "fresh-access", refresh_token: "fresh-refresh" }),
+      );
+      const secondParts = await secondPartsPromise;
+
+      expect(refreshCalls).toBe(1);
+      expect(responseCalls).toBe(1);
+      expect(secondParts.some((part) => part.type === "finish")).toBe(true);
+      expect(tokens.access).toBe("fresh-access");
+      expect(tokens.refresh).toBe("fresh-refresh");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

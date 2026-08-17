@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { ZodError } from "zod";
+import { Panic } from "better-result";
 
 import {
   CONTENT_INSPECT_MAX_SOURCE_BYTES,
@@ -49,8 +49,35 @@ describe("content.inspect", () => {
     expect(entry?.primaryPositional).toEqual({ field: "text" });
   });
 
-  it("retains raw Zod input validation", async () => {
-    await expect(new ContentInspect().call("content.inspect", {})).rejects.toBeInstanceOf(ZodError);
+  it("returns malformed input as a usage failure", async () => {
+    await expect(new ContentInspect().call("content.inspect", {})).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "usage", code: "invalid_input", retryable: false },
+    });
+  });
+
+  it("returns malformed URLs as nonretryable usage failures", async () => {
+    await expect(
+      new ContentInspect().call("content.inspect", { url: "not a URL" }),
+    ).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "usage", code: "invalid_input", retryable: false },
+    });
+  });
+
+  it("preserves Panic from config loading", async () => {
+    const panic = new Panic({ message: "content inspect config invariant" });
+    const tool = new ContentInspect({
+      getConfig: async () => {
+        throw panic;
+      },
+    });
+
+    const [settled] = await Promise.allSettled([
+      tool.call("content.inspect", { text: "inspect me" }),
+    ]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
   });
 
   it("recognizes text-like media types", () => {
@@ -78,7 +105,7 @@ describe("content.inspect", () => {
       const input = contentInspectInputSchema.parse({ path: filePath });
       if (input.type !== "binary") throw new Error("expected binary input");
 
-      const source = await loadInspectSource(input);
+      const source = (await loadInspectSource(input)).unwrap();
 
       expect(source.kind).toBe("text");
       expect(source.mediaType).toBe("text/plain");
@@ -98,13 +125,26 @@ describe("content.inspect", () => {
     const input = contentInspectInputSchema.parse({ url: "https://example.com" });
     if (input.type !== "binary") throw new Error("expected binary input");
 
-    const source = await loadInspectSource(input);
+    const source = (await loadInspectSource(input)).unwrap();
 
     expect(source.kind).toBe("text");
     expect(source.mediaType).toBe("text/html");
     if (source.kind === "text") {
       expect(source.text).toBe("<html>hello</html>");
     }
+  });
+
+  it("preserves Panic from URL fetching", async () => {
+    const panic = new Panic({ message: "content source invariant" });
+    installMockFetch(async () => {
+      throw panic;
+    });
+    const input = contentInspectInputSchema.parse({ url: "https://example.com/source.txt" });
+    if (input.type !== "binary") throw new Error("expected binary input");
+
+    const [settled] = await Promise.allSettled([loadInspectSource(input)]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
   });
 
   it("decodes text URLs using the declared charset", async () => {
@@ -117,7 +157,7 @@ describe("content.inspect", () => {
     const input = contentInspectInputSchema.parse({ url: "https://example.com/latin1.txt" });
     if (input.type !== "binary") throw new Error("expected binary input");
 
-    const source = await loadInspectSource(input);
+    const source = (await loadInspectSource(input)).unwrap();
 
     expect(source.kind).toBe("text");
     expect(source.mediaType).toBe("text/plain");
@@ -136,11 +176,17 @@ describe("content.inspect", () => {
     );
     const remote = contentInspectInputSchema.parse({ url: "https://example.com/large.bin" });
     if (remote.type !== "binary") throw new Error("expected binary input");
-    await expect(loadInspectSource(remote)).rejects.toThrow("exceeds");
+    await expect(loadInspectSource(remote)).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "usage", message: expect.stringContaining("exceeds") },
+    });
 
     const oversizedBase64 = Buffer.alloc(CONTENT_INSPECT_MAX_SOURCE_BYTES + 1).toString("base64");
     const base64 = contentInspectInputSchema.parse({ base64: oversizedBase64 });
     if (base64.type !== "binary") throw new Error("expected binary input");
-    await expect(loadInspectSource(base64)).rejects.toThrow("exceeds");
+    await expect(loadInspectSource(base64)).resolves.toMatchObject({
+      status: "error",
+      error: { kind: "usage", message: expect.stringContaining("exceeds") },
+    });
   });
 });

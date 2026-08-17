@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { serverToolFailure, type ServerToolResult } from "@stanley2058/lilac-plugin-runtime";
 import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
 import {
@@ -105,7 +106,25 @@ export class Discovery implements ServerTool {
             "Search unified agent memory across conversations, prompts, and heartbeat files. Output is { meta, groups }, where groups[].entries[][] contains matched message/file entries plus surrounding context windows.",
           inputSchema: discoverySearchInputSchema,
           primaryPositional: "query",
-          run: (input) => this.params.discovery.search(input),
+          run: async (input) =>
+            (await this.params.discovery.searchResult(input)).mapError((error) => {
+              switch (error._tag) {
+                case "DiscoverySearchInputError":
+                  return serverToolFailure({
+                    kind: "usage",
+                    code: "discovery_invalid_search",
+                    message: error.message,
+                    retryable: false,
+                  });
+                case "DiscoverySearchOperationError":
+                  return serverToolFailure({
+                    kind: "unavailable",
+                    code: "discovery_search_unavailable",
+                    message: error.message,
+                    retryable: true,
+                  });
+              }
+            }),
         }),
       }),
     });
@@ -131,7 +150,7 @@ export class Discovery implements ServerTool {
     callableId: string,
     input: Record<string, unknown>,
     opts?: ServerToolCallOptions,
-  ): Promise<unknown> {
+  ): Promise<ServerToolResult> {
     return this.tool.call(callableId, input, opts);
   }
 }

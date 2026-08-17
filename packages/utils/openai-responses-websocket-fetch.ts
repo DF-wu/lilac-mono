@@ -8,6 +8,7 @@ import { isPanic, isRecord } from "./runtime-utils";
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS = "responses_websockets=2026-02-06";
 const CONTINUATION_CACHE_TTL_MS = 30 * 60 * 1000;
+const RESPONSES_WEBSOCKET_TIMEOUT_MS = 30_000;
 
 export type CreateOpenAIResponsesWebSocketFetchOptions = {
   mode: ResponsesTransportMode;
@@ -134,10 +135,11 @@ export function createOpenAIResponsesWebSocketFetch(
   const fetchFn = options.fetch ?? globalThis.fetch;
   const completionEventTypes = new Set(options.completionEventTypes ?? ["response.completed"]);
   completionEventTypes.add("response.incomplete");
-  const idleTimeoutMs = options.idleTimeoutMs ?? 30_000;
+  const idleTimeoutMs = options.idleTimeoutMs ?? RESPONSES_WEBSOCKET_TIMEOUT_MS;
 
   let ws: WebSocket | null = null;
   let connecting: Promise<WebSocket> | null = null;
+  let connectingAbortController: AbortController | null = null;
   let connectingKey: string | null = null;
   let reusableBusy = false;
   let idleCloseTimer: ReturnType<typeof setTimeout> | null = null;
@@ -292,31 +294,53 @@ export function createOpenAIResponsesWebSocketFetch(
   function connectWebSocket(
     socketUrl: string,
     headers: Record<string, string>,
+    signal?: AbortSignal,
   ): Promise<WebSocket> {
     return new Promise<WebSocket>((resolve, reject) => {
-      let socket: WebSocket;
+      let socket: WebSocket | undefined;
       const WebSocketCtor = globalThis.WebSocket as typeof globalThis.WebSocket &
         WebSocketWithHeadersConstructor;
 
+      const cleanup = () => {
+        clearTimeout(timeout);
+        socket?.removeEventListener("open", onOpen);
+        socket?.removeEventListener("error", onError);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const rejectConnection = (error: Error) => {
+        cleanup();
+        closeSocket(socket ?? null);
+        reject(error);
+      };
+      const onOpen = () => {
+        if (!socket) return;
+        cleanup();
+        resolve(socket);
+      };
+      const onError = (event: Event) => rejectConnection(extractWebSocketError(event));
+      const onAbort = () =>
+        rejectConnection(
+          projectResponsesStreamError(signal?.reason ?? new DOMException("Aborted", "AbortError")),
+        );
+      const timeout = setTimeout(() => {
+        rejectConnection(
+          new DOMException("WebSocket connection timed out before opening", "TimeoutError"),
+        );
+      }, RESPONSES_WEBSOCKET_TIMEOUT_MS);
+
       try {
+        signal?.throwIfAborted();
         socket = new WebSocketCtor(socketUrl, { headers });
       } catch (error) {
+        cleanup();
         reject(projectResponsesStreamError(error));
         return;
       }
 
-      const onOpen = () => {
-        socket.removeEventListener("error", onError);
-        resolve(socket);
-      };
-
-      const onError = (event: Event) => {
-        socket.removeEventListener("open", onOpen);
-        reject(extractWebSocketError(event));
-      };
-
       socket.addEventListener("open", onOpen, { once: true });
       socket.addEventListener("error", onError, { once: true });
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
 
@@ -326,7 +350,11 @@ export function createOpenAIResponsesWebSocketFetch(
     )}`;
   }
 
-  function getConnection(socketUrl: string, headers: Record<string, string>): Promise<WebSocket> {
+  function getConnection(
+    socketUrl: string,
+    headers: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<WebSocket> {
     const key = getConnectionKey(socketUrl, headers);
 
     if (ws?.readyState === WebSocket.OPEN && connectionHeadersKey === key) {
@@ -344,7 +372,12 @@ export function createOpenAIResponsesWebSocketFetch(
       invalidateReusableContinuationResponseIds();
     }
 
-    connecting = connectWebSocket(socketUrl, headers)
+    const connectionController = new AbortController();
+    const connectionSignal = signal
+      ? AbortSignal.any([signal, connectionController.signal])
+      : connectionController.signal;
+    connectingAbortController = connectionController;
+    connecting = connectWebSocket(socketUrl, headers, connectionSignal)
       .then((socket) => {
         ws = socket;
         connectionHeadersKey = key;
@@ -364,6 +397,9 @@ export function createOpenAIResponsesWebSocketFetch(
       .finally(() => {
         connecting = null;
         connectingKey = null;
+        if (connectingAbortController === connectionController) {
+          connectingAbortController = null;
+        }
       });
 
     connectingKey = key;
@@ -385,6 +421,7 @@ export function createOpenAIResponsesWebSocketFetch(
         requestUrl,
         method,
         normalizeEvent,
+        completionEventTypes,
       });
     };
 
@@ -428,10 +465,11 @@ export function createOpenAIResponsesWebSocketFetch(
     let connection: WebSocket;
     try {
       connection = useReusableConnection
-        ? await getConnection(socketUrl, wsHeaders)
-        : await connectWebSocket(socketUrl, wsHeaders);
+        ? await getConnection(socketUrl, wsHeaders, signal ?? undefined)
+        : await connectWebSocket(socketUrl, wsHeaders, signal ?? undefined);
     } catch (error) {
       if (useReusableConnection) reusableBusy = false;
+      if (signal?.aborted) throw projectResponsesStreamError(signal.reason);
       if (options.mode === "auto") {
         reportAutoFallback({
           reason: "websocket_connect_failed",
@@ -749,6 +787,8 @@ export function createOpenAIResponsesWebSocketFetch(
   return Object.assign(websocketFetch as typeof globalThis.fetch, {
     close() {
       clearIdleCloseTimer();
+      connectingAbortController?.abort(new Error("Responses WebSocket fetch closed"));
+      connectingAbortController = null;
       if (connecting) {
         connecting = null;
         connectingKey = null;
@@ -1418,8 +1458,9 @@ function maybeNormalizeResponsesSseResponse(input: {
   requestUrl: URL;
   method: string;
   normalizeEvent?: (event: Record<string, unknown>) => Record<string, unknown>;
+  completionEventTypes: ReadonlySet<string>;
 }): Response {
-  const { response, requestUrl, method, normalizeEvent } = input;
+  const { response, requestUrl, method, normalizeEvent, completionEventTypes } = input;
 
   if (!response.body) return response;
   if (method !== "POST" || !requestUrl.pathname.endsWith("/responses")) return response;
@@ -1434,11 +1475,15 @@ function maybeNormalizeResponsesSseResponse(input: {
       const encoder = new TextEncoder();
       const decoder = new TextDecoder();
       let buffered = "";
+      let sawTerminalEvent = false;
 
       const flushFrame = (frame: string) => {
         if (frame.length === 0) return;
         const next = normalizeSseFrame(frame, normalizeEvent);
-        controller.enqueue(encoder.encode(next));
+        if (completionEventTypes.has(next.type) || next.type === "error") {
+          sawTerminalEvent = true;
+        }
+        controller.enqueue(encoder.encode(next.frame));
       };
 
       void (async () => {
@@ -1467,6 +1512,13 @@ function maybeNormalizeResponsesSseResponse(input: {
             flushFrame(buffered);
           }
 
+          if (!sawTerminalEvent) {
+            signalResponsesStreamError(
+              controller,
+              new Error("Response stream ended before a terminal response event"),
+            );
+            return;
+          }
           controller.close();
         } catch (error) {
           signalResponsesStreamError(controller, projectResponsesStreamError(error));
@@ -1489,7 +1541,7 @@ function maybeNormalizeResponsesSseResponse(input: {
 function normalizeSseFrame(
   frame: string,
   normalizeEvent?: (event: Record<string, unknown>) => Record<string, unknown>,
-): string {
+): { readonly frame: string; readonly type: string } {
   const normalizedFrame = frame.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
   const dataLines = normalizedFrame
@@ -1498,27 +1550,31 @@ function normalizeSseFrame(
     .map((line) => line.slice(5).trimStart());
 
   if (dataLines.length === 0) {
-    return `${normalizedFrame}\n\n`;
+    return { frame: `${normalizedFrame}\n\n`, type: "" };
   }
 
   const data = dataLines.join("\n");
   if (data.trim() === "[DONE]") {
-    return "data: [DONE]\n\n";
+    return { frame: "data: [DONE]\n\n", type: "" };
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(data) as unknown;
   } catch {
-    return `${normalizedFrame}\n\n`;
+    return { frame: `${normalizedFrame}\n\n`, type: "" };
   }
 
   const event = asRecord(parsed);
   if (!event) {
-    return `${normalizedFrame}\n\n`;
+    return { frame: `${normalizedFrame}\n\n`, type: "" };
   }
 
-  return `data: ${JSON.stringify(normalizeResponsesEvent(event, normalizeEvent))}\n\n`;
+  const normalized = normalizeResponsesEvent(event, normalizeEvent);
+  return {
+    frame: `data: ${JSON.stringify(normalized)}\n\n`,
+    type: readString(normalized.type) ?? "",
+  };
 }
 
 function normalizeResponsesEvent(

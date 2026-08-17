@@ -81,26 +81,38 @@ describe("Generate image upstream characterization", () => {
     const generate = new Generate();
 
     // When / Then
-    await expect(
-      generate.call("generate.image", { prompt: "test", model: "gpt-5-image", size: "512x512" }),
-    ).rejects.toThrow("Unsupported size '512x512' for gpt-5-image");
-    await expect(
-      generate.call("generate.image", { prompt: "test", model: "nanobanana", aspectRatio: "1:8" }),
-    ).rejects.toThrow("Unsupported aspectRatio '1:8' for nanobanana");
-    await expect(
-      generate.call("generate.image", {
-        prompt: "test",
-        model: "grok-imagine-image",
-        size: "1024x1024",
-      }),
-    ).rejects.toThrow("grok-imagine-image does not support size");
-    await expect(
-      generate.call("generate.image", {
-        prompt: "test",
-        model: "grok-imagine-image-pro",
-        inputImages: ["first.png", "second.png"],
-      }),
-    ).rejects.toThrow("grok-imagine-image-pro supports only one input image");
+    const unsupportedSize = await generate.call("generate.image", {
+      prompt: "test",
+      model: "gpt-5-image",
+      size: "512x512",
+    });
+    expect(unsupportedSize.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "Unsupported size '512x512' for gpt-5-image",
+    );
+    const unsupportedRatio = await generate.call("generate.image", {
+      prompt: "test",
+      model: "nanobanana",
+      aspectRatio: "1:8",
+    });
+    expect(unsupportedRatio.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "Unsupported aspectRatio '1:8' for nanobanana",
+    );
+    const unsupportedGrokSize = await generate.call("generate.image", {
+      prompt: "test",
+      model: "grok-imagine-image",
+      size: "1024x1024",
+    });
+    expect(unsupportedGrokSize.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "grok-imagine-image does not support size",
+    );
+    const unsupportedImageCount = await generate.call("generate.image", {
+      prompt: "test",
+      model: "grok-imagine-image-pro",
+      inputImages: ["first.png", "second.png"],
+    });
+    expect(unsupportedImageCount.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "grok-imagine-image-pro supports only one input image",
+    );
     expect(requestCount).toBe(0);
   });
 
@@ -113,21 +125,23 @@ describe("Generate image upstream characterization", () => {
     // When / Then
     // With only OpenRouter configured, the fallback order still resolves to
     // gpt-image-2, so its validator rejects a ratio it does not support.
-    await expect(
-      new Generate().call("generate.image", {
-        prompt: "test",
-        aspectRatio: "1:8",
-        inputImages: [join(outputDir, "missing.png")],
-      }),
-    ).rejects.toThrow("Unsupported aspectRatio '1:8' for gpt-image-2");
+    const unsupportedRatio = await new Generate().call("generate.image", {
+      prompt: "test",
+      aspectRatio: "1:8",
+      inputImages: [join(outputDir, "missing.png")],
+    });
+    expect(unsupportedRatio.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "Unsupported aspectRatio '1:8' for gpt-image-2",
+    );
     // A supported ratio gets past validation and fails on the missing input.
-    await expect(
-      new Generate().call("generate.image", {
-        prompt: "test",
-        aspectRatio: "1:1",
-        inputImages: [join(outputDir, "missing.png")],
-      }),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+    const missingInput = await new Generate().call("generate.image", {
+      prompt: "test",
+      aspectRatio: "1:1",
+      inputImages: [join(outputDir, "missing.png")],
+    });
+    expect(missingInput.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "missing.png",
+    );
   });
 
   it("preserves generation result fields and unique PNG filename behavior", async () => {
@@ -151,7 +165,7 @@ describe("Generate image upstream characterization", () => {
     });
 
     // Then
-    expect(result).toEqual({
+    expect(result.unwrap()).toEqual({
       ok: true,
       path: join(outputDir, "generated-image (1).png"),
       bytes: PNG_BYTES.byteLength,
@@ -179,7 +193,7 @@ describe("Generate image upstream characterization", () => {
     });
 
     // Then
-    expect(prompt).toEqual({
+    expect(prompt.unwrap()).toEqual({
       text: "replace the background",
       images: [Buffer.from(PNG_BYTES)],
       mask: Buffer.from(PNG_BYTES),

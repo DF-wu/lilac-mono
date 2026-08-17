@@ -2,7 +2,10 @@ import { describe, expect, it, spyOn } from "bun:test";
 
 import { createLogger } from "@stanley2058/lilac-utils";
 
-import { createTransientModelRetryController } from "../transient-model-retry";
+import {
+  createTransientModelRetryController,
+  isRetryableTransientModelError,
+} from "../transient-model-retry";
 
 const SAFE_MODEL_CALL_CONTEXT = {
   retrySafety: { canRetry: true } as const,
@@ -14,6 +17,30 @@ function createTestLogger() {
 }
 
 describe("transient model fallback", () => {
+  it("classifies validated transient status, network, exhaustion, and retry phrases", () => {
+    for (const error of [
+      { statusCode: 524 },
+      "failed to fetch",
+      "getaddrinfo ENOTFOUND api.example.test",
+      "EAI_AGAIN",
+      "connect ECONNREFUSED",
+      "request ETIMEDOUT",
+      '{"code":"resource_exhausted"}',
+      "Please retry your request",
+      "Try your request again",
+    ]) {
+      expect(isRetryableTransientModelError(error)).toBe(true);
+    }
+  });
+
+  it("classifies a Responses stream EOF before its terminal event as transient", () => {
+    expect(
+      isRetryableTransientModelError(
+        new Error("Response stream ended before a terminal response event"),
+      ),
+    ).toBe(true);
+  });
+
   it("gives every advanced candidate a fresh same-model retry budget", async () => {
     const logger = createTestLogger();
     const warn = spyOn(logger, "warn").mockImplementation(() => {});

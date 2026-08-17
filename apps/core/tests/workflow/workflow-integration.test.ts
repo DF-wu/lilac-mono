@@ -8,6 +8,7 @@ import { Result } from "better-result";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import type { ToolSet } from "ai";
 import { AiSdkPiAgent, type AiSdkPiAgentOptions } from "@stanley2058/lilac-agent";
+import type { ServerToolResult } from "@stanley2058/lilac-plugin-runtime";
 import { parseCoreConfigV1ToUniversal, toDurableResolvedModelPlan } from "@stanley2058/lilac-utils";
 import {
   createLilacBus,
@@ -52,6 +53,15 @@ import { createCoreToolPluginManager, type CoreToolPluginManager } from "../../s
 import { createToolServer } from "../../src/tool-server/create-tool-server";
 import { RequestControlAuthority } from "../../src/tool-server/request-control-authority";
 import type { RequestContext, ServerTool } from "../../src/tool-server/types";
+
+function serverToolValue<T>(result: ServerToolResult<T>): T {
+  return result.match({
+    ok: (value) => () => value,
+    err: (error) => () => {
+      throw new Error(error.message);
+    },
+  })();
+}
 
 const TEST_SURFACE_PROTOCOL_RESOLVER: SurfaceProtocolResolver = {
   resolve: (platform) =>
@@ -345,7 +355,7 @@ describe("unified workflow integration", () => {
       },
       async call(_callableId, _input, options) {
         if (options?.context) level2Contexts.push(options.context);
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const requestControlAuthority = new RequestControlAuthority();
@@ -475,29 +485,35 @@ describe("unified workflow integration", () => {
     try {
       await projector.start();
       await tool.init();
-      await tool.call(
-        "workflow.definition.save",
-        { scope: "project", name: "integration-audit", source: source() },
-        { context },
+      serverToolValue(
+        await tool.call(
+          "workflow.definition.save",
+          { scope: "project", name: "integration-audit", source: source() },
+          { context },
+        ),
       );
-      await tool.call(
-        "workflow.definition.validate",
-        {
-          scope: "auto",
-          name: "integration-audit",
-          args: { target: "src", token: "super-secret-value" },
-        },
-        { context },
+      serverToolValue(
+        await tool.call(
+          "workflow.definition.validate",
+          {
+            scope: "auto",
+            name: "integration-audit",
+            args: { target: "src", token: "super-secret-value" },
+          },
+          { context },
+        ),
       );
-      const triggered = await tool.call(
-        "workflow.run.trigger",
-        {
-          scope: "auto",
-          name: "integration-audit",
-          args: { target: "src", token: "super-secret-value" },
-          progress: { requestOrigin: true },
-        },
-        { context },
+      const triggered = serverToolValue(
+        await tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "auto",
+            name: "integration-audit",
+            args: { target: "src", token: "super-secret-value" },
+            progress: { requestOrigin: true },
+          },
+          { context },
+        ),
       );
       const { runId } = z.object({ runId: z.string() }).parse(triggered);
       expect(workflowStoreValue(store.getRun(runId))?.state).toBe("queued");
@@ -603,19 +619,23 @@ describe("unified workflow integration", () => {
     });
     await tool.init();
     await firstProjector.start();
-    await tool.call(
-      "workflow.definition.save",
-      { scope: "project", name: "integration-audit", source: source() },
-      { context },
+    serverToolValue(
+      await tool.call(
+        "workflow.definition.save",
+        { scope: "project", name: "integration-audit", source: source() },
+        { context },
+      ),
     );
-    const triggered = await tool.call(
-      "workflow.run.trigger",
-      {
-        scope: "auto",
-        name: "integration-audit",
-        args: { target: "restart", token: "restart-secret" },
-      },
-      { context },
+    const triggered = serverToolValue(
+      await tool.call(
+        "workflow.run.trigger",
+        {
+          scope: "auto",
+          name: "integration-audit",
+          args: { target: "restart", token: "restart-secret" },
+        },
+        { context },
+      ),
     );
     const { runId } = z.object({ runId: z.string() }).parse(triggered);
     const firstBinding = workflowStoreValue(store.getSurfaceBinding(runId))?.messageRef;

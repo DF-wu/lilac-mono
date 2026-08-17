@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import {
+  serverToolFailure,
   ToolPluginCleanupError,
   ToolPluginHookError,
   ToolPluginManager,
@@ -21,7 +22,7 @@ import {
 } from "../src/tool-server/create-tool-server";
 import type { ServerTool } from "../src/tool-server/types";
 import { RequestControlAuthority } from "../src/tool-server/request-control-authority";
-import { parseToolInput } from "../src/tool-server/validation-error-message";
+import { decodeToolInput } from "../src/tool-server/validation-error-message";
 import type { AuthenticatedRequestProjection } from "../src/surface/authenticated-request";
 
 const originalMemoryUsage = process.memoryUsage;
@@ -137,7 +138,8 @@ async function writePluginServerTool(params: {
   );
   await fs.writeFile(
     path.join(pluginDir, "index.js"),
-    `export default {
+    `import { Result } from ${JSON.stringify(import.meta.resolve("better-result"))};
+export default {
   meta: { id: "${params.pluginId}" },
   create() {
     return {
@@ -146,7 +148,7 @@ async function writePluginServerTool(params: {
         async init() {},
         async destroy() {},
         async list() { return [{ callableId: "${params.callableId}", name: "${params.callableId}", description: "${params.callableId}", shortInput: [], input: [] }]; },
-        async call() { return { value: "${params.value}" }; },
+        async call() { return Result.ok({ value: "${params.value}" }); },
       }],
     };
   },
@@ -160,6 +162,306 @@ describe("createToolServer", () => {
     expect(() => createToolServer({ operatorTokenSha256: "not-a-sha256-digest" })).toThrow(
       "operatorTokenSha256 must be a SHA-256 hex digest",
     );
+  });
+
+  it("returns a typed not-found failure for an unknown /call callable", async () => {
+    const server = createToolServer({ tools: [] });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "missing.call", input: {} }),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        status: "error",
+        error: {
+          kind: "not_found",
+          code: "unknown_callable",
+          message: "Unknown callable ID 'missing.call'",
+          retryable: false,
+        },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("returns a typed denial when /call authentication fails", async () => {
+    const tool: ServerTool = {
+      id: "authentication-test",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [{ callableId: "auth.call", name: "Auth", description: "Auth", shortInput: [] }];
+      },
+      async call() {
+        return Result.ok({ ok: true });
+      },
+    };
+    const server = createToolServer({
+      tools: [tool],
+      authorizeControlRequest: () => null,
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "auth.call", input: {} }),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        status: "error",
+        error: {
+          kind: "denied",
+          code: "authentication_failed",
+          message: "Level-2 tools require an active server-issued request capability",
+          retryable: false,
+        },
+      });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("preserves typed semantic tool failures over HTTP 200", async () => {
+    const failure = serverToolFailure({
+      kind: "unavailable",
+      code: "backend_offline",
+      message: "Backend is offline",
+      retryable: true,
+      details: { region: "west", attempts: [1, 2] },
+    });
+    const tool: ServerTool = {
+      id: "semantic-failure",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "semantic.fail",
+            name: "Semantic failure",
+            description: "Returns a typed failure",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        return Result.err(failure);
+      },
+    };
+    const server = createToolServer({ tools: [tool] });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "semantic.fail", input: {} }),
+        }),
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ status: "error", error: failure });
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("normalizes a side-effect-like successful value without executing the tool twice", async () => {
+    let calls = 0;
+    const tool: ServerTool = {
+      id: "successful-output-projection",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "projection.side-effect",
+            name: "Projection side effect",
+            description: "Returns an optional success field",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        calls += 1;
+        return Result.ok({ ok: true, optional: undefined });
+      },
+    };
+    const server = createToolServer({ tools: [tool] });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "projection.side-effect", input: {} }),
+        }),
+      );
+
+      expect(await response.json()).toEqual({ status: "ok", value: { ok: true } });
+      expect(calls).toBe(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("reports output serialization defects opaquely while preserving mcp.add safety", async () => {
+    const secret = "mcp-output-serialization-secret";
+    const reported: Error[] = [];
+    let calls = 0;
+    const tool: ServerTool = {
+      id: "output-serialization-defect",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "mcp.add",
+            name: "MCP add",
+            description: "Returns an unserializable successful value",
+            shortInput: [],
+          },
+        ];
+      },
+      async call() {
+        calls += 1;
+        return Result.ok({
+          toJSON() {
+            throw new Error(secret);
+          },
+        });
+      },
+    };
+    const chunks: string[] = [];
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const server = createToolServer({
+      tools: [tool],
+      logger: createLogger({
+        module: "output-serialization-defect-test",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
+      reportFatalToolCallDefect: (defect) => reported.push(defect),
+    });
+    await server.init();
+    try {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ callableId: "mcp.add", input: {} }),
+        }),
+      );
+      const body = await response.json();
+
+      expect(body).toEqual({
+        status: "error",
+        error: {
+          kind: "internal",
+          code: "mcp_add_failed",
+          message: "mcp.add failed without exposing sensitive configuration",
+          retryable: false,
+        },
+      });
+      expect(calls).toBe(1);
+      expect(reported).toHaveLength(1);
+      expect(reported[0]?.message).toBe("Plugin tool output violated the JSON wire contract");
+      expect(
+        `${JSON.stringify(body)}\n${chunks.join("\n")}\n${reported[0]?.message}`,
+      ).not.toContain(secret);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("turns malformed plugin Results into opaque internal contract failures", async () => {
+    const secret = "legacy-result-secret";
+    const reported: Error[] = [];
+    const chunks: string[] = [];
+    const tool = {
+      id: "legacy-result",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [
+          {
+            callableId: "legacy.envelope",
+            name: "Legacy envelope",
+            description: "Returns a raw wire-shaped envelope",
+            shortInput: [],
+          },
+          {
+            callableId: "legacy.empty-code",
+            name: "Empty failure code",
+            description: "Returns a malformed Result failure",
+            shortInput: [],
+          },
+        ];
+      },
+      async call(callableId: string) {
+        if (callableId === "legacy.envelope") {
+          return { status: "ok", value: { secret } };
+        }
+        return Result.err({
+          kind: "internal",
+          code: "",
+          message: "Missing failure code",
+          retryable: false,
+          details: { secret },
+        });
+      },
+    } as unknown as ServerTool;
+    const output = { write: (chunk: string) => chunks.push(chunk) };
+    const server = createToolServer({
+      tools: [tool],
+      logger: createLogger({
+        module: "malformed-result-test",
+        outputFormat: "jsonl",
+        stdout: output,
+        stderr: output,
+      }),
+      reportFatalToolCallDefect: (defect) => reported.push(defect),
+    });
+    await server.init();
+    try {
+      for (const callableId of ["legacy.envelope", "legacy.empty-code"]) {
+        const response = await server.app.handle(
+          new Request("http://localhost/call", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ callableId, input: {} }),
+          }),
+        );
+        const body = await response.json();
+
+        expect(response.status).toBe(200);
+        expect(body).toEqual({
+          status: "error",
+          error: {
+            kind: "internal",
+            code: "plugin_call_failed",
+            message: "Internal tool server failure",
+            retryable: false,
+          },
+        });
+        expect(JSON.stringify(body)).not.toContain(secret);
+      }
+      expect(reported).toEqual([]);
+      expect(chunks.join("\n")).not.toContain(secret);
+    } finally {
+      await server.stop();
+    }
   });
 
   it("redacts nested sensitive JSON fields before ordinary tool-input logging", async () => {
@@ -180,7 +482,7 @@ describe("createToolServer", () => {
         ];
       },
       async call() {
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const output = { write: (chunk: string) => chunks.push(chunk) };
@@ -206,7 +508,7 @@ describe("createToolServer", () => {
           }),
         }),
       );
-      expect(await response.json()).toEqual({ isError: false, output: { ok: true } });
+      expect(await response.json()).toEqual({ status: "ok", value: { ok: true } });
       const logged = chunks.join("\n");
       expect(logged).toContain("<redacted>");
       expect(logged).toContain("retained");
@@ -283,7 +585,7 @@ describe("createToolServer", () => {
       },
       async call(_callableId, _input, options) {
         if (options?.context) contexts.push(options.context);
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const server = createToolServer({
@@ -341,7 +643,7 @@ describe("createToolServer", () => {
             body: JSON.stringify({ callableId: "workflow.test", input: {} }),
           }),
         );
-        expect(await call.json()).toMatchObject({ isError: false, output: { ok: true } });
+        expect(await call.json()).toMatchObject({ status: "ok", value: { ok: true } });
       }
       expect(
         contexts.map(
@@ -432,7 +734,7 @@ describe("createToolServer", () => {
       },
       async call(_callableId, _input, options) {
         if (options?.context) calls.push(options.context);
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const server = createToolServer({
@@ -475,7 +777,7 @@ describe("createToolServer", () => {
           }),
         }),
       );
-      expect(await allowed.json()).toMatchObject({ isError: false, output: { ok: true } });
+      expect(await allowed.json()).toMatchObject({ status: "ok", value: { ok: true } });
       expect(calls[0]).toMatchObject({
         requestInitiator: { platform: "telegram", userId: "user-7" },
         requestInitiatorSessionId: originSessionId,
@@ -492,8 +794,11 @@ describe("createToolServer", () => {
         }),
       );
       expect(await blocked.json()).toMatchObject({
-        isError: true,
-        output: "Tool 'surface.messages.send' is not allowed in restricted public-session mode",
+        status: "error",
+        error: {
+          kind: "denied",
+          message: "Tool 'surface.messages.send' is not allowed in restricted public-session mode",
+        },
       });
       expect(calls).toHaveLength(1);
     } finally {
@@ -531,7 +836,7 @@ describe("createToolServer", () => {
       },
       async call(callableId) {
         calls.push(callableId);
-        return { callableId };
+        return Result.ok({ callableId });
       },
     };
     const pluginManager = {
@@ -602,8 +907,13 @@ describe("createToolServer", () => {
         }),
       );
       expect(await denied.json()).toEqual({
-        isError: true,
-        output: "Tool 'profile.denied' is not enabled for this subagent profile",
+        status: "error",
+        error: {
+          kind: "denied",
+          code: "profile_denied",
+          message: "Tool 'profile.denied' is not enabled for this subagent profile",
+          retryable: false,
+        },
       });
       expect(calls).toEqual([]);
     } finally {
@@ -622,7 +932,7 @@ describe("createToolServer", () => {
       },
       async call(_callableId, _input, options) {
         if (options?.context) contexts.push(options.context);
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const server = createToolServer({
@@ -680,7 +990,7 @@ describe("createToolServer", () => {
             }),
           )
         ).json(),
-      ).toMatchObject({ isError: false, output: { ok: true } });
+      ).toMatchObject({ status: "ok", value: { ok: true } });
       expect(contexts).toHaveLength(1);
       expect(contexts[0]?.cwd).toBe("/workspace");
       expect(
@@ -810,7 +1120,7 @@ describe("createToolServer", () => {
         ];
       },
       async call() {
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const server = createToolServerImpl({ tools: [tool] });
@@ -826,8 +1136,13 @@ describe("createToolServer", () => {
         }),
       );
       expect(await called.json()).toMatchObject({
-        isError: true,
-        output: expect.stringContaining("restricted public-session mode"),
+        status: "error",
+        error: {
+          kind: "denied",
+          code: "restricted_mode_denied",
+          message: expect.stringContaining("restricted public-session mode"),
+          retryable: false,
+        },
       });
     } finally {
       await server.stop();
@@ -853,7 +1168,7 @@ describe("createToolServer", () => {
       },
       async call(_callableId, _input, options) {
         if (options?.context) contexts.push(options.context);
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const server = createToolServer({
@@ -909,7 +1224,7 @@ describe("createToolServer", () => {
             body: JSON.stringify({ callableId: "workflow.safety-precedence", input: {} }),
           }),
         );
-        expect(await response.json()).toMatchObject({ isError: false });
+        expect(await response.json()).toMatchObject({ status: "ok" });
       }
       expect(discordPolicyCalls).toBe(1);
       expect(contexts.map((context) => context.requestInitiator)).toEqual([undefined, undefined]);
@@ -929,7 +1244,7 @@ describe("createToolServer", () => {
       },
       async call(_callableId, _input, options) {
         if (options?.context) contexts.push(options.context);
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const server = createToolServer({
@@ -967,7 +1282,7 @@ describe("createToolServer", () => {
           body: JSON.stringify({ callableId: "fetch", input: {} }),
         }),
       );
-      expect(await response.json()).toMatchObject({ isError: false });
+      expect(await response.json()).toMatchObject({ status: "ok" });
       expect(contexts[0]).toMatchObject({
         safetyMode: "restricted",
         serverOwnedRequest: false,
@@ -998,7 +1313,7 @@ describe("createToolServer", () => {
       },
       async call(_callableId, _input, options) {
         if (options?.context) contexts.push(options.context);
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const server = createToolServer({
@@ -1044,7 +1359,7 @@ describe("createToolServer", () => {
             }),
           )
         ).json(),
-      ).toMatchObject({ isError: false, output: { ok: true } });
+      ).toMatchObject({ status: "ok", value: { ok: true } });
       expect(
         await (
           await server.app.handle(
@@ -1059,7 +1374,7 @@ describe("createToolServer", () => {
             }),
           )
         ).json(),
-      ).toMatchObject({ isError: false, output: { ok: true } });
+      ).toMatchObject({ status: "ok", value: { ok: true } });
       expect(contexts).toEqual([
         {
           requestId: "operator:request-1",
@@ -1105,7 +1420,7 @@ describe("createToolServer", () => {
         called.push(callableId);
         expect(options?.context?.cwd).toBe("/canonical-workspace");
         expect(options?.context?.requestInitiator).toBeUndefined();
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const server = createToolServer({
@@ -1155,8 +1470,13 @@ describe("createToolServer", () => {
         }),
       );
       expect(await deniedCall.json()).toMatchObject({
-        isError: true,
-        output: expect.stringContaining("outside the internal request capability"),
+        status: "error",
+        error: {
+          kind: "denied",
+          code: "capability_denied",
+          message: expect.stringContaining("outside the internal request capability"),
+          retryable: false,
+        },
       });
 
       const deniedAttachment = await server.app.handle(
@@ -1170,8 +1490,13 @@ describe("createToolServer", () => {
         }),
       );
       expect(await deniedAttachment.json()).toMatchObject({
-        isError: true,
-        output: expect.stringContaining("text-only"),
+        status: "error",
+        error: {
+          kind: "denied",
+          code: "heartbeat_attachments_denied",
+          message: expect.stringContaining("text-only"),
+          retryable: false,
+        },
       });
 
       const allowedCall = await server.app.handle(
@@ -1181,7 +1506,7 @@ describe("createToolServer", () => {
           body: JSON.stringify({ callableId: "surface.messages.send", input: { content: "due" } }),
         }),
       );
-      expect(await allowedCall.json()).toMatchObject({ isError: false, output: { ok: true } });
+      expect(await allowedCall.json()).toMatchObject({ status: "ok", value: { ok: true } });
       expect(called).toEqual(["surface.messages.send"]);
     } finally {
       await server.stop();
@@ -1235,7 +1560,7 @@ describe("createToolServer", () => {
           messages: opts?.messages,
           serverOwnedRequest: opts?.context?.serverOwnedRequest,
         });
-        return { ok: true, echo: input };
+        return Result.ok({ ok: true, echo: input });
       },
     };
 
@@ -1289,7 +1614,7 @@ describe("createToolServer", () => {
 
     expect(response.status).toBe(200);
     const body = await response.json();
-    expect(body).toEqual({ isError: false, output: { ok: true, echo: { hello: "world" } } });
+    expect(body).toEqual({ status: "ok", value: { ok: true, echo: { hello: "world" } } });
 
     const captured = seenCalls[0]!;
     expect(captured.callableId).toBe("test.echo");
@@ -1323,7 +1648,7 @@ describe("createToolServer", () => {
         ];
       },
       async call() {
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
 
@@ -1457,7 +1782,7 @@ describe("createToolServer", () => {
       },
       async call(callableId) {
         calls.push(callableId);
-        return { ok: true, callableId };
+        return Result.ok({ ok: true, callableId });
       },
     };
 
@@ -1577,8 +1902,13 @@ describe("createToolServer", () => {
     );
     expect(blockedRes.status).toBe(200);
     expect(await blockedRes.json()).toEqual({
-      isError: true,
-      output: "Tool 'onboarding.restart' is not allowed in restricted public-session mode",
+      status: "error",
+      error: {
+        kind: "denied",
+        code: "restricted_mode_denied",
+        message: "Tool 'onboarding.restart' is not allowed in restricted public-session mode",
+        retryable: false,
+      },
     });
 
     const crossSessionRes = await server.app.handle(
@@ -1596,8 +1926,13 @@ describe("createToolServer", () => {
     );
     expect(crossSessionRes.status).toBe(200);
     expect(await crossSessionRes.json()).toEqual({
-      isError: true,
-      output: "Tool 'surface.messages.send' is not allowed in restricted public-session mode",
+      status: "error",
+      error: {
+        kind: "denied",
+        code: "restricted_mode_denied",
+        message: "Tool 'surface.messages.send' is not allowed in restricted public-session mode",
+        retryable: false,
+      },
     });
 
     const crossSessionEditRes = await server.app.handle(
@@ -1615,8 +1950,13 @@ describe("createToolServer", () => {
     );
     expect(crossSessionEditRes.status).toBe(200);
     expect(await crossSessionEditRes.json()).toEqual({
-      isError: true,
-      output: "Tool 'surface.messages.edit' is not allowed in restricted public-session mode",
+      status: "error",
+      error: {
+        kind: "denied",
+        code: "restricted_mode_denied",
+        message: "Tool 'surface.messages.edit' is not allowed in restricted public-session mode",
+        retryable: false,
+      },
     });
 
     const allowedRes = await server.app.handle(
@@ -1631,8 +1971,8 @@ describe("createToolServer", () => {
     );
     expect(allowedRes.status).toBe(200);
     expect(await allowedRes.json()).toEqual({
-      isError: false,
-      output: { ok: true, callableId: "fetch" },
+      status: "ok",
+      value: { ok: true, callableId: "fetch" },
     });
     const discoveryRes = await server.app.handle(
       new Request("http://localhost/call", {
@@ -1646,8 +1986,8 @@ describe("createToolServer", () => {
     );
     expect(discoveryRes.status).toBe(200);
     expect(await discoveryRes.json()).toEqual({
-      isError: false,
-      output: { ok: true, callableId: "discovery.search" },
+      status: "ok",
+      value: { ok: true, callableId: "discovery.search" },
     });
 
     expect(calls).toEqual(["fetch", "discovery.search"]);
@@ -1674,7 +2014,7 @@ describe("createToolServer", () => {
       },
       async call() {
         called = true;
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const server = createToolServer({
@@ -1720,8 +2060,13 @@ describe("createToolServer", () => {
         }),
       );
       expect(await response.json()).toEqual({
-        isError: true,
-        output: "Tool 'workflow.test' is not allowed in restricted public-session mode",
+        status: "error",
+        error: {
+          kind: "denied",
+          code: "restricted_mode_denied",
+          message: "Tool 'workflow.test' is not allowed in restricted public-session mode",
+          retryable: false,
+        },
       });
       expect(called).toBe(false);
     } finally {
@@ -1780,7 +2125,7 @@ describe("createToolServer", () => {
         body: JSON.stringify({ callableId: "echo.call", input: {} }),
       }),
     );
-    expect(await firstCall.json()).toEqual({ isError: false, output: { value: "one" } });
+    expect(await firstCall.json()).toEqual({ status: "ok", value: { value: "one" } });
 
     // test-wait-justification: advances filesystem mtime so explicit reload observes the rewritten plugin bundle
     await Bun.sleep(5);
@@ -1820,7 +2165,7 @@ describe("createToolServer", () => {
         body: JSON.stringify({ callableId: "echo.call.v2", input: {} }),
       }),
     );
-    expect(await secondCall.json()).toEqual({ isError: false, output: { value: "two" } });
+    expect(await secondCall.json()).toEqual({ status: "ok", value: { value: "two" } });
 
     await server.stop();
   });
@@ -1841,7 +2186,7 @@ describe("createToolServer", () => {
         return [{ callableId, name: callableId, description: callableId, shortInput: [] }];
       },
       async call(callableId) {
-        return { callableId };
+        return Result.ok({ callableId });
       },
     };
     const pluginManager = new ToolPluginManager<
@@ -1873,8 +2218,8 @@ describe("createToolServer", () => {
       }),
     );
     expect(await called.json()).toEqual({
-      isError: false,
-      output: { callableId: "dynamic.call.v2" },
+      status: "ok",
+      value: { callableId: "dynamic.call.v2" },
     });
     expect(listCalls).toBe(7);
     await server.stop();
@@ -1909,7 +2254,7 @@ describe("createToolServer", () => {
                     ];
                   },
                   async call() {
-                    return { generation: current };
+                    return Result.ok({ generation: current });
                   },
                 },
               ],
@@ -1946,7 +2291,7 @@ describe("createToolServer", () => {
         body: JSON.stringify({ callableId: "committed.call.2", input: {} }),
       }),
     );
-    expect(await called.json()).toEqual({ isError: false, output: { generation: 2 } });
+    expect(await called.json()).toEqual({ status: "ok", value: { generation: 2 } });
     expect(chunks.join("\n")).toContain("reload committed");
     await server.stop();
   });
@@ -2010,7 +2355,7 @@ describe("createToolServer", () => {
         body: JSON.stringify({ callableId: "fresh.call.v2", input: {} }),
       }),
     );
-    expect(await callRes.json()).toEqual({ isError: false, output: { value: "two" } });
+    expect(await callRes.json()).toEqual({ status: "ok", value: { value: "two" } });
 
     await server.stop();
   });
@@ -2256,8 +2601,13 @@ describe("createToolServer", () => {
       const callRes = await callResponse;
       expect(callRes.status).toBe(200);
       expect(await callRes.json()).toEqual({
-        isError: true,
-        output: "Tool call timed out after 20ms",
+        status: "error",
+        error: {
+          kind: "timeout",
+          code: "tool_timeout",
+          message: "Tool call timed out after 20ms",
+          retryable: true,
+        },
       });
 
       jest.advanceTimersByTime(11);
@@ -2376,8 +2726,13 @@ describe("createToolServer", () => {
 
       const response = await responsePromise;
       expect(await response.json()).toEqual({
-        isError: true,
-        output: "Tool call timed out after 10ms",
+        status: "error",
+        error: {
+          kind: "timeout",
+          code: "tool_timeout",
+          message: "Tool call timed out after 10ms",
+          retryable: true,
+        },
       });
       expect(await observed.promise).toBe(panic);
       expect(fatalReports).toBe(1);
@@ -2393,7 +2748,8 @@ describe("createToolServer", () => {
   it("reports a late non-Panic rejection to the fatal supervisor", async () => {
     const defect = new Error("late logging defect");
     const started = Promise.withResolvers<void>();
-    const observed = Promise.withResolvers<unknown>();
+    const observed = Promise.withResolvers<readonly Error[]>();
+    const reported: Error[] = [];
     const chunks: string[] = [];
     const output = { write: (chunk: string) => chunks.push(chunk) };
     const logger = createLogger({
@@ -2439,7 +2795,10 @@ describe("createToolServer", () => {
         tools: [tool],
         logger,
         toolCallTimeouts: { defaultTimeoutMs: 10 },
-        reportFatalToolCallDefect: observed.resolve,
+        reportFatalToolCallDefect: (fatalDefect) => {
+          reported.push(fatalDefect);
+          if (reported.length === 2) observed.resolve(reported);
+        },
       });
       await server.init();
       const responsePromise = server.app.handle(
@@ -2454,10 +2813,18 @@ describe("createToolServer", () => {
 
       const response = await responsePromise;
       expect(await response.json()).toEqual({
-        isError: true,
-        output: "Tool call timed out after 10ms",
+        status: "error",
+        error: {
+          kind: "timeout",
+          code: "tool_timeout",
+          message: "Tool call timed out after 10ms",
+          retryable: true,
+        },
       });
-      expect(await observed.promise).toMatchObject({ message: defect.message });
+      expect((await observed.promise).map((error) => error.message)).toEqual([
+        "expected plugin cancellation failure",
+        defect.message,
+      ]);
     } finally {
       try {
         await server?.stop();
@@ -2490,7 +2857,7 @@ describe("createToolServer", () => {
         started.resolve();
         await release.promise;
         settled.resolve();
-        return { late: true };
+        return Result.ok({ late: true });
       },
     };
     jest.useFakeTimers({ now: 0 });
@@ -2516,8 +2883,13 @@ describe("createToolServer", () => {
 
       const response = await responsePromise;
       expect(await response.json()).toEqual({
-        isError: true,
-        output: "Tool call timed out after 10ms",
+        status: "error",
+        error: {
+          kind: "timeout",
+          code: "tool_timeout",
+          message: "Tool call timed out after 10ms",
+          retryable: true,
+        },
       });
       release.resolve();
       await settled.promise;
@@ -2563,7 +2935,7 @@ describe("createToolServer", () => {
         ];
       },
       async call() {
-        return { ok: true };
+        return Result.ok({ ok: true });
       },
     };
     const server = createToolServer({ tools: [tool], logger });
@@ -2577,11 +2949,12 @@ describe("createToolServer", () => {
       }),
     );
     expect(response.status).toBe(500);
-    expect(await response.text()).not.toContain('"isError":true');
+    expect(await response.text()).not.toContain('"status":"error"');
     await server.stop();
   });
 
   it("does not leak active tool calls when tool.call throws synchronously", async () => {
+    const reported: Error[] = [];
     const tool: ServerTool = {
       id: "sync-throw",
       async init() {},
@@ -2615,6 +2988,7 @@ describe("createToolServer", () => {
           maxRssBytes: Number.MAX_SAFE_INTEGER,
           toolCallOverdueGraceMs: 10,
         },
+        reportFatalToolCallDefect: (defect) => reported.push(defect),
       });
       await server.init();
       await server.start(0);
@@ -2632,9 +3006,16 @@ describe("createToolServer", () => {
         }),
       );
       expect(await callRes.json()).toEqual({
-        isError: true,
-        output: "sync boom",
+        status: "error",
+        error: {
+          kind: "internal",
+          code: "plugin_call_failed",
+          message: "Internal tool server failure",
+          retryable: false,
+        },
       });
+      expect(reported).toHaveLength(1);
+      expect(reported[0]?.message).toBe("sync boom");
 
       jest.advanceTimersByTime(31);
 
@@ -2664,6 +3045,7 @@ describe("createToolServer", () => {
       readonly message: string;
     }> {}
     const chunks: string[] = [];
+    const reported: Error[] = [];
     const secret = "plugin-tagged-secret-value";
     const tool: ServerTool = {
       id: "tagged-secret",
@@ -2692,6 +3074,7 @@ describe("createToolServer", () => {
         stdout: output,
         stderr: output,
       }),
+      reportFatalToolCallDefect: (defect) => reported.push(defect),
     });
 
     await server.init();
@@ -2703,7 +3086,17 @@ describe("createToolServer", () => {
       }),
     );
     const body = await response.json();
-    expect(body).toEqual({ isError: true, output: "External tagged error" });
+    expect(body).toEqual({
+      status: "error",
+      error: {
+        kind: "internal",
+        code: "plugin_call_failed",
+        message: "Internal tool server failure",
+        retryable: false,
+      },
+    });
+    expect(reported).toHaveLength(1);
+    expect(reported[0]?.message).toBe("External tagged error");
     expect(`${JSON.stringify(body)}\n${chunks.join("\n")}`).not.toContain(secret);
     await server.stop();
   });
@@ -2725,13 +3118,20 @@ describe("createToolServer", () => {
         ];
       },
       async call(_callableId, input) {
-        return parseToolInput({
+        return decodeToolInput({
           callableId: "validate.input",
           input,
           schema: z.object({
             paths: z.union([z.string().min(1), z.array(z.string().min(1)).min(1)]),
           }),
-        });
+        }).mapError((error) =>
+          serverToolFailure({
+            kind: "usage",
+            code: "invalid_input",
+            message: error.message,
+            retryable: false,
+          }),
+        );
       },
     };
 
@@ -2758,13 +3158,18 @@ describe("createToolServer", () => {
     );
 
     expect(await callRes.json()).toEqual({
-      isError: true,
-      output: [
-        "validate.input has invalid input.",
-        "Missing or invalid fields: paths",
-        "Provided keys: files",
-        "Run 'tools --help validate.input' for details.",
-      ].join("\n"),
+      status: "error",
+      error: {
+        kind: "usage",
+        code: "invalid_input",
+        message: [
+          "validate.input has invalid input.",
+          "Missing or invalid fields: paths",
+          "Provided keys: files",
+          "Run 'tools --help validate.input' for details.",
+        ].join("\n"),
+        retryable: false,
+      },
     });
 
     await server.stop();
@@ -2772,6 +3177,7 @@ describe("createToolServer", () => {
 
   it("never logs mcp.add input or retained validation secrets", async () => {
     const chunks: string[] = [];
+    const reported: Error[] = [];
     const output = {
       write(chunk: string) {
         chunks.push(chunk);
@@ -2793,12 +3199,21 @@ describe("createToolServer", () => {
         ];
       },
       async call(callableId, input) {
-        if (input && typeof input === "object" && Reflect.get(input, "transport") === "stdio") {
-          const error = new Error(`MCP runtime failed: ${JSON.stringify(input)}`);
-          error.name = `McpRuntimeError:${Reflect.get(input, "env") ? "env-secret-value" : ""}`;
-          throw error;
+        if (input && typeof input === "object" && Reflect.get(input, "transport") === "defect") {
+          throw new Error(`MCP defect: ${JSON.stringify(input)}`);
         }
-        return parseToolInput({
+        if (input && typeof input === "object" && Reflect.get(input, "transport") === "stdio") {
+          return Result.err(
+            serverToolFailure({
+              kind: "unavailable",
+              code: "mcp_unavailable",
+              message: `MCP runtime failed: ${JSON.stringify(input)}`,
+              retryable: true,
+              details: { retained: "env-secret-value" },
+            }),
+          );
+        }
+        return decodeToolInput({
           callableId,
           input,
           schema: z.strictObject({
@@ -2806,7 +3221,14 @@ describe("createToolServer", () => {
             transport: z.literal("http"),
             url: z.url(),
           }),
-        });
+        }).mapError((error) =>
+          serverToolFailure({
+            kind: "usage",
+            code: "invalid_input",
+            message: error.message,
+            retryable: false,
+          }),
+        );
       },
     };
     const server = createToolServer({
@@ -2818,6 +3240,7 @@ describe("createToolServer", () => {
         stdout: output,
         stderr: output,
       }),
+      reportFatalToolCallDefect: (defect) => reported.push(defect),
     });
     const secrets = {
       clientSecret: "client-secret-value",
@@ -2851,8 +3274,13 @@ describe("createToolServer", () => {
       );
       const validationResult = await response.json();
       expect(validationResult).toEqual({
-        isError: true,
-        output: "mcp.add input validation failed",
+        status: "error",
+        error: {
+          kind: "usage",
+          code: "invalid_input",
+          message: "mcp.add input validation failed",
+          retryable: false,
+        },
       });
 
       const runtimeResponse = await server.app.handle(
@@ -2877,24 +3305,56 @@ describe("createToolServer", () => {
       );
       const runtimeResult = await runtimeResponse.json();
       expect(runtimeResult).toEqual({
-        isError: true,
-        output: "mcp.add failed without exposing sensitive configuration",
+        status: "error",
+        error: {
+          kind: "unavailable",
+          code: "mcp_add_failed",
+          message: "mcp.add failed without exposing sensitive configuration",
+          retryable: true,
+        },
+      });
+
+      const defectResponse = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            callableId: "mcp.add",
+            input: {
+              transport: "defect",
+              command: `bun --token=${secrets.commandToken}`,
+              env: { MCP_TOKEN: secrets.envToken },
+            },
+          }),
+        }),
+      );
+      const defectResult = await defectResponse.json();
+      expect(defectResult).toEqual({
+        status: "error",
+        error: {
+          kind: "internal",
+          code: "mcp_add_failed",
+          message: "mcp.add failed without exposing sensitive configuration",
+          retryable: false,
+        },
       });
 
       const logged = chunks.join("");
       expect(logged).toContain("<redacted mcp.add input>");
-      expect(logged).toContain("McpAddError");
+      expect(logged).toContain("mcp_add_failed");
       expect(logged).not.toContain("MCP runtime failed");
       expect(logged).not.toContain("mcp.add has invalid input");
       expect(logged).not.toContain("?code=");
-      const observableOutput = `${logged}\n${JSON.stringify({ validationResult, runtimeResult })}`;
+      expect(reported).toHaveLength(1);
+      const observableOutput = `${logged}\n${reported[0]?.message}\n${JSON.stringify({ validationResult, runtimeResult, defectResult })}`;
       for (const secret of Object.values(secrets)) expect(observableOutput).not.toContain(secret);
     } finally {
       await server.stop();
     }
   });
 
-  it("preserves runtime Zod errors that are not input parsing failures", async () => {
+  it("returns an opaque internal failure for runtime Zod defects", async () => {
+    const reported: Error[] = [];
     const tool: ServerTool = {
       id: "validate-runtime",
       async init() {},
@@ -2911,16 +3371,18 @@ describe("createToolServer", () => {
         ];
       },
       async call() {
-        return z
+        const parsed = z
           .object({
             tag: z.string(),
           })
           .parse({});
+        return Result.ok(parsed);
       },
     };
 
     const server = createToolServer({
       tools: [tool],
+      reportFatalToolCallDefect: (defect) => reported.push(defect),
     });
 
     await server.init();
@@ -2939,10 +3401,16 @@ describe("createToolServer", () => {
       }),
     );
 
-    const body = (await callRes.json()) as { isError: boolean; output: string };
-    expect(body.isError).toBe(true);
-    expect(body.output).toContain('"tag"');
-    expect(body.output).not.toContain("validate.runtime has invalid input.");
+    expect(await callRes.json()).toEqual({
+      status: "error",
+      error: {
+        kind: "internal",
+        code: "plugin_call_failed",
+        message: "Internal tool server failure",
+        retryable: false,
+      },
+    });
+    expect(reported).toHaveLength(1);
 
     await server.stop();
   });
@@ -2985,7 +3453,9 @@ describe("createToolServer", () => {
           { callableId: "healthy.call", name: "Healthy", description: "Healthy", shortInput: [] },
         ];
       },
-      async call() {},
+      async call() {
+        return Result.ok(null);
+      },
     };
     const broken: ServerTool = {
       id: "broken",
@@ -2994,7 +3464,9 @@ describe("createToolServer", () => {
       async list() {
         throw new Error("list boom");
       },
-      async call() {},
+      async call() {
+        return Result.ok(null);
+      },
     };
     const server = createToolServer({ tools: [healthy, broken] });
     await server.init();
@@ -3022,7 +3494,9 @@ describe("createToolServer", () => {
       async list() {
         throw panic;
       },
-      async call() {},
+      async call() {
+        return Result.ok(null);
+      },
     };
     const server = createToolServer({ tools: [tool] });
     try {

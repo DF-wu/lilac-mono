@@ -1,8 +1,16 @@
 import { describe, expect, expectTypeOf, it } from "bun:test";
-import { z, ZodError } from "zod";
+import { z } from "zod";
+import { Result } from "better-result";
 
 import type { Level1ExecutionRequestContext, RequestContext } from "../types";
-import { defineServerTool, ToolInputValidationError, type ServerToolCallOptions } from "../index";
+import {
+  defineServerTool,
+  serverToolExitCode,
+  serverToolFailure,
+  type ServerToolCallOptions,
+  type ServerToolFailureKind,
+  type ServerToolResult,
+} from "../index";
 
 expectTypeOf<NonNullable<RequestContext["requestInitiator"]>["platform"]>().toEqualTypeOf<string>();
 expectTypeOf<
@@ -19,14 +27,14 @@ describe("defineServerTool", () => {
           description: "First callable",
           inputSchema: z.object({ query: z.string().describe("Search query") }),
           primaryPositional: "query",
-          run: ({ query }) => query,
+          run: ({ query }) => Result.ok(query),
         }),
         standalone: callable({
           name: "Second",
           description: "Second callable",
           inputSchema: z.object({ count: z.number().optional() }),
           primaryPositional: { field: "count", variadic: true },
-          run: ({ count }) => count,
+          run: ({ count }) => Result.ok(count),
         }),
       }),
     });
@@ -69,13 +77,16 @@ describe("defineServerTool", () => {
             const source: string = input.count;
             void source;
             expect(count).toBe(3);
-            return output;
+            return Result.ok(output);
           },
         }),
       }),
     });
 
-    expect(await tool.call("convert", { count: "3" })).toBe(output);
+    const result = await tool.call("convert", { count: "3" });
+    expect(result.status).toBe("ok");
+    if (result.status === "error") throw new Error(result.error.message);
+    expect(result.value).toBe(output);
   });
 
   it("omits disabled catalog entries and applies sync and async catalog overrides", async () => {
@@ -92,14 +103,14 @@ describe("defineServerTool", () => {
           description: "Hidden from catalog",
           inputSchema: z.object({}),
           catalog: false,
-          run: () => undefined,
+          run: () => Result.ok(),
         }),
         dynamicDisabled: callable({
           name: "Dynamic disabled",
           description: "Hidden from catalog",
           inputSchema: z.object({}),
           catalog: () => false,
-          run: () => undefined,
+          run: () => Result.ok(),
         }),
         syncOverride: callable({
           name: "Sync",
@@ -107,28 +118,28 @@ describe("defineServerTool", () => {
           inputSchema: z.object({}),
           hidden: true,
           catalog: () => ({ description: "Current sync description", hidden: false }),
-          run: () => undefined,
+          run: () => Result.ok(),
         }),
         asyncOverride: callable({
           name: "Async",
           description: "Original async description",
           inputSchema: z.object({}),
           catalog: async () => ({ description: "Current async description", hidden: true }),
-          run: () => undefined,
+          run: () => Result.ok(),
         }),
         sharedFirst: callable({
           name: "Shared first",
           description: "Shared catalog snapshot",
           inputSchema: z.object({}),
           catalog: sharedCatalog,
-          run: () => undefined,
+          run: () => Result.ok(),
         }),
         sharedSecond: callable({
           name: "Shared second",
           description: "Shared catalog snapshot",
           inputSchema: z.object({}),
           catalog: sharedCatalog,
-          run: () => undefined,
+          run: () => Result.ok(),
         }),
       }),
     });
@@ -170,14 +181,14 @@ describe("defineServerTool", () => {
             shortInput: ["custom-short"],
             input: ["custom-all"],
           },
-          run: () => undefined,
+          run: () => Result.ok(),
         }),
         partial: callable({
           name: "Partial",
           description: "Partial CLI",
           inputSchema: z.object({ requiredValue: z.string() }),
           cli: { shortInput: ["partial-short"] },
-          run: () => undefined,
+          run: () => Result.ok(),
         }),
       }),
     });
@@ -228,13 +239,16 @@ describe("defineServerTool", () => {
           inputSchema: z.object({}),
           run(_input, runOpts) {
             received = runOpts;
-            return "ok";
+            return Result.ok("ok");
           },
         }),
       }),
     });
 
-    expect(await tool.call("inspect", {}, opts)).toBe("ok");
+    const result = await tool.call("inspect", {}, opts);
+    expect(result.status).toBe("ok");
+    if (result.status === "error") throw new Error(result.error.message);
+    expect(result.value).toBe("ok");
     expect(received).toBe(opts);
   });
 
@@ -246,30 +260,99 @@ describe("defineServerTool", () => {
           name: "Guided",
           description: "Guided validation",
           inputSchema: z.object({ value: z.string() }),
-          run: ({ value }) => value,
+          run: ({ value }) => Result.ok(value),
         }),
         rawZod: callable({
           name: "Zod",
           description: "Zod validation",
           inputSchema: z.object({ value: z.string() }),
           validation: "zod",
-          run: ({ value }) => value,
+          run: ({ value }) => Result.ok(value),
         }),
       }),
     });
 
-    const guided = tool.call("guided", { value: 1 });
-    await expect(guided).rejects.toBeInstanceOf(ToolInputValidationError);
-    await expect(guided).rejects.toThrow("guided has invalid input.");
-    await expect(tool.call("rawZod", { value: 1 })).rejects.toBeInstanceOf(ZodError);
+    const guided = await tool.call("guided", { value: 1 });
+    expect(guided.status).toBe("error");
+    if (guided.status === "ok") throw new Error("expected guided validation failure");
+    expect(guided.error).toEqual({
+      kind: "usage",
+      code: "invalid_input",
+      message: expect.stringContaining("guided has invalid input."),
+      retryable: false,
+    });
+
+    const rawZod = await tool.call("rawZod", { value: 1 });
+    expect(rawZod.status).toBe("error");
+    if (rawZod.status === "ok") throw new Error("expected Zod validation failure");
+    expect(rawZod.error).toEqual({
+      kind: "usage",
+      code: "invalid_input",
+      message: expect.stringContaining("expected string"),
+      retryable: false,
+    });
+    expect(() => JSON.parse(rawZod.error.message)).not.toThrow();
   });
 
-  it("rejects unknown callable IDs with the exact host message", async () => {
+  it("returns semantic not-found failures for unknown callable IDs", async () => {
     const tool = defineServerTool({ id: "empty", callables: () => ({}) });
 
-    await expect(tool.call("toString", {})).rejects.toHaveProperty(
-      "message",
-      "Invalid callable ID 'toString'",
-    );
+    const result = await tool.call("toString", {});
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected unknown callable failure");
+    expect(result.error).toEqual({
+      kind: "not_found",
+      code: "unknown_callable",
+      message: "Invalid callable ID 'toString'",
+      retryable: false,
+    });
+  });
+
+  it("exports the failure helper, exhaustive exit codes, and strict callable return type", () => {
+    const failure = serverToolFailure({
+      kind: "unavailable",
+      code: "backend_offline",
+      message: "Backend is offline",
+      retryable: true,
+      details: { attempts: 2, regions: ["west", null] },
+    });
+    const expectedExitCodes = {
+      internal: 1,
+      usage: 2,
+      denied: 3,
+      not_found: 4,
+      conflict: 5,
+      unavailable: 6,
+      timeout: 7,
+      cancelled: 8,
+    } as const satisfies Record<ServerToolFailureKind, number>;
+
+    expect(failure).toEqual({
+      kind: "unavailable",
+      code: "backend_offline",
+      message: "Backend is offline",
+      retryable: true,
+      details: { attempts: 2, regions: ["west", null] },
+    });
+    expect(serverToolExitCode).toEqual(expectedExitCodes);
+
+    defineServerTool({
+      id: "strict-result",
+      callables: ({ callable }) => ({
+        invalid: callable({
+          name: "Invalid",
+          description: "Compile-time contract fixture",
+          inputSchema: z.object({}),
+          // @ts-expect-error Raw callable returns are not supported.
+          run: () => "legacy raw value",
+        }),
+        valid: callable({
+          name: "Valid",
+          description: "Typed Result fixture",
+          inputSchema: z.object({}),
+          run: (): ServerToolResult<string> => Result.ok("value"),
+        }),
+      }),
+    });
   });
 });
