@@ -40,6 +40,8 @@ describe("Docker image identity variants", () => {
     const pushIndex = workflow.indexOf("Push verified image tags");
 
     expect(workflow).toContain("push: false");
+    expect(workflow).toContain("VERIFY_IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}");
+    expect(workflow).toContain('"$VERIFY_IMAGE"');
     expect(workflow).toContain('"${{ matrix.variant.container_user }}"');
     expect(workflow).toContain('"${{ matrix.variant.container_uid }}"');
     expect(verifyIndex).toBeGreaterThan(0);
