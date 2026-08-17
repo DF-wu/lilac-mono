@@ -1349,23 +1349,24 @@ export class Surface implements ServerTool {
     input: z.output<typeof helpInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const adapterResolver = this.params.adapterResolver;
+    const getCfg = this.getCfg.bind(this);
     return Result.gen(async function* () {
       const ctxClientRaw = ctx?.requestClient;
       const ctxClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : "unknown";
-      const contextAdapter = self.params.adapterResolver.resolve(ctxClient);
-      const registeredPlatforms = self.params.adapterResolver.registeredPlatforms();
+      const contextAdapter = adapterResolver.resolve(ctxClient);
+      const registeredPlatforms = adapterResolver.registeredPlatforms();
       let effective = contextAdapter;
       if (input.client) {
         effective = yield* resolveSurfaceAdapter({
           inputClient: input.client,
           ctx,
-          resolver: self.params.adapterResolver,
+          resolver: adapterResolver,
         });
       } else if (!effective) {
         effective =
           registeredPlatforms
-            .map((platform) => self.params.adapterResolver.resolve(platform))
+            .map((platform) => adapterResolver.resolve(platform))
             .filter((resolved) => resolved?.protocol.toolTargets !== undefined)
             .sort(
               (left, right) =>
@@ -1373,7 +1374,7 @@ export class Surface implements ServerTool {
                 right!.protocol.toolTargets!.helpFallbackPriority,
             )[0] ?? null;
       }
-      const cfg = yield* Result.await(self.getCfg());
+      const cfg = yield* Result.await(getCfg());
       const contextSessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : null;
       const targetHelp = effective?.protocol.toolTargets?.describeSessionIds({
         contextSessionId,
@@ -1719,12 +1720,13 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof sessionsListParticipantsInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const resolveAdapter = this.resolveAdapter.bind(this);
+    const resolveSessionTarget = this.resolveSessionTarget.bind(this);
     return Result.gen(async function* () {
-      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const input = yield* withDefaultSessionId(decodedInput, ctx);
       const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
-      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      const target = yield* Result.await(resolveSessionTarget({ resolved, sessionId }));
       const participants = yield* surfaceOperationResult(
         await target.resolved.adapter.listSessionParticipants(target.sessionRef, {
           limit: input.limit,
@@ -1746,12 +1748,13 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesListInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const resolveAdapter = this.resolveAdapter.bind(this);
+    const resolveSessionTarget = this.resolveSessionTarget.bind(this);
     return Result.gen(async function* () {
-      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const input = yield* withDefaultSessionId(decodedInput, ctx);
       const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
-      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      const target = yield* Result.await(resolveSessionTarget({ resolved, sessionId }));
       if (
         target.resolved.platform === "discord" &&
         hasCacheBurstProvider(target.resolved.adapter)
@@ -1819,14 +1822,15 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesReadInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const resolveAdapter = this.resolveAdapter.bind(this);
+    const resolveSessionTarget = this.resolveSessionTarget.bind(this);
     return Result.gen(async function* () {
-      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const sessionInput = yield* withDefaultSessionId(decodedInput, ctx);
       const input = yield* withDefaultMessageId(sessionInput, ctx);
       const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
       const messageId = yield* mustPresentString(input.messageId, "messageId");
-      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      const target = yield* Result.await(resolveSessionTarget({ resolved, sessionId }));
       const msgRef = createSurfaceMessageRef(target.sessionRef, messageId);
       if (
         target.resolved.platform === "discord" &&
@@ -2007,12 +2011,14 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesSendInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const resolveAdapter = this.resolveAdapter.bind(this);
+    const resolveSessionTarget = this.resolveSessionTarget.bind(this);
+    const linkSentMessageToTranscript = this.linkSentMessageToTranscript.bind(this);
     return Result.gen(async function* () {
-      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const input = yield* withDefaultSessionId(decodedInput, ctx);
       const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
-      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      const target = yield* Result.await(resolveSessionTarget({ resolved, sessionId }));
 
       const replyTo = input.replyToMessageId
         ? createSurfaceMessageRef(target.sessionRef, input.replyToMessageId)
@@ -2057,7 +2063,7 @@ export class Surface implements ServerTool {
         ),
       );
 
-      self.linkSentMessageToTranscript(ref, ctx);
+      linkSentMessageToTranscript(ref, ctx);
 
       return Result.ok({
         ok: true as const,
@@ -2071,12 +2077,13 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesEditInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const resolveAdapter = this.resolveAdapter.bind(this);
+    const resolveSessionTarget = this.resolveSessionTarget.bind(this);
     return Result.gen(async function* () {
-      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const input = yield* withDefaultSessionId(decodedInput, ctx);
       const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
-      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      const target = yield* Result.await(resolveSessionTarget({ resolved, sessionId }));
       yield* surfaceOperationResult(
         await target.resolved.adapter.editMsg(
           createSurfaceMessageRef(target.sessionRef, input.messageId),
@@ -2091,12 +2098,13 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof messagesDeleteInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const resolveAdapter = this.resolveAdapter.bind(this);
+    const resolveSessionTarget = this.resolveSessionTarget.bind(this);
     return Result.gen(async function* () {
-      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const input = yield* withDefaultSessionId(decodedInput, ctx);
       const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
-      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      const target = yield* Result.await(resolveSessionTarget({ resolved, sessionId }));
       yield* surfaceOperationResult(
         await target.resolved.adapter.deleteMsg(
           createSurfaceMessageRef(target.sessionRef, input.messageId),
@@ -2110,15 +2118,16 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof reactionsListInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const resolveAdapter = this.resolveAdapter.bind(this);
+    const resolveMessageTarget = this.resolveMessageTarget.bind(this);
     return Result.gen(async function* () {
-      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const sessionInput = yield* withDefaultSessionId(decodedInput, ctx);
       const input = yield* withDefaultMessageId(sessionInput, ctx);
       const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
       const messageId = yield* mustPresentString(input.messageId, "messageId");
       const target = yield* Result.await(
-        self.resolveMessageTarget({
+        resolveMessageTarget({
           resolved,
           sessionId,
           messageId,
@@ -2140,15 +2149,16 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof reactionsListDetailedInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const resolveAdapter = this.resolveAdapter.bind(this);
+    const resolveMessageTarget = this.resolveMessageTarget.bind(this);
     return Result.gen(async function* () {
-      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const sessionInput = yield* withDefaultSessionId(decodedInput, ctx);
       const input = yield* withDefaultMessageId(sessionInput, ctx);
       const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
       const messageId = yield* mustPresentString(input.messageId, "messageId");
       const target = yield* Result.await(
-        self.resolveMessageTarget({
+        resolveMessageTarget({
           resolved,
           sessionId,
           messageId,
@@ -2165,16 +2175,15 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof reactionsAddInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const resolveAdapter = this.resolveAdapter.bind(this);
+    const resolveMessageTarget = this.resolveMessageTarget.bind(this);
     return Result.gen(async function* () {
-      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const sessionInput = yield* withDefaultSessionId(decodedInput, ctx);
       const input = yield* withDefaultMessageId(sessionInput, ctx);
       const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
       const messageId = yield* mustPresentString(input.messageId, "messageId");
-      const target = yield* Result.await(
-        self.resolveMessageTarget({ resolved, sessionId, messageId }),
-      );
+      const target = yield* Result.await(resolveMessageTarget({ resolved, sessionId, messageId }));
       yield* surfaceOperationResult(
         await target.resolved.adapter.addReaction(target.msgRef, input.reaction),
       );
@@ -2186,16 +2195,15 @@ export class Surface implements ServerTool {
     decodedInput: z.output<typeof reactionsRemoveInputSchema>,
     ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
-    const self = this;
+    const resolveAdapter = this.resolveAdapter.bind(this);
+    const resolveMessageTarget = this.resolveMessageTarget.bind(this);
     return Result.gen(async function* () {
-      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const sessionInput = yield* withDefaultSessionId(decodedInput, ctx);
       const input = yield* withDefaultMessageId(sessionInput, ctx);
       const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
       const messageId = yield* mustPresentString(input.messageId, "messageId");
-      const target = yield* Result.await(
-        self.resolveMessageTarget({ resolved, sessionId, messageId }),
-      );
+      const target = yield* Result.await(resolveMessageTarget({ resolved, sessionId, messageId }));
       yield* surfaceOperationResult(
         await target.resolved.adapter.removeReaction(target.msgRef, input.reaction),
       );
