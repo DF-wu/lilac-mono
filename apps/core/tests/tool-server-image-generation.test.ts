@@ -1,4 +1,6 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import type { ServerToolFailure } from "@stanley2058/lilac-plugin-runtime";
+import { Panic, type Result as ResultType } from "better-result";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +21,11 @@ import { resolveRestrictedSessionTmpDir } from "../src/shared/attachment-utils";
 const ONE_BY_ONE_PNG_BASE64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7+9n0AAAAASUVORK5CYII=";
 
+function value<T>(result: ResultType<T, ServerToolFailure>): T {
+  if (result.status === "error") throw new Error(result.error.message);
+  return result.value;
+}
+
 describe("tool-server image generation", () => {
   it("uses gpt-image-2 as the recommended default", () => {
     expect(DEFAULT_IMAGE_MODEL_FALLBACK_ORDER[0]).toBe("gpt-image-2");
@@ -32,27 +39,36 @@ describe("tool-server image generation", () => {
     expect(gptAspectRatioToSize("3:2")).toBe("1536x1024");
     expect(gptAspectRatioToSize("2:3")).toBe("1024x1536");
 
-    expect(() =>
+    expect(
       validateImageGenerationInputForModel("gpt-image-2", {
         prompt: "Create a landscape",
         inputImages: undefined,
         size: "2048x2048",
       }),
-    ).not.toThrow();
-    expect(() =>
+    ).toMatchObject({ status: "ok" });
+    expect(
       validateImageGenerationInputForModel("gpt-image-2", {
         prompt: "Create a landscape",
         inputImages: undefined,
         size: "2047x2048",
       }),
-    ).toThrow("Unsupported size '2047x2048' for gpt-image-2");
-    expect(() =>
+    ).toMatchObject({
+      status: "error",
+      error: { kind: "usage", message: expect.stringContaining("Unsupported size '2047x2048'") },
+    });
+    expect(
       validateImageGenerationInputForModel("gpt-image-2", {
         prompt: "Edit this image",
         inputImages: ["input.png"],
         size: "2048x2048",
       }),
-    ).toThrow("Unsupported size '2048x2048' for gpt-image-2 image edits");
+    ).toMatchObject({
+      status: "error",
+      error: {
+        kind: "usage",
+        message: expect.stringContaining("Unsupported size '2048x2048'"),
+      },
+    });
   });
 
   it("converts GPT aspect ratios to size without forwarding aspectRatio", () => {
@@ -65,34 +81,43 @@ describe("tool-server image generation", () => {
   });
 
   it("enforces nanobanana-2-lite capabilities", () => {
-    expect(() =>
+    expect(
       validateImageGenerationInputForModel("nanobanana-2-lite", {
         prompt: "Create a wide banner",
         inputImages: undefined,
         aspectRatio: "8:1",
       }),
-    ).not.toThrow();
-    expect(() =>
+    ).toMatchObject({ status: "ok" });
+    expect(
       validateImageGenerationInputForModel("nanobanana-2-lite", {
         prompt: "Create a banner",
         inputImages: undefined,
         aspectRatio: "7:1",
       }),
-    ).toThrow("Unsupported aspectRatio '7:1' for nanobanana-2-lite");
-    expect(() =>
+    ).toMatchObject({
+      status: "error",
+      error: { kind: "usage", message: expect.stringContaining("Unsupported aspectRatio '7:1'") },
+    });
+    expect(
       validateImageGenerationInputForModel("nanobanana-2-lite", {
         prompt: "Create an icon",
         inputImages: undefined,
         size: "1024x1024",
       }),
-    ).toThrow("produces 1K output; use aspectRatio instead of size");
-    expect(() =>
+    ).toMatchObject({
+      status: "error",
+      error: { kind: "usage", message: expect.stringContaining("produces 1K output") },
+    });
+    expect(
       validateImageGenerationInputForModel("nanobanana-2-lite", {
         prompt: "Edit this image",
         inputImages: ["input.png"],
         maskImage: "mask.png",
       }),
-    ).toThrow("does not support maskImage");
+    ).toMatchObject({
+      status: "error",
+      error: { kind: "usage", message: expect.stringContaining("does not support maskImage") },
+    });
   });
 
   it("normalizes a single inputImages value into an array", () => {
@@ -133,9 +158,11 @@ describe("tool-server image generation", () => {
   });
 
   it("returns plain text prompt when inputImages are not provided", async () => {
-    const prompt = await buildImageGenerationPrompt(process.cwd(), {
-      prompt: "Generate a scenic mountain view",
-    });
+    const prompt = value(
+      await buildImageGenerationPrompt(process.cwd(), {
+        prompt: "Generate a scenic mountain view",
+      }),
+    );
 
     expect(prompt).toBe("Generate a scenic mountain view");
   });
@@ -150,11 +177,13 @@ describe("tool-server image generation", () => {
       await fs.writeFile(basePath, pngBytes);
       await fs.writeFile(maskPath, pngBytes);
 
-      const prompt = await buildImageGenerationPrompt(tmp, {
-        prompt: "Replace the background with a sunset sky",
-        inputImages: ["base.png"],
-        maskImage: "mask.png",
-      });
+      const prompt = value(
+        await buildImageGenerationPrompt(tmp, {
+          prompt: "Replace the background with a sunset sky",
+          inputImages: ["base.png"],
+          maskImage: "mask.png",
+        }),
+      );
 
       expect(typeof prompt).toBe("object");
       if (typeof prompt === "string") return;
@@ -177,16 +206,18 @@ describe("tool-server image generation", () => {
       await fs.mkdir(restrictedTmp, { recursive: true });
       await fs.writeFile(imagePath, Buffer.from(ONE_BY_ONE_PNG_BASE64, "base64"));
 
-      const prompt = await buildImageGenerationPrompt(
-        "/tmp",
-        {
-          prompt: "Make this brighter",
-          inputImages: ["input.png"],
-        },
-        {
-          sessionId,
-          safetyMode: "restricted",
-        },
+      const prompt = value(
+        await buildImageGenerationPrompt(
+          "/tmp",
+          {
+            prompt: "Make this brighter",
+            inputImages: ["input.png"],
+          },
+          {
+            sessionId,
+            safetyMode: "restricted",
+          },
+        ),
       );
 
       expect(typeof prompt).toBe("object");
@@ -198,8 +229,8 @@ describe("tool-server image generation", () => {
   });
 
   it("rejects restricted image inputs outside sandbox /tmp", async () => {
-    await expect(
-      buildImageGenerationPrompt(
+    expect(
+      await buildImageGenerationPrompt(
         "/workspace",
         {
           prompt: "Edit this image",
@@ -210,7 +241,10 @@ describe("tool-server image generation", () => {
           safetyMode: "restricted",
         },
       ),
-    ).rejects.toThrow("Restricted mode only allows file paths under /tmp");
+    ).toMatchObject({
+      status: "error",
+      error: { kind: "denied", message: expect.stringContaining("Restricted mode") },
+    });
   });
 
   it("rejects non-image files in inputImages", async () => {
@@ -220,13 +254,29 @@ describe("tool-server image generation", () => {
     try {
       await fs.writeFile(textPath, "not an image", "utf8");
 
-      await expect(
-        resolveImageEditInputs(tmp, {
+      expect(
+        await resolveImageEditInputs(tmp, {
           inputImages: ["note.txt"],
         }),
-      ).rejects.toThrow("not a valid image file");
+      ).toMatchObject({
+        status: "error",
+        error: { kind: "usage", message: expect.stringContaining("not a valid image file") },
+      });
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves Panic from image filesystem capture", async () => {
+    const panic = new Panic({ message: "image filesystem invariant failed" });
+    const readFile = spyOn(fs, "readFile").mockRejectedValue(panic);
+
+    try {
+      await expect(
+        resolveImageEditInputs(process.cwd(), { inputImages: ["input.png"] }),
+      ).rejects.toBeInstanceOf(Panic);
+    } finally {
+      readFile.mockRestore();
     }
   });
 
@@ -237,11 +287,14 @@ describe("tool-server image generation", () => {
     try {
       await fs.writeFile(fakePngPath, "not an image", "utf8");
 
-      await expect(
-        resolveImageEditInputs(tmp, {
+      expect(
+        await resolveImageEditInputs(tmp, {
           inputImages: ["fake.png"],
         }),
-      ).rejects.toThrow("not a valid image file");
+      ).toMatchObject({
+        status: "error",
+        error: { kind: "usage", message: expect.stringContaining("not a valid image file") },
+      });
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
     }
@@ -274,9 +327,11 @@ describe("tool-server image generation", () => {
   });
 
   it("returns plain text prompt when video inputImage is not provided", async () => {
-    const prompt = await buildVideoGenerationPrompt(process.cwd(), {
-      prompt: "A cinematic drone shot of mountain cliffs",
-    });
+    const prompt = value(
+      await buildVideoGenerationPrompt(process.cwd(), {
+        prompt: "A cinematic drone shot of mountain cliffs",
+      }),
+    );
 
     expect(prompt).toBe("A cinematic drone shot of mountain cliffs");
   });
@@ -289,10 +344,12 @@ describe("tool-server image generation", () => {
       const pngBytes = Buffer.from(ONE_BY_ONE_PNG_BASE64, "base64");
       await fs.writeFile(imagePath, pngBytes);
 
-      const prompt = await buildVideoGenerationPrompt(tmp, {
-        prompt: "The camera slowly zooms in",
-        inputImage: "input.png",
-      });
+      const prompt = value(
+        await buildVideoGenerationPrompt(tmp, {
+          prompt: "The camera slowly zooms in",
+          inputImage: "input.png",
+        }),
+      );
 
       expect(typeof prompt).toBe("object");
       if (typeof prompt === "string") return;
@@ -311,12 +368,15 @@ describe("tool-server image generation", () => {
     try {
       await fs.writeFile(textPath, "not an image", "utf8");
 
-      await expect(
-        buildVideoGenerationPrompt(tmp, {
+      expect(
+        await buildVideoGenerationPrompt(tmp, {
           prompt: "Animate this",
           inputImage: "note.txt",
         }),
-      ).rejects.toThrow("not a valid image file");
+      ).toMatchObject({
+        status: "error",
+        error: { kind: "usage", message: expect.stringContaining("not a valid image file") },
+      });
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
     }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 
 import {
   startCodexOAuthLogin,
@@ -73,6 +73,17 @@ function dependencies(
 }
 
 describe("Codex Core tool OAuth lifecycle", () => {
+  it("preserves Panic from OAuth login capture", async () => {
+    const panic = new Panic({ message: "Codex login invariant failed" });
+    const tool = new Codex(
+      dependencies(async () => {
+        throw panic;
+      }),
+    );
+
+    await expect(tool.call("codex.login", { mode: "start" })).rejects.toBeInstanceOf(Panic);
+  });
+
   it("requires state with a manually extracted authorization code", async () => {
     const tool = new Codex(
       dependencies(async () => {
@@ -80,13 +91,16 @@ describe("Codex Core tool OAuth lifecycle", () => {
       }),
     );
 
-    await expect(
-      tool.call("codex.login", {
+    expect(
+      await tool.call("codex.login", {
         mode: "exchange",
         code: "code",
         pkceVerifier: "verifier",
       }),
-    ).rejects.toThrow("requires state");
+    ).toMatchObject({
+      status: "error",
+      error: { kind: "usage", message: expect.stringContaining("requires state") },
+    });
   });
 
   it("waits for a pending write before logout clears tokens", async () => {
@@ -118,7 +132,7 @@ describe("Codex Core tool OAuth lifecycle", () => {
         },
       ),
     );
-    await tool.call("codex.login", { mode: "start" });
+    expect(await tool.call("codex.login", { mode: "start" })).toMatchObject({ status: "ok" });
     const exchange = login.exchange({ code: "code", state: login.state });
     await writeStarted.promise;
 
@@ -144,7 +158,7 @@ describe("Codex Core tool OAuth lifecycle", () => {
         return login;
       }),
     );
-    await tool.call("codex.login", { mode: "start" });
+    expect(await tool.call("codex.login", { mode: "start" })).toMatchObject({ status: "ok" });
     const exchange = first.login.exchange({ code: "code", state: first.login.state });
     await first.started;
 
@@ -170,17 +184,20 @@ describe("Codex Core tool OAuth lifecycle", () => {
       writeTokens: async () => {},
     });
     const tool = new Codex(dependencies(async () => login));
-    await tool.call("codex.login", { mode: "start" });
+    expect(await tool.call("codex.login", { mode: "start" })).toMatchObject({ status: "ok" });
     await login.exchange({ code: "code", state: login.state });
     await login.result;
 
-    await expect(
-      tool.call("codex.login", {
+    expect(
+      await tool.call("codex.login", {
         mode: "exchange",
         code: "code",
         state: login.state,
         pkceVerifier: login.pkce.verifier,
       }),
-    ).rejects.toThrow("Missing PKCE challenge");
+    ).toMatchObject({
+      status: "error",
+      error: { kind: "conflict", message: expect.stringContaining("Missing PKCE challenge") },
+    });
   });
 });

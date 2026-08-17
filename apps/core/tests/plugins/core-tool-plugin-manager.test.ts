@@ -831,7 +831,8 @@ describe("core tool plugin manager", () => {
     await writeExternalPlugin({
       dataDir,
       pluginId: "fixture-plugin",
-      entryBody: `import { z } from ${JSON.stringify(import.meta.resolve("zod"))};
+      entryBody: `import { Result } from ${JSON.stringify(import.meta.resolve("better-result"))};
+import { z } from ${JSON.stringify(import.meta.resolve("zod"))};
 import { defineServerTool } from ${JSON.stringify(new URL("../../../../packages/plugin-runtime/index.ts", import.meta.url).href)};
 import { markAggregateOutputBudgetExempt, markBoundedBuiltinOutput } from ${JSON.stringify(new URL("../../src/plugins/types.ts", import.meta.url).href)};
 export default {
@@ -851,7 +852,7 @@ export default {
             name: "Fixture Echo",
             description: "Fixture",
             inputSchema: z.object({ text: z.string() }),
-            run: ({ text }) => ({ echo: text }),
+            run: ({ text }) => Result.ok({ echo: text }),
           }),
         }),
       })],
@@ -919,10 +920,17 @@ export default {
     expect(callableIds).toContain("fixture.echo");
     const fixtureTool = manager.getLevel2Tools().find((tool) => tool.id === "fixture");
     if (!fixtureTool) throw new Error("missing fixture Level 2 tool");
-    expect(await fixtureTool.call("fixture.echo", { text: "hello" })).toEqual({ echo: "hello" });
-    await expect(fixtureTool.call("fixture.echo", { text: 42 })).rejects.toThrow(
-      "fixture.echo has invalid input.",
-    );
+    expect(await fixtureTool.call("fixture.echo", { text: "hello" })).toMatchObject({
+      status: "ok",
+      value: { echo: "hello" },
+    });
+    expect(await fixtureTool.call("fixture.echo", { text: 42 })).toMatchObject({
+      status: "error",
+      error: {
+        kind: "usage",
+        message: expect.stringContaining("fixture.echo has invalid input."),
+      },
+    });
   });
 
   it("captures hostile executable metadata getters at the plugin boundary", async () => {
@@ -1266,7 +1274,8 @@ export default {
     await writeExternalPlugin({
       dataDir,
       pluginId: "profile-fixture",
-      entryBody: `export default {
+      entryBody: `import { Result } from ${JSON.stringify(import.meta.resolve("better-result"))};
+export default {
   meta: { id: "profile-fixture" },
   create() { return {
     level1: [{
@@ -1278,7 +1287,7 @@ export default {
       id: "fixture",
       async init() {}, async destroy() {},
       async list() { return [{ callableId: "fixture.echo", name: "Fixture", description: "Fixture", shortInput: [] }]; },
-      async call() { return { ok: true }; },
+      async call() { return Result.ok({ ok: true }); },
     }],
   }; },
 };`,

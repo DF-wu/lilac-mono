@@ -1,8 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import { Panic, Result } from "better-result";
+import type { ServerToolResult } from "@stanley2058/lilac-plugin-runtime";
 import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
-import { Surface as ProductionSurface } from "../src/tool-server/tools/surface";
-import { SurfaceUnavailable, type SurfaceAdapter } from "../src/surface/adapter";
+import { Surface as RawProductionSurface } from "../src/tool-server/tools/surface";
+import {
+  SurfaceOperationPartiallyCompleted,
+  SurfaceOperationUnsupported,
+  SurfaceRateLimited,
+  SurfaceUnavailable,
+  type SurfaceAdapter,
+} from "../src/surface/adapter";
 import { BUILTIN_SURFACE_PROTOCOLS } from "../src/surface/builtin-surface-protocols";
 import {
   GithubAdapter,
@@ -56,12 +63,39 @@ const DEFAULT_GITHUB_TEST_ADAPTER = createDescriptorBoundSurfaceAdapter(
 );
 
 type TestSurfaceParams = Omit<
-  ConstructorParameters<typeof ProductionSurface>[0],
+  ConstructorParameters<typeof RawProductionSurface>[0],
   "adapterResolver"
 > & {
   readonly adapter: SurfaceAdapter;
   readonly githubAdapter?: SurfaceAdapter;
 };
+
+class ProductionSurface {
+  protected readonly raw: RawProductionSurface;
+
+  constructor(params: ConstructorParameters<typeof RawProductionSurface>[0]) {
+    this.raw = new RawProductionSurface(params);
+  }
+
+  list() {
+    return this.raw.list();
+  }
+
+  callResult(...args: Parameters<RawProductionSurface["call"]>): Promise<ServerToolResult> {
+    return this.raw.call(...args);
+  }
+
+  async call(...args: Parameters<RawProductionSurface["call"]>): Promise<unknown> {
+    const outcome = (await this.callResult(...args)).match<
+      { readonly value: unknown } | { readonly error: { readonly message: string } }
+    >({
+      ok: (value) => ({ value }),
+      err: (error) => ({ error }),
+    });
+    if ("error" in outcome) throw new Error(outcome.error.message);
+    return outcome.value;
+  }
+}
 
 class Surface extends ProductionSurface {
   constructor(params: TestSurfaceParams) {
@@ -421,26 +455,44 @@ describe("tool-server surface", () => {
   it("uses a registered request context as authoritative and rejects an explicit conflict", async () => {
     const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
 
-    await expect(
-      tool.call(
-        "surface.messages.read",
-        { client: "discord", sessionId: "channel-1", messageId: "message-1" },
-        { context: { requestClient: "github" } },
-      ),
-    ).rejects.toThrow(
-      "Client mismatch: context requestClient is 'github' but input client is 'discord'",
+    const result = await tool.callResult(
+      "surface.messages.read",
+      { client: "discord", sessionId: "channel-1", messageId: "message-1" },
+      { context: { requestClient: "github" } },
     );
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error).toMatchObject({
+        kind: "conflict",
+        message: "Client mismatch: context requestClient is 'github' but input client is 'discord'",
+      });
+    }
   });
 
   it("distinguishes unregistered wire clients from malformed context values", async () => {
     const tool = new Surface({ adapter: new FakeAdapter([], {}), config: testConfig({}) });
 
-    await expect(tool.call("surface.sessions.list", { client: "slack" })).rejects.toThrow(
-      "client 'slack' is recognized but has no registered executable adapter",
+    const unregistered = await tool.callResult("surface.sessions.list", { client: "slack" });
+    expect(unregistered.status).toBe("error");
+    if (unregistered.status === "error") {
+      expect(unregistered.error.kind).toBe("unavailable");
+      expect(unregistered.error.message).toContain(
+        "client 'slack' is recognized but has no registered executable adapter",
+      );
+    }
+
+    const malformed = await tool.callResult(
+      "surface.sessions.list",
+      {},
+      { context: { requestClient: "desktop" } },
     );
-    await expect(
-      tool.call("surface.sessions.list", {}, { context: { requestClient: "desktop" } }),
-    ).rejects.toThrow("context requestClient 'desktop' is not a valid surface wire value");
+    expect(malformed.status).toBe("error");
+    if (malformed.status === "error") {
+      expect(malformed.error).toMatchObject({ kind: "usage" });
+      expect(malformed.error.message).toContain(
+        "context requestClient 'desktop' is not a valid surface wire value",
+      );
+    }
   });
 
   it("does not route an unregistered wire client target operation through Discord", async () => {
@@ -2296,6 +2348,56 @@ describe("tool-server surface", () => {
     expect(linked).toEqual([]);
   });
 
+  it("preserves Panic from best-effort transcript linkage", async () => {
+    const panic = new Panic({ message: "transcript linkage invariant" });
+    const transcriptStore: TranscriptStore = {
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
+      linkSurfaceMessagesToRequest() {
+        throw panic;
+      },
+      getTranscriptBySurfaceMessage() {
+        return Result.ok(null);
+      },
+      close() {},
+    };
+    const tool = new Surface({
+      adapter: new FakeAdapter([], {}),
+      transcriptStore,
+      config: testConfig({
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: ["123456789012345678"],
+            allowedGuildIds: [],
+            botName: "lilac",
+          },
+        },
+      }),
+    });
+
+    const [settled] = await Promise.allSettled([
+      tool.call(
+        "surface.messages.send",
+        {
+          client: "discord",
+          sessionId: "123456789012345678",
+          text: "hello",
+        },
+        {
+          context: {
+            requestId: "heartbeat:panic-link",
+            sessionId: "__heartbeat__",
+            requestClient: "unknown",
+          },
+        },
+      ),
+    ]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
+  });
+
   it("lists recent visible agent writes with thin previews", async () => {
     const cfg = testConfig({
       surface: {
@@ -2667,13 +2769,15 @@ describe("tool-server surface", () => {
     const adapter = createDescriptorBoundSurfaceAdapter("discord", rawAdapter);
     const tool = new Surface({ adapter, config: cfg });
 
-    await expect(
+    const [settled] = await Promise.allSettled([
       tool.call("surface.messages.send", {
         sessionId: "ops",
         text: "hi",
         client: "discord",
       }),
-    ).rejects.toBe(panic);
+    ]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
     expect(rawAdapter.sendCalls).toEqual([]);
   });
 
@@ -2728,6 +2832,130 @@ describe("tool-server surface", () => {
     await expect(tool.call("surface.sessions.list", { client: "github" })).rejects.toThrow(
       "GitHub session discovery is not supported; use GitHub issue/PR discovery",
     );
+  });
+
+  it("maps unsupported operations to nonretryable usage failures", async () => {
+    const adapter: SurfaceAdapter = new FakeAdapter([], {});
+    adapter.listSessions = async () =>
+      Result.err(
+        new SurfaceOperationUnsupported({
+          platform: "discord",
+          operation: "list-sessions",
+          message: "session discovery is unsupported",
+        }),
+      );
+    const tool = new Surface({ adapter, config: testConfig({}) });
+
+    const result = await tool.callResult("surface.sessions.list", { client: "discord" });
+    expect(result).toMatchObject({
+      status: "error",
+      error: {
+        kind: "usage",
+        code: "surface_operation_unsupported",
+        retryable: false,
+      },
+    });
+  });
+
+  it("rejects unexpected adapter defects", async () => {
+    const defect = new TypeError("invalid adapter state");
+    const adapter: SurfaceAdapter = new FakeAdapter([], {});
+    adapter.listSessions = async () => {
+      throw defect;
+    };
+    const tool = new Surface({ adapter, config: testConfig({}) });
+
+    const [settled] = await Promise.allSettled([
+      tool.callResult("surface.sessions.list", { client: "discord" }),
+    ]);
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") {
+      expect(Panic.is(settled.reason)).toBe(true);
+      expect(settled.reason).toMatchObject({ cause: defect });
+    }
+  });
+
+  it("preserves rate-limit retry metadata and unavailable retryability", async () => {
+    const adapter: SurfaceAdapter = new FakeAdapter([], {});
+    adapter.listSessions = async () =>
+      Result.err(
+        new SurfaceRateLimited({
+          platform: "discord",
+          operation: "list-sessions",
+          retryAfterMs: 2_500,
+          message: "surface rate limited",
+        }),
+      );
+    const tool = new Surface({ adapter, config: testConfig({}) });
+
+    const rateLimited = await tool.callResult("surface.sessions.list", { client: "discord" });
+    expect(rateLimited).toMatchObject({
+      status: "error",
+      error: {
+        kind: "unavailable",
+        code: "surface_rate_limited",
+        retryable: true,
+        details: { retryAfterMs: 2_500 },
+      },
+    });
+
+    adapter.listSessions = async () =>
+      Result.err(
+        new SurfaceUnavailable({
+          platform: "discord",
+          operation: "list-sessions",
+          message: "surface unavailable",
+        }),
+      );
+    const unavailable = await tool.callResult("surface.sessions.list", { client: "discord" });
+    expect(unavailable).toMatchObject({
+      status: "error",
+      error: { kind: "unavailable", code: "surface_unavailable", retryable: true },
+    });
+  });
+
+  it("preserves a safely projected created ref after partial completion", async () => {
+    const adapter: SurfaceAdapter = new FakeAdapter([], {});
+    const channelId = "123456789012345678";
+    adapter.sendMsg = async () =>
+      Result.err(
+        new SurfaceOperationPartiallyCompleted({
+          platform: "discord",
+          operation: "send-message",
+          created: { platform: "discord", channelId, messageId: "created-message" },
+          message: "message was created before follow-up work failed",
+        }),
+      );
+    const tool = new Surface({
+      adapter,
+      config: testConfig({
+        surface: {
+          discord: {
+            tokenEnv: "DISCORD_TOKEN",
+            allowedChannelIds: [channelId],
+            allowedGuildIds: [],
+            botName: "lilac",
+          },
+        },
+      }),
+    });
+
+    const result = await tool.callResult("surface.messages.send", {
+      client: "discord",
+      sessionId: channelId,
+      text: "hello",
+    });
+    expect(result).toMatchObject({
+      status: "error",
+      error: {
+        kind: "conflict",
+        code: "surface_operation_partially_completed",
+        retryable: false,
+        details: {
+          created: { platform: "discord", channelId, messageId: "created-message" },
+        },
+      },
+    });
   });
 
   it("returns the GitHub adapter's stable unsupported participant output", async () => {

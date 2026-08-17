@@ -1,7 +1,12 @@
 import fs from "node:fs/promises";
 import { z } from "zod";
 import { Fzf } from "fzf";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
+import {
+  serverToolFailure,
+  type ServerToolFailure,
+  type ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
 import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
 import {
@@ -11,24 +16,15 @@ import {
   env,
   findWorkspaceRootResult,
 } from "@stanley2058/lilac-utils";
+import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
-class SkillsToolFailure extends TaggedError("SkillsToolFailure")<{
-  readonly message: string;
-}> {}
-
-function adaptSkillsResultToToolHost<TValue>(
-  result: ResultType<TValue, SkillsToolFailure>,
-): TValue {
-  return result.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      throw new Error(error.message);
-    },
-  })();
-}
-
-function signalSkillsFailureToToolHost(message: string): never {
-  return adaptSkillsResultToToolHost(Result.err(new SkillsToolFailure({ message })));
+function skillsFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
+  return serverToolFailure({
+    kind,
+    code: `skills_${kind}`,
+    message,
+    retryable: kind === "unavailable" || kind === "timeout",
+  });
 }
 
 const listInputSchema = z.object({
@@ -121,71 +117,99 @@ function scoreAndFilter(
     .map((r) => r.item);
 }
 
-function requireSkillByName(skills: DiscoveredSkill[], name: string): DiscoveredSkill {
+function requireSkillByName(
+  skills: DiscoveredSkill[],
+  name: string,
+): ResultType<DiscoveredSkill, ServerToolFailure> {
   const found = skills.find((s) => s.name === name);
   if (!found) {
-    return signalSkillsFailureToToolHost(
-      `Skill not found: '${name}'. Use skills.list to see available skills.`,
+    return Result.err(
+      skillsFailure(
+        "not_found",
+        `Skill not found: '${name}'. Use skills.list to see available skills.`,
+      ),
     );
   }
-  return found;
+  return Result.ok(found);
 }
 
-async function loadSkillsForToolHost() {
-  const workspaceRootResult = findWorkspaceRootResult();
-  const workspaceRoot = workspaceRootResult.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      switch (error._tag) {
-        case "WorkspaceRootNotFound":
-          return signalSkillsFailureToToolHost(error.message);
-      }
-    },
-  })();
-
-  return await discoverSkills({
-    workspaceRoot,
-    dataDir: env.dataDir,
+async function loadSkillsForToolHost(): Promise<
+  ResultType<Awaited<ReturnType<typeof discoverSkills>>, ServerToolFailure>
+> {
+  return Result.gen(async function* () {
+    const workspaceRoot = yield* findWorkspaceRootResult().mapError((error) =>
+      skillsFailure("not_found", error.message),
+    );
+    const discovered = yield* Result.await(
+      Result.tryPromise({
+        try: () => discoverSkills({ workspaceRoot, dataDir: env.dataDir }),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return skillsFailure(
+            "unavailable",
+            cause instanceof Error ? cause.message : "Skill discovery failed",
+          );
+        },
+      }),
+    );
+    return Result.ok(discovered);
   });
 }
 
 async function readSkillForToolHost(
   input: z.output<typeof readInputSchema>,
   mode: "brief" | "full",
-) {
-  const { skills } = await loadSkillsForToolHost();
-  const found = requireSkillByName(skills, input.name);
+): Promise<ServerToolResult> {
+  return Result.gen(async function* () {
+    const { skills } = yield* Result.await(loadSkillsForToolHost());
+    const found = yield* requireSkillByName(skills, input.name);
+    const raw = yield* Result.await(
+      Result.tryPromise({
+        try: () => Bun.file(found.location).text(),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return skillsFailure(
+            typeof cause === "object" &&
+              cause !== null &&
+              "code" in cause &&
+              cause.code === "ENOENT"
+              ? "not_found"
+              : "unavailable",
+            cause instanceof Error ? cause.message : "Skill could not be read",
+          );
+        },
+      }),
+    );
+    const parsed = yield* parseSkillMarkdownResult(raw).mapError((error) =>
+      skillsFailure("unavailable", error.message),
+    );
+    const defaultCap = mode === "brief" ? 8000 : 50_000;
+    const { text, truncated } = truncateText(parsed.body, input.maxChars ?? defaultCap);
+    const includes = yield* Result.await(
+      Result.tryPromise({
+        try: () => listTopLevelEntries(found.baseDir),
+        catch: (cause) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          return skillsFailure(
+            "unavailable",
+            cause instanceof Error ? cause.message : "Skill resources could not be listed",
+          );
+        },
+      }),
+    );
 
-  const raw = await Bun.file(found.location).text();
-  const parsedResult = parseSkillMarkdownResult(raw);
-  const parsed = parsedResult.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      switch (error._tag) {
-        case "SkillMarkdownInvalid":
-          return signalSkillsFailureToToolHost(error.message);
-      }
-    },
-  })();
-
-  // Keep returned frontmatter stable + minimal-ish.
-  const frontmatter = parsed.frontmatter;
-  const defaultCap = mode === "brief" ? 8000 : 50_000;
-  const { text, truncated } = truncateText(parsed.body, input.maxChars ?? defaultCap);
-
-  const includes = await listTopLevelEntries(found.baseDir);
-
-  return {
-    name: found.name,
-    description: found.description,
-    source: found.source,
-    location: found.location,
-    baseDir: found.baseDir,
-    frontmatter,
-    body: text,
-    truncated,
-    includes: mode === "full" ? includes : undefined,
-  };
+    return Result.ok({
+      name: found.name,
+      description: found.description,
+      source: found.source,
+      location: found.location,
+      baseDir: found.baseDir,
+      frontmatter: parsed.frontmatter,
+      body: text,
+      truncated,
+      includes: mode === "full" ? includes : undefined,
+    });
+  });
 }
 
 export class Skills implements ServerTool {
@@ -199,24 +223,24 @@ export class Skills implements ServerTool {
         validation: "zod",
         primaryPositional: "query",
         async run(input) {
-          const { skills, warnings } = await loadSkillsForToolHost();
+          return (await loadSkillsForToolHost()).map(({ skills, warnings }) => {
+            let filtered = skills;
+            if (input.sources && input.sources.length > 0) {
+              const allowed = new Set(input.sources);
+              filtered = filtered.filter((skill) => allowed.has(skill.source));
+            }
 
-          let filtered = skills;
-          if (input.sources && input.sources.length > 0) {
-            const allowed = new Set(input.sources);
-            filtered = filtered.filter((skill) => allowed.has(skill.source));
-          }
-
-          const ranked = scoreAndFilter(filtered, input.query, input.limit);
-          return {
-            skills: ranked.map((skill) => ({
-              name: skill.name,
-              description: skill.description,
-              source: skill.source,
-              location: skill.location,
-            })),
-            warnings,
-          };
+            const ranked = scoreAndFilter(filtered, input.query, input.limit);
+            return {
+              skills: ranked.map((skill) => ({
+                name: skill.name,
+                description: skill.description,
+                source: skill.source,
+                location: skill.location,
+              })),
+              warnings,
+            };
+          });
         },
       }),
       "skills.brief": callable({
@@ -259,7 +283,7 @@ export class Skills implements ServerTool {
     callableId: string,
     input: Record<string, unknown>,
     opts?: ServerToolCallOptions,
-  ): Promise<unknown> {
+  ): Promise<ServerToolResult> {
     return this.tool.call(callableId, input, opts);
   }
 }

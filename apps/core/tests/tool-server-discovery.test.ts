@@ -163,7 +163,21 @@ describe("tool-server discovery", () => {
       last: { platform: "github", channelId: "owner/repo#12", messageId: "9001" },
     });
 
-    const tool = new Discovery({ discovery: discoveryService });
+    const rawTool = new Discovery({ discovery: discoveryService });
+    const tool = {
+      list: () => rawTool.list(),
+      callResult: (...args: Parameters<Discovery["call"]>) => rawTool.call(...args),
+      async call(...args: Parameters<Discovery["call"]>): Promise<unknown> {
+        const outcome = (await rawTool.call(...args)).match<
+          { readonly value: unknown } | { readonly error: { readonly message: string } }
+        >({
+          ok: (value) => ({ value }),
+          err: (error) => ({ error }),
+        });
+        if ("error" in outcome) throw new Error(outcome.error.message);
+        return outcome.value;
+      },
+    };
 
     return {
       root,
@@ -682,12 +696,15 @@ describe("tool-server discovery", () => {
     const fixture = await makeFixture();
 
     try {
-      await expect(
-        fixture.tool.call("discovery.search", {
-          query: "deploy",
-          sources: "missing",
-        }),
-      ).rejects.toThrow("discovery.search has invalid input.");
+      const result = await fixture.tool.callResult("discovery.search", {
+        query: "deploy",
+        sources: "missing",
+      });
+      expect(result.status).toBe("error");
+      if (result.status === "error") {
+        expect(result.error.kind).toBe("usage");
+        expect(result.error.message).toContain("discovery.search has invalid input.");
+      }
     } finally {
       fixture.discoveryService.close();
       fixture.discordSearchStore.close();

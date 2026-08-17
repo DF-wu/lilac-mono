@@ -2,8 +2,13 @@ import { z } from "zod";
 import fs from "node:fs/promises";
 import { basename } from "node:path";
 import { fileTypeFromBuffer } from "file-type";
-import { getDiscordUserAliasValue, type CoreConfig } from "@stanley2058/lilac-utils";
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { errorMessage, getDiscordUserAliasValue, type CoreConfig } from "@stanley2058/lilac-utils";
+import { Panic, Result, type Result as ResultType } from "better-result";
+import {
+  serverToolFailure,
+  type ServerToolFailure,
+  type ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
 
 import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
@@ -35,6 +40,7 @@ import type { DiscordSearchService } from "../../surface/store/discord-search-st
 import type { RequestContext } from "../types";
 import type { RecentAgentWriteSnapshot, TranscriptStore } from "../../transcript/transcript-store";
 import { isHeartbeatSessionId } from "../../transcript/heartbeat-handoff";
+import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
 import {
   bestEffortAliasForDiscordChannelId,
@@ -44,7 +50,7 @@ import {
 import {
   formatToolPathForRequestContext,
   inferMimeTypeFromFilename,
-  resolveToolPathForRequestContext,
+  resolveToolPathForRequestContextResult,
 } from "../../shared/attachment-utils";
 import { getDiscordSurfaceDisplayText } from "../../surface/discord/discord-surface-display-text";
 import {
@@ -53,52 +59,104 @@ import {
   normalizeDiscordRaw,
 } from "../../surface/discord/discord-raw-normalizer";
 
-class SurfaceToolFailure extends TaggedError("SurfaceToolFailure")<{
-  readonly message: string;
-}> {}
-
-function adaptSurfaceResultToToolHost<TValue>(
-  result: ResultType<TValue, SurfaceToolFailure>,
-): TValue {
-  return result.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      throw new Error(error.message);
-    },
-  })();
+function surfaceFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
+  return serverToolFailure({
+    kind,
+    code: `surface_${kind}`,
+    message,
+    retryable: kind === "unavailable" || kind === "timeout",
+  });
 }
 
-function signalSurfaceFailureToToolHost(message: string): never {
-  return adaptSurfaceResultToToolHost(Result.err(new SurfaceToolFailure({ message })));
+const surfaceFailureSchema: z.ZodType<ServerToolFailure> = z
+  .object({
+    kind: z.enum([
+      "usage",
+      "denied",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "timeout",
+      "cancelled",
+      "internal",
+    ]),
+    code: z.string(),
+    message: z.string(),
+    retryable: z.boolean(),
+    details: z.json().optional(),
+  })
+  .strict();
+
+function surfaceExternalFailure(cause: unknown, signal?: AbortSignal): ServerToolFailure {
+  if (Panic.is(cause)) preserveToolPanic(cause);
+  const decodedFailure = surfaceFailureSchema.safeParse(cause);
+  if (decodedFailure.success) return decodedFailure.data;
+  const message = errorMessage(cause);
+  const normalized = message.toLowerCase();
+  const code = cause && typeof cause === "object" && "code" in cause ? cause.code : undefined;
+  let category: ServerToolFailure["kind"] = "unavailable";
+  if (signal?.aborted || /\babort(?:ed)?\b/.test(normalized)) category = "cancelled";
+  else if (/\b(?:timeout|timed out)\b/.test(normalized)) category = "timeout";
+  else if (code === "ENOENT") category = "not_found";
+  else if (code === "EACCES" || code === "EPERM") category = "denied";
+  return surfaceFailure(category, message);
 }
 
-function adaptSurfaceTargetResultToToolHost<T>(
+function surfaceTargetResult<T>(
   result: ResultType<T, { readonly message: string }>,
-): T {
-  return result.match({
-    ok: (value) => () => value,
-    err: (error) => () => signalSurfaceFailureToToolHost(error.message),
-  })();
+): ResultType<T, ServerToolFailure> {
+  return result.mapError((error) => surfaceFailure("usage", error.message));
 }
 
-function adaptSurfaceOperationToToolHost<T>(result: ResultType<T, SurfaceOperationError>): T {
-  return result.match({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      switch (error._tag) {
-        case "SurfaceOperationUnsupported":
-        case "SurfacePlatformMismatch":
-        case "SurfaceSessionMismatch":
-        case "SurfaceInvalidInput":
-        case "SurfaceOperationPartiallyCompleted":
-        case "SurfaceMessageNotFound":
-        case "SurfacePermissionDenied":
-        case "SurfaceRateLimited":
-        case "SurfaceUnavailable":
-          return signalSurfaceFailureToToolHost(error.message);
-      }
-    },
-  })();
+function surfaceOperationResult<T>(
+  result: ResultType<T, SurfaceOperationError>,
+): ResultType<T, ServerToolFailure> {
+  return result.mapError((error) => {
+    switch (error._tag) {
+      case "SurfaceOperationUnsupported":
+        return serverToolFailure({
+          kind: "usage",
+          code: "surface_operation_unsupported",
+          message: error.message,
+          retryable: false,
+        });
+      case "SurfaceRateLimited":
+        return serverToolFailure({
+          kind: "unavailable",
+          code: "surface_rate_limited",
+          message: error.message,
+          retryable: true,
+          ...(error.retryAfterMs === undefined
+            ? {}
+            : { details: { retryAfterMs: error.retryAfterMs } }),
+        });
+      case "SurfaceUnavailable":
+        return surfaceFailure("unavailable", error.message);
+      case "SurfacePlatformMismatch":
+      case "SurfaceSessionMismatch":
+        return surfaceFailure("conflict", error.message);
+      case "SurfaceOperationPartiallyCompleted":
+        return serverToolFailure({
+          kind: "conflict",
+          code: "surface_operation_partially_completed",
+          message: error.message,
+          retryable: false,
+          details: {
+            created: {
+              platform: error.created.platform,
+              channelId: error.created.channelId,
+              messageId: error.created.messageId,
+            },
+          },
+        });
+      case "SurfaceInvalidInput":
+        return surfaceFailure("usage", error.message);
+      case "SurfaceMessageNotFound":
+        return surfaceFailure("not_found", error.message);
+      case "SurfacePermissionDenied":
+        return surfaceFailure("denied", error.message);
+    }
+  });
 }
 
 function createSurfaceMessageRef<P extends RegisteredSurfacePlatform>(
@@ -128,42 +186,57 @@ function resolveSurfaceAdapter(params: {
   inputClient?: SurfaceClient;
   ctx?: RequestContext;
   resolver: SurfaceAdapterResolver;
-}): ResolvedSurfaceAdapter {
+}): ResultType<ResolvedSurfaceAdapter, ServerToolFailure> {
   const ctxClientRaw = params.ctx?.requestClient;
   const ctxClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : null;
   const contextAdapter = ctxClient ? params.resolver.resolve(ctxClient) : null;
 
   if (contextAdapter) {
     if (params.inputClient && params.inputClient !== contextAdapter.platform) {
-      signalSurfaceFailureToToolHost(
-        `Client mismatch: context requestClient is '${contextAdapter.platform}' but input client is '${params.inputClient}'`,
+      return Result.err(
+        surfaceFailure(
+          "conflict",
+          `Client mismatch: context requestClient is '${contextAdapter.platform}' but input client is '${params.inputClient}'`,
+        ),
       );
     }
-    return contextAdapter;
+    return Result.ok(contextAdapter);
   }
 
   if (params.inputClient) {
     const inputAdapter = params.resolver.resolve(params.inputClient);
-    if (inputAdapter) return inputAdapter;
-    signalSurfaceFailureToToolHost(
-      `surface tool: client '${params.inputClient}' is recognized but has no registered executable adapter (registered: ${formatRegisteredPlatforms(params.resolver)})`,
+    if (inputAdapter) return Result.ok(inputAdapter);
+    return Result.err(
+      surfaceFailure(
+        "unavailable",
+        `surface tool: client '${params.inputClient}' is recognized but has no registered executable adapter (registered: ${formatRegisteredPlatforms(params.resolver)})`,
+      ),
     );
   }
 
   if (ctxClient && ctxClient !== "unknown") {
-    signalSurfaceFailureToToolHost(
-      `surface tool: context client '${ctxClient}' is recognized but has no registered executable adapter (registered: ${formatRegisteredPlatforms(params.resolver)})`,
+    return Result.err(
+      surfaceFailure(
+        "unavailable",
+        `surface tool: context client '${ctxClient}' is recognized but has no registered executable adapter (registered: ${formatRegisteredPlatforms(params.resolver)})`,
+      ),
     );
   }
 
   if (typeof ctxClientRaw === "string" && ctxClientRaw.length > 0 && !ctxClient) {
-    signalSurfaceFailureToToolHost(
-      `surface tool: context requestClient '${ctxClientRaw}' is not a valid surface wire value; pass --client=<client> explicitly`,
+    return Result.err(
+      surfaceFailure(
+        "usage",
+        `surface tool: context requestClient '${ctxClientRaw}' is not a valid surface wire value; pass --client=<client> explicitly`,
+      ),
     );
   }
 
-  signalSurfaceFailureToToolHost(
-    "surface tool requires --client when request client is unknown (set LILAC_REQUEST_CLIENT or pass --client=<client>)",
+  return Result.err(
+    surfaceFailure(
+      "usage",
+      "surface tool requires --client when request client is unknown (set LILAC_REQUEST_CLIENT or pass --client=<client>)",
+    ),
   );
 }
 
@@ -171,8 +244,10 @@ function shouldAllowDiscordChannel(params: {
   cfg: CoreConfig;
   channelId: string;
   guildId?: string | null;
-}): boolean {
-  return adaptSurfaceTargetResultToToolHost(checkDiscordChannelAllowed(params));
+}): ResultType<boolean, ServerToolFailure> {
+  return checkDiscordChannelAllowed(params).mapError((error) =>
+    surfaceFailure("unavailable", error.message),
+  );
 }
 
 const DEFAULT_OUTBOUND_MAX_FILE_BYTES = 8 * 1024 * 1024;
@@ -184,67 +259,81 @@ export async function loadLocalAttachments(params: {
   filenames?: string[];
   mimeTypes?: string[];
   context?: RequestContext | undefined;
-}): Promise<SurfaceAttachment[]> {
-  let totalBytes = 0;
+}): Promise<ResultType<SurfaceAttachment[], ServerToolFailure>> {
+  return Result.gen(async function* () {
+    let totalBytes = 0;
+    const out: SurfaceAttachment[] = [];
 
-  const out: SurfaceAttachment[] = [];
-
-  for (let i = 0; i < params.paths.length; i++) {
-    const inputPath = params.paths[i]!;
-    const resolvedPath = resolveToolPathForRequestContext({
-      cwd: params.cwd,
-      inputPath,
-      context: params.context,
-    });
-
-    const st = await fs.stat(resolvedPath);
-    if (!st.isFile()) {
-      signalSurfaceFailureToToolHost(
-        `Not a file: ${formatToolPathForRequestContext({
-          path: resolvedPath,
-          context: params.context,
-        })}`,
+    for (let i = 0; i < params.paths.length; i++) {
+      const inputPath = params.paths[i]!;
+      const resolvedPath = yield* resolveToolPathForRequestContextResult({
+        cwd: params.cwd,
+        inputPath,
+        context: params.context,
+      }).mapError((error) => surfaceFailure("denied", error.message));
+      const st = yield* Result.await(
+        Result.tryPromise({
+          try: () => fs.stat(resolvedPath),
+          catch: (cause) => surfaceExternalFailure(cause),
+        }),
       );
+      if (!st.isFile()) {
+        return Result.err(
+          surfaceFailure(
+            "usage",
+            `Not a file: ${formatToolPathForRequestContext({
+              path: resolvedPath,
+              context: params.context,
+            })}`,
+          ),
+        );
+      }
+      if (st.size > DEFAULT_OUTBOUND_MAX_FILE_BYTES) {
+        return Result.err(
+          surfaceFailure(
+            "usage",
+            `Attachment too large (${st.size} bytes). Max is ${DEFAULT_OUTBOUND_MAX_FILE_BYTES} bytes: ${formatToolPathForRequestContext(
+              { path: resolvedPath, context: params.context },
+            )}`,
+          ),
+        );
+      }
+      totalBytes += st.size;
+      if (totalBytes > DEFAULT_OUTBOUND_MAX_TOTAL_BYTES) {
+        return Result.err(
+          surfaceFailure(
+            "usage",
+            `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_OUTBOUND_MAX_TOTAL_BYTES} bytes.`,
+          ),
+        );
+      }
+      const bytes = yield* Result.await(
+        Result.tryPromise({
+          try: () => fs.readFile(resolvedPath),
+          catch: (cause) => surfaceExternalFailure(cause),
+        }),
+      );
+      const filename = (params.filenames && params.filenames[i]) ?? basename(resolvedPath);
+      const typeFromBytes = yield* Result.await(
+        Result.tryPromise({
+          try: () => fileTypeFromBuffer(bytes),
+          catch: (cause) => surfaceExternalFailure(cause),
+        }),
+      );
+      const mimeType =
+        (params.mimeTypes && params.mimeTypes[i]) ??
+        typeFromBytes?.mime ??
+        inferMimeTypeFromFilename(filename);
+      out.push({
+        kind: mimeType.startsWith("image/") ? "image" : "file",
+        mimeType,
+        filename,
+        bytes: new Uint8Array(bytes),
+      });
     }
 
-    if (st.size > DEFAULT_OUTBOUND_MAX_FILE_BYTES) {
-      signalSurfaceFailureToToolHost(
-        `Attachment too large (${st.size} bytes). Max is ${DEFAULT_OUTBOUND_MAX_FILE_BYTES} bytes: ${formatToolPathForRequestContext(
-          {
-            path: resolvedPath,
-            context: params.context,
-          },
-        )}`,
-      );
-    }
-
-    totalBytes += st.size;
-    if (totalBytes > DEFAULT_OUTBOUND_MAX_TOTAL_BYTES) {
-      signalSurfaceFailureToToolHost(
-        `Total attachment bytes too large (${totalBytes} bytes). Max is ${DEFAULT_OUTBOUND_MAX_TOTAL_BYTES} bytes.`,
-      );
-    }
-
-    const bytes = await fs.readFile(resolvedPath);
-
-    const filename = (params.filenames && params.filenames[i]) ?? basename(resolvedPath);
-
-    const typeFromBytes = await fileTypeFromBuffer(bytes);
-
-    const mimeType =
-      (params.mimeTypes && params.mimeTypes[i]) ??
-      typeFromBytes?.mime ??
-      inferMimeTypeFromFilename(filename);
-
-    out.push({
-      kind: mimeType.startsWith("image/") ? "image" : "file",
-      mimeType,
-      filename,
-      bytes: new Uint8Array(bytes),
-    });
-  }
-
-  return out;
+    return Result.ok(out);
+  });
 }
 
 function buildDiscordUserAliasById(cfg: CoreConfig): Map<string, string> {
@@ -293,8 +382,8 @@ const sessionsListLimitSchema = z
 function withDefaultSessionId<TInput extends { readonly sessionId?: string }>(
   input: TInput,
   ctx: RequestContext | undefined,
-): TInput {
-  if (input.sessionId !== undefined) return input;
+): ResultType<TInput, ServerToolFailure> {
+  if (input.sessionId !== undefined) return Result.ok(input);
 
   const ctxSessionId =
     typeof ctx?.sessionId === "string" && ctx.sessionId.length > 0
@@ -302,35 +391,41 @@ function withDefaultSessionId<TInput extends { readonly sessionId?: string }>(
       : inferBuiltinSurfaceToolRequestTarget(ctx?.requestId)?.sessionId;
 
   if (ctxSessionId) {
-    return { ...input, sessionId: ctxSessionId };
+    return Result.ok({ ...input, sessionId: ctxSessionId });
   }
 
-  signalSurfaceFailureToToolHost(
-    "surface tool requires --session-id when request session is unknown (set LILAC_SESSION_ID or pass --session-id=<id>)",
+  return Result.err(
+    surfaceFailure(
+      "usage",
+      "surface tool requires --session-id when request session is unknown (set LILAC_SESSION_ID or pass --session-id=<id>)",
+    ),
   );
 }
 
 function withDefaultMessageId<TInput extends { readonly messageId?: string }>(
   input: TInput,
   ctx: RequestContext | undefined,
-): TInput {
-  if (input.messageId !== undefined) return input;
+): ResultType<TInput, ServerToolFailure> {
+  if (input.messageId !== undefined) return Result.ok(input);
 
   const inferred = inferBuiltinSurfaceToolRequestTarget(ctx?.requestId);
-  if (inferred?.messageId) return { ...input, messageId: inferred.messageId };
+  if (inferred?.messageId) return Result.ok({ ...input, messageId: inferred.messageId });
 
   const rid = typeof ctx?.requestId === "string" ? ctx.requestId : undefined;
   const hint = rid ? ` (requestId='${rid}')` : " (no requestId in context)";
 
-  signalSurfaceFailureToToolHost(
-    `surface tool requires --message-id when origin message is unknown${hint}. ` +
-      "This is expected for active-mode gated batches (requestId like 'req:<uuid>'); pass --message-id explicitly.",
+  return Result.err(
+    surfaceFailure(
+      "usage",
+      `surface tool requires --message-id when origin message is unknown${hint}. ` +
+        "This is expected for active-mode gated batches (requestId like 'req:<uuid>'); pass --message-id explicitly.",
+    ),
   );
 }
 
-function mustPresentString(v: unknown, label: string): string {
-  if (typeof v === "string" && v.length > 0) return v;
-  signalSurfaceFailureToToolHost(`surface tool internal error: missing ${label}`);
+function mustPresentString(v: unknown, label: string): ResultType<string, ServerToolFailure> {
+  if (typeof v === "string" && v.length > 0) return Result.ok(v);
+  return Result.err(surfaceFailure("internal", `surface tool internal error: missing ${label}`));
 }
 
 type SurfaceMessageAttachmentKind = "image" | "video" | "audio" | "file";
@@ -564,67 +659,60 @@ async function resolveDiscordReferencedMessage(input: {
   message: SurfaceMessage;
   alreadyFetchedByKey?: Map<string, SurfaceMessage>;
   fetchedReferenceByKey?: Map<string, Promise<SurfaceMessage | null>>;
-}): Promise<SurfaceMessage | null> {
-  const msg = input.message;
-  if (msg.session.platform !== "discord") return null;
+}): Promise<ResultType<SurfaceMessage | null, ServerToolFailure>> {
+  return Result.gen(async function* () {
+    const msg = input.message;
+    if (msg.session.platform !== "discord") return Result.ok(null);
 
-  const ref = getDiscordReferenceFromRaw(msg.raw);
-  if (!ref?.messageId) return null;
+    const ref = getDiscordReferenceFromRaw(msg.raw);
+    if (!ref?.messageId) return Result.ok(null);
 
-  const referenceType = ref.type ?? DISCORD_REFERENCE_TYPE_DEFAULT;
-  if (referenceType === DISCORD_REFERENCE_TYPE_FORWARD) return null;
+    const referenceType = ref.type ?? DISCORD_REFERENCE_TYPE_DEFAULT;
+    if (referenceType === DISCORD_REFERENCE_TYPE_FORWARD) return Result.ok(null);
 
-  const meta = getDiscordMessageTypeMetaFromRaw(msg.raw);
-  const refChannelId = ref.channelId ?? msg.session.channelId;
-  const isSameSession = refChannelId === msg.session.channelId;
-  const isThreadStarterParentReference =
-    isDiscordThreadStarterMessage(meta) &&
-    typeof msg.session.parentChannelId === "string" &&
-    refChannelId === msg.session.parentChannelId;
+    const meta = getDiscordMessageTypeMetaFromRaw(msg.raw);
+    const refChannelId = ref.channelId ?? msg.session.channelId;
+    const isSameSession = refChannelId === msg.session.channelId;
+    const isThreadStarterParentReference =
+      isDiscordThreadStarterMessage(meta) &&
+      typeof msg.session.parentChannelId === "string" &&
+      refChannelId === msg.session.parentChannelId;
 
-  if (!isSameSession && !isThreadStarterParentReference) return null;
+    if (!isSameSession && !isThreadStarterParentReference) return Result.ok(null);
 
-  if (
-    !shouldAllowDiscordChannel({
+    const targetAllowed = yield* shouldAllowDiscordChannel({
       cfg: input.cfg,
       channelId: refChannelId,
       guildId: ref.guildId ?? msg.session.guildId,
-    })
-  ) {
-    return null;
-  }
+    });
+    if (!targetAllowed) return Result.ok(null);
 
-  const targetKey = `${refChannelId}:${ref.messageId}`;
-  const alreadyFetched = input.alreadyFetchedByKey?.get(targetKey);
-  if (alreadyFetched) return alreadyFetched;
+    const targetKey = `${refChannelId}:${ref.messageId}`;
+    const alreadyFetched = input.alreadyFetchedByKey?.get(targetKey);
+    if (alreadyFetched) return Result.ok(alreadyFetched);
 
-  let referencedPromise = input.fetchedReferenceByKey?.get(targetKey);
-  if (!referencedPromise) {
-    referencedPromise = input.adapter
-      .readMsg({
-        platform: "discord",
-        channelId: refChannelId,
-        messageId: ref.messageId,
-      })
-      .then((result) => result.match({ ok: (value) => value, err: () => null }));
-    input.fetchedReferenceByKey?.set(targetKey, referencedPromise);
-  }
+    let referencedPromise = input.fetchedReferenceByKey?.get(targetKey);
+    if (!referencedPromise) {
+      referencedPromise = input.adapter
+        .readMsg({
+          platform: "discord",
+          channelId: refChannelId,
+          messageId: ref.messageId,
+        })
+        .then((result) => result.match({ ok: (value) => value, err: () => null }));
+      input.fetchedReferenceByKey?.set(targetKey, referencedPromise);
+    }
 
-  const referenced = await referencedPromise;
+    const referenced = await referencedPromise;
+    if (!referenced || referenced.session.platform !== "discord") return Result.ok(null);
 
-  if (!referenced || referenced.session.platform !== "discord") return null;
-
-  if (
-    !shouldAllowDiscordChannel({
+    const referencedAllowed = yield* shouldAllowDiscordChannel({
       cfg: input.cfg,
       channelId: referenced.session.channelId,
       guildId: referenced.session.guildId,
-    })
-  ) {
-    return null;
-  }
-
-  return referenced;
+    });
+    return Result.ok(referencedAllowed ? referenced : null);
+  });
 }
 
 async function mapWithConcurrency<T, R>(input: {
@@ -653,7 +741,7 @@ async function resolveDiscordReferencedMessages(input: {
   adapter: SurfaceAdapter;
   cfg: CoreConfig;
   messages: readonly SurfaceMessage[];
-}): Promise<Map<string, SurfaceMessage>> {
+}): Promise<ResultType<Map<string, SurfaceMessage>, ServerToolFailure>> {
   const out = new Map<string, SurfaceMessage>();
   const alreadyFetchedByKey = new Map<string, SurfaceMessage>();
   const fetchedReferenceByKey = new Map<string, Promise<SurfaceMessage | null>>();
@@ -662,22 +750,25 @@ async function resolveDiscordReferencedMessages(input: {
     alreadyFetchedByKey.set(surfaceMessageKey(message), message);
   }
 
-  await mapWithConcurrency({
+  const resolved = await mapWithConcurrency({
     items: input.messages,
     concurrency: 8,
     run: async (message) => {
-      const referenced = await resolveDiscordReferencedMessage({
-        adapter: input.adapter,
-        cfg: input.cfg,
-        message,
-        alreadyFetchedByKey,
-        fetchedReferenceByKey,
+      return (
+        await resolveDiscordReferencedMessage({
+          adapter: input.adapter,
+          cfg: input.cfg,
+          message,
+          alreadyFetchedByKey,
+          fetchedReferenceByKey,
+        })
+      ).map((referenced) => {
+        if (referenced) out.set(surfaceMessageKey(message), referenced);
       });
-      if (referenced) out.set(surfaceMessageKey(message), referenced);
     },
   });
 
-  return out;
+  return Result.all(resolved).map(() => out);
 }
 
 const MESSAGE_LIST_ORDER_SCHEMA = z.enum(["ts_asc", "ts_desc"]);
@@ -1250,89 +1341,103 @@ export class Surface implements ServerTool {
     callableId: string,
     input: Record<string, unknown>,
     opts?: ServerToolCallOptions,
-  ): Promise<unknown> {
+  ): Promise<ServerToolResult> {
     return await this.tool.call(callableId, input, opts);
   }
 
-  private async callHelp(input: z.output<typeof helpInputSchema>, ctx: RequestContext | undefined) {
-    const ctxClientRaw = ctx?.requestClient;
-    const ctxClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : "unknown";
-    const contextAdapter = this.params.adapterResolver.resolve(ctxClient);
-    const registeredPlatforms = this.params.adapterResolver.registeredPlatforms();
-    let effective = contextAdapter;
-    if (input.client) {
-      effective = resolveSurfaceAdapter({
-        inputClient: input.client,
-        ctx,
-        resolver: this.params.adapterResolver,
+  private async callHelp(
+    input: z.output<typeof helpInputSchema>,
+    ctx: RequestContext | undefined,
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const ctxClientRaw = ctx?.requestClient;
+      const ctxClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : "unknown";
+      const contextAdapter = self.params.adapterResolver.resolve(ctxClient);
+      const registeredPlatforms = self.params.adapterResolver.registeredPlatforms();
+      let effective = contextAdapter;
+      if (input.client) {
+        effective = yield* resolveSurfaceAdapter({
+          inputClient: input.client,
+          ctx,
+          resolver: self.params.adapterResolver,
+        });
+      } else if (!effective) {
+        effective =
+          registeredPlatforms
+            .map((platform) => self.params.adapterResolver.resolve(platform))
+            .filter((resolved) => resolved?.protocol.toolTargets !== undefined)
+            .sort(
+              (left, right) =>
+                left!.protocol.toolTargets!.helpFallbackPriority -
+                right!.protocol.toolTargets!.helpFallbackPriority,
+            )[0] ?? null;
+      }
+      const cfg = yield* Result.await(self.getCfg());
+      const contextSessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : null;
+      const targetHelp = effective?.protocol.toolTargets?.describeSessionIds({
+        contextSessionId,
+        config: cfg,
       });
-    } else if (!effective) {
-      effective =
-        registeredPlatforms
-          .map((platform) => this.params.adapterResolver.resolve(platform))
-          .filter((resolved) => resolved?.protocol.toolTargets !== undefined)
-          .sort(
-            (left, right) =>
-              left!.protocol.toolTargets!.helpFallbackPriority -
-              right!.protocol.toolTargets!.helpFallbackPriority,
-          )[0] ?? null;
-    }
-    const cfg = await this.getCfg();
-    const contextSessionId = typeof ctx?.sessionId === "string" ? ctx.sessionId : null;
-    const targetHelp = effective?.protocol.toolTargets?.describeSessionIds({
-      contextSessionId,
-      config: cfg,
-    });
 
-    return {
-      tool: "surface" as const,
-      supportedClients: registeredPlatforms,
-      context: {
-        requestClient: ctxClient,
-        sessionId: contextSessionId,
-        alias: targetHelp?.contextAlias,
-      },
-      terminology: {
-        client:
-          "Surface client/platform. A registered request-context adapter is authoritative; an explicit conflicting --client fails closed. Otherwise pass --client to select a registered adapter.",
-        adapterResolution:
-          "supportedClients lists registered executable adapters only. It does not predict support for individual operations; each operation returns its declared runtime result.",
-        session:
-          "A conversation container. For Discord, a session maps to a channel; for GitHub, a session maps to an issue/PR thread.",
-        sessionId:
-          "The CLI/session selector used by most surface.* tools. If omitted, surface tools default to the current request session (LILAC_SESSION_ID, or inferred from requestId when available).",
-        alias:
-          "Human-friendly Discord session alias from cfg.entity.sessions.discord. Prefer aliases over raw channel ids when available.",
-        messageId:
-          "A platform-specific message identifier inside a session/channel. Many surface tools can default this to the origin message when requestId is 'discord:<sessionId>:<messageId>' or 'github:<OWNER/REPO#N>:<triggerId>'.",
-        replyToMessageId: "When sending a message, optionally reply to an existing messageId.",
-        silent: "When true, suppress all notifications for this send (mentions + reply ping).",
-        attachments:
-          "Outbound: local files offered to the selected adapter (paths resolved relative to request cwd; unsupported adapters reject them explicitly). Inbound: message attachment/media metadata is first-class on surface.messages.read and hinted on surface.messages.list.",
-      },
-      sessionIdFormats: targetHelp?.sessionIdFormats ?? null,
-      relatedConfigKeys: {
-        requestClientEnv: "LILAC_REQUEST_CLIENT",
-        sessionIdEnv: "LILAC_SESSION_ID",
-        discordSessionAliases: "cfg.entity.sessions.discord",
-        surfaceAllowlistChannels: "cfg.surface.discord.allowedChannelIds",
-        surfaceAllowlistGuilds: "cfg.surface.discord.allowedGuildIds",
-      },
-    };
+      return Result.ok({
+        tool: "surface" as const,
+        supportedClients: registeredPlatforms,
+        context: {
+          requestClient: ctxClient,
+          sessionId: contextSessionId,
+          alias: targetHelp?.contextAlias,
+        },
+        terminology: {
+          client:
+            "Surface client/platform. A registered request-context adapter is authoritative; an explicit conflicting --client fails closed. Otherwise pass --client to select a registered adapter.",
+          adapterResolution:
+            "supportedClients lists registered executable adapters only. It does not predict support for individual operations; each operation returns its declared runtime result.",
+          session:
+            "A conversation container. For Discord, a session maps to a channel; for GitHub, a session maps to an issue/PR thread.",
+          sessionId:
+            "The CLI/session selector used by most surface.* tools. If omitted, surface tools default to the current request session (LILAC_SESSION_ID, or inferred from requestId when available).",
+          alias:
+            "Human-friendly Discord session alias from cfg.entity.sessions.discord. Prefer aliases over raw channel ids when available.",
+          messageId:
+            "A platform-specific message identifier inside a session/channel. Many surface tools can default this to the origin message when requestId is 'discord:<sessionId>:<messageId>' or 'github:<OWNER/REPO#N>:<triggerId>'.",
+          replyToMessageId: "When sending a message, optionally reply to an existing messageId.",
+          silent: "When true, suppress all notifications for this send (mentions + reply ping).",
+          attachments:
+            "Outbound: local files offered to the selected adapter (paths resolved relative to request cwd; unsupported adapters reject them explicitly). Inbound: message attachment/media metadata is first-class on surface.messages.read and hinted on surface.messages.list.",
+        },
+        sessionIdFormats: targetHelp?.sessionIdFormats ?? null,
+        relatedConfigKeys: {
+          requestClientEnv: "LILAC_REQUEST_CLIENT",
+          sessionIdEnv: "LILAC_SESSION_ID",
+          discordSessionAliases: "cfg.entity.sessions.discord",
+          surfaceAllowlistChannels: "cfg.surface.discord.allowedChannelIds",
+          surfaceAllowlistGuilds: "cfg.surface.discord.allowedGuildIds",
+        },
+      });
+    });
   }
 
-  private async getCfg(): Promise<CoreConfig> {
-    if (this.params.config) return this.params.config;
-    if (this.params.getConfig) return this.params.getConfig();
-    signalSurfaceFailureToToolHost(
-      "surface tool requires core config (tool server must be started with config)",
+  private async getCfg(): Promise<ResultType<CoreConfig, ServerToolFailure>> {
+    if (this.params.config) return Result.ok(this.params.config);
+    if (this.params.getConfig) {
+      return Result.tryPromise({
+        try: this.params.getConfig,
+        catch: (cause) => surfaceExternalFailure(cause),
+      });
+    }
+    return Result.err(
+      surfaceFailure(
+        "unavailable",
+        "surface tool requires core config (tool server must be started with config)",
+      ),
     );
   }
 
   private resolveAdapter(
     inputClient: SurfaceClient | undefined,
     ctx: RequestContext | undefined,
-  ): ResolvedSurfaceAdapter {
+  ): ResultType<ResolvedSurfaceAdapter, ServerToolFailure> {
     return resolveSurfaceAdapter({
       inputClient,
       ctx,
@@ -1343,31 +1448,41 @@ export class Surface implements ServerTool {
   private async resolveSessionTarget(params: {
     readonly resolved: ResolvedSurfaceAdapter;
     readonly sessionId: string;
-  }): Promise<{
-    readonly resolved: ResolvedSurfaceAdapter;
-    readonly sessionRef: SessionRef;
-    readonly cfg?: CoreConfig;
-  }> {
+  }): Promise<
+    ResultType<
+      {
+        readonly resolved: ResolvedSurfaceAdapter;
+        readonly sessionRef: SessionRef;
+        readonly cfg?: CoreConfig;
+      },
+      ServerToolFailure
+    >
+  > {
     const routing = params.resolved.protocol.toolTargets;
     if (!routing) {
-      signalSurfaceFailureToToolHost(
-        `surface tool: client '${params.resolved.platform}' does not provide target routing`,
+      return Result.err(
+        surfaceFailure(
+          "unavailable",
+          `surface tool: client '${params.resolved.platform}' does not provide target routing`,
+        ),
       );
     }
-    const target: ResultType<
-      { readonly sessionRef: SessionRef; readonly config?: CoreConfig },
-      SurfaceToolTargetInvalid
-    > = await routing.resolveSession({
-      selector: params.sessionId,
-      adapter: params.resolved.adapter,
-      getConfig: () => this.getCfg(),
+    const configResult = await this.getCfg();
+    return configResult.andThenAsync(async (config) => {
+      const target: ResultType<
+        { readonly sessionRef: SessionRef; readonly config?: CoreConfig },
+        SurfaceToolTargetInvalid
+      > = await routing.resolveSession({
+        selector: params.sessionId,
+        adapter: params.resolved.adapter,
+        getConfig: async () => config,
+      });
+      return surfaceTargetResult(target).map((targetValue) => ({
+        resolved: params.resolved,
+        sessionRef: targetValue.sessionRef,
+        cfg: targetValue.config,
+      }));
     });
-    const targetValue = adaptSurfaceTargetResultToToolHost(target);
-    return {
-      resolved: params.resolved,
-      sessionRef: targetValue.sessionRef,
-      cfg: targetValue.config,
-    };
   }
 
   private async resolveMessageTarget(params: {
@@ -1375,21 +1490,38 @@ export class Surface implements ServerTool {
     readonly sessionId: string;
     readonly messageId: string;
     readonly burstDiscordCache?: boolean;
-  }) {
-    const target = await this.resolveSessionTarget(params);
-    const msgRef = createSurfaceMessageRef(target.sessionRef, params.messageId);
-    if (
-      params.burstDiscordCache &&
-      target.resolved.platform === "discord" &&
-      hasCacheBurstProvider(target.resolved.adapter)
-    ) {
-      await target.resolved.adapter.burstCache({
-        msgRef,
-        sessionRef: target.sessionRef,
-        reason: "surface_tool",
-      });
-    }
-    return { ...target, msgRef };
+  }): Promise<
+    ResultType<
+      {
+        readonly resolved: ResolvedSurfaceAdapter;
+        readonly sessionRef: SessionRef;
+        readonly cfg?: CoreConfig;
+        readonly msgRef: MsgRef;
+      },
+      ServerToolFailure
+    >
+  > {
+    return (await this.resolveSessionTarget(params)).andThenAsync(async (target) => {
+      const msgRef = createSurfaceMessageRef(target.sessionRef, params.messageId);
+      if (
+        params.burstDiscordCache &&
+        target.resolved.platform === "discord" &&
+        hasCacheBurstProvider(target.resolved.adapter)
+      ) {
+        const adapter = target.resolved.adapter;
+        const burst = await Result.tryPromise({
+          try: () =>
+            adapter.burstCache({
+              msgRef,
+              sessionRef: target.sessionRef,
+              reason: "surface_tool",
+            }),
+          catch: (cause) => surfaceExternalFailure(cause),
+        });
+        return burst.map(() => ({ ...target, msgRef }));
+      }
+      return Result.ok({ ...target, msgRef });
+    });
   }
 
   private async readRecentAgentWriteText(row: RecentAgentWriteSnapshot): Promise<string> {
@@ -1419,437 +1551,492 @@ export class Surface implements ServerTool {
         created: [ref],
         last: ref,
       });
-    } catch {
+    } catch (cause) {
+      if (Panic.is(cause)) preserveToolPanic(cause);
       // Best-effort only. Do not fail the send on transcript linkage issues.
     }
   }
 
   private async callActivitiesRecentAgentWrites(
     input: z.output<typeof activitiesRecentAgentWritesInputSchema>,
-  ) {
+  ): Promise<ServerToolResult> {
     const transcriptStore = this.params.transcriptStore;
+    const listRecentAgentWrites = transcriptStore?.listRecentAgentWrites;
 
-    if (!transcriptStore?.listRecentAgentWrites) {
-      signalSurfaceFailureToToolHost(
-        "surface.activities.recentAgentWrites is unavailable: transcript store is not initialized.",
+    if (!transcriptStore || !listRecentAgentWrites) {
+      return Result.err(
+        surfaceFailure(
+          "unavailable",
+          "surface.activities.recentAgentWrites is unavailable: transcript store is not initialized.",
+        ),
       );
     }
 
-    const cfg = await this.getCfg();
-    const targetLimit = Math.min(200, Math.max(1, Math.floor(input.limit ?? 20)));
+    const cfgResult = await this.getCfg();
+    return cfgResult.andThenAsync(async (cfg) => {
+      const targetLimit = Math.min(200, Math.max(1, Math.floor(input.limit ?? 20)));
 
-    const out: Array<{
-      sessionId: string;
-      messageId: string;
-      alias?: string;
-      client: string;
-      requestId: string;
-      preview: string;
-      updatedTs: number;
-      truncated: boolean;
-    }> = [];
+      const out: Array<{
+        sessionId: string;
+        messageId: string;
+        alias?: string;
+        client: string;
+        requestId: string;
+        preview: string;
+        updatedTs: number;
+        truncated: boolean;
+      }> = [];
 
-    let offset = 0;
-    const pageSize = Math.min(200, Math.max(targetLimit, 20));
+      let offset = 0;
+      const pageSize = Math.min(200, Math.max(targetLimit, 20));
 
-    while (out.length < targetLimit) {
-      const rows = transcriptStore.listRecentAgentWrites({
-        limit: pageSize,
-        offset,
-        client: input.client,
-      });
-      if (rows.length === 0) break;
+      while (out.length < targetLimit) {
+        const rows = listRecentAgentWrites.call(transcriptStore, {
+          limit: pageSize,
+          offset,
+          client: input.client,
+        });
+        if (rows.length === 0) break;
 
-      offset += rows.length;
+        offset += rows.length;
 
-      for (const row of rows) {
-        if (row.client === "discord") {
-          const discord = this.params.adapterResolver.resolve("discord");
-          if (!discord) continue;
-          const guildId = await resolveGuildIdForChannel({
-            adapter: discord.adapter,
-            channelId: row.sessionId,
-          });
+        for (const row of rows) {
+          if (row.client === "discord") {
+            const discord = this.params.adapterResolver.resolve("discord");
+            if (!discord) continue;
+            const guildId = await resolveGuildIdForChannel({
+              adapter: discord.adapter,
+              channelId: row.sessionId,
+            });
 
-          if (
-            !shouldAllowDiscordChannel({
+            const allowed = shouldAllowDiscordChannel({
               cfg,
               channelId: row.sessionId,
               guildId,
-            })
-          ) {
-            continue;
+            });
+            const include = allowed.match({ ok: (value) => value, err: () => false });
+            if (!include) {
+              continue;
+            }
           }
+
+          const text = (
+            await Result.tryPromise({
+              try: () => this.readRecentAgentWriteText(row),
+              catch: (cause) => surfaceExternalFailure(cause),
+            })
+          ).match({
+            ok: (value) => value,
+            err: () => row.finalText ?? "",
+          });
+
+          const preview = toPreviewText(text);
+
+          out.push({
+            sessionId: row.sessionId,
+            messageId: row.messageId,
+            alias:
+              row.client === "discord"
+                ? bestEffortAliasForDiscordChannelId({
+                    channelId: row.sessionId,
+                    cfg,
+                  })
+                : undefined,
+            client: row.client,
+            requestId: row.requestId,
+            preview: preview.preview,
+            updatedTs: row.updatedTs,
+            truncated: preview.truncated,
+          });
+
+          if (out.length >= targetLimit) break;
         }
 
-        let text = row.finalText ?? "";
-        try {
-          text = await this.readRecentAgentWriteText(row);
-        } catch (cause) {
-          if (Panic.is(cause)) throw cause;
-          // Fall back to persisted finalText when the backing message cannot be fetched.
-        }
-
-        const preview = toPreviewText(text);
-
-        out.push({
-          sessionId: row.sessionId,
-          messageId: row.messageId,
-          alias:
-            row.client === "discord"
-              ? bestEffortAliasForDiscordChannelId({
-                  channelId: row.sessionId,
-                  cfg,
-                })
-              : undefined,
-          client: row.client,
-          requestId: row.requestId,
-          preview: preview.preview,
-          updatedTs: row.updatedTs,
-          truncated: preview.truncated,
-        });
-
-        if (out.length >= targetLimit) break;
+        if (rows.length < pageSize) break;
       }
 
-      if (rows.length < pageSize) break;
-    }
-
-    return out;
+      return Result.ok(out);
+    });
   }
 
   private async callSessionsList(
     input: z.output<typeof sessionsListInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(input.client, ctx);
-    const cfg = resolved.platform === "discord" ? await this.getCfg() : undefined;
-    const limit = input.limit ?? Number.POSITIVE_INFINITY;
+  ): Promise<ServerToolResult> {
+    const resolvedResult = this.resolveAdapter(input.client, ctx);
+    return resolvedResult.andThenAsync(async (resolved) => {
+      const cfgResult =
+        resolved.platform === "discord" ? await this.getCfg() : Result.ok(undefined);
+      return cfgResult.andThenAsync(async (cfg) => {
+        const limit = input.limit ?? Number.POSITIVE_INFINITY;
 
-    const sessions = adaptSurfaceOperationToToolHost(await resolved.adapter.listSessions());
-    const out: Array<{
-      channelId: string;
-      guildId?: string;
-      parentChannelId?: string;
-      kind: string;
-      title?: string;
-      alias?: string;
-    }> = [];
+        const sessionsResult = surfaceOperationResult(await resolved.adapter.listSessions());
+        return sessionsResult.andThen((sessions) => {
+          const out: Array<{
+            channelId: string;
+            guildId?: string;
+            parentChannelId?: string;
+            kind: string;
+            title?: string;
+            alias?: string;
+          }> = [];
 
-    for (const s of sessions) {
-      const channelId = s.ref.channelId;
-      const guildId = s.ref.platform === "discord" ? s.ref.guildId : undefined;
-      const parentChannelId = s.ref.platform === "discord" ? s.ref.parentChannelId : undefined;
+          for (const s of sessions) {
+            const channelId = s.ref.channelId;
+            const guildId = s.ref.platform === "discord" ? s.ref.guildId : undefined;
+            const parentChannelId =
+              s.ref.platform === "discord" ? s.ref.parentChannelId : undefined;
 
-      if (
-        s.ref.platform === "discord" &&
-        cfg &&
-        !shouldAllowDiscordChannel({
-          cfg,
-          channelId,
-          guildId,
-        })
-      ) {
-        continue;
-      }
+            if (s.ref.platform === "discord" && cfg) {
+              const allowed = shouldAllowDiscordChannel({
+                cfg,
+                channelId,
+                guildId,
+              });
+              const include = allowed.match({ ok: (value) => value, err: () => false });
+              if (!include) continue;
+            }
 
-      out.push({
-        channelId,
-        guildId,
-        parentChannelId,
-        kind: s.kind,
-        title: s.title,
-        alias: cfg ? bestEffortAliasForDiscordChannelId({ channelId, cfg }) : undefined,
+            out.push({
+              channelId,
+              guildId,
+              parentChannelId,
+              kind: s.kind,
+              title: s.title,
+              alias: cfg ? bestEffortAliasForDiscordChannelId({ channelId, cfg }) : undefined,
+            });
+
+            if (out.length >= limit) break;
+          }
+
+          return Result.ok(out);
+        });
       });
-
-      if (out.length >= limit) break;
-    }
-
-    return out;
+    });
   }
 
   private async callSessionsListParticipants(
     decodedInput: z.output<typeof sessionsListParticipantsInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultSessionId(decodedInput, ctx);
-    const target = await this.resolveSessionTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
-    });
-    const participants = adaptSurfaceOperationToToolHost(
-      await target.resolved.adapter.listSessionParticipants(target.sessionRef, {
-        limit: input.limit,
-      }),
-    );
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const input = yield* withDefaultSessionId(decodedInput, ctx);
+      const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
+      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      const participants = yield* surfaceOperationResult(
+        await target.resolved.adapter.listSessionParticipants(target.sessionRef, {
+          limit: input.limit,
+        }),
+      );
 
-    return {
-      meta: {
-        session: toSessionMeta(target.sessionRef, target.cfg),
-        source: participants.source,
-        count: participants.participants.length,
-      },
-      participants: participants.participants,
-    };
+      return Result.ok({
+        meta: {
+          session: toSessionMeta(target.sessionRef, target.cfg),
+          source: participants.source,
+          count: participants.participants.length,
+        },
+        participants: participants.participants,
+      });
+    });
   }
 
   private async callMessagesList(
     decodedInput: z.output<typeof messagesListInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultSessionId(decodedInput, ctx);
-    const order: MessageListOrder = input.order ?? "ts_desc";
-    const includeRaw = input.includeRaw ?? false;
-    const includeAttachments = input.includeAttachments ?? false;
-    const target = await this.resolveSessionTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
-    });
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const input = yield* withDefaultSessionId(decodedInput, ctx);
+      const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
+      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      if (
+        target.resolved.platform === "discord" &&
+        hasCacheBurstProvider(target.resolved.adapter)
+      ) {
+        const adapter = target.resolved.adapter;
+        yield* Result.await(
+          Result.tryPromise({
+            try: () =>
+              adapter.burstCache({
+                sessionRef: target.sessionRef,
+                reason: "surface_tool",
+              }),
+            catch: (cause) => surfaceExternalFailure(cause),
+          }),
+        );
+      }
+      const messages = yield* surfaceOperationResult(
+        await target.resolved.adapter.listMsg(target.sessionRef, {
+          limit: input.limit ?? 50,
+          beforeMessageId: input.beforeMessageId,
+          afterMessageId: input.afterMessageId,
+        }),
+      );
+      const discordCfg = target.resolved.platform === "discord" ? target.cfg : undefined;
+      const filtered: SurfaceMessage[] = [];
+      for (const message of messages) {
+        if (!discordCfg) {
+          filtered.push(message);
+          continue;
+        }
+        if (message.session.platform !== "discord") continue;
+        const allowed = yield* shouldAllowDiscordChannel({
+          cfg: discordCfg,
+          channelId: message.session.channelId,
+          guildId: message.session.guildId,
+        });
+        if (allowed) filtered.push(message);
+      }
+      const referencedByMessageKey =
+        target.resolved.platform === "discord" && discordCfg
+          ? yield* Result.await(
+              resolveDiscordReferencedMessages({
+                adapter: target.resolved.adapter,
+                cfg: discordCfg,
+                messages: filtered,
+              }),
+            )
+          : undefined;
 
-    if (target.resolved.platform === "discord" && hasCacheBurstProvider(target.resolved.adapter)) {
-      await target.resolved.adapter.burstCache({
-        sessionRef: target.sessionRef,
-        reason: "surface_tool",
-      });
-    }
-
-    const limit = input.limit ?? 50;
-    const messages = adaptSurfaceOperationToToolHost(
-      await target.resolved.adapter.listMsg(target.sessionRef, {
-        limit,
-        beforeMessageId: input.beforeMessageId,
-        afterMessageId: input.afterMessageId,
-      }),
-    );
-
-    const discordCfg = target.resolved.platform === "discord" ? target.cfg : undefined;
-    const filtered = discordCfg
-      ? messages.filter(
-          (message) =>
-            message.session.platform === "discord" &&
-            shouldAllowDiscordChannel({
-              cfg: discordCfg,
-              channelId: message.session.channelId,
-              guildId: message.session.guildId,
-            }),
-        )
-      : messages;
-
-    const referencedByMessageKey =
-      target.resolved.platform === "discord" && discordCfg
-        ? await resolveDiscordReferencedMessages({
-            adapter: target.resolved.adapter,
-            cfg: discordCfg,
-            messages: filtered,
-          })
-        : undefined;
-
-    return buildMessagesListOutput({
-      session: target.sessionRef,
-      cfg: target.cfg,
-      messages: filtered,
-      order,
-      includeRaw,
-      includeAttachments,
-      referencedByMessageKey,
+      return Result.ok(
+        buildMessagesListOutput({
+          session: target.sessionRef,
+          cfg: target.cfg,
+          messages: filtered,
+          order: input.order ?? "ts_desc",
+          includeRaw: input.includeRaw ?? false,
+          includeAttachments: input.includeAttachments ?? false,
+          referencedByMessageKey,
+        }),
+      );
     });
   }
 
   private async callMessagesRead(
     decodedInput: z.output<typeof messagesReadInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
-    const includeRaw = input.includeRaw ?? false;
-    const target = await this.resolveSessionTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
-    });
-    const msgRef = createSurfaceMessageRef(
-      target.sessionRef,
-      mustPresentString(input.messageId, "messageId"),
-    );
-
-    if (target.resolved.platform === "discord" && hasCacheBurstProvider(target.resolved.adapter)) {
-      await target.resolved.adapter.burstCache({
-        msgRef,
-        sessionRef: target.sessionRef,
-        reason: "surface_tool",
-      });
-    }
-
-    const msg = adaptSurfaceOperationToToolHost(await target.resolved.adapter.readMsg(msgRef));
-
-    if (!msg) {
-      return buildMessagesReadOutput({
-        session: target.sessionRef,
-        cfg: target.cfg,
-        message: null,
-        includeRaw,
-      });
-    }
-
-    if (
-      target.resolved.platform === "discord" &&
-      target.cfg &&
-      (msg.session.platform !== "discord" ||
-        !shouldAllowDiscordChannel({
-          cfg: target.cfg,
-          channelId: msg.session.channelId,
-          guildId: msg.session.guildId,
-        }))
-    ) {
-      return buildMessagesReadOutput({
-        session: target.sessionRef,
-        cfg: target.cfg,
-        message: null,
-        includeRaw,
-      });
-    }
-
-    const referenced =
-      target.resolved.platform === "discord" && target.cfg
-        ? await resolveDiscordReferencedMessage({
-            adapter: target.resolved.adapter,
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const sessionInput = yield* withDefaultSessionId(decodedInput, ctx);
+      const input = yield* withDefaultMessageId(sessionInput, ctx);
+      const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
+      const messageId = yield* mustPresentString(input.messageId, "messageId");
+      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      const msgRef = createSurfaceMessageRef(target.sessionRef, messageId);
+      if (
+        target.resolved.platform === "discord" &&
+        hasCacheBurstProvider(target.resolved.adapter)
+      ) {
+        const adapter = target.resolved.adapter;
+        yield* Result.await(
+          Result.tryPromise({
+            try: () =>
+              adapter.burstCache({
+                msgRef,
+                sessionRef: target.sessionRef,
+                reason: "surface_tool",
+              }),
+            catch: (cause) => surfaceExternalFailure(cause),
+          }),
+        );
+      }
+      const msg = yield* surfaceOperationResult(await target.resolved.adapter.readMsg(msgRef));
+      if (!msg) {
+        return Result.ok(
+          buildMessagesReadOutput({
+            session: target.sessionRef,
             cfg: target.cfg,
-            message: msg,
-          })
-        : undefined;
-
-    return buildMessagesReadOutput({
-      session: target.sessionRef,
-      cfg: target.cfg,
-      message: msg,
-      referenced,
-      includeRaw,
+            message: null,
+            includeRaw: input.includeRaw ?? false,
+          }),
+        );
+      }
+      if (target.resolved.platform === "discord" && target.cfg) {
+        const allowed =
+          msg.session.platform === "discord" &&
+          (yield* shouldAllowDiscordChannel({
+            cfg: target.cfg,
+            channelId: msg.session.channelId,
+            guildId: msg.session.guildId,
+          }));
+        if (!allowed) {
+          return Result.ok(
+            buildMessagesReadOutput({
+              session: target.sessionRef,
+              cfg: target.cfg,
+              message: null,
+              includeRaw: input.includeRaw ?? false,
+            }),
+          );
+        }
+      }
+      const referenced =
+        target.resolved.platform === "discord" && target.cfg
+          ? yield* Result.await(
+              resolveDiscordReferencedMessage({
+                adapter: target.resolved.adapter,
+                cfg: target.cfg,
+                message: msg,
+              }),
+            )
+          : undefined;
+      return Result.ok(
+        buildMessagesReadOutput({
+          session: target.sessionRef,
+          cfg: target.cfg,
+          message: msg,
+          referenced,
+          includeRaw: input.includeRaw ?? false,
+        }),
+      );
     });
   }
 
   private async callMessagesSearch(
     decodedInput: z.output<typeof messagesSearchInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultSessionId(decodedInput, ctx);
-    const target = await this.resolveSessionTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
+  ): Promise<ServerToolResult> {
+    const resolvedResult = this.resolveAdapter(decodedInput.client, ctx);
+    return resolvedResult.andThenAsync(async (resolved) => {
+      const inputResult = withDefaultSessionId(decodedInput, ctx);
+      return inputResult.andThenAsync(async (input) => {
+        const sessionIdResult = mustPresentString(input.sessionId, "sessionId");
+        return sessionIdResult.andThenAsync(async (sessionId) => {
+          return (await this.resolveSessionTarget({ resolved, sessionId })).andThenAsync(
+            async (target) => {
+              if (
+                target.resolved.platform !== "discord" ||
+                target.sessionRef.platform !== "discord" ||
+                !target.cfg
+              ) {
+                return Result.err(
+                  surfaceFailure(
+                    "unavailable",
+                    "surface.messages.search is a Discord-owned sidecar and is unavailable for GitHub; use discovery.search for shared memory retrieval.",
+                  ),
+                );
+              }
+
+              const search = this.params.discordSearch;
+              if (!search) {
+                return Result.err(
+                  surfaceFailure(
+                    "unavailable",
+                    "surface.messages.search is unavailable: Discord search index is not initialized.",
+                  ),
+                );
+              }
+
+              const result = await search.searchSession({
+                sessionRef: target.sessionRef,
+                query: input.query,
+                limit: input.limit,
+              });
+
+              const userAliasById = buildDiscordUserAliasById(target.cfg);
+              const baseHits = result.hits.map((hit) => ({
+                ...hit,
+                userAlias: userAliasById.get(hit.userId),
+              }));
+
+              const order: MessageSearchOrder = input.order ?? "relevance";
+              const hits =
+                order === "relevance"
+                  ? baseHits
+                  : [...baseHits]
+                      .sort((a, b) => compareSurfaceMessageChronological(a, b))
+                      .map((hit) => hit);
+
+              if (order === "ts_desc") {
+                hits.reverse();
+              }
+
+              const attachmentHintsByMessageId = new Map<string, SurfaceMessageAttachmentHints>();
+              await Promise.all(
+                hits.map(async (hit) => {
+                  const read = await Result.tryPromise({
+                    try: () => target.resolved.adapter.readMsg(hit.ref),
+                    catch: (cause) => surfaceExternalFailure(cause),
+                  });
+                  const msg = read.match({
+                    ok: (result) => result.match({ ok: (value) => value, err: () => null }),
+                    err: () => null,
+                  });
+                  const attachments = msg ? getMessageAttachmentMeta(msg) : [];
+                  attachmentHintsByMessageId.set(
+                    hit.ref.messageId,
+                    buildAttachmentHints(attachments),
+                  );
+                }),
+              );
+
+              return Result.ok({
+                meta: {
+                  session: toSessionMeta(target.sessionRef, target.cfg),
+                  order,
+                  count: hits.length,
+                },
+                query: input.query,
+                heal: result.heal,
+                hits: hits.map((hit) => ({
+                  messageId: hit.ref.messageId,
+                  userId: hit.userId,
+                  userName: hit.userName,
+                  userAlias: hit.userAlias,
+                  richText: hit.text,
+                  ts: hit.ts,
+                  editedTs: hit.editedTs,
+                  score: hit.score,
+                  ...(attachmentHintsByMessageId.get(hit.ref.messageId) ??
+                    buildAttachmentHints([])),
+                })),
+              });
+            },
+          );
+        });
+      });
     });
-
-    if (
-      target.resolved.platform !== "discord" ||
-      target.sessionRef.platform !== "discord" ||
-      !target.cfg
-    ) {
-      signalSurfaceFailureToToolHost(
-        "surface.messages.search is a Discord-owned sidecar and is unavailable for GitHub; use discovery.search for shared memory retrieval.",
-      );
-    }
-
-    const search = this.params.discordSearch;
-    if (!search) {
-      signalSurfaceFailureToToolHost(
-        "surface.messages.search is unavailable: Discord search index is not initialized.",
-      );
-    }
-
-    const result = await search.searchSession({
-      sessionRef: target.sessionRef,
-      query: input.query,
-      limit: input.limit,
-    });
-
-    const userAliasById = buildDiscordUserAliasById(target.cfg);
-    const baseHits = result.hits.map((hit) => ({
-      ...hit,
-      userAlias: userAliasById.get(hit.userId),
-    }));
-
-    const order: MessageSearchOrder = input.order ?? "relevance";
-    const hits =
-      order === "relevance"
-        ? baseHits
-        : [...baseHits].sort((a, b) => compareSurfaceMessageChronological(a, b)).map((hit) => hit);
-
-    if (order === "ts_desc") {
-      hits.reverse();
-    }
-
-    const attachmentHintsByMessageId = new Map<string, SurfaceMessageAttachmentHints>();
-    await Promise.all(
-      hits.map(async (hit) => {
-        try {
-          const read = await target.resolved.adapter.readMsg(hit.ref);
-          const msg = read.match({ ok: (value) => value, err: () => null });
-          const attachments = msg ? getMessageAttachmentMeta(msg) : [];
-          attachmentHintsByMessageId.set(hit.ref.messageId, buildAttachmentHints(attachments));
-        } catch (cause) {
-          if (Panic.is(cause)) throw cause;
-          attachmentHintsByMessageId.set(hit.ref.messageId, buildAttachmentHints([]));
-        }
-      }),
-    );
-
-    return {
-      meta: {
-        session: toSessionMeta(target.sessionRef, target.cfg),
-        order,
-        count: hits.length,
-      },
-      query: input.query,
-      heal: result.heal,
-      hits: hits.map((hit) => ({
-        messageId: hit.ref.messageId,
-        userId: hit.userId,
-        userName: hit.userName,
-        userAlias: hit.userAlias,
-        richText: hit.text,
-        ts: hit.ts,
-        editedTs: hit.editedTs,
-        score: hit.score,
-        ...(attachmentHintsByMessageId.get(hit.ref.messageId) ?? buildAttachmentHints([])),
-      })),
-    };
   }
 
   private async callMessagesSend(
     decodedInput: z.output<typeof messagesSendInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultSessionId(decodedInput, ctx);
-    const target = await this.resolveSessionTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
-    });
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const input = yield* withDefaultSessionId(decodedInput, ctx);
+      const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
+      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
 
-    const replyTo = input.replyToMessageId
-      ? createSurfaceMessageRef(target.sessionRef, input.replyToMessageId)
-      : undefined;
-
-    const paths = input.paths ?? [];
-    const sendOpts =
-      replyTo || input.silent === true
-        ? {
-            ...(replyTo ? { replyTo } : {}),
-            ...(input.silent === true ? { silent: true } : {}),
-          }
+      const replyTo = input.replyToMessageId
+        ? createSurfaceMessageRef(target.sessionRef, input.replyToMessageId)
         : undefined;
-    adaptSurfaceOperationToToolHost(
-      await target.resolved.adapter.prepareSendMsg(
-        target.sessionRef,
-        { text: input.text, attachmentCount: paths.length, actionCount: 0 },
-        sendOpts,
-      ),
-    );
 
-    const cwd = ctx?.cwd ?? process.cwd();
+      const paths = input.paths ?? [];
+      const sendOpts =
+        replyTo || input.silent === true
+          ? {
+              ...(replyTo ? { replyTo } : {}),
+              ...(input.silent === true ? { silent: true } : {}),
+            }
+          : undefined;
+      yield* surfaceOperationResult(
+        await target.resolved.adapter.prepareSendMsg(
+          target.sessionRef,
+          { text: input.text, attachmentCount: paths.length, actionCount: 0 },
+          sendOpts,
+        ),
+      );
 
-    const attachments =
-      paths.length > 0
+      const cwd = ctx?.cwd ?? process.cwd();
+
+      const attachments = yield* paths.length > 0
         ? await loadLocalAttachments({
             cwd,
             paths,
@@ -1857,142 +2044,162 @@ export class Surface implements ServerTool {
             mimeTypes: input.mimeTypes,
             context: ctx,
           })
-        : [];
+        : Result.ok([]);
 
-    const ref = adaptSurfaceOperationToToolHost(
-      await target.resolved.adapter.sendMsg(
-        target.sessionRef,
-        {
-          text: input.text,
-          attachments,
-        },
-        sendOpts,
-      ),
-    );
+      const ref = yield* surfaceOperationResult(
+        await target.resolved.adapter.sendMsg(
+          target.sessionRef,
+          {
+            text: input.text,
+            attachments,
+          },
+          sendOpts,
+        ),
+      );
 
-    this.linkSentMessageToTranscript(ref, ctx);
+      self.linkSentMessageToTranscript(ref, ctx);
 
-    return { ok: true as const, ref, session: toSessionMeta(target.sessionRef, target.cfg) };
+      return Result.ok({
+        ok: true as const,
+        ref,
+        session: toSessionMeta(target.sessionRef, target.cfg),
+      });
+    });
   }
 
   private async callMessagesEdit(
     decodedInput: z.output<typeof messagesEditInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultSessionId(decodedInput, ctx);
-    const target = await this.resolveSessionTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const input = yield* withDefaultSessionId(decodedInput, ctx);
+      const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
+      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      yield* surfaceOperationResult(
+        await target.resolved.adapter.editMsg(
+          createSurfaceMessageRef(target.sessionRef, input.messageId),
+          { text: input.text },
+        ),
+      );
+      return Result.ok({ ok: true as const });
     });
-
-    adaptSurfaceOperationToToolHost(
-      await target.resolved.adapter.editMsg(
-        createSurfaceMessageRef(target.sessionRef, input.messageId),
-        { text: input.text },
-      ),
-    );
-
-    return { ok: true as const };
   }
 
   private async callMessagesDelete(
     decodedInput: z.output<typeof messagesDeleteInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultSessionId(decodedInput, ctx);
-    const target = await this.resolveSessionTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const input = yield* withDefaultSessionId(decodedInput, ctx);
+      const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
+      const target = yield* Result.await(self.resolveSessionTarget({ resolved, sessionId }));
+      yield* surfaceOperationResult(
+        await target.resolved.adapter.deleteMsg(
+          createSurfaceMessageRef(target.sessionRef, input.messageId),
+        ),
+      );
+      return Result.ok({ ok: true as const });
     });
-
-    adaptSurfaceOperationToToolHost(
-      await target.resolved.adapter.deleteMsg(
-        createSurfaceMessageRef(target.sessionRef, input.messageId),
-      ),
-    );
-    return { ok: true as const };
   }
 
   private async callReactionsList(
     decodedInput: z.output<typeof reactionsListInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
-    const target = await this.resolveMessageTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
-      messageId: mustPresentString(input.messageId, "messageId"),
-      burstDiscordCache: true,
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const sessionInput = yield* withDefaultSessionId(decodedInput, ctx);
+      const input = yield* withDefaultMessageId(sessionInput, ctx);
+      const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
+      const messageId = yield* mustPresentString(input.messageId, "messageId");
+      const target = yield* Result.await(
+        self.resolveMessageTarget({
+          resolved,
+          sessionId,
+          messageId,
+          burstDiscordCache: true,
+        }),
+      );
+      const details = yield* surfaceOperationResult(
+        await target.resolved.adapter.listReactionDetails(target.msgRef),
+      );
+      const out: SurfaceReactionSummary[] = details.map((detail) => ({
+        emoji: detail.emoji,
+        count: detail.count,
+      }));
+      return Result.ok(out);
     });
-
-    const details = adaptSurfaceOperationToToolHost(
-      await target.resolved.adapter.listReactionDetails(target.msgRef),
-    );
-
-    const out: SurfaceReactionSummary[] = details.map((d) => ({
-      emoji: d.emoji,
-      count: d.count,
-    }));
-
-    return out;
   }
 
   private async callReactionsListDetailed(
     decodedInput: z.output<typeof reactionsListDetailedInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
-    const target = await this.resolveMessageTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
-      messageId: mustPresentString(input.messageId, "messageId"),
-      burstDiscordCache: true,
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const sessionInput = yield* withDefaultSessionId(decodedInput, ctx);
+      const input = yield* withDefaultMessageId(sessionInput, ctx);
+      const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
+      const messageId = yield* mustPresentString(input.messageId, "messageId");
+      const target = yield* Result.await(
+        self.resolveMessageTarget({
+          resolved,
+          sessionId,
+          messageId,
+          burstDiscordCache: true,
+        }),
+      );
+      return surfaceOperationResult(
+        await target.resolved.adapter.listReactionDetails(target.msgRef),
+      );
     });
-
-    return adaptSurfaceOperationToToolHost(
-      await target.resolved.adapter.listReactionDetails(target.msgRef),
-    );
   }
 
   private async callReactionsAdd(
     decodedInput: z.output<typeof reactionsAddInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
-    const target = await this.resolveMessageTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
-      messageId: mustPresentString(input.messageId, "messageId"),
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const sessionInput = yield* withDefaultSessionId(decodedInput, ctx);
+      const input = yield* withDefaultMessageId(sessionInput, ctx);
+      const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
+      const messageId = yield* mustPresentString(input.messageId, "messageId");
+      const target = yield* Result.await(
+        self.resolveMessageTarget({ resolved, sessionId, messageId }),
+      );
+      yield* surfaceOperationResult(
+        await target.resolved.adapter.addReaction(target.msgRef, input.reaction),
+      );
+      return Result.ok({ ok: true as const });
     });
-
-    adaptSurfaceOperationToToolHost(
-      await target.resolved.adapter.addReaction(target.msgRef, input.reaction),
-    );
-
-    return { ok: true as const };
   }
 
   private async callReactionsRemove(
     decodedInput: z.output<typeof reactionsRemoveInputSchema>,
     ctx: RequestContext | undefined,
-  ) {
-    const resolved = this.resolveAdapter(decodedInput.client, ctx);
-    const input = withDefaultMessageId(withDefaultSessionId(decodedInput, ctx), ctx);
-    const target = await this.resolveMessageTarget({
-      resolved,
-      sessionId: mustPresentString(input.sessionId, "sessionId"),
-      messageId: mustPresentString(input.messageId, "messageId"),
+  ): Promise<ServerToolResult> {
+    const self = this;
+    return Result.gen(async function* () {
+      const resolved = yield* self.resolveAdapter(decodedInput.client, ctx);
+      const sessionInput = yield* withDefaultSessionId(decodedInput, ctx);
+      const input = yield* withDefaultMessageId(sessionInput, ctx);
+      const sessionId = yield* mustPresentString(input.sessionId, "sessionId");
+      const messageId = yield* mustPresentString(input.messageId, "messageId");
+      const target = yield* Result.await(
+        self.resolveMessageTarget({ resolved, sessionId, messageId }),
+      );
+      yield* surfaceOperationResult(
+        await target.resolved.adapter.removeReaction(target.msgRef, input.reaction),
+      );
+      return Result.ok({ ok: true as const });
     });
-
-    adaptSurfaceOperationToToolHost(
-      await target.resolved.adapter.removeReaction(target.msgRef, input.reaction),
-    );
-
-    return { ok: true as const };
   }
 }

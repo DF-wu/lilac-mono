@@ -7,8 +7,13 @@ import {
   getCoreConfig,
   isRecord,
 } from "@stanley2058/lilac-utils";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 import { z } from "zod";
+import {
+  serverToolFailure,
+  type ServerToolFailure,
+  type ServerToolResult,
+} from "@stanley2058/lilac-plugin-runtime";
 
 import { defineServerTool, type RequestContext, type ServerTool } from "../types";
 import {
@@ -40,6 +45,7 @@ import {
   PageContent,
   slicePageContent,
   type PageAcquisitionInput,
+  type PageContentError,
   type PageContentResult,
   type PageFormat,
   type ParsedPageContent,
@@ -49,6 +55,7 @@ import {
   type ProviderPageExtractor,
   type WebProviderEnvironment,
 } from "./web/provider-page-extraction";
+import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
 export {
   decodeFirecrawlScrapeResponse,
@@ -88,7 +95,10 @@ const getPageSchema = z.object({
 
 type GetPageMode = z.infer<typeof getPageModeSchema>;
 type GetPageInput = z.infer<typeof getPageSchema>;
-type WebProviderFailure = { providerId: WebSearchProviderId; message: string };
+type WebProviderFailure = { providerId: WebSearchProviderId; failure: ServerToolFailure };
+type WebPageContentError = PageContentError & { failure?: ServerToolFailure };
+type WebPageContentResult = Exclude<PageContentResult, PageContentError> | WebPageContentError;
+type WebFetchResult = ReturnType<typeof slicePageContent> | WebPageContentError;
 type WebToolConfig = {
   extractProviders: readonly WebSearchProviderId[];
   fetchMode: GetPageMode;
@@ -176,7 +186,7 @@ const defaultWebDependencies: WebDependencies = {
 };
 
 function captureWebConfigFailure(error: unknown): string {
-  return getErrorMessage(error);
+  return webFailure(error).message;
 }
 
 function getNumericField(record: Record<string, unknown>, key: string): number | null {
@@ -218,15 +228,70 @@ function isRetriableWebProviderError(error: unknown): boolean {
   return RETRIABLE_WEB_PROVIDER_ERROR_PATTERNS.some((pattern) => pattern.test(message));
 }
 
+function webFailure(error: unknown, signal?: AbortSignal): ServerToolFailure {
+  if (Panic.is(error)) preserveToolPanic(error);
+  const message =
+    isRecord(error) && typeof error.message === "string" ? error.message : getErrorMessage(error);
+  const status = getErrorStatus(error);
+  const normalized = message.toLowerCase();
+  let category: ServerToolFailure["kind"] = "unavailable";
+  if (signal?.aborted || /\babort(?:ed)?\b/.test(normalized)) {
+    category = "cancelled";
+  } else if (status === 408 || /\b(?:timeout|timed out)\b/.test(normalized)) {
+    category = "timeout";
+  } else if (
+    status === 401 ||
+    status === 403 ||
+    /\b(?:401|403|unauthori[sz]ed|forbidden)\b/.test(normalized)
+  ) {
+    category = "denied";
+  } else if (status === 404 || /\b(?:404|not found)\b/.test(normalized)) {
+    category = "not_found";
+  } else if (/unsupported|invalid (?:url|format|content)|response too large/.test(normalized)) {
+    category = "usage";
+  }
+  return serverToolFailure({
+    kind: category,
+    code: `web_${category}`,
+    message,
+    retryable: category === "unavailable" || category === "timeout",
+  });
+}
+
 function formatWebProviderFailureMessage(
   operation: "search" | "extract",
   failures: readonly WebProviderFailure[],
 ): string {
   if (failures.length === 0) return `web.${operation} failed.`;
-  if (failures.length === 1) return failures[0]!.message;
+  if (failures.length === 1) return failures[0]!.failure.message;
   return `web.${operation} failed across fallback providers: ${failures
-    .map((failure) => `${failure.providerId}: ${failure.message}`)
+    .map((failure) => `${failure.providerId}: ${failure.failure.message}`)
     .join(" | ")}`;
+}
+
+function aggregateWebProviderFailure(
+  operation: "search" | "extract",
+  failures: readonly WebProviderFailure[],
+): ServerToolFailure {
+  const message = formatWebProviderFailureMessage(operation, failures);
+  const terminalFailure = failures.at(-1)?.failure;
+  return terminalFailure ? serverToolFailure({ ...terminalFailure, message }) : webFailure(message);
+}
+
+function webPageContentFailure(
+  result: WebPageContentError,
+  signal?: AbortSignal,
+): ServerToolFailure {
+  return (
+    result.failure ??
+    webFailure(
+      {
+        message: result.error,
+        ...(result.status === undefined ? {} : { status: result.status }),
+      },
+      signal,
+    )
+  );
 }
 
 function supportsHtmlExtractFormat(providerId: WebSearchProviderId): boolean {
@@ -305,7 +370,7 @@ export class Web implements ServerTool {
       context?: RequestContext;
       messages?: readonly unknown[];
     },
-  ): Promise<unknown> {
+  ): Promise<ServerToolResult> {
     return this.serverTool.call(callableId, rawInput, opts);
   }
 
@@ -391,37 +456,47 @@ export class Web implements ServerTool {
   private async callFetch(
     input: GetPageInput,
     opts?: { signal?: AbortSignal; context?: RequestContext },
-  ) {
+  ): Promise<ServerToolResult> {
     await this.refreshWebConfig();
     const mode = input.mode ?? this.webFetchDefaultMode;
-    try {
-      switch (mode) {
-        case "auto":
-          return await this.getPageAuto(input, opts);
-        case "fetch":
-          return await this.getPageFetch(input, opts);
-        case "browser":
-          return await this.getPageBrowser(input, opts);
-        case "extract":
-          return await this.getPageExtract(input, opts);
-        case "provider-only":
-          return await this.getPageProviderOnly(input, opts);
-      }
-    } catch (error) {
-      return { isError: true, error: getErrorMessage(error) } as const;
+    let result: WebFetchResult;
+    switch (mode) {
+      case "auto":
+        result = await this.getPageAuto(input, opts);
+        break;
+      case "fetch":
+        result = await this.getPageFetch(input, opts);
+        break;
+      case "browser":
+        result = await this.getPageBrowser(input, opts);
+        break;
+      case "extract":
+        result = await this.getPageExtract(input, opts);
+        break;
+      case "provider-only":
+        result = await this.getPageProviderOnly(input, opts);
+        break;
     }
+    return result.isError
+      ? Result.err(webPageContentFailure(result, opts?.signal))
+      : Result.ok(result);
   }
 
   private async callSearch(
     input: z.output<typeof webSearchInputSchema>,
     opts?: { signal?: AbortSignal },
-  ) {
+  ): Promise<ServerToolResult> {
     await this.refreshWebConfig();
     if (this.webSearchProviders.length === 0) {
-      return {
-        isError: true as const,
-        error: this.webSearchProviderError ?? "web.search is unavailable: no provider configured.",
-      };
+      return Result.err(
+        serverToolFailure({
+          kind: "unavailable",
+          code: "web_provider_unavailable",
+          message:
+            this.webSearchProviderError ?? "web.search is unavailable: no provider configured.",
+          retryable: true,
+        }),
+      );
     }
 
     const failures: WebProviderFailure[] = [];
@@ -441,7 +516,8 @@ export class Web implements ServerTool {
           },
         );
         if ("error" in acquired) {
-          failures.push({ providerId: provider.id, message: acquired.error.message });
+          const failure = webFailure(acquired.error, opts?.signal);
+          failures.push({ providerId: provider.id, failure });
           if (acquired.timedOut && index < this.webSearchProviders.length - 1) {
             this.logger.logInfo(
               `web.search retryable failure (${provider.id}); falling back to next provider.`,
@@ -453,16 +529,17 @@ export class Web implements ServerTool {
             `web.search failed (${provider.id}).`,
             formatTaggedErrorForLog(acquired.error),
           );
-          break;
+          return Result.err(failure);
         }
         permit = acquired.permit;
       }
 
       try {
-        return await provider.search(input, { signal: opts?.signal });
+        return Result.ok(await provider.search(input, { signal: opts?.signal }));
       } catch (error) {
-        const message = getErrorMessage(error);
-        failures.push({ providerId: provider.id, message });
+        const failure = webFailure(error, opts?.signal);
+        const message = failure.message;
+        failures.push({ providerId: provider.id, failure });
         if (isRetriableWebProviderError(error) && index < this.webSearchProviders.length - 1) {
           this.logger.logInfo(
             `web.search retryable failure (${provider.id}): ${message}. Falling back to next provider.`,
@@ -475,13 +552,13 @@ export class Web implements ServerTool {
         permit?.release();
       }
     }
-    return { isError: true as const, error: formatWebProviderFailureMessage("search", failures) };
+    return Result.err(aggregateWebProviderFailure("search", failures));
   }
 
   private async extractPageContent(
     input: PageAcquisitionInput,
     opts?: { signal?: AbortSignal },
-  ): Promise<PageContentResult> {
+  ): Promise<WebPageContentResult> {
     const { format = "markdown" } = input;
     if (this.webSearchProviders.length === 0) {
       return {
@@ -499,7 +576,16 @@ export class Web implements ServerTool {
         const result = await this.providerPageExtractor.extract(provider.id, input, opts);
         if (!result.isError) return result;
         if (result.aborted) return result;
-        failures.push({ providerId: provider.id, message: result.error });
+        failures.push({
+          providerId: provider.id,
+          failure: webFailure(
+            {
+              message: result.error,
+              ...(result.status === undefined ? {} : { status: result.status }),
+            },
+            opts?.signal,
+          ),
+        });
 
         const canTryNextProviderForFormat =
           format === "html" && !supportsHtmlExtractFormat(provider.id);
@@ -515,8 +601,9 @@ export class Web implements ServerTool {
         this.logger.logError(`web.extract failed (${provider.id}): ${result.error}`);
         break;
       } catch (error) {
-        const message = getErrorMessage(error);
-        failures.push({ providerId: provider.id, message });
+        const failure = webFailure(error, opts?.signal);
+        const message = failure.message;
+        failures.push({ providerId: provider.id, failure });
         if (isRetriableWebProviderError(error) && index < this.webSearchProviders.length - 1) {
           this.logger.logInfo(
             `web.extract retryable failure (${provider.id}): ${message}. Falling back to next provider.`,
@@ -527,22 +614,32 @@ export class Web implements ServerTool {
         break;
       }
     }
-    return { isError: true, error: formatWebProviderFailureMessage("extract", failures) };
+    const failure = aggregateWebProviderFailure("extract", failures);
+    return { isError: true, error: failure.message, failure };
   }
 
-  private async getPageFetch(input: GetPageInput, opts?: { signal?: AbortSignal }) {
+  private async getPageFetch(
+    input: GetPageInput,
+    opts?: { signal?: AbortSignal },
+  ): Promise<WebFetchResult> {
     const { format = "markdown", startOffset = 0, maxCharacters = 200_000 } = input;
     const result = await this.directPageAcquisition.acquire(input, opts);
     return this.formatPageResult(result, format, startOffset, maxCharacters);
   }
 
-  private async getPageBrowser(input: GetPageInput, opts?: { signal?: AbortSignal }) {
+  private async getPageBrowser(
+    input: GetPageInput,
+    opts?: { signal?: AbortSignal },
+  ): Promise<WebFetchResult> {
     const { format = "markdown", startOffset = 0, maxCharacters = 200_000 } = input;
     const result = await this.browserPageAcquisition.acquire(input, opts);
     return this.formatPageResult(result, format, startOffset, maxCharacters);
   }
 
-  private async getPageExtract(input: GetPageInput, opts?: { signal?: AbortSignal }) {
+  private async getPageExtract(
+    input: GetPageInput,
+    opts?: { signal?: AbortSignal },
+  ): Promise<WebFetchResult> {
     const { format = "markdown", startOffset = 0, maxCharacters = 200_000 } = input;
     const result = await this.extractPageContent(input, opts);
     if (result.isError) {
@@ -559,18 +656,21 @@ export class Web implements ServerTool {
     });
   }
 
-  private async getPageProviderOnly(input: GetPageInput, opts?: { signal?: AbortSignal }) {
+  private async getPageProviderOnly(
+    input: GetPageInput,
+    opts?: { signal?: AbortSignal },
+  ): Promise<WebFetchResult> {
     const { format = "markdown", startOffset = 0, maxCharacters = 200_000 } = input;
     const result = await this.extractPageContent(input, opts);
     return this.formatPageResult(result, format, startOffset, maxCharacters);
   }
 
   private formatPageResult(
-    result: PageContentResult,
+    result: WebPageContentResult,
     format: PageFormat,
     startOffset: number,
     maxCharacters: number,
-  ) {
+  ): WebFetchResult {
     if (result.isError) return result;
     return slicePageContent({
       content: result.content,
@@ -581,7 +681,10 @@ export class Web implements ServerTool {
     });
   }
 
-  private async getPageAuto(input: GetPageInput, opts?: { signal?: AbortSignal }) {
+  private async getPageAuto(
+    input: GetPageInput,
+    opts?: { signal?: AbortSignal },
+  ): Promise<WebFetchResult> {
     const {
       url,
       format = "markdown",
