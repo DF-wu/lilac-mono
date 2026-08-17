@@ -1161,10 +1161,6 @@ export class DiscordAdapter implements SurfaceAdapter {
       const resumeError = resumed.match({ ok: () => null, err: (error) => error });
       if (resumeError) return Result.err(resumeError);
     }
-    await this.reloadCoreConfigIfNeeded({
-      applyPresence: opts?.preparationMode !== "paused-recovery",
-    });
-
     const cfg = this.cfg;
     const clientResult = this.clientResult();
     const clientError = clientResult.match({ ok: () => null, err: (error) => error });
@@ -1234,31 +1230,11 @@ export class DiscordAdapter implements SurfaceAdapter {
     const client = selectResultValue(clientResult);
     const discordRef = selectResultValue(refResult);
 
-    const fetched = await captureDiscordOperation("start-typing", () =>
-      client.channels.fetch(discordRef.channelId),
-    );
-    const fetchError = fetched.match({ ok: () => null, err: (error) => error });
-    if (fetchError) return Result.err(fetchError);
-    const ch = selectResultValue(fetched);
-
-    const sendTyping = ch && "sendTyping" in ch ? ch.sendTyping : null;
-
-    if (!sendTyping) {
-      return Result.err(
-        new SurfaceUnavailable({
-          platform: "discord",
-          operation: "start-typing",
-          message: `Discord channel cannot accept typing indicators: ${discordRef.channelId}`,
-        }),
-      );
-    }
-
     // Discord typing indicators last ~10s; refresh a bit earlier.
     const REFRESH_MS = 8000;
 
     let stopped = false;
     let timer: ReturnType<typeof setInterval> | null = null;
-    let consecutiveFailures = 0;
 
     const stop = () => {
       if (stopped) return;
@@ -1269,30 +1245,63 @@ export class DiscordAdapter implements SurfaceAdapter {
       }
     };
 
-    const tick = async () => {
+    // Typing is cosmetic; keep Discord REST latency out of relay startup.
+    this.superviseDiscordCallback("typing-indicator-start", async () => {
+      const fetched = await captureDiscordOperation("start-typing", () =>
+        client.channels.fetch(discordRef.channelId),
+      );
+      const fetchError = fetched.match({ ok: () => null, err: (error) => error });
+      if (fetchError) {
+        this.logger.warn(
+          "surface typing indicator unavailable",
+          formatTaggedErrorForLog(fetchError),
+        );
+        return;
+      }
       if (stopped) return;
-      const sent = await Result.tryPromise({
-        try: () => sendTyping.call(ch),
-        catch: surfaceExternalFallback(externalCallFailure("channel.sendTyping")),
-      });
-      sent.match({
-        ok: () => {
-          consecutiveFailures = 0;
-        },
-        err: () => {
-          consecutiveFailures += 1;
-          // Best-effort: avoid spamming if missing perms / rate-limited.
-          if (consecutiveFailures >= 3) stop();
-        },
-      });
-    };
 
-    const initial = await captureDiscordOperation("start-typing", () => sendTyping.call(ch));
-    const initialError = initial.match({ ok: () => null, err: (error) => error });
-    if (initialError) return Result.err(initialError);
-    timer = setInterval(() => {
-      this.superviseDiscordCallback("typing-indicator", tick);
-    }, REFRESH_MS);
+      const ch = selectResultValue(fetched);
+      const sendTyping = ch && "sendTyping" in ch ? ch.sendTyping : null;
+      if (!sendTyping) {
+        this.logger.warn("surface typing indicator unavailable", {
+          channelId: discordRef.channelId,
+          reason: "channel_cannot_send_typing",
+        });
+        return;
+      }
+
+      let consecutiveFailures = 0;
+      const tick = async () => {
+        if (stopped) return;
+        const sent = await Result.tryPromise({
+          try: () => sendTyping.call(ch),
+          catch: surfaceExternalFallback(externalCallFailure("channel.sendTyping")),
+        });
+        sent.match({
+          ok: () => {
+            consecutiveFailures = 0;
+          },
+          err: () => {
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= 3) stop();
+          },
+        });
+      };
+
+      const initial = await captureDiscordOperation("start-typing", () => sendTyping.call(ch));
+      const initialError = initial.match({ ok: () => null, err: (error) => error });
+      if (initialError) {
+        this.logger.warn(
+          "surface typing indicator unavailable",
+          formatTaggedErrorForLog(initialError),
+        );
+        return;
+      }
+      if (stopped) return;
+      timer = setInterval(() => {
+        this.superviseDiscordCallback("typing-indicator", tick);
+      }, REFRESH_MS);
+    });
 
     return Result.ok({
       stop: async () => {
@@ -3077,18 +3086,19 @@ export class DiscordAdapter implements SurfaceAdapter {
       parentChannelId,
     });
 
-    const replied = await Result.tryPromise({
-      try: () => interaction.reply({ content: preview, allowedMentions: { parse: [] } }),
-      catch: surfaceExternalFallback(externalCallFailure("interaction.reply")),
+    this.superviseDiscordCallback("custom-command-preview", async () => {
+      const replied = await Result.tryPromise({
+        try: () => interaction.reply({ content: preview, allowedMentions: { parse: [] } }),
+        catch: surfaceExternalFallback(externalCallFailure("interaction.reply")),
+      });
+      const replyError = replied.match({ ok: () => null, err: (error) => error });
+      if (replyError) {
+        await tryEditOrReplyEphemeral(
+          interaction,
+          `Failed to acknowledge custom command: ${replyError.message}`,
+        );
+      }
     });
-    const replyError = replied.match({ ok: () => null, err: (error) => error });
-    if (replyError) {
-      await tryEditOrReplyEphemeral(
-        interaction,
-        `Failed to run custom command: ${replyError.message}`,
-      );
-      return;
-    }
 
     this.emit({
       type: "adapter.command.invoked",
