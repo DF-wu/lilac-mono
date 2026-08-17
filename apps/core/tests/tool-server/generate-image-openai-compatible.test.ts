@@ -79,7 +79,7 @@ describe("Generate OpenAI-compatible image routing", () => {
 
     // Then
     expect(body).toMatchObject({ model: canonicalId });
-    expect(result).toMatchObject({ ok: true, model: alias, mimeType: "image/png" });
+    expect(result.unwrap()).toMatchObject({ ok: true, model: alias, mimeType: "image/png" });
   });
 
   it("throws a stable configuration error before default fallback", async () => {
@@ -88,11 +88,10 @@ describe("Generate OpenAI-compatible image routing", () => {
     Object.assign(env.providers.openai, { apiKey: "official-key", baseUrl: "http://127.0.0.1" });
 
     // When / Then
-    await expect(
-      new Generate({ getConfig: compatibleConfig }).call("generate.image", {
-        prompt: "no request",
-      }),
-    ).rejects.toThrow(CONFIG_ERROR);
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "no request",
+    });
+    expect(result.match({ ok: () => "", err: (error) => error.message })).toContain(CONFIG_ERROR);
   });
 
   it("rejects invalid compatible input before HTTP", async () => {
@@ -106,21 +105,23 @@ describe("Generate OpenAI-compatible image routing", () => {
     const generate = new Generate({ getConfig: compatibleConfig });
 
     // When / Then
-    await expect(
-      generate.call("generate.image", {
-        prompt: "invalid",
-        model: "gpt-5-image",
-        size: "512x512",
-      }),
-    ).rejects.toThrow("Unsupported size '512x512' for gpt-5-image");
-    await expect(
-      generate.call("generate.image", {
-        prompt: "invalid",
-        model: "grok-imagine-image",
-        maskImage: "mask.png",
-        inputImages: "source.png",
-      }),
-    ).rejects.toThrow("grok-imagine-image does not support maskImage");
+    const unsupportedSize = await generate.call("generate.image", {
+      prompt: "invalid",
+      model: "gpt-5-image",
+      size: "512x512",
+    });
+    expect(unsupportedSize.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "Unsupported size '512x512' for gpt-5-image",
+    );
+    const unsupportedMask = await generate.call("generate.image", {
+      prompt: "invalid",
+      model: "grok-imagine-image",
+      maskImage: "mask.png",
+      inputImages: "source.png",
+    });
+    expect(unsupportedMask.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "grok-imagine-image does not support maskImage",
+    );
     expect(requestCount).toBe(0);
   });
 
@@ -160,11 +161,10 @@ describe("Generate OpenAI-compatible image routing", () => {
         prompt: "json prompt",
         n: 1,
         size: "1024x1024",
-        response_format: "b64_json",
       },
     });
     expect(await readFile(join(outputDir, "generated-image.png"))).toEqual(PNG_BYTES);
-    expect(result).toMatchObject({ path: join(outputDir, "generated-image.png") });
+    expect(result.unwrap()).toMatchObject({ path: join(outputDir, "generated-image.png") });
   });
 
   it("uses the multipart edit path", async () => {
@@ -228,12 +228,13 @@ describe("Generate OpenAI-compatible image routing", () => {
     });
 
     // When / Then
-    await expect(
-      new Generate({ getConfig: compatibleConfig }).call("generate.image", {
-        prompt: "fail once",
-        model: "gpt-5-image",
-      }),
-    ).rejects.toThrow("compatible failed");
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "fail once",
+      model: "gpt-5-image",
+    });
+    expect(result.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "compatible failed",
+    );
     expect(requestCount).toBe(1);
   });
 
@@ -249,13 +250,12 @@ describe("Generate OpenAI-compatible image routing", () => {
     temporaryPaths.push(outputDir);
 
     // When / Then
-    await expect(
-      new Generate({ getConfig: compatibleConfig }).call("generate.image", {
-        prompt: "malformed once",
-        model: "gpt-5-image",
-        outputDir,
-      }),
-    ).rejects.toThrow();
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "malformed once",
+      model: "gpt-5-image",
+      outputDir,
+    });
+    expect(result.match({ ok: () => false, err: () => true })).toBe(true);
     expect(requestCount).toBe(1);
     expect(await Array.fromAsync(new Bun.Glob("*").scan({ cwd: outputDir }))).toEqual([]);
   });
@@ -287,9 +287,8 @@ describe("Generate OpenAI-compatible image routing", () => {
         model: "google/gemini-3.1-flash-image-preview",
         prompt: "wide shot",
         n: 1,
-        response_format: "b64_json",
       });
-      expect(result).toMatchObject({
+      expect(result.unwrap()).toMatchObject({
         ok: true,
         warnings: [{ type: "unsupported", feature: "aspectRatio" }],
       });
@@ -323,8 +322,7 @@ describe("Generate OpenAI-compatible image routing", () => {
       prompt: "portrait shot",
       n: 1,
       size: "1024x1536",
-      response_format: "b64_json",
     });
-    expect(result).toMatchObject({ ok: true, warnings: [] });
+    expect(result.unwrap()).toMatchObject({ ok: true, warnings: [] });
   });
 });

@@ -160,6 +160,8 @@ const GROK_VIDEO_ALLOWED_ASPECT_RATIOS = [
 const GROK_VIDEO_ALLOWED_RESOLUTIONS = ["1280x720", "854x480", "640x480"] as const;
 const DEFAULT_VIDEO_MODEL_FALLBACK_ORDER: readonly SupportedVideoModelId[] = ["grok-imagine-video"];
 const DEFAULT_IMAGE_OUTPUT_BASENAME = "generated-image";
+const OPENAI_COMPATIBLE_IMAGE_CONFIG_ERROR =
+  "Image generation provider 'openai-compatible' requires OPENAI_COMPATIBLE_BASE_URL.";
 
 const optionalNonEmptyStringListInputSchema = z
   .union([z.string().min(1), z.array(z.string().min(1)).min(1)])
@@ -1070,6 +1072,12 @@ export class Generate implements ServerTool {
       async function* (this: Generate) {
         const config = await this.options.getConfig?.();
         const imageProvider = config?.tools.generate.image.provider ?? "default";
+        if (
+          imageProvider === "openai-compatible" &&
+          !env.providers.openaiCompatible.baseUrl?.trim()
+        ) {
+          return Result.err(generateFailure("usage", OPENAI_COMPATIBLE_IMAGE_CONFIG_ERROR));
+        }
         const availableModels = getAvailableImageModels(imageProvider);
         const picked = yield* pickModel(
           availableModels.available,
