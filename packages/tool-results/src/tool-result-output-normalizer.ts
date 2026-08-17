@@ -10,7 +10,7 @@ import type {
 } from "./tool-result-artifact-store";
 
 const GENERATED_OVERFLOW_REFERENCE =
-  /^\[tool result overflow\]\nThe tool completed, but its output exceeded the inline limit\.\n(?:Complete captured output: tool-result:\/\/[0-9a-f-]{36}\nUse read with this URI and start: \{ "type": "offset", "offset": 0 \}\. Reuse nextStart unchanged while more content remains\. Do not re-run the original tool\.|The complete output could not be retained\. Narrow the request or re-run the tool\.)$/u;
+  /^\[tool result overflow\]\nThe tool completed, but its output exceeded the inline limit\.\n(?:Complete captured output: tool-result:\/\/[0-9a-f-]{36}\nUse grep with this URI as path to search the complete output, or use read with this URI and start: \{ "type": "offset", "offset": 0 \}\. Reuse nextStart unchanged while more content remains\. Do not re-run the original tool\.|The complete output could not be retained\. Narrow the request or re-run the tool\.)$/u;
 const UNSERIALIZABLE_JSON_OUTPUT = "[tool result is not JSON-serializable]";
 
 export type ToolResultOutput = Extract<
@@ -109,7 +109,7 @@ function removeUnsafeControls(value: string): string {
 
 function buildOverflowReference(uri?: string): string {
   return uri
-    ? `[tool result overflow]\nThe tool completed, but its output exceeded the inline limit.\nComplete captured output: ${uri}\nUse read with this URI and start: { "type": "offset", "offset": 0 }. Reuse nextStart unchanged while more content remains. Do not re-run the original tool.`
+    ? `[tool result overflow]\nThe tool completed, but its output exceeded the inline limit.\nComplete captured output: ${uri}\nUse grep with this URI as path to search the complete output, or use read with this URI and start: { "type": "offset", "offset": 0 }. Reuse nextStart unchanged while more content remains. Do not re-run the original tool.`
     : "[tool result overflow]\nThe tool completed, but its output exceeded the inline limit.\nThe complete output could not be retained. Narrow the request or re-run the tool.";
 }
 
