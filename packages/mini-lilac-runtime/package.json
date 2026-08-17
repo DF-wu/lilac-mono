@@ -14,8 +14,8 @@
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.12",
     "@ai-sdk/groq": "^4.0.8",
-    "@ai-sdk/openai": "^4.0.11",
-    "@ai-sdk/openai-compatible": "^3.0.7",
+    "@ai-sdk/openai": "4.0.42",
+    "@ai-sdk/openai-compatible": "3.0.30",
     "@ai-sdk/xai": "^4.0.10",
     "@openrouter/ai-sdk-provider": "^3.0.0",
     "@stanley2058/lilac-agent": "workspace:*",

@@ -25,10 +25,15 @@ export function createWebSearchProviderResolver(
 }
 
 export function createWebsearchTool(provider: WebSearchProvider): ToolSet {
+  if (provider === "anthropic") {
+    return { websearch: anthropic.tools.webSearch_20250305({ maxUses: 3 }) };
+  }
   return {
-    websearch:
-      provider === "anthropic"
-        ? anthropic.tools.webSearch_20250305({ maxUses: 3 })
-        : openai.tools.webSearch({ externalWebAccess: true, searchContextSize: "medium" }),
+    // @ai-sdk/openai 4.0.42 and ai 7.0.22 resolve separate patch versions of
+    // @ai-sdk/provider; the hosted-tool runtime contract is unchanged.
+    websearch: openai.tools.webSearch({
+      externalWebAccess: true,
+      searchContextSize: "medium",
+    }) as ToolSet[string],
   };
 }
