@@ -17,6 +17,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         variant:
           - tag: catalina
@@ -66,9 +67,11 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Verify image identity and runtime isolation
+        env:
+          VERIFY_IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
         run: |
           bash docker/verify-image.sh \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.variant.tag }}" \
+            "$VERIFY_IMAGE" \
             "${{ matrix.variant.container_user }}" \
             "${{ matrix.variant.container_uid }}"
 
