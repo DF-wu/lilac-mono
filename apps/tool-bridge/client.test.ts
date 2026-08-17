@@ -235,8 +235,9 @@ describe("tool-bridge CLI runtime", () => {
 
       expect(result).toEqual({
         stdout: "",
-        stderr: "Error: fetch tools list failed\n",
-        exitCode: 1,
+        stderr:
+          '{"status":"error","error":{"kind":"unavailable","code":"bridge_unavailable","message":"fetch tools list failed","retryable":true}}\n',
+        exitCode: 6,
       });
     } finally {
       await fs.rm(root, { recursive: true, force: true });
@@ -320,8 +321,8 @@ describe("tool-bridge CLI runtime", () => {
 
         return new Response(
           JSON.stringify({
-            isError: false,
-            output: {
+            status: "ok",
+            value: {
               ok: true,
               value: 42,
             },
@@ -376,7 +377,7 @@ describe("tool-bridge CLI runtime", () => {
       port: 0,
       hostname: "127.0.0.1",
       fetch() {
-        return Response.json({ isError: false, output: { ok: true, nested: { value: 42 } } });
+        return Response.json({ status: "ok", value: { ok: true, nested: { value: 42 } } });
       },
     });
 
@@ -405,15 +406,15 @@ describe("tool-bridge CLI runtime", () => {
         const body = (await req.json()) as { callableId: string; input: Record<string, unknown> };
         calls.push(body);
         if (body.callableId === "onboarding.bootstrap") {
-          return Response.json({ isError: false, output: { bootstrapped: true } });
+          return Response.json({ status: "ok", value: { bootstrapped: true } });
         }
         if (body.callableId === "onboarding.vcs_env") {
-          return Response.json({ isError: false, output: { GIT_CONFIG_GLOBAL: "/tmp/gitconfig" } });
+          return Response.json({ status: "ok", value: { GIT_CONFIG_GLOBAL: "/tmp/gitconfig" } });
         }
         if (body.callableId === "onboarding.git_identity" && body.input.mode === "test") {
-          return Response.json({ isError: false, output: { ok: true } });
+          return Response.json({ status: "ok", value: { ok: true } });
         }
-        return Response.json({ isError: false, output: { configured: true } });
+        return Response.json({ status: "ok", value: { configured: true } });
       },
     });
 
@@ -451,6 +452,45 @@ describe("tool-bridge CLI runtime", () => {
     }
   });
 
+  it("propagates the originating server failure from onboarding", async () => {
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const body = (await req.json()) as { callableId: string };
+        if (body.callableId === "onboarding.bootstrap") {
+          return Response.json({ status: "ok", value: { bootstrapped: true } });
+        }
+        return Response.json({
+          status: "error",
+          error: {
+            kind: "denied",
+            code: "identity_denied",
+            message: "Git identity configuration denied",
+            retryable: false,
+            details: { operation: "vcs_env" },
+          },
+        });
+      },
+    });
+
+    try {
+      const result = await runToolBridgeCli({
+        args: ["onboard", "--yes", "--no-sign", "--output=json"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(result).toEqual({
+        stdout: "",
+        stderr:
+          '{"status":"error","error":{"kind":"denied","code":"identity_denied","message":"Git identity configuration denied","retryable":false,"details":{"operation":"vcs_env"}}}\n',
+        exitCode: 3,
+      });
+    } finally {
+      server.stop(true);
+    }
+  });
+
   it("advertises JSON output modes without compact output", async () => {
     const server = Bun.serve({
       port: 0,
@@ -469,6 +509,11 @@ describe("tool-bridge CLI runtime", () => {
       expect(result.exitCode).toBe(0);
       expect(result.stderr).toBe("");
       expect(result.stdout).toContain('--output=<"json" | "json-pretty"> (default: "json")');
+      expect(result.stdout).toContain("Output and exit codes");
+      expect(result.stdout).toContain(
+        "1 internal, 2 usage, 3 denied, 4 not_found, 5 conflict, 6 unavailable, 7 timeout, 8 cancelled.",
+      );
+      expect(result.stdout).toContain('Failure writes {"status":"error","error"');
       expect(result.stdout).not.toContain("compact");
     } finally {
       server.stop(true);
@@ -495,7 +540,7 @@ describe("tool-bridge CLI runtime", () => {
         }
 
         requests.push({ pathname, body: (await req.json()) as unknown });
-        return Response.json({ isError: false, output: { ok: true } });
+        return Response.json({ status: "ok", value: { ok: true } });
       },
     });
 
@@ -552,7 +597,7 @@ describe("tool-bridge CLI runtime", () => {
         }
 
         requests.push({ pathname, body: (await req.json()) as unknown });
-        return Response.json({ isError: false, output: { ok: true } });
+        return Response.json({ status: "ok", value: { ok: true } });
       },
     });
 
@@ -586,26 +631,90 @@ describe("tool-bridge CLI runtime", () => {
     }
   });
 
-  it("exits nonzero and writes stderr when the backend returns a tool error", async () => {
+  it("preserves server tool failures and maps all semantic exit codes", async () => {
+    const cases = [
+      ["internal", 1],
+      ["usage", 2],
+      ["denied", 3],
+      ["not_found", 4],
+      ["conflict", 5],
+      ["unavailable", 6],
+      ["timeout", 7],
+      ["cancelled", 8],
+    ] as const;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const body = (await req.json()) as { callableId: string };
+        const kind = body.callableId.slice("demo.".length);
+        return Response.json({
+          status: "error",
+          error: {
+            kind,
+            code: `${kind}_failure`,
+            message: `${kind} failure`,
+            retryable: kind === "timeout" || kind === "unavailable",
+          },
+        });
+      },
+    });
+
+    try {
+      for (const [kind, exitCode] of cases) {
+        const result = await runToolBridgeCli({
+          args: [`demo.${kind}`, "--input={}", "--output=json"],
+          backendUrl: `http://127.0.0.1:${server.port}`,
+        });
+
+        expect(result).toEqual({
+          stdout: "",
+          stderr: JSON.stringify({
+            status: "error",
+            error: {
+              kind,
+              code: `${kind}_failure`,
+              message: `${kind} failure`,
+              retryable: kind === "timeout" || kind === "unavailable",
+            },
+          }).concat("\n"),
+          exitCode,
+        });
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("pretty-prints semantic failures to stderr", async () => {
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
       fetch() {
-        return new Response(JSON.stringify({ isError: true, output: "tool failed" }), {
-          headers: { "content-type": "application/json" },
+        return Response.json({
+          status: "error",
+          error: {
+            kind: "conflict",
+            code: "already_exists",
+            message: "already exists",
+            retryable: false,
+          },
         });
       },
     });
 
     try {
       const result = await runToolBridgeCli({
-        args: ["demo.fail", "--input={}", "--output=json"],
+        args: ["demo.conflict", "--input={}", "--output=json-pretty"],
         backendUrl: `http://127.0.0.1:${server.port}`,
       });
 
-      expect(result.exitCode).toBe(1);
-      expect(result.stdout).toBe("");
-      expect(result.stderr).toContain("Error: tool failed");
+      expect(result).toEqual({
+        stdout: "",
+        stderr:
+          '{\n  "status": "error",\n  "error": {\n    "kind": "conflict",\n    "code": "already_exists",\n    "message": "already exists",\n    "retryable": false\n  }\n}\n',
+        exitCode: 5,
+      });
     } finally {
       server.stop(true);
     }
@@ -647,23 +756,121 @@ describe("tool-bridge CLI runtime", () => {
         backendUrl: `http://127.0.0.1:${server.port}`,
       });
 
-      expect(result.exitCode).toBe(1);
+      expect(result.exitCode).toBe(4);
       expect(result.stdout).toBe("");
-      expect(result.stderr).toContain(
-        "Unknown callable ID 'workflo.run.trigger'. Did you mean 'workflow.run.trigger'?",
-      );
+      expect(JSON.parse(result.stderr)).toEqual({
+        status: "error",
+        error: {
+          kind: "not_found",
+          code: "http_not_found",
+          message:
+            "Unknown callable ID 'workflo.run.trigger'. Did you mean 'workflow.run.trigger'?",
+          retryable: false,
+        },
+      });
     } finally {
       server.stop(true);
     }
   });
 
-  it("rejects malformed tool-call responses without leaking their payload", async () => {
+  it("projects HTTP failures into the server tool taxonomy", async () => {
+    const cases = [
+      ["usage", 400, 2],
+      ["denied", 403, 3],
+      ["conflict", 409, 5],
+      ["timeout", 408, 7],
+      ["unavailable", 503, 6],
+    ] as const;
+    const statuses = new Map(cases.map(([name, status]) => [`demo.${name}`, status]));
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const body = (await req.json()) as { callableId: string };
+        return Response.json(
+          { message: `${body.callableId} failed` },
+          { status: statuses.get(body.callableId) ?? 500 },
+        );
+      },
+    });
+
+    try {
+      for (const [kind, _status, exitCode] of cases) {
+        const result = await runToolBridgeCli({
+          args: [`demo.${kind}`, "--input={}"],
+          backendUrl: `http://127.0.0.1:${server.port}`,
+        });
+
+        expect(result.exitCode).toBe(exitCode);
+        expect(result.stdout).toBe("");
+        expect(JSON.parse(result.stderr)).toEqual({
+          status: "error",
+          error: {
+            kind,
+            code: `http_${kind}`,
+            message: `Failed to call tool: demo.${kind} failed`,
+            retryable: kind === "timeout" || kind === "unavailable",
+          },
+        });
+      }
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("extracts current Elysia errors but ignores legacy non-2xx output", async () => {
+    const secret = "legacy-error-output-secret";
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const body = (await req.json()) as { callableId: string };
+        if (body.callableId === "demo.current") {
+          return Response.json(
+            { error: { message: "Current Elysia validation detail" } },
+            { status: 422 },
+          );
+        }
+        return new Response(JSON.stringify({ isError: true, output: secret }), {
+          status: 400,
+          statusText: "Bad Request",
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+
+    try {
+      const current = await runToolBridgeCli({
+        args: ["demo.current", "--input={}"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+      const legacy = await runToolBridgeCli({
+        args: ["demo.legacy", "--input={}"],
+        backendUrl: `http://127.0.0.1:${server.port}`,
+      });
+
+      expect(JSON.parse(current.stderr)).toMatchObject({
+        error: {
+          kind: "usage",
+          message: "Failed to call tool: Current Elysia validation detail",
+        },
+      });
+      expect(JSON.parse(legacy.stderr)).toMatchObject({
+        error: { kind: "usage", message: "Failed to call tool: 400 Bad Request" },
+      });
+      expect(legacy.stderr).not.toContain(secret);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  it("rejects legacy tool-call responses without leaking their payload", async () => {
     const secret = "secret-api-key-value";
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
       fetch() {
-        return Response.json({ isError: secret, output: { token: secret } });
+        return Response.json({ isError: false, output: { token: secret } });
       },
     });
 
@@ -675,7 +882,15 @@ describe("tool-bridge CLI runtime", () => {
 
       expect(result.exitCode).toBe(1);
       expect(result.stdout).toBe("");
-      expect(result.stderr).toContain("Backend returned an invalid tool call response");
+      expect(JSON.parse(result.stderr)).toEqual({
+        status: "error",
+        error: {
+          kind: "internal",
+          code: "malformed_response",
+          message: "Backend returned an invalid tool call response",
+          retryable: false,
+        },
+      });
       expect(result.stderr).not.toContain(secret);
     } finally {
       server.stop(true);
@@ -690,9 +905,17 @@ describe("tool-bridge CLI runtime", () => {
       stdin: `{"token":"${secret}"`,
     });
 
-    expect(result.exitCode).toBe(1);
+    expect(result.exitCode).toBe(2);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toContain("--input/--stdin is not valid JSON");
+    expect(JSON.parse(result.stderr)).toEqual({
+      status: "error",
+      error: {
+        kind: "usage",
+        code: "invalid_json",
+        message: "--input/--stdin is not valid JSON",
+        retryable: false,
+      },
+    });
     expect(result.stderr).not.toContain(secret);
   });
 
@@ -713,54 +936,69 @@ describe("tool-bridge CLI runtime", () => {
 
       expect(result.exitCode).toBe(1);
       expect(result.stdout).toBe("");
-      expect(result.stderr).toContain("Backend returned an invalid tool help response");
+      expect(JSON.parse(result.stderr)).toEqual({
+        status: "error",
+        error: {
+          kind: "internal",
+          code: "malformed_response",
+          message: "Backend returned an invalid tool help response",
+          retryable: false,
+        },
+      });
     } finally {
       server.stop(true);
     }
   });
 
-  it("preserves process signal cancellation while a tool call is in flight", async () => {
-    const requestStarted = Promise.withResolvers<void>();
-    const server = Bun.serve({
-      port: 0,
-      hostname: "127.0.0.1",
-      fetch() {
-        requestStarted.resolve();
-        return new Promise<Response>(() => {});
-      },
-    });
-    const proc = Bun.spawn(["bun", CLIENT_ENTRY, "demo.wait", "--input={}"], {
-      cwd: import.meta.dir,
-      env: {
-        ...process.env,
-        TOOL_SERVER_BACKEND_URL: `http://127.0.0.1:${server.port}`,
-        NO_COLOR: "1",
-      },
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const guard = setTimeout(
-      () => requestStarted.reject(new Error("request did not start")),
-      5_000,
-    );
+  it("preserves OS SIGTERM and SIGINT behavior while a tool call is in flight", async () => {
+    const cases = [
+      ["SIGTERM", 143],
+      ["SIGINT", 130],
+    ] as const;
 
-    try {
-      await requestStarted.promise;
-      clearTimeout(guard);
-      proc.kill("SIGTERM");
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-      expect(exitCode).toBe(143);
-      expect(stdout).toBe("");
-      expect(stderr).toBe("");
-    } finally {
-      clearTimeout(guard);
-      proc.kill();
-      server.stop(true);
+    for (const [signal, expectedExitCode] of cases) {
+      const requestStarted = Promise.withResolvers<void>();
+      const server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch() {
+          requestStarted.resolve();
+          return new Promise<Response>(() => {});
+        },
+      });
+      const proc = Bun.spawn(["bun", CLIENT_ENTRY, "demo.wait", "--input={}"], {
+        cwd: import.meta.dir,
+        env: {
+          ...process.env,
+          TOOL_SERVER_BACKEND_URL: `http://127.0.0.1:${server.port}`,
+          NO_COLOR: "1",
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const guard = setTimeout(
+        () => requestStarted.reject(new Error("request did not start")),
+        5_000,
+      );
+
+      try {
+        await requestStarted.promise;
+        clearTimeout(guard);
+        proc.kill(signal);
+        const [stdout, stderr, exitCode] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+          proc.exited,
+        ]);
+        expect(exitCode).toBe(expectedExitCode);
+        expect(stdout).toBe("");
+        expect(stderr).toBe("");
+      } finally {
+        clearTimeout(guard);
+        proc.kill();
+        server.stop(true);
+      }
     }
   });
 });

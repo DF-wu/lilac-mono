@@ -1,6 +1,11 @@
 /* oxlint-disable eslint/no-control-regex */
 
 import { getBuildInfo, type BuildInfo } from "@stanley2058/lilac-utils";
+import {
+  serverToolExitCode,
+  type ServerToolFailure,
+  type ServerToolFailureKind,
+} from "@stanley2058/lilac-plugin-runtime";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 import { createHash, randomUUID } from "node:crypto";
@@ -81,7 +86,7 @@ export class BridgeHttpFailed extends TaggedError("BridgeHttpFailed")<{
   readonly message: string;
 }> {}
 
-export class BridgeToolReportedFailure extends TaggedError("BridgeToolReportedFailure")<{
+export class BridgeInternalFailure extends TaggedError("BridgeInternalFailure")<{
   readonly message: string;
 }> {}
 
@@ -100,13 +105,14 @@ export class BridgeOperationAndCleanupFailed extends TaggedError(
 }> {}
 
 export type BridgeClientError =
+  | ServerToolFailure
   | BridgeArgumentInvalid
   | BridgeExternalOperationFailed
   | BridgeRequestCancelled
   | BridgeResponseInvalid
   | BridgeJsonInvalid
   | BridgeHttpFailed
-  | BridgeToolReportedFailure
+  | BridgeInternalFailure
   | BridgeCleanupFailed
   | BridgeOperationAndCleanupFailed;
 
@@ -269,7 +275,6 @@ const callableIdListPayloadSchema = z.object({
 
 const errorPayloadSchema = z.object({
   message: z.string().optional(),
-  output: z.string().optional(),
   error: jsonValueSchema.optional(),
 });
 
@@ -286,9 +291,28 @@ const backendVersionPayloadSchema = z.object({
     .optional(),
 });
 
-const toolCallPayloadSchema = z.discriminatedUnion("isError", [
-  z.object({ isError: z.literal(true), output: z.string() }),
-  z.object({ isError: z.literal(false), output: jsonValueSchema }),
+const serverToolFailureSchema: z.ZodType<ServerToolFailure> = z
+  .object({
+    kind: z.enum([
+      "usage",
+      "not_found",
+      "denied",
+      "conflict",
+      "timeout",
+      "unavailable",
+      "cancelled",
+      "internal",
+    ]),
+    code: z.string().min(1),
+    message: z.string(),
+    retryable: z.boolean(),
+    details: jsonValueSchema.optional(),
+  })
+  .strict();
+
+const toolCallPayloadSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), value: jsonValueSchema }).strict(),
+  z.object({ status: z.literal("error"), error: serverToolFailureSchema }).strict(),
 ]);
 
 const onboardingGpgGenerateSchema = z.object({ fingerprint: z.string().min(1) });
@@ -481,9 +505,6 @@ function extractErrorMessage(payload: JsonValue): string | undefined {
   const directMessage = maybeString(parsed.data.message);
   if (directMessage) return directMessage;
 
-  const outputMessage = maybeString(parsed.data.output);
-  if (outputMessage) return outputMessage;
-
   const errorValue = parsed.data.error;
   if (errorValue === undefined) return undefined;
   const nested = extractErrorMessage(errorValue);
@@ -526,7 +547,7 @@ async function readHttpErrorMessage(res: Response): Promise<string | undefined> 
   if (!body) return undefined;
 
   return decodeJsonText(body, "backend error response").match({
-    ok: (payload) => extractErrorMessage(payload) ?? body,
+    ok: (payload) => extractErrorMessage(payload),
     err: () => body,
   });
 }
@@ -1150,6 +1171,13 @@ async function main(): Promise<ResultType<void, BridgeClientError>> {
           "",
           section("Options", formatBullets(commonOptions)),
           "",
+          section("Output and exit codes", [
+            "Success writes the callable's JSON value to stdout and exits 0.",
+            'Failure writes {"status":"error","error":{"kind":...,"code":...,"message":...,"retryable":...,"details":...}} JSON to stderr. details is optional.',
+            "1 internal, 2 usage, 3 denied, 4 not_found, 5 conflict, 6 unavailable, 7 timeout, 8 cancelled.",
+            "A successfully produced report or diagnostic exits 0 even when it describes warnings, unhealthy state, or another negative conclusion.",
+          ]),
+          "",
           section(
             "Examples",
             formatBullets([
@@ -1227,12 +1255,12 @@ async function main(): Promise<ResultType<void, BridgeClientError>> {
         () => ResultType<void, BridgeClientError>
       >({
         ok: (called) => () => {
-          if (called.isError) {
-            return Result.err(new BridgeToolReportedFailure({ message: called.output }));
+          if (called.status === "error") {
+            return Result.err(called.error);
           }
           console.log(
             JSON.stringify(
-              called.output,
+              called.value,
               null,
               command.outputMode === "json-pretty" ? 2 : undefined,
             ),
@@ -1705,7 +1733,7 @@ type OnboardingOutput = {
 
 function openPromptInterface(): ResultType<PromptInterface, BridgeExternalOperationFailed> {
   return captureBridgeOperation(
-    () => createInterface({ input: process.stdin, output: process.stdout }),
+    () => createInterface({ input: process.stdin, output: process.stderr }),
     (cause) =>
       new BridgeExternalOperationFailed({
         cause,
@@ -1747,10 +1775,10 @@ function toolOutput(
 ): ResultType<JsonValue, BridgeClientError> {
   const outcome = resultOutcome(result);
   if (!outcome.ok) return Result.err(outcome.error);
-  if (outcome.value.isError) {
-    return Result.err(new BridgeToolReportedFailure({ message: outcome.value.output }));
+  if (outcome.value.status === "error") {
+    return Result.err(outcome.value.error);
   }
-  return Result.ok(outcome.value.output);
+  return Result.ok(outcome.value.value);
 }
 
 async function runOnboardingOperation(
@@ -1868,7 +1896,7 @@ async function runOnboardingOperation(
   if (sign) {
     if (fingerprint === undefined) {
       return Result.err(
-        new BridgeToolReportedFailure({
+        new BridgeInternalFailure({
           message: "GPG key generation did not return a fingerprint",
         }),
       );
@@ -2088,35 +2116,122 @@ export function isMainModule(args = process.argv, cwd = process.cwd(), currentFi
   return false;
 }
 
-function reportMainResult(result: ResultType<void, BridgeClientError>): void {
+function failure(
+  kind: ServerToolFailureKind,
+  code: string,
+  message: string,
+  retryable: boolean,
+): ServerToolFailure {
+  return { kind, code, message, retryable };
+}
+
+function isTimeoutCause(cause: unknown): boolean {
+  if (!(cause instanceof Error)) return false;
+  const code = Reflect.get(cause, "code");
+  return (
+    cause.name === "TimeoutError" ||
+    code === "ETIMEDOUT" ||
+    /(?:timed? out|timeout)/iu.test(cause.message)
+  );
+}
+
+function projectBridgeFailure(error: BridgeClientError): ServerToolFailure {
+  const serverFailure = serverToolFailureSchema.safeParse(error);
+  if (serverFailure.success) return serverFailure.data;
+  if (error instanceof BridgeOperationAndCleanupFailed) {
+    return projectBridgeFailure(error.operationError);
+  }
+  if (error instanceof BridgeArgumentInvalid) {
+    return failure("usage", "bridge_usage", error.message, false);
+  }
+  if (error instanceof BridgeJsonInvalid) {
+    const kind = error.source.endsWith(" response") ? "internal" : "usage";
+    const code = kind === "internal" ? "malformed_response" : "invalid_json";
+    return failure(kind, code, error.message, false);
+  }
+  if (error instanceof BridgeResponseInvalid) {
+    return failure("internal", "malformed_response", error.message, false);
+  }
+  if (error instanceof BridgeRequestCancelled) {
+    return failure("cancelled", "bridge_cancelled", error.message, false);
+  }
+  if (error instanceof BridgeExternalOperationFailed) {
+    return isTimeoutCause(error.cause)
+      ? failure("timeout", "bridge_timeout", error.message, true)
+      : failure("unavailable", "bridge_unavailable", error.message, true);
+  }
+  if (error instanceof BridgeHttpFailed) {
+    if (error.status === 400 || error.status === 422) {
+      return failure("usage", "http_usage", error.message, false);
+    }
+    if (error.status === 401 || error.status === 403) {
+      return failure("denied", "http_denied", error.message, false);
+    }
+    if (error.status === 404) {
+      return failure("not_found", "http_not_found", error.message, false);
+    }
+    if (error.status === 408 || error.status === 504) {
+      return failure("timeout", "http_timeout", error.message, true);
+    }
+    if (error.status === 409) {
+      return failure("conflict", "http_conflict", error.message, false);
+    }
+    if (error.status === 429 || error.status >= 500) {
+      return failure("unavailable", "http_unavailable", error.message, true);
+    }
+  }
+  return failure("internal", "bridge_internal", error.message, false);
+}
+
+function outputModeFromArgs(args: readonly string[]): OutputMode {
+  let outputMode: OutputMode = "json";
+  for (const arg of args) {
+    if (arg === "--") break;
+    if (arg === "--output=json") outputMode = "json";
+    if (arg === "--output=json-pretty") outputMode = "json-pretty";
+  }
+  return outputMode;
+}
+
+function reportFailure(error: ServerToolFailure, outputMode: OutputMode): void {
+  process.stderr.write(
+    `${JSON.stringify(
+      { status: "error", error },
+      null,
+      outputMode === "json-pretty" ? 2 : undefined,
+    )}\n`,
+  );
+  process.exitCode = serverToolExitCode[error.kind];
+}
+
+function reportMainResult(
+  result: ResultType<void, BridgeClientError>,
+  outputMode: OutputMode,
+): void {
   const report = result.match<() => void>({
     ok: () => () => undefined,
-    err: (error) => () => {
-      console.error(`${styles.red("Error:")} ${error.message}`);
-      process.exitCode = 1;
-    },
+    err: (error) => () => reportFailure(projectBridgeFailure(error), outputMode),
   });
   report();
 }
 
-export function reportMainDefect(cause: unknown): void {
-  if (Panic.is(cause)) {
-    console.error(`${styles.red("Error:")} internal tool bridge failure`);
-  } else {
-    console.error(`${styles.red("Error:")} unexpected tool bridge failure`);
-  }
-  process.exitCode = 1;
+export function reportMainDefect(_cause: unknown, outputMode: OutputMode = "json"): void {
+  reportFailure(
+    failure("internal", "bridge_defect", "Internal tool bridge failure", false),
+    outputMode,
+  );
 }
 
 async function runMainEntrypoint(): Promise<void> {
+  const outputMode = outputModeFromArgs(parseGlobalArgs().args);
   const result = await Result.tryPromise({
     try: main,
     catch: captureBridgeFailure,
   });
   const report = result.match<() => void>({
-    ok: (value) => () => reportMainResult(value),
+    ok: (value) => () => reportMainResult(value, outputMode),
     err: (failure) => () =>
-      reportMainDefect(failure.kind === "panic" ? failure.panic : failure.cause),
+      reportMainDefect(failure.kind === "panic" ? failure.panic : failure.cause, outputMode),
   });
   report();
 }

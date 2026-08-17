@@ -1,5 +1,10 @@
 import { expandTilde } from "@stanley2058/lilac-fs";
 import {
+  serverToolExitCode,
+  type ServerToolFailure,
+  type ServerToolJsonValue,
+} from "@stanley2058/lilac-plugin-runtime";
+import {
   createLogger,
   errorCode,
   formatTaggedErrorForLog,
@@ -51,6 +56,11 @@ const logger = createLogger({ module: "restricted-bash" });
 class RestrictedBashOperationError extends TaggedError("RestrictedBashOperationError")<{
   readonly operation: string;
   readonly cause: unknown;
+  readonly message: string;
+}> {}
+
+class NestedToolsCommandFailure extends TaggedError("NestedToolsCommandFailure")<{
+  readonly failure: ServerToolFailure;
   readonly message: string;
 }> {}
 
@@ -126,6 +136,7 @@ function restrictedHostErrorCode(cause: Error): string | undefined {
 }
 
 type RestrictedBashTermination = "wall_clock" | "aborted";
+type RestrictedBashTerminationClassifier = () => RestrictedBashTermination | undefined;
 
 function toRestrictedTerminationError(
   termination: RestrictedBashTermination | undefined,
@@ -398,6 +409,119 @@ function parseBooleanLike(value: string): boolean | undefined {
   return undefined;
 }
 
+const nestedToolJsonValueSchema: z.ZodType<ServerToolJsonValue> = z.lazy(() =>
+  z.union([
+    z.null(),
+    z.string(),
+    z.number().finite(),
+    z.boolean(),
+    z.array(nestedToolJsonValueSchema),
+    z.record(z.string(), nestedToolJsonValueSchema),
+  ]),
+);
+
+const nestedToolFailureSchema: z.ZodType<ServerToolFailure> = z
+  .object({
+    kind: z.enum([
+      "usage",
+      "denied",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "timeout",
+      "cancelled",
+      "internal",
+    ]),
+    code: z.string().min(1),
+    message: z.string(),
+    retryable: z.boolean(),
+    details: nestedToolJsonValueSchema.optional(),
+  })
+  .strict();
+
+const nestedToolResponseSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), value: nestedToolJsonValueSchema }).strict(),
+  z.object({ status: z.literal("error"), error: nestedToolFailureSchema }).strict(),
+]);
+
+type NestedToolResponse = z.infer<typeof nestedToolResponseSchema>;
+type NestedToolsOutputMode = "json" | "json-pretty";
+
+function createNestedToolsFailure(params: {
+  kind: ServerToolFailure["kind"];
+  code: string;
+  message: string;
+  retryable: boolean;
+  details?: ServerToolJsonValue;
+}): ServerToolFailure {
+  return {
+    kind: params.kind,
+    code: params.code,
+    message: params.message,
+    retryable: params.retryable,
+    ...(params.details === undefined ? {} : { details: params.details }),
+  };
+}
+
+function nestedToolsTerminationFailure(
+  termination: RestrictedBashTermination | undefined,
+  operation: string,
+): ServerToolFailure | undefined {
+  switch (termination) {
+    case "wall_clock":
+      return createNestedToolsFailure({
+        kind: "timeout",
+        code: "TOOL_SERVER_REQUEST_TIMEOUT",
+        message: `${operation} timed out`,
+        retryable: true,
+      });
+    case "aborted":
+      return createNestedToolsFailure({
+        kind: "cancelled",
+        code: "TOOL_SERVER_REQUEST_CANCELLED",
+        message: `${operation} was cancelled`,
+        retryable: false,
+      });
+    case undefined:
+      return undefined;
+  }
+}
+
+function signalNestedToolsFailure(failure: ServerToolFailure): never {
+  return adaptToolResultToHost(
+    Result.err(new NestedToolsCommandFailure({ failure, message: failure.message })),
+  );
+}
+
+function formatNestedToolsJson(
+  value: ServerToolJsonValue,
+  outputMode: NestedToolsOutputMode,
+): string {
+  return `${JSON.stringify(value, null, outputMode === "json-pretty" ? 2 : undefined)}\n`;
+}
+
+function nestedToolsFailureResult(
+  failure: ServerToolFailure,
+  outputMode: NestedToolsOutputMode,
+): ExecResult {
+  return {
+    stdout: "",
+    stderr: formatNestedToolsJson({ status: "error", error: failure }, outputMode),
+    exitCode: serverToolExitCode[failure.kind],
+  };
+}
+
+function signalNestedToolsInputFailure(code: string, message: string): never {
+  return signalNestedToolsFailure(
+    createNestedToolsFailure({
+      kind: "usage",
+      code,
+      message,
+      retryable: false,
+    }),
+  );
+}
+
 async function readJsonSource(source: string, ctx: CommandContext): Promise<unknown> {
   if (source === "@-") {
     return adaptToolResultToHost(decodeRestrictedJson(decodeBytesToUtf8(ctx.stdin)));
@@ -410,19 +534,23 @@ async function readJsonSource(source: string, ctx: CommandContext): Promise<unkn
   return adaptToolResultToHost(decodeRestrictedJson(source));
 }
 
-function decodeRestrictedJson(source: string): ResultType<unknown, RestrictedBashOperationError> {
+function decodeRestrictedJson(source: string): ResultType<unknown, NestedToolsCommandFailure> {
   const decoded = Result.try({
     try: () => JSON.parse(source),
     catch: projectRuntimeError("Opaque restricted Bash JSON parse failure"),
   });
-  return decoded.match<() => ResultType<unknown, RestrictedBashOperationError>>({
+  return decoded.match<() => ResultType<unknown, NestedToolsCommandFailure>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {
       const cause = preserveToolPanic(error);
       return Result.err(
-        new RestrictedBashOperationError({
-          operation: "parse_json",
-          cause,
+        new NestedToolsCommandFailure({
+          failure: createNestedToolsFailure({
+            kind: "usage",
+            code: "INVALID_JSON",
+            message: opaqueErrorMessage(cause, "Invalid JSON input"),
+            retryable: false,
+          }),
           message: opaqueErrorMessage(cause, "Invalid JSON input"),
         }),
       );
@@ -432,21 +560,54 @@ function decodeRestrictedJson(source: string): ResultType<unknown, RestrictedBas
 
 function decodeNestedToolInput(
   value: unknown,
-): ResultType<Record<string, unknown>, RestrictedBashOperationError> {
+): ResultType<Record<string, unknown>, NestedToolsCommandFailure> {
   const decoded = z.record(z.string(), z.unknown()).safeParse(value);
   if (decoded.success) return Result.ok(decoded.data);
   return Result.err(
-    new RestrictedBashOperationError({
-      operation: "decode_tool_input",
-      cause: decoded.error,
+    new NestedToolsCommandFailure({
+      failure: createNestedToolsFailure({
+        kind: "usage",
+        code: "INVALID_TOOL_INPUT",
+        message: "Tool input must be a JSON object",
+        retryable: false,
+      }),
       message: "Tool input must be a JSON object",
     }),
   );
 }
 
-function formatToolOutput(value: unknown): string {
-  if (typeof value === "string") return value.endsWith("\n") ? value : `${value}\n`;
-  return `${JSON.stringify(value, null, 2)}\n`;
+function parseNestedToolsOutputOption(args: readonly string[]): {
+  args: string[];
+  outputMode: NestedToolsOutputMode;
+} {
+  const remaining: string[] = [];
+  let outputMode: NestedToolsOutputMode = "json";
+  let optionsEnded = false;
+  for (const arg of args) {
+    if (arg === "--") {
+      optionsEnded = true;
+      remaining.push(arg);
+      continue;
+    }
+    if (optionsEnded || (arg !== "--output" && !arg.startsWith("--output="))) {
+      remaining.push(arg);
+      continue;
+    }
+    if (arg === "--output") {
+      signalNestedToolsInputFailure(
+        "MISSING_OUTPUT_MODE",
+        "--output requires a value: --output=json|json-pretty",
+      );
+    }
+    if (arg !== "--output=json" && arg !== "--output=json-pretty") {
+      signalNestedToolsInputFailure(
+        "INVALID_OUTPUT_MODE",
+        `Invalid --output value '${arg.slice("--output=".length)}' (expected json|json-pretty)`,
+      );
+    }
+    outputMode = arg === "--output=json-pretty" ? "json-pretty" : "json";
+  }
+  return { args: remaining, outputMode };
 }
 
 function buildToolServerHeaders(
@@ -472,45 +633,177 @@ function buildToolServerHeaders(
   return headers;
 }
 
-async function readHttpErrorMessage(res: Response): Promise<string> {
-  const read = await captureRestrictedBashOperation({
-    operation: "read_http_error",
-    run: () => res.text(),
+async function fetchNestedToolsJson(params: {
+  url: string;
+  operation: string;
+  init: RequestInit;
+  signal?: AbortSignal;
+  classifyTermination: RestrictedBashTerminationClassifier;
+}): Promise<ServerToolJsonValue> {
+  const fetched = await captureRestrictedBashOperation({
+    operation: params.operation,
+    run: () => fetch(params.url, { ...params.init, signal: params.signal }),
   });
-  const body = read.match({ ok: (value) => value, err: () => "" });
-  if (body.trim().length === 0) return `${res.status} ${res.statusText}`.trim();
-  const parsed = decodeRestrictedJson(body);
-  const parsedValue = parsed.match({ ok: (value) => value, err: () => null });
-  if (parsedValue !== null) {
-    const decoded = z
-      .object({ message: z.string().optional(), output: z.string().optional() })
-      .passthrough()
-      .safeParse(parsedValue);
-    if (decoded.success) {
-      if (decoded.data.message) return decoded.data.message;
-      if (decoded.data.output) return decoded.data.output;
-    }
+  const fetchError = fetched.match({ ok: () => null, err: (error) => error });
+  if (fetchError) {
+    const terminationFailure = nestedToolsTerminationFailure(
+      params.classifyTermination(),
+      params.operation,
+    );
+    if (terminationFailure) return signalNestedToolsFailure(terminationFailure);
+    signalNestedToolsFailure(
+      createNestedToolsFailure({
+        kind: "unavailable",
+        code: "TOOL_SERVER_NETWORK_ERROR",
+        message: fetchError.message,
+        retryable: true,
+      }),
+    );
   }
-  return body;
+  const response = fetched.match({ ok: (value) => value, err: () => null });
+  if (!response) {
+    return signalNestedToolsFailure(
+      createNestedToolsFailure({
+        kind: "internal",
+        code: "TOOL_SERVER_FETCH_INVARIANT",
+        message: "Tool server request did not produce a response",
+        retryable: false,
+      }),
+    );
+  }
+  const read = await captureRestrictedBashOperation({
+    operation: `read_${params.operation}`,
+    run: () => response.text(),
+  });
+  const readError = read.match({ ok: () => null, err: (error) => error });
+  if (readError) {
+    const terminationFailure = nestedToolsTerminationFailure(
+      params.classifyTermination(),
+      params.operation,
+    );
+    if (terminationFailure) return signalNestedToolsFailure(terminationFailure);
+    return signalNestedToolsFailure(
+      createNestedToolsFailure({
+        kind: "unavailable",
+        code: "TOOL_SERVER_RESPONSE_READ_ERROR",
+        message: readError.message,
+        retryable: true,
+      }),
+    );
+  }
+  const text = read.match({ ok: (value) => value, err: () => "" });
+  if (!response.ok) {
+    const status = response.status;
+    let projection: Pick<ServerToolFailure, "kind" | "retryable"> = {
+      kind: "internal",
+      retryable: false,
+    };
+    if (status === 400 || status === 422) projection = { kind: "usage", retryable: false };
+    else if (status === 401 || status === 403) {
+      projection = { kind: "denied", retryable: false };
+    } else if (status === 404) projection = { kind: "not_found", retryable: false };
+    else if (status === 408 || status === 504) {
+      projection = { kind: "timeout", retryable: true };
+    } else if (status === 409) projection = { kind: "conflict", retryable: false };
+    else if (status === 429 || status >= 500) {
+      projection = { kind: "unavailable", retryable: true };
+    }
+    return signalNestedToolsFailure(
+      createNestedToolsFailure({
+        kind: projection.kind,
+        code: "TOOL_SERVER_HTTP_ERROR",
+        message: `Tool server returned HTTP ${status}`,
+        retryable: projection.retryable,
+        details: { status },
+      }),
+    );
+  }
+  let hasNonFiniteNumber = false;
+  const parsed = Result.try({
+    try: (): ServerToolJsonValue =>
+      JSON.parse(text, (_key, value: ServerToolJsonValue) => {
+        if (typeof value === "number" && !Number.isFinite(value)) {
+          hasNonFiniteNumber = true;
+          return null;
+        }
+        return value;
+      }),
+    catch: projectRuntimeError("Tool server returned invalid JSON"),
+  });
+  const parseError = parsed.match({ ok: () => null, err: (error) => error });
+  if (parseError) {
+    return signalNestedToolsFailure(
+      createNestedToolsFailure({
+        kind: "internal",
+        code: "TOOL_SERVER_INVALID_JSON",
+        message: opaqueErrorMessage(parseError, "Tool server returned invalid JSON"),
+        retryable: false,
+      }),
+    );
+  }
+  if (hasNonFiniteNumber) {
+    return signalNestedToolsFailure(
+      createNestedToolsFailure({
+        kind: "internal",
+        code: "TOOL_SERVER_INVALID_JSON",
+        message: "Tool server returned invalid JSON",
+        retryable: false,
+      }),
+    );
+  }
+  return parsed.match({ ok: (value) => value, err: () => null });
 }
 
-async function fetchToolHelp(callableId: string, headers: Record<string, string>) {
-  const res = await fetch(`${TOOL_SERVER_BACKEND_URL}/help/${encodeURIComponent(callableId)}`, {
-    headers,
-  });
-  if (!res.ok) {
-    signalRestrictedBashFailure("fetch_tool_help", await readHttpErrorMessage(res));
+async function fetchNestedToolCallResponse(params: {
+  url: string;
+  operation: string;
+  init: RequestInit;
+  signal?: AbortSignal;
+  classifyTermination: RestrictedBashTerminationClassifier;
+}): Promise<NestedToolResponse> {
+  const decoded = nestedToolResponseSchema.safeParse(await fetchNestedToolsJson(params));
+  if (!decoded.success) {
+    return signalNestedToolsFailure(
+      createNestedToolsFailure({
+        kind: "internal",
+        code: "TOOL_SERVER_INVALID_RESPONSE",
+        message: "Tool server response is invalid",
+        retryable: false,
+      }),
+    );
   }
-  const body = await res.json();
+  return decoded.data;
+}
+
+async function fetchToolHelp(
+  callableId: string,
+  headers: Record<string, string>,
+  classifyTermination: RestrictedBashTerminationClassifier,
+  signal?: AbortSignal,
+) {
+  const value = await fetchNestedToolsJson({
+    url: `${TOOL_SERVER_BACKEND_URL}/help/${encodeURIComponent(callableId)}`,
+    operation: "fetch_tool_help",
+    init: { headers },
+    signal,
+    classifyTermination,
+  });
   const decoded = z
     .object({
       primaryPositional: z
         .object({ field: z.string(), variadic: z.boolean().optional() })
         .optional(),
     })
-    .safeParse(body);
+    .safeParse(value);
   if (!decoded.success) {
-    signalRestrictedBashFailure("decode_tool_help", "Tool help response is invalid");
+    signalNestedToolsFailure(
+      createNestedToolsFailure({
+        kind: "internal",
+        code: "TOOL_SERVER_INVALID_HELP",
+        message: "Tool help response is invalid",
+        retryable: false,
+      }),
+    );
   }
   return decoded.data;
 }
@@ -520,6 +813,8 @@ async function buildNestedToolInput(params: {
   args: readonly string[];
   ctx: CommandContext;
   headers: Record<string, string>;
+  signal?: AbortSignal;
+  classifyTermination: RestrictedBashTerminationClassifier;
 }): Promise<Record<string, unknown>> {
   let input: Record<string, unknown> = {};
   const positionals: string[] = [];
@@ -538,8 +833,8 @@ async function buildNestedToolInput(params: {
       continue;
     }
     if (arg === "--input") {
-      signalRestrictedBashFailure(
-        "parse_tool_input",
+      signalNestedToolsInputFailure(
+        "MISSING_TOOL_INPUT",
         "--input requires a value: --input=@file.json, --input=@-, or --input='<json>'",
       );
     }
@@ -566,7 +861,10 @@ async function buildNestedToolInput(params: {
     const field = kebabToCamelCase(isJson ? rawKey.slice(0, -":json".length) : rawKey);
     if (isJson) {
       if (eq === -1) {
-        signalRestrictedBashFailure("parse_tool_input", `--${field}:json requires a value`);
+        signalNestedToolsInputFailure(
+          "MISSING_JSON_FLAG_VALUE",
+          `--${field}:json requires a value`,
+        );
       }
       input[field] = await readJsonSource(rawValue, params.ctx);
       continue;
@@ -581,21 +879,26 @@ async function buildNestedToolInput(params: {
   }
 
   if (positionals.length > 0) {
-    const help = await fetchToolHelp(params.callableId, params.headers);
+    const help = await fetchToolHelp(
+      params.callableId,
+      params.headers,
+      params.classifyTermination,
+      params.signal,
+    );
     const primaryPositional = help.primaryPositional;
     if (!primaryPositional) {
       const bareFlag = bareBooleanFlags[0];
       const flagHint = bareFlag
         ? ` Bare --${bareFlag} was parsed as boolean true; if you meant to pass a value, use --${bareFlag}=<value>.`
         : " If you meant to pass a flag value, use --field=<value>.";
-      signalRestrictedBashFailure(
-        "parse_tool_input",
+      signalNestedToolsInputFailure(
+        "UNSUPPORTED_POSITIONAL_INPUT",
         `Tool '${params.callableId}' does not support positional input.${flagHint} Space-separated flag values are not supported; use --input JSON or stdin for structured input.`,
       );
     }
     if (Object.hasOwn(input, primaryPositional.field)) {
-      signalRestrictedBashFailure(
-        "parse_tool_input",
+      signalNestedToolsInputFailure(
+        "CONFLICTING_POSITIONAL_INPUT",
         `Primary positional conflicts with an existing '${primaryPositional.field}' value from flags or JSON input`,
       );
     }
@@ -605,8 +908,8 @@ async function buildNestedToolInput(params: {
     }
 
     if (positionals.length > 1) {
-      signalRestrictedBashFailure(
-        "parse_tool_input",
+      signalNestedToolsInputFailure(
+        "TOO_MANY_POSITIONAL_ARGUMENTS",
         `Tool '${params.callableId}' accepts at most one positional argument`,
       );
     }
@@ -616,54 +919,74 @@ async function buildNestedToolInput(params: {
   return input;
 }
 
-function createToolsCommand(context: RestrictedBashContext) {
+function createToolsCommand(
+  context: RestrictedBashContext,
+  classifyTermination: RestrictedBashTerminationClassifier,
+) {
   return defineCommand("tools", async (args, ctx): Promise<ExecResult> => {
     const headers = buildToolServerHeaders(context, ctx.cwd);
     const [first, ...rest] = args;
+    let outputMode: NestedToolsOutputMode = "json";
 
     const runToolsCommand = async (): Promise<ExecResult> => {
+      const parsedOptions = parseNestedToolsOutputOption(rest);
+      outputMode = parsedOptions.outputMode;
+      const commandArgs = parsedOptions.args;
       if (!first || first === "--list") {
-        const res = await fetch(`${TOOL_SERVER_BACKEND_URL}/list`, { headers });
-        if (!res.ok) {
-          signalRestrictedBashFailure("list_tools", await readHttpErrorMessage(res));
-        }
-        return { stdout: formatToolOutput(await res.json()), stderr: "", exitCode: 0 };
+        const value = await fetchNestedToolsJson({
+          url: `${TOOL_SERVER_BACKEND_URL}/list`,
+          operation: "list_tools",
+          init: { headers },
+          signal: ctx.signal,
+          classifyTermination,
+        });
+        return { stdout: formatNestedToolsJson(value, outputMode), stderr: "", exitCode: 0 };
       }
 
       if (first === "--help") {
-        const callableId = rest[0];
+        const callableId = commandArgs[0];
         if (!callableId) {
           return {
-            stdout: "Usage: tools [--list] [--help <callableId>] <callableId> [args...]\n",
+            stdout: formatNestedToolsJson(
+              "Usage: tools [--list] [--help <callableId>] <callableId> [args...]",
+              outputMode,
+            ),
             stderr: "",
             exitCode: 0,
           };
         }
-        const help = await fetchToolHelp(callableId, headers);
-        return { stdout: formatToolOutput(help), stderr: "", exitCode: 0 };
+        const help = await fetchToolHelp(callableId, headers, classifyTermination, ctx.signal);
+        return { stdout: formatNestedToolsJson(help, outputMode), stderr: "", exitCode: 0 };
       }
 
       const callableId = first;
-      const input = await buildNestedToolInput({ callableId, args: rest, ctx, headers });
-      const res = await fetch(`${TOOL_SERVER_BACKEND_URL}/call`, {
-        method: "POST",
+      const input = await buildNestedToolInput({
+        callableId,
+        args: commandArgs,
+        ctx,
         headers,
-        body: JSON.stringify({ callableId, input }),
+        signal: ctx.signal,
+        classifyTermination,
       });
-      if (!res.ok) {
-        signalRestrictedBashFailure("call_tool", await readHttpErrorMessage(res));
+      const response = await fetchNestedToolCallResponse({
+        url: `${TOOL_SERVER_BACKEND_URL}/call`,
+        operation: "call_tool",
+        init: {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ callableId, input }),
+        },
+        signal: ctx.signal,
+        classifyTermination,
+      });
+      if (response.status === "error") {
+        return nestedToolsFailureResult(response.error, outputMode);
       }
-      const decoded = z
-        .object({ isError: z.boolean(), output: z.unknown() })
-        .safeParse(await res.json());
-      if (!decoded.success) {
-        signalRestrictedBashFailure("decode_tool_result", "Tool call response is invalid");
-      }
-      const payload = decoded.data;
-      if (payload.isError) {
-        return { stdout: "", stderr: formatToolOutput(payload.output), exitCode: 1 };
-      }
-      return { stdout: formatToolOutput(payload.output), stderr: "", exitCode: 0 };
+      return {
+        stdout: formatNestedToolsJson(response.value, outputMode),
+        stderr: "",
+        exitCode: 0,
+      };
     };
     const executed = await captureRestrictedBashOperation({
       operation: "run_tools_command",
@@ -671,7 +994,27 @@ function createToolsCommand(context: RestrictedBashContext) {
     });
     return executed.match({
       ok: (value) => value,
-      err: (error) => ({ stdout: "", stderr: `${error.message}\n`, exitCode: 1 }),
+      err: (error) => {
+        if (error.cause instanceof NestedToolsCommandFailure) {
+          return nestedToolsFailureResult(error.cause.failure, outputMode);
+        }
+        const terminationFailure = nestedToolsTerminationFailure(
+          classifyTermination(),
+          "Tools command",
+        );
+        if (terminationFailure) {
+          return nestedToolsFailureResult(terminationFailure, outputMode);
+        }
+        return nestedToolsFailureResult(
+          createNestedToolsFailure({
+            kind: "internal",
+            code: "TOOLS_COMMAND_FAILED",
+            message: error.message,
+            retryable: false,
+          }),
+          outputMode,
+        );
+      },
     });
   });
 }
@@ -719,6 +1062,7 @@ async function createRestrictedBash(params: {
   workspaceRoot: string;
   sessionTmpDir: string;
   context: RestrictedBashContext;
+  classifyTermination: RestrictedBashTerminationClassifier;
 }): Promise<Bash> {
   await fs.mkdir(params.sessionTmpDir, { recursive: true, mode: 0o700 });
   if (params.context.workspaceWritable) {
@@ -783,7 +1127,7 @@ async function createRestrictedBash(params: {
         ? { LILAC_CURRENT_TURN_USER_ID: params.context.currentTurnUserId }
         : {}),
     },
-    customCommands: [createToolsCommand(params.context)],
+    customCommands: [createToolsCommand(params.context, params.classifyTermination)],
     defenseInDepth: true,
     executionLimits: {
       maxCommandCount: 10000,
@@ -806,6 +1150,7 @@ async function getRestrictedBash(params: {
   workspaceRoot: string;
   sessionTmpDir: string;
   context: RestrictedBashContext;
+  classifyTermination: RestrictedBashTerminationClassifier;
 }): Promise<Bash> {
   const now = Date.now();
   pruneRestrictedBashCache(now);
@@ -892,6 +1237,7 @@ export async function executeRestrictedBash(
     if (options.abortSignal.aborted) abortListener();
     else options.abortSignal.addEventListener("abort", abortListener, { once: true });
   }
+  const classifyTermination: RestrictedBashTerminationClassifier = () => termination;
 
   const runRestrictedExecution = async (): Promise<BashToolOutput> => {
     // just-bash temporarily locks down dynamic constructors while executing a script.
@@ -905,6 +1251,7 @@ export async function executeRestrictedBash(
       workspaceRoot,
       sessionTmpDir,
       context,
+      classifyTermination,
     });
     const result = await bash.exec(command, {
       cwd: restrictedCwd,
