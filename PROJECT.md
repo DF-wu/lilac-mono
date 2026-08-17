@@ -122,6 +122,14 @@ Native Bash executes with the Core or Mini service user's host authority. Static
 
 Level 2 is Core's Elysia tool service in `apps/core/src/tool-server`, consumed by `apps/tool-bridge/client.ts` and commonly reached by an agent through Level 1 Bash. The same Core plugin manager owns Level 1 and Level 2 registration. Built-ins are composed from `apps/core/src/plugins/builtin`; external plugins are trusted process code discovered under `${DATA_DIR}/plugins` through `packages/plugin-runtime`.
 
+Level 2 callables settle with actual `better-result` Results. Expected failures carry the closed
+`ServerToolFailure` contract; raw returns are invalid and throws are defects. Core projects Results
+onto the strict `{ status: "ok", value } | { status: "error", error }` wire envelope, and the
+`tools` CLI writes successful values to stdout and failure JSON to stderr with kind-specific exit
+codes. Successfully produced report and diagnostic payloads remain successes even when their
+findings are negative. See `PLUGIN_AUTHORING.md` for authoring details and `MIGRATIONS.md` for the
+clean-break migration.
+
 Request capabilities bind request context, cwd, profile, callable authority, and expiry. They constrain agent calls but are not general public HTTP authentication. The Core tool server belongs on a trusted host/network. Core also owns configured MCP clients process-wide; MCP tools join the run-scoped catalog only through the Core manager and profile policy.
 
 ### Level 3: Skills
