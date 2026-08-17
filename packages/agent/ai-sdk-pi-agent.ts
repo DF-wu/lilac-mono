@@ -56,6 +56,11 @@ import type { ExpandedToolCall } from "./tool-call-expansion";
 
 const logger = createLogger({ module: "ai-sdk-pi-agent" });
 const SETTLED_NORMALIZATION_FAILED = "[settled tool results could not be normalized]";
+const LENGTH_RECOVERY_CONTINUE_TEXT =
+  "Continue from the compacted context. Do not retry any tool call that was truncated unless it is still necessary.";
+const LENGTH_RECOVERY_PROVIDER_OPTIONS = {
+  lilac: { autoCompactionContinue: true },
+} as const satisfies NonNullable<ModelMessage["providerOptions"]>;
 
 function canonicalToolName(name: string): string {
   switch (name) {
@@ -1137,6 +1142,32 @@ function getUnresolvedAssistantToolCallIds(message: ModelMessage): string[] {
     if (part.type === "tool-result") open.delete(part.toolCallId);
   }
   return [...open];
+}
+
+function truncatedToolCallResultMessage(
+  toolCalls: readonly ExpandedToolCall[],
+): ToolModelMessage | null {
+  if (toolCalls.length === 0) return null;
+  return {
+    role: "tool",
+    content: toolCalls.map((toolCall) => ({
+      type: "tool-result" as const,
+      toolCallId: toolCall.toolCallId,
+      toolName: toolCall.toolName,
+      output: {
+        type: "error-text" as const,
+        value: "Tool call was not executed because the model output was truncated.",
+      },
+    })),
+  };
+}
+
+function lengthRecoveryContinueMessage(): ModelMessage {
+  return {
+    role: "user",
+    content: [{ type: "text", text: LENGTH_RECOVERY_CONTINUE_TEXT }],
+    providerOptions: LENGTH_RECOVERY_PROVIDER_OPTIONS,
+  };
 }
 
 function completedAssistantPrefix(message: AssistantModelMessage): AssistantModelMessage | null {
@@ -2477,6 +2508,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       this.emit({ type: "agent_start" });
 
       let runTotalUsage: LanguageModelUsage | undefined = undefined;
+      let lengthRecoveryAttempted = false;
 
       try {
         if (options.newMessages) {
@@ -2582,11 +2614,24 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             for (const delivered of takeAll(this.deliveredSteeringMessages)) {
               this.appendMessage(delivered);
             }
+            const truncatedToolResult =
+              turn.finishReason === "length"
+                ? truncatedToolCallResultMessage(turn.toolCalls)
+                : null;
+            const normalizedTruncatedToolResult = truncatedToolResult
+              ? await this.normalizeNewToolMessage(truncatedToolResult)
+              : null;
             for (const added of turn.newMessages) {
               this.state.messages.push(added);
             }
+            if (normalizedTruncatedToolResult) {
+              this.appendMessage(normalizedTruncatedToolResult);
+            }
+            const newMessages = normalizedTruncatedToolResult
+              ? [...turn.newMessages, normalizedTruncatedToolResult]
+              : turn.newMessages;
             this.recoveryCheckpoint = null;
-            for (const added of turn.newMessages) {
+            for (const added of newMessages) {
               if (
                 added.role === "assistant" &&
                 getUnresolvedAssistantToolCallIds(added).length > 0
@@ -2603,7 +2648,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             this.emit({
               type: "turn_end",
               finishReason: turn.finishReason,
-              newMessages: turn.newMessages.map(cloneMessage),
+              newMessages: newMessages.map(cloneMessage),
               usage: turn.usage,
               totalUsage: turn.totalUsage,
             });
@@ -2618,7 +2663,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             // Continue so the model can inspect the validation error and retry.
             const hasCompletedToolExchange =
               turn.finishReason === "tool-calls" &&
-              turn.newMessages.some(
+              newMessages.some(
                 (message) => message.role === "tool" || hasInlineToolResult(message),
               );
             const toolExecution = hasLocalToolCalls
@@ -2634,6 +2679,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               modelInputMessages: turn.modelInputMessages,
               executedToolCallCount,
             });
+            const recoverFromLength = turn.finishReason === "length" && !lengthRecoveryAttempted;
+            if (recoverFromLength) {
+              lengthRecoveryAttempted = true;
+              this.appendMessage(lengthRecoveryContinueMessage());
+            }
 
             if (this.cancelResetPending) {
               throw new TurnAbortedError({ reason: "cancel", phase: "tools" });
@@ -2663,7 +2713,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             if (this.pendingInterrupt || this.abortController?.signal.aborted) continue;
 
             const naturallyRequiresNextTurn =
-              hasLocalToolCalls || hasCompletedToolExchange || boundaryDecision.requiresNextTurn;
+              hasLocalToolCalls ||
+              hasCompletedToolExchange ||
+              boundaryDecision.requiresNextTurn ||
+              recoverFromLength;
             if (
               steeringPreparation.status === "failed" ||
               steeringPreparation.status === "external-settled"

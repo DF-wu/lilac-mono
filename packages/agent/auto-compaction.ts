@@ -2101,6 +2101,7 @@ export async function attachAutoCompaction(
   let pendingCompactionReason: PendingCompactionReason | null = null;
   let inCompaction = false;
   let overflowRecoveryAttempts = 0;
+  let lengthCompactionScheduled = false;
   let lastTurnInputTokens: number | null = null;
   let lastModelInputEstimate: number | null = null;
 
@@ -2233,9 +2234,21 @@ export async function attachAutoCompaction(
   };
 
   const unsubscribe = agent.subscribe((event: AiSdkPiAgentEvent<ToolSet>) => {
+    if (event.type === "agent_start") {
+      lengthCompactionScheduled = false;
+      return;
+    }
     if (event.type !== "turn_end") return;
 
     overflowRecoveryAttempts = 0;
+
+    if (event.finishReason === "length") {
+      if (!lengthCompactionScheduled) {
+        lengthCompactionScheduled = true;
+        scheduleCompaction("overflow");
+      }
+      return;
+    }
 
     const inputTokens = resolveThresholdInputTokens({
       source: thresholdInputSource,

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from "bun:test";
 import { createOpenAI } from "@ai-sdk/openai";
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { streamText } from "ai";
 
 import { createOpenAIResponsesWebSocketFetch } from "../openai-responses-websocket-fetch";
@@ -15,6 +16,8 @@ class FakeWebSocket {
   static readonly CLOSED = 3;
 
   static instances: FakeWebSocket[] = [];
+  static openOnConstruct = true;
+  static onConstruct: (() => void) | undefined;
 
   readonly url: string;
   readonly init?: WebSocketInit;
@@ -32,11 +35,14 @@ class FakeWebSocket {
     this.url = String(url);
     this.init = init;
     FakeWebSocket.instances.push(this);
-    queueMicrotask(() => this.emitOpen());
+    FakeWebSocket.onConstruct?.();
+    if (FakeWebSocket.openOnConstruct) queueMicrotask(() => this.emitOpen());
   }
 
   static reset(): void {
     FakeWebSocket.instances.length = 0;
+    FakeWebSocket.openOnConstruct = true;
+    FakeWebSocket.onConstruct = undefined;
   }
 
   addEventListener(type: string, listener: (event: Event) => void): void {
@@ -260,6 +266,63 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
     expect(fallbackDetails?.requestUrl).toBe("https://api.openai.com/v1/responses");
   });
 
+  it("times out websocket setup so auto mode can fall back to SSE", async () => {
+    jest.useFakeTimers({ now: 0 });
+    FakeWebSocket.openOnConstruct = false;
+    const constructed = Promise.withResolvers<void>();
+    FakeWebSocket.onConstruct = () => constructed.resolve();
+    let fallbackCalls = 0;
+    globals.fetch = (async () => {
+      fallbackCalls += 1;
+      return new Response("fallback");
+    }) as unknown as typeof globalThis.fetch;
+    const wsFetch = createOpenAIResponsesWebSocketFetch({ mode: "auto" });
+
+    try {
+      const responsePromise = wsFetch("https://api.openai.com/v1/responses", {
+        method: "POST",
+        body: JSON.stringify({ stream: true, input: "hi" }),
+      });
+      await constructed.promise;
+      jest.advanceTimersByTime(30_000);
+
+      const response = await responsePromise;
+      expect(await response.text()).toBe("fallback");
+      expect(fallbackCalls).toBe(1);
+      expect(FakeWebSocket.instances[0]?.readyState).toBe(FakeWebSocket.CLOSED);
+    } finally {
+      wsFetch.close();
+      jest.useRealTimers();
+    }
+  });
+
+  it("cancels websocket setup without falling back after caller abort", async () => {
+    FakeWebSocket.openOnConstruct = false;
+    const constructed = Promise.withResolvers<void>();
+    FakeWebSocket.onConstruct = () => constructed.resolve();
+    let fallbackCalls = 0;
+    globals.fetch = (async () => {
+      fallbackCalls += 1;
+      return new Response("fallback");
+    }) as unknown as typeof globalThis.fetch;
+    const wsFetch = createOpenAIResponsesWebSocketFetch({ mode: "auto" });
+    const controller = new AbortController();
+    const reason = new DOMException("caller stopped", "AbortError");
+
+    const responsePromise = wsFetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ stream: true, input: "hi" }),
+      signal: controller.signal,
+    });
+    await constructed.promise;
+    controller.abort(reason);
+
+    await expect(responsePromise).rejects.toBe(reason);
+    expect(fallbackCalls).toBe(0);
+    expect(FakeWebSocket.instances[0]?.readyState).toBe(FakeWebSocket.CLOSED);
+    wsFetch.close();
+  });
+
   it("throws when mode=websocket and websocket transport is unavailable", async () => {
     globals.fetch = (async () => new Response("fallback")) as unknown as typeof globalThis.fetch;
     globals.WebSocket = undefined as unknown as typeof WebSocket;
@@ -363,9 +426,12 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
 
     const partsPromise = withTimeout(
       (async () => {
-        const parts: Array<{ type: string }> = [];
+        const parts: Array<{ type: string; error?: unknown }> = [];
         for await (const part of result.stream) {
-          parts.push({ type: part.type });
+          parts.push({
+            type: part.type,
+            ...(part.type === "error" ? { error: part.error } : {}),
+          });
         }
         return parts;
       })(),
@@ -392,6 +458,85 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
 
     const parts = await partsPromise;
     expect(parts.some((part) => part.type === "error")).toBe(true);
+    expect(JSON.stringify(parts.find((part) => part.type === "error")?.error)).toContain(
+      "Instructions are required",
+    );
+  });
+
+  it("uses installed OpenAI Responses cache write usage", async () => {
+    const wsFetch = createOpenAIResponsesWebSocketFetch({
+      mode: "sse",
+      fetch: (async () =>
+        eventStreamResponse(
+          [
+            {
+              type: "response.created",
+              response: { id: "resp_cache", created_at: 1_783_620_000, model: "gpt-5.6" },
+            },
+            {
+              type: "response.completed",
+              response: {
+                id: "resp_cache",
+                incomplete_details: null,
+                usage: {
+                  input_tokens: 100,
+                  input_tokens_details: { cached_tokens: 40, cache_write_tokens: 25 },
+                  output_tokens: 20,
+                  output_tokens_details: { reasoning_tokens: 5 },
+                },
+              },
+            },
+          ]
+            .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+            .join("") + "data: [DONE]\n\n",
+        )) as unknown as typeof globalThis.fetch,
+    });
+    const openai = createOpenAI({ apiKey: "test-token", fetch: wsFetch });
+    const result = streamText({ model: openai.responses("gpt-5.6"), prompt: "hi" });
+
+    for await (const _part of result.stream) {
+      void _part;
+    }
+
+    await expect(result.usage).resolves.toMatchObject({
+      inputTokens: 100,
+      inputTokenDetails: {
+        noCacheTokens: 35,
+        cacheReadTokens: 40,
+        cacheWriteTokens: 25,
+      },
+    });
+    wsFetch.close();
+  });
+
+  it("preserves installed OpenAI-compatible structured stream errors", async () => {
+    const provider = createOpenAICompatible({
+      name: "test-compatible",
+      baseURL: "https://compatible.example/v1",
+      apiKey: "test-token",
+      fetch: (async () =>
+        eventStreamResponse(
+          `data: ${JSON.stringify({
+            error: {
+              message: "Context length exceeded",
+              code: "CONTEXT_LENGTH_EXCEEDED",
+            },
+          })}\n\ndata: [DONE]\n\n`,
+        )) as unknown as typeof globalThis.fetch,
+    });
+    const result = streamText({
+      model: provider.chatModel("test-model"),
+      prompt: "hi",
+      onError: () => {},
+    });
+    const errors: unknown[] = [];
+
+    for await (const part of result.stream) {
+      if (part.type === "error") errors.push(part.error);
+    }
+
+    expect(JSON.stringify(errors)).toContain("Context length exceeded");
+    expect(JSON.stringify(errors)).toContain("CONTEXT_LENGTH_EXCEEDED");
   });
 
   it("errors when websocket closes before a terminal response event", async () => {
@@ -538,6 +683,24 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
     expect(text).toContain('"code":"model_not_found"');
     expect(text).not.toContain('"type":"response.failed"');
     expect(text).toContain("data: [DONE]");
+  });
+
+  it("rejects SSE EOF without a terminal response event", async () => {
+    globals.fetch = (async () =>
+      eventStreamResponse(
+        `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_1" } })}\n\ndata: [DONE]\n\n`,
+      )) as unknown as typeof globalThis.fetch;
+
+    const wsFetch = createOpenAIResponsesWebSocketFetch({ mode: "sse" });
+    const response = await wsFetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ stream: true, input: "hi" }),
+    });
+
+    await expect(response.text()).rejects.toThrow(
+      "Response stream ended before a terminal response event",
+    );
+    wsFetch.close();
   });
 
   it("supports concurrent websocket requests via dedicated connection", async () => {

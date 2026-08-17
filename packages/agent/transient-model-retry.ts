@@ -8,10 +8,17 @@ import type { TurnErrorHandler, TurnErrorHandlerDecision } from "./ai-sdk-pi-age
 import { computeRetryBackoffDelayMs, type RetryBackoffConfig } from "./retry-backoff";
 
 const TRANSIENT_MODEL_ERROR_PATTERN =
-  /overloaded|server_is_overloaded|service[_\s-]*unavailable|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|socket connection was closed unexpectedly|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before message_stop|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
+  /overloaded|server_is_overloaded|service[_\s-]*unavailable|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|524|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|socket connection was closed unexpectedly|websocket.?closed|websocket.?error|other side closed|fetch failed|failed to fetch|upstream.?connect|reset before headers|socket hang up|ended without|stream ended before|http2 request did not get a response|timed? out|timeout|terminated|retry delay|resource[_\s-]*exhausted|try your request again|retry your request|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT/i;
 
-const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
-const RETRYABLE_NETWORK_ERROR_CODES = new Set(["ConnectionClosed", "ECONNRESET"]);
+const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504, 524]);
+const RETRYABLE_NETWORK_ERROR_CODES = new Set([
+  "ConnectionClosed",
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ENOTFOUND",
+  "ETIMEDOUT",
+]);
 
 export type TransientModelRetryConfig = RetryBackoffConfig;
 

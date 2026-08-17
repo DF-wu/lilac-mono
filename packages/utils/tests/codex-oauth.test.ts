@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, jest } from "bun:test";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -649,5 +649,45 @@ describe("Codex OAuth refresh", () => {
     await expect(
       refreshAccessToken("refresh", async () => Response.json({ expires_in: 120 })),
     ).rejects.toThrow();
+  });
+
+  it("bounds a refresh even when the fetch implementation ignores abort", async () => {
+    jest.useFakeTimers({ now: 0 });
+    const signals: AbortSignal[] = [];
+    try {
+      const refresh = refreshAccessTokenResult("refresh", async (_input, init) => {
+        if (init?.signal) signals.push(init.signal);
+        return await new Promise<Response>(() => {});
+      });
+
+      jest.advanceTimersByTime(45_000);
+      const result = await refresh;
+
+      expect(signals[0]?.aborted).toBe(true);
+      expect(result.status).toBe("error");
+      if (result.status === "error") {
+        expect(result.error._tag).toBe("CodexOAuthRequestFailed");
+        expect(result.error.cause).toBeInstanceOf(DOMException);
+        expect((result.error.cause as DOMException).name).toBe("TimeoutError");
+      }
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("preserves the caller abort reason", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("caller stopped", "AbortError");
+    const refresh = refreshAccessTokenResult(
+      "refresh",
+      async () => await new Promise<Response>(() => {}),
+      controller.signal,
+    );
+
+    controller.abort(reason);
+    const result = await refresh;
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") expect(result.error.cause).toBe(reason);
   });
 });
