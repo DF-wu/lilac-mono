@@ -2667,7 +2667,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               newMessages.some(
                 (message) => message.role === "tool" || hasInlineToolResult(message),
               );
-            const toolExecution = hasLocalToolCalls
+            const shouldExecuteLocalToolCalls = hasLocalToolCalls && turn.finishReason !== "length";
+            const toolExecution = shouldExecuteLocalToolCalls
               ? await this.executeToolCalls(turn.toolCalls, turn.toolSnapshot)
               : Result.ok<number, ToolBatchExecutionFailed>(0);
             const toolExecutionOutcome = resultOutcome(toolExecution);
