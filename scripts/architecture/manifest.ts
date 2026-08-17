@@ -427,6 +427,7 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         "validateToolServerOptions",
         "decodeToolRequestHeaders",
         "decodeToolPayload",
+        "normalizeSuccessfulToolValue",
         "createToolServer.authenticateContext",
         "createToolServer.captureAuthenticationOperation",
         "createToolServer.resolveSafetyMode",
@@ -991,6 +992,51 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     identity: { module: "src/tool-server/tools/surface.ts", exportName },
     category: "projection" as const,
   })),
+  ...[
+    ["src/tools/restricted-bash.ts", "fetchNestedToolCallResponse"],
+    ["src/tools/restricted-bash.ts", "createToolsCommand.defineCommand.<callback@2>.err"],
+    ["src/tool-server/create-tool-server.ts", "createToolServer.post.<callback@2>@2"],
+    ["src/tool-server/tools/attachment.ts", "attachmentFailureFromUnknown"],
+    ["src/tool-server/tools/attachment.ts", "Attachment.callAddFiles"],
+    ["src/tool-server/tools/codex.ts", "observeCodexLogin"],
+    ["src/tool-server/tools/codex.ts", "Codex.runCallable"],
+    ["src/tool-server/tools/content-inspect.ts", "contentInspectExternalFailure"],
+    ["src/tool-server/tools/content-inspect.ts", "ContentInspect.inspect"],
+    ["src/tool-server/tools/content-inspect.ts", "inspectContent"],
+    ["src/tool-server/tools/content-inspect.ts", "loadInspectSource"],
+    ["src/tool-server/tools/content-inspect.ts", "readInspectResponseBytes"],
+    ["src/tool-server/tools/conversation-thread.ts", "conversationThreadFailure"],
+    ["src/tool-server/tools/generate.ts", "readImageDataFromPath"],
+    ["src/tool-server/tools/generate.ts", "resolveImageEditInputs"],
+    ["src/tool-server/tools/generate.ts", "buildVideoGenerationPrompt"],
+    ["src/tool-server/tools/generate.ts", "Generate.callGenerateImage"],
+    ["src/tool-server/tools/generate.ts", "Generate.callGenerateVideo"],
+    ["src/tool-server/tools/mcp.ts", "McpManagement.callAuth"],
+    ["src/tool-server/tools/mcp.ts", "McpManagement.reconcileProviders"],
+    ["src/tool-server/tools/onboarding.ts", "ensurePlaywrightChromiumInstalled"],
+    ["src/tool-server/tools/onboarding.ts", "downloadToFile"],
+    ["src/tool-server/tools/onboarding.ts", "fetchGithubLatestRelease"],
+    ["src/tool-server/tools/onboarding.ts", "Onboarding.runCallable"],
+    ["src/tool-server/tools/programmatic-workflow.ts", "ProgrammaticWorkflow.projectScope"],
+    ["src/tool-server/tools/programmatic-workflow.ts", "ProgrammaticWorkflow.callTriggerCreate"],
+    ["src/tool-server/tools/programmatic-workflow.ts", "ProgrammaticWorkflow.callRunTrigger"],
+    ["src/tool-server/tools/skills.ts", "loadSkillsForToolHost"],
+    ["src/tool-server/tools/skills.ts", "readSkillForToolHost"],
+    ["src/tool-server/tools/ssh.ts", "SSH.callRun"],
+    ["src/tool-server/tools/ssh.ts", "SSH.callProbe"],
+    ["src/tool-server/tools/surface.ts", "surfaceExternalFailure"],
+    ["src/tool-server/tools/surface.ts", "loadLocalAttachments"],
+    ["src/tool-server/tools/surface.ts", "Surface.getCfg"],
+    ["src/tool-server/tools/surface.ts", "Surface.resolveMessageTarget"],
+    ["src/tool-server/tools/surface.ts", "Surface.callActivitiesRecentAgentWrites"],
+    ["src/tool-server/tools/surface.ts", "Surface.callMessagesList"],
+    ["src/tool-server/tools/surface.ts", "Surface.callMessagesRead"],
+    ["src/tool-server/tools/surface.ts", "Surface.callMessagesSearch"],
+    ["src/tool-server/tools/web.ts", "webFailure"],
+  ].map(([module, exportName]) => ({
+    identity: { module: module!, exportName: exportName! },
+    category: "plugin" as const,
+  })),
   {
     identity: { module: "src/tool-server/tools/ssh.ts", exportName: "readStreamText" },
     category: "wire",
@@ -1109,6 +1155,8 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       "decodeJsonText",
       "decodeJsonObject",
       "extractErrorMessage",
+      "isTimeoutCause",
+      "projectBridgeFailure",
     ].map((exportName) => ({
       identity: { module: "client.ts", exportName },
       category: "wire" as const,
@@ -1423,6 +1471,13 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
           exportName: "projectFatalToolCallDefect",
         },
         category: "projection",
+      },
+      {
+        identity: {
+          module: "src/tool-server/create-tool-server.ts",
+          exportName: "normalizeSuccessfulToolValue",
+        },
+        category: "plugin",
       },
       {
         identity: {
@@ -1841,6 +1896,14 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module: "discovery.ts", exportName: "decodePluginPackageJsonText" },
         category: "plugin",
       },
+      {
+        identity: { module: "server-tool-result.ts", exportName: "decodeServerToolResult" },
+        category: "plugin",
+      },
+      ...["transform.<callback@1>@1", "transform.<callback@1>@2"].map((exportName) => ({
+        identity: { module: "server-tool-result.ts", exportName },
+        category: "plugin" as const,
+      })),
     ],
   ],
   [
@@ -2565,23 +2628,6 @@ const OPEN_PROTOCOL_RULE_ZONES = new Map<string, readonly RuleZone[]>([
 ]);
 
 const CORE_TOOL_SERVER_EXCEPTION_ADAPTERS = [
-  ...[
-    [
-      "src/tool-server/tools/programmatic-workflow.ts",
-      "adaptWorkflowJsonProjectionResultToToolHost.err.<callback>",
-      "programmatic workflow tool projection",
-    ],
-  ].map(([module, exportName, externalExportName]) => ({
-    identity: { module, exportName },
-    category: "result-to-framework" as const,
-    externalApi: {
-      package: "@stanley2058/lilac-plugin-runtime",
-      exportName: externalExportName,
-    },
-    direction: "signal-host" as const,
-    reason:
-      "Adapts one typed tool boundary Result to the established rejecting tool host contract.",
-  })),
   {
     identity: {
       module: "src/tool-server/tools/ssh.ts",
@@ -3406,6 +3452,17 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         },
         direction: "capture-external",
         reason: "Maps a safety provider rejection to an owned safety-mode resolution error.",
+      },
+      {
+        identity: {
+          module: "src/tool-server/create-tool-server.ts",
+          exportName: "normalizeSuccessfulToolValue",
+        },
+        category: "external-to-result",
+        externalApi: { package: "global", exportName: "JSON.stringify" },
+        direction: "capture-external",
+        reason:
+          "Normalizes plugin success values through HTTP JSON semantics and maps serialization failure to an opaque defect Result.",
       },
       {
         identity: {
@@ -7185,6 +7242,21 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : [],
     eventDeliveryConsumers: root === "apps/core" ? CORE_EVENT_DELIVERY_CONSUMERS : [],
+    compatibilityOutputs:
+      root === "apps/core"
+        ? [
+            {
+              sink: {
+                kind: "local",
+                module: "src/tool-server/create-tool-server.ts",
+                exportName: "createToolServer.post.<callback@2>@2",
+              },
+              category: "http",
+              reason:
+                "Projects Level-2 Results to the established strict Core tool-server wire envelope.",
+            },
+          ]
+        : [],
     boundaryDecoders: [
       ...(root === "packages/plugin-runtime"
         ? ([
@@ -8116,19 +8188,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               reason:
                 "OAuthClientProvider requires credential failure through its rejection channel.",
             },
-            {
-              identity: {
-                module: "src/tool-server/tools/mcp.ts",
-                exportName: "resultToMcpToolValue.err.<callback>",
-              },
-              category: "result-to-framework",
-              externalApi: {
-                package: "@stanley2058/lilac-plugin-runtime",
-                exportName: "ServerTool",
-              },
-              direction: "signal-host",
-              reason: "ServerTool reports a failed tool call through the host exception channel.",
-            },
           ] satisfies readonly ExceptionAdapter[])
         : []),
       ...(root === "packages/utils"
@@ -8154,8 +8213,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       ...(root === "packages/plugin-runtime"
         ? ([
             ...[
-              ["adaptToolInputResultToServerToolHost", "ServerTool.call input validation"],
-              ["adaptToolInputResultToZodHost", "legacy ServerTool.call Zod validation"],
+              ["adaptToolInputResultToServerToolHost", "parseToolInput"],
+              ["adaptToolInputResultToZodHost", "parseToolInputPreservingZodError"],
             ].map(([exportName, externalExportName]) => ({
               identity: { module: "validation-error-message.ts", exportName },
               category: "result-to-framework" as const,
@@ -8164,33 +8223,17 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 exportName: externalExportName,
               },
               direction: "signal-host" as const,
-              reason:
-                "Adapts one typed tool boundary Result to the established rejecting tool host contract.",
+              reason: "Preserves the explicit compatibility parser's rejecting host contract.",
             })),
             {
               identity: { module: "zod-cli.ts", exportName: "adaptZodCliResultToToolHost" },
-              category: "result-to-framework" as const,
+              category: "result-to-framework",
               externalApi: {
                 package: "@stanley2058/lilac-plugin-runtime",
                 exportName: "ServerTool.list CLI projection",
               },
-              direction: "signal-host" as const,
-              reason:
-                "Adapts invalid Zod CLI projection state to the established rejecting ServerTool list contract.",
-            },
-            {
-              identity: {
-                module: "define-server-tool.ts",
-                exportName: "adaptServerToolDispatchResultToHost",
-              },
-              category: "result-to-framework" as const,
-              externalApi: {
-                package: "@stanley2058/lilac-plugin-runtime",
-                exportName: "ServerTool.call callable dispatch",
-              },
-              direction: "signal-host" as const,
-              reason:
-                "Adapts an unknown callable Result to the established rejecting ServerTool call contract.",
+              direction: "signal-host",
+              reason: "Signals invalid internal CLI projection through the list host contract.",
             },
           ] satisfies readonly ExceptionAdapter[])
         : []),
@@ -8361,10 +8404,33 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               module: "src/surface/bridge/bus-agent-runner.ts",
               exportName: "startBusAgentRunner.handleCmdRequestMessage",
             },
+            ...[
+              ["src/tool-server/tools/attachment.ts", "Attachment.call"],
+              ["src/tool-server/tools/codex.ts", "Codex.call"],
+              ["src/tool-server/tools/content-inspect.ts", "ContentInspect.call"],
+              ["src/tool-server/tools/conversation-thread.ts", "ConversationThread.call"],
+              ["src/tool-server/tools/discovery.ts", "Discovery.call"],
+              ["src/tool-server/tools/generate.ts", "Generate.call"],
+              ["src/tool-server/tools/mcp.ts", "McpManagement.call"],
+              ["src/tool-server/tools/onboarding.ts", "Onboarding.call"],
+              ["src/tool-server/tools/programmatic-workflow.ts", "ProgrammaticWorkflow.call"],
+              ["src/tool-server/tools/skills.ts", "Skills.call"],
+              ["src/tool-server/tools/ssh.ts", "SSH.call"],
+              ["src/tool-server/tools/surface.ts", "Surface.call"],
+              ["src/tool-server/tools/web.ts", "Web.call"],
+            ].map(([module, exportName]) => ({ module: module!, exportName: exportName! })),
           ]
         : []),
       ...(root === "packages/plugin-runtime"
-        ? [{ module: "validation-error-message.ts", exportName: "decodeToolInput" }]
+        ? [
+            { module: "validation-error-message.ts", exportName: "decodeToolInput" },
+            { module: "server-tool-result.ts", exportName: "decodeServerToolResult" },
+            { module: "define-server-tool.ts", exportName: "createCallable.<callback>.invoke" },
+            { module: "define-server-tool.ts", exportName: "lookupServerToolCallable" },
+            { module: "define-server-tool.ts", exportName: "defineServerTool.call" },
+            { module: "hooks.ts", exportName: "invokeLevel2Call" },
+            { module: "types.ts", exportName: "ServerTool.call" },
+          ]
         : []),
       ...(root === "packages/tool-results"
         ? [
@@ -8752,7 +8818,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "4236247508d3c47b3ea82ab63adfe5782f687f3bf89cb359a90a681a2af2030a";
+  "643c5ce059a7413c8bd774bd12cc3ab2fd0ac1693939b2bc45cd7b498ba333d9";
 
 export const architectureManifest = {
   version: 1,

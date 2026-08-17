@@ -16,8 +16,6 @@ export const CORE_REVIEWED_PANIC_IDENTITIES = [
   ["src/workflow/workflow-engine.ts", "WorkflowEngine.claimAndLaunch.catch.<callback@1>"],
   ["src/workflow/workflow-sandbox.ts", "startWorkflowSandbox.respondToHostCall"],
   ["src/workflow/workflow-sandbox.ts", "startWorkflowSandbox.result.<callback>"],
-  ["src/tool-server/tools/surface.ts", "Surface.callActivitiesRecentAgentWrites"],
-  ["src/tool-server/tools/surface.ts", "Surface.callMessagesSearch.map.<callback@1>@3"],
 ] as const;
 
 export const CORE_FATAL_SIGNAL_IDENTITIES = [
@@ -655,7 +653,11 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ["src/tool-server/create-tool-server.ts", "adaptPanicToToolServerHost", "signal"],
     ["src/tool-server/create-tool-server.ts", "adaptResultToHost.err.<callback>", "signal"],
     ["src/tool-server/create-tool-server.ts", "frameworkErrorLogProjection", "capture"],
-    ["src/tool-server/create-tool-server.ts", "isToolInputValidationCause", "capture"],
+    [
+      "src/runtime/create-core-runtime.ts",
+      "createCoreRuntime.start.try.<callback>.runSummarization.err.<callback>",
+      "signal",
+    ],
     [
       "src/tool-server/health-state.ts",
       "createToolServerHealthState.captureActiveLevel1Work",
@@ -669,77 +671,19 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ["src/tool-server/health-state.ts", "createToolServerHealthState.getSnapshot", "both"],
     ["src/tool-server/health-state.ts", "previewReason", "capture"],
     ["src/tool-server/runtime-diagnostics.ts", "readOptional", "capture"],
-    [
-      "src/tool-server/tools/attachment.ts",
-      "adaptAttachmentResultToToolHost.err.<callback>",
-      "signal",
-    ],
-    [
-      "src/tool-server/tools/attachment.ts",
-      "Attachment.callDownload.catch.<callback@1>",
-      "capture",
-    ],
-    ["src/tool-server/tools/codex.ts", "adaptCodexResultToToolHost.err.<callback>", "signal"],
-    ["src/tool-server/tools/content-inspect.ts", "ContentInspect.inspect", "capture"],
-    [
-      "src/tool-server/tools/content-inspect.ts",
-      "adaptContentInspectResultToToolHost.err.<callback>",
-      "signal",
-    ],
     ["src/tool-server/tools/content-inspect.ts", "decodeInspectText", "capture"],
     ["src/tool-server/tools/content-inspect.ts", "looksLikeUtf8Text", "capture"],
     [
       "src/tool-server/tools/content-inspect.ts",
-      "readInspectResponseBytes.catch.<callback@1>",
+      "readInspectResponseBytes.gen.<callback@1>.catch.<callback@1>",
       "capture",
     ],
-    [
-      "src/tool-server/tools/conversation-thread.ts",
-      "adaptConversationThreadResultToToolHost.err.<callback>",
-      "signal",
-    ],
-    ["src/tool-server/tools/generate.ts", "adaptGenerateResultToToolHost.err.<callback>", "signal"],
     ["src/tool-server/tools/generate.ts", "writeFileWithUniqueName", "capture"],
-    ["src/tool-server/tools/onboarding.ts", "Onboarding.runCallable.runStep", "capture"],
-    [
-      "src/tool-server/tools/onboarding.ts",
-      "Onboarding.runCallable.catch.<callback@1>@1",
-      "capture",
-    ],
-    [
-      "src/tool-server/tools/onboarding.ts",
-      "Onboarding.runCallable.catch.<callback@1>@2",
-      "capture",
-    ],
-    [
-      "src/tool-server/tools/onboarding.ts",
-      "adaptOnboardingResultToToolHost.err.<callback>",
-      "signal",
-    ],
     ["src/tool-server/tools/onboarding.ts", "ensureDir0700", "capture"],
     ["src/tool-server/tools/onboarding.ts", "hasAnySkillMdUnder", "capture"],
     ["src/tool-server/tools/onboarding.ts", "isRootUser", "capture"],
     ["src/tool-server/tools/onboarding.ts", "pathExecutable", "capture"],
-    [
-      "src/tool-server/tools/programmatic-workflow.ts",
-      "adaptWorkflowInvocationResultToToolHost.err.<callback>",
-      "signal",
-    ],
-    [
-      "src/tool-server/tools/programmatic-workflow.ts",
-      "ProgrammaticWorkflow.definitions.catch.<callback@1>",
-      "capture",
-    ],
-    [
-      "src/tool-server/tools/programmatic-workflow.ts",
-      "adaptWorkflowToolResultToHost.err.<callback>",
-      "signal",
-    ],
-    ["src/tool-server/tools/skills.ts", "adaptSkillsResultToToolHost.err.<callback>", "signal"],
-    ["src/tool-server/tools/surface.ts", "adaptSurfaceResultToToolHost.err.<callback>", "signal"],
-    ["src/tool-server/tools/surface.ts", "Surface.callActivitiesRecentAgentWrites", "capture"],
     ["src/tool-server/tools/surface.ts", "Surface.linkSentMessageToTranscript", "capture"],
-    ["src/tool-server/tools/web.ts", "Web.callFetch", "capture"],
     ["src/tool-server/tools/web.ts", "Web.callSearch", "capture"],
     ["src/tool-server/tools/web.ts", "Web.extractPageContent", "capture"],
     [
@@ -797,17 +741,7 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
       "createToolServerHealthState.signalWatchdogDefect.queueMicrotask.<callback@1>",
       "signal",
     ],
-    [
-      "src/tool-server/tools/codex.ts",
-      "Codex.runCallable.runPendingTransition.<callback@1>@1.then.<callback@2>",
-      "capture",
-    ],
     ["src/tool-server/tools/onboarding.ts", "scheduleRestart.setTimeout.<callback@1>", "capture"],
-    [
-      "src/tool-server/tools/surface.ts",
-      "Surface.callMessagesSearch.map.<callback@1>@3",
-      "capture",
-    ],
     ["src/tool-server/tools/web-search/shared.ts", "withAbortSignal.<callback>.onAbort", "signal"],
     [
       "src/tool-server/tools/web-search/shared.ts",
