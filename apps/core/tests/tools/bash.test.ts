@@ -1620,6 +1620,125 @@ done`;
     expect(result?.reason).toContain("git reset --hard");
   });
 
+  it("integrates recursive rm and active Git metadata containment", () => {
+    const repositoryRoot = path.resolve(import.meta.dir, "../../../..");
+    const blocked = [
+      "rm -r /",
+      "rm --recurs .",
+      "rm -r ../outside",
+      "rm -r .git",
+      "rmdir .git",
+      "mv .git metadata-backup",
+      "printf corrupt > .git/config",
+      "cp source .git/config",
+      "truncate -s 0 .git/config",
+      "printf corrupt | tee .git/config",
+      "install source .git/hooks/pre-commit",
+      "ln -s source .git/hooks/pre-commit",
+      "dd if=source of=.git/index",
+    ];
+    const allowed = [
+      "rm -r packages",
+      "rm -r /tmp/cache",
+      'rm -r "$target"',
+      "cat .git/config",
+      "cp .git/config backup",
+      "truncate -s 0 output",
+      "printf ok | tee output",
+      "install source output",
+      "ln -s source output",
+      "dd if=source of=output",
+    ];
+
+    for (const command of blocked) {
+      expect(analyzeBashCommand(command, { cwd: repositoryRoot }), command).not.toBeNull();
+    }
+    for (const command of allowed) {
+      expect(analyzeBashCommand(command, { cwd: repositoryRoot }), command).toBeNull();
+    }
+  });
+
+  it("integrates device, Git grammar, and wrapper safety passes", () => {
+    const blocked = [
+      "dd if=/dev/zero of=/dev/sda",
+      "mkfs.ext4 /dev/sda1",
+      "shred important.bin",
+      "git checkout -fq main",
+      "git switch --disc main",
+      "git push --mir origin",
+      "git push -d origin old",
+      "git push origin :old",
+      "git push origin +main:main",
+      "git push --force --force-with-lease origin main",
+      "git branch -df old",
+      "git branch --forc old",
+      "git tag --del v1",
+      "git reflog delete HEAD@{0}",
+      "git worktree remove -fv ../old-tree",
+      "watch -n 2 git reset --hard",
+      "watch -q 3 git reset --hard",
+      "watch --equexit=3 git reset --hard",
+      "watch --shotsdir /tmp git reset --hard",
+      "watch --inter 2 git reset --hard",
+      "watch --equ=3 git reset --hard",
+      "watch --shot=/tmp git reset --hard",
+      "bash -c -- 'git reset --hard'",
+    ];
+    const allowed = [
+      "dd if=/dev/zero of=disk.img",
+      "mkfs.ext4 disk.img",
+      'shred "$target"',
+      "git checkout main",
+      "git switch main",
+      "git push --force-with-lease origin main",
+      "git push origin main:main",
+      'git push origin "+$refspec"',
+      "git branch -d merged",
+      "git tag --list",
+      "git reflog show",
+      "git worktree remove ../clean-tree",
+      "watch git status",
+      "watch -q3 git status",
+      "watch --shotsdir=/tmp git status",
+      "watch --inter=2 git status",
+      "watch --equ 3 git status",
+      "watch --shot /tmp git status",
+      "bash -c -- 'git status'",
+    ];
+
+    for (const command of blocked) expect(analyzeBashCommand(command), command).not.toBeNull();
+    for (const command of allowed) expect(analyzeBashCommand(command), command).toBeNull();
+  });
+
+  it("integrates malformed static fallback without broadening dynamic operands", () => {
+    const options = { cwd: "/tmp/lilac-project" };
+    const blocked = [
+      "rm -r ../outside &&",
+      "dd if=/dev/zero of=/dev/sda &&",
+      "mkfs.xfs /dev/sda1 &&",
+      "shred important.bin &&",
+      "git push origin :old &&",
+      "git push -d origin old &&",
+      "git push origin +main:main &&",
+    ];
+    const allowed = [
+      "rm -r build &&",
+      'rm -r "$target" &&',
+      'dd if=/dev/zero of="$target" &&',
+      'shred "$target" &&',
+      "git push --force-with-lease origin main &&",
+      "git push origin main:main &&",
+      'git push origin "+$refspec" &&',
+    ];
+
+    for (const command of blocked) {
+      expect(analyzeBashCommand(command, options), command).not.toBeNull();
+    }
+    for (const command of allowed) {
+      expect(analyzeBashCommand(command, options), command).toBeNull();
+    }
+  });
+
   it("blocks rm -rf against root", () => {
     const result = analyzeBashCommand("rm -rf /");
     expect(result).not.toBeNull();

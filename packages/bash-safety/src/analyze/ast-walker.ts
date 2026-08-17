@@ -3,6 +3,7 @@ import { isAbsolute, resolve } from "node:path";
 
 import type { AnalyzeOptions, AnalyzeResult } from "../types";
 import { MAX_RECURSION_DEPTH, SHELL_WRAPPERS } from "../types";
+import { analyzeGitMetadataOutputPath } from "../rules-filesystem";
 import {
   ARITHMETIC_EXPANSION_MARKER,
   BRACE_EXPANSION_MARKER,
@@ -76,6 +77,7 @@ const REDIRECTION_OPERATORS = new Set([
   "<<",
   "<<-",
 ]);
+const OUTPUT_REDIRECTION_OPERATORS = new Set([">", ">>", ">&", "<>", ">|", "&>", "&>>"]);
 
 export function analyzeScript(
   script: ScriptNode,
@@ -790,6 +792,9 @@ function analyzeRedirections(
 
     if (redirection.operator !== "<<<") {
       const reason =
+        (OUTPUT_REDIRECTION_OPERATORS.has(redirection.operator)
+          ? analyzeGitMetadataOutputPath(analyzed.value.text, state.cwd)
+          : null) ??
         analyzeSensitiveTokens([analyzed.value.text]) ??
         analyzeProtectedPathTokens([analyzed.value.text], {
           cwd: context.originalCwd,

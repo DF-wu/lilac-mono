@@ -365,6 +365,7 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
     "packages/bash-safety",
     [
       { module: "src/analyze/analyze-command.ts", exportName: "parseBashCommand" },
+      { module: "src/rules-filesystem.ts", exportName: "readGitMetadataFile" },
       { module: "src/rules-rm.ts", exportName: "resolveRmPaths" },
     ],
   ],
@@ -2811,6 +2812,13 @@ export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly Exc
         "just-bash",
         "parse",
         "Maps parser exceptions to BashCommandParseFailed.",
+      ],
+      [
+        "src/rules-filesystem.ts",
+        "readGitMetadataFile.catch",
+        "node:fs",
+        "readFileSync",
+        "Maps Git metadata file read exceptions to GitMetadataReadFailed.",
       ],
       [
         "src/rules-rm.ts",
@@ -8744,7 +8752,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "c8fb58d1fe9c5b9314b7c8feaceacf12d8322d3a940415e56c55d38b07e04334";
+  "4236247508d3c47b3ea82ab63adfe5782f687f3bf89cb359a90a681a2af2030a";
 
 export const architectureManifest = {
   version: 1,

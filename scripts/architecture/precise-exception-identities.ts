@@ -931,6 +931,7 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
   ],
   "packages/bash-safety": [
     ["src/analyze/analyze-command.ts", "parseBashCommand.catch", "both"],
+    ["src/rules-filesystem.ts", "readGitMetadataFile.catch", "both"],
     ["src/rules-rm.ts", "resolveRmPaths.catch", "both"],
   ],
   "packages/claude-code-bridge": [
@@ -1441,6 +1442,7 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
     ["model-capability.ts", "ModelCapability.resolve", "signal"],
     ["model-capability.ts", "parseModelSpecifier", "signal"],
     ["model-provider.ts", "createCodexOAuthProvider.<callback>", "signal"],
+    ["model-provider.ts", "createCodexOAuthProvider.<callback>.refreshIfNeeded", "signal"],
     [
       "model-provider.ts",
       "createCodexOAuthProvider.<callback>.refreshIfNeeded.<callback>",
@@ -1463,6 +1465,11 @@ export const PRECISE_EXCEPTION_IDENTITIES: Readonly<
       "openai-responses-websocket-fetch.ts",
       "createOpenAIResponsesWebSocketFetch.connectWebSocket.<callback>.onError",
       "capture",
+    ],
+    [
+      "openai-responses-websocket-fetch.ts",
+      "createOpenAIResponsesWebSocketFetch.connectWebSocket.<callback>.rejectConnection",
+      "signal",
     ],
     [
       "openai-responses-websocket-fetch.ts",
