@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import type { ServerToolFailure } from "@stanley2058/lilac-plugin-runtime";
+
 const PrimaryPositionalSchema = z.object({
   field: z.string(),
   variadic: z.boolean().optional(),
@@ -52,7 +54,26 @@ export const BridgeFnRequest = z.object({
   input: z.record(z.string(), z.unknown()),
 });
 
-export const BridgeFnResponse = z.object({
-  isError: z.boolean(),
-  output: z.unknown(),
-});
+const ServerToolFailureSchema: z.ZodType<ServerToolFailure> = z
+  .object({
+    kind: z.enum([
+      "usage",
+      "denied",
+      "not_found",
+      "conflict",
+      "unavailable",
+      "timeout",
+      "cancelled",
+      "internal",
+    ]),
+    code: z.string().min(1),
+    message: z.string(),
+    retryable: z.boolean(),
+    details: z.json().optional(),
+  })
+  .strict();
+
+export const BridgeFnResponse = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("ok"), value: z.json() }).strict(),
+  z.object({ status: z.literal("error"), error: ServerToolFailureSchema }).strict(),
+]);

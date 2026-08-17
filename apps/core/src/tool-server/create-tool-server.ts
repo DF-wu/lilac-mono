@@ -1,7 +1,6 @@
 import Elysia, { NotFoundError } from "elysia";
 import {
   createLogger,
-  extractAiErrorLogDetails,
   formatTaggedErrorForLog,
   getBuildInfo,
   isPanic,
@@ -20,9 +19,12 @@ import {
   isPluginPanic,
   opaquePluginExceptionMessage,
   safePluginExceptionCause,
+  serverToolFailure,
   type Level2ContributionInfo,
   type ServerToolCapabilitySnapshot,
+  type ServerToolFailure,
   type ServerToolListResult,
+  type ServerToolResult,
   type ToolPluginCleanupError,
   type ToolPluginCapabilityError,
   type ToolPluginInvocationError,
@@ -55,7 +57,6 @@ import type { RequestContext, ServerTool } from "./types";
 import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../surface/types";
 import { resolveAuthenticatedRequestSafetyMode } from "../surface/builtin-surface-protocols";
 import type { AuthenticatedRequestOrigin } from "./request-message-cache";
-import { ToolInputValidationError } from "./validation-error-message";
 
 type ToolPluginManagerLike = {
   init(): Promise<Result<void, ToolPluginManagerError>>;
@@ -98,7 +99,7 @@ type AuthenticatedToolRequest = {
 const toolJsonValueSchema: z.ZodType<ToolJsonValue> = z.lazy(() =>
   z.union([
     z.string(),
-    z.number(),
+    z.number().finite(),
     z.boolean(),
     z.null(),
     z.array(toolJsonValueSchema),
@@ -187,28 +188,6 @@ function safeToolInputPreview(callableId: string, input: ToolJsonObject): string
   if (callableId === "mcp.add") return "<redacted mcp.add input>";
   if (callableId.startsWith("workflow.")) return "<redacted workflow input>";
   return safeJsonPreview(input);
-}
-
-function toolCallErrorOutput(callableId: string, error: Error | string): string {
-  if (callableId === "mcp.add") {
-    return error instanceof ToolInputValidationError ||
-      (error instanceof Error && error.name === "ToolInputValidationError")
-      ? "mcp.add input validation failed"
-      : "mcp.add failed without exposing sensitive configuration";
-  }
-  if (error instanceof Error) return error.message;
-  return error;
-}
-
-function isToolInputValidationCause<TValue>(value: TValue): boolean {
-  try {
-    return (
-      value instanceof ToolInputValidationError ||
-      (value instanceof Error && value.name === "ToolInputValidationError")
-    );
-  } catch {
-    return false;
-  }
 }
 
 function frameworkErrorLogProjection<TError>(error: TError): Readonly<Record<string, string>> {
@@ -302,22 +281,6 @@ function authenticateRequestContext(
 }
 
 type SafetyMode = "trusted" | "restricted";
-
-type ToolCallSuccess = {
-  toResponse(): { readonly isError: false; readonly output: unknown };
-};
-
-function projectToolCallSuccess<TOutput>(output: TOutput): ToolCallSuccess {
-  return {
-    toResponse: () => ({ isError: false, output }),
-  };
-}
-
-function projectToolCallSuccessResult<TOutput>(
-  output: TOutput,
-): () => ResultType<ToolCallSuccess, Error> {
-  return () => Result.ok(projectToolCallSuccess(output));
-}
 
 const RESTRICTED_LEVEL2_ALLOWED = new Set([
   "fetch",
@@ -458,12 +421,6 @@ function adaptToolRequestHeadersResultToElysia(
   return adaptResultToHost(result, (error) => new Error(error.message));
 }
 
-function adaptToolPayloadResultToElysia(
-  result: ResultType<ToolJsonObject, ToolPayloadInvalid>,
-): ToolJsonObject {
-  return adaptResultToHost(result, (error) => new Error(error.message));
-}
-
 function adaptSafetyModeResultToElysia(
   result: ResultType<SafetyMode, ToolSafetyModeResolutionError>,
 ): SafetyMode {
@@ -531,9 +488,43 @@ function countLoadedExternalPlugins(statuses: readonly ToolPluginStatus[] | unde
     .length;
 }
 
-function projectFatalToolCallDefect(reason: unknown): FatalToolCallDefect {
+const TOOL_CALL_OUTPUT_CONTRACT_DEFECT_MESSAGE =
+  "Plugin tool output violated the JSON wire contract";
+
+function projectFatalToolCallDefect(reason: unknown, opaque = false): FatalToolCallDefect {
   if (isPluginPanic(reason)) return reason;
+  if (opaque) return new Error(TOOL_CALL_OUTPUT_CONTRACT_DEFECT_MESSAGE);
   return safePluginExceptionCause(reason);
+}
+
+export function normalizeSuccessfulToolValue(
+  value: unknown,
+): ResultType<ToolJsonValue, FatalToolCallDefect> {
+  let containsNonFiniteNumber = false;
+  const normalized = Result.try({
+    try: () => {
+      const serialized = JSON.stringify(value, (_key, nested: unknown) => {
+        if (typeof nested === "number" && !Number.isFinite(nested)) {
+          containsNonFiniteNumber = true;
+        }
+        return nested;
+      });
+      if (serialized === undefined || containsNonFiniteNumber) {
+        return { kind: "invalid" as const };
+      }
+      const parsed: unknown = JSON.parse(serialized);
+      const decoded = toolJsonValueSchema.safeParse(parsed);
+      return decoded.success
+        ? { kind: "valid" as const, value: decoded.data }
+        : { kind: "invalid" as const };
+    },
+    catch: (cause) => projectFatalToolCallDefect(cause, true),
+  });
+  return normalized.andThen((outcome) =>
+    outcome.kind === "valid"
+      ? Result.ok(outcome.value)
+      : Result.err(projectFatalToolCallDefect(undefined, true)),
+  );
 }
 
 function signalFatalToolCallDefectToProcess(defect: FatalToolCallDefect): void {
@@ -583,6 +574,8 @@ export function createToolServer(options: ToolServerOptions) {
 
   const staticTools = options.tools ?? [];
   const serverStartedAt = Date.now();
+  const reportFatalToolCallDefect =
+    options.reportFatalToolCallDefect ?? signalFatalToolCallDefectToProcess;
 
   let callMapping = new Map<string, ServerTool>();
   let level2ContributionMapping = new Map<string, Level2ContributionInfo>();
@@ -592,7 +585,7 @@ export function createToolServer(options: ToolServerOptions) {
     externalHealthProvider: options.healthProvider,
     activeLevel1WorkProvider: options.activeLevel1WorkProvider,
     onUnhealthy: options.onUnhealthy,
-    reportFatalDefect: options.reportFatalToolCallDefect ?? signalFatalToolCallDefectToProcess,
+    reportFatalDefect: reportFatalToolCallDefect,
     ...options.healthConfig,
   });
 
@@ -605,18 +598,6 @@ export function createToolServer(options: ToolServerOptions) {
       "tool plugin operation failed",
       toolServerTaggedErrorLogProjection(error, { operation, ...context }),
     );
-  }
-
-  function pluginCallCompatibilityError(
-    error: ToolPluginInvocationError | ToolPluginCapabilityError,
-  ): Error {
-    if (error._tag !== "ToolPluginHookError") {
-      return new Error(formatTaggedErrorForLog(error).errorMessage);
-    }
-    const compatibilityError = new Error(opaquePluginExceptionMessage(error.cause));
-    if (isToolInputValidationCause(error.cause))
-      compatibilityError.name = "ToolInputValidationError";
-    return compatibilityError;
   }
 
   async function requirePluginLifecycle(
@@ -1205,16 +1186,98 @@ export function createToolServer(options: ToolServerOptions) {
       await ensureFreshToolMapping();
       const startedAt = Date.now();
 
-      const tool = adaptToolRouteResultToElysia(lookupTool(body.callableId));
+      const toolResult = lookupTool(body.callableId);
+      const tool = toolResult.match({ ok: (value) => value, err: () => null });
+      if (!tool) {
+        return {
+          status: "error" as const,
+          error: serverToolFailure({
+            kind: "not_found",
+            code: "unknown_callable",
+            message: `Unknown callable ID '${body.callableId}'`,
+            retryable: false,
+          }),
+        };
+      }
 
-      const decodedHeaders = adaptToolRequestHeadersResultToElysia(
-        decodeToolRequestHeaders(headers),
-      );
-      const { context: ctx, messages } = adaptToolAuthenticationResultToElysia(
-        await authenticateContext(decodedHeaders),
-      );
-      const input = adaptToolPayloadResultToElysia(decodeToolPayload(body.input));
-      const safetyMode = resolveSafetyModeFailClosed(await resolveSafetyMode(ctx));
+      const decodedHeaders = decodeToolRequestHeaders(headers);
+      const headerError = decodedHeaders.match({ ok: () => null, err: (error) => error });
+      if (headerError) {
+        return {
+          status: "error" as const,
+          error: serverToolFailure({
+            kind: "usage",
+            code: "invalid_headers",
+            message: headerError.message,
+            retryable: false,
+          }),
+        };
+      }
+      const decodedHeaderValues = decodedHeaders.match({ ok: (value) => value, err: () => null });
+      const authenticated = await authenticateContext(decodedHeaderValues ?? {});
+      const authenticationError = authenticated.match({ ok: () => null, err: (error) => error });
+      if (authenticationError) {
+        return {
+          status: "error" as const,
+          error: serverToolFailure({
+            kind: "denied",
+            code: "authentication_failed",
+            message: authenticationError.message,
+            retryable: false,
+          }),
+        };
+      }
+      const authenticatedRequest = authenticated.match({ ok: (value) => value, err: () => null });
+      const { context: ctx, messages } = authenticatedRequest ?? {
+        context: {},
+        messages: undefined,
+      };
+      const decodedInput = decodeToolPayload(body.input);
+      const inputError = decodedInput.match({ ok: () => null, err: (error) => error });
+      if (inputError) {
+        return {
+          status: "error" as const,
+          error: serverToolFailure({
+            kind: "usage",
+            code: "invalid_input",
+            message: inputError.message,
+            retryable: false,
+          }),
+        };
+      }
+      const input = decodedInput.match({ ok: (value) => value, err: () => null }) ?? {};
+      const safetyModeResult = await resolveSafetyMode(ctx);
+      const safetyModeOutcome = safetyModeResult.match<
+        { readonly safetyMode: SafetyMode } | { readonly error: ToolSafetyModeResolutionError }
+      >({
+        ok: (value) => ({ safetyMode: value }),
+        err: (error) => ({ error }),
+      });
+      let safetyMode: SafetyMode;
+      if ("error" in safetyModeOutcome) {
+        if (safetyModeOutcome.error.source === "server-provider") {
+          logger.error(
+            "failed to resolve tool request safety mode",
+            toolServerTaggedErrorLogProjection(safetyModeOutcome.error),
+          );
+          return {
+            status: "error" as const,
+            error: serverToolFailure({
+              kind: "internal",
+              code: "safety_mode_resolution_failed",
+              message: "Internal tool server failure",
+              retryable: false,
+            }),
+          };
+        }
+        logger.warn(
+          "failed to resolve tool request safety mode",
+          toolServerTaggedErrorLogProjection(safetyModeOutcome.error),
+        );
+        safetyMode = "restricted";
+      } else {
+        safetyMode = safetyModeOutcome.safetyMode;
+      }
       ctx.safetyMode = safetyMode;
       if (
         ctx.controlPolicy?.kind === "heartbeat" &&
@@ -1223,20 +1286,35 @@ export function createToolServer(options: ToolServerOptions) {
         ["paths", "filenames", "mimeTypes"].some((key) => input[key] !== undefined)
       ) {
         return {
-          isError: true,
-          output: "Heartbeat surface messages are text-only and cannot include attachments",
+          status: "error" as const,
+          error: serverToolFailure({
+            kind: "denied",
+            code: "heartbeat_attachments_denied",
+            message: "Heartbeat surface messages are text-only and cannot include attachments",
+            retryable: false,
+          }),
         };
       }
       if (!isCallableAllowedForControlCapability(body.callableId, ctx)) {
         return {
-          isError: true,
-          output: `Tool '${body.callableId}' is outside the internal request capability`,
+          status: "error" as const,
+          error: serverToolFailure({
+            kind: "denied",
+            code: "capability_denied",
+            message: `Tool '${body.callableId}' is outside the internal request capability`,
+            retryable: false,
+          }),
         };
       }
       if (!(await isCallableAllowedForNativeProfile(body.callableId, ctx))) {
         return {
-          isError: true,
-          output: `Tool '${body.callableId}' is not enabled for this subagent profile`,
+          status: "error" as const,
+          error: serverToolFailure({
+            kind: "denied",
+            code: "profile_denied",
+            message: `Tool '${body.callableId}' is not enabled for this subagent profile`,
+            retryable: false,
+          }),
         };
       }
       if (
@@ -1244,8 +1322,13 @@ export function createToolServer(options: ToolServerOptions) {
         !isRestrictedCallableAllowed({ callableId: body.callableId, input, ctx })
       ) {
         return {
-          isError: true,
-          output: `Tool '${body.callableId}' is not allowed in restricted public-session mode`,
+          status: "error" as const,
+          error: serverToolFailure({
+            kind: "denied",
+            code: "restricted_mode_denied",
+            message: `Tool '${body.callableId}' is not allowed in restricted public-session mode`,
+            retryable: false,
+          }),
         };
       }
       const inputBytes = estimateJsonBytes(input);
@@ -1277,7 +1360,22 @@ export function createToolServer(options: ToolServerOptions) {
         input: safeToolInputPreview(body.callableId, input),
       });
 
-      const toolErrorResponse = (error: Error) => {
+      const toolFailureResponse = (failure: ServerToolFailure) => {
+        const safeFailure =
+          body.callableId === "mcp.add"
+            ? serverToolFailure({
+                kind: failure.kind,
+                code:
+                  failure.kind === "usage" && failure.code === "invalid_input"
+                    ? "invalid_input"
+                    : "mcp_add_failed",
+                message:
+                  failure.kind === "usage" && failure.code === "invalid_input"
+                    ? "mcp.add input validation failed"
+                    : "mcp.add failed without exposing sensitive configuration",
+                retryable: failure.retryable,
+              })
+            : failure;
         const errorLogDetails = {
           callableId: body.callableId,
           requestId: ctx.requestId,
@@ -1287,31 +1385,28 @@ export function createToolServer(options: ToolServerOptions) {
           durationMs: Date.now() - startedAt,
           timeoutMs,
           ok: false,
-          errorClass: error.name,
+          errorKind: safeFailure.kind,
+          errorCode: safeFailure.code,
           cancelled: combinedSignal.aborted,
         };
         if (body.callableId === "mcp.add") {
-          // mcp.add accepts arbitrary credential-bearing strings. Do not inspect or serialize
-          // unexpected failures because providers may echo partial command-line values.
           logger.error("tool.call.result", {
             ...errorLogDetails,
-            errorClass: error.name === "ToolInputValidationError" ? error.name : "McpAddError",
           });
         } else {
-          logger.error(
-            "tool.call.result",
-            {
-              ...errorLogDetails,
-              ...extractAiErrorLogDetails(error),
-            },
-            error,
-          );
+          logger.error("tool.call.result", errorLogDetails);
         }
         return {
-          isError: true,
-          output: toolCallErrorOutput(body.callableId, error),
+          status: "error" as const,
+          error: safeFailure,
         };
       };
+      const internalPluginCallFailure = serverToolFailure({
+        kind: "internal",
+        code: "plugin_call_failed",
+        message: "Internal tool server failure",
+        retryable: false,
+      });
 
       if (!ctx.operator && (!ctx.requestId || !ctx.sessionId || !ctx.requestClient)) {
         logger.warn("tool.call.context_missing", {
@@ -1344,16 +1439,26 @@ export function createToolServer(options: ToolServerOptions) {
           }),
         )
         .then((output) => {
-          return output.match<() => ResultType<ToolCallSuccess, Error>>({
-            ok: projectToolCallSuccessResult,
+          return output.match<() => ServerToolResult>({
+            ok: (result) => () => result,
             err: (error) => () => {
+              if (error._tag === "ToolPluginHookError") {
+                reportFatalToolCallDefect(safePluginExceptionCause(error.cause));
+              }
               if (body.callableId !== "mcp.add") {
                 logPluginError("level2.call", error, {
                   toolId: capturedToolId,
                   callableId: body.callableId,
                 });
+              } else {
+                logger.error("tool plugin operation failed", {
+                  operation: "level2.call",
+                  toolId: capturedToolId,
+                  callableId: body.callableId,
+                  errorTag: formatTaggedErrorForLog(error).errorTag,
+                });
               }
-              return Result.err(pluginCallCompatibilityError(error));
+              return Result.err(internalPluginCallFailure);
             },
           })();
         })
@@ -1368,7 +1473,7 @@ export function createToolServer(options: ToolServerOptions) {
       superviseToolCallRejections({
         didTimeout: () => toolCallTimedOut,
         promise: callResult,
-        report: options.reportFatalToolCallDefect ?? signalFatalToolCallDefectToProcess,
+        report: reportFatalToolCallDefect,
       });
 
       const timeoutResult = new Promise<"timeout">((resolve) => {
@@ -1403,31 +1508,52 @@ export function createToolServer(options: ToolServerOptions) {
           timedOut: true,
         });
         return {
-          isError: true,
-          output: `Tool call timed out after ${timeoutMs}ms`,
+          status: "error" as const,
+          error: serverToolFailure({
+            kind: "timeout",
+            code: "tool_timeout",
+            message: `Tool call timed out after ${timeoutMs}ms`,
+            retryable: true,
+          }),
         };
       }
 
-      const completed: ResultType<ToolCallSuccess, Error> = result;
-      return completed.match<
-        () => ReturnType<ToolCallSuccess["toResponse"]> | ReturnType<typeof toolErrorResponse>
+      const completed: ServerToolResult = result;
+      const completedOutcome = completed.match<
+        | { readonly kind: "success"; readonly value: unknown }
+        | { readonly kind: "failure"; readonly failure: ServerToolFailure }
       >({
-        ok: (success) => () => {
-          logger.info("tool.call.result", {
-            callableId: body.callableId,
-            requestId: ctx.requestId,
-            sessionId: ctx.sessionId,
-            requestClient: ctx.requestClient,
-            hasMessagesContext: Array.isArray(messages) && messages.length > 0,
-            inputBytes,
-            durationMs: Date.now() - startedAt,
-            timeoutMs,
-            ok: true,
-          });
-          return success.toResponse();
-        },
-        err: (error) => () => toolErrorResponse(error),
-      })();
+        ok: (value) => ({ kind: "success", value }),
+        err: (failure) => ({ kind: "failure", failure }),
+      });
+      if (completedOutcome.kind === "failure") {
+        return toolFailureResponse(completedOutcome.failure);
+      }
+      const normalizedValue = normalizeSuccessfulToolValue(completedOutcome.value);
+      const outputDefect = normalizedValue.match({ ok: () => null, err: (error) => error });
+      if (outputDefect) {
+        reportFatalToolCallDefect(outputDefect);
+        logger.error("tool plugin operation failed", {
+          operation: "level2.call",
+          toolId: capturedToolId,
+          callableId: body.callableId,
+          errorTag: "ToolPluginCapabilityError",
+        });
+        return toolFailureResponse(internalPluginCallFailure);
+      }
+      const outputValue = normalizedValue.match({ ok: (value) => value, err: () => null });
+      logger.info("tool.call.result", {
+        callableId: body.callableId,
+        requestId: ctx.requestId,
+        sessionId: ctx.sessionId,
+        requestClient: ctx.requestClient,
+        hasMessagesContext: Array.isArray(messages) && messages.length > 0,
+        inputBytes,
+        durationMs: Date.now() - startedAt,
+        timeoutMs,
+        ok: true,
+      });
+      return { status: "ok" as const, value: outputValue };
     },
     {
       body: BridgeFnRequest,
