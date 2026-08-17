@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { Panic, TaggedError } from "better-result";
+import { Ok, Panic, Result, TaggedError } from "better-result";
 
 import {
   decodeLevel1ExecutableMetadata,
@@ -292,7 +292,9 @@ describe("plugin hook adapters", () => {
       get list(): ServerTool["list"] {
         throw hostile;
       },
-      async call() {},
+      async call() {
+        return Result.ok();
+      },
     };
     const decoded = decodeServerTool("hooks", hostileGetter);
     expect(decoded.status).toBe("error");
@@ -306,7 +308,9 @@ describe("plugin hook adapters", () => {
       async list() {
         throw hostile;
       },
-      async call() {},
+      async call() {
+        return Result.ok();
+      },
     };
     const listed = await invokeLevel2List({ ...context, tool: throwingList });
     expect(listed.status).toBe("error");
@@ -331,10 +335,170 @@ describe("plugin hook adapters", () => {
       async list() {
         return hostileList;
       },
-      async call() {},
+      async call() {
+        return Result.ok();
+      },
     };
 
     await expect(invokeLevel2List({ ...context, tool })).rejects.toBe(panic);
+  });
+
+  it("keeps semantic Level 2 failures inside outer invocation success", async () => {
+    const failure = Result.err({
+      kind: "unavailable" as const,
+      code: "backend_offline",
+      message: "Backend is offline",
+      retryable: true,
+      details: { region: "west", attempts: [1, 2] },
+    });
+    const tool: ServerTool = {
+      id: "semantic-failure",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [];
+      },
+      async call() {
+        return failure;
+      },
+    };
+
+    const invoked = await invokeLevel2Call({
+      ...context,
+      tool,
+      callableId: "semantic-failure.call",
+      input: {},
+    });
+    expect(invoked.status).toBe("ok");
+    if (invoked.status === "error") throw new Error(invoked.error.message);
+    expect(invoked.value.status).toBe("error");
+    if (invoked.value.status === "ok") throw new Error("expected semantic tool failure");
+    expect(invoked.value.error).toEqual(failure.error);
+    expect(invoked.value).not.toBe(failure);
+  });
+
+  it("reconstructs a genuine Result with a non-instance prototype", async () => {
+    const local = Result.ok({ source: "alternate-copy" });
+    const alternatePrototype = Object.create(null);
+    Object.defineProperties(
+      alternatePrototype,
+      Object.getOwnPropertyDescriptors(Object.getPrototypeOf(local)),
+    );
+    const alternate = Object.create(alternatePrototype);
+    Object.defineProperties(alternate, Object.getOwnPropertyDescriptors(local));
+    expect(alternate).not.toBeInstanceOf(Ok);
+
+    const tool = {
+      id: "alternate-result",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [];
+      },
+      async call() {
+        return alternate;
+      },
+    } as ServerTool;
+    const invoked = await invokeLevel2Call({
+      ...context,
+      tool,
+      callableId: "alternate-result.call",
+      input: {},
+    });
+
+    expect(invoked.status).toBe("ok");
+    if (invoked.status === "error") throw new Error(invoked.error.message);
+    expect(invoked.value).toEqual(Result.ok({ source: "alternate-copy" }));
+    expect(invoked.value).not.toBe(alternate);
+    expect(invoked.value).toBeInstanceOf(Ok);
+  });
+
+  it("rejects legacy raw values and malformed inner failures as contract errors", async () => {
+    const toolWithCall = (call: (...args: unknown[]) => unknown): ServerTool =>
+      ({
+        id: "invalid-result",
+        async init() {},
+        async destroy() {},
+        async list() {
+          return [];
+        },
+        call,
+      }) as unknown as ServerTool;
+
+    const raw = await invokeLevel2Call({
+      ...context,
+      tool: toolWithCall(async () => ({ legacy: true })),
+      callableId: "invalid-result.raw",
+      input: {},
+    });
+    expect(raw.status).toBe("error");
+    if (raw.status === "ok") throw new Error("expected raw result contract failure");
+    expect(raw.error._tag).toBe("ToolPluginCapabilityError");
+    expect(raw.error).toHaveProperty("capability", "hook_result");
+
+    const rawEnvelope = await invokeLevel2Call({
+      ...context,
+      tool: toolWithCall(async () => ({ status: "ok", value: { legacy: true } })),
+      callableId: "invalid-result.envelope",
+      input: {},
+    });
+    expect(rawEnvelope.status).toBe("error");
+    if (rawEnvelope.status === "ok") throw new Error("expected raw envelope contract failure");
+    expect(rawEnvelope.error._tag).toBe("ToolPluginCapabilityError");
+
+    const malformed = await invokeLevel2Call({
+      ...context,
+      tool: toolWithCall(async () =>
+        Result.err({
+          kind: "retry_later",
+          code: "bad_kind",
+          message: "Malformed",
+          retryable: "yes",
+          details: { invalid: undefined },
+        }),
+      ),
+      callableId: "invalid-result.failure",
+      input: {},
+    });
+    expect(malformed.status).toBe("error");
+    if (malformed.status === "ok") throw new Error("expected malformed failure contract error");
+    expect(malformed.error._tag).toBe("ToolPluginCapabilityError");
+
+    const emptyCode = await invokeLevel2Call({
+      ...context,
+      tool: toolWithCall(async () =>
+        Result.err({
+          kind: "internal",
+          code: "",
+          message: "Missing code",
+          retryable: false,
+        }),
+      ),
+      callableId: "invalid-result.empty-code",
+      input: {},
+    });
+    expect(emptyCode.status).toBe("error");
+    if (emptyCode.status === "ok") throw new Error("expected empty code contract error");
+    expect(emptyCode.error._tag).toBe("ToolPluginCapabilityError");
+  });
+
+  it("preserves Panic identity from Level 2 calls", async () => {
+    const panic = new Panic({ message: "call invariant" });
+    const tool: ServerTool = {
+      id: "panic-call",
+      async init() {},
+      async destroy() {},
+      async list() {
+        return [];
+      },
+      async call() {
+        throw panic;
+      },
+    };
+
+    await expect(
+      invokeLevel2Call({ ...context, tool, callableId: "panic-call.call", input: {} }),
+    ).rejects.toBe(panic);
   });
 
   it("propagates Panic from external hooks", () => {

@@ -1,4 +1,5 @@
 import type { ToolSet } from "ai";
+import type { Result } from "better-result";
 
 export type PluginSource = "builtin" | "external";
 
@@ -41,6 +42,49 @@ export type ServerToolHelpEntry = {
 
 export type ServerToolListResult = ServerToolHelpEntry[];
 
+export type ServerToolFailureKind =
+  | "usage"
+  | "denied"
+  | "not_found"
+  | "conflict"
+  | "unavailable"
+  | "timeout"
+  | "cancelled"
+  | "internal";
+
+export type ServerToolJsonValue =
+  | null
+  | string
+  | number
+  | boolean
+  | readonly ServerToolJsonValue[]
+  | { readonly [key: string]: ServerToolJsonValue };
+
+export type ServerToolFailure = {
+  readonly kind: ServerToolFailureKind;
+  readonly code: string;
+  readonly message: string;
+  readonly retryable: boolean;
+  readonly details?: ServerToolJsonValue;
+};
+
+export type ServerToolResult<T = unknown> = Result<T, ServerToolFailure>;
+
+export function serverToolFailure(failure: ServerToolFailure): ServerToolFailure {
+  return failure;
+}
+
+export const serverToolExitCode = {
+  internal: 1,
+  usage: 2,
+  denied: 3,
+  not_found: 4,
+  conflict: 5,
+  unavailable: 6,
+  timeout: 7,
+  cancelled: 8,
+} as const satisfies Readonly<Record<ServerToolFailureKind, number>>;
+
 export type ServerToolCallOptions<P extends string = string> = {
   signal?: AbortSignal;
   context?: RequestContext<P>;
@@ -57,7 +101,7 @@ export interface ServerTool<P extends string = string> {
     callableId: string,
     input: Record<string, unknown>,
     opts?: ServerToolCallOptions<P>,
-  ): Promise<unknown>;
+  ): Promise<ServerToolResult>;
 }
 
 export type Level1RunProfile = "primary" | "explore" | "general" | "self";
