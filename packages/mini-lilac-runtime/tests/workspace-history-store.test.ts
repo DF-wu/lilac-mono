@@ -486,18 +486,54 @@ describe("WorkspaceHistoryStore", () => {
     expect(await readFile(path.join(external, "child.txt"), "utf8")).toBe("outside\n");
   });
 
-  it("restores add, modify, delete, binary, executable, symlink, and type transitions", async () => {
+  it("restores added, modified, deleted, binary, and executable files", async () => {
     const root = await temporaryDirectory();
     const { workspace, store } = await createStore(root);
-    await mkdir(path.join(workspace, "directory-to-file"));
-    await writeFile(path.join(workspace, "directory-to-file", "child.txt"), "child-a\n");
-    await writeFile(path.join(workspace, "file-to-directory"), "file-a\n");
     await writeFile(path.join(workspace, "modified.txt"), "version-a\n");
     await writeFile(path.join(workspace, "deleted-in-b.txt"), "only-a\n");
     await writeFile(path.join(workspace, "binary.bin"), new Uint8Array([0, 1, 2, 0, 255]));
     await writeFile(path.join(workspace, "script.sh"), "#!/bin/sh\necho a\n");
     await chmod(path.join(workspace, "script.sh"), 0o755);
-    await symlink("modified.txt", path.join(workspace, "link"));
+    const first = await captured(store);
+
+    await writeFile(path.join(workspace, "modified.txt"), "version-b\n");
+    await rm(path.join(workspace, "deleted-in-b.txt"));
+    await writeFile(path.join(workspace, "added-in-b.txt"), "only-b\n");
+    await writeFile(path.join(workspace, "binary.bin"), new Uint8Array([255, 0, 9, 8, 0]));
+    await chmod(path.join(workspace, "script.sh"), 0o644);
+    const second = await captured(store);
+
+    expect(await restoreFromCurrent(store, first.rootTreeOid)).toEqual({ status: "restored" });
+    expect(await readFile(path.join(workspace, "modified.txt"), "utf8")).toBe("version-a\n");
+    expect(await readFile(path.join(workspace, "deleted-in-b.txt"), "utf8")).toBe("only-a\n");
+    expect(
+      await lstat(path.join(workspace, "added-in-b.txt")).catch(() => undefined),
+    ).toBeUndefined();
+    expect(Array.from(await readFile(path.join(workspace, "binary.bin")))).toEqual([
+      0, 1, 2, 0, 255,
+    ]);
+    expect((await stat(path.join(workspace, "script.sh"))).mode & 0o111).not.toBe(0);
+    expect(await restoreFromCurrent(store, first.rootTreeOid)).toEqual({ status: "restored" });
+
+    expect(await restoreFromCurrent(store, second.rootTreeOid)).toEqual({ status: "restored" });
+    expect(await readFile(path.join(workspace, "modified.txt"), "utf8")).toBe("version-b\n");
+    expect(
+      await lstat(path.join(workspace, "deleted-in-b.txt")).catch(() => undefined),
+    ).toBeUndefined();
+    expect(await readFile(path.join(workspace, "added-in-b.txt"), "utf8")).toBe("only-b\n");
+    expect(Array.from(await readFile(path.join(workspace, "binary.bin")))).toEqual([
+      255, 0, 9, 8, 0,
+    ]);
+    expect((await stat(path.join(workspace, "script.sh"))).mode & 0o111).toBe(0);
+  });
+
+  it("restores file, directory, and symlink type transitions", async () => {
+    const root = await temporaryDirectory();
+    const { workspace, store } = await createStore(root);
+    await mkdir(path.join(workspace, "directory-to-file"));
+    await writeFile(path.join(workspace, "directory-to-file", "child.txt"), "child-a\n");
+    await writeFile(path.join(workspace, "file-to-directory"), "file-a\n");
+    await symlink("file-to-directory", path.join(workspace, "link"));
     const first = await captured(store);
 
     await rm(path.join(workspace, "directory-to-file"), { recursive: true });
@@ -505,11 +541,6 @@ describe("WorkspaceHistoryStore", () => {
     await rm(path.join(workspace, "file-to-directory"));
     await mkdir(path.join(workspace, "file-to-directory"));
     await writeFile(path.join(workspace, "file-to-directory", "child.txt"), "child-b\n");
-    await writeFile(path.join(workspace, "modified.txt"), "version-b\n");
-    await rm(path.join(workspace, "deleted-in-b.txt"));
-    await writeFile(path.join(workspace, "added-in-b.txt"), "only-b\n");
-    await writeFile(path.join(workspace, "binary.bin"), new Uint8Array([255, 0, 9, 8, 0]));
-    await chmod(path.join(workspace, "script.sh"), 0o644);
     await rm(path.join(workspace, "link"));
     await writeFile(path.join(workspace, "link"), "regular-b\n");
     const second = await captured(store);
@@ -520,18 +551,8 @@ describe("WorkspaceHistoryStore", () => {
       "child-a\n",
     );
     expect(await readFile(path.join(workspace, "file-to-directory"), "utf8")).toBe("file-a\n");
-    expect(await readFile(path.join(workspace, "modified.txt"), "utf8")).toBe("version-a\n");
-    expect(await readFile(path.join(workspace, "deleted-in-b.txt"), "utf8")).toBe("only-a\n");
-    expect(
-      await lstat(path.join(workspace, "added-in-b.txt")).catch(() => undefined),
-    ).toBeUndefined();
-    expect(Array.from(await readFile(path.join(workspace, "binary.bin")))).toEqual([
-      0, 1, 2, 0, 255,
-    ]);
-    expect((await stat(path.join(workspace, "script.sh"))).mode & 0o111).not.toBe(0);
     expect((await lstat(path.join(workspace, "link"))).isSymbolicLink()).toBe(true);
-    expect(await readlink(path.join(workspace, "link"))).toBe("modified.txt");
-    expect(await restoreFromCurrent(store, first.rootTreeOid)).toEqual({ status: "restored" });
+    expect(await readlink(path.join(workspace, "link"))).toBe("file-to-directory");
 
     expect(await restoreFromCurrent(store, second.rootTreeOid)).toEqual({ status: "restored" });
     expect(await readFile(path.join(workspace, "directory-to-file"), "utf8")).toBe("file-b\n");
@@ -539,14 +560,6 @@ describe("WorkspaceHistoryStore", () => {
     expect(await readFile(path.join(workspace, "file-to-directory", "child.txt"), "utf8")).toBe(
       "child-b\n",
     );
-    expect(
-      await lstat(path.join(workspace, "deleted-in-b.txt")).catch(() => undefined),
-    ).toBeUndefined();
-    expect(await readFile(path.join(workspace, "added-in-b.txt"), "utf8")).toBe("only-b\n");
-    expect(Array.from(await readFile(path.join(workspace, "binary.bin")))).toEqual([
-      255, 0, 9, 8, 0,
-    ]);
-    expect((await stat(path.join(workspace, "script.sh"))).mode & 0o111).toBe(0);
     expect((await lstat(path.join(workspace, "link"))).isFile()).toBe(true);
     expect(await readFile(path.join(workspace, "link"), "utf8")).toBe("regular-b\n");
   });
