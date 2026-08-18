@@ -41,6 +41,18 @@ import {
   type SessionIndexEntry,
 } from "./types.ts";
 
+function settleAcpCapture<T>(
+  captured: ResultType<T, ReturnType<typeof captureAcpFailure>>,
+): ResultType<T, CapturedAcpFailure> {
+  return captured.mapError(({ settle }) => settle());
+}
+
+async function settleAcpCapturePromise<T>(
+  captured: Promise<ResultType<T, ReturnType<typeof captureAcpFailure>>>,
+): Promise<ResultType<T, CapturedAcpFailure>> {
+  return settleAcpCapture(await captured);
+}
+
 type PersistedRead<T> = {
   readonly provenance: "current" | "migrated" | "missing-defaulted";
   readonly value: T;
@@ -120,10 +132,12 @@ function validateRunId(runId: string): ResultType<string, InvalidRunId> {
 }
 
 function parseJson(content: string): ResultType<unknown, { readonly cause: Error }> {
-  const parsed = Result.try({
-    try: () => JSON.parse(content),
-    catch: captureAcpFailure,
-  });
+  const parsed = settleAcpCapture(
+    Result.try({
+      try: () => JSON.parse(content),
+      catch: captureAcpFailure,
+    }),
+  );
   const outcome = parsed.match<ResultType<unknown, { readonly cause: Error }> | Panic>({
     ok: (value) => Result.ok(value),
     err: (failure) =>
@@ -338,17 +352,21 @@ async function withSessionIndexLock<T>(
   const acquireError = acquired.match({ ok: () => undefined, err: (error) => error });
   if (acquireError !== undefined) return Result.err(acquireError);
 
-  const attempted = await Result.tryPromise({
-    try: work,
-    catch: captureAcpFailure,
-  });
-  const cleanupAttempted = await Result.tryPromise({
-    try: () =>
-      captureExternal("remove-session-lock", () =>
-        fs.rm(sessionIndexLockPath(), { recursive: true, force: true }),
-      ),
-    catch: captureAcpFailure,
-  });
+  const attempted = await settleAcpCapturePromise(
+    Result.tryPromise({
+      try: work,
+      catch: captureAcpFailure,
+    }),
+  );
+  const cleanupAttempted = await settleAcpCapturePromise(
+    Result.tryPromise({
+      try: () =>
+        captureExternal("remove-session-lock", () =>
+          fs.rm(sessionIndexLockPath(), { recursive: true, force: true }),
+        ),
+      catch: captureAcpFailure,
+    }),
+  );
 
   function ordinaryCaptureToExternal(
     operation: "remove-session-lock" | "session-index-work",
@@ -620,10 +638,12 @@ export async function observeRunCancellation(
     if (!accepting || settled) return;
     pendingCheck = pendingCheck.then(async () => {
       if (settled) return;
-      const inspected = await Result.tryPromise({
-        try: () => inspect(run),
-        catch: captureAcpFailure,
-      });
+      const inspected = await settleAcpCapturePromise(
+        Result.tryPromise({
+          try: () => inspect(run),
+          catch: captureAcpFailure,
+        }),
+      );
       const inspectionFailure = inspected.match({ ok: () => undefined, err: (failure) => failure });
       if (inspectionFailure !== undefined) {
         switch (inspectionFailure.kind) {

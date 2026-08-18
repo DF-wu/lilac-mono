@@ -4,7 +4,7 @@ export type CapturedTuiFailure =
   | { readonly kind: "panic"; readonly panic: Panic }
   | { readonly kind: "ordinary"; readonly cause: Error };
 
-export function captureTuiFailure(cause: unknown): CapturedTuiFailure {
+export function captureTuiFailure<Cause>(cause: Cause): CapturedTuiFailure {
   if (Panic.is(cause)) return { kind: "panic", panic: cause };
   return {
     kind: "ordinary",
@@ -16,7 +16,7 @@ export function captureTuiFailure(cause: unknown): CapturedTuiFailure {
 }
 
 /** Signal a retained terminal defect after its owner has completed cleanup. */
-export function signalTuiDefect(defect: Error): never {
+export function signalTuiDefect<Defect>(defect: Defect): never {
   throw defect;
 }
 
@@ -28,12 +28,16 @@ export function captureTuiOperation<T, E>(
     try: operation,
     catch: captureTuiFailure,
   });
-  const finish = captured.match<() => ResultType<T, E>>({
-    ok: (value) => () => Result.ok(value),
-    err: (error) => () =>
-      error.kind === "panic" ? signalTuiDefect(error.panic) : Result.err(mapError(error.cause)),
+  const settlement = captured.match<
+    | { readonly kind: "success"; readonly value: T }
+    | { readonly kind: "failure"; failure: CapturedTuiFailure }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: (failure) => ({ kind: "failure", failure }),
   });
-  return finish();
+  if (settlement.kind === "success") return Result.ok(settlement.value);
+  if (settlement.failure.kind === "panic") return signalTuiDefect(settlement.failure.panic);
+  return Result.err(mapError(settlement.failure.cause));
 }
 
 export async function captureTuiOperationAsync<T, E>(
@@ -41,10 +45,14 @@ export async function captureTuiOperationAsync<T, E>(
   mapError: (cause: Error) => E,
 ): Promise<ResultType<T, E>> {
   const captured = await Result.tryPromise({ try: operation, catch: captureTuiFailure });
-  const finish = captured.match<() => ResultType<T, E>>({
-    ok: (value) => () => Result.ok(value),
-    err: (error) => () =>
-      error.kind === "panic" ? signalTuiDefect(error.panic) : Result.err(mapError(error.cause)),
+  const settlement = captured.match<
+    | { readonly kind: "success"; readonly value: T }
+    | { readonly kind: "failure"; failure: CapturedTuiFailure }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: (failure) => ({ kind: "failure", failure }),
   });
-  return finish();
+  if (settlement.kind === "success") return Result.ok(settlement.value);
+  if (settlement.failure.kind === "panic") return signalTuiDefect(settlement.failure.panic);
+  return Result.err(mapError(settlement.failure.cause));
 }

@@ -1471,11 +1471,10 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     const profile = nextProfile(props.profiles, bindings().profile);
     if (profile === undefined || profile.id === bindings().profile) return;
     setProfileCycleBusy(true);
-    try {
-      await applyBindings({ profile: profile.id });
-    } finally {
-      setProfileCycleBusy(false);
-    }
+    using _profileCycle = {
+      [Symbol.dispose]: () => setProfileCycleBusy(false),
+    };
+    await applyBindings({ profile: profile.id });
   }
 
   function createDraftExtmark(id: string, placeholder: string, start: number): void {
@@ -1789,13 +1788,12 @@ export function MiniLilacApp(props: MiniLilacAppProps) {
     const value = state().editor;
     if (composer === undefined || composer.isDestroyed || composer.plainText === value) return;
     restoringDraft = true;
-    try {
-      composer.setText(value);
-      restoreDraftExtmarks();
-      composer.gotoBufferEnd();
-    } finally {
-      restoringDraft = false;
-    }
+    using _draftRestoration = {
+      [Symbol.dispose]: () => void (restoringDraft = false),
+    };
+    composer.setText(value);
+    restoreDraftExtmarks();
+    composer.gotoBufferEnd();
   });
 
   onMount(() => {

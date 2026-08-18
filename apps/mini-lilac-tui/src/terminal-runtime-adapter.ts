@@ -134,25 +134,36 @@ export function requestTerminalRendererShutdown(
   renderer: OwnedTerminalRenderer,
   settle: () => void,
 ): TerminalShutdownOutcome {
-  let attempted: ResultType<ResultType<void, TerminalRuntimeFailed>, CapturedTuiFailure>;
-  try {
-    attempted = Result.try({
-      try: () => destroyTerminalRenderer(renderer),
-      catch: captureTuiFailure,
-    });
-  } finally {
-    settle();
-  }
-  return attempted.match<TerminalShutdownOutcome>({
-    err: (error) => ({
+  const attempted = Result.try<ResultType<void, TerminalRuntimeFailed>, CapturedTuiFailure>({
+    try: () => destroyTerminalRenderer(renderer),
+    catch: captureTuiFailure,
+  });
+  const cleanupAttempted = Result.try({ try: settle, catch: (cause) => cause });
+  const cleanupSettlement = cleanupAttempted.match<
+    { readonly kind: "success" } | { readonly kind: "failure"; readonly cause: unknown }
+  >({
+    ok: () => ({ kind: "success" }),
+    err: (cause) => ({ kind: "failure", cause }),
+  });
+  if (cleanupSettlement.kind === "failure") return signalTuiDefect(cleanupSettlement.cause);
+
+  const settlement = attempted.match<
+    | { readonly kind: "success"; readonly result: ResultType<void, TerminalRuntimeFailed> }
+    | { readonly kind: "failure"; readonly failure: CapturedTuiFailure }
+  >({
+    ok: (result) => ({ kind: "success", result }),
+    err: (failure) => ({ kind: "failure", failure }),
+  });
+  if (settlement.kind === "failure") {
+    return {
       kind: "defect",
-      defect: error.kind === "panic" ? error.panic : error.cause,
-    }),
-    ok: (result) =>
-      result.match<TerminalShutdownOutcome>({
-        ok: () => ({ kind: "success" }),
-        err: (error) => ({ kind: "failure", error }),
-      }),
+      defect:
+        settlement.failure.kind === "panic" ? settlement.failure.panic : settlement.failure.cause,
+    };
+  }
+  return settlement.result.match<TerminalShutdownOutcome>({
+    ok: () => ({ kind: "success" }),
+    err: (error) => ({ kind: "failure", error }),
   });
 }
 
@@ -179,19 +190,25 @@ export async function runWithOwnedTerminalRenderer<T>(
     try: operation,
     catch: captureTuiFailure,
   });
-  const resolveWork = attempted.match<() => ResultType<T, TerminalRuntimeFailed>>({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      if (!renderer.isDestroyed) {
-        Result.try({
-          try: () => destroyTerminalRenderer(renderer),
-          catch: () => undefined,
-        });
-      }
-      return signalTuiDefect(error.kind === "panic" ? error.panic : error.cause);
-    },
+  const settlement = attempted.match<
+    | { readonly kind: "success"; readonly result: ResultType<T, TerminalRuntimeFailed> }
+    | { readonly kind: "failure"; readonly failure: CapturedTuiFailure }
+  >({
+    ok: (result) => ({ kind: "success", result }),
+    err: (failure) => ({ kind: "failure", failure }),
   });
-  const work = resolveWork();
+  if (settlement.kind === "failure") {
+    if (!renderer.isDestroyed) {
+      Result.try({
+        try: () => destroyTerminalRenderer(renderer),
+        catch: () => undefined,
+      });
+    }
+    return signalTuiDefect(
+      settlement.failure.kind === "panic" ? settlement.failure.panic : settlement.failure.cause,
+    );
+  }
+  const work = settlement.result;
 
   if (renderer.isDestroyed) return work;
   const cleanup = destroyTerminalRenderer(renderer);
@@ -220,17 +237,21 @@ export async function runTerminalEntrypoint(
     try: operation,
     catch: captureTuiFailure,
   });
-  return captured.match<ResultType<number, TerminalRuntimeFailed>>({
-    ok: (value) => Result.ok(value),
-    err: (error) => {
-      const cause = error.kind === "panic" ? error.panic : error.cause;
-      return Result.err(
-        new TerminalRuntimeFailed({
-          operation: "entrypoint",
-          cause,
-          message: Panic.is(cause) ? cause.message : "Mini Lilac terminal entrypoint failed",
-        }),
-      );
-    },
+  const settlement = captured.match<
+    | { readonly kind: "success"; readonly value: number }
+    | { readonly kind: "failure"; readonly failure: CapturedTuiFailure }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: (failure) => ({ kind: "failure", failure }),
   });
+  if (settlement.kind === "success") return Result.ok(settlement.value);
+  const cause =
+    settlement.failure.kind === "panic" ? settlement.failure.panic : settlement.failure.cause;
+  return Result.err(
+    new TerminalRuntimeFailed({
+      operation: "entrypoint",
+      cause,
+      message: Panic.is(cause) ? cause.message : "Mini Lilac terminal entrypoint failed",
+    }),
+  );
 }

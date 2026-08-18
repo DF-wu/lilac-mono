@@ -60,18 +60,31 @@ async function captureBuildOperation<T>(
   operation: string,
   run: () => Promise<T>,
 ): Promise<ResultType<T, MiniLilacBuildOperationFailed>> {
-  try {
-    return Result.ok(await run());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new MiniLilacBuildOperationFailed({
-        operation,
-        cause,
-        message: `Mini Lilac build failed while attempting to ${operation}`,
-      }),
-    );
+  type CapturedBuildFailure =
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "failure"; readonly error: MiniLilacBuildOperationFailed };
+  function captureBuildFailure<Cause>(cause: Cause): CapturedBuildFailure {
+    return Panic.is(cause)
+      ? { kind: "panic", panic: cause }
+      : {
+          kind: "failure",
+          error: new MiniLilacBuildOperationFailed({
+            operation,
+            cause,
+            message: `Mini Lilac build failed while attempting to ${operation}`,
+          }),
+        };
   }
+  const attempted = await Result.tryPromise({ try: run, catch: captureBuildFailure });
+  const settlement = attempted.match<
+    { readonly kind: "success"; readonly value: T } | CapturedBuildFailure
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: (failure) => failure,
+  });
+  if (settlement.kind === "success") return Result.ok(settlement.value);
+  if (settlement.kind === "panic") throw settlement.panic;
+  return Result.err(settlement.error);
 }
 
 export function decodeSourcePackage(
