@@ -1,5 +1,5 @@
 export type ExceptionFlowKind =
-  | "catch-clause"
+  | "try-statement"
   | "promise-catch"
   | "promise-reject"
   | "rejection-callback"

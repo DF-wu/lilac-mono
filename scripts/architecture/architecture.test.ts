@@ -1,5 +1,5 @@
 import path from "node:path";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 import { describe, expect, test } from "bun:test";
@@ -163,8 +163,6 @@ function fixtureExceptionSyntaxKinds(
   direction: ExceptionAdapter["direction"],
 ): ApprovedExceptionAdapter["syntaxKinds"] {
   switch (direction) {
-    case "capture-external":
-      return ["catch-clause", "rejection-callback"];
     case "signal-host":
       return ["throw-statement", "host-rejection-call", "registered-host-signal-call"];
     case "observe-panic":
@@ -307,7 +305,6 @@ describe("boundary validation rules", () => {
         fixtureProgram,
         fixtureProgram.getTypeChecker(),
         [["stage7-boundary.ts", exportName, "signal"]],
-        [],
         [],
         [],
       );
@@ -634,21 +631,11 @@ describe("boundary validation rules", () => {
     expect(findings.some((finding) => finding.location?.line === 57)).toBeTrue();
   });
 
-  test("exception adapters exempt only their exact callable unknown parameters", () => {
-    const findings = findingsFor("architecture/no-domain-unknown", "exception-adapter.ts", {
-      exceptionAdapters: [
-        {
-          identity: { module: "exception-adapter.ts", exportName: "exactExceptionAdapter" },
-          category: "external-to-result",
-          externalApi: { package: "global", exportName: "language exception capture" },
-          direction: "capture-external",
-          reason: "Fixture exact exception adapter.",
-        },
-      ],
-    });
-    expect(findings).toHaveLength(1);
-    expect(findings[0]?.message).toContain("payload");
-    expect(findings[0]?.identity).toContain("exactExceptionAdapter.inspectNested");
+  test("does not exempt unknown parameters through exception capture registrations", () => {
+    const findings = findingsFor("architecture/no-domain-unknown", "exception-adapter.ts");
+    expect(findings).toHaveLength(2);
+    expect(findings.some(({ message }) => message.includes("error"))).toBeTrue();
+    expect(findings.some(({ message }) => message.includes("payload"))).toBeTrue();
   });
 
   test("rejects only structured assertions whose resolved source is unknown", () => {
@@ -720,10 +707,223 @@ describe("failure flow rules", () => {
     expect(findings).toHaveLength(4);
   });
 
-  test("rejects only captures whose selected overload exposes UnhandledException", () => {
-    const findings = findingsFor("architecture/no-unmapped-result-capture", "result.ts");
-    expect(findings).toHaveLength(2);
-    expect(findings.every((finding) => finding.message.includes("UnhandledException"))).toBeTrue();
+  test("approves object capture intrinsically but rejects unbounded errors and exception channels", () => {
+    const signalAdapter = {
+      identity: { module: "result.ts", exportName: "signalResultCaptureFailure" },
+      category: "result-to-framework" as const,
+      externalApi: { package: "global", exportName: "language host failure signal" },
+      direction: "signal-host" as const,
+      reason: "Fixture host signal contract.",
+    };
+    const findings = findingsFor("architecture/no-unmapped-result-capture", "result.ts", {
+      exceptionAdapters: [signalAdapter],
+    });
+    expect(
+      findings.filter(({ message }) => message.includes("exposes UnhandledException")),
+    ).toHaveLength(2);
+    expect(
+      findings.filter(({ message }) => message.includes("explicitly throws, rejects, or signals")),
+    ).toHaveLength(11);
+    expect(
+      findings.some(({ identity }) => identity.includes("mappedCaptureThroughArbitraryHelper")),
+    ).toBeFalse();
+    expect(
+      findings.some(({ identity }) => identity.includes("nestedObjectCaptureInCatchMapper")),
+    ).toBeFalse();
+    expect(
+      findings.filter(({ identity }) => identity.includes("nestedThrowingCaptureInCatchMapper")),
+    ).toHaveLength(2);
+    expect(
+      findings.some(({ identity }) => identity.includes("unrelatedRejectMethodCatchMapper")),
+    ).toBeFalse();
+    expect(
+      findings.some(({ identity }) => identity.includes("declaredUnresolvedCatchMapper")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("importedUnresolvedCatchMapper")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("directDeclaredUnresolvedCatchMapper")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("directImportedUnresolvedCatchMapper")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("localResultAliasUnknownBypass")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("reassignedResultUnknownBypass")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("transitiveReassignedCatchMapper")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("dynamicOptionsCatchMapper")),
+    ).toBeTrue();
+  });
+
+  test("grants unknown ownership only to direct immutable capture imports and mappers", () => {
+    const findings = findingsFor("architecture/no-domain-unknown", "result.ts");
+    expect(
+      findings.some(({ identity }) => identity.includes("fakeResultUnknownBypass")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("unrelatedUnknownInCaptureScope")),
+    ).toBeTrue();
+    expect(findings.some(({ identity }) => identity.includes("mappedUnknownCapture"))).toBeFalse();
+    expect(findings.some(({ identity }) => identity.includes("importAliasedCapture"))).toBeFalse();
+    expect(
+      findings.some(({ identity }) => identity.includes("namedCapturedCauseMapper")),
+    ).toBeFalse();
+    expect(findings.some(({ identity }) => identity.includes("classifyCapturedCause"))).toBeFalse();
+    expect(
+      findings.filter(({ identity }) => identity.includes("classifyInlineCapturedThunk")),
+    ).toEqual([]);
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyCapturedMapError")),
+    ).toBeFalse();
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyUnrelatedClosedWrapper")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("ancestorCaptureDoesNotOwnUnknown")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyMixedCapturedCause")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyMixedCapturedComposite")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("locallyAliasedCapturedCauseMapper")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("reassignedCapturedCauseMapper")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("localResultAliasUnknownBypass")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("reassignedResultUnknownBypass")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyConditionallyAssignedCause")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyMultiplyAssignedCause")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyCompoundAssignedCause")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyDestructuringAssignedCause")),
+    ).toBeTrue();
+  });
+
+  test("rejects indirect mutation of a direct better-result import binding", () => {
+    const domainFindings = findingsFor("architecture/no-domain-unknown", "result-mutation.ts");
+    expect(
+      domainFindings.some(({ identity }) => identity.includes("mutatedImportedResultCapture")),
+    ).toBeTrue();
+    const captureFindings = findingsFor(
+      "architecture/no-unmapped-result-capture",
+      "result-mutation.ts",
+    );
+    expect(captureFindings).toHaveLength(1);
+    expect(captureFindings[0]?.message).toContain("direct immutable better-result import");
+  });
+
+  test("follows closed captured output through immediate match, helper, and thunk classification", () => {
+    const findings = findingsFor("architecture/no-unknown-member-read", "result.ts");
+    expect(
+      findings.some(({ identity }) => identity.includes("mappedCaptureThroughProjectionHelper")),
+    ).toBeFalse();
+    expect(
+      findings.some(({ identity }) => identity.includes("mappedCaptureThroughUnrelatedProjection")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("mappedCaptureOutcomeRead")),
+    ).toBeFalse();
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyNamedCapturedWrapperOutside")),
+    ).toBeFalse();
+    expect(
+      findings.filter(({ identity }) => identity.includes("classifyInlineCapturedThunk")),
+    ).toEqual([]);
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyCapturedMapError")),
+    ).toBeFalse();
+    expect(
+      findings.some(({ identity }) => identity.includes("classifyUnrelatedClosedWrapper")),
+    ).toBeTrue();
+    expect(
+      findings.some(({ identity }) => identity.includes("ancestorCaptureDoesNotOwnUnknown")),
+    ).toBeTrue();
+  });
+
+  test("does not let signal registrations authorize unknown interpretation", () => {
+    const signalAdapter = {
+      identity: { module: "signal-unknown.ts", exportName: "signalUnknown" },
+      category: "result-to-framework" as const,
+      externalApi: { package: "global", exportName: "language host failure signal" },
+      direction: "signal-host" as const,
+      reason: "Fixture signal contract.",
+    };
+    const findings = findingsFor("architecture/no-domain-unknown", "signal-unknown.ts", {
+      exceptionAdapters: [signalAdapter],
+    });
+    expect(findings).toHaveLength(1);
+  });
+
+  test("requires exact Panic observation instead of text or panic-like helper names", () => {
+    const observer = (exportName: string) => ({
+      identity: { module: "stage7-boundary.ts", exportName },
+      category: "defect-supervisor" as const,
+      externalApi: { package: "better-result", exportName: "Panic.is" },
+      direction: "observe-panic" as const,
+      reason: "Fixture exact Panic observer.",
+    });
+    const verify = (exportName: string): void => {
+      const adapter = observer(exportName);
+      analyzeWorkspace(
+        { ...BASE_WORKSPACE, exceptionAdapters: [adapter] },
+        FIXTURE_ROOT,
+        fixtureProgram,
+        undefined,
+        undefined,
+        undefined,
+        [fixtureExceptionApproval(adapter)],
+      );
+    };
+
+    expect(() => verify("exactPanicObserver")).not.toThrow();
+    expect(() => verify("stringOnlyPanicObserver")).toThrow(
+      "has no recognizable externalApi or host relationship",
+    );
+    expect(() => verify("staleNamedPanicObserver")).toThrow(
+      "has no recognizable externalApi or host relationship",
+    );
+    expect(() => verify("unrelatedPanicObserver")).toThrow(
+      "has no recognizable externalApi or host relationship",
+    );
+    expect(() => verify("discardedPanicObserver")).toThrow(
+      "has no recognizable externalApi or host relationship",
+    );
+    expect(() => verify("negatedPanicObserver")).toThrow(
+      "has no recognizable externalApi or host relationship",
+    );
+    expect(() => verify("mixedControlPanicObserver")).toThrow(
+      "has no recognizable externalApi or host relationship",
+    );
+    expect(() => verify("commonRootDifferentCauseObserver")).toThrow(
+      "has no recognizable externalApi or host relationship",
+    );
+    expect(() => verify("elseBranchPanicObserver")).toThrow(
+      "has no recognizable externalApi or host relationship",
+    );
+    expect(() => verify("partialBranchPanicObserver")).toThrow(
+      "has no recognizable externalApi or host relationship",
+    );
   });
 
   test("registers Panic by movement-tolerant exact callsite fingerprint", () => {
@@ -1047,10 +1247,10 @@ describe("Stage 2 union rules", () => {
             ruleZones: PERMANENT_RULE_ZONES,
             exceptionAdapters: [
               {
-                identity: { module: "adapter.ts", exportName: "capture.catch" },
-                category: "external-to-result",
-                externalApi: { package: "fixture", exportName: "operation" },
-                direction: "capture-external",
+                identity: { module: "adapter.ts", exportName: "signalFailure" },
+                category: "result-to-framework",
+                externalApi: { package: "fixture", exportName: "host failure contract" },
+                direction: "signal-host",
                 reason: "",
               },
             ],
@@ -1982,6 +2182,105 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     expect(findings[0]?.message).toContain("exact SQLite driver classifier");
   });
 
+  test("requires exact captured-cause, thrown Panic, and callback-state SQLite proofs", () => {
+    const source = readFileSync(path.join(realRoot, "stage6-transactions.ts"), "utf8");
+    const mutations = [
+      [
+        "const driverFailure = classifyFixtureSqliteDriverError(cause);",
+        'const driverFailure = classifyFixtureSqliteDriverError(new Error("unrelated"));',
+        "exact SQLite driver classifier",
+      ],
+      [
+        "if (Panic.is(cause)) throw cause;",
+        "void Panic.is(cause);\n  if (cause instanceof Panic) throw cause;",
+        "exact Panic classifier result",
+      ],
+      [
+        "if (Panic.is(cause)) throw cause;",
+        "if (!Panic.is(cause)) throw cause;",
+        "exact Panic classifier result",
+      ],
+      [
+        "if (Panic.is(cause)) throw cause;",
+        "if (Panic.is(cause) && cause instanceof Error) throw cause;",
+        "exact Panic classifier result",
+      ],
+      [
+        "if (Panic.is(cause)) throw cause;",
+        "if (Panic.is(cause)) {\n    if (cause instanceof Error) throw cause;\n  }",
+        "exact Panic classifier result",
+      ],
+      [
+        "const driverFailure = classifyFixtureSqliteDriverError(cause);",
+        "const driverFailure = classifyFixtureSqliteDriverError(Object.assign(cause, { mixed: true }));",
+        "exact SQLite driver classifier",
+      ],
+      [
+        "const driverFailure = classifyFixtureSqliteDriverError(cause);\n    if (driverFailure) return Result.err(driverFailure);",
+        'void classifyFixtureSqliteDriverError(cause);\n    const driverFailure = new FixtureDriverFailed({ message: "fabricated" });\n    return Result.err(driverFailure);',
+        "returned driver Err",
+      ],
+      [
+        "const driverFailure = classifyFixtureSqliteDriverError(cause);\n    if (driverFailure) return Result.err(driverFailure);",
+        "const driverFailure = classifyFixtureSqliteDriverError(cause);\n    const copiedDriverFailure = driverFailure;\n    if (driverFailure) return Result.err(copiedDriverFailure);",
+        "returned driver Err",
+      ],
+      [
+        "const driverFailure = classifyFixtureSqliteDriverError(cause);\n    if (driverFailure) return Result.err(driverFailure);",
+        'let driverFailure = classifyFixtureSqliteDriverError(cause);\n    driverFailure = new FixtureDriverFailed({ message: "overwritten" });\n    if (driverFailure) return Result.err(driverFailure);',
+        "returned driver Err",
+      ],
+      [
+        "throw rollbackSentinel;",
+        "throw new FixtureRollback(result);",
+        "raw driver callback does not throw the rollback sentinel",
+      ],
+      [
+        'throw new Panic({ message: "fixture transaction atomicity is unknown", cause });',
+        'void new Panic({ message: "fixture transaction atomicity is unknown", cause });',
+        "escalate unknown transaction atomicity",
+      ],
+      [
+        "if (rollbackSentinel !== undefined || callbackCompleted) {",
+        "if (cause instanceof Error) {",
+        "escalate unknown transaction atomicity",
+      ],
+    ] as const;
+
+    for (const [before, after, expected] of mutations) {
+      const fixtureRoot = mkdtempSync(path.join(realRoot, "sqlite-contract-mutation-"));
+      const relativeRoot = path.relative(REPOSITORY_ROOT, fixtureRoot);
+      try {
+        writeFileSync(
+          path.join(fixtureRoot, "tsconfig.json"),
+          JSON.stringify({ extends: "../tsconfig.json", include: ["stage6-transactions.ts"] }),
+        );
+        writeFileSync(
+          path.join(fixtureRoot, "stage6-transactions.ts"),
+          source.replace(before, after),
+        );
+        const workspace = {
+          ...realWorkspaceBase,
+          root: relativeRoot,
+          tsconfig: `${relativeRoot}/tsconfig.json`,
+          ruleZones: {
+            "architecture/sqlite-transaction-adapter-contract": [
+              { include: "stage6-transactions.ts" },
+            ],
+          },
+          sqliteTransactionAdapters: [transactionAdapter],
+          operationalResultApis: [transactionAdapter.identity],
+        } satisfies WorkspaceArchitecture;
+        const program = createWorkspaceProgram(REPOSITORY_ROOT, workspace).program;
+        const findings = analyzeWorkspace(workspace, fixtureRoot, program);
+        expect(findings).toHaveLength(1);
+        expect(findings[0]?.message).toContain(expected);
+      } finally {
+        rmSync(fixtureRoot, { recursive: true, force: true });
+      }
+    }
+  }, 30_000);
+
   test("manifest integrity requires exact Panic identity and operational linkage", () => {
     const base = {
       ...realWorkspaceBase,
@@ -2461,6 +2760,48 @@ describe("real declaration integration", () => {
     );
   });
 
+  test("permits positive isErr guards only for direct local object-form captures", () => {
+    const workspace = {
+      ...BASE_WORKSPACE,
+      name: "real-libraries-result-capture-settlement",
+      packageName: "architecture-real-libraries",
+      root: "scripts/architecture/fixtures/real-libraries",
+      tsconfig: "scripts/architecture/fixtures/real-libraries/tsconfig.json",
+      ruleZones: {
+        "architecture/no-manual-result-branching": [
+          { include: "manual-result-capture-settlement-valid.ts" },
+        ],
+      },
+    } satisfies WorkspaceArchitecture;
+    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
+
+    expect(analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program)).toEqual(
+      [],
+    );
+  });
+
+  test("rejects other guards and non-local or non-object-form capture provenance", () => {
+    const workspace = {
+      ...BASE_WORKSPACE,
+      name: "real-libraries-invalid-result-capture-settlement",
+      packageName: "architecture-real-libraries",
+      root: "scripts/architecture/fixtures/real-libraries",
+      tsconfig: "scripts/architecture/fixtures/real-libraries/tsconfig.json",
+      ruleZones: {
+        "architecture/no-manual-result-branching": [
+          { include: "manual-result-capture-settlement-invalid.ts" },
+        ],
+      },
+    } satisfies WorkspaceArchitecture;
+    const workspaceProgram = createWorkspaceProgram(REPOSITORY_ROOT, workspace);
+    const findings = analyzeWorkspace(workspace, workspaceProgram.root, workspaceProgram.program);
+
+    expect(findings).toHaveLength(9);
+    expect(findings.every(({ rule }) => rule === "architecture/no-manual-result-branching")).toBe(
+      true,
+    );
+  });
+
   test("recognizes real installed zod and better-result 3.0 declarations", () => {
     const workspace = {
       ...BASE_WORKSPACE,
@@ -2573,14 +2914,15 @@ describe("real declaration integration", () => {
 
     expect(
       findings.filter((finding) => finding.rule === "architecture/no-unhandled-exception-contract"),
-    ).toHaveLength(7);
+    ).toHaveLength(9);
     const unhandledMessages = findings
       .filter((finding) => finding.rule === "architecture/no-unhandled-exception-contract")
       .map((finding) => finding.message);
     const unhandledIdentities = findings
       .filter((finding) => finding.rule === "architecture/no-unhandled-exception-contract")
       .map((finding) => finding.identity);
-    expect(new Set(unhandledIdentities).size).toBe(7);
+    expect(new Set(unhandledIdentities).size).toBe(9);
+    expect(unhandledMessages.some((message) => message.includes("Panic or unknown"))).toBeTrue();
     expect(
       unhandledMessages.some((message) => message.includes("UnhandledService.load")),
     ).toBeTrue();

@@ -180,7 +180,7 @@ function manifestWithStage6(): FixtureArchitectureManifest {
 function adapter(exportName: string, direction: ExceptionAdapter["direction"]): ExceptionAdapter {
   return {
     identity: { module: "src/adapter.ts", exportName },
-    category: direction === "signal-host" ? "result-to-framework" : "external-to-result",
+    category: direction === "signal-host" ? "result-to-framework" : "defect-supervisor",
     externalApi: { package: "example-host", exportName: "operation" },
     direction,
     reason: "Test exact adapter registration",
@@ -410,12 +410,76 @@ describe("production exception syntax", () => {
     );
 
     expect(violations.map((violation) => violation.kind)).toEqual([
+      "try-statement",
       "throw",
-      "catch-clause",
       "stream-error-signal",
       "stream-error-signal",
       "stream-error-signal",
     ]);
+  });
+
+  it("exempts only throws inside object captures proven from better-result imports", () => {
+    const violations = findExceptionFlowViolations(
+      `
+        import { Result as R } from "better-result";
+        import * as Better from "better-result";
+        const Alias = R;
+        const capture = Alias.try;
+        const FakeResult = { try: (options) => options.try() };
+        export function run() {
+          const captured = capture({ try: () => { throw new Error("captured"); }, catch: String });
+          Better.Result.try({ try: () => { throw new Error("namespace captured"); }, catch: String });
+          FakeResult.try({ try: () => { throw new Error("fake"); }, catch: String });
+          if (captured) throw new Error("same callable");
+        }
+      `,
+      "apps/example/src/service.ts",
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind, symbol }) => [kind, symbol])).toEqual([
+      ["throw", "run.try@3"],
+      ["throw", "run"],
+    ]);
+  });
+
+  it("does not trust mutated better-result bindings or aliases", () => {
+    const violations = findExceptionFlowViolations(
+      `
+        import { Result } from "better-result";
+        const Alias = Result;
+        Alias.try = fakeCapture;
+        Alias.try({ try: () => { throw new Error("mutated alias"); }, catch: String });
+        Result.try = fakeCapture;
+        Result.try({ try: () => { throw new Error("mutated root"); }, catch: String });
+      `,
+      "apps/example/src/service.ts",
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind }) => kind)).toEqual(["throw", "throw"]);
+  });
+
+  it("does not trust better-result aliases mutated through reflective object operations", () => {
+    const violations = findExceptionFlowViolations(
+      `
+        import { Result } from "better-result";
+        const Assigned = Result;
+        Object.assign(Assigned, { try: fakeCapture });
+        Assigned.try({ try: () => { throw new Error("assigned"); }, catch: String });
+        const Reflected = Result;
+        Reflect.set(Reflected, "try", fakeCapture);
+        Reflected.try({ try: () => { throw new Error("reflected"); }, catch: String });
+        const Defined = Result;
+        Object.defineProperty(Defined, "try", { value: fakeCapture });
+        const capture = Defined.try;
+        capture({ try: () => { throw new Error("defined"); }, catch: String });
+      `,
+      "apps/example/src/service.ts",
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind }) => kind)).toEqual(["throw", "throw", "throw"]);
   });
 
   it("owns Stage 1 TaggedError throws, broad catches, and rejected Result promises", () => {
@@ -439,12 +503,12 @@ describe("production exception syntax", () => {
 
     expect(violations.map((violation) => violation.kind)).toEqual([
       "throw",
-      "catch-clause",
+      "try-statement",
       "promise-reject",
     ]);
     expect(violations.map((violation) => violation.message)).toEqual([
       "Return a typed Result error; throw only in an exactly registered adapter",
-      "Capture the external exception in an exactly registered adapter; try/finally remains allowed",
+      "Use object-form Result.try or Result.tryPromise; production try statements are forbidden",
       "Return Result.err instead of Promise.reject",
     ]);
   });
@@ -456,7 +520,7 @@ describe("production exception syntax", () => {
       export function domainFlow() { throw new Error("domain"); }
     `;
     const manifest = manifestWithAdapters([
-      adapter("captureExternal", "capture-external"),
+      adapter("captureExternal", "signal-host"),
       adapter("signalHost", "signal-host"),
     ]);
 
@@ -465,12 +529,12 @@ describe("production exception syntax", () => {
         (violation) => [violation.symbol, violation.kind],
       ),
     ).toEqual([
-      ["captureExternal", "throw"],
+      ["captureExternal", "try-statement"],
       ["domainFlow", "throw"],
     ]);
   });
 
-  it("allows observe-panic flow only in the exact registered callable", () => {
+  it("allows exact observe-panic throws but never exempts a try statement", () => {
     const code = `
       export function observePanic() {
         try { return operation(); } catch (cause) {
@@ -491,8 +555,10 @@ describe("production exception syntax", () => {
     ]);
 
     expect(
-      findExceptionFlowViolations(code, "apps/example/src/adapter.ts", policyWith(), manifest),
-    ).toEqual([]);
+      findExceptionFlowViolations(code, "apps/example/src/adapter.ts", policyWith(), manifest).map(
+        ({ symbol, kind }) => [symbol, kind],
+      ),
+    ).toEqual([["observePanic", "try-statement"]]);
   });
 
   it("does not let observe-panic authorize signaling forms or sibling callables", () => {
@@ -516,7 +582,7 @@ describe("production exception syntax", () => {
       ),
     ).toEqual([
       ["observePanic", "promise-reject"],
-      ["sibling", "catch-clause"],
+      ["sibling", "try-statement"],
       ["sibling", "throw"],
       ["signalStream.start", "stream-error-signal"],
     ]);
@@ -542,8 +608,8 @@ describe("production exception syntax", () => {
         "apps/example/src/adapter.ts",
         policyWith(),
         manifestWithAdapters([
-          adapter("namedRejection", "capture-external"),
-          adapter("outer.catch.<callback@1>", "capture-external"),
+          adapter("namedRejection", "signal-host"),
+          adapter("outer.catch.<callback@1>", "signal-host"),
         ]),
       ),
     ).toEqual([]);
@@ -552,7 +618,7 @@ describe("production exception syntax", () => {
         code,
         "apps/example/src/adapter.ts",
         policyWith(),
-        manifestWithAdapters([adapter("outer", "capture-external")]),
+        manifestWithAdapters([adapter("outer", "signal-host")]),
       ).map((violation) => violation.symbol),
     ).toEqual(["namedRejection", "outer.catch.<callback@1>"]);
   });
@@ -576,7 +642,7 @@ describe("production exception syntax", () => {
         code,
         "apps/example/src/adapter.ts",
         policyWith(),
-        manifestWithAdapters([adapter("repeated.catch.<callback@1>@1", "capture-external")]),
+        manifestWithAdapters([adapter("repeated.catch.<callback@1>@1", "signal-host")]),
       ).map((violation) => violation.symbol),
     ).toEqual(["repeated.catch.<callback@1>@2"]);
   });

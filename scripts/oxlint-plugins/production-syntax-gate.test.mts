@@ -65,16 +65,16 @@ describe("repository syntax gate", () => {
       workspace: "apps/example",
       module: "src/service",
       symbol: "captureFailure",
-      kind: "catch-clause",
+      kind: "try-statement",
       digest: "a".repeat(64),
       rule: "lilac/no-exception-flow",
       line: 12,
       column: 5,
-      message: "Capture the external exception in an exactly registered adapter",
+      message: "Use object-form Result.try or Result.tryPromise",
     } satisfies SyntaxFinding;
 
     expect(formatSyntaxDiagnostic(finding)).toBe(
-      `apps/example/src/service:12:5 error lilac/no-exception-flow [captureFailure/catch-clause] Capture the external exception in an exactly registered adapter [digest=${"a".repeat(64)}]`,
+      `apps/example/src/service:12:5 error lilac/no-exception-flow [captureFailure/try-statement] Use object-form Result.try or Result.tryPromise [digest=${"a".repeat(64)}]`,
     );
   });
 });

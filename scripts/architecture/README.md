@@ -38,24 +38,27 @@ set from the registrations and rejects missing, stale, wildcard, or extra zones.
 
 ## Exact Registrations
 
-`manifest.ts` is the reviewed catalog for:
+`manifest.ts`, `precise-exception-identities.ts`, and `reviewed-exception-adapters.ts` are the
+reviewed catalog for:
 
 - boundary decoders, opaque values, and exact capability predicates;
 - open-protocol adapters and their explicit local fallback variants;
 - event, tool, Result-decoder, persistence, and SQLite contracts;
 - event delivery APIs and cross-workspace consumers;
 - operational Result APIs, compatibility outputs, and Panic sites; and
-- exception adapters and defect supervisors.
+- host-signal adapters and defect supervisors.
 
 Registrations name exact modules and symbols. Specialized Result-bearing registrations must also appear
 in `operationalResultApis`. Event codec registrations point to one strict `defineLilacEvents` catalog;
 the analyzer derives canonical and family membership and verifies that the codec registry is projected
 from that exact catalog.
 
-`APPROVED_EXCEPTION_ADAPTER_CATALOG` is derived from the exact exception-adapter registrations. Manifest
-integrity validates callable identity, direction, syntax kinds, provenance, external/host relationship,
-reason, complete registration coverage, and `APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256`. Change the
-owning registration, review the derived catalog metadata, then update the digest and focused tests.
+`APPROVED_EXCEPTION_ADAPTER_CATALOG` is derived only from exact host-signal and Panic-observation
+registrations. External-to-Result capture is intrinsic and is not an exception-adapter category or
+inventoried registration. Manifest integrity validates callable identity,
+direction, syntax kinds, provenance, external/host relationship, reason, complete registration coverage,
+and `APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256`. Change the owning registration, review the derived
+catalog metadata, then update the digest and focused tests.
 
 ## Permanent Rules
 
@@ -69,7 +72,21 @@ objects and serialized compatibility envelopes with their own `status` fields re
 Actual Result `match` calls also may not rebuild both `{ status: "ok", value }` and
 `{ status: "error", error }` branches; domain projections and `Result.codec` envelopes remain valid.
 
-The syntax gate rejects unregistered exception flow, inline async Result callbacks, presentation decoder
+One local settlement form is intrinsic: a positive instance `captured.isErr()` may be the complete
+condition of an `if` when `captured` is an immutable local initialized directly, and in the same lexical
+block, from object-form `Result.try` or an awaited object-form `Result.tryPromise`. The Err branch may
+return, throw, or record failure state before continuing. Aliases, transformed Results, negated or compound
+conditions, `isOk`, static guards, and all other manual Result discrimination remain invalid.
+
+Object-form `Result.try` and `Result.tryPromise` are intrinsic capture boundaries only through direct
+immutable `better-result` import bindings and need no exception registration. Catch mappers must be inline
+or direct immutable function bindings with visible implementations, and must return captured data rather
+than throw, reject, or signal a host;
+exported and operational Result error contracts cannot contain `Panic` or `unknown`. Function-form capture
+remains invalid because it exposes `UnhandledException`.
+
+The syntax gate rejects every production `TryStatement` without a manifest exemption, as well as
+unregistered host exception flow, inline async Result callbacks, presentation decoder
 imports, store-owned inline decoding, and direct SQLite transactions. Oxlint also applies the permanent
 package-wide nested-ternary and local-record-guard rules. Syntax registrations use the same exact manifest
 identities as semantic analysis; there is no separate syntax exception catalog.
@@ -104,8 +121,9 @@ rollback sentinel, Panic classifier, and SQLite driver classifier. The adapter m
 - accept a real `bun:sqlite` `Database` and a callback returning a direct Result;
 - invoke `Database.transaction` with a callback that returns a plain value;
 - throw one exact non-exported sentinel when the logical callback returns Err and recover only that
-  sentinel immediately outside the driver callback;
-- call the exact `better-result#Panic.is` registration and rethrow the same Panic;
+  sentinel from an object-form `Result.try` captured outcome outside the driver callback;
+- take a positive branch controlled only by exact `better-result#Panic.is` classification of the captured
+  cause and rethrow that same cause before ordinary driver classification;
 - return only failures recognized by the exact registered SQLite driver classifier;
 - rethrow every unrecognized thrown value as a defect; and
 - be linked in `operationalResultApis`.

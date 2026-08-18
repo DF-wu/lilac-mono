@@ -27,12 +27,22 @@ ruleTester.run("lilac/no-fixed-test-wait", noFixedTestWaitRule, {
 const productionFile = "apps/example/src/example.ts";
 
 ruleTester.run("lilac/no-exception-flow", noExceptionFlowRule, {
-  valid: [{ code: "try { operation(); } finally { cleanup(); }", filename: productionFile }],
+  valid: [
+    {
+      code: "Result.try({ try: () => operation(), catch: (cause) => mapCause(cause) });",
+      filename: productionFile,
+    },
+  ],
   invalid: [
     {
       code: "function run() { throw new Error('bad'); }",
       filename: productionFile,
       errors: [{ message: /Return a typed Result error/u, line: 1, column: 17 }],
+    },
+    {
+      code: "try { operation(); } finally { cleanup(); }",
+      filename: productionFile,
+      errors: [{ message: /production try statements are forbidden/u, line: 1, column: 0 }],
     },
   ],
 });

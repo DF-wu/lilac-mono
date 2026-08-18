@@ -565,10 +565,231 @@ function isExplicitHostErrorSignal(
 }
 
 const DIRECTION_KINDS = {
-  "capture-external": ["catch-clause", "promise-catch", "rejection-callback"],
-  "signal-host": ["promise-reject", "rejection-callback", "stream-error-signal", "throw"],
-  "observe-panic": ["catch-clause", "promise-catch", "rejection-callback", "throw"],
+  "signal-host": [
+    "promise-catch",
+    "promise-reject",
+    "rejection-callback",
+    "stream-error-signal",
+    "throw",
+  ],
+  "observe-panic": ["promise-catch", "rejection-callback", "throw"],
 } as const satisfies Readonly<Record<ExceptionDirection, readonly ExceptionFlowKind[]>>;
+
+function propertyStringName(name: ts.PropertyName): string | undefined {
+  return ts.isIdentifier(name) || ts.isStringLiteralLike(name) ? name.text : undefined;
+}
+
+interface BetterResultProvenance {
+  readonly captureFunctions: ReadonlyMap<string, number>;
+  readonly moduleNamespaces: ReadonlyMap<string, number>;
+  readonly resultNamespaces: ReadonlyMap<string, number>;
+}
+
+function mutationRootIdentifier(expression: ts.Expression): ts.Identifier | undefined {
+  let current = unwrappedExpression(expression);
+  while (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+    current = unwrappedExpression(current.expression);
+  }
+  return ts.isIdentifier(current) ? current : undefined;
+}
+
+function collectMutatedBindings(sourceFile: ts.SourceFile): ReadonlySet<string> {
+  const mutated = new Set<string>();
+  const aliases: [string, string][] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      const source = mutationRootIdentifier(node.initializer);
+      if (source) aliases.push([node.name.text, source.text]);
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+    ) {
+      const root =
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left)
+          ? undefined
+          : mutationRootIdentifier(node.left);
+      if (root) mutated.add(root.text);
+    } else if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) {
+      const root = mutationRootIdentifier(node.operand);
+      if (root) mutated.add(root.text);
+    } else if (ts.isCallExpression(node)) {
+      const parts = propertyAccessParts(node.expression);
+      const receiver = parts ? unwrappedExpression(parts[0]) : undefined;
+      const indirectMutation =
+        parts &&
+        receiver !== undefined &&
+        ts.isIdentifier(receiver) &&
+        ((receiver.text === "Object" && (parts[1] === "assign" || parts[1] === "defineProperty")) ||
+          (receiver.text === "Reflect" && (parts[1] === "set" || parts[1] === "defineProperty")));
+      const target = indirectMutation && node.arguments[0];
+      if (target && !ts.isSpreadElement(target)) {
+        const root = mutationRootIdentifier(target);
+        if (root) mutated.add(root.text);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [alias, source] of aliases) {
+      if (mutated.has(alias) === mutated.has(source)) continue;
+      mutated.add(alias);
+      mutated.add(source);
+      changed = true;
+    }
+  }
+  return mutated;
+}
+
+function collectBetterResultProvenance(sourceFile: ts.SourceFile): BetterResultProvenance {
+  const counts = collectBindingNameCounts(sourceFile);
+  const captureFunctions = new Map<string, number>();
+  const moduleNamespaces = new Map<string, number>();
+  const resultNamespaces = new Map<string, number>();
+  const declarations: ts.VariableDeclaration[] = [];
+  const mutated = collectMutatedBindings(sourceFile);
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node)) declarations.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+
+  for (const statement of sourceFile.statements) {
+    if (
+      !ts.isImportDeclaration(statement) ||
+      !ts.isStringLiteral(statement.moduleSpecifier) ||
+      statement.moduleSpecifier.text !== "better-result" ||
+      statement.importClause?.isTypeOnly
+    ) {
+      continue;
+    }
+    const bindings = statement.importClause?.namedBindings;
+    if (!bindings) continue;
+    if (ts.isNamespaceImport(bindings)) {
+      if (!mutated.has(bindings.name.text)) {
+        setProvenance(moduleNamespaces, counts, bindings.name.text, statement.getStart(sourceFile));
+      }
+      continue;
+    }
+    for (const specifier of bindings.elements) {
+      if (
+        !specifier.isTypeOnly &&
+        (specifier.propertyName?.text ?? specifier.name.text) === "Result" &&
+        !mutated.has(specifier.name.text)
+      ) {
+        setProvenance(
+          resultNamespaces,
+          counts,
+          specifier.name.text,
+          statement.getStart(sourceFile),
+        );
+      }
+    }
+  }
+
+  const available = (values: ReadonlyMap<string, number>, name: string, at: number): boolean =>
+    !mutated.has(name) && (values.get(name) ?? Number.POSITIVE_INFINITY) <= at;
+  const isResultNamespace = (expression: ts.Expression, at: number): boolean => {
+    const value = unwrappedExpression(expression);
+    if (ts.isIdentifier(value)) return available(resultNamespaces, value.text, at);
+    const parts = propertyAccessParts(value);
+    if (!parts || parts[1] !== "Result") return false;
+    const receiver = unwrappedExpression(parts[0]);
+    return ts.isIdentifier(receiver) && available(moduleNamespaces, receiver.text, at);
+  };
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const declaration of declarations) {
+      if (
+        !ts.isIdentifier(declaration.name) ||
+        !declaration.initializer ||
+        mutated.has(declaration.name.text)
+      ) {
+        continue;
+      }
+      const position = declaration.getStart(sourceFile);
+      if (isResultNamespace(declaration.initializer, position)) {
+        changed =
+          setProvenance(resultNamespaces, counts, declaration.name.text, position) || changed;
+      }
+      const parts = propertyAccessParts(declaration.initializer);
+      if (
+        parts &&
+        (parts[1] === "try" || parts[1] === "tryPromise") &&
+        isResultNamespace(parts[0], position)
+      ) {
+        changed =
+          setProvenance(captureFunctions, counts, declaration.name.text, position) || changed;
+      }
+    }
+  }
+  return { captureFunctions, moduleNamespaces, resultNamespaces };
+}
+
+function isBetterResultCaptureCall(
+  call: ts.CallExpression,
+  provenance: BetterResultProvenance,
+): boolean {
+  const callee = unwrappedExpression(call.expression);
+  if (ts.isIdentifier(callee)) {
+    return (
+      (provenance.captureFunctions.get(callee.text) ?? Number.POSITIVE_INFINITY) <= call.getStart()
+    );
+  }
+  const parts = propertyAccessParts(callee);
+  if (!parts || (parts[1] !== "try" && parts[1] !== "tryPromise")) return false;
+  const receiver = unwrappedExpression(parts[0]);
+  if (ts.isIdentifier(receiver)) {
+    return (
+      (provenance.resultNamespaces.get(receiver.text) ?? Number.POSITIVE_INFINITY) <=
+      call.getStart()
+    );
+  }
+  const namespaceParts = propertyAccessParts(receiver);
+  if (!namespaceParts || namespaceParts[1] !== "Result") return false;
+  const namespace = unwrappedExpression(namespaceParts[0]);
+  return (
+    ts.isIdentifier(namespace) &&
+    (provenance.moduleNamespaces.get(namespace.text) ?? Number.POSITIVE_INFINITY) <= call.getStart()
+  );
+}
+
+function resultCaptureObjectForProperty(
+  property: ts.ObjectLiteralElementLike,
+  provenance: BetterResultProvenance,
+): ts.CallExpression | undefined {
+  if (!property.name || !ts.isObjectLiteralExpression(property.parent)) return undefined;
+  const object = property.parent;
+  let expression: ts.Expression = object;
+  while (ts.isParenthesizedExpression(expression.parent)) expression = expression.parent;
+  const call = expression.parent;
+  if (!ts.isCallExpression(call) || call.arguments[0] !== expression) return undefined;
+  return isBetterResultCaptureCall(call, provenance) ? call : undefined;
+}
+
+function throwIsCapturedByObjectResult(
+  node: ts.ThrowStatement,
+  provenance: BetterResultProvenance,
+): boolean {
+  for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+    if (!ts.isFunctionLike(current)) continue;
+    const property = current.parent;
+    if (
+      ts.isPropertyAssignment(property) &&
+      propertyStringName(property.name) === "try" &&
+      resultCaptureObjectForProperty(property, provenance)
+    ) {
+      return true;
+    }
+    break;
+  }
+  return false;
+}
 
 function normalizedAdapterModule(workspaceRoot: string, module: string): string {
   const normalizedRoot = normalizeFilePath(workspaceRoot).replace(/\/$/u, "");
@@ -613,6 +834,7 @@ export function findExceptionFlowViolationsInSourceFile(
   manifest: ArchitectureManifest = architectureManifest,
 ): SyntacticFinding<ExceptionFlowKind>[] {
   const provenance = collectPromiseProvenance(sourceFile);
+  const betterResultProvenance = collectBetterResultProvenance(sourceFile);
   const namedCallbackBodies = collectNamedCallbackBodies(sourceFile);
   const streamControllers = collectStreamControllers(sourceFile);
   const findings: SyntacticFinding<ExceptionFlowKind>[] = [];
@@ -626,18 +848,25 @@ export function findExceptionFlowViolationsInSourceFile(
     if (!adapterAllows(finding, manifest)) findings.push(finding);
   };
   const visit = (node: ts.Node): void => {
-    if (ts.isThrowStatement(node)) {
-      add(
-        node,
-        "throw",
-        "Return a typed Result error; throw only in an exactly registered adapter",
+    if (ts.isTryStatement(node)) {
+      findings.push(
+        createFinding(
+          sourceFile,
+          filePath,
+          node,
+          "try-statement",
+          "Use object-form Result.try or Result.tryPromise; production try statements are forbidden",
+          node,
+        ),
       );
-    } else if (ts.isCatchClause(node)) {
-      add(
-        node,
-        "catch-clause",
-        "Capture the external exception in an exactly registered adapter; try/finally remains allowed",
-      );
+    } else if (ts.isThrowStatement(node)) {
+      if (!throwIsCapturedByObjectResult(node, betterResultProvenance)) {
+        add(
+          node,
+          "throw",
+          "Return a typed Result error; throw only in an exactly registered adapter",
+        );
+      }
     } else if (ts.isNewExpression(node)) {
       for (const call of usedExecutorRejectCalls(node, provenance)) {
         add(
@@ -656,7 +885,7 @@ export function findExceptionFlowViolationsInSourceFile(
           add(
             node,
             "promise-catch",
-            "Capture rejection in an exactly registered external-to-result adapter instead of .catch",
+            "Use Result.tryPromise for ordinary rejection capture; reserve .catch for an exact host signal contract",
             callback && !ts.isSpreadElement(callback)
               ? rejectionCallbackOwner(callback, namedCallbackBodies)
               : node,
@@ -1274,6 +1503,7 @@ function typeIsImportedResult(
 
 function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
   const counts = collectBindingNameCounts(sourceFile);
+  const mutated = collectMutatedBindings(sourceFile);
   const moduleNamespaces = new Set<string>();
   const importedResultTypeNames = new Set<string>();
   const resultFactories = new Map<string, number>();
@@ -1296,20 +1526,29 @@ function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
         : [statement.importClause.namedBindings]
       : []) {
       if (ts.isNamespaceImport(specifier)) {
-        moduleNamespaces.add(specifier.name.text);
+        if (!mutated.has(specifier.name.text)) moduleNamespaces.add(specifier.name.text);
         continue;
       }
       const importedName = (specifier.propertyName ?? specifier.name).text;
       if (importedName === "Result") {
-        setProvenance(
-          resultNamespaces,
-          counts,
-          specifier.name.text,
-          statement.getStart(sourceFile),
-        );
-        importedResultTypeNames.add(specifier.name.text);
+        if (!mutated.has(specifier.name.text)) {
+          setProvenance(
+            resultNamespaces,
+            counts,
+            specifier.name.text,
+            statement.getStart(sourceFile),
+          );
+          importedResultTypeNames.add(specifier.name.text);
+        }
       } else if (importedName === "ok" || importedName === "err") {
-        setProvenance(resultFactories, counts, specifier.name.text, statement.getStart(sourceFile));
+        if (!mutated.has(specifier.name.text)) {
+          setProvenance(
+            resultFactories,
+            counts,
+            specifier.name.text,
+            statement.getStart(sourceFile),
+          );
+        }
       }
     }
   }
@@ -1319,6 +1558,7 @@ function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
     if (
       ts.isVariableDeclaration(node) &&
       ts.isIdentifier(node.name) &&
+      !mutated.has(node.name.text) &&
       typeIsImportedResult(node.type, importedResultTypeNames)
     ) {
       setProvenance(resultValues, counts, node.name.text, node.getStart(sourceFile));
@@ -1326,6 +1566,7 @@ function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
     if (
       ts.isParameter(node) &&
       ts.isIdentifier(node.name) &&
+      !mutated.has(node.name.text) &&
       typeIsImportedResult(node.type, importedResultTypeNames)
     ) {
       setProvenance(resultValues, counts, node.name.text, node.getStart(sourceFile));
@@ -1353,6 +1594,7 @@ function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
     for (const declaration of declarations) {
       if (!declaration.initializer || !ts.isIdentifier(declaration.name)) continue;
       const name = declaration.name.text;
+      if (mutated.has(name)) continue;
       const position = declaration.getStart(sourceFile);
       if (isResultNamespaceExpression(declaration.initializer, current, position)) {
         changed = setProvenance(resultNamespaces, counts, name, position) || changed;
@@ -1363,6 +1605,7 @@ function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
     }
     for (const assignment of assignments) {
       if (!ts.isIdentifier(assignment.left)) continue;
+      if (mutated.has(assignment.left.text)) continue;
       if (isKnownResultExpression(assignment.right, current, assignment.getStart(sourceFile))) {
         changed =
           setProvenance(

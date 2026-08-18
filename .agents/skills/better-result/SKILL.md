@@ -34,8 +34,12 @@ remain defects.
   syntax gate rejects inline async Result callbacks.
 - Use `Result.all` when every operation must succeed and `Result.partition` when all successes and errors
   must be retained. Use their async variants only with promises that resolve to Results.
-- Use object-form `Result.try` or `Result.tryPromise` at an external exception boundary and map the caught
-  value to an owned error. Forward cancellation signals when the operation supports them.
+- Use object-form `Result.try` or `Result.tryPromise` at an external exception boundary. Its catch function
+  must be total: return a closed captured value and never throw, reject, or signal a host. Classify or
+  re-signal retained defects only after leaving protected Better Result callbacks. A positive `isErr()`
+  `if` guard may settle the immutable local returned directly by that capture; keep the guard and capture in
+  the same lexical block and do not alias or transform the Result first. Forward cancellation signals when
+  the operation supports them.
 - Use `match` when leaving the Result abstraction at the final policy or host boundary. Exhaustively match
   tagged error unions there rather than spreading error policy through the workflow.
 - Use `Result.codec` with boundary-owned schemas for persisted, wire, or independently versioned Result
@@ -43,14 +47,19 @@ remain defects.
 
 ## Preserve Local Boundaries
 
-Lilac is stricter than upstream examples: production code composes Results declaratively rather than
-reading branch discriminants, calling Result guards, or extracting with `unwrap`. Follow diagnostics from
-`scripts/architecture` and read `scripts/architecture/README.md` before changing a registered boundary.
+Lilac is stricter than upstream examples: except for the narrow direct-capture `isErr()` settlement above,
+production code composes Results declaratively rather than reading branch discriminants, calling Result
+guards, or extracting with `unwrap`. Follow diagnostics from `scripts/architecture` and read
+`scripts/architecture/README.md` before changing a registered boundary.
 
 Better Result protects combinator and `match` callbacks by wrapping thrown values in a new `Panic`.
 Existing thunked `match` handlers can intentionally execute host signals, SQLite operations, or retained
 Panics outside that protection. Do not simplify one without proving exception identity, cleanup ordering,
 and transaction behavior with focused tests.
+
+Production `TryStatement` syntax is forbidden. Use `using` or `await using` only when lexical ownership and
+`SuppressedError` precedence match the required policy. When cleanup can fail or an original Panic must win,
+capture operation and cleanup outcomes separately and settle their precedence outside protected callbacks.
 
 When API details are still unclear, read the smallest relevant page indexed by
 `https://better-result.dev/agents.txt` rather than loading the full documentation corpus.

@@ -71,7 +71,6 @@ const declarationPackageCache = new WeakMap<
 interface SourceAnalysisIndex {
   readonly aliases: readonly (readonly [source: string, target: string])[];
   readonly calls: readonly ts.CallExpression[];
-  readonly errorCallbackReferences: readonly ts.Identifier[];
 }
 
 interface ProgramProductionSourceIndex {
@@ -94,7 +93,7 @@ const SYMBOL_ASSIGNMENT_INDEXES = new WeakMap<
   ts.TypeChecker,
   WeakMap<ts.SourceFile, ReadonlyMap<ts.Symbol, readonly SymbolSource[]>>
 >();
-const ERROR_CALLBACK_SYMBOLS = new WeakMap<
+const MUTATED_SYMBOL_INDEXES = new WeakMap<
   ts.TypeChecker,
   WeakMap<ts.SourceFile, ReadonlySet<ts.Symbol>>
 >();
@@ -105,6 +104,18 @@ const TYPE_FLAG_FACTS = new WeakMap<
 const PACKAGE_TYPE_FACTS = new WeakMap<
   ts.TypeChecker,
   WeakMap<readonly WorkspacePackageRoot[], WeakMap<ts.Node, WeakMap<ts.Type, Map<string, boolean>>>>
+>();
+const INTRINSIC_RESULT_CATCH_MAPPERS = new WeakMap<
+  ts.TypeChecker,
+  ReadonlySet<ts.SignatureDeclaration>
+>();
+const INTRINSIC_RESULT_MATCH_HANDLERS = new WeakMap<
+  ts.TypeChecker,
+  ReadonlySet<ts.SignatureDeclaration>
+>();
+const INTRINSIC_RESULT_CLASSIFIER_PARAMETERS = new WeakMap<
+  ts.TypeChecker,
+  ReadonlySet<ts.ParameterDeclaration>
 >();
 
 function normalizedPath(value: string): string {
@@ -192,19 +203,12 @@ function sourceAnalysisIndex(sourceFile: ts.SourceFile): SourceAnalysisIndex {
 
   const aliases: Array<readonly [source: string, target: string]> = [];
   const calls: ts.CallExpression[] = [];
-  const errorCallbackReferences: ts.Identifier[] = [];
   const addAlias = (source: string | undefined, target: ts.BindingName | ts.PropertyName): void => {
     if (!source || !ts.isIdentifier(target)) return;
     aliases.push([source, target.text]);
   };
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) calls.push(node);
-    if (
-      ts.isIdentifier(node) &&
-      (ts.isPropertyAssignment(node.parent) || ts.isCallExpression(node.parent))
-    ) {
-      errorCallbackReferences.push(node);
-    }
     if (ts.isImportSpecifier(node)) {
       aliases.push([node.propertyName?.text ?? node.name.text, node.name.text]);
     } else if (ts.isVariableDeclaration(node) && node.initializer) {
@@ -226,7 +230,7 @@ function sourceAnalysisIndex(sourceFile: ts.SourceFile): SourceAnalysisIndex {
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
-  const index = { aliases, calls, errorCallbackReferences };
+  const index = { aliases, calls };
   SOURCE_ANALYSIS_INDEXES.set(sourceFile, index);
   return index;
 }
@@ -995,6 +999,22 @@ function typeContainsUnhandledException(
   );
 }
 
+function typeContainsPanic(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  location: ts.Node,
+): boolean {
+  return typeContainsPackageType(
+    type,
+    checker,
+    packageRoots,
+    "better-result",
+    new Set(["Panic"]),
+    location,
+  );
+}
+
 function typeContainsTaggedError(
   type: ts.Type,
   checker: ts.TypeChecker,
@@ -1103,14 +1123,69 @@ function callReceiver(node: ts.CallExpression): ts.Expression | undefined {
   return undefined;
 }
 
+function importDeclarationFor(node: ts.Node): ts.ImportDeclaration | undefined {
+  for (let current: ts.Node | undefined = node; current; current = current.parent) {
+    if (ts.isImportDeclaration(current)) return current;
+  }
+  return undefined;
+}
+
+function isDirectImmutableResultBinding(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+): boolean {
+  const value = unwrapExpression(expression);
+  if (ts.isIdentifier(value)) {
+    const symbol = checker.getSymbolAtLocation(value);
+    if (!symbol || symbolIsMutated(symbol, value.getSourceFile(), checker)) return false;
+    return (symbol.declarations ?? []).some((declaration) => {
+      if (!ts.isImportSpecifier(declaration)) return false;
+      const imported = (declaration.propertyName ?? declaration.name).text;
+      return (
+        imported === "Result" &&
+        importDeclarationFor(declaration)?.moduleSpecifier.getText().replaceAll(/["']/gu, "") ===
+          "better-result"
+      );
+    });
+  }
+  const selected = selectedProperty(value);
+  if (!selected || selected.name !== "Result") return false;
+  const namespace = unwrapExpression(selected.receiver);
+  if (!ts.isIdentifier(namespace)) return false;
+  const symbol = checker.getSymbolAtLocation(namespace);
+  if (!symbol || symbolIsMutated(symbol, namespace.getSourceFile(), checker)) return false;
+  return (symbol.declarations ?? []).some(
+    (declaration) =>
+      ts.isNamespaceImport(declaration) &&
+      importDeclarationFor(declaration)?.moduleSpecifier.getText().replaceAll(/["']/gu, "") ===
+        "better-result",
+  );
+}
+
+function isDirectImmutableResultCaptureCall(
+  call: ts.CallExpression,
+  checker: ts.TypeChecker,
+): boolean {
+  const selected = selectedProperty(call.expression);
+  return Boolean(
+    selected &&
+    RESULT_CAPTURE_MEMBERS.has(selected.name) &&
+    isDirectImmutableResultBinding(selected.receiver, checker),
+  );
+}
+
 function callableExpressionDeclaration(
   expression: ts.Expression,
   checker: ts.TypeChecker,
+  seenSymbols: Set<ts.Symbol> = new Set(),
 ): ts.FunctionLikeDeclaration | undefined {
   const unwrapped = unwrapExpression(expression);
   if (ts.isArrowFunction(unwrapped) || ts.isFunctionExpression(unwrapped)) return unwrapped;
   const symbol = checker.getSymbolAtLocation(unwrapped);
-  for (const declaration of symbol?.declarations ?? []) {
+  const resolvedSymbol = symbol && canonicalSymbol(symbol, checker);
+  if (!resolvedSymbol || seenSymbols.has(resolvedSymbol)) return undefined;
+  seenSymbols.add(resolvedSymbol);
+  for (const declaration of resolvedSymbol?.declarations ?? []) {
     if (ts.isFunctionDeclaration(declaration) || ts.isMethodDeclaration(declaration)) {
       if (declaration.body) return declaration;
       continue;
@@ -1119,7 +1194,274 @@ function callableExpressionDeclaration(
       const initializer = unwrapExpression(declaration.initializer);
       if (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer))
         return initializer;
+      const callable = callableExpressionDeclaration(initializer, checker, seenSymbols);
+      if (callable) return callable;
     }
+  }
+  return undefined;
+}
+
+function immutableCallableExpressionDeclaration(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+): ts.FunctionLikeDeclaration | undefined {
+  const value = unwrapExpression(expression);
+  if (ts.isArrowFunction(value) || ts.isFunctionExpression(value)) return value;
+  if (!ts.isIdentifier(value)) {
+    const root = rootIdentifier(value);
+    const rootSymbol = root && checker.getSymbolAtLocation(root);
+    const immutableRoot = rootSymbol?.declarations?.some(
+      (declaration) =>
+        ts.isVariableDeclaration(declaration) &&
+        (declaration.parent.flags & ts.NodeFlags.Const) !== 0,
+    );
+    if (
+      !root ||
+      !rootSymbol ||
+      !immutableRoot ||
+      symbolIsMutated(rootSymbol, root.getSourceFile(), checker)
+    ) {
+      return undefined;
+    }
+    const implementation = callableExpressionDeclaration(value, checker);
+    return implementation?.body ? implementation : undefined;
+  }
+  const symbol = checker.getSymbolAtLocation(value);
+  if (!symbol || symbolIsMutated(symbol, value.getSourceFile(), checker)) return undefined;
+  for (const declaration of symbol.declarations ?? []) {
+    if (ts.isFunctionDeclaration(declaration)) return declaration.body ? declaration : undefined;
+    if (
+      ts.isVariableDeclaration(declaration) &&
+      (declaration.parent.flags & ts.NodeFlags.Const) !== 0 &&
+      declaration.initializer
+    ) {
+      const initializer = unwrapExpression(declaration.initializer);
+      return ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)
+        ? initializer
+        : undefined;
+    }
+    if (ts.isImportSpecifier(declaration)) {
+      const implementation = callableExpressionDeclaration(value, checker);
+      return implementation?.body ? implementation : undefined;
+    }
+  }
+  return undefined;
+}
+
+interface CatchMapperResolution {
+  readonly expression?: ts.Expression;
+  readonly mapper?: ts.FunctionLikeDeclaration;
+  readonly unresolved: boolean;
+}
+
+function resultCaptureCatchMapperResolution(
+  node: ts.CallExpression,
+  checker: ts.TypeChecker,
+): CatchMapperResolution {
+  const options = node.arguments[0];
+  if (!options || ts.isSpreadElement(options)) return { unresolved: false };
+  const object = returnedObjectLiteral(options, checker);
+  if (!object) {
+    const value = unwrapExpression(options);
+    return ts.isArrowFunction(value) || ts.isFunctionExpression(value)
+      ? { unresolved: false }
+      : { expression: options, unresolved: true };
+  }
+  const mapper = object && objectPropertyExpression(object, "catch", checker, new Set());
+  if (!mapper) return { unresolved: true };
+  const expression = unwrapExpression(mapper);
+  if (ts.isArrowFunction(expression) || ts.isFunctionExpression(expression)) {
+    return { expression, mapper: expression, unresolved: false };
+  }
+  if (!ts.isIdentifier(expression)) return { expression, unresolved: true };
+  const implementation = immutableCallableExpressionDeclaration(expression, checker);
+  return implementation?.body
+    ? { expression, mapper: implementation, unresolved: false }
+    : { expression, unresolved: true };
+}
+
+function resultCaptureCatchMapper(
+  node: ts.CallExpression,
+  checker: ts.TypeChecker,
+): ts.FunctionLikeDeclaration | undefined {
+  return resultCaptureCatchMapperResolution(node, checker).mapper;
+}
+
+function mapperHasExplicitExceptionChannel(
+  mapper: ts.FunctionLikeDeclaration,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  if (!mapper.body) return false;
+  let found = false;
+  const visitedCallables = new Set<ts.FunctionLikeDeclaration>([mapper]);
+  const visit = (node: ts.Node): void => {
+    if (found || (node !== mapper.body && ts.isFunctionLike(node))) return;
+    if (ts.isThrowStatement(node)) {
+      found = true;
+      return;
+    }
+    if (ts.isCallExpression(node)) {
+      const signature = resolvedSignature(checker, node);
+      const member = declarationName(signature?.declaration) ?? expressionName(node.expression);
+      if (
+        packageForSignature(signature, packageRoots) === "better-result" &&
+        member !== undefined &&
+        RESULT_CAPTURE_MEMBERS.has(member) &&
+        isDirectImmutableResultCaptureCall(node, checker)
+      ) {
+        const nestedMapper = resultCaptureCatchMapper(node, checker);
+        if (!nestedMapper?.body || visitedCallables.has(nestedMapper)) {
+          found = true;
+          return;
+        }
+        visitedCallables.add(nestedMapper);
+        visit(nestedMapper.body);
+        return;
+      }
+      if (packageForSignature(signature, packageRoots) === "better-result" && member === "match") {
+        const input = resultMatchInputExpression(node, signature, checker, packageRoots);
+        const handlers = resultMatchHandlersArgument(node, signature, checker, packageRoots);
+        if (input && handlers && resolvesToDirectLocalResultCapture(input, checker, packageRoots)) {
+          const ok = resultMatchHandler(handlers, "ok", checker);
+          const err = resultMatchHandler(handlers, "err", checker);
+          if (!ok?.body || !err?.body) {
+            found = true;
+            return;
+          }
+          for (const branch of new Set([ok, err])) {
+            const body = branch.body;
+            if (!body || visitedCallables.has(branch)) {
+              found = true;
+              return;
+            }
+            visitedCallables.add(branch);
+            visit(body);
+          }
+          return;
+        }
+      }
+      if (
+        isDefaultLibraryDeclaration(signature?.declaration) &&
+        declarationOwnerName(signature?.declaration) === "PromiseConstructor" &&
+        member === "reject"
+      ) {
+        found = true;
+        return;
+      }
+      const declaration = signature?.declaration;
+      if (
+        declaration &&
+        workspace.exceptionAdapters.some(
+          (adapter) =>
+            adapter.direction === "signal-host" &&
+            identityOwns(adapter.identity, nodeIdentity(declaration, workspaceRoot)),
+        )
+      ) {
+        found = true;
+        return;
+      }
+      const called = immutableCallableExpressionDeclaration(node.expression, checker);
+      if (called?.body && !visitedCallables.has(called)) {
+        visitedCallables.add(called);
+        visit(called.body);
+      } else if (
+        !called?.body &&
+        !(
+          (isDefaultLibraryDeclaration(signature?.declaration) &&
+            ["BooleanConstructor", "NumberConstructor", "StringConstructor"].includes(
+              declarationOwnerName(signature?.declaration) ?? "",
+            )) ||
+          externalCallMatches(
+            node,
+            { package: "better-result", exportName: "Panic.is" },
+            checker,
+            packageRoots,
+          )
+        )
+      ) {
+        found = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(mapper.body);
+  return found;
+}
+
+function analyzeMappedResultCapture(
+  node: ts.CallExpression,
+  member: string,
+  checker: ts.TypeChecker,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  if (!isDirectImmutableResultCaptureCall(node, checker)) {
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/no-unmapped-result-capture",
+        node,
+        `Result.${member} is not invoked through a direct immutable better-result import binding.`,
+        "Call Result.try or Result.tryPromise directly through its immutable import binding.",
+      ),
+    );
+    return;
+  }
+  const resolution = resultCaptureCatchMapperResolution(node, checker);
+  if (!resolution.expression && !resolution.unresolved) return;
+  const mapper = resolution.mapper;
+  if (resolution.unresolved || !mapper?.body) {
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/no-unmapped-result-capture",
+        resolution.expression ?? node,
+        `Result.${member} catch mapper has no directly resolvable immutable implementation.`,
+        "Use an inline mapper or a direct immutable function binding with a visible implementation.",
+      ),
+    );
+    return;
+  }
+  if (mapperHasExplicitExceptionChannel(mapper, checker, workspace, workspaceRoot, packageRoots)) {
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/no-unmapped-result-capture",
+        mapper,
+        `Result.${member} catch mapper explicitly throws, rejects, or signals a registered host failure, or transitively calls an unresolved helper.`,
+        "Return a specific expected error value from the catch mapper; signal host failure only after Result policy is resolved.",
+      ),
+    );
+  }
+}
+
+function resultExpectedErrorType(
+  type: ts.Type,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+  location: ts.Node,
+): ts.Type | undefined {
+  if (!isDirectResultType(type, packageRoots)) {
+    const name = type.aliasSymbol?.getName() ?? type.getSymbol()?.getName();
+    if (name !== "Promise") return undefined;
+    const [value] = typeArguments(type, checker);
+    return value && resultExpectedErrorType(value, checker, packageRoots, location);
+  }
+  const members = type.isUnion() ? type.types : [type];
+  for (const member of members) {
+    if (!typeIsPackageType(member, "better-result", new Set(["Err"]), packageRoots)) continue;
+    const error = member.getProperty("error");
+    if (error) return checker.getTypeOfSymbolAtLocation(error, location);
+    return typeArguments(member, checker).at(-1);
   }
   return undefined;
 }
@@ -1375,6 +1717,141 @@ function latestSymbolSource(
   const assignment = assignments[left - 1];
   if (assignment && (!latest || assignment.position > latest.position)) latest = assignment;
   return latest?.expression;
+}
+
+function stableSymbolSource(
+  symbol: ts.Symbol,
+  use: ts.Identifier,
+  checker: ts.TypeChecker,
+): ts.Expression | undefined {
+  if (symbolIsMutated(symbol, use.getSourceFile(), checker)) return undefined;
+  const usePosition = nodeStart(use);
+  const assignments = symbolAssignmentIndex(use.getSourceFile(), checker).get(symbol) ?? [];
+  if (assignments.some(({ position }) => position < usePosition)) return undefined;
+  const declarations = (symbol.declarations ?? []).flatMap((declaration) => {
+    let expression: ts.Expression | undefined;
+    if (ts.isVariableDeclaration(declaration)) expression = declaration.initializer;
+    if (ts.isBindingElement(declaration)) expression = bindingElementSource(declaration, checker);
+    return expression && nodeStart(declaration) < usePosition ? [expression] : [];
+  });
+  return declarations.length === 1 ? declarations[0] : undefined;
+}
+
+function rootIdentifier(expression: ts.Expression): ts.Identifier | undefined {
+  let current = unwrapExpression(expression);
+  while (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+    current = unwrapExpression(current.expression);
+  }
+  return ts.isIdentifier(current) ? current : undefined;
+}
+
+function mutatedSymbols(
+  sourceFile: ts.SourceFile,
+  checker: ts.TypeChecker,
+): ReadonlySet<ts.Symbol> {
+  let checkerCache = MUTATED_SYMBOL_INDEXES.get(checker);
+  if (!checkerCache) {
+    checkerCache = new WeakMap();
+    MUTATED_SYMBOL_INDEXES.set(checker, checkerCache);
+  }
+  const cached = checkerCache.get(sourceFile);
+  if (cached) return cached;
+  const bindingMutated = new Set<ts.Symbol>();
+  const objectMutated = new Set<ts.Symbol>();
+  const aliases: [ts.Symbol, ts.Symbol][] = [];
+  const add = (symbols: Set<ts.Symbol>, expression: ts.Expression): void => {
+    const identifier = rootIdentifier(expression);
+    const symbol = identifier && checker.getSymbolAtLocation(identifier);
+    if (symbol) symbols.add(canonicalSymbol(symbol, checker));
+  };
+  const addAssignmentTarget = (target: ts.Expression): void => {
+    const value = unwrapExpression(target);
+    if (ts.isArrayLiteralExpression(value)) {
+      for (const element of value.elements) {
+        if (ts.isOmittedExpression(element)) continue;
+        addAssignmentTarget(ts.isSpreadElement(element) ? element.expression : element);
+      }
+      return;
+    }
+    if (ts.isObjectLiteralExpression(value)) {
+      for (const property of value.properties) {
+        if (ts.isShorthandPropertyAssignment(property)) {
+          const symbol = checker.getShorthandAssignmentValueSymbol(property);
+          if (symbol) bindingMutated.add(canonicalSymbol(symbol, checker));
+          else add(bindingMutated, property.name);
+        }
+        if (ts.isPropertyAssignment(property)) addAssignmentTarget(property.initializer);
+        if (ts.isSpreadAssignment(property)) addAssignmentTarget(property.expression);
+      }
+      return;
+    }
+    if (ts.isBinaryExpression(value) && value.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      addAssignmentTarget(value.left);
+      return;
+    }
+    add(ts.isIdentifier(value) ? bindingMutated : objectMutated, value);
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      const source = rootIdentifier(node.initializer);
+      const aliasSymbol = checker.getSymbolAtLocation(node.name);
+      const sourceSymbol = source && checker.getSymbolAtLocation(source);
+      if (aliasSymbol && sourceSymbol) {
+        aliases.push([
+          canonicalSymbol(aliasSymbol, checker),
+          canonicalSymbol(sourceSymbol, checker),
+        ]);
+      }
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+    ) {
+      addAssignmentTarget(node.left);
+    } else if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) {
+      const operand = unwrapExpression(node.operand);
+      add(ts.isIdentifier(operand) ? bindingMutated : objectMutated, operand);
+    } else if (ts.isCallExpression(node)) {
+      const selected = selectedProperty(node.expression);
+      const receiver = selected && unwrapExpression(selected.receiver);
+      if (
+        selected &&
+        receiver !== undefined &&
+        ts.isIdentifier(receiver) &&
+        ((receiver.text === "Object" &&
+          (selected.name === "assign" || selected.name === "defineProperty")) ||
+          (receiver.text === "Reflect" &&
+            (selected.name === "set" || selected.name === "defineProperty")))
+      ) {
+        const target = node.arguments[0];
+        if (target && !ts.isSpreadElement(target)) add(objectMutated, target);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [alias, source] of aliases) {
+      if (objectMutated.has(alias) === objectMutated.has(source)) continue;
+      objectMutated.add(alias);
+      objectMutated.add(source);
+      changed = true;
+    }
+  }
+  const mutated = new Set([...bindingMutated, ...objectMutated]);
+  checkerCache.set(sourceFile, mutated);
+  return mutated;
+}
+
+function symbolIsMutated(
+  symbol: ts.Symbol,
+  sourceFile: ts.SourceFile,
+  checker: ts.TypeChecker,
+): boolean {
+  return mutatedSymbols(sourceFile, checker).has(canonicalSymbol(symbol, checker));
 }
 
 function expressionContainsUnformattedTaggedError(
@@ -1701,6 +2178,101 @@ function invokedBetterResultBranchMember(
   return betterResultBranchMemberFromExpression(node.expression, checker, packageRoots);
 }
 
+function directResultCaptureCall(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): ts.CallExpression | undefined {
+  let value = unwrapExpression(expression);
+  if (ts.isAwaitExpression(value)) value = unwrapExpression(value.expression);
+  if (!ts.isCallExpression(value)) return undefined;
+  const signature = resolvedSignature(checker, value);
+  const member = declarationName(signature?.declaration) ?? expressionName(value.expression);
+  return packageForSignature(signature, packageRoots) === "better-result" &&
+    member !== undefined &&
+    RESULT_CAPTURE_MEMBERS.has(member) &&
+    isDirectImmutableResultCaptureCall(value, checker) &&
+    resultCaptureCatchMapper(value, checker)
+    ? value
+    : undefined;
+}
+
+function resolvesToDirectLocalResultCapture(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  if (directResultCaptureCall(expression, checker, packageRoots)) return true;
+  const value = unwrapExpression(expression);
+  if (!ts.isIdentifier(value)) return false;
+  const symbol = checker.getSymbolAtLocation(value);
+  if (!symbol || symbolIsMutated(symbol, value.getSourceFile(), checker)) return false;
+  const declarations = canonicalSymbol(symbol, checker).declarations?.filter(
+    ts.isVariableDeclaration,
+  );
+  if (declarations?.length !== 1) return false;
+  const [declaration] = declarations;
+  return Boolean(
+    declaration?.initializer &&
+    (declaration.parent.flags & ts.NodeFlags.Const) !== 0 &&
+    directResultCaptureCall(declaration.initializer, checker, packageRoots),
+  );
+}
+
+function isDirectLocalResultCaptureErrGuard(
+  node: ts.CallExpression,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  if (node.arguments.length !== 0) return false;
+  const selected = selectedProperty(node.expression);
+  if (selected?.name !== "isErr") return false;
+
+  let condition: ts.Expression = node;
+  while (
+    ts.isParenthesizedExpression(condition.parent) ||
+    ts.isAsExpression(condition.parent) ||
+    ts.isSatisfiesExpression(condition.parent) ||
+    ts.isTypeAssertionExpression(condition.parent) ||
+    ts.isNonNullExpression(condition.parent)
+  ) {
+    condition = condition.parent;
+  }
+  const branch = condition.parent;
+  if (!ts.isIfStatement(branch) || branch.expression !== condition) return false;
+
+  const receiver = unwrapExpression(selected.receiver);
+  if (!ts.isIdentifier(receiver)) return false;
+  const receiverSymbol = checker.getSymbolAtLocation(receiver);
+  if (!receiverSymbol || symbolIsMutated(receiverSymbol, receiver.getSourceFile(), checker)) {
+    return false;
+  }
+  const declarations = canonicalSymbol(receiverSymbol, checker).declarations?.filter(
+    ts.isVariableDeclaration,
+  );
+  if (declarations?.length !== 1) return false;
+  const [declaration] = declarations;
+  if (
+    !declaration ||
+    !ts.isIdentifier(declaration.name) ||
+    !declaration.initializer ||
+    (declaration.parent.flags & ts.NodeFlags.Const) === 0
+  ) {
+    return false;
+  }
+  if (!directResultCaptureCall(declaration.initializer, checker, packageRoots)) return false;
+
+  const variableStatement = declaration.parent.parent;
+  if (!ts.isVariableStatement(variableStatement) || variableStatement.parent !== branch.parent) {
+    return false;
+  }
+  const statements =
+    ts.isBlock(branch.parent) || ts.isSourceFile(branch.parent)
+      ? branch.parent.statements
+      : undefined;
+  return Boolean(statements && statements.indexOf(variableStatement) < statements.indexOf(branch));
+}
+
 function expressionReferencesBetterResultStaticMatch(
   expression: ts.Expression,
   checker: ts.TypeChecker,
@@ -1778,6 +2350,19 @@ function resultMatchHandlersArgument(
     return node.arguments.length > 1 ? node.arguments[1] : node.arguments[0];
   }
   return undefined;
+}
+
+function resultMatchInputExpression(
+  node: ts.CallExpression,
+  signature: ts.Signature | undefined,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): ts.Expression | undefined {
+  const handlers = resultMatchHandlersArgument(node, signature, checker, packageRoots);
+  if (!handlers) return undefined;
+  if (handlers === node.arguments[0]) return callReceiver(node);
+  const input = node.arguments[0];
+  return input && !ts.isSpreadElement(input) ? input : undefined;
 }
 
 function resolvedPropertyNameText(
@@ -2112,7 +2697,14 @@ function analyzeCall(
     );
   }
 
-  if (activeRules.has("architecture/no-manual-result-branching") && manualResultBranchMember) {
+  if (
+    activeRules.has("architecture/no-manual-result-branching") &&
+    manualResultBranchMember &&
+    !(
+      manualResultBranchMember === "isErr" &&
+      isDirectLocalResultCaptureErrGuard(node, checker, packageRoots)
+    )
+  ) {
     diagnostics.push(
       makeDiagnostic(
         workspace,
@@ -2142,19 +2734,31 @@ function analyzeCall(
     activeRules.has("architecture/no-unmapped-result-capture") &&
     sourcePackage === "better-result" &&
     member &&
-    RESULT_CAPTURE_MEMBERS.has(member) &&
-    typeContainsUnhandledException(checker.getTypeAtLocation(node), checker, packageRoots, node)
+    RESULT_CAPTURE_MEMBERS.has(member)
   ) {
-    diagnostics.push(
-      makeDiagnostic(
-        workspace,
-        workspaceRoot,
-        "architecture/no-unmapped-result-capture",
-        node,
-        `Result.${member} exposes UnhandledException.`,
-        "Use the object overload and map the caught cause to a specific domain-owned error.",
-      ),
+    analyzeMappedResultCapture(
+      node,
+      member,
+      checker,
+      workspace,
+      workspaceRoot,
+      packageRoots,
+      diagnostics,
     );
+    if (
+      typeContainsUnhandledException(checker.getTypeAtLocation(node), checker, packageRoots, node)
+    ) {
+      diagnostics.push(
+        makeDiagnostic(
+          workspace,
+          workspaceRoot,
+          "architecture/no-unmapped-result-capture",
+          node,
+          `Result.${member} exposes UnhandledException.`,
+          "Use the object overload and map the caught cause to a specific domain-owned error.",
+        ),
+      );
+    }
   }
 
   if (
@@ -2393,6 +2997,29 @@ function analyzeResultContract(
     );
   }
 
+  const expectedError = resultExpectedErrorType(returnType, checker, packageRoots, node);
+  if (
+    activeRules.has("architecture/no-unhandled-exception-contract") &&
+    (isExportedContract(node, checker, exports) ||
+      workspace.operationalResultApis.some((api) => identityMatches(api, identity))) &&
+    expectedError &&
+    ((expectedError.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0 ||
+      typeContainsPanic(expectedError, checker, packageRoots, node)) &&
+    !reported.has(`invalid-error:${key}`)
+  ) {
+    reported.add(`invalid-error:${key}`);
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/no-unhandled-exception-contract",
+        node,
+        `API ${identity.symbolPath} exposes Panic or unknown as an expected Result error.`,
+        "Return a closed domain-owned expected error union and keep Panic or unknown defects on the defect channel.",
+      ),
+    );
+  }
+
   if (
     activeRules.has("architecture/fallible-api-result") &&
     workspace.operationalResultApis.some((api) => identityMatches(api, identity)) &&
@@ -2454,10 +3081,22 @@ function analyzeParameter(
   checker: ts.TypeChecker,
   workspace: WorkspaceArchitecture,
   workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
   diagnostics: ArchitectureDiagnostic[],
 ): void {
   if (!isUnknown(checker.getTypeAtLocation(node))) return;
   const identity = nodeIdentity(node, workspaceRoot);
+  const signalHostParameter = workspace.exceptionAdapters.some(
+    (adapter) => adapter.direction === "signal-host" && identityMatches(adapter.identity, identity),
+  );
+  if (
+    !signalHostParameter &&
+    (intrinsicResultCatchParameter(node, checker, packageRoots) ||
+      intrinsicResultCaptureMatchParameter(node, checker, packageRoots) ||
+      intrinsicResultClassifierParameter(node, checker))
+  ) {
+    return;
+  }
   if (workspace.boundaryDecoders.some((decoder) => identityOwns(decoder.identity, identity)))
     return;
   if (
@@ -2469,7 +3108,7 @@ function analyzeParameter(
   if (
     workspace.exceptionAdapters.some(
       (adapter) =>
-        adapter.direction !== "signal-host" && identityMatches(adapter.identity, identity),
+        adapter.direction === "observe-panic" && identityMatches(adapter.identity, identity),
     )
   ) {
     return;
@@ -2509,7 +3148,8 @@ function registeredUnknownInterpreterOwns(
     ) ||
     workspace.opaqueUnknown.some((exception) => identityOwns(exception.identity, identity)) ||
     workspace.exceptionAdapters.some(
-      (adapter) => adapter.direction !== "signal-host" && identityOwns(adapter.identity, identity),
+      (adapter) =>
+        adapter.direction === "observe-panic" && identityOwns(adapter.identity, identity),
     )
   );
 }
@@ -2544,11 +3184,32 @@ function analyzeUnknownMemberRead(
   checker: ts.TypeChecker,
   workspace: WorkspaceArchitecture,
   workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
   diagnostics: ArchitectureDiagnostic[],
 ): void {
   if (!isUnknown(checker.getTypeAtLocation(node))) return;
   const identity = nodeIdentity(node, workspaceRoot);
   if (registeredUnknownInterpreterOwns(workspace, identity)) return;
+  if (ts.isBindingElement(node)) {
+    for (let owner: ts.Node | undefined = node.parent; owner; owner = owner.parent) {
+      if (!ts.isParameter(owner)) continue;
+      if (
+        intrinsicResultCatchParameter(owner, checker, packageRoots) ||
+        intrinsicResultCaptureMatchParameter(owner, checker, packageRoots) ||
+        intrinsicResultClassifierParameter(owner, checker)
+      ) {
+        return;
+      }
+      break;
+    }
+  }
+  if (
+    !ts.isBindingElement(node) &&
+    (intrinsicResultCaptureOwnsUnknown(node.expression, checker, packageRoots) ||
+      intrinsicResultBoundaryOwnsUnknown(node.expression, checker, packageRoots))
+  ) {
+    return;
+  }
   diagnostics.push(
     makeDiagnostic(
       workspace,
@@ -2754,6 +3415,7 @@ function analyzeUnknownExtraction(
   checker: ts.TypeChecker,
   workspace: WorkspaceArchitecture,
   workspaceRoot: string,
+  packageRoots: readonly WorkspacePackageRoot[],
   diagnostics: ArchitectureDiagnostic[],
 ): void {
   const source = unknownExtractionSource(node, checker);
@@ -2762,6 +3424,12 @@ function analyzeUnknownExtraction(
   }
   const identity = nodeIdentity(node, workspaceRoot);
   if (registeredUnknownInterpreterOwns(workspace, identity)) return;
+  if (
+    intrinsicResultCaptureOwnsUnknown(source, checker, packageRoots) ||
+    intrinsicResultBoundaryOwnsUnknown(source, checker, packageRoots)
+  ) {
+    return;
+  }
   diagnostics.push(
     makeDiagnostic(
       workspace,
@@ -5305,6 +5973,564 @@ function nodeIsWithin(node: ts.Node, owner: ts.Node): boolean {
   return false;
 }
 
+function expressionDerivesFromSymbols(
+  expression: ts.Expression,
+  sources: ReadonlySet<ts.Symbol>,
+  checker: ts.TypeChecker,
+  seen: Set<ts.Symbol> = new Set(),
+): boolean {
+  const value = unwrapExpression(expression);
+  if (ts.isIdentifier(value)) {
+    const symbol = checker.getSymbolAtLocation(value);
+    if (symbol) {
+      const canonical = canonicalSymbol(symbol, checker);
+      if (sources.has(canonical)) return true;
+      if (!seen.has(canonical)) {
+        seen.add(canonical);
+        const source = stableSymbolSource(canonical, value, checker);
+        if (source && expressionDerivesFromSymbols(source, sources, checker, seen)) return true;
+      }
+    }
+  }
+  let found = false;
+  ts.forEachChild(value, (child) => {
+    if (found || !ts.isExpression(child)) return;
+    found = expressionDerivesFromSymbols(child, sources, checker, new Set(seen));
+  });
+  return found;
+}
+
+function expressionDerivesExclusivelyFromSymbols(
+  expression: ts.Expression,
+  sources: ReadonlySet<ts.Symbol>,
+  checker: ts.TypeChecker,
+  seen: Set<ts.Symbol> = new Set(),
+): boolean {
+  const value = unwrapExpression(expression);
+  if (ts.isIdentifier(value)) {
+    const symbol = ts.isShorthandPropertyAssignment(value.parent)
+      ? checker.getShorthandAssignmentValueSymbol(value.parent)
+      : checker.getSymbolAtLocation(value);
+    if (!symbol) return false;
+    const canonical = canonicalSymbol(symbol, checker);
+    if (sources.has(canonical)) return true;
+    if (seen.has(canonical)) return false;
+    seen.add(canonical);
+    const source = stableSymbolSource(canonical, value, checker);
+    return Boolean(
+      source && expressionDerivesExclusivelyFromSymbols(source, sources, checker, seen),
+    );
+  }
+  if (ts.isPropertyAccessExpression(value)) {
+    return expressionDerivesExclusivelyFromSymbols(value.expression, sources, checker, seen);
+  }
+  if (ts.isElementAccessExpression(value)) {
+    return (
+      expressionDerivesExclusivelyFromSymbols(value.expression, sources, checker, seen) &&
+      (ts.isStringLiteralLike(value.argumentExpression) ||
+        ts.isNumericLiteral(value.argumentExpression))
+    );
+  }
+  if (ts.isConditionalExpression(value)) {
+    return (
+      expressionDerivesExclusivelyFromSymbols(value.whenTrue, sources, checker, new Set(seen)) &&
+      expressionDerivesExclusivelyFromSymbols(value.whenFalse, sources, checker, new Set(seen))
+    );
+  }
+  if (
+    ts.isBinaryExpression(value) &&
+    (value.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
+      value.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+      value.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken)
+  ) {
+    return (
+      expressionDerivesExclusivelyFromSymbols(value.left, sources, checker, new Set(seen)) &&
+      expressionDerivesExclusivelyFromSymbols(value.right, sources, checker, new Set(seen))
+    );
+  }
+  return false;
+}
+
+function callableProjectsUnknownOnlyFromSymbols(
+  callable: ts.FunctionLikeDeclaration,
+  sources: ReadonlySet<ts.Symbol>,
+  checker: ts.TypeChecker,
+): boolean {
+  if (!callable.body || handlerReturnExpressions(callable).length === 0) return false;
+  let safe = true;
+  let observedSource = false;
+  const visit = (node: ts.Node): void => {
+    if (!safe || (node !== callable && ts.isFunctionLike(node))) return;
+    if (
+      ts.isThrowStatement(node) ||
+      ts.isAwaitExpression(node) ||
+      ts.isYieldExpression(node) ||
+      ts.isCallExpression(node) ||
+      (ts.isBinaryExpression(node) &&
+        node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+        node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) ||
+      (ts.isPrefixUnaryExpression(node) &&
+        (node.operator === ts.SyntaxKind.PlusPlusToken ||
+          node.operator === ts.SyntaxKind.MinusMinusToken)) ||
+      ts.isPostfixUnaryExpression(node)
+    ) {
+      safe = false;
+      return;
+    }
+    const isPropertyName =
+      ts.isIdentifier(node) &&
+      ((ts.isPropertyAssignment(node.parent) && node.parent.name === node) ||
+        (ts.isPropertyAccessExpression(node.parent) && node.parent.name === node));
+    if (!isPropertyName && ts.isExpression(node) && isUnknown(checker.getTypeAtLocation(node))) {
+      if (!expressionDerivesExclusivelyFromSymbols(node, sources, checker)) {
+        safe = false;
+        return;
+      }
+      observedSource = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(callable.body);
+  return safe && observedSource;
+}
+
+function visibleImmutableProjectionCallDerivesFromSymbols(
+  expression: ts.Expression,
+  sources: ReadonlySet<ts.Symbol>,
+  checker: ts.TypeChecker,
+): boolean {
+  const value = unwrapExpression(expression);
+  if (!ts.isCallExpression(value) || value.arguments.some(ts.isSpreadElement)) return false;
+  const callable = immutableCallableExpressionDeclaration(value.expression, checker);
+  if (!callable?.body) return false;
+
+  const projectedSources = new Set<ts.Symbol>();
+  for (const [index, argument] of value.arguments.entries()) {
+    if (!expressionHasUnknownProvenance(argument, checker)) continue;
+    if (!expressionDerivesExclusivelyFromSymbols(argument, sources, checker)) return false;
+    const parameter = callable.parameters[Math.min(index, callable.parameters.length - 1)];
+    if (!parameter) return false;
+    const symbol = checker.getSymbolAtLocation(parameter.name);
+    if (!symbol) return false;
+    projectedSources.add(canonicalSymbol(symbol, checker));
+  }
+  return (
+    projectedSources.size > 0 &&
+    callableProjectsUnknownOnlyFromSymbols(callable, projectedSources, checker)
+  );
+}
+
+function enclosingResultTryCapture(
+  node: ts.Node,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): ts.CallExpression | undefined {
+  for (let current: ts.Node | undefined = node; current; current = current.parent) {
+    if (!ts.isCallExpression(current)) continue;
+    const signature = resolvedSignature(checker, current);
+    if (
+      packageForSignature(signature, packageRoots) === "better-result" &&
+      (declarationName(signature?.declaration) === "try" ||
+        expressionName(current.expression) === "try") &&
+      isDirectImmutableResultCaptureCall(current, checker) &&
+      resultCaptureCatchMapper(current, checker)
+    ) {
+      return current;
+    }
+  }
+  return undefined;
+}
+
+function variableSymbolForExpression(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+): ts.Symbol | undefined {
+  let current: ts.Node = expression;
+  while (
+    ts.isParenthesizedExpression(current.parent) ||
+    ts.isAwaitExpression(current.parent) ||
+    (ts.isCallExpression(current.parent) &&
+      current.parent.arguments.includes(current as ts.Expression))
+  ) {
+    current = current.parent;
+  }
+  const declaration = current.parent;
+  if (!ts.isVariableDeclaration(declaration) || declaration.initializer !== current)
+    return undefined;
+  const symbol = checker.getSymbolAtLocation(declaration.name);
+  return symbol && canonicalSymbol(symbol, checker);
+}
+
+function intrinsicResultCaptureOwnsUnknown(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const derives = (
+    candidate: ts.Expression,
+    seenSymbols: Set<ts.Symbol>,
+    seenCallables: Set<ts.FunctionLikeDeclaration>,
+  ): boolean => {
+    const value = unwrapExpression(candidate);
+    if (ts.isCallExpression(value)) {
+      const signature = resolvedSignature(checker, value);
+      if (
+        packageForSignature(signature, packageRoots) === "better-result" &&
+        RESULT_CAPTURE_MEMBERS.has(declarationName(signature?.declaration) ?? "") &&
+        isDirectImmutableResultCaptureCall(value, checker) &&
+        resultCaptureCatchMapper(value, checker)
+      ) {
+        return true;
+      }
+      const matchInput = resultMatchInputExpression(value, signature, checker, packageRoots);
+      if (matchInput && derives(matchInput, new Set(seenSymbols), new Set(seenCallables))) {
+        return true;
+      }
+      const called = callableExpressionDeclaration(value.expression, checker);
+      if (called?.body && !seenCallables.has(called)) {
+        const calledSignature = checker.getSignatureFromDeclaration(called);
+        if (
+          calledSignature &&
+          !isFallibleResultContract(calledSignature.getReturnType(), checker, packageRoots)
+        ) {
+          const nextCallables = new Set(seenCallables).add(called);
+          const returned = handlerReturnExpressions(called);
+          if (
+            returned.length > 0 &&
+            returned.every((result) =>
+              derives(result, new Set(seenSymbols), new Set(nextCallables)),
+            )
+          ) {
+            return true;
+          }
+        }
+      }
+      const receiver = callReceiver(value);
+      if (receiver && derives(receiver, new Set(seenSymbols), new Set(seenCallables))) {
+        return true;
+      }
+      const callee = unwrapExpression(value.expression);
+      return (
+        ts.isCallExpression(callee) && derives(callee, new Set(seenSymbols), new Set(seenCallables))
+      );
+    }
+    if (ts.isIdentifier(value)) {
+      const symbol = checker.getSymbolAtLocation(value);
+      if (symbol) {
+        const canonical = canonicalSymbol(symbol, checker);
+        if (!seenSymbols.has(canonical)) {
+          seenSymbols.add(canonical);
+          const source = stableSymbolSource(canonical, value, checker);
+          if (source && derives(source, seenSymbols, seenCallables)) return true;
+        }
+      }
+    }
+    if (ts.isPropertyAccessExpression(value)) {
+      return derives(value.expression, seenSymbols, seenCallables);
+    }
+    if (ts.isElementAccessExpression(value)) {
+      return (
+        (ts.isStringLiteralLike(value.argumentExpression) ||
+          ts.isNumericLiteral(value.argumentExpression)) &&
+        derives(value.expression, seenSymbols, seenCallables)
+      );
+    }
+    if (ts.isConditionalExpression(value)) {
+      return (
+        derives(value.whenTrue, new Set(seenSymbols), new Set(seenCallables)) &&
+        derives(value.whenFalse, new Set(seenSymbols), new Set(seenCallables))
+      );
+    }
+    if (
+      ts.isBinaryExpression(value) &&
+      (value.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
+        value.operatorToken.kind === ts.SyntaxKind.BarBarToken ||
+        value.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken)
+    ) {
+      return (
+        derives(value.left, new Set(seenSymbols), new Set(seenCallables)) &&
+        derives(value.right, new Set(seenSymbols), new Set(seenCallables))
+      );
+    }
+    return false;
+  };
+  return derives(expression, new Set(), new Set());
+}
+
+function intrinsicResultCatchParameter(
+  parameter: ts.ParameterDeclaration,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  if (!ts.isFunctionLike(parameter.parent) || parameter.parent.parameters[0] !== parameter) {
+    return false;
+  }
+  void packageRoots;
+  return INTRINSIC_RESULT_CATCH_MAPPERS.get(checker)?.has(parameter.parent) === true;
+}
+
+function intrinsicResultCaptureMatchParameter(
+  parameter: ts.ParameterDeclaration,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  if (!ts.isFunctionLike(parameter.parent) || parameter.parent.parameters[0] !== parameter) {
+    return false;
+  }
+  void packageRoots;
+  return INTRINSIC_RESULT_MATCH_HANDLERS.get(checker)?.has(parameter.parent) === true;
+}
+
+function intrinsicResultClassifierParameter(
+  parameter: ts.ParameterDeclaration,
+  checker: ts.TypeChecker,
+): boolean {
+  return INTRINSIC_RESULT_CLASSIFIER_PARAMETERS.get(checker)?.has(parameter) === true;
+}
+
+function intrinsicResultBoundaryOwnsUnknown(
+  expression: ts.Expression,
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  for (let owner: ts.Node | undefined = expression; owner; owner = owner.parent) {
+    if (!isImplementedCallable(owner)) continue;
+    const sources = new Set<ts.Symbol>();
+    for (const parameter of owner.parameters) {
+      if (
+        !intrinsicResultCatchParameter(parameter, checker, packageRoots) &&
+        !intrinsicResultCaptureMatchParameter(parameter, checker, packageRoots) &&
+        !intrinsicResultClassifierParameter(parameter, checker)
+      ) {
+        continue;
+      }
+      const symbol = checker.getSymbolAtLocation(parameter.name);
+      if (symbol) sources.add(canonicalSymbol(symbol, checker));
+    }
+    if (sources.size > 0) {
+      if (expressionDerivesExclusivelyFromSymbols(expression, sources, checker)) return true;
+      if (visibleImmutableProjectionCallDerivesFromSymbols(expression, sources, checker)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function indexIntrinsicResultUnknownBoundaries(
+  sourceFiles: readonly ts.SourceFile[],
+  checker: ts.TypeChecker,
+  packageRoots: readonly WorkspacePackageRoot[],
+): void {
+  const calls = sourceFiles.flatMap((sourceFile) => [...sourceAnalysisIndex(sourceFile).calls]);
+  const catchMappers = new Set<ts.SignatureDeclaration>();
+  for (const call of calls) {
+    const signature = resolvedSignature(checker, call);
+    if (
+      packageForSignature(signature, packageRoots) !== "better-result" ||
+      !RESULT_CAPTURE_MEMBERS.has(declarationName(signature?.declaration) ?? "") ||
+      !isDirectImmutableResultCaptureCall(call, checker)
+    ) {
+      continue;
+    }
+    const mapper = resultCaptureCatchMapper(call, checker);
+    if (mapper) catchMappers.add(mapper);
+  }
+  INTRINSIC_RESULT_CATCH_MAPPERS.set(checker, catchMappers);
+
+  const matchHandlers = new Set<ts.SignatureDeclaration>();
+  for (const call of calls) {
+    const signature = resolvedSignature(checker, call);
+    const member = declarationName(signature?.declaration) ?? expressionName(call.expression);
+    if (packageForSignature(signature, packageRoots) !== "better-result") continue;
+    if (member === "mapError") {
+      const selected = selectedProperty(call.expression);
+      const handlerExpression = call.arguments[0];
+      if (
+        !selected ||
+        selected.name !== "mapError" ||
+        !handlerExpression ||
+        ts.isSpreadElement(handlerExpression) ||
+        !intrinsicResultCaptureOwnsUnknown(selected.receiver, checker, packageRoots)
+      ) {
+        continue;
+      }
+      const handler = callableExpressionDeclaration(handlerExpression, checker);
+      if (handler) matchHandlers.add(handler);
+      continue;
+    }
+    if (member !== "match") {
+      continue;
+    }
+    const receiver = resultMatchInputExpression(call, signature, checker, packageRoots);
+    const handlers = resultMatchHandlersArgument(call, signature, checker, packageRoots);
+    if (
+      !receiver ||
+      !handlers ||
+      ts.isSpreadElement(handlers) ||
+      !intrinsicResultCaptureOwnsUnknown(receiver, checker, packageRoots)
+    ) {
+      continue;
+    }
+    for (const branch of ["ok", "err"] as const) {
+      const handler = resultMatchHandler(handlers, branch, checker);
+      if (handler) matchHandlers.add(handler);
+    }
+  }
+  INTRINSIC_RESULT_MATCH_HANDLERS.set(checker, matchHandlers);
+
+  const classifierCalls = new Map<ts.ParameterDeclaration, { safe: boolean; unsafe: boolean }>();
+  for (const call of calls) {
+    const argument = call.arguments[0];
+    if (!argument || ts.isSpreadElement(argument)) continue;
+    const called = callableExpressionDeclaration(call.expression, checker);
+    if (!called?.body || !ts.isFunctionDeclaration(called) || hasExportModifier(called)) continue;
+    const parameter = called.parameters[0];
+    if (!parameter || !isUnknown(checker.getTypeAtLocation(parameter))) continue;
+    const state = classifierCalls.get(parameter) ?? { safe: false, unsafe: false };
+    if (
+      intrinsicResultCaptureOwnsUnknown(argument, checker, packageRoots) ||
+      intrinsicResultBoundaryOwnsUnknown(argument, checker, packageRoots)
+    ) {
+      state.safe = true;
+    } else {
+      state.unsafe = true;
+    }
+    classifierCalls.set(parameter, state);
+  }
+  INTRINSIC_RESULT_CLASSIFIER_PARAMETERS.set(
+    checker,
+    new Set(
+      [...classifierCalls].flatMap(([parameter, state]) =>
+        state.safe && !state.unsafe ? [parameter] : [],
+      ),
+    ),
+  );
+}
+
+function capturedCauseSymbols(
+  adapter: ts.Node,
+  capture: ts.CallExpression,
+  checker: ts.TypeChecker,
+): ReadonlySet<ts.Symbol> {
+  const captureSymbol = variableSymbolForExpression(capture, checker);
+  if (!captureSymbol) return new Set();
+  const sources = new Set([captureSymbol]);
+  const causes = new Set<ts.Symbol>();
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && node.initializer && ts.isIdentifier(node.name)) {
+      const initializer = unwrapExpression(node.initializer);
+      const property =
+        ts.isPropertyAccessExpression(initializer) && initializer.name.text === "cause"
+          ? initializer
+          : undefined;
+      if (property && expressionDerivesFromSymbols(property.expression, sources, checker)) {
+        const symbol = checker.getSymbolAtLocation(node.name);
+        if (symbol) causes.add(canonicalSymbol(symbol, checker));
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(adapter);
+  return causes;
+}
+
+function expressionDerivesFromCapturedCause(
+  expression: ts.Expression,
+  capture: ts.CallExpression,
+  checker: ts.TypeChecker,
+  seen: Set<ts.Symbol> = new Set(),
+): boolean {
+  const captureSymbol = variableSymbolForExpression(capture, checker);
+  if (!captureSymbol) return false;
+  const value = unwrapExpression(expression);
+  if (
+    ts.isPropertyAccessExpression(value) &&
+    value.name.text === "cause" &&
+    expressionDerivesFromSymbols(value.expression, new Set([captureSymbol]), checker)
+  ) {
+    return true;
+  }
+  if (ts.isIdentifier(value)) {
+    const symbol = checker.getSymbolAtLocation(value);
+    if (symbol) {
+      const canonical = canonicalSymbol(symbol, checker);
+      if (!seen.has(canonical)) {
+        seen.add(canonical);
+        const source = stableSymbolSource(canonical, value, checker);
+        if (source && expressionDerivesFromCapturedCause(source, capture, checker, seen))
+          return true;
+      }
+    }
+  }
+  if (ts.isPropertyAccessExpression(value)) {
+    return expressionDerivesFromCapturedCause(value.expression, capture, checker, seen);
+  }
+  if (ts.isElementAccessExpression(value)) {
+    return (
+      (ts.isStringLiteralLike(value.argumentExpression) ||
+        ts.isNumericLiteral(value.argumentExpression)) &&
+      expressionDerivesFromCapturedCause(value.expression, capture, checker, seen)
+    );
+  }
+  if (ts.isConditionalExpression(value)) {
+    return (
+      expressionDerivesFromCapturedCause(value.whenTrue, capture, checker, new Set(seen)) &&
+      expressionDerivesFromCapturedCause(value.whenFalse, capture, checker, new Set(seen))
+    );
+  }
+  return false;
+}
+
+function symbolsAssignedWithin(node: ts.Node, checker: ts.TypeChecker): ReadonlySet<ts.Symbol> {
+  const symbols = new Set<ts.Symbol>();
+  const visit = (current: ts.Node): void => {
+    if (
+      ts.isBinaryExpression(current) &&
+      current.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(unwrapExpression(current.left))
+    ) {
+      const symbol = checker.getSymbolAtLocation(unwrapExpression(current.left));
+      if (symbol) symbols.add(canonicalSymbol(symbol, checker));
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(node);
+  return symbols;
+}
+
+function symbolsDerivedWithin(
+  node: ts.Node,
+  sources: ReadonlySet<ts.Symbol>,
+  checker: ts.TypeChecker,
+): ReadonlySet<ts.Symbol> {
+  const derived = new Set(sources);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const visit = (current: ts.Node): void => {
+      if (
+        ts.isVariableDeclaration(current) &&
+        ts.isIdentifier(current.name) &&
+        current.initializer &&
+        expressionDerivesExclusivelyFromSymbols(current.initializer, derived, checker)
+      ) {
+        const symbol = checker.getSymbolAtLocation(current.name);
+        if (symbol && !symbolIsMutated(symbol, current.getSourceFile(), checker)) {
+          const canonical = canonicalSymbol(symbol, checker);
+          if (!derived.has(canonical)) {
+            derived.add(canonical);
+            changed = true;
+          }
+        }
+      }
+      ts.forEachChild(current, visit);
+    };
+    visit(node);
+  }
+  return derived;
+}
+
 function analyzeSqliteTransactionAdapter(
   registration: SqliteTransactionAdapterRegistration,
   checker: ts.TypeChecker,
@@ -5351,16 +6577,55 @@ function analyzeSqliteTransactionAdapter(
   let transactionCallback: ts.FunctionLikeDeclaration | undefined;
   let sentinelThrow = false;
   let sentinelCheck = false;
-  let panicCheck = false;
-  let classifierCall = false;
+  const storedSentinelSymbols = new Set<ts.Symbol>();
+  const panicClassifierCalls: ts.CallExpression[] = [];
+  const driverClassifierCalls: ts.CallExpression[] = [];
+  const ordinaryClassificationPositions: number[] = [];
   let unknownRethrow = false;
+  let atomicityUnknown = false;
   const sentinelSymbol = sentinel.name && checker.getSymbolAtLocation(sentinel.name);
-  const catchSymbols = new Set<ts.Symbol>();
-  const expressionIsCatchValue = (expression: ts.Expression): boolean => {
-    const value = unwrapExpression(expression);
-    const symbol = ts.isIdentifier(value) ? checker.getSymbolAtLocation(value) : undefined;
-    return Boolean(symbol && catchSymbols.has(symbol));
+  const findTransaction = (node: ts.Node): void => {
+    if (transactionCall || !ts.isCallExpression(node)) {
+      ts.forEachChild(node, findTransaction);
+      return;
+    }
+    const signature = resolvedSignature(checker, node);
+    if (
+      packageForSignature(signature, packageRoots) === "bun:sqlite" &&
+      declarationName(signature?.declaration) === "transaction"
+    ) {
+      transactionCall = node;
+      const callback = node.arguments[0];
+      if (callback && !ts.isSpreadElement(callback)) {
+        transactionCallback = callableExpressionDeclaration(callback, checker);
+      }
+      return;
+    }
+    ts.forEachChild(node, findTransaction);
   };
+  findTransaction(adapter);
+  const capture =
+    transactionCall && enclosingResultTryCapture(transactionCall, checker, packageRoots);
+  const causeSymbols = capture
+    ? capturedCauseSymbols(adapter, capture, checker)
+    : new Set<ts.Symbol>();
+  const causeDataSymbols = symbolsDerivedWithin(adapter, causeSymbols, checker);
+  const callbackStateSymbols = transactionCallback
+    ? symbolsAssignedWithin(transactionCallback, checker)
+    : new Set<ts.Symbol>();
+  const expressionIsExactCapturedCause = (expression: ts.Expression): boolean => {
+    const value = unwrapExpression(expression);
+    if (!ts.isIdentifier(value)) return false;
+    const symbol = checker.getSymbolAtLocation(value);
+    return Boolean(
+      symbol &&
+      causeDataSymbols.has(canonicalSymbol(symbol, checker)) &&
+      !symbolIsMutated(symbol, value.getSourceFile(), checker),
+    );
+  };
+  const expressionIsCapturedCause = (expression: ts.Expression): boolean =>
+    expressionDerivesExclusivelyFromSymbols(expression, causeDataSymbols, checker) ||
+    (capture !== undefined && expressionDerivesFromCapturedCause(expression, capture, checker));
   const expressionIsSentinel = (expression: ts.Expression): boolean => {
     if (!sentinelSymbol) return false;
     const value = unwrapExpression(expression);
@@ -5373,30 +6638,15 @@ function analyzeSqliteTransactionAdapter(
     return typeContainsExactSymbol(checker.getTypeAtLocation(value), sentinelSymbol, checker);
   };
   const visit = (node: ts.Node): void => {
-    const catchName = ts.isCatchClause(node) ? node.variableDeclaration?.name : undefined;
-    if (catchName && ts.isIdentifier(catchName)) {
-      const symbol = checker.getSymbolAtLocation(catchName);
-      if (symbol) catchSymbols.add(symbol);
-    }
     if (ts.isCallExpression(node)) {
-      const signature = resolvedSignature(checker, node);
-      if (
-        packageForSignature(signature, packageRoots) === "bun:sqlite" &&
-        declarationName(signature?.declaration) === "transaction"
-      ) {
-        transactionCall ??= node;
-        const callback = node.arguments[0];
-        if (callback && !ts.isSpreadElement(callback)) {
-          transactionCallback ??= callableExpressionDeclaration(callback, checker);
-        }
-      }
+      const argument = node.arguments[0];
       if (
         externalCallMatches(node, registration.panicClassifier, checker, packageRoots) &&
-        node.arguments.some(
-          (argument) => !ts.isSpreadElement(argument) && expressionIsCatchValue(argument),
-        )
+        argument &&
+        !ts.isSpreadElement(argument) &&
+        expressionIsExactCapturedCause(argument)
       ) {
-        panicCheck = true;
+        panicClassifierCalls.push(node);
       }
       if (
         resolvedCallMatchesIdentity(
@@ -5406,21 +6656,72 @@ function analyzeSqliteTransactionAdapter(
           workspaceRoot,
           packageRoots,
         ) &&
-        node.arguments.some(
-          (argument) => !ts.isSpreadElement(argument) && expressionIsCatchValue(argument),
-        )
+        argument &&
+        !ts.isSpreadElement(argument) &&
+        expressionIsExactCapturedCause(argument)
       ) {
-        classifierCall = true;
+        driverClassifierCalls.push(node);
+      }
+    }
+    if (
+      transactionCallback &&
+      nodeIsWithin(node, transactionCallback) &&
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(unwrapExpression(node.left)) &&
+      ts.isNewExpression(unwrapExpression(node.right)) &&
+      expressionIsSentinel(node.right)
+    ) {
+      const created = unwrapExpression(node.right) as ts.NewExpression;
+      const logicalResult = created.arguments?.[0];
+      if (logicalResult && ts.isIdentifier(unwrapExpression(logicalResult))) {
+        const resultIdentifier = unwrapExpression(logicalResult) as ts.Identifier;
+        const resultSymbol = checker.getSymbolAtLocation(resultIdentifier);
+        const resultSource =
+          resultSymbol &&
+          stableSymbolSource(canonicalSymbol(resultSymbol, checker), resultIdentifier, checker);
+        const operationSymbol = operation && checker.getSymbolAtLocation(operation.name);
+        const resultValue = resultSource && unwrapExpression(resultSource);
+        const callsOperation =
+          resultValue &&
+          ts.isCallExpression(resultValue) &&
+          operationSymbol &&
+          checker.getSymbolAtLocation(resultValue.expression) === operationSymbol;
+        let parent: ts.Node | undefined = node.parent;
+        while (parent && !ts.isIfStatement(parent) && parent !== transactionCallback) {
+          parent = parent.parent;
+        }
+        if (
+          callsOperation &&
+          resultSymbol &&
+          parent &&
+          ts.isIfStatement(parent) &&
+          parent.expression.getText().includes('"error"') &&
+          expressionDerivesFromSymbols(
+            parent.expression,
+            new Set([canonicalSymbol(resultSymbol, checker)]),
+            checker,
+          )
+        ) {
+          const stored = checker.getSymbolAtLocation(unwrapExpression(node.left));
+          if (stored) storedSentinelSymbols.add(canonicalSymbol(stored, checker));
+        }
       }
     }
     if (
       ts.isBinaryExpression(node) &&
       node.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword
     ) {
+      if (
+        expressionIsCapturedCause(node.left) &&
+        unwrapExpression(node.right).getText() === "Error"
+      ) {
+        ordinaryClassificationPositions.push(nodeStart(node));
+      }
       const symbol = checker.getSymbolAtLocation(unwrapExpression(node.right));
       if (
         sentinelSymbol &&
-        expressionIsCatchValue(node.left) &&
+        expressionIsCapturedCause(node.left) &&
         symbol &&
         canonicalSymbol(symbol, checker) === canonicalSymbol(sentinelSymbol!, checker)
       ) {
@@ -5431,8 +6732,8 @@ function analyzeSqliteTransactionAdapter(
       ts.isBinaryExpression(node) &&
       (node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken ||
         node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsToken) &&
-      ((expressionIsCatchValue(node.left) && expressionIsSentinel(node.right)) ||
-        (expressionIsCatchValue(node.right) && expressionIsSentinel(node.left)))
+      ((expressionIsCapturedCause(node.left) && expressionIsSentinel(node.right)) ||
+        (expressionIsCapturedCause(node.right) && expressionIsSentinel(node.left)))
     ) {
       sentinelCheck = true;
     }
@@ -5441,18 +6742,149 @@ function analyzeSqliteTransactionAdapter(
       if (
         transactionCallback &&
         nodeIsWithin(node, transactionCallback) &&
-        expressionIsSentinel(expression)
+        ts.isIdentifier(expression)
       ) {
-        sentinelThrow = true;
+        const symbol = checker.getSymbolAtLocation(expression);
+        if (symbol && storedSentinelSymbols.has(canonicalSymbol(symbol, checker))) {
+          sentinelThrow = true;
+        }
       }
       if (ts.isIdentifier(expression)) {
         const symbol = checker.getSymbolAtLocation(expression);
-        if (symbol && catchSymbols.has(symbol)) unknownRethrow = true;
+        if (symbol && expressionIsCapturedCause(expression)) unknownRethrow = true;
+      }
+    }
+    if (ts.isNewExpression(node)) {
+      const symbol = checker.getSymbolAtLocation(unwrapExpression(node.expression));
+      if (
+        symbol &&
+        symbolComesFromPackage(canonicalSymbol(symbol, checker), "better-result", packageRoots) &&
+        canonicalSymbol(symbol, checker).getName() === "Panic" &&
+        node.getText().includes("atomicity is unknown")
+      ) {
+        let thrown: ts.Node | undefined = node.parent;
+        while (thrown && !ts.isThrowStatement(thrown) && thrown !== adapter) {
+          thrown = thrown.parent;
+        }
+        if (!thrown || !ts.isThrowStatement(thrown)) {
+          ts.forEachChild(node, visit);
+          return;
+        }
+        let parent: ts.Node | undefined = thrown.parent;
+        while (parent && !ts.isIfStatement(parent) && parent !== adapter) parent = parent.parent;
+        if (
+          parent &&
+          ts.isIfStatement(parent) &&
+          expressionDerivesFromSymbols(parent.expression, callbackStateSymbols, checker)
+        ) {
+          atomicityUnknown = true;
+        }
       }
     }
     ts.forEachChild(node, visit);
   };
   visit(adapter);
+  let panicControl = false;
+  let panicControlPosition = Number.POSITIVE_INFINITY;
+  let driverClassifierReturn = false;
+  const sameCanonicalExpression = (left: ts.Expression, right: ts.Expression): boolean => {
+    const leftValue = unwrapExpression(left);
+    const rightValue = unwrapExpression(right);
+    if (!ts.isIdentifier(leftValue) || !ts.isIdentifier(rightValue)) return false;
+    const leftSymbol = checker.getSymbolAtLocation(leftValue);
+    const rightSymbol = checker.getSymbolAtLocation(rightValue);
+    return Boolean(
+      leftSymbol &&
+      rightSymbol &&
+      canonicalSymbol(leftSymbol, checker) === canonicalSymbol(rightSymbol, checker),
+    );
+  };
+  const panicClassifierControls = (condition: ts.Expression, call: ts.CallExpression): boolean => {
+    const value = unwrapExpression(condition);
+    if (value === call) return true;
+    if (!ts.isIdentifier(value)) return false;
+    const symbol = checker.getSymbolAtLocation(value);
+    const source = symbol && stableSymbolSource(canonicalSymbol(symbol, checker), value, checker);
+    return Boolean(source && unwrapExpression(source) === call);
+  };
+  const branchGuaranteesThrow = (branch: ts.Statement, thrown: ts.ThrowStatement): boolean => {
+    if (branch === thrown) return true;
+    return (
+      ts.isBlock(branch) &&
+      branch.statements.length === 1 &&
+      branchGuaranteesThrow(branch.statements[0]!, thrown)
+    );
+  };
+  const proveClassifierFlow = (node: ts.Node): void => {
+    if (ts.isThrowStatement(node) && expressionIsCapturedCause(node.expression)) {
+      for (
+        let parent: ts.Node | undefined = node.parent;
+        parent && parent !== adapter;
+        parent = parent.parent
+      ) {
+        if (ts.isIfStatement(parent) && branchGuaranteesThrow(parent.thenStatement, node)) {
+          const controlled = panicClassifierCalls.some((call) => {
+            const argument = call.arguments[0];
+            return Boolean(
+              argument &&
+              !ts.isSpreadElement(argument) &&
+              sameCanonicalExpression(argument, node.expression) &&
+              panicClassifierControls(parent.expression, call),
+            );
+          });
+          if (!controlled) continue;
+          panicControl = true;
+          panicControlPosition = Math.min(panicControlPosition, nodeStart(node));
+          break;
+        }
+      }
+    }
+    if (ts.isReturnStatement(node) && node.expression) {
+      const returned = unwrapExpression(node.expression);
+      if (
+        ts.isCallExpression(returned) &&
+        externalCallMatches(
+          returned,
+          { package: "better-result", exportName: "Result.err" },
+          checker,
+          packageRoots,
+        )
+      ) {
+        const error = returned.arguments[0];
+        if (
+          error &&
+          !ts.isSpreadElement(error) &&
+          driverClassifierCalls.some((call) => {
+            const symbol = variableSymbolForExpression(call, checker);
+            const value = unwrapExpression(error);
+            if (!symbol || !ts.isIdentifier(value)) return false;
+            const errorSymbol = checker.getSymbolAtLocation(value);
+            if (!errorSymbol || canonicalSymbol(errorSymbol, checker) !== symbol) return false;
+            const declarations = symbol.declarations ?? [];
+            if (declarations.length !== 1) return false;
+            const declaration = declarations[0];
+            return Boolean(
+              declaration &&
+              ts.isVariableDeclaration(declaration) &&
+              (declaration.parent.flags & ts.NodeFlags.Const) !== 0 &&
+              declaration.initializer &&
+              unwrapExpression(declaration.initializer) === call &&
+              !symbolIsMutated(symbol, value.getSourceFile(), checker),
+            );
+          })
+        ) {
+          driverClassifierReturn = true;
+        }
+      }
+    }
+    ts.forEachChild(node, proveClassifierFlow);
+  };
+  proveClassifierFlow(adapter);
+  const firstOrdinaryClassification = Math.min(
+    ...driverClassifierCalls.map(nodeStart),
+    ...ordinaryClassificationPositions,
+  );
+  if (panicControlPosition >= firstOrdinaryClassification) panicControl = false;
   const transactionCallbackReturn = transactionCallback
     ? checker.getSignatureFromDeclaration(transactionCallback)?.getReturnType()
     : undefined;
@@ -5474,15 +6906,21 @@ function analyzeSqliteTransactionAdapter(
       ? undefined
       : "adapter does not return a direct Result",
     transactionCall ? undefined : "adapter does not call bun:sqlite Database.transaction",
+    capture ? undefined : "raw driver call is not captured by object-form Result.try",
     transactionCallbackReturn &&
     !typeContainsResult(transactionCallbackReturn, checker, packageRoots, transactionCallback!)
       ? undefined
       : "raw driver callback returns Result",
     sentinelThrow ? undefined : "raw driver callback does not throw the rollback sentinel",
     sentinelCheck ? undefined : "adapter does not recognize the exact rollback sentinel",
-    panicCheck ? undefined : "adapter does not invoke the exact Panic classifier",
-    classifierCall ? undefined : "adapter does not invoke the exact SQLite driver classifier",
+    panicControl
+      ? undefined
+      : "exact Panic classifier result does not control rethrow of the captured cause",
+    driverClassifierReturn
+      ? undefined
+      : "returned driver Err does not derive from the exact SQLite driver classifier result",
     unknownRethrow ? undefined : "adapter does not rethrow unknown defects",
+    atomicityUnknown ? undefined : "adapter does not escalate unknown transaction atomicity",
     !hasExportModifier(sentinel) ? undefined : "rollback sentinel is exported instead of private",
     classifierInput &&
     (checker.getTypeAtLocation(classifierInput).flags &
@@ -6213,7 +7651,6 @@ function isImplementedCallable(node: ts.Node): node is ts.SignatureDeclaration {
   return ts.isFunctionLike(node) && functionHasImplementation(node);
 }
 
-const LANGUAGE_EXCEPTION_CAPTURE = "language exception capture";
 const LANGUAGE_HOST_FAILURE_SIGNAL = "language host failure signal";
 
 function callableBody(node: ts.SignatureDeclaration): ts.ConciseBody | undefined {
@@ -6230,106 +7667,144 @@ function callableBody(node: ts.SignatureDeclaration): ts.ConciseBody | undefined
   return undefined;
 }
 
-function isErrorCallbackPropertyName(name: string): boolean {
-  return /^(?:catch|on.*(?:error|failure|reject))$/iu.test(name);
-}
-
-function isErrorCallbackReference(node: ts.Identifier, checker: ts.TypeChecker): boolean {
-  const parent = node.parent;
-  if (ts.isPropertyAssignment(parent)) {
-    const propertyName = propertyStringValue(parent, checker);
-    return propertyName !== undefined && isErrorCallbackPropertyName(propertyName);
-  }
-  return (
-    ts.isCallExpression(parent) &&
-    ((expressionName(parent.expression) === "catch" && parent.arguments.includes(node)) ||
-      (expressionName(parent.expression) === "then" && parent.arguments[1] === node) ||
-      (expressionName(parent.expression) === "addEventListener" &&
-        ts.isStringLiteral(parent.arguments[0]) &&
-        parent.arguments[0].text === "error" &&
-        parent.arguments[1] === node))
-  );
-}
-
-function errorCallbackSymbols(
-  sourceFile: ts.SourceFile,
+function callableHasControlledPanicObservation(
+  node: ts.SignatureDeclaration,
   checker: ts.TypeChecker,
-): ReadonlySet<ts.Symbol> {
-  let checkerIndexes = ERROR_CALLBACK_SYMBOLS.get(checker);
-  if (!checkerIndexes) {
-    checkerIndexes = new WeakMap();
-    ERROR_CALLBACK_SYMBOLS.set(checker, checkerIndexes);
-  }
-  const cached = checkerIndexes.get(sourceFile);
-  if (cached) return cached;
-
-  const symbols = new Set<ts.Symbol>();
-  for (const reference of sourceAnalysisIndex(sourceFile).errorCallbackReferences) {
-    if (!isErrorCallbackReference(reference, checker)) continue;
-    const symbol = checker.getSymbolAtLocation(reference);
-    if (symbol) symbols.add(canonicalSymbol(symbol, checker));
-  }
-  checkerIndexes.set(sourceFile, symbols);
-  return symbols;
-}
-
-function callableIsErrorCallback(node: ts.SignatureDeclaration, checker: ts.TypeChecker): boolean {
-  if (
-    ts.isMethodDeclaration(node) &&
-    ts.isObjectLiteralExpression(node.parent) &&
-    isErrorCallbackPropertyName(node.name.getText().replaceAll(/["']/gu, ""))
-  ) {
-    return true;
-  }
-  const parent = node.parent;
-  if (ts.isPropertyAssignment(parent)) {
-    const name = propertyStringValue(parent, checker);
-    if (name && isErrorCallbackPropertyName(name)) return true;
-  }
-  if (
-    ts.isCallExpression(parent) &&
-    ((expressionName(parent.expression) === "catch" &&
-      parent.arguments.includes(node as ts.Expression)) ||
-      (expressionName(parent.expression) === "then" && parent.arguments[1] === node) ||
-      (expressionName(parent.expression) === "addEventListener" &&
-        ts.isStringLiteral(parent.arguments[0]) &&
-        parent.arguments[0].text === "error" &&
-        parent.arguments[1] === node))
-  ) {
-    return true;
-  }
-
-  const name =
-    node.name ??
-    (ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)
-      ? node.parent.name
-      : undefined);
-  if (!name || !ts.isIdentifier(name)) return false;
-  const symbol = checker.getSymbolAtLocation(name);
-  if (!symbol) return false;
-  return errorCallbackSymbols(node.getSourceFile(), checker).has(canonicalSymbol(symbol, checker));
+  workspaceRoot: string,
+  signalAdapterKeys: ReadonlySet<string>,
+  packageRoots: readonly WorkspacePackageRoot[],
+): boolean {
+  const body = callableBody(node);
+  if (!body) return false;
+  const inputs = node.parameters.flatMap((parameter) => {
+    const symbol = checker.getSymbolAtLocation(parameter.name);
+    return symbol ? [canonicalSymbol(symbol, checker)] : [];
+  });
+  const sameCanonicalExpression = (left: ts.Expression, right: ts.Expression): boolean => {
+    const leftValue = unwrapExpression(left);
+    const rightValue = unwrapExpression(right);
+    if (ts.isIdentifier(leftValue) && ts.isIdentifier(rightValue)) {
+      const leftSymbol = checker.getSymbolAtLocation(leftValue);
+      const rightSymbol = checker.getSymbolAtLocation(rightValue);
+      return Boolean(
+        leftSymbol &&
+        rightSymbol &&
+        canonicalSymbol(leftSymbol, checker) === canonicalSymbol(rightSymbol, checker),
+      );
+    }
+    if (ts.isPropertyAccessExpression(leftValue) && ts.isPropertyAccessExpression(rightValue)) {
+      return (
+        leftValue.name.text === rightValue.name.text &&
+        sameCanonicalExpression(leftValue.expression, rightValue.expression)
+      );
+    }
+    if (ts.isElementAccessExpression(leftValue) && ts.isElementAccessExpression(rightValue)) {
+      return (
+        leftValue.argumentExpression.getText() === rightValue.argumentExpression.getText() &&
+        sameCanonicalExpression(leftValue.expression, rightValue.expression)
+      );
+    }
+    return false;
+  };
+  const classifiers: { readonly argument: ts.Expression; readonly call: ts.CallExpression }[] = [];
+  const signals: { readonly node: ts.Node; readonly expression: ts.Expression }[] = [];
+  const visit = (current: ts.Node): void => {
+    if (current !== body && ts.isFunctionLike(current)) return;
+    if (ts.isCallExpression(current)) {
+      if (
+        externalCallMatches(
+          current,
+          { package: "better-result", exportName: "Panic.is" },
+          checker,
+          packageRoots,
+        )
+      ) {
+        const argument = current.arguments[0];
+        if (argument && !ts.isSpreadElement(argument)) {
+          const source = inputs.find((candidate) =>
+            expressionDerivesExclusivelyFromSymbols(argument, new Set([candidate]), checker),
+          );
+          if (source) classifiers.push({ argument, call: current });
+        }
+      }
+      const calledDeclaration = resolvedSignature(checker, current)?.declaration;
+      if (calledDeclaration && isImplementedCallable(calledDeclaration)) {
+        const calledKey = symbolIdentityKey(nodeIdentity(calledDeclaration, workspaceRoot));
+        if (signalAdapterKeys.has(calledKey)) {
+          const argument = current.arguments[0];
+          if (argument && !ts.isSpreadElement(argument)) {
+            signals.push({ node: current, expression: argument });
+          }
+        }
+      }
+    } else if (ts.isThrowStatement(current)) {
+      signals.push({ node: current, expression: current.expression });
+    }
+    ts.forEachChild(current, visit);
+  };
+  visit(body);
+  const branchGuaranteesSignal = (branch: ts.Statement, signal: ts.Node): boolean => {
+    if (branch === signal || branch === signal.parent) return true;
+    return (
+      ts.isBlock(branch) &&
+      branch.statements.length === 1 &&
+      branchGuaranteesSignal(branch.statements[0]!, signal)
+    );
+  };
+  return signals.some((signal) =>
+    classifiers.some(({ argument, call }) => {
+      if (!sameCanonicalExpression(signal.expression, argument)) return false;
+      for (
+        let parent: ts.Node | undefined = signal.node.parent;
+        parent && parent !== node;
+        parent = parent.parent
+      ) {
+        if (!ts.isIfStatement(parent)) continue;
+        if (!branchGuaranteesSignal(parent.thenStatement, signal.node)) return false;
+        const condition = unwrapExpression(parent.expression);
+        if (
+          ts.isPrefixUnaryExpression(condition) ||
+          ts.isBinaryExpression(condition) ||
+          ts.isConditionalExpression(condition)
+        ) {
+          return false;
+        }
+        if (condition === call) return true;
+        if (!ts.isIdentifier(condition)) return false;
+        const conditionSymbol = checker.getSymbolAtLocation(condition);
+        const source =
+          conditionSymbol &&
+          stableSymbolSource(canonicalSymbol(conditionSymbol, checker), condition, checker);
+        return Boolean(source && unwrapExpression(source) === call);
+      }
+      return false;
+    }),
+  );
 }
 
 function callableHasExceptionRelationship(
   node: ts.SignatureDeclaration,
-  direction: "capture-external" | "signal-host" | "observe-panic",
+  direction: "signal-host" | "observe-panic",
   checker: ts.TypeChecker,
   workspaceRoot: string,
   signalAdapterKeys: ReadonlySet<string>,
+  packageRoots: readonly WorkspacePackageRoot[],
 ): boolean {
   const body = callableBody(node);
   if (!body) return false;
+  if (direction === "observe-panic") {
+    return callableHasControlledPanicObservation(
+      node,
+      checker,
+      workspaceRoot,
+      signalAdapterKeys,
+      packageRoots,
+    );
+  }
   const callableKey = symbolIdentityKey(nodeIdentity(node, workspaceRoot));
-  if (direction === "capture-external" && callableIsErrorCallback(node, checker)) return true;
-  if (direction === "observe-panic" && /\bPanic\.is\s*\(/u.test(body.getText())) return true;
   let found = false;
   const visit = (current: ts.Node): void => {
     if (found) return;
-    if (current !== body && ts.isFunctionLike(current)) return;
-    if (direction === "capture-external" && ts.isCatchClause(current)) {
-      found = true;
-      return;
-    }
     if (ts.isThrowStatement(current)) {
       found = direction === "signal-host";
       if (found) return;
@@ -6344,25 +7819,13 @@ function callableHasExceptionRelationship(
         found = true;
         return;
       }
-      if (direction === "signal-host") {
-        const calledDeclaration = resolvedSignature(checker, current)?.declaration;
-        if (calledDeclaration && isImplementedCallable(calledDeclaration)) {
-          const calledKey = symbolIdentityKey(nodeIdentity(calledDeclaration, workspaceRoot));
-          if (calledKey !== callableKey && signalAdapterKeys.has(calledKey)) {
-            found = true;
-            return;
-          }
+      const calledDeclaration = resolvedSignature(checker, current)?.declaration;
+      if (calledDeclaration && isImplementedCallable(calledDeclaration)) {
+        const calledKey = symbolIdentityKey(nodeIdentity(calledDeclaration, workspaceRoot));
+        if (calledKey !== callableKey && signalAdapterKeys.has(calledKey)) {
+          found = true;
+          return;
         }
-      }
-      if (
-        direction === "observe-panic" &&
-        (/(?:panic|rethrow|preserve)/iu.test(called) ||
-          (ts.isPropertyAccessExpression(current.expression) &&
-            current.expression.name.text === "is" &&
-            /(?:^|\.)Panic$/u.test(current.expression.expression.getText())))
-      ) {
-        found = true;
-        return;
       }
     }
     ts.forEachChild(current, visit);
@@ -6467,16 +7930,14 @@ function hasRecognizableExceptionExternalApi(
   const { package: packageName, exportName } = adapter.externalApi;
   switch (approval.relationship) {
     case "language-runtime":
-      if (
-        packageName === "global" &&
-        (exportName === LANGUAGE_EXCEPTION_CAPTURE || exportName === LANGUAGE_HOST_FAILURE_SIGNAL)
-      ) {
+      if (packageName === "global" && exportName === LANGUAGE_HOST_FAILURE_SIGNAL) {
         return callableHasExceptionRelationship(
           declaration,
           adapter.direction,
           checker,
           workspaceRoot,
           signalAdapterKeys,
+          packageRoots,
         );
       }
       if (packageName === "global") return exportName.trim().length > 0;
@@ -6485,16 +7946,18 @@ function hasRecognizableExceptionExternalApi(
       return (
         packageName === "better-result" &&
         exportName === "Panic.is" &&
-        adapter.direction === "observe-panic"
+        adapter.direction === "observe-panic" &&
+        callableHasExceptionRelationship(
+          declaration,
+          adapter.direction,
+          checker,
+          workspaceRoot,
+          signalAdapterKeys,
+          packageRoots,
+        )
       );
     case "host-contract":
       return adapter.direction === "signal-host";
-    case "injected-external-effect":
-      return adapter.direction === "capture-external";
-    case "external-rejection":
-      return (
-        adapter.direction === "capture-external" && callableIsErrorCallback(declaration, checker)
-      );
     case "external-package":
       if (packageName === workspacePackageName) return false;
       return callableReferencesExternalApi(declaration, adapter, checker, packageRoots);
@@ -6534,6 +7997,7 @@ function exceptionAdapterDeclarations(
   program: ts.Program,
   checker: ts.TypeChecker,
   signalAdapterKeys: ReadonlySet<string>,
+  packageRoots: readonly WorkspacePackageRoot[],
 ): readonly ts.SignatureDeclaration[] {
   const direct = registeredNodes(adapter.identity, workspaceRoot, program, isImplementedCallable);
   if (direct.length > 0) return direct;
@@ -6564,6 +8028,7 @@ function exceptionAdapterDeclarations(
         checker,
         workspaceRoot,
         signalAdapterKeys,
+        packageRoots,
       ),
     )
     .sort((left, right) => left.getStart() - right.getStart());
@@ -6621,6 +8086,7 @@ export function assertEveryExceptionAdapterResolves(
       program,
       checker,
       signalAdapterKeys,
+      packageRoots,
     );
     if (declarations.length !== 1) {
       failures.push(
@@ -6654,6 +8120,7 @@ export function assertEveryExceptionAdapterResolves(
         checker,
         workspaceRoot,
         signalAdapterKeys,
+        packageRoots,
       )
     ) {
       failures.push(
@@ -6693,9 +8160,8 @@ export function assertCoreFinalExceptionAdaptersResolve(
   exceptionIdentities: readonly (readonly [
     module: string,
     exportName: string,
-    mode: "capture" | "signal" | "both",
+    mode: "signal",
   ])[] = PRECISE_EXCEPTION_IDENTITIES["apps/core"],
-  captureIdentities: readonly (readonly [module: string, exportName: string])[] = [],
   panicIdentities: readonly (readonly [
     module: string,
     exportName: string,
@@ -6704,33 +8170,20 @@ export function assertCoreFinalExceptionAdaptersResolve(
     module: string,
     exportName: string,
   ])[] = CORE_FATAL_SIGNAL_IDENTITIES,
+  packageRoots: readonly WorkspacePackageRoot[] = [],
 ): void {
   if (workspace.name !== "apps/core") return;
   type ExpectedCoreExceptionAdapter = {
     readonly module: string;
     readonly exportName: string;
-    readonly direction: "capture-external" | "signal-host" | "observe-panic";
+    readonly direction: "signal-host" | "observe-panic";
   };
   const expected: ExpectedCoreExceptionAdapter[] = [];
-  for (const [module, exportName, mode] of exceptionIdentities) {
+  for (const [module, exportName] of exceptionIdentities) {
     const signalDirection = exportName.startsWith("preserve")
       ? ("observe-panic" as const)
       : ("signal-host" as const);
-    switch (mode) {
-      case "capture":
-        expected.push({ module, exportName, direction: "capture-external" });
-        break;
-      case "signal":
-        expected.push({ module, exportName, direction: signalDirection });
-        break;
-      case "both":
-        expected.push({ module, exportName, direction: "capture-external" });
-        expected.push({ module, exportName, direction: signalDirection });
-        break;
-    }
-  }
-  for (const [module, exportName] of captureIdentities) {
-    expected.push({ module, exportName, direction: "capture-external" });
+    expected.push({ module, exportName, direction: signalDirection });
   }
   for (const [module, exportName] of panicIdentities) {
     expected.push({ module, exportName, direction: "observe-panic" });
@@ -6764,13 +8217,11 @@ export function assertCoreFinalExceptionAdaptersResolve(
         ? "defect-supervisor"
         : "compatibility";
     const expectedApi =
-      registration.direction === "capture-external"
-        ? { package: "global", exportName: LANGUAGE_EXCEPTION_CAPTURE }
-        : registration.direction === "signal-host" && !isFatalSignal
-          ? { package: "global", exportName: LANGUAGE_HOST_FAILURE_SIGNAL }
-          : registration.direction === "observe-panic"
-            ? { package: "better-result", exportName: "Panic.is" }
-            : { package: "@stanley2058/lilac-core", exportName: "fatal Panic reporter" };
+      registration.direction === "signal-host" && !isFatalSignal
+        ? { package: "global", exportName: LANGUAGE_HOST_FAILURE_SIGNAL }
+        : registration.direction === "observe-panic"
+          ? { package: "better-result", exportName: "Panic.is" }
+          : { package: "@stanley2058/lilac-core", exportName: "fatal Panic reporter" };
     if (
       adapter.category !== expectedCategory ||
       adapter.externalApi.package !== expectedApi.package ||
@@ -6796,6 +8247,7 @@ export function assertCoreFinalExceptionAdaptersResolve(
           program,
           checker,
           signalAdapterKeys,
+          packageRoots,
         );
       }
       if (declarations.length === 0) {
@@ -6813,6 +8265,7 @@ export function assertCoreFinalExceptionAdaptersResolve(
             checker,
             workspaceRoot,
             signalAdapterKeys,
+            packageRoots,
           ),
     );
     if (!validRelationship) {
@@ -6965,6 +8418,21 @@ export function analyzeWorkspace(
   assertOpenProtocolAdaptersResolve(workspace, workspaceRoot, program);
   assertOperationalResultApisResolve(workspace, workspaceRoot, program);
   const checker = program.getTypeChecker();
+  const productionFiles = productionSourceIndex(program, workspaceRoot).files;
+  const indexesResultUnknown = productionFiles.some((sourceFile) => {
+    const module = relativeModulePath(workspaceRoot, sourceFile);
+    return (
+      ruleApplies(workspace, "architecture/no-domain-unknown", module) ||
+      ruleApplies(workspace, "architecture/no-unknown-member-read", module)
+    );
+  });
+  if (indexesResultUnknown) {
+    indexIntrinsicResultUnknownBoundaries(productionFiles, checker, packageRoots);
+  } else {
+    INTRINSIC_RESULT_CATCH_MAPPERS.set(checker, new Set());
+    INTRINSIC_RESULT_MATCH_HANDLERS.set(checker, new Set());
+    INTRINSIC_RESULT_CLASSIFIER_PARAMETERS.set(checker, new Set());
+  }
   assertEveryExceptionAdapterResolves(
     workspace,
     workspaceRoot,
@@ -6973,7 +8441,16 @@ export function analyzeWorkspace(
     approvedExceptionAdapters,
     packageRoots,
   );
-  assertCoreFinalExceptionAdaptersResolve(workspace, workspaceRoot, program, checker);
+  assertCoreFinalExceptionAdaptersResolve(
+    workspace,
+    workspaceRoot,
+    program,
+    checker,
+    undefined,
+    undefined,
+    undefined,
+    packageRoots,
+  );
   const diagnostics: ArchitectureDiagnostic[] = [];
   assertPersistenceInfrastructureCallsResolve(
     workspace,
@@ -7004,7 +8481,7 @@ export function analyzeWorkspace(
   const reportedCustomDecoders = new Set<string>();
   const reportedMaps = new Set<string>();
 
-  for (const sourceFile of productionSourceIndex(program, workspaceRoot).files) {
+  for (const sourceFile of productionFiles) {
     const module = relativeModulePath(workspaceRoot, sourceFile);
     const activeRules = new Set(
       ARCHITECTURE_RULES.filter((rule) => ruleApplies(workspace, rule, module)),
@@ -7048,7 +8525,7 @@ export function analyzeWorkspace(
         );
       }
       if (activeRules.has("architecture/no-domain-unknown") && ts.isParameter(node)) {
-        analyzeParameter(node, checker, workspace, workspaceRoot, diagnostics);
+        analyzeParameter(node, checker, workspace, workspaceRoot, packageRoots, diagnostics);
       }
       if (
         activeRules.has("architecture/no-unknown-member-read") &&
@@ -7056,7 +8533,14 @@ export function analyzeWorkspace(
           ts.isElementAccessExpression(node) ||
           ts.isBindingElement(node))
       ) {
-        analyzeUnknownMemberRead(node, checker, workspace, workspaceRoot, diagnostics);
+        analyzeUnknownMemberRead(
+          node,
+          checker,
+          workspace,
+          workspaceRoot,
+          packageRoots,
+          diagnostics,
+        );
       }
       if (
         activeRules.has("architecture/no-unknown-member-read") &&
@@ -7065,7 +8549,14 @@ export function analyzeWorkspace(
           ts.isSpreadAssignment(node) ||
           ts.isCallExpression(node))
       ) {
-        analyzeUnknownExtraction(node, checker, workspace, workspaceRoot, diagnostics);
+        analyzeUnknownExtraction(
+          node,
+          checker,
+          workspace,
+          workspaceRoot,
+          packageRoots,
+          diagnostics,
+        );
       }
       if (
         activeRules.has("architecture/no-unregistered-custom-decoder") &&
