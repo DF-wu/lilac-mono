@@ -63,6 +63,13 @@ function normalizeNameSegment(value: string): string {
   return normalized.replace(/^_+|_+$/g, "");
 }
 
+export function catalogToolNamespaceName(
+  identity: Pick<CatalogToolIdentity, "source" | "sourceId">,
+): string {
+  const sourceId = normalizeNameSegment(identity.sourceId) || "source";
+  return `${identity.source}_${sourceId}`;
+}
+
 function identityHash(identity: CatalogToolIdentity): string {
   return createHash("sha256").update(catalogToolStableId(identity)).digest("hex").slice(0, 10);
 }
@@ -76,9 +83,9 @@ function appendHash(base: string, identity: CatalogToolIdentity): string {
 
 /** Deterministic candidate before catalog-wide collision resolution. */
 export function baseCatalogToolName(identity: CatalogToolIdentity): string {
-  const sourceId = normalizeNameSegment(identity.sourceId) || "source";
+  const namespace = catalogToolNamespaceName(identity);
   const rawToolName = normalizeNameSegment(identity.rawToolName) || "tool";
-  const base = `${identity.source}_${sourceId}_${rawToolName}`;
+  const base = `${namespace}_${rawToolName}`;
   return base.length <= MAX_MODEL_TOOL_NAME_LENGTH ? base : appendHash(base, identity);
 }
 

@@ -169,6 +169,7 @@ export type ClaudeCodeToolCatalogMetadata = {
   readonly rawName: string;
   readonly title?: string;
   readonly description?: string;
+  readonly namespaceSummary?: string;
 };
 
 export type ClaudeCodeToolCatalogMetadataMap = Readonly<
@@ -476,6 +477,7 @@ function pruneCorrelations(pending: Map<string, PendingCorrelation>, now: number
 
 function catalogSearchHint(metadata: ClaudeCodeToolCatalogMetadata): string {
   return [
+    ...(metadata.namespaceSummary ? [`Namespace: ${metadata.namespaceSummary}`] : []),
     `Source ID: ${metadata.sourceId}`,
     `Raw tool name: ${metadata.rawName}`,
     ...(metadata.title ? [`Title: ${metadata.title}`] : []),

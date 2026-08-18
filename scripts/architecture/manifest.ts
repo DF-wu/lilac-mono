@@ -3885,6 +3885,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               category: "projection",
             },
             {
+              identity: { module: "src/mcp/registry.ts", exportName: "decodeMcpServerInfo" },
+              category: "projection",
+            },
+            {
               identity: {
                 module: "src/tools/fs/remote-fs.ts",
                 exportName: "decodeRemoteFsRunnerPackageSpec",

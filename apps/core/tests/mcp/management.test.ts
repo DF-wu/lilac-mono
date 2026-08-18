@@ -102,6 +102,10 @@ class RecordingRegistry implements McpRegistryApi {
     return this.configStatus;
   }
 
+  getCatalogServers() {
+    return [];
+  }
+
   getTools(): readonly McpCatalogTool[] {
     return [];
   }
@@ -217,6 +221,7 @@ describe("MCP management calls", () => {
 
     const added = await callValue(setup.tool, "mcp.add", {
       serverId: "docs",
+      description: "Documentation search and retrieval.",
       transport: "http",
       url: "https://mcp.example.test/service",
     });
@@ -235,6 +240,9 @@ describe("MCP management calls", () => {
       url: "https://mcp.example.test/service",
       headers: {},
     });
+    expect((await readConfigValue(setup.configPath)).config.servers.docs?.description).toBe(
+      "Documentation search and retrieval.",
+    );
 
     expect(await callValue(setup.tool, "mcp.list", {})).toEqual({
       servers: [{ serverId: "docs", transport: "http", authentication: "none" }],

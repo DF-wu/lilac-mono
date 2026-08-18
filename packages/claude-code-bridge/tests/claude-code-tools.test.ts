@@ -529,6 +529,7 @@ describe("Claude Code tool bridge", () => {
           rawName: "ticket/search-by-customer-reference",
           title: "Customer escalation finder",
           description: "Finds escalations using the original account codename marmalade.",
+          namespaceSummary: "mcp_linear_production.* — 1 tool: Issue tracking",
         },
         find_tools: {
           sourceId: "lilac",
@@ -549,6 +550,7 @@ describe("Claude Code tool bridge", () => {
     });
     expect(listed.tools.find((entry) => entry.name === "mcp_issue_tracker_lookup")?._meta).toEqual({
       "anthropic/searchHint": [
+        "Namespace: mcp_linear_production.* — 1 tool: Issue tracking",
         "Source ID: linear-production",
         "Raw tool name: ticket/search-by-customer-reference",
         "Title: Customer escalation finder",

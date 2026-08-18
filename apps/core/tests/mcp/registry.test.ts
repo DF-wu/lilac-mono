@@ -694,6 +694,128 @@ describe("McpRegistry startup and discovery", () => {
     await registry.shutdown();
   });
 
+  it("retains serverInfo and resolves configured descriptions before advertised descriptions", async () => {
+    const configuredDefinition = {
+      ...stdioDefinition("configured"),
+      description: "Configured catalog description.",
+    };
+    const advertisedDefinition = stdioDefinition("advertised");
+    let config = mcpConfig([configuredDefinition, advertisedDefinition]);
+    const clients = new Map([
+      [
+        "configured",
+        new FakeMcpClient(
+          { first: { tools: [mcpToolDefinition("configured-tool")] } },
+          {
+            name: "configured-server",
+            title: "Configured Server",
+            version: "1.0.0",
+            description: "Advertised description that must lose precedence.",
+          },
+        ),
+      ],
+      [
+        "advertised",
+        new FakeMcpClient(
+          { first: { tools: [mcpToolDefinition("advertised-tool")] } },
+          {
+            name: "advertised-server",
+            version: "2.0.0",
+            description: "Advertised catalog description.",
+          },
+        ),
+      ],
+    ]);
+    let createCount = 0;
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () => configSnapshot(config),
+        createClient: async (clientConfig) => {
+          createCount += 1;
+          const serverId = clientConfig.clientName?.replace(/^lilac-mcp-/, "") ?? "";
+          const client = clients.get(serverId);
+          if (!client) throw new Error(`Missing client for ${serverId}`);
+          return client;
+        },
+      },
+    });
+
+    await registry.init();
+    const initial = registry.getCatalogServers();
+    expect(initial).toEqual([
+      {
+        serverId: "advertised",
+        serverInfo: {
+          name: "advertised-server",
+          version: "2.0.0",
+          description: "Advertised catalog description.",
+        },
+        description: "Advertised catalog description.",
+      },
+      {
+        serverId: "configured",
+        serverInfo: {
+          name: "configured-server",
+          title: "Configured Server",
+          version: "1.0.0",
+          description: "Advertised description that must lose precedence.",
+        },
+        description: "Configured catalog description.",
+      },
+    ]);
+    expect(Object.isFrozen(initial)).toBe(true);
+    expect(Object.isFrozen(initial[0])).toBe(true);
+    expect(Object.isFrozen(initial[0]?.serverInfo)).toBe(true);
+
+    config = mcpConfig([
+      { ...configuredDefinition, description: "Updated configured description." },
+      advertisedDefinition,
+    ]);
+    expect(await reloadRegistry(registry, "configured")).toEqual([
+      { serverId: "configured", reconciliation: "unchanged", result: "available" },
+    ]);
+    expect(createCount).toBe(2);
+    expect(registry.getCatalogServers()[1]?.description).toBe("Updated configured description.");
+    await registry.shutdown();
+  });
+
+  it("rejects malformed advertised serverInfo before publishing catalog metadata", async () => {
+    const client = new FakeMcpClient(
+      { first: { tools: [mcpToolDefinition("must-not-be-discovered")] } },
+      {
+        name: "malformed-server",
+        version: "1.0.0",
+        description: 123,
+      },
+    );
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("malformed")])),
+        createClient: async () => client,
+      },
+    });
+
+    await registry.init();
+    expect(registry.list()).toEqual([
+      {
+        serverId: "malformed",
+        transport: "stdio",
+        status: "unavailable",
+        phase: "discovery",
+        error: expect.stringContaining("Invalid MCP serverInfo"),
+      },
+    ]);
+    expect(registry.getCatalogServers()).toEqual([]);
+    expect(registry.getTools()).toEqual([]);
+    expect(client.cursors).toEqual([]);
+    expect(client.closeCount).toBe(1);
+    await registry.shutdown();
+  });
+
   it("returns after discovery failure when once-only client cleanup hangs", async () => {
     const secret = "do-not-leak";
     const closeStarted = deferred<void>();

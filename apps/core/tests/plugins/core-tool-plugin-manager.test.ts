@@ -1113,6 +1113,18 @@ export default {
           },
           getConfigStatus: () => ({ status: "valid" }),
           list: () => [],
+          getCatalogServers: () => [
+            {
+              serverId: "allowed",
+              serverInfo: { name: "allowed", version: "1.0.0" },
+              description: "Allowed server tools.",
+            },
+            {
+              serverId: "blocked",
+              serverInfo: { name: "blocked", version: "1.0.0" },
+              description: "Blocked server tools.",
+            },
+          ],
           getTools: () => entries,
           async shutdown() {},
         },
@@ -1142,6 +1154,13 @@ export default {
       "mcp_allowed_model_raw",
       "mcp_allowed_raw_allowed",
     ]);
+    expect(general.catalogMetadata.mcp_allowed_model_raw?.namespaceSummary).toBe(
+      "mcp_allowed.* — 2 tools: Allowed server tools.",
+    );
+    expect(getToolDescription(general.tools, "find_tools")).toContain(
+      "mcp_allowed.* — 2 tools: Allowed server tools.",
+    );
+    expect(getToolDescription(general.tools, "find_tools")).not.toContain("mcp_blocked.*");
     expect(general.directToolNames.has("find_tools")).toBe(true);
   });
 
@@ -1236,6 +1255,7 @@ export default {
           },
           getConfigStatus: () => ({ status: "valid" }),
           list: () => [],
+          getCatalogServers: () => [],
           getTools: () => [
             {
               serverId: "server",

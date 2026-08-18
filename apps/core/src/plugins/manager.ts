@@ -30,10 +30,12 @@ import {
   buildUnifiedToolCatalogResult,
   catalogCandidateExecutable,
   createPortableToolSearchResult,
-  type PortableToolSearchInvalid,
-  type UnifiedToolCatalogInvalid,
+  formatCatalogNamespaceSummary,
+  type CatalogNamespaceSummary,
   type CatalogToolCandidate,
   type CatalogToolEntry,
+  type PortableToolSearchInvalid,
+  type UnifiedToolCatalogInvalid,
 } from "../mcp/catalog";
 import {
   assignCatalogToolNames,
@@ -377,6 +379,36 @@ export function createCoreToolPluginManager(params: {
         mcpTools.push(entry);
       }
     }
+    const mcpCatalogServerById = new Map(
+      (params.runtime.mcpRegistry?.getCatalogServers() ?? []).map((server) => [
+        server.serverId,
+        server,
+      ]),
+    );
+    const mcpToolCountsByServerId = new Map<string, number>();
+    for (const entry of mcpTools) {
+      mcpToolCountsByServerId.set(
+        entry.serverId,
+        (mcpToolCountsByServerId.get(entry.serverId) ?? 0) + 1,
+      );
+    }
+    const mcpNamespaceSummaries: CatalogNamespaceSummary[] = [
+      ...mcpToolCountsByServerId.entries(),
+    ].map(([serverId, toolCount]) => {
+      const description = mcpCatalogServerById.get(serverId)?.description;
+      return {
+        source: "mcp",
+        sourceId: serverId,
+        toolCount,
+        ...(description === undefined ? {} : { description }),
+      };
+    });
+    const mcpNamespaceSummaryByServerId = new Map(
+      mcpNamespaceSummaries.map((summary) => [
+        summary.sourceId,
+        formatCatalogNamespaceSummary(summary),
+      ]),
+    );
 
     for (const spec of builtinSpecs) {
       const specName = nameForSpec(spec);
@@ -481,10 +513,12 @@ export function createCoreToolPluginManager(params: {
       });
     }
     for (const entry of mcpTools) {
+      const namespaceSummary = mcpNamespaceSummaryByServerId.get(entry.serverId);
       candidates.push({
         identity: entry.identity,
         ...(entry.title === undefined ? {} : { title: entry.title }),
         ...(entry.description === undefined ? {} : { description: entry.description }),
+        ...(namespaceSummary === undefined ? {} : { namespaceSummary }),
         tool: mcpBinaryMaterializer
           ? wrapMcpToolWithBinaryMaterialization(entry.tool, mcpBinaryMaterializer)
           : entry.tool,
@@ -519,6 +553,7 @@ export function createCoreToolPluginManager(params: {
       const search: ResultType<unknown, PortableToolSearchInvalid> = createPortableToolSearchResult(
         {
           catalog: catalog.entries,
+          namespaceSummaries: mcpNamespaceSummaries,
           transcriptStore: params.runtime.transcriptStore,
           requestContext: buildParams.requestContext,
         },

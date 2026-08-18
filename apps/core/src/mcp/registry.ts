@@ -19,6 +19,7 @@ import { McpConfigError, readMcpConfigFile } from "./config-file";
 import { rethrowPanic, safeMcpErrorText } from "./error-format";
 import type {
   McpCatalogTool,
+  McpCatalogServer,
   McpConvertedTool,
   McpRegistryApi,
   McpRegistryClient,
@@ -29,6 +30,7 @@ import type {
   McpReloadOutcome,
   McpReloadReconciliation,
   McpServerStatus,
+  McpServerInfo,
 } from "./registry-types";
 import { resolveMcpValueSourceMap, validateHttpHeaders } from "./value-source";
 
@@ -43,12 +45,19 @@ const optionalHttpInboundSseErrorSchema = z.object({
   statusCode: z.number().int(),
   url: z.string(),
 });
+const mcpServerInfoSchema = z.object({
+  name: z.string(),
+  version: z.string(),
+  title: z.string().optional(),
+  description: z.string().optional(),
+});
 
 type RegistryEntry = {
   readonly definition: McpServerDefinition;
   readonly fingerprint: string;
   readonly transportFingerprint?: string;
   readonly client?: McpRegistryClient;
+  readonly serverInfo?: McpServerInfo;
   readonly sensitiveValues: readonly string[];
   readonly status: McpServerStatus;
   readonly tools: readonly McpCatalogTool[];
@@ -56,6 +65,7 @@ type RegistryEntry = {
 
 type InitializedCandidate = {
   readonly client: McpRegistryClient;
+  readonly serverInfo: McpServerInfo;
   readonly sensitiveValues: readonly string[];
   readonly transportFingerprint: string;
   readonly tools: readonly McpCatalogTool[];
@@ -157,9 +167,28 @@ class McpRegistryCloseDeadlineError extends Error {
 }
 
 class McpRegistryDiscoveryInvalid extends TaggedError("McpRegistryDiscoveryInvalid")<{
-  readonly reason: "duplicate-tool" | "missing-conversion" | "repeated-cursor";
+  readonly reason:
+    | "duplicate-tool"
+    | "invalid-server-info"
+    | "missing-conversion"
+    | "repeated-cursor";
   readonly message: string;
 }> {}
+
+function decodeMcpServerInfo(
+  value: unknown,
+): ResultType<McpServerInfo, McpRegistryDiscoveryInvalid> {
+  const parsed = mcpServerInfoSchema.safeParse(value);
+  if (!parsed.success) {
+    return Result.err(
+      new McpRegistryDiscoveryInvalid({
+        reason: "invalid-server-info",
+        message: `Invalid MCP serverInfo: ${z.prettifyError(parsed.error)}`,
+      }),
+    );
+  }
+  return Result.ok(Object.freeze(parsed.data));
+}
 
 class McpRegistryTerminalFailure extends TaggedError("McpRegistryTerminalFailure")<{
   readonly status: "unavailable" | "authentication_required";
@@ -297,6 +326,7 @@ export class McpRegistry implements McpRegistryApi {
   private entries = new Map<string, RegistryEntry>();
   private configStatus: McpRegistryConfigStatus = Object.freeze({ status: "valid" });
   private statusSnapshot: readonly McpServerStatus[] = Object.freeze([]);
+  private catalogServerSnapshot: readonly McpCatalogServer[] = Object.freeze([]);
   private toolSnapshot: readonly McpCatalogTool[] = Object.freeze([]);
   private lifecycleQueue: Promise<void> = Promise.resolve();
   private initialized = false;
@@ -404,6 +434,10 @@ export class McpRegistry implements McpRegistryApi {
 
   getConfigStatus(): McpRegistryConfigStatus {
     return this.configStatus;
+  }
+
+  getCatalogServers(): readonly McpCatalogServer[] {
+    return this.catalogServerSnapshot;
   }
 
   getTools(): readonly McpCatalogTool[] {
@@ -545,6 +579,8 @@ export class McpRegistry implements McpRegistryApi {
             }
             this.entries.set(serverId, {
               ...current,
+              definition,
+              fingerprint: definitionFingerprint(definition),
               tools,
               status: Object.freeze({
                 serverId,
@@ -684,7 +720,7 @@ export class McpRegistry implements McpRegistryApi {
               const candidate = await this.withDeadline(
                 definition.id,
                 async (signal) => {
-                  const createdClient = await this.createClient({
+                  const createdClient: McpRegistryClient = await this.createClient({
                     transport,
                     clientName: `lilac-mcp-${definition.id}`,
                     maxRetries: 0,
@@ -716,16 +752,29 @@ export class McpRegistry implements McpRegistryApi {
                   if (holder.terminalFailure) return Result.err(holder.terminalFailure);
 
                   phase = "discovery";
-                  const tools = await this.discoverTools(definition, createdClient, signal, holder);
-                  return tools.map(
-                    (value) =>
-                      ({
-                        client: createdClient,
-                        sensitiveValues: Object.freeze([...sensitiveValues]),
-                        transportFingerprint: transportFingerprint(resolved.input),
-                        tools: value,
-                      }) satisfies InitializedCandidate,
-                  );
+                  return await decodeMcpServerInfo(createdClient.serverInfo).match<
+                    () => Promise<ResultType<InitializedCandidate, McpRegistryDiscoveryError>>
+                  >({
+                    err: (error) => async () => Result.err(error),
+                    ok: (serverInfo) => async () => {
+                      const tools = await this.discoverTools(
+                        definition,
+                        createdClient,
+                        signal,
+                        holder,
+                      );
+                      return tools.map(
+                        (value) =>
+                          ({
+                            client: createdClient,
+                            serverInfo,
+                            sensitiveValues: Object.freeze([...sensitiveValues]),
+                            transportFingerprint: transportFingerprint(resolved.input),
+                            tools: value,
+                          }) satisfies InitializedCandidate,
+                      );
+                    },
+                  })();
                 },
                 () => {
                   if (isCustomTransport(transport)) this.closeTransportInBackground(transport);
@@ -1147,6 +1196,7 @@ export class McpRegistry implements McpRegistryApi {
       fingerprint: definitionFingerprint(definition),
       transportFingerprint: result.candidate.transportFingerprint,
       client: result.candidate.client,
+      serverInfo: result.candidate.serverInfo,
       sensitiveValues: result.candidate.sensitiveValues,
       status: Object.freeze({
         serverId: definition.id,
@@ -1311,6 +1361,19 @@ export class McpRegistry implements McpRegistryApi {
       left.definition.id.localeCompare(right.definition.id),
     );
     this.statusSnapshot = Object.freeze(entries.map((entry) => entry.status));
+    this.catalogServerSnapshot = Object.freeze(
+      entries.flatMap((entry) => {
+        if (entry.status.status !== "available" || !entry.serverInfo) return [];
+        const description = entry.definition.description ?? entry.serverInfo.description;
+        return [
+          Object.freeze({
+            serverId: entry.definition.id,
+            serverInfo: entry.serverInfo,
+            ...(description === undefined ? {} : { description }),
+          } satisfies McpCatalogServer),
+        ];
+      }),
+    );
     this.toolSnapshot = Object.freeze(
       entries.flatMap((entry) => (entry.status.status === "available" ? entry.tools : [])),
     );
