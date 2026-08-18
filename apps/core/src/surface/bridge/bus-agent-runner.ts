@@ -2445,6 +2445,16 @@ export function selectedLevel1ToolNames(
   return active;
 }
 
+export function shouldLogLevel1ToolCompletionAtInfo(
+  toolName: string,
+  catalog: BuiltLevel1Toolset["catalog"],
+): boolean {
+  return (
+    toolName === "find_tools" ||
+    catalog.some((entry) => entry.source === "mcp" && entry.modelName === toolName)
+  );
+}
+
 export async function refreshSelectedLevel1Tools(params: {
   target: Pick<Level1ToolAuthorityTarget, "setActiveTools">;
   toolset: BuiltLevel1Toolset;
@@ -7080,19 +7090,23 @@ export async function startBusAgentRunner(params: {
                 );
               }
 
-              logger.debug(
-                "tool finished",
-                formatBridgeLogContext({
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                  toolCallId: event.toolCallId,
-                  toolName: event.toolName,
-                  ok,
-                  deferredAccepted,
-                  durationMs: toolDurationMs,
-                  failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
-                }),
-              );
+              const toolCompletionLogContext = formatBridgeLogContext({
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                toolCallId: event.toolCallId,
+                toolName: event.toolName,
+                ok,
+                deferredAccepted,
+                durationMs: toolDurationMs,
+                failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
+              });
+              if (
+                shouldLogLevel1ToolCompletionAtInfo(event.toolName, activeBinding.toolset.catalog)
+              ) {
+                logger.info("tool finished", toolCompletionLogContext);
+              } else {
+                logger.debug("tool finished", toolCompletionLogContext);
+              }
 
               if (event.toolName === "batch" || deferredAccepted) {
                 return;

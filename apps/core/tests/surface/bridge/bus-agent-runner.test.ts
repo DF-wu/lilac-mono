@@ -99,6 +99,7 @@ import {
   selectNextNativeModelFallback,
   shouldRunAutoInjectedThreadSearch,
   shouldQueueIncompatibleActiveRuntimeModel,
+  shouldLogLevel1ToolCompletionAtInfo,
   shouldCancelRunPolicyRequest,
   shouldCancelIdleOnlyGlobalRequest,
   shouldUsePersistentCoreClaudeRuntime,
@@ -524,6 +525,16 @@ describe("Claude lifecycle logging", () => {
 });
 
 describe("runner Level 1 catalog selection", () => {
+  it("audits portable search and MCP completions at info without duplicating built-in logs", () => {
+    const toolset = level1TestToolset();
+    const mcpEntry = toolset.catalog[0];
+    if (!mcpEntry) throw new Error("missing MCP catalog fixture");
+
+    expect(shouldLogLevel1ToolCompletionAtInfo("find_tools", toolset.catalog)).toBe(true);
+    expect(shouldLogLevel1ToolCompletionAtInfo("deferred_tool", toolset.catalog)).toBe(true);
+    expect(shouldLogLevel1ToolCompletionAtInfo("builtin", toolset.catalog)).toBe(false);
+  });
+
   it("applies persisted initial selection by stable ID and omits unavailable selected rows", () => {
     const toolset = level1TestToolset();
     const persistedRows = ["catalog-id", "missing-catalog-id"];
