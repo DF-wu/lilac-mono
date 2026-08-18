@@ -1,7 +1,7 @@
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-import { isPanic } from "./runtime-utils";
+import { capturePromiseResult, captureResultOutcome, isPanic } from "./runtime-utils";
 
 export const SERVER_COMPACTION_REQUEST_HEADER = "x-lilac-server-compaction-request";
 export const SERVER_COMPACTION_REQUEST_MARKER = "true";
@@ -111,19 +111,19 @@ export async function prepareServerCompactionRequestResult(
     );
   }
 
-  let encoded: string | undefined;
-  try {
-    encoded = await requestBody(input, init);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+  const bodyRead = await capturePromiseResult(() => requestBody(input, init));
+  const readOutcome = captureResultOutcome(bodyRead);
+  if (!readOutcome.ok && isPanic(readOutcome.error)) throw readOutcome.error;
+  if (!readOutcome.ok) {
     return Result.err(
       new ServerCompactionRequestInvalid({
         issue: "unreadable-body",
-        cause,
+        cause: readOutcome.error,
         message: "Marked server compaction request must have a readable JSON body",
       }),
     );
   }
+  const encoded = readOutcome.value;
   if (encoded === undefined) {
     return Result.err(
       new ServerCompactionRequestInvalid({
@@ -132,25 +132,28 @@ export async function prepareServerCompactionRequestResult(
       }),
     );
   }
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(encoded);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+  const bodyDecoded = Result.try({
+    try: () => JSON.parse(encoded) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const decodeOutcome = captureResultOutcome(bodyDecoded);
+  if (!decodeOutcome.ok && isPanic(decodeOutcome.error.cause)) throw decodeOutcome.error.cause;
+  if (!decodeOutcome.ok) {
     return Result.err(
       new ServerCompactionRequestInvalid({
         issue: "malformed-json",
-        cause,
+        cause: decodeOutcome.error.cause,
         message: "Marked server compaction request must have a valid JSON body",
       }),
     );
   }
+  const decoded = decodeOutcome.value;
   const parsed = decodeServerCompactionPayload(decoded);
-  return parsed.map((value) => {
-    const body = encodeServerCompactionPayload(value);
-    mergeRemoteCompactionFeature(headers);
-    return { input, init: { ...strippedInit, body } };
-  });
+  const parsedOutcome = captureResultOutcome(parsed);
+  if (!parsedOutcome.ok) return Result.err(parsedOutcome.error);
+  const body = encodeServerCompactionPayload(parsedOutcome.value);
+  mergeRemoteCompactionFeature(headers);
+  return Result.ok({ input, init: { ...strippedInit, body } });
 }
 
 /** Adds server compaction wire fields only to explicitly marked Responses requests. */

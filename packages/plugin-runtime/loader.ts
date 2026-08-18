@@ -9,6 +9,7 @@ import {
   isPluginPanic,
   opaquePluginExceptionMessage,
   safePluginExceptionCause,
+  type DynamicToolPluginModuleCapabilitySnapshot,
   type ToolPluginCapabilitySnapshot,
 } from "./capabilities";
 import { ToolPluginCapabilityError, ToolPluginModuleLoadError } from "./errors";
@@ -77,11 +78,23 @@ export async function loadToolPluginModuleCapability<TRuntimeContext = unknown>(
   pluginDir?: string;
   cacheBustKey: string;
 }): Promise<ResultType<ToolPluginCapabilitySnapshot<TRuntimeContext>, ToolPluginLoaderError>> {
-  let imported: unknown;
-  try {
-    const snapshotPath = await createSnapshot(params);
-    imported = await importDynamicModule(pathToFileURL(snapshotPath).toString());
-  } catch (cause) {
+  const captured = await Result.tryPromise({
+    try: async () => {
+      const snapshotPath = await createSnapshot(params);
+      const imported = await importDynamicModule(pathToFileURL(snapshotPath).toString());
+      return () => imported;
+    },
+    catch: (cause) => ({ restoreCause: () => cause }),
+  });
+  const outcome = captured.match<
+    | { readonly kind: "imported"; readonly restoreImported: () => unknown }
+    | { readonly kind: "failure"; readonly restoreCause: () => unknown }
+  >({
+    ok: (restoreImported) => ({ kind: "imported", restoreImported }),
+    err: ({ restoreCause }) => ({ kind: "failure", restoreCause }),
+  });
+  if (outcome.kind === "failure") {
+    const cause = outcome.restoreCause();
     if (isPluginPanic(cause)) throw cause;
     return Result.err(
       new ToolPluginModuleLoadError({
@@ -92,8 +105,20 @@ export async function loadToolPluginModuleCapability<TRuntimeContext = unknown>(
     );
   }
 
-  const decoded = decodeDynamicToolPluginModule<TRuntimeContext>(imported);
-  return decoded.map((value) => value.plugin);
+  const decoded = decodeDynamicToolPluginModule<TRuntimeContext>(outcome.restoreImported());
+  const decodedOutcome = decoded.match<
+    | {
+        readonly ok: true;
+        readonly value: DynamicToolPluginModuleCapabilitySnapshot<TRuntimeContext>;
+      }
+    | { readonly ok: false; readonly error: ToolPluginCapabilityError }
+  >({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+  return decodedOutcome.ok
+    ? Result.ok(decodedOutcome.value.plugin)
+    : Result.err(decodedOutcome.error);
 }
 
 export async function loadToolPluginModule<TRuntimeContext = unknown>(params: {
@@ -107,5 +132,12 @@ export async function loadToolPluginModule<TRuntimeContext = unknown>(params: {
   >
 > {
   const loaded = await loadToolPluginModuleCapability<TRuntimeContext>(params);
-  return loaded.map((value) => value.plugin);
+  const loadedOutcome = loaded.match<
+    | { readonly ok: true; readonly value: ToolPluginCapabilitySnapshot<TRuntimeContext> }
+    | { readonly ok: false; readonly error: ToolPluginLoaderError }
+  >({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+  return loadedOutcome.ok ? Result.ok(loadedOutcome.value.plugin) : Result.err(loadedOutcome.error);
 }

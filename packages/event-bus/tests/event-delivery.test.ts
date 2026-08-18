@@ -7,6 +7,7 @@ import { Panic, Result, TaggedError, type Result as ResultType } from "better-re
 import { env } from "@stanley2058/lilac-utils";
 
 import {
+  captureDeadLetterAcceptance,
   RedisEventDeadLetterAuthenticationFailed,
   RedisEventDeadLetterCiphertextInvalid,
   RedisEventDeadLetterConfigInvalid,
@@ -274,6 +275,31 @@ function inconsistentDeadLetterRecordFixtures(): readonly EventDeadLetterRecord[
 }
 
 describe("result-based event delivery", () => {
+  it("preserves an opaque dead-letter rejection cause by identity", async () => {
+    const cause = Object.create(null);
+    const accepted = await captureDeadLetterAcceptance(async () => {
+      throw cause;
+    });
+
+    expect(accepted.status).toBe("error");
+    if (accepted.status === "error") expect(accepted.error.cause).toBe(cause);
+  });
+
+  it("signals a captured dead-letter Panic outside Result projection", async () => {
+    const panic = new Panic({ message: "dead-letter acceptance invariant" });
+    let caught: unknown;
+
+    try {
+      await captureDeadLetterAcceptance(async () => {
+        throw panic;
+      });
+    } catch (cause) {
+      caught = cause;
+    }
+
+    expect(caught).toBe(panic);
+  });
+
   it("rejects malformed XRANGE evidence before starting a dead-letter transaction", async () => {
     const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
     let xrangeResponse: unknown = [];
@@ -1232,82 +1258,85 @@ describe("result-based event delivery", () => {
     }
   });
 
-  const malformedResults: ReadonlyArray<[string, () => ResultType<void, HandlerFailure>]> = [
+  const panicErrCause = new Panic({ message: "not an expected handler error" });
+  const malformedResults: ReadonlyArray<[string, () => ResultType<void, HandlerFailure>, Panic?]> =
     [
-      "forged prototype",
-      () => {
-        const result = Result.ok(undefined);
-        Object.setPrototypeOf(result, Object.prototype);
-        return result;
-      },
-    ],
-    [
-      "missing Ok value",
-      () => {
-        const result = Result.ok(undefined);
-        Reflect.deleteProperty(result, "value");
-        return result;
-      },
-    ],
-    [
-      "non-undefined Ok value",
-      () => {
-        const result = Result.ok(undefined);
-        Reflect.set(result, "value", "forged");
-        return result;
-      },
-    ],
-    [
-      "missing Err error",
-      () => {
-        const result = Result.err(new HandlerFailure({ message: "missing" }));
-        Reflect.deleteProperty(result, "error");
-        return result;
-      },
-    ],
-    [
-      "invalid Err status",
-      () => {
-        const result = Result.err(new HandlerFailure({ message: "invalid status" }));
-        Reflect.set(result, "status", "ok");
-        return result;
-      },
-    ],
-    [
-      "non-tagged Err error",
-      () => {
-        const result = Result.err(new HandlerFailure({ message: "replaced" }));
-        Reflect.set(result, "error", new Error("not owned"));
-        return result;
-      },
-    ],
-    [
-      "incomplete tagged Err error",
-      () => {
-        const result = Result.err(new HandlerFailure({ message: "incomplete" }));
-        Reflect.deleteProperty(result.error, "message");
-        return result;
-      },
-    ],
-    [
-      "Panic Err error",
-      () => {
-        const result = Result.err(new HandlerFailure({ message: "replaced" }));
-        Reflect.set(result, "error", new Panic({ message: "not an expected handler error" }));
-        return result;
-      },
-    ],
-    [
-      "revoked Result",
-      () => {
-        const { proxy, revoke } = Proxy.revocable(Result.ok(undefined), {});
-        revoke();
-        return proxy;
-      },
-    ],
-  ];
+      [
+        "forged prototype",
+        () => {
+          const result = Result.ok(undefined);
+          Object.setPrototypeOf(result, Object.prototype);
+          return result;
+        },
+      ],
+      [
+        "missing Ok value",
+        () => {
+          const result = Result.ok(undefined);
+          Reflect.deleteProperty(result, "value");
+          return result;
+        },
+      ],
+      [
+        "non-undefined Ok value",
+        () => {
+          const result = Result.ok(undefined);
+          Reflect.set(result, "value", "forged");
+          return result;
+        },
+      ],
+      [
+        "missing Err error",
+        () => {
+          const result = Result.err(new HandlerFailure({ message: "missing" }));
+          Reflect.deleteProperty(result, "error");
+          return result;
+        },
+      ],
+      [
+        "invalid Err status",
+        () => {
+          const result = Result.err(new HandlerFailure({ message: "invalid status" }));
+          Reflect.set(result, "status", "ok");
+          return result;
+        },
+      ],
+      [
+        "non-tagged Err error",
+        () => {
+          const result = Result.err(new HandlerFailure({ message: "replaced" }));
+          Reflect.set(result, "error", new Error("not owned"));
+          return result;
+        },
+      ],
+      [
+        "incomplete tagged Err error",
+        () => {
+          const result = Result.err(new HandlerFailure({ message: "incomplete" }));
+          Reflect.deleteProperty(result.error, "message");
+          return result;
+        },
+      ],
+      [
+        "Panic Err error",
+        () => {
+          const result = Result.err(new HandlerFailure({ message: "replaced" }));
+          Reflect.set(result, "error", panicErrCause);
+          return result;
+        },
+        panicErrCause,
+      ],
+      [
+        "revoked Result",
+        () => {
+          const { proxy, revoke } = Proxy.revocable(Result.ok(undefined), {});
+          revoke();
+          return proxy;
+        },
+      ],
+    ];
 
-  for (const [label, malformedResult] of malformedResults) {
+  for (const [label, malformedResult, expectedPanic] of malformedResults) {
     it(`reports ${label} handler Result and preserves its pending entry`, async () => {
       const redis = new Redis(TEST_REDIS_URL);
       const keyPrefix = `test:lilac-delivery:${randomId(`handler-${label}`)}`;
@@ -1333,8 +1362,13 @@ describe("result-based event delivery", () => {
       if (started.status === "error") throw started.error;
       try {
         const id = await publishRequest(bus, randomId("request"));
-        await reported.promise;
-        await expect(started.value.done).rejects.toBeDefined();
+        const reportedCause = await reported.promise;
+        if (expectedPanic) {
+          expect(reportedCause).toBe(expectedPanic);
+          await expect(started.value.done).rejects.toBe(expectedPanic);
+        } else {
+          await expect(started.value.done).rejects.toBeDefined();
+        }
         expect(await pendingIds(redis, streamKey, physicalGroup)).toEqual([id]);
       } finally {
         await started.value.stop().catch(() => undefined);

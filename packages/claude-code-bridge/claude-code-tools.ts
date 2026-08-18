@@ -146,6 +146,24 @@ function resultOutcome<T, E>(
   });
 }
 
+type OpaqueClaudeToolValue = {} | null | undefined;
+
+function capturedClaudeToolError(cause: OpaqueClaudeToolValue, message: string): Error {
+  return cause instanceof Error ? cause : new Error(message, { cause });
+}
+
+function captureClaudeToolOperation<T>(
+  operation: () => Awaited<T>,
+): ResultType<T, OpaqueClaudeToolValue> {
+  return Result.try<T, OpaqueClaudeToolValue>({ try: operation, catch: (cause) => cause });
+}
+
+function captureClaudeToolPromise<T>(
+  operation: () => Promise<T>,
+): Promise<ResultType<T, OpaqueClaudeToolValue>> {
+  return Result.tryPromise<T, OpaqueClaudeToolValue>({ try: operation, catch: (cause) => cause });
+}
+
 export type ClaudeCodeToolCatalogMetadata = {
   readonly sourceId: string;
   readonly rawName: string;
@@ -200,18 +218,18 @@ function toolError(message: string): CallToolResult {
 }
 
 function stringifyJson(value: unknown): ResultType<string, ClaudeCodeToolOutputMappingFailed> {
-  try {
-    return Result.ok(JSON.stringify(value) ?? "null");
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new ClaudeCodeToolOutputMappingFailed({
-        outputType: "json",
-        cause,
-        message: `Tool output is not JSON-serializable: ${opaqueErrorMessage(cause, "opaque serialization failure")}`,
-      }),
-    );
-  }
+  const serialized = resultOutcome(
+    captureClaudeToolOperation(() => JSON.stringify(value) ?? "null"),
+  );
+  if (serialized.ok) return Result.ok(serialized.value);
+  if (Panic.is(serialized.error)) throw serialized.error;
+  return Result.err(
+    new ClaudeCodeToolOutputMappingFailed({
+      outputType: "json",
+      cause: serialized.error,
+      message: `Tool output is not JSON-serializable: ${opaqueErrorMessage(serialized.error, "opaque serialization failure")}`,
+    }),
+  );
 }
 
 function resourceName(url: string, fallback: string): string {
@@ -517,8 +535,8 @@ export async function createClaudeCodeToolBridgeResult(options: {
     }
     validators.set(toolName, schema.validate);
     const catalogMetadata = options.catalogMetadata?.[toolName];
-    try {
-      declarations.push(
+    const declared = resultOutcome(
+      await captureClaudeToolPromise(async () =>
         ToolSchema.parse({
           name: toolName,
           ...(typeof definition.description === "string"
@@ -529,14 +547,16 @@ export async function createClaudeCodeToolBridgeResult(options: {
             ? { "anthropic/searchHint": catalogSearchHint(catalogMetadata) }
             : { "anthropic/alwaysLoad": true },
         }),
-      );
-    } catch (error) {
-      if (Panic.is(error)) throw error;
+      ),
+    );
+    if (declared.ok) declarations.push(declared.value);
+    else {
+      if (Panic.is(declared.error)) throw declared.error;
       return Result.err(
         new ClaudeCodeToolBridgeConfigurationFailed({
           toolName,
-          cause: error,
-          message: `Cannot expose Claude MCP tool '${toolName}': ${opaqueErrorMessage(error, "opaque schema failure")}`,
+          cause: declared.error,
+          message: `Cannot expose Claude MCP tool '${toolName}': ${opaqueErrorMessage(declared.error, "opaque schema failure")}`,
         }),
       );
     }
@@ -582,14 +602,19 @@ export async function createClaudeCodeToolBridgeResult(options: {
       return toolError(validation.error.message);
     }
 
-    try {
-      const outcome = await options.execute({
-        toolCallId: correlation.toolUseId,
-        toolName,
-        input: validation.value,
-        abortSignal: extra.signal,
-        inputValidation: "prevalidated",
-      });
+    const executed = resultOutcome(
+      await captureClaudeToolPromise(() =>
+        options.execute({
+          toolCallId: correlation.toolUseId,
+          toolName,
+          input: validation.value,
+          abortSignal: extra.signal,
+          inputValidation: "prevalidated",
+        }),
+      ),
+    );
+    if (executed.ok) {
+      const outcome = executed.value;
       if (outcome.executedExpansion) {
         return mapExecutedExpansionToMcp(outcome.executedExpansion);
       }
@@ -598,21 +623,26 @@ export async function createClaudeCodeToolBridgeResult(options: {
       }
       const mapped = mapToolResultOutputToMcpResult(outcome.toolOutput, outcome.isError);
       return mapped.match({ ok: (value) => value, err: (error) => toolError(error.message) });
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      const error = extra.signal.aborted
-        ? new ClaudeCodeToolExecutionCancelled({
-            toolName,
-            cause,
-            message: opaqueErrorMessage(cause, `Lilac tool '${toolName}' execution was cancelled`),
-          })
-        : new ClaudeCodeToolExecutionFailed({
-            toolName,
-            cause,
-            message: opaqueErrorMessage(cause, `Lilac tool '${toolName}' execution failed`),
-          });
-      return toolError(error.message);
     }
+    if (Panic.is(executed.error)) throw executed.error;
+    const error = extra.signal.aborted
+      ? new ClaudeCodeToolExecutionCancelled({
+          toolName,
+          cause: capturedClaudeToolError(executed.error, `Lilac tool '${toolName}' was cancelled`),
+          message: opaqueErrorMessage(
+            executed.error,
+            `Lilac tool '${toolName}' execution was cancelled`,
+          ),
+        })
+      : new ClaudeCodeToolExecutionFailed({
+          toolName,
+          cause: capturedClaudeToolError(
+            executed.error,
+            `Lilac tool '${toolName}' execution failed`,
+          ),
+          message: opaqueErrorMessage(executed.error, `Lilac tool '${toolName}' execution failed`),
+        });
+    return toolError(error.message);
   });
 
   const canUseTool: CanUseTool = async (toolName, input, callbackOptions) => {
@@ -646,18 +676,15 @@ export async function createClaudeCodeToolBridgeResult(options: {
 
   const closeResult = async (): Promise<ResultType<void, ClaudeCodeToolBridgeCleanupFailed>> => {
     pending.clear();
-    try {
-      await server.close();
-      return Result.ok();
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      return Result.err(
-        new ClaudeCodeToolBridgeCleanupFailed({
-          cause,
-          message: "Claude MCP bridge cleanup failed",
-        }),
-      );
-    }
+    const closed = resultOutcome(await captureClaudeToolPromise(() => server.close()));
+    if (closed.ok) return Result.ok();
+    if (Panic.is(closed.error)) throw closed.error;
+    return Result.err(
+      new ClaudeCodeToolBridgeCleanupFailed({
+        cause: capturedClaudeToolError(closed.error, "Claude MCP bridge cleanup failed"),
+        message: "Claude MCP bridge cleanup failed",
+      }),
+    );
   };
   return Result.ok({
     mcpServers: {

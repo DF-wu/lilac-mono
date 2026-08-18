@@ -42,6 +42,7 @@ import {
   type DecodedLilacMessage,
   type LilacEventDecodeError,
 } from "./lilac-codecs";
+import { panic as signalEventBusPanic } from "./redis-managed-delivery";
 import {
   lilacEventTypes,
   type AdapterPlatform,
@@ -81,6 +82,40 @@ export type CreateLilacBusOptions = {
 };
 
 const KNOWN_EVENT_TYPES = new Set<string>(Object.values(lilacEventTypes));
+
+type CapturedLilacBusFailure =
+  | { readonly kind: "panic"; readonly panic: Panic }
+  | { readonly kind: "ordinary"; readonly restoreCause: () => unknown };
+
+type LilacBusFailureSettlement = () => CapturedLilacBusFailure;
+
+function captureLilacBusFailure(cause: unknown): LilacBusFailureSettlement {
+  return () => {
+    const inspected = Result.try({
+      try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),
+      catch: () => undefined,
+    });
+    const panic = inspected.match({ ok: (value) => value, err: () => undefined });
+    return panic ? { kind: "panic", panic } : { kind: "ordinary", restoreCause: () => cause };
+  };
+}
+
+function settleLilacBusCapture<T>(
+  result: ResultType<T, LilacBusFailureSettlement>,
+): ResultType<T, CapturedLilacBusFailure> {
+  return result.mapError((settle) => settle());
+}
+
+function lilacBusOutcome<T, E>(
+  result: ResultType<T, E>,
+): { readonly kind: "ok"; readonly value: T } | { readonly kind: "error"; readonly error: E } {
+  return result.match<
+    { readonly kind: "ok"; readonly value: T } | { readonly kind: "error"; readonly error: E }
+  >({
+    ok: (value) => ({ kind: "ok", value }),
+    err: (error) => ({ kind: "error", error }),
+  });
+}
 
 function requireRequestId(
   headers: LilacEnvelopeHeaders | undefined,
@@ -189,7 +224,9 @@ function checkedHandlerResult<TError extends AnyTaggedError>(
       !("value" in payload) ||
       payload.value !== undefined
     ) {
-      throw new Panic({ message: "Event handler returned an incomplete Ok<void> Result" });
+      return signalEventBusPanic(
+        new Panic({ message: "Event handler returned an incomplete Ok<void> Result" }),
+      );
     }
     return value;
   }
@@ -202,8 +239,14 @@ function checkedHandlerResult<TError extends AnyTaggedError>(
       !("value" in status) ||
       status.value !== "error" ||
       error === undefined ||
-      !("value" in error) ||
-      Panic.is(error.value) ||
+      !("value" in error)
+    ) {
+      return signalEventBusPanic(
+        new Panic({ message: "Event handler returned an incomplete Err Result" }),
+      );
+    }
+    if (Panic.is(error.value)) return signalEventBusPanic(error.value);
+    if (
       !TaggedError.is(error.value) ||
       !Object.hasOwn(error.value, "_tag") ||
       !Object.hasOwn(error.value, "name") ||
@@ -212,12 +255,16 @@ function checkedHandlerResult<TError extends AnyTaggedError>(
       typeof error.value.name !== "string" ||
       typeof error.value.message !== "string"
     ) {
-      throw new Panic({ message: "Event handler returned an incomplete Err Result" });
+      return signalEventBusPanic(
+        new Panic({ message: "Event handler returned an incomplete Err Result" }),
+      );
     }
     return value;
   }
 
-  throw new Panic({ message: "Event handler returned a forged or malformed Result" });
+  return signalEventBusPanic(
+    new Panic({ message: "Event handler returned a forged or malformed Result" }),
+  );
 }
 
 /**
@@ -337,34 +384,42 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
         key = resolvedKey;
       }
 
-      let res: Awaited<ReturnType<RawBus["publish"]>>;
-      try {
-        res = await raw.publish(
-          {
-            topic,
-            type,
-            key,
-            headers: options?.headers,
-            data,
-          },
-          {
-            topic,
-            type,
-            key,
-            headers: options?.headers,
-          },
-        );
-      } catch (cause) {
-        if (Panic.is(cause)) throw cause;
+      const published = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () =>
+            raw.publish(
+              {
+                topic,
+                type,
+                key,
+                headers: options?.headers,
+                data,
+              },
+              {
+                topic,
+                type,
+                key,
+                headers: options?.headers,
+              },
+            ),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const publishOutcome = lilacBusOutcome(published);
+      if (publishOutcome.kind === "error") {
+        if (publishOutcome.error.kind === "panic") {
+          throw publishOutcome.error.panic;
+        }
         return Result.err(
           new EventPublishTransportFailed({
-            cause,
+            cause: publishOutcome.error.restoreCause(),
             eventType: type,
             topic,
             message: "Event publish failed",
           }),
         );
       }
+      const res = publishOutcome.value;
 
       return Result.ok({ ...res, topic });
     },
@@ -466,19 +521,26 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
     },
 
     fetchTopic: async <TTopic extends LilacTopic>(topic: TTopic, opts: FetchOptions) => {
-      let fetched: Awaited<ReturnType<RawBus["fetch"]>>;
-      try {
-        fetched = await raw.fetch(topic, opts);
-      } catch (cause) {
-        if (Panic.is(cause)) throw cause;
+      const captured = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () => raw.fetch(topic, opts),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const fetchOutcome = lilacBusOutcome(captured);
+      if (fetchOutcome.kind === "error") {
+        if (fetchOutcome.error.kind === "panic") {
+          return signalEventBusPanic(fetchOutcome.error.panic);
+        }
         return Result.err(
           new EventFetchTransportFailed({
-            cause,
+            cause: fetchOutcome.error.restoreCause(),
             topic,
             message: "Event topic fetch failed",
           }),
         );
       }
+      const fetched = fetchOutcome.value;
 
       const messages: Array<{
         msg: DecodedLilacMessageForTopic<TTopic>;
@@ -526,19 +588,23 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
           }),
         );
       }
-      try {
-        return Result.ok(await raw.watermark(topic));
-      } catch (cause) {
-        if (Panic.is(cause)) throw cause;
-        return Result.err(
-          new EventTopicOperationFailed({
-            cause,
-            operation: "watermark",
-            topic,
-            message: "Event topic watermark read failed",
-          }),
-        );
-      }
+      const captured = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () => raw.watermark!(topic),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const outcome = lilacBusOutcome(captured);
+      if (outcome.kind === "ok") return Result.ok(outcome.value);
+      if (outcome.error.kind === "panic") throw outcome.error.panic;
+      return Result.err(
+        new EventTopicOperationFailed({
+          cause: outcome.error.restoreCause(),
+          operation: "watermark",
+          topic,
+          message: "Event topic watermark read failed",
+        }),
+      );
     },
 
     trimTopicBeforeCheckpoint: async (topic, checkpoint, safetyMargin) => {
@@ -551,19 +617,23 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
           }),
         );
       }
-      try {
-        return Result.ok(await raw.trimBeforeCheckpoint(topic, checkpoint, safetyMargin));
-      } catch (cause) {
-        if (Panic.is(cause)) throw cause;
-        return Result.err(
-          new EventTopicOperationFailed({
-            cause,
-            operation: "trim",
-            topic,
-            message: "Event topic checkpoint trim failed",
-          }),
-        );
-      }
+      const captured = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () => raw.trimBeforeCheckpoint!(topic, checkpoint, safetyMargin),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const outcome = lilacBusOutcome(captured);
+      if (outcome.kind === "ok") return Result.ok(outcome.value);
+      if (outcome.error.kind === "panic") throw outcome.error.panic;
+      return Result.err(
+        new EventTopicOperationFailed({
+          cause: outcome.error.restoreCause(),
+          operation: "trim",
+          topic,
+          message: "Event topic checkpoint trim failed",
+        }),
+      );
     },
 
     retireTopicConsumerGroup: async (topic, group, confirmSingleVersionRollout = false) => {
@@ -576,34 +646,41 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
           }),
         );
       }
-      try {
-        return Result.ok(await raw.retireConsumerGroup(topic, group, confirmSingleVersionRollout));
-      } catch (cause) {
-        if (Panic.is(cause)) throw cause;
-        return Result.err(
-          new EventTopicOperationFailed({
-            cause,
-            operation: "retire-consumer-group",
-            topic,
-            message: "Event topic consumer-group retirement failed",
-          }),
-        );
-      }
+      const captured = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () => raw.retireConsumerGroup!(topic, group, confirmSingleVersionRollout),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const outcome = lilacBusOutcome(captured);
+      if (outcome.kind === "ok") return Result.ok(outcome.value);
+      if (outcome.error.kind === "panic") throw outcome.error.panic;
+      return Result.err(
+        new EventTopicOperationFailed({
+          cause: outcome.error.restoreCause(),
+          operation: "retire-consumer-group",
+          topic,
+          message: "Event topic consumer-group retirement failed",
+        }),
+      );
     },
 
     close: async () => {
-      try {
-        await raw.close();
-        return Result.ok(undefined);
-      } catch (cause) {
-        if (Panic.is(cause)) throw cause;
-        return Result.err(
-          new EventBusCloseFailed({
-            cause,
-            message: "Event bus close failed",
-          }),
-        );
-      }
+      const captured = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () => raw.close(),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const outcome = lilacBusOutcome(captured);
+      if (outcome.kind === "ok") return Result.ok(undefined);
+      if (outcome.error.kind === "panic") throw outcome.error.panic;
+      return Result.err(
+        new EventBusCloseFailed({
+          cause: outcome.error.restoreCause(),
+          message: "Event bus close failed",
+        }),
+      );
     },
   };
 

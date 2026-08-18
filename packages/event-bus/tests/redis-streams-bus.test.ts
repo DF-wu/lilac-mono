@@ -379,6 +379,161 @@ describe("RedisStreamsBus", () => {
     redis.disconnect();
   });
 
+  it("releases its pooled lease when an ephemeral consumer group collides", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const subscriberRedis = redis.duplicate();
+    let destroyCalls = 0;
+    Reflect.set(redis, "duplicate", () => subscriberRedis);
+    Reflect.set(subscriberRedis, "xgroup", async (command: string) => {
+      if (command === "DESTROY") {
+        destroyCalls += 1;
+        return 1;
+      }
+      throw new Error("BUSYGROUP Consumer Group name already exists");
+    });
+    const raw = createRedisStreamsBus({ redis, subscriberPool: { max: 1 } });
+
+    const subscription = await raw.subscribe(
+      "topic",
+      {
+        mode: "work",
+        subscriptionId: "colliding-ephemeral",
+        ephemeral: true,
+      },
+      async () => ({ disposition: "commit" }),
+    );
+
+    expect(subscription.status).toBe("error");
+    expect(destroyCalls).toBe(0);
+    expect(subscriberPoolStats(raw).inUse).toBe(0);
+    await raw.close();
+    redis.disconnect();
+  });
+
+  it("removes a newly created ephemeral group when managed setup fails", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("ephemeral-init-rollback")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const duplicate = redis.duplicate.bind(redis);
+    const setupFailure = new Error("managed setup failed");
+    let duplicateCalls = 0;
+    Reflect.set(redis, "duplicate", () => {
+      duplicateCalls += 1;
+      if (duplicateCalls === 2) throw setupFailure;
+      return duplicate();
+    });
+    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
+    try {
+      const subscription = await raw.subscribe(
+        "topic",
+        {
+          mode: "work",
+          subscriptionId: "ephemeral-init-rollback",
+          ephemeral: true,
+        },
+        async () => ({ disposition: "commit" }),
+      );
+
+      expect(subscription.status).toBe("error");
+      if (subscription.status === "error") expect(subscription.error.cause).toBe(setupFailure);
+      expect(ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey))).toEqual([]);
+      expect(subscriberPoolStats(raw).inUse).toBe(0);
+    } finally {
+      await raw.close();
+      await redis.del(streamKey);
+      redis.disconnect();
+    }
+  });
+
+  it("retries ephemeral initialization after rolling back a partial setup", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("ephemeral-init-retry")}`;
+    const streamKey = `${keyPrefix}:topic`;
+    const duplicate = redis.duplicate.bind(redis);
+    let duplicateCalls = 0;
+    Reflect.set(redis, "duplicate", () => {
+      duplicateCalls += 1;
+      if (duplicateCalls === 2) throw new Error("first managed setup failed");
+      return duplicate();
+    });
+    const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
+    try {
+      const first = await raw.subscribe(
+        "topic",
+        {
+          mode: "work",
+          subscriptionId: "ephemeral-init-retry",
+          ephemeral: true,
+          batch: { maxWaitMs: 50 },
+        },
+        async () => ({ disposition: "commit" }),
+      );
+      expect(first.status).toBe("error");
+      expect(ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey))).toEqual([]);
+
+      const retried = requireOk(
+        await raw.subscribe(
+          "topic",
+          {
+            mode: "work",
+            subscriptionId: "ephemeral-init-retry",
+            ephemeral: true,
+            batch: { maxWaitMs: 50 },
+          },
+          async () => ({ disposition: "commit" }),
+        ),
+      );
+      expect(ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey))).toHaveLength(1);
+      requireOk(await retried.stop());
+      expect(ephemeralGroupNames(await redis.xinfo("GROUPS", streamKey))).toEqual([]);
+    } finally {
+      await raw.close();
+      await redis.del(streamKey);
+      redis.disconnect();
+    }
+  });
+
+  it("preserves an initialization Panic when ephemeral rollback also panics", async () => {
+    const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
+    const subscriberRedis = redis.duplicate();
+    const initializationPanic = new Panic({ message: "subscription initialization invariant" });
+    const cleanupPanic = new Panic({ message: "subscription rollback invariant" });
+    let duplicateCalls = 0;
+    let destroyCalls = 0;
+    Reflect.set(redis, "duplicate", () => {
+      duplicateCalls += 1;
+      if (duplicateCalls === 2) throw initializationPanic;
+      return subscriberRedis;
+    });
+    Reflect.set(subscriberRedis, "xgroup", async (command: string) => {
+      if (command === "CREATE") return "OK";
+      destroyCalls += 1;
+      throw cleanupPanic;
+    });
+    const raw = createRedisStreamsBus({ redis, subscriberPool: { max: 1 } });
+    let caught: unknown;
+
+    try {
+      await raw.subscribe(
+        "topic",
+        {
+          mode: "work",
+          subscriptionId: "panicking-initialization",
+          ephemeral: true,
+        },
+        async () => ({ disposition: "commit" }),
+      );
+    } catch (cause) {
+      caught = cause;
+    }
+
+    expect(caught).toBe(initializationPanic);
+    expect(destroyCalls).toBe(1);
+    expect(subscriberPoolStats(raw).inUse).toBe(0);
+    await raw.close();
+    redis.disconnect();
+  });
+
   it("preserves Panic from a read rejection racing with stop", async () => {
     const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
     const duplicate = redis.duplicate();

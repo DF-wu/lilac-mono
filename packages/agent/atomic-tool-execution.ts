@@ -8,7 +8,13 @@ import {
 import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
 import { createLogger, errorMessage } from "@stanley2058/lilac-utils";
 
-import { isAgentPanic, rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
+import {
+  captureAgentOperation,
+  captureAgentPromise,
+  isAgentPanic,
+  rethrowAgentPanic,
+  type OpaqueAgentValue,
+} from "./failure-adapters";
 import { isToolExpansion, type ExpandedToolCall, type ToolExpansion } from "./tool-call-expansion";
 
 const logger = createLogger({ module: "atomic-tool-execution" });
@@ -150,6 +156,15 @@ export type ExecuteAtomicToolCallOptions = {
 
 type JsonToolOutputValue = Extract<ToolResultOutput, { type: "json" }>["value"];
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { ok: true; value: T } | { ok: false; error: E } {
+  return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
     !!value &&
@@ -185,15 +200,15 @@ function isJsonToolOutputValueInner(
     case "object":
       if (activeObjects.has(value)) return false;
       activeObjects.add(value);
-      try {
+      const inspected = captureAgentOperation(() => {
         const values = Array.isArray(value) ? value : Object.values(value);
         return values.every((item) => isJsonToolOutputValueInner(item, activeObjects));
-      } catch (cause) {
-        rethrowAgentPanic(cause);
-        return false;
-      } finally {
-        activeObjects.delete(value);
-      }
+      });
+      activeObjects.delete(value);
+      const inspection = resultOutcome(inspected);
+      if (inspection.ok) return inspection.value;
+      rethrowAgentPanic(inspection.error);
+      return false;
     default:
       return false;
   }
@@ -203,24 +218,30 @@ function toJsonToolOutputValue(value: unknown): JsonToolOutputValue {
   if (typeof value === "undefined") return null;
   if (isJsonToolOutputValue(value)) return value;
 
-  try {
+  const serialized = captureAgentOperation(() => {
     const parsed: unknown = JSON.parse(JSON.stringify(value));
-    if (isJsonToolOutputValue(parsed)) return parsed;
-  } catch (cause) {
-    rethrowAgentPanic(cause);
-    // Fall through to the stable string representation.
+    return isJsonToolOutputValue(parsed) ? parsed : undefined;
+  });
+  const serialization = resultOutcome(serialized);
+  if (serialization.ok && serialization.value !== undefined) return serialization.value;
+  if (!serialization.ok) {
+    rethrowAgentPanic(serialization.error);
   }
 
   return String(value);
 }
 
 function stringifyToolInput(value: OpaqueAgentValue): string {
-  try {
-    return JSON.stringify(value) ?? errorMessage(value);
-  } catch (cause) {
-    rethrowAgentPanic(cause);
-    return errorMessage(value);
-  }
+  const serialized = resultOutcome(
+    captureAgentOperation(() => JSON.stringify(value) ?? errorMessage(value)),
+  );
+  if (serialized.ok) return serialized.value;
+  rethrowAgentPanic(serialized.error);
+  return errorMessage(value);
+}
+
+function capturedToolError(cause: OpaqueAgentValue, message: string): Error {
+  return cause instanceof Error ? cause : new Error(message, { cause });
 }
 
 function invalidInputMessage(error: unknown): string {
@@ -241,33 +262,31 @@ export async function consumeAtomicToolResultStream(
   let streamPanic: Panic | undefined;
 
   while (!completed && streamError === undefined && streamPanic === undefined) {
-    let next: IteratorResult<unknown>;
-    try {
-      next = await iterator.next();
-    } catch (cause) {
-      if (isAgentPanic(cause)) streamPanic = cause;
+    const attemptedNext = resultOutcome(await captureAgentPromise(() => iterator.next()));
+    if (!attemptedNext.ok) {
+      if (isAgentPanic(attemptedNext.error)) streamPanic = attemptedNext.error;
       else {
         streamError = new AtomicToolStreamFailed({
-          cause,
-          message: `Tool result stream failed: ${errorMessage(cause)}`,
+          cause: capturedToolError(attemptedNext.error, "Tool result stream failed"),
+          message: `Tool result stream failed: ${errorMessage(attemptedNext.error)}`,
         });
       }
       break;
     }
+    const next = attemptedNext.value;
     if (next.done) {
       completed = true;
       last = next.value === undefined ? last : next.value;
       break;
     }
     last = next.value;
-    try {
-      onUpdate(next.value);
-    } catch (cause) {
-      if (isAgentPanic(cause)) streamPanic = cause;
+    const attemptedUpdate = resultOutcome(captureAgentOperation(() => onUpdate(next.value)));
+    if (!attemptedUpdate.ok) {
+      if (isAgentPanic(attemptedUpdate.error)) streamPanic = attemptedUpdate.error;
       else {
         streamError = new AtomicToolStreamFailed({
-          cause,
-          message: `Tool result update failed: ${errorMessage(cause)}`,
+          cause: capturedToolError(attemptedUpdate.error, "Tool result update failed"),
+          message: `Tool result update failed: ${errorMessage(attemptedUpdate.error)}`,
         });
       }
     }
@@ -275,15 +294,14 @@ export async function consumeAtomicToolResultStream(
 
   let cleanupError: AtomicToolStreamCleanupFailed | undefined;
   if (!completed && iterator.return) {
-    try {
-      await iterator.return();
-    } catch (cause) {
-      if (isAgentPanic(cause)) {
-        if (streamPanic === undefined) rethrowAgentPanic(cause);
+    const attemptedReturn = resultOutcome(await captureAgentPromise(() => iterator.return!()));
+    if (!attemptedReturn.ok) {
+      if (isAgentPanic(attemptedReturn.error)) {
+        if (streamPanic === undefined) rethrowAgentPanic(attemptedReturn.error);
       } else {
         cleanupError = new AtomicToolStreamCleanupFailed({
-          cause,
-          message: `Tool result stream cleanup failed: ${errorMessage(cause)}`,
+          cause: capturedToolError(attemptedReturn.error, "Tool result stream cleanup failed"),
+          message: `Tool result stream cleanup failed: ${errorMessage(attemptedReturn.error)}`,
         });
       }
     }
@@ -334,19 +352,20 @@ async function validateInput(
   const schema = asSchema(tool.inputSchema);
   if (!schema.validate) return Result.ok(options.call.input);
 
-  let validation: Awaited<ReturnType<NonNullable<typeof schema.validate>>>;
-  try {
-    validation = await schema.validate(options.call.input);
-  } catch (error) {
-    rethrowAgentPanic(error);
+  const attemptedValidation = resultOutcome(
+    await captureAgentPromise(async () => await schema.validate!(options.call.input)),
+  );
+  if (!attemptedValidation.ok) {
+    rethrowAgentPanic(attemptedValidation.error);
     return Result.err(
       new InvalidToolInputError({
         toolName: options.call.toolName,
         toolInput: stringifyToolInput(options.call.input),
-        cause: error,
+        cause: attemptedValidation.error,
       }),
     );
   }
+  const validation = attemptedValidation.value;
   if (!validation.success) {
     return Result.err(
       new InvalidToolInputError({
@@ -366,17 +385,19 @@ export async function normalizeToolResultOutput(
 ): Promise<ToolResultOutput> {
   if (!normalize) return output;
 
-  try {
-    return await normalize(output, context);
-  } catch (error) {
-    rethrowAgentPanic(error);
+  const attempted = resultOutcome(
+    await captureAgentPromise(async () => await normalize(output, context)),
+  );
+  if (!attempted.ok) {
+    rethrowAgentPanic(attempted.error);
     logger.warn("tool result normalization failed", {
       toolCallId: context.toolCallId,
       toolName: context.toolName,
-      error: errorMessage(error),
+      error: errorMessage(attempted.error),
     });
     return { type: "error-text", value: UNSERIALIZABLE_TOOL_RESULT };
   }
+  return attempted.value;
 }
 
 async function settleAtomicToolCallImpl(
@@ -396,159 +417,163 @@ async function settleAtomicToolCallImpl(
   });
   assertNotAborted();
 
-  let result: unknown;
-  let isError = false;
-  let toolOutput: ToolResultOutput;
-  let expansion: ToolExpansion | undefined;
-  let outcome: AtomicToolExecutionOutcomeKind = "success";
+  const attempted = resultOutcome(
+    await captureAgentPromise(async () => {
+      let result: unknown;
+      let isError = false;
+      let toolOutput: ToolResultOutput;
+      let expansion: ToolExpansion | undefined;
+      let outcome: AtomicToolExecutionOutcomeKind = "success";
 
-  try {
-    if (options.executionRejection) {
-      isError = true;
-      outcome = "error";
-      result = options.executionRejection;
-      toolOutput = { type: "error-text", value: options.executionRejection };
-    } else if (options.inputValidation.type === "invalid") {
-      isError = true;
-      outcome = "invalid-input";
-      const message = invalidInputMessage(options.inputValidation.error);
-      result = message;
-      toolOutput = { type: "error-text", value: message };
-    } else if (!tool) {
-      const message = `Tool not found: ${call.toolName}`;
-      isError = true;
-      outcome = "error";
-      result = message;
-      toolOutput = { type: "error-text", value: message };
-    } else {
-      assertNotAborted();
-      const validatedInput = await validateInput(options);
-      const validationError = validatedInput.match({ ok: () => null, err: (error) => error });
-      if (validationError) {
+      if (options.executionRejection) {
+        isError = true;
+        outcome = "error";
+        result = options.executionRejection;
+        toolOutput = { type: "error-text", value: options.executionRejection };
+      } else if (options.inputValidation.type === "invalid") {
         isError = true;
         outcome = "invalid-input";
-        result = validationError.message;
-        toolOutput = { type: "error-text", value: validationError.message };
+        const message = invalidInputMessage(options.inputValidation.error);
+        result = message;
+        toolOutput = { type: "error-text", value: message };
+      } else if (!tool) {
+        const message = `Tool not found: ${call.toolName}`;
+        isError = true;
+        outcome = "error";
+        result = message;
+        toolOutput = { type: "error-text", value: message };
       } else {
-        const input = validatedInput.match({ ok: (value) => value, err: () => call.input });
         assertNotAborted();
-
-        const needsApproval =
-          typeof tool.needsApproval === "function"
-            ? await tool.needsApproval(input, {
-                toolCallId: call.toolCallId,
-                messages: options.messages,
-                context: options.context,
-              })
-            : Boolean(tool.needsApproval);
-        assertNotAborted();
-
-        if (needsApproval) {
+        const validatedInput = await validateInput(options);
+        const validationError = validatedInput.match({ ok: () => null, err: (error) => error });
+        if (validationError) {
           isError = true;
-          outcome = "denied";
-          result = { denied: true };
-          toolOutput = {
-            type: "execution-denied",
-            reason: "Tool requires approval.",
-          };
-        } else if (!tool.execute) {
-          const message = `Tool has no execute(): ${call.toolName}`;
-          isError = true;
-          outcome = "error";
-          result = message;
-          toolOutput = { type: "error-text", value: message };
+          outcome = "invalid-input";
+          result = validationError.message;
+          toolOutput = { type: "error-text", value: validationError.message };
         } else {
-          assertNotAborted();
-          const raw = tool.execute(input, {
-            toolCallId: call.toolCallId,
-            messages: options.messages,
-            abortSignal: options.abortSignal,
-            context: options.context,
-          });
-
-          let rawResult: unknown;
-          let streamFailure: AtomicToolStreamError | undefined;
-          if (isAsyncIterable(raw)) {
-            const streamed = await consumeAtomicToolResultStream(raw, (partialResult) => {
-              assertNotAborted();
-              options.onEvent?.({
-                type: "tool_execution_update",
-                toolCallId: call.toolCallId,
-                toolName: call.toolName,
-                args: call.input,
-                partialResult,
-              });
-              assertNotAborted();
-            });
-            streamed.match({
-              err: (error) => {
-                streamFailure = error;
-              },
-              ok: (value) => {
-                rawResult = value;
-              },
-            });
-          } else {
-            rawResult = await raw;
-          }
+          const input = validatedInput.match({ ok: (value) => value, err: () => call.input });
           assertNotAborted();
 
-          if (streamFailure) {
+          const needsApproval =
+            typeof tool.needsApproval === "function"
+              ? await tool.needsApproval(input, {
+                  toolCallId: call.toolCallId,
+                  messages: options.messages,
+                  context: options.context,
+                })
+              : Boolean(tool.needsApproval);
+          assertNotAborted();
+
+          if (needsApproval) {
+            isError = true;
+            outcome = "denied";
+            result = { denied: true };
+            toolOutput = {
+              type: "execution-denied",
+              reason: "Tool requires approval.",
+            };
+          } else if (!tool.execute) {
+            const message = `Tool has no execute(): ${call.toolName}`;
             isError = true;
             outcome = "error";
-            result = streamFailure.message;
-            toolOutput = { type: "error-text", value: streamFailure.message };
-          } else if (isToolExpansion(rawResult)) {
-            if (options.expansionHandling.type === "reject") {
-              const message =
-                options.expansionHandling.message ?? "Tool-call expansions are not supported.";
+            result = message;
+            toolOutput = { type: "error-text", value: message };
+          } else {
+            assertNotAborted();
+            const raw = tool.execute(input, {
+              toolCallId: call.toolCallId,
+              messages: options.messages,
+              abortSignal: options.abortSignal,
+              context: options.context,
+            });
+
+            let rawResult: unknown;
+            let streamFailure: AtomicToolStreamError | undefined;
+            if (isAsyncIterable(raw)) {
+              const streamed = await consumeAtomicToolResultStream(raw, (partialResult) => {
+                assertNotAborted();
+                options.onEvent?.({
+                  type: "tool_execution_update",
+                  toolCallId: call.toolCallId,
+                  toolName: call.toolName,
+                  args: call.input,
+                  partialResult,
+                });
+                assertNotAborted();
+              });
+              streamed.match({
+                err: (error) => {
+                  streamFailure = error;
+                },
+                ok: (value) => {
+                  rawResult = value;
+                },
+              });
+            } else {
+              rawResult = await raw;
+            }
+            assertNotAborted();
+
+            if (streamFailure) {
               isError = true;
               outcome = "error";
-              result = message;
-              toolOutput = { type: "error-text", value: message };
+              result = streamFailure.message;
+              toolOutput = { type: "error-text", value: streamFailure.message };
+            } else if (isToolExpansion(rawResult)) {
+              if (options.expansionHandling.type === "reject") {
+                const message =
+                  options.expansionHandling.message ?? "Tool-call expansions are not supported.";
+                isError = true;
+                outcome = "error";
+                result = message;
+                toolOutput = { type: "error-text", value: message };
+              } else {
+                expansion = rawResult;
+                result = rawResult.result;
+                toolOutput = { type: "json", value: toJsonToolOutputValue(result) };
+              }
             } else {
-              expansion = rawResult;
-              result = rawResult.result;
-              toolOutput = { type: "json", value: toJsonToolOutputValue(result) };
+              result = rawResult;
+              toolOutput = tool.toModelOutput
+                ? await tool.toModelOutput({
+                    toolCallId: call.toolCallId,
+                    input,
+                    output: result,
+                  })
+                : { type: "json", value: toJsonToolOutputValue(result) };
+              assertNotAborted();
             }
-          } else {
-            result = rawResult;
-            toolOutput = tool.toModelOutput
-              ? await tool.toModelOutput({
-                  toolCallId: call.toolCallId,
-                  input,
-                  output: result,
-                })
-              : { type: "json", value: toJsonToolOutputValue(result) };
-            assertNotAborted();
           }
         }
       }
-    }
-  } catch (error) {
-    rethrowAgentPanic(error);
+
+      assertNotAborted();
+      return {
+        result,
+        isError,
+        toolOutput,
+        outcome,
+        ...(expansion ? { expansion } : {}),
+      };
+    }),
+  );
+  if (!attempted.ok) {
+    rethrowAgentPanic(attempted.error);
     assertNotAborted();
-    isError = true;
-    const message = errorMessage(error);
-    outcome =
-      isInvalidToolInputError(error) || message.includes("AI_InvalidToolInputError")
+    const message = errorMessage(attempted.error);
+    const outcome =
+      isInvalidToolInputError(attempted.error) || message.includes("AI_InvalidToolInputError")
         ? "invalid-input"
         : "error";
-    result = message;
-    toolOutput = {
-      type: "error-text",
-      value: message,
+    return {
+      result: message,
+      isError: true,
+      toolOutput: { type: "error-text", value: message },
+      outcome,
     };
   }
-
-  assertNotAborted();
-  return {
-    result,
-    isError,
-    toolOutput,
-    outcome,
-    ...(expansion ? { expansion } : {}),
-  };
+  return attempted.value;
 }
 
 function cleanupFailedAtomicToolCall(
@@ -558,26 +583,27 @@ function cleanupFailedAtomicToolCall(
   if (!options.pendingToolCalls.delete(options.call.toolCallId)) return Result.ok(undefined);
 
   const message = errorMessage(error);
-  try {
-    options.onEvent?.({
-      type: "tool_execution_end",
-      toolCallId: options.call.toolCallId,
-      toolName: options.call.toolName,
-      args: options.call.input,
-      result: message,
-      isError: true,
-      output: { type: "error-text", value: message },
-      outcome: "error",
-    });
-    return Result.ok(undefined);
-  } catch (cause) {
-    return Result.err(
-      new AtomicToolTerminalCleanupFailed({
-        cause,
-        message: `Atomic tool terminal event failed: ${errorMessage(cause)}`,
-      }),
-    );
-  }
+  const attempted = resultOutcome(
+    captureAgentOperation(() => {
+      options.onEvent?.({
+        type: "tool_execution_end",
+        toolCallId: options.call.toolCallId,
+        toolName: options.call.toolName,
+        args: options.call.input,
+        result: message,
+        isError: true,
+        output: { type: "error-text", value: message },
+        outcome: "error",
+      });
+    }),
+  );
+  if (attempted.ok) return Result.ok(undefined);
+  return Result.err(
+    new AtomicToolTerminalCleanupFailed({
+      cause: attempted.error,
+      message: `Atomic tool terminal event failed: ${errorMessage(attempted.error)}`,
+    }),
+  );
 }
 
 type AtomicToolFailureAfterCleanup =
@@ -606,18 +632,18 @@ function resolveAtomicToolFailureAfterCleanup(
 export async function settleAtomicToolCallResult(
   options: ExecuteAtomicToolCallOptions,
 ): Promise<ResultType<AtomicToolExecutionOutcome, AtomicToolExecutionFailed>> {
-  try {
-    return Result.ok(await settleAtomicToolCallImpl(options));
-  } catch (error) {
-    const failure = resolveAtomicToolFailureAfterCleanup(options, error);
-    if (failure.type === "panic") rethrowAgentPanic(failure.panic);
-    return Result.err(
-      new AtomicToolExecutionFailed({
-        cause: failure.error,
-        message: errorMessage(failure.error),
-      }),
-    );
-  }
+  const attempted = resultOutcome(
+    await captureAgentPromise(() => settleAtomicToolCallImpl(options)),
+  );
+  if (attempted.ok) return Result.ok(attempted.value);
+  const failure = resolveAtomicToolFailureAfterCleanup(options, attempted.error);
+  if (failure.type === "panic") rethrowAgentPanic(failure.panic);
+  return Result.err(
+    new AtomicToolExecutionFailed({
+      cause: failure.error,
+      message: errorMessage(failure.error),
+    }),
+  );
 }
 
 function signalAtomicToolExecutionHost(error: AtomicToolExecutionFailed): never {
@@ -666,27 +692,33 @@ export function finalizeSettledAtomicToolCall(
 export async function executeAtomicToolCallResult(
   options: ExecuteAtomicToolCallOptions,
 ): Promise<ResultType<AtomicToolExecutionOutcome, AtomicToolExecutionFailed>> {
-  try {
-    const settled = atomicToolResultOutcome(await settleAtomicToolCallResult(options));
-    if (!settled.ok) return Result.err(settled.error);
-    const toolOutput = await normalizeToolResultOutput(
-      settled.value.toolOutput,
-      {
-        toolCallId: options.call.toolCallId,
-        toolName: options.call.toolName,
-        ...(options.bypassGenericOutputNormalizer === undefined
-          ? {}
-          : { bypassGenericOutputNormalizer: options.bypassGenericOutputNormalizer }),
-        ...(options.aggregateOutputBudgetExempt === undefined
-          ? {}
-          : { aggregateOutputBudgetExempt: options.aggregateOutputBudgetExempt }),
-      },
-      options.normalizeToolResultOutput,
-    );
-    (options.assertNotAborted ?? (() => options.abortSignal?.throwIfAborted()))();
-    return Result.ok(finalizeSettledAtomicToolCall(options, settled.value, toolOutput));
-  } catch (error) {
-    const failure = resolveAtomicToolFailureAfterCleanup(options, error);
+  const attempted = resultOutcome(
+    await captureAgentPromise(async () => {
+      const settled = atomicToolResultOutcome(await settleAtomicToolCallResult(options));
+      if (!settled.ok) return settled;
+      const toolOutput = await normalizeToolResultOutput(
+        settled.value.toolOutput,
+        {
+          toolCallId: options.call.toolCallId,
+          toolName: options.call.toolName,
+          ...(options.bypassGenericOutputNormalizer === undefined
+            ? {}
+            : { bypassGenericOutputNormalizer: options.bypassGenericOutputNormalizer }),
+          ...(options.aggregateOutputBudgetExempt === undefined
+            ? {}
+            : { aggregateOutputBudgetExempt: options.aggregateOutputBudgetExempt }),
+        },
+        options.normalizeToolResultOutput,
+      );
+      (options.assertNotAborted ?? (() => options.abortSignal?.throwIfAborted()))();
+      return {
+        ok: true as const,
+        value: finalizeSettledAtomicToolCall(options, settled.value, toolOutput),
+      };
+    }),
+  );
+  if (!attempted.ok) {
+    const failure = resolveAtomicToolFailureAfterCleanup(options, attempted.error);
     if (failure.type === "panic") rethrowAgentPanic(failure.panic);
     return Result.err(
       new AtomicToolExecutionFailed({
@@ -695,6 +727,7 @@ export async function executeAtomicToolCallResult(
       }),
     );
   }
+  return attempted.value.ok ? Result.ok(attempted.value.value) : Result.err(attempted.value.error);
 }
 
 export async function executeAtomicToolCall(

@@ -67,34 +67,65 @@ export class SearchBackendUnavailable extends TaggedError("SearchBackendUnavaila
   readonly message: string;
 }> {}
 
+function resultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E } {
+  return result.match<
+    { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E }
+  >({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+}
+
 async function captureFffOperation<T>(
   effect: () => Promise<T>,
 ): Promise<ResultType<T, SearchBackendUnavailable>> {
-  try {
-    return Result.ok(await effect());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new SearchBackendUnavailable({
-        backend: "fff",
-        message: cause instanceof Error ? cause.message : "FFF search backend is unavailable",
-      }),
-    );
-  }
+  const captured = await Result.tryPromise({
+    try: effect,
+    catch: (cause) =>
+      Panic.is(cause)
+        ? { kind: "panic" as const, panic: cause }
+        : {
+            kind: "error" as const,
+            error: new SearchBackendUnavailable({
+              backend: "fff",
+              message: cause instanceof Error ? cause.message : "FFF search backend is unavailable",
+            }),
+          },
+  });
+  const outcome = captured.match<
+    | { readonly kind: "value"; readonly value: T }
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "error"; readonly error: SearchBackendUnavailable }
+  >({
+    ok: (value) => ({ kind: "value", value }),
+    err: (failure) => failure,
+  });
+  if (outcome.kind === "panic") throw outcome.panic;
+  return outcome.kind === "value" ? Result.ok(outcome.value) : Result.err(outcome.error);
 }
 
 function captureFffSyncOperation<T>(effect: () => T): ResultType<T, SearchBackendUnavailable> {
-  try {
-    return Result.ok(effect());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new SearchBackendUnavailable({
-        backend: "fff",
-        message: cause instanceof Error ? cause.message : "FFF search backend is unavailable",
-      }),
-    );
-  }
+  const captured = Result.try({
+    try: () => ({ value: effect() }),
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = captured.match<{ readonly value: T } | { readonly cause: unknown }>({
+    ok: ({ value }) => ({ value }),
+    err: ({ cause }) => ({ cause }),
+  });
+  if ("value" in outcome) return Result.ok(outcome.value);
+  if (Panic.is(outcome.cause)) throw outcome.cause;
+  return Result.err(
+    new SearchBackendUnavailable({
+      backend: "fff",
+      message:
+        outcome.cause instanceof Error
+          ? outcome.cause.message
+          : "FFF search backend is unavailable",
+    }),
+  );
 }
 
 const nodeRgBackend: SearchBackend = {
@@ -156,18 +187,11 @@ async function resolveFffStoragePaths(
   const frecencyCreated = await captureFilesystemOperation("create FFF frecency directory", () =>
     fs.mkdir(frecencyDbPath, { recursive: true }),
   );
-  return frecencyCreated.match({
-    err: () => ({}),
-    ok: async () => {
-      const historyCreated = await captureFilesystemOperation("create FFF history directory", () =>
-        fs.mkdir(historyDbPath, { recursive: true }),
-      );
-      return historyCreated.match({
-        err: () => ({}),
-        ok: () => ({ frecencyDbPath, historyDbPath }),
-      });
-    },
-  });
+  if (!resultOutcome(frecencyCreated).ok) return {};
+  const historyCreated = await captureFilesystemOperation("create FFF history directory", () =>
+    fs.mkdir(historyDbPath, { recursive: true }),
+  );
+  return resultOutcome(historyCreated).ok ? { frecencyDbPath, historyDbPath } : {};
 }
 
 function shouldFallbackForDenyPaths(params: {
@@ -313,30 +337,27 @@ export async function fuzzyFileSearch(params: {
   const searched = captureFffSyncOperation(() =>
     finder.fileSearch(params.query, { pageSize: limit + 1 }),
   );
-  return searched.match({
-    err: () => null,
-    ok: (result) => {
-      if (!result.ok) return null;
-      const items = result.value.items.slice(0, limit);
+  const searchedOutcome = resultOutcome(searched);
+  if (!searchedOutcome.ok || !searchedOutcome.value.ok) return null;
+  const result = searchedOutcome.value.value;
+  const items = result.items.slice(0, limit);
+  return {
+    results: items.map((item, index) => {
+      const score = result.scores[index];
       return {
-        results: items.map((item, index) => {
-          const score = result.value.scores[index];
-          return {
-            path: item.relativePath,
-            fileName: item.fileName,
-            size: item.size,
-            gitStatus: item.gitStatus,
-            score: score?.total,
-            matchType: score?.matchType,
-          };
-        }),
-        totalMatched: result.value.totalMatched,
-        totalFiles: result.value.totalFiles,
-        truncated: result.value.items.length > limit || result.value.totalMatched > limit,
-        effectiveBackend: "fff",
+        path: item.relativePath,
+        fileName: item.fileName,
+        size: item.size,
+        gitStatus: item.gitStatus,
+        score: score?.total,
+        matchType: score?.matchType,
       };
-    },
-  });
+    }),
+    totalMatched: result.totalMatched,
+    totalFiles: result.totalFiles,
+    truncated: result.items.length > limit || result.totalMatched > limit,
+    effectiveBackend: "fff",
+  };
 }
 
 export async function fzfFileSearch(params: {
@@ -538,22 +559,20 @@ const fffBackend: SearchBackend = {
         afterContext: options.contextLines ?? 0,
       }),
     );
-    return captured.match({
-      err: () => nodeRgBackend.grep(options),
-      ok: async (result) => {
-        if (!result.ok) return await nodeRgBackend.grep(options);
-        if (options.regex && result.value.regexFallbackError) {
-          return await nodeRgBackend.grep(options);
-        }
+    const capturedOutcome = resultOutcome(captured);
+    if (!capturedOutcome.ok || !capturedOutcome.value.ok) {
+      return nodeRgBackend.grep(options);
+    }
+    if (options.regex && capturedOutcome.value.value.regexFallbackError) {
+      return nodeRgBackend.grep(options);
+    }
 
-        const matches = result.value.items.map(mapFffGrepMatch);
-        const truncated = matches.length > limit;
-        return Result.ok({
-          matches: truncated ? matches.slice(0, limit) : matches,
-          truncated,
-          effectiveBackend: "fff",
-        });
-      },
+    const matches = capturedOutcome.value.value.items.map(mapFffGrepMatch);
+    const truncated = matches.length > limit;
+    return Result.ok({
+      matches: truncated ? matches.slice(0, limit) : matches,
+      truncated,
+      effectiveBackend: "fff",
     });
   },
 
@@ -592,9 +611,9 @@ const fffBackend: SearchBackend = {
       const captured = captureFffSyncOperation(() =>
         finder.glob(pattern, { pageSize: options.maxEntries + 1 }),
       );
-      const result = captured.match({ ok: (value) => value, err: () => null });
-      if (result === null) return null;
-      if (!result.ok) return null;
+      const capturedOutcome = resultOutcome(captured);
+      if (!capturedOutcome.ok || !capturedOutcome.value.ok) return null;
+      const result = capturedOutcome.value;
 
       for (const item of result.value.items) {
         const relPath = item.relativePath;

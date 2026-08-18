@@ -307,11 +307,15 @@ function decodePlainJson(
   raw: string,
   input: VersionedInput & { readonly field: PersistedField },
 ): ResultType<MiniLilacPersistedJsonValue, MalformedSerialization | CorruptPersistedFields> {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
+  const parsed = Result.try<unknown, unknown>({
+    try: () => JSON.parse(raw),
+    catch: (cause) => cause,
+  });
+  const parsedOutcome = parsed.match<
+    { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly error: unknown }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+  if (!parsedOutcome.ok) {
+    if (Panic.is(parsedOutcome.error)) throw parsedOutcome.error;
     return Result.err(
       new MalformedSerialization(
         context({
@@ -323,6 +327,7 @@ function decodePlainJson(
       ),
     );
   }
+  const value = parsedOutcome.value;
   const decoded = jsonValueSchema.safeParse(value);
   if (decoded.success) return Result.ok(decoded.data);
   return Result.err(
@@ -339,11 +344,15 @@ function decodeSuperJson(
   raw: string,
   input: VersionedInput & { readonly field: PersistedField },
 ): ResultType<unknown, MalformedSerialization | CorruptPersistedFields> {
-  let envelope: unknown;
-  try {
-    envelope = JSON.parse(raw);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
+  const parsed = Result.try<unknown, unknown>({
+    try: () => JSON.parse(raw),
+    catch: (cause) => cause,
+  });
+  const parsedOutcome = parsed.match<
+    { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly error: unknown }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+  if (!parsedOutcome.ok) {
+    if (Panic.is(parsedOutcome.error)) throw parsedOutcome.error;
     return Result.err(
       new MalformedSerialization(
         context({
@@ -355,6 +364,7 @@ function decodeSuperJson(
       ),
     );
   }
+  const envelope = parsedOutcome.value;
   if (
     !isRecord(envelope) ||
     !("json" in envelope) ||
@@ -369,22 +379,25 @@ function decodeSuperJson(
       }),
     );
   }
-  try {
-    const value: unknown = SuperJSON.parse(raw);
-    return Result.ok(value);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new MalformedSerialization(
-        context({
-          field: input.field,
-          version: input.schemaVersion,
-          issueCode: "malformed-json",
-          recordId: input.recordId,
-        }),
-      ),
-    );
-  }
+  const superJson = Result.try<unknown, unknown>({
+    try: () => SuperJSON.parse(raw),
+    catch: (cause) => cause,
+  });
+  const superJsonOutcome = superJson.match<
+    { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly error: unknown }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+  if (superJsonOutcome.ok) return Result.ok(superJsonOutcome.value);
+  if (Panic.is(superJsonOutcome.error)) throw superJsonOutcome.error;
+  return Result.err(
+    new MalformedSerialization(
+      context({
+        field: input.field,
+        version: input.schemaVersion,
+        issueCode: "malformed-json",
+        recordId: input.recordId,
+      }),
+    ),
+  );
 }
 
 export function migrateMiniLilacUiMessageValue(input: {

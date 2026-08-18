@@ -117,14 +117,15 @@ export function decodeToolResultArtifactMetadata(
   const serialized = input.serialized;
   const parsedJson = Result.try({
     try: () => JSON.parse(serialized) as unknown,
-    catch: () =>
-      new ToolResultArtifactMetadataMalformed({
+    catch: () => undefined,
+  }).match<{ value: unknown } | { error: ToolResultArtifactMetadataMalformed }>({
+    ok: (value) => ({ value }),
+    err: () => ({
+      error: new ToolResultArtifactMetadataMalformed({
         issueCode: "malformed-serialization",
         message: "Tool result artifact metadata is not valid JSON",
       }),
-  }).match<{ value: unknown } | { error: ToolResultArtifactMetadataMalformed }>({
-    ok: (value) => ({ value }),
-    err: (error) => ({ error }),
+    }),
   });
   if ("error" in parsedJson) return Result.err(parsedJson.error);
   const parsed = parsedJson.value;

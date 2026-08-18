@@ -4,7 +4,13 @@ import fs from "node:fs/promises";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { env } from "./env";
-import { errorMessage, isPanic, isRecord } from "./runtime-utils";
+import {
+  capturePromiseResult,
+  captureResultOutcome,
+  errorMessage,
+  isPanic,
+  isRecord,
+} from "./runtime-utils";
 import { findWorkspaceRoot } from "./find-root";
 import { createLogger } from "./logging";
 import { parseModelSpecifierResult } from "./model-capability";
@@ -165,17 +171,30 @@ export class CoreConfigYamlInvalid extends TaggedError("CoreConfigYamlInvalid")<
 }> {}
 
 export function decodeCoreConfigYaml(raw: string): ResultType<unknown, CoreConfigYamlInvalid> {
-  try {
-    return Result.ok(Bun.YAML.parse(raw));
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return Result.err(
-      new CoreConfigYamlInvalid({
-        cause,
-        message: `Failed to parse core-config.yaml: ${errorMessage(cause)}`,
-      }),
-    );
-  }
+  const captured = Result.try({
+    try: () => Bun.YAML.parse(raw),
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = captured.match<
+    | { readonly kind: "result"; readonly result: ResultType<unknown, CoreConfigYamlInvalid> }
+    | { readonly kind: "panic"; readonly panic: import("better-result").Panic }
+  >({
+    ok: (value) => ({ kind: "result", result: Result.ok(value) }),
+    err: ({ cause }) =>
+      isPanic(cause)
+        ? { kind: "panic", panic: cause }
+        : {
+            kind: "result",
+            result: Result.err(
+              new CoreConfigYamlInvalid({
+                cause,
+                message: `Failed to parse core-config.yaml: ${errorMessage(cause)}`,
+              }),
+            ),
+          },
+  });
+  if (outcome.kind === "panic") throw outcome.panic;
+  return outcome.result;
 }
 
 export class CoreConfigVersionInvalid extends TaggedError("CoreConfigVersionInvalid")<{
@@ -390,22 +409,19 @@ export async function getCoreConfig(options?: {
   const filePath = resolveCoreConfigPath();
 
   if (!forceReload && cached) {
-    try {
-      const stat = await Bun.file(filePath).stat();
-      const promptSig = await promptWorkspaceSignature();
-
-      if (
-        cachedMtimeMs !== null &&
-        stat.mtimeMs === cachedMtimeMs &&
-        cachedPromptMaxMtimeMs !== null &&
-        promptSig.maxMtimeMs === cachedPromptMaxMtimeMs
-      ) {
-        return cached;
-      }
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-      // If stat/signature fails, fall through to re-read to produce a better error.
-    }
+    const inspected = await capturePromiseResult(async () => ({
+      stat: await Bun.file(filePath).stat(),
+      promptSig: await promptWorkspaceSignature(),
+    }));
+    const inspectOutcome = captureResultOutcome(inspected);
+    if (!inspectOutcome.ok && isPanic(inspectOutcome.error)) throw inspectOutcome.error;
+    const cacheMatches =
+      inspectOutcome.ok &&
+      cachedMtimeMs !== null &&
+      inspectOutcome.value.stat.mtimeMs === cachedMtimeMs &&
+      cachedPromptMaxMtimeMs !== null &&
+      inspectOutcome.value.promptSig.maxMtimeMs === cachedPromptMaxMtimeMs;
+    if (cacheMatches) return cached;
   }
 
   const raw = await Bun.file(filePath).text();
@@ -443,21 +459,15 @@ export async function getCoreConfig(options?: {
   };
 
   cached = nextCfg;
-  try {
-    const stat = await Bun.file(filePath).stat();
-    cachedMtimeMs = stat.mtimeMs;
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    cachedMtimeMs = null;
-  }
+  const stat = await capturePromiseResult(() => Bun.file(filePath).stat());
+  const statOutcome = captureResultOutcome(stat);
+  if (!statOutcome.ok && isPanic(statOutcome.error)) throw statOutcome.error;
+  cachedMtimeMs = statOutcome.ok ? statOutcome.value.mtimeMs : null;
 
-  try {
-    const sig = await promptWorkspaceSignature();
-    cachedPromptMaxMtimeMs = sig.maxMtimeMs;
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    cachedPromptMaxMtimeMs = null;
-  }
+  const signature = await capturePromiseResult(() => promptWorkspaceSignature());
+  const signatureOutcome = captureResultOutcome(signature);
+  if (!signatureOutcome.ok && isPanic(signatureOutcome.error)) throw signatureOutcome.error;
+  cachedPromptMaxMtimeMs = signatureOutcome.ok ? signatureOutcome.value.maxMtimeMs : null;
 
   return nextCfg;
 }

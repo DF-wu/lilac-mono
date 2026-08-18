@@ -1,10 +1,4 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  randomBytes,
-  randomUUID,
-  type DecipherGCM,
-} from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -303,8 +297,9 @@ export function adaptToolResultArtifactStoreInitToHost(
 }
 
 function resultOutcome<T, E>(
-  result: ResultType<T, E>,
+  result: ResultType<T, E> | { ok: true; value: T } | { ok: false; error: E },
 ): { ok: true; value: T } | { ok: false; error: E } {
+  if ("ok" in result) return result;
   return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
     ok: (value) => ({ ok: true, value }),
     err: (error) => ({ ok: false, error }),
@@ -328,19 +323,48 @@ type CapturedToolResultEffect<T> =
   | { readonly kind: "panic"; readonly panic: Panic }
   | { readonly kind: "defect"; readonly error: Error };
 
-function captureToolResultEffect<T>(effect: Promise<T>): Promise<CapturedToolResultEffect<T>> {
-  return effect.then(
-    (value) => ({ kind: "completed", value }),
-    (cause) => {
-      try {
-        if (Panic.is(cause)) return { kind: "panic", panic: cause };
-        if (cause instanceof Error) return { kind: "defect", error: cause };
-      } catch {
-        return { kind: "defect", error: new Error("Opaque tool-result operation defect") };
-      }
+type CapturedToolResultFailure = Exclude<
+  CapturedToolResultEffect<never>,
+  { readonly kind: "completed" }
+>;
+
+function captureToolResultFailure(restoreCause: () => unknown): CapturedToolResultFailure {
+  const cause = restoreCause();
+  return Result.try({
+    try: (): CapturedToolResultFailure => {
+      if (Panic.is(cause)) return { kind: "panic", panic: cause };
+      if (cause instanceof Error) return { kind: "defect", error: cause };
       return { kind: "defect", error: new Error("Opaque tool-result operation defect") };
     },
-  );
+    catch: () => undefined,
+  }).match({
+    ok: (value) => value,
+    err: () => ({ kind: "defect", error: new Error("Opaque tool-result operation defect") }),
+  });
+}
+
+async function captureToolResultEffect<T>(
+  effect: Promise<T>,
+): Promise<CapturedToolResultEffect<T>> {
+  const captured = await Result.tryPromise({
+    try: () => effect,
+    catch: (cause) => ({ restoreCause: () => cause }),
+  });
+  return captured.match<CapturedToolResultEffect<T>>({
+    ok: (value) => ({ kind: "completed", value }),
+    err: ({ restoreCause }) => captureToolResultFailure(restoreCause),
+  });
+}
+
+function captureToolResultSyncEffect<T>(effect: () => T): CapturedToolResultEffect<T> {
+  const captured = Result.try({
+    try: () => ({ value: effect() }),
+    catch: (cause) => ({ restoreCause: () => cause }),
+  });
+  return captured.match<CapturedToolResultEffect<T>>({
+    ok: ({ value }) => ({ kind: "completed", value }),
+    err: ({ restoreCause }) => captureToolResultFailure(restoreCause),
+  });
 }
 
 function validateHardLimit(
@@ -443,43 +467,38 @@ export function createToolResultArtifactStore(
     operation: ToolResultArtifactStorageOperation,
     effect: () => Promise<T>,
   ): Promise<ResultType<T, ToolResultArtifactStorageFailure>> {
-    try {
-      return Result.ok(await effect());
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      return Result.err(storageFailure(operation, cause instanceof Error ? cause : undefined));
-    }
+    const outcome = await captureToolResultEffect(effect());
+    if (outcome.kind === "completed") return Result.ok(outcome.value);
+    if (outcome.kind === "panic") throw outcome.panic;
+    return Result.err(storageFailure(operation, outcome.error));
   }
 
   function applyWriteCleanup(
     primary: ToolResultArtifactWriteError,
     cleanup: ResultType<void, ToolResultArtifactStorageFailure>,
   ): ResultType<never, ToolResultArtifactWriteError> {
-    return cleanup.match({
-      ok: () => Result.err(primary),
-      err: (error) => Result.err(combineWriteAndCleanupFailure(primary, error)),
-    });
+    const outcome = resultOutcome(cleanup);
+    return Result.err(outcome.ok ? primary : combineWriteAndCleanupFailure(primary, outcome.error));
   }
 
   function applyReadCleanup<T>(
     primary: ResultType<T, ToolResultArtifactReadOperationError>,
     cleanup: ResultType<void, ToolResultArtifactStorageFailure>,
   ): ResultType<T, ToolResultArtifactReadError> {
-    return primary.match<ResultType<T, ToolResultArtifactReadError>>({
-      ok: (value) => cleanup.map(() => value),
-      err: (primaryError) =>
-        cleanup.match<ResultType<T, ToolResultArtifactReadError>>({
-          ok: () => Result.err(primaryError),
-          err: (cleanupError) =>
-            Result.err(
-              new ToolResultArtifactReadAndCleanupFailure({
-                primaryError,
-                cleanupError,
-                message: "Tool result artifact read and cleanup failed",
-              }),
-            ),
-        }),
-    });
+    const primaryOutcome = resultOutcome(primary);
+    const cleanupOutcome = resultOutcome(cleanup);
+    if (primaryOutcome.ok) {
+      return cleanupOutcome.ok ? Result.ok(primaryOutcome.value) : Result.err(cleanupOutcome.error);
+    }
+    return cleanupOutcome.ok
+      ? Result.err(primaryOutcome.error)
+      : Result.err(
+          new ToolResultArtifactReadAndCleanupFailure({
+            primaryError: primaryOutcome.error,
+            cleanupError: cleanupOutcome.error,
+            message: "Tool result artifact read and cleanup failed",
+          }),
+        );
   }
 
   function contentPath(storageKey: string): string {
@@ -494,15 +513,15 @@ export function createToolResultArtifactStore(
     value: string,
     operation: ToolResultArtifactStorageOperation,
   ): ResultType<Buffer, ToolResultArtifactStorageFailure> {
-    try {
+    const outcome = captureToolResultSyncEffect(() => {
       const nonce = randomBytes(12);
       const cipher = createCipheriv("aes-256-gcm", encryptionKey, nonce);
       const ciphertext = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
-      return Result.ok(Buffer.concat([nonce, ciphertext, cipher.getAuthTag()]));
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      return Result.err(storageFailure(operation, cause instanceof Error ? cause : undefined));
-    }
+      return Buffer.concat([nonce, ciphertext, cipher.getAuthTag()]);
+    });
+    if (outcome.kind === "completed") return Result.ok(outcome.value);
+    if (outcome.kind === "panic") throw outcome.panic;
+    return Result.err(storageFailure(operation, outcome.error));
   }
 
   function decrypt(
@@ -518,49 +537,44 @@ export function createToolResultArtifactStore(
         }),
       );
     }
-    try {
+    const outcome = captureToolResultSyncEffect(() => {
       const nonce = value.subarray(0, 12);
       const authTag = value.subarray(value.length - 16);
       const decipher = createDecipheriv("aes-256-gcm", encryptionKey, nonce);
       decipher.setAuthTag(authTag);
-      return Result.ok(
-        Buffer.concat([decipher.update(value.subarray(12, -16)), decipher.final()]).toString(
-          "utf8",
-        ),
+      return Buffer.concat([decipher.update(value.subarray(12, -16)), decipher.final()]).toString(
+        "utf8",
       );
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      return Result.err(
-        new ToolResultArtifactDecryptAuthenticationFailed({
-          target,
-          issueCode: "decrypt-auth-failed",
-          message: `Tool result artifact ${target} authentication failed`,
-        }),
-      );
-    }
+    });
+    if (outcome.kind === "completed") return Result.ok(outcome.value);
+    if (outcome.kind === "panic") throw outcome.panic;
+    return Result.err(
+      new ToolResultArtifactDecryptAuthenticationFailed({
+        target,
+        issueCode: "decrypt-auth-failed",
+        message: `Tool result artifact ${target} authentication failed`,
+      }),
+    );
   }
 
   async function readMetadata(
     storageKey: string,
   ): Promise<ResultType<DecodedToolResultArtifactMetadata, ToolResultArtifactMetadataReadError>> {
-    let encrypted: Buffer;
-    try {
-      encrypted = await fs.readFile(metadataPath(storageKey));
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (cause instanceof Error && errorCode(cause) === "ENOENT") {
-        const absent = decodeToolResultArtifactMetadata({
-          serialized: null,
-          expectedStorageKey: storageKey,
-        });
-        const absentOutcome = resultOutcome(absent);
-        if (!absentOutcome.ok) reportDiagnostic(absentOutcome.error);
-        return absent;
-      }
-      return Result.err(
-        storageFailure("read-metadata", cause instanceof Error ? cause : undefined),
-      );
+    const readOutcome = await captureToolResultEffect(fs.readFile(metadataPath(storageKey)));
+    if (readOutcome.kind === "panic") throw readOutcome.panic;
+    if (readOutcome.kind === "defect" && errorCode(readOutcome.error) === "ENOENT") {
+      const absent = decodeToolResultArtifactMetadata({
+        serialized: null,
+        expectedStorageKey: storageKey,
+      });
+      const absentOutcome = resultOutcome(absent);
+      if (!absentOutcome.ok) reportDiagnostic(absentOutcome.error);
+      return absent;
     }
+    if (readOutcome.kind === "defect") {
+      return Result.err(storageFailure("read-metadata", readOutcome.error));
+    }
+    const encrypted = readOutcome.value;
 
     const decrypted = resultOutcome(decrypt(encrypted, "metadata"));
     if (!decrypted.ok) {
@@ -624,14 +638,16 @@ export function createToolResultArtifactStore(
     primaryError: ToolResultArtifactReadError,
   ): Promise<ResultType<void, ToolResultArtifactMaintenanceAndCleanupFailure>> {
     const removed = await removeArtifact(storageKey);
-    return removed.mapError(
-      (cleanupError) =>
-        new ToolResultArtifactMaintenanceAndCleanupFailure({
-          primaryError,
-          cleanupError,
-          message: "Tool result artifact invalidation cleanup failed",
-        }),
-    );
+    const outcome = resultOutcome(removed);
+    return outcome.ok
+      ? Result.ok(outcome.value)
+      : Result.err(
+          new ToolResultArtifactMaintenanceAndCleanupFailure({
+            primaryError,
+            cleanupError: outcome.error,
+            message: "Tool result artifact invalidation cleanup failed",
+          }),
+        );
   }
 
   async function maintainArtifacts(
@@ -679,7 +695,7 @@ export function createToolResultArtifactStore(
     return Result.ok({ removedInvalid, removedExpired });
   }
 
-  function exclusive<T>(operation: () => Promise<T>): Promise<T> {
+  function exclusive<T, E>(operation: () => Promise<ResultType<T, E>>): Promise<ResultType<T, E>> {
     const previous = operationQueue;
     let release = () => {};
     operationQueue = new Promise<void>((resolve) => {
@@ -687,11 +703,10 @@ export function createToolResultArtifactStore(
     });
     return (async () => {
       await previous;
-      try {
-        return await operation();
-      } finally {
-        release();
-      }
+      const operated = operation();
+      await Promise.allSettled([operated]);
+      release();
+      return operated;
     })();
   }
 
@@ -706,15 +721,12 @@ export function createToolResultArtifactStore(
       await fs.rename(temporaryPath, filePath);
       await fs.chmod(filePath, 0o600);
     });
-    return written.match<Promise<ResultType<void, ToolResultArtifactWriteError>>>({
-      ok: async () => Result.ok(undefined),
-      err: async (error) => {
-        const cleanup = await captureOperation("remove-artifact", () =>
-          fs.rm(temporaryPath, { force: true }),
-        );
-        return applyWriteCleanup(error, cleanup);
-      },
-    });
+    const writtenOutcome = resultOutcome(written);
+    if (writtenOutcome.ok) return Result.ok(undefined);
+    const cleanup = await captureOperation("remove-artifact", () =>
+      fs.rm(temporaryPath, { force: true }),
+    );
+    return applyWriteCleanup(writtenOutcome.error, cleanup);
   }
 
   async function writeEncryptedStreamAtomic(
@@ -741,42 +753,39 @@ export function createToolResultArtifactStore(
         callback(null, chunk);
       },
     });
-    let written: ResultType<number, ToolResultArtifactWriteOperationError>;
-    try {
-      await fs.writeFile(temporaryPath, nonce, { mode: 0o600, flag: "wx" });
-      await pipeline(
-        source,
-        countBytes,
-        cipher,
-        createWriteStream(temporaryPath, { flags: "a", mode: 0o600 }),
-      );
-      await fs.appendFile(temporaryPath, cipher.getAuthTag());
-      await fs.rename(temporaryPath, filePath);
-      await fs.chmod(filePath, 0o600);
-      written = Result.ok(bytes);
-    } catch (cause) {
-      if (Panic.is(cause)) {
-        await Result.tryPromise({
-          try: () => fs.rm(temporaryPath, { force: true }),
-          catch: () => undefined,
-        });
-        throw cause;
-      }
-      written = Result.err(
-        cause instanceof ToolResultArtifactTooLargeError
-          ? cause
-          : storageFailure("write-content", cause instanceof Error ? cause : undefined),
-      );
-    }
-    return written.match<Promise<ResultType<number, ToolResultArtifactWriteError>>>({
-      ok: async (value) => Result.ok(value),
-      err: async (error) => {
-        const cleanup = await captureOperation("remove-artifact", () =>
-          fs.rm(temporaryPath, { force: true }),
+    const writeOutcome = await captureToolResultEffect(
+      (async () => {
+        await fs.writeFile(temporaryPath, nonce, { mode: 0o600, flag: "wx" });
+        await pipeline(
+          source,
+          countBytes,
+          cipher,
+          createWriteStream(temporaryPath, { flags: "a", mode: 0o600 }),
         );
-        return applyWriteCleanup(error, cleanup);
-      },
-    });
+        await fs.appendFile(temporaryPath, cipher.getAuthTag());
+        await fs.rename(temporaryPath, filePath);
+        await fs.chmod(filePath, 0o600);
+        return bytes;
+      })(),
+    );
+    if (writeOutcome.kind === "panic") {
+      await captureToolResultEffect(fs.rm(temporaryPath, { force: true }));
+      throw writeOutcome.panic;
+    }
+    const written: ResultType<number, ToolResultArtifactWriteOperationError> =
+      writeOutcome.kind === "completed"
+        ? Result.ok(writeOutcome.value)
+        : Result.err(
+            writeOutcome.error instanceof ToolResultArtifactTooLargeError
+              ? writeOutcome.error
+              : storageFailure("write-content", writeOutcome.error),
+          );
+    const writtenOutcome = resultOutcome(written);
+    if (writtenOutcome.ok) return Result.ok(writtenOutcome.value);
+    const cleanup = await captureOperation("remove-artifact", () =>
+      fs.rm(temporaryPath, { force: true }),
+    );
+    return applyWriteCleanup(writtenOutcome.error, cleanup);
   }
 
   async function createArtifact(
@@ -936,12 +945,14 @@ export function createToolResultArtifactStore(
       return Result.err(error);
     }
 
-    let decipher: DecipherGCM;
-    try {
-      decipher = createDecipheriv("aes-256-gcm", encryptionKey, nonce);
-      decipher.setAuthTag(authTag);
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
+    const decipherOutcome = captureToolResultSyncEffect(() => {
+      const value = createDecipheriv("aes-256-gcm", encryptionKey, nonce);
+      value.setAuthTag(authTag);
+      return value;
+    });
+    if (decipherOutcome.kind === "panic") throw decipherOutcome.panic;
+    const decipher = decipherOutcome.kind === "completed" ? decipherOutcome.value : null;
+    if (decipher === null) {
       return Result.err(
         new ToolResultArtifactDecryptAuthenticationFailed({
           target: "content",
@@ -1033,26 +1044,31 @@ export function createToolResultArtifactStore(
           | ToolResultArtifactStorageFailure
           | ToolResultArtifactDecryptAuthenticationFailed
           | undefined;
-        try {
-          if (ciphertextBytes > 0) {
-            const decrypted = createReadStream(filePath, {
-              fd: ciphertextHandle.fd,
-              autoClose: false,
-              start: 12,
-              end: size - 17,
-            }).pipe(decipher);
-            for await (const chunk of decrypted) {
-              consume(decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+        const decryptedOutcome = await captureToolResultEffect(
+          (async () => {
+            if (ciphertextBytes > 0) {
+              const decrypted = createReadStream(filePath, {
+                fd: ciphertextHandle.fd,
+                autoClose: false,
+                start: 12,
+                end: size - 17,
+              }).pipe(decipher);
+              for await (const chunk of decrypted) {
+                consume(decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+              }
+            } else {
+              decipher.final();
             }
-          } else {
-            decipher.final();
-          }
-        } catch (cause) {
-          if (Panic.is(cause)) throw cause;
-          if (cause instanceof Error) {
-            const code = errorCode(cause);
+          })(),
+        );
+        if (decryptedOutcome.kind === "panic") {
+          throw decryptedOutcome.panic;
+        }
+        if (decryptedOutcome.kind === "defect") {
+          if (decryptedOutcome.error instanceof Error) {
+            const code = errorCode(decryptedOutcome.error);
             if (code !== undefined && !code.startsWith("ERR_CRYPTO")) {
-              decryptionError = storageFailure("read-content", cause);
+              decryptionError = storageFailure("read-content", decryptedOutcome.error);
             }
           }
           decryptionError ??= new ToolResultArtifactDecryptAuthenticationFailed({

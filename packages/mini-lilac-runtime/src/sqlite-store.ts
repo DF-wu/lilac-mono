@@ -220,6 +220,8 @@ type MiniLilacSchemaInitializationError =
   | MiniLilacSchemaMigrationFailure
   | MiniLilacSchemaInitializationCombinedFailure;
 
+type OpaqueMiniLilacSqliteValue = {} | null | undefined;
+
 type MiniLilacCleanupOutcome =
   | { readonly status: "ok" }
   | { readonly status: "expected-error"; readonly error: MiniLilacSqliteDriverFailure }
@@ -234,42 +236,57 @@ type MiniLilacCleanupOutcome =
 type MiniLilacCaughtDefect =
   | { readonly kind: "panic"; readonly cause: Panic }
   | { readonly kind: "error"; readonly cause: Error }
-  | { readonly kind: "hostile"; readonly cause: unknown };
+  | { readonly kind: "hostile"; readonly cause: OpaqueMiniLilacSqliteValue };
+
+function sqliteCaptureOutcome<T, E>(
+  result: ResultType<T, E>,
+): { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E } {
+  return result.match<
+    { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+}
 
 function captureMiniLilacCleanup(
   cleanup: () => ResultType<void, MiniLilacSqliteDriverFailure>,
 ): MiniLilacCleanupOutcome {
-  try {
-    const result = cleanup();
+  const attempted = sqliteCaptureOutcome(
+    Result.try<ResultType<void, MiniLilacSqliteDriverFailure>, OpaqueMiniLilacSqliteValue>({
+      try: cleanup,
+      catch: (cause) => cause,
+    }),
+  );
+  if (attempted.ok) {
+    const result = attempted.value;
     return result.match<MiniLilacCleanupOutcome>({
       ok: () => ({ status: "ok" }),
       err: (error) => ({ status: "expected-error", error }),
     });
-  } catch (cause) {
-    return {
-      status: "defect",
-      report: (reporter, operation) =>
-        reportMiniLilacCleanupFailure(reporter, { operation, cleanupFailure: cause }),
-      rethrow: () => {
-        throw cause;
-      },
-    };
   }
+  const cause = attempted.error;
+  return {
+    status: "defect",
+    report: (reporter, operation) =>
+      reportMiniLilacCleanupFailure(reporter, { operation, cleanupFailure: cause }),
+    rethrow: () => storeResultToLegacy(Result.err(cause)),
+  };
 }
 
 function reportMiniLilacCleanupFailure(
   reporter: (report: MiniLilacCleanupDefectReport) => void,
   report: MiniLilacCleanupDefectReport,
 ): void {
-  try {
-    reporter(report);
-  } catch {
-    try {
-      logger.error("Mini Lilac cleanup defect reporter failed", { operation: report.operation });
-    } catch {
-      // A reporter failure must never replace the defect whose cleanup it was reporting.
-    }
-  }
+  const reported = sqliteCaptureOutcome(
+    Result.try<void, OpaqueMiniLilacSqliteValue>({
+      try: () => reporter(report),
+      catch: (cause) => cause,
+    }),
+  );
+  if (reported.ok) return;
+  Result.try<void, OpaqueMiniLilacSqliteValue>({
+    try: () =>
+      logger.error("Mini Lilac cleanup defect reporter failed", { operation: report.operation }),
+    catch: (cause) => cause,
+  });
 }
 
 function throwPrimaryAfterCleanup(
@@ -1563,17 +1580,20 @@ function serializeStoreValueResult(
   value: unknown,
   operation: string,
 ): ResultType<string, MiniLilacStoreOperationRejected> {
-  try {
-    return Result.ok(serialize(value));
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new MiniLilacStoreOperationRejected({
-        operation,
-        message: "Store value is not serializable",
-      }),
-    );
-  }
+  const serialized = sqliteCaptureOutcome(
+    Result.try<string, OpaqueMiniLilacSqliteValue>({
+      try: () => serialize(value),
+      catch: (cause) => cause,
+    }),
+  );
+  if (serialized.ok) return Result.ok(serialized.value);
+  if (Panic.is(serialized.error)) throw serialized.error;
+  return Result.err(
+    new MiniLilacStoreOperationRejected({
+      operation,
+      message: "Store value is not serializable",
+    }),
+  );
 }
 
 function storeResultToLegacy<T, E>(result: ResultType<T, E>): T {
@@ -1625,11 +1645,14 @@ function canonicalCommandPayloadResult(
   { readonly json: string; readonly fingerprint: string },
   MiniLilacStoreOperationRejected
 > {
-  let serialized: string | undefined;
-  try {
-    serialized = JSON.stringify(payload);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
+  const serializedAttempt = sqliteCaptureOutcome(
+    Result.try<string | undefined, OpaqueMiniLilacSqliteValue>({
+      try: () => JSON.stringify(payload),
+      catch: (cause) => cause,
+    }),
+  );
+  if (!serializedAttempt.ok) {
+    if (Panic.is(serializedAttempt.error)) throw serializedAttempt.error;
     return Result.err(
       new MiniLilacStoreOperationRejected({
         operation: "canonicalCommandPayload",
@@ -1637,6 +1660,7 @@ function canonicalCommandPayloadResult(
       }),
     );
   }
+  const serialized = serializedAttempt.value;
   if (serialized === undefined) {
     return Result.err(
       new MiniLilacStoreOperationRejected({
@@ -1798,13 +1822,13 @@ function validateSteeringHistoryBoundaryInput(
 
 function canonicalizeStoredCwd(cwd: string): string {
   const resolved = path.resolve(cwd);
-  try {
-    return realpathSync.native(resolved);
-  } catch {
-    // A migrated session may outlive its workspace. Its already-canonical
-    // absolute path remains the stable identity until the directory returns.
-    return resolved;
-  }
+  const canonical = sqliteCaptureOutcome(
+    Result.try<string, OpaqueMiniLilacSqliteValue>({
+      try: () => realpathSync.native(resolved),
+      catch: (cause) => cause,
+    }),
+  );
+  return canonical.ok ? canonical.value : resolved;
 }
 
 function isCanonicalPrefix(prefix: readonly unknown[], values: readonly unknown[]): boolean {
@@ -2091,16 +2115,18 @@ export function readMiniLilacHistoryRecoveryStatus(
 function closeMiniLilacHistoryRecoveryDatabase(
   database: Database,
 ): ResultType<void, MiniLilacSqliteDriverFailure> {
-  try {
-    database.close();
-    return Result.ok(undefined);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    if (!(cause instanceof Error)) throw cause;
-    const failure = classifyMiniLilacSqliteDriverFailure("readHistoryRecovery.close", cause);
-    if (failure !== undefined) return Result.err(failure);
-    throw cause;
-  }
+  const closed = sqliteCaptureOutcome(
+    Result.try<void, OpaqueMiniLilacSqliteValue>({
+      try: () => database.close(),
+      catch: (cause) => cause,
+    }),
+  );
+  if (closed.ok) return Result.ok(undefined);
+  if (Panic.is(closed.error)) throw closed.error;
+  if (!(closed.error instanceof Error)) throw closed.error;
+  const failure = classifyMiniLilacSqliteDriverFailure("readHistoryRecovery.close", closed.error);
+  if (failure !== undefined) return Result.err(failure);
+  throw closed.error;
 }
 
 export function readMiniLilacHistoryRecoveryStatusResult(
@@ -2116,262 +2142,277 @@ export function readMiniLilacHistoryRecoveryStatusResult(
       }),
     );
   }
-  let database: Database;
-  try {
-    database = new Database(resolvedFilename, { readonly: true, strict: true });
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    if (!(cause instanceof Error)) throw cause;
-    const failure = classifyMiniLilacSqliteDriverFailure("readHistoryRecovery.open", cause);
+  const opened = sqliteCaptureOutcome(
+    Result.try<Database, OpaqueMiniLilacSqliteValue>({
+      try: () => new Database(resolvedFilename, { readonly: true, strict: true }),
+      catch: (cause) => cause,
+    }),
+  );
+  if (!opened.ok) {
+    if (Panic.is(opened.error)) throw opened.error;
+    if (!(opened.error instanceof Error)) throw opened.error;
+    const failure = classifyMiniLilacSqliteDriverFailure("readHistoryRecovery.open", opened.error);
     if (failure !== undefined) return Result.err(failure);
-    throw cause;
+    throw opened.error;
   }
+  const database = opened.value;
   const diagnostics: MiniLilacPersistenceDiagnostic[] = [];
   let outcome:
     | ResultType<ReadonlyStoredHistoryRecoveryStatus, MiniLilacHistoryRecoveryReadError>
     | undefined;
   let readDefect: MiniLilacCaughtDefect | undefined;
-  try {
-    const decodedVersion = decodeMiniLilacDatabaseVersion(
-      database.query("PRAGMA user_version").get(),
-    );
-    let $decodedVersionResultValue62612!: import("better-result").InferOk<
-      NonNullable<typeof decodedVersion>
-    >;
-    let $decodedVersionResultError62612!: import("better-result").InferErr<
-      NonNullable<typeof decodedVersion>
-    >;
-    const $decodedVersionResultOk62612 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof decodedVersion>>,
-      import("better-result").InferErr<NonNullable<typeof decodedVersion>>,
-      boolean
-    >(decodedVersion, {
-      ok: (value) => {
-        $decodedVersionResultValue62612 = value;
-        return true;
-      },
-      err: (error) => {
-        $decodedVersionResultError62612 = error;
-        return false;
-      },
-    });
-    if (($decodedVersionResultOk62612 ? "ok" : "error") === "error") {
-      diagnostics.push({
-        table: $decodedVersionResultError62612.table,
-        field: $decodedVersionResultError62612.field,
-        version: $decodedVersionResultError62612.version,
-        issueCode: $decodedVersionResultError62612.issueCode,
-        recordId: $decodedVersionResultError62612.recordId,
-        message: $decodedVersionResultError62612.message,
-      });
-      outcome = Result.err($decodedVersionResultError62612);
-    } else if ($decodedVersionResultValue62612 !== MINI_LILAC_DATABASE_SCHEMA_VERSION) {
-      outcome = Result.err(
-        new MiniLilacHistoryRecoveryVersionError($decodedVersionResultValue62612),
-      );
-    } else {
-      const navigation: Array<{
-        readonly canonicalCwd: string;
-        readonly operation: StoredHistoryOperation;
-      }> = [];
-      const operations = decodeMiniLilacStructuralHistoryRows({
-        kind: "operation",
-        rows: database.query("SELECT * FROM history_operations ORDER BY prepared_at, rowid").all(),
-        schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-        recordId: "recovery-operation",
-      });
-      let $operationsResultValue63462!: import("better-result").InferOk<
-        NonNullable<typeof operations>
-      >;
-      let $operationsResultError63462!: import("better-result").InferErr<
-        NonNullable<typeof operations>
-      >;
-      const $operationsResultOk63462 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof operations>>,
-        import("better-result").InferErr<NonNullable<typeof operations>>,
-        boolean
-      >(operations, {
-        ok: (value) => {
-          $operationsResultValue63462 = value;
-          return true;
-        },
-        err: (error) => {
-          $operationsResultError63462 = error;
-          return false;
-        },
-      });
-      if (($operationsResultOk63462 ? "ok" : "error") === "error") {
-        diagnostics.push({
-          table: $operationsResultError63462.table,
-          field: $operationsResultError63462.field,
-          version: $operationsResultError63462.version,
-          issueCode: $operationsResultError63462.issueCode,
-          recordId: $operationsResultError63462.recordId,
-          message: $operationsResultError63462.message,
-        });
-        outcome = Result.err($operationsResultError63462);
-      } else {
-        for (const operation of $operationsResultValue63462.value) {
-          const workspace = decodeMiniLilacStructuralHistoryRow({
-            kind: "workspace",
-            row: database.query("SELECT * FROM workspaces WHERE id = ?").get(operation.workspaceId),
-            schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-            recordId: operation.workspaceId,
-          });
-          let $workspaceResultValue64237!: import("better-result").InferOk<
-            NonNullable<typeof workspace>
-          >;
-          let $workspaceResultError64237!: import("better-result").InferErr<
-            NonNullable<typeof workspace>
-          >;
-          const $workspaceResultOk64237 = Result.match<
-            import("better-result").InferOk<NonNullable<typeof workspace>>,
-            import("better-result").InferErr<NonNullable<typeof workspace>>,
-            boolean
-          >(workspace, {
-            ok: (value) => {
-              $workspaceResultValue64237 = value;
-              return true;
-            },
-            err: (error) => {
-              $workspaceResultError64237 = error;
-              return false;
-            },
-          });
-          if (($workspaceResultOk64237 ? "ok" : "error") === "error") {
-            diagnostics.push({
-              table: $workspaceResultError64237.table,
-              field: $workspaceResultError64237.field,
-              version: $workspaceResultError64237.version,
-              issueCode: $workspaceResultError64237.issueCode,
-              recordId: $workspaceResultError64237.recordId,
-              message: $workspaceResultError64237.message,
-            });
-            outcome = Result.err($workspaceResultError64237);
-            break;
-          }
-          if ($workspaceResultValue64237.value?.kind !== "workspace") {
-            outcome = Result.err(
-              new MiniLilacHistoryRecordMissing({
-                recordKind: "workspace",
-                recordId: operation.workspaceId,
-                message: "Mini Lilac recovery workspace was not found",
-              }),
-            );
-            break;
-          }
-          navigation.push({
-            canonicalCwd: $workspaceResultValue64237.value.value.canonicalCwd,
-            operation,
-          });
-        }
-      }
-
-      if (outcome === undefined) {
-        const pendingFinalizations: Array<{
-          readonly canonicalCwd: string;
-          readonly finalization: PendingStoredRunFinalization;
-        }> = [];
-        const finalizations = decodeMiniLilacStructuralHistoryRows({
-          kind: "pending-finalization",
-          rows: database
-            .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
-            .all(),
-          schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-          recordId: "recovery-finalization",
-        });
-        let $finalizationsResultValue65739!: import("better-result").InferOk<
-          NonNullable<typeof finalizations>
+  const readAttempt = sqliteCaptureOutcome(
+    Result.try<void, OpaqueMiniLilacSqliteValue>({
+      try: () => {
+        const decodedVersion = decodeMiniLilacDatabaseVersion(
+          database.query("PRAGMA user_version").get(),
+        );
+        let $decodedVersionResultValue62612!: import("better-result").InferOk<
+          NonNullable<typeof decodedVersion>
         >;
-        let $finalizationsResultError65739!: import("better-result").InferErr<
-          NonNullable<typeof finalizations>
+        let $decodedVersionResultError62612!: import("better-result").InferErr<
+          NonNullable<typeof decodedVersion>
         >;
-        const $finalizationsResultOk65739 = Result.match<
-          import("better-result").InferOk<NonNullable<typeof finalizations>>,
-          import("better-result").InferErr<NonNullable<typeof finalizations>>,
+        const $decodedVersionResultOk62612 = Result.match<
+          import("better-result").InferOk<NonNullable<typeof decodedVersion>>,
+          import("better-result").InferErr<NonNullable<typeof decodedVersion>>,
           boolean
-        >(finalizations, {
+        >(decodedVersion, {
           ok: (value) => {
-            $finalizationsResultValue65739 = value;
+            $decodedVersionResultValue62612 = value;
             return true;
           },
           err: (error) => {
-            $finalizationsResultError65739 = error;
+            $decodedVersionResultError62612 = error;
             return false;
           },
         });
-        if (($finalizationsResultOk65739 ? "ok" : "error") === "error") {
+        if (($decodedVersionResultOk62612 ? "ok" : "error") === "error") {
           diagnostics.push({
-            table: $finalizationsResultError65739.table,
-            field: $finalizationsResultError65739.field,
-            version: $finalizationsResultError65739.version,
-            issueCode: $finalizationsResultError65739.issueCode,
-            recordId: $finalizationsResultError65739.recordId,
-            message: $finalizationsResultError65739.message,
+            table: $decodedVersionResultError62612.table,
+            field: $decodedVersionResultError62612.field,
+            version: $decodedVersionResultError62612.version,
+            issueCode: $decodedVersionResultError62612.issueCode,
+            recordId: $decodedVersionResultError62612.recordId,
+            message: $decodedVersionResultError62612.message,
           });
-          outcome = Result.err($finalizationsResultError65739);
+          outcome = Result.err($decodedVersionResultError62612);
+        } else if ($decodedVersionResultValue62612 !== MINI_LILAC_DATABASE_SCHEMA_VERSION) {
+          outcome = Result.err(
+            new MiniLilacHistoryRecoveryVersionError($decodedVersionResultValue62612),
+          );
         } else {
-          for (const finalization of $finalizationsResultValue65739.value) {
-            const workspace = decodeMiniLilacStructuralHistoryRow({
-              kind: "workspace",
-              row: database
-                .query("SELECT * FROM workspaces WHERE id = ?")
-                .get(finalization.workspaceId),
-              schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
-              recordId: finalization.workspaceId,
+          const navigation: Array<{
+            readonly canonicalCwd: string;
+            readonly operation: StoredHistoryOperation;
+          }> = [];
+          const operations = decodeMiniLilacStructuralHistoryRows({
+            kind: "operation",
+            rows: database
+              .query("SELECT * FROM history_operations ORDER BY prepared_at, rowid")
+              .all(),
+            schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+            recordId: "recovery-operation",
+          });
+          let $operationsResultValue63462!: import("better-result").InferOk<
+            NonNullable<typeof operations>
+          >;
+          let $operationsResultError63462!: import("better-result").InferErr<
+            NonNullable<typeof operations>
+          >;
+          const $operationsResultOk63462 = Result.match<
+            import("better-result").InferOk<NonNullable<typeof operations>>,
+            import("better-result").InferErr<NonNullable<typeof operations>>,
+            boolean
+          >(operations, {
+            ok: (value) => {
+              $operationsResultValue63462 = value;
+              return true;
+            },
+            err: (error) => {
+              $operationsResultError63462 = error;
+              return false;
+            },
+          });
+          if (($operationsResultOk63462 ? "ok" : "error") === "error") {
+            diagnostics.push({
+              table: $operationsResultError63462.table,
+              field: $operationsResultError63462.field,
+              version: $operationsResultError63462.version,
+              issueCode: $operationsResultError63462.issueCode,
+              recordId: $operationsResultError63462.recordId,
+              message: $operationsResultError63462.message,
             });
-            let $workspaceResultValue66630!: import("better-result").InferOk<
-              NonNullable<typeof workspace>
+            outcome = Result.err($operationsResultError63462);
+          } else {
+            for (const operation of $operationsResultValue63462.value) {
+              const workspace = decodeMiniLilacStructuralHistoryRow({
+                kind: "workspace",
+                row: database
+                  .query("SELECT * FROM workspaces WHERE id = ?")
+                  .get(operation.workspaceId),
+                schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+                recordId: operation.workspaceId,
+              });
+              let $workspaceResultValue64237!: import("better-result").InferOk<
+                NonNullable<typeof workspace>
+              >;
+              let $workspaceResultError64237!: import("better-result").InferErr<
+                NonNullable<typeof workspace>
+              >;
+              const $workspaceResultOk64237 = Result.match<
+                import("better-result").InferOk<NonNullable<typeof workspace>>,
+                import("better-result").InferErr<NonNullable<typeof workspace>>,
+                boolean
+              >(workspace, {
+                ok: (value) => {
+                  $workspaceResultValue64237 = value;
+                  return true;
+                },
+                err: (error) => {
+                  $workspaceResultError64237 = error;
+                  return false;
+                },
+              });
+              if (($workspaceResultOk64237 ? "ok" : "error") === "error") {
+                diagnostics.push({
+                  table: $workspaceResultError64237.table,
+                  field: $workspaceResultError64237.field,
+                  version: $workspaceResultError64237.version,
+                  issueCode: $workspaceResultError64237.issueCode,
+                  recordId: $workspaceResultError64237.recordId,
+                  message: $workspaceResultError64237.message,
+                });
+                outcome = Result.err($workspaceResultError64237);
+                break;
+              }
+              if ($workspaceResultValue64237.value?.kind !== "workspace") {
+                outcome = Result.err(
+                  new MiniLilacHistoryRecordMissing({
+                    recordKind: "workspace",
+                    recordId: operation.workspaceId,
+                    message: "Mini Lilac recovery workspace was not found",
+                  }),
+                );
+                break;
+              }
+              navigation.push({
+                canonicalCwd: $workspaceResultValue64237.value.value.canonicalCwd,
+                operation,
+              });
+            }
+          }
+
+          if (outcome === undefined) {
+            const pendingFinalizations: Array<{
+              readonly canonicalCwd: string;
+              readonly finalization: PendingStoredRunFinalization;
+            }> = [];
+            const finalizations = decodeMiniLilacStructuralHistoryRows({
+              kind: "pending-finalization",
+              rows: database
+                .query("SELECT * FROM pending_run_finalizations ORDER BY prepared_at, rowid")
+                .all(),
+              schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
+              recordId: "recovery-finalization",
+            });
+            let $finalizationsResultValue65739!: import("better-result").InferOk<
+              NonNullable<typeof finalizations>
             >;
-            let $workspaceResultError66630!: import("better-result").InferErr<
-              NonNullable<typeof workspace>
+            let $finalizationsResultError65739!: import("better-result").InferErr<
+              NonNullable<typeof finalizations>
             >;
-            const $workspaceResultOk66630 = Result.match<
-              import("better-result").InferOk<NonNullable<typeof workspace>>,
-              import("better-result").InferErr<NonNullable<typeof workspace>>,
+            const $finalizationsResultOk65739 = Result.match<
+              import("better-result").InferOk<NonNullable<typeof finalizations>>,
+              import("better-result").InferErr<NonNullable<typeof finalizations>>,
               boolean
-            >(workspace, {
+            >(finalizations, {
               ok: (value) => {
-                $workspaceResultValue66630 = value;
+                $finalizationsResultValue65739 = value;
                 return true;
               },
               err: (error) => {
-                $workspaceResultError66630 = error;
+                $finalizationsResultError65739 = error;
                 return false;
               },
             });
-            if (($workspaceResultOk66630 ? "ok" : "error") === "error") {
+            if (($finalizationsResultOk65739 ? "ok" : "error") === "error") {
               diagnostics.push({
-                table: $workspaceResultError66630.table,
-                field: $workspaceResultError66630.field,
-                version: $workspaceResultError66630.version,
-                issueCode: $workspaceResultError66630.issueCode,
-                recordId: $workspaceResultError66630.recordId,
-                message: $workspaceResultError66630.message,
+                table: $finalizationsResultError65739.table,
+                field: $finalizationsResultError65739.field,
+                version: $finalizationsResultError65739.version,
+                issueCode: $finalizationsResultError65739.issueCode,
+                recordId: $finalizationsResultError65739.recordId,
+                message: $finalizationsResultError65739.message,
               });
-              outcome = Result.err($workspaceResultError66630);
-              break;
-            }
-            if ($workspaceResultValue66630.value?.kind !== "workspace") {
-              outcome = Result.err(
-                new MiniLilacHistoryRecordMissing({
-                  recordKind: "workspace",
+              outcome = Result.err($finalizationsResultError65739);
+            } else {
+              for (const finalization of $finalizationsResultValue65739.value) {
+                const workspace = decodeMiniLilacStructuralHistoryRow({
+                  kind: "workspace",
+                  row: database
+                    .query("SELECT * FROM workspaces WHERE id = ?")
+                    .get(finalization.workspaceId),
+                  schemaVersion: MINI_LILAC_DATABASE_SCHEMA_VERSION,
                   recordId: finalization.workspaceId,
-                  message: "Mini Lilac recovery workspace was not found",
-                }),
-              );
-              break;
+                });
+                let $workspaceResultValue66630!: import("better-result").InferOk<
+                  NonNullable<typeof workspace>
+                >;
+                let $workspaceResultError66630!: import("better-result").InferErr<
+                  NonNullable<typeof workspace>
+                >;
+                const $workspaceResultOk66630 = Result.match<
+                  import("better-result").InferOk<NonNullable<typeof workspace>>,
+                  import("better-result").InferErr<NonNullable<typeof workspace>>,
+                  boolean
+                >(workspace, {
+                  ok: (value) => {
+                    $workspaceResultValue66630 = value;
+                    return true;
+                  },
+                  err: (error) => {
+                    $workspaceResultError66630 = error;
+                    return false;
+                  },
+                });
+                if (($workspaceResultOk66630 ? "ok" : "error") === "error") {
+                  diagnostics.push({
+                    table: $workspaceResultError66630.table,
+                    field: $workspaceResultError66630.field,
+                    version: $workspaceResultError66630.version,
+                    issueCode: $workspaceResultError66630.issueCode,
+                    recordId: $workspaceResultError66630.recordId,
+                    message: $workspaceResultError66630.message,
+                  });
+                  outcome = Result.err($workspaceResultError66630);
+                  break;
+                }
+                if ($workspaceResultValue66630.value?.kind !== "workspace") {
+                  outcome = Result.err(
+                    new MiniLilacHistoryRecordMissing({
+                      recordKind: "workspace",
+                      recordId: finalization.workspaceId,
+                      message: "Mini Lilac recovery workspace was not found",
+                    }),
+                  );
+                  break;
+                }
+                pendingFinalizations.push({
+                  canonicalCwd: $workspaceResultValue66630.value.value.canonicalCwd,
+                  finalization,
+                });
+              }
             }
-            pendingFinalizations.push({
-              canonicalCwd: $workspaceResultValue66630.value.value.canonicalCwd,
-              finalization,
-            });
+            if (outcome === undefined) outcome = Result.ok({ navigation, pendingFinalizations });
           }
         }
-        if (outcome === undefined) outcome = Result.ok({ navigation, pendingFinalizations });
-      }
-    }
-  } catch (cause) {
+      },
+      catch: (cause) => cause,
+    }),
+  );
+  if (!readAttempt.ok) {
+    const cause = readAttempt.error;
     if (Panic.is(cause)) {
       readDefect = { kind: "panic", cause };
     } else if (cause instanceof Error) {
@@ -2430,11 +2471,18 @@ export class MiniLilacSqliteStore {
       }
     }
     this.database = new Database(this.filename, { create: true, strict: true });
-    try {
-      this.database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
-      this.secureDatabaseFiles();
-      this.initializeSchema();
-    } catch (primary) {
+    const initialized = sqliteCaptureOutcome(
+      Result.try<void, OpaqueMiniLilacSqliteValue>({
+        try: () => {
+          this.database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+          this.secureDatabaseFiles();
+          this.initializeSchema();
+        },
+        catch: (cause) => cause,
+      }),
+    );
+    if (!initialized.ok) {
+      const primary = initialized.error;
       let primaryFailure: MiniLilacCaughtDefect;
       if (Panic.is(primary)) {
         primaryFailure = { kind: "panic", cause: primary };
@@ -2469,19 +2517,21 @@ export class MiniLilacSqliteStore {
   }
 
   private closeAfterInitializationFailure(): ResultType<void, MiniLilacSqliteDriverFailure> {
-    try {
-      this.database.close();
-      return Result.ok(undefined);
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (!(cause instanceof Error)) throw cause;
-      const failure = classifyMiniLilacSqliteDriverFailure(
-        "closeAfterInitializationFailure",
-        cause,
-      );
-      if (failure !== undefined) return Result.err(failure);
-      throw cause;
-    }
+    const closed = sqliteCaptureOutcome(
+      Result.try<void, OpaqueMiniLilacSqliteValue>({
+        try: () => this.database.close(),
+        catch: (cause) => cause,
+      }),
+    );
+    if (closed.ok) return Result.ok(undefined);
+    if (Panic.is(closed.error)) throw closed.error;
+    if (!(closed.error instanceof Error)) throw closed.error;
+    const failure = classifyMiniLilacSqliteDriverFailure(
+      "closeAfterInitializationFailure",
+      closed.error,
+    );
+    if (failure !== undefined) return Result.err(failure);
+    throw closed.error;
   }
 
   private secureDatabaseFiles(): void {
@@ -2501,191 +2551,224 @@ export class MiniLilacSqliteStore {
   }
 
   private initializeSchemaResult(): ResultType<void, MiniLilacSchemaInitializationError> {
-    try {
-      const decodedVersion = decodeMiniLilacDatabaseVersion(
-        this.database.query("PRAGMA user_version").get(),
-      );
-      let $decodedVersionResultValue72988!: import("better-result").InferOk<
-        NonNullable<typeof decodedVersion>
-      >;
-      let $decodedVersionResultError72988!: import("better-result").InferErr<
-        NonNullable<typeof decodedVersion>
-      >;
-      const $decodedVersionResultOk72988 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof decodedVersion>>,
-        import("better-result").InferErr<NonNullable<typeof decodedVersion>>,
-        boolean
-      >(decodedVersion, {
-        ok: (value) => {
-          $decodedVersionResultValue72988 = value;
-          return true;
-        },
-        err: (error) => {
-          $decodedVersionResultError72988 = error;
-          return false;
-        },
-      });
-      if (($decodedVersionResultOk72988 ? "ok" : "error") === "error")
-        return Result.err($decodedVersionResultError72988);
-      const version = $decodedVersionResultValue72988;
-      if (version === MINI_LILAC_DATABASE_SCHEMA_VERSION) return Result.ok(undefined);
-      if (
-        version !== 0 &&
-        version !== 2 &&
-        version !== 3 &&
-        version !== 4 &&
-        version !== 5 &&
-        version !== 6 &&
-        version !== 7
-      ) {
-        return Result.err(new MiniLilacDatabaseVersionError(version));
-      }
+    const initialized = sqliteCaptureOutcome(
+      Result.try<ResultType<void, MiniLilacSchemaInitializationError>, OpaqueMiniLilacSqliteValue>({
+        try: () => {
+          const decodedVersion = decodeMiniLilacDatabaseVersion(
+            this.database.query("PRAGMA user_version").get(),
+          );
+          let $decodedVersionResultValue72988!: import("better-result").InferOk<
+            NonNullable<typeof decodedVersion>
+          >;
+          let $decodedVersionResultError72988!: import("better-result").InferErr<
+            NonNullable<typeof decodedVersion>
+          >;
+          const $decodedVersionResultOk72988 = Result.match<
+            import("better-result").InferOk<NonNullable<typeof decodedVersion>>,
+            import("better-result").InferErr<NonNullable<typeof decodedVersion>>,
+            boolean
+          >(decodedVersion, {
+            ok: (value) => {
+              $decodedVersionResultValue72988 = value;
+              return true;
+            },
+            err: (error) => {
+              $decodedVersionResultError72988 = error;
+              return false;
+            },
+          });
+          if (($decodedVersionResultOk72988 ? "ok" : "error") === "error")
+            return Result.err($decodedVersionResultError72988);
+          const version = $decodedVersionResultValue72988;
+          if (version === MINI_LILAC_DATABASE_SCHEMA_VERSION) return Result.ok(undefined);
+          if (
+            version !== 0 &&
+            version !== 2 &&
+            version !== 3 &&
+            version !== 4 &&
+            version !== 5 &&
+            version !== 6 &&
+            version !== 7
+          ) {
+            return Result.err(new MiniLilacDatabaseVersionError(version));
+          }
 
-      // Session and run composite ownership require SQLite's documented table
-      // rebuild. These pragmas cannot be changed from inside the transaction.
-      this.database.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
-      let migrated: ResultType<
-        void,
-        MiniLilacSchemaMigrationFailure | MiniLilacSqliteDriverFailure | PersistedDataError
-      >;
-      let migrationDefect: MiniLilacCaughtDefect | undefined;
-      try {
-        migrated = runBunSqliteTransaction(
-          this.database,
-          () => {
-            if (version === 0) {
-              this.createSchemaV6();
-            } else {
-              if (version === 2) {
-                const migration = this.migrateSchemaV2ToV3();
-                const migrationError = migration.match({ ok: () => null, err: (error) => error });
-                if (migrationError !== null) return Result.err(migrationError);
-              }
-              if (version === 2 || version === 3) this.migrateSchemaV3ToV4();
-              if (version === 2 || version === 3 || version === 4) {
-                const migration = this.migrateSchemaV4ToV5();
-                const migrationError = migration.match({ ok: () => null, err: (error) => error });
-                if (migrationError !== null) return Result.err(migrationError);
-              }
-              if (version === 5) this.migrateSchemaV5ToV6();
-            }
-            if (version <= 6) this.migrateSchemaV6ToV7();
-            this.migrateSchemaV7ToV8();
-            const violations = this.database.query("PRAGMA foreign_key_check").all();
-            if (violations.length > 0) {
-              return Result.err(
+          // Session and run composite ownership require SQLite's documented table
+          // rebuild. These pragmas cannot be changed from inside the transaction.
+          this.database.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
+          let migrated: ResultType<
+            void,
+            MiniLilacSchemaMigrationFailure | MiniLilacSqliteDriverFailure | PersistedDataError
+          >;
+          let migrationDefect: MiniLilacCaughtDefect | undefined;
+          const migrationAttempt = sqliteCaptureOutcome(
+            Result.try<
+              ResultType<
+                void,
+                MiniLilacSchemaMigrationFailure | MiniLilacSqliteDriverFailure | PersistedDataError
+              >,
+              OpaqueMiniLilacSqliteValue
+            >({
+              try: () =>
+                runBunSqliteTransaction(
+                  this.database,
+                  () => {
+                    if (version === 0) {
+                      this.createSchemaV6();
+                    } else {
+                      if (version === 2) {
+                        const migration = this.migrateSchemaV2ToV3();
+                        const migrationError = migration.match({
+                          ok: () => null,
+                          err: (error) => error,
+                        });
+                        if (migrationError !== null) return Result.err(migrationError);
+                      }
+                      if (version === 2 || version === 3) this.migrateSchemaV3ToV4();
+                      if (version === 2 || version === 3 || version === 4) {
+                        const migration = this.migrateSchemaV4ToV5();
+                        const migrationError = migration.match({
+                          ok: () => null,
+                          err: (error) => error,
+                        });
+                        if (migrationError !== null) return Result.err(migrationError);
+                      }
+                      if (version === 5) this.migrateSchemaV5ToV6();
+                    }
+                    if (version <= 6) this.migrateSchemaV6ToV7();
+                    this.migrateSchemaV7ToV8();
+                    const violations = this.database.query("PRAGMA foreign_key_check").all();
+                    if (violations.length > 0) {
+                      return Result.err(
+                        new MiniLilacSchemaMigrationFailure({
+                          operation: "initializeSchema",
+                          message: `Mini Lilac schema migration left ${violations.length} foreign key violation(s)`,
+                        }),
+                      );
+                    }
+                    this.database.exec(
+                      `PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};`,
+                    );
+                    return Result.ok(undefined);
+                  },
+                  (cause) => classifyMiniLilacSqliteDriverFailure("initializeSchema", cause),
+                ),
+              catch: (cause) => cause,
+            }),
+          );
+          if (migrationAttempt.ok) {
+            migrated = migrationAttempt.value;
+          } else {
+            const cause = migrationAttempt.error;
+            if (cause instanceof z.ZodError) {
+              migrated = Result.err(
                 new MiniLilacSchemaMigrationFailure({
                   operation: "initializeSchema",
-                  message: `Mini Lilac schema migration left ${violations.length} foreign key violation(s)`,
+                  message: "Mini Lilac schema migration encountered corrupt structural fields",
+                }),
+              );
+            } else if (
+              cause instanceof MiniLilacSchemaMigrationFailure ||
+              cause instanceof MiniLilacSqliteDriverFailure ||
+              cause instanceof CorruptPersistedFields ||
+              cause instanceof MalformedSerialization ||
+              cause instanceof UnsupportedVersion
+            ) {
+              migrated = Result.err(cause);
+            } else {
+              if (Panic.is(cause)) {
+                migrationDefect = { kind: "panic", cause };
+              } else if (cause instanceof Error) {
+                migrationDefect = { kind: "error", cause };
+              } else {
+                migrationDefect = { kind: "hostile", cause };
+              }
+              migrated = Result.ok(undefined);
+            }
+          }
+          const migrationError = migrated.match({ ok: () => null, err: (error) => error });
+          const cleanup = captureMiniLilacCleanup(() => this.restoreSchemaMigrationPragmas());
+          if (migrationDefect !== undefined) {
+            throwPrimaryAfterCleanup(
+              migrationDefect,
+              "initializeSchema.restorePragmas",
+              cleanup,
+              this.onCleanupDefect,
+            );
+          }
+          if (cleanup.status === "expected-error") {
+            if (migrationError !== null) {
+              return Result.err(
+                new MiniLilacSchemaInitializationCombinedFailure({
+                  operation: "initializeSchema",
+                  primary: migrationError,
+                  cleanup: cleanup.error,
+                  message: "Mini Lilac schema migration and cleanup both failed",
                 }),
               );
             }
-            this.database.exec(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};`);
-            return Result.ok(undefined);
-          },
-          (cause) => classifyMiniLilacSqliteDriverFailure("initializeSchema", cause),
-        );
-      } catch (cause) {
-        if (cause instanceof z.ZodError) {
-          migrated = Result.err(
-            new MiniLilacSchemaMigrationFailure({
-              operation: "initializeSchema",
-              message: "Mini Lilac schema migration encountered corrupt structural fields",
-            }),
-          );
-        } else if (
-          cause instanceof MiniLilacSchemaMigrationFailure ||
-          cause instanceof MiniLilacSqliteDriverFailure ||
-          cause instanceof CorruptPersistedFields ||
-          cause instanceof MalformedSerialization ||
-          cause instanceof UnsupportedVersion
-        ) {
-          migrated = Result.err(cause);
-        } else {
-          if (Panic.is(cause)) {
-            migrationDefect = { kind: "panic", cause };
-          } else if (cause instanceof Error) {
-            migrationDefect = { kind: "error", cause };
-          } else {
-            migrationDefect = { kind: "hostile", cause };
+            return Result.err(cleanup.error);
           }
-          migrated = Result.ok(undefined);
-        }
-      }
-      const migrationError = migrated.match({ ok: () => null, err: (error) => error });
-      const cleanup = captureMiniLilacCleanup(() => this.restoreSchemaMigrationPragmas());
-      if (migrationDefect !== undefined) {
-        throwPrimaryAfterCleanup(
-          migrationDefect,
-          "initializeSchema.restorePragmas",
-          cleanup,
-          this.onCleanupDefect,
-        );
-      }
-      if (cleanup.status === "expected-error") {
-        if (migrationError !== null) {
-          return Result.err(
-            new MiniLilacSchemaInitializationCombinedFailure({
-              operation: "initializeSchema",
-              primary: migrationError,
-              cleanup: cleanup.error,
-              message: "Mini Lilac schema migration and cleanup both failed",
-            }),
-          );
-        }
-        return Result.err(cleanup.error);
-      }
-      if (cleanup.status === "defect") cleanup.rethrow();
-      if (migrationError !== null) return Result.err(migrationError);
-      const violations = this.database.query("PRAGMA foreign_key_check").all();
-      if (violations.length > 0) {
-        return Result.err(
-          new MiniLilacSchemaMigrationFailure({
-            operation: "initializeSchema",
-            message: `Mini Lilac migrated schema has ${violations.length} foreign key violation(s)`,
-          }),
-        );
-      }
-      return Result.ok(undefined);
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (
-        cause instanceof MiniLilacDatabaseVersionError ||
-        cause instanceof CorruptPersistedFields ||
-        cause instanceof MalformedSerialization ||
-        cause instanceof UnsupportedVersion ||
-        cause instanceof MiniLilacSchemaMigrationFailure ||
-        cause instanceof MiniLilacSqliteDriverFailure ||
-        cause instanceof MiniLilacSchemaInitializationCombinedFailure
-      ) {
-        return Result.err(cause);
-      }
-      if (cause instanceof z.ZodError) {
-        return Result.err(
-          new MiniLilacSchemaMigrationFailure({
-            operation: "initializeSchema",
-            message: "Mini Lilac schema migration encountered corrupt structural fields",
-          }),
-        );
-      }
-      if (!(cause instanceof Error)) throw cause;
-      const driverFailure = classifyMiniLilacSqliteDriverFailure("initializeSchema", cause);
-      if (driverFailure !== undefined) return Result.err(driverFailure);
-      throw cause;
+          if (cleanup.status === "defect") cleanup.rethrow();
+          if (migrationError !== null) return Result.err(migrationError);
+          const violations = this.database.query("PRAGMA foreign_key_check").all();
+          if (violations.length > 0) {
+            return Result.err(
+              new MiniLilacSchemaMigrationFailure({
+                operation: "initializeSchema",
+                message: `Mini Lilac migrated schema has ${violations.length} foreign key violation(s)`,
+              }),
+            );
+          }
+          return Result.ok(undefined);
+        },
+        catch: (cause) => cause,
+      }),
+    );
+    if (initialized.ok) return initialized.value;
+    const cause = initialized.error;
+    if (Panic.is(cause)) throw cause;
+    if (
+      cause instanceof MiniLilacDatabaseVersionError ||
+      cause instanceof CorruptPersistedFields ||
+      cause instanceof MalformedSerialization ||
+      cause instanceof UnsupportedVersion ||
+      cause instanceof MiniLilacSchemaMigrationFailure ||
+      cause instanceof MiniLilacSqliteDriverFailure ||
+      cause instanceof MiniLilacSchemaInitializationCombinedFailure
+    ) {
+      return Result.err(cause);
     }
+    if (cause instanceof z.ZodError) {
+      return Result.err(
+        new MiniLilacSchemaMigrationFailure({
+          operation: "initializeSchema",
+          message: "Mini Lilac schema migration encountered corrupt structural fields",
+        }),
+      );
+    }
+    if (!(cause instanceof Error)) throw cause;
+    const driverFailure = classifyMiniLilacSqliteDriverFailure("initializeSchema", cause);
+    if (driverFailure !== undefined) return Result.err(driverFailure);
+    throw cause;
   }
 
   private restoreSchemaMigrationPragmas(): ResultType<void, MiniLilacSqliteDriverFailure> {
-    try {
-      this.database.exec("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;");
-      return Result.ok(undefined);
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (!(cause instanceof Error)) throw cause;
-      const failure = classifyMiniLilacSqliteDriverFailure("initializeSchema.cleanup", cause);
-      if (failure !== undefined) return Result.err(failure);
-      throw cause;
-    }
+    const restored = sqliteCaptureOutcome(
+      Result.try<void, OpaqueMiniLilacSqliteValue>({
+        try: () => this.database.exec("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;"),
+        catch: (cause) => cause,
+      }),
+    );
+    if (restored.ok) return Result.ok(undefined);
+    if (Panic.is(restored.error)) throw restored.error;
+    if (!(restored.error instanceof Error)) throw restored.error;
+    const failure = classifyMiniLilacSqliteDriverFailure(
+      "initializeSchema.cleanup",
+      restored.error,
+    );
+    if (failure !== undefined) return Result.err(failure);
+    throw restored.error;
   }
 
   private createSchemaV6(): void {
@@ -5228,14 +5311,22 @@ export class MiniLilacSqliteStore {
     operation: () => ResultType<T, E>,
   ): ResultType<T, E | MiniLilacSqliteDriverFailure> {
     this.transactionDepth += 1;
-    try {
-      return runBunSqliteTransaction(this.database, operation, (cause) =>
-        classifyMiniLilacSqliteDriverFailure(operationName, cause),
-      );
-    } finally {
-      this.transactionDepth -= 1;
-      if (this.transactionDepth === 0) this.flushPersistenceDiagnostics();
-    }
+    const attempted = sqliteCaptureOutcome(
+      Result.try<
+        ResultType<T, E | MiniLilacSqliteDriverFailure>,
+        { readonly rethrow: () => never }
+      >({
+        try: () =>
+          runBunSqliteTransaction(this.database, operation, (cause) =>
+            classifyMiniLilacSqliteDriverFailure(operationName, cause),
+          ),
+        catch: (cause) => ({ rethrow: () => storeResultToLegacy(Result.err(cause)) }),
+      }),
+    );
+    this.transactionDepth -= 1;
+    if (this.transactionDepth === 0) this.flushPersistenceDiagnostics();
+    if (!attempted.ok) return attempted.error.rethrow();
+    return attempted.value;
   }
 
   private decodeStructuralHistoryRow<K extends MiniLilacStructuralHistoryRecordKind>(input: {
@@ -5350,17 +5441,19 @@ export class MiniLilacSqliteStore {
     operationName: string,
     operation: () => ResultType<T, E>,
   ): ResultType<T, E | MiniLilacSqliteDriverFailure> {
-    try {
-      return operation();
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (!(cause instanceof Error)) throw cause;
-      const failure = classifyMiniLilacSqliteDriverFailure(operationName, cause);
-      if (failure !== undefined) return Result.err(failure);
-      throw cause;
-    } finally {
-      if (this.transactionDepth === 0) this.flushPersistenceDiagnostics();
-    }
+    const attempted = sqliteCaptureOutcome(
+      Result.try<ResultType<T, E>, OpaqueMiniLilacSqliteValue>({
+        try: operation,
+        catch: (cause) => cause,
+      }),
+    );
+    if (this.transactionDepth === 0) this.flushPersistenceDiagnostics();
+    if (attempted.ok) return attempted.value;
+    if (Panic.is(attempted.error)) throw attempted.error;
+    if (!(attempted.error instanceof Error)) throw attempted.error;
+    const failure = classifyMiniLilacSqliteDriverFailure(operationName, attempted.error);
+    if (failure !== undefined) return Result.err(failure);
+    throw attempted.error;
   }
 
   private flushPersistenceDiagnostics(): void {

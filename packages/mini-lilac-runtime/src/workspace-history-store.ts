@@ -467,11 +467,16 @@ type WorkspaceHistoryFailure =
   | { readonly kind: "persistence"; readonly error: WorkspaceHistoryPersistenceCodecError }
   | { readonly kind: "host"; readonly cause: Error }
   | { readonly kind: "callback"; readonly cause: Error }
-  | { readonly kind: "panic"; readonly cause: Panic }
+  | { readonly kind: "panic"; readonly signal: WorkspaceHistoryPanicSignal }
   | { readonly kind: "git-unavailable"; readonly signal: GitUnavailableSignal };
 
 type WorkspaceHistoryResult<T> = ResultType<T, WorkspaceHistoryFailure>;
-type WorkspaceHistoryOperationalFailure = Exclude<WorkspaceHistoryFailure, { kind: "panic" }>;
+type WorkspaceHistoryOperationalFailure = WorkspaceHistoryFailure;
+
+interface WorkspaceHistoryPanicSignal {
+  cause(): Error;
+  rethrow(): never;
+}
 
 interface WorkspaceHistoryDefectRejection {
   reject<T>(): Promise<T>;
@@ -485,13 +490,13 @@ interface WorkspaceHistoryDefectRejection {
 type SupervisedOutcome<T> =
   | { readonly status: "ok"; readonly value: T }
   | { readonly status: "failed"; readonly failure: WorkspaceHistoryOperationalFailure }
-  | { readonly status: "panic"; readonly cause: Panic }
+  | { readonly status: "panic"; readonly signal: WorkspaceHistoryPanicSignal }
   | { readonly status: "defect"; readonly rejection: WorkspaceHistoryDefectRejection };
 
 type CleanupOutcome =
   | { readonly status: "ok" }
   | { readonly status: "failed"; readonly error: WorkspaceHistoryCleanupFailed }
-  | { readonly status: "panic"; readonly cause: Panic }
+  | { readonly status: "panic"; readonly signal: WorkspaceHistoryPanicSignal }
   | { readonly status: "defect"; readonly rejection: WorkspaceHistoryDefectRejection };
 
 function ownedFailure(params: WorkspaceHistoryStoreErrorParams): WorkspaceHistoryFailure {
@@ -524,10 +529,17 @@ function failureCause(failure: WorkspaceHistoryFailure): Error {
     case "callback":
       return failure.cause;
     case "panic":
-      return failure.cause;
+      return failure.signal.cause();
     case "git-unavailable":
       return failure.signal;
   }
+}
+
+function panicFailure(cause: Panic): Extract<WorkspaceHistoryFailure, { kind: "panic" }> {
+  return {
+    kind: "panic",
+    signal: { cause: () => cause, rethrow: () => throwFailure(cause) },
+  };
 }
 
 /** Attaches `operation` to an unlabelled host or Git-unavailable failure. */
@@ -543,6 +555,8 @@ function labelFailure(
       return hostStoreError(failure.cause, operation);
     case "callback":
       return hostStoreError(failure.cause, operation);
+    case "panic":
+      return failure.signal.rethrow();
     case "git-unavailable":
       return hostStoreError(failure.signal, operation);
   }
@@ -575,40 +589,51 @@ function hostStoreError(cause: Error, operation: string): WorkspaceHistoryStoreE
   });
 }
 
+function workspaceHistoryResultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E } {
+  return result.match<
+    { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+}
+
 /**
  * The module's only immediate host adapter. It wraps exactly one filesystem, subprocess, or
  * host-callback call, preserves `Panic` identity, keeps already-owned errors intact, and rethrows
  * any non-`Error` defect unchanged.
  */
 async function attemptHost<T>(effect: () => Promise<T>): Promise<WorkspaceHistoryResult<T>> {
-  try {
-    return Result.ok(await effect());
-  } catch (cause) {
-    if (Panic.is(cause)) return Result.err({ kind: "panic", cause });
-    if (cause instanceof WorkspaceHistoryStoreError)
-      return Result.err({ kind: "owned", error: cause });
-    if (cause instanceof GitUnavailableSignal) {
-      return Result.err({ kind: "git-unavailable", signal: cause });
-    }
-    if (cause instanceof Error) return Result.err({ kind: "host", cause });
-    throw cause;
+  const attempted = workspaceHistoryResultOutcome(
+    await Result.tryPromise<T, OpaqueWorkspaceHistoryValue>({
+      try: effect,
+      catch: (cause) => cause,
+    }),
+  );
+  if (attempted.ok) return Result.ok(attempted.value);
+  if (Panic.is(attempted.error)) return Result.err(panicFailure(attempted.error));
+  if (attempted.error instanceof WorkspaceHistoryStoreError)
+    return Result.err({ kind: "owned", error: attempted.error });
+  if (attempted.error instanceof GitUnavailableSignal) {
+    return Result.err({ kind: "git-unavailable", signal: attempted.error });
   }
+  if (attempted.error instanceof Error) return Result.err({ kind: "host", cause: attempted.error });
+  return throwFailure(new WorkspaceHistoryDefectSignal(attempted.error));
 }
 
 /** Synchronous counterpart of {@link attemptHost} for the two synchronous host calls. */
-function attemptHostSync<T>(effect: () => T): WorkspaceHistoryResult<T> {
-  try {
-    return Result.ok(effect());
-  } catch (cause) {
-    if (Panic.is(cause)) return Result.err({ kind: "panic", cause });
-    if (cause instanceof WorkspaceHistoryStoreError)
-      return Result.err({ kind: "owned", error: cause });
-    if (cause instanceof GitUnavailableSignal) {
-      return Result.err({ kind: "git-unavailable", signal: cause });
-    }
-    if (cause instanceof Error) return Result.err({ kind: "host", cause });
-    throw cause;
+function attemptHostSync<T>(effect: () => Awaited<T>): WorkspaceHistoryResult<T> {
+  const attempted = workspaceHistoryResultOutcome(
+    Result.try<T, OpaqueWorkspaceHistoryValue>({ try: effect, catch: (cause) => cause }),
+  );
+  if (attempted.ok) return Result.ok(attempted.value);
+  if (Panic.is(attempted.error)) return Result.err(panicFailure(attempted.error));
+  if (attempted.error instanceof WorkspaceHistoryStoreError)
+    return Result.err({ kind: "owned", error: attempted.error });
+  if (attempted.error instanceof GitUnavailableSignal) {
+    return Result.err({ kind: "git-unavailable", signal: attempted.error });
   }
+  if (attempted.error instanceof Error) return Result.err({ kind: "host", cause: attempted.error });
+  return throwFailure(new WorkspaceHistoryDefectSignal(attempted.error));
 }
 
 function callPosixFileApi(operation: string, effect: () => number): WorkspaceHistoryResult<void> {
@@ -696,8 +721,14 @@ async function superviseOutcome<T>(
   effect: () => Promise<WorkspaceHistoryResult<T>>,
   errorKind: "host" | "callback" = "host",
 ): Promise<SupervisedOutcome<T>> {
-  try {
-    const result = await effect();
+  const attempted = workspaceHistoryResultOutcome(
+    await Result.tryPromise<WorkspaceHistoryResult<T>, OpaqueWorkspaceHistoryValue>({
+      try: effect,
+      catch: (cause) => cause,
+    }),
+  );
+  if (attempted.ok) {
+    const result = attempted.value;
     let $resultResultValue23196!: import("better-result").InferOk<NonNullable<typeof result>>;
     let $resultResultError23196!: import("better-result").InferErr<NonNullable<typeof result>>;
     const $resultResultOk23196 = Result.match<
@@ -716,23 +747,23 @@ async function superviseOutcome<T>(
     });
     if (($resultResultOk23196 ? "ok" : "error") === "error") {
       if ($resultResultError23196.kind === "panic")
-        return { status: "panic", cause: $resultResultError23196.cause };
+        return { status: "panic", signal: $resultResultError23196.signal };
       return { status: "failed", failure: $resultResultError23196 };
     }
     return { status: "ok", value: $resultResultValue23196 };
-  } catch (cause) {
-    if (Panic.is(cause)) return { status: "panic", cause };
-    if (cause instanceof WorkspaceHistoryStoreError) {
-      return { status: "failed", failure: { kind: "owned", error: cause } };
-    }
-    if (cause instanceof Error) {
-      return { status: "failed", failure: { kind: errorKind, cause } };
-    }
-    return {
-      status: "defect",
-      rejection: { reject: <R>() => Promise.reject<R>(cause) },
-    };
   }
+  if (Panic.is(attempted.error))
+    return { status: "panic", signal: panicFailure(attempted.error).signal };
+  if (attempted.error instanceof WorkspaceHistoryStoreError) {
+    return { status: "failed", failure: { kind: "owned", error: attempted.error } };
+  }
+  if (attempted.error instanceof Error) {
+    return { status: "failed", failure: { kind: errorKind, cause: attempted.error } };
+  }
+  return {
+    status: "defect",
+    rejection: { reject: <R>() => Promise.reject<R>(attempted.error) },
+  };
 }
 
 function cleanupFailure(
@@ -755,7 +786,7 @@ async function runWorkspaceHistoryCleanup(
   cleanups: readonly (() => Promise<WorkspaceHistoryResult<void>>)[],
 ): Promise<CleanupOutcome> {
   const failures: WorkspaceHistoryOperationalFailure[] = [];
-  let panic: { readonly cause: Panic } | undefined;
+  let panic: { readonly signal: WorkspaceHistoryPanicSignal } | undefined;
   let defect: { readonly rejection: WorkspaceHistoryDefectRejection } | undefined;
   for (const cleanup of cleanups) {
     const outcome = await superviseOutcome(cleanup);
@@ -766,14 +797,14 @@ async function runWorkspaceHistoryCleanup(
         failures.push(outcome.failure);
         break;
       case "panic":
-        panic ??= { cause: outcome.cause };
+        panic ??= { signal: outcome.signal };
         break;
       case "defect":
         defect ??= { rejection: outcome.rejection };
         break;
     }
   }
-  if (panic) return { status: "panic", cause: panic.cause };
+  if (panic) return { status: "panic", signal: panic.signal };
   if (defect) return { status: "defect", rejection: defect.rejection };
   if (failures.length > 0) return { status: "failed", error: cleanupFailure(operation, failures) };
   return { status: "ok" };
@@ -786,7 +817,7 @@ async function runWorkspaceHistoryCleanup(
 type ResolvedOutcome<T> =
   | { readonly status: "ok"; readonly value: T }
   | { readonly status: "failed"; readonly failure: WorkspaceHistoryOperationalFailure }
-  | { readonly status: "panic"; readonly cause: Panic }
+  | { readonly status: "panic"; readonly signal: WorkspaceHistoryPanicSignal }
   | { readonly status: "defect"; readonly rejection: WorkspaceHistoryDefectRejection };
 
 /**
@@ -805,13 +836,13 @@ function resolveOutcomeWithCleanup<T>(
       case "failed":
         return { status: "failed", failure: primary.failure };
       case "panic":
-        return { status: "panic", cause: primary.cause };
+        return { status: "panic", signal: primary.signal };
       case "defect":
         return { status: "defect", rejection: primary.rejection };
     }
   }
-  if (primary.status === "panic") return { status: "panic", cause: primary.cause };
-  if (cleanup.status === "panic") return { status: "panic", cause: cleanup.cause };
+  if (primary.status === "panic") return { status: "panic", signal: primary.signal };
+  if (cleanup.status === "panic") return { status: "panic", signal: cleanup.signal };
   if (primary.status === "defect") return { status: "defect", rejection: primary.rejection };
   if (cleanup.status === "defect") return { status: "defect", rejection: cleanup.rejection };
   const cleanupError = cleanup.error;
@@ -948,6 +979,12 @@ interface FilesystemCapacity {
 
 type GitInput = Blob | Uint8Array | number;
 
+type OpaqueWorkspaceHistoryValue = {} | null | undefined;
+
+class WorkspaceHistoryDefectSignal {
+  constructor(readonly cause: OpaqueWorkspaceHistoryValue) {}
+}
+
 const operationQueues = new Map<string, Promise<void>>();
 const heldStoreLocks = new AsyncLocalStorage<ReadonlyMap<string, { active: boolean }>>();
 
@@ -964,13 +1001,17 @@ async function withStoreLock<T>(key: string, operation: () => Promise<T>): Promi
   const lease = { active: true };
   const nextHeldLocks = new Map(heldLocks ?? []);
   nextHeldLocks.set(key, lease);
-  try {
-    return await heldStoreLocks.run(nextHeldLocks, operation);
-  } finally {
-    lease.active = false;
-    release?.();
-    if (operationQueues.get(key) === current) operationQueues.delete(key);
-  }
+  const attempted = workspaceHistoryResultOutcome(
+    await Result.tryPromise<T, WorkspaceHistoryDefectSignal>({
+      try: () => heldStoreLocks.run(nextHeldLocks, operation),
+      catch: (cause) => new WorkspaceHistoryDefectSignal(cause),
+    }),
+  );
+  lease.active = false;
+  release?.();
+  if (operationQueues.get(key) === current) operationQueues.delete(key);
+  if (!attempted.ok) return throwFailure(attempted.error);
+  return attempted.value;
 }
 
 function bytesToText(bytes: Uint8Array, operation: string): WorkspaceHistoryResult<string> {
@@ -1380,7 +1421,12 @@ export function createWorkspaceHistoryStore(
  * Throwing public API edge. Every internal path composes Results; only the exported throwing methods
  * call this, and they rethrow exactly the value the pre-migration implementation raised.
  */
-function throwFailure(failure: WorkspaceHistoryFailure): never {
+function throwFailure(
+  failure: WorkspaceHistoryFailure | Panic | WorkspaceHistoryDefectSignal,
+): never {
+  if (failure instanceof WorkspaceHistoryDefectSignal) throw failure.cause;
+  if (Panic.is(failure)) throw failure;
+  if (failure.kind === "panic") return failure.signal.rethrow();
   throw failureCause(failure);
 }
 
@@ -1685,9 +1731,6 @@ export class WorkspaceHistoryStore {
           },
         });
         if (($capturedResultOk51132 ? "ok" : "error") === "error") {
-          if ($capturedResultError51132.kind === "panic") {
-            return await Promise.reject($capturedResultError51132.cause);
-          }
           return Result.err(labelFailure($capturedResultError51132, "capture workspace"));
         }
         lastCapture = $capturedResultValue51132;
@@ -1727,9 +1770,6 @@ export class WorkspaceHistoryStore {
             },
           });
           if (($invalidatedResultOk51799 ? "ok" : "error") === "error") {
-            if ($invalidatedResultError51799.kind === "panic") {
-              return await Promise.reject($invalidatedResultError51799.cause);
-            }
             return Result.err(
               labelStoreError($invalidatedResultError51799, "invalidate capture cache"),
             );
@@ -1887,7 +1927,7 @@ export class WorkspaceHistoryStore {
           labelFailure(outcome.failure, "run workspace history lock callback"),
         );
       case "panic":
-        return await Promise.reject(outcome.cause);
+        return outcome.signal.rethrow();
       case "defect":
         return await outcome.rejection.reject<T>();
     }
@@ -1909,7 +1949,7 @@ export class WorkspaceHistoryStore {
       case "failed":
         return Result.err(labelStoreError(outcome.failure, "run workspace history lock callback"));
       case "panic":
-        return await Promise.reject(outcome.cause);
+        return outcome.signal.rethrow();
       case "defect":
         return await outcome.rejection.reject<ResultType<T, WorkspaceHistoryStoreError>>();
     }
@@ -1995,8 +2035,6 @@ export class WorkspaceHistoryStore {
         });
       }
       this.emitCaptureMetric(startedAt, observation, "failed");
-      if ($attemptedResultError56922.kind === "panic")
-        return Result.err($attemptedResultError56922);
       if ($attemptedResultError56922.kind === "persistence")
         return Result.err($attemptedResultError56922);
       return failWith(labelStoreError($attemptedResultError56922, "capture workspace"));
@@ -2345,7 +2383,7 @@ export class WorkspaceHistoryStore {
       case "failed":
         return Result.err(labelStoreError(outcome.failure, operation));
       case "panic":
-        return await Promise.reject(outcome.cause);
+        return outcome.signal.rethrow();
       case "defect":
         return await outcome.rejection.reject<ResultType<T, WorkspaceHistoryStoreError>>();
     }
@@ -2372,8 +2410,7 @@ export class WorkspaceHistoryStore {
       },
     });
     if (($resultResultOk71833 ? "ok" : "error") === "ok") return Result.ok($resultResultValue71833);
-    if ($resultResultError71833.kind === "panic")
-      return await Promise.reject($resultResultError71833.cause);
+    if ($resultResultError71833.kind === "panic") return $resultResultError71833.signal.rethrow();
     return Result.err(labelStoreError($resultResultError71833, operation));
   }
 
@@ -2571,7 +2608,6 @@ export class WorkspaceHistoryStore {
       });
       if (($attemptedResultOk78510 ? "ok" : "error") === "ok")
         return Result.ok($attemptedResultValue78510);
-      if ($attemptedResultError78510.kind === "panic") return attempted;
       this.emitVerifyMetric(startedAt, counters.managedPathCount, 0n, "failed");
       const failure = labelStoreError($attemptedResultError78510, "verify workspace snapshot");
       this.emitVerificationFailure(startedAt, "verify", counters.managedPathCount, failure);
@@ -2755,7 +2791,6 @@ export class WorkspaceHistoryStore {
           reason: "git-unavailable",
         });
       }
-      if ($attemptedResultError83857.kind === "panic") return attempted;
       this.emitRestoreMetric(
         metricStartedAt,
         counters.candidatePathCount,
@@ -3090,7 +3125,6 @@ export class WorkspaceHistoryStore {
           reason: "git-unavailable",
         });
       }
-      if ($attemptedResultError94849.kind === "panic") return attempted;
       this.emitRestoreMetric(metricStartedAt, 0, 0, counters.materializedBytes, false, "failed");
       const failure = labelStoreError(
         $attemptedResultError94849,
@@ -3720,7 +3754,6 @@ export class WorkspaceHistoryStore {
         this.emitMaintenanceMetric(startedAt, unavailable);
         return Result.ok<WorkspaceHistoryMaintenanceResult>(unavailable);
       }
-      if ($maintainedResultError113040.kind === "panic") return maintained;
       this.emitMetric({
         type: "maintenance",
         workspaceId: this.workspaceId,
@@ -4268,19 +4301,12 @@ export class WorkspaceHistoryStore {
   private writeCaptureCache(
     cache: WorkspaceHistoryCaptureCache,
   ): Promise<WorkspaceHistoryResult<void>> {
-    return (async () => {
-      try {
-        return await this.writeAtomicPrivateFile(
-          this.captureCachePath,
-          canonicalJson(cache),
-          "write capture cache",
-          () => `${this.captureCachePath}.${randomUUID()}.tmp`,
-        );
-      } catch (cause) {
-        if (Panic.is(cause)) throw cause;
-        throw cause;
-      }
-    })();
+    return this.writeAtomicPrivateFile(
+      this.captureCachePath,
+      canonicalJson(cache),
+      "write capture cache",
+      () => `${this.captureCachePath}.${randomUUID()}.tmp`,
+    );
   }
 
   private async writeAtomicPrivateFile(
@@ -5034,7 +5060,6 @@ export class WorkspaceHistoryStore {
           if (($removedResultOk144868 ? "ok" : "error") === "ok") operationDirectoryOwned = false;
           if (($removedResultOk144868 ? "ok" : "error") === "ok")
             return Result.ok($removedResultValue144868);
-          if ($removedResultError144868.kind === "panic") return removed;
           return failOwned({
             code: "ownership-mismatch",
             operation,
@@ -5075,7 +5100,7 @@ export class WorkspaceHistoryStore {
         case "failed":
           return Result.err(labelWorkspaceFailure(resolved.failure, operation));
         case "panic":
-          return Result.err({ kind: "panic", cause: resolved.cause });
+          return Result.err({ kind: "panic", signal: resolved.signal });
         case "defect":
           return await resolved.rejection.reject<WorkspaceHistoryResult<void>>();
       }
@@ -5228,7 +5253,7 @@ export class WorkspaceHistoryStore {
       case "failed":
         return Result.err(resolved.failure);
       case "panic":
-        return Result.err({ kind: "panic", cause: resolved.cause });
+        return Result.err({ kind: "panic", signal: resolved.signal });
       case "defect":
         return await resolved.rejection.reject<WorkspaceHistoryResult<string>>();
     }
@@ -5644,7 +5669,7 @@ export class WorkspaceHistoryStore {
         case "failed":
           return Result.err(resolved.failure);
         case "panic":
-          return Result.err({ kind: "panic", cause: resolved.cause });
+          return Result.err({ kind: "panic", signal: resolved.signal });
         case "defect":
           return await resolved.rejection.reject<WorkspaceHistoryResult<GitResult>>();
       }
@@ -5824,7 +5849,7 @@ export class WorkspaceHistoryStore {
       case "failed":
         return Result.err(resolved.failure);
       case "panic":
-        return Result.err({ kind: "panic", cause: resolved.cause });
+        return Result.err({ kind: "panic", signal: resolved.signal });
       case "defect":
         return await resolved.rejection.reject<WorkspaceHistoryResult<void>>();
     }
@@ -6185,7 +6210,7 @@ export class WorkspaceHistoryStore {
         case "failed":
           return Result.err(resolved.failure);
         case "panic":
-          return Result.err({ kind: "panic", cause: resolved.cause });
+          return Result.err({ kind: "panic", signal: resolved.signal });
         case "defect":
           return await resolved.rejection.reject<
             WorkspaceHistoryResult<Map<string, ScannedEntry>>
@@ -6640,7 +6665,7 @@ export class WorkspaceHistoryStore {
             case "failed":
               return Result.err(stagedAndClosed.failure);
             case "panic":
-              return Result.err({ kind: "panic", cause: stagedAndClosed.cause });
+              return Result.err({ kind: "panic", signal: stagedAndClosed.signal });
             case "defect":
               return await stagedAndClosed.rejection.reject<WorkspaceHistoryResult<never>>();
           }
@@ -6720,7 +6745,7 @@ export class WorkspaceHistoryStore {
         case "failed":
           return Result.err(resolved.failure);
         case "panic":
-          return Result.err({ kind: "panic", cause: resolved.cause });
+          return Result.err({ kind: "panic", signal: resolved.signal });
         case "defect":
           return await resolved.rejection.reject<
             WorkspaceHistoryResult<{
@@ -8406,7 +8431,7 @@ export class WorkspaceHistoryStore {
       case "failed":
         return Result.err(resolved.failure);
       case "panic":
-        return Result.err({ kind: "panic", cause: resolved.cause });
+        return Result.err({ kind: "panic", signal: resolved.signal });
       case "defect":
         return await resolved.rejection.reject<WorkspaceHistoryResult<bigint>>();
     }
@@ -8642,7 +8667,7 @@ export class WorkspaceHistoryStore {
       case "failed":
         return Result.err(regularResolved.failure);
       case "panic":
-        return Result.err({ kind: "panic", cause: regularResolved.cause });
+        return Result.err({ kind: "panic", signal: regularResolved.signal });
       case "defect":
         return await regularResolved.rejection.reject<WorkspaceHistoryResult<void>>();
     }
@@ -9427,7 +9452,7 @@ export class WorkspaceHistoryStore {
       case "failed":
         return Result.err(resolved.failure);
       case "panic":
-        return Result.err({ kind: "panic", cause: resolved.cause });
+        return Result.err({ kind: "panic", signal: resolved.signal });
       case "defect":
         return await resolved.rejection.reject<WorkspaceHistoryResult<never>>();
     }
@@ -10021,7 +10046,7 @@ export class WorkspaceHistoryStore {
             case "failed":
               return Result.err(syncedAndClosed.failure);
             case "panic":
-              return Result.err({ kind: "panic", cause: syncedAndClosed.cause });
+              return Result.err({ kind: "panic", signal: syncedAndClosed.signal });
             case "defect":
               return await syncedAndClosed.rejection.reject<WorkspaceHistoryResult<never>>();
           }
@@ -10106,7 +10131,7 @@ export class WorkspaceHistoryStore {
         case "failed":
           return Result.err(resolved.failure);
         case "panic":
-          return Result.err({ kind: "panic", cause: resolved.cause });
+          return Result.err({ kind: "panic", signal: resolved.signal });
         case "defect":
           return await resolved.rejection.reject<WorkspaceHistoryResult<OwnedTemporaryPath>>();
       }
@@ -10649,7 +10674,7 @@ export class WorkspaceHistoryStore {
       case "failed":
         return Result.err(resolved.failure);
       case "panic":
-        return Result.err({ kind: "panic", cause: resolved.cause });
+        return Result.err({ kind: "panic", signal: resolved.signal });
       case "defect":
         return await resolved.rejection.reject<WorkspaceHistoryResult<void>>();
     }
@@ -11445,7 +11470,7 @@ export class WorkspaceHistoryStore {
           case "failed":
             return Result.err(cacheResolved.failure);
           case "panic":
-            return Result.err({ kind: "panic", cause: cacheResolved.cause });
+            return Result.err({ kind: "panic", signal: cacheResolved.signal });
           case "defect":
             return await cacheResolved.rejection.reject<WorkspaceHistoryResult<never>>();
         }
@@ -11549,7 +11574,7 @@ export class WorkspaceHistoryStore {
         return failWith(error);
       }
       case "panic":
-        return Result.err({ kind: "panic", cause: resolved.cause });
+        return Result.err({ kind: "panic", signal: resolved.signal });
       case "defect":
         return await resolved.rejection.reject<WorkspaceHistoryResult<{ status: "restored" }>>();
     }
@@ -14314,19 +14339,23 @@ export class WorkspaceHistoryStore {
     directory: string,
     operation: string,
   ): Promise<WorkspaceHistoryResult<void>> {
-    let stats: Stats;
-    try {
-      stats = await lstat(directory);
-    } catch (cause) {
-      if (Panic.is(cause)) return Result.err({ kind: "panic", cause });
-      if (!(cause instanceof Error)) return await Promise.reject(cause);
+    const inspected = workspaceHistoryResultOutcome(
+      await Result.tryPromise<Stats, OpaqueWorkspaceHistoryValue>({
+        try: () => lstat(directory),
+        catch: (cause) => cause,
+      }),
+    );
+    if (!inspected.ok) {
+      if (Panic.is(inspected.error)) return Result.err(panicFailure(inspected.error));
+      if (!(inspected.error instanceof Error)) return await Promise.reject(inspected.error);
       return failOwned({
         code: "workspace-invalid",
         operation,
         message: `Cannot access source Git directory: ${directory}`,
-        cause,
+        cause: inspected.error,
       });
     }
+    const stats = inspected.value;
     if (!stats.isDirectory() || stats.isSymbolicLink()) {
       return failOwned({
         code: "workspace-invalid",
@@ -14347,28 +14376,33 @@ export class WorkspaceHistoryStore {
     },
   ): Promise<WorkspaceHistoryResult<GitResult>> {
     const accepted = options.acceptedExitCodes ?? [0];
-    let processHandle: Bun.Subprocess<"ignore" | GitInput, "pipe", "pipe">;
-    try {
-      processHandle = Bun.spawn([this.gitExecutable, ...args], {
-        cwd: path.parse(this.cwd).root,
-        env: this.gitEnvironment(options.env),
-        stdin: options.input ?? "ignore",
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-    } catch (cause) {
-      if (Panic.is(cause)) return Result.err({ kind: "panic", cause });
-      if (!(cause instanceof Error)) return await Promise.reject(cause);
-      if (nodeErrorCode(cause) === "ENOENT") {
+    const spawned = workspaceHistoryResultOutcome(
+      Result.try<Bun.Subprocess<"ignore" | GitInput, "pipe", "pipe">, OpaqueWorkspaceHistoryValue>({
+        try: () =>
+          Bun.spawn([this.gitExecutable, ...args], {
+            cwd: path.parse(this.cwd).root,
+            env: this.gitEnvironment(options.env),
+            stdin: options.input ?? "ignore",
+            stdout: "pipe",
+            stderr: "pipe",
+          }),
+        catch: (cause) => cause,
+      }),
+    );
+    if (!spawned.ok) {
+      if (Panic.is(spawned.error)) return Result.err(panicFailure(spawned.error));
+      if (!(spawned.error instanceof Error)) return await Promise.reject(spawned.error);
+      if (nodeErrorCode(spawned.error) === "ENOENT") {
         return Result.err({ kind: "git-unavailable", signal: new GitUnavailableSignal() });
       }
       return failOwned({
         code: "git-command-failed",
         operation: options.operation,
-        message: `Unable to spawn Git while ${options.operation}: ${opaqueErrorMessage(cause, "Git spawn failed")}`,
-        cause,
+        message: `Unable to spawn Git while ${options.operation}: ${opaqueErrorMessage(spawned.error, "Git spawn failed")}`,
+        cause: spawned.error,
       });
     }
+    const processHandle = spawned.value;
     const completed = await attemptHost(() =>
       Promise.all([
         new Response(processHandle.stdout).arrayBuffer(),
@@ -14431,37 +14465,42 @@ export class WorkspaceHistoryStore {
     });
     if (($ownedResultOk324303 ? "ok" : "error") === "error")
       return Result.err($ownedResultError324303);
-    let processHandle: Bun.Subprocess<"ignore", number, "pipe">;
-    try {
-      processHandle = Bun.spawn(
-        [
-          this.gitExecutable,
-          `--git-dir=${this.storeDirectory}`,
-          `--work-tree=${this.cwd}`,
-          ...this.privateConfigArgs(),
-          ...args,
-        ],
-        {
-          cwd: path.parse(this.cwd).root,
-          env: this.gitEnvironment(),
-          stdin: "ignore",
-          stdout: destinationFd,
-          stderr: "pipe",
-        },
-      );
-    } catch (cause) {
-      if (Panic.is(cause)) return Result.err({ kind: "panic", cause });
-      if (!(cause instanceof Error)) return await Promise.reject(cause);
-      if (isMissingExecutable(cause)) {
+    const spawned = workspaceHistoryResultOutcome(
+      Result.try<Bun.Subprocess<"ignore", number, "pipe">, OpaqueWorkspaceHistoryValue>({
+        try: () =>
+          Bun.spawn(
+            [
+              this.gitExecutable,
+              `--git-dir=${this.storeDirectory}`,
+              `--work-tree=${this.cwd}`,
+              ...this.privateConfigArgs(),
+              ...args,
+            ],
+            {
+              cwd: path.parse(this.cwd).root,
+              env: this.gitEnvironment(),
+              stdin: "ignore",
+              stdout: destinationFd,
+              stderr: "pipe",
+            },
+          ),
+        catch: (cause) => cause,
+      }),
+    );
+    if (!spawned.ok) {
+      if (Panic.is(spawned.error)) return Result.err(panicFailure(spawned.error));
+      if (!(spawned.error instanceof Error)) return await Promise.reject(spawned.error);
+      if (isMissingExecutable(spawned.error)) {
         return Result.err({ kind: "git-unavailable", signal: new GitUnavailableSignal() });
       }
       return failOwned({
         code: "git-command-failed",
         operation: options.operation,
-        message: `Unable to spawn Git while ${options.operation}: ${opaqueErrorMessage(cause, "Git spawn failed")}`,
-        cause,
+        message: `Unable to spawn Git while ${options.operation}: ${opaqueErrorMessage(spawned.error, "Git spawn failed")}`,
+        cause: spawned.error,
       });
     }
+    const processHandle = spawned.value;
     const completed = await attemptHost(() =>
       Promise.all([new Response(processHandle.stderr).text(), processHandle.exited]),
     );
@@ -14630,15 +14669,16 @@ export class WorkspaceHistoryStore {
     if (!this.onMetric) return;
     const waitForActiveOperation = operationQueues.get(this.storeDirectory) ?? Promise.resolve();
     heldStoreLocks.run(new Map(), () => {
-      this.metricQueue = this.metricQueue
-        .then(async () => {
-          await waitForActiveOperation;
-          await new Promise<void>((resolve) => queueMicrotask(resolve));
-          await this.onMetric?.(metric);
-        })
-        .catch(() => {
-          // Metrics are observational and must never affect workspace operations.
+      const previousMetric = this.metricQueue;
+      this.metricQueue = (async () => {
+        await previousMetric;
+        await waitForActiveOperation;
+        await new Promise<void>((resolve) => queueMicrotask(resolve));
+        await Result.tryPromise<void, "metric-failed">({
+          try: async () => await this.onMetric?.(metric),
+          catch: () => "metric-failed",
         });
+      })();
     });
   }
 

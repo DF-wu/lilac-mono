@@ -13,7 +13,7 @@ import {
   type EventDeadLetterAcceptFailed,
   type EventDeadLetterRecord,
 } from "./event-dead-letter";
-import { managedRedisPhysicalGroup } from "./redis-managed-delivery";
+import { managedRedisPhysicalGroup, panic as signalEventBusPanic } from "./redis-managed-delivery";
 
 const DEFAULT_RECORD_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_INDEX_MAX_LEN = 10_000;
@@ -22,6 +22,21 @@ const NONCE_BYTES = 12;
 const AUTH_TAG_BYTES = 16;
 const CIPHERTEXT_VERSION = 1 as const;
 const CIPHERTEXT_ALGORITHM = "aes-256-gcm" as const;
+
+type CapturedDeadLetterFailure =
+  | { readonly kind: "panic"; readonly panic: Panic }
+  | { readonly kind: "ordinary"; readonly cause: unknown };
+
+function captureDeadLetterFailure(cause: unknown): () => CapturedDeadLetterFailure {
+  return () => {
+    const inspected = Result.try({
+      try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),
+      catch: () => undefined,
+    });
+    const panic = inspected.match({ ok: (value) => value, err: () => undefined });
+    return panic ? { kind: "panic", panic } : { kind: "ordinary", cause };
+  };
+}
 
 export type RedisEventDeadLetterOptions = {
   readonly redis: Redis;
@@ -173,17 +188,23 @@ function decodeCanonicalBase64(value: string, expectedBytes?: number): Buffer | 
 export function decodeRedisEventDeadLetterCiphertextEnvelope(
   encoded: string,
 ): ResultType<RedisEventDeadLetterCiphertextEnvelope, RedisEventDeadLetterCiphertextInvalid> {
-  let serialized: unknown;
-  try {
-    serialized = JSON.parse(encoded);
-  } catch {
+  const serialized = Result.try({
+    try: () => JSON.parse(encoded),
+    catch: captureDeadLetterFailure,
+  });
+  const parseFailure = serialized
+    .mapError((settle) => settle())
+    .match({ ok: () => undefined, err: (failure) => failure });
+  if (parseFailure) {
     return Result.err(
       new RedisEventDeadLetterCiphertextInvalid({
         message: "Dead-letter ciphertext envelope is not valid JSON",
       }),
     );
   }
-  const decoded = ciphertextEnvelopeSchema.safeParse(serialized);
+  const decoded = ciphertextEnvelopeSchema.safeParse(
+    serialized.match({ ok: (value) => value, err: () => undefined }),
+  );
   if (!decoded.success) {
     return Result.err(
       new RedisEventDeadLetterCiphertextInvalid({
@@ -225,31 +246,45 @@ export function encryptRedisEventDeadLetterRecoveryValue(options: {
   });
   if ("error" in resolved) return Result.err(resolved.error);
   const encryptionKey = Buffer.from(options.encryptionKey);
-  try {
-    const nonce = randomBytes(NONCE_BYTES);
-    const cipher = createCipheriv(CIPHERTEXT_ALGORITHM, encryptionKey, nonce, {
-      authTagLength: AUTH_TAG_BYTES,
+  const encrypted = Result.try({
+    try: () => {
+      const nonce = randomBytes(NONCE_BYTES);
+      const cipher = createCipheriv(CIPHERTEXT_ALGORITHM, encryptionKey, nonce, {
+        authTagLength: AUTH_TAG_BYTES,
+      });
+      cipher.setAAD(authenticatedData(options.kind, options.identity));
+      const ciphertext = Buffer.concat([cipher.update(options.plaintext, "utf8"), cipher.final()]);
+      const envelope: RedisEventDeadLetterCiphertextEnvelope = {
+        version: CIPHERTEXT_VERSION,
+        algorithm: CIPHERTEXT_ALGORITHM,
+        kind: options.kind,
+        nonce: nonce.toString("base64"),
+        authTag: cipher.getAuthTag().toString("base64"),
+        ciphertext: ciphertext.toString("base64"),
+      };
+      return JSON.stringify(envelope);
+    },
+    catch: captureDeadLetterFailure,
+  });
+  const encryptionOutcome = encrypted
+    .mapError((settle) => settle())
+    .match<
+      | { readonly kind: "encrypted"; readonly value: string }
+      | { readonly kind: "failed"; readonly failure: CapturedDeadLetterFailure }
+    >({
+      ok: (value) => ({ kind: "encrypted", value }),
+      err: (failure) => ({ kind: "failed", failure }),
     });
-    cipher.setAAD(authenticatedData(options.kind, options.identity));
-    const ciphertext = Buffer.concat([cipher.update(options.plaintext, "utf8"), cipher.final()]);
-    const envelope: RedisEventDeadLetterCiphertextEnvelope = {
-      version: CIPHERTEXT_VERSION,
-      algorithm: CIPHERTEXT_ALGORITHM,
-      kind: options.kind,
-      nonce: nonce.toString("base64"),
-      authTag: cipher.getAuthTag().toString("base64"),
-      ciphertext: ciphertext.toString("base64"),
-    };
-    return Result.ok(JSON.stringify(envelope));
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new RedisEventDeadLetterEncryptFailed({
-        cause,
-        message: "Dead-letter value encryption failed",
-      }),
-    );
+  if (encryptionOutcome.kind === "encrypted") return Result.ok(encryptionOutcome.value);
+  if (encryptionOutcome.failure.kind === "panic") {
+    return signalEventBusPanic(encryptionOutcome.failure.panic);
   }
+  return Result.err(
+    new RedisEventDeadLetterEncryptFailed({
+      cause: encryptionOutcome.failure.cause,
+      message: "Dead-letter value encryption failed",
+    }),
+  );
 }
 
 export function decryptRedisEventDeadLetterRecoveryValue(options: {
@@ -306,24 +341,38 @@ export function decryptRedisEventDeadLetterRecoveryValue(options: {
     );
   }
 
-  try {
-    const decipher = createDecipheriv(CIPHERTEXT_ALGORITHM, config.encryptionKey, nonce, {
-      authTagLength: AUTH_TAG_BYTES,
+  const decrypted = Result.try({
+    try: () => {
+      const decipher = createDecipheriv(CIPHERTEXT_ALGORITHM, config.encryptionKey, nonce, {
+        authTagLength: AUTH_TAG_BYTES,
+      });
+      decipher.setAAD(authenticatedData(options.kind, options.expectedIdentity));
+      decipher.setAuthTag(authTag);
+      const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+      return plaintext.toString("utf8");
+    },
+    catch: captureDeadLetterFailure,
+  });
+  const decryptionOutcome = decrypted
+    .mapError((settle) => settle())
+    .match<
+      | { readonly kind: "decrypted"; readonly value: string }
+      | { readonly kind: "failed"; readonly failure: CapturedDeadLetterFailure }
+    >({
+      ok: (value) => ({ kind: "decrypted", value }),
+      err: (failure) => ({ kind: "failed", failure }),
     });
-    decipher.setAAD(authenticatedData(options.kind, options.expectedIdentity));
-    decipher.setAuthTag(authTag);
-    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-    return Result.ok(plaintext.toString("utf8"));
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new RedisEventDeadLetterAuthenticationFailed({
-        expectedIdentity: options.expectedIdentity,
-        cause,
-        message: "Dead-letter ciphertext authentication failed for the expected storage identity",
-      }),
-    );
+  if (decryptionOutcome.kind === "decrypted") return Result.ok(decryptionOutcome.value);
+  if (decryptionOutcome.failure.kind === "panic") {
+    return signalEventBusPanic(decryptionOutcome.failure.panic);
   }
+  return Result.err(
+    new RedisEventDeadLetterAuthenticationFailed({
+      expectedIdentity: options.expectedIdentity,
+      cause: decryptionOutcome.failure.cause,
+      message: "Dead-letter ciphertext authentication failed for the expected storage identity",
+    }),
+  );
 }
 
 const redisWireValueEvidenceSchema = z.discriminatedUnion("kind", [
@@ -728,17 +777,23 @@ export function decryptRedisEventDeadLetterRecord(options: {
   });
   if (TaggedError.is(decrypted)) return Result.err(decrypted);
 
-  let serialized: unknown;
-  try {
-    serialized = SuperJSON.parse(decrypted);
-  } catch {
+  const serialized = Result.try({
+    try: () => SuperJSON.parse(decrypted),
+    catch: captureDeadLetterFailure,
+  });
+  const parseFailure = serialized
+    .mapError((settle) => settle())
+    .match({ ok: () => undefined, err: (failure) => failure });
+  if (parseFailure) {
     return Result.err(
       new RedisEventDeadLetterRecordInvalid({
         message: "Decrypted dead-letter record serialization is invalid",
       }),
     );
   }
-  const record = decodeEventDeadLetterRecord(serialized);
+  const record = decodeEventDeadLetterRecord(
+    serialized.match({ ok: (value) => value, err: () => undefined }),
+  );
   if (record.status === "error") {
     return Result.err(
       new RedisEventDeadLetterRecordInvalid({

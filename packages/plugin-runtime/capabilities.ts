@@ -111,11 +111,10 @@ export function getServerToolCapabilitySnapshot(
 }
 
 export function isPluginPanic(value: unknown): value is Panic {
-  try {
-    return Panic.is(value);
-  } catch {
-    return false;
-  }
+  return Result.try({ try: () => Panic.is(value), catch: () => undefined }).match({
+    ok: (isValuePanic) => isValuePanic,
+    err: () => false,
+  });
 }
 
 export function isFunctionCapability(value: unknown): value is PluginFunctionCapability {
@@ -375,40 +374,41 @@ function redactAndBoundPluginExceptionMessage(value: string): string {
 }
 
 export function opaquePluginExceptionMessage(cause: unknown): string {
-  try {
-    if (TaggedError.is(cause)) return "External tagged error";
-  } catch {
-    return "Unknown plugin exception";
-  }
+  const tagged = Result.try({ try: () => TaggedError.is(cause), catch: () => undefined });
+  const isTagged = tagged.match({ ok: (value) => value, err: () => undefined });
+  if (isTagged === undefined) return "Unknown plugin exception";
+  if (isTagged) return "External tagged error";
 
   if (typeof cause === "string") return redactAndBoundPluginExceptionMessage(cause);
-  try {
-    if (cause instanceof Error) {
+  const errorMessage = Result.try({
+    try: () => {
+      if (!(cause instanceof Error)) return undefined;
       const message = cause.message;
       return typeof message === "string" && message.length > 0
         ? redactAndBoundPluginExceptionMessage(message)
         : "External Error";
-    }
-  } catch {
-    return "Unknown plugin exception";
-  }
-
-  try {
-    return redactAndBoundPluginExceptionMessage(String(cause));
-  } catch {
-    return "Unknown plugin exception";
-  }
+    },
+    catch: () => undefined,
+  });
+  const projected = errorMessage.match({ ok: (value) => value, err: () => null });
+  if (projected === null) return "Unknown plugin exception";
+  if (projected !== undefined) return projected;
+  return Result.try({
+    try: () => redactAndBoundPluginExceptionMessage(String(cause)),
+    catch: () => undefined,
+  }).match({ ok: (value) => value, err: () => "Unknown plugin exception" });
 }
 
 export function safePluginExceptionCause(cause: unknown): Error {
   const safeCause = new Error(opaquePluginExceptionMessage(cause));
-  try {
-    if (cause instanceof Error && cause.name === "ToolInputValidationError") {
-      safeCause.name = "ToolInputValidationError";
-    }
-  } catch {
-    safeCause.name = "Error";
-  }
+  const name = Result.try({
+    try: () =>
+      cause instanceof Error && cause.name === "ToolInputValidationError"
+        ? "ToolInputValidationError"
+        : safeCause.name,
+    catch: () => undefined,
+  }).match({ ok: (value) => value, err: () => "Error" });
+  safeCause.name = name;
   return safeCause;
 }
 
@@ -458,12 +458,16 @@ function capturePluginInspection<T, E>(params: {
   run: () => ResultType<T, E>;
   mapException: (cause: Error) => E;
 }): ResultType<T, E> {
-  try {
-    return params.run();
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(params.mapException(safePluginExceptionCause(cause)));
-  }
+  const captured = Result.try({ try: params.run, catch: (cause) => ({ cause }) });
+  const outcome = captured.match<
+    { readonly result: ResultType<T, E> } | { readonly cause: unknown }
+  >({
+    ok: (result) => ({ result }),
+    err: ({ cause }) => ({ cause }),
+  });
+  if ("result" in outcome) return outcome.result;
+  if (isPluginPanic(outcome.cause)) throw outcome.cause;
+  return Result.err(params.mapException(safePluginExceptionCause(outcome.cause)));
 }
 
 export function decodeDynamicToolPluginModule<TRuntimeContext>(

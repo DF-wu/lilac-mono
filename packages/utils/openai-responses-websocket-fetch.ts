@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import type { ResponsesTransportMode } from "./env";
-import { isPanic, isRecord } from "./runtime-utils";
+import { captureResultOutcome, isPanic, isRecord, settleSyncResult } from "./runtime-utils";
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS = "responses_websockets=2026-02-06";
+const WEBSOCKET_OPEN_STATE = 1;
 const CONTINUATION_CACHE_TTL_MS = 30 * 60 * 1000;
 const RESPONSES_WEBSOCKET_TIMEOUT_MS = 30_000;
 
@@ -54,18 +55,21 @@ export class ResponsesRequestBodyInvalid extends TaggedError("ResponsesRequestBo
 export function decodeResponsesRequestBody(
   text: string,
 ): ResultType<ResponsesRequestBody, ResponsesRequestBodyInvalid> {
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(text);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+  const captured = Result.try({
+    try: () => JSON.parse(text) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = captureResultOutcome(captured);
+  if (!outcome.ok && isPanic(outcome.error.cause)) throw outcome.error.cause;
+  if (!outcome.ok) {
     return Result.err(
       new ResponsesRequestBodyInvalid({
-        cause,
+        cause: outcome.error.cause,
         message: "Responses request body is not valid JSON",
       }),
     );
   }
+  const decoded = outcome.value;
   const parsed = responsesRequestBodySchema.safeParse(decoded);
   return parsed.success
     ? Result.ok(parsed.data)
@@ -86,6 +90,57 @@ export function signalResponsesStreamError<T>(
   error: Error,
 ): void {
   controller.error(error);
+}
+
+type CapturedResponsesFailure =
+  | { readonly kind: "panic"; readonly panic: import("better-result").Panic }
+  | { readonly kind: "error"; readonly error: Error };
+
+type CapturedResponsesResult<T> =
+  | { readonly kind: "value"; readonly value: T }
+  | CapturedResponsesFailure;
+
+function captureResponsesFailure(restoreCause: () => unknown): CapturedResponsesFailure {
+  const cause = restoreCause();
+  const panic = Result.try({
+    try: () => (Panic.is(cause) ? cause : undefined),
+    catch: () => undefined,
+  }).match({ ok: (value) => value, err: () => undefined });
+  return panic
+    ? { kind: "panic", panic }
+    : {
+        kind: "error",
+        error:
+          cause instanceof Error
+            ? cause
+            : new Error(
+                typeof cause === "object" && cause !== null
+                  ? "Opaque Responses stream failure"
+                  : String(cause),
+              ),
+      };
+}
+
+function settleResponsesResult<T>(
+  result: ResultType<T, { readonly restoreCause: () => unknown }>,
+): CapturedResponsesResult<T> {
+  return result.match<CapturedResponsesResult<T>>({
+    ok: (value) => ({ kind: "value", value }),
+    err: ({ restoreCause }) => captureResponsesFailure(restoreCause),
+  });
+}
+
+function responsesFailureError(failure: CapturedResponsesFailure): Error {
+  return failure.kind === "panic" ? failure.panic : failure.error;
+}
+
+function captureResponsesSyncFailure(effect: () => void): CapturedResponsesFailure | null {
+  const captured = Result.try({
+    try: effect,
+    catch: (cause) => ({ restoreCause: () => cause }),
+  });
+  const outcome = settleResponsesResult(captured);
+  return outcome.kind === "value" ? null : outcome;
 }
 
 type ResponsesContinuationCacheEntry = {
@@ -138,7 +193,7 @@ export function createOpenAIResponsesWebSocketFetch(
   const idleTimeoutMs = options.idleTimeoutMs ?? RESPONSES_WEBSOCKET_TIMEOUT_MS;
 
   let ws: WebSocket | null = null;
-  let connecting: Promise<WebSocket> | null = null;
+  let connecting: Promise<ResultType<WebSocket, CapturedResponsesFailure>> | null = null;
   let connectingAbortController: AbortController | null = null;
   let connectingKey: string | null = null;
   let reusableBusy = false;
@@ -189,11 +244,8 @@ export function createOpenAIResponsesWebSocketFetch(
 
   function closeSocket(socket: WebSocket | null): void {
     if (!socket) return;
-    try {
-      socket.close();
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-    }
+    const outcome = settleSyncResult(() => socket.close());
+    if (outcome.kind === "panic") throw outcome.panic;
   }
 
   function clearIdleCloseTimer(): void {
@@ -204,7 +256,7 @@ export function createOpenAIResponsesWebSocketFetch(
 
   function scheduleIdleClose(): void {
     clearIdleCloseTimer();
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WEBSOCKET_OPEN_STATE) return;
 
     if (idleTimeoutMs <= 0) {
       closeSocket(ws);
@@ -215,7 +267,7 @@ export function createOpenAIResponsesWebSocketFetch(
     }
 
     idleCloseTimer = setTimeout(() => {
-      if (!reusableBusy && ws?.readyState === WebSocket.OPEN) {
+      if (!reusableBusy && ws?.readyState === WEBSOCKET_OPEN_STATE) {
         closeSocket(ws);
         ws = null;
         connectionHeadersKey = null;
@@ -295,8 +347,8 @@ export function createOpenAIResponsesWebSocketFetch(
     socketUrl: string,
     headers: Record<string, string>,
     signal?: AbortSignal,
-  ): Promise<WebSocket> {
-    return new Promise<WebSocket>((resolve, reject) => {
+  ): Promise<ResultType<WebSocket, CapturedResponsesFailure>> {
+    return new Promise<ResultType<WebSocket, CapturedResponsesFailure>>((resolve) => {
       let socket: WebSocket | undefined;
       const WebSocketCtor = globalThis.WebSocket as typeof globalThis.WebSocket &
         WebSocketWithHeadersConstructor;
@@ -307,35 +359,41 @@ export function createOpenAIResponsesWebSocketFetch(
         socket?.removeEventListener("error", onError);
         signal?.removeEventListener("abort", onAbort);
       };
-      const rejectConnection = (error: Error) => {
+      const failConnection = (error: Error) => {
         cleanup();
         closeSocket(socket ?? null);
-        reject(error);
+        resolve(Result.err(captureResponsesFailure(() => error)));
       };
       const onOpen = () => {
         if (!socket) return;
         cleanup();
-        resolve(socket);
+        resolve(Result.ok(socket));
       };
-      const onError = (event: Event) => rejectConnection(extractWebSocketError(event));
+      const onError = (event: Event) => failConnection(extractWebSocketError(event));
       const onAbort = () =>
-        rejectConnection(
+        failConnection(
           projectResponsesStreamError(signal?.reason ?? new DOMException("Aborted", "AbortError")),
         );
       const timeout = setTimeout(() => {
-        rejectConnection(
+        failConnection(
           new DOMException("WebSocket connection timed out before opening", "TimeoutError"),
         );
       }, RESPONSES_WEBSOCKET_TIMEOUT_MS);
 
-      try {
-        signal?.throwIfAborted();
-        socket = new WebSocketCtor(socketUrl, { headers });
-      } catch (error) {
+      const created = Result.try({
+        try: () => {
+          signal?.throwIfAborted();
+          return new WebSocketCtor(socketUrl, { headers });
+        },
+        catch: (cause) => ({ restoreCause: () => cause }),
+      });
+      const outcome = settleResponsesResult(created);
+      if (outcome.kind !== "value") {
         cleanup();
-        reject(projectResponsesStreamError(error));
+        resolve(Result.err(outcome));
         return;
       }
+      socket = outcome.value;
 
       socket.addEventListener("open", onOpen, { once: true });
       socket.addEventListener("error", onError, { once: true });
@@ -354,11 +412,11 @@ export function createOpenAIResponsesWebSocketFetch(
     socketUrl: string,
     headers: Record<string, string>,
     signal?: AbortSignal,
-  ): Promise<WebSocket> {
+  ): Promise<ResultType<WebSocket, CapturedResponsesFailure>> {
     const key = getConnectionKey(socketUrl, headers);
 
-    if (ws?.readyState === WebSocket.OPEN && connectionHeadersKey === key) {
-      return Promise.resolve(ws);
+    if (ws?.readyState === WEBSOCKET_OPEN_STATE && connectionHeadersKey === key) {
+      return Promise.resolve(Result.ok(ws));
     }
 
     if (connecting && connectingKey === key) {
@@ -377,8 +435,15 @@ export function createOpenAIResponsesWebSocketFetch(
       ? AbortSignal.any([signal, connectionController.signal])
       : connectionController.signal;
     connectingAbortController = connectionController;
-    connecting = connectWebSocket(socketUrl, headers, connectionSignal)
-      .then((socket) => {
+    connecting = (async () => {
+      const connected = captureResultOutcome(
+        await connectWebSocket(socketUrl, headers, connectionSignal),
+      );
+      let result: ResultType<WebSocket, CapturedResponsesFailure>;
+      if (!connected.ok) {
+        result = Result.err(connected.error);
+      } else {
+        const socket = connected.value;
         ws = socket;
         connectionHeadersKey = key;
         socket.addEventListener(
@@ -392,15 +457,15 @@ export function createOpenAIResponsesWebSocketFetch(
           },
           { once: true },
         );
-        return socket;
-      })
-      .finally(() => {
-        connecting = null;
-        connectingKey = null;
-        if (connectingAbortController === connectionController) {
-          connectingAbortController = null;
-        }
-      });
+        result = Result.ok(socket);
+      }
+      connecting = null;
+      connectingKey = null;
+      if (connectingAbortController === connectionController) {
+        connectingAbortController = null;
+      }
+      return result;
+    })();
 
     connectingKey = key;
 
@@ -462,19 +527,19 @@ export function createOpenAIResponsesWebSocketFetch(
       clearIdleCloseTimer();
     }
 
-    let connection: WebSocket;
-    try {
-      connection = useReusableConnection
-        ? await getConnection(socketUrl, wsHeaders, signal ?? undefined)
-        : await connectWebSocket(socketUrl, wsHeaders, signal ?? undefined);
-    } catch (error) {
+    const connected = await (useReusableConnection
+      ? getConnection(socketUrl, wsHeaders, signal ?? undefined)
+      : connectWebSocket(socketUrl, wsHeaders, signal ?? undefined));
+    const connectOutcome = captureResultOutcome(connected);
+    if (!connectOutcome.ok) {
       if (useReusableConnection) reusableBusy = false;
+      const connectionError = responsesFailureError(connectOutcome.error);
       if (signal?.aborted) throw projectResponsesStreamError(signal.reason);
       if (options.mode === "auto") {
         reportAutoFallback({
           reason: "websocket_connect_failed",
           requestUrl,
-          error,
+          error: connectionError,
         });
         reportTransportSelected({
           requestUrl,
@@ -484,8 +549,9 @@ export function createOpenAIResponsesWebSocketFetch(
         });
         return forwardWithSseNormalization();
       }
-      throw error;
+      throw connectionError;
     }
+    const connection = connectOutcome.value;
     const { stream: _stream, ...requestBody } = parsedBody;
     const fullRequestBody = cloneJsonObject(requestBody);
     pruneContinuationCache(Date.now());
@@ -560,15 +626,9 @@ export function createOpenAIResponsesWebSocketFetch(
 
         const enqueueNormalizedEvent = (event: Record<string, unknown>): boolean => {
           const bytes = encoder.encode(`data: ${JSON.stringify(event)}\n\n`);
-          try {
-            controller.enqueue(bytes);
-            forwardedEventCount++;
-            return true;
-          } catch (cause) {
-            if (isPanic(cause)) throw cause;
-            cleanup({ closeConnection: true });
-            return false;
-          }
+          controller.enqueue(bytes);
+          forwardedEventCount++;
+          return true;
         };
 
         const flushPendingPreOutputEvents = (): boolean => {
@@ -612,105 +672,100 @@ export function createOpenAIResponsesWebSocketFetch(
 
         const onMessage = (event: Event) => {
           void (async () => {
-            if (cleanedUp) return;
-            const text = await decodeWebSocketData(event);
-            if (cleanedUp) return;
-            if (!text) return;
+            const handled = await Result.tryPromise({
+              try: async () => {
+                if (cleanedUp) return;
+                const text = await decodeWebSocketData(event);
+                if (cleanedUp) return;
+                if (!text) return;
 
-            let eventJson: unknown;
-            try {
-              eventJson = JSON.parse(text);
-            } catch (cause) {
-              if (isPanic(cause)) throw cause;
-              return;
-            }
+                const eventJson = JSON.parse(text) as unknown;
 
-            const eventRecord = asRecord(eventJson);
-            if (!eventRecord) return;
-            responseTurnState ??= extractTurnState(eventRecord, options.turnStateHeaderName);
-            const nextResponseId = extractResponseId(eventRecord);
-            if (nextResponseId) {
-              responseId = nextResponseId;
-            }
+                const eventRecord = asRecord(eventJson);
+                if (!eventRecord) return;
+                responseTurnState ??= extractTurnState(eventRecord, options.turnStateHeaderName);
+                const nextResponseId = extractResponseId(eventRecord);
+                if (nextResponseId) {
+                  responseId = nextResponseId;
+                }
 
-            updateOutputItemDraft(outputItemDrafts, eventRecord);
-            const doneItem = extractOutputItemDone(eventRecord);
-            if (doneItem) {
-              outputItems.push(mergeOutputItemDraft(doneItem, outputItemDrafts));
-            }
-            const projectedEvent = projectResponsesEvent(eventRecord);
-            if (options.turnStateHeaderName && projectedEvent.type === "response.metadata") {
-              return;
-            }
+                updateOutputItemDraft(outputItemDrafts, eventRecord);
+                const doneItem = extractOutputItemDone(eventRecord);
+                if (doneItem) {
+                  outputItems.push(mergeOutputItemDraft(doneItem, outputItemDrafts));
+                }
+                const projectedEvent = projectResponsesEvent(eventRecord);
+                if (options.turnStateHeaderName && projectedEvent.type === "response.metadata") {
+                  return;
+                }
 
-            const normalized = projectResponsesEvent(
-              normalizeResponsesEvent(eventRecord, normalizeEvent),
-            );
+                const normalized = projectResponsesEvent(
+                  normalizeResponsesEvent(eventRecord, normalizeEvent),
+                );
 
-            if (isPreviousResponseNotFoundError(normalized.record) && retryWithoutOptimization()) {
-              return;
-            }
+                if (
+                  isPreviousResponseNotFoundError(normalized.record) &&
+                  retryWithoutOptimization()
+                ) {
+                  return;
+                }
 
-            const type = normalized.type;
-            if (forwardedEventCount === 0 && isPreOutputMetadataEvent(type)) {
-              pendingPreOutputEvents.push(normalized.record);
-              return;
-            }
+                const type = normalized.type;
+                if (forwardedEventCount === 0 && isPreOutputMetadataEvent(type)) {
+                  pendingPreOutputEvents.push(normalized.record);
+                  return;
+                }
 
-            if (!flushPendingPreOutputEvents()) return;
-            if (!enqueueNormalizedEvent(normalized.record)) return;
+                if (!flushPendingPreOutputEvents()) return;
+                if (!enqueueNormalizedEvent(normalized.record)) return;
 
-            if (type === "error") {
-              canPersistContinuation = false;
-            }
-            if (completionEventTypes.has(type) || type === "error") {
-              if (
-                useReusableConnection &&
-                canPersistContinuation &&
-                responseId &&
-                connection === ws &&
-                connection.readyState === WebSocket.OPEN
-              ) {
-                storeReusableContinuation({
-                  requestBody: fullRequestBody,
-                  requestUrl,
-                  responseId,
-                  outputItems,
-                  turnState: responseTurnState,
-                });
-              }
-              try {
-                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-              } catch (cause) {
-                if (isPanic(cause)) throw cause;
-                cleanup({ closeConnection: true });
-                return;
-              }
-              cleanup({ closeConnection: type === "error" });
-              if (type === "error" && useReusableConnection) {
-                storeReusableTurnStateRetry(fullRequestBody, responseTurnState);
-              }
-              try {
-                controller.close();
-              } catch (cause) {
-                if (isPanic(cause)) throw cause;
-              }
-            }
-          })().catch((error: unknown) => {
+                if (type === "error") {
+                  canPersistContinuation = false;
+                }
+                if (completionEventTypes.has(type) || type === "error") {
+                  if (
+                    useReusableConnection &&
+                    canPersistContinuation &&
+                    responseId &&
+                    connection === ws &&
+                    connection.readyState === WEBSOCKET_OPEN_STATE
+                  ) {
+                    storeReusableContinuation({
+                      requestBody: fullRequestBody,
+                      requestUrl,
+                      responseId,
+                      outputItems,
+                      turnState: responseTurnState,
+                    });
+                  }
+                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                  cleanup({ closeConnection: type === "error" });
+                  if (type === "error" && useReusableConnection) {
+                    storeReusableTurnStateRetry(fullRequestBody, responseTurnState);
+                  }
+                  controller.close();
+                }
+              },
+              catch: (cause) => ({ restoreCause: () => cause }),
+            });
+            const handledOutcome = settleResponsesResult(handled);
+            if (handledOutcome.kind === "value") return;
+            const error = responsesFailureError(handledOutcome);
             canPersistContinuation = false;
             cleanup({ closeConnection: true });
             if (useReusableConnection) {
               storeReusableTurnStateRetry(fullRequestBody, responseTurnState);
             }
-            try {
-              signalResponsesStreamError(
-                controller,
-                isPanic(error) ? error : projectResponsesStreamError(error),
-              );
-            } catch (cause) {
-              if (isPanic(cause)) throw cause;
+            const signalled = Result.try({
+              try: () => signalResponsesStreamError(controller, error),
+              catch: (cause) => ({ restoreCause: () => cause }),
+            });
+            const signalOutcome = settleResponsesResult(signalled);
+            if (signalOutcome.kind !== "value") {
+              return Promise.reject(responsesFailureError(signalOutcome));
             }
-          });
+            return;
+          })();
         };
 
         const onError = (event: Event) => {
@@ -728,29 +783,27 @@ export function createOpenAIResponsesWebSocketFetch(
           if (useReusableConnection) {
             storeReusableTurnStateRetry(fullRequestBody, responseTurnState);
           }
-          try {
+          const outcome = settleSyncResult(() =>
             signalResponsesStreamError(
               controller,
               new Error("WebSocket closed before a terminal response event"),
-            );
-          } catch (cause) {
-            if (isPanic(cause)) throw cause;
-          }
+            ),
+          );
+          if (outcome.kind === "panic") throw outcome.panic;
         };
 
         const onAbort = () => {
           canPersistContinuation = false;
           cleanup({ closeConnection: true });
-          try {
+          const outcome = settleSyncResult(() =>
             signalResponsesStreamError(
               controller,
               projectResponsesStreamError(
                 signal?.reason ?? new DOMException("Aborted", "AbortError"),
               ),
-            );
-          } catch (cause) {
-            if (isPanic(cause)) throw cause;
-          }
+            ),
+          );
+          if (outcome.kind === "panic") throw outcome.panic;
         };
 
         connection.addEventListener("message", onMessage);
@@ -765,15 +818,19 @@ export function createOpenAIResponsesWebSocketFetch(
           signal.addEventListener("abort", onAbort, { once: true });
         }
 
-        try {
-          sendPayload(websocketPayload);
-        } catch (error) {
+        const sendOutcome = settleSyncResult(() => sendPayload(websocketPayload));
+        if (sendOutcome.kind !== "value") {
           canPersistContinuation = false;
           cleanup({ closeConnection: true });
           if (useReusableConnection) {
             storeReusableTurnStateRetry(fullRequestBody, responseTurnState);
           }
-          signalResponsesStreamError(controller, projectResponsesStreamError(error));
+          signalResponsesStreamError(
+            controller,
+            sendOutcome.kind === "panic"
+              ? sendOutcome.panic
+              : projectResponsesStreamError(sendOutcome.restoreCause()),
+          );
         }
       },
     });
@@ -1469,65 +1526,128 @@ function maybeNormalizeResponsesSseResponse(input: {
   if (!/text\/event-stream/i.test(contentType)) return response;
 
   const source = response.body;
+  const reader = source.getReader();
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  let sawTerminalEvent = false;
+  let released = false;
+
+  const releaseReader = (): CapturedResponsesFailure | null => {
+    if (released) return null;
+    released = true;
+    return captureResponsesSyncFailure(() => reader.releaseLock());
+  };
+
+  const signalFailureAndRelease = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    primaryFailure: CapturedResponsesFailure,
+  ): CapturedResponsesFailure | null => {
+    const signalFailure = captureResponsesSyncFailure(() =>
+      signalResponsesStreamError(controller, responsesFailureError(primaryFailure)),
+    );
+    releaseReader();
+    return signalFailure;
+  };
+
+  const flushFrame = (controller: ReadableStreamDefaultController<Uint8Array>, frame: string) => {
+    if (frame.length === 0) return;
+    const next = normalizeSseFrame(frame, normalizeEvent);
+    if (completionEventTypes.has(next.type) || next.type === "error") {
+      sawTerminalEvent = true;
+    }
+    controller.enqueue(encoder.encode(next.frame));
+  };
+
   const transformed = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const reader = source.getReader();
-      const encoder = new TextEncoder();
-      const decoder = new TextDecoder();
-      let buffered = "";
-      let sawTerminalEvent = false;
-
-      const flushFrame = (frame: string) => {
-        if (frame.length === 0) return;
-        const next = normalizeSseFrame(frame, normalizeEvent);
-        if (completionEventTypes.has(next.type) || next.type === "error") {
-          sawTerminalEvent = true;
+    async pull(controller) {
+      while (true) {
+        const read = await Result.tryPromise({
+          try: () => reader.read(),
+          catch: (cause) => ({ restoreCause: () => cause }),
+        });
+        const readOutcome = settleResponsesResult(read);
+        if (readOutcome.kind !== "value") {
+          signalFailureAndRelease(controller, readOutcome);
+          return;
         }
-        controller.enqueue(encoder.encode(next.frame));
-      };
 
-      void (async () => {
-        try {
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            if (!value) continue;
-
-            buffered += decoder.decode(value, { stream: true });
-
-            while (true) {
-              const split = findSseFrameDelimiter(buffered);
-              if (!split) break;
-              const frame = buffered.slice(0, split.index);
-              buffered = buffered.slice(split.index + split.delimiterLength);
-              flushFrame(frame);
+        let emittedFrame = false;
+        const processed = Result.try({
+          try: () => {
+            const { value, done } = readOutcome.value;
+            if (!done && value) {
+              buffered += decoder.decode(value, { stream: true });
+              while (true) {
+                const split = findSseFrameDelimiter(buffered);
+                if (!split) break;
+                const frame = buffered.slice(0, split.index);
+                buffered = buffered.slice(split.index + split.delimiterLength);
+                flushFrame(controller, frame);
+                emittedFrame = true;
+              }
             }
-          }
-
-          const tail = decoder.decode();
-          if (tail.length > 0) {
-            buffered += tail;
-          }
-          if (buffered.length > 0) {
-            flushFrame(buffered);
-          }
-
-          if (!sawTerminalEvent) {
-            signalResponsesStreamError(
-              controller,
-              new Error("Response stream ended before a terminal response event"),
-            );
-            return;
-          }
-          controller.close();
-        } catch (error) {
-          signalResponsesStreamError(controller, projectResponsesStreamError(error));
-        } finally {
-          try {
-            reader.releaseLock();
-          } catch {}
+            return done;
+          },
+          catch: (cause) => ({ restoreCause: () => cause }),
+        });
+        const processedOutcome = settleResponsesResult(processed);
+        if (processedOutcome.kind !== "value") {
+          signalFailureAndRelease(controller, processedOutcome);
+          return;
         }
-      })();
+        if (processedOutcome.value) break;
+        if (emittedFrame) return;
+      }
+
+      const completed = Result.try({
+        try: () => {
+          const tail = decoder.decode();
+          if (tail.length > 0) buffered += tail;
+          if (buffered.length > 0) flushFrame(controller, buffered);
+        },
+        catch: (cause) => ({ restoreCause: () => cause }),
+      });
+      const completedOutcome = settleResponsesResult(completed);
+      if (completedOutcome.kind !== "value") {
+        signalFailureAndRelease(controller, completedOutcome);
+        return;
+      }
+
+      if (!sawTerminalEvent) {
+        const primaryFailure = captureResponsesFailure(
+          () => new Error("Response stream ended before a terminal response event"),
+        );
+        signalFailureAndRelease(controller, primaryFailure);
+        return;
+      }
+
+      const releaseFailure = releaseReader();
+      if (releaseFailure) {
+        const signalFailure = captureResponsesSyncFailure(() =>
+          signalResponsesStreamError(controller, responsesFailureError(releaseFailure)),
+        );
+        void signalFailure;
+        return;
+      }
+      const closeFailure = captureResponsesSyncFailure(() => controller.close());
+      if (closeFailure) {
+        const signalFailure = captureResponsesSyncFailure(() =>
+          signalResponsesStreamError(controller, responsesFailureError(closeFailure)),
+        );
+        void signalFailure;
+      }
+    },
+    cancel(reason) {
+      const cancelled = Result.try({
+        try: () => reader.cancel(reason),
+        catch: (cause) => ({ restoreCause: () => cause }),
+      });
+      const cancelledOutcome = settleResponsesResult(cancelled);
+      const releaseFailure = releaseReader();
+      if (cancelledOutcome.kind !== "value") return;
+      void releaseFailure;
+      return cancelledOutcome.value;
     },
   });
 
@@ -1558,22 +1678,22 @@ function normalizeSseFrame(
     return { frame: "data: [DONE]\n\n", type: "" };
   }
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(data) as unknown;
-  } catch {
-    return { frame: `${normalizedFrame}\n\n`, type: "" };
-  }
+  const decoded = Result.try({
+    try: () => JSON.parse(data) as unknown,
+    catch: () => undefined,
+  });
+  const parsed = decoded.match({ ok: (value) => value, err: () => undefined });
+  if (parsed === undefined) return { frame: `${normalizedFrame}\n\n`, type: "" };
 
   const event = asRecord(parsed);
   if (!event) {
     return { frame: `${normalizedFrame}\n\n`, type: "" };
   }
 
-  const normalized = normalizeResponsesEvent(event, normalizeEvent);
+  const normalized = projectResponsesEvent(normalizeResponsesEvent(event, normalizeEvent));
   return {
-    frame: `data: ${JSON.stringify(normalized)}\n\n`,
-    type: readString(normalized.type) ?? "",
+    frame: `data: ${JSON.stringify(normalized.record)}\n\n`,
+    type: normalized.type,
   };
 }
 
@@ -1847,11 +1967,11 @@ async function decodeRequestBody(input: FetchInput, init?: FetchInit): Promise<s
   if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
 
   if (input instanceof Request) {
-    try {
-      return await input.clone().text();
-    } catch {
-      return undefined;
-    }
+    const captured = await Result.tryPromise({
+      try: () => input.clone().text(),
+      catch: () => undefined,
+    });
+    return captured.match({ ok: (value) => value, err: () => undefined });
   }
 
   return undefined;

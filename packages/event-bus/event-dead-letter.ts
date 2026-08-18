@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { Err, Ok, Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
+import { panic as signalEventBusPanic } from "./redis-managed-delivery";
 import type { RedisMessageDecodeIssue, RedisWireValueEvidence, Topic } from "./types";
 
 export const EVENT_DEAD_LETTER_VERSION = 2 as const;
@@ -303,14 +304,49 @@ export function createTailEventDeadLetterRecord(options: {
   };
 }
 
-export function captureDeadLetterAcceptance(
+type CapturedDeadLetterAcceptanceFailure =
+  | { readonly kind: "failure"; readonly error: EventDeadLetterAcceptFailed }
+  | { readonly kind: "panic"; readonly panic: Panic };
+
+export async function captureDeadLetterAcceptance(
   operation: () => Promise<EventDeadLetterAcceptance>,
 ): Promise<ResultType<EventDeadLetterAcceptance, EventDeadLetterAcceptFailed>> {
-  return Result.tryPromise({
+  const captured = await Result.tryPromise({
     try: operation,
-    catch: (cause) => {
-      if (Panic.is(cause)) throw cause;
-      return new EventDeadLetterAcceptFailed({ cause, message: "Dead-letter acceptance failed" });
+    catch: (cause): (() => CapturedDeadLetterAcceptanceFailure) => {
+      return () => {
+        const inspectedPanic = Result.try({
+          try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),
+          catch: () => undefined,
+        });
+        const panic = inspectedPanic.match({ ok: (value) => value, err: () => undefined });
+        if (panic) return { kind: "panic" as const, panic };
+        return {
+          kind: "failure" as const,
+          error: new EventDeadLetterAcceptFailed({
+            cause,
+            message: "Dead-letter acceptance failed",
+          }),
+        };
+      };
     },
   });
+  const outcome = captured
+    .mapError((settle) => settle())
+    .match<
+      | {
+          readonly kind: "result";
+          readonly result: ResultType<EventDeadLetterAcceptance, EventDeadLetterAcceptFailed>;
+        }
+      | { readonly kind: "panic"; readonly panic: Panic }
+    >({
+      ok: (acceptance) => ({ kind: "result", result: Result.ok(acceptance) }),
+      err: (failure) =>
+        failure.kind === "panic" ? failure : { kind: "result", result: Result.err(failure.error) },
+    });
+  if (outcome.kind === "panic") {
+    const failure = outcome;
+    return signalEventBusPanic(failure.panic);
+  }
+  return outcome.result;
 }

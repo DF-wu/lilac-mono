@@ -6,7 +6,11 @@ import { z } from "zod";
 
 import { isRecord } from "@stanley2058/lilac-utils";
 
-import { rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
+import {
+  captureAgentOperation,
+  rethrowAgentPanic,
+  type OpaqueAgentValue,
+} from "./failure-adapters";
 
 const CANONICAL_HEAD_HASH_VERSION = 1 as const;
 const CANONICAL_HEAD_HASH_DOMAIN = "lilac:canonical-head:v1" as const;
@@ -232,8 +236,9 @@ class CanonicalJsonInvalid extends TaggedError("CanonicalJsonInvalid")<{
   readonly message: string;
 }> {}
 
-function signalCanonicalJsonInvalid(error: CanonicalJsonInvalid): never {
-  throw new TypeError(error.message);
+function signalCanonicalJsonInvalid(error: CanonicalJsonInvalid | OpaqueAgentValue): never {
+  if (error instanceof CanonicalJsonInvalid) throw new TypeError(error.message);
+  throw error;
 }
 
 function resultOutcome<T, E>(
@@ -266,7 +271,7 @@ function parseStrictJsonValue(
     );
   }
   ancestors.add(value);
-  try {
+  const parsedValue = captureAgentOperation(() => {
     if (Array.isArray(value)) {
       const result: StrictJsonValue[] = [];
       for (const item of value) {
@@ -294,9 +299,14 @@ function parseStrictJsonValue(
       entries.push([key, parsed.value]);
     }
     return Result.ok(Object.fromEntries(entries));
-  } finally {
-    ancestors.delete(value);
+  });
+  ancestors.delete(value);
+  const parsedOutcome = resultOutcome(parsedValue);
+  if (!parsedOutcome.ok) {
+    rethrowAgentPanic(parsedOutcome.error);
+    return signalCanonicalJsonInvalid(parsedOutcome.error);
   }
+  return parsedOutcome.value;
 }
 
 function requireStrictJsonValue(value: OpaqueAgentValue): StrictJsonValue {
@@ -396,12 +406,10 @@ function fileStringContentDigest(value: string): string {
   if (dataUrl) {
     const payload = dataUrl[1] ?? "";
     if (/^data:[^,]*;base64,/i.test(value)) return sha256(Buffer.from(payload, "base64"));
-    try {
-      return sha256(decodeURIComponent(payload));
-    } catch (cause) {
-      rethrowAgentPanic(cause);
-      return sha256(payload);
-    }
+    const decoded = resultOutcome(captureAgentOperation(() => decodeURIComponent(payload)));
+    if (decoded.ok) return sha256(decoded.value);
+    rethrowAgentPanic(decoded.error);
+    return sha256(payload);
   }
   return sha256(Buffer.from(value, "base64"));
 }
@@ -712,10 +720,16 @@ function sanitizeReplayValue(
   if (Array.isArray(value)) {
     const result: StrictJsonValue[] = [];
     for (let index = 0; index < value.length; index += 1) {
-      try {
-        result.push(sanitizeReplayValue(value[index], options, ancestors));
-      } catch (cause) {
-        rethrowAgentPanic(cause);
+      const sanitized:
+        | { ok: true; value: StrictJsonValue }
+        | { ok: false; error: OpaqueAgentValue } = resultOutcome(
+        captureAgentOperation(
+          (): StrictJsonValue => sanitizeReplayValue(value[index], options, ancestors),
+        ),
+      );
+      if (sanitized.ok) result.push(sanitized.value);
+      else {
+        rethrowAgentPanic(sanitized.error);
         result.push("[Unreadable value]");
       }
     }
@@ -741,10 +755,15 @@ function sanitizeReplayValue(
       entries.push([key, "[Payload omitted]"]);
       continue;
     }
-    try {
-      entries.push([key, sanitizeReplayValue(value[key], options, ancestors)]);
-    } catch (cause) {
-      rethrowAgentPanic(cause);
+    const sanitized: { ok: true; value: StrictJsonValue } | { ok: false; error: OpaqueAgentValue } =
+      resultOutcome(
+        captureAgentOperation(
+          (): StrictJsonValue => sanitizeReplayValue(value[key], options, ancestors),
+        ),
+      );
+    if (sanitized.ok) entries.push([key, sanitized.value]);
+    else {
+      rethrowAgentPanic(sanitized.error);
       entries.push([key, "[Unreadable value]"]);
     }
   }
@@ -763,12 +782,10 @@ function safeReplayJsonStringify(
 }
 
 function toolInputText(input: unknown): string {
-  try {
-    return canonicalJsonStringify(input);
-  } catch (cause) {
-    rethrowAgentPanic(cause);
-    return safeReplayJsonStringify(input, { stripMetadata: true, stripPayloads: true });
-  }
+  const serialized = resultOutcome(captureAgentOperation(() => canonicalJsonStringify(input)));
+  if (serialized.ok) return serialized.value;
+  rethrowAgentPanic(serialized.error);
+  return safeReplayJsonStringify(input, { stripMetadata: true, stripPayloads: true });
 }
 
 function toolOutputValueText(value: unknown): string {

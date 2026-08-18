@@ -1,4 +1,5 @@
 import { APICallError, RetryError } from "ai";
+import { Result } from "better-result";
 
 import { isRecord } from "./runtime-utils";
 
@@ -50,16 +51,20 @@ function sanitizeProviderText(value: string): string {
 }
 
 function sanitizeRequestUrl(value: string): string {
-  try {
-    const url = new URL(value);
-    url.username = "";
-    url.password = "";
-    url.search = "";
-    url.hash = "";
-    return truncate(url.toString(), MAX_URL_LENGTH);
-  } catch {
-    return truncate(value.split(/[?#]/u, 1)[0] ?? value, MAX_URL_LENGTH);
-  }
+  return Result.try({
+    try: () => {
+      const url = new URL(value);
+      url.username = "";
+      url.password = "";
+      url.search = "";
+      url.hash = "";
+      return truncate(url.toString(), MAX_URL_LENGTH);
+    },
+    catch: () => undefined,
+  }).match({
+    ok: (sanitized) => sanitized,
+    err: () => truncate(value.split(/[?#]/u, 1)[0] ?? value, MAX_URL_LENGTH),
+  });
 }
 
 function readString(value: unknown): string | undefined {
@@ -87,12 +92,16 @@ function parseProviderErrorDetails(value: unknown): ProviderErrorDetails {
 }
 
 function parseResponseBody(responseBody: string): ProviderErrorDetails {
-  try {
-    return parseProviderErrorDetails(JSON.parse(responseBody) as unknown);
-  } catch {
-    const providerMessage = sanitizeProviderText(responseBody.trim());
-    return providerMessage.length > 0 ? { providerMessage } : {};
-  }
+  return Result.try({
+    try: () => parseProviderErrorDetails(JSON.parse(responseBody) as unknown),
+    catch: () => undefined,
+  }).match({
+    ok: (details) => details,
+    err: () => {
+      const providerMessage = sanitizeProviderText(responseBody.trim());
+      return providerMessage.length > 0 ? { providerMessage } : {};
+    },
+  });
 }
 
 function locateAiErrors(
@@ -139,11 +148,12 @@ function locateAiErrors(
 
 export function extractAiErrorLogDetails(error: unknown): AiErrorLogDetails | undefined {
   const located: LocatedAiErrors = {};
-  try {
-    locateAiErrors(error, located, new Set<unknown>(), 0);
-  } catch {
-    return undefined;
-  }
+  const captured = Result.try({
+    try: () => locateAiErrors(error, located, new Set<unknown>(), 0),
+    catch: () => undefined,
+  });
+  const locatedSuccessfully = captured.match({ ok: () => true, err: () => false });
+  if (!locatedSuccessfully) return undefined;
 
   const apiCallError = located.apiCallError;
   const retryError = located.retryError;

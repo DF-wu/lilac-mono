@@ -547,7 +547,7 @@ describe("MiniLilacTransport", () => {
     }
     const ownedReader = ownedAdmission.value.getReader();
     const ownedPending = ownedReader.read();
-    const ownedReason = new Error("owned cancellation");
+    const ownedReason = "owned cancellation";
     ownedController.abort(ownedReason);
     if (ownedBodyController === undefined) throw new Error("expected owned body controller");
     ownedBodyController.error(ownedReason);

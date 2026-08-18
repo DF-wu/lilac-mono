@@ -10,7 +10,7 @@ import { createGroq } from "@ai-sdk/groq";
 import type { OpenAICompatibleProvider } from "@ai-sdk/openai-compatible";
 import { createGateway } from "ai";
 import { createClaudeCode, type ClaudeCodeSettings } from "ai-sdk-provider-claude-code";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { CODEX_BASE_INSTRUCTIONS } from "./codex-instructions";
@@ -28,7 +28,7 @@ import { createLogger } from "./logging";
 import { withOpenAIImageEditFilenamesFetch } from "./openai-image-edit-fetch";
 import { createOpenAIResponsesWebSocketFetch } from "./openai-responses-websocket-fetch";
 import { withLlmWireDebugFetch } from "./llm-wire-debug";
-import { isPanic, isRecord } from "./runtime-utils";
+import { captureResultOutcome, isPanic, isRecord } from "./runtime-utils";
 import { withServerCompactionRequestFetch } from "./server-compaction-request";
 
 let resolvedClaudeExecutable: string | null | undefined;
@@ -102,13 +102,13 @@ function decodeCodexRequestBody(body: unknown): string | undefined {
 const codexResponsesRequestRecordSchema = z.record(z.string(), z.unknown());
 
 export function decodeCodexResponsesRequestBody(body: string): Record<string, unknown> | undefined {
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(body);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return undefined;
-  }
+  const captured = Result.try({
+    try: () => JSON.parse(body) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = captureResultOutcome(captured);
+  if (!outcome.ok && isPanic(outcome.error.cause)) throw outcome.error.cause;
+  const decoded = outcome.ok ? outcome.value : undefined;
   const parsed = codexResponsesRequestRecordSchema.safeParse(decoded);
   return parsed.success ? parsed.data : undefined;
 }
@@ -315,10 +315,28 @@ export type CreateCodexOAuthProviderOptions = {
 
 const CODEX_REFRESH_CALLER_ABORTED = Symbol("codex-refresh-caller-aborted");
 
+type CapturedCodexRefreshFailure =
+  | { readonly kind: "panic"; readonly panic: import("better-result").Panic }
+  | { readonly kind: "defect"; readonly error: Error };
+type CodexRefreshOutcome = { readonly kind: "success" } | CapturedCodexRefreshFailure;
+
+function captureCodexRefreshFailure(restoreCause: () => unknown): CapturedCodexRefreshFailure {
+  const cause = restoreCause();
+  const panic = Result.try({
+    try: () => (Panic.is(cause) ? cause : undefined),
+    catch: () => undefined,
+  }).match({ ok: (value) => value, err: () => undefined });
+  if (panic) return { kind: "panic", panic };
+  return {
+    kind: "defect",
+    error: cause instanceof Error ? cause : new Error("Codex OAuth token refresh failed"),
+  };
+}
+
 async function waitForCodexRefresh(
-  refresh: Promise<void>,
+  refresh: Promise<CodexRefreshOutcome>,
   signal: AbortSignal,
-): Promise<void | typeof CODEX_REFRESH_CALLER_ABORTED> {
+): Promise<CodexRefreshOutcome | typeof CODEX_REFRESH_CALLER_ABORTED> {
   if (signal.aborted) return CODEX_REFRESH_CALLER_ABORTED;
   let removeAbortListener = () => {};
   const aborted = new Promise<typeof CODEX_REFRESH_CALLER_ABORTED>((resolve) => {
@@ -326,15 +344,13 @@ async function waitForCodexRefresh(
     removeAbortListener = () => signal.removeEventListener("abort", onAbort);
     signal.addEventListener("abort", onAbort, { once: true });
   });
-  try {
-    return await Promise.race([refresh, aborted]);
-  } finally {
-    removeAbortListener();
-  }
+  const outcome = await Promise.race([refresh, aborted]);
+  removeAbortListener();
+  return outcome;
 }
 
 export function createCodexOAuthProvider(options: CreateCodexOAuthProviderOptions = {}) {
-  let refreshInFlight: Promise<void> | null = null;
+  let refreshInFlight: Promise<CodexRefreshOutcome> | null = null;
   const readTokens = options.readTokens ?? readCodexTokens;
   const writeTokens = options.writeTokens ?? writeCodexTokens;
   const logger = createLogger({ module: "utils:model-provider" });
@@ -396,37 +412,56 @@ export function createCodexOAuthProvider(options: CreateCodexOAuthProviderOption
         );
       }
 
-      const refreshIfNeeded = async () => {
-        if (auth && !shouldRefreshCodexOAuthTokens(auth)) return;
+      const refreshIfNeeded = async (): Promise<
+        CodexRefreshOutcome | typeof CODEX_REFRESH_CALLER_ABORTED
+      > => {
+        if (auth && !shouldRefreshCodexOAuthTokens(auth)) return { kind: "success" };
         if (!refreshInFlight) {
-          refreshInFlight = (async () => {
-            const latest = await readTokens();
-            if (!latest) {
-              throw new Error(
-                "Codex OAuth not configured. Complete a Codex OAuth login to authenticate.",
-              );
-            }
-            if (!shouldRefreshCodexOAuthTokens(latest)) {
-              auth = latest;
-              return;
-            }
+          refreshInFlight = (async (): Promise<CodexRefreshOutcome> => {
+            const captured = await Result.tryPromise({
+              try: async () => {
+                const latest = await readTokens();
+                if (!latest) {
+                  return {
+                    kind: "defect" as const,
+                    error: new Error(
+                      "Codex OAuth not configured. Complete a Codex OAuth login to authenticate.",
+                    ),
+                  };
+                }
+                if (!shouldRefreshCodexOAuthTokens(latest)) {
+                  auth = latest;
+                  return { kind: "success" as const };
+                }
 
-            auth = await refreshCodexOAuthTokens(latest, { writeTokens });
-          })().finally(() => {
+                auth = await refreshCodexOAuthTokens(latest, { writeTokens });
+                return { kind: "success" as const };
+              },
+              catch: (cause) => ({ restoreCause: () => cause }),
+            });
             refreshInFlight = null;
-          });
+            return captured.match<CodexRefreshOutcome>({
+              ok: (outcome) => outcome,
+              err: ({ restoreCause }) => captureCodexRefreshFailure(restoreCause),
+            });
+          })();
         }
+        const activeRefresh = refreshInFlight;
+        if (!activeRefresh) return { kind: "success" };
         const callerSignal = init?.signal ?? undefined;
         if (!callerSignal) {
-          await refreshInFlight;
-        } else {
-          const outcome = await waitForCodexRefresh(refreshInFlight, callerSignal);
-          if (outcome === CODEX_REFRESH_CALLER_ABORTED) throw callerSignal.reason;
+          return activeRefresh;
         }
+        return waitForCodexRefresh(activeRefresh, callerSignal);
       };
 
       if (shouldRefreshCodexOAuthTokens(auth, now)) {
-        await refreshIfNeeded();
+        const refreshOutcome = await refreshIfNeeded();
+        if (refreshOutcome === CODEX_REFRESH_CALLER_ABORTED) {
+          throw init?.signal?.reason;
+        }
+        if (refreshOutcome.kind === "panic") throw refreshOutcome.panic;
+        if (refreshOutcome.kind === "defect") throw refreshOutcome.error;
         auth = await readTokens();
         if (!auth?.access) {
           throw new Error("Codex OAuth token refresh failed. Complete a new Codex OAuth login.");
