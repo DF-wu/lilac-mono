@@ -1,4 +1,6 @@
+import { captureError } from "../../shared/error-capture";
 import { createLogger, type CoreConfig } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 
 import type { ThreadMaterializer } from "../../conversation/thread-materializer";
 import { classifyConversationThreadMessageUpdate } from "../../conversation/thread-store";
@@ -91,15 +93,20 @@ export async function startDiscordSearchIndexer(params: {
   const inFlight = new Set<Promise<void>>();
   const subscription = await params.eventSource.subscribe((evt) => {
     let task: Promise<void>;
-    task = handleEvent(evt)
-      .catch((e) => {
-        logger.error("discord search indexer handler failed", e);
-      })
-      .finally(() => {
-        inFlight.delete(task);
-      });
+    task = observeEvent().finally(() => inFlight.delete(task));
     inFlight.add(task);
     return task;
+
+    async function observeEvent(): Promise<void> {
+      const handled = await Result.tryPromise({
+        try: () => handleEvent(evt),
+        catch: captureError,
+      });
+      handled.match({
+        ok: () => undefined,
+        err: ({ cause }) => logger.error("discord search indexer handler failed", cause),
+      });
+    }
   });
 
   return {

@@ -28,7 +28,7 @@ import {
   SurfacePlatformMismatch,
   SurfaceOperationPartiallyCompleted,
   SurfaceUnavailable,
-  surfaceExternalFallback,
+  settleSurfaceFallback,
   type SurfaceOperation,
   type SurfaceOperationResult,
 } from "../../adapter";
@@ -55,7 +55,11 @@ import {
 import { renderMarkdownTablesAsCodeBlocks } from "../../../shared/markdown-table-renderer";
 import { buildCancelCustomId } from "../discord-cancel";
 import { isTextSendableChannel, type SendableDiscordChannel } from "../discord-channel-guards";
-import { classifyDiscordSurfaceError, classifyDiscordSurfaceNotFound } from "../discord-adapter";
+import {
+  captureDiscordSurfaceError,
+  classifyDiscordSurfaceError,
+  classifyDiscordSurfaceNotFound,
+} from "../discord-adapter";
 
 function asDiscordMsgRef(channelId: string, messageId: string): MsgRef {
   return { platform: "discord", channelId, messageId };
@@ -116,33 +120,54 @@ async function captureDiscordOutputOperation<T>(
   operation: SurfaceOperation,
   effect: () => Promise<T>,
 ): Promise<SurfaceOperationResult<T>> {
-  try {
-    return Result.ok(await effect());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    if (cause instanceof DiscordOutputPlatformUnsupported) {
-      return Result.err(
-        new SurfacePlatformMismatch({
-          operation,
-          refRole: "sessionRef",
-          expectedPlatform: "discord",
-          receivedPlatform: cause.platform,
-          message: cause.message,
-        }),
-      );
-    }
-    if (cause instanceof DiscordOutputChannelUnavailable) {
-      return Result.err(
-        new SurfaceUnavailable({ platform: "discord", operation, message: cause.message }),
-      );
-    }
-    if (cause instanceof DiscordOutputInvariantViolation) {
-      throw new Panic({ message: "Discord output invariant violated", cause });
-    }
-    const classified = classifyDiscordSurfaceError(operation, cause);
-    if (classified) return Result.err(classified);
-    throw cause;
-  }
+  const captured = await Result.tryPromise({
+    try: effect,
+    catch: captureDiscordSurfaceError,
+  });
+  const outcome = captured.match<
+    | { readonly kind: "result"; readonly result: SurfaceOperationResult<T> }
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "failure"; readonly cause: Error }
+  >({
+    ok: (value) => ({ kind: "result", result: Result.ok(value) }),
+    err: (cause) => {
+      if (Panic.is(cause)) return { kind: "panic", panic: cause };
+      if (cause instanceof DiscordOutputPlatformUnsupported) {
+        return {
+          kind: "result",
+          result: Result.err(
+            new SurfacePlatformMismatch({
+              operation,
+              refRole: "sessionRef",
+              expectedPlatform: "discord",
+              receivedPlatform: cause.platform,
+              message: cause.message,
+            }),
+          ),
+        };
+      }
+      if (cause instanceof DiscordOutputChannelUnavailable) {
+        return {
+          kind: "result",
+          result: Result.err(
+            new SurfaceUnavailable({ platform: "discord", operation, message: cause.message }),
+          ),
+        };
+      }
+      if (cause instanceof DiscordOutputInvariantViolation) {
+        return {
+          kind: "panic",
+          panic: new Panic({ message: "Discord output invariant violated", cause }),
+        };
+      }
+      const classified = classifyDiscordSurfaceError(operation, cause);
+      if (classified) return { kind: "result", result: Result.err(classified) };
+      return { kind: "failure", cause };
+    },
+  });
+  if (outcome.kind === "panic") return adaptDiscordOutputResultToHost(Result.err(outcome.panic));
+  if (outcome.kind === "failure") return adaptDiscordOutputResultToHost(Result.err(outcome.cause));
+  return outcome.result;
 }
 
 function discordOutputSessionResult(
@@ -585,14 +610,28 @@ async function fetchExistingMessagesForResume(params: {
     if (ref.channelId !== channelId) continue;
     if (seen.has(ref.messageId)) continue;
 
-    let msg: Message;
-    try {
-      msg = await messagesApi.fetch(ref.messageId);
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (classifyDiscordSurfaceNotFound(cause)) continue;
-      throw cause;
+    const fetched = await Result.tryPromise({
+      try: () => messagesApi.fetch(ref.messageId),
+      catch: captureDiscordSurfaceError,
+    });
+    const outcome = fetched.match<
+      | { readonly kind: "message"; readonly msg: Message }
+      | { readonly kind: "continue" }
+      | { readonly kind: "failure"; readonly cause: Error | Panic }
+    >({
+      ok: (msg) => ({ kind: "message", msg }),
+      err: (cause) => {
+        if (Panic.is(cause)) return { kind: "failure", cause };
+        if (classifyDiscordSurfaceNotFound(cause)) return { kind: "continue" };
+        return { kind: "failure", cause };
+      },
+    });
+    if (outcome.kind === "failure") {
+      adaptDiscordOutputResultToHost(Result.err(outcome.cause));
+      continue;
     }
+    if (outcome.kind === "continue") continue;
+    const msg = outcome.msg;
 
     seen.add(ref.messageId);
     out.push(msg);
@@ -613,10 +652,15 @@ function toDiscordFiles(attachments: readonly SurfaceAttachment[]): MessageCreat
 }
 
 async function safeEdit(msg: Message, options: Parameters<Message["edit"]>[0]): Promise<boolean> {
-  const edited = await Result.tryPromise({
-    try: () => msg.edit(options),
-    catch: surfaceExternalFallback(false),
-  });
+  const edited = settleSurfaceFallback(
+    await Result.tryPromise({
+      try: () => msg.edit(options),
+      catch: (cause) =>
+        Panic.is(cause)
+          ? { kind: "panic", panic: cause, fallback: false }
+          : { kind: "fallback", fallback: false },
+    }),
+  );
   return edited.match({ ok: () => true, err: () => false });
 }
 
@@ -704,10 +748,15 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   }
 
   private notifyCreated(msgRef: MsgRef) {
-    Result.try({
-      try: () => this.deps.opts?.onMessageCreated?.(msgRef),
-      catch: surfaceExternalFallback(undefined),
-    });
+    settleSurfaceFallback(
+      Result.try({
+        try: () => this.deps.opts?.onMessageCreated?.(msgRef),
+        catch: (cause) =>
+          Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback: undefined }
+            : { kind: "fallback", fallback: undefined },
+      }),
+    );
   }
 
   private isPreviewMode(): boolean {
@@ -791,25 +840,40 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const { client } = this.deps;
     if (ref.platform !== "discord") return;
 
-    const fetchedChannel = await Result.tryPromise({
-      try: () => client.channels.fetch(ref.channelId),
-      catch: surfaceExternalFallback(null),
-    });
+    const fetchedChannel = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => client.channels.fetch(ref.channelId),
+        catch: (cause) =>
+          Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback: null }
+            : { kind: "fallback", fallback: null },
+      }),
+    );
     const channel = fetchedChannel.match({ ok: (value) => value, err: () => null });
     if (!channel || !("messages" in channel) || !channel.messages?.fetch) {
       return;
     }
 
-    const fetchedMessage = await Result.tryPromise({
-      try: () => channel.messages.fetch(ref.messageId),
-      catch: surfaceExternalFallback(null),
-    });
+    const fetchedMessage = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => channel.messages.fetch(ref.messageId),
+        catch: (cause) =>
+          Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback: null }
+            : { kind: "fallback", fallback: null },
+      }),
+    );
     const msg = fetchedMessage.match({ ok: (value) => value, err: () => null });
     if (!msg) return;
-    await Result.tryPromise({
-      try: () => msg.delete(),
-      catch: surfaceExternalFallback(undefined),
-    });
+    settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => msg.delete(),
+        catch: (cause) =>
+          Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback: undefined }
+            : { kind: "fallback", fallback: undefined },
+      }),
+    );
   }
 
   private shouldShowProgressTitle(): boolean {

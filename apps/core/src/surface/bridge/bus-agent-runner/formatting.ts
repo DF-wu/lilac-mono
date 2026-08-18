@@ -1,6 +1,7 @@
 /* oxlint-disable eslint/no-control-regex */
 
 import { Buffer } from "node:buffer";
+import { Result } from "better-result";
 
 export function formatInt(n: number): string {
   // Locale-independent grouping.
@@ -60,10 +61,6 @@ export function safeStringify(value: unknown): string {
   if (typeof value === "string") return value;
   if (value instanceof URL) return value.toString();
   if (value === undefined) return "undefined";
-  try {
-    const s = JSON.stringify(value);
-    return s ?? String(value);
-  } catch {
-    return String(value);
-  }
+  const serialized = Result.try({ try: () => JSON.stringify(value), catch: () => undefined });
+  return serialized.match({ ok: (text) => text ?? String(value), err: () => String(value) });
 }

@@ -8,6 +8,8 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
+import { captureRuntimeError } from "../../../runtime/error-format";
+
 export const AGENT_OUTPUT_FLUSH_INTERVAL_MS = 40;
 export const AGENT_OUTPUT_FLUSH_BYTES = 4 * 1024;
 
@@ -106,12 +108,20 @@ export function createAgentOutputPublisher(params: {
     };
     const settlement = settle();
     publicationTail = settlement;
-    const superviseSettlement = (cause: unknown): void => {
-      if (!Panic.is(cause) || reportedPanic) return;
-      reportedPanic = cause;
-      params.reportFatalPanic(cause);
-    };
-    void settlement.then(undefined, superviseSettlement);
+    const supervisedSettlement = Result.tryPromise({
+      try: () => settlement,
+      catch: captureRuntimeError,
+    });
+    void supervisedSettlement.then((result) =>
+      result.match({
+        ok: () => undefined,
+        err: (captured) => {
+          if (captured.kind !== "panic" || reportedPanic) return;
+          reportedPanic = captured.panic;
+          params.reportFatalPanic(captured.panic);
+        },
+      }),
+    );
     return publication;
   };
 

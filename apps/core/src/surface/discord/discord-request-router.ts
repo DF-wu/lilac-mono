@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import {
   createLogger,
   extractAiErrorLogDetails,
@@ -402,17 +403,26 @@ async function captureRouterRouting(
   topic: "evt.request" | "evt.adapter",
   operation: () => Promise<void | ResultType<void, BusRequestRouterRoutingError>>,
 ): Promise<ResultType<void, BusRequestRouterRoutingError>> {
-  try {
-    return (await operation()) ?? Result.ok(undefined);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return Result.err(
-      new BusRequestRouterRoutingError({
-        topic,
-        cause,
-        message: `Bus request router failed while handling ${topic}`,
-      }),
-    );
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return (await operation()) ?? Result.ok(undefined);
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (isPanic(cause)) throw cause;
+      return Result.err(
+        new BusRequestRouterRoutingError({
+          topic,
+          cause,
+          message: `Bus request router failed while handling ${topic}`,
+        }),
+      );
+    }
+    return attempt.value;
   }
 }
 
@@ -420,17 +430,26 @@ async function captureRouterActiveBatchGate(
   sessionId: string,
   operation: () => Promise<RouterGateDecision>,
 ): Promise<ResultType<RouterGateDecision, BusRequestRouterActiveBatchGateFailed>> {
-  try {
-    return Result.ok(await operation());
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return Result.err(
-      new BusRequestRouterActiveBatchGateFailed({
-        sessionId,
-        cause,
-        message: "Active-batch router gate failed",
-      }),
-    );
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await operation());
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (isPanic(cause)) throw cause;
+      return Result.err(
+        new BusRequestRouterActiveBatchGateFailed({
+          sessionId,
+          cause,
+          message: "Active-batch router gate failed",
+        }),
+      );
+    }
+    return attempt.value;
   }
 }
 
@@ -439,21 +458,30 @@ async function captureRouterDebounceFlush(input: {
   readonly operation: () => Promise<void>;
   readonly reportFatalPanic: (panic: Panic) => void;
 }): Promise<ResultType<void, BusRequestRouterDebounceFlushFailed>> {
-  try {
-    await input.operation();
-    return Result.ok(undefined);
-  } catch (cause) {
-    if (isPanic(cause)) {
-      input.reportFatalPanic(cause);
-      return Result.ok(undefined);
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        await input.operation();
+        return Result.ok(undefined);
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (isPanic(cause)) {
+        input.reportFatalPanic(cause);
+        return Result.ok(undefined);
+      }
+      return Result.err(
+        new BusRequestRouterDebounceFlushFailed({
+          sessionId: input.sessionId,
+          cause,
+          message: "Bus request router debounce flush failed",
+        }),
+      );
     }
-    return Result.err(
-      new BusRequestRouterDebounceFlushFailed({
-        sessionId: input.sessionId,
-        cause,
-        message: "Bus request router debounce flush failed",
-      }),
-    );
+    return attempt.value;
   }
 }
 
@@ -505,7 +533,7 @@ async function adaptRouterSelfLookup(
   return Result.tryPromise({
     try: operation,
     catch: <T>(cause: T) =>
-      isPanic(cause)
+      Panic.is(cause)
         ? cause
         : new DiscordRequestRouterAdapterSelfLookupRejected({
             cause,
@@ -526,7 +554,7 @@ async function adaptRouterSubscriptionStart(
   const captured = await Result.tryPromise({
     try: () => started,
     catch: <T>(cause: T) =>
-      isPanic(cause)
+      Panic.is(cause)
         ? cause
         : new DiscordRequestRouterSubscriptionStartRejected({
             cause,
@@ -782,33 +810,41 @@ export async function startDiscordRequestRouter(
   async function reloadCoreConfigIfNeeded(): Promise<void> {
     if (params.config) return;
 
-    try {
-      cfg = await getCoreConfig();
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          cfg = await getCoreConfig();
 
-      if (coreConfigReloadHadError) {
-        logger.info("core-config reload recovered", {
+          if (coreConfigReloadHadError) {
+            logger.info("core-config reload recovered", {
+              path: "core-config.yaml",
+            });
+          }
+
+          coreConfigReloadHadError = false;
+          lastCoreConfigReloadError = null;
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const e = attempt.error.cause;
+        if (isPanic(e)) throw e;
+        const failure = new BusRequestRouterConfigReloadFailed({
+          cause: e,
+          message: "Core config reload failed",
+        });
+        const logContext = formatBridgeTaggedErrorForLog(failure, {
           path: "core-config.yaml",
         });
-      }
+        const msg = logContext.errorMessage;
+        if (!coreConfigReloadHadError || lastCoreConfigReloadError !== msg) {
+          logger.warn("core-config reload failed; using last known config", logContext);
+        }
 
-      coreConfigReloadHadError = false;
-      lastCoreConfigReloadError = null;
-    } catch (e) {
-      if (isPanic(e)) throw e;
-      const failure = new BusRequestRouterConfigReloadFailed({
-        cause: e,
-        message: "Core config reload failed",
-      });
-      const logContext = formatBridgeTaggedErrorForLog(failure, {
-        path: "core-config.yaml",
-      });
-      const msg = logContext.errorMessage;
-      if (!coreConfigReloadHadError || lastCoreConfigReloadError !== msg) {
-        logger.warn("core-config reload failed; using last known config", logContext);
+        coreConfigReloadHadError = true;
+        lastCoreConfigReloadError = msg;
       }
-
-      coreConfigReloadHadError = true;
-      lastCoreConfigReloadError = msg;
     }
   }
 
@@ -943,45 +979,70 @@ export async function startDiscordRequestRouter(
   async function evaluateAdapterSuppression(
     evt: EvtAdapterMessageCreatedData,
   ): Promise<{ suppress: boolean; reason?: string }> {
-    if (!params.shouldSuppressAdapterEvent) return { suppress: false };
-    try {
-      return await params.shouldSuppressAdapterEvent({ evt });
-    } catch (cause) {
+    const shouldSuppressAdapterEvent = params.shouldSuppressAdapterEvent;
+    if (!shouldSuppressAdapterEvent) return { suppress: false };
+    const captured = await Result.tryPromise({
+      try: () => shouldSuppressAdapterEvent({ evt }),
+      catch: (cause) => ({ restoreCause: () => cause }),
+    });
+    const outcome = captured.match<
+      | {
+          readonly kind: "success";
+          readonly decision: Awaited<
+            ReturnType<NonNullable<typeof params.shouldSuppressAdapterEvent>>
+          >;
+        }
+      | { readonly kind: "failure"; readonly restoreCause: () => unknown }
+    >({
+      ok: (decision) => ({ kind: "success", decision }),
+      err: ({ restoreCause }) => ({ kind: "failure", restoreCause }),
+    });
+    if (outcome.kind === "failure") {
+      const cause = outcome.restoreCause();
       if (isPanic(cause)) throw cause;
+      const error = new BusRequestRouterSuppressionFailed({
+        cause,
+        message: "Router suppression hook failed",
+      });
       logger.error(
         "router suppression hook failed; proceeding",
-        formatBridgeTaggedErrorForLog(
-          new BusRequestRouterSuppressionFailed({
-            cause,
-            message: "Router suppression hook failed",
-          }),
-        ),
+        formatBridgeTaggedErrorForLog(error),
       );
       return { suppress: false };
     }
+    return outcome.decision;
   }
 
   async function evaluateDirectReplyRouterGate(input: {
     readonly sessionId: string;
     readonly gateInput: RouterGateInput;
   }): Promise<RouterGateDecision> {
-    try {
-      return await evaluateRouterGate(input.gateInput);
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-      const failure = new BusRequestRouterActiveBatchGateFailed({
-        sessionId: input.sessionId,
-        cause,
-        message: "Direct-reply router gate failed",
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          return await evaluateRouterGate(input.gateInput);
+        },
+        catch: captureError,
       });
-      logger.error(
-        "router direct-reply gate failed; forwarding",
-        formatBridgeTaggedErrorForLog(failure, {
+
+      if (attempt.isErr()) {
+        const cause = attempt.error.cause;
+        if (isPanic(cause)) throw cause;
+        const failure = new BusRequestRouterActiveBatchGateFailed({
           sessionId: input.sessionId,
-          ...extractAiErrorLogDetails(cause),
-        }),
-      );
-      return { forward: true, reason: "error-fail-open" };
+          cause,
+          message: "Direct-reply router gate failed",
+        });
+        logger.error(
+          "router direct-reply gate failed; forwarding",
+          formatBridgeTaggedErrorForLog(failure, {
+            sessionId: input.sessionId,
+            ...extractAiErrorLogDetails(cause),
+          }),
+        );
+        return { forward: true, reason: "error-fail-open" };
+      }
+      return attempt.value;
     }
   }
 
@@ -2830,9 +2891,7 @@ export async function startDiscordRequestRouter(
       done,
       restoreActiveOutputChains,
       stop: async () => {
-        try {
-          await adaptRouterSubscriptionsStop(subscriptions);
-        } finally {
+        await adaptRouterSubscriptionsStop(subscriptions).finally(() => {
           for (const b of buffers.values()) {
             if (b.timer) clearTimeout(b.timer);
           }
@@ -2840,7 +2899,7 @@ export async function startDiscordRequestRouter(
           pendingMentionReplyBatchBySession.clear();
           terminalLifecycleTombstones.clear();
           terminalLifecycleTombstoneOverflow = false;
-        }
+        });
       },
     }),
   };

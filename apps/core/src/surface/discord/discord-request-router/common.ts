@@ -1,3 +1,4 @@
+import { captureError } from "../../../shared/error-capture";
 import type { EvtAdapterMessageCreatedData } from "@stanley2058/lilac-event-bus";
 import {
   getDiscordUserAliasValue,
@@ -6,6 +7,7 @@ import {
   parseCoreConfigResult,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 import { z } from "zod";
 
 import type { MsgRefFor } from "../../runtime-descriptor";
@@ -350,34 +352,44 @@ const discordFlagsSchema = z.strictObject({
 export type DiscordFlags = z.output<typeof discordFlagsSchema>;
 
 export function getDiscordFlags(raw: unknown): DiscordFlags {
-  try {
-    if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const captured = Result.try({
+    try: (): DiscordFlags => {
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
 
-    const discordDescriptor = Object.getOwnPropertyDescriptor(raw, "discord");
-    if (!discordDescriptor || !("value" in discordDescriptor)) return {};
+      const discordDescriptor = Object.getOwnPropertyDescriptor(raw, "discord");
+      if (!discordDescriptor || !("value" in discordDescriptor)) return {};
 
-    const discord = discordDescriptor.value;
-    if (discord === null || typeof discord !== "object" || Array.isArray(discord)) return {};
+      const discord = discordDescriptor.value;
+      if (discord === null || typeof discord !== "object" || Array.isArray(discord)) return {};
 
-    const ownDataProperty = (key: keyof DiscordFlags): unknown => {
-      const descriptor = Object.getOwnPropertyDescriptor(discord, key);
-      return descriptor && "value" in descriptor ? descriptor.value : undefined;
-    };
-    const parsed = discordFlagsSchema.safeParse({
-      isDMBased: ownDataProperty("isDMBased"),
-      mentionsBot: ownDataProperty("mentionsBot"),
-      replyToBot: ownDataProperty("replyToBot"),
-      replyToMessageId: ownDataProperty("replyToMessageId"),
-      parentChannelId: ownDataProperty("parentChannelId"),
-      guildId: ownDataProperty("guildId"),
-      sessionModelOverride: ownDataProperty("sessionModelOverride"),
-      botUserId: ownDataProperty("botUserId"),
-    });
-    return parsed.success ? parsed.data : {};
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return {};
-  }
+      const ownDataProperty = (key: keyof DiscordFlags): unknown => {
+        const descriptor = Object.getOwnPropertyDescriptor(discord, key);
+        return descriptor && "value" in descriptor ? descriptor.value : undefined;
+      };
+      const parsed = discordFlagsSchema.safeParse({
+        isDMBased: ownDataProperty("isDMBased"),
+        mentionsBot: ownDataProperty("mentionsBot"),
+        replyToBot: ownDataProperty("replyToBot"),
+        replyToMessageId: ownDataProperty("replyToMessageId"),
+        parentChannelId: ownDataProperty("parentChannelId"),
+        guildId: ownDataProperty("guildId"),
+        sessionModelOverride: ownDataProperty("sessionModelOverride"),
+        botUserId: ownDataProperty("botUserId"),
+      });
+      return parsed.success ? parsed.data : {};
+    },
+    catch: captureError,
+  }).match<
+    | { readonly kind: "success"; readonly flags: DiscordFlags }
+    | { readonly kind: "failure"; readonly failure: { readonly cause: unknown } }
+  >({
+    ok: (flags) => ({ kind: "success", flags }),
+    err: (failure) => ({ kind: "failure", failure }),
+  });
+  if (captured.kind === "success") return captured.flags;
+  const cause = captured.failure.cause;
+  if (isPanic(cause)) throw cause;
+  return {};
 }
 
 export type RouterConfigOverride = Record<string, unknown>;

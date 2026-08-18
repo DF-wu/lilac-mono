@@ -1,3 +1,5 @@
+import { captureError } from "../../../shared/error-capture";
+import { Result } from "better-result";
 import { Buffer } from "node:buffer";
 
 import type { UserContent } from "ai";
@@ -240,11 +242,19 @@ export async function appendDiscordAttachmentsToUserContent(
   state: DiscordAttachmentState,
 ): Promise<void> {
   for (const att of attachments) {
-    let url: URL;
-    try {
-      url = new URL(att.url);
-    } catch {
-      continue;
+    let url!: URL;
+    {
+      const attempt = Result.try({
+        try: () => {
+          url = new URL(att.url);
+
+          return { status: "fallthrough" } as const;
+        },
+        catch: captureError,
+      });
+      if (attempt.isErr()) {
+        continue;
+      }
     }
 
     const mimeType = normalizeMimeType(att.mimeType);
@@ -314,13 +324,83 @@ export async function appendDiscordAttachmentsToUserContent(
         continue;
       }
 
-      try {
-        const cached = state.cache.get(url.toString());
-        const downloaded = cached ? null : await downloadDiscordAttachment(url);
+      {
+        const attempt = await Result.tryPromise({
+          try: async () => {
+            const cached = state.cache.get(url.toString());
+            const downloaded = cached ? null : await downloadDiscordAttachment(url);
 
-        const bytes = cached?.bytes ?? downloaded!.bytes;
+            const bytes = cached?.bytes ?? downloaded!.bytes;
 
-        if (bytes.byteLength > DEFAULT_INBOUND_MAX_FILE_BYTES) {
+            if (bytes.byteLength > DEFAULT_INBOUND_MAX_FILE_BYTES) {
+              const header = formatDiscordAttachmentHeader({
+                url,
+                filename: att.filename,
+                mimeType,
+                size: att.size,
+              });
+              parts.push({
+                type: "text",
+                text: `${header}\n(text attachment too large to inline; fetch via URL)`,
+              });
+              return { status: "continue" } as const;
+            }
+
+            if (!cached) {
+              const nextTotal = state.downloadedTotalBytes + bytes.byteLength;
+              if (nextTotal > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
+                const header = formatDiscordAttachmentHeader({
+                  url,
+                  filename: att.filename,
+                  mimeType,
+                  size: att.size,
+                });
+                parts.push({
+                  type: "text",
+                  text: `${header}\n(text attachment skipped; total download bytes too large; fetch via URL)`,
+                });
+                return { status: "continue" } as const;
+              }
+
+              state.downloadedTotalBytes = nextTotal;
+              state.cache.set(url.toString(), { bytes, mimeType });
+            }
+            ownAttachmentBytes({
+              state,
+              bytes,
+              mediaType: mimeType,
+              filename: att.filename,
+              url,
+            });
+
+            const decoded = decodeUtf8BestEffort(bytes);
+            const header = formatDiscordAttachmentHeader({
+              url,
+              filename: att.filename,
+              mimeType,
+              size: att.size,
+            });
+
+            if (!decoded.text) {
+              parts.push({
+                type: "text",
+                text: `${header}\n(text extraction failed: ${decoded.reason ?? "unknown"}; fetch via URL)`,
+              });
+              return { status: "continue" } as const;
+            }
+
+            const suffix = decoded.truncatedBytes ? "\n\n(truncated)" : "";
+            parts.push({
+              type: "text",
+              text: `${header}\n${decoded.text}${suffix}`,
+            });
+            return { status: "continue" } as const;
+          },
+          catch: captureError,
+        });
+        if (attempt.isErr()) {
+          const error = attempt.error.cause;
+          if (state.ownBlob) throw error;
           const header = formatDiscordAttachmentHeader({
             url,
             filename: att.filename,
@@ -329,66 +409,10 @@ export async function appendDiscordAttachmentsToUserContent(
           });
           parts.push({
             type: "text",
-            text: `${header}\n(text attachment too large to inline; fetch via URL)`,
+            text: `${header}\n(text attachment download failed; fetch via URL)`,
           });
           continue;
         }
-
-        if (!cached) {
-          const nextTotal = state.downloadedTotalBytes + bytes.byteLength;
-          if (nextTotal > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
-            const header = formatDiscordAttachmentHeader({
-              url,
-              filename: att.filename,
-              mimeType,
-              size: att.size,
-            });
-            parts.push({
-              type: "text",
-              text: `${header}\n(text attachment skipped; total download bytes too large; fetch via URL)`,
-            });
-            continue;
-          }
-
-          state.downloadedTotalBytes = nextTotal;
-          state.cache.set(url.toString(), { bytes, mimeType });
-        }
-        ownAttachmentBytes({ state, bytes, mediaType: mimeType, filename: att.filename, url });
-
-        const decoded = decodeUtf8BestEffort(bytes);
-        const header = formatDiscordAttachmentHeader({
-          url,
-          filename: att.filename,
-          mimeType,
-          size: att.size,
-        });
-
-        if (!decoded.text) {
-          parts.push({
-            type: "text",
-            text: `${header}\n(text extraction failed: ${decoded.reason ?? "unknown"}; fetch via URL)`,
-          });
-          continue;
-        }
-
-        const suffix = decoded.truncatedBytes ? "\n\n(truncated)" : "";
-        parts.push({
-          type: "text",
-          text: `${header}\n${decoded.text}${suffix}`,
-        });
-        continue;
-      } catch (error) {
-        if (state.ownBlob) throw error;
-        const header = formatDiscordAttachmentHeader({
-          url,
-          filename: att.filename,
-          mimeType,
-          size: att.size,
-        });
-        parts.push({
-          type: "text",
-          text: `${header}\n(text attachment download failed; fetch via URL)`,
-        });
         continue;
       }
     }
@@ -440,13 +464,83 @@ export async function appendDiscordAttachmentsToUserContent(
         continue;
       }
 
-      try {
-        const cached = state.cache.get(url.toString());
-        const downloaded = cached ? null : await downloadDiscordAttachment(url);
+      {
+        const attempt = await Result.tryPromise({
+          try: async () => {
+            const cached = state.cache.get(url.toString());
+            const downloaded = cached ? null : await downloadDiscordAttachment(url);
 
-        const bytes = cached?.bytes ?? downloaded!.bytes;
+            const bytes = cached?.bytes ?? downloaded!.bytes;
 
-        if (bytes.byteLength > DEFAULT_INBOUND_MAX_FILE_BYTES) {
+            if (bytes.byteLength > DEFAULT_INBOUND_MAX_FILE_BYTES) {
+              const header = formatDiscordAttachmentHeader({
+                url,
+                filename: att.filename,
+                mimeType: inferred,
+                size: att.size,
+              });
+              parts.push({
+                type: "text",
+                text: `${header}\n(text attachment too large to inline; fetch via URL)`,
+              });
+              return { status: "continue" } as const;
+            }
+
+            if (!cached) {
+              const nextTotal = state.downloadedTotalBytes + bytes.byteLength;
+              if (nextTotal > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
+                const header = formatDiscordAttachmentHeader({
+                  url,
+                  filename: att.filename,
+                  mimeType: inferred,
+                  size: att.size,
+                });
+                parts.push({
+                  type: "text",
+                  text: `${header}\n(text attachment skipped; total download bytes too large; fetch via URL)`,
+                });
+                return { status: "continue" } as const;
+              }
+
+              state.downloadedTotalBytes = nextTotal;
+              state.cache.set(url.toString(), { bytes, mimeType: inferred });
+            }
+            ownAttachmentBytes({
+              state,
+              bytes,
+              mediaType: inferred,
+              filename: att.filename,
+              url,
+            });
+
+            const decoded = decodeUtf8BestEffort(bytes);
+            const header = formatDiscordAttachmentHeader({
+              url,
+              filename: att.filename,
+              mimeType: inferred,
+              size: att.size,
+            });
+
+            if (!decoded.text) {
+              parts.push({
+                type: "text",
+                text: `${header}\n(text extraction failed: ${decoded.reason ?? "unknown"}; fetch via URL)`,
+              });
+              return { status: "continue" } as const;
+            }
+
+            const suffix = decoded.truncatedBytes ? "\n\n(truncated)" : "";
+            parts.push({
+              type: "text",
+              text: `${header}\n${decoded.text}${suffix}`,
+            });
+            return { status: "continue" } as const;
+          },
+          catch: captureError,
+        });
+        if (attempt.isErr()) {
+          const error = attempt.error.cause;
+          if (state.ownBlob) throw error;
           const header = formatDiscordAttachmentHeader({
             url,
             filename: att.filename,
@@ -455,66 +549,10 @@ export async function appendDiscordAttachmentsToUserContent(
           });
           parts.push({
             type: "text",
-            text: `${header}\n(text attachment too large to inline; fetch via URL)`,
+            text: `${header}\n(text attachment download failed; fetch via URL)`,
           });
           continue;
         }
-
-        if (!cached) {
-          const nextTotal = state.downloadedTotalBytes + bytes.byteLength;
-          if (nextTotal > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
-            const header = formatDiscordAttachmentHeader({
-              url,
-              filename: att.filename,
-              mimeType: inferred,
-              size: att.size,
-            });
-            parts.push({
-              type: "text",
-              text: `${header}\n(text attachment skipped; total download bytes too large; fetch via URL)`,
-            });
-            continue;
-          }
-
-          state.downloadedTotalBytes = nextTotal;
-          state.cache.set(url.toString(), { bytes, mimeType: inferred });
-        }
-        ownAttachmentBytes({ state, bytes, mediaType: inferred, filename: att.filename, url });
-
-        const decoded = decodeUtf8BestEffort(bytes);
-        const header = formatDiscordAttachmentHeader({
-          url,
-          filename: att.filename,
-          mimeType: inferred,
-          size: att.size,
-        });
-
-        if (!decoded.text) {
-          parts.push({
-            type: "text",
-            text: `${header}\n(text extraction failed: ${decoded.reason ?? "unknown"}; fetch via URL)`,
-          });
-          continue;
-        }
-
-        const suffix = decoded.truncatedBytes ? "\n\n(truncated)" : "";
-        parts.push({
-          type: "text",
-          text: `${header}\n${decoded.text}${suffix}`,
-        });
-        continue;
-      } catch (error) {
-        if (state.ownBlob) throw error;
-        const header = formatDiscordAttachmentHeader({
-          url,
-          filename: att.filename,
-          mimeType: inferred,
-          size: att.size,
-        });
-        parts.push({
-          type: "text",
-          text: `${header}\n(text attachment download failed; fetch via URL)`,
-        });
         continue;
       }
     }
@@ -576,105 +614,127 @@ export async function appendDiscordAttachmentsToUserContent(
         continue;
       }
 
-      try {
-        const downloaded = await downloadDiscordAttachment(url);
-        bytes = downloaded.bytes;
+      {
+        const attempt = await Result.tryPromise({
+          try: async () => {
+            const downloaded = await downloadDiscordAttachment(url);
+            bytes = downloaded.bytes;
 
-        if (bytes.byteLength > DEFAULT_INBOUND_MAX_FILE_BYTES) {
-          const fallback =
-            bestEffortInferMimeType({ filename: att.filename, url }) ?? "application/octet-stream";
-          if (isImageMimeType(fallback)) {
-            parts.push({ type: "file", data: url, filename: att.filename, mediaType: fallback });
-            continue;
-          }
-          if (isPdfMimeType(fallback)) {
-            parts.push({
-              type: "file",
-              data: url,
+            if (bytes.byteLength > DEFAULT_INBOUND_MAX_FILE_BYTES) {
+              const fallback =
+                bestEffortInferMimeType({ filename: att.filename, url }) ??
+                "application/octet-stream";
+              if (isImageMimeType(fallback)) {
+                parts.push({
+                  type: "file",
+                  data: url,
+                  filename: att.filename,
+                  mediaType: fallback,
+                });
+                return { status: "continue" } as const;
+              }
+              if (isPdfMimeType(fallback)) {
+                parts.push({
+                  type: "file",
+                  data: url,
+                  filename: att.filename,
+                  mediaType: "application/pdf",
+                });
+                return { status: "continue" } as const;
+              }
+
+              const header = formatDiscordAttachmentHeader({
+                url,
+                filename: att.filename,
+                mimeType: fallback,
+                size: att.size,
+              });
+              parts.push({
+                type: "text",
+                text: `${header}\n(attachment too large to download; fetch via URL)`,
+              });
+              return { status: "continue" } as const;
+            }
+
+            // Track only bytes we actually downloaded in this call.
+            const nextTotal = state.downloadedTotalBytes + bytes.byteLength;
+            if (nextTotal > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
+              const fallback =
+                bestEffortInferMimeType({ filename: att.filename, url }) ??
+                "application/octet-stream";
+              if (isImageMimeType(fallback)) {
+                parts.push({
+                  type: "file",
+                  data: url,
+                  filename: att.filename,
+                  mediaType: fallback,
+                });
+                return { status: "continue" } as const;
+              }
+              if (isPdfMimeType(fallback)) {
+                parts.push({
+                  type: "file",
+                  data: url,
+                  filename: att.filename,
+                  mediaType: "application/pdf",
+                });
+                return { status: "continue" } as const;
+              }
+
+              const header = formatDiscordAttachmentHeader({
+                url,
+                filename: att.filename,
+                mimeType: fallback,
+                size: att.size,
+              });
+              parts.push({
+                type: "text",
+                text: `${header}\n(attachment download skipped; total bytes too large; fetch via URL)`,
+              });
+              return { status: "continue" } as const;
+            }
+            state.downloadedTotalBytes = nextTotal;
+
+            const buf = Buffer.from(bytes);
+            const detected = await fileTypeFromBuffer(buf);
+
+            resolvedMimeType =
+              detected?.mime ||
+              downloaded.contentType ||
+              inferred ||
+              bestEffortInferMimeType({ filename: att.filename, url }) ||
+              "application/octet-stream";
+
+            ownAttachmentBytes({
+              state,
+              bytes,
+              mediaType: resolvedMimeType,
               filename: att.filename,
-              mediaType: "application/pdf",
+              url,
             });
-            continue;
-          }
 
+            state.cache.set(url.toString(), { bytes, mimeType: resolvedMimeType });
+
+            return { status: "fallthrough" } as const;
+          },
+          catch: captureError,
+        });
+        if (attempt.isErr()) {
+          const error = attempt.error.cause;
+          if (state.ownBlob) throw error;
+          // Best-effort: fall back to URL-based attachment.
           const header = formatDiscordAttachmentHeader({
             url,
             filename: att.filename,
-            mimeType: fallback,
+            mimeType: inferred,
             size: att.size,
           });
           parts.push({
             type: "text",
-            text: `${header}\n(attachment too large to download; fetch via URL)`,
+            text: `${header}\n(attachment download failed; fetch via URL)`,
           });
           continue;
         }
-
-        // Track only bytes we actually downloaded in this call.
-        const nextTotal = state.downloadedTotalBytes + bytes.byteLength;
-        if (nextTotal > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
-          const fallback =
-            bestEffortInferMimeType({ filename: att.filename, url }) ?? "application/octet-stream";
-          if (isImageMimeType(fallback)) {
-            parts.push({ type: "file", data: url, filename: att.filename, mediaType: fallback });
-            continue;
-          }
-          if (isPdfMimeType(fallback)) {
-            parts.push({
-              type: "file",
-              data: url,
-              filename: att.filename,
-              mediaType: "application/pdf",
-            });
-            continue;
-          }
-
-          const header = formatDiscordAttachmentHeader({
-            url,
-            filename: att.filename,
-            mimeType: fallback,
-            size: att.size,
-          });
-          parts.push({
-            type: "text",
-            text: `${header}\n(attachment download skipped; total bytes too large; fetch via URL)`,
-          });
-          continue;
-        }
-        state.downloadedTotalBytes = nextTotal;
-
-        const buf = Buffer.from(bytes);
-        const detected = await fileTypeFromBuffer(buf);
-
-        resolvedMimeType =
-          detected?.mime ||
-          downloaded.contentType ||
-          inferred ||
-          bestEffortInferMimeType({ filename: att.filename, url }) ||
-          "application/octet-stream";
-
-        ownAttachmentBytes({
-          state,
-          bytes,
-          mediaType: resolvedMimeType,
-          filename: att.filename,
-          url,
-        });
-
-        state.cache.set(url.toString(), { bytes, mimeType: resolvedMimeType });
-      } catch (error) {
-        if (state.ownBlob) throw error;
-        // Best-effort: fall back to URL-based attachment.
-        const header = formatDiscordAttachmentHeader({
-          url,
-          filename: att.filename,
-          mimeType: inferred,
-          size: att.size,
-        });
-        parts.push({
-          type: "text",
-          text: `${header}\n(attachment download failed; fetch via URL)`,
-        });
         continue;
       }
     }

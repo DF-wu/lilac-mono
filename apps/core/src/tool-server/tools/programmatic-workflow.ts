@@ -60,6 +60,12 @@ function workflowFailure(kind: ServerToolFailure["kind"], message: string): Serv
   });
 }
 
+function captureWorkflowFailure(error: unknown): { readonly cause: Error | Panic } {
+  if (Panic.is(error)) return { cause: error };
+  if (error instanceof Error) return { cause: error };
+  return { cause: new Error("Workflow operation failed", { cause: error }) };
+}
+
 function workflowRunCreatedProjectionFailure(runId: string): ServerToolFailure {
   return serverToolFailure({
     kind: "conflict",
@@ -656,19 +662,22 @@ export class ProgrammaticWorkflow implements ServerTool {
           canonicalProjectId: `project:${sha256(canonicalRoot)}`,
         });
       },
-      catch: (error) => {
-        if (Panic.is(error)) return preserveToolPanic(error);
-        const message =
-          error instanceof Error ? error.message : "Workflow project root unavailable";
-        let category: ServerToolFailure["kind"] = "unavailable";
-        if (/ENOENT|not found|no such file/i.test(message)) {
-          category = "not_found";
-        } else if (/EACCES|EPERM|permission/i.test(message)) {
-          category = "denied";
-        }
-        return workflowFailure(category, message);
-      },
-    }).then((captured) => captured.andThen((result) => result));
+      catch: captureWorkflowFailure,
+    }).then((captured) =>
+      captured
+        .mapError(({ cause }) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          const message = cause.message;
+          let category: ServerToolFailure["kind"] = "unavailable";
+          if (/ENOENT|not found|no such file/i.test(message)) {
+            category = "not_found";
+          } else if (/EACCES|EPERM|permission/i.test(message)) {
+            category = "denied";
+          }
+          return workflowFailure(category, message);
+        })
+        .andThen((result) => result),
+    );
   }
 
   private async definitions(
@@ -844,13 +853,10 @@ export class ProgrammaticWorkflow implements ServerTool {
       };
       yield* Result.try({
         try: () => store.createRevision(revision),
-        catch: (error) => {
-          if (Panic.is(error)) return preserveToolPanic(error);
-          return workflowFailure(
-            "unavailable",
-            error instanceof Error ? error.message : "Workflow revision persistence failed",
-          );
-        },
+        catch: captureWorkflowFailure,
+      }).mapError(({ cause }) => {
+        if (Panic.is(cause)) return preserveToolPanic(cause);
+        return workflowFailure("unavailable", cause.message);
       });
       const storedRevisionResult = store.findRevisionByIdentity(revisionIdentity);
       const storedRevision = yield* durableWorkflowReadResult(storedRevisionResult);
@@ -876,13 +882,10 @@ export class ProgrammaticWorkflow implements ServerTool {
       const schedule = input.schedule;
       const { timestampAt, nextFireAt } = yield* Result.try({
         try: () => resolveScheduleTiming(schedule, now),
-        catch: (error) => {
-          if (Panic.is(error)) return preserveToolPanic(error);
-          return workflowFailure(
-            "usage",
-            error instanceof Error ? error.message : "Invalid workflow trigger schedule",
-          );
-        },
+        catch: captureWorkflowFailure,
+      }).mapError(({ cause }) => {
+        if (Panic.is(cause)) return preserveToolPanic(cause);
+        return workflowFailure("usage", cause.message);
       });
       if (schedule.kind === "timestamp" && !Number.isFinite(timestampAt)) {
         return Result.err(
@@ -939,15 +942,13 @@ export class ProgrammaticWorkflow implements ServerTool {
             trigger,
             idempotency: { key: idempotencyKey, fingerprintSha256: triggerFingerprint },
           }),
-        catch: (error) => {
-          if (Panic.is(error)) return preserveToolPanic(error);
-          return workflowFailure(
-            /idempotency|conflict|already/i.test(error instanceof Error ? error.message : "")
-              ? "conflict"
-              : "unavailable",
-            error instanceof Error ? error.message : "Workflow trigger persistence failed",
-          );
-        },
+        catch: captureWorkflowFailure,
+      }).mapError(({ cause }) => {
+        if (Panic.is(cause)) return preserveToolPanic(cause);
+        return workflowFailure(
+          /idempotency|conflict|already/i.test(cause.message) ? "conflict" : "unavailable",
+          cause.message,
+        );
       });
       return Result.ok({
         ok: true as const,
@@ -1185,16 +1186,13 @@ export class ProgrammaticWorkflow implements ServerTool {
         Result.tryPromise({
           try: async () =>
             (await this.params.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
-          catch: (error) => {
-            if (Panic.is(error)) return preserveToolPanic(error);
-            return workflowFailure(
-              "unavailable",
-              error instanceof Error
-                ? error.message
-                : "Workflow capacity configuration unavailable",
-            );
-          },
-        }),
+          catch: captureWorkflowFailure,
+        }).then((result) =>
+          result.mapError(({ cause }) => {
+            if (Panic.is(cause)) return preserveToolPanic(cause);
+            return workflowFailure("unavailable", cause.message);
+          }),
+        ),
       );
       const invocation = yield* store
         .createInvocation({
@@ -1223,11 +1221,13 @@ export class ProgrammaticWorkflow implements ServerTool {
         card = yield* Result.await(
           Result.tryPromise({
             try: () => this.params.progressCards!.ensureInitialCard(invocation.run.runId),
-            catch: (error) => {
-              if (Panic.is(error)) return preserveToolPanic(error);
+            catch: captureWorkflowFailure,
+          }).then((result) =>
+            result.mapError(({ cause }) => {
+              if (Panic.is(cause)) return preserveToolPanic(cause);
               return workflowRunCreatedProjectionFailure(invocation.run.runId);
-            },
-          }),
+            }),
+          ),
         );
       }
       if (this.params.bus) {

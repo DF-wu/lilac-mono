@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import { isDeepStrictEqual } from "node:util";
 
 import type { ModelMessage, UserContent } from "ai";
@@ -342,7 +343,7 @@ async function composeSelectedDiscordChain(input: {
         }
       : undefined,
   });
-  try {
+  const outcome = await (async () => {
     const projections = new Map<string, CoreSurfaceProjection | null>();
     for (const message of input.chain) {
       const stored = projectionStore?.getCoreSurfaceProjection(
@@ -392,8 +393,11 @@ async function composeSelectedDiscordChain(input: {
       adapter: input.adapter,
       refs: unknownUserRefs,
     });
-    const reactionsError = reactionsByMessageId.match({ ok: () => null, err: (error) => error });
-    if (reactionsError) return Result.err(reactionsError);
+    const reactionsError = reactionsByMessageId.match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (reactionsError) return { status: "return", value: Result.err(reactionsError) } as const;
     const reactionValues = reactionsByMessageId.match({
       ok: (value) => value,
       err: () => new Map<string, readonly string[]>(),
@@ -633,22 +637,26 @@ async function composeSelectedDiscordChain(input: {
       corePrimaryLineage = createFreshOnlyLineage(reason, currentCanonicalStart);
     }
     const ownershipError = getDiscordAttachmentOwnershipError(attachmentState);
-    if (ownershipError) return Result.err(ownershipError);
-    return Result.ok({
-      messages,
-      mergedGroups: merged.map((chunk) => ({
-        authorId: chunk.authorId,
-        messageIds: [...chunk.messageIds],
-      })),
-      corePrimaryLineage,
-    });
-  } finally {
+    if (ownershipError) return { status: "return", value: Result.err(ownershipError) } as const;
+    return {
+      status: "return",
+      value: Result.ok({
+        messages,
+        mergedGroups: merged.map((chunk) => ({
+          authorId: chunk.authorId,
+          messageIds: [...chunk.messageIds],
+        })),
+        corePrimaryLineage,
+      }),
+    } as const;
+  })().finally(() => {
     if (projectionStore) {
       for (const reference of getDiscordOwnedBlobReferences(attachmentState)) {
         projectionStore.deleteCoreOwnedBlobIfUnreferenced({ sha256: reference.sha256 });
       }
     }
-  }
+  });
+  return outcome.value;
 }
 
 function resolveTranscriptSnapshot(input: {
@@ -893,14 +901,22 @@ async function listRecentMessagesEndingAt(params: {
 }
 
 function compareDiscordSnowflakeLike(a: string, b: string): number {
-  try {
-    const ai = BigInt(a);
-    const bi = BigInt(b);
-    if (ai < bi) return -1;
-    if (ai > bi) return 1;
-    return 0;
-  } catch {
-    return a.localeCompare(b);
+  {
+    const attempt = Result.try({
+      try: () => {
+        const ai = BigInt(a);
+        const bi = BigInt(b);
+        if (ai < bi) return -1;
+        if (ai > bi) return 1;
+        return 0;
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      return a.localeCompare(b);
+    }
+    return attempt.value;
   }
 }
 

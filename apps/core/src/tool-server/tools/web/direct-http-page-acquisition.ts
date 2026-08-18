@@ -7,7 +7,8 @@ import {
   type PageContent,
   type PageContentResult,
 } from "./page-content";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { adaptToolResultToHost } from "../../../tools/tool-result-adapters";
 
 const MAX_FETCH_RESPONSE_BYTES = 5 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES = 64 * 1024;
@@ -80,6 +81,54 @@ type BoundedResponseText =
   | { isError: false; text: string; bytesRead: number; truncated: boolean }
   | { isError: true; error: string };
 
+function captureDirectHttpCleanupFailure(cause: unknown): Error | Panic {
+  if (Panic.is(cause)) return cause;
+  if (cause instanceof Error) return cause;
+  return new Error("Direct HTTP response cleanup failed", { cause });
+}
+
+async function cancelResponseBody(
+  body: ReadableStream<Uint8Array> | null,
+  reason: Error,
+): Promise<ResultType<void, Error | Panic>> {
+  if (!body) return Result.ok(undefined);
+  return (
+    await Result.tryPromise({
+      try: () => body.cancel(reason),
+      catch: captureDirectHttpCleanupFailure,
+    })
+  ).map(() => undefined);
+}
+
+async function cancelResponseReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  reason: Error,
+): Promise<ResultType<void, Error | Panic>> {
+  return (
+    await Result.tryPromise({
+      try: () => reader.cancel(reason),
+      catch: captureDirectHttpCleanupFailure,
+    })
+  ).map(() => undefined);
+}
+
+function releaseResponseReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): ResultType<void, Error | Panic> {
+  return Result.try({
+    try: () => reader.releaseLock(),
+    catch: captureDirectHttpCleanupFailure,
+  });
+}
+
+function directHttpCleanupFailure<T>(result: ResultType<T, Error | Panic>): Error | Panic | null {
+  return result.match({ ok: () => null, err: (error) => error });
+}
+
+function signalDirectHttpCleanupFailure(error: Error | Panic): never {
+  return adaptToolResultToHost(Result.err(error));
+}
+
 async function readResponseTextWithLimit(params: {
   res: Response;
   maxBytes: number;
@@ -88,6 +137,12 @@ async function readResponseTextWithLimit(params: {
   checkPageSignal(params.signal);
   const contentLength = contentLengthFromHeaders(params.res.headers);
   if (contentLength !== null && contentLength > params.maxBytes) {
+    const cancellation = await cancelResponseBody(
+      params.res.body,
+      new Error("response byte limit reached"),
+    );
+    const cancellationFailure = directHttpCleanupFailure(cancellation);
+    if (cancellationFailure) signalDirectHttpCleanupFailure(cancellationFailure);
     signalDirectHttpPageFailure(
       `response too large (${contentLength} bytes > ${params.maxBytes} byte limit)`,
     );
@@ -111,38 +166,62 @@ async function readResponseTextWithLimit(params: {
   let bytesRead = 0;
   let text = "";
   let truncated = false;
+  let cancelPending: Promise<ResultType<void, Error | Panic>> | undefined;
+  let cancelReason: Error | undefined;
+  const requestCancel = (reason: Error): Promise<ResultType<void, Error | Panic>> => {
+    cancelReason ??= reason;
+    cancelPending ??= cancelResponseReader(reader, cancelReason);
+    return cancelPending;
+  };
   const onAbort = () => {
-    void reader.cancel(getAbortReasonError(params.signal!)).catch(() => null);
+    void requestCancel(getAbortReasonError(params.signal!));
   };
   params.signal?.addEventListener("abort", onAbort, { once: true });
 
-  try {
-    while (true) {
-      checkPageSignal(params.signal);
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      bytesRead += chunk.value.byteLength;
-      if (bytesRead > params.maxBytes) {
-        truncated = true;
-        const allowedBytes = chunk.value.byteLength - (bytesRead - params.maxBytes);
-        if (allowedBytes > 0) {
-          text += decoder.decode(chunk.value.subarray(0, allowedBytes), { stream: true });
+  const read = await Result.tryPromise({
+    try: async () => {
+      while (true) {
+        checkPageSignal(params.signal);
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        bytesRead += chunk.value.byteLength;
+        if (bytesRead > params.maxBytes) {
+          truncated = true;
+          cancelReason = new Error("response byte limit reached");
+          const allowedBytes = chunk.value.byteLength - (bytesRead - params.maxBytes);
+          if (allowedBytes > 0) {
+            text += decoder.decode(chunk.value.subarray(0, allowedBytes), { stream: true });
+          }
+          break;
         }
-        await reader.cancel("response byte limit reached").catch(() => null);
-        break;
+        text += decoder.decode(chunk.value, { stream: true });
       }
-      text += decoder.decode(chunk.value, { stream: true });
-    }
-    text += decoder.decode();
-    return {
-      isError: false,
-      text,
-      bytesRead: Math.min(bytesRead, params.maxBytes),
-      truncated,
-    };
-  } finally {
-    params.signal?.removeEventListener("abort", onAbort);
+      text += decoder.decode();
+      return {
+        isError: false,
+        text,
+        bytesRead: Math.min(bytesRead, params.maxBytes),
+        truncated,
+      } as const;
+    },
+    catch: captureDirectHttpCleanupFailure,
+  });
+  params.signal?.removeEventListener("abort", onAbort);
+
+  if (cancelReason || directHttpCleanupFailure(read)) {
+    await requestCancel(cancelReason ?? new Error("response read failed"));
   }
+  const cancellationFailure = cancelPending ? directHttpCleanupFailure(await cancelPending) : null;
+  const releaseFailure = directHttpCleanupFailure(releaseResponseReader(reader));
+  if (cancellationFailure) signalDirectHttpCleanupFailure(cancellationFailure);
+  if (releaseFailure) signalDirectHttpCleanupFailure(releaseFailure);
+
+  const readFailure = directHttpCleanupFailure(read);
+  if (readFailure) signalDirectHttpCleanupFailure(readFailure);
+  return read.match<BoundedResponseText>({
+    ok: (value) => value,
+    err: () => ({ isError: true, error: "response read failed" }),
+  });
 }
 
 export function createDirectHttpPageAcquisition(params: {

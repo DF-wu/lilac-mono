@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
+import { Result } from "better-result";
 
 export type PressureMetrics = {
   some?: {
@@ -259,11 +260,10 @@ export function parseSmapsRollupMemory(
 }
 
 function readOptional(filePath: string): string | undefined {
-  try {
-    return readFileSync(filePath, "utf8").trim();
-  } catch {
-    return undefined;
-  }
+  return Result.try({
+    try: () => readFileSync(filePath, "utf8").trim(),
+    catch: () => undefined,
+  }).match({ ok: (value) => value, err: () => undefined });
 }
 
 function readPressure(filePath: string): PressureMetrics | undefined {

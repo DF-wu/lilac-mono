@@ -23,7 +23,7 @@ import {
 } from "../shared/attachment-utils";
 import { requireRequestContext } from "../shared/req-context";
 import { adaptEventPublishResultToHost } from "../shared/event-bus-result";
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
@@ -45,10 +45,11 @@ async function captureAttachmentOperation<T>(params: {
   readonly operation: string;
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, AttachmentOperationError>> {
-  const captured = await Result.tryPromise({
-    try: params.run,
-    catch: projectRuntimeError(`Opaque attachment ${params.operation} failure`),
-  });
+  const captured = (
+    await Result.tryPromise({ try: params.run, catch: captureRuntimeError })
+  ).mapError((error) =>
+    projectCapturedRuntimeError(error, `Opaque attachment ${params.operation} failure`),
+  );
   return captured.match<() => ResultType<T, AttachmentOperationError>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {

@@ -126,10 +126,10 @@ function asBuffer(data: unknown): ResultType<Buffer, ServerToolFailure> {
     if (looksLikeDataUrl(data)) {
       return Result.try({
         try: () => decodeDataUrl(data).bytes,
-        catch: (cause) => {
-          const failure = attachmentFailureFromUnknown(cause, "Invalid attachment data URL");
-          return attachmentFailure("usage", failure.message);
-        },
+        catch: (cause) => ({ cause }),
+      }).mapError(({ cause }) => {
+        const failure = attachmentFailureFromUnknown(cause, "Invalid attachment data URL");
+        return attachmentFailure("usage", failure.message);
       });
     }
 
@@ -164,13 +164,15 @@ async function downloadToBuffer(
     }
 
     const safeUrl = attachmentUrlForFailure(input);
-    const fetched = await Result.tryPromise({
-      try: () => fetch(input.toString(), { redirect: "follow", signal }),
-      catch: (cause) => {
-        const message = `Attachment download failed for ${safeUrl}`;
-        const failure = attachmentFailureFromUnknown(cause, message);
-        return attachmentFailure(failure.kind, message);
-      },
+    const fetched = (
+      await Result.tryPromise({
+        try: () => fetch(input.toString(), { redirect: "follow", signal }),
+        catch: (cause) => ({ cause }),
+      })
+    ).mapError(({ cause }) => {
+      const message = `Attachment download failed for ${safeUrl}`;
+      const failure = attachmentFailureFromUnknown(cause, message);
+      return attachmentFailure(failure.kind, message);
     });
     return fetched.andThenAsync(async (res) => {
       if (!res.ok) {
@@ -186,17 +188,19 @@ async function downloadToBuffer(
       return (
         await Result.tryPromise({
           try: () => res.arrayBuffer(),
-          catch: (cause) => {
-            const message = `Failed to read attachment response for ${safeUrl}`;
-            const failure = attachmentFailureFromUnknown(cause, message);
-            return attachmentFailure(failure.kind, message);
-          },
+          catch: (cause) => ({ cause }),
         })
-      ).map((ab) => ({
-        bytes: Buffer.from(ab),
-        sourceUrl: input.toString(),
-        contentType: res.headers.get("content-type") ?? undefined,
-      }));
+      )
+        .mapError(({ cause }) => {
+          const message = `Failed to read attachment response for ${safeUrl}`;
+          const failure = attachmentFailureFromUnknown(cause, message);
+          return attachmentFailure(failure.kind, message);
+        })
+        .map((ab) => ({
+          bytes: Buffer.from(ab),
+          sourceUrl: input.toString(),
+          contentType: res.headers.get("content-type") ?? undefined,
+        }));
     });
   }
 
@@ -207,11 +211,13 @@ async function downloadToBuffer(
   if (typeof input === "string" && looksLikeDataUrl(input)) {
     return Result.try({
       try: () => decodeDataUrl(input),
-      catch: (cause) => {
+      catch: (cause) => ({ cause }),
+    })
+      .mapError(({ cause }) => {
         const failure = attachmentFailureFromUnknown(cause, "Invalid attachment data URL");
         return attachmentFailure("usage", failure.message);
-      },
-    }).map((decoded) => ({ bytes: decoded.bytes, contentType: decoded.mimeType }));
+      })
+      .map((decoded) => ({ bytes: decoded.bytes, contentType: decoded.mimeType }));
   }
 
   return asBuffer(input).map((bytes) => ({ bytes }));
@@ -405,10 +411,14 @@ export class Attachment implements ServerTool {
       if ("failure" in resolvedPathBranch) return Result.err(resolvedPathBranch.failure);
       const resolvedPath = resolvedPathBranch.value;
 
-      const stat = await Result.tryPromise({
-        try: () => fs.stat(resolvedPath),
-        catch: (cause) => attachmentFailureFromUnknown(cause, `Unable to read ${resolvedPath}`),
-      });
+      const stat = (
+        await Result.tryPromise({
+          try: () => fs.stat(resolvedPath),
+          catch: (cause) => ({ cause }),
+        })
+      ).mapError(({ cause }) =>
+        attachmentFailureFromUnknown(cause, `Unable to read ${resolvedPath}`),
+      );
       const statBranch = resultBranch(stat);
       if ("failure" in statBranch) return Result.err(statBranch.failure);
       const st = statBranch.value;
@@ -440,10 +450,14 @@ export class Attachment implements ServerTool {
         );
       }
 
-      const read = await Result.tryPromise({
-        try: () => fs.readFile(resolvedPath),
-        catch: (cause) => attachmentFailureFromUnknown(cause, `Unable to read ${resolvedPath}`),
-      });
+      const read = (
+        await Result.tryPromise({
+          try: () => fs.readFile(resolvedPath),
+          catch: (cause) => ({ cause }),
+        })
+      ).mapError(({ cause }) =>
+        attachmentFailureFromUnknown(cause, `Unable to read ${resolvedPath}`),
+      );
       const readBranch = resultBranch(read);
       if ("failure" in readBranch) return Result.err(readBranch.failure);
       const bytes = readBranch.value;
@@ -499,11 +513,14 @@ export class Attachment implements ServerTool {
       return Result.ok({ ok: true as const, downloadDir: outputDownloadDir, files: [] });
     }
 
-    const madeDirectory = await Result.tryPromise({
-      try: () => fs.mkdir(downloadDir, { recursive: true }),
-      catch: (cause) =>
-        attachmentFailureFromUnknown(cause, `Unable to create download directory ${downloadDir}`),
-    });
+    const madeDirectory = (
+      await Result.tryPromise({
+        try: () => fs.mkdir(downloadDir, { recursive: true }),
+        catch: (cause) => ({ cause }),
+      })
+    ).mapError(({ cause }) =>
+      attachmentFailureFromUnknown(cause, `Unable to create download directory ${downloadDir}`),
+    );
     const madeDirectoryBranch = resultBranch(madeDirectory);
     if ("failure" in madeDirectoryBranch) return Result.err(madeDirectoryBranch.failure);
 
@@ -570,18 +587,22 @@ export class Attachment implements ServerTool {
       const exists = (
         await Result.tryPromise({
           try: () => fs.access(target),
-          catch: (cause) => attachmentFailureFromUnknown(cause, `Unable to access ${target}`),
+          catch: (cause) => ({ cause }),
         })
-      ).match({
-        ok: () => true,
-        err: () => false,
-      });
+      )
+        .mapError(({ cause }) => attachmentFailureFromUnknown(cause, `Unable to access ${target}`))
+        .match({
+          ok: () => true,
+          err: () => false,
+        });
 
       if (!exists) {
-        const written = await Result.tryPromise({
-          try: () => fs.writeFile(target, downloaded.bytes),
-          catch: (cause) => attachmentFailureFromUnknown(cause, `Unable to write ${target}`),
-        });
+        const written = (
+          await Result.tryPromise({
+            try: () => fs.writeFile(target, downloaded.bytes),
+            catch: (cause) => ({ cause }),
+          })
+        ).mapError(({ cause }) => attachmentFailureFromUnknown(cause, `Unable to write ${target}`));
         const writtenBranch = resultBranch(written);
         if ("failure" in writtenBranch) return Result.err(writtenBranch.failure);
       }

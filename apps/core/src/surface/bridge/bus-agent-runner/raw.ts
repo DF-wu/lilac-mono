@@ -13,7 +13,10 @@ export type SubagentProfile = (typeof SUBAGENT_PROFILES)[number];
 export type AgentRunProfile = "primary" | SubagentProfile;
 export type AgentRunnerRaw = {} | null;
 
-export function preserveAgentRunnerRaw(raw: unknown): AgentRunnerRaw | undefined {
+export function preserveAgentRunnerRaw(message: {
+  readonly data: { readonly raw?: unknown };
+}): AgentRunnerRaw | undefined {
+  const { raw } = message.data;
   if (raw === undefined || raw === null) return raw;
   return raw;
 }

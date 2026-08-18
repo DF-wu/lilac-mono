@@ -13,7 +13,7 @@ import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
-import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { formatBlockedMessage, redactSecrets } from "./bash-safety/format";
 import { expandTilde } from "@stanley2058/lilac-fs";
 
@@ -34,7 +34,7 @@ import {
 } from "./bash-output-sanitizer";
 import { loadToolEnv } from "./tool-env";
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
 export const BASH_NO_OUTPUT_TIMEOUT_MS = 3 * 60 * 1000;
@@ -170,8 +170,8 @@ function settleBashExecution(
 ): Promise<ResultType<BashToolOutput, BashAdapterError | Panic>> {
   return Result.tryPromise({
     try: run,
-    catch: <TCaught>(caught: TCaught) =>
-      isPanic(caught)
+    catch: (caught) =>
+      Panic.is(caught)
         ? caught
         : new BashAdapterError({
             operation: "execute",
@@ -442,10 +442,11 @@ function previewStream(value: string, maxBytes: number): string {
 
 async function overflowStreamBytes(captured: string, overflowPath?: string): Promise<number> {
   if (!overflowPath) return Buffer.byteLength(captured, "utf8");
-  const inspected = await Result.tryPromise({
-    try: () => fs.stat(overflowPath),
-    catch: projectRuntimeError("Opaque Bash overflow stat failure"),
-  });
+  const inspected = (
+    await Result.tryPromise({ try: () => fs.stat(overflowPath), catch: captureRuntimeError })
+  ).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque Bash overflow stat failure"),
+  );
   const inspectError = inspected.match({ ok: () => null, err: (error) => error });
   if (inspectError) {
     preserveToolPanic(inspectError);
@@ -458,10 +459,14 @@ async function readOverflowTail(
   overflowPath: string,
   contentBudget: number,
 ): Promise<ResultType<Buffer, BashAdapterError | BashOperationAndCleanupError>> {
-  const opened = await Result.tryPromise({
-    try: () => fs.open(overflowPath, "r"),
-    catch: projectRuntimeError("Opaque Bash overflow open failure"),
-  });
+  const opened = (
+    await Result.tryPromise({
+      try: () => fs.open(overflowPath, "r"),
+      catch: captureRuntimeError,
+    })
+  ).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque Bash overflow open failure"),
+  );
   const openError = opened.match({ ok: () => null, err: (error) => error });
   if (openError) {
     return Result.err(
@@ -481,14 +486,14 @@ async function readOverflowTail(
     await handle.read(buffer, 0, readBytes, Math.max(0, stat.size - readBytes));
     return buffer;
   };
-  const read = await Result.tryPromise({
-    try: readTail,
-    catch: projectRuntimeError("Opaque Bash overflow read failure"),
-  });
-  const closed = await Result.tryPromise({
-    try: () => handle.close(),
-    catch: projectRuntimeError("Opaque Bash overflow close failure"),
-  });
+  const read = (await Result.tryPromise({ try: readTail, catch: captureRuntimeError })).mapError(
+    (captured) => projectCapturedRuntimeError(captured, "Opaque Bash overflow read failure"),
+  );
+  const closed = (
+    await Result.tryPromise({ try: () => handle.close(), catch: captureRuntimeError })
+  ).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque Bash overflow close failure"),
+  );
   const readCause = read.match({ ok: () => null, err: (error) => error });
   const closeCause = closed.match({ ok: () => null, err: (error) => error });
   if (readCause && isPanic(readCause)) preserveToolPanic(readCause);
@@ -715,19 +720,23 @@ async function persistTruncatedOutput(params: {
     stdoutOverflowPath: params.stdoutOverflowPath,
     stderrOverflowPath: params.stderrOverflowPath,
   }).pipe(createBashOutputSanitizerTransform(params.literalSecrets));
-  const created = await Result.tryPromise({
-    try: () =>
-      artifacts.createFromStream({
-        sessionId: context.sessionId,
-        requestId: context.requestId,
-        toolCallId,
-        toolName: "bash",
-        source,
-        ttlMs: params.outputConfig.artifactTtlMs,
-        maxBytesPerSession: params.outputConfig.artifactMaxBytesPerSession,
-      }),
-    catch: projectRuntimeError("Opaque Bash artifact persistence failure"),
-  });
+  const created = (
+    await Result.tryPromise({
+      try: () =>
+        artifacts.createFromStream({
+          sessionId: context.sessionId,
+          requestId: context.requestId,
+          toolCallId,
+          toolName: "bash",
+          source,
+          ttlMs: params.outputConfig.artifactTtlMs,
+          maxBytesPerSession: params.outputConfig.artifactMaxBytesPerSession,
+        }),
+      catch: captureRuntimeError,
+    })
+  ).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque Bash artifact persistence failure"),
+  );
   let result: { uri?: string } = {};
   const createError = created.match({ ok: () => null, err: (error) => error });
   if (createError) {
@@ -917,12 +926,16 @@ export async function executeBash(
     // Negative pid means "process group" on POSIX.
     const groupKill = Result.try({
       try: () => process.kill(-pid, signal),
-      catch: projectRuntimeError("Opaque Bash process-group termination failure"),
-    });
+      catch: captureRuntimeError,
+    }).mapError((captured) =>
+      projectCapturedRuntimeError(captured, "Opaque Bash process-group termination failure"),
+    );
     const processKill = Result.try({
       try: () => process.kill(pid, signal),
-      catch: projectRuntimeError("Opaque Bash process termination failure"),
-    });
+      catch: captureRuntimeError,
+    }).mapError((captured) =>
+      projectCapturedRuntimeError(captured, "Opaque Bash process termination failure"),
+    );
     groupKill.match<() => void>({
       ok: () => () => undefined,
       err: (error) => () => preserveToolPanic(error),

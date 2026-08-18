@@ -1836,7 +1836,7 @@ describe("startBusRequestRouter", () => {
       subscriptionId: "router-suppression-log",
       config: parseCoreConfigV1ToUniversal({}),
       logger,
-      shouldSuppressAdapterEvent: async () => {
+      shouldSuppressAdapterEvent: () => {
         throw new RouterTestHookFailure({
           cause: { authorization: "Bearer cause-secret" },
           message: "hook failed token=sk-super-secret",

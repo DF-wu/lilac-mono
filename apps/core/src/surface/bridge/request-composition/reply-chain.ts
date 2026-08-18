@@ -25,15 +25,16 @@ function continueResult<T, E, ROk, RErr>(
 }
 
 function compareDiscordSnowflakeLike(a: string, b: string): number {
-  try {
-    const ai = BigInt(a);
-    const bi = BigInt(b);
-    if (ai < bi) return -1;
-    if (ai > bi) return 1;
-    return 0;
-  } catch {
-    return a.localeCompare(b);
-  }
+  return Result.try({
+    try: () => {
+      const ai = BigInt(a);
+      const bi = BigInt(b);
+      if (ai < bi) return -1;
+      if (ai > bi) return 1;
+      return 0;
+    },
+    catch: () => null,
+  }).match({ ok: (order) => order, err: () => a.localeCompare(b) });
 }
 
 export function getForwardSnapshotTextFromRaw(raw: unknown): string | undefined {

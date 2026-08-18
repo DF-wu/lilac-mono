@@ -186,6 +186,28 @@ describe("classifyDiscordSurfaceError", () => {
     ).toBeInstanceOf(SurfaceUnavailable);
     expect(classifyDiscordSurfaceError("send-message", new Error("unknown"))).toBeNull();
   });
+
+  it("classifies a plain Discord rejection before defect propagation", async () => {
+    const adapter = createTestDiscordAdapter();
+    const state = adapter as unknown as {
+      cfg: CoreConfig | null;
+      client: { channels: { fetch(channelId: string): Promise<unknown> } } | null;
+    };
+    state.cfg = testConfigWithStatusMessage();
+    state.client = {
+      channels: {
+        fetch: async () => {
+          throw { code: 10_003 };
+        },
+      },
+    };
+
+    const listed = await adapter.listMsg({ platform: "discord", channelId: "missing" });
+
+    expect(listed.status).toBe("error");
+    if (listed.status === "ok") throw new Error("expected missing channel failure");
+    expect(listed.error).toBeInstanceOf(SurfaceMessageNotFound);
+  });
 });
 
 describe("DiscordAdapter nested refs", () => {

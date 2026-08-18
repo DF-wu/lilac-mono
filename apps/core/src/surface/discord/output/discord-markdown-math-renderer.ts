@@ -1,11 +1,11 @@
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
 import type { Nodes, Root } from "mdast";
 
 import { renderLatex } from "../../../vendor/opentui-math/render";
-import { surfaceExternalFallback } from "../../adapter";
+import { settleSurfaceFallback } from "../../adapter";
 
 export type DiscordMarkdownMathFallbackMode = "source" | "passthrough";
 export type DiscordMarkdownMathRenderPhase = "streaming" | "terminal";
@@ -450,21 +450,26 @@ function fencedCode(content: string, language: "text" | "latex", eol: string): s
 
 function renderCandidate(body: string, kind: MathKind, maxWidth: number): string | null {
   if (body.trim().length === 0) return null;
-  const renderAttempt = Result.try({
-    try: () => {
-      const layout = renderLatex(body, {
-        strict: true,
-        compactScripts: true,
-        displayMode: kind === "display",
-        maxSourceLength: 2000,
-        maxExpandedLength: 2000,
-        maxDepth: 32,
-        macros: {},
-      });
-      return { layout, output: layout.toString() };
-    },
-    catch: surfaceExternalFallback(null),
-  });
+  const renderAttempt = settleSurfaceFallback(
+    Result.try({
+      try: () => {
+        const layout = renderLatex(body, {
+          strict: true,
+          compactScripts: true,
+          displayMode: kind === "display",
+          maxSourceLength: 2000,
+          maxExpandedLength: 2000,
+          maxDepth: 32,
+          macros: {},
+        });
+        return { layout, output: layout.toString() };
+      },
+      catch: (cause) =>
+        Panic.is(cause)
+          ? { kind: "panic", panic: cause, fallback: null }
+          : { kind: "fallback", fallback: null },
+    }),
+  );
   const rendered = renderAttempt.match({
     err: () => null,
     ok: (value) => value,
@@ -508,10 +513,15 @@ export function renderDiscordMarkdownMath(
 
   const fallbackMode = options.fallbackMode ?? "source";
   const maxWidth = resolvedMaxWidth(options.maxWidth);
-  const collectionAttempt = Result.try({
-    try: () => collectCandidates(markdown),
-    catch: surfaceExternalFallback(null),
-  });
+  const collectionAttempt = settleSurfaceFallback(
+    Result.try({
+      try: () => collectCandidates(markdown),
+      catch: (cause) =>
+        Panic.is(cause)
+          ? { kind: "panic", panic: cause, fallback: null }
+          : { kind: "fallback", fallback: null },
+    }),
+  );
   const candidates = collectionAttempt.match({
     err: () => null,
     ok: (value) => value,

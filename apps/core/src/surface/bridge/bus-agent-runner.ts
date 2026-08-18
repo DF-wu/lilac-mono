@@ -1,5 +1,7 @@
 /* oxlint-disable eslint/no-control-regex */
 
+import { captureError } from "../../shared/error-capture";
+
 import {
   type CallWarning,
   type FinishReason,
@@ -11,10 +13,10 @@ import {
   type UserContent,
 } from "ai";
 import {
+  Panic,
   Result,
   TaggedError,
   type AnyTaggedError,
-  type Panic,
   type Result as ResultType,
 } from "better-result";
 import { boundToolResultMediaForModelView } from "@stanley2058/lilac-tool-results/tool-result-media";
@@ -394,25 +396,34 @@ export async function captureBusAgentRunnerOperation<T>(
   run: () => T | Promise<T>,
   beforePanicRethrow?: (panic: Panic) => void,
 ): Promise<ResultType<Awaited<T>, BusAgentRunnerOperationFailed>> {
-  try {
-    return Result.ok(await run());
-  } catch (cause) {
-    rethrowBusAgentRunnerPanic(cause, beforePanicRethrow);
-    const projection = projectBusAgentRunnerError(cause, `${operation} failed`);
-    let failureKind: BusAgentRunnerOperationFailed["failureKind"] = "other";
-    if (cause instanceof AgentIdleTimeoutError) failureKind = "idle-timeout";
-    if (cause instanceof PreAgentRunCancelledError) failureKind = "pre-agent-cancelled";
-    if (cause instanceof RestartDrainingAbort) failureKind = "restart-draining";
-    return Result.err(
-      new BusAgentRunnerOperationFailed({
-        operation,
-        cause,
-        failureKind,
-        displayMessage: formatUnknownErrorForDisplay(cause),
-        details: projection.details,
-        message: projection.message,
-      }),
-    );
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await run());
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      rethrowBusAgentRunnerPanic(cause, beforePanicRethrow);
+      const projection = projectBusAgentRunnerError(cause, `${operation} failed`);
+      let failureKind: BusAgentRunnerOperationFailed["failureKind"] = "other";
+      if (cause instanceof AgentIdleTimeoutError) failureKind = "idle-timeout";
+      if (cause instanceof PreAgentRunCancelledError) failureKind = "pre-agent-cancelled";
+      if (cause instanceof RestartDrainingAbort) failureKind = "restart-draining";
+      return Result.err(
+        new BusAgentRunnerOperationFailed({
+          operation,
+          cause,
+          failureKind,
+          displayMessage: formatUnknownErrorForDisplay(cause),
+          details: projection.details,
+          message: projection.message,
+        }),
+      );
+    }
+    return attempt.value;
   }
 }
 
@@ -468,11 +479,19 @@ export function projectBusAgentRunnerError(
   const projectedCause =
     isRecord(cause) && cause["loaded"] === false && "error" in cause ? cause["error"] : cause;
   const message = opaqueErrorMessage(projectedCause, fallback);
-  try {
-    const details = extractAiErrorLogDetails(projectedCause);
-    return details ? { message, details } : { message };
-  } catch {
-    return { message };
+  {
+    const attempt = Result.try({
+      try: () => {
+        const details = extractAiErrorLogDetails(projectedCause);
+        return details ? { message, details } : { message };
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      return { message };
+    }
+    return attempt.value;
   }
 }
 
@@ -846,24 +865,27 @@ export function scrubLargeBinaryForModelView(
   return boundToolResultMediaForModelView(messages, limits);
 }
 
-function getBatchOkFromResult(result: unknown): boolean | null {
+function getBatchOkFromResult(event: { readonly result: unknown }): boolean | null {
+  const { result } = event;
   if (!result || typeof result !== "object" || Array.isArray(result)) return null;
   const v = (result as Record<string, unknown>)["ok"];
   return typeof v === "boolean" ? v : null;
 }
 
-function getSubagentOkFromResult(result: unknown): boolean | null {
+function getSubagentOkFromResult(event: { readonly result: unknown }): boolean | null {
+  const { result } = event;
   if (!result || typeof result !== "object" || Array.isArray(result)) return null;
   const v = (result as Record<string, unknown>)["ok"];
   return typeof v === "boolean" ? v : null;
 }
 
-function decodeDeferredSubagentAcceptedResult(result: unknown): {
+function decodeDeferredSubagentAcceptedResult(event: { readonly result: unknown }): {
   ok: true;
   mode: "deferred";
   status: "accepted";
   sessionName: string;
 } | null {
+  const { result } = event;
   if (!isRecord(result)) return null;
   const sessionName = result["sessionName"];
   if (
@@ -1261,105 +1283,133 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
     ok?: boolean;
     error?: string;
   }) => {
-    try {
-      await params.publishToolStatus(update);
-    } catch (error) {
-      params.onError(
-        "auto-injected thread search status publish failed; continuing",
-        projectBusAgentRunnerError(error),
-      );
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          await params.publishToolStatus(update);
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const error = attempt.error.cause;
+        params.onError(
+          "auto-injected thread search status publish failed; continuing",
+          projectBusAgentRunnerError(error),
+        );
+      }
     }
   };
 
   await publishToolStatusBestEffort({ toolCallId, status: "start", display });
 
-  try {
-    const plan = await conversationThreads.planAutoInjectSearch({
-      text,
-      content: latestInput.content,
-    });
-    const searchRecallLimit = Math.min(50, autoInject.limit * plan.searches.length);
-    const settledSearches = await Promise.allSettled(
-      plan.searches.map((searchPlan) =>
-        conversationThreads.search({
-          query: searchPlan.queries,
-          queryAboutness: searchPlan.aboutness,
-          limit: searchRecallLimit,
-          minScore: autoInject.minScore,
-          mode: autoInject.mode,
-          verbose: true,
-          ...(participantIds.length > 0 ? { participantIdsAny: participantIds } : {}),
-        }),
-      ),
-    );
-    let fulfilledSearches = 0;
-    const candidateGroups = settledSearches.map((result, searchIndex) => {
-      if (result.status === "fulfilled") {
-        fulfilledSearches += 1;
-        return buildAutoInjectedThreadSearchCandidates({
-          search: result.value,
-          searchIndex,
-          previouslyInjectedThreadIds,
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        const plan = await conversationThreads.planAutoInjectSearch({
+          text,
+          content: latestInput.content,
         });
-      }
+        const searchRecallLimit = Math.min(50, autoInject.limit * plan.searches.length);
+        const settledSearches = await Promise.allSettled(
+          plan.searches.map((searchPlan) =>
+            conversationThreads.search({
+              query: searchPlan.queries,
+              queryAboutness: searchPlan.aboutness,
+              limit: searchRecallLimit,
+              minScore: autoInject.minScore,
+              mode: autoInject.mode,
+              verbose: true,
+              ...(participantIds.length > 0 ? { participantIdsAny: participantIds } : {}),
+            }),
+          ),
+        );
+        let fulfilledSearches = 0;
+        const candidateGroups = settledSearches.map((result, searchIndex) => {
+          if (result.status === "fulfilled") {
+            fulfilledSearches += 1;
+            return buildAutoInjectedThreadSearchCandidates({
+              search: result.value,
+              searchIndex,
+              previouslyInjectedThreadIds,
+            });
+          }
 
-      params.onError(
-        "auto-injected thread search failed; continuing with partial metadata",
-        projectBusAgentRunnerError(result.reason, `Search ${searchIndex} failed`),
-      );
-      return [];
+          params.onError(
+            "auto-injected thread search failed; continuing with partial metadata",
+            projectBusAgentRunnerError(result.reason, `Search ${searchIndex} failed`),
+          );
+          return [];
+        });
+        if (fulfilledSearches === 0) {
+          const failure = projectBusAgentRunnerError(
+            new Error("all auto-injected thread searches failed"),
+          );
+          await publishToolStatusBestEffort({
+            toolCallId,
+            status: "end",
+            display,
+            ok: false,
+            error: failure.message,
+          });
+          params.onError(
+            "auto-injected thread search failed; continuing without metadata",
+            failure,
+          );
+          return [];
+        }
+        const entries = selectAutoInjectedThreadSearchEntries(candidateGroups, autoInject.limit);
+
+        await publishToolStatusBestEffort({
+          toolCallId,
+          status: "end",
+          display,
+          ok: true,
+        });
+
+        if (entries.length === 0) return [];
+        {
+          const attempt = Result.try({
+            try: () => {
+              params.onInjected?.({
+                toolCallId,
+                mode: autoInject.mode,
+                limit: autoInject.limit,
+                searches: plan.searches.map((searchPlan) => searchPlan.queries),
+                participantFilterUserCount: participantIds.length,
+                entries,
+              });
+            },
+            catch: captureError,
+          });
+
+          if (attempt.isErr()) {
+            const error = attempt.error.cause;
+            params.onError(
+              "auto-injected thread search append log failed; continuing",
+              projectBusAgentRunnerError(error),
+            );
+          }
+        }
+        return buildAutoInjectedThreadSearchMessages({ toolCallId, entries });
+      },
+      catch: captureError,
     });
-    if (fulfilledSearches === 0) {
-      const failure = projectBusAgentRunnerError(
-        new Error("all auto-injected thread searches failed"),
-      );
+
+    if (attempt.isErr()) {
+      const error = attempt.error.cause;
+      const projected = projectBusAgentRunnerError(error);
       await publishToolStatusBestEffort({
         toolCallId,
         status: "end",
         display,
         ok: false,
-        error: failure.message,
+        error: projected.message,
       });
-      params.onError("auto-injected thread search failed; continuing without metadata", failure);
+      params.onError("auto-injected thread search failed; continuing without metadata", projected);
       return [];
     }
-    const entries = selectAutoInjectedThreadSearchEntries(candidateGroups, autoInject.limit);
-
-    await publishToolStatusBestEffort({
-      toolCallId,
-      status: "end",
-      display,
-      ok: true,
-    });
-
-    if (entries.length === 0) return [];
-    try {
-      params.onInjected?.({
-        toolCallId,
-        mode: autoInject.mode,
-        limit: autoInject.limit,
-        searches: plan.searches.map((searchPlan) => searchPlan.queries),
-        participantFilterUserCount: participantIds.length,
-        entries,
-      });
-    } catch (error) {
-      params.onError(
-        "auto-injected thread search append log failed; continuing",
-        projectBusAgentRunnerError(error),
-      );
-    }
-    return buildAutoInjectedThreadSearchMessages({ toolCallId, entries });
-  } catch (error) {
-    const projected = projectBusAgentRunnerError(error);
-    await publishToolStatusBestEffort({
-      toolCallId,
-      status: "end",
-      display,
-      ok: false,
-      error: projected.message,
-    });
-    params.onError("auto-injected thread search failed; continuing without metadata", projected);
-    return [];
+    return attempt.value;
   }
 }
 
@@ -2033,16 +2083,25 @@ async function maybeBuildSkillsSectionForPrimary(): Promise<string | null> {
   const workspaceRoot = findWorkspaceRootResult();
   const root = workspaceRoot.match({ ok: (value) => value, err: () => null });
   if (root === null) return null;
-  try {
-    const { skills } = await discoverSkills({
-      workspaceRoot: root,
-      dataDir: env.dataDir,
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        const { skills } = await discoverSkills({
+          workspaceRoot: root,
+          dataDir: env.dataDir,
+        });
+        return formatAvailableSkillsSection(skills);
+      },
+      catch: captureError,
     });
-    return formatAvailableSkillsSection(skills);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    // Best-effort: never fail a run due to skill discovery.
-    return null;
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (isPanic(cause)) throw cause;
+      // Best-effort: never fail a run due to skill discovery.
+      return null;
+    }
+    return attempt.value;
   }
 }
 
@@ -2763,17 +2822,25 @@ export async function startBusAgentRunner(params: {
     state: SessionQueue,
     requestId?: string,
   ): void {
-    const superviseDetachedDrain = (error: unknown): void => {
+    const superviseDetachedDrain = <ErrorCause>(error: ErrorCause): void => {
       rethrowBusAgentRunnerPanic(error, reportFatalPanic);
       logger.error(
         "drainSessionQueue failed",
         formatBusAgentRunnerDrainFailureForLog(error, { sessionId, requestId }),
       );
     };
-    const observeSupervisedDrainRejection = (): void => undefined;
-    const operation = drainSessionQueue(sessionId, state).catch(superviseDetachedDrain);
+    const operation = superviseDrain();
     activeDrainOperation = operation;
-    void operation.catch(observeSupervisedDrainRejection);
+    void ignoreDetachedFailure(operation);
+
+    async function superviseDrain(): Promise<void> {
+      const drained = await Result.tryPromise({
+        try: () => drainSessionQueue(sessionId, state),
+        catch: captureError,
+      });
+      const failure = drained.match({ ok: () => null, err: ({ cause }) => ({ cause }) });
+      if (failure) superviseDetachedDrain(failure.cause);
+    }
   }
 
   type CmdRequestMessage = Extract<
@@ -2846,7 +2913,7 @@ export async function startBusAgentRunner(params: {
       if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
       return Result.ok(undefined);
     }
-    const raw = preserveAgentRunnerRaw(msg.data.raw);
+    const raw = preserveAgentRunnerRaw(msg);
     let cacheAdmitted = false;
     let identityError:
       | RequestIdentitySourceMissing
@@ -2855,684 +2922,734 @@ export async function startBusAgentRunner(params: {
       | undefined;
     let intakeError: BusAgentRunnerOperationFailed | undefined;
     let parkPending = false;
-    try {
-      const cachedExternal = requestMessageCache.cacheMessage(msg, requestProjection);
-      let cachedExternalError: RequestMessageCacheAdmissionError | null = null;
-      const selectExternalProjection = cachedExternal.match<
-        () => AuthenticatedRequestProjection | undefined
-      >({
-        err: (error) => () => {
-          cachedExternalError = error;
-          return undefined;
-        },
-        ok: (projection) => () => projection,
-      });
-      const externalProjection = selectExternalProjection();
-      if (cachedExternalError) {
-        return Result.err(
-          new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: cachedExternalError,
-            message: "cmd.request.message cache admission is invalid",
-          }),
-        );
-      }
-      if (!externalProjection) return Result.ok(undefined);
-      cacheAdmitted = true;
-      const trustedProjection = projectDurableWorkflowRequestIdentity({
-        projection: requestProjection,
-        raw,
-        store: params.durableWorkflowStore,
-      });
-      const cachedTrusted = requestMessageCache.cacheMessage(msg, trustedProjection);
-      let cachedTrustedError: RequestMessageCacheAdmissionError | null = null;
-      const selectAuthenticatedRequest = cachedTrusted.match<
-        () => AuthenticatedRequestProjection | undefined
-      >({
-        err: (error) => () => {
-          cachedTrustedError = error;
-          return undefined;
-        },
-        ok: (projection) => () => projection ?? externalProjection,
-      });
-      const authenticatedRequest = selectAuthenticatedRequest();
-      if (cachedTrustedError) {
-        return Result.err(
-          new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: cachedTrustedError,
-            message: "cmd.request.message trusted cache admission is invalid",
-          }),
-        );
-      }
-      if (!authenticatedRequest) return Result.ok(undefined);
-      await (async () => {
-        rethrowBusAgentRunnerPanic(terminalPanic);
-        await params.beforeRequestIntake?.(msg);
-
-        if (env.perf.log) {
-          const lagMs = Date.now() - msg.ts;
-          const shouldWarn = lagMs >= env.perf.lagWarnMs;
-          const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
-          if (shouldWarn || shouldSample) {
-            if (shouldWarn) {
-              logger.warn("perf.bus_lag", {
-                stage: "cmd.request->agent_runner",
-                lagMs,
-                requestId,
-                sessionId,
-                requestClient,
-                queue: msg.data.queue,
-              });
-            } else {
-              logger.info("perf.bus_lag", {
-                stage: "cmd.request->agent_runner",
-                lagMs,
-                requestId,
-                sessionId,
-                requestClient,
-                queue: msg.data.queue,
-              });
-            }
+    return await (async () => {
+      const attempted = await Result.tryPromise({
+        try: async () => {
+          const cachedExternal = requestMessageCache.cacheMessage(msg, requestProjection);
+          let cachedExternalError: RequestMessageCacheAdmissionError | null = null;
+          const selectExternalProjection = cachedExternal.match<
+            () => AuthenticatedRequestProjection | undefined
+          >({
+            err: (error) => () => {
+              cachedExternalError = error;
+              return undefined;
+            },
+            ok: (projection) => () => projection,
+          });
+          const externalProjection = selectExternalProjection();
+          if (cachedExternalError) {
+            return {
+              status: "return",
+              value: Result.err(
+                new BusAgentRunnerAuthenticationProjectionInvalid({
+                  cause: cachedExternalError,
+                  message: "cmd.request.message cache admission is invalid",
+                }),
+              ),
+            } as const;
           }
-        }
+          if (!externalProjection)
+            return { status: "return", value: Result.ok(undefined) } as const;
+          cacheAdmitted = true;
+          const trustedProjection = projectDurableWorkflowRequestIdentity({
+            projection: requestProjection,
+            raw,
+            store: params.durableWorkflowStore,
+          });
+          const cachedTrusted = requestMessageCache.cacheMessage(msg, trustedProjection);
+          let cachedTrustedError: RequestMessageCacheAdmissionError | null = null;
+          const selectAuthenticatedRequest = cachedTrusted.match<
+            () => AuthenticatedRequestProjection | undefined
+          >({
+            err: (error) => () => {
+              cachedTrustedError = error;
+              return undefined;
+            },
+            ok: (projection) => () => projection ?? externalProjection,
+          });
+          const authenticatedRequest = selectAuthenticatedRequest();
+          if (cachedTrustedError) {
+            return {
+              status: "return",
+              value: Result.err(
+                new BusAgentRunnerAuthenticationProjectionInvalid({
+                  cause: cachedTrustedError,
+                  message: "cmd.request.message trusted cache admission is invalid",
+                }),
+              ),
+            } as const;
+          }
+          if (!authenticatedRequest)
+            return { status: "return", value: Result.ok(undefined) } as const;
+          await (async () => {
+            rethrowBusAgentRunnerPanic(terminalPanic);
+            await params.beforeRequestIntake?.(msg);
 
-        logger.debug("cmd.request.message received", {
-          requestId,
-          sessionId,
-          requestClient,
-          queue: msg.data.queue,
-          runPolicy: msg.data.runPolicy ?? "normal",
-          originKind: msg.data.origin?.kind,
-          modelOverride: msg.data.modelOverride,
-          messageCount: msg.data.messages.length,
-        });
+            if (env.perf.log) {
+              const lagMs = Date.now() - msg.ts;
+              const shouldWarn = lagMs >= env.perf.lagWarnMs;
+              const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
+              if (shouldWarn || shouldSample) {
+                if (shouldWarn) {
+                  logger.warn("perf.bus_lag", {
+                    stage: "cmd.request->agent_runner",
+                    lagMs,
+                    requestId,
+                    sessionId,
+                    requestClient,
+                    queue: msg.data.queue,
+                  });
+                } else {
+                  logger.info("perf.bus_lag", {
+                    stage: "cmd.request->agent_runner",
+                    lagMs,
+                    requestId,
+                    sessionId,
+                    requestClient,
+                    queue: msg.data.queue,
+                  });
+                }
+              }
+            }
 
-        // reload config opportunistically (mtime cached in getCoreConfig).
-        // If reload fails, keep using the last known good config.
-        await reloadCoreConfigIfNeeded();
-
-        const intakeRunProfile = parseSubagentMetaFromRaw(raw).profile;
-        const entry: Enqueued = {
-          queueEntryId: msg.id,
-          requestId,
-          sessionId,
-          requestClient,
-          queue: msg.data.queue,
-          runPolicy: msg.data.runPolicy ?? "normal",
-          origin: msg.data.origin,
-          messages: msg.data.messages,
-          corePrimaryLineage: validateCorePrimaryLineageAtRunnerIntake({
-            requestClient,
-            sessionId,
-            runProfile: intakeRunProfile,
-            messages: msg.data.messages,
-            corePrimaryLineage: msg.data.corePrimaryLineage,
-            transcriptStore: params.transcriptStore,
-          }),
-          modelOverride: msg.data.modelOverride,
-          raw,
-          authenticatedOrigin: authenticatedRequest?.authenticatedOrigin,
-          currentTurnUserId: trustedProjection.authenticatedOrigin?.userId,
-          verifiedIngress: authenticatedRequest?.verifiedIngress,
-        };
-
-        const requestControl = parseRequestControlFromRaw(entry.raw);
-
-        const state =
-          bySession.get(sessionId) ??
-          ({
-            running: false,
-            agent: null,
-            queue: [] as Enqueued[],
-            activeRequestId: null,
-            activeRun: null,
-            compactedToolCallIds: new Set<string>(),
-          } satisfies SessionQueue);
-        bySession.set(sessionId, state);
-
-        const logQueueTransition = (input: {
-          action: string;
-          queueDepthBefore: number;
-          queueDepthAfter: number;
-          reason?: string;
-          activeRequestId?: string | null;
-        }) => {
-          logger.debug(
-            "agent.queue.transition",
-            formatBridgeLogContext({
+            logger.debug("cmd.request.message received", {
               requestId,
               sessionId,
               requestClient,
-              queueMode: entry.queue,
-              running: state.running,
-              queueDepthBefore: input.queueDepthBefore,
-              queueDepthAfter: input.queueDepthAfter,
-              action: input.action,
-              reason: input.reason,
-              activeRequestId: input.activeRequestId ?? state.activeRequestId,
-              draining,
-            }),
-          );
-        };
-        const logQueuedBehindActiveRun = (queuedRequestId: string) => {
-          logger.info("request queued behind active run", {
-            requestId: queuedRequestId,
-            activeRequestId: state.activeRequestId,
-            queueDepth: state.queue.length,
-          });
-        };
+              queue: msg.data.queue,
+              runPolicy: msg.data.runPolicy ?? "normal",
+              originKind: msg.data.origin?.kind,
+              modelOverride: msg.data.modelOverride,
+              messageCount: msg.data.messages.length,
+            });
 
-        if (pendingAttempt) {
-          await resumeQueueLifecycleAttempt(pendingAttempt, state);
-          return;
-        }
-        const enqueueWithLifecycle = async (
-          queuedEntry: Enqueued,
-          detail: string,
-        ): Promise<ResultType<void, BusAgentRunnerOperationFailed>> => {
-          state.queue.push(queuedEntry);
-          const published = await captureBusAgentRunnerOperation(
-            "queued lifecycle publication",
-            () =>
-              publishLifecycle({
-                bus,
-                headers: {
-                  request_id: queuedEntry.requestId,
-                  session_id: sessionId,
-                  request_client: queuedEntry.requestClient,
-                },
-                state: "queued",
-                detail,
-              }),
-          );
-          const publishError = published.match({ ok: () => null, err: (error) => error });
-          if (publishError) {
-            removeQueuedEntriesByReference(state.queue, [queuedEntry]);
-            if (queuedEntry.identityOwner) {
-              requestMessageCache.releaseOwner(queuedEntry.identityOwner);
-            }
-            return Result.err(publishError);
-          }
-          return Result.ok(undefined);
-        };
+            // reload config opportunistically (mtime cached in getCoreConfig).
+            // If reload fails, keep using the last known good config.
+            await reloadCoreConfigIfNeeded();
 
-        if (
-          !requestControl.cancel &&
-          shouldCancelRunPolicyRequest({ runPolicy: entry.runPolicy, sessionId, states: bySession })
-        ) {
-          await publishLifecycle({
-            bus,
-            headers: {
-              request_id: requestId,
-              session_id: sessionId,
-              request_client: requestClient,
-            },
-            state: "cancelled",
-            detail:
-              entry.runPolicy === "idle_only_session"
-                ? "idle_only_session_busy"
-                : "idle_only_global_busy",
-          });
-          logQueueTransition({
-            action: "drop",
-            queueDepthBefore: state.queue.length,
-            queueDepthAfter: state.queue.length,
-            reason:
-              entry.runPolicy === "idle_only_session"
-                ? "idle_only_session_busy"
-                : "idle_only_global_busy",
-          });
-          return;
-        }
-
-        if (draining) {
-          logger.debug("dropping request message while draining", {
-            requestId,
-            sessionId,
-            queue: msg.data.queue,
-          });
-          logQueueTransition({
-            action: "drop",
-            queueDepthBefore: state.queue.length,
-            queueDepthAfter: state.queue.length,
-            reason: "draining",
-          });
-          return;
-        }
-
-        const dropCancelNoTarget = async (reason: string) => {
-          logger.debug(
-            "dropping cancel request with no target",
-            formatBridgeLogContext({
+            const intakeRunProfile = parseSubagentMetaFromRaw(raw).profile;
+            const entry: Enqueued = {
+              queueEntryId: msg.id,
               requestId,
               sessionId,
-              queue: entry.queue,
-              activeRequestId: state.activeRequestId,
-              reason,
-            }),
-          );
-          logQueueTransition({
-            action: "drop",
-            queueDepthBefore: state.queue.length,
-            queueDepthAfter: state.queue.length,
-            reason,
-          });
-        };
-
-        if (requestControl.cancel && requestControl.cancelQueued) {
-          const matchedEntries: Enqueued[] = [];
-
-          for (const queued of state.queue) {
-            if (queued.requestId === requestId && !reservedQueueEntries.has(queued)) {
-              matchedEntries.push(queued);
-            }
-          }
-
-          const targetMessageId = requestControl.targetMessageId;
-          if (targetMessageId) {
-            for (const queued of state.queue) {
-              if (
-                !matchedEntries.includes(queued) &&
-                !reservedQueueEntries.has(queued) &&
-                requestRawReferencesMessage(queued.raw, targetMessageId)
-              ) {
-                matchedEntries.push(queued);
-              }
-            }
-          }
-
-          if (matchedEntries.length > 0) {
-            for (const queued of matchedEntries) reservedQueueEntries.add(queued);
-            const attempt: QueueLifecycleAttempt = {
-              eventId: msg.id,
-              controlRequestId: requestId,
-              controlRequestClient: requestClient,
-              sessionId,
-              kind: "queued-cancellation",
-              detail: "cancelled while queued",
-              pendingGroups: groupQueueCancellationEntries(matchedEntries),
-              controlApplied: true,
-            };
-            queueLifecycleAttempts.set(msg.id, attempt);
-            await resumeQueueLifecycleAttempt(attempt, state);
-
-            logger.debug("queued request cancelled", {
-              requestId,
-              sessionId,
-              cancelledRequestIds: [...new Set(matchedEntries.map((queued) => queued.requestId))],
-              queueDepth: state.queue.length,
-            });
-            logQueueTransition({
-              action: "cancel_queued",
-              queueDepthBefore: state.queue.length + matchedEntries.length,
-              queueDepthAfter: state.queue.length,
-              reason: "cancel_queued",
-            });
-
-            return;
-          }
-
-          const targetMessageIdForActive = requestControl.targetMessageId;
-          const targetMatchesActive =
-            typeof targetMessageIdForActive === "string" &&
-            requestRawReferencesMessage(state.activeRun?.raw, targetMessageIdForActive);
-
-          if (
-            !state.running ||
-            !state.activeRequestId ||
-            (!state.agent && !state.activeRun?.cancel)
-          ) {
-            await dropCancelNoTarget("request not queued or active");
-            return;
-          }
-
-          if (state.activeRequestId === requestId || targetMatchesActive) {
-            const activeCancelEntry: Enqueued = {
-              ...entry,
-              requestId: state.activeRequestId,
-              requestClient: state.activeRun?.requestClient ?? entry.requestClient,
-            };
-            if (state.activeRun?.started === false) {
-              state.activeRun.cancel();
-            } else if (state.agent) {
-              await applyToRunningAgent(
-                state.agent,
-                activeCancelEntry,
-                cancelledByRequestId,
-                state.activeRun,
-              );
-            }
-            logQueueTransition({
-              action: "apply_to_active",
-              queueDepthBefore: state.queue.length,
-              queueDepthAfter: state.queue.length,
-              reason: targetMatchesActive
-                ? "cancel_active_by_message_id"
-                : "cancel_active_by_request_id",
-            });
-            return;
-          }
-
-          await dropCancelNoTarget("request not queued or active");
-          return;
-        }
-
-        if (!state.running) {
-          if (requestControl.cancel) {
-            await dropCancelNoTarget("request not active");
-            return;
-          }
-
-          // Some messages only make sense when a run is already active.
-          if (requestControl.requiresActive && entry.queue !== "prompt") {
-            logger.debug(
-              "dropping request message (requires active run)",
-              formatBridgeLogContext({
-                requestId,
-                sessionId,
-                queue: entry.queue,
-              }),
-            );
-            logQueueTransition({
-              action: "drop",
-              queueDepthBefore: state.queue.length,
-              queueDepthAfter: state.queue.length,
-              reason: "requires_active_without_run",
-            });
-            return;
-          }
-
-          const queueDepthBefore = state.queue.length;
-          const owner = requestMessageCache.acquireOwner(requestId);
-          const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
-            err: (error) => () => {
-              identityError = error;
-              return null;
-            },
-            ok: (identityOwner) => () => identityOwner,
-          });
-          const identityOwner = selectOwner();
-          if (!identityOwner) return;
-          entry.identityOwner = identityOwner;
-          state.queue.push(entry);
-          logQueueTransition({
-            action: "enqueue",
-            queueDepthBefore,
-            queueDepthAfter: state.queue.length,
-            reason: "start_when_idle",
-          });
-          startSessionQueueDrain(sessionId, state, requestId);
-        } else {
-          if (
-            state.activeRequestId === requestId &&
-            requestControl.cancel &&
-            state.activeRun?.started === false &&
-            state.activeRun?.cancel
-          ) {
-            state.activeRun.cancel();
-            logQueueTransition({
-              action: "apply_to_active",
-              queueDepthBefore: state.queue.length,
-              queueDepthAfter: state.queue.length,
-              reason: "cancel_active_before_agent_start",
-            });
-            return;
-          }
-
-          if (
-            state.activeRequestId === requestId &&
-            !requestControl.cancel &&
-            state.activeRun?.runProfile === "primary"
-          ) {
-            const activeRun = state.activeRun;
-            const incomingOverride =
-              entry.modelOverride ?? parseRequestModelOverrideFromRaw(entry.raw) ?? undefined;
-            let incompatible =
-              activeRun.resolvedModelSpec === null &&
-              incomingOverride !== undefined &&
-              incomingOverride !== activeRun.modelOverride;
-            if (
-              incomingOverride !== undefined &&
-              activeRun.resolvedModelSpec !== null &&
-              activeRun.resolvedProviderFamily !== null
-            ) {
-              const activeSpec = activeRun.resolvedModelSpec;
-              const activeFamily = activeRun.resolvedProviderFamily;
-              const requestedPlan = resolveAgentRunModelResult({
-                cfg,
-                runProfile: "primary",
-                requestModelOverride: incomingOverride,
-              });
-              incompatible = requestedPlan.match({
-                ok: (plan) =>
-                  shouldQueueIncompatibleActiveRuntimeModel({
-                    activeSpec,
-                    activeReasoning: activeRun.resolvedReasoning,
-                    activeFamily,
-                    requested: plan.head,
-                  }),
-                err: () => true,
-              });
-            }
-            if (incompatible) {
-              const aliasRequestId = deriveModelChangingRequestId(entry);
-              const aliased = requestMessageCache.createAliasOwner({
-                sourceRequestId: requestId,
-                aliasRequestId,
+              requestClient,
+              queue: msg.data.queue,
+              runPolicy: msg.data.runPolicy ?? "normal",
+              origin: msg.data.origin,
+              messages: msg.data.messages,
+              corePrimaryLineage: validateCorePrimaryLineageAtRunnerIntake({
                 requestClient,
                 sessionId,
-              });
-              const selectAlias = aliased.match<() => RequestMessageCacheAliasOwner | null>({
-                err: (error) => () => {
-                  identityError = error;
-                  return null;
-                },
-                ok: (aliasOwner) => () => aliasOwner,
-              });
-              const alias = selectAlias();
-              if (!alias) return;
-              const aliasProjection = alias.projection;
-              const queuedEntry: Enqueued = {
-                ...entry,
-                requestId: aliasProjection.requestId,
-                sessionId: aliasProjection.sessionId,
-                requestClient: aliasProjection.requestClient,
-                queue: "prompt",
-                authenticatedOrigin: aliasProjection.authenticatedOrigin,
-                verifiedIngress: aliasProjection.verifiedIngress,
-                identityOwner: {
-                  requestId: alias.requestId,
-                  ownerId: alias.ownerId,
-                },
-              };
-              const queueDepthBefore = state.queue.length;
-              const enqueued = await enqueueWithLifecycle(
-                queuedEntry,
-                "queued for incompatible model or reasoning selection",
-              );
-              const enqueueError = enqueued.match({ ok: () => null, err: (error) => error });
-              if (enqueueError) {
-                intakeError = enqueueError;
-                return;
-              }
-              logQueueTransition({
-                action: "enqueue",
-                queueDepthBefore,
-                queueDepthAfter: state.queue.length,
-                reason: "incompatible_active_model",
-              });
-              logQueuedBehindActiveRun(queuedEntry.requestId);
-              return;
-            }
-          }
+                runProfile: intakeRunProfile,
+                messages: msg.data.messages,
+                corePrimaryLineage: msg.data.corePrimaryLineage,
+                transcriptStore: params.transcriptStore,
+              }),
+              modelOverride: msg.data.modelOverride,
+              raw,
+              authenticatedOrigin: authenticatedRequest?.authenticatedOrigin,
+              currentTurnUserId: trustedProjection.authenticatedOrigin?.userId,
+              verifiedIngress: authenticatedRequest?.verifiedIngress,
+            };
 
-          // If the message is intended for the currently active request, apply immediately.
-          if (state.activeRequestId && state.activeRequestId === requestId && state.agent) {
-            const runningAgent = state.agent;
-            const queueDepthBefore = state.queue.length;
-            const shouldAbsorbBufferedPrompts =
-              (entry.queue === "steer" || entry.queue === "interrupt") &&
-              !isCancelControlEntry(entry);
+            const requestControl = parseRequestControlFromRaw(entry.raw);
 
-            const bufferedPrompts = shouldAbsorbBufferedPrompts
-              ? collectBufferedPromptEntriesForActiveRequest({
-                  queue: state.queue,
-                  activeRequestId: requestId,
-                }).filter((queued) => !reservedQueueEntries.has(queued))
-              : [];
+            const state =
+              bySession.get(sessionId) ??
+              ({
+                running: false,
+                agent: null,
+                queue: [] as Enqueued[],
+                activeRequestId: null,
+                activeRun: null,
+                compactedToolCallIds: new Set<string>(),
+              } satisfies SessionQueue);
+            bySession.set(sessionId, state);
 
-            const mergedEntry =
-              bufferedPrompts.length > 0
-                ? ({
-                    ...entry,
-                    messages: [
-                      ...bufferedPrompts.flatMap((queuedPrompt) => queuedPrompt.messages),
-                      ...entry.messages,
-                    ],
-                    corePrimaryLineage: degradeCorePrimaryLineageForMutation(
-                      "queued-buffer-absorbed-into-steering",
-                      runningAgent.state.messages.length,
-                    ),
-                  } satisfies Enqueued)
-                : entry;
-
-            if (bufferedPrompts.length > 0) {
-              const absorbMode: "steer" | "interrupt" =
-                entry.queue === "interrupt" ? "interrupt" : "steer";
-              for (const bufferedPrompt of bufferedPrompts) {
-                reservedQueueEntries.add(bufferedPrompt);
-              }
-              const attempt: QueueLifecycleAttempt = {
-                eventId: msg.id,
-                controlRequestId: requestId,
-                controlRequestClient: requestClient,
-                sessionId,
-                kind: "buffered-absorption",
-                detail:
-                  absorbMode === "interrupt"
-                    ? "cancelled: absorbed into active interrupt"
-                    : "cancelled: absorbed into active steer",
-                pendingGroups: groupQueueCancellationEntries(bufferedPrompts),
-                controlApplied: false,
-              };
-              queueLifecycleAttempts.set(msg.id, attempt);
-              const applied = await captureBusAgentRunnerOperation(
-                "buffered prompt control application",
-                () =>
-                  applyToRunningAgent(
-                    runningAgent,
-                    mergedEntry,
-                    cancelledByRequestId,
-                    state.activeRun,
-                  ),
-              );
-              const applyError = applied.match({ ok: () => null, err: (error) => error });
-              if (applyError) {
-                for (const bufferedPrompt of bufferedPrompts) {
-                  reservedQueueEntries.delete(bufferedPrompt);
-                }
-                queueLifecycleAttempts.delete(msg.id);
-                signalBusAgentRunnerHostFailure(applyError);
-              }
-              attempt.controlApplied = true;
-              await resumeQueueLifecycleAttempt(attempt, state);
-            } else {
-              await applyToRunningAgent(
-                runningAgent,
-                mergedEntry,
-                cancelledByRequestId,
-                state.activeRun,
-              );
-            }
-
-            logQueueTransition({
-              action: "apply_to_active",
-              queueDepthBefore,
-              queueDepthAfter: state.queue.length,
-              reason:
-                bufferedPrompts.length > 0
-                  ? `same_request_id_absorbed_${bufferedPrompts.length}`
-                  : "same_request_id",
-            });
-          } else {
-            // Prevent stale surface controls (e.g. Cancel button) from enqueueing behind
-            // an unrelated active request.
-            if (requestControl.requiresActive || requestControl.cancel) {
+            const logQueueTransition = (input: {
+              action: string;
+              queueDepthBefore: number;
+              queueDepthAfter: number;
+              reason?: string;
+              activeRequestId?: string | null;
+            }) => {
               logger.debug(
-                "dropping request message (requires active request id)",
+                "agent.queue.transition",
                 formatBridgeLogContext({
                   requestId,
                   sessionId,
-                  activeRequestId: state.activeRequestId,
+                  requestClient,
+                  queueMode: entry.queue,
+                  running: state.running,
+                  queueDepthBefore: input.queueDepthBefore,
+                  queueDepthAfter: input.queueDepthAfter,
+                  action: input.action,
+                  reason: input.reason,
+                  activeRequestId: input.activeRequestId ?? state.activeRequestId,
+                  draining,
+                }),
+              );
+            };
+            const logQueuedBehindActiveRun = (queuedRequestId: string) => {
+              logger.info("request queued behind active run", {
+                requestId: queuedRequestId,
+                activeRequestId: state.activeRequestId,
+                queueDepth: state.queue.length,
+              });
+            };
+
+            if (pendingAttempt) {
+              await resumeQueueLifecycleAttempt(pendingAttempt, state);
+              return;
+            }
+            const enqueueWithLifecycle = async (
+              queuedEntry: Enqueued,
+              detail: string,
+            ): Promise<ResultType<void, BusAgentRunnerOperationFailed>> => {
+              state.queue.push(queuedEntry);
+              const published = await captureBusAgentRunnerOperation(
+                "queued lifecycle publication",
+                () =>
+                  publishLifecycle({
+                    bus,
+                    headers: {
+                      request_id: queuedEntry.requestId,
+                      session_id: sessionId,
+                      request_client: queuedEntry.requestClient,
+                    },
+                    state: "queued",
+                    detail,
+                  }),
+              );
+              const publishError = published.match({ ok: () => null, err: (error) => error });
+              if (publishError) {
+                removeQueuedEntriesByReference(state.queue, [queuedEntry]);
+                if (queuedEntry.identityOwner) {
+                  requestMessageCache.releaseOwner(queuedEntry.identityOwner);
+                }
+                return Result.err(publishError);
+              }
+              return Result.ok(undefined);
+            };
+
+            if (
+              !requestControl.cancel &&
+              shouldCancelRunPolicyRequest({
+                runPolicy: entry.runPolicy,
+                sessionId,
+                states: bySession,
+              })
+            ) {
+              await publishLifecycle({
+                bus,
+                headers: {
+                  request_id: requestId,
+                  session_id: sessionId,
+                  request_client: requestClient,
+                },
+                state: "cancelled",
+                detail:
+                  entry.runPolicy === "idle_only_session"
+                    ? "idle_only_session_busy"
+                    : "idle_only_global_busy",
+              });
+              logQueueTransition({
+                action: "drop",
+                queueDepthBefore: state.queue.length,
+                queueDepthAfter: state.queue.length,
+                reason:
+                  entry.runPolicy === "idle_only_session"
+                    ? "idle_only_session_busy"
+                    : "idle_only_global_busy",
+              });
+              return;
+            }
+
+            if (draining) {
+              logger.debug("dropping request message while draining", {
+                requestId,
+                sessionId,
+                queue: msg.data.queue,
+              });
+              logQueueTransition({
+                action: "drop",
+                queueDepthBefore: state.queue.length,
+                queueDepthAfter: state.queue.length,
+                reason: "draining",
+              });
+              return;
+            }
+
+            const dropCancelNoTarget = async (reason: string) => {
+              logger.debug(
+                "dropping cancel request with no target",
+                formatBridgeLogContext({
+                  requestId,
+                  sessionId,
                   queue: entry.queue,
+                  activeRequestId: state.activeRequestId,
+                  reason,
                 }),
               );
               logQueueTransition({
                 action: "drop",
                 queueDepthBefore: state.queue.length,
                 queueDepthAfter: state.queue.length,
-                reason: "requires_active_different_request_id",
+                reason,
               });
+            };
+
+            if (requestControl.cancel && requestControl.cancelQueued) {
+              const matchedEntries: Enqueued[] = [];
+
+              for (const queued of state.queue) {
+                if (queued.requestId === requestId && !reservedQueueEntries.has(queued)) {
+                  matchedEntries.push(queued);
+                }
+              }
+
+              const targetMessageId = requestControl.targetMessageId;
+              if (targetMessageId) {
+                for (const queued of state.queue) {
+                  if (
+                    !matchedEntries.includes(queued) &&
+                    !reservedQueueEntries.has(queued) &&
+                    requestRawReferencesMessage(queued.raw, targetMessageId)
+                  ) {
+                    matchedEntries.push(queued);
+                  }
+                }
+              }
+
+              if (matchedEntries.length > 0) {
+                for (const queued of matchedEntries) reservedQueueEntries.add(queued);
+                const attempt: QueueLifecycleAttempt = {
+                  eventId: msg.id,
+                  controlRequestId: requestId,
+                  controlRequestClient: requestClient,
+                  sessionId,
+                  kind: "queued-cancellation",
+                  detail: "cancelled while queued",
+                  pendingGroups: groupQueueCancellationEntries(matchedEntries),
+                  controlApplied: true,
+                };
+                queueLifecycleAttempts.set(msg.id, attempt);
+                await resumeQueueLifecycleAttempt(attempt, state);
+
+                logger.debug("queued request cancelled", {
+                  requestId,
+                  sessionId,
+                  cancelledRequestIds: [
+                    ...new Set(matchedEntries.map((queued) => queued.requestId)),
+                  ],
+                  queueDepth: state.queue.length,
+                });
+                logQueueTransition({
+                  action: "cancel_queued",
+                  queueDepthBefore: state.queue.length + matchedEntries.length,
+                  queueDepthAfter: state.queue.length,
+                  reason: "cancel_queued",
+                });
+
+                return;
+              }
+
+              const targetMessageIdForActive = requestControl.targetMessageId;
+              const targetMatchesActive =
+                typeof targetMessageIdForActive === "string" &&
+                requestRawReferencesMessage(state.activeRun?.raw, targetMessageIdForActive);
+
+              if (
+                !state.running ||
+                !state.activeRequestId ||
+                (!state.agent && !state.activeRun?.cancel)
+              ) {
+                await dropCancelNoTarget("request not queued or active");
+                return;
+              }
+
+              if (state.activeRequestId === requestId || targetMatchesActive) {
+                const activeCancelEntry: Enqueued = {
+                  ...entry,
+                  requestId: state.activeRequestId,
+                  requestClient: state.activeRun?.requestClient ?? entry.requestClient,
+                };
+                if (state.activeRun?.started === false) {
+                  state.activeRun.cancel();
+                } else if (state.agent) {
+                  await applyToRunningAgent(
+                    state.agent,
+                    activeCancelEntry,
+                    cancelledByRequestId,
+                    state.activeRun,
+                  );
+                }
+                logQueueTransition({
+                  action: "apply_to_active",
+                  queueDepthBefore: state.queue.length,
+                  queueDepthAfter: state.queue.length,
+                  reason: targetMatchesActive
+                    ? "cancel_active_by_message_id"
+                    : "cancel_active_by_request_id",
+                });
+                return;
+              }
+
+              await dropCancelNoTarget("request not queued or active");
               return;
             }
 
-            // No parallel runs: queue prompt messages for later.
-            const queueDepthBefore = state.queue.length;
-            const owner = requestMessageCache.acquireOwner(requestId);
-            const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
-              err: (error) => () => {
-                identityError = error;
-                return null;
-              },
-              ok: (identityOwner) => () => identityOwner,
-            });
-            const identityOwner = selectOwner();
-            if (!identityOwner) return;
-            entry.identityOwner = identityOwner;
-            const enqueued = await enqueueWithLifecycle(entry, "queued behind active request");
-            const enqueueError = enqueued.match({ ok: () => null, err: (error) => error });
-            if (enqueueError) {
-              intakeError = enqueueError;
-              return;
-            }
+            if (!state.running) {
+              if (requestControl.cancel) {
+                await dropCancelNoTarget("request not active");
+                return;
+              }
 
-            logQueuedBehindActiveRun(requestId);
-            logQueueTransition({
-              action: "enqueue",
-              queueDepthBefore,
-              queueDepthAfter: state.queue.length,
-              reason: "queued_behind_active",
-            });
+              // Some messages only make sense when a run is already active.
+              if (requestControl.requiresActive && entry.queue !== "prompt") {
+                logger.debug(
+                  "dropping request message (requires active run)",
+                  formatBridgeLogContext({
+                    requestId,
+                    sessionId,
+                    queue: entry.queue,
+                  }),
+                );
+                logQueueTransition({
+                  action: "drop",
+                  queueDepthBefore: state.queue.length,
+                  queueDepthAfter: state.queue.length,
+                  reason: "requires_active_without_run",
+                });
+                return;
+              }
+
+              const queueDepthBefore = state.queue.length;
+              const owner = requestMessageCache.acquireOwner(requestId);
+              const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
+                err: (error) => () => {
+                  identityError = error;
+                  return null;
+                },
+                ok: (identityOwner) => () => identityOwner,
+              });
+              const identityOwner = selectOwner();
+              if (!identityOwner) return;
+              entry.identityOwner = identityOwner;
+              state.queue.push(entry);
+              logQueueTransition({
+                action: "enqueue",
+                queueDepthBefore,
+                queueDepthAfter: state.queue.length,
+                reason: "start_when_idle",
+              });
+              startSessionQueueDrain(sessionId, state, requestId);
+            } else {
+              if (
+                state.activeRequestId === requestId &&
+                requestControl.cancel &&
+                state.activeRun?.started === false &&
+                state.activeRun?.cancel
+              ) {
+                state.activeRun.cancel();
+                logQueueTransition({
+                  action: "apply_to_active",
+                  queueDepthBefore: state.queue.length,
+                  queueDepthAfter: state.queue.length,
+                  reason: "cancel_active_before_agent_start",
+                });
+                return;
+              }
+
+              if (
+                state.activeRequestId === requestId &&
+                !requestControl.cancel &&
+                state.activeRun?.runProfile === "primary"
+              ) {
+                const activeRun = state.activeRun;
+                const incomingOverride =
+                  entry.modelOverride ?? parseRequestModelOverrideFromRaw(entry.raw) ?? undefined;
+                let incompatible =
+                  activeRun.resolvedModelSpec === null &&
+                  incomingOverride !== undefined &&
+                  incomingOverride !== activeRun.modelOverride;
+                if (
+                  incomingOverride !== undefined &&
+                  activeRun.resolvedModelSpec !== null &&
+                  activeRun.resolvedProviderFamily !== null
+                ) {
+                  const activeSpec = activeRun.resolvedModelSpec;
+                  const activeFamily = activeRun.resolvedProviderFamily;
+                  const requestedPlan = resolveAgentRunModelResult({
+                    cfg,
+                    runProfile: "primary",
+                    requestModelOverride: incomingOverride,
+                  });
+                  incompatible = requestedPlan.match({
+                    ok: (plan) =>
+                      shouldQueueIncompatibleActiveRuntimeModel({
+                        activeSpec,
+                        activeReasoning: activeRun.resolvedReasoning,
+                        activeFamily,
+                        requested: plan.head,
+                      }),
+                    err: () => true,
+                  });
+                }
+                if (incompatible) {
+                  const aliasRequestId = deriveModelChangingRequestId(entry);
+                  const aliased = requestMessageCache.createAliasOwner({
+                    sourceRequestId: requestId,
+                    aliasRequestId,
+                    requestClient,
+                    sessionId,
+                  });
+                  const selectAlias = aliased.match<() => RequestMessageCacheAliasOwner | null>({
+                    err: (error) => () => {
+                      identityError = error;
+                      return null;
+                    },
+                    ok: (aliasOwner) => () => aliasOwner,
+                  });
+                  const alias = selectAlias();
+                  if (!alias) return;
+                  const aliasProjection = alias.projection;
+                  const queuedEntry: Enqueued = {
+                    ...entry,
+                    requestId: aliasProjection.requestId,
+                    sessionId: aliasProjection.sessionId,
+                    requestClient: aliasProjection.requestClient,
+                    queue: "prompt",
+                    authenticatedOrigin: aliasProjection.authenticatedOrigin,
+                    verifiedIngress: aliasProjection.verifiedIngress,
+                    identityOwner: {
+                      requestId: alias.requestId,
+                      ownerId: alias.ownerId,
+                    },
+                  };
+                  const queueDepthBefore = state.queue.length;
+                  const enqueued = await enqueueWithLifecycle(
+                    queuedEntry,
+                    "queued for incompatible model or reasoning selection",
+                  );
+                  const enqueueError = enqueued.match({ ok: () => null, err: (error) => error });
+                  if (enqueueError) {
+                    intakeError = enqueueError;
+                    return;
+                  }
+                  logQueueTransition({
+                    action: "enqueue",
+                    queueDepthBefore,
+                    queueDepthAfter: state.queue.length,
+                    reason: "incompatible_active_model",
+                  });
+                  logQueuedBehindActiveRun(queuedEntry.requestId);
+                  return;
+                }
+              }
+
+              // If the message is intended for the currently active request, apply immediately.
+              if (state.activeRequestId && state.activeRequestId === requestId && state.agent) {
+                const runningAgent = state.agent;
+                const queueDepthBefore = state.queue.length;
+                const shouldAbsorbBufferedPrompts =
+                  (entry.queue === "steer" || entry.queue === "interrupt") &&
+                  !isCancelControlEntry(entry);
+
+                const bufferedPrompts = shouldAbsorbBufferedPrompts
+                  ? collectBufferedPromptEntriesForActiveRequest({
+                      queue: state.queue,
+                      activeRequestId: requestId,
+                    }).filter((queued) => !reservedQueueEntries.has(queued))
+                  : [];
+
+                const mergedEntry =
+                  bufferedPrompts.length > 0
+                    ? ({
+                        ...entry,
+                        messages: [
+                          ...bufferedPrompts.flatMap((queuedPrompt) => queuedPrompt.messages),
+                          ...entry.messages,
+                        ],
+                        corePrimaryLineage: degradeCorePrimaryLineageForMutation(
+                          "queued-buffer-absorbed-into-steering",
+                          runningAgent.state.messages.length,
+                        ),
+                      } satisfies Enqueued)
+                    : entry;
+
+                if (bufferedPrompts.length > 0) {
+                  const absorbMode: "steer" | "interrupt" =
+                    entry.queue === "interrupt" ? "interrupt" : "steer";
+                  for (const bufferedPrompt of bufferedPrompts) {
+                    reservedQueueEntries.add(bufferedPrompt);
+                  }
+                  const attempt: QueueLifecycleAttempt = {
+                    eventId: msg.id,
+                    controlRequestId: requestId,
+                    controlRequestClient: requestClient,
+                    sessionId,
+                    kind: "buffered-absorption",
+                    detail:
+                      absorbMode === "interrupt"
+                        ? "cancelled: absorbed into active interrupt"
+                        : "cancelled: absorbed into active steer",
+                    pendingGroups: groupQueueCancellationEntries(bufferedPrompts),
+                    controlApplied: false,
+                  };
+                  queueLifecycleAttempts.set(msg.id, attempt);
+                  const applied = await captureBusAgentRunnerOperation(
+                    "buffered prompt control application",
+                    () =>
+                      applyToRunningAgent(
+                        runningAgent,
+                        mergedEntry,
+                        cancelledByRequestId,
+                        state.activeRun,
+                      ),
+                  );
+                  const applyError = applied.match({ ok: () => null, err: (error) => error });
+                  if (applyError) {
+                    for (const bufferedPrompt of bufferedPrompts) {
+                      reservedQueueEntries.delete(bufferedPrompt);
+                    }
+                    queueLifecycleAttempts.delete(msg.id);
+                    signalBusAgentRunnerHostFailure(applyError);
+                  }
+                  attempt.controlApplied = true;
+                  await resumeQueueLifecycleAttempt(attempt, state);
+                } else {
+                  await applyToRunningAgent(
+                    runningAgent,
+                    mergedEntry,
+                    cancelledByRequestId,
+                    state.activeRun,
+                  );
+                }
+
+                logQueueTransition({
+                  action: "apply_to_active",
+                  queueDepthBefore,
+                  queueDepthAfter: state.queue.length,
+                  reason:
+                    bufferedPrompts.length > 0
+                      ? `same_request_id_absorbed_${bufferedPrompts.length}`
+                      : "same_request_id",
+                });
+              } else {
+                // Prevent stale surface controls (e.g. Cancel button) from enqueueing behind
+                // an unrelated active request.
+                if (requestControl.requiresActive || requestControl.cancel) {
+                  logger.debug(
+                    "dropping request message (requires active request id)",
+                    formatBridgeLogContext({
+                      requestId,
+                      sessionId,
+                      activeRequestId: state.activeRequestId,
+                      queue: entry.queue,
+                    }),
+                  );
+                  logQueueTransition({
+                    action: "drop",
+                    queueDepthBefore: state.queue.length,
+                    queueDepthAfter: state.queue.length,
+                    reason: "requires_active_different_request_id",
+                  });
+                  return;
+                }
+
+                // No parallel runs: queue prompt messages for later.
+                const queueDepthBefore = state.queue.length;
+                const owner = requestMessageCache.acquireOwner(requestId);
+                const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
+                  err: (error) => () => {
+                    identityError = error;
+                    return null;
+                  },
+                  ok: (identityOwner) => () => identityOwner,
+                });
+                const identityOwner = selectOwner();
+                if (!identityOwner) return;
+                entry.identityOwner = identityOwner;
+                const enqueued = await enqueueWithLifecycle(entry, "queued behind active request");
+                const enqueueError = enqueued.match({ ok: () => null, err: (error) => error });
+                if (enqueueError) {
+                  intakeError = enqueueError;
+                  return;
+                }
+
+                logQueuedBehindActiveRun(requestId);
+                logQueueTransition({
+                  action: "enqueue",
+                  queueDepthBefore,
+                  queueDepthAfter: state.queue.length,
+                  reason: "queued_behind_active",
+                });
+              }
+            }
+          })();
+          if (intakeError) {
+            parkPending = true;
+            return {
+              status: "return",
+              value: Result.err(
+                new BusAgentRunnerIntakeFailed({
+                  cause: intakeError,
+                  message: "cmd.request.message intake failed",
+                }),
+              ),
+            } as const;
           }
-        }
-      })();
-      if (intakeError) {
-        parkPending = true;
+          if (identityError) {
+            return {
+              status: "return",
+              value: Result.err(
+                new BusAgentRunnerAuthenticationProjectionInvalid({
+                  cause: identityError,
+                  message: "cmd.request.message identity ownership is invalid",
+                }),
+              ),
+            } as const;
+          }
+          return { status: "return", value: Result.ok(undefined) } as const;
+        },
+        catch: (cause) =>
+          Panic.is(cause)
+            ? ({ kind: "panic", panic: cause } as const)
+            : ({
+                kind: "failure",
+                error: new BusAgentRunnerIntakeFailed({
+                  cause,
+                  message: "cmd.request.message intake failed",
+                }),
+              } as const),
+      });
+      const outcome = attempted.match<
+        | {
+            readonly kind: "success";
+            readonly operation: import("better-result").InferOk<typeof attempted>;
+          }
+        | { readonly kind: "panic"; readonly panic: Panic }
+        | { readonly kind: "failure"; readonly error: BusAgentRunnerIntakeFailed }
+      >({
+        ok: (operation) => ({ kind: "success", operation }),
+        err: (failure) => failure,
+      });
+      if (outcome.kind === "panic") {
+        rethrowBusAgentRunnerPanic(outcome.panic);
         return Result.err(
           new BusAgentRunnerIntakeFailed({
-            cause: intakeError,
+            cause: outcome.panic,
             message: "cmd.request.message intake failed",
           }),
         );
       }
-      if (identityError) {
-        return Result.err(
-          new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: identityError,
-            message: "cmd.request.message identity ownership is invalid",
-          }),
-        );
+      if (outcome.kind === "failure") {
+        parkPending = true;
+        return Result.err(outcome.error);
       }
-      return Result.ok(undefined);
-    } catch (cause) {
-      rethrowBusAgentRunnerPanic(cause);
-      parkPending = true;
-      return Result.err(
-        new BusAgentRunnerIntakeFailed({
-          cause,
-          message: "cmd.request.message intake failed",
-        }),
-      );
-    } finally {
+      return outcome.operation.value;
+    })().finally(() => {
       if (!parkPending) abandonQueueLifecycleAttempt(msg.id);
       if (cacheAdmitted) {
         requestMessageCache.finishDelivery({
@@ -3541,17 +3658,19 @@ export async function startBusAgentRunner(params: {
           disposition: parkPending ? "park" : "release",
         });
       }
-    }
+    });
   }
 
   let stopStartedSubscription: (() => Promise<void>) | null = null;
   let subscriptionStart: Promise<void> | null = null;
-  const superviseAgentRunnerBackgroundFailure = (cause: unknown): void => {
+  const superviseAgentRunnerBackgroundFailure = <Cause>(cause: Cause): void => {
     rethrowBusAgentRunnerPanic(cause, reportFatalPanic);
     const error = projectBusAgentRunnerError(cause, "agent runner background operation failed");
     logger.error("agent runner background operation failed", { error: error.message });
   };
-  const observeSupervisedSubscriptionDoneRejection = (): void => undefined;
+  const ignoreDetachedFailure = async (operation: Promise<unknown>): Promise<void> => {
+    await Result.tryPromise({ try: () => operation, catch: () => undefined });
+  };
   const isRunnerAdmissionStop = (error: EventDeliveryStopped): boolean =>
     runnerAdmissionStopped && error.reason === "requested";
   const startSubscription = (): Promise<void> => {
@@ -3587,10 +3706,17 @@ export async function startBusAgentRunner(params: {
           },
         })();
       });
-      const supervisedSubscriptionDone = subscriptionDone.catch(
-        superviseAgentRunnerBackgroundFailure,
-      );
-      void supervisedSubscriptionDone.catch(observeSupervisedSubscriptionDoneRejection);
+      const supervisedSubscriptionDone = superviseSubscriptionDone();
+      void ignoreDetachedFailure(supervisedSubscriptionDone);
+
+      async function superviseSubscriptionDone(): Promise<void> {
+        const completed = await Result.tryPromise({
+          try: () => subscriptionDone,
+          catch: captureError,
+        });
+        const failure = completed.match({ ok: () => null, err: ({ cause }) => ({ cause }) });
+        if (failure) superviseAgentRunnerBackgroundFailure(failure.cause);
+      }
       stopStartedSubscription = async () => {
         const stopped = await sub.stop();
         stopped.match({
@@ -4546,15 +4672,11 @@ export async function startBusAgentRunner(params: {
     ) => {
       if (!liveParentSession) return;
       const controller = new AbortController();
-      try {
-        await Promise.race([
-          liveParentSession.waitForSignalSince(liveParentSignalVersion, controller.signal),
-          waitForContinuationSignalSince(continuationVersion, controller.signal),
-          Bun.sleep(LIVE_PARENT_RECONCILE_MS),
-        ]);
-      } finally {
-        controller.abort();
-      }
+      await Promise.race([
+        liveParentSession.waitForSignalSince(liveParentSignalVersion, controller.signal),
+        waitForContinuationSignalSince(continuationVersion, controller.signal),
+        Bun.sleep(LIVE_PARENT_RECONCILE_MS),
+      ]).finally(() => controller.abort());
     };
 
     state.activeRun = {
@@ -4617,7 +4739,7 @@ export async function startBusAgentRunner(params: {
 
     let resolvedModelLabel = "unknown";
     let resolvedProviderFamily: HistoryProviderState["lastFamily"] = "ai-sdk";
-    try {
+    const outcome = await (async () => {
       const runResult = await captureBusAgentRunnerOperation(
         "agent queue run",
         async () => {
@@ -4787,10 +4909,10 @@ export async function startBusAgentRunner(params: {
               }
               customCommandAbortController = new AbortController();
               runIdleWatchdog?.start();
-              try {
+              await (async () => {
                 const executed = await waitForPreAgent(
                   waitForRunAtHost(
-                    params.customCommands.execute({
+                    params.customCommands!.execute({
                       command,
                       args: parsedCustomCommand.args,
                       context: {
@@ -4800,7 +4922,7 @@ export async function startBusAgentRunner(params: {
                         commandName: command.def.name,
                         requestId: next.requestId,
                         sessionId: next.sessionId,
-                        abortSignal: customCommandAbortController.signal,
+                        abortSignal: customCommandAbortController!.signal,
                         reportActivity: () => markRunActivity("tool"),
                       },
                     }),
@@ -4814,10 +4936,10 @@ export async function startBusAgentRunner(params: {
                     customError = customCommandExecutionErrorText(error);
                   },
                 });
-              } finally {
+              })().finally(() => {
                 runIdleWatchdog?.pause();
                 customCommandAbortController = null;
-              }
+              });
             }
 
             const customCancelled = cancelledByRequestId.has(headers.request_id);
@@ -4892,7 +5014,10 @@ export async function startBusAgentRunner(params: {
                   finalText,
                   modelLabel: resolvedModelLabel,
                 });
-                const persistError = persisted.match({ ok: () => null, err: (error) => error });
+                const persistError = persisted.match({
+                  ok: () => null,
+                  err: (error) => error,
+                });
                 if (persistError) {
                   logger.error(
                     "failed to persist transcript after custom command error",
@@ -5435,8 +5560,8 @@ export async function startBusAgentRunner(params: {
           });
           const disabledServerCompactionReplayKeys = new Set<string>();
           let activeNativeServerCompactionReplayKey: string | null = null;
-          const turnErrorHandler = async (
-            error: unknown,
+          const turnErrorHandler = async <ErrorCause>(
+            error: ErrorCause,
             errorContext: Parameters<
               NonNullable<Parameters<typeof attachAutoCompaction>[1]["baseTurnErrorHandler"]>
             >[1],
@@ -5494,22 +5619,29 @@ export async function startBusAgentRunner(params: {
                   return await activeAgent.executeExternalToolCall(request);
                 },
               } satisfies Parameters<typeof materializeClaudeCodeRunResult>[0];
-              const run = params.materializeClaudeCodeRun
-                ? await params.materializeClaudeCodeRun(options)
-                : (await materializeClaudeCodeRunResult(options)).match({
-                    ok: (value) => () => value,
-                    err: (error) => () => {
-                      switch (error._tag) {
-                        case "ClaudeCodeRunInvalidConfiguration":
-                        case "ClaudeNativeSessionPreflightError":
-                        case "ClaudeCodeRunExternalFailure":
-                        case "ClaudeCodeBuiltInToolUnsupported":
-                        case "ClaudeCodeToolBridgeConfigurationFailed":
-                        case "ClaudeCodeRunOperationAndCleanupFailed":
-                          throw error;
-                      }
-                    },
-                  })();
+              let run;
+              if (params.materializeClaudeCodeRun) {
+                run = await params.materializeClaudeCodeRun(options);
+              } else {
+                const materializedResult = await materializeClaudeCodeRunResult(options);
+                const materialized = materializedResult.match<
+                  | {
+                      readonly kind: "success";
+                      readonly value: import("better-result").InferOk<typeof materializedResult>;
+                    }
+                  | {
+                      readonly kind: "failure";
+                      readonly error: import("better-result").InferErr<typeof materializedResult>;
+                    }
+                >({
+                  ok: (value) => ({ kind: "success" as const, value }),
+                  err: (error) => ({ kind: "failure" as const, error }),
+                });
+                run =
+                  materialized.kind === "success"
+                    ? materialized.value
+                    : signalBusAgentRunnerHostFailure(materialized.error);
+              }
               if (state.activeRun) state.activeRun.claudeCodeControl = run.control;
               return run;
             };
@@ -5904,7 +6036,7 @@ export async function startBusAgentRunner(params: {
 
             auxiliaryOutputTail = auxiliaryOutputTail.then(publishOne);
           };
-          const reportServerCompactionError = (cause: unknown): void => {
+          const reportServerCompactionError = <Cause>(cause: Cause): void => {
             const error = projectBusAgentRunnerError(cause, "OpenAI server compaction failed");
             logger.warn(
               "OpenAI server compaction failed; using portable summary",
@@ -6004,17 +6136,22 @@ export async function startBusAgentRunner(params: {
                   reasoning: agent.state.reasoning,
                   abortSignal,
                 });
-                return compacted.match({
-                  ok: (value) => () => value,
-                  err: (error) => () => {
-                    switch (error._tag) {
-                      case "OpenAIServerCompactionAborted":
-                      case "OpenAIServerCompactionRequestFailed":
-                      case "OpenAIServerCompactionOutputInvalid":
-                        throw error;
+                const outcome = compacted.match<
+                  | {
+                      readonly kind: "success";
+                      readonly value: import("better-result").InferOk<typeof compacted>;
                     }
-                  },
-                })();
+                  | {
+                      readonly kind: "failure";
+                      readonly error: import("better-result").InferErr<typeof compacted>;
+                    }
+                >({
+                  ok: (value) => ({ kind: "success" as const, value }),
+                  err: (error) => ({ kind: "failure" as const, error }),
+                });
+                return outcome.kind === "success"
+                  ? outcome.value
+                  : signalBusAgentRunnerHostFailure(outcome.error);
               },
               serverCompactionEnabled: () => {
                 if (!activeBinding.resolved.openaiServerCompaction) return false;
@@ -6022,17 +6159,13 @@ export async function startBusAgentRunner(params: {
                 return !disabledServerCompactionReplayKeys.has(replayKey);
               },
               onServerCompactionError: reportServerCompactionError,
-              onUnknownCapability: ({ spec, reason, error }) => {
-                logger.warn(
-                  "auto-compaction capability unknown; disabling threshold compaction",
-                  {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    modelSpec: spec,
-                    reason,
-                  },
-                  error,
-                );
+              onUnknownCapability: ({ spec, reason }) => {
+                logger.warn("auto-compaction capability unknown; disabling threshold compaction", {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  modelSpec: spec,
+                  reason,
+                });
               },
               onOverflowRecoveryAttempt: ({ spec, attempt, maxAttempts }) => {
                 logger.info("auto-compaction overflow recovery retry", {
@@ -6100,7 +6233,6 @@ export async function startBusAgentRunner(params: {
                 estimatedInputTokensAfter,
                 durationMs,
                 status,
-                error,
                 canonicalReplacement,
               }) => {
                 const toolCallId =
@@ -6159,11 +6291,7 @@ export async function startBusAgentRunner(params: {
                   logger.info("auto-compaction end", payload);
                   return;
                 }
-                logger.warn(
-                  "auto-compaction end",
-                  { ...payload, ...extractAiErrorLogDetails(error) },
-                  error,
-                );
+                logger.warn("auto-compaction end", payload);
               },
             }),
           );
@@ -6892,7 +7020,7 @@ export async function startBusAgentRunner(params: {
                   outputPublisher.publishToolCall({
                     toolCallId: event.toolCallId,
                     status: "start",
-                    display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
+                    display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event)}`,
                   }),
                 );
               }
@@ -6905,20 +7033,20 @@ export async function startBusAgentRunner(params: {
               const toolFailure = summarizeToolFailure({
                 toolName: event.toolName,
                 isError: event.isError,
-                result: event.result,
+                event,
                 toolSpecs: activeBinding.toolset.specs,
               });
               const deferredAccepted =
                 event.toolName === "subagent_delegate" &&
-                decodeDeferredSubagentAcceptedResult(event.result) !== null;
+                decodeDeferredSubagentAcceptedResult(event) !== null;
 
               let ok: boolean;
               switch (event.toolName) {
                 case "batch":
-                  ok = getBatchOkFromResult(event.result) ?? toolFailure.ok;
+                  ok = getBatchOkFromResult(event) ?? toolFailure.ok;
                   break;
                 case "subagent_delegate":
-                  ok = getSubagentOkFromResult(event.result) ?? toolFailure.ok;
+                  ok = getSubagentOkFromResult(event) ?? toolFailure.ok;
                   break;
                 default:
                   ok = toolFailure.ok;
@@ -6940,11 +7068,13 @@ export async function startBusAgentRunner(params: {
                     error: interruptedForRestart ? "server restarted" : toolFailureError,
                     argsPreview: formatToolLogPreview({
                       toolName: event.toolName,
-                      value: event.args,
+                      event,
+                      field: "args",
                     }),
                     resultPreview: formatToolLogPreview({
                       toolName: event.toolName,
-                      value: event.result,
+                      event,
+                      field: "result",
                     }),
                   }),
                 );
@@ -6976,7 +7106,7 @@ export async function startBusAgentRunner(params: {
                 outputPublisher.publishToolCall({
                   toolCallId: event.toolCallId,
                   status: "end",
-                  display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
+                  display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event)}`,
                   ok,
                   error: publishedToolError,
                 }),
@@ -7285,7 +7415,10 @@ export async function startBusAgentRunner(params: {
                     ? { stableNamedRequestClient: stableNamedContinuation.requestClient }
                     : {}),
                 });
-                const saveError = savedTranscript.match({ ok: () => null, err: (error) => error });
+                const saveError = savedTranscript.match({
+                  ok: () => null,
+                  err: (error) => error,
+                });
                 if (saveError) {
                   coreNamedClaudeRuntime?.markTerminalFailure(false);
                   corePrimaryClaudeRuntime?.markTerminalFailure(false);
@@ -7452,7 +7585,10 @@ export async function startBusAgentRunner(params: {
                   responseMessages,
                 }),
             );
-            const handoffError = persistedHandoffs.match({ ok: () => null, err: (error) => error });
+            const handoffError = persistedHandoffs.match({
+              ok: () => null,
+              err: (error) => error,
+            });
             if (handoffError) {
               logger.error(
                 "failed to persist heartbeat handoff transcripts",
@@ -7632,7 +7768,7 @@ export async function startBusAgentRunner(params: {
             sessionId: headers.session_id,
             durationMs: Date.now() - runStartedAt,
           });
-          return;
+          return { status: "return", value: undefined } as const;
         }
 
         if (failure.failureKind === "pre-agent-cancelled") {
@@ -7648,7 +7784,7 @@ export async function startBusAgentRunner(params: {
             output: finalText,
           });
           await outputPublisher.publishResponseText({ finalText });
-          return;
+          return { status: "return", value: undefined } as const;
         }
 
         const rawMsg = failure.displayMessage;
@@ -7816,7 +7952,9 @@ export async function startBusAgentRunner(params: {
           }),
         );
       }
-    } finally {
+
+      return { status: "continue" } as const;
+    })().finally(async () => {
       const cleanupCoreNamedRuntime = getCoreNamedClaudeRuntime();
       const cleanupCorePrimaryRuntime = getCorePrimaryClaudeRuntime();
       const cleanupClaudeCodeRun = getClaudeCodeRun();
@@ -7972,7 +8110,8 @@ export async function startBusAgentRunner(params: {
       if (!terminalPanic) {
         startSessionQueueDrain(sessionId, state);
       }
-    }
+    });
+    if (outcome.status === "return") return outcome.value;
   }
 
   function getActiveLevel1Work(): readonly AgentRunnerActiveWork[] {
@@ -8124,10 +8263,16 @@ async function applyToRunningAgent(
   };
 
   const promptWhileIdle = () => {
-    void agent.prompt(merged).catch(() => {
-      notifyWaiters?.();
-    });
+    void observePrompt();
     notifyWaiters?.();
+
+    async function observePrompt(): Promise<void> {
+      const prompted = await Result.tryPromise({
+        try: () => agent.prompt(merged),
+        catch: () => undefined,
+      });
+      if (prompted.match({ ok: () => false, err: () => true })) notifyWaiters?.();
+    }
   };
 
   const cancel = parseRequestControlFromRaw(entry.raw).cancel;

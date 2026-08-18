@@ -143,14 +143,16 @@ async function loadSkillsForToolHost(): Promise<
     const discovered = yield* Result.await(
       Result.tryPromise({
         try: () => discoverSkills({ workspaceRoot, dataDir: env.dataDir }),
-        catch: (cause) => {
+        catch: (cause) => ({ cause }),
+      }).then((result) =>
+        result.mapError(({ cause }) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
           return skillsFailure(
             "unavailable",
             cause instanceof Error ? cause.message : "Skill discovery failed",
           );
-        },
-      }),
+        }),
+      ),
     );
     return Result.ok(discovered);
   });
@@ -166,7 +168,9 @@ async function readSkillForToolHost(
     const raw = yield* Result.await(
       Result.tryPromise({
         try: () => Bun.file(found.location).text(),
-        catch: (cause) => {
+        catch: (cause) => ({ cause }),
+      }).then((result) =>
+        result.mapError(({ cause }) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
           return skillsFailure(
             typeof cause === "object" &&
@@ -177,8 +181,8 @@ async function readSkillForToolHost(
               : "unavailable",
             cause instanceof Error ? cause.message : "Skill could not be read",
           );
-        },
-      }),
+        }),
+      ),
     );
     const parsed = yield* parseSkillMarkdownResult(raw).mapError((error) =>
       skillsFailure("unavailable", error.message),
@@ -188,14 +192,16 @@ async function readSkillForToolHost(
     const includes = yield* Result.await(
       Result.tryPromise({
         try: () => listTopLevelEntries(found.baseDir),
-        catch: (cause) => {
+        catch: (cause) => ({ cause }),
+      }).then((result) =>
+        result.mapError(({ cause }) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
           return skillsFailure(
             "unavailable",
             cause instanceof Error ? cause.message : "Skill resources could not be listed",
           );
-        },
-      }),
+        }),
+      ),
     );
 
     return Result.ok({

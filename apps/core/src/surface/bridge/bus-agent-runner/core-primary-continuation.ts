@@ -1,3 +1,4 @@
+import { captureError } from "../../../shared/error-capture";
 import { isDeepStrictEqual } from "node:util";
 
 import type { ModelMessage } from "ai";
@@ -391,27 +392,36 @@ export function createCorePrimaryClaudeRuntime(input: {
           candidateSessionId,
           sourceSessionId: binding?.claudeSessionId ?? null,
         });
-        try {
-          const run = await input.materialize(
-            binding
-              ? {
-                  mode: "fork",
-                  baseSessionId: binding.claudeSessionId,
-                  sessionId: candidateSessionId,
-                  expectedSourceLastModified: binding.nativeLastModified,
-                }
-              : { mode: "fresh", sessionId: candidateSessionId },
-          );
-          return Result.ok({
-            run,
-            modelSpecifier: input.modelSpecifier,
-            initialPayload: binding
-              ? ({ mode: "suffix", startIndex: canonicalEnd } as const)
-              : ({ mode: "full" } as const),
+        {
+          const attempt = await Result.tryPromise({
+            try: async () => {
+              const run = await input.materialize(
+                binding
+                  ? {
+                      mode: "fork",
+                      baseSessionId: binding.claudeSessionId,
+                      sessionId: candidateSessionId,
+                      expectedSourceLastModified: binding.nativeLastModified,
+                    }
+                  : { mode: "fresh", sessionId: candidateSessionId },
+              );
+              return Result.ok({
+                run,
+                modelSpecifier: input.modelSpecifier,
+                initialPayload: binding
+                  ? ({ mode: "suffix", startIndex: canonicalEnd } as const)
+                  : ({ mode: "full" } as const),
+              });
+            },
+            catch: captureError,
           });
-        } catch (error) {
-          recordAttemptOutcome("failed");
-          throw error;
+
+          if (attempt.isErr()) {
+            const error = attempt.error.cause;
+            recordAttemptOutcome("failed");
+            throw error;
+          }
+          return attempt.value;
         }
       };
 
@@ -448,20 +458,30 @@ export function createCorePrimaryClaudeRuntime(input: {
             ...(selection.mode === "fork" ? { reason: "exact-binding" } : {}),
           });
           if (selection.mode === "fork" && sourceBinding) {
-            try {
-              const materialized = await materializeAttempt(
-                persistedAttemptIndex,
-                sourceBinding,
-                selection.canonicalEnd,
-              );
-              return adaptContinuationResultToHost(materialized);
-            } catch (error) {
-              if (!(error instanceof ClaudeNativeSessionPreflightError)) throw error;
-              diagnostic("native-source-invalid", {
-                issues: error.issues.map((issue) => issue.code).join(","),
-                mode: "fresh",
-                reason: "native-source-invalid",
+            {
+              const attempt = await Result.tryPromise({
+                try: async () => {
+                  const materialized = await materializeAttempt(
+                    persistedAttemptIndex,
+                    sourceBinding,
+                    selection.canonicalEnd,
+                  );
+                  return {
+                    status: "return",
+                    value: adaptContinuationResultToHost(materialized),
+                  } as const;
+                },
+                catch: captureError,
               });
+              if (attempt.isErr()) {
+                const error = attempt.error.cause;
+                if (!(error instanceof ClaudeNativeSessionPreflightError)) throw error;
+                diagnostic("native-source-invalid", {
+                  issues: error.issues.map((issue) => issue.code).join(","),
+                  mode: "fresh",
+                  reason: "native-source-invalid",
+                });
+              } else if (attempt.value.status === "return") return attempt.value.value;
             }
           }
           const materialized = await materializeAttempt(
@@ -569,19 +589,28 @@ export function createCorePrimaryClaudeRuntime(input: {
           });
         },
         recordSuccessfulModelCall: async (canonicalMessages) => {
-          try {
-            await owner.recordSuccessfulModelCall(canonicalMessages);
-            if (owner.state.phase !== "unusable") return;
-            throw new Error(owner.state.unusableReason ?? "Claude native observability failed");
-          } catch (error) {
-            recordAttemptOutcome("failed");
-            await owner.retireForCanonicalReplacement();
-            diagnostic("candidate-observability-lost", {
-              mode: "fresh",
-              reason: "native-observability-lost",
-              error: opaqueErrorMessage(error, "Unknown continuation failure"),
+          {
+            const attempt = await Result.tryPromise({
+              try: async () => {
+                await owner.recordSuccessfulModelCall(canonicalMessages);
+                if (owner.state.phase !== "unusable")
+                  return { status: "return", value: undefined } as const;
+                throw new Error(owner.state.unusableReason ?? "Claude native observability failed");
+              },
+              catch: captureError,
             });
+            if (attempt.isErr()) {
+              const error = attempt.error.cause;
+              recordAttemptOutcome("failed");
+              await owner.retireForCanonicalReplacement();
+              diagnostic("candidate-observability-lost", {
+                mode: "fresh",
+                reason: "native-observability-lost",
+                error: opaqueErrorMessage(error, "Unknown continuation failure"),
+              });
+            } else if (attempt.value.status === "return") return attempt.value.value;
           }
+          return undefined as never;
         },
         retireForRetry: async () => {
           recordAttemptOutcome("failed");
@@ -684,27 +713,52 @@ export function createCorePrimaryClaudeRuntime(input: {
             return false;
           }
           let publicationRecovered = false;
-          try {
-            const publication = input.store.publishCorePrimaryClaudeSuccess({
-              providerId: input.providerId,
-              requestClient: "discord",
-              lilacSessionId: input.sessionId,
-              requestId: input.requestId,
-              attemptIndex: attempt.attemptIndex,
-              terminalRequestId: terminalTranscript.requestId,
-              terminalLineageVersion: verifiedTerminalHead.lineageVersion,
-              terminalAtomCount: verifiedTerminalHead.atomCount,
-              terminalPrefixDigest: verifiedTerminalHead.prefixDigest,
-              terminalCanonicalMessageCount: verifiedTerminalHead.canonicalMessageCount,
-              providerState,
-              nativeCwd: finalized.candidate.cwd,
-              nativeLastModified: finalized.candidate.lastModified,
-              nativeContextTokens: finalized.observations.contextTokens,
-              nativeContextMaxTokens: finalized.observations.contextMaxTokens,
-              lastModelSpecifier: input.modelSpecifier,
-              lastReasoning: input.reasoning,
+          const attemptedPublication = Result.try({
+            try: () =>
+              input.store.publishCorePrimaryClaudeSuccess({
+                providerId: input.providerId,
+                requestClient: "discord",
+                lilacSessionId: input.sessionId,
+                requestId: input.requestId,
+                attemptIndex: attempt.attemptIndex,
+                terminalRequestId: terminalTranscript.requestId,
+                terminalLineageVersion: verifiedTerminalHead.lineageVersion,
+                terminalAtomCount: verifiedTerminalHead.atomCount,
+                terminalPrefixDigest: verifiedTerminalHead.prefixDigest,
+                terminalCanonicalMessageCount: verifiedTerminalHead.canonicalMessageCount,
+                providerState,
+                nativeCwd: finalized.candidate!.cwd,
+                nativeLastModified: finalized.candidate!.lastModified,
+                nativeContextTokens: finalized.observations.contextTokens!,
+                nativeContextMaxTokens: finalized.observations.contextMaxTokens!,
+                lastModelSpecifier: input.modelSpecifier,
+                lastReasoning: input.reasoning,
+              }),
+            catch: (error) => {
+              let message = "Unknown continuation failure";
+              if (typeof error === "string") message = error;
+              else if (error instanceof Error) message = error.message;
+              return { message, captured: error instanceof Error ? undefined : error };
+            },
+          });
+          const publicationOutcome = attemptedPublication.match<
+            | {
+                readonly kind: "success";
+                readonly publication: import("better-result").InferOk<typeof attemptedPublication>;
+              }
+            | {
+                readonly kind: "failure";
+                readonly failure: import("better-result").InferErr<typeof attemptedPublication>;
+              }
+          >({
+            ok: (publication) => ({ kind: "success" as const, publication }),
+            err: (failure) => ({ kind: "failure" as const, failure }),
+          });
+          if (publicationOutcome.kind === "success") {
+            const publicationError = publicationOutcome.publication.match({
+              ok: () => null,
+              err: (error) => error,
             });
-            const publicationError = publication.match({ ok: () => null, err: (error) => error });
             if (publicationError) {
               recordAttemptOutcome("failed");
               diagnostic(
@@ -714,20 +768,18 @@ export function createCorePrimaryClaudeRuntime(input: {
               );
               return false;
             }
-          } catch (error) {
-            let persistedState: CorePrimaryClaudeSessionAttempt["state"] | null = null;
-            try {
-              persistedState =
+          } else {
+            const persistedState = Result.try({
+              try: () =>
                 input.store.getCorePrimaryClaudeSessionAttempt({
                   providerId: input.providerId,
                   requestClient: "discord",
                   lilacSessionId: input.sessionId,
                   requestId: input.requestId,
                   attemptIndex: attempt.attemptIndex,
-                })?.state ?? null;
-            } catch {
-              // Leave an unknown publication outcome for startup recovery.
-            }
+                })?.state ?? null,
+              catch: () => null,
+            }).match({ ok: (state) => state, err: () => null });
             if (persistedState === "succeeded") {
               publicationRecovered = true;
             } else {
@@ -741,7 +793,7 @@ export function createCorePrimaryClaudeRuntime(input: {
                 mode: "canonical-publication",
                 reason: "publication-failed",
                 persistedState,
-                error: opaqueErrorMessage(error, "Unknown continuation failure"),
+                error: publicationOutcome.failure.message,
               });
               return false;
             }

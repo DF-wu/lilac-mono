@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import {
   lilacEventTypes,
   outReqTopic,
@@ -218,21 +219,30 @@ export async function captureBusToAdapterEffect<T>(
   operation: BusToAdapterEffect,
   effect: () => Promise<T>,
 ): Promise<ResultType<T, BusToAdapterEffectFailed>> {
-  try {
-    return Result.ok(await effect());
-  } catch (cause) {
-    rethrowBusToAdapterPanic(cause);
-    if (cause instanceof BusToAdapterEffectFailed) return Result.err(cause);
-    return Result.err(
-      new BusToAdapterEffectFailed({
-        operation,
-        failureKind: "external-effect",
-        surfaceErrorTag: null,
-        created: null,
-        cause,
-        message: `Bus-to-adapter effect failed: ${operation}`,
-      }),
-    );
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await effect());
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      rethrowBusToAdapterPanic(cause);
+      if (cause instanceof BusToAdapterEffectFailed) return Result.err(cause);
+      return Result.err(
+        new BusToAdapterEffectFailed({
+          operation,
+          failureKind: "external-effect",
+          surfaceErrorTag: null,
+          created: null,
+          cause,
+          message: `Bus-to-adapter effect failed: ${operation}`,
+        }),
+      );
+    }
+    return attempt.value;
   }
 }
 
@@ -317,16 +327,23 @@ export function adaptBusToAdapterSubscriptionStop(
 export async function superviseBusToAdapterCleanup(
   effects: readonly (() => Promise<void>)[],
 ): Promise<void> {
-  let failure: { readonly cause: unknown; readonly panic: boolean } | null = null;
+  let failureCause: unknown;
+  let failureIsPanic = false;
+  let hasFailure = false;
   for (const effect of effects) {
-    try {
-      await effect();
-    } catch (cause) {
-      const panic = Panic.is(cause);
-      if (failure === null || (panic && !failure.panic)) failure = { cause, panic };
-    }
+    await Result.tryPromise({
+      try: effect,
+      catch: (cause) => {
+        const panic = Panic.is(cause);
+        if (!hasFailure || (panic && !failureIsPanic)) {
+          failureCause = cause;
+          failureIsPanic = panic;
+          hasFailure = true;
+        }
+      },
+    });
   }
-  if (failure !== null) throw failure.cause;
+  if (hasFailure) throw failureCause;
 }
 
 function signalSurfaceRelayRecoveryAtomicityUnknown(
@@ -1596,7 +1613,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
           }
 
           handlingOutputEvent = true;
-          try {
+          const outcome = await (async () => {
             let part: SurfaceOutputPart | null = null;
 
             switch (outMsg.type) {
@@ -1790,12 +1807,14 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                     requestId,
                     sessionId,
                   });
-                  return;
+                  return { status: "return", value: undefined } as const;
                 }
 
                 if (
-                  policy.finalization?.isFinalResponseSuperseded?.({ requestId, sessionId }) ===
-                  true
+                  policy.finalization?.isFinalResponseSuperseded?.({
+                    requestId,
+                    sessionId,
+                  }) === true
                 ) {
                   logger.info("surface reply suppressed (superseded)", {
                     requestId,
@@ -1815,7 +1834,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                       }),
                     relayStop,
                   ]);
-                  return;
+                  return { status: "return", value: undefined } as const;
                 }
 
                 const statsLineRaw = outMsg.data.statsForNerdsLine;
@@ -1867,7 +1886,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                     requestId,
                     sessionId,
                   });
-                  return;
+                  return { status: "return", value: undefined } as const;
                 }
 
                 if (statsLine.length > 0) {
@@ -1881,7 +1900,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                   });
                   if (pushedStatsError) {
                     processingError = pushedStatsError;
-                    return;
+                    return { status: "return", value: undefined } as const;
                   }
                 }
 
@@ -1925,14 +1944,17 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                 });
                 if (pushedFinalError) {
                   processingError = pushedFinalError;
-                  return;
+                  return { status: "return", value: undefined } as const;
                 }
                 recordOutputPartDisposition(selectResultValue(pushedFinal));
                 const finished = await finishOutput();
-                const finishError = finished.match({ ok: () => undefined, err: (error) => error });
+                const finishError = finished.match({
+                  ok: () => undefined,
+                  err: (error) => error,
+                });
                 if (finishError) {
                   processingError = finishError;
-                  return;
+                  return { status: "return", value: undefined } as const;
                 }
                 const res = selectResultValue(finished);
 
@@ -1966,11 +1988,11 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                   sessionId,
                   finalTextChars: streamFinalText.length,
                 });
-                return;
+                return { status: "return", value: undefined } as const;
               }
 
               default:
-                return;
+                return { status: "return", value: undefined } as const;
             }
 
             if (part) {
@@ -1978,13 +2000,16 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
               const pushError = pushed.match({ ok: () => undefined, err: (error) => error });
               if (pushError) {
                 processingError = pushError;
-                return;
+                return { status: "return", value: undefined } as const;
               }
               recordOutputPartDisposition(selectResultValue(pushed));
             }
-          } finally {
+
+            return { status: "continue" } as const;
+          })().finally(() => {
             handlingOutputEvent = false;
-          }
+          });
+          if (outcome.status === "return") return outcome.value;
         });
 
         if (processingError) return Result.err(processingError);
@@ -2026,12 +2051,12 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
       const captured = await captureBusToAdapterEffect("start-typing", () =>
         adapter.startTyping(sessionRef),
       );
-      const captureError = captured.match({ ok: () => null, err: (error) => error });
-      if (captureError) {
+      const capturedError = captured.match({ ok: () => null, err: (error) => error });
+      if (capturedError) {
         logger.warn("surface typing indicator unavailable", {
           requestId,
           sessionId,
-          ...formatTaggedErrorForLog(captureError),
+          ...formatTaggedErrorForLog(capturedError),
         });
         return;
       }
@@ -2178,36 +2203,45 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     input: Parameters<typeof startRelayUnchecked>[0],
   ): Promise<ActiveRelay> {
     const resources: RelayStartupResources = {};
-    try {
-      return await startRelayUnchecked(input, resources);
-    } catch (cause) {
-      const settled = await Promise.allSettled([
-        resources.output
-          ? resources.output
-              .abort("restore_start_failed")
-              .then((result) => result.match({ ok: () => true, err: () => false }))
-          : Promise.resolve(true),
-        resources.subscription
-          ? resources.subscription.stop().then(async (stopped) => {
-              const stoppedCleanly = stopped.match({ ok: () => true, err: () => false });
-              if (!stoppedCleanly) return false;
-              const done = await resources.subscription?.done;
-              return done?.match({ ok: () => true, err: () => false }) ?? false;
-            })
-          : Promise.resolve(true),
-        resources.typing
-          ? resources.typing
-              .stop()
-              .then((result) => result.match({ ok: () => true, err: () => false }))
-          : Promise.resolve(true),
-      ]);
-      if (settled.some((result) => result.status === "rejected" || result.value === false)) {
-        throw new Panic({
-          message: "Relay startup cleanup left recovery atomicity unknown",
-          cause,
-        });
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          return await startRelayUnchecked(input, resources);
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const cause = attempt.error.cause;
+        const settled = await Promise.allSettled([
+          resources.output
+            ? resources.output
+                .abort("restore_start_failed")
+                .then((result) => result.match({ ok: () => true, err: () => false }))
+            : Promise.resolve(true),
+          resources.subscription
+            ? resources.subscription.stop().then(async (stopped) => {
+                const stoppedCleanly = stopped.match({ ok: () => true, err: () => false });
+                if (!stoppedCleanly) return false;
+                const done = await resources.subscription?.done;
+                return done?.match({ ok: () => true, err: () => false }) ?? false;
+              })
+            : Promise.resolve(true),
+          resources.typing
+            ? resources.typing
+                .stop()
+                .then((result) => result.match({ ok: () => true, err: () => false }))
+            : Promise.resolve(true),
+        ]);
+        if (settled.some((result) => result.status === "rejected" || result.value === false)) {
+          throw new Panic({
+            message: "Relay startup cleanup left recovery atomicity unknown",
+            cause,
+          });
+        }
+        throw cause;
       }
-      throw cause;
+      return attempt.value;
     }
   }
 

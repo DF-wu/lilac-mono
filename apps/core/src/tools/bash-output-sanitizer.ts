@@ -4,9 +4,9 @@ import { Transform, type TransformCallback } from "node:stream";
 
 import { BufferedFileSink } from "@stanley2058/lilac-coding-tools/buffered-file-sink";
 import { isPanic } from "@stanley2058/lilac-utils";
-import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { normalizeLiteralSecrets, REDACTION_PLACEHOLDER } from "./bash-literal-redactor";
 import { redactSecrets } from "./bash-safety/format";
 import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
@@ -364,8 +364,8 @@ function settleBashOutputCleanup(
 ): Promise<ResultType<void, BashOutputStreamError | Panic>> {
   return Result.tryPromise({
     try: run,
-    catch: <TCaught>(caught: TCaught) =>
-      isPanic(caught)
+    catch: (caught) =>
+      Panic.is(caught)
         ? caught
         : new BashOutputStreamError({
             operation,
@@ -387,10 +387,9 @@ function captureBashOutputOperation<T>(params: {
   readonly operation: string;
   readonly run: () => Awaited<T>;
 }): ResultType<T, BashOutputStreamError | Panic> {
-  const captured = Result.try({
-    try: params.run,
-    catch: projectRuntimeError(`Opaque Bash output ${params.operation} failure`),
-  });
+  const captured = Result.try({ try: params.run, catch: captureRuntimeError }).mapError((error) =>
+    projectCapturedRuntimeError(error, `Opaque Bash output ${params.operation} failure`),
+  );
   return captured.match<() => ResultType<T, BashOutputStreamError | Panic>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () =>
@@ -410,10 +409,11 @@ async function captureBashOutputPromise<T>(params: {
   readonly operation: string;
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, BashOutputStreamError | Panic>> {
-  const captured = await Result.tryPromise({
-    try: params.run,
-    catch: projectRuntimeError(`Opaque Bash output ${params.operation} failure`),
-  });
+  const captured = (
+    await Result.tryPromise({ try: params.run, catch: captureRuntimeError })
+  ).mapError((error) =>
+    projectCapturedRuntimeError(error, `Opaque Bash output ${params.operation} failure`),
+  );
   return captured.match<() => ResultType<T, BashOutputStreamError | Panic>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () =>

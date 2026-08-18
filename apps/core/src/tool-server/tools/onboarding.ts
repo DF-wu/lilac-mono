@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import { $ } from "bun";
 import { z } from "zod";
 import path from "node:path";
@@ -6,6 +7,40 @@ import { constants as fsConstants } from "node:fs";
 import { createHash } from "node:crypto";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
+
+type OnboardingCapturedFailure = {
+  readonly cause: Error | Panic;
+  readonly code?: string;
+  readonly name?: string;
+};
+
+function captureOnboardingFailure(cause: unknown): OnboardingCapturedFailure {
+  const code =
+    typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "string"
+      ? cause.code
+      : undefined;
+  const name =
+    typeof cause === "object" && cause !== null && "name" in cause && typeof cause.name === "string"
+      ? cause.name
+      : undefined;
+  if (Panic.is(cause)) return { cause, code, name };
+  if (cause instanceof Error) return { cause, code, name };
+  const message =
+    typeof cause === "object" &&
+    cause !== null &&
+    "message" in cause &&
+    typeof cause.message === "string"
+      ? cause.message
+      : "Onboarding operation failed";
+  return { cause: new Error(message, { cause }), code, name };
+}
+
+async function settleCapturedPromise<T, E>(
+  result: Promise<ResultType<T, OnboardingCapturedFailure>>,
+  resolve: (failure: OnboardingCapturedFailure) => E,
+): Promise<ResultType<T, E>> {
+  return (await result).mapError(resolve);
+}
 import {
   serverToolFailure,
   type ServerToolFailure,
@@ -18,7 +53,6 @@ import {
   ensurePromptWorkspace,
   findWorkspaceRootResult,
   getCoreConfig,
-  isRecord,
   resolveCoreConfigPath,
   resolvePromptDir,
   seedCoreConfig,
@@ -51,10 +85,13 @@ function onboardingFailure(kind: ServerToolFailure["kind"], message: string): Se
 }
 
 function requireWorkspaceRoot(): ResultType<string, ServerToolFailure> {
-  return findWorkspaceRootResult().mapError((error) => {
-    if (Panic.is(error)) return preserveToolPanic(error);
-    return onboardingFailure("not_found", error.message);
-  });
+  return findWorkspaceRootResult().match<() => ResultType<string, ServerToolFailure>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      if (Panic.is(error)) return preserveToolPanic(error);
+      return Result.err(onboardingFailure("not_found", error.message));
+    },
+  })();
 }
 
 const githubBashEnvDocs = {
@@ -238,12 +275,21 @@ const allInputSchema = z.object({
 });
 
 async function pathExecutable(p: string): Promise<boolean> {
-  try {
-    await fs.access(p, fsConstants.X_OK);
-    return true;
-  } catch (cause) {
-    if (Panic.is(cause)) return preserveToolPanic(cause);
-    return false;
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        await fs.access(p, fsConstants.X_OK);
+        return true;
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (Panic.is(cause)) return preserveToolPanic(cause);
+      return false;
+    }
+    return attempt.value;
   }
 }
 
@@ -274,11 +320,20 @@ async function findSystemChromiumExecutable(): Promise<string | null> {
 }
 
 function isRootUser(): boolean {
-  try {
-    return typeof process.getuid === "function" && process.getuid() === 0;
-  } catch (cause) {
-    if (Panic.is(cause)) return preserveToolPanic(cause);
-    return false;
+  {
+    const attempt = Result.try({
+      try: () => {
+        return typeof process.getuid === "function" && process.getuid() === 0;
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (Panic.is(cause)) return preserveToolPanic(cause);
+      return false;
+    }
+    return attempt.value;
   }
 }
 
@@ -300,16 +355,19 @@ async function ensurePlaywrightChromiumInstalled(options: {
     );
   }
 
-  const installed = await Result.tryPromise({
-    try: () =>
-      options.withDeps
-        ? $`bunx playwright install chromium --with-deps`.then(() => undefined)
-        : $`bunx playwright install chromium`.then(() => undefined),
-    catch: (cause) => {
+  const installed = await settleCapturedPromise(
+    Result.tryPromise({
+      try: () =>
+        options.withDeps
+          ? $`bunx playwright install chromium --with-deps`.then(() => undefined)
+          : $`bunx playwright install chromium`.then(() => undefined),
+      catch: captureOnboardingFailure,
+    }),
+    ({ cause }) => {
       if (Panic.is(cause)) return preserveToolPanic(cause);
       return onboardingFailure("unavailable", errorMessage(cause));
     },
-  });
+  );
   const installFailure = installed.match({
     ok: () => undefined,
     err: (failure) => failure,
@@ -332,12 +390,17 @@ async function ensurePlaywrightChromiumInstalled(options: {
 function scheduleRestart(): { ok: true; scheduled: true } {
   // Give the HTTP response a moment to flush.
   setTimeout(() => {
-    try {
-      process.kill(process.pid, "SIGTERM");
-    } catch (cause) {
-      if (Panic.is(cause)) return preserveToolPanic(cause);
-      process.exit(0);
-    }
+    const signalled = Result.try({
+      try: () => process.kill(process.pid, "SIGTERM"),
+      catch: captureError,
+    }).match<{ readonly kind: "success" } | { readonly kind: "failure"; readonly failure: Error }>({
+      ok: () => ({ kind: "success" }),
+      err: ({ cause }) => ({ kind: "failure", failure: cause }),
+    });
+    if (signalled.kind === "success") return;
+    const cause = signalled.failure;
+    if (Panic.is(cause)) preserveToolPanic(cause);
+    process.exit(0);
   }, 250);
   return { ok: true as const, scheduled: true as const };
 }
@@ -405,11 +468,17 @@ function resolveVcsPaths(dataDir: string): {
 
 async function ensureDir0700(p: string): Promise<void> {
   await fs.mkdir(p, { recursive: true });
-  try {
-    await fs.chmod(p, 0o700);
-  } catch (cause) {
-    if (Panic.is(cause)) return preserveToolPanic(cause);
-    // Best-effort.
+  const changed = (
+    await Result.tryPromise({
+      try: () => fs.chmod(p, 0o700),
+      catch: captureError,
+    })
+  ).match<{ readonly kind: "success" } | { readonly kind: "failure"; readonly failure: Error }>({
+    ok: () => ({ kind: "success" }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (changed.kind === "failure" && Panic.is(changed.failure)) {
+    preserveToolPanic(changed.failure);
   }
 }
 
@@ -497,13 +566,16 @@ async function downloadToFile(
 ): Promise<ResultType<void, ServerToolFailure>> {
   return Result.gen(async function* () {
     const res = yield* Result.await(
-      Result.tryPromise({
-        try: () => fetch(url),
-        catch: (cause) => {
+      settleCapturedPromise(
+        Result.tryPromise({
+          try: () => fetch(url),
+          catch: captureOnboardingFailure,
+        }),
+        ({ cause }) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
           return onboardingFailure("unavailable", errorMessage(cause));
         },
-      }),
+      ),
     );
     if (!res.ok) {
       return Result.err(
@@ -511,13 +583,16 @@ async function downloadToFile(
       );
     }
     yield* Result.await(
-      Result.tryPromise({
-        try: () => Bun.write(filePath, res).then(() => undefined),
-        catch: (cause) => {
+      settleCapturedPromise(
+        Result.tryPromise({
+          try: () => Bun.write(filePath, res).then(() => undefined),
+          catch: captureOnboardingFailure,
+        }),
+        ({ cause }) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
           return onboardingFailure("unavailable", errorMessage(cause));
         },
-      }),
+      ),
     );
     return Result.ok(undefined);
   });
@@ -595,13 +670,16 @@ async function fetchGithubLatestRelease(
 ): Promise<ResultType<GithubRelease, ServerToolFailure>> {
   return Result.gen(async function* () {
     const res = yield* Result.await(
-      Result.tryPromise({
-        try: () => fetch(`https://api.github.com/repos/${repo}/releases/latest`),
-        catch: (cause) => {
+      settleCapturedPromise(
+        Result.tryPromise({
+          try: () => fetch(`https://api.github.com/repos/${repo}/releases/latest`),
+          catch: captureOnboardingFailure,
+        }),
+        ({ cause }) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
           return onboardingFailure("unavailable", errorMessage(cause));
         },
-      }),
+      ),
     );
     if (!res.ok) {
       return Result.err(
@@ -612,18 +690,26 @@ async function fetchGithubLatestRelease(
       );
     }
     const raw = yield* Result.await(
-      Result.tryPromise({
-        try: async () => (await res.json()) as unknown,
-        catch: (cause) => {
+      settleCapturedPromise(
+        Result.tryPromise({
+          try: async () => (await res.json()) as unknown,
+          catch: captureOnboardingFailure,
+        }),
+        ({ cause }) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
           return onboardingFailure("unavailable", errorMessage(cause));
         },
-      }),
+      ),
     );
-    return decodeGithubReleaseResponse(raw).mapError((error) => {
-      if (Panic.is(error)) return preserveToolPanic(error);
-      return onboardingFailure("unavailable", `${error.message} for ${repo}`);
-    });
+    return decodeGithubReleaseResponse(raw).match<
+      () => ResultType<GithubRelease, ServerToolFailure>
+    >({
+      ok: (value) => () => Result.ok(value),
+      err: (error) => () => {
+        if (Panic.is(error)) return preserveToolPanic(error);
+        return Result.err(onboardingFailure("unavailable", `${error.message} for ${repo}`));
+      },
+    })();
   });
 }
 
@@ -778,10 +864,17 @@ async function installGithubTarGzBinary(params: {
 }
 
 async function hasAnySkillMdUnder(dir: string): Promise<boolean> {
-  try {
-    await fs.access(dir);
-  } catch (cause) {
-    if (Panic.is(cause)) return preserveToolPanic(cause);
+  const accessed = (
+    await Result.tryPromise({
+      try: () => fs.access(dir),
+      catch: captureError,
+    })
+  ).match<{ readonly kind: "success" } | { readonly kind: "failure"; readonly failure: Error }>({
+    ok: () => ({ kind: "success" }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (accessed.kind === "failure") {
+    if (Panic.is(accessed.failure)) preserveToolPanic(accessed.failure);
     return false;
   }
   const glob = new Bun.Glob(path.join(dir, "**", "SKILL.md"));
@@ -945,13 +1038,13 @@ export class Onboarding implements ServerTool {
       kind: ServerToolFailure["kind"] = "unavailable",
       fallbackMessage?: string,
     ): Promise<ResultType<T, ServerToolFailure>> =>
-      Result.tryPromise({
-        try: operation,
-        catch: (cause) => {
+      settleCapturedPromise(
+        Result.tryPromise({
+          try: operation,
+          catch: captureOnboardingFailure,
+        }),
+        ({ cause, code, name }) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
-          const error = isRecord(cause) ? cause : {};
-          const code = typeof error.code === "string" ? error.code : undefined;
-          const name = typeof error.name === "string" ? error.name : undefined;
           let classifiedKind = kind;
           if (code === "EACCES" || code === "EPERM") classifiedKind = "denied";
           else if (code === "ENOENT") classifiedKind = "not_found";
@@ -961,10 +1054,10 @@ export class Onboarding implements ServerTool {
           }
           return onboardingFailure(
             classifiedKind,
-            cause instanceof Error ? cause.message : (fallbackMessage ?? errorMessage(cause)),
+            cause.message || fallbackMessage || errorMessage(cause),
           );
         },
-      });
+      );
 
     return Result.gen(
       async function* (this: Onboarding) {

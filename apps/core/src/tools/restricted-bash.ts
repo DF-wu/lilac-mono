@@ -34,7 +34,7 @@ import {
 } from "just-bash";
 
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { resolveRestrictedSessionTmpDir } from "../shared/attachment-utils";
 import { parseSshCwdTarget } from "../ssh/ssh-cwd";
 import {
@@ -68,10 +68,11 @@ async function captureRestrictedBashOperation<T>(params: {
   readonly operation: string;
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, RestrictedBashOperationError>> {
-  const captured = await Result.tryPromise({
-    try: params.run,
-    catch: projectRuntimeError(`Opaque restricted Bash ${params.operation} failure`),
-  });
+  const captured = (
+    await Result.tryPromise({ try: params.run, catch: captureRuntimeError })
+  ).mapError((error) =>
+    projectCapturedRuntimeError(error, `Opaque restricted Bash ${params.operation} failure`),
+  );
   return captured.match<() => ResultType<T, RestrictedBashOperationError>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {
@@ -91,10 +92,9 @@ function captureRestrictedBashSync<T>(params: {
   readonly operation: string;
   readonly run: () => Awaited<T>;
 }): ResultType<T, RestrictedBashOperationError> {
-  const captured = Result.try({
-    try: params.run,
-    catch: projectRuntimeError(`Opaque restricted Bash ${params.operation} failure`),
-  });
+  const captured = Result.try({ try: params.run, catch: captureRuntimeError }).mapError((error) =>
+    projectCapturedRuntimeError(error, `Opaque restricted Bash ${params.operation} failure`),
+  );
   return captured.match<() => ResultType<T, RestrictedBashOperationError>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {
@@ -122,13 +122,12 @@ function signalRestrictedBashFailure(operation: string, message: string): never 
   );
 }
 
-function captureRestrictedHostPromise<T>(
+async function captureRestrictedHostPromise<T>(
   run: () => Promise<T>,
 ): Promise<ResultType<T, Error | Panic>> {
-  return Result.tryPromise({
-    try: run,
-    catch: projectRuntimeError("Opaque restricted host operation failure"),
-  });
+  return (await Result.tryPromise({ try: run, catch: captureRuntimeError })).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque restricted host operation failure"),
+  );
 }
 
 function restrictedHostErrorCode(cause: Error): string | undefined {
@@ -537,8 +536,10 @@ async function readJsonSource(source: string, ctx: CommandContext): Promise<unkn
 function decodeRestrictedJson(source: string): ResultType<unknown, NestedToolsCommandFailure> {
   const decoded = Result.try({
     try: () => JSON.parse(source),
-    catch: projectRuntimeError("Opaque restricted Bash JSON parse failure"),
-  });
+    catch: captureRuntimeError,
+  }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque restricted Bash JSON parse failure"),
+  );
   return decoded.match<() => ResultType<unknown, NestedToolsCommandFailure>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {
@@ -728,8 +729,10 @@ async function fetchNestedToolsJson(params: {
         }
         return value;
       }),
-    catch: projectRuntimeError("Tool server returned invalid JSON"),
-  });
+    catch: captureRuntimeError,
+  }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Tool server returned invalid JSON"),
+  );
   const parseError = parsed.match({ ok: () => null, err: (error) => error });
   if (parseError) {
     return signalNestedToolsFailure(
@@ -1333,16 +1336,13 @@ export async function executeRestrictedBash(
       originalStderrBytes: Buffer.byteLength(output.stderr, "utf8"),
     });
   };
-  let executed: ResultType<BashToolOutput, RestrictedBashOperationError>;
-  try {
-    executed = await captureRestrictedBashOperation({
-      operation: "execute",
-      run: runRestrictedExecution,
-    });
-  } finally {
+  const executed = await captureRestrictedBashOperation({
+    operation: "execute",
+    run: runRestrictedExecution,
+  }).finally(() => {
     clearTimeout(timeout);
     options.abortSignal?.removeEventListener("abort", abortListener);
-  }
+  });
   return executed.match<() => BashToolOutput>({
     err: (error) => () => {
       const executionError = toRestrictedTerminationError(termination, wallClockTimeoutMs) ?? {

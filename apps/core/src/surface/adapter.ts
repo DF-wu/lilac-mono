@@ -21,11 +21,26 @@ export function preserveSurfacePanic(cause: unknown): void {
   if (Panic.is(cause)) throw cause;
 }
 
+export type SurfaceFallbackCapture<T> =
+  | { readonly kind: "fallback"; readonly fallback: T }
+  | { readonly kind: "panic"; readonly panic: Panic; readonly fallback: T };
+
 export function surfaceExternalFallback<T>(fallback: T): (cause: unknown) => T {
   return (cause) => {
     preserveSurfacePanic(cause);
     return fallback;
   };
+}
+
+export function settleSurfaceFallback<T, E>(
+  result: ResultType<T, SurfaceFallbackCapture<E>>,
+): ResultType<T, E> {
+  return result.mapError((captured) => {
+    if (captured.kind === "panic" && Panic.is(captured.panic)) {
+      preserveSurfacePanic(captured.panic);
+    }
+    return captured.fallback;
+  });
 }
 
 export type SurfaceOperation =

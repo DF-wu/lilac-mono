@@ -1,3 +1,5 @@
+import { captureError } from "../../../shared/error-capture";
+import { Result } from "better-result";
 import { createDownload, type Experimental_DownloadFunction as DownloadFunction } from "ai";
 import { opaqueErrorMessage, type JSONObject } from "@stanley2058/lilac-utils";
 
@@ -23,6 +25,10 @@ const ANTHROPIC_FALLBACK_IMAGE_MAX_RENDER_ATTEMPTS = 5;
 const downloadUrlForAnthropicFallback = createDownload({
   maxBytes: ANTHROPIC_FALLBACK_FORCE_DOWNLOAD_MAX_BYTES,
 });
+
+async function ignoreFallbackFsFailure(operation: () => Promise<unknown>): Promise<void> {
+  await Result.tryPromise({ try: operation, catch: () => undefined });
+}
 
 type AnthropicFallbackCacheRecord =
   | {
@@ -161,18 +167,27 @@ function formatAnthropicFallbackImageTooLargeError(params: {
 }
 
 async function runCommand(params: { cmd: string[] }): Promise<{ code: number; stderr: string }> {
-  try {
-    const proc = Bun.spawn(params.cmd, {
-      stdout: "ignore",
-      stderr: "pipe",
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        const proc = Bun.spawn(params.cmd, {
+          stdout: "ignore",
+          stderr: "pipe",
+        });
+
+        const stderr = proc.stderr ? await new Response(proc.stderr).text() : "";
+        const code = await proc.exited;
+        return { code, stderr };
+      },
+      catch: captureError,
     });
 
-    const stderr = proc.stderr ? await new Response(proc.stderr).text() : "";
-    const code = await proc.exited;
-    return { code, stderr };
-  } catch (error) {
-    const message = opaqueErrorMessage(error, "Unknown media conversion failure");
-    return { code: -1, stderr: message };
+    if (attempt.isErr()) {
+      const error = attempt.error.cause;
+      const message = opaqueErrorMessage(error, "Unknown media conversion failure");
+      return { code: -1, stderr: message };
+    }
+    return attempt.value;
   }
 }
 
@@ -213,7 +228,7 @@ async function renderAnthropicFallbackImageCandidate(params: {
   width: number;
   quality: number;
 }): Promise<{ bytes?: Uint8Array; error?: string }> {
-  await fs.rm(params.outputPath, { force: true }).catch(() => {});
+  await ignoreFallbackFsFailure(() => fs.rm(params.outputPath, { force: true }));
 
   const resize = `${params.width}x${params.width}>`;
   let lastError = "";
@@ -249,55 +264,75 @@ async function fitImageForAnthropicFallback(params: {
 
   let lastError = "";
   let renderAttempts = 0;
-  try {
-    for (const width of ANTHROPIC_FALLBACK_IMAGE_MAX_WIDTHS) {
-      let low = ANTHROPIC_FALLBACK_IMAGE_MIN_QUALITY;
-      let high = ANTHROPIC_FALLBACK_IMAGE_MAX_QUALITY;
-      let bestBytes: Uint8Array | undefined;
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        for (const width of ANTHROPIC_FALLBACK_IMAGE_MAX_WIDTHS) {
+          let low = ANTHROPIC_FALLBACK_IMAGE_MIN_QUALITY;
+          let high = ANTHROPIC_FALLBACK_IMAGE_MAX_QUALITY;
+          let bestBytes: Uint8Array | undefined;
 
-      while (low <= high) {
-        const quality = Math.floor((low + high) / 2);
-        const rendered = await renderAnthropicFallbackImageCandidate({
-          inputPath: paths.originalPath,
-          outputPath: paths.resizedPath,
-          width,
-          quality,
-        });
+          while (low <= high) {
+            const quality = Math.floor((low + high) / 2);
+            const rendered = await renderAnthropicFallbackImageCandidate({
+              inputPath: paths.originalPath,
+              outputPath: paths.resizedPath,
+              width,
+              quality,
+            });
 
-        if (!rendered.bytes) {
-          lastError = rendered.error ?? lastError;
-          break;
-        }
+            if (!rendered.bytes) {
+              lastError = rendered.error ?? lastError;
+              break;
+            }
 
-        renderAttempts += 1;
+            renderAttempts += 1;
 
-        if (rendered.bytes.byteLength <= ANTHROPIC_FALLBACK_IMAGE_MAX_BYTES) {
-          bestBytes = rendered.bytes;
-          if (renderAttempts >= ANTHROPIC_FALLBACK_IMAGE_MAX_RENDER_ATTEMPTS) {
-            return {
+            if (rendered.bytes.byteLength <= ANTHROPIC_FALLBACK_IMAGE_MAX_BYTES) {
+              bestBytes = rendered.bytes;
+              if (renderAttempts >= ANTHROPIC_FALLBACK_IMAGE_MAX_RENDER_ATTEMPTS) {
+                return {
+                  status: "return",
+                  value: {
+                    data: bestBytes,
+                    mediaType: "image/jpeg",
+                  },
+                } as const;
+              }
+              low = quality + 1;
+              continue;
+            }
+
+            high = quality - 1;
+          }
+
+          if (!bestBytes) {
+            continue;
+          }
+
+          return {
+            status: "return",
+            value: {
               data: bestBytes,
               mediaType: "image/jpeg",
-            };
-          }
-          low = quality + 1;
-          continue;
+            },
+          } as const;
         }
 
-        high = quality - 1;
-      }
-
-      if (!bestBytes) {
-        continue;
-      }
-
-      return {
-        data: bestBytes,
-        mediaType: "image/jpeg",
-      };
-    }
-  } finally {
-    await fs.rm(paths.originalPath, { force: true }).catch(() => {});
-    await fs.rm(paths.resizedPath, { force: true }).catch(() => {});
+        return { status: "continue" } as const;
+      },
+      catch: captureError,
+    });
+    const cleanupAttempt = await Result.tryPromise({
+      try: async () => {
+        await ignoreFallbackFsFailure(() => fs.rm(paths.originalPath, { force: true }));
+        await ignoreFallbackFsFailure(() => fs.rm(paths.resizedPath, { force: true }));
+      },
+      catch: captureError,
+    });
+    if (cleanupAttempt.isErr()) throw cleanupAttempt.error.cause;
+    if (attempt.isErr()) throw attempt.error.cause;
+    if (attempt.value.status === "return") return attempt.value.value;
   }
 
   if (lastError) {
@@ -324,27 +359,29 @@ async function readAnthropicFallbackCache(params: {
   }
 
   const paths = getAnthropicFallbackCachePaths(params.cacheDir, params.url);
-  let rawMeta: string;
-  try {
-    rawMeta = await fs.readFile(paths.metaPath, "utf8");
-  } catch {
+  const readMeta = (
+    await Result.tryPromise({ try: () => fs.readFile(paths.metaPath, "utf8"), catch: () => null })
+  ).match({ ok: (rawMeta) => rawMeta, err: () => null });
+  if (readMeta === null) {
     anthropicFallbackMemoryCache.delete(urlText);
     return null;
   }
 
-  let meta: AnthropicFallbackCacheRecord;
-  try {
-    meta = JSON.parse(rawMeta) as AnthropicFallbackCacheRecord;
-  } catch {
-    await fs.rm(paths.metaPath, { force: true }).catch(() => {});
+  const parsedMeta = Result.try({
+    try: () => JSON.parse(readMeta) as AnthropicFallbackCacheRecord,
+    catch: () => null,
+  }).match({ ok: (meta) => meta, err: () => null });
+  if (parsedMeta === null) {
+    await ignoreFallbackFsFailure(() => fs.rm(paths.metaPath, { force: true }));
     anthropicFallbackMemoryCache.delete(urlText);
     return null;
   }
+  const meta = parsedMeta;
 
   if (!isFreshAnthropicFallbackCache(meta.cachedAt, nowMs)) {
     anthropicFallbackMemoryCache.delete(urlText);
-    await fs.rm(paths.metaPath, { force: true }).catch(() => {});
-    await fs.rm(paths.dataPath, { force: true }).catch(() => {});
+    await ignoreFallbackFsFailure(() => fs.rm(paths.metaPath, { force: true }));
+    await ignoreFallbackFsFailure(() => fs.rm(paths.dataPath, { force: true }));
     return null;
   }
 
@@ -353,14 +390,18 @@ async function readAnthropicFallbackCache(params: {
     return meta;
   }
 
-  let bytes: Uint8Array;
-  try {
-    bytes = new Uint8Array(await fs.readFile(paths.dataPath));
-  } catch {
-    await fs.rm(paths.metaPath, { force: true }).catch(() => {});
+  const readBytes = (
+    await Result.tryPromise({
+      try: async () => new Uint8Array(await fs.readFile(paths.dataPath)),
+      catch: () => null,
+    })
+  ).match({ ok: (bytes) => bytes, err: () => null });
+  if (readBytes === null) {
+    await ignoreFallbackFsFailure(() => fs.rm(paths.metaPath, { force: true }));
     anthropicFallbackMemoryCache.delete(urlText);
     return null;
   }
+  const bytes = readBytes;
 
   const entry: AnthropicFallbackMemoryEntry =
     bytes.byteLength <= ANTHROPIC_FALLBACK_MEMORY_CACHE_MAX_BYTES ? { ...meta, bytes } : meta;
@@ -375,21 +416,21 @@ async function writeAnthropicFallbackCache(params: {
   bytes?: Uint8Array;
 }): Promise<void> {
   await fs.mkdir(params.cacheDir, { recursive: true, mode: 0o700 });
-  await fs.chmod(params.cacheDir, 0o700).catch(() => {});
+  await ignoreFallbackFsFailure(() => fs.chmod(params.cacheDir, 0o700));
   const paths = getAnthropicFallbackCachePaths(params.cacheDir, params.url);
 
   if (params.entry.status === "ok" && params.bytes) {
     await fs.writeFile(paths.dataPath, params.bytes, { mode: 0o600 });
-    await fs.chmod(paths.dataPath, 0o600).catch(() => {});
+    await ignoreFallbackFsFailure(() => fs.chmod(paths.dataPath, 0o600));
   } else {
-    await fs.rm(paths.dataPath, { force: true }).catch(() => {});
+    await ignoreFallbackFsFailure(() => fs.rm(paths.dataPath, { force: true }));
   }
 
   await fs.writeFile(paths.metaPath, JSON.stringify(params.entry), {
     encoding: "utf8",
     mode: 0o600,
   });
-  await fs.chmod(paths.metaPath, 0o600).catch(() => {});
+  await ignoreFallbackFsFailure(() => fs.chmod(paths.metaPath, 0o600));
 
   const memoryEntry: AnthropicFallbackMemoryEntry =
     params.entry.status === "ok" &&
@@ -494,11 +535,24 @@ async function resolveAnthropicFallbackDownload(params: {
   })();
 
   anthropicFallbackInflight.set(urlText, promise);
-  try {
-    return await promise;
-  } finally {
-    anthropicFallbackInflight.delete(urlText);
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return { status: "return", value: await promise } as const;
+      },
+      catch: captureError,
+    });
+    const cleanupAttempt = Result.try({
+      try: () => {
+        anthropicFallbackInflight.delete(urlText);
+      },
+      catch: captureError,
+    });
+    if (cleanupAttempt.isErr()) throw cleanupAttempt.error.cause;
+    if (attempt.isErr()) throw attempt.error.cause;
+    if (attempt.value.status === "return") return attempt.value.value;
   }
+  return undefined as never;
 }
 
 export function withStableAnthropicUpstreamOrder(

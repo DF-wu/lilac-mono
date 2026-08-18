@@ -1,3 +1,5 @@
+import { captureError } from "../../shared/error-capture";
+import { Result, TaggedError } from "better-result";
 import { Database } from "bun:sqlite";
 import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import {
@@ -62,6 +64,10 @@ export type DiscordSearchHealResult = {
   fetched: number;
   indexed: number;
 };
+
+class DiscordSearchHealFailed extends TaggedError("DiscordSearchHealFailed")<{
+  readonly message: string;
+}> {}
 
 function normalizeFtsQuery(input: string): string | null {
   const tokens = input
@@ -643,49 +649,72 @@ export class DiscordSearchService {
         sessionRef: input.sessionRef,
         reason: "other",
       };
-      try {
-        await this.params.adapter.burstCache(cacheInput);
-      } catch (cause) {
-        preserveSurfacePanic(cause);
-        // ignore cache invalidation errors
+      {
+        const attempt = await Result.tryPromise({
+          try: async () => {
+            await this.params.adapter.burstCache!(cacheInput);
+          },
+          catch: captureError,
+        });
+
+        if (attempt.isErr()) {
+          const cause = attempt.error.cause;
+          preserveSurfacePanic(cause);
+          // ignore cache invalidation errors
+        }
       }
     }
 
-    try {
-      const messages = await this.params.adapter.listMsg(input.sessionRef, {
-        limit,
-      });
-      return messages.match({
-        err: (error) => () => {
-          this.logger.error("search heal failed", {
-            channelId: input.sessionRef.channelId,
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          const messages = await this.params.adapter.listMsg(input.sessionRef, {
             limit,
-            ...formatTaggedErrorForLog(error),
           });
-          return { attempted: true, skipped: false, limit, fetched: 0, indexed: 0 };
+          return messages.match({
+            err: (error) => () => {
+              this.logger.error("search heal failed", {
+                channelId: input.sessionRef.channelId,
+                limit,
+                ...formatTaggedErrorForLog(error),
+              });
+              return { attempted: true, skipped: false, limit, fetched: 0, indexed: 0 };
+            },
+            ok: (value) => () => {
+              const indexed = this.params.store.upsertMessages(value);
+              if (indexed > 0) this.params.onMessagesIndexed?.(input.sessionRef.channelId);
+              return {
+                attempted: true,
+                skipped: false,
+                limit,
+                fetched: value.length,
+                indexed,
+              };
+            },
+          })();
         },
-        ok: (value) => () => {
-          const indexed = this.params.store.upsertMessages(value);
-          if (indexed > 0) this.params.onMessagesIndexed?.(input.sessionRef.channelId);
-          return {
-            attempted: true,
-            skipped: false,
-            limit,
-            fetched: value.length,
-            indexed,
-          };
-        },
-      })();
-    } catch (e) {
-      preserveSurfacePanic(e);
-      this.logger.error("search heal failed", { channelId: input.sessionRef.channelId, limit }, e);
-      return {
-        attempted: true,
-        skipped: false,
-        limit,
-        fetched: 0,
-        indexed: 0,
-      };
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const e = attempt.error.cause;
+        preserveSurfacePanic(e);
+        this.logger.error("search heal failed", {
+          channelId: input.sessionRef.channelId,
+          limit,
+          ...formatTaggedErrorForLog(
+            new DiscordSearchHealFailed({ message: "Discord search heal failed" }),
+          ),
+        });
+        return {
+          attempted: true,
+          skipped: false,
+          limit,
+          fetched: 0,
+          indexed: 0,
+        };
+      }
+      return attempt.value;
     }
   }
 }

@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import {
   generateText,
   isStepCount,
@@ -24,7 +25,7 @@ import {
   type ServerToolFailure,
   type ServerToolResult,
 } from "@stanley2058/lilac-plugin-runtime";
-import { preserveToolPanic } from "../../tools/tool-result-adapters";
+import { adaptToolResultToHost, preserveToolPanic } from "../../tools/tool-result-adapters";
 
 function contentInspectFailure(
   kind: ServerToolFailure["kind"],
@@ -38,7 +39,20 @@ function contentInspectFailure(
   });
 }
 
-function contentInspectExternalFailure(error: unknown, signal?: AbortSignal): ServerToolFailure {
+function captureContentInspectFailure(error: unknown): { readonly cause: Error | Panic } {
+  if (Panic.is(error)) return { cause: error };
+  if (error instanceof Error) return { cause: error };
+  return {
+    cause: new Error(typeof error === "string" ? error : "Content inspect operation failed", {
+      cause: error,
+    }),
+  };
+}
+
+function contentInspectExternalFailure(
+  error: Error | Panic,
+  signal?: AbortSignal,
+): ServerToolFailure {
   if (Panic.is(error)) preserveToolPanic(error);
   const message = errorMessage(error);
   const normalized = message.toLowerCase();
@@ -128,6 +142,15 @@ export type LoadedInspectSource =
       source: string;
     };
 
+type InspectCleanupFailure = {
+  kind: "cleanup-error";
+  cause: Error;
+};
+
+type InspectResponseReadOutcome =
+  | { kind: "result"; result: ResultType<Uint8Array, ServerToolFailure> }
+  | InspectCleanupFailure;
+
 export class ContentInspect implements ServerTool {
   private readonly tool: ServerTool;
 
@@ -181,10 +204,12 @@ export class ContentInspect implements ServerTool {
     payload: z.output<typeof contentInspectInputSchema>,
     opts: ServerToolCallOptions | undefined,
   ): Promise<ServerToolResult> {
-    const modelResult = await Result.tryPromise({
-      try: () => resolveContentInspectModel(this.options.getConfig),
-      catch: (error) => contentInspectExternalFailure(error, opts?.signal),
-    });
+    const modelResult = (
+      await Result.tryPromise({
+        try: () => resolveContentInspectModel(this.options.getConfig),
+        catch: captureContentInspectFailure,
+      })
+    ).mapError(({ cause }) => contentInspectExternalFailure(cause, opts?.signal));
     return Result.gen(async function* () {
       const model = yield* modelResult;
       const text = yield* Result.await(
@@ -415,32 +440,35 @@ export async function inspectContent(
       return Result.err(contentInspectFailure("unavailable", "AI-GATEWAY not configured"));
     }
 
-    const generated = await Result.tryPromise({
-      try: () =>
-        generateText({
-          model: gateway(model ?? V2_CONTENT_INSPECT_DEFAULT_MODEL),
-          instructions: CONTENT_INSPECT_INSTRUCTIONS,
-          messages,
-          maxOutputTokens: input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
-          abortSignal,
-          tools: {
-            google_search: google.tools.googleSearch({}),
-            url_context: google.tools.urlContext({}),
-          } as ToolSet,
-          providerOptions: {
-            google: {
-              thinkingConfig: {
-                thinkingLevel: "high",
-                includeThoughts: true,
-              },
-            } satisfies GoogleLanguageModelOptions,
-          },
-          stopWhen: isStepCount(10),
-        }),
-      catch: (error) => {
-        logger.error("content.inspect failed", { ...extractAiErrorLogDetails(error) }, error);
-        return contentInspectExternalFailure(error, abortSignal);
-      },
+    const generated = (
+      await Result.tryPromise({
+        try: () =>
+          generateText({
+            model: gateway(model ?? V2_CONTENT_INSPECT_DEFAULT_MODEL),
+            instructions: CONTENT_INSPECT_INSTRUCTIONS,
+            messages,
+            maxOutputTokens: input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+            abortSignal,
+            tools: {
+              google_search: google.tools.googleSearch({}),
+              url_context: google.tools.urlContext({}),
+            } as ToolSet,
+            providerOptions: {
+              google: {
+                thinkingConfig: {
+                  thinkingLevel: "high",
+                  includeThoughts: true,
+                },
+              } satisfies GoogleLanguageModelOptions,
+            },
+            stopWhen: isStepCount(10),
+          }),
+        catch: captureContentInspectFailure,
+      })
+    ).mapError(({ cause }) => {
+      if (Panic.is(cause)) return preserveToolPanic(cause);
+      logger.error("content.inspect failed", { ...extractAiErrorLogDetails(cause) }, cause);
+      return contentInspectExternalFailure(cause, abortSignal);
     });
     return Result.ok((yield* generated).text);
   });
@@ -454,7 +482,7 @@ export async function loadInspectSource(
   input: Extract<z.infer<typeof contentInspectInputSchema>, { type: "binary" }>,
   abortSignal?: AbortSignal,
 ): Promise<ResultType<LoadedInspectSource, ServerToolFailure>> {
-  return Result.gen(async function* () {
+  const loaded = await Result.gen(async function* () {
     if (typeof input.url === "string") {
       if (isYouTubeURL(input.url)) {
         return Result.ok({
@@ -468,8 +496,10 @@ export async function loadInspectSource(
       const res = yield* Result.await(
         Result.tryPromise({
           try: () => fetch(input.url!, { signal: abortSignal }),
-          catch: (error) => contentInspectExternalFailure(error, abortSignal),
-        }),
+          catch: captureContentInspectFailure,
+        }).then((result) =>
+          result.mapError(({ cause }) => contentInspectExternalFailure(cause, abortSignal)),
+        ),
       );
       if (!res.ok) {
         let category: ServerToolFailure["kind"] = "unavailable";
@@ -486,7 +516,9 @@ export async function loadInspectSource(
         );
       }
 
-      const bytes = yield* Result.await(readInspectResponseBytes(res));
+      const readOutcome = await readInspectResponseBytes(res);
+      if (readOutcome.kind === "cleanup-error") return Result.ok(readOutcome);
+      const bytes = yield* readOutcome.result;
       const meta = await fileTypeFromBuffer(Buffer.from(bytes));
       const declared = res.headers.get("content-type") ?? undefined;
       const mediaType = resolveInspectMediaType({
@@ -516,8 +548,10 @@ export async function loadInspectSource(
       const bytes = yield* Result.await(
         Result.tryPromise({
           try: () => file.bytes(),
-          catch: (error) => {
-            const external = contentInspectExternalFailure(error);
+          catch: captureContentInspectFailure,
+        }).then((result) =>
+          result.mapError(({ cause }) => {
+            const external = contentInspectExternalFailure(cause);
             const message = external.message;
             let category: ServerToolFailure["kind"] = "unavailable";
             if (/ENOENT|not found|no such file/i.test(message)) {
@@ -526,8 +560,8 @@ export async function loadInspectSource(
               category = "denied";
             }
             return contentInspectFailure(category, message);
-          },
-        }),
+          }),
+        ),
       );
       const buf = Buffer.from(bytes);
       const meta = await fileTypeFromBuffer(buf);
@@ -569,55 +603,100 @@ export async function loadInspectSource(
     });
     return sourceFromBytes({ bytes: buf, mediaType, source: "base64 input" });
   });
+  const settled = loaded.match<
+    | InspectCleanupFailure
+    | { kind: "result"; result: ResultType<LoadedInspectSource, ServerToolFailure> }
+  >({
+    ok: (value) =>
+      value.kind === "cleanup-error" ? value : { kind: "result", result: Result.ok(value) },
+    err: (error) => ({ kind: "result", result: Result.err(error) }),
+  });
+  if (settled.kind === "cleanup-error") {
+    return adaptToolResultToHost(Result.err(settled.cause));
+  }
+  return settled.result;
 }
 
-async function readInspectResponseBytes(
-  response: Response,
-): Promise<ResultType<Uint8Array, ServerToolFailure>> {
-  return Result.gen(async function* () {
-    const declaredLength = response.headers.get("content-length");
-    if (declaredLength !== null) {
-      const parsed = Number(declaredLength);
-      if (Number.isFinite(parsed) && parsed > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
-        await response.body?.cancel().catch((error) => {
-          contentInspectExternalFailure(error);
-        });
-        return Result.err(
+async function readInspectResponseBytes(response: Response): Promise<InspectResponseReadOutcome> {
+  const declaredLength = response.headers.get("content-length");
+  if (declaredLength !== null) {
+    const parsed = Number(declaredLength);
+    if (Number.isFinite(parsed) && parsed > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
+      const captured = await Result.tryPromise({
+        try: async () => {
+          await response.body?.cancel();
+        },
+        catch: captureError,
+      });
+      const settled = captured.match<
+        { readonly status: "ok" } | { readonly status: "error"; readonly cause: Error }
+      >({
+        ok: () => ({ status: "ok" }) as const,
+        err: ({ cause }) => ({ status: "error", cause }) as const,
+      });
+      if (settled.status === "error") return { kind: "cleanup-error", cause: settled.cause };
+      return {
+        kind: "result",
+        result: Result.err(
           contentInspectFailure(
             "usage",
             `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
           ),
-        );
-      }
+        ),
+      };
     }
-    if (!response.body) return Result.ok(new Uint8Array());
+  }
+  if (!response.body) return { kind: "result", result: Result.ok(new Uint8Array()) };
 
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    try {
-      while (true) {
-        const chunk = yield* Result.await(
-          Result.tryPromise({
-            try: () => reader.read(),
-            catch: (error) => contentInspectExternalFailure(error),
-          }),
-        );
-        if (chunk.done) break;
-        total += chunk.value.byteLength;
-        if (total > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
-          await reader.cancel();
-          return Result.err(
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  return await (async () => {
+    while (true) {
+      const read = (
+        await Result.tryPromise({
+          try: () => reader.read(),
+          catch: captureContentInspectFailure,
+        })
+      ).mapError(({ cause }) => contentInspectExternalFailure(cause));
+      const readOutcome = read.match<
+        | { readonly kind: "success"; readonly chunk: Awaited<ReturnType<typeof reader.read>> }
+        | { readonly kind: "failure"; readonly error: ServerToolFailure }
+      >({
+        ok: (chunk) => ({ kind: "success", chunk }),
+        err: (error) => ({ kind: "failure", error }),
+      });
+      if (readOutcome.kind === "failure") {
+        return { kind: "result", result: Result.err(readOutcome.error) } as const;
+      }
+      const { chunk } = readOutcome;
+      if (chunk.done) break;
+      total += chunk.value.byteLength;
+      if (total > CONTENT_INSPECT_MAX_SOURCE_BYTES) {
+        const captured = await Result.tryPromise({
+          try: () => reader.cancel(),
+          catch: captureError,
+        });
+        const settled = captured.match<
+          { readonly status: "ok" } | { readonly status: "error"; readonly cause: Error }
+        >({
+          ok: () => ({ status: "ok" }) as const,
+          err: ({ cause }) => ({ status: "error", cause }) as const,
+        });
+        if (settled.status === "error") {
+          return { kind: "cleanup-error", cause: settled.cause } as const;
+        }
+        return {
+          kind: "result",
+          result: Result.err(
             contentInspectFailure(
               "usage",
               `Content inspect source exceeds ${CONTENT_INSPECT_MAX_SOURCE_BYTES} bytes`,
             ),
-          );
-        }
-        chunks.push(chunk.value);
+          ),
+        } as const;
       }
-    } finally {
-      reader.releaseLock();
+      chunks.push(chunk.value);
     }
 
     const bytes = new Uint8Array(total);
@@ -626,8 +705,8 @@ async function readInspectResponseBytes(
       bytes.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    return Result.ok(bytes);
-  });
+    return { kind: "result", result: Result.ok(bytes) } as const;
+  })().finally(() => reader.releaseLock());
 }
 
 function sourceFromBytes(input: {
@@ -735,18 +814,27 @@ function looksLikeUtf8Text(bytes: Uint8Array): boolean {
   if (bytes.length === 0) return true;
   if (bytes.includes(0)) return false;
 
-  try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    if (!text) return true;
-    let suspicious = 0;
-    for (const char of text) {
-      const code = char.charCodeAt(0);
-      if (code < 32 && code !== 9 && code !== 10 && code !== 13) suspicious += 1;
+  {
+    const attempt = Result.try({
+      try: () => {
+        const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        if (!text) return true;
+        let suspicious = 0;
+        for (const char of text) {
+          const code = char.charCodeAt(0);
+          if (code < 32 && code !== 9 && code !== 10 && code !== 13) suspicious += 1;
+        }
+        return suspicious / text.length < 0.01;
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const error = attempt.error.cause;
+      contentInspectExternalFailure(error);
+      return false;
     }
-    return suspicious / text.length < 0.01;
-  } catch (error) {
-    contentInspectExternalFailure(error);
-    return false;
+    return attempt.value;
   }
 }
 
@@ -755,13 +843,22 @@ function decodeInspectText(
   charset: string | undefined,
 ): ResultType<string, ServerToolFailure> {
   const encoding = charset ?? "utf-8";
-  try {
-    return Result.ok(new TextDecoder(encoding, { fatal: true }).decode(bytes));
-  } catch (error) {
-    const message = contentInspectExternalFailure(error).message;
-    return Result.err(
-      contentInspectFailure("usage", `Failed to decode text content as ${encoding}: ${message}`),
-    );
+  {
+    const attempt = Result.try({
+      try: () => {
+        return Result.ok(new TextDecoder(encoding, { fatal: true }).decode(bytes));
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const error = attempt.error.cause;
+      const message = contentInspectExternalFailure(error).message;
+      return Result.err(
+        contentInspectFailure("usage", `Failed to decode text content as ${encoding}: ${message}`),
+      );
+    }
+    return attempt.value;
   }
 }
 

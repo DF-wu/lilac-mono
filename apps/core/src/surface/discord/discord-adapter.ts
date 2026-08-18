@@ -71,7 +71,7 @@ import {
   type StartOutputOpts,
   type SurfaceAdapter,
 } from "../adapter";
-import { surfaceExternalFallback } from "../adapter";
+import { settleSurfaceFallback, type SurfaceFallbackCapture } from "../adapter";
 import { createDiscordEntityMapper, type EntityMapper } from "../../entity/entity-mapper";
 import { DiscordSurfaceStore, type DbDiscordMessageRelation } from "../store/discord-surface-store";
 import { splitByDiscordWindowOldestToNewest } from "./merge-window";
@@ -95,6 +95,50 @@ const discordOperationErrorSchema = z
     retry_after: z.number().finite().nonnegative().optional(),
   })
   .passthrough();
+
+class CapturedDiscordSurfaceError extends Error {
+  readonly code?: number;
+  readonly status?: number;
+  readonly retry_after?: number;
+
+  constructor(message: string, fields: { code?: number; status?: number; retryAfter?: number }) {
+    super(message);
+    this.code = fields.code;
+    this.status = fields.status;
+    this.retry_after = fields.retryAfter;
+  }
+}
+
+export function captureDiscordSurfaceError(cause: unknown): Error | Panic {
+  if (Panic.is(cause)) return cause;
+  if (cause instanceof Error) return cause;
+  const code =
+    typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "number"
+      ? cause.code
+      : undefined;
+  const status =
+    typeof cause === "object" &&
+    cause !== null &&
+    "status" in cause &&
+    typeof cause.status === "number"
+      ? cause.status
+      : undefined;
+  const retryAfter =
+    typeof cause === "object" &&
+    cause !== null &&
+    "retry_after" in cause &&
+    typeof cause.retry_after === "number"
+      ? cause.retry_after
+      : undefined;
+  const message =
+    typeof cause === "object" &&
+    cause !== null &&
+    "message" in cause &&
+    typeof cause.message === "string"
+      ? cause.message
+      : "Discord operation failed";
+  return new CapturedDiscordSurfaceError(message, { code, status, retryAfter });
+}
 
 export function classifyDiscordSurfaceError(
   operation: SurfaceOperation,
@@ -384,13 +428,22 @@ async function captureDiscordOperation<T>(
   operation: SurfaceOperation,
   effect: () => Promise<T>,
 ): Promise<SurfaceOperationResult<T>> {
-  try {
-    return Result.ok(await effect());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    const classified = classifyDiscordSurfaceError(operation, cause);
-    if (classified) return Result.err(classified);
-    throw cause;
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await effect());
+      },
+      catch: (cause) => ({ restoreCause: () => cause }),
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.restoreCause();
+      if (Panic.is(cause)) throw cause;
+      const classified = classifyDiscordSurfaceError(operation, cause);
+      if (classified) return Result.err(classified);
+      throw cause;
+    }
+    return attempt.value;
   }
 }
 
@@ -399,6 +452,18 @@ function externalCallFailure(operation: string): DiscordExternalCallFailed {
     operation,
     message: `Discord SDK call failed: ${operation}`,
   });
+}
+
+function captureNullSurfaceFallback(cause: unknown): SurfaceFallbackCapture<null> {
+  return Panic.is(cause)
+    ? { kind: "panic", panic: cause, fallback: null }
+    : { kind: "fallback", fallback: null };
+}
+
+function captureUndefinedSurfaceFallback(cause: unknown): SurfaceFallbackCapture<undefined> {
+  return Panic.is(cause)
+    ? { kind: "panic", panic: cause, fallback: undefined }
+    : { kind: "fallback", fallback: undefined };
 }
 
 function asDiscordSessionRef(input: {
@@ -732,10 +797,17 @@ export class DiscordAdapter implements SurfaceAdapter {
         // 2) ALWAYS update if exists
         // 3) register if not exist
         // This avoids stale command definitions when iterating.
-        const registered = await Result.tryPromise({
-          try: () => this.registerSlashCommands(),
-          catch: surfaceExternalFallback(externalCallFailure("register-slash-commands")),
-        });
+        const registered = settleSurfaceFallback(
+          await Result.tryPromise({
+            try: () => this.registerSlashCommands(),
+            catch: (cause) => {
+              const fallback = externalCallFailure("register-slash-commands");
+              return Panic.is(cause)
+                ? { kind: "panic", panic: cause, fallback }
+                : { kind: "fallback", fallback };
+            },
+          }),
+        );
         registered.match({
           ok: () => undefined,
           err: (error) => {
@@ -825,10 +897,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     client.on("messageUpdate", (_old, next) => {
       this.superviseDiscordCallback("messageUpdate", async () => {
         const fetched = next.partial
-          ? await Result.tryPromise({
-              try: () => next.fetch(),
-              catch: surfaceExternalFallback(null),
-            })
+          ? settleSurfaceFallback(
+              await Result.tryPromise({
+                try: () => next.fetch(),
+                catch: captureNullSurfaceFallback,
+              }),
+            )
           : Result.ok(next);
         const msg = selectResultValueOr(fetched, null);
         if (!msg) return;
@@ -839,10 +913,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     client.on("messageDelete", (deleted) => {
       this.superviseDiscordCallback("messageDelete", async () => {
         const fetched = deleted.partial
-          ? await Result.tryPromise({
-              try: () => deleted.fetch(),
-              catch: surfaceExternalFallback(null),
-            })
+          ? settleSurfaceFallback(
+              await Result.tryPromise({
+                try: () => deleted.fetch(),
+                catch: captureNullSurfaceFallback,
+              }),
+            )
           : Result.ok(deleted);
         const msg = selectResultValueOr(fetched, null);
         await this.onMessageDelete(msg, deleted.id, deleted.channelId);
@@ -852,10 +928,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     client.on("messageReactionAdd", (reaction, user) => {
       this.superviseDiscordCallback("messageReactionAdd", async () => {
         const fetched = reaction.partial
-          ? await Result.tryPromise({
-              try: () => reaction.fetch(),
-              catch: surfaceExternalFallback(null),
-            })
+          ? settleSurfaceFallback(
+              await Result.tryPromise({
+                try: () => reaction.fetch(),
+                catch: captureNullSurfaceFallback,
+              }),
+            )
           : Result.ok(reaction);
         const r = selectResultValueOr(fetched, null);
         if (!r) return;
@@ -871,10 +949,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     client.on("messageReactionRemove", (reaction, user) => {
       this.superviseDiscordCallback("messageReactionRemove", async () => {
         const fetched = reaction.partial
-          ? await Result.tryPromise({
-              try: () => reaction.fetch(),
-              catch: surfaceExternalFallback(null),
-            })
+          ? settleSurfaceFallback(
+              await Result.tryPromise({
+                try: () => reaction.fetch(),
+                catch: captureNullSurfaceFallback,
+              }),
+            )
           : Result.ok(reaction);
         const r = selectResultValueOr(fetched, null);
         if (!r) return;
@@ -893,10 +973,17 @@ export class DiscordAdapter implements SurfaceAdapter {
       );
     });
 
-    const loggedIn = await Result.tryPromise({
-      try: () => client.login(token),
-      catch: surfaceExternalFallback(externalCallFailure("client.login")),
-    });
+    const loggedIn = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => client.login(token),
+        catch: (cause) => {
+          const fallback = externalCallFailure("client.login");
+          return Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback }
+            : { kind: "fallback", fallback };
+        },
+      }),
+    );
     loggedIn.match({
       ok: () => () => undefined,
       err: (error) => () => {
@@ -1001,10 +1088,17 @@ export class DiscordAdapter implements SurfaceAdapter {
   ): Promise<void> {
     if (this.opts?.config) return;
 
-    const loaded = await Result.tryPromise({
-      try: () => this.resolveCoreConfig(),
-      catch: surfaceExternalFallback(externalCallFailure("load-core-config")),
-    });
+    const loaded = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => this.resolveCoreConfig(),
+        catch: (cause) => {
+          const fallback = externalCallFailure("load-core-config");
+          return Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback }
+            : { kind: "fallback", fallback };
+        },
+      }),
+    );
     loaded.match({
       ok: (cfg) => {
         this.cfg = cfg;
@@ -1046,26 +1140,28 @@ export class DiscordAdapter implements SurfaceAdapter {
     const statusMessage = this.cfg.surface.discord.statusMessage?.trim() || null;
     if (!input.force && this.appliedStatusMessage === statusMessage) return;
 
-    const applied = Result.try({
-      try: () => {
-        if (statusMessage) {
-          user.setPresence({
-            activities: [
-              {
-                name: statusMessage,
-                state: statusMessage,
-                type: ActivityType.Custom,
-              },
-            ],
-            status: "online",
-          });
-        } else {
-          user.setPresence({ activities: [], status: "online" });
-        }
-        this.appliedStatusMessage = statusMessage;
-      },
-      catch: surfaceExternalFallback(undefined),
-    });
+    const applied = settleSurfaceFallback(
+      Result.try({
+        try: () => {
+          if (statusMessage) {
+            user.setPresence({
+              activities: [
+                {
+                  name: statusMessage,
+                  state: statusMessage,
+                  type: ActivityType.Custom,
+                },
+              ],
+              status: "online",
+            });
+          } else {
+            user.setPresence({ activities: [], status: "online" });
+          }
+          this.appliedStatusMessage = statusMessage;
+        },
+        catch: captureUndefinedSurfaceFallback,
+      }),
+    );
     void applied;
   }
 
@@ -1088,10 +1184,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     const channelId = fromMsg ?? fromSession;
     if (!channelId) return;
 
-    const fetched = await Result.tryPromise({
-      try: () => client.channels.fetch(channelId),
-      catch: surfaceExternalFallback(null),
-    });
+    const fetched = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => client.channels.fetch(channelId),
+        catch: captureNullSurfaceFallback,
+      }),
+    );
     const ch = client.channels.cache.get(channelId) ?? selectResultValueOr(fetched, null);
     if (!ch || !("messages" in ch) || !ch.messages?.cache) return;
 
@@ -1123,10 +1221,12 @@ export class DiscordAdapter implements SurfaceAdapter {
       throw new DiscordAdapterUnavailable({ message: "DiscordAdapter not connected" });
     }
 
-    const fetched = await Result.tryPromise({
-      try: () => client.channels.fetch(channelId),
-      catch: surfaceExternalFallback(null),
-    });
+    const fetched = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => client.channels.fetch(channelId),
+        catch: captureNullSurfaceFallback,
+      }),
+    );
     const ch = selectResultValueOr(fetched, null);
     if (!ch) return null;
 
@@ -1273,10 +1373,17 @@ export class DiscordAdapter implements SurfaceAdapter {
       let consecutiveFailures = 0;
       const tick = async () => {
         if (stopped) return;
-        const sent = await Result.tryPromise({
-          try: () => sendTyping.call(ch),
-          catch: surfaceExternalFallback(externalCallFailure("channel.sendTyping")),
-        });
+        const sent = settleSurfaceFallback(
+          await Result.tryPromise({
+            try: () => sendTyping.call(ch),
+            catch: (cause) => {
+              const fallback = externalCallFailure("channel.sendTyping");
+              return Panic.is(cause)
+                ? { kind: "panic", panic: cause, fallback }
+                : { kind: "fallback", fallback };
+            },
+          }),
+        );
         sent.match({
           ok: () => {
             consecutiveFailures = 0;
@@ -2592,12 +2699,19 @@ export class DiscordAdapter implements SurfaceAdapter {
 
   private emit(evt: AdapterEvent) {
     for (const h of this.handlers) {
-      Promise.resolve()
-        .then(() => h(evt))
-        .catch((cause) => {
-          if (Panic.is(cause)) this.reportDetachedPanic(cause);
-          // Ordinary event-handler failures remain best-effort.
-        });
+      const handled = Result.tryPromise({
+        try: async () => await Promise.resolve().then(() => h(evt)),
+        catch: (cause): { kind: "panic"; panic: Panic } | { kind: "ordinary" } =>
+          Panic.is(cause) ? { kind: "panic", panic: cause } : { kind: "ordinary" },
+      });
+      void handled.then((result) =>
+        result.match({
+          ok: () => undefined,
+          err: (captured) => {
+            if (captured.kind === "panic") this.reportDetachedPanic(captured.panic);
+          },
+        }),
+      );
     }
   }
 
@@ -2697,18 +2811,25 @@ export class DiscordAdapter implements SurfaceAdapter {
         await tryReplyEphemeral(interaction, "Unable to authenticate this workflow action.");
         return;
       }
-      const published = await Result.tryPromise({
-        try: () =>
-          this.emitAndWait({
-            type: "adapter.action.invoked",
-            platform: "discord",
-            ts: Date.now(),
-            actionId,
-            userId,
-            messageRef: { platform: "discord", channelId, messageId },
-          }),
-        catch: surfaceExternalFallback(externalCallFailure("surface-event-handler")),
-      });
+      const published = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () =>
+            this.emitAndWait({
+              type: "adapter.action.invoked",
+              platform: "discord",
+              ts: Date.now(),
+              actionId,
+              userId,
+              messageRef: { platform: "discord", channelId, messageId },
+            }),
+          catch: (cause) => {
+            const fallback = externalCallFailure("surface-event-handler");
+            return Panic.is(cause)
+              ? { kind: "panic", panic: cause, fallback }
+              : { kind: "fallback", fallback };
+          },
+        }),
+      );
       const publishSucceeded = published.match({ ok: () => true, err: () => false });
       if (publishSucceeded) {
         await tryReplyEphemeral(interaction, "Workflow action received.");
@@ -2799,10 +2920,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     if (!app) return;
 
     // Ensure the application is fetched (discord.js sometimes lazily loads it).
-    await Result.tryPromise({
-      try: () => app.fetch(),
-      catch: surfaceExternalFallback(null),
-    });
+    settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => app.fetch(),
+        catch: captureNullSurfaceFallback,
+      }),
+    );
 
     const customOptions = (this.opts?.customCommands?.list() ?? []).map((cmd) => ({
       type: ApplicationCommandOptionType.Subcommand as const,
@@ -2870,10 +2993,17 @@ export class DiscordAdapter implements SurfaceAdapter {
     // source of truth for this application.
     const desired = [slashDefinition, modelSlashDefinition, cancelContextMenuDefinition];
     let syncFailed = false;
-    const globalSync = await Result.tryPromise({
-      try: () => app.commands.set(desired),
-      catch: surfaceExternalFallback(externalCallFailure("application.commands.set")),
-    });
+    const globalSync = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => app.commands.set(desired),
+        catch: (cause) => {
+          const fallback = externalCallFailure("application.commands.set");
+          return Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback }
+            : { kind: "fallback", fallback };
+        },
+      }),
+    );
     const globalSyncError = globalSync.match({ ok: () => null, err: (error) => error });
     if (globalSyncError) {
       syncFailed = true;
@@ -2889,10 +3019,17 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     // Global-only strategy: clear guild-scoped commands to avoid duplicate
     // entries in Discord command pickers.
-    const fetchedGuilds = await Result.tryPromise({
-      try: () => client.guilds.fetch(),
-      catch: surfaceExternalFallback(externalCallFailure("client.guilds.fetch")),
-    });
+    const fetchedGuilds = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => client.guilds.fetch(),
+        catch: (cause) => {
+          const fallback = externalCallFailure("client.guilds.fetch");
+          return Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback }
+            : { kind: "fallback", fallback };
+        },
+      }),
+    );
     const fetchGuildsError = fetchedGuilds.match({ ok: () => null, err: (error) => error });
     if (fetchGuildsError) {
       syncFailed = true;
@@ -2903,10 +3040,17 @@ export class DiscordAdapter implements SurfaceAdapter {
     const guilds = selectResultValueOr(fetchedGuilds, null);
     const guildIds = guilds ? [...guilds.keys()] : [];
     for (const guildId of guildIds) {
-      const fetchedGuild = await Result.tryPromise({
-        try: () => client.guilds.fetch(guildId),
-        catch: surfaceExternalFallback(externalCallFailure("client.guilds.fetch")),
-      });
+      const fetchedGuild = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => client.guilds.fetch(guildId),
+          catch: (cause) => {
+            const fallback = externalCallFailure("client.guilds.fetch");
+            return Panic.is(cause)
+              ? { kind: "panic", panic: cause, fallback }
+              : { kind: "fallback", fallback };
+          },
+        }),
+      );
       const fetchGuildError = fetchedGuild.match({ ok: () => null, err: (error) => error });
       if (fetchGuildError) {
         syncFailed = true;
@@ -2918,10 +3062,17 @@ export class DiscordAdapter implements SurfaceAdapter {
       }
       const guild = selectResultValue(fetchedGuild);
 
-      const guildSync = await Result.tryPromise({
-        try: () => guild.commands.set([]),
-        catch: surfaceExternalFallback(externalCallFailure("guild.commands.set")),
-      });
+      const guildSync = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => guild.commands.set([]),
+          catch: (cause) => {
+            const fallback = externalCallFailure("guild.commands.set");
+            return Panic.is(cause)
+              ? { kind: "panic", panic: cause, fallback }
+              : { kind: "fallback", fallback };
+          },
+        }),
+      );
       const guildSyncError = guildSync.match({ ok: () => null, err: (error) => error });
       if (guildSyncError) {
         syncFailed = true;
@@ -2981,10 +3132,12 @@ export class DiscordAdapter implements SurfaceAdapter {
       return;
     }
 
-    const subcommand = Result.try({
-      try: () => interaction.options.getSubcommand(),
-      catch: surfaceExternalFallback(null),
-    });
+    const subcommand = settleSurfaceFallback(
+      Result.try({
+        try: () => interaction.options.getSubcommand(),
+        catch: captureNullSurfaceFallback,
+      }),
+    );
     const sub = selectResultValueOr(subcommand, null);
 
     if (sub === "divider") {
@@ -2997,10 +3150,12 @@ export class DiscordAdapter implements SurfaceAdapter {
       });
 
       // Defer immediately to avoid the 3s interaction timeout.
-      await Result.tryPromise({
-        try: () => interaction.deferReply({ flags: MessageFlags.Ephemeral }),
-        catch: surfaceExternalFallback(undefined),
-      });
+      settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => interaction.deferReply({ flags: MessageFlags.Ephemeral }),
+          catch: captureUndefinedSurfaceFallback,
+        }),
+      );
 
       const ch = await resolveTextSendableChannel(client, channelId);
       if (!ch) {
@@ -3008,10 +3163,17 @@ export class DiscordAdapter implements SurfaceAdapter {
         return;
       }
 
-      const sent = await Result.tryPromise({
-        try: async () => await ch.send({ content, allowedMentions: { parse: [] } }),
-        catch: surfaceExternalFallback(externalCallFailure("channel.send-divider")),
-      });
+      const sent = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: async () => await ch.send({ content, allowedMentions: { parse: [] } }),
+          catch: (cause) => {
+            const fallback = externalCallFailure("channel.send-divider");
+            return Panic.is(cause)
+              ? { kind: "panic", panic: cause, fallback }
+              : { kind: "fallback", fallback };
+          },
+        }),
+      );
       const sendError = sent.match({ ok: () => null, err: (error) => error });
       if (sendError) {
         await tryEditOrReplyEphemeral(
@@ -3036,18 +3198,25 @@ export class DiscordAdapter implements SurfaceAdapter {
       await tryReplyEphemeral(interaction, "Unknown subcommand.");
       return;
     }
-    const preparedArgs = Result.try({
-      try: () => ({
-        rawArgs: Object.fromEntries(
-          custom.def.args.flatMap((arg) => {
-            const value = readDiscordSlashOption(interaction, arg);
-            return value === null ? [] : [[arg.key, value] as const];
-          }),
-        ),
-        prompt: interaction.options.getString(CUSTOM_COMMAND_PROMPT_ARG_KEY),
+    const preparedArgs = settleSurfaceFallback(
+      Result.try({
+        try: () => ({
+          rawArgs: Object.fromEntries(
+            custom.def.args.flatMap((arg) => {
+              const value = readDiscordSlashOption(interaction, arg);
+              return value === null ? [] : [[arg.key, value] as const];
+            }),
+          ),
+          prompt: interaction.options.getString(CUSTOM_COMMAND_PROMPT_ARG_KEY),
+        }),
+        catch: (cause) => {
+          const fallback = externalCallFailure("interaction.options");
+          return Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback }
+            : { kind: "fallback", fallback };
+        },
       }),
-      catch: surfaceExternalFallback(externalCallFailure("interaction.options")),
-    });
+    );
     const prepareError = preparedArgs.match({ ok: () => null, err: (error) => error });
     if (prepareError) {
       await tryEditOrReplyEphemeral(
@@ -3087,10 +3256,17 @@ export class DiscordAdapter implements SurfaceAdapter {
     });
 
     this.superviseDiscordCallback("custom-command-preview", async () => {
-      const replied = await Result.tryPromise({
-        try: () => interaction.reply({ content: preview, allowedMentions: { parse: [] } }),
-        catch: surfaceExternalFallback(externalCallFailure("interaction.reply")),
-      });
+      const replied = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => interaction.reply({ content: preview, allowedMentions: { parse: [] } }),
+          catch: (cause) => {
+            const fallback = externalCallFailure("interaction.reply");
+            return Panic.is(cause)
+              ? { kind: "panic", panic: cause, fallback }
+              : { kind: "fallback", fallback };
+          },
+        }),
+      );
       const replyError = replied.match({ ok: () => null, err: (error) => error });
       if (replyError) {
         await tryEditOrReplyEphemeral(
@@ -3132,10 +3308,12 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     const cfg = this.cfg;
     if (!cfg) {
-      await Result.tryPromise({
-        try: () => interaction.respond([]),
-        catch: surfaceExternalFallback(undefined),
-      });
+      settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => interaction.respond([]),
+          catch: captureUndefinedSurfaceFallback,
+        }),
+      );
       return;
     }
 
@@ -3149,10 +3327,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     const query = `${focusedValue}`.trim().toLowerCase();
     const aliases = Object.keys(cfg.models.def ?? {}).sort((a, b) => a.localeCompare(b));
     if (aliases.length === 0) {
-      await Result.tryPromise({
-        try: () => interaction.respond([]),
-        catch: surfaceExternalFallback(undefined),
-      });
+      settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => interaction.respond([]),
+          catch: captureUndefinedSurfaceFallback,
+        }),
+      );
       return;
     }
 
@@ -3181,10 +3361,12 @@ export class DiscordAdapter implements SurfaceAdapter {
       if (choices.length >= 25) break;
     }
 
-    await Result.tryPromise({
-      try: () => interaction.respond(choices.slice(0, 25)),
-      catch: surfaceExternalFallback(undefined),
-    });
+    settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => interaction.respond(choices.slice(0, 25)),
+        catch: captureUndefinedSurfaceFallback,
+      }),
+    );
   }
 
   private async onModelCommand(
@@ -3263,24 +3445,58 @@ export class DiscordAdapter implements SurfaceAdapter {
       throw new DiscordAdapterUnavailable({ message: "Discord adapter is not connected" });
     }
 
-    let ch;
-    try {
-      ch = await client.channels.fetch(input.channelId);
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (discordNotFoundCode(cause) !== null) return null;
-      throw cause;
+    const fetchedChannel = await Result.tryPromise({
+      try: () => client.channels.fetch(input.channelId),
+      catch: captureDiscordSurfaceError,
+    });
+    const channelOutcome = fetchedChannel.match<
+      | {
+          readonly kind: "value";
+          readonly value: Awaited<ReturnType<Client["channels"]["fetch"]>>;
+        }
+      | { readonly kind: "missing" }
+      | { readonly kind: "failure"; readonly cause: Error | Panic }
+    >({
+      ok: (value) => ({ kind: "value", value }),
+      err: (cause) => {
+        if (Panic.is(cause)) return { kind: "failure", cause };
+        if (discordNotFoundCode(cause) !== null) return { kind: "missing" };
+        return { kind: "failure", cause };
+      },
+    });
+    if (channelOutcome.kind === "failure") {
+      return adaptToolResultToHost(Result.err(channelOutcome.cause));
     }
+    const ch = channelOutcome.kind === "value" ? channelOutcome.value : null;
     if (!ch || !("messages" in ch) || !ch.messages?.fetch) return null;
+    const messageChannel = ch;
 
-    let msg;
-    try {
-      msg = await ch.messages.fetch({ message: input.messageId, cache: false, force: true });
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (discordNotFoundCode(cause) !== null) return null;
-      throw cause;
+    const fetchedMessage = await Result.tryPromise({
+      try: () =>
+        messageChannel.messages.fetch({
+          message: input.messageId,
+          cache: false,
+          force: true,
+        }),
+      catch: captureDiscordSurfaceError,
+    });
+    const messageOutcome = fetchedMessage.match<
+      | { readonly kind: "value"; readonly value: Message }
+      | { readonly kind: "missing" }
+      | { readonly kind: "failure"; readonly cause: Error | Panic }
+    >({
+      ok: (value) => ({ kind: "value", value }),
+      err: (cause) => {
+        if (Panic.is(cause)) return { kind: "failure", cause };
+        if (discordNotFoundCode(cause) !== null) return { kind: "missing" };
+        return { kind: "failure", cause };
+      },
+    });
+    if (messageOutcome.kind === "failure") {
+      return adaptToolResultToHost(Result.err(messageOutcome.cause));
     }
+    const msg = messageOutcome.kind === "value" ? messageOutcome.value : null;
+    if (!msg) return null;
 
     if (
       !shouldAllowMessage({
@@ -3517,10 +3733,12 @@ export class DiscordAdapter implements SurfaceAdapter {
 
   private async onMessageCreate(msg: Message | PartialMessage) {
     if (msg.partial) {
-      const fetched = await Result.tryPromise({
-        try: () => msg.fetch(),
-        catch: surfaceExternalFallback(null),
-      });
+      const fetched = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => msg.fetch(),
+          catch: captureNullSurfaceFallback,
+        }),
+      );
       const full = selectResultValueOr(fetched, null);
       if (!full) return;
       await this.onMessageCreate(full);
@@ -3736,19 +3954,24 @@ export class DiscordAdapter implements SurfaceAdapter {
     if (!channel?.messages?.fetch) return false;
     const cached = channel.messages.cache.get(replyRef.messageId);
     if (cached) return cached.author?.id === botUserId;
-    const fetched = await Result.tryPromise({
-      try: () => channel.messages.fetch({ message: replyRef.messageId, cache: false, force: true }),
-      catch: surfaceExternalFallback(null),
-    });
+    const fetched = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () =>
+          channel.messages.fetch({ message: replyRef.messageId, cache: false, force: true }),
+        catch: captureNullSurfaceFallback,
+      }),
+    );
     return fetched.match({ ok: (value) => value?.author?.id === botUserId, err: () => false });
   }
 
   private async onMessageUpdate(msg: Message | PartialMessage) {
     if (msg.partial) {
-      const fetched = await Result.tryPromise({
-        try: () => msg.fetch(),
-        catch: surfaceExternalFallback(null),
-      });
+      const fetched = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => msg.fetch(),
+          catch: captureNullSurfaceFallback,
+        }),
+      );
       const full = selectResultValueOr(fetched, null);
       if (!full) return;
       await this.onMessageUpdate(full);
@@ -3881,10 +4104,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     if (!guildId) {
       const client = this.client;
       const fetched = client
-        ? await Result.tryPromise({
-            try: () => client.channels.fetch(channelId),
-            catch: surfaceExternalFallback(null),
-          })
+        ? settleSurfaceFallback(
+            await Result.tryPromise({
+              try: () => client.channels.fetch(channelId),
+              catch: captureNullSurfaceFallback,
+            }),
+          )
         : Result.ok(null);
       const ch = selectResultValueOr(fetched, null);
       guildId = ch && "guildId" in ch ? ch.guildId : null;
@@ -3924,10 +4149,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     userName?: string,
   ) {
     if (msg.partial) {
-      const fetched = await Result.tryPromise({
-        try: () => msg.fetch(),
-        catch: surfaceExternalFallback(null),
-      });
+      const fetched = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => msg.fetch(),
+          catch: captureNullSurfaceFallback,
+        }),
+      );
       const full = selectResultValueOr(fetched, null);
       if (!full) return;
       await this.onReactionAdd(full, reaction, userId, userName);
@@ -3978,10 +4205,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     userName?: string,
   ) {
     if (msg.partial) {
-      const fetched = await Result.tryPromise({
-        try: () => msg.fetch(),
-        catch: surfaceExternalFallback(null),
-      });
+      const fetched = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => msg.fetch(),
+          catch: captureNullSurfaceFallback,
+        }),
+      );
       const full = selectResultValueOr(fetched, null);
       if (!full) return;
       await this.onReactionRemove(full, reaction, userId, userName);
