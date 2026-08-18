@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="Lilac" width="160">
+</p>
+
 # Lilac Monorepo
 
 Lilac contains three related agent products built on shared Bun workspaces:
