@@ -60,7 +60,7 @@ function permissionOptions(
 }
 
 describe("Claude Code tool bridge", () => {
-  it("lists batch, omits portable tool_search, and preserves input transforms exactly once", async () => {
+  it("lists batch, omits portable find_tools, and preserves input transforms exactly once", async () => {
     let transforms = 0;
     const seen: unknown[] = [];
     const bridge = await createClaudeCodeToolBridge({
@@ -73,7 +73,7 @@ describe("Claude Code tool bridge", () => {
           execute: () => "unused",
         }),
         batch: tool({ inputSchema: z.object({}), execute: () => "unused" }),
-        tool_search: tool({
+        find_tools: tool({
           inputSchema: z.object({ query: z.string() }),
           execute: () => "unused",
         }),
@@ -521,7 +521,7 @@ describe("Claude Code tool bridge", () => {
           inputSchema: z.object({ issue: z.string() }),
           execute: () => "value",
         }),
-        tool_search: tool({ inputSchema: z.object({ query: z.string() }), execute: () => "value" }),
+        find_tools: tool({ inputSchema: z.object({ query: z.string() }), execute: () => "value" }),
       },
       catalogMetadata: {
         mcp_issue_tracker_lookup: {
@@ -530,9 +530,9 @@ describe("Claude Code tool bridge", () => {
           title: "Customer escalation finder",
           description: "Finds escalations using the original account codename marmalade.",
         },
-        tool_search: {
+        find_tools: {
           sourceId: "lilac",
-          rawName: "tool_search",
+          rawName: "find_tools",
           description: "Portable search must not be exposed to Claude Code.",
         },
       },
@@ -555,7 +555,7 @@ describe("Claude Code tool bridge", () => {
         "Description: Finds escalations using the original account codename marmalade.",
       ].join("\n"),
     });
-    expect(bridge.exposedToolNames).not.toContain("tool_search");
+    expect(bridge.exposedToolNames).not.toContain("find_tools");
   });
 
   it("serializes and parses all 5,000 deferred declarations over stdio MCP", async () => {

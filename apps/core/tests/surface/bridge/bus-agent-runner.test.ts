@@ -325,14 +325,14 @@ function level1TestToolset(params?: {
   const catalogTool = level1TestTool(params?.catalogExecute ?? (() => "catalog"));
   const tools = {
     builtin: level1TestTool(params?.builtinExecute ?? (() => "builtin")),
-    tool_search: level1TestTool(params?.searchExecute ?? (() => "search")),
+    find_tools: level1TestTool(params?.searchExecute ?? (() => "search")),
     deferred_tool: catalogTool,
   } satisfies ToolSet;
   return {
     tools,
     specs: new Map(),
     contributionInfo: new Map(),
-    directToolNames: new Set(["builtin", "tool_search"]),
+    directToolNames: new Set(["builtin", "find_tools"]),
     catalog: [
       {
         source: "mcp",
@@ -530,18 +530,18 @@ describe("runner Level 1 catalog selection", () => {
 
     expect([...selectedLevel1ToolNames(toolset, persistedRows)]).toEqual([
       "builtin",
-      "tool_search",
+      "find_tools",
       "deferred_tool",
     ]);
     expect(persistedRows).toEqual(["catalog-id", "missing-catalog-id"]);
     expect([...selectedLevel1ToolNames({ ...toolset, catalog: [] }, persistedRows)]).toEqual([
       "builtin",
-      "tool_search",
+      "find_tools",
     ]);
     expect(persistedRows).toEqual(["catalog-id", "missing-catalog-id"]);
   });
 
-  it("activates tool_search results on the next step and denies hidden same-step calls", async () => {
+  it("activates find_tools results on the next step and denies hidden same-step calls", async () => {
     const offered: string[][] = [];
     const selectedIds: string[] = [];
     let catalogCreates = 0;
@@ -551,7 +551,7 @@ describe("runner Level 1 catalog selection", () => {
         offered.push(level1OfferedToolNames(options));
         if (offered.length === 1) {
           return level1ToolCallStep([
-            { toolCallId: "search", toolName: "tool_search" },
+            { toolCallId: "search", toolName: "find_tools" },
             { toolCallId: "hidden", toolName: "deferred_tool" },
           ]);
         }
@@ -593,13 +593,13 @@ describe("runner Level 1 catalog selection", () => {
     expect(catalogCreates).toBe(1);
     expect(catalogExecutions).toBe(1);
     expect(offered).toEqual([
-      ["builtin", "tool_search"],
-      ["builtin", "tool_search", "deferred_tool"],
-      ["builtin", "tool_search", "deferred_tool"],
+      ["builtin", "find_tools"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools", "deferred_tool"],
     ]);
     expect(agent.getLastStepToolSnapshot()?.names).toEqual([
       "builtin",
-      "tool_search",
+      "find_tools",
       "deferred_tool",
     ]);
   });
@@ -707,7 +707,7 @@ describe("runner Level 1 catalog selection", () => {
     expect(mapping.catalogMetadata).toBe(toolset.catalogMetadata);
     expect(Object.keys(mapping.catalogMetadata)).toEqual(["deferred_tool"]);
     expect(applied.tools).toBe(toolset.tools);
-    expect([...(applied.names ?? [])]).toEqual(["builtin", "tool_search", "deferred_tool"]);
+    expect([...(applied.names ?? [])]).toEqual(["builtin", "find_tools", "deferred_tool"]);
   });
 
   it("refreshes selection and batch authority without rebuilding the catalog", async () => {
@@ -735,7 +735,7 @@ describe("runner Level 1 catalog selection", () => {
 
     expect(catalogCreates).toBe(1);
     expect(batchUpdates).toBe(1);
-    expect([...appliedNames]).toEqual(["builtin", "tool_search"]);
+    expect([...appliedNames]).toEqual(["builtin", "find_tools"]);
   });
 });
 

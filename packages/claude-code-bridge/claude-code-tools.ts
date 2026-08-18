@@ -504,7 +504,7 @@ export async function createClaudeCodeToolBridgeResult(options: {
   // still fails loudly below, because that is a toolset bug rather than a
   // deliberate handover.
   const exposedEntries = Object.entries(options.tools).filter(
-    ([name, definition]) => name !== "tool_search" && definition.isProviderExecuted !== true,
+    ([name, definition]) => name !== "find_tools" && definition.isProviderExecuted !== true,
   );
   const exposedNames = new Set(exposedEntries.map(([name]) => name));
   const validatedBuiltIns = resultOutcome(

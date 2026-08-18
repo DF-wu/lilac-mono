@@ -316,7 +316,7 @@ describe("core tool plugin manager", () => {
       "read",
       "subagent_delegate",
     ]);
-    expect(applyPatchTools.tools).not.toHaveProperty("tool_search");
+    expect(applyPatchTools.tools).not.toHaveProperty("find_tools");
 
     const editFileTools = await manager.buildLevel1Toolset({
       cwd: dataDir,
@@ -1142,7 +1142,7 @@ export default {
       "mcp_allowed_model_raw",
       "mcp_allowed_raw_allowed",
     ]);
-    expect(general.directToolNames.has("tool_search")).toBe(true);
+    expect(general.directToolNames.has("find_tools")).toBe(true);
   });
 
   it("reuses one registry client while creating run-scoped MCP model projections", async () => {

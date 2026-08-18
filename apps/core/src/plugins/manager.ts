@@ -339,7 +339,7 @@ export function createCoreToolPluginManager(params: {
         .filter((spec) => contributionForSpec(spec).source === "builtin")
         .map(nameForSpec),
     );
-    reservedNames.add("tool_search");
+    reservedNames.add("find_tools");
     const nameAssignment = assignCatalogToolNames(identities, reservedNames);
     if (nameAssignment.collisions.length > 0) {
       return Result.err(
@@ -515,7 +515,7 @@ export function createCoreToolPluginManager(params: {
       assignOpaqueTool(tools, entry.modelName, catalogCandidateExecutable(entry));
     }
     if (catalog.entries.length > 0) {
-      directToolNames.add("tool_search");
+      directToolNames.add("find_tools");
       const search: ResultType<unknown, PortableToolSearchInvalid> = createPortableToolSearchResult(
         {
           catalog: catalog.entries,
@@ -533,7 +533,7 @@ export function createCoreToolPluginManager(params: {
         );
       }
       const searchTool = selectResultValue(search);
-      assignOpaqueTool(tools, "tool_search", searchTool);
+      assignOpaqueTool(tools, "find_tools", searchTool);
     }
 
     let batchAuthorityKey = [...directSpecs.keys()].sort().join("\0");

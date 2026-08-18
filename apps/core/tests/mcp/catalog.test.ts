@@ -59,7 +59,7 @@ function executableSearch(searchTool: unknown) {
     !("execute" in searchTool) ||
     typeof searchTool.execute !== "function"
   ) {
-    throw new Error("portable tool_search is not executable");
+    throw new Error("portable find_tools is not executable");
   }
   return searchTool.execute;
 }
