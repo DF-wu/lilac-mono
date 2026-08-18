@@ -1206,6 +1206,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module, exportName },
         category: "projection" as const,
       })),
+      ...["binaryContent", "binaryContent.flatMap.<callback@1>"].map((exportName) => ({
+        identity: { module: "src/mcp/binary-result-materializer.ts", exportName },
+        category: "projection" as const,
+      })),
       ...[
         ["src/github/github-api.ts", "decodeGithubApiErrorResponse", "wire"],
         ["src/github/github-api.ts", "githubFetchJsonResult", "wire"],

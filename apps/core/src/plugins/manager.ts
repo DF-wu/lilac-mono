@@ -40,6 +40,10 @@ import {
   baseCatalogToolName,
   catalogToolStableId,
 } from "../mcp/catalog-identity";
+import {
+  createMcpBinaryResultMaterializer,
+  wrapMcpToolWithBinaryMaterialization,
+} from "../mcp/binary-result-materializer";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import {
   hasBoundedBuiltinOutput,
@@ -313,6 +317,9 @@ export function createCoreToolPluginManager(params: {
       (spec) => contributionInfo.get(spec)?.source === "external",
     );
     const allMcpTools = params.runtime.mcpRegistry?.getTools() ?? [];
+    const mcpBinaryMaterializer = buildParams.requestContext
+      ? createMcpBinaryResultMaterializer({ requestId: buildParams.requestContext.requestId })
+      : undefined;
     const identities = [
       ...externalSpecs.map((spec) => {
         const contribution = contributionForSpec(spec);
@@ -478,7 +485,9 @@ export function createCoreToolPluginManager(params: {
         identity: entry.identity,
         ...(entry.title === undefined ? {} : { title: entry.title }),
         ...(entry.description === undefined ? {} : { description: entry.description }),
-        tool: entry.tool,
+        tool: mcpBinaryMaterializer
+          ? wrapMcpToolWithBinaryMaterialization(entry.tool, mcpBinaryMaterializer)
+          : entry.tool,
       });
     }
 

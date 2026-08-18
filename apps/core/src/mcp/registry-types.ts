@@ -1,5 +1,4 @@
 import type { ListToolsResult, MCPClient, MCPClientConfig, OAuthClientProvider } from "@ai-sdk/mcp";
-import type { Tool } from "ai";
 import type { Result } from "better-result";
 
 import type { CatalogToolIdentity } from "./catalog-identity";
@@ -40,7 +39,7 @@ export type McpCatalogTool = {
   readonly description?: string;
   readonly identity: CatalogToolIdentity;
   readonly stableId: string;
-  readonly tool: McpConvertedTool | Tool;
+  readonly tool: McpConvertedTool;
 };
 
 export type McpReloadReconciliation =

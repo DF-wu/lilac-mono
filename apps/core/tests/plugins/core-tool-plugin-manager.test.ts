@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { asSchema, jsonSchema, tool } from "ai";
+import { asSchema } from "ai";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import {
   parseCoreConfigV1ToUniversal,
@@ -41,6 +41,13 @@ function createCoreToolPluginManager(
       return built.value;
     },
   };
+}
+
+function convertedMcpTool(name: string) {
+  const client = new FakeMcpClient();
+  const converted = client.toolsFromDefinitions({ tools: [mcpToolDefinition(name)] })[name];
+  if (!converted) throw new Error(`missing converted MCP tool: ${name}`);
+  return converted;
 }
 
 const TEST_SURFACE_REGISTRY = SurfaceRuntimeRegistry.create([
@@ -1087,10 +1094,7 @@ export default {
         rawName,
         identity,
         stableId: catalogToolStableId(identity),
-        tool: tool({
-          inputSchema: jsonSchema<unknown>({ type: "object", properties: {} }),
-          execute: () => `${serverId}:${rawName}`,
-        }),
+        tool: convertedMcpTool(rawName),
       };
     };
     const entries = [
@@ -1141,7 +1145,7 @@ export default {
     expect(general.directToolNames.has("tool_search")).toBe(true);
   });
 
-  it("reuses one registry client and its tool wrappers across concurrent Level 1 sessions", async () => {
+  it("reuses one registry client while creating run-scoped MCP model projections", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
@@ -1161,6 +1165,12 @@ export default {
       },
     });
     await registry.init();
+    const registryTool = registry.getTools()[0];
+    if (!registryTool) throw new Error("missing shared MCP tool");
+    registryTool.tool.toModelOutput = () => ({
+      type: "content",
+      value: [{ type: "text", text: "projected" }],
+    });
     const manager = createCoreToolPluginManager({
       runtime: { config: cfg, mcpRegistry: registry },
       dataDir,
@@ -1183,19 +1193,17 @@ export default {
       });
 
     const [first, second] = await Promise.all([buildSession("first"), buildSession("second")]);
-    const registryTool = registry.getTools()[0];
-    const firstEntry = first.catalog.find((entry) => entry.stableId === registryTool?.stableId);
-    const secondEntry = second.catalog.find((entry) => entry.stableId === registryTool?.stableId);
-    if (!registryTool || !firstEntry || !secondEntry) throw new Error("missing shared MCP tool");
+    const firstEntry = first.catalog.find((entry) => entry.stableId === registryTool.stableId);
+    const secondEntry = second.catalog.find((entry) => entry.stableId === registryTool.stableId);
+    if (!firstEntry || !secondEntry) throw new Error("missing run-scoped MCP tool");
 
     expect(factory.configs).toHaveLength(1);
     expect(factory.created).toEqual([client]);
-    expect(firstEntry.tool).toBe(registryTool.tool);
-    expect(secondEntry.tool).toBe(registryTool.tool);
-    expect(Object.is(first.tools[firstEntry.modelName], registryTool.tool)).toBe(true);
-    expect(Object.is(second.tools[secondEntry.modelName], first.tools[firstEntry.modelName])).toBe(
-      true,
-    );
+    expect(Object.is(firstEntry.tool, registryTool.tool)).toBe(false);
+    expect(Object.is(secondEntry.tool, registryTool.tool)).toBe(false);
+    expect(Object.is(firstEntry.tool, secondEntry.tool)).toBe(false);
+    expect(Object.is(first.tools[firstEntry.modelName], firstEntry.tool)).toBe(true);
+    expect(Object.is(second.tools[secondEntry.modelName], secondEntry.tool)).toBe(true);
 
     await manager.destroy();
     await registry.shutdown();
@@ -1234,13 +1242,7 @@ export default {
               rawName: "remote",
               identity,
               stableId: catalogToolStableId(identity),
-              tool: tool({
-                inputSchema: jsonSchema<unknown>({
-                  type: "object",
-                  properties: {},
-                }),
-                execute: () => "remote",
-              }),
+              tool: convertedMcpTool("remote"),
             },
           ],
           async shutdown() {},
