@@ -2,7 +2,12 @@ import type { Logger } from "@stanley2058/simple-module-logger";
 import { Result, TaggedError } from "better-result";
 import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 
-import { projectRuntimeError, safeRuntimeErrorText } from "./error-format";
+import { captureError } from "../shared/error-capture.js";
+import {
+  captureRuntimeError,
+  projectCapturedRuntimeError,
+  safeRuntimeErrorText,
+} from "./error-format";
 
 export type ProcessSignal = "SIGINT" | "SIGTERM";
 
@@ -28,7 +33,7 @@ export type ProcessHandlers = {
 const DEFAULT_EXIT_TIMEOUT_MS = 5_000;
 
 class ProcessShutdownFailed extends TaggedError("ProcessShutdownFailed")<{
-  readonly cause: Error;
+  readonly cause: unknown;
   readonly message: string;
 }> {}
 
@@ -69,10 +74,12 @@ export function createProcessHandlers(params: ProcessHandlerParams): ProcessHand
     shuttingDown = true;
 
     params.logger.info(`Received ${signal}, shutting down...`);
-    const stopped = await Result.tryPromise({
-      try: () => params.stop(fatalError),
-      catch: projectRuntimeError("Opaque shutdown failure"),
-    });
+    const stopped = (
+      await Result.tryPromise({
+        try: () => params.stop(fatalError),
+        catch: captureRuntimeError,
+      })
+    ).mapError((captured) => projectCapturedRuntimeError(captured, "Opaque shutdown failure"));
     stopped.match({
       ok: () => undefined,
       err: (error) => {
@@ -108,12 +115,23 @@ export function createProcessHandlers(params: ProcessHandlerParams): ProcessHand
     params.logger.error("Fatal process error", { trigger, error: errorMessage });
     scheduleForceExit(trigger);
 
-    try {
-      await handleSignal("SIGTERM", error);
-    } catch (cause) {
+    const stopped = (
+      await Result.tryPromise({
+        try: () => handleSignal("SIGTERM", error),
+        catch: captureRuntimeError,
+      })
+    ).mapError((captured) =>
+      projectCapturedRuntimeError(captured, "Opaque fatal shutdown failure"),
+    );
+    const stopFailure = stopped.match({ ok: () => null, err: (failure) => failure });
+    if (stopFailure) {
+      const failure = new ProcessShutdownFailed({
+        cause: stopFailure,
+        message: "Fatal shutdown handler failed",
+      });
       params.logger.error("Fatal shutdown handler failed", {
         trigger,
-        error: safeRuntimeErrorText(cause, "Opaque fatal shutdown failure"),
+        ...formatTaggedErrorForLog(failure),
       });
       clearForceExitTimer();
       exit(1);
@@ -121,10 +139,14 @@ export function createProcessHandlers(params: ProcessHandlerParams): ProcessHand
   }
 
   async function superviseFatal(trigger: string, error: Error): Promise<void> {
-    const handled = await Result.tryPromise({
-      try: () => handleFatal(trigger, error),
-      catch: (cause) => new Error(safeRuntimeErrorText(cause, "Opaque fatal shutdown rejection")),
-    });
+    const handled = (
+      await Result.tryPromise({
+        try: () => handleFatal(trigger, error),
+        catch: (cause) => captureError(cause, "Opaque fatal shutdown rejection"),
+      })
+    ).mapError(
+      ({ cause }) => new Error(safeRuntimeErrorText(cause, "Opaque fatal shutdown rejection")),
+    );
     handled.match({
       ok: () => undefined,
       err: (error) => {

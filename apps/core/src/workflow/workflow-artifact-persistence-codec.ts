@@ -108,17 +108,23 @@ export function workflowValueArtifactFileByteLimit(maxValueBytes: number): numbe
 export function decodeWorkflowValueArtifact(
   input: WorkflowValueArtifactCodecInput,
 ): ResultType<DecodedPersistedValue<JsonValue>, WorkflowArtifactCodecError> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(input.encoded);
-  } catch {
-    return Result.err(
+  const parsedResult = Result.try({
+    try: (): unknown => JSON.parse(input.encoded),
+    catch: () =>
       new WorkflowArtifactMalformedJson({
         artifactId: input.artifactId,
         message: "Workflow value artifact contains malformed JSON",
       }),
-    );
-  }
+  });
+  const parsedOutcome = parsedResult.match<
+    | { readonly kind: "success"; readonly parsed: unknown }
+    | { readonly kind: "failure"; readonly error: WorkflowArtifactMalformedJson }
+  >({
+    ok: (parsed) => ({ kind: "success", parsed }),
+    err: (error) => ({ kind: "failure", error }),
+  });
+  if (parsedOutcome.kind === "failure") return Result.err(parsedOutcome.error);
+  const { parsed } = parsedOutcome;
 
   const json = jsonValueSchema.safeParse(parsed);
   if (!json.success) return Result.err(corrupt(input.artifactId, "invalid-json-value"));

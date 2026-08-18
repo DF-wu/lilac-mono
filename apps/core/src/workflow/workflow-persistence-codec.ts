@@ -10,7 +10,6 @@ import {
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-import { projectRuntimeError } from "../runtime/error-format";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import {
   jsonValueSchema,
@@ -372,12 +371,13 @@ function decodeJson(input: {
 }): ResultType<unknown, MalformedSerialization | Panic> {
   const parsed = Result.try({
     try: () => JSON.parse(input.raw),
-    catch: projectRuntimeError("Opaque workflow persistence JSON failure"),
+    catch: (cause): { kind: "panic"; panic: Panic } | { kind: "error" } =>
+      Panic.is(cause) ? { kind: "panic", panic: cause } : { kind: "error" },
   });
   const finish = parsed.match<() => ResultType<unknown, MalformedSerialization | Panic>>({
     ok: (value) => () => Result.ok(value),
-    err: (error) => () => {
-      if (Panic.is(error)) return Result.err(error);
+    err: (captured) => () => {
+      if (captured.kind === "panic") return Result.err(captured.panic);
       return Result.err(
         new MalformedSerialization(
           diagnostic({

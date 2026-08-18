@@ -4,16 +4,17 @@ import {
   redactErrorTextForLog,
   type TaggedErrorLogProjection,
 } from "@stanley2058/lilac-utils";
-import { TaggedError } from "better-result";
+import { Result, TaggedError } from "better-result";
 
 export function formatWorkflowErrorForLog(
   error: Error,
 ): TaggedErrorLogProjection | { readonly errorMessage: string } {
-  try {
-    if (TaggedError.is(error)) return formatTaggedErrorForLog(error);
-  } catch {
-    // Logging must never replace the workflow failure being reported.
-  }
+  const formatted = Result.try({
+    try: () => (TaggedError.is(error) ? formatTaggedErrorForLog(error) : null),
+    catch: () => null,
+  });
+  const projection = formatted.match({ ok: (value) => value, err: () => null });
+  if (projection) return projection;
   return {
     errorMessage: redactErrorTextForLog(opaqueErrorMessage(error, "Unknown workflow failure")),
   };

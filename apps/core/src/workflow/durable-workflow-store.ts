@@ -9,7 +9,7 @@ import {
 } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { configureSqliteConnection } from "../shared/sqlite";
 import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 import {
@@ -163,12 +163,14 @@ function captureWorkflowRead<T>(
 ): ResultType<T, DurableWorkflowReadError> {
   const captured = Result.try({
     try: read,
-    catch: projectRuntimeError("Opaque durable workflow read failure"),
+    catch: captureRuntimeError,
   });
   const finishRead = captured.match<() => ResultType<T, DurableWorkflowReadError>>({
     ok: (value) => () => value,
-    err: (error) => () => {
-      const cause = preserveToolPanic(error);
+    err: (captured) => () => {
+      const cause = preserveToolPanic(
+        projectCapturedRuntimeError(captured, "Opaque durable workflow read failure"),
+      );
       const failure = classifyWorkflowSqliteDriverFailure(operation, cause);
       if (failure === undefined) return adaptToolResultToHost(Result.err(cause));
       return Result.err(failure);

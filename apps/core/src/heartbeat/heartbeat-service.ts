@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import {
   lilacEventTypes,
   type CmdRequestMessageData,
@@ -16,6 +17,7 @@ import {
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { preserveToolPanic } from "../tools/tool-result-adapters";
 
 import {
   buildHeartbeatRequestMessages,
@@ -96,16 +98,25 @@ export type HeartbeatService = {
 async function reloadHeartbeatCoreConfig(): Promise<
   ResultType<CoreConfig, HeartbeatConfigReloadError>
 > {
-  try {
-    return Result.ok(await getCoreConfig());
-  } catch (caught) {
-    if (isPanic(caught)) throw caught;
-    return Result.err(
-      new HeartbeatConfigReloadError({
-        cause: opaqueErrorCause(caught, "Opaque core-config reload failure"),
-        message: "Core config reload failed",
-      }),
-    );
+  {
+    const captured = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await getCoreConfig());
+      },
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const caught = captured.error.cause;
+      if (isPanic(caught)) preserveToolPanic(caught);
+      return Result.err(
+        new HeartbeatConfigReloadError({
+          cause: opaqueErrorCause(caught, "Opaque core-config reload failure"),
+          message: "Core config reload failed",
+        }),
+      );
+    }
+    return captured.value;
   }
 }
 
@@ -113,17 +124,26 @@ function computeHeartbeatCronAtMs(
   cron: string,
   currentMs: number,
 ): ResultType<number, HeartbeatCronInvalidError> {
-  try {
-    return Result.ok(computeNextCronAtMs({ expr: cron }, currentMs));
-  } catch (caught) {
-    if (isPanic(caught)) throw caught;
-    return Result.err(
-      new HeartbeatCronInvalidError({
-        cron,
-        cause: opaqueErrorCause(caught, "Opaque heartbeat cron failure"),
-        message: "Heartbeat cron is invalid",
-      }),
-    );
+  {
+    const captured = Result.try({
+      try: () => {
+        return Result.ok(computeNextCronAtMs({ expr: cron }, currentMs));
+      },
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const caught = captured.error.cause;
+      if (isPanic(caught)) preserveToolPanic(caught);
+      return Result.err(
+        new HeartbeatCronInvalidError({
+          cron,
+          cause: opaqueErrorCause(caught, "Opaque heartbeat cron failure"),
+          message: "Heartbeat cron is invalid",
+        }),
+      );
+    }
+    return captured.value;
   }
 }
 
@@ -313,7 +333,7 @@ export async function startHeartbeatServiceResult(params: {
 
     outstandingHeartbeatRequestIds.add(requestId);
     let published = false;
-    try {
+    await (async () => {
       adaptEventPublishResultToHost(
         await params.bus.publish(lilacEventTypes.CmdRequestMessage, data, {
           headers: {
@@ -324,9 +344,9 @@ export async function startHeartbeatServiceResult(params: {
         }),
       );
       published = true;
-    } finally {
+    })().finally(() => {
       if (!published) outstandingHeartbeatRequestIds.delete(requestId);
-    }
+    });
 
     logger.info("heartbeat request published", {
       requestId,
@@ -386,13 +406,11 @@ export async function startHeartbeatServiceResult(params: {
     })();
 
     activeTick = runningTick;
-    try {
-      await runningTick;
-    } finally {
+    await runningTick.finally(() => {
       if (activeTick === runningTick) {
         activeTick = null;
       }
-    }
+    });
   }
 
   async function startHeartbeatLifecycleResult(): Promise<

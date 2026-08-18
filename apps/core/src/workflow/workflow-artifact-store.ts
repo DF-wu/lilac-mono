@@ -1,9 +1,10 @@
+import { captureError } from "../shared/error-capture";
 import fs from "node:fs/promises";
 import path from "node:path";
 
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 import type { JsonValue } from "./workflow-domain";
 import {
@@ -142,10 +143,11 @@ async function captureIo<T>(input: {
   readonly operation: WorkflowArtifactIoOperation;
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, WorkflowArtifactIoFailed>> {
-  const captured = await Result.tryPromise({
-    try: input.run,
-    catch: projectRuntimeError(`Opaque workflow artifact ${input.operation} failure`),
-  });
+  const captured = (
+    await Result.tryPromise({ try: input.run, catch: captureRuntimeError })
+  ).mapError((error) =>
+    projectCapturedRuntimeError(error, `Opaque workflow artifact ${input.operation} failure`),
+  );
   const finishCapture = captured.match<() => ResultType<T, WorkflowArtifactIoFailed>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {
@@ -168,20 +170,29 @@ async function lstatOrMissing(input: {
   readonly artifactId: string;
   readonly filePath: string;
 }): Promise<ResultType<Awaited<ReturnType<typeof fs.lstat>> | null, WorkflowArtifactIoFailed>> {
-  try {
-    return Result.ok(await fs.lstat(input.filePath));
-  } catch (cause) {
-    rethrowWorkflowArtifactPanic(cause);
-    const failure = projectFilesystemFailure(cause);
-    if (failure.missing) return Result.ok(null);
-    return Result.err(
-      new WorkflowArtifactIoFailed({
-        artifactId: input.artifactId,
-        operation: "inspect-artifact",
-        code: failure.code,
-        message: "Workflow value artifact I/O failed during inspect-artifact",
-      }),
-    );
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await fs.lstat(input.filePath));
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      rethrowWorkflowArtifactPanic(cause);
+      const failure = projectFilesystemFailure(cause);
+      if (failure.missing) return Result.ok(null);
+      return Result.err(
+        new WorkflowArtifactIoFailed({
+          artifactId: input.artifactId,
+          operation: "inspect-artifact",
+          code: failure.code,
+          message: "Workflow value artifact I/O failed during inspect-artifact",
+        }),
+      );
+    }
+    return attempt.value;
   }
 }
 
@@ -208,58 +219,74 @@ async function artifactRoot(input: {
   const inspected = await Result.tryPromise({
     try: () => fs.lstat(root),
     catch: (cause) => {
-      rethrowWorkflowArtifactPanic(cause);
+      if (Panic.is(cause)) return { kind: "panic", panic: cause } as const;
       const failure = projectFilesystemFailure(cause);
-      if (!input.create && failure.missing) {
-        return new WorkflowArtifactAbsent({
-          artifactId: input.artifactId,
-          message: "Workflow value artifact is absent",
-        });
-      }
-      return new WorkflowArtifactIoFailed({
+      return {
+        kind: "failure",
+        error:
+          !input.create && failure.missing
+            ? new WorkflowArtifactAbsent({
+                artifactId: input.artifactId,
+                message: "Workflow value artifact is absent",
+              })
+            : new WorkflowArtifactIoFailed({
+                artifactId: input.artifactId,
+                operation: "inspect-root",
+                code: failure.code,
+                message: "Workflow value artifact I/O failed during inspect-root",
+              }),
+      } as const;
+    },
+  }).then((result) =>
+    result.match<
+      | { readonly kind: "success"; readonly stats: import("node:fs").Stats }
+      | { readonly kind: "panic"; readonly panic: Panic }
+      | {
+          readonly kind: "failure";
+          readonly error: WorkflowArtifactAbsent | WorkflowArtifactIoFailed;
+        }
+    >({
+      ok: (stats) => ({ kind: "success", stats }),
+      err: (failure) => failure,
+    }),
+  );
+  if (inspected.kind === "panic") {
+    rethrowWorkflowArtifactPanic(inspected.panic);
+    return Result.err(
+      new WorkflowArtifactIoFailed({
         artifactId: input.artifactId,
         operation: "inspect-root",
-        code: failure.code,
+        code: "UNKNOWN",
         message: "Workflow value artifact I/O failed during inspect-root",
-      });
-    },
-  });
-  return inspected.match<
-    Promise<
-      ResultType<
-        string,
-        WorkflowArtifactAbsent | WorkflowArtifactUnsafePath | WorkflowArtifactIoFailed
-      >
-    >
-  >({
-    err: (error) => Promise.resolve(Result.err(error)),
-    ok: async (stats) => {
-      if (stats.isSymbolicLink()) {
-        return Result.err(
-          new WorkflowArtifactUnsafePath({
-            artifactId: input.artifactId,
-            location: "root",
-            issue: "symlink",
-            message: "Workflow value artifact root cannot be a symlink",
-          }),
-        );
-      }
-      if (!stats.isDirectory()) {
-        return Result.err(
-          new WorkflowArtifactUnsafePath({
-            artifactId: input.artifactId,
-            location: "root",
-            issue: "not-directory",
-            message: "Workflow value artifact root is not a directory",
-          }),
-        );
-      }
-      return captureIo({
+      }),
+    );
+  }
+  if (inspected.kind === "failure") return Result.err(inspected.error);
+  const { stats } = inspected;
+  if (stats.isSymbolicLink()) {
+    return Result.err(
+      new WorkflowArtifactUnsafePath({
         artifactId: input.artifactId,
-        operation: "resolve-root",
-        run: () => fs.realpath(root),
-      });
-    },
+        location: "root",
+        issue: "symlink",
+        message: "Workflow value artifact root cannot be a symlink",
+      }),
+    );
+  }
+  if (!stats.isDirectory()) {
+    return Result.err(
+      new WorkflowArtifactUnsafePath({
+        artifactId: input.artifactId,
+        location: "root",
+        issue: "not-directory",
+        message: "Workflow value artifact root is not a directory",
+      }),
+    );
+  }
+  return captureIo({
+    artifactId: input.artifactId,
+    operation: "resolve-root",
+    run: () => fs.realpath(root),
   });
 }
 

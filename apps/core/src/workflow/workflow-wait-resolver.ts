@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture";
 import {
   type DeliveryDisposition,
   type EventDeliveryDoneError,
@@ -318,41 +319,50 @@ export class WorkflowWaitResolver {
   private async captureWorkflowWaitResolverConsumerGroupRetirement(
     subscription: WorkflowWaitResolverSubscription,
   ): Promise<ResultType<void, WorkflowWaitResolverConsumerGroupRetirementFailed>> {
-    try {
-      const retired = await this.input.bus.retireTopicConsumerGroup(
-        "evt.adapter",
-        this.input.subscriptionId,
-        this.input.confirmLegacyGroupSingleVersionRollout ?? false,
-      );
-      return retired
-        .map(() => undefined)
-        .mapError(
-          (cause) =>
-            new WorkflowWaitResolverConsumerGroupRetirementFailed({
-              cause,
-              message: "Workflow wait resolver consumer-group retirement failed",
-            }),
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          const retired = await this.input.bus.retireTopicConsumerGroup(
+            "evt.adapter",
+            this.input.subscriptionId,
+            this.input.confirmLegacyGroupSingleVersionRollout ?? false,
+          );
+          return retired
+            .map(() => undefined)
+            .mapError(
+              (cause) =>
+                new WorkflowWaitResolverConsumerGroupRetirementFailed({
+                  cause,
+                  message: "Workflow wait resolver consumer-group retirement failed",
+                }),
+            );
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const cause = attempt.error.cause;
+        if (Panic.is(cause)) {
+          const stopped = await subscription.stop();
+          stopped.match({
+            ok: () => undefined,
+            err: (error) =>
+              this.logger.error(
+                "Workflow wait resolver subscription cleanup failed",
+                formatTaggedErrorForLog(error),
+              ),
+          });
+          this.releaseLease();
+          preserveToolPanic(cause);
+        }
+        return Result.err(
+          new WorkflowWaitResolverConsumerGroupRetirementFailed({
+            cause,
+            message: "Workflow wait resolver consumer-group retirement failed",
+          }),
         );
-    } catch (cause) {
-      if (Panic.is(cause)) {
-        const stopped = await subscription.stop();
-        stopped.match({
-          ok: () => undefined,
-          err: (error) =>
-            this.logger.error(
-              "Workflow wait resolver subscription cleanup failed",
-              formatTaggedErrorForLog(error),
-            ),
-        });
-        this.releaseLease();
-        throw cause;
       }
-      return Result.err(
-        new WorkflowWaitResolverConsumerGroupRetirementFailed({
-          cause,
-          message: "Workflow wait resolver consumer-group retirement failed",
-        }),
-      );
+      return attempt.value;
     }
   }
 
@@ -510,11 +520,9 @@ export class WorkflowWaitResolver {
   private async stopWorkflowWaitSubscriptionResult(
     subscription: WorkflowWaitResolverSubscription,
   ): Promise<ResultType<void, EventDeliveryStopFailed>> {
-    try {
-      return await subscription.stop();
-    } finally {
+    return await subscription.stop().finally(() => {
       this.releaseLease();
-    }
+    });
   }
 
   private async stopWorkflowWaitResolverResult(): Promise<
@@ -651,9 +659,10 @@ export class WorkflowWaitResolver {
   > {
     if (this.polling) return Result.ok(undefined);
     this.polling = true;
-    try {
+    const outcome = await (async () => {
       const now = this.now();
-      if (!this.ensureLeaseOwnership(now)) return Result.ok(undefined);
+      if (!this.ensureLeaseOwnership(now))
+        return { status: "return", value: Result.ok(undefined) } as const;
       const candidates = this.input.store.listDueWaits(now);
       const dueWaits = candidates.match<
         | { readonly kind: "ok"; readonly waits: WorkflowWait[] }
@@ -662,10 +671,12 @@ export class WorkflowWaitResolver {
         ok: (waits) => ({ kind: "ok", waits }),
         err: (error) => ({ kind: "error", error }),
       });
-      if (dueWaits.kind === "error") return Result.err(dueWaits.error);
+      if (dueWaits.kind === "error")
+        return { status: "return", value: Result.err(dueWaits.error) } as const;
       for (const candidate of dueWaits.waits) {
         if (candidate.match.kind === "reply") {
-          if (!this.ensureLeaseOwnership(this.now())) return Result.ok(undefined);
+          if (!this.ensureLeaseOwnership(this.now()))
+            return { status: "return", value: Result.ok(undefined) } as const;
           const barrier = this.input.store.prepareWaitExpiryBarrier({
             runId: candidate.runId,
             operationId: candidate.operationId,
@@ -675,20 +686,26 @@ export class WorkflowWaitResolver {
           });
           if (!barrier) continue;
           if (barrier.shouldPublish) {
-            if (!this.ensureLeaseOwnership(this.now())) return Result.ok(undefined);
+            if (!this.ensureLeaseOwnership(this.now()))
+              return { status: "return", value: Result.ok(undefined) } as const;
             const published = await this.captureWorkflowWaitResolverBarrierPublication(
               barrier.barrierId,
               now,
             );
             const publication = published.match<
               | { readonly kind: "ok"; readonly cursor: string }
-              | { readonly kind: "error"; readonly error: WorkflowWaitResolverBarrierPublishFailed }
+              | {
+                  readonly kind: "error";
+                  readonly error: WorkflowWaitResolverBarrierPublishFailed;
+                }
             >({
               ok: ({ cursor }) => ({ kind: "ok", cursor }),
               err: (error) => ({ kind: "error", error }),
             });
-            if (publication.kind === "error") return Result.err(publication.error);
-            if (!this.ensureLeaseOwnership(this.now())) return Result.ok(undefined);
+            if (publication.kind === "error")
+              return { status: "return", value: Result.err(publication.error) } as const;
+            if (!this.ensureLeaseOwnership(this.now()))
+              return { status: "return", value: Result.ok(undefined) } as const;
             this.input.store.recordWaitExpiryBarrierCursor(
               barrier.barrierId,
               publication.cursor,
@@ -705,10 +722,12 @@ export class WorkflowWaitResolver {
           ok: (run) => ({ kind: "ok", ownerId: run?.claimedBy }),
           err: (error) => ({ kind: "error", error }),
         });
-        if (runOutcome.kind === "error") return Result.err(runOutcome.error);
+        if (runOutcome.kind === "error")
+          return { status: "return", value: Result.err(runOutcome.error) } as const;
         const runOwnerId = runOutcome.ownerId;
         if (!runOwnerId) continue;
-        if (!this.ensureLeaseOwnership(this.now())) return Result.ok(undefined);
+        if (!this.ensureLeaseOwnership(this.now()))
+          return { status: "return", value: Result.ok(undefined) } as const;
         const claimed = this.input.store.tryClaimWait({
           runId: candidate.runId,
           operationId: candidate.operationId,
@@ -721,7 +740,8 @@ export class WorkflowWaitResolver {
           claimed.match.kind === "sleep" && claimed.dueAt !== null && claimed.dueAt <= now;
         const isExpired = claimed.deadlineAt !== null && claimed.deadlineAt <= now;
         if (!isSleep && !isExpired) {
-          if (!this.ensureLeaseOwnership(this.now())) return Result.ok(undefined);
+          if (!this.ensureLeaseOwnership(this.now()))
+            return { status: "return", value: Result.ok(undefined) } as const;
           this.input.store.transitionWait({
             runId: claimed.runId,
             operationId: claimed.operationId,
@@ -733,7 +753,8 @@ export class WorkflowWaitResolver {
           continue;
         }
         const to = isSleep ? "resolved" : "expired";
-        if (!this.ensureLeaseOwnership(this.now())) return Result.ok(undefined);
+        if (!this.ensureLeaseOwnership(this.now()))
+          return { status: "return", value: Result.ok(undefined) } as const;
         const changed = this.input.store.transitionWait({
           runId: claimed.runId,
           operationId: claimed.operationId,
@@ -746,10 +767,11 @@ export class WorkflowWaitResolver {
         });
         if (changed) await this.publishWakeupAdvisory(claimed);
       }
-      return Result.ok(undefined);
-    } finally {
+      return { status: "return", value: Result.ok(undefined) } as const;
+    })().finally(() => {
       this.polling = false;
-    }
+    });
+    return outcome.value;
   }
 
   private async captureWorkflowWaitResolverWakeupPublication(

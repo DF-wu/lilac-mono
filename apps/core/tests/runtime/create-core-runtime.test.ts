@@ -196,6 +196,25 @@ describe("Core runtime startup", () => {
     expect(() => cleanup.finish()).toThrow(firstPanic);
   });
 
+  it("records a synchronous cleanup throw and continues cleanup", async () => {
+    const failure = new Error("cleanup threw synchronously");
+    const calls: string[] = [];
+    const cleanup = createCoreRuntimeCleanupSupervisor(null);
+
+    await cleanup.run("synchronous", () => {
+      calls.push("synchronous");
+      throw failure;
+    });
+    await cleanup.run("continued", async () => {
+      calls.push("continued");
+    });
+
+    expect(calls).toEqual(["synchronous", "continued"]);
+    expect(cleanup.failures).toEqual([
+      { label: "synchronous", error: failure.message, panic: false },
+    ]);
+  });
+
   it("reports detached config validation Panic with exact identity", async () => {
     const panic = new Panic({ message: "config validation invariant failed" });
     const reported: Error[] = [];
@@ -488,7 +507,7 @@ describe("Core runtime startup", () => {
     const done = Promise.withResolvers<CoreResidualDiscordRequestRouterDoneOutcome>();
     const reported = Promise.withResolvers<Panic>();
     const panic = new Panic({ message: "late residual done invariant failed" });
-    const recorded: Array<{ readonly label: string; readonly cause: Error }> = [];
+    const recorded: Array<{ readonly label: string; readonly cause: unknown }> = [];
     let expireDeadline: () => void = () => {
       throw new Error("deadline was not scheduled");
     };

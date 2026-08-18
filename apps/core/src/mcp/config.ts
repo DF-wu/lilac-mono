@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { z } from "zod";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
@@ -251,14 +252,17 @@ export function parseMcpConfigDocument(raw: unknown): McpConfigParseResult {
 }
 
 export function parseMcpConfigYaml(source: string): McpConfigParseResult {
-  let document: unknown;
-  try {
-    document = Bun.YAML.parse(source);
-  } catch (error) {
-    const message = opaqueErrorMessage(error);
-    return { ok: false, issues: [`<root>: failed to parse YAML: ${message}`] };
-  }
-  return parseMcpConfigDocument(document);
+  const parsed = Result.try({
+    try: () => Bun.YAML.parse(source) as unknown,
+    catch: captureError,
+  });
+  return parsed.match<() => McpConfigParseResult>({
+    ok: (document) => () => parseMcpConfigDocument(document),
+    err: (error) => () => ({
+      ok: false as const,
+      issues: [`<root>: failed to parse YAML: ${opaqueErrorMessage(error)}`],
+    }),
+  })();
 }
 
 export function serializeMcpConfigYamlResult(

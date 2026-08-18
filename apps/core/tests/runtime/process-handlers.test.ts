@@ -3,7 +3,11 @@ import { createLogger } from "@stanley2058/lilac-utils";
 import { Panic } from "better-result";
 
 import { createProcessHandlers } from "../../src/runtime/process-handlers";
-import { projectRuntimeError, safeRuntimeErrorText } from "../../src/runtime/error-format";
+import {
+  captureRuntimeError,
+  projectRuntimeError,
+  safeRuntimeErrorText,
+} from "../../src/runtime/error-format";
 
 function createLoggerStub() {
   return createLogger({
@@ -43,6 +47,7 @@ describe("createProcessHandlers", () => {
   it("safely projects revoked failures", () => {
     const { proxy, revoke } = Proxy.revocable({}, {});
     revoke();
+    expect(captureRuntimeError(proxy)).toEqual({ kind: "opaque" });
     const projected = projectRuntimeError(proxy, "Opaque revoked process failure");
     expect(projected).toBeInstanceOf(Error);
     expect(projected.message).toBe("Opaque revoked process failure");

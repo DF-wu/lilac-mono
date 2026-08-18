@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture.js";
 import crypto from "node:crypto";
 import Elysia from "elysia";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
@@ -135,14 +136,16 @@ export function decodeGithubWebhookEvent(
       }
       return fallback;
     },
-    catch: (cause) => cause,
+    catch: captureError,
   });
   return decoded.match<() => ProjectedGithubWebhookEvent>({
     ok: (value) => () => value,
-    err: (error) => () => {
-      if (Panic.is(error)) return adaptToolResultToHost(Result.err(error));
-      return { kind: "unsupported", reason: "payload_invalid" };
-    },
+    err:
+      ({ cause }) =>
+      () => {
+        if (Panic.is(cause)) return adaptToolResultToHost(Result.err(cause));
+        return { kind: "unsupported", reason: "payload_invalid" };
+      },
   })();
 }
 
@@ -150,17 +153,26 @@ async function captureGithubWebhookOperation<T>(
   operation: string,
   run: () => Promise<T>,
 ): Promise<ResultType<T, GithubWebhookOperationError>> {
-  try {
-    return Result.ok(await run());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new GithubWebhookOperationError({
-        operation,
-        cause,
-        message: `GitHub webhook ${operation} failed`,
-      }),
-    );
+  {
+    const captured = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await run());
+      },
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const cause = captured.error.cause;
+      if (Panic.is(cause)) throw cause;
+      return Result.err(
+        new GithubWebhookOperationError({
+          operation,
+          cause,
+          message: `GitHub webhook ${operation} failed`,
+        }),
+      );
+    }
+    return captured.value;
   }
 }
 
@@ -168,12 +180,21 @@ export async function superviseGithubWebhookHandler<T>(options: {
   readonly run: () => Promise<T>;
   readonly reportFatalError: (error: Error) => void;
 }): Promise<ResultType<T, GithubWebhookOperationError>> {
-  try {
-    return await captureGithubWebhookOperation("handler", options.run);
-  } catch (cause) {
-    if (!Panic.is(cause)) throw cause;
-    options.reportFatalError(cause);
-    throw cause;
+  {
+    const captured = await Result.tryPromise({
+      try: async () => {
+        return await captureGithubWebhookOperation("handler", options.run);
+      },
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const cause = captured.error.cause;
+      if (!Panic.is(cause)) throw cause;
+      options.reportFatalError(cause);
+      throw cause;
+    }
+    return captured.value;
   }
 }
 
@@ -399,15 +420,12 @@ async function runGithubSessionOperation<T>(
   const gate = Promise.withResolvers<void>();
   githubSessionOperationTails.set(sessionId, gate.promise);
   if (previous) await previous;
-
-  try {
-    return await operation();
-  } finally {
+  return await operation().finally(() => {
     gate.resolve();
     if (githubSessionOperationTails.get(sessionId) === gate.promise) {
       githubSessionOperationTails.delete(sessionId);
     }
-  }
+  });
 }
 
 export async function startGithubWebhookServer(options: GithubWebhookOptions): Promise<{
@@ -830,7 +848,7 @@ async function onReviewRequested(input: {
     const latestTransition = setGithubLatestRequestForSession(sessionId, requestId);
     let startupCompleted = false;
 
-    try {
+    return await (async () => {
       input.logger.info("github trigger: review_requested", {
         repo: input.repoFullName,
         prNumber,
@@ -857,7 +875,6 @@ async function onReviewRequested(input: {
       }
 
       const prData = await getPullRequest({ owner, repo, number: prNumber });
-
       const prompt = buildPrReviewPrompt({
         repoFullName: input.repoFullName,
         prNumber,
@@ -866,7 +883,6 @@ async function onReviewRequested(input: {
         prUrl: prData.html_url,
         headSha: prData.head.sha,
       });
-
       const messages: ModelMessage[] = [{ role: "user", content: prompt }];
 
       setGithubRequestMeta({
@@ -910,12 +926,12 @@ async function onReviewRequested(input: {
 
       startupCompleted = true;
       return requestId;
-    } finally {
+    })().finally(() => {
       if (!startupCompleted) {
         rollbackGithubAcknowledgementClaim(acknowledgementClaim);
         restoreGithubLatestRequestForSession(latestTransition);
       }
-    }
+    });
   });
 }
 
@@ -978,7 +994,7 @@ async function onPullRequestSynchronize(input: {
     const latestTransition = setGithubLatestRequestForSession(sessionId, requestId);
     let replacementPublished = false;
 
-    try {
+    return await (async () => {
       setGithubRequestMeta({
         requestId,
         sessionId,
@@ -1045,11 +1061,11 @@ async function onPullRequestSynchronize(input: {
       );
 
       return requestId;
-    } finally {
+    })().finally(() => {
       if (!replacementPublished) {
         rollbackGithubAcknowledgementClaim(acknowledgementClaim);
         restoreGithubLatestRequestForSession(latestTransition);
       }
-    }
+    });
   });
 }

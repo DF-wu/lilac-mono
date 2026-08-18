@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -35,6 +36,7 @@ import {
   type AuthenticatedRequestProjection,
 } from "../surface/authenticated-request";
 import type { BusToAdapterRelaySnapshot } from "../surface/bridge/subscribe-from-bus";
+import { preserveToolPanic } from "../tools/tool-result-adapters";
 
 export const GRACEFUL_RESTART_SNAPSHOT_VERSION = 4 as const;
 
@@ -146,24 +148,33 @@ export function decodeOpaqueSuperJsonValue(
       }),
     );
   }
-  try {
-    const serialized = SuperJSON.stringify(value);
-    const roundTripped: unknown = SuperJSON.parse(serialized);
-    if (!isOpaqueSuperJsonValue(roundTripped) || !isDeepStrictEqual(roundTripped, value)) {
+  {
+    const captured = Result.try({
+      try: () => {
+        const serialized = SuperJSON.stringify(value);
+        const roundTripped: unknown = SuperJSON.parse(serialized);
+        if (!isOpaqueSuperJsonValue(roundTripped) || !isDeepStrictEqual(roundTripped, value)) {
+          return Result.err(
+            new OpaqueSuperJsonValueUnsupported({
+              message: "Opaque graceful restart value cannot be preserved exactly by SuperJSON",
+            }),
+          );
+        }
+        return Result.ok(value);
+      },
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const cause = captured.error.cause;
+      preserveToolPanic(cause);
       return Result.err(
         new OpaqueSuperJsonValueUnsupported({
-          message: "Opaque graceful restart value cannot be preserved exactly by SuperJSON",
+          message: "Opaque graceful restart value cannot be serialized safely by SuperJSON",
         }),
       );
     }
-    return Result.ok(value);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new OpaqueSuperJsonValueUnsupported({
-        message: "Opaque graceful restart value cannot be serialized safely by SuperJSON",
-      }),
-    );
+    return captured.value;
   }
 }
 
@@ -724,16 +735,25 @@ function corruptSnapshot(version: number, field: "payload_json" | "status") {
 }
 
 function parsePersistedPayload(payloadJson: string): ResultType<unknown, MalformedSerialization> {
-  try {
-    const parsed: unknown = SuperJSON.parse(payloadJson);
-    return Result.ok(parsed);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new MalformedSerialization(
-        persistenceContext({ field: "payload_json", version: -1, issueCode: "malformed-json" }),
-      ),
-    );
+  {
+    const captured = Result.try({
+      try: () => {
+        const parsed: unknown = SuperJSON.parse(payloadJson);
+        return Result.ok(parsed);
+      },
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const cause = captured.error.cause;
+      preserveToolPanic(cause);
+      return Result.err(
+        new MalformedSerialization(
+          persistenceContext({ field: "payload_json", version: -1, issueCode: "malformed-json" }),
+        ),
+      );
+    }
+    return captured.value;
   }
 }
 
@@ -1049,40 +1069,67 @@ export function decodeGracefulRestartSnapshot(
 function encodeGracefulRestartSnapshot(
   snapshot: GracefulRestartSnapshotInput,
 ): ResultType<string, CorruptPersistedFields | GracefulRestartSerializationFailure> {
-  try {
-    for (const entry of snapshot.agent) {
-      if (entry.raw === undefined) continue;
-      const opaque = decodeOpaqueSuperJsonValue(entry.raw);
-      if (!opaque.match({ ok: () => true, err: () => false })) {
-        return Result.err(corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json"));
-      }
-    }
-    const payloadJson = SuperJSON.stringify(snapshot);
-    const validated = decodeGracefulRestartSnapshot({
-      status: "completed",
-      payload_json: payloadJson,
-    });
-    return validated.match({
-      err: (error) => () => {
-        if (error instanceof CorruptPersistedFields) return Result.err(error);
-        throw new Panic({
-          message: "Graceful restart current snapshot encoding produced an invalid envelope",
-          cause: error,
+  {
+    const captured = Result.try({
+      try: () => {
+        for (const entry of snapshot.agent) {
+          if (entry.raw === undefined) continue;
+          const opaque = decodeOpaqueSuperJsonValue(entry.raw);
+          if (!opaque.match({ ok: () => true, err: () => false })) {
+            return {
+              kind: "result",
+              result: Result.err(
+                corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json"),
+              ),
+            } as const;
+          }
+        }
+        const payloadJson = SuperJSON.stringify(snapshot);
+        const validated = decodeGracefulRestartSnapshot({
+          status: "completed",
+          payload_json: payloadJson,
+        });
+        return validated.match<
+          | { readonly kind: "result"; readonly result: ResultType<string, CorruptPersistedFields> }
+          | {
+              readonly kind: "panic";
+              readonly error: import("better-result").InferErr<typeof validated>;
+            }
+        >({
+          err: (error) =>
+            error instanceof CorruptPersistedFields
+              ? ({ kind: "result", result: Result.err(error) } as const)
+              : ({ kind: "panic", error } as const),
+          ok: (value) => ({
+            kind: "result",
+            result: isDeepStrictEqual(value.value, snapshot)
+              ? Result.ok(payloadJson)
+              : Result.err(corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json")),
+          }),
         });
       },
-      ok: (value) => () =>
-        isDeepStrictEqual(value.value, snapshot)
-          ? Result.ok(payloadJson)
-          : Result.err(corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json")),
-    })();
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    if (!(cause instanceof Error)) throw cause;
-    return Result.err(
-      new GracefulRestartSerializationFailure({
-        message: "Graceful restart snapshot serialization failed",
-      }),
-    );
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const cause = captured.error.cause;
+      preserveToolPanic(cause);
+      return Result.err(
+        new GracefulRestartSerializationFailure({
+          message: "Graceful restart snapshot serialization failed",
+        }),
+      );
+    }
+    const encoded = captured.value;
+    if (encoded.kind === "panic") {
+      preserveToolPanic(
+        new Panic({
+          message: "Graceful restart current snapshot encoding produced an invalid envelope",
+          cause: encoded.error,
+        }),
+      );
+    }
+    return encoded.result;
   }
 }
 

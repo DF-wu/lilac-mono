@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture.js";
 import type { ServerTool } from "@stanley2058/lilac-plugin-runtime";
 import {
   applyPatchInputSchema,
@@ -150,18 +151,28 @@ class LocalApplyPatchGuardFailed extends TaggedError("LocalApplyPatchGuardFailed
 async function captureLocalApplyPatchFs<T>(
   run: () => Promise<T>,
 ): Promise<ResultType<T, LocalApplyPatchGuardFailed>> {
-  try {
-    return Result.ok(await run());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new LocalApplyPatchGuardFailed({
-        ...(errorCode(cause) === undefined ? {} : { code: errorCode(cause) }),
-        cause,
-        message: opaqueErrorMessage(cause, "Local patch filesystem operation failed"),
-      }),
-    );
-  }
+  const captured = (
+    await Result.tryPromise({
+      try: run,
+      catch: captureError,
+    })
+  ).match<
+    | { readonly kind: "success"; readonly value: T }
+    | { readonly kind: "failure"; readonly failure: Error }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (captured.kind === "success") return Result.ok(captured.value);
+  const cause = captured.failure;
+  if (Panic.is(cause)) throw cause;
+  return Result.err(
+    new LocalApplyPatchGuardFailed({
+      ...(errorCode(cause) === undefined ? {} : { code: errorCode(cause) }),
+      cause,
+      message: opaqueErrorMessage(cause, "Local patch filesystem operation failed"),
+    }),
+  );
 }
 
 async function canonicalizeAsFarAsExists(

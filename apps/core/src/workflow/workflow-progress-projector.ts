@@ -603,11 +603,9 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
     if (this.actionOutboxDrain) return await this.actionOutboxDrain;
     const drain = this.drainPendingActionOutboxProjections();
     this.actionOutboxDrain = drain;
-    try {
-      await drain;
-    } finally {
+    await drain.finally(() => {
       if (this.actionOutboxDrain === drain) this.actionOutboxDrain = null;
-    }
+    });
   }
 
   private async drainPendingActionOutboxProjections(): Promise<void> {
@@ -663,13 +661,11 @@ export class WorkflowProgressProjector implements WorkflowProgressCardService {
       return await this.projectRun(runId, requireMessage, verifyExisting);
     })();
     this.projectionInFlight.set(runId, projection);
-    try {
-      return await projection;
-    } finally {
+    return await projection.finally(() => {
       if (this.projectionInFlight.get(runId) === projection) {
         this.projectionInFlight.delete(runId);
       }
-    }
+    });
   }
 
   private issueActions(

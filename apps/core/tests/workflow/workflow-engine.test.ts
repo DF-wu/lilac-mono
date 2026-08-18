@@ -477,7 +477,7 @@ describe("WorkflowEngine", () => {
   });
   it("returns idle cancellation publication failures as values and preserves Panic", async () => {
     class CancellationFailingRawBus extends CapturingRawBus {
-      constructor(private readonly cause: Error) {
+      constructor(private readonly cause: unknown) {
         super();
       }
       override async publish<TData>(

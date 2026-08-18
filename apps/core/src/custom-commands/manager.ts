@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { pathToFileURL } from "node:url";
 
 import { Result, TaggedError, type Result as ResultType } from "better-result";
@@ -157,17 +158,21 @@ async function importCustomCommandModule(params: {
 }): Promise<
   ResultType<CustomCommandModule, CustomCommandImportError | CustomCommandExecuteMissingError>
 > {
-  try {
-    const imported: unknown = await import(pathToFileURL(params.entrypointPath).href);
-    const commandModule = decodeCustomCommandModule(imported);
-    if (commandModule) return Result.ok(commandModule);
-    return Result.err(
-      new CustomCommandExecuteMissingError({
-        ...params,
-        message: `Command '${params.commandName}' must export async execute(args, ctx).`,
-      }),
-    );
-  } catch (caught) {
+  const captured = (
+    await Result.tryPromise({
+      try: async () =>
+        decodeCustomCommandModule(await import(pathToFileURL(params.entrypointPath).href)),
+      catch: captureError,
+    })
+  ).match<
+    | { readonly kind: "success"; readonly commandModule: CustomCommandModule | null }
+    | { readonly kind: "failure"; readonly failure: Error }
+  >({
+    ok: (commandModule) => ({ kind: "success", commandModule }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (captured.kind === "failure") {
+    const caught = captured.failure;
     if (isPanic(caught)) throw caught;
     const cause = opaqueErrorCause(caught, "Opaque custom-command import failure");
     return Result.err(
@@ -178,6 +183,13 @@ async function importCustomCommandModule(params: {
       }),
     );
   }
+  if (captured.commandModule) return Result.ok(captured.commandModule);
+  return Result.err(
+    new CustomCommandExecuteMissingError({
+      ...params,
+      message: `Command '${params.commandName}' must export async execute(args, ctx).`,
+    }),
+  );
 }
 
 function invokeCustomCommand(params: {
@@ -193,50 +205,62 @@ function invokeCustomCommand(params: {
   >,
   CustomCommandExecuteThrownError
 > {
-  try {
+  const captured = Result.try({
+    try: params.run,
+    catch: captureError,
+  }).match<
+    | { readonly kind: "success"; readonly execution: unknown }
+    | { readonly kind: "failure"; readonly failure: Error }
+  >({
+    ok: (execution) => ({ kind: "success", execution }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (captured.kind === "success") {
     return Result.ok(
       settleCustomCommand({
         commandName: params.commandName,
         entrypointPath: params.entrypointPath,
-        execution: params.run(),
-      }),
-    );
-  } catch (caught) {
-    if (isPanic(caught)) throw caught;
-    const cause = opaqueErrorCause(caught, "Opaque custom-command execution failure");
-    return Result.err(
-      new CustomCommandExecuteThrownError({
-        commandName: params.commandName,
-        entrypointPath: params.entrypointPath,
-        cause,
-        message: `Command '${params.commandName}' threw while executing: ${opaqueErrorMessage(cause, "Opaque custom-command execution failure")}`,
+        run: async () => await captured.execution,
       }),
     );
   }
+  const caught = captured.failure;
+  if (isPanic(caught)) throw caught;
+  const cause = opaqueErrorCause(caught, "Opaque custom-command execution failure");
+  return Result.err(
+    new CustomCommandExecuteThrownError({
+      commandName: params.commandName,
+      entrypointPath: params.entrypointPath,
+      cause,
+      message: `Command '${params.commandName}' threw while executing: ${opaqueErrorMessage(cause, "Opaque custom-command execution failure")}`,
+    }),
+  );
 }
 
 async function settleCustomCommand(params: {
   commandName: string;
   entrypointPath: string;
-  execution: unknown;
+  run: () => Promise<unknown>;
 }): Promise<
   ResultType<
     CustomCommandResult,
     CustomCommandExecuteRejectedError | CustomCommandResultInvalidError
   >
 > {
-  try {
-    const value: unknown = await params.execution;
-    const decoded = decodeCustomCommandResult(value);
-    if (decoded !== null) return Result.ok(decoded);
-    return Result.err(
-      new CustomCommandResultInvalidError({
-        commandName: params.commandName,
-        entrypointPath: params.entrypointPath,
-        message: `Command '${params.commandName}' returned an invalid tool result payload.`,
-      }),
-    );
-  } catch (caught) {
+  const captured = (
+    await Result.tryPromise({
+      try: async () => decodeCustomCommandResult(await params.run()),
+      catch: captureError,
+    })
+  ).match<
+    | { readonly kind: "success"; readonly value: CustomCommandResult | null }
+    | { readonly kind: "failure"; readonly failure: Error }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (captured.kind === "failure") {
+    const caught = captured.failure;
     if (isPanic(caught)) throw caught;
     const cause = opaqueErrorCause(caught, "Opaque custom-command rejection");
     return Result.err(
@@ -248,6 +272,14 @@ async function settleCustomCommand(params: {
       }),
     );
   }
+  if (captured.value !== null) return Result.ok(captured.value);
+  return Result.err(
+    new CustomCommandResultInvalidError({
+      commandName: params.commandName,
+      entrypointPath: params.entrypointPath,
+      message: `Command '${params.commandName}' returned an invalid tool result payload.`,
+    }),
+  );
 }
 
 function validateArgChoice(

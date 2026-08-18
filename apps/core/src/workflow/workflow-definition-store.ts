@@ -415,7 +415,7 @@ export class WorkflowDefinitionStore {
       );
     }
     const lock = openedLock.value;
-    try {
+    const outcome = await (async () => {
       const existingStats = await lstatOrNull(location.candidate);
       if (existingStats) {
         const existingResult = await readBoundedRegularFile(location.candidate, "save");
@@ -426,48 +426,59 @@ export class WorkflowDefinitionStore {
           ok: (existing) => ({ kind: "ok", ...existing }),
           err: (error) => ({ kind: "error", error }),
         });
-        if (existingOutcome.kind === "error") return Result.err(existingOutcome.error);
+        if (existingOutcome.kind === "error")
+          return { status: "return", value: Result.err(existingOutcome.error) } as const;
         const existing = existingOutcome;
         if (!isContained(location.root, existing.canonicalPath)) {
-          return Result.err(
-            storeFailure(
-              "save",
-              `Workflow definition escapes canonical scope root: ${existing.canonicalPath}`,
+          return {
+            status: "return",
+            value: Result.err(
+              storeFailure(
+                "save",
+                `Workflow definition escapes canonical scope root: ${existing.canonicalPath}`,
+              ),
             ),
-          );
+          } as const;
         }
         const currentSha256 = sha256(existing.source);
         if (!params.expectedSha256) {
-          return Result.err(
-            storeFailure(
-              "save",
-              `Workflow already exists; expectedSha256 is required (current ${currentSha256})`,
+          return {
+            status: "return",
+            value: Result.err(
+              storeFailure(
+                "save",
+                `Workflow already exists; expectedSha256 is required (current ${currentSha256})`,
+              ),
             ),
-          );
+          } as const;
         }
         if (params.expectedSha256 !== currentSha256) {
-          return Result.err(
-            storeFailure(
-              "save",
-              `Workflow optimistic hash mismatch: expected ${params.expectedSha256}, current ${currentSha256}`,
+          return {
+            status: "return",
+            value: Result.err(
+              storeFailure(
+                "save",
+                `Workflow optimistic hash mismatch: expected ${params.expectedSha256}, current ${currentSha256}`,
+              ),
             ),
-          );
+          } as const;
         }
       } else if (params.expectedSha256 !== undefined) {
-        return Result.err(
-          storeFailure("save", "Workflow does not exist, but expectedSha256 was provided"),
-        );
+        return {
+          status: "return",
+          value: Result.err(
+            storeFailure("save", "Workflow does not exist, but expectedSha256 was provided"),
+          ),
+        } as const;
       }
 
       const tempPath = path.join(location.root, `.${location.name}.${crypto.randomUUID()}.tmp`);
       const mode = scope === "personal" ? 0o600 : 0o644;
       const handle = await fs.open(tempPath, "wx", mode);
-      try {
+      await (async () => {
         await handle.writeFile(params.source, "utf8");
         await handle.sync();
-      } finally {
-        await handle.close();
-      }
+      })().finally(() => handle.close());
       const [renamed] = await Promise.allSettled([
         fs.rename(tempPath, location.candidate).then(async () => {
           if (scope === "personal") await fs.chmod(location.candidate, 0o600);
@@ -476,12 +487,15 @@ export class WorkflowDefinitionStore {
       if (renamed.status === "rejected") {
         if (isPanic(renamed.reason)) preserveToolPanic(renamed.reason);
         await fs.rm(tempPath, { force: true });
-        return Result.err(
-          storeFailure(
-            "save",
-            `Could not commit workflow ${location.name}: ${opaqueErrorMessage(renamed.reason, "opaque save failure")}`,
+        return {
+          status: "return",
+          value: Result.err(
+            storeFailure(
+              "save",
+              `Could not commit workflow ${location.name}: ${opaqueErrorMessage(renamed.reason, "opaque save failure")}`,
+            ),
           ),
-        );
+        } as const;
       }
 
       const saved = await readBoundedRegularFile(location.candidate, "save");
@@ -492,25 +506,33 @@ export class WorkflowDefinitionStore {
         ok: ({ canonicalPath }) => ({ kind: "ok", canonicalPath }),
         err: (error) => ({ kind: "error", error }),
       });
-      if (savedOutcome.kind === "error") return Result.err(savedOutcome.error);
+      if (savedOutcome.kind === "error")
+        return { status: "return", value: Result.err(savedOutcome.error) } as const;
       const { canonicalPath } = savedOutcome;
       if (!isContained(location.root, canonicalPath)) {
-        return Result.err(
-          storeFailure("save", `Saved workflow escapes canonical scope root: ${canonicalPath}`),
-        );
+        return {
+          status: "return",
+          value: Result.err(
+            storeFailure("save", `Saved workflow escapes canonical scope root: ${canonicalPath}`),
+          ),
+        } as const;
       }
-      return Result.ok({
-        scope,
-        name: location.name,
-        normalizedPath: `${location.name}.js`,
-        canonicalPath,
-        source: params.source,
-        validation,
-      });
-    } finally {
+      return {
+        status: "return",
+        value: Result.ok({
+          scope,
+          name: location.name,
+          normalizedPath: `${location.name}.js`,
+          canonicalPath,
+          source: params.source,
+          validation,
+        }),
+      } as const;
+    })().finally(async () => {
       await lock.close();
       await fs.rm(lockPath, { force: true });
-    }
+    });
+    return outcome.value;
   }
 
   async saveResult(params: {
@@ -694,12 +716,10 @@ export class WorkflowDefinitionStore {
       );
     }
     const handle = opened.value;
-    try {
+    await (async () => {
       await handle.writeFile(source, "utf8");
       await handle.sync();
-    } finally {
-      await handle.close();
-    }
+    })().finally(() => handle.close());
     await fs.chmod(snapshotPath, 0o600);
     return Result.ok({
       artifactId: `workflow-source:${sourceSha256}`,

@@ -1,11 +1,12 @@
+import { captureError } from "../shared/error-capture";
 import path from "node:path";
 
 import { z } from "zod";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
 
-import { projectRuntimeError } from "../runtime/error-format";
-import { preserveToolPanic } from "../tools/tool-result-adapters";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
+import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 import { jsonValueSchema, type JsonObject, type JsonValue } from "./workflow-domain";
 import {
   parseWorkflowCallSiteManifestUnchecked,
@@ -151,10 +152,9 @@ function captureSandboxTerminationSync<T>(
   operation: string,
   effect: () => Awaited<T>,
 ): ResultType<T, WorkflowSandboxTerminationFailed | Panic> {
-  const started = Result.try({
-    try: effect,
-    catch: projectRuntimeError(`Opaque ${operation}`),
-  });
+  const started = Result.try({ try: effect, catch: captureRuntimeError }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, `Opaque ${operation}`),
+  );
   return started.mapError((error) =>
     Panic.is(error)
       ? error
@@ -264,12 +264,11 @@ export function startWorkflowSandbox(input: {
     ]);
     if (raced.type === "exit") {
       void delay.then((late) => {
-        late.match({
-          ok: () => undefined,
-          err: (error) => {
-            if (Panic.is(error)) input.reportFatalPanic?.(error);
-          },
+        const panic = late.match({
+          ok: () => null,
+          err: (error) => (Panic.is(error) ? error : null),
         });
+        if (panic) input.reportFatalPanic?.(panic);
       });
       return Result.ok(true);
     }
@@ -396,13 +395,20 @@ export function startWorkflowSandbox(input: {
   const respondToHostCall = async (
     message: WorkflowSandboxCall,
   ): Promise<ResultType<void, WorkflowSandboxExecutionFailed>> => {
-    let response: ResultType<JsonValue, Error>;
-    try {
-      response = await input.onCall(message);
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (!(cause instanceof Error)) throw cause;
-      response = Result.err(cause);
+    let response!: ResultType<JsonValue, Error>;
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          response = await input.onCall(message);
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const cause = attempt.error.cause;
+        preserveToolPanic(cause);
+        response = Result.err(cause);
+      }
     }
     const payload = response.match<JsonObject>({
       ok: (value) => ({ type: "resolve", id: message.id, value }),
@@ -499,32 +505,48 @@ export function startWorkflowSandbox(input: {
             await terminate(failure);
             return Result.err(failure);
           }
-          const hostCall = respondToHostCall(message).then(
-            (outcome) =>
-              outcome.match<Promise<ResultType<void, WorkflowSandboxExecutionFailed>>>({
-                ok: () => Promise.resolve(outcome),
-                err: async (error) => {
-                  if (!hasHostDefect) {
-                    hasHostDefect = true;
-                    firstHostDefect = error;
-                  }
-                  await terminate(error);
-                  return outcome;
-                },
-              }),
-            async (cause: unknown) => {
-              if (!hasHostDefect) {
-                hasHostDefect = true;
-                firstHostDefect = cause;
-              }
-              if (Panic.is(cause) && hostPanic === undefined) hostPanic = cause;
-              const error = errorFrom(cause);
-              await terminate(error);
-              return Result.err(new WorkflowSandboxExecutionFailed({ message: error.message }));
-            },
-          );
+          const callMessage = message;
+          const hostCall = observeHostCall();
           hostCallsInFlight.add(hostCall);
           void Promise.allSettled([hostCall]).then(() => hostCallsInFlight.delete(hostCall));
+
+          async function observeHostCall(): Promise<
+            ResultType<void, WorkflowSandboxExecutionFailed>
+          > {
+            const responded = await Result.tryPromise({
+              try: () => respondToHostCall(callMessage),
+              catch: captureError,
+            });
+            const response = responded.match<
+              | {
+                  readonly status: "ok";
+                  readonly outcome: ResultType<void, WorkflowSandboxExecutionFailed>;
+                }
+              | { readonly status: "error"; readonly cause: unknown }
+            >({
+              ok: (outcome) => ({ status: "ok", outcome }) as const,
+              err: ({ cause }) => ({ status: "error", cause }) as const,
+            });
+            if (response.status === "error") {
+              if (!hasHostDefect) {
+                hasHostDefect = true;
+                firstHostDefect = response.cause;
+              }
+              if (Panic.is(response.cause) && hostPanic === undefined) hostPanic = response.cause;
+              const error = errorFrom(response.cause);
+              await terminate(error);
+              return Result.err(new WorkflowSandboxExecutionFailed({ message: error.message }));
+            }
+            const failure = response.outcome.match({ ok: () => null, err: (error) => error });
+            if (failure) {
+              if (!hasHostDefect) {
+                hasHostDefect = true;
+                firstHostDefect = failure;
+              }
+              await terminate(failure);
+            }
+            return response.outcome;
+          }
         } else if (message.type === "result") {
           receivedResult = true;
           resolvedResult = message.result;
@@ -581,38 +603,66 @@ export function startWorkflowSandbox(input: {
   })();
 
   const result = (async (): Promise<ResultType<JsonValue, WorkflowSandboxError>> => {
-    try {
-      const outcome = await Promise.race([
-        executionResult.then((execution) => ({ type: "execution" as const, execution })),
-        terminationResult,
-      ]);
-      while (hostCallsInFlight.size > 0) {
-        await Promise.allSettled(hostCallsInFlight);
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          const outcome = await Promise.race([
+            executionResult.then((execution) => ({ type: "execution" as const, execution })),
+            terminationResult,
+          ]);
+          while (hostCallsInFlight.size > 0) {
+            await Promise.allSettled(hostCallsInFlight);
+          }
+          if (hostPanic !== undefined) throw hostPanic;
+          if (terminationPanic) preserveToolPanic(terminationPanic);
+          if (hasHostDefect) throw firstHostDefect;
+          if (outcome.type === "execution")
+            return { status: "return", value: outcome.execution } as const;
+          if (outcome.error instanceof WorkflowSandboxTerminationSignal) {
+            return {
+              status: "return",
+              value: Result.err(
+                new WorkflowSandboxTerminationFailed({ message: outcome.error.message }),
+              ),
+            } as const;
+          }
+          if (outcome.error === cancellationError) {
+            return {
+              status: "return",
+              value: Result.err(new WorkflowSandboxCancelled({ message: outcome.error.message })),
+            } as const;
+          }
+          return {
+            status: "return",
+            value: Result.err(
+              new WorkflowSandboxExecutionFailed({ message: outcome.error.message }),
+            ),
+          } as const;
+        },
+        catch: captureError,
+      });
+      const cleanupAttempt = Result.try({
+        try: () => {
+          input.signal?.removeEventListener("abort", abort);
+        },
+        catch: captureError,
+      });
+      if (cleanupAttempt.isErr()) {
+        return adaptToolResultToHost(Result.err(cleanupAttempt.error.cause));
       }
-      if (hostPanic !== undefined) throw hostPanic;
-      if (terminationPanic) preserveToolPanic(terminationPanic);
-      if (hasHostDefect) throw firstHostDefect;
-      if (outcome.type === "execution") return outcome.execution;
-      if (outcome.error instanceof WorkflowSandboxTerminationSignal) {
-        return Result.err(new WorkflowSandboxTerminationFailed({ message: outcome.error.message }));
-      }
-      if (outcome.error === cancellationError) {
-        return Result.err(new WorkflowSandboxCancelled({ message: outcome.error.message }));
-      }
-      return Result.err(new WorkflowSandboxExecutionFailed({ message: outcome.error.message }));
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (!(cause instanceof Error)) throw cause;
-      if (cause instanceof WorkflowSandboxTerminationSignal) {
-        return Result.err(new WorkflowSandboxTerminationFailed({ message: cause.message }));
-      }
-      if (cause === cancellationError) {
-        return Result.err(new WorkflowSandboxCancelled({ message: cause.message }));
-      }
-      return Result.err(new WorkflowSandboxExecutionFailed({ message: cause.message }));
-    } finally {
-      input.signal?.removeEventListener("abort", abort);
+      if (attempt.isErr()) {
+        const cause = attempt.error.cause;
+        preserveToolPanic(cause);
+        if (cause instanceof WorkflowSandboxTerminationSignal) {
+          return Result.err(new WorkflowSandboxTerminationFailed({ message: cause.message }));
+        }
+        if (cause === cancellationError) {
+          return Result.err(new WorkflowSandboxCancelled({ message: cause.message }));
+        }
+        return Result.err(new WorkflowSandboxExecutionFailed({ message: cause.message }));
+      } else if (attempt.value.status === "return") return attempt.value.value;
     }
+    return undefined as never;
   })();
 
   return { result, cancel };

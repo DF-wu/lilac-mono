@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture";
 import {
   lilacEventTypes,
   outReqTopic,
@@ -17,7 +18,7 @@ import {
   type OutReqTopic,
 } from "@stanley2058/lilac-event-bus";
 import { createLogger, env, formatTaggedErrorForLog, isPanic } from "@stanley2058/lilac-utils";
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
 import { type ChildToolState, renderSubagentDisplay } from "../tools/subagent";
@@ -111,30 +112,39 @@ async function captureRunEvent(
   runId: string,
   handle: () => Promise<void | ResultType<void, WorkflowLiveParentTopicError>>,
 ): Promise<ResultType<void, WorkflowLiveParentRunEventFailed>> {
-  try {
-    const handled = await handle();
-    if (handled) {
-      return handled
-        .map(() => undefined)
-        .mapError(
-          (cause) =>
-            new WorkflowLiveParentRunEventFailed({
-              cause,
-              runId,
-              message: "Live-parent workflow event handling failed",
-            }),
-        );
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        const handled = await handle();
+        if (handled) {
+          return handled
+            .map(() => undefined)
+            .mapError(
+              (cause) =>
+                new WorkflowLiveParentRunEventFailed({
+                  cause,
+                  runId,
+                  message: "Live-parent workflow event handling failed",
+                }),
+            );
+        }
+        return Result.ok(undefined);
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      preserveToolPanic(cause);
+      return Result.err(
+        new WorkflowLiveParentRunEventFailed({
+          cause,
+          runId,
+          message: "Live-parent workflow event handling failed",
+        }),
+      );
     }
-    return Result.ok(undefined);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new WorkflowLiveParentRunEventFailed({
-        cause,
-        runId,
-        message: "Live-parent workflow event handling failed",
-      }),
-    );
+    return attempt.value;
   }
 }
 
@@ -143,19 +153,28 @@ async function captureChildActivity(
   childRequestId: string,
   handle: () => Promise<void>,
 ): Promise<ResultType<void, WorkflowLiveParentChildActivityFailed>> {
-  try {
-    await handle();
-    return Result.ok(undefined);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new WorkflowLiveParentChildActivityFailed({
-        cause,
-        runId,
-        childRequestId,
-        message: "Live-parent child activity handling failed",
-      }),
-    );
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        await handle();
+        return Result.ok(undefined);
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      preserveToolPanic(cause);
+      return Result.err(
+        new WorkflowLiveParentChildActivityFailed({
+          cause,
+          runId,
+          childRequestId,
+          message: "Live-parent child activity handling failed",
+        }),
+      );
+    }
+    return attempt.value;
   }
 }
 
@@ -766,13 +785,11 @@ export class WorkflowLiveParentBridge {
       });
     })();
     forwarding.subscriptionStarts.set(childRequestId, start);
-    try {
-      await start;
-    } finally {
+    await start.finally(() => {
       if (forwarding.subscriptionStarts.get(childRequestId) === start) {
         forwarding.subscriptionStarts.delete(childRequestId);
       }
-    }
+    });
   }
 
   private createChildActivityForwarding(
@@ -1028,7 +1045,7 @@ export class WorkflowLiveParentBridge {
     forwarding.acceptingLive = false;
     await this.stopChildActivity(forwarding);
 
-    try {
+    const outcome = await (async () => {
       forwarding.children.clear();
       forwarding.updateSeq = 0;
       for (const childRequestId of this.resolveChildRequestIds(run, target)) {
@@ -1041,7 +1058,8 @@ export class WorkflowLiveParentBridge {
           ok: (watermark) => ({ kind: "ok", watermark }),
           err: (error) => ({ kind: "error", error }),
         });
-        if (watermarkOutcome.kind === "error") return Result.err(watermarkOutcome.error);
+        if (watermarkOutcome.kind === "error")
+          return { status: "return", value: Result.err(watermarkOutcome.error) } as const;
         const { watermark } = watermarkOutcome;
         if (!watermark) continue;
         let cursor: string | undefined;
@@ -1079,12 +1097,13 @@ export class WorkflowLiveParentBridge {
       if (this.parents.get(target.parentRequestId) === signal) {
         await this.publishParentDisplay(forwarding, target, fallbackDisplay, true);
       }
-      return Result.ok(undefined);
-    } finally {
+      return { status: "return", value: Result.ok(undefined) } as const;
+    })().finally(() => {
       if (this.childActivitySubscriptions.get(run.runId) === forwarding) {
         this.childActivitySubscriptions.delete(run.runId);
       }
-    }
+    });
+    return outcome.value;
   }
 
   private async stopChildActivity(forwarding: ChildActivityForwarding): Promise<void> {

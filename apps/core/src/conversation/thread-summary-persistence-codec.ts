@@ -162,21 +162,21 @@ function parseJson(input: {
   readonly version: number;
   readonly recordId: string;
 }): ResultType<unknown, MalformedSerialization> {
-  try {
-    const value: unknown = JSON.parse(input.raw);
-    return Result.ok(value);
-  } catch {
-    return Result.err(
-      new MalformedSerialization(
-        storageContext({
-          field: input.field,
-          version: input.version,
-          issueCode: "malformed-json",
-          recordId: input.recordId,
-        }),
+  const parsed = Result.try({ try: () => JSON.parse(input.raw) as unknown, catch: () => null });
+  return parsed.match<ResultType<unknown, MalformedSerialization>>({
+    ok: (value) => Result.ok(value),
+    err: () =>
+      Result.err(
+        new MalformedSerialization(
+          storageContext({
+            field: input.field,
+            version: input.version,
+            issueCode: "malformed-json",
+            recordId: input.recordId,
+          }),
+        ),
       ),
-    );
-  }
+  });
 }
 
 function nonEmptyStrings(values: readonly string[]): string[] {

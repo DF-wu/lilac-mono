@@ -5,7 +5,11 @@ import type { BundledRemoteRunnerRequest, RemoteFsRequest } from "@stanley2058/l
 import { createLogger, formatTaggedErrorForLog, isPanic } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { projectRuntimeError } from "../runtime/error-format";
+import {
+  captureRuntimeError,
+  projectCapturedRuntimeError,
+  projectRuntimeError,
+} from "../runtime/error-format";
 import { requireConfiguredSshHost } from "./ssh-config";
 import { preserveToolPanic } from "../tools/tool-result-adapters";
 
@@ -172,8 +176,8 @@ function captureSshOperation<T, E extends Error>(params: {
 }): ResultType<T, E> {
   const captured = Result.try({
     try: params.run,
-    catch: projectRuntimeError(params.fallback),
-  });
+    catch: (cause) => new Error(params.fallback, { cause }),
+  }).mapError((captured) => projectRuntimeError(captured.cause, params.fallback));
   return captured.match<() => ResultType<T, E>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => Result.err(params.mapError(rethrowSshPanic(error))),
@@ -185,10 +189,9 @@ async function captureSshPromise<T, E extends Error>(params: {
   readonly fallback: string;
   readonly mapError: (cause: Error) => E;
 }): Promise<ResultType<T, E>> {
-  const captured = await Result.tryPromise({
-    try: params.run,
-    catch: projectRuntimeError(params.fallback),
-  });
+  const captured = (
+    await Result.tryPromise({ try: params.run, catch: captureRuntimeError })
+  ).mapError((error) => projectCapturedRuntimeError(error, params.fallback));
   return captured.match<() => ResultType<T, E>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => Result.err(params.mapError(rethrowSshPanic(error))),
@@ -368,10 +371,9 @@ function removeOverflowFile(target: string): Promise<ResultType<void, SshOverflo
 async function settleOverflowOperation<T>(
   run: () => Promise<ResultType<T, SshOverflowOperationError>>,
 ): Promise<ResultType<ResultType<T, SshOverflowOperationError>, Panic>> {
-  const settled = await Result.tryPromise({
-    try: run,
-    catch: projectRuntimeError("Opaque SSH overflow Result rejection"),
-  });
+  const settled = (await Result.tryPromise({ try: run, catch: captureRuntimeError })).mapError(
+    (captured) => projectCapturedRuntimeError(captured, "Opaque SSH overflow Result rejection"),
+  );
   return settled.mapError((error) =>
     isPanic(error)
       ? error
@@ -536,7 +538,7 @@ async function readReadableStreamTextCapped(
     ok: (reader) => async () => {
       let releaseAttempted = false;
 
-      try {
+      const outcome = await (async () => {
         const decoder = new TextDecoder();
         let text = "";
         let totalChars = 0;
@@ -650,8 +652,11 @@ async function readReadableStreamTextCapped(
         }
 
         releaseAttempted = true;
-        return combineStreamReadAndCleanup(primary, releaseStreamReader(reader));
-      } finally {
+        return {
+          status: "return",
+          value: combineStreamReadAndCleanup(primary, releaseStreamReader(reader)),
+        } as const;
+      })().finally(() => {
         if (!releaseAttempted) {
           const released = releaseStreamReader(reader);
           released.match({
@@ -660,7 +665,8 @@ async function readReadableStreamTextCapped(
               logger.debug("SSH stream reader cleanup failed", formatTaggedErrorForLog(error)),
           });
         }
-      }
+      });
+      return outcome.value;
     },
   })();
 }
@@ -967,7 +973,7 @@ export async function sshExecBash(params: {
   };
 
   const startedAt = Date.now();
-  try {
+  const outcome = await (async () => {
     const sshArgs = [
       "-T",
       "-o",
@@ -1036,25 +1042,27 @@ export async function sshExecBash(params: {
     const transportError = exitCode === 255 ? inferTransportError(stderr) : undefined;
 
     return {
-      stdout,
-      stderr,
-      exitCode,
-      durationMs: Date.now() - startedAt,
-      timedOut: termination === "timeout",
-      aborted: termination === "aborted",
-      capped: {
-        stdout: stdoutResult.capped,
-        stderr: stderrResult.capped,
+      status: "return",
+      value: {
+        stdout,
+        stderr,
+        exitCode,
+        durationMs: Date.now() - startedAt,
+        timedOut: termination === "timeout",
+        aborted: termination === "aborted",
+        capped: {
+          stdout: stdoutResult.capped,
+          stderr: stderrResult.capped,
+        },
+        overflowPaths: {
+          stdout: stdoutResult.overflowFilePath,
+          stderr: stderrResult.overflowFilePath,
+        },
+        transportError,
       },
-      overflowPaths: {
-        stdout: stdoutResult.overflowFilePath,
-        stderr: stderrResult.overflowFilePath,
-      },
-      transportError,
-    };
-  } finally {
-    stopWatchingExecution();
-  }
+    } as const;
+  })().finally(stopWatchingExecution);
+  return outcome.value;
 }
 
 export async function sshExecScriptJson<T, TDecodeError>(params: {

@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { z } from "zod";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
@@ -30,12 +31,22 @@ async function captureGithubAuthExternal<T>(
   message: string,
   run: () => Promise<T>,
 ): Promise<ResultType<T, GithubAuthFailed>> {
-  try {
-    return Result.ok(await run());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(new GithubAuthFailed({ operation, cause, message }));
-  }
+  const captured = (
+    await Result.tryPromise({
+      try: run,
+      catch: captureError,
+    })
+  ).match<
+    | { readonly kind: "success"; readonly value: T }
+    | { readonly kind: "failure"; readonly failure: Error }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (captured.kind === "success") return Result.ok(captured.value);
+  const cause = captured.failure;
+  if (Panic.is(cause)) throw cause;
+  return Result.err(new GithubAuthFailed({ operation, cause, message }));
 }
 
 function tokenCacheKey(input: { apiBaseUrl: string; token: string }): string {
@@ -139,11 +150,9 @@ export async function getGithubViewerLoginResult(input: {
     });
   })();
   viewerLoginPending.set(key, request);
-  try {
-    return await request;
-  } finally {
+  return await request.finally(() => {
     viewerLoginPending.delete(key);
-  }
+  });
 }
 
 export async function getGithubViewerLoginOrThrow(input: {

@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { randomBytes } from "node:crypto";
 
 import {
@@ -90,12 +91,19 @@ async function captureOAuthAttempt<T>(options: {
   readonly operation: "start" | "complete";
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, McpOAuthProviderError>> {
-  try {
-    return Result.ok(await options.run());
-  } catch (cause) {
-    rethrowPanic(cause);
-    return Result.err(oauthProviderError(options.serverId, options.operation, cause));
-  }
+  const captured = await Result.tryPromise({
+    try: options.run,
+    catch: captureError,
+  });
+  return captured.match<() => ResultType<T, McpOAuthProviderError>>({
+    ok: (value) => () => Result.ok(value),
+    err:
+      ({ cause }) =>
+      () => {
+        rethrowPanic(cause);
+        return Result.err(oauthProviderError(options.serverId, options.operation, cause));
+      },
+  })();
 }
 
 export class McpOAuthCredentialResolutionError extends TaggedError(
@@ -103,7 +111,7 @@ export class McpOAuthCredentialResolutionError extends TaggedError(
 )<{
   readonly serverId: string;
   readonly field: "client_id" | "client_secret";
-  readonly cause: Error;
+  readonly cause: unknown;
   readonly message: string;
 }> {}
 

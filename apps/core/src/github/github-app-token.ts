@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { createAppAuth } from "@octokit/auth-app";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
@@ -34,17 +35,27 @@ let pending: Promise<ResultType<InstallationToken, GithubAppTokenError>> | null 
 async function captureGithubAppAuth<T>(
   run: () => Promise<T>,
 ): Promise<ResultType<T, GithubAppTokenMintFailed>> {
-  try {
-    return Result.ok(await run());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new GithubAppTokenMintFailed({
-        cause,
-        message: "Failed to mint GitHub App installation token",
-      }),
-    );
-  }
+  const captured = (
+    await Result.tryPromise({
+      try: run,
+      catch: captureError,
+    })
+  ).match<
+    | { readonly kind: "success"; readonly value: T }
+    | { readonly kind: "failure"; readonly failure: Error }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (captured.kind === "success") return Result.ok(captured.value);
+  const cause = captured.failure;
+  if (Panic.is(cause)) throw cause;
+  return Result.err(
+    new GithubAppTokenMintFailed({
+      cause,
+      message: "Failed to mint GitHub App installation token",
+    }),
+  );
 }
 
 function fingerprintSecret(secret: GithubAppSecret): string {
@@ -189,18 +200,16 @@ export async function getGithubInstallationTokenResult(params: {
         return await continuePrivateKey();
       })();
 
-      try {
-        const pendingToken = pending;
-        const resolved = await pendingToken;
-        return resolved.map(({ token, expiresAtMs, host, apiBaseUrl }) => ({
-          token,
-          expiresAtMs,
-          host,
-          apiBaseUrl,
-        }));
-      } finally {
+      const pendingToken = pending;
+      const resolved = await pendingToken.finally(() => {
         pending = null;
-      }
+      });
+      return resolved.map(({ token, expiresAtMs, host, apiBaseUrl }) => ({
+        token,
+        expiresAtMs,
+        host,
+        apiBaseUrl,
+      }));
     },
   })();
 }

@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -1091,13 +1092,15 @@ export class SqliteTranscriptStore implements TranscriptStore {
     for (const diagnostic of diagnostics) {
       const emitted = Result.try({
         try: () => this.onPersistenceDiagnostic(diagnostic),
-        catch: (cause) => cause,
+        catch: captureError,
       });
       const finishEmission = emitted.match<() => void>({
         ok: () => () => undefined,
-        err: (error) => () => {
-          if (Panic.is(error)) adaptToolResultToHost(Result.err(error));
-        },
+        err:
+          ({ cause }) =>
+          () => {
+            if (Panic.is(cause)) adaptToolResultToHost(Result.err(cause));
+          },
       });
       finishEmission();
     }
@@ -1137,14 +1140,22 @@ export class SqliteTranscriptStore implements TranscriptStore {
     operation: string,
     read: () => T,
   ): ResultType<T, TranscriptStoreSqliteDriverFailure> {
-    try {
-      return Result.ok(read());
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (!(cause instanceof Error)) throw cause;
-      const failure = classifyTranscriptSqliteDriverFailure(operation, cause);
-      if (failure) return Result.err(failure);
-      throw cause;
+    {
+      const captured = Result.try({
+        try: () => {
+          return Result.ok(read());
+        },
+        catch: captureError,
+      });
+
+      if (captured.isErr()) {
+        const cause = captured.error.cause;
+        if (Panic.is(cause)) return adaptToolResultToHost(Result.err(cause));
+        const failure = classifyTranscriptSqliteDriverFailure(operation, cause);
+        if (failure) return Result.err(failure);
+        return adaptToolResultToHost(Result.err(cause));
+      }
+      return captured.value;
     }
   }
 

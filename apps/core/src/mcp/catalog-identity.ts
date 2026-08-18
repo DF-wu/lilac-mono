@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { Result } from "better-result";
 import { z } from "zod";
 
 export const CATALOG_TOOL_ID_VERSION = 1 as const;
@@ -37,14 +38,13 @@ export function catalogToolStableId(identity: CatalogToolIdentity): string {
 }
 
 export function parseCatalogToolStableId(stableId: string): CatalogStableIdParseResult {
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(stableId);
-  } catch {
-    return { ok: false, error: "invalid catalog tool ID JSON" };
-  }
+  const decoded = Result.try({ try: () => JSON.parse(stableId) as unknown, catch: () => null });
 
-  const parsed = stableIdSchema.safeParse(decoded);
+  const parsed = decoded.match<() => ReturnType<typeof stableIdSchema.safeParse> | null>({
+    ok: (value) => () => stableIdSchema.safeParse(value),
+    err: () => () => null,
+  })();
+  if (!parsed) return { ok: false, error: "invalid catalog tool ID JSON" };
   if (!parsed.success) return { ok: false, error: z.prettifyError(parsed.error) };
   return {
     ok: true,

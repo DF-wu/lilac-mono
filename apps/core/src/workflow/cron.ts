@@ -2,7 +2,7 @@ import { CronExpressionParser } from "cron-parser";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
 
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 
 export type CronScheduleInput = {
@@ -55,8 +55,10 @@ export function computeNextCronAtMsResult(
       const parsed = Result.try({
         try: () =>
           CronExpressionParser.parse(expression, { currentDate, tz }).next().toDate().getTime(),
-        catch: projectRuntimeError("Opaque workflow cron failure"),
-      });
+        catch: captureRuntimeError,
+      }).mapError((captured) =>
+        projectCapturedRuntimeError(captured, "Opaque workflow cron failure"),
+      );
       const finish = parsed.match<() => ResultType<number, WorkflowCronInvalid>>({
         ok: (value) => () => Result.ok(value),
         err: (error) => () => {

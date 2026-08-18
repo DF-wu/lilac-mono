@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { createAppAuth } from "@octokit/auth-app";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { z } from "zod";
@@ -133,13 +134,22 @@ async function captureGithubApiExternal<T, E>(
   run: () => Promise<T>,
   mapError: (cause: Error) => E,
 ): Promise<ResultType<T, E>> {
-  try {
-    return Result.ok(await run());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    if (!(cause instanceof Error)) throw cause;
-    return Result.err(mapError(cause));
-  }
+  const captured = (
+    await Result.tryPromise({
+      try: run,
+      catch: captureError,
+    })
+  ).match<
+    | { readonly kind: "success"; readonly value: T }
+    | { readonly kind: "failure"; readonly failure: Error }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (captured.kind === "success") return Result.ok(captured.value);
+  const cause = captured.failure;
+  if (Panic.is(cause)) throw cause;
+  return Result.err(mapError(cause));
 }
 
 async function captureGithubResponseText(response: Response): Promise<ResultType<string, Error>> {

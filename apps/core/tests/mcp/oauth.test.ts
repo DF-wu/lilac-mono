@@ -665,6 +665,31 @@ describe("Core-owned MCP OAuth", () => {
     });
   });
 
+  it("updates listener status when server stop throws synchronously", async () => {
+    const dataDir = await createDataDir();
+    const providers = new McpOAuthProviderService({ dataDir });
+    const failure = new Error("stop failed synchronously");
+    const callbacks = new McpOAuthCallbackService({
+      providers,
+      serverFactory: (options) => ({
+        port: options.port,
+        stop() {
+          throw failure;
+        },
+      }),
+    });
+    callbackServices.push(callbacks);
+
+    expect(callbacks.start().status).toBe("listening");
+    await expect(callbacks.stop()).rejects.toBe(failure);
+    expect(callbacks.getStatus()).toEqual({
+      status: "unavailable",
+      hostname: "localhost",
+      port: 1456,
+      error: "OAuth callback listener is stopped",
+    });
+  });
+
   it("drops providers on removal without deleting their credential file", async () => {
     const flow = await startFlow();
     const credentialPath = resolveMcpOAuthCredentialPath({
