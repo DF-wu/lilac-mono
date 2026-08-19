@@ -70,6 +70,11 @@ DF-wu fork adds these downstream-only v2 contracts:
   image aliases. It is v2-only; frozen v1 configs receive `default`. Canonical model IDs remain fixed and
   the compatible route has no automatic fallback. See
   [`docs/generate-image-openai-compatible.md`](docs/generate-image-openai-compatible.md).
+- `surface.telegram.inboundMedia` delivers inbound Telegram photos and documents to the model, enabled by
+  default with `maxBytesPerAttachment: 5MiB` and `maxBytesPerRequest: 10MiB` decoded-byte budgets. It is
+  v2-only; frozen v1 configs receive the same defaults. Behavioral consequence relative to earlier builds:
+  an uncaptioned photo or document now starts a run (set `inboundMedia.enabled: false` to restore
+  caption-only routing). See [`docs/telegram-surface.md`](docs/telegram-surface.md).
 
 ## Historical Mini Lilac Database Schema 3
 
