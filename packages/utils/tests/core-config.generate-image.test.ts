@@ -57,7 +57,7 @@ describe("generate.image openai-compatible config", () => {
         },
       }),
     ).rejects.toThrow(
-      `Unknown generate.image alias 'not-a-model'. Valid aliases: ${IMAGE_GENERATION_MODEL_ALIASES.join(", ")}.`,
+      `Unknown generate.image alias. Valid aliases: ${IMAGE_GENERATION_MODEL_ALIASES.join(", ")}.`,
     );
   });
 

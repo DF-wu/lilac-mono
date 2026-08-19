@@ -414,8 +414,7 @@ const webConfigSchemaV2 = z
   });
 
 const imageGenerationAliasSchema = z.enum(IMAGE_GENERATION_MODEL_ALIASES, {
-  error: (issue) =>
-    `Unknown generate.image alias '${String(issue.input)}'. Valid aliases: ${IMAGE_GENERATION_MODEL_ALIASES.join(", ")}.`,
+  error: `Unknown generate.image alias. Valid aliases: ${IMAGE_GENERATION_MODEL_ALIASES.join(", ")}.`,
 });
 
 const generateImageOpenAICompatibleSchema = z
