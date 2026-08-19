@@ -3,6 +3,8 @@ import { lilacEventTypes, type LilacMessageForTopic } from "@stanley2058/lilac-e
 
 import {
   createRequestMessageCache,
+  estimateCachedMessageBytes,
+  projectCachedRequestMessageLineage,
   type AuthenticatedRequestOrigin,
 } from "../../src/tool-server/request-message-cache";
 import {
@@ -617,5 +619,77 @@ describe("request message cache", () => {
     });
     expect(cache.cacheMessage(second).status).toBe("ok");
     expect(cache.getOrigin("reused")?.authenticatedOrigin?.userId).toBe("new-user");
+  });
+});
+
+describe("byte-weighted lineage clamping", () => {
+  it("drops the oldest messages once the byte budget is exceeded", () => {
+    const oldMessage = { role: "user", content: "x".repeat(600) };
+    const midMessage = { role: "user", content: "y".repeat(600) };
+    const newMessage = { role: "user", content: "z".repeat(600) };
+
+    const projected = projectCachedRequestMessageLineage(
+      [oldMessage, midMessage],
+      [newMessage],
+      Number.POSITIVE_INFINITY,
+      1400,
+    );
+
+    expect(projected).toEqual([midMessage, newMessage]);
+  });
+
+  it("always retains the newest message even when it alone exceeds the budget", () => {
+    const oversized = { role: "user", content: "x".repeat(10_000) };
+
+    const projected = projectCachedRequestMessageLineage([], [oversized], 512, 100);
+
+    expect(projected).toEqual([oversized]);
+  });
+
+  it("keeps the count clamp when the byte budget is unbounded", () => {
+    const messages = ["a", "b", "c", "d"].map((content) => ({ role: "user", content }));
+
+    const projected = projectCachedRequestMessageLineage(messages, [], 2);
+
+    expect(projected).toEqual(messages.slice(2));
+  });
+
+  it("weighs inline attachment payloads, not just text", () => {
+    const filePart = {
+      role: "user",
+      content: [
+        { type: "text", text: "photo" },
+        { type: "file", data: "A".repeat(4096), mediaType: "image/png" },
+      ],
+    };
+    const typedArrayPart = {
+      role: "user",
+      content: [{ type: "file", data: new Uint8Array(4096), mediaType: "image/png" }],
+    };
+
+    expect(estimateCachedMessageBytes(filePart)).toBeGreaterThan(4096);
+    expect(estimateCachedMessageBytes(typedArrayPart)).toBeGreaterThan(4096);
+    expect(estimateCachedMessageBytes({ role: "user", content: "hi" })).toBeLessThan(100);
+  });
+
+  it("clamps merged lineage by bytes inside the cache", () => {
+    const cache = createRequestMessageCache({ maxBytesPerRequest: 1500 });
+    const first = requestMessage({
+      eventId: "byte-1",
+      requestId: "byte-req",
+      text: "x".repeat(1200),
+    });
+    expect(cache.cacheMessage(first).status).toBe("ok");
+    const second = requestMessage({
+      eventId: "byte-2",
+      requestId: "byte-req",
+      text: "y".repeat(1200),
+    });
+    expect(cache.cacheMessage(second).status).toBe("ok");
+
+    const messages = cache.get("byte-req");
+    expect(messages).toHaveLength(1);
+    expect(JSON.stringify(messages)).toContain("y".repeat(32));
+    expect(JSON.stringify(messages)).not.toContain("x".repeat(32));
   });
 });

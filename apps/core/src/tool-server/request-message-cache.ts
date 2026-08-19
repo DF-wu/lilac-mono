@@ -19,13 +19,80 @@ export {
 };
 export type AuthenticatedRequestOrigin = AuthenticatedRequestProjection;
 
+const messageWeightCache = new WeakMap<object, number>();
+
+/**
+ * Approximate retained size of one cached message, in bytes.
+ *
+ * Message-count clamping stops being a memory bound the moment attachment
+ * bytes live inside messages (inline base64 file parts, typed arrays), so the
+ * cache also clamps on this estimate. Weights are memoized per message object:
+ * cached messages are treated as immutable once admitted.
+ *
+ * Registered boundary interpreter: cached messages are deliberately opaque
+ * (`unknown`) and this walk is the one place their structure is inspected.
+ */
+export function estimateCachedMessageBytes(message: unknown): number {
+  const memoizable = typeof message === "object" && message !== null;
+  if (memoizable) {
+    const cached = messageWeightCache.get(message);
+    if (cached !== undefined) return cached;
+  }
+
+  let weight = 0;
+  const pending: unknown[] = [message];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value === "string") {
+      weight += value.length;
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      weight += 8;
+    } else if (value === null || value === undefined) {
+      weight += 4;
+    } else if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
+      weight += value.byteLength;
+    } else if (Array.isArray(value)) {
+      weight += 2;
+      for (const entry of value) pending.push(entry);
+    } else if (typeof value === "object") {
+      weight += 2;
+      for (const [key, entry] of Object.entries(value)) {
+        weight += key.length + 4;
+        pending.push(entry);
+      }
+    } else {
+      weight += 8;
+    }
+  }
+
+  if (memoizable) messageWeightCache.set(message, weight);
+  return weight;
+}
+
 export function projectCachedRequestMessageLineage(
   existing: readonly unknown[],
   incoming: readonly unknown[] = [],
   maxMessages = Number.POSITIVE_INFINITY,
+  maxBytes = Number.POSITIVE_INFINITY,
 ): readonly unknown[] {
   const merged = [...existing, ...incoming];
-  return merged.length > maxMessages ? merged.slice(merged.length - maxMessages) : merged;
+  const clamped = merged.length > maxMessages ? merged.slice(merged.length - maxMessages) : merged;
+
+  if (!Number.isFinite(maxBytes)) return clamped;
+
+  let total = 0;
+  // Walk newest-first so the byte clamp drops the oldest messages, mirroring
+  // the count clamp. The newest message is always retained even when it alone
+  // exceeds the budget: an empty lineage would break follow-up composition
+  // outright, which is worse than one oversized entry.
+  let firstKept = clamped.length;
+  for (let index = clamped.length - 1; index >= 0; index -= 1) {
+    const weight = estimateCachedMessageBytes(clamped[index]);
+    if (index < clamped.length - 1 && total + weight > maxBytes) break;
+    total += weight;
+    firstKept = index;
+  }
+  return firstKept === 0 ? clamped : clamped.slice(firstKept);
 }
 
 export class RequestMessageCacheRequestIdMissing extends TaggedError(
@@ -80,6 +147,8 @@ type CacheEntry = {
 export type RequestMessageCacheOptions = {
   readonly ttlMs?: number;
   readonly maxEntries?: number;
+  /** Byte-weighted clamp for one request's retained lineage. */
+  readonly maxBytesPerRequest?: number;
   readonly now?: () => number;
 };
 
@@ -130,7 +199,16 @@ export type RequestMessageCache = {
 export function createRequestMessageCache(
   options: RequestMessageCacheOptions = {},
 ): RequestMessageCache {
-  const { ttlMs = 30 * 60 * 1000, maxEntries = 256, now = Date.now } = options;
+  const {
+    ttlMs = 30 * 60 * 1000,
+    maxEntries = 256,
+    // Bounds worst-case retention at maxEntries * maxBytesPerRequest (~8 GiB
+    // with defaults) only if every request actually carries the full media
+    // budget; the ingestion caps upstream make that the pathological case,
+    // not the normal one.
+    maxBytesPerRequest = 32 * 1024 * 1024,
+    now = Date.now,
+  } = options;
   const maxMessagesPerRequest = 512;
   const logger = createLogger({ module: "tool-server:request-message-cache" });
   const entries = new Map<string, CacheEntry>();
@@ -244,6 +322,7 @@ export function createRequestMessageCache(
                 existing.messages,
                 msg.data.messages,
                 maxMessagesPerRequest,
+                maxBytesPerRequest,
               );
             }
             existing.expiresAt = at + ttlMs;
@@ -276,6 +355,7 @@ export function createRequestMessageCache(
             msg.data.messages,
             [],
             maxMessagesPerRequest,
+            maxBytesPerRequest,
           ),
           projection,
           intakeEventIds: new Set([msg.id]),
