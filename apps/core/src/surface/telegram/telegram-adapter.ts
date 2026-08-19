@@ -1,4 +1,5 @@
-import { Result } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
+import { fileTypeFromBuffer } from "file-type";
 import { Bot } from "grammy";
 import type {
   InlineKeyboardMarkup,
@@ -32,13 +33,21 @@ import type {
   SurfaceAction,
 } from "../types";
 import type { CustomCommandManager } from "../../custom-commands/manager";
+import { inferMimeTypeFromFilename } from "../../shared/attachment-utils";
 
 import type { AdapterEvent } from "../events";
 import {
+  SurfaceAttachmentTooLarge,
+  SurfaceMessageNotFound,
+  SurfaceUnavailable,
   type AdapterEventHandler,
   type AdapterSubscription,
+  type ResolvedSurfaceAttachment,
   type StartOutputOpts,
   type SurfaceAdapter,
+  type SurfaceAttachmentRef,
+  type SurfaceAttachmentResolveError,
+  type SurfaceAttachmentResolver,
   type SurfaceMergeBlockPlanOptions,
   type SurfaceOperationResult,
   type SurfaceOutputStream,
@@ -211,7 +220,7 @@ export function isFatalTelegramPollingExit(error: TelegramErrorProjection | null
 
 type TelegramIngressDeliveryResult = { ok: true } | { ok: false; error: string; cause: Error };
 
-export class TelegramAdapter implements SurfaceAdapter {
+export class TelegramAdapter implements SurfaceAdapter, SurfaceAttachmentResolver {
   private bot: Bot | null = null;
   private store: TelegramSurfaceStore | null = null;
   private cfg: CoreConfig | null = null;
@@ -730,6 +739,196 @@ export class TelegramAdapter implements SurfaceAdapter {
     return await continueRead();
   }
 
+  /**
+   * Resolve an inbound attachment into bytes via `getFile` and an
+   * authenticated download.
+   *
+   * The download URL embeds the bot token, so it never leaves this method:
+   * every error message is passed through the same sanitizer the polling path
+   * uses, and the returned value carries bytes only. The download streams and
+   * aborts as soon as `maxBytes` is exceeded rather than buffering the body
+   * and checking afterwards, because Telegram's declared `file_size` can be
+   * absent or wrong.
+   */
+  async resolveAttachment(
+    ref: SurfaceAttachmentRef,
+    opts: { readonly maxBytes: number; readonly signal?: AbortSignal },
+  ): Promise<ResultType<ResolvedSurfaceAttachment, SurfaceAttachmentResolveError>> {
+    const cfg = this.cfg;
+    const bot = this.bot;
+    if (!cfg || !bot) {
+      return Result.err(
+        new SurfaceUnavailable({
+          platform: "telegram",
+          operation: "resolve-attachment",
+          message: "Telegram adapter is not connected",
+        }),
+      );
+    }
+    const token = resolveTelegramToken(cfg);
+    const sanitize = (message: string) => sanitizeTelegramErrorMessage(message, token);
+
+    if (typeof ref.size === "number" && ref.size > opts.maxBytes) {
+      return Result.err(
+        new SurfaceAttachmentTooLarge({
+          platform: "telegram",
+          maxBytes: opts.maxBytes,
+          message: `Telegram attachment declares ${ref.size} bytes; limit is ${opts.maxBytes}`,
+        }),
+      );
+    }
+
+    const file = await Result.tryPromise({
+      try: () => bot.api.getFile(ref.fileId),
+      catch: projectTelegramError("Telegram getFile failed"),
+    });
+
+    const continueResolve = file.match<
+      () => Promise<ResultType<ResolvedSurfaceAttachment, SurfaceAttachmentResolveError>>
+    >({
+      err: (projection) => async () =>
+        Result.err(
+          new SurfaceUnavailable({
+            platform: "telegram",
+            operation: "resolve-attachment",
+            message: sanitize(projection.message),
+          }),
+        ),
+      ok: (fileInfo) => async () => {
+        const filePath = fileInfo.file_path;
+        if (!filePath) {
+          return Result.err(
+            new SurfaceMessageNotFound({
+              platform: "telegram",
+              operation: "resolve-attachment",
+              message: "Telegram getFile returned no file_path",
+            }),
+          );
+        }
+        if (filePath.startsWith("/")) {
+          // A self-hosted Bot API server in --local mode returns an absolute
+          // filesystem path instead of a downloadable path; supporting that
+          // needs filesystem access, not HTTP, and is out of scope here.
+          return Result.err(
+            new SurfaceUnavailable({
+              platform: "telegram",
+              operation: "resolve-attachment",
+              message:
+                "Telegram getFile returned a local filesystem path; local-mode Bot API servers are not supported for inbound media",
+            }),
+          );
+        }
+        if (typeof fileInfo.file_size === "number" && fileInfo.file_size > opts.maxBytes) {
+          return Result.err(
+            new SurfaceAttachmentTooLarge({
+              platform: "telegram",
+              maxBytes: opts.maxBytes,
+              message: `Telegram file declares ${fileInfo.file_size} bytes; limit is ${opts.maxBytes}`,
+            }),
+          );
+        }
+
+        const apiRoot =
+          this.opts?.apiRoot ?? cfg.surface.telegram.apiRoot ?? "https://api.telegram.org";
+        const downloadUrl = `${apiRoot.replace(/\/+$/u, "")}/file/bot${token}/${filePath}`;
+
+        const downloaded = await Result.tryPromise({
+          // Never throws for expected outcomes: the union keeps over-budget
+          // and HTTP failures typed, so the catch below stays a plain
+          // registered error projection covering only transport exceptions.
+          try: async (): Promise<
+            | { kind: "bytes"; bytes: Uint8Array }
+            | { kind: "too-large" }
+            | { kind: "http-error"; status: number }
+          > => {
+            const response = await fetch(downloadUrl, {
+              redirect: "follow",
+              ...(opts.signal === undefined ? {} : { signal: opts.signal }),
+            });
+            if (!response.ok) {
+              return { kind: "http-error", status: response.status };
+            }
+            const body = response.body;
+            if (!body) return { kind: "bytes", bytes: new Uint8Array(0) };
+
+            const chunks: Uint8Array[] = [];
+            let total = 0;
+            const reader = body.getReader();
+            try {
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                total += value.byteLength;
+                if (total > opts.maxBytes) {
+                  await reader.cancel();
+                  return { kind: "too-large" };
+                }
+                chunks.push(value);
+              }
+            } finally {
+              reader.releaseLock();
+            }
+
+            const bytes = new Uint8Array(total);
+            let offset = 0;
+            for (const chunk of chunks) {
+              bytes.set(chunk, offset);
+              offset += chunk.byteLength;
+            }
+            return { kind: "bytes", bytes };
+          },
+          catch: projectTelegramError("Telegram file download failed"),
+        });
+
+        const continueDownloaded = downloaded.match<
+          () => Promise<ResultType<ResolvedSurfaceAttachment, SurfaceAttachmentResolveError>>
+        >({
+          err: (projection) => async () =>
+            Result.err(
+              new SurfaceUnavailable({
+                platform: "telegram",
+                operation: "resolve-attachment",
+                message: sanitize(projection.message),
+              }),
+            ),
+          ok: (outcome) => async () => {
+            if (outcome.kind === "too-large") {
+              return Result.err(
+                new SurfaceAttachmentTooLarge({
+                  platform: "telegram",
+                  maxBytes: opts.maxBytes,
+                  message: `Telegram file exceeds ${opts.maxBytes} bytes; download aborted`,
+                }),
+              );
+            }
+            if (outcome.kind === "http-error") {
+              return Result.err(
+                new SurfaceUnavailable({
+                  platform: "telegram",
+                  operation: "resolve-attachment",
+                  message: `Telegram file download failed (${outcome.status})`,
+                }),
+              );
+            }
+            const bytes = outcome.bytes;
+            const sniffed = await fileTypeFromBuffer(bytes);
+            const inferredFromName = ref.filename
+              ? inferMimeTypeFromFilename(ref.filename)
+              : inferMimeTypeFromFilename(filePath.split("/").pop() ?? "");
+            const mediaType =
+              sniffed?.mime ??
+              ref.mimeType ??
+              (inferredFromName !== "application/octet-stream" ? inferredFromName : undefined) ??
+              "application/octet-stream";
+            return Result.ok({ kind: "bytes" as const, bytes, mediaType });
+          },
+        });
+        return await continueDownloaded();
+      },
+    });
+    return await continueResolve();
+  }
+
   async listMsg(
     sessionRef: SessionRef,
     opts?: LimitOpts,
@@ -1198,7 +1397,15 @@ export class TelegramAdapter implements SurfaceAdapter {
     const fromBot = message.from?.is_bot === true;
     this.recordMessage(message, { fromBot });
 
-    if (!isRoutableTelegramMessage({ message, botUserId: this.me?.id })) return;
+    if (
+      !isRoutableTelegramMessage({
+        message,
+        botUserId: this.me?.id,
+        allowUncaptionedMedia: this.cfg?.surface.telegram.inboundMedia.enabled === true,
+      })
+    ) {
+      return;
+    }
 
     const surfaceMessage = toSurfaceMessage({
       message,

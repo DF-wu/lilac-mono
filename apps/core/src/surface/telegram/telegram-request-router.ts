@@ -144,6 +144,7 @@ export async function startTelegramRequestRouter(
       botUserId: self.userId,
       botNames,
       modelOverride,
+      inboundMedia: cfg.surface.telegram.inboundMedia,
     });
     const requestId = formatTelegramMessageRequestId({
       sessionId: event.channelId,

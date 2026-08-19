@@ -73,7 +73,7 @@ function normalizeMimeType(mimeType: string | undefined): string | undefined {
   return m || undefined;
 }
 
-function isTextExtractableMimeType(mimeType: string): boolean {
+export function isTextExtractableMimeType(mimeType: string): boolean {
   if (mimeType.startsWith("text/")) return true;
   if (mimeType.endsWith("+json")) return true;
 
@@ -95,7 +95,7 @@ function isImageMimeType(mimeType: string): boolean {
   return mimeType.startsWith("image/");
 }
 
-function escapeMetadataValue(value: string): string {
+export function escapeMetadataValue(value: string): string {
   // Keep one-line marker robust; avoid breaking quoting.
   return value.replace(/[\n\r"\\]/g, "_");
 }
@@ -114,7 +114,7 @@ function formatDiscordAttachmentHeader(params: {
   return `[discord_attachment ${fields.join(" ")}]`;
 }
 
-function decodeUtf8BestEffort(bytes: Uint8Array): {
+export function decodeUtf8BestEffort(bytes: Uint8Array): {
   text?: string;
   reason?: "too_large" | "looks_binary";
   truncatedBytes: boolean;

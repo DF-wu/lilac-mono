@@ -7401,6 +7401,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 ["src/surface/telegram/telegram-error-projection.ts", "projectTelegramError"],
                 ["src/surface/telegram/telegram-error-projection.ts", "projectTelegramBotFailure"],
                 ["src/surface/telegram/telegram-request-router-composition.ts", "telegramFlags"],
+                ["src/surface/telegram/telegram-inbound-media.ts", "telegramInboundMediaFromRaw"],
+                ["src/tool-server/request-message-cache.ts", "estimateCachedMessageBytes"],
               ] as const
             ).map(([module, exportName]) => ({
               identity: { module, exportName },

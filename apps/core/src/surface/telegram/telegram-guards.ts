@@ -41,6 +41,16 @@ export function isTelegramUserAllowed(input: {
 export function isRoutableTelegramMessage(input: {
   message: Message;
   botUserId?: number;
+  /**
+   * Whether inbound media delivery is enabled (`surface.telegram.inboundMedia`).
+   *
+   * When media is delivered to the model, an uncaptioned photo is a complete
+   * request and routes on its own. When delivery is disabled, media still
+   * requires a caption — otherwise the run's user content would be only
+   * attribution metadata, inviting the agent to answer about an image it
+   * never received.
+   */
+  allowUncaptionedMedia?: boolean;
 }): boolean {
   const { message } = input;
 
@@ -49,16 +59,11 @@ export function isRoutableTelegramMessage(input: {
 
   if (isTelegramServiceMessage(message)) return false;
 
-  // Media requires a caption to be routable.
-  //
-  // Inbound attachments are not yet forwarded to the model, so an uncaptioned
-  // photo would start a run whose user content is only attribution metadata,
-  // inviting the agent to answer about an image it never received. Once
-  // attachment resolution lands this becomes `hasText || hasCaption || hasMedia`.
   const hasText = typeof message.text === "string" && message.text.trim().length > 0;
   const hasCaption = typeof message.caption === "string" && message.caption.trim().length > 0;
+  const hasMedia = input.allowUncaptionedMedia === true && hasSupportedTelegramMedia(message);
 
-  return hasText || hasCaption;
+  return hasText || hasCaption || hasMedia;
 }
 
 /**
