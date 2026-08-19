@@ -89,6 +89,13 @@ type SurfaceOperationEntrypoint =
   | {
       readonly target: "typing-subscription";
       readonly method: "stop";
+    }
+  | {
+      // Optional capability (SurfaceAttachmentResolver), not a SurfaceAdapter
+      // method: only adapters whose platform requires credentialed downloads
+      // implement it, discovered via hasSurfaceAttachmentResolver.
+      readonly target: "attachment-resolver";
+      readonly method: "resolveAttachment";
     };
 
 type SurfaceAdapterOperationContractFixture<P extends RegisteredSurfacePlatform> = {
@@ -130,6 +137,7 @@ const DISCORD_ADAPTER_OPERATION_CONTRACT = {
     "list-reaction-details": { target: "adapter", method: "listReactionDetails" },
     "get-unread": { target: "adapter", method: "getUnRead" },
     "mark-read": { target: "adapter", method: "markRead" },
+    "resolve-attachment": { target: "attachment-resolver", method: "resolveAttachment" },
   },
   result: DISCORD_OPERATION_RESULT,
 } as const satisfies SurfaceAdapterOperationContractFixture<"discord">;
@@ -165,6 +173,7 @@ const GITHUB_ADAPTER_OPERATION_CONTRACT = {
     "list-reaction-details": { target: "adapter", method: "listReactionDetails" },
     "get-unread": { target: "adapter", method: "getUnRead" },
     "mark-read": { target: "adapter", method: "markRead" },
+    "resolve-attachment": { target: "attachment-resolver", method: "resolveAttachment" },
   },
   result: GITHUB_OPERATION_RESULT,
 } as const satisfies SurfaceAdapterOperationContractFixture<"github">;
@@ -279,6 +288,7 @@ describe("surface operation contract", () => {
       "push-output",
       "read-message",
       "remove-reaction",
+      "resolve-attachment",
       "send-message",
       "start-output",
       "start-typing",
