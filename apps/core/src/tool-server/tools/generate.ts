@@ -650,7 +650,20 @@ function resolveAvailableModels<TId extends string, TModel, TInput>(
   };
 }
 
-function getAvailableImageModels(provider: "default" | "openai-compatible" = "default") {
+type ImageOpenAICompatibleConfig = CoreConfig["tools"]["generate"]["image"]["openaiCompatible"];
+
+function filterImageDescriptorsForAllowlist(
+  models: ImageOpenAICompatibleConfig["models"],
+): readonly ImageModelDescriptor[] {
+  if (!models) return IMAGE_MODEL_DESCRIPTORS;
+  const allowed: ReadonlySet<string> = new Set(models);
+  return IMAGE_MODEL_DESCRIPTORS.filter((descriptor) => allowed.has(descriptor.id));
+}
+
+function getAvailableImageModels(
+  provider: "default" | "openai-compatible" = "default",
+  openaiCompatible?: ImageOpenAICompatibleConfig,
+) {
   const providers = getModelProviders();
   if (provider === "openai-compatible") {
     const compatibleProvider = providers["openai-compatible"];
@@ -658,9 +671,12 @@ function getAvailableImageModels(provider: "default" | "openai-compatible" = "de
       return resolveAvailableModels([] as readonly ImageModelDescriptor[], providers);
     }
     return resolveAvailableModels(
-      IMAGE_MODEL_DESCRIPTORS.map((descriptor) => ({
+      filterImageDescriptorsForAllowlist(openaiCompatible?.models).map((descriptor) => ({
         ...descriptor,
-        createModel: () => compatibleProvider.imageModel(descriptor.openAICompatibleModelId),
+        createModel: () =>
+          compatibleProvider.imageModel(
+            openaiCompatible?.modelIds[descriptor.id] ?? descriptor.openAICompatibleModelId,
+          ),
       })),
       providers,
     );
@@ -955,6 +971,7 @@ export function generateImageWithModel(
     size?: `${number}x${number}`;
     aspectRatio?: `${number}:${number}`;
     maxRetries?: number;
+    providerOptions?: Parameters<typeof generateImage>[0]["providerOptions"];
   },
 ) {
   return generateImage({
@@ -964,6 +981,7 @@ export function generateImageWithModel(
     size: opts?.size,
     aspectRatio: opts?.aspectRatio,
     maxRetries: opts?.maxRetries,
+    providerOptions: opts?.providerOptions,
   });
 }
 
@@ -1009,10 +1027,13 @@ export class Generate implements ServerTool {
         primaryPositional: "prompt",
         catalog: async () => {
           const config = await this.options.getConfig?.();
-          const imageProvider = config?.tools.generate.image.provider ?? "default";
+          const imageConfig = config?.tools.generate.image;
+          const imageProvider = imageConfig?.provider ?? "default";
           const imageModels = orderImageModelIds(
             imageProvider === "openai-compatible"
-              ? IMAGE_MODEL_DESCRIPTORS.map((descriptor) => descriptor.id)
+              ? filterImageDescriptorsForAllowlist(imageConfig?.openaiCompatible.models).map(
+                  (descriptor) => descriptor.id,
+                )
               : getAvailableImageModels().ids,
           );
           if (imageModels.length === 0) return false;
@@ -1071,14 +1092,18 @@ export class Generate implements ServerTool {
     return Result.gen(
       async function* (this: Generate) {
         const config = await this.options.getConfig?.();
-        const imageProvider = config?.tools.generate.image.provider ?? "default";
+        const imageConfig = config?.tools.generate.image;
+        const imageProvider = imageConfig?.provider ?? "default";
         if (
           imageProvider === "openai-compatible" &&
           !env.providers.openaiCompatible.baseUrl?.trim()
         ) {
           return Result.err(generateFailure("usage", OPENAI_COMPATIBLE_IMAGE_CONFIG_ERROR));
         }
-        const availableModels = getAvailableImageModels(imageProvider);
+        const availableModels = getAvailableImageModels(
+          imageProvider,
+          imageConfig?.openaiCompatible,
+        );
         const picked = yield* pickModel(
           availableModels.available,
           payload.model,
@@ -1109,7 +1134,21 @@ export class Generate implements ServerTool {
           },
         });
 
-        const { size, aspectRatio } = resolveImageDimensions(picked.id, payload);
+        const dimensions = resolveImageDimensions(picked.id, payload);
+        // The OpenAI-compatible image API has no aspect-ratio parameter, so the
+        // SDK would drop `aspectRatio` with an unsupported warning. Forward the
+        // validated ratio as a colon-form `size` provider option instead:
+        // gateways that understand it (e.g. new-api for Gemini models) honor
+        // it, and gateways that reject non-WxH sizes fail loudly rather than
+        // silently produce the wrong ratio.
+        const compatibleRatioSize =
+          imageProvider === "openai-compatible" ? dimensions.aspectRatio : undefined;
+        const size = dimensions.size;
+        const aspectRatio = compatibleRatioSize === undefined ? dimensions.aspectRatio : undefined;
+        const providerOptions =
+          compatibleRatioSize === undefined
+            ? undefined
+            : { openaiCompatible: { size: compatibleRatioSize } };
         const prompt = yield* Result.await(buildImageGenerationPrompt(cwd, payload, opts?.context));
 
         const res = yield* Result.await(
@@ -1120,6 +1159,7 @@ export class Generate implements ServerTool {
                 size,
                 aspectRatio,
                 maxRetries: imageProvider === "openai-compatible" ? 0 : undefined,
+                providerOptions,
               }),
             catch: (cause) => {
               if (Panic.is(cause)) return preserveToolPanic(cause);
