@@ -91,6 +91,11 @@ surface:
     outputNotification: true
     commandMenu: true
 
+    inboundMedia:
+      enabled: true
+      maxBytesPerAttachment: 5MiB
+      maxBytesPerRequest: 10MiB
+
     markdownTableRender:
       enabled: true
       style: unicode
@@ -122,6 +127,9 @@ the grammY client receives it when the adapter is constructed.
 | `commandMenu` | `true` | Publishes the custom-command menu via `setMyCommands` on connect (see §7). `false` leaves whatever menu the bot already has untouched. |
 | `workingIndicators` | shared default | Streaming progress phrases. |
 | `markdownTableRender` | enabled | Renders markdown tables as fixed-width blocks. |
+| `inboundMedia.enabled` | `true` | Deliver inbound photos/documents to the model. `false` restores caption-only routing: media is dropped and an uncaptioned photo does not start a run. |
+| `inboundMedia.maxBytesPerAttachment` | `5MiB` | Decoded-byte cap per attachment. Larger media degrades to a metadata marker instead of being delivered. |
+| `inboundMedia.maxBytesPerRequest` | `10MiB` | One decoded-byte budget across every attachment in a composed request, including reply-chain history. The trigger message wins the budget over older history. |
 
 Routing behaviour (mention vs active mode, the ML gate, debounce) is configured
 under `surface.router` and applies to Telegram exactly as it does to Discord.
@@ -275,6 +283,25 @@ bot only ever sees updates delivered to it. Reply context, `listMsg`, and unread
 tracking are therefore served from a local SQLite index at `dbPath`, populated as
 messages arrive. A freshly-provisioned bot has no history of a chat, even one it
 has been in for a while.
+
+**Inbound media is re-resolved from `file_id`, never fetched by URL.** Telegram
+download URLs embed the bot token and the underlying `file_path` expires after
+about an hour, so neither may enter composed content, transcripts, or logs.
+Composition instead carries the permanent `file_id` (persisted with the message
+in the local index) and asks the adapter to resolve it at request time:
+`getFile`, then an authenticated download that streams and aborts the moment a
+byte budget is exceeded — Telegram's declared sizes are treated as advisory
+because they can be absent or wrong. Historical messages in a reply chain
+re-resolve the same way, which is what makes re-composition after a restart
+work. Delivered bytes are inlined as base64 file parts: base64 survives every
+JSON serialization boundary (bus, request cache, transcripts) with a fixed 4/3
+expansion, so the configured decoded-byte budgets bound the on-wire payload by
+construction. Images and PDFs become file parts, text-extractable documents are
+inlined as text, and audio/video/voice degrade to one-line
+`[telegram_attachment …]` markers — a partial file would be corrupt rather than
+smaller, so oversized or unavailable media degrades to a marker too. A
+self-hosted Bot API server running in `--local` mode returns filesystem paths
+instead of downloadable ones and is not supported for inbound media.
 
 **Edit rate limits.** Telegram throttles `editMessageText` at roughly one call
 per second per chat and rejects an edit whose content is unchanged. Streaming
@@ -459,11 +486,6 @@ Discord has, stated precisely so nobody has to infer it from silence.
 
 ### Not implemented
 
-- **Inbound attachments.** A photo or document *sent to* the bot reaches the
-  agent as its caption text only; the media itself is dropped, and an
-  uncaptioned photo does not start a run at all. Outbound attachments work.
-  Tracked in [#42](https://github.com/DF-wu/lilac-mono/issues/42), which carries
-  the agreed design.
 - **Webhook ingress.** Long polling only.
 - **A Telegram-side conversation search index.** Discord has a dedicated search
   store; Telegram relies on the shared transcript store.
@@ -475,6 +497,14 @@ Discord has, stated precisely so nobody has to infer it from silence.
 These are platform consequences rather than omissions. They are listed because
 code that assumes Discord semantics will be surprised.
 
+- **Inbound attachments are delivered as bytes, not URLs.** Photos and
+  documents sent to the bot reach the model as inline file parts (images and
+  PDFs) or inlined text (text-extractable documents), bounded by the
+  `inboundMedia` budgets; audio, video, voice, and oversized or unavailable
+  media degrade to `[telegram_attachment …]` metadata markers. Discord hands
+  the provider a CDN URL instead; Telegram has no token-free URL to hand over.
+  See §7 and [#42](https://github.com/DF-wu/lilac-mono/issues/42) for the
+  design.
 - **Workflow progress cards use inline keyboards.** Pause, resume and cancel
   actions are projected to Telegram and consumed through the same durable
   workflow action store as Discord/GitHub. Callback data over Telegram's
