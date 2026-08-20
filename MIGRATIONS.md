@@ -67,8 +67,11 @@ DF-wu fork adds these downstream-only v2 contracts:
   [`core-config.example.yaml`](packages/utils/config-templates/core-config.example.yaml) and operational
   guidance is in [`docs/telegram-surface.md`](docs/telegram-surface.md).
 - `tools.generate.image.provider` selects `default` built-in routing or `openai-compatible` routing for all
-  image aliases. It is v2-only; frozen v1 configs receive `default`. Canonical model IDs remain fixed and
-  the compatible route has no automatic fallback. See
+  image aliases. The v2-only `tools.generate.image.openaiCompatible.models` allowlist restricts which
+  aliases the compatible endpoint advertises and serves, and `tools.generate.image.openaiCompatible.modelIds`
+  overrides the upstream model ID per alias (unlisted aliases keep their canonical IDs). All of these
+  fields are v2-only; frozen v1 configs receive `provider: default` with the empty
+  `openaiCompatible: { modelIds: {} }` defaults. The compatible route has no automatic fallback. See
   [`docs/generate-image-openai-compatible.md`](docs/generate-image-openai-compatible.md).
 
 ## Historical Mini Lilac Database Schema 3

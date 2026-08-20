@@ -276,7 +276,7 @@ docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
 
 從 source 執行時，改為 `export` 同名變數後再啟動 Core。
 
-Alias、generation/edit endpoints、無 fallback 行為與 `aspectRatio` 限制見 [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md)。
+Alias、`openaiCompatible.models` allowlist 與 `openaiCompatible.modelIds` overrides、generation/edit endpoints、無 fallback 行為與 colon-form `size` aspect-ratio 轉送見 [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md)。
 
 ### 使用 custom-media plugin 範例
 

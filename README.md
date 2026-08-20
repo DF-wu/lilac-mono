@@ -284,7 +284,7 @@ docker compose up -d --force-recreate --wait --wait-timeout 120 lilac
 
 When running from source, export the variables with the same names before starting Core.
 
-See [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md) for aliases, generation/edit endpoints, the absence of fallback behavior, and `aspectRatio` limitations.
+See [`docs/generate-image-openai-compatible.md`](./docs/generate-image-openai-compatible.md) for aliases, the `openaiCompatible.models` allowlist and `openaiCompatible.modelIds` overrides, generation/edit endpoints, the absence of fallback behavior, and colon-form `size` aspect-ratio forwarding.
 
 ### Use the Custom Media Plugin Example
 

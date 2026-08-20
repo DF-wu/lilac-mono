@@ -701,6 +701,7 @@ function coreConfigV1ToUniversal(
       generate: {
         image: {
           provider: "default",
+          openaiCompatible: { modelIds: {} },
         },
       },
       inspect: {
