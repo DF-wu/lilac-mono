@@ -18,7 +18,15 @@ import {
   type MiniLilacUIMessage,
   type MiniLilacUserUIMessage,
 } from "@stanley2058/mini-lilac-client";
-import { Panic, Result, type Result as ResultType } from "better-result";
+import {
+  Panic,
+  Result,
+  type Err,
+  type InferErr,
+  type InferOk,
+  type Ok,
+  type Result as ResultType,
+} from "better-result";
 
 import {
   miniLilacPersistedModelMessagesSchema,
@@ -252,6 +260,20 @@ function corrupt(input: {
   return new CorruptPersistedFields(context(input));
 }
 
+type AnyMiniResult = Ok<unknown, unknown> | Err<unknown, unknown>;
+type MiniResultOutcome<R extends AnyMiniResult> =
+  | { readonly ok: true; readonly value: InferOk<R> }
+  | { readonly ok: false; readonly error: InferErr<R> };
+
+function persistenceCodecResultOutcome<R extends AnyMiniResult>(result: R): MiniResultOutcome<R>;
+function persistenceCodecResultOutcome<T, E>(
+  result: ResultType<T, E>,
+): { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E } {
+  return result.match<
+    { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+}
+
 function decodeVersion(
   schemaVersion: number,
   field: PersistedField,
@@ -474,23 +496,10 @@ function migrateMiniLilacUiMessageValues(input: {
       schemaVersion: input.schemaVersion,
       recordId: `${input.recordId}:${index}`,
     });
-    let $migratedResultValue13777!: import("better-result").InferOk<NonNullable<typeof migrated>>;
-    let $migratedResultError13777!: import("better-result").InferErr<NonNullable<typeof migrated>>;
-    const $migratedResultOk13777 = migrated.match({
-      ok: (value) => {
-        $migratedResultValue13777 = value;
-        return true;
-      },
-      err: (error) => {
-        $migratedResultError13777 = error;
-        return false;
-      },
-    });
-    if (($migratedResultOk13777 ? "ok" : "error") === "error")
-      return Result.err($migratedResultError13777);
-    changed ||= $migratedResultValue13777.changed;
-    if ($migratedResultValue13777.message !== null)
-      messages.push($migratedResultValue13777.message);
+    const migratedOutcome = persistenceCodecResultOutcome(migrated);
+    if (!migratedOutcome.ok) return Result.err(migratedOutcome.error);
+    changed ||= migratedOutcome.value.changed;
+    if (migratedOutcome.value.message !== null) messages.push(migratedOutcome.value.message);
   }
   return Result.ok({ messages, changed });
 }
@@ -499,20 +508,8 @@ export function decodeMiniLilacMigrationUiTranscript(
   input: MiniLilacTranscriptCodecInput,
 ): ResultType<DecodedPersistedValue<MigratedMiniLilacUiMessages>, PersistedDataError> {
   const version = decodeVersion(input.schemaVersion, "ui_transcript", input.recordId);
-  let $versionResultValue14362!: import("better-result").InferOk<NonNullable<typeof version>>;
-  let $versionResultError14362!: import("better-result").InferErr<NonNullable<typeof version>>;
-  const $versionResultOk14362 = version.match({
-    ok: (value) => {
-      $versionResultValue14362 = value;
-      return true;
-    },
-    err: (error) => {
-      $versionResultError14362 = error;
-      return false;
-    },
-  });
-  if (($versionResultOk14362 ? "ok" : "error") === "error")
-    return Result.err($versionResultError14362);
+  const versionOutcome = persistenceCodecResultOutcome(version);
+  if (!versionOutcome.ok) return Result.err(versionOutcome.error);
   if (input.rawValues === null) {
     return Result.ok({
       value: { messages: [], changed: false },
@@ -522,26 +519,14 @@ export function decodeMiniLilacMigrationUiTranscript(
   const values: MiniLilacPersistedSuperJsonValue[] = [];
   for (const raw of input.rawValues) {
     const value = decodeSuperJson(raw, { ...input, field: "ui_transcript" });
-    let $valueResultValue14770!: import("better-result").InferOk<NonNullable<typeof value>>;
-    let $valueResultError14770!: import("better-result").InferErr<NonNullable<typeof value>>;
-    const $valueResultOk14770 = value.match({
-      ok: (value) => {
-        $valueResultValue14770 = value;
-        return true;
-      },
-      err: (error) => {
-        $valueResultError14770 = error;
-        return false;
-      },
-    });
-    if (($valueResultOk14770 ? "ok" : "error") === "error")
-      return Result.err($valueResultError14770);
-    const decoded = superJsonValueSchema.safeParse($valueResultValue14770);
+    const valueOutcome = persistenceCodecResultOutcome(value);
+    if (!valueOutcome.ok) return Result.err(valueOutcome.error);
+    const decoded = superJsonValueSchema.safeParse(valueOutcome.value);
     if (!decoded.success) {
       return Result.err(
         corrupt({
           field: "ui_transcript",
-          version: $versionResultValue14362.version,
+          version: versionOutcome.value.version,
           issueCode: "invalid-transcript-messages",
           recordId: input.recordId,
         }),
@@ -551,26 +536,14 @@ export function decodeMiniLilacMigrationUiTranscript(
   }
   const migrated = migrateMiniLilacUiMessageValues({
     values,
-    schemaVersion: $versionResultValue14362.version,
+    schemaVersion: versionOutcome.value.version,
     recordId: input.recordId,
   });
-  let $migratedResultValue15274!: import("better-result").InferOk<NonNullable<typeof migrated>>;
-  let $migratedResultError15274!: import("better-result").InferErr<NonNullable<typeof migrated>>;
-  const $migratedResultOk15274 = migrated.match({
-    ok: (value) => {
-      $migratedResultValue15274 = value;
-      return true;
-    },
-    err: (error) => {
-      $migratedResultError15274 = error;
-      return false;
-    },
-  });
-  if (($migratedResultOk15274 ? "ok" : "error") === "error")
-    return Result.err($migratedResultError15274);
+  const migratedOutcome = persistenceCodecResultOutcome(migrated);
+  if (!migratedOutcome.ok) return Result.err(migratedOutcome.error);
   return Result.ok({
-    value: $migratedResultValue15274,
-    provenance: $versionResultValue14362.provenance,
+    value: migratedOutcome.value,
+    provenance: versionOutcome.value.provenance,
   });
 }
 
@@ -580,65 +553,30 @@ export function decodeMiniLilacMigrationUserUiMessage(input: {
   readonly recordId: string;
 }): ResultType<DecodedPersistedValue<MiniLilacUserUIMessage>, PersistedDataError> {
   const version = decodeVersion(input.schemaVersion, "history_user_message", input.recordId);
-  let $versionResultValue15809!: import("better-result").InferOk<NonNullable<typeof version>>;
-  let $versionResultError15809!: import("better-result").InferErr<NonNullable<typeof version>>;
-  const $versionResultOk15809 = version.match({
-    ok: (value) => {
-      $versionResultValue15809 = value;
-      return true;
-    },
-    err: (error) => {
-      $versionResultError15809 = error;
-      return false;
-    },
-  });
-  if (($versionResultOk15809 ? "ok" : "error") === "error")
-    return Result.err($versionResultError15809);
+  const versionOutcome = persistenceCodecResultOutcome(version);
+  if (!versionOutcome.ok) return Result.err(versionOutcome.error);
   const value = decodeSuperJson(input.raw, { ...input, field: "history_user_message" });
-  let $valueResultValue15971!: import("better-result").InferOk<NonNullable<typeof value>>;
-  let $valueResultError15971!: import("better-result").InferErr<NonNullable<typeof value>>;
-  const $valueResultOk15971 = value.match({
-    ok: (value) => {
-      $valueResultValue15971 = value;
-      return true;
-    },
-    err: (error) => {
-      $valueResultError15971 = error;
-      return false;
-    },
-  });
-  if (($valueResultOk15971 ? "ok" : "error") === "error") return Result.err($valueResultError15971);
+  const valueOutcome = persistenceCodecResultOutcome(value);
+  if (!valueOutcome.ok) return Result.err(valueOutcome.error);
   const migrated = migrateMiniLilacUiMessageValue({
-    value: $valueResultValue15971,
-    schemaVersion: $versionResultValue15809.version,
+    value: valueOutcome.value,
+    schemaVersion: versionOutcome.value.version,
     recordId: input.recordId,
   });
-  let $migratedResultValue16124!: import("better-result").InferOk<NonNullable<typeof migrated>>;
-  let $migratedResultError16124!: import("better-result").InferErr<NonNullable<typeof migrated>>;
-  const $migratedResultOk16124 = migrated.match({
-    ok: (value) => {
-      $migratedResultValue16124 = value;
-      return true;
-    },
-    err: (error) => {
-      $migratedResultError16124 = error;
-      return false;
-    },
-  });
-  if (($migratedResultOk16124 ? "ok" : "error") === "error")
-    return Result.err($migratedResultError16124);
-  const message = miniLilacUserUIMessageSchema.safeParse($migratedResultValue16124.message);
+  const migratedOutcome = persistenceCodecResultOutcome(migrated);
+  if (!migratedOutcome.ok) return Result.err(migratedOutcome.error);
+  const message = miniLilacUserUIMessageSchema.safeParse(migratedOutcome.value.message);
   if (!message.success) {
     return Result.err(
       corrupt({
         field: "history_user_message",
-        version: $versionResultValue15809.version,
+        version: versionOutcome.value.version,
         issueCode: "invalid-transcript-messages",
         recordId: input.recordId,
       }),
     );
   }
-  return Result.ok({ value: message.data, provenance: $versionResultValue15809.provenance });
+  return Result.ok({ value: message.data, provenance: versionOutcome.value.provenance });
 }
 
 export function decodeMiniLilacMigrationModelPrefix(input: {
@@ -650,46 +588,26 @@ export function decodeMiniLilacMigrationModelPrefix(input: {
   PersistedDataError
 > {
   const version = decodeVersion(input.schemaVersion, "model_transcript", input.recordId);
-  let $versionResultValue17023!: import("better-result").InferOk<NonNullable<typeof version>>;
-  let $versionResultError17023!: import("better-result").InferErr<NonNullable<typeof version>>;
-  const $versionResultOk17023 = version.match({
-    ok: (value) => {
-      $versionResultValue17023 = value;
-      return true;
-    },
-    err: (error) => {
-      $versionResultError17023 = error;
-      return false;
-    },
-  });
-  if (($versionResultOk17023 ? "ok" : "error") === "error")
-    return Result.err($versionResultError17023);
+  const versionOutcome = persistenceCodecResultOutcome(version);
+  if (!versionOutcome.ok) return Result.err(versionOutcome.error);
   const value = decodeSuperJson(input.raw, { ...input, field: "model_transcript" });
-  let $valueResultValue17181!: import("better-result").InferOk<NonNullable<typeof value>>;
-  let $valueResultError17181!: import("better-result").InferErr<NonNullable<typeof value>>;
-  const $valueResultOk17181 = value.match({
-    ok: (value) => {
-      $valueResultValue17181 = value;
-      return true;
-    },
-    err: (error) => {
-      $valueResultError17181 = error;
-      return false;
-    },
-  });
-  if (($valueResultOk17181 ? "ok" : "error") === "error") return Result.err($valueResultError17181);
-  const messages = miniLilacPersistedModelMessagesSchema.safeParse($valueResultValue17181);
+  const valueOutcome = persistenceCodecResultOutcome(value);
+  if (!valueOutcome.ok) return Result.err(valueOutcome.error);
+  const messages = miniLilacPersistedModelMessagesSchema.safeParse(valueOutcome.value);
   if (!messages.success) {
     return Result.err(
       corrupt({
         field: "model_transcript",
-        version: $versionResultValue17023.version,
+        version: versionOutcome.value.version,
         issueCode: "invalid-transcript-messages",
         recordId: input.recordId,
       }),
     );
   }
-  return Result.ok({ value: messages.data, provenance: $versionResultValue17023.provenance });
+  return Result.ok({
+    value: messages.data,
+    provenance: versionOutcome.value.provenance,
+  });
 }
 
 export function decodeMiniLilacMigrationUiPrefix(input: {
@@ -698,40 +616,17 @@ export function decodeMiniLilacMigrationUiPrefix(input: {
   readonly recordId: string;
 }): ResultType<DecodedPersistedValue<MigratedMiniLilacUiMessages>, PersistedDataError> {
   const version = decodeVersion(input.schemaVersion, "ui_transcript", input.recordId);
-  let $versionResultValue17978!: import("better-result").InferOk<NonNullable<typeof version>>;
-  let $versionResultError17978!: import("better-result").InferErr<NonNullable<typeof version>>;
-  const $versionResultOk17978 = version.match({
-    ok: (value) => {
-      $versionResultValue17978 = value;
-      return true;
-    },
-    err: (error) => {
-      $versionResultError17978 = error;
-      return false;
-    },
-  });
-  if (($versionResultOk17978 ? "ok" : "error") === "error")
-    return Result.err($versionResultError17978);
+  const versionOutcome = persistenceCodecResultOutcome(version);
+  if (!versionOutcome.ok) return Result.err(versionOutcome.error);
   const value = decodeSuperJson(input.raw, { ...input, field: "ui_transcript" });
-  let $valueResultValue18133!: import("better-result").InferOk<NonNullable<typeof value>>;
-  let $valueResultError18133!: import("better-result").InferErr<NonNullable<typeof value>>;
-  const $valueResultOk18133 = value.match({
-    ok: (value) => {
-      $valueResultValue18133 = value;
-      return true;
-    },
-    err: (error) => {
-      $valueResultError18133 = error;
-      return false;
-    },
-  });
-  if (($valueResultOk18133 ? "ok" : "error") === "error") return Result.err($valueResultError18133);
-  const values = z.array(superJsonValueSchema).safeParse($valueResultValue18133);
+  const valueOutcome = persistenceCodecResultOutcome(value);
+  if (!valueOutcome.ok) return Result.err(valueOutcome.error);
+  const values = z.array(superJsonValueSchema).safeParse(valueOutcome.value);
   if (!values.success) {
     return Result.err(
       corrupt({
         field: "ui_transcript",
-        version: $versionResultValue17978.version,
+        version: versionOutcome.value.version,
         issueCode: "invalid-transcript-messages",
         recordId: input.recordId,
       }),
@@ -739,26 +634,14 @@ export function decodeMiniLilacMigrationUiPrefix(input: {
   }
   const migrated = migrateMiniLilacUiMessageValues({
     values: values.data,
-    schemaVersion: $versionResultValue17978.version,
+    schemaVersion: versionOutcome.value.version,
     recordId: input.recordId,
   });
-  let $migratedResultValue18591!: import("better-result").InferOk<NonNullable<typeof migrated>>;
-  let $migratedResultError18591!: import("better-result").InferErr<NonNullable<typeof migrated>>;
-  const $migratedResultOk18591 = migrated.match({
-    ok: (value) => {
-      $migratedResultValue18591 = value;
-      return true;
-    },
-    err: (error) => {
-      $migratedResultError18591 = error;
-      return false;
-    },
-  });
-  if (($migratedResultOk18591 ? "ok" : "error") === "error")
-    return Result.err($migratedResultError18591);
+  const migratedOutcome = persistenceCodecResultOutcome(migrated);
+  if (!migratedOutcome.ok) return Result.err(migratedOutcome.error);
   return Result.ok({
-    value: $migratedResultValue18591,
-    provenance: $versionResultValue17978.provenance,
+    value: migratedOutcome.value,
+    provenance: versionOutcome.value.provenance,
   });
 }
 
@@ -770,27 +653,15 @@ function decodeTranscript<T>(input: {
   readonly schema: z.ZodType<T>;
 }): ResultType<DecodedPersistedValue<T>, PersistedDataError> {
   const version = decodeVersion(input.schemaVersion, input.field, input.recordId);
-  let $versionResultValue19206!: import("better-result").InferOk<NonNullable<typeof version>>;
-  let $versionResultError19206!: import("better-result").InferErr<NonNullable<typeof version>>;
-  const $versionResultOk19206 = version.match({
-    ok: (value) => {
-      $versionResultValue19206 = value;
-      return true;
-    },
-    err: (error) => {
-      $versionResultError19206 = error;
-      return false;
-    },
-  });
-  if (($versionResultOk19206 ? "ok" : "error") === "error")
-    return Result.err($versionResultError19206);
+  const versionOutcome = persistenceCodecResultOutcome(version);
+  if (!versionOutcome.ok) return Result.err(versionOutcome.error);
   if (input.rawValues === null) {
     const empty = input.schema.safeParse([]);
     if (!empty.success) {
       return Result.err(
         corrupt({
           field: input.field,
-          version: $versionResultValue19206.version,
+          version: versionOutcome.value.version,
           issueCode: "invalid-transcript-messages",
           recordId: input.recordId,
         }),
@@ -802,37 +673,28 @@ function decodeTranscript<T>(input: {
   for (const raw of input.rawValues) {
     const decoded = decodeSuperJson(raw, {
       field: input.field,
-      schemaVersion: $versionResultValue19206.version,
+      schemaVersion: versionOutcome.value.version,
       recordId: input.recordId,
     });
-    let $decodedResultValue19848!: import("better-result").InferOk<NonNullable<typeof decoded>>;
-    let $decodedResultError19848!: import("better-result").InferErr<NonNullable<typeof decoded>>;
-    const $decodedResultOk19848 = decoded.match({
-      ok: (value) => {
-        $decodedResultValue19848 = value;
-        return true;
-      },
-      err: (error) => {
-        $decodedResultError19848 = error;
-        return false;
-      },
-    });
-    if (($decodedResultOk19848 ? "ok" : "error") === "error")
-      return Result.err($decodedResultError19848);
-    values.push($decodedResultValue19848);
+    const decodedOutcome = persistenceCodecResultOutcome(decoded);
+    if (!decodedOutcome.ok) return Result.err(decodedOutcome.error);
+    values.push(decodedOutcome.value);
   }
   const transcript = input.schema.safeParse(values);
   if (!transcript.success) {
     return Result.err(
       corrupt({
         field: input.field,
-        version: $versionResultValue19206.version,
+        version: versionOutcome.value.version,
         issueCode: "invalid-transcript-messages",
         recordId: input.recordId,
       }),
     );
   }
-  return Result.ok({ value: transcript.data, provenance: $versionResultValue19206.provenance });
+  return Result.ok({
+    value: transcript.data,
+    provenance: versionOutcome.value.provenance,
+  });
 }
 
 export function decodeMiniLilacTranscriptChain(
@@ -844,26 +706,14 @@ export function decodeMiniLilacTranscriptChain(
 ): ResultType<DecodedPersistedValue<string[]>, PersistedDataError> {
   const field = input.lane === "model" ? "model_transcript" : "ui_transcript";
   const version = decodeVersion(input.schemaVersion, field, input.recordId);
-  let $versionResultValue20816!: import("better-result").InferOk<NonNullable<typeof version>>;
-  let $versionResultError20816!: import("better-result").InferErr<NonNullable<typeof version>>;
-  const $versionResultOk20816 = version.match({
-    ok: (value) => {
-      $versionResultValue20816 = value;
-      return true;
-    },
-    err: (error) => {
-      $versionResultError20816 = error;
-      return false;
-    },
-  });
-  if (($versionResultOk20816 ? "ok" : "error") === "error")
-    return Result.err($versionResultError20816);
+  const versionOutcome = persistenceCodecResultOutcome(version);
+  if (!versionOutcome.ok) return Result.err(versionOutcome.error);
   const decodedRows = transcriptChainRowsSchema.safeParse(input.rows);
   if (!decodedRows.success) {
     return Result.err(
       corrupt({
         field,
-        version: $versionResultValue20816.version,
+        version: versionOutcome.value.version,
         issueCode: "invalid-row-field",
         recordId: input.recordId,
       }),
@@ -891,7 +741,7 @@ export function decodeMiniLilacTranscriptChain(
       return Result.err(
         corrupt({
           field,
-          version: $versionResultValue20816.version,
+          version: versionOutcome.value.version,
           issueCode: "digest-mismatch",
           recordId: input.recordId,
         }),
@@ -905,13 +755,13 @@ export function decodeMiniLilacTranscriptChain(
     return Result.err(
       corrupt({
         field,
-        version: $versionResultValue20816.version,
+        version: versionOutcome.value.version,
         issueCode: "digest-mismatch",
         recordId: input.recordId,
       }),
     );
   }
-  return Result.ok({ value: values, provenance: $versionResultValue20816.provenance });
+  return Result.ok({ value: values, provenance: versionOutcome.value.provenance });
 }
 
 export function decodeMiniLilacMigrationTranscriptRows(input: {
@@ -920,32 +770,20 @@ export function decodeMiniLilacMigrationTranscriptRows(input: {
   readonly recordId: string;
 }): ResultType<DecodedPersistedValue<MiniLilacMigrationTranscriptChainRow[]>, PersistedDataError> {
   const version = decodeVersion(input.schemaVersion, "model_transcript", input.recordId);
-  let $versionResultValue22704!: import("better-result").InferOk<NonNullable<typeof version>>;
-  let $versionResultError22704!: import("better-result").InferErr<NonNullable<typeof version>>;
-  const $versionResultOk22704 = version.match({
-    ok: (value) => {
-      $versionResultValue22704 = value;
-      return true;
-    },
-    err: (error) => {
-      $versionResultError22704 = error;
-      return false;
-    },
-  });
-  if (($versionResultOk22704 ? "ok" : "error") === "error")
-    return Result.err($versionResultError22704);
+  const versionOutcome = persistenceCodecResultOutcome(version);
+  if (!versionOutcome.ok) return Result.err(versionOutcome.error);
   const rows = migrationTranscriptChainRowsSchema.safeParse(input.rows);
   if (!rows.success) {
     return Result.err(
       corrupt({
         field: "model_transcript",
-        version: $versionResultValue22704.version,
+        version: versionOutcome.value.version,
         issueCode: "invalid-row-field",
         recordId: input.recordId,
       }),
     );
   }
-  return Result.ok({ value: rows.data, provenance: $versionResultValue22704.provenance });
+  return Result.ok({ value: rows.data, provenance: versionOutcome.value.provenance });
 }
 
 export function decodeMiniLilacModelTranscript(
@@ -980,47 +818,24 @@ export function decodeMiniLilacHistoryUserMessage(input: {
   PersistedDataError
 > {
   const version = decodeVersion(input.schemaVersion, "history_user_message", input.recordId);
-  let $versionResultValue24161!: import("better-result").InferOk<NonNullable<typeof version>>;
-  let $versionResultError24161!: import("better-result").InferErr<NonNullable<typeof version>>;
-  const $versionResultOk24161 = version.match({
-    ok: (value) => {
-      $versionResultValue24161 = value;
-      return true;
-    },
-    err: (error) => {
-      $versionResultError24161 = error;
-      return false;
-    },
-  });
-  if (($versionResultOk24161 ? "ok" : "error") === "error")
-    return Result.err($versionResultError24161);
+  const versionOutcome = persistenceCodecResultOutcome(version);
+  if (!versionOutcome.ok) return Result.err(versionOutcome.error);
   if (input.raw === null) return Result.ok({ value: null, provenance: "missing-defaulted" });
   const value = decodeSuperJson(input.raw, { ...input, field: "history_user_message" });
-  let $valueResultValue24417!: import("better-result").InferOk<NonNullable<typeof value>>;
-  let $valueResultError24417!: import("better-result").InferErr<NonNullable<typeof value>>;
-  const $valueResultOk24417 = value.match({
-    ok: (value) => {
-      $valueResultValue24417 = value;
-      return true;
-    },
-    err: (error) => {
-      $valueResultError24417 = error;
-      return false;
-    },
-  });
-  if (($valueResultOk24417 ? "ok" : "error") === "error") return Result.err($valueResultError24417);
-  const message = miniLilacPersistedUserUiMessageSchema.safeParse($valueResultValue24417);
+  const valueOutcome = persistenceCodecResultOutcome(value);
+  if (!valueOutcome.ok) return Result.err(valueOutcome.error);
+  const message = miniLilacPersistedUserUiMessageSchema.safeParse(valueOutcome.value);
   if (!message.success) {
     return Result.err(
       corrupt({
         field: "history_user_message",
-        version: $versionResultValue24161.version,
+        version: versionOutcome.value.version,
         issueCode: "invalid-row-field",
         recordId: input.recordId,
       }),
     );
   }
-  return Result.ok({ value: message.data, provenance: $versionResultValue24161.provenance });
+  return Result.ok({ value: message.data, provenance: versionOutcome.value.provenance });
 }
 
 export function decodeMiniLilacCommandRequest(
@@ -1030,82 +845,47 @@ export function decodeMiniLilacCommandRequest(
   PersistedDataError
 > {
   const version = decodeVersion(input.schemaVersion, "command_request", input.recordId);
-  let $versionResultValue25182!: import("better-result").InferOk<NonNullable<typeof version>>;
-  let $versionResultError25182!: import("better-result").InferErr<NonNullable<typeof version>>;
-  const $versionResultOk25182 = version.match({
-    ok: (value) => {
-      $versionResultValue25182 = value;
-      return true;
-    },
-    err: (error) => {
-      $versionResultError25182 = error;
-      return false;
-    },
-  });
-  if (($versionResultOk25182 ? "ok" : "error") === "error")
-    return Result.err($versionResultError25182);
+  const versionOutcome = persistenceCodecResultOutcome(version);
+  if (!versionOutcome.ok) return Result.err(versionOutcome.error);
   if (input.raw === null) return Result.ok({ value: null, provenance: "missing-defaulted" });
   const value = decodePlainJson(input.raw, { ...input, field: "command_request" });
-  let $valueResultValue25433!: import("better-result").InferOk<NonNullable<typeof value>>;
-  let $valueResultError25433!: import("better-result").InferErr<NonNullable<typeof value>>;
-  const $valueResultOk25433 = value.match({
-    ok: (value) => {
-      $valueResultValue25433 = value;
-      return true;
-    },
-    err: (error) => {
-      $valueResultError25433 = error;
-      return false;
-    },
-  });
-  if (($valueResultOk25433 ? "ok" : "error") === "error") return Result.err($valueResultError25433);
+  const valueOutcome = persistenceCodecResultOutcome(value);
+  if (!valueOutcome.ok) return Result.err(valueOutcome.error);
   if (
-    isRecord($valueResultValue25433) &&
-    "json" in $valueResultValue25433 &&
-    Object.keys($valueResultValue25433).every((key) => key === "json" || key === "meta")
+    isRecord(valueOutcome.value) &&
+    "json" in valueOutcome.value &&
+    Object.keys(valueOutcome.value).every((key) => key === "json" || key === "meta")
   ) {
     return Result.err(
       corrupt({
         field: "command_request",
-        version: $versionResultValue25182.version,
+        version: versionOutcome.value.version,
         issueCode: "invalid-row-field",
         recordId: input.recordId,
       }),
     );
   }
-  const request = commandRequestSchema.safeParse($valueResultValue25433);
+  const request = commandRequestSchema.safeParse(valueOutcome.value);
   if (!request.success) {
     return Result.err(
       corrupt({
         field: "command_request",
-        version: $versionResultValue25182.version,
+        version: versionOutcome.value.version,
         issueCode: "invalid-row-field",
         recordId: input.recordId,
       }),
     );
   }
-  return Result.ok({ value: request.data, provenance: $versionResultValue25182.provenance });
+  return Result.ok({ value: request.data, provenance: versionOutcome.value.provenance });
 }
 
 export function decodeMiniLilacSteeringCommandRequest(
   input: MiniLilacCanonicalJsonCodecInput,
 ): ResultType<DecodedPersistedValue<DecodedMiniLilacSteeringCommandPayload>, PersistedDataError> {
   const request = decodeMiniLilacCommandRequest(input);
-  let $requestResultValue26518!: import("better-result").InferOk<NonNullable<typeof request>>;
-  let $requestResultError26518!: import("better-result").InferErr<NonNullable<typeof request>>;
-  const $requestResultOk26518 = request.match({
-    ok: (value) => {
-      $requestResultValue26518 = value;
-      return true;
-    },
-    err: (error) => {
-      $requestResultError26518 = error;
-      return false;
-    },
-  });
-  if (($requestResultOk26518 ? "ok" : "error") === "error")
-    return Result.err($requestResultError26518);
-  const decoded = steeringCommandPayloadSchema.safeParse($requestResultValue26518.value);
+  const requestOutcome = persistenceCodecResultOutcome(request);
+  if (!requestOutcome.ok) return Result.err(requestOutcome.error);
+  const decoded = steeringCommandPayloadSchema.safeParse(requestOutcome.value.value);
   if (!decoded.success) {
     return Result.err(
       corrupt({
@@ -1116,77 +896,40 @@ export function decodeMiniLilacSteeringCommandRequest(
       }),
     );
   }
-  return Result.ok({ value: decoded.data, provenance: $requestResultValue26518.provenance });
+  return Result.ok({ value: decoded.data, provenance: requestOutcome.value.provenance });
 }
 
 export function decodeMiniLilacSuperJsonPayload(
   input: MiniLilacSuperJsonCodecInput,
 ): ResultType<DecodedPersistedValue<MiniLilacPersistedSuperJsonValue>, PersistedDataError> {
   const version = decodeVersion(input.schemaVersion, input.field, input.recordId);
-  let $versionResultValue27220!: import("better-result").InferOk<NonNullable<typeof version>>;
-  let $versionResultError27220!: import("better-result").InferErr<NonNullable<typeof version>>;
-  const $versionResultOk27220 = version.match({
-    ok: (value) => {
-      $versionResultValue27220 = value;
-      return true;
-    },
-    err: (error) => {
-      $versionResultError27220 = error;
-      return false;
-    },
-  });
-  if (($versionResultOk27220 ? "ok" : "error") === "error")
-    return Result.err($versionResultError27220);
+  const versionOutcome = persistenceCodecResultOutcome(version);
+  if (!versionOutcome.ok) return Result.err(versionOutcome.error);
   if (input.raw === null) return Result.ok({ value: null, provenance: "missing-defaulted" });
   const value = decodeSuperJson(input.raw, input);
-  let $valueResultValue27465!: import("better-result").InferOk<NonNullable<typeof value>>;
-  let $valueResultError27465!: import("better-result").InferErr<NonNullable<typeof value>>;
-  const $valueResultOk27465 = value.match({
-    ok: (value) => {
-      $valueResultValue27465 = value;
-      return true;
-    },
-    err: (error) => {
-      $valueResultError27465 = error;
-      return false;
-    },
-  });
-  if (($valueResultOk27465 ? "ok" : "error") === "error") return Result.err($valueResultError27465);
-  const decoded = superJsonValueSchema.safeParse($valueResultValue27465);
+  const valueOutcome = persistenceCodecResultOutcome(value);
+  if (!valueOutcome.ok) return Result.err(valueOutcome.error);
+  const decoded = superJsonValueSchema.safeParse(valueOutcome.value);
   if (!decoded.success) {
     return Result.err(
       corrupt({
         field: input.field,
-        version: $versionResultValue27220.version,
+        version: versionOutcome.value.version,
         issueCode: "invalid-row-field",
         recordId: input.recordId,
       }),
     );
   }
-  return Result.ok({ value: decoded.data, provenance: $versionResultValue27220.provenance });
+  return Result.ok({ value: decoded.data, provenance: versionOutcome.value.provenance });
 }
 
 export function decodeMiniMainClaudeBindingPromotion(
   input: MiniLilacSuperJsonCodecInput,
 ): ResultType<DecodedPersistedValue<DecodedMiniMainClaudeBindingPromotion>, PersistedDataError> {
   const payload = decodeMiniLilacSuperJsonPayload(input);
-  let $payloadResultValue28148!: import("better-result").InferOk<NonNullable<typeof payload>>;
-  let $payloadResultError28148!: import("better-result").InferErr<NonNullable<typeof payload>>;
-  const $payloadResultOk28148 = payload.match({
-    ok: (value) => {
-      $payloadResultValue28148 = value;
-      return true;
-    },
-    err: (error) => {
-      $payloadResultError28148 = error;
-      return false;
-    },
-  });
-  if (($payloadResultOk28148 ? "ok" : "error") === "error")
-    return Result.err($payloadResultError28148);
-  const decoded = promoteMiniMainClaudeSessionBindingSchema.safeParse(
-    $payloadResultValue28148.value,
-  );
+  const payloadOutcome = persistenceCodecResultOutcome(payload);
+  if (!payloadOutcome.ok) return Result.err(payloadOutcome.error);
+  const decoded = promoteMiniMainClaudeSessionBindingSchema.safeParse(payloadOutcome.value.value);
   if (!decoded.success) {
     return Result.err(
       corrupt({
@@ -1197,30 +940,16 @@ export function decodeMiniMainClaudeBindingPromotion(
       }),
     );
   }
-  return Result.ok({ value: decoded.data, provenance: $payloadResultValue28148.provenance });
+  return Result.ok({ value: decoded.data, provenance: payloadOutcome.value.provenance });
 }
 
 export function decodeMiniNamedClaudeBindingPromotion(
   input: MiniLilacSuperJsonCodecInput,
 ): ResultType<DecodedPersistedValue<DecodedMiniNamedClaudeBindingPromotion>, PersistedDataError> {
   const payload = decodeMiniLilacSuperJsonPayload(input);
-  let $payloadResultValue28871!: import("better-result").InferOk<NonNullable<typeof payload>>;
-  let $payloadResultError28871!: import("better-result").InferErr<NonNullable<typeof payload>>;
-  const $payloadResultOk28871 = payload.match({
-    ok: (value) => {
-      $payloadResultValue28871 = value;
-      return true;
-    },
-    err: (error) => {
-      $payloadResultError28871 = error;
-      return false;
-    },
-  });
-  if (($payloadResultOk28871 ? "ok" : "error") === "error")
-    return Result.err($payloadResultError28871);
-  const decoded = promoteMiniNamedClaudeSessionBindingSchema.safeParse(
-    $payloadResultValue28871.value,
-  );
+  const payloadOutcome = persistenceCodecResultOutcome(payload);
+  if (!payloadOutcome.ok) return Result.err(payloadOutcome.error);
+  const decoded = promoteMiniNamedClaudeSessionBindingSchema.safeParse(payloadOutcome.value.value);
   if (!decoded.success) {
     return Result.err(
       corrupt({
@@ -1231,7 +960,7 @@ export function decodeMiniNamedClaudeBindingPromotion(
       }),
     );
   }
-  return Result.ok({ value: decoded.data, provenance: $payloadResultValue28871.provenance });
+  return Result.ok({ value: decoded.data, provenance: payloadOutcome.value.provenance });
 }
 
 const modelMessage = SuperJSON.stringify({ role: "user", content: "current" });

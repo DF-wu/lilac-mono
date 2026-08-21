@@ -136,7 +136,16 @@ import {
   UnsupportedVersion,
   withoutOpenAIItemIds,
 } from "@stanley2058/lilac-utils";
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import {
+  Panic,
+  Result,
+  TaggedError,
+  type Err,
+  type InferErr,
+  type InferOk,
+  type Ok,
+  type Result as ResultType,
+} from "better-result";
 import { z } from "zod";
 
 import {
@@ -271,24 +280,9 @@ function rejectSessionOperation(
 }
 
 function sessionResultToCompatibility<T, E>(result: ResultType<T, E>): T {
-  let $resultResultValue8531!: import("better-result").InferOk<NonNullable<typeof result>>;
-  let $resultResultError8531!: import("better-result").InferErr<NonNullable<typeof result>>;
-  const $resultResultOk8531 = Result.match<
-    import("better-result").InferOk<NonNullable<typeof result>>,
-    import("better-result").InferErr<NonNullable<typeof result>>,
-    boolean
-  >(result, {
-    ok: (value) => {
-      $resultResultValue8531 = value;
-      return true;
-    },
-    err: (error) => {
-      $resultResultError8531 = error;
-      return false;
-    },
-  });
-  if (($resultResultOk8531 ? "ok" : "error") === "error") throw $resultResultError8531;
-  return $resultResultValue8531;
+  const resultOutcome = sessionCaptureOutcome(result);
+  if (!resultOutcome.ok) throw resultOutcome.error;
+  return resultOutcome.value;
 }
 
 function rethrowSessionPanic(cause: unknown): void;
@@ -301,6 +295,12 @@ function rethrowSessionPanic(cause: unknown, inspectCause?: true): OpaqueSession
 
 type OpaqueSessionValue = {} | null | undefined;
 
+type AnyMiniResult = Ok<unknown, unknown> | Err<unknown, unknown>;
+type MiniResultOutcome<R extends AnyMiniResult> =
+  | { readonly ok: true; readonly value: InferOk<R> }
+  | { readonly ok: false; readonly error: InferErr<R> };
+
+function sessionCaptureOutcome<R extends AnyMiniResult>(result: R): MiniResultOutcome<R>;
 function sessionCaptureOutcome<T, E>(
   result: ResultType<T, E>,
 ): { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E } {
@@ -379,27 +379,12 @@ export function resolveMiniClaudeCompactionSummaryModel(input: {
   if (input.run === null) return input.fallback();
 
   const created = input.run.createUtilityModelResult();
-  let $createdResultValue10416!: import("better-result").InferOk<NonNullable<typeof created>>;
-  let $createdResultError10416!: import("better-result").InferErr<NonNullable<typeof created>>;
-  const $createdResultOk10416 = Result.match<
-    import("better-result").InferOk<NonNullable<typeof created>>,
-    import("better-result").InferErr<NonNullable<typeof created>>,
-    boolean
-  >(created, {
-    ok: (value) => {
-      $createdResultValue10416 = value;
-      return true;
-    },
-    err: (error) => {
-      $createdResultError10416 = error;
-      return false;
-    },
-  });
-  if (($createdResultOk10416 ? "ok" : "error") === "ok") return $createdResultValue10416;
+  const createdOutcome = sessionCaptureOutcome(created);
+  if (createdOutcome.ok) return createdOutcome.value;
 
-  switch ($createdResultError10416._tag) {
+  switch (createdOutcome.error._tag) {
     case "ClaudeCodeRunExternalFailure":
-      input.onFailure($createdResultError10416);
+      input.onFailure(createdOutcome.error);
       return input.fallback();
   }
 }
@@ -2456,36 +2441,17 @@ class SessionActor {
             return null;
           }
           const finalizedResult = await candidate.run.nativeSession.finalizeResult();
-          let $finalizedResultResultValue86044!: import("better-result").InferOk<
-            NonNullable<typeof finalizedResult>
-          >;
-          let $finalizedResultResultError86044!: import("better-result").InferErr<
-            NonNullable<typeof finalizedResult>
-          >;
-          const $finalizedResultResultOk86044 = Result.match<
-            import("better-result").InferOk<NonNullable<typeof finalizedResult>>,
-            import("better-result").InferErr<NonNullable<typeof finalizedResult>>,
-            boolean
-          >(finalizedResult, {
-            ok: (value) => {
-              $finalizedResultResultValue86044 = value;
-              return true;
-            },
-            err: (error) => {
-              $finalizedResultResultError86044 = error;
-              return false;
-            },
-          });
-          if (($finalizedResultResultOk86044 ? "ok" : "error") === "error") {
+          const finalizedResultOutcome = sessionCaptureOutcome(finalizedResult);
+          if (!finalizedResultOutcome.ok) {
             recordAttemptOutcome("failed");
             logger.warn("Claude native candidate finalization failed", {
               ...lifecycleOperationalFields,
               reason: "native-finalization-failed",
-              error: $finalizedResultResultError86044.message,
+              error: finalizedResultOutcome.error.message,
             });
             return null;
           }
-          const finalized = $finalizedResultResultValue86044;
+          const finalized = finalizedResultOutcome.value;
           if (
             finalized.status !== "promotable" ||
             finalized.candidate === null ||
@@ -4714,28 +4680,11 @@ class SessionActor {
       for (const cancel of this.delegatedCancels.values()) cancel();
       return Result.ok({ kind: "pending" as const, id, command, active, operation });
     });
-    let $preparedResultValue168449!: import("better-result").InferOk<NonNullable<typeof prepared>>;
-    let $preparedResultError168449!: import("better-result").InferErr<NonNullable<typeof prepared>>;
-    const $preparedResultOk168449 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof prepared>>,
-      import("better-result").InferErr<NonNullable<typeof prepared>>,
-      boolean
-    >(prepared, {
-      ok: (value) => {
-        $preparedResultValue168449 = value;
-        return true;
-      },
-      err: (error) => {
-        $preparedResultError168449 = error;
-        return false;
-      },
-    });
-    if (($preparedResultOk168449 ? "ok" : "error") === "error")
-      return Result.err($preparedResultError168449);
-    if ($preparedResultValue168449.kind === "replay")
-      return Result.ok($preparedResultValue168449.result);
+    const preparedOutcome = sessionCaptureOutcome(prepared);
+    if (!preparedOutcome.ok) return Result.err(preparedOutcome.error);
+    if (preparedOutcome.value.kind === "replay") return Result.ok(preparedOutcome.value.result);
 
-    const pending = $preparedResultValue168449;
+    const pending = preparedOutcome.value;
     const interrupted = await pending.operation;
     return this.withLock(async () => {
       const decoded = miniLilacInterruptQueuedSteeringResultSchema.safeParse({
@@ -5230,37 +5179,19 @@ class SessionActor {
       this.manualCompaction = live;
       return Result.ok({ kind: "admitted", id, command, messages, live } as const);
     });
-    let $admittedResultValue186491!: import("better-result").InferOk<NonNullable<typeof admitted>>;
-    let $admittedResultError186491!: import("better-result").InferErr<NonNullable<typeof admitted>>;
-    const $admittedResultOk186491 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof admitted>>,
-      import("better-result").InferErr<NonNullable<typeof admitted>>,
-      boolean
-    >(admitted, {
-      ok: (value) => {
-        $admittedResultValue186491 = value;
-        return true;
-      },
-      err: (error) => {
-        $admittedResultError186491 = error;
-        return false;
-      },
-    });
+    const admittedOutcome = sessionCaptureOutcome(admitted);
 
-    if (($admittedResultOk186491 ? "ok" : "error") === "error")
-      return Result.err($admittedResultError186491);
-    if ($admittedResultValue186491.kind === "replay") {
+    if (!admittedOutcome.ok) return Result.err(admittedOutcome.error);
+    if (admittedOutcome.value.kind === "replay") {
       return Result.ok({
-        stream: singleCompactionEventStream(compactionEventFor($admittedResultValue186491.result)),
+        stream: singleCompactionEventStream(compactionEventFor(admittedOutcome.value.result)),
       });
     }
 
     // Tracked as runtime work rather than as part of the caller's promise: the
     // store must stay open, and shutdown must wait, even with no client attached.
-    void this.trackExecution(
-      this.runCompaction($admittedResultValue186491, $admittedResultValue186491.live),
-    );
-    return Result.ok({ stream: this.subscribeCompaction($admittedResultValue186491.live) });
+    void this.trackExecution(this.runCompaction(admittedOutcome.value, admittedOutcome.value.live));
+    return Result.ok({ stream: this.subscribeCompaction(admittedOutcome.value.live) });
   }
 
   /**
@@ -5403,34 +5334,15 @@ class SessionActor {
             publish(event("progress", { progress }));
           },
         });
-        let $summarizedResultValue193700!: import("better-result").InferOk<
-          NonNullable<typeof summarized>
-        >;
-        let $summarizedResultError193700!: import("better-result").InferErr<
-          NonNullable<typeof summarized>
-        >;
-        const $summarizedResultOk193700 = Result.match<
-          import("better-result").InferOk<NonNullable<typeof summarized>>,
-          import("better-result").InferErr<NonNullable<typeof summarized>>,
-          boolean
-        >(summarized, {
-          ok: (value) => {
-            $summarizedResultValue193700 = value;
-            return true;
-          },
-          err: (error) => {
-            $summarizedResultError193700 = error;
-            return false;
-          },
-        });
-        if (($summarizedResultOk193700 ? "ok" : "error") === "error") {
+        const summarizedOutcome = sessionCaptureOutcome(summarized);
+        if (!summarizedOutcome.ok) {
           await fail({
             cancelled: false,
-            error: $summarizedResultError193700.message,
+            error: summarizedOutcome.error.message,
           });
           return;
         }
-        const summaryResult = $summarizedResultValue193700;
+        const summaryResult = summarizedOutcome.value;
 
         // Validate the terminal payload before committing. Once the transaction
         // below returns, no failure may be reported as if the transcript were
@@ -6035,36 +5947,20 @@ export class SessionService {
     lockedStore: LockedWorkspaceHistoryStore,
   ): Promise<ResultType<WorkspaceHistoryCaptureResult, MiniLilacSessionServiceError>> {
     const captured = await lockedStore.captureResult();
-    let $capturedResultValue217391!: import("better-result").InferOk<NonNullable<typeof captured>>;
-    let $capturedResultError217391!: import("better-result").InferErr<NonNullable<typeof captured>>;
-    const $capturedResultOk217391 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof captured>>,
-      import("better-result").InferErr<NonNullable<typeof captured>>,
-      boolean
-    >(captured, {
-      ok: (value) => {
-        $capturedResultValue217391 = value;
-        return true;
-      },
-      err: (error) => {
-        $capturedResultError217391 = error;
-        return false;
-      },
-    });
-    if (($capturedResultOk217391 ? "ok" : "error") === "ok")
-      return Result.ok($capturedResultValue217391);
-    if ($capturedResultError217391 instanceof WorkspaceHistoryStoreError) {
+    const capturedOutcome = sessionCaptureOutcome(captured);
+    if (capturedOutcome.ok) return Result.ok(capturedOutcome.value);
+    if (capturedOutcome.error instanceof WorkspaceHistoryStoreError) {
       return Result.err(
-        mapMiniLilacPersistenceFailure("captureWorkspaceHistory", $capturedResultError217391),
+        mapMiniLilacPersistenceFailure("captureWorkspaceHistory", capturedOutcome.error),
       );
     }
 
     const diagnostic: WorkspaceHistoryPersistenceDiagnostic = {
       operation: "invalidate-capture-cache",
-      recordKind: $capturedResultError217391.recordKind,
-      issueCode: $capturedResultError217391.issueCode,
-      ...($capturedResultError217391._tag === "WorkspaceHistoryPersistenceUnsupportedVersion"
-        ? { versionCategory: $capturedResultError217391.versionCategory }
+      recordKind: capturedOutcome.error.recordKind,
+      issueCode: capturedOutcome.error.issueCode,
+      ...(capturedOutcome.error._tag === "WorkspaceHistoryPersistenceUnsupportedVersion"
+        ? { versionCategory: capturedOutcome.error.versionCategory }
         : {}),
     };
     logger.warn("workspace history capture cache invalidated", diagnostic);
@@ -6078,32 +5974,13 @@ export class SessionService {
       );
     }
     const recomputed = await lockedStore.captureResult();
-    let $recomputedResultValue218448!: import("better-result").InferOk<
-      NonNullable<typeof recomputed>
-    >;
-    let $recomputedResultError218448!: import("better-result").InferErr<
-      NonNullable<typeof recomputed>
-    >;
-    const $recomputedResultOk218448 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof recomputed>>,
-      import("better-result").InferErr<NonNullable<typeof recomputed>>,
-      boolean
-    >(recomputed, {
-      ok: (value) => {
-        $recomputedResultValue218448 = value;
-        return true;
-      },
-      err: (error) => {
-        $recomputedResultError218448 = error;
-        return false;
-      },
-    });
-    if (($recomputedResultOk218448 ? "ok" : "error") === "error") {
+    const recomputedOutcome = sessionCaptureOutcome(recomputed);
+    if (!recomputedOutcome.ok) {
       return Result.err(
-        mapMiniLilacPersistenceFailure("recomputeWorkspaceCapture", $recomputedResultError218448),
+        mapMiniLilacPersistenceFailure("recomputeWorkspaceCapture", recomputedOutcome.error),
       );
     }
-    return Result.ok($recomputedResultValue218448);
+    return Result.ok(recomputedOutcome.value);
   }
 
   private logWorkspaceHistoryMetric(workspaceId: string, metric: WorkspaceHistoryMetric): void {
@@ -6242,30 +6119,15 @@ export class SessionService {
     };
     let capture: WorkspaceHistoryCaptureResult | undefined;
     const captured = await this.captureWorkspaceWithCacheInvalidationPolicyResult(lockedStore);
-    let $capturedResultValue223662!: import("better-result").InferOk<NonNullable<typeof captured>>;
-    let $capturedResultError223662!: import("better-result").InferErr<NonNullable<typeof captured>>;
-    const $capturedResultOk223662 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof captured>>,
-      import("better-result").InferErr<NonNullable<typeof captured>>,
-      boolean
-    >(captured, {
-      ok: (value) => {
-        $capturedResultValue223662 = value;
-        return true;
-      },
-      err: (error) => {
-        $capturedResultError223662 = error;
-        return false;
-      },
-    });
-    if (($capturedResultOk223662 ? "ok" : "error") === "error") {
+    const capturedOutcome = sessionCaptureOutcome(captured);
+    if (!capturedOutcome.ok) {
       logger.warn("recovery workspace capture failed", {
         requestId: pending.runId,
         sessionId: pending.sessionId,
-        error: opaqueErrorMessage($capturedResultError223662, "Recovery workspace capture failed"),
+        error: opaqueErrorMessage(capturedOutcome.error, "Recovery workspace capture failed"),
       });
     } else {
-      capture = $capturedResultValue223662;
+      capture = capturedOutcome.value;
     }
     if (capture !== undefined) {
       workspace = this.recordWorkspaceCaptureForSession(pending.sessionId, capture);
@@ -6392,27 +6254,8 @@ export class SessionService {
           },
         },
       });
-      let $maintenanceResultValue228648!: import("better-result").InferOk<
-        NonNullable<typeof maintenance>
-      >;
-      let $maintenanceResultError228648!: import("better-result").InferErr<
-        NonNullable<typeof maintenance>
-      >;
-      const $maintenanceResultOk228648 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof maintenance>>,
-        import("better-result").InferErr<NonNullable<typeof maintenance>>,
-        boolean
-      >(maintenance, {
-        ok: (value) => {
-          $maintenanceResultValue228648 = value;
-          return true;
-        },
-        err: (error) => {
-          $maintenanceResultError228648 = error;
-          return false;
-        },
-      });
-      if (($maintenanceResultOk228648 ? "ok" : "error") === "error") {
+      const maintenanceOutcome = sessionCaptureOutcome(maintenance);
+      if (!maintenanceOutcome.ok) {
         const accounting = this.store.getHistoryAccountingResult(workspace.id);
         const accountingValue = accounting.match({ ok: (value) => value, err: () => null });
         if (accountingValue === null) {
@@ -6422,8 +6265,8 @@ export class SessionService {
             maintenanceFailureCount: 1,
             accountingUnavailableCount: 1,
             errorType:
-              $maintenanceResultError228648 instanceof WorkspaceHistoryStoreError
-                ? $maintenanceResultError228648.code
+              maintenanceOutcome.error instanceof WorkspaceHistoryStoreError
+                ? maintenanceOutcome.error.code
                 : "unexpected",
           });
         } else {
@@ -6439,14 +6282,14 @@ export class SessionService {
             activeOperationCount: accountingValue.activeOperationCount,
             pendingFinalizationCount: accountingValue.pendingFinalizationCount,
             errorType:
-              $maintenanceResultError228648 instanceof WorkspaceHistoryStoreError
-                ? $maintenanceResultError228648.code
+              maintenanceOutcome.error instanceof WorkspaceHistoryStoreError
+                ? maintenanceOutcome.error.code
                 : "unexpected",
           });
         }
         continue;
       }
-      const result = $maintenanceResultValue228648;
+      const result = maintenanceOutcome.value;
       const accounting = this.store.getHistoryAccounting(workspace.id);
       if (result.status === "unavailable") {
         logger.info("workspace history maintenance completed", {
@@ -6513,76 +6356,39 @@ export class SessionService {
           this.store.listWorkspaceSnapshots(workspace.id).map((snapshot) => snapshot.rootTreeOid),
         );
       });
-      let $lockedResultValue233716!: import("better-result").InferOk<NonNullable<typeof locked>>;
-      let $lockedResultError233716!: import("better-result").InferErr<NonNullable<typeof locked>>;
-      const $lockedResultOk233716 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof locked>>,
-        import("better-result").InferErr<NonNullable<typeof locked>>,
-        boolean
-      >(locked, {
-        ok: (value) => {
-          $lockedResultValue233716 = value;
-          return true;
-        },
-        err: (error) => {
-          $lockedResultError233716 = error;
-          return false;
-        },
-      });
-      if (($lockedResultOk233716 ? "ok" : "error") === "error") {
+      const lockedOutcome = sessionCaptureOutcome(locked);
+      if (!lockedOutcome.ok) {
         return Result.err(
           mapMiniLilacPersistenceFailure(
             "reconcileWorkspaceSnapshotRefs.lock",
-            $lockedResultError233716,
+            lockedOutcome.error,
           ),
         );
       }
-      const reconciliation = $lockedResultValue233716;
-      let $reconciliationResultValue234253!: import("better-result").InferOk<
-        NonNullable<typeof reconciliation>
-      >;
-      let $reconciliationResultError234253!: import("better-result").InferErr<
-        NonNullable<typeof reconciliation>
-      >;
-      const $reconciliationResultOk234253 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof reconciliation>>,
-        import("better-result").InferErr<NonNullable<typeof reconciliation>>,
-        boolean
-      >(reconciliation, {
-        ok: (value) => {
-          $reconciliationResultValue234253 = value;
-          return true;
-        },
-        err: (error) => {
-          $reconciliationResultError234253 = error;
-          return false;
-        },
-      });
-      if (($reconciliationResultOk234253 ? "ok" : "error") === "error") {
+      const reconciliation = lockedOutcome.value;
+      const reconciliationOutcome = sessionCaptureOutcome(reconciliation);
+      if (!reconciliationOutcome.ok) {
         return Result.err(
           mapMiniLilacPersistenceFailure(
             "reconcileWorkspaceSnapshotRefs",
-            $reconciliationResultError234253,
+            reconciliationOutcome.error,
           ),
         );
       }
       const snapshots = this.store.listWorkspaceSnapshots(workspace.id);
-      if ($reconciliationResultValue234253.status === "unavailable") {
+      if (reconciliationOutcome.value.status === "unavailable") {
         statuses.push({
           workspaceId: workspace.id,
           canonicalCwd: workspace.canonicalCwd,
           status: "unavailable",
-          reason: $reconciliationResultValue234253.reason,
+          reason: reconciliationOutcome.value.reason,
           orphanRefs: [],
         });
         continue;
       }
 
       const expectedByRoot = new Map(
-        $reconciliationResultValue234253.expected.map((expected) => [
-          expected.rootTreeOid,
-          expected,
-        ]),
+        reconciliationOutcome.value.expected.map((expected) => [expected.rootTreeOid, expected]),
       );
       const updates = [];
       for (const snapshot of snapshots) {
@@ -6623,12 +6429,12 @@ export class SessionService {
         workspaceId: workspace.id,
         canonicalCwd: workspace.canonicalCwd,
         status: "reconciled",
-        orphanRefs: $reconciliationResultValue234253.orphanRefs,
+        orphanRefs: reconciliationOutcome.value.orphanRefs,
       });
-      if ($reconciliationResultValue234253.orphanRefs.length > 0) {
+      if (reconciliationOutcome.value.orphanRefs.length > 0) {
         logger.warn("workspace history reconciliation retained orphan snapshot refs", {
           workspaceId: workspace.id,
-          orphanRefCount: $reconciliationResultValue234253.orphanRefs.length,
+          orphanRefCount: reconciliationOutcome.value.orphanRefs.length,
         });
       }
     }
@@ -6720,35 +6526,16 @@ export class SessionService {
         const verification = await this.workspaceHistoryForSession(
           operation.sessionId,
         ).verifySnapshotResult(snapshot.rootTreeOid);
-        let $verificationResultValue239725!: import("better-result").InferOk<
-          NonNullable<typeof verification>
-        >;
-        let $verificationResultError239725!: import("better-result").InferErr<
-          NonNullable<typeof verification>
-        >;
-        const $verificationResultOk239725 = Result.match<
-          import("better-result").InferOk<NonNullable<typeof verification>>,
-          import("better-result").InferErr<NonNullable<typeof verification>>,
-          boolean
-        >(verification, {
-          ok: (value) => {
-            $verificationResultValue239725 = value;
-            return true;
-          },
-          err: (error) => {
-            $verificationResultError239725 = error;
-            return false;
-          },
-        });
-        if (($verificationResultOk239725 ? "ok" : "error") === "error") {
+        const verificationOutcome = sessionCaptureOutcome(verification);
+        if (!verificationOutcome.ok) {
           return Result.err(
             mapMiniLilacPersistenceFailure(
               "recoverHistoryNavigation.verifySnapshot",
-              $verificationResultError239725,
+              verificationOutcome.error,
             ),
           );
         }
-        const verified = $verificationResultValue239725;
+        const verified = verificationOutcome.value;
         if (verified.status === "skipped" && verified.reason !== "non-git-workspace") {
           return Result.err(
             rejectSessionOperation(
@@ -6991,25 +6778,9 @@ export class SessionService {
         contextWindow: limits?.context,
       }),
     );
-    let $createdResultValue248238!: import("better-result").InferOk<NonNullable<typeof created>>;
-    let $createdResultError248238!: import("better-result").InferErr<NonNullable<typeof created>>;
-    const $createdResultOk248238 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof created>>,
-      import("better-result").InferErr<NonNullable<typeof created>>,
-      boolean
-    >(created, {
-      ok: (value) => {
-        $createdResultValue248238 = value;
-        return true;
-      },
-      err: (error) => {
-        $createdResultError248238 = error;
-        return false;
-      },
-    });
-    if (($createdResultOk248238 ? "ok" : "error") === "error")
-      return Result.err($createdResultError248238);
-    const snapshot = $createdResultValue248238;
+    const createdOutcome = sessionCaptureOutcome(created);
+    if (!createdOutcome.ok) return Result.err(createdOutcome.error);
+    const snapshot = createdOutcome.value;
     this.actors.set(snapshot.id, this.createActor(snapshot));
     return Result.ok(snapshot);
   }
@@ -7129,36 +6900,17 @@ export class SessionService {
     }
     if (!profileRequestsTool(profile, "skill")) return Result.ok([]);
     const discovered = await this.options.skillCatalog.discoverResult(cwd);
-    let $discoveredResultValue252569!: import("better-result").InferOk<
-      NonNullable<typeof discovered>
-    >;
-    let $discoveredResultError252569!: import("better-result").InferErr<
-      NonNullable<typeof discovered>
-    >;
-    const $discoveredResultOk252569 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof discovered>>,
-      import("better-result").InferErr<NonNullable<typeof discovered>>,
-      boolean
-    >(discovered, {
-      ok: (value) => {
-        $discoveredResultValue252569 = value;
-        return true;
-      },
-      err: (error) => {
-        $discoveredResultError252569 = error;
-        return false;
-      },
-    });
-    if (($discoveredResultOk252569 ? "ok" : "error") === "error") {
+    const discoveredOutcome = sessionCaptureOutcome(discovered);
+    if (!discoveredOutcome.ok) {
       return Result.err(
         new MiniLilacSessionExternalFailure({
           operation: "listSkills.discover",
-          cause: $discoveredResultError252569,
-          message: $discoveredResultError252569.message,
+          cause: discoveredOutcome.error,
+          message: discoveredOutcome.error.message,
         }),
       );
     }
-    return Result.ok([...$discoveredResultValue252569.summaries]);
+    return Result.ok([...discoveredOutcome.value.summaries]);
   }
 
   startPrompt(
@@ -7486,28 +7238,13 @@ export class SessionService {
       }
       return Result.ok(abandoned);
     });
-    let $lockedResultValue264121!: import("better-result").InferOk<NonNullable<typeof locked>>;
-    let $lockedResultError264121!: import("better-result").InferErr<NonNullable<typeof locked>>;
-    const $lockedResultOk264121 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof locked>>,
-      import("better-result").InferErr<NonNullable<typeof locked>>,
-      boolean
-    >(locked, {
-      ok: (value) => {
-        $lockedResultValue264121 = value;
-        return true;
-      },
-      err: (error) => {
-        $lockedResultError264121 = error;
-        return false;
-      },
-    });
-    if (($lockedResultOk264121 ? "ok" : "error") === "error") {
+    const lockedOutcome = sessionCaptureOutcome(locked);
+    if (!lockedOutcome.ok) {
       return Result.err(
-        mapMiniLilacPersistenceFailure("abandonHistoryNavigation.lock", $lockedResultError264121),
+        mapMiniLilacPersistenceFailure("abandonHistoryNavigation.lock", lockedOutcome.error),
       );
     }
-    return $lockedResultValue264121;
+    return lockedOutcome.value;
   }
 
   compact(request: MiniLilacCompactRequest): Promise<StartedCompaction> {
@@ -7614,29 +7351,8 @@ export class SessionService {
       const performed = await this.capturePersistencePromise("shutdown", () =>
         this.performShutdownResult(graceMs),
       );
-      let $performedResultValue268969!: import("better-result").InferOk<
-        NonNullable<typeof performed>
-      >;
-      let $performedResultError268969!: import("better-result").InferErr<
-        NonNullable<typeof performed>
-      >;
-      const $performedResultOk268969 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof performed>>,
-        import("better-result").InferErr<NonNullable<typeof performed>>,
-        boolean
-      >(performed, {
-        ok: (value) => {
-          $performedResultValue268969 = value;
-          return true;
-        },
-        err: (error) => {
-          $performedResultError268969 = error;
-          return false;
-        },
-      });
-      return ($performedResultOk268969 ? "ok" : "error") === "error"
-        ? Result.err($performedResultError268969)
-        : $performedResultValue268969;
+      const performedOutcome = sessionCaptureOutcome(performed);
+      return !performedOutcome.ok ? Result.err(performedOutcome.error) : performedOutcome.value;
     })().finally(() => {
       if (this.shutdownAttempt === attempt) this.shutdownAttempt = undefined;
     });
