@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Buffer } from "node:buffer";
 import { Result } from "better-result";
 
 import type { UserContent } from "ai";
@@ -244,8 +245,16 @@ describe("appendTelegramMediaToUserContent", () => {
     );
   });
 
-  it("degrades an unsupported binary document to a marker without resolving", async () => {
-    const resolver = stubResolver({});
+  it("resolves an unsupported binary document and degrades it after sniffing", async () => {
+    const zipBytes = Uint8Array.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00]);
+    const resolver = stubResolver({
+      results: new Map([
+        [
+          "d-3",
+          Result.ok({ kind: "bytes" as const, bytes: zipBytes, mediaType: "application/zip" }),
+        ],
+      ]),
+    });
     const parts: Exclude<UserContent, string> = [];
     const ref: TelegramInboundMediaRef = {
       kind: "document",
@@ -261,7 +270,78 @@ describe("appendTelegramMediaToUserContent", () => {
       budget: budget(1024, 4096),
     });
 
-    expect(resolver.calls).toEqual([]);
+    expect(resolver.calls).toEqual([
+      {
+        ref: {
+          platform: "telegram",
+          fileId: "d-3",
+          filename: "backup.zip",
+          mimeType: "application/zip",
+        },
+        maxBytes: 1024,
+      },
+    ]);
+    expect(parts).toEqual([
+      {
+        type: "text",
+        text: `${formatTelegramAttachmentMarker(ref)}\n(unsupported media type; not delivered)`,
+      },
+    ]);
+  });
+
+  it("delivers a PNG declared as octet-stream after resolution", async () => {
+    const resolver = stubResolver({
+      fallback: { kind: "bytes", bytes: PNG_BYTES, mediaType: "image/png" },
+    });
+    const parts: Exclude<UserContent, string> = [];
+    const ref: TelegramInboundMediaRef = {
+      kind: "document",
+      fileId: "png-1",
+      filename: "photo.bin",
+      mimeType: "application/octet-stream",
+    };
+
+    await appendTelegramMediaToUserContent({
+      parts,
+      media: [ref],
+      resolver,
+      budget: budget(1024, 4096),
+    });
+
+    expect(resolver.calls).toHaveLength(1);
+    expect(parts).toEqual([
+      {
+        type: "file",
+        data: Buffer.from(PNG_BYTES).toString("base64"),
+        mediaType: "image/png",
+        filename: "photo.bin",
+      },
+    ]);
+  });
+
+  it("does not promote uns sniffed bytes just because they were declared as an image", async () => {
+    const resolver = stubResolver({
+      fallback: {
+        kind: "bytes",
+        bytes: Uint8Array.from([0, 1, 2, 3, 4]),
+        mediaType: "application/octet-stream",
+      },
+    });
+    const parts: Exclude<UserContent, string> = [];
+    const ref: TelegramInboundMediaRef = {
+      kind: "document",
+      fileId: "fake-1",
+      filename: "payload.bin",
+      mimeType: "image/png",
+    };
+
+    await appendTelegramMediaToUserContent({
+      parts,
+      media: [ref],
+      resolver,
+      budget: budget(1024, 4096),
+    });
+
     expect(parts).toEqual([
       {
         type: "text",

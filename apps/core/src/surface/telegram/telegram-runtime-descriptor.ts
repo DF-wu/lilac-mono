@@ -6,6 +6,7 @@ import type {
   SurfaceAdapterIngress,
   SurfaceRelayDescriptor,
   SurfaceRelayPolicy,
+  SurfaceRequestIngress,
   SurfaceRuntimeDescriptor,
   SurfaceRuntimeHealthPort,
   SurfaceWorkflowProgressPort,
@@ -109,6 +110,7 @@ export function createTelegramWorkflowProgressPort(
 export function createTelegramSurfaceRuntimeDescriptor(input: {
   readonly adapter: SurfaceAdapter;
   readonly adapterIngress: SurfaceAdapterIngress<"telegram">;
+  readonly requestIngress?: SurfaceRequestIngress;
   readonly health: SurfaceRuntimeHealthPort;
   readonly createRelay: (guardedAdapter: SurfaceAdapter) => SurfaceRelayDescriptor<"telegram">;
 }): SurfaceRuntimeDescriptor<"telegram"> {
@@ -116,6 +118,7 @@ export function createTelegramSurfaceRuntimeDescriptor(input: {
     protocol: telegramSurfaceProtocol,
     adapter: input.adapter,
     adapterIngress: input.adapterIngress,
+    ...(input.requestIngress ? { requestIngress: input.requestIngress } : {}),
     health: input.health,
     createRelay: input.createRelay,
     createWorkflowProgress: createTelegramWorkflowProgressPort,

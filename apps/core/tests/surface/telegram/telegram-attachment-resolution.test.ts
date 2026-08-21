@@ -92,39 +92,38 @@ describe("TelegramAdapter.resolveAttachment", () => {
     ]);
   });
 
-  it("rejects on the declared ref size before any HTTP request", async () => {
+  it("streams an overdeclared but actually small file instead of trusting the ref size", async () => {
     const connected = await connectAdapter(testConfig());
+    server.setFile({ fileId: "overdeclared-1", filePath: "photos/small.jpg", bytes: PNG_BYTES });
 
     const resolved = await connected.resolveAttachment(
-      { platform: "telegram", fileId: "big-1", size: 2048 },
+      { platform: "telegram", fileId: "overdeclared-1", size: 5 * 1024 * 1024 },
       { maxBytes: 1024 },
     );
 
-    expect(resolved.match({ ok: () => "", err: (error) => error._tag })).toBe(
-      "SurfaceAttachmentTooLarge",
-    );
-    expect(server.callsOf("getFile")).toHaveLength(0);
-    expect(server.callsOf("downloadFile")).toHaveLength(0);
+    const value = resolved.unwrap();
+    expect(value.mediaType).toBe("image/png");
+    expect([...value.bytes]).toEqual([...PNG_BYTES]);
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
   });
 
-  it("rejects on the getFile-declared size before downloading", async () => {
+  it("streams an overdeclared getFile size when the body is actually small", async () => {
     const connected = await connectAdapter(testConfig());
     server.setFile({
-      fileId: "big-2",
-      filePath: "documents/big-2.bin",
+      fileId: "overdeclared-2",
+      filePath: "documents/small.bin",
       bytes: PNG_BYTES,
       declaredSize: 5 * 1024 * 1024,
     });
 
     const resolved = await connected.resolveAttachment(
-      { platform: "telegram", fileId: "big-2" },
+      { platform: "telegram", fileId: "overdeclared-2" },
       { maxBytes: 1024 },
     );
 
-    expect(resolved.match({ ok: () => "", err: (error) => error._tag })).toBe(
-      "SurfaceAttachmentTooLarge",
-    );
-    expect(server.callsOf("downloadFile")).toHaveLength(0);
+    const value = resolved.unwrap();
+    expect(value.mediaType).toBe("image/png");
+    expect(server.callsOf("downloadFile")).toHaveLength(1);
   });
 
   it("aborts mid-download when the declared size lies", async () => {

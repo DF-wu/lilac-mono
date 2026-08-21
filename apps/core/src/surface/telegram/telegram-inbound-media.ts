@@ -247,10 +247,12 @@ function isPdfMimeType(mimeType: string): boolean {
 }
 
 /**
- * Per-modality delivery policy, mirroring the Discord composition policy:
- * images and PDFs become file parts, text-extractable documents are inlined,
- * and everything else (video, audio, voice, unsupported binaries) degrades to
- * a metadata marker. Transcription is a stated non-goal of the surface.
+ * Per-modality delivery policy applied after resolution:
+ * sniffed images and PDFs become file parts, text-extractable documents are
+ * inlined, and everything else (video, audio, voice, unsupported binaries)
+ * degrades to a metadata marker. Declared MIME and filenames are fallbacks
+ * only, never a reason to skip the download. Transcription is a stated
+ * non-goal of the surface.
  */
 export async function appendTelegramMediaToUserContent(input: {
   readonly parts: Exclude<UserContent, string>;
@@ -261,17 +263,6 @@ export async function appendTelegramMediaToUserContent(input: {
 }): Promise<void> {
   for (const ref of input.media) {
     if (ref.kind === "video" || ref.kind === "audio" || ref.kind === "voice") {
-      input.parts.push(markerPart(ref, "unsupported media type; not delivered"));
-      continue;
-    }
-
-    const knownMime = ref.kind === "photo" ? "image/jpeg" : declaredOrInferredMimeType(ref);
-    const deliverable =
-      knownMime === undefined ||
-      isImageMimeType(knownMime) ||
-      isPdfMimeType(knownMime) ||
-      isTextExtractableMimeType(knownMime);
-    if (!deliverable) {
       input.parts.push(markerPart(ref, "unsupported media type; not delivered"));
       continue;
     }
@@ -299,9 +290,24 @@ export async function appendTelegramMediaToUserContent(input: {
           ? markerPart(ref, "media exceeds the inbound media limit; not delivered")
           : markerPart(ref, "media unavailable; not delivered"),
       ok: (attachment) => {
+        const sniffed = attachment.mediaType;
+        const declaredMime = declaredOrInferredMimeType(ref);
+        const filePartType =
+          isImageMimeType(sniffed) || isPdfMimeType(sniffed) ? sniffed : undefined;
+        const textType = isTextExtractableMimeType(sniffed)
+          ? sniffed
+          : sniffed === "application/octet-stream" &&
+              declaredMime &&
+              isTextExtractableMimeType(declaredMime)
+            ? declaredMime
+            : undefined;
+        if (!filePartType && !textType) {
+          return markerPart(ref, "unsupported media type; not delivered");
+        }
+
         input.budget.remainingRequestBytes -= attachment.bytes.byteLength;
 
-        if (isImageMimeType(attachment.mediaType) || isPdfMimeType(attachment.mediaType)) {
+        if (filePartType) {
           return {
             type: "file",
             // Base64 rather than a typed array: it survives every JSON
@@ -309,12 +315,12 @@ export async function appendTelegramMediaToUserContent(input: {
             // predictable 4/3 expansion instead of SuperJSON's ~4x numeric
             // encoding, and providers accept it as DataContent unchanged.
             data: Buffer.from(attachment.bytes).toString("base64"),
-            mediaType: attachment.mediaType,
+            mediaType: filePartType,
             ...(ref.filename === undefined ? {} : { filename: ref.filename }),
           };
         }
 
-        if (isTextExtractableMimeType(attachment.mediaType)) {
+        if (textType) {
           const decoded = decodeUtf8BestEffort(attachment.bytes);
           if (!decoded.text) {
             return markerPart(

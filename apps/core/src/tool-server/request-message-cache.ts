@@ -149,6 +149,8 @@ export type RequestMessageCacheOptions = {
   readonly maxEntries?: number;
   /** Byte-weighted clamp for one request's retained lineage. */
   readonly maxBytesPerRequest?: number;
+  /** Byte-weighted clamp across every cached request, including retained ones. */
+  readonly maxBytesTotal?: number;
   readonly now?: () => number;
 };
 
@@ -202,11 +204,8 @@ export function createRequestMessageCache(
   const {
     ttlMs = 30 * 60 * 1000,
     maxEntries = 256,
-    // Bounds worst-case retention at maxEntries * maxBytesPerRequest (~8 GiB
-    // with defaults) only if every request actually carries the full media
-    // budget; the ingestion caps upstream make that the pathological case,
-    // not the normal one.
     maxBytesPerRequest = 32 * 1024 * 1024,
+    maxBytesTotal = 256 * 1024 * 1024,
     now = Date.now,
   } = options;
   const maxMessagesPerRequest = 512;
@@ -232,16 +231,49 @@ export function createRequestMessageCache(
     }
   }
 
+  function entryWeight(entry: CacheEntry): number {
+    let total = 0;
+    for (const message of entry.messages) total += estimateCachedMessageBytes(message);
+    return total;
+  }
+
+  function mapBytes(target: ReadonlyMap<string, CacheEntry>): number {
+    let total = 0;
+    for (const entry of target.values()) total += entryWeight(entry);
+    return total;
+  }
+
+  function oldestEvictableKey(
+    target: ReadonlyMap<string, CacheEntry>,
+    allowRetained: boolean,
+  ): string | undefined {
+    let oldestKey: string | undefined;
+    let oldestUpdatedAt = Infinity;
+    for (const [requestId, entry] of target) {
+      if (!allowRetained && isRetained(entry)) continue;
+      if (entry.updatedAt >= oldestUpdatedAt) continue;
+      oldestUpdatedAt = entry.updatedAt;
+      oldestKey = requestId;
+    }
+    return oldestKey;
+  }
+
   function pruneMapToCapacity(target: Map<string, CacheEntry>): string[] {
     const evicted: string[] = [];
     while (target.size > maxEntries) {
-      let oldestKey: string | undefined;
-      let oldestUpdatedAt = Infinity;
-      for (const [requestId, entry] of target) {
-        if (isRetained(entry) || entry.updatedAt >= oldestUpdatedAt) continue;
-        oldestUpdatedAt = entry.updatedAt;
-        oldestKey = requestId;
-      }
+      const oldestKey = oldestEvictableKey(target, false) ?? oldestEvictableKey(target, true);
+      if (!oldestKey) break;
+      target.delete(oldestKey);
+      evicted.push(oldestKey);
+    }
+    return evicted;
+  }
+
+  function pruneMapToByteBudget(target: Map<string, CacheEntry>): string[] {
+    if (!Number.isFinite(maxBytesTotal)) return [];
+    const evicted: string[] = [];
+    while (mapBytes(target) > maxBytesTotal && target.size > 0) {
+      const oldestKey = oldestEvictableKey(target, false) ?? oldestEvictableKey(target, true);
       if (!oldestKey) break;
       target.delete(oldestKey);
       evicted.push(oldestKey);
@@ -260,8 +292,20 @@ export function createRequestMessageCache(
     }
   }
 
+  function logByteEvictions(evicted: readonly string[], sizeAfter: number): void {
+    for (const requestId of evicted) {
+      logger.info("request_message_cache.evicted", {
+        requestId,
+        reason: "max_bytes_total",
+        maxBytesTotal,
+        sizeAfter,
+      });
+    }
+  }
+
   function pruneMax(): void {
     logCapacityEvictions(pruneMapToCapacity(entries), entries.size);
+    logByteEvictions(pruneMapToByteBudget(entries), entries.size);
   }
 
   function cacheMessage(
@@ -521,10 +565,12 @@ export function createRequestMessageCache(
               err: (error) => () => Result.err(error),
               ok: () => () => {
                 const evicted = pruneMapToCapacity(staged);
+                const byteEvicted = pruneMapToByteBudget(staged);
                 before = cloneEntries(entries);
                 replaceEntries(staged);
                 applied = true;
                 logCapacityEvictions(evicted, entries.size);
+                logByteEvictions(byteEvicted, entries.size);
                 return Result.ok(undefined);
               },
             });

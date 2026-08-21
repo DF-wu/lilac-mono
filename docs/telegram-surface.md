@@ -296,12 +296,18 @@ re-resolve the same way, which is what makes re-composition after a restart
 work. Delivered bytes are inlined as base64 file parts: base64 survives every
 JSON serialization boundary (bus, request cache, transcripts) with a fixed 4/3
 expansion, so the configured decoded-byte budgets bound the on-wire payload by
-construction. Images and PDFs become file parts, text-extractable documents are
-inlined as text, and audio/video/voice degrade to one-line
-`[telegram_attachment …]` markers — a partial file would be corrupt rather than
-smaller, so oversized or unavailable media degrades to a marker too. A
-self-hosted Bot API server running in `--local` mode returns filesystem paths
-instead of downloadable ones and is not supported for inbound media.
+construction. Ordinary transcripts keep only the response-side messages, so
+inbound file parts are not retained there. A compaction checkpoint does persist
+the complete final message list, including any still-present base64 file parts,
+because that checkpoint is the resume surface after compaction. Images and PDFs
+become file parts, text-extractable documents are inlined as text, and
+audio/video/voice degrade to one-line `[telegram_attachment …]` markers — a
+partial file would be corrupt rather than smaller, so oversized or unavailable
+media degrades to a marker too. Declared Telegram sizes and MIME types are
+advisory: the download stream is authoritative, and delivery policy is applied
+after sniffing the bytes. A self-hosted Bot API server running in `--local`
+mode returns filesystem paths instead of downloadable ones and is not supported
+for inbound media.
 
 **Edit rate limits.** Telegram throttles `editMessageText` at roughly one call
 per second per chat and rejects an edit whose content is unchanged. Streaming

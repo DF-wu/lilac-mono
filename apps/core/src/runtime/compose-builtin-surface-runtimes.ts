@@ -1,5 +1,7 @@
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 
+import type { CustomCommandManager } from "../custom-commands/manager";
+import { startGithubWebhookServer } from "../github/webhook/github-webhook-server";
 import type { TranscriptStore } from "../transcript/transcript-store";
 import type { SurfaceAdapter, SurfaceAdapterEventSource } from "../surface/adapter";
 import { bridgeAdapterToBus } from "../surface/bridge/publish-to-bus";
@@ -23,7 +25,9 @@ import {
 } from "../surface/telegram/telegram-runtime-descriptor";
 import type { TelegramRuntimeHealthProvider } from "../surface/telegram/telegram-runtime-health";
 import { createTelegramRuntimeHealthPort } from "../surface/telegram/telegram-runtime-health";
-import { startGithubWebhookServer } from "../github/webhook/github-webhook-server";
+import { startTelegramRequestRouter } from "../surface/telegram/telegram-request-router";
+import type { DurableWorkflowStore } from "../workflow/durable-workflow-store";
+import { shouldSuppressRouterForWorkflowReply } from "../workflow/workflow-router-suppression";
 
 type BuiltinSurfaceRuntimeLogger = {
   debug(message: string, context: Readonly<Record<string, unknown>>): void;
@@ -40,6 +44,9 @@ export type ComposeBuiltinSurfaceRuntimesInput = {
     readonly adapter: SurfaceAdapter & { stopIngress(): Promise<void> };
     readonly eventSource: SurfaceAdapterEventSource;
     readonly healthProvider: TelegramRuntimeHealthProvider;
+    readonly customCommands?: CustomCommandManager;
+    readonly getWorkflowStore?: () => DurableWorkflowStore;
+    readonly config?: Record<string, unknown>;
   };
   readonly bus: LilacBus;
   readonly subscriptionPrefix: string;
@@ -137,8 +144,32 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
     ...(telegram
       ? [
           createTelegramSurfaceRuntimeDescriptor({
-            adapter: input.telegram.adapter,
-            health: createTelegramRuntimeHealthPort(input.telegram.healthProvider),
+            adapter: telegram.adapter,
+            health: createTelegramRuntimeHealthPort(telegram.healthProvider),
+            requestIngress: {
+              start: async () => {
+                const id = subscriptionId("telegram-request-router");
+                const getWorkflowStore = telegram.getWorkflowStore;
+                const router = await startTelegramRequestRouter({
+                  adapter: telegram.adapter,
+                  bus: input.bus,
+                  subscriptionId: id,
+                  ...(telegram.customCommands ? { customCommands: telegram.customCommands } : {}),
+                  ...(telegram.config ? { config: telegram.config } : {}),
+                  ...(getWorkflowStore
+                    ? {
+                        shouldSuppressAdapterEvent: async ({ evt }) =>
+                          shouldSuppressRouterForWorkflowReply({
+                            store: getWorkflowStore(),
+                            event: evt,
+                          }),
+                      }
+                    : {}),
+                });
+                input.logger.debug("Telegram request router started", { subscriptionId: id });
+                return router;
+              },
+            },
             adapterIngress: {
               start: async () => {
                 const id = subscriptionId("telegram-adapter-to-bus");

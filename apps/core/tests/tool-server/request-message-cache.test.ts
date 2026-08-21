@@ -692,4 +692,32 @@ describe("byte-weighted lineage clamping", () => {
     expect(JSON.stringify(messages)).toContain("y".repeat(32));
     expect(JSON.stringify(messages)).not.toContain("x".repeat(32));
   });
+
+  it("evicts oldest requests when the global byte ceiling is exceeded, including retained ones", () => {
+    const cache = createRequestMessageCache({
+      maxEntries: 8,
+      maxBytesPerRequest: 10_000,
+      maxBytesTotal: 2_500,
+    });
+    expect(
+      cache.cacheMessage(
+        requestMessage({ eventId: "g-1", requestId: "old", text: "a".repeat(1200) }),
+      ).status,
+    ).toBe("ok");
+    expect(cache.acquireOwner("old").status).toBe("ok");
+    expect(
+      cache.cacheMessage(
+        requestMessage({ eventId: "g-2", requestId: "mid", text: "b".repeat(1200) }),
+      ).status,
+    ).toBe("ok");
+    expect(
+      cache.cacheMessage(
+        requestMessage({ eventId: "g-3", requestId: "new", text: "c".repeat(1200) }),
+      ).status,
+    ).toBe("ok");
+
+    expect(cache.get("old")).toBeUndefined();
+    expect(cache.get("mid")).toBeDefined();
+    expect(cache.get("new")).toBeDefined();
+  });
 });

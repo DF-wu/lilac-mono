@@ -1685,6 +1685,8 @@ export async function createCoreRuntime(
                   adapter: telegramAdapter,
                   eventSource: createDescriptorBoundSurfaceEventSource("telegram", telegramAdapter),
                   healthProvider: telegramAdapter,
+                  customCommands,
+                  getWorkflowStore: () => durableWorkflowStore,
                 },
               }
             : {}),
