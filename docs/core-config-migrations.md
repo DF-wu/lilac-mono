@@ -57,6 +57,11 @@ New v2 fields:
 - `agent.idleTimeoutMs`: primary agent inactivity timeout; defaults to `900000` (15 minutes). Active runs
   have no total runtime cap. Frozen v1 configs receive the same universal fallback but cannot override it.
 - `tools.inspect.model`: configurable Gemini model for `content.inspect`; must start with `google/`.
+- `tools.generate.image.provider`: selects the built-in default image routing or the
+  `openai-compatible` endpoint. The optional `tools.generate.image.openaiCompatible.models` allowlist
+  limits the aliases advertised and considered for fallback, while `modelIds` overrides the upstream
+  model ID for each alias. Frozen v1 configs cannot configure these fields and receive
+  `provider: default` with an empty `modelIds` map in the universal config.
 - `tools.web.firecrawl`: optional process-local concurrency policy applied independently to Firecrawl
   fetch and search calls. When present, `maxConcurrency` defaults to `2` and `queueTtl` defaults to `3s`;
   when absent, Firecrawl calls remain unlimited.

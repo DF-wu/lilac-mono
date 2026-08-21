@@ -16,9 +16,9 @@ The configured base URL is prepended to those paths. For example, a base URL of
 `https://provider.example.com/v1` results in requests to
 `https://provider.example.com/v1/images/generations`.
 
-The provider must accept the canonical model IDs listed in
-[Model aliases](#model-aliases). Lilac does not support custom alias-to-model
-mappings in this configuration.
+The provider must accept the model IDs Lilac sends. By default these are the
+canonical model IDs listed in [Model aliases](#model-aliases); use
+`openaiCompatible.modelIds` to override the ID sent for individual aliases.
 
 ## Configuration
 
@@ -35,6 +35,24 @@ tools:
   generate:
     image:
       provider: openai-compatible
+```
+
+An optional `openaiCompatible` sub-object (v2-only, meaningful only when
+`provider` is `openai-compatible`) restricts the served aliases and overrides
+upstream model IDs:
+
+```yaml
+tools:
+  generate:
+    image:
+      provider: openai-compatible
+      openaiCompatible:
+        # Optional allowlist of Lilac aliases the endpoint serves.
+        # Omitted = all aliases.
+        models: [nanobanana-2, gpt-image-2]
+        # Optional per-alias upstream model-ID overrides.
+        modelIds:
+          nanobanana-2: gemini-3.1-flash-image-preview
 ```
 
 Set the endpoint and API key in the environment of the core runtime or
@@ -55,9 +73,9 @@ variables.
 ## Model aliases
 
 Callers continue to use Lilac's existing aliases. In OpenAI-compatible mode,
-Lilac sends the corresponding canonical model ID to the provider.
+Lilac sends the corresponding canonical model ID to the provider by default.
 
-| Lilac alias | Canonical model ID sent upstream |
+| Lilac alias | Default model ID sent upstream |
 | --- | --- |
 | `gpt-image-2` | `gpt-image-2` |
 | `gpt-5-image` | `gpt-image-1.5` |
@@ -68,8 +86,19 @@ Lilac sends the corresponding canonical model ID to the provider.
 | `grok-imagine-image` | `grok-imagine-image` |
 | `grok-imagine-image-pro` | `grok-imagine-image-pro` |
 
-All aliases route through the same configured endpoint. Routing cannot be
-enabled for only one alias.
+`openaiCompatible.modelIds` overrides the upstream model ID per alias. For
+example, `modelIds: { nanobanana-2: gemini-3.1-flash-image-preview }` sends
+`gemini-3.1-flash-image-preview` (without the `google/` prefix) whenever a
+caller selects `nanobanana-2`. Aliases without an override keep the default
+from the table. Unknown alias keys are rejected at config parse time.
+
+`openaiCompatible.models` declares which aliases the endpoint actually serves.
+When present, the tool catalog advertises only those aliases, the default
+fallback picks only among them, and requesting any other alias fails before an
+HTTP request is sent. When omitted, all aliases are advertised and served.
+
+All served aliases route through the same configured endpoint. Routing cannot
+be split across endpoints per alias.
 
 ## Start the standalone tool server
 
@@ -161,43 +190,38 @@ existing OpenAI, OpenRouter, and xAI provider selection behavior.
   OpenAI-compatible routing is selected.
 - `generate.video` remains independent of this image-provider setting.
 
-## Known limitation: `aspectRatio` is not sent upstream
+## Aspect ratio forwarding
 
-The OpenAI-compatible image API has no aspect-ratio parameter, so
-`aspectRatio` is **not** forwarded to the provider in this mode. Lilac still
-validates it against the alias, then the request omits it and the result
-carries a warning:
+The OpenAI-compatible image API has no dedicated aspect-ratio parameter. For
+the ratio-driven aliases (`nanobanana*` and `grok-imagine-image*`), Lilac
+validates `aspectRatio` against the alias and then forwards it as a colon-form
+`size` value on the wire, e.g. `"size": "16:9"`. No `unsupported: aspectRatio`
+warning is produced.
 
-```json
-{
-  "type": "unsupported",
-  "feature": "aspectRatio",
-  "details": "This model does not support aspect ratio. Use `size` instead."
-}
-```
+How gateways handle the colon-form `size`:
 
-The image is generated at the provider's default ratio. This differs from
-`default` mode, where `aspectRatio` reaches OpenRouter and xAI as a real
-parameter.
+- new-api maps a `size` containing a colon to Gemini's `aspectRatio` for
+  Gemini image models, so `nanobanana*` aliases produce the requested ratio.
+- xAI's image API has no size parameter, so grok-via-gateway ignores the value
+  and `grok-imagine-image*` behaves as it does today.
+- Gateways that reject non-WxH `size` values fail loudly with a provider
+  error rather than silently producing the wrong ratio.
 
-Practical consequences:
-
-- Prefer `size` in this mode. For `gpt-image-2` and `gpt-5-image`, Lilac
-  already converts `aspectRatio` into an equivalent `size`, so those two
-  aliases are unaffected.
-- The `nanobanana*` and `grok-imagine-image*` aliases are aspect-ratio-driven
-  and have no `size` equivalent here. `grok-imagine-image*` rejects `size`
-  outright, so in this mode those aliases can only produce the provider's
-  default ratio.
-- Check the `warnings` array in the tool result to detect a dropped
-  `aspectRatio`.
+For `gpt-image-2` and `gpt-5-image`, Lilac converts `aspectRatio` into an
+equivalent WxH `size` before the request, exactly as in `default` mode, so
+those aliases never send a colon-form `size`.
 
 ## Troubleshooting
 
 ### The provider returns model-not-found
 
-Confirm that the provider recognizes the canonical model ID from the alias
-table. Custom model-ID mappings are not supported.
+Confirm that the provider recognizes the model ID Lilac sends: the canonical
+ID from the alias table, or the `openaiCompatible.modelIds` override when one
+is configured. If the provider expects a different ID for an alias (for
+example `gemini-3.1-flash-image-preview` without the `google/` prefix), map it
+with `openaiCompatible.modelIds`. If the provider serves only some aliases,
+list them in `openaiCompatible.models` so unavailable aliases are not
+advertised or selected.
 
 ### The request returns 404
 

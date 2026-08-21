@@ -26,10 +26,20 @@ const originalProviders = structuredClone(env.providers);
 const temporaryPaths: string[] = [];
 const servers: Bun.Server<unknown>[] = [];
 
-async function compatibleConfig(): Promise<Pick<CoreConfig, "tools">> {
+async function compatibleConfig(openaiCompatible?: {
+  models?: string[];
+  modelIds?: Record<string, string>;
+}): Promise<Pick<CoreConfig, "tools">> {
   const config = await parseCoreConfig({
     configVersion: 2,
-    tools: { generate: { image: { provider: "openai-compatible" } } },
+    tools: {
+      generate: {
+        image: {
+          provider: "openai-compatible",
+          ...(openaiCompatible ? { openaiCompatible } : {}),
+        },
+      },
+    },
   });
   return config;
 }
@@ -260,10 +270,8 @@ describe("Generate OpenAI-compatible image routing", () => {
     expect(await Array.fromAsync(new Bun.Glob("*").scan({ cwd: outputDir }))).toEqual([]);
   });
 
-  it("drops aspectRatio upstream and surfaces an unsupported warning", async () => {
+  it("forwards aspectRatio as a colon-form size without an unsupported warning", async () => {
     // Given
-    const previousLogWarnings = globalThis.AI_SDK_LOG_WARNINGS;
-    globalThis.AI_SDK_LOG_WARNINGS = false;
     let body: unknown;
     const server = startServer(async (request) => {
       body = await request.json();
@@ -274,27 +282,50 @@ describe("Generate OpenAI-compatible image routing", () => {
     temporaryPaths.push(outputDir);
 
     // When
-    try {
-      const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
-        prompt: "wide shot",
-        model: "nanobanana-2",
-        aspectRatio: "16:9",
-        outputDir,
-      });
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "wide shot",
+      model: "nanobanana-2",
+      aspectRatio: "16:9",
+      outputDir,
+    });
 
-      // Then
-      expect(body).toEqual({
-        model: "google/gemini-3.1-flash-image-preview",
-        prompt: "wide shot",
-        n: 1,
-      });
-      expect(result.unwrap()).toMatchObject({
-        ok: true,
-        warnings: [{ type: "unsupported", feature: "aspectRatio" }],
-      });
-    } finally {
-      globalThis.AI_SDK_LOG_WARNINGS = previousLogWarnings;
-    }
+    // Then
+    expect(body).toEqual({
+      model: "google/gemini-3.1-flash-image-preview",
+      prompt: "wide shot",
+      n: 1,
+      size: "16:9",
+    });
+    expect(result.unwrap()).toMatchObject({ ok: true, warnings: [] });
+  });
+
+  it("forwards grok aspect ratios as a colon-form size", async () => {
+    // Given
+    let body: unknown;
+    const server = startServer(async (request) => {
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-grok-aspect-"));
+    temporaryPaths.push(outputDir);
+
+    // When
+    const result = await new Generate({ getConfig: compatibleConfig }).call("generate.image", {
+      prompt: "tall shot",
+      model: "grok-imagine-image",
+      aspectRatio: "19.5:9",
+      outputDir,
+    });
+
+    // Then
+    expect(body).toEqual({
+      model: "grok-imagine-image",
+      prompt: "tall shot",
+      n: 1,
+      size: "19.5:9",
+    });
+    expect(result.unwrap()).toMatchObject({ ok: true, warnings: [] });
   });
 
   it("still converts aspectRatio to size for gpt aliases", async () => {
@@ -324,5 +355,71 @@ describe("Generate OpenAI-compatible image routing", () => {
       size: "1024x1536",
     });
     expect(result.unwrap()).toMatchObject({ ok: true, warnings: [] });
+  });
+
+  it("sends configured modelIds overrides as the upstream model id", async () => {
+    // Given
+    let body: unknown;
+    const server = startServer(async (request) => {
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-model-ids-"));
+    temporaryPaths.push(outputDir);
+    const getConfig = () =>
+      compatibleConfig({ modelIds: { "nanobanana-2": "gemini-3.1-flash-image-preview" } });
+
+    // When
+    const result = await new Generate({ getConfig }).call("generate.image", {
+      prompt: "override id",
+      model: "nanobanana-2",
+      outputDir,
+    });
+
+    // Then
+    expect(body).toMatchObject({ model: "gemini-3.1-flash-image-preview" });
+    expect(result.unwrap()).toMatchObject({ ok: true, model: "nanobanana-2" });
+  });
+
+  it("restricts aliases to the configured models allowlist", async () => {
+    // Given
+    let requestCount = 0;
+    let body: unknown;
+    const server = startServer(async (request) => {
+      requestCount += 1;
+      body = await request.json();
+      return Response.json({ data: [{ b64_json: PNG_BASE64 }] });
+    });
+    configureCompatible(`http://127.0.0.1:${server.port}/v1`);
+    const outputDir = await mkdtemp(join(tmpdir(), "lilac-compatible-allowlist-"));
+    temporaryPaths.push(outputDir);
+    const getConfig = () => compatibleConfig({ models: ["nanobanana-2"] });
+    const generate = new Generate({ getConfig });
+
+    // When / Then: a disallowed alias fails before HTTP and lists only allowed aliases.
+    const denied = await generate.call("generate.image", {
+      prompt: "denied",
+      model: "gpt-image-2",
+    });
+    expect(denied.match({ ok: () => "", err: (error) => error.message })).toContain(
+      "Requested model 'gpt-image-2' is not available for image generation (configured: nanobanana-2).",
+    );
+    expect(requestCount).toBe(0);
+
+    // When / Then: omitting the model falls back to the allowed alias.
+    const fallback = await generate.call("generate.image", {
+      prompt: "fallback",
+      outputDir,
+    });
+    expect(fallback.unwrap()).toMatchObject({ ok: true, model: "nanobanana-2" });
+    expect(body).toMatchObject({ model: "google/gemini-3.1-flash-image-preview" });
+    expect(requestCount).toBe(1);
+
+    // When / Then: the catalog advertises only the allowlisted alias.
+    const entries = await generate.list();
+    expect(entries.find((entry) => entry.callableId === "generate.image")?.description).toEndWith(
+      "Available models: nanobanana-2",
+    );
   });
 });

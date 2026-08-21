@@ -61,7 +61,7 @@ export {
   parseCoreConfigV2,
   parseCoreConfigV2ToUniversal,
 };
-export { MODEL_REASONING_EFFORTS } from "./core-config/types";
+export { IMAGE_GENERATION_MODEL_ALIASES, MODEL_REASONING_EFFORTS } from "./core-config/types";
 export type {
   ConfiguredModelChainEntry,
   ConfiguredModelRef,
@@ -73,6 +73,7 @@ export type {
   CoreConfigVersion,
   DiscordSessionAliasConfig,
   DiscordUserAliasConfig,
+  ImageGenerationModelAlias,
   JSONValue,
   JSONArray,
   JSONObject,

@@ -1,5 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import type { ServerToolFailure } from "@stanley2058/lilac-plugin-runtime";
+import { IMAGE_GENERATION_MODEL_ALIASES } from "@stanley2058/lilac-utils";
 import { Panic, type Result as ResultType } from "better-result";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -27,6 +28,12 @@ function value<T>(result: ResultType<T, ServerToolFailure>): T {
 }
 
 describe("tool-server image generation", () => {
+  it("keeps the utils alias list and the fallback order in sync", () => {
+    expect([...IMAGE_GENERATION_MODEL_ALIASES].sort()).toEqual(
+      [...DEFAULT_IMAGE_MODEL_FALLBACK_ORDER].sort(),
+    );
+  });
+
   it("uses gpt-image-2 as the recommended default", () => {
     expect(DEFAULT_IMAGE_MODEL_FALLBACK_ORDER[0]).toBe("gpt-image-2");
     expect(

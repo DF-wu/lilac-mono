@@ -145,6 +145,24 @@ export function cloneDefaultTelegramSurface(): UniversalCoreConfig["surface"]["t
   };
 }
 
+/**
+ * Canonical list of Lilac `generate.image` model aliases. A drift test in
+ * apps/core pins this list to the generate tool's fallback order so the two
+ * cannot diverge silently.
+ */
+export const IMAGE_GENERATION_MODEL_ALIASES = [
+  "gpt-image-2",
+  "gpt-5-image",
+  "nanobanana",
+  "nanobanana-2",
+  "nanobanana-2-lite",
+  "nanobanana-pro",
+  "grok-imagine-image",
+  "grok-imagine-image-pro",
+] as const;
+
+export type ImageGenerationModelAlias = (typeof IMAGE_GENERATION_MODEL_ALIASES)[number];
+
 export type UniversalCoreConfig = {
   configVersion: CoreConfigVersion;
 
@@ -153,6 +171,13 @@ export type UniversalCoreConfig = {
     generate: {
       image: {
         provider: "default" | "openai-compatible";
+        /** Only meaningful when provider is "openai-compatible". */
+        openaiCompatible: {
+          /** Optional allowlist of aliases the endpoint serves; omitted = all aliases. */
+          models?: readonly ImageGenerationModelAlias[];
+          /** Per-alias upstream model-ID overrides; unlisted aliases keep canonical IDs. */
+          modelIds: Partial<Record<ImageGenerationModelAlias, string>>;
+        };
       };
     };
     web: {

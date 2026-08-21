@@ -21,6 +21,7 @@ import {
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
 import {
   cloneDefaultTelegramSurface,
+  IMAGE_GENERATION_MODEL_ALIASES,
   MODEL_REASONING_EFFORTS,
   TELEGRAM_SURFACE_DEFAULTS,
 } from "./types";
@@ -423,6 +424,24 @@ const webConfigSchemaV2 = z
     },
   });
 
+const imageGenerationAliasSchema = z.enum(IMAGE_GENERATION_MODEL_ALIASES, {
+  error: `Unknown generate.image alias. Valid aliases: ${IMAGE_GENERATION_MODEL_ALIASES.join(", ")}.`,
+});
+
+const generateImageOpenAICompatibleSchema = z
+  .object({
+    models: z.array(imageGenerationAliasSchema).min(1).optional(),
+    modelIds: z
+      .partialRecord(imageGenerationAliasSchema, z.string().trim().min(1), {
+        error: (issue) =>
+          issue.code === "invalid_key"
+            ? `Unknown generate.image alias in modelIds. Valid aliases: ${IMAGE_GENERATION_MODEL_ALIASES.join(", ")}.`
+            : undefined,
+      })
+      .default({}),
+  })
+  .default({ modelIds: {} });
+
 const toolsSchema = z
   .object({
     fsBackend: z.enum(["fff", "node-rg"]).default("fff"),
@@ -431,10 +450,11 @@ const toolsSchema = z
         image: z
           .object({
             provider: z.enum(["default", "openai-compatible"]).default("default"),
+            openaiCompatible: generateImageOpenAICompatibleSchema,
           })
-          .default({ provider: "default" }),
+          .default({ provider: "default", openaiCompatible: { modelIds: {} } }),
       })
-      .default({ image: { provider: "default" } }),
+      .default({ image: { provider: "default", openaiCompatible: { modelIds: {} } } }),
     web: webConfigSchemaV2,
     inspect: z
       .object({
@@ -492,6 +512,7 @@ const toolsSchema = z
     generate: {
       image: {
         provider: "default",
+        openaiCompatible: { modelIds: {} },
       },
     },
     web: {
