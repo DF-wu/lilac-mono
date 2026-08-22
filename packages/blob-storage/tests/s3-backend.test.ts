@@ -37,6 +37,7 @@ function failure<T, E>(result: Result<T, E>): E {
 class FakeS3Client {
   readonly values = new Map<string, Uint8Array>();
   readonly writes: Array<{ readonly key: string; readonly acl?: string }> = [];
+  readonly fetches: Array<{ readonly key: string; readonly method: string }> = [];
   failExists?: Error;
   ambiguousContentWrite = false;
   ambiguousKeyIncludes?: string;
@@ -60,8 +61,14 @@ class FakeS3Client {
   readonly fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = input instanceof Request ? input.url : input.toString();
     const key = decodeURIComponent(new URL(url).pathname.slice(1));
-    const bytes = new Uint8Array(await new Response(init?.body).arrayBuffer());
-    const text = new TextDecoder().decode(bytes);
+    const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+    this.fetches.push({ key, method });
+    if (method === "GET") {
+      const value = this.values.get(key);
+      return value === undefined
+        ? new Response(null, { status: 404 })
+        : new Response(value.slice(), { status: 200 });
+    }
     if (
       this.failKeyIncludesBeforeWrite !== undefined &&
       key.includes(this.failKeyIncludesBeforeWrite)
@@ -69,6 +76,23 @@ class FakeS3Client {
       this.failKeyIncludesBeforeWrite = undefined;
       throw new Error("controlled conditional write failed before commit");
     }
+    const copySource = new Headers(init?.headers).get("x-amz-copy-source");
+    if (method === "PUT" && copySource !== null) {
+      const sourcePath = decodeURIComponent(copySource).replace(/^\//u, "");
+      const sourceKey = sourcePath.slice(sourcePath.indexOf("/") + 1);
+      const source = this.values.get(sourceKey);
+      if (source === undefined) return new Response(null, { status: 404 });
+      this.notifyContentCopy?.();
+      if (this.blockContentCopy !== undefined) await this.blockContentCopy;
+      this.values.set(key, source.slice());
+      if (this.ambiguousContentWrite) {
+        this.ambiguousContentWrite = false;
+        throw new Error("connection closed after copy response was lost");
+      }
+      return new Response("<CopyObjectResult />", { status: 200 });
+    }
+    const bytes = new Uint8Array(await new Response(init?.body).arrayBuffer());
+    const text = new TextDecoder().decode(bytes);
     if (new Headers(init?.headers).get("if-none-match") === "*" && this.values.has(key)) {
       return new Response(null, { status: 412 });
     }
@@ -160,7 +184,7 @@ class FakeS3Client {
     ) {
       await this.blockReservationWrite;
     }
-    if (key.includes("/content/")) {
+    if (key.includes("/content/") && !key.endsWith(".json")) {
       this.notifyContentCopy?.();
       if (this.blockContentCopy !== undefined) await this.blockContentCopy;
     }

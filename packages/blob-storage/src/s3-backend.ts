@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 
 import { Result, type Result as ResultType } from "better-result";
 
@@ -36,9 +36,19 @@ export class S3BlobBackend implements BlobBackend {
   readonly #client: Bun.S3Client;
   readonly #fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
   readonly #prefix: string;
+  readonly #bucket: string;
+  readonly #region: string;
+  readonly #accessKeyId: string;
+  readonly #secretAccessKey: string;
+  readonly #sessionToken?: string;
 
   constructor(options: S3BackendOptions) {
     this.#prefix = normalizePrefix(options.prefix);
+    this.#bucket = options.bucket;
+    this.#region = options.region ?? "us-east-1";
+    this.#accessKeyId = options.accessKeyId;
+    this.#secretAccessKey = options.secretAccessKey;
+    this.#sessionToken = options.sessionToken;
     const clientOptions: Bun.S3Options = {
       bucket: options.bucket,
       endpoint: options.endpoint,
@@ -112,31 +122,11 @@ export class S3BlobBackend implements BlobBackend {
   }
 
   async readReservation(objectId: string): Promise<ResultType<string | null, BlobAdapterFailure>> {
-    for (const reservationPath of [
-      reservationFenceKey(objectId),
-      reservationTransitionKey(objectId),
-      reservationKey(objectId),
-    ]) {
-      const key = this.#key(reservationPath);
-      const read = await captureAdapterOperation({
-        adapter: this.kind,
-        operation: "read upload reservation",
-        run: async () => {
-          if (!(await this.#client.exists(key))) return null;
-          return this.#client.file(key).text();
-        },
-      });
-      const outcome = read.match<
-        | { readonly kind: "value"; readonly value: string | null }
-        | { readonly kind: "failure"; readonly failure: BlobAdapterFailure }
-      >({
-        ok: (value) => ({ kind: "value", value }),
-        err: (failure) => ({ kind: "failure", failure }),
-      });
-      if (outcome.kind === "failure") return Result.err(outcome.failure);
-      if (outcome.value !== null) return Result.ok(outcome.value);
-    }
-    return Result.ok(null);
+    const read = await this.#readTextObjects(
+      [reservationFenceKey(objectId), reservationTransitionKey(objectId), reservationKey(objectId)],
+      "read upload reservation",
+    );
+    return read.map((values) => values.find((value) => value !== null) ?? null);
   }
 
   async compareAndSwapReservation(
@@ -170,9 +160,7 @@ export class S3BlobBackend implements BlobBackend {
       err: (failure) => ({ kind: "failure", failure }),
     });
     if (publishState.kind === "failure") return Result.err(publishState.failure);
-    if (!publishState.published) return Result.ok(false);
-    const effective = await this.readReservation(objectId);
-    return effective.map((value) => value === serialized);
+    return Result.ok(publishState.published);
   }
 
   async openSink(
@@ -248,9 +236,7 @@ export class S3BlobBackend implements BlobBackend {
       adapter: this.kind,
       operation: "commit upload content",
       run: async () => {
-        await this.#client.write(destination, this.#client.file(temporary), {
-          acl: "private",
-        });
+        await this.#copyObject(temporary, destination);
       },
     });
     const metadataOperation = captureAdapterOperation({
@@ -425,6 +411,91 @@ export class S3BlobBackend implements BlobBackend {
     });
   }
 
+  async #readTextObjects(
+    keys: readonly string[],
+    operation: string,
+  ): Promise<ResultType<readonly (string | null)[], BlobAdapterFailure>> {
+    return captureAdapterOperation({
+      adapter: this.kind,
+      operation,
+      run: async () =>
+        Promise.all(
+          keys.map(async (key) => {
+            const response = await this.#fetch(
+              this.#client.presign(this.#key(key), {
+                method: "GET",
+                expiresIn: 60,
+              }),
+            );
+            if (response.status === 404) return null;
+            if (!response.ok) signalBlobAdapterFailure(`S3 request returned ${response.status}`);
+            return response.text();
+          }),
+        ),
+    });
+  }
+
+  async #copyObject(sourceKey: string, destinationKey: string): Promise<void> {
+    const destination = new URL(
+      this.#client.presign(destinationKey, {
+        method: "PUT",
+        expiresIn: 60,
+        acl: "private",
+      }),
+    );
+    destination.search = "";
+    const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/gu, "");
+    const date = amzDate.slice(0, 8);
+    const payloadHash = createHash("sha256").update("").digest("hex");
+    const copySource = `/${encodeS3Path(this.#bucket)}/${encodeS3Path(sourceKey)}`;
+    const signedHeaders = new Map<string, string>([
+      ["host", destination.host],
+      ["x-amz-acl", "private"],
+      ["x-amz-content-sha256", payloadHash],
+      ["x-amz-copy-source", copySource],
+      ["x-amz-date", amzDate],
+      ...(this.#sessionToken === undefined
+        ? []
+        : ([["x-amz-security-token", this.#sessionToken]] as const)),
+    ]);
+    const canonicalHeaderNames = [...signedHeaders.keys()].sort();
+    const canonicalHeaders = canonicalHeaderNames
+      .map((name) => `${name}:${signedHeaders.get(name)?.trim()}\n`)
+      .join("");
+    const signedHeaderNames = canonicalHeaderNames.join(";");
+    const canonicalRequest = [
+      "PUT",
+      destination.pathname,
+      "",
+      canonicalHeaders,
+      signedHeaderNames,
+      payloadHash,
+    ].join("\n");
+    const scope = `${date}/${this.#region}/s3/aws4_request`;
+    const stringToSign = [
+      "AWS4-HMAC-SHA256",
+      amzDate,
+      scope,
+      createHash("sha256").update(canonicalRequest).digest("hex"),
+    ].join("\n");
+    const dateKey = hmacSha256(`AWS4${this.#secretAccessKey}`, date);
+    const regionKey = hmacSha256(dateKey, this.#region);
+    const serviceKey = hmacSha256(regionKey, "s3");
+    const signingKey = hmacSha256(serviceKey, "aws4_request");
+    const signature = createHmac("sha256", signingKey).update(stringToSign).digest("hex");
+    const response = await this.#fetch(destination, {
+      method: "PUT",
+      headers: {
+        authorization: `AWS4-HMAC-SHA256 Credential=${this.#accessKeyId}/${scope}, SignedHeaders=${signedHeaderNames}, Signature=${signature}`,
+        ...Object.fromEntries([...signedHeaders].filter(([name]) => name !== "host")),
+      },
+    });
+    const responseText = await response.text();
+    if (!response.ok || responseText.includes("<Error>")) {
+      signalBlobAdapterFailure(`S3 copy request returned ${response.status}`);
+    }
+  }
+
   async #writeTextExclusive(
     key: string,
     serialized: string,
@@ -456,7 +527,11 @@ export class S3BlobBackend implements BlobBackend {
       },
     });
     const state = written.match<
-      | { readonly kind: "response"; readonly ok: boolean; readonly status: number }
+      | {
+          readonly kind: "response";
+          readonly ok: boolean;
+          readonly status: number;
+        }
       | { readonly kind: "failure"; readonly failure: BlobAdapterFailure }
     >({
       ok: (response) => ({ kind: "response", ...response }),
@@ -515,4 +590,19 @@ export class S3BlobBackend implements BlobBackend {
 
 function normalizePrefix(prefix: string | undefined): string {
   return (prefix ?? "").replace(/^\/+|\/+$/gu, "");
+}
+
+function encodeS3Path(value: string): string {
+  return value
+    .split("/")
+    .map((segment) => encodeURIComponent(segment).replace(/[!'()*]/gu, percentEncodeCharacter))
+    .join("/");
+}
+
+function percentEncodeCharacter(character: string): string {
+  return `%${character.charCodeAt(0).toString(16).toUpperCase()}`;
+}
+
+function hmacSha256(key: string | Uint8Array, value: string): Uint8Array {
+  return createHmac("sha256", key).update(value).digest();
 }
