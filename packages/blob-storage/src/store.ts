@@ -994,18 +994,7 @@ export class SupervisedBlobStore implements BlobStore {
     }
 
     return this.#withObjectLock(active.reservation.objectId, async () => {
-      const observed = await this.#readReservation(active.reservation.objectId);
-      const current = observed.match<Reservation | null>({
-        ok: (value) => value,
-        err: () => null,
-      });
-      if (
-        current === null ||
-        current.state !== "pending" ||
-        current.generation !== active.reservation.generation ||
-        active.phase === "interrupted" ||
-        active.phase === "deleted"
-      ) {
+      if (active.phase === "interrupted" || active.phase === "deleted") {
         await this.#backend.deleteKeys([
           temporaryKey(active.reservation.objectId, active.reservation.generation),
         ]);
@@ -1067,19 +1056,8 @@ export class SupervisedBlobStore implements BlobStore {
               }),
             );
       }
-      const afterCommit = await this.#readReservation(active.reservation.objectId);
-      const currentAfterCommit = afterCommit.match<Reservation | null>({
-        ok: (value) => value,
-        err: () => null,
-      });
       const afterCommitPhase = this.#uploadPhase(active);
-      if (
-        currentAfterCommit === null ||
-        currentAfterCommit.state !== "pending" ||
-        currentAfterCommit.generation !== active.reservation.generation ||
-        afterCommitPhase === "interrupted" ||
-        afterCommitPhase === "deleted"
-      ) {
+      if (afterCommitPhase === "interrupted" || afterCommitPhase === "deleted") {
         await this.#backend.deleteKeys([contentKey, metadataKey(contentKey)]);
         return Result.err(
           afterCommitPhase === "interrupted"
@@ -1102,7 +1080,7 @@ export class SupervisedBlobStore implements BlobStore {
       };
       const publication = this.#backend.compareAndSwapReservation(
         active.reservation.objectId,
-        serializeReservation(currentAfterCommit),
+        serializeReservation(active.reservation),
         serializeReservation(ready),
       );
       active.readyPublication = publication;

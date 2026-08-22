@@ -511,6 +511,48 @@ test("S3 shutdown fence wins over a controlled late content copy", async () => {
   expect(failure(resolved)._tag).toBe("BlobUploadInterrupted");
 });
 
+test("S3 cross-process fence wins while content commit is in flight", async () => {
+  const client = new FakeS3Client();
+  let releaseCopy: (() => void) | undefined;
+  client.blockContentCopy = new Promise<void>((resolve) => {
+    releaseCopy = resolve;
+  });
+  let announceCopy: (() => void) | undefined;
+  const copyStarted = new Promise<void>((resolve) => {
+    announceCopy = resolve;
+  });
+  client.notifyContentCopy = announceCopy;
+  const producerBackend = backend(client);
+  const fencingBackend = backend(client);
+  success(await producerBackend.initialize({ createIfMissing: true }));
+  const store = new SupervisedBlobStore(producerBackend);
+  const started = success(
+    await store.startUpload({
+      source: new TextEncoder().encode("cross-process fence"),
+      retention: { kind: "durable" },
+    }),
+  );
+  await copyStarted;
+
+  const pending = success(await fencingBackend.readReservation(started.handle.objectId));
+  expect(pending).not.toBeNull();
+  const interrupted = `${JSON.stringify({ ...JSON.parse(pending ?? "{}"), state: "interrupted" })}\n`;
+  expect(
+    success(
+      await fencingBackend.compareAndSwapReservation(
+        started.handle.objectId,
+        pending ?? "",
+        interrupted,
+      ),
+    ),
+  ).toBe(true);
+
+  releaseCopy?.();
+  expect(failure(await started.completion)._tag).toBe("BlobUploadFailed");
+  expect(success(await fencingBackend.readReservation(started.handle.objectId))).toBe(interrupted);
+  expect([...client.values.keys()].some((key) => key.includes("/content/"))).toBe(false);
+});
+
 test("S3 close starts multipart abort while its interruption fence is blocked", async () => {
   const client = new FakeS3Client();
   let announceWrite: (() => void) | undefined;

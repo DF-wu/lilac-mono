@@ -243,7 +243,8 @@ export class S3BlobBackend implements BlobBackend {
   ): Promise<ResultType<void, BlobAdapterFailure>> {
     const temporary = this.#key(temporaryKey(objectId, generation));
     const destination = this.#key(contentKey);
-    const copied = await captureAdapterOperation({
+    const metadataPath = this.#key(metadataKey(contentKey));
+    const copiedOperation = captureAdapterOperation({
       adapter: this.kind,
       operation: "commit upload content",
       run: async () => {
@@ -252,6 +253,17 @@ export class S3BlobBackend implements BlobBackend {
         });
       },
     });
+    const metadataOperation = captureAdapterOperation({
+      adapter: this.kind,
+      operation: "commit upload metadata",
+      run: async () => {
+        await this.#client.write(metadataPath, metadata, {
+          acl: "private",
+          type: "application/json",
+        });
+      },
+    });
+    const [copied, metadataWritten] = await Promise.all([copiedOperation, metadataOperation]);
     const copyState = copied.match<
       | { readonly complete: true }
       | { readonly complete: false; readonly failure: BlobAdapterFailure }
@@ -268,17 +280,6 @@ export class S3BlobBackend implements BlobBackend {
       if (!recovered) return Result.err(copyState.failure);
     }
 
-    const metadataPath = this.#key(metadataKey(contentKey));
-    const metadataWritten = await captureAdapterOperation({
-      adapter: this.kind,
-      operation: "commit upload metadata",
-      run: async () => {
-        await this.#client.write(metadataPath, metadata, {
-          acl: "private",
-          type: "application/json",
-        });
-      },
-    });
     const metadataState = metadataWritten.match<
       | { readonly complete: true }
       | { readonly complete: false; readonly failure: BlobAdapterFailure }
