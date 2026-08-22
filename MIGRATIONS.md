@@ -36,6 +36,53 @@ Existing rows retain an unknown attachment fingerprint and are not backfilled. N
 messages record known empty or populated attachment state; attachment bytes and signed Discord CDN URLs
 are not persisted.
 
+## Core Unified Blob Storage Clean Break
+
+Core now stores managed opaque bytes through `packages/blob-storage`. Current Redis messages and Core
+databases carry versioned `BlobHandleV1` or `BlobRefV1` values, not `dataBase64`, data URLs, SQLite byte
+columns, or private domain-owned content paths. Local and S3-compatible adapters share the same
+adapter-neutral references. Tool-result encryption and domain retention metadata remain owned by their
+domains.
+
+This transition is offline and fail-closed. Runtime startup does not read or rewrite legacy blob state.
+Before starting the new runtime, stop Core, back up its data, and run:
+
+```sh
+bun run migrate:blob-storage -- --config /path/to/core-config.yaml --data-dir /path/to/data
+```
+
+If Core sets `SQLITE_URL`, run the migration with the same environment value. The command resolves
+`SQLITE_URL` from its working directory exactly as Core does. Without `SQLITE_URL`, it migrates
+`<data-dir>/data.sqlite3`.
+
+Use `--dry-run` for a read-only preflight. The normal command preflights and then applies in one
+invocation. It accepts only supported legacy schemas, verifies every copied object's SHA-256 and byte
+length, rewrites each database only after its required objects exist, and removes replaced legacy byte
+columns and files. Transcript schema 6 and workflow schema 26 are the current reference-bearing schemas;
+legacy or partially migrated versions stop startup with the migration command.
+
+The migration copies durable transcript, projection, lineage, and workflow artifact content. It discards
+rebuildable Discord downloads, Anthropic fallback media, and legacy tool-result artifacts. It does not
+translate queued Redis requests, output events, pending entries, consumer groups, or dead-letter
+payloads. Drain accepted work before cutover when it must finish. Export any required legacy Redis
+evidence, then remove the inert old versioned namespaces separately.
+
+The operator-approved graceful-restart exception is narrower and explicit. The offline command discards
+one exact, valid snapshot v1, v2, v3, or v4 instead of preserving it. Graceful snapshots contain live
+process recovery state whose inline provider bytes have no safe owner after the singleton row is consumed;
+adding another durable ownership subsystem is outside this clean break. Stop and drain Core before cutover.
+`--dry-run` reports the planned graceful snapshot discard without deleting it. Malformed rows, corrupt v5
+rows, future versions, and drifted table layouts remain blockers and are never classified for discard.
+
+The operation is transactional per database, not across the object store and every database. If apply
+fails after mutation starts, keep Core stopped, restore the operator backup, and rerun. Do not point Core
+at a partially copied local root, bucket, or prefix. Whole-store local-to-S3 or S3-to-local moves are also
+offline: preserve object IDs, verify all durable references at the destination, then switch configuration.
+
+Configuration remains version 2. An omitted `blobStorage` field, including the universal projection of a
+frozen v1 config, selects the local default under `DATA_DIR`. Only v2 can set a local root or select S3.
+S3 credentials are names of environment variables in config; literal credentials are invalid.
+
 ## Redis Managed Event Delivery V2
 
 Durable event-bus subscriptions use new transport-owned physical consumer-group names and create missing
@@ -44,8 +91,8 @@ replayed or migrated. They remain in Redis until an operator deliberately remove
 the v2 runtime never treats them as managed work.
 
 The v2 delivery path stores lease, attempt, retry, and terminalization metadata in a separate versioned
-Redis namespace. Existing v1 dead-letter records remain under their old keys and are not readable through
-the v2 record codec. New encrypted records use the `:v2:` dead-letter namespace and are finalized
+Redis namespace. Existing v1 and v2 dead-letter records remain under their old keys and are not readable
+through the v3 record codec. New encrypted records use the `:v3:` dead-letter namespace and are finalized
 atomically with source acknowledgement. Deployments that need old event or dead-letter evidence must
 export it before switching versions.
 
@@ -208,23 +255,14 @@ surface projections, total Core-owned blob bytes, and unreferenced blob counts/b
 pruning emits per-owner metadata-pruned diagnostics. These are internal retention/operational
 diagnostics and do not add a `core-config.yaml` key; the config contract remains `configVersion: 2`.
 
-## Graceful Restart Snapshot v4
+## Graceful Restart Snapshot v5
 
-Graceful restart snapshot v4 adds the optional non-empty `currentTurnUserId` to active and queued
-agent recovery entries. Persisted snapshots v1, v2, and v3 remain readable and are normalized to v4
-in memory; reads do not rewrite the SQLite row.
-
-- v1 and v2 relay entries default a missing `requestClient` to their relay `platform`; an explicit
-  disagreement is corrupt. Agent entries receive synthetic per-entry queue IDs, no queue-attempt
-  records, `currentTurnUserId: undefined`, and restricted recovery identity because those versions
-  persisted no durable proof. Their queue-attempt proof is `legacy-ambiguous` when any queued entry
-  exists and `complete` for active-only snapshots.
-- v3 preserves its complete queue-attempt proof, queue attempts, relay correlation, and durable
-  recovery identity. It receives only `currentTurnUserId: undefined`; the value is not inferred from
-  the original authenticated initiator.
-- v4 requires its current strict shape, including a non-empty value when `currentTurnUserId` is
-  present. Unsupported versions and malformed or correlation-invalid snapshots fail the persisted
-  boundary instead of being guessed or partially restored.
+Graceful restart snapshot v5 persists only strict `StoredMessageV1` messages and
+`CorePrimaryLineageV2`. Its opaque `raw` state may retain SuperJSON values such as maps, sets, dates,
+URLs, regular expressions, and bigints, but it rejects `Uint8Array`, `ArrayBuffer`, and other array-buffer
+views at any depth. The runtime reads only valid v5 rows. A v1, v2, v3, or v4 row stops startup with the
+single offline blob-migration command; the command's exact legacy codecs validate and discard that row.
+Malformed, future, corrupt-current, or correlation-invalid snapshots fail closed and remain on disk.
 
 ## Historical Workflow Schema 18
 

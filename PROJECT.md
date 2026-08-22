@@ -71,6 +71,8 @@ The fail-closed workspace inventory is `ACTIVE_WORKSPACES` in `scripts/architect
 
 - `packages/agent`: provider-neutral AI SDK agent loop, steering/follow-up/interrupt queues, atomic tool execution, compaction hooks, retries, and cross-provider history projection.
 - `packages/bash-safety`: static Bash analysis and accidental-damage policy. It is a guardrail, not isolation.
+- `packages/blob-storage`: the adapter-neutral Core managed-blob seam, strict handle/reference codecs,
+  supervised uploads, verified reads, expiry, maintenance, and local and S3-compatible adapters.
 - `packages/claude-code-bridge`: Claude runtime integration, in-process MCP tool bridge, native attempt ownership, and continuation metadata.
 - `packages/coding-tools`: shared coding-tool schemas and implementations, patch/edit behavior, batching, instruction discovery, and tool guardrails.
 - `packages/event-bus`: event catalog, codecs, typed bus, delivery policy, dead letters, and Redis Streams transport.
@@ -105,6 +107,11 @@ The typed API wraps Redis Streams and decodes complete `Message<unknown>` envelo
 - `tail` is a non-durable read without a consumer group and may start at the beginning, now, or a cursor.
 
 Every subscription handler returns `Result<void, TaggedError>` and supplies an explicit delivery policy. Success commits. A managed durable error policy may choose `commit`, `retry`, `park-pending`, `dead-letter`, or `stop`; tail does not retry. `retry` uses the package-owned lease, attempt, and capped-backoff policy. `park-pending` leaves durable work in the Redis pending-entry list and is excluded from automatic reclamation. Contract-invalid transport or event data is dead-lettered by the package policy. Throws, malformed Results, and Panics are defects handled by the registered fatal boundary, not ordinary handler failures. Manual fetch decodes the complete batch and fails on the first invalid entry rather than exposing it as typed data.
+
+Core request publication acquires a finite Redis fencing claim before its final durable-state reread.
+Only the exact live token can create or observe the `requestDeliveryId` to stream-ID marker. After Core
+records that stream ID, one Redis operation confirms the exact marker and removes it with the claim. An
+expired or superseded producer token cannot append a request.
 
 Durable consumers need stable `subscriptionId` values. The transport maps them to versioned physical groups created at the current stream end, leases each invocation, heartbeats live attempts, and reclaims expired attempts with token fencing. Delivery is at-least-once: handlers that perform external effects own their idempotency. The fixed policy allows five attempts before Redis-only dead-letter exhaustion. Managed dead-letter persistence, source acknowledgement, and delivery-metadata cleanup are atomic; ordinary commit atomically acknowledges and removes metadata. `consumerId` identifies one process within a group, and the Redis stream entry ID is the cursor/checkpoint. Tail delivery retains its cursor behavior and no lease.
 
@@ -166,6 +173,20 @@ Workflow SQLite state is authoritative for execution and recovery. Do not reintr
 - SQLite state for Discord cache/search and conversation threads, discovery, agent transcripts and continuation bindings, workflows, and graceful-restart snapshots. The workflow database path may be selected separately by `SQLITE_URL`.
 - Transient or rebuildable artifacts and caches, including bounded tool-result artifacts and filesystem-search caches.
 
+Core-managed opaque bytes live behind `packages/blob-storage`. Domain databases, Redis messages, and
+dead-letter evidence keep only `BlobHandleV1` or `BlobRefV1` plus domain metadata. One configured local
+or S3-compatible adapter owns byte integrity, exact logical expiry, physical cleanup, and pending-upload
+fences. References do not reveal the adapter, path, bucket, endpoint, or credentials. Domains retain
+ownership, quota, encryption, and deletion policy; the blob module has no cross-domain reference table.
+At runtime, only the Core composition root constructs and closes the store. The offline migration task
+owns and closes its separate store. Providers and surfaces open references through registered
+materialization modules immediately before use.
+
+Graceful-restart persistence accepts only snapshot v5 with strict stored-message blob references and
+byte-free opaque raw state. Runtime startup never translates legacy snapshots. The single offline blob
+migration command validates and discards one exact v1-v4 graceful snapshot as the operator-approved
+preservation exception; malformed, future, or corrupt-current rows remain blocking evidence.
+
 Redis Streams is separate durable bus state. Project workflow source lives in each project's `.lilac/workflows`, outside `DATA_DIR`. The workspace operated on by tools is user data, not Lilac metadata.
 
 ### Mini Lilac
@@ -224,4 +245,6 @@ These invariants matter more than a fragile numbered list. Update this section o
 - ACP harness behavior or controller persistence: `apps/acp-controller`.
 - Core config/model/provider/prompt behavior: `packages/utils`; config version changes also require
   `docs/core-config-migrations.md`.
+- Core managed opaque bytes, adapter behavior, handle/reference codecs, integrity, or expiry:
+  `packages/blob-storage`; domain retention and ownership stay with the consuming Core module.
 - Architecture boundary registration or a new workspace: `scripts/architecture/manifest.ts` and its focused tests; read `scripts/architecture/README.md` first.
