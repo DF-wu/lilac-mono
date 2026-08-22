@@ -23,12 +23,22 @@ function cacheIndexPath(cacheDir: string, url: URL): string {
   return path.join(cacheDir, `${key}.json`);
 }
 
-function createOversizePortablePixmap(): Uint8Array {
+function createOversizeBitmap(): Uint8Array {
   const edge = 1_323;
-  const header = new TextEncoder().encode(`P6\n${edge} ${edge}\n255\n`);
-  const image = new Uint8Array(header.byteLength + edge * edge * 3);
-  image.set(header);
-  image.fill(255, header.byteLength);
+  const pixelOffset = 54;
+  const rowStride = (edge * 3 + 3) & ~3;
+  const image = new Uint8Array(pixelOffset + rowStride * edge);
+  const header = new DataView(image.buffer);
+  image.set([0x42, 0x4d]);
+  header.setUint32(2, image.byteLength, true);
+  header.setUint32(10, pixelOffset, true);
+  header.setUint32(14, 40, true);
+  header.setInt32(18, edge, true);
+  header.setInt32(22, edge, true);
+  header.setUint16(26, 1, true);
+  header.setUint16(28, 24, true);
+  header.setUint32(34, rowStride * edge, true);
+  image.fill(255, pixelOffset);
   return image;
 }
 
@@ -116,12 +126,12 @@ describe("Anthropic fallback blob cache", () => {
 
   it("streams oversized image resizing without leaving source or output payload files", async () => {
     const cacheDir = await mkdtemp(path.join(tmpdir(), "lilac-fallback-resize-"));
-    const url = new URL("https://example.com/oversized.ppm?test=streamed-resize");
-    const source = createOversizePortablePixmap();
+    const url = new URL("https://example.com/oversized.bmp?test=streamed-resize");
+    const source = createOversizeBitmap();
     const download = buildDownload({
       blobStore,
       cacheDir,
-      downloadUrl: async () => ({ data: source, mediaType: "image/x-portable-pixmap" }),
+      downloadUrl: async () => ({ data: source, mediaType: "image/bmp" }),
     });
 
     try {

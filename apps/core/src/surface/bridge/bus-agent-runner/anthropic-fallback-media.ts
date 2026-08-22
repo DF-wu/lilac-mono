@@ -172,89 +172,30 @@ function formatAnthropicFallbackImageTooLargeError(params: {
   return `Image attachment too large for Anthropic fallback uploads (${params.byteLength} bytes > ${ANTHROPIC_FALLBACK_IMAGE_MAX_BYTES} byte limit): ${params.url.toString()}. Send a smaller image, or pin routing to a provider that supports image URLs.`;
 }
 
-async function runImageResizeCommand(params: {
-  cmd: string[];
-  data: Uint8Array;
-}): Promise<{ bytes?: Uint8Array; error?: string }> {
-  {
-    const attempt = await Result.tryPromise({
-      try: async () => {
-        const proc = Bun.spawn(params.cmd, {
-          stdin: params.data,
-          stdout: "pipe",
-          stderr: "pipe",
-        });
-
-        const [stdout, stderr, code] = await Promise.all([
-          new Response(proc.stdout).arrayBuffer(),
-          new Response(proc.stderr).text(),
-          proc.exited,
-        ]);
-        return { bytes: new Uint8Array(stdout), code, stderr };
-      },
-      catch: captureError,
-    });
-
-    if (attempt.isErr()) {
-      const error = attempt.error.cause;
-      const message = opaqueErrorMessage(error, "Unknown media conversion failure");
-      return { error: message };
-    }
-    if (attempt.value.code !== 0) {
-      return { error: attempt.value.stderr.trim() || "image resize command failed" };
-    }
-    return { bytes: attempt.value.bytes };
-  }
-}
-
-function buildImageResizeCommands(params: { resize: string; quality: number }): string[][] {
-  const commonArgs = [
-    "-",
-    "-auto-orient",
-    "-strip",
-    "-background",
-    "white",
-    "-alpha",
-    "remove",
-    "-alpha",
-    "off",
-    "-resize",
-    params.resize,
-    "-sampling-factor",
-    "4:2:0",
-    "-quality",
-    String(params.quality),
-    "jpeg:-",
-  ];
-
-  return [
-    ["magick", ...commonArgs],
-    ["convert", ...commonArgs],
-  ];
-}
-
 async function renderAnthropicFallbackImageCandidate(params: {
   data: Uint8Array;
   width: number;
   quality: number;
 }): Promise<{ bytes?: Uint8Array; error?: string }> {
-  const resize = `${params.width}x${params.width}>`;
-  let lastError = "";
+  {
+    const attempt = await Result.tryPromise({
+      try: () =>
+        new Bun.Image(params.data, { autoOrient: true })
+          .resize(params.width, params.width, {
+            fit: "inside",
+            withoutEnlargement: true,
+          })
+          .jpeg({ progressive: false, quality: params.quality })
+          .bytes(),
+      catch: captureError,
+    });
 
-  for (const command of buildImageResizeCommands({
-    resize,
-    quality: params.quality,
-  })) {
-    const result = await runImageResizeCommand({ cmd: command, data: params.data });
-    if (!result.bytes) {
-      lastError = result.error ?? lastError;
-      continue;
+    if (attempt.isErr()) {
+      const message = opaqueErrorMessage(attempt.error.cause, "Unknown media conversion failure");
+      return { error: message };
     }
-
-    return { bytes: result.bytes };
+    return { bytes: attempt.value };
   }
-
-  return { error: lastError || "image resize command failed" };
 }
 
 async function fitImageForAnthropicFallback(params: {
