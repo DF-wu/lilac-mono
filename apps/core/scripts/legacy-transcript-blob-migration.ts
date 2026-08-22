@@ -1423,8 +1423,9 @@ function namedTerminalMatches(input: {
   readonly hash: string;
   readonly messageCount: number;
 }): boolean {
+  // requestClient records the transport that produced the transcript. Named continuation ownership is
+  // the separately published stableNamedRequestClient marker and may intentionally cross transports.
   return (
-    input.transcript.requestClient === input.requestClient &&
     input.transcript.sessionId === input.sessionId &&
     input.transcript.stableNamedRequestClient === input.requestClient &&
     input.transcript.providerState?.lastFamily === "claude-code" &&

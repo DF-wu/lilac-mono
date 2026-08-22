@@ -326,6 +326,58 @@ describe("legacy transcript blob migration", () => {
     });
   });
 
+  it("accepts a named continuation published from a different transport client", async () => {
+    const dbPath = await schema5Fixture();
+    using database = new Database(dbPath, { strict: true });
+    const transcript = database
+      .query<{ transcript_digest: string }, []>(
+        "SELECT transcript_digest FROM request_transcripts WHERE request_id = 'schema-v5'",
+      )
+      .get()!;
+    database.run(
+      `UPDATE request_transcripts
+       SET request_client = 'github', provider_state_json = ?, stable_named_request_client = 'discord'
+       WHERE request_id = 'schema-v5'`,
+      [SuperJSON.stringify({ lastFamily: "claude-code", containsCrossFamilyTurns: false })],
+    );
+    database.run(
+      `INSERT INTO core_named_claude_bindings VALUES
+       (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        "discord",
+        "session-v5",
+        "named-provider",
+        1,
+        "claude-code",
+        "schema-v5",
+        1,
+        transcript.transcript_digest,
+        2,
+        1,
+        "named-scope",
+        "11111111-1111-4111-8111-111111111111",
+        "/named",
+        10.5,
+        100,
+        200,
+        "named-model",
+        "named-reasoning",
+        1,
+        50,
+      ],
+    );
+    database.close();
+
+    const preflight = preflightLegacyTranscriptDb(dbPath).match({
+      ok: (value) => value,
+      err: (error) => {
+        throw error;
+      },
+    });
+
+    expect(preflight.plan.namedClaudeBindings).toHaveLength(1);
+  });
+
   it("preserves and rewrites all schema-5 Claude continuation rows as schema 6", async () => {
     const dbPath = await schema5Fixture();
     const database = new Database(dbPath, { strict: true });
