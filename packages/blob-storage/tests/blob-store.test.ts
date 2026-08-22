@@ -60,6 +60,7 @@ function adapterFailure(operation: string): BlobAdapterFailure {
 }
 
 class ControlledMemoryBackend extends MemoryBlobBackend {
+  reservationReads = 0;
   failReads = false;
   failDeletes = 0;
   failSinkWrite = false;
@@ -83,6 +84,7 @@ class ControlledMemoryBackend extends MemoryBlobBackend {
   }
 
   override async readReservation(objectId: string) {
+    this.reservationReads += 1;
     if (this.failReads) return Result.err(adapterFailure("read reservation"));
     return super.readReservation(objectId);
   }
@@ -208,6 +210,27 @@ describe("blob storage contract", () => {
     controlled.close();
     const localRef = success(await started.completion);
     expect(success(await resolving)).toEqual(localRef);
+  });
+
+  test("the producing store resolves its active upload without polling the backend", async () => {
+    const backend = new ControlledMemoryBackend();
+    const store = new SupervisedBlobStore(backend);
+    const controlled = controlledStream();
+    const started = success(
+      await store.startUpload({
+        source: controlled.stream,
+        retention: { kind: "durable" },
+      }),
+    );
+    backend.reservationReads = 0;
+    const resolving = store.resolve(started.handle, { timeoutMs: 1_000 });
+    await Promise.resolve();
+    expect(backend.reservationReads).toBe(0);
+
+    controlled.enqueue(new Uint8Array([1, 2, 3]));
+    controlled.close();
+    const ref = success(await started.completion);
+    expect(success(await resolving)).toEqual(ref);
   });
 
   test("delete fences a pending upload and is idempotent", async () => {

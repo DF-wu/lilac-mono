@@ -362,6 +362,50 @@ export class SupervisedBlobStore implements BlobStore {
       );
     }
     const deadline = Date.now() + options.timeoutMs;
+    const localUpload = this.#active.get(handle.objectId);
+    if (localUpload !== undefined) {
+      const remaining = Math.max(0, deadline - Date.now());
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      const localDeadline = new Promise<{ readonly kind: "deadline" }>((resolve) => {
+        deadlineTimer = setTimeout(() => resolve({ kind: "deadline" }), remaining);
+        deadlineTimer.unref?.();
+      });
+      const localSettlement = await Promise.race([
+        localUpload.completion.promise.then((result) => ({ kind: "settled" as const, result })),
+        localDeadline,
+      ]).finally(() => clearTimeout(deadlineTimer));
+      if (localSettlement.kind === "deadline") {
+        return Result.err(
+          new BlobResolveTimeout({
+            objectId: handle.objectId,
+            timeoutMs: options.timeoutMs,
+            message: `Timed out resolving blob upload ${handle.objectId}`,
+          }),
+        );
+      }
+      return localSettlement.result.match<ResultType<BlobRefV1, BlobResolveError>>({
+        ok: (ref) => Result.ok(ref),
+        err: (error) => {
+          if (localUpload.phase === "deleted") {
+            return Result.err(
+              new BlobObjectAbsent({
+                objectId: handle.objectId,
+                message: `Blob ${handle.objectId} is absent`,
+              }),
+            );
+          }
+          return Result.err(
+            error instanceof BlobUploadFailed || error instanceof BlobUploadInterrupted
+              ? error
+              : new BlobUploadFailed({
+                  objectId: handle.objectId,
+                  reason: "write",
+                  message: `Blob upload ${handle.objectId} failed`,
+                }),
+          );
+        },
+      });
+    }
     let delayMs = 5;
     while (true) {
       const observed = await this.#readReservation(handle.objectId);
