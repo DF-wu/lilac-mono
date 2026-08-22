@@ -8,6 +8,7 @@ import {
   type EventDeliveryStopFailed,
   type LilacBus,
 } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { createLogger, env, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
@@ -27,7 +28,7 @@ import type {
   TypingIndicatorSubscription,
 } from "../adapter";
 import { SurfaceOperationUnsupported } from "../adapter";
-import type { MsgRef, MsgRefFor, SessionRef, SurfaceAttachment } from "../types";
+import type { MsgRef, MsgRefFor, SessionRef } from "../types";
 import type {
   RegisteredSurfacePlatform,
   SurfaceIngressAcknowledgementCleanupFailed,
@@ -53,6 +54,10 @@ import type { TranscriptStore } from "../../transcript/transcript-store";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import { adaptToolResultToHost } from "../../tools/tool-result-adapters";
 import { formatBridgeTaggedErrorForLog } from "./bridge-log";
+import {
+  materializeSurfaceOutputAttachment,
+  type SurfaceOutputBlobMaterializationFailed,
+} from "./generated-output-materialization";
 
 class CmdRequestRequiredHeadersMissing extends TaggedError("CmdRequestRequiredHeadersMissing")<{
   readonly message: string;
@@ -167,7 +172,11 @@ class OutReqFinishFailed extends TaggedError("OutReqFinishFailed")<{
   readonly message: string;
 }> {}
 
-type OutReqDeliveryError = OutReqPushFailed | OutReqFinishFailed | RelayEventCorrelationInvalid;
+type OutReqDeliveryError =
+  | OutReqPushFailed
+  | OutReqFinishFailed
+  | SurfaceOutputBlobMaterializationFailed
+  | RelayEventCorrelationInvalid;
 
 type BusToAdapterEffect =
   | "abort-output"
@@ -200,6 +209,7 @@ function applyOutReqDeliveryPolicy(error: OutReqDeliveryError): DeliveryDisposit
   switch (error._tag) {
     case "OutReqPushFailed":
     case "OutReqFinishFailed":
+    case "SurfaceOutputBlobMaterializationFailed":
       return "stop";
     case "RelayEventCorrelationInvalid":
       return "dead-letter";
@@ -426,29 +436,6 @@ function parseRouterSessionMode(raw: string | undefined): "mention" | "active" |
   return undefined;
 }
 
-function decodeBase64ToBytes(base64: string): Uint8Array {
-  // Bun provides Buffer.
-  const buf = Buffer.from(base64, "base64");
-  return new Uint8Array(buf);
-}
-
-function toAttachment(params: {
-  mimeType: string;
-  dataBase64: string;
-  filename?: string;
-}): SurfaceAttachment {
-  const kind: SurfaceAttachment["kind"] = params.mimeType.startsWith("image/") ? "image" : "file";
-
-  const filename = params.filename ?? (kind === "image" ? "image" : "file");
-
-  return {
-    kind,
-    mimeType: params.mimeType,
-    filename,
-    bytes: decodeBase64ToBytes(params.dataBase64),
-  };
-}
-
 const MAX_REASONING_DETAIL_CHARS = 4_000;
 
 function clampReasoningDetail(text: string): string {
@@ -534,6 +521,7 @@ function mergeContinuationText(existing: string, continuation: string): string {
 
 export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(params: {
   adapter: SurfaceAdapter;
+  blobStore: BlobStore;
   bus: LilacBus;
   platform: P;
   policy: SurfaceRelayPolicy<P>;
@@ -1777,9 +1765,26 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
               }
 
               case lilacEventTypes.EvtAgentOutputResponseBinary: {
+                const materialized = await materializeSurfaceOutputAttachment({
+                  blobStore: params.blobStore,
+                  ...outMsg.data,
+                });
+                const materializationError = materialized.match({
+                  ok: () => undefined,
+                  err: (error) => error,
+                });
+                if (materializationError) {
+                  logger.error("failed to materialize generated surface output", {
+                    requestId,
+                    sessionId,
+                    ...formatTaggedErrorForLog(materializationError),
+                  });
+                  processingError = materializationError;
+                  return { status: "return", value: undefined } as const;
+                }
                 part = {
                   type: "attachment.add",
-                  attachment: toAttachment(outMsg.data),
+                  attachment: selectResultValue(materialized).attachment,
                 };
                 break;
               }

@@ -1,6 +1,7 @@
 import { captureError } from "../../shared/error-capture";
 import { Result, TaggedError } from "better-result";
 import { Database } from "bun:sqlite";
+import type { BlobRefV1 } from "@stanley2058/lilac-blob-storage";
 import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import {
   preserveSurfacePanic,
@@ -14,6 +15,9 @@ import {
   hashIndexedDiscordAttachments,
   toIndexedDiscordAttachments,
   type DiscordIndexedAttachmentMeta,
+  type DiscordAttachmentCacheAccess,
+  type DiscordAttachmentCacheEntry,
+  type DiscordAttachmentCacheKey,
 } from "../discord/discord-attachment";
 import { normalizeDiscordRaw } from "../discord/discord-raw-normalizer";
 import type { DiscordMsgRef, DiscordSessionRef, SurfaceMessage, SurfacePlatform } from "../types";
@@ -134,7 +138,55 @@ type RawIndexedAttachmentRow = {
   filename: string | null;
   mime_type: string | null;
   size: number | null;
+  blob_ref_version: number | null;
+  blob_object_id: string | null;
+  blob_sha256: string | null;
+  blob_byte_length: number | null;
+  blob_expires_at: number | null;
+  blob_cached_at: number | null;
 };
+
+function decodeCachedBlobReference(
+  row: RawIndexedAttachmentRow,
+): DiscordAttachmentCacheEntry | null {
+  const fields = [
+    row.blob_ref_version,
+    row.blob_object_id,
+    row.blob_sha256,
+    row.blob_byte_length,
+    row.blob_expires_at,
+    row.blob_cached_at,
+  ];
+  if (fields.every((field) => field === null)) return null;
+  if (typeof row.blob_cached_at !== "number" || !Number.isSafeInteger(row.blob_cached_at))
+    return null;
+  if (row.blob_ref_version !== 1) return null;
+  if (typeof row.blob_object_id !== "string" || !/^b1_[0-9a-f]{32}$/u.test(row.blob_object_id))
+    return null;
+  if (typeof row.blob_sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(row.blob_sha256)) return null;
+  if (
+    typeof row.blob_byte_length !== "number" ||
+    !Number.isSafeInteger(row.blob_byte_length) ||
+    row.blob_byte_length < 0
+  )
+    return null;
+  if (
+    typeof row.blob_expires_at !== "number" ||
+    !Number.isSafeInteger(row.blob_expires_at) ||
+    row.blob_expires_at < 0
+  )
+    return null;
+  return {
+    blob: {
+      version: 1,
+      objectId: row.blob_object_id,
+      sha256: row.blob_sha256,
+      byteLength: row.blob_byte_length,
+      expiresAt: row.blob_expires_at,
+    },
+    cachedAt: row.blob_cached_at,
+  };
+}
 
 function asDiscordSearchIndexedMessage(
   row: RawIndexedRow,
@@ -160,7 +212,12 @@ function asDiscordSearchIndexedMessage(
 export class DiscordSearchStore {
   private readonly db: Database;
 
-  constructor(dbPath: string) {
+  constructor(
+    dbPath: string,
+    private readonly options: {
+      onAttachmentCachePruned?: (blob: BlobRefV1) => void;
+    } = {},
+  ) {
     this.db = new Database(dbPath);
     configureSqliteConnection(this.db);
     this.migrate();
@@ -204,12 +261,35 @@ export class DiscordSearchStore {
         filename TEXT,
         mime_type TEXT,
         size INTEGER,
+        blob_ref_version INTEGER,
+        blob_object_id TEXT,
+        blob_sha256 TEXT,
+        blob_byte_length INTEGER,
+        blob_expires_at INTEGER,
+        blob_cached_at INTEGER,
         PRIMARY KEY (channel_id, message_id, ordinal),
         FOREIGN KEY (channel_id, message_id)
           REFERENCES discord_search_messages(channel_id, message_id)
           ON DELETE CASCADE
       );
     `);
+
+    const attachmentColumns = this.db
+      .query<{ name: string }, []>("PRAGMA table_info(discord_search_message_attachments)")
+      .all();
+    const cacheColumns = [
+      ["blob_ref_version", "INTEGER"],
+      ["blob_object_id", "TEXT"],
+      ["blob_sha256", "TEXT"],
+      ["blob_byte_length", "INTEGER"],
+      ["blob_expires_at", "INTEGER"],
+      ["blob_cached_at", "INTEGER"],
+    ] as const;
+    for (const [name, type] of cacheColumns) {
+      if (!attachmentColumns.some((column) => column.name === name)) {
+        this.db.run(`ALTER TABLE discord_search_message_attachments ADD COLUMN ${name} ${type};`);
+      }
+    }
 
     this.db.run(`
       CREATE INDEX IF NOT EXISTS idx_discord_search_messages_channel_ts
@@ -274,6 +354,7 @@ export class DiscordSearchStore {
   upsertMessages(messages: readonly SurfaceMessage[]): number {
     const now = Date.now();
     let wrote = 0;
+    const prunedCacheBlobs = new Map<string, BlobRefV1>();
 
     const tx = this.db.transaction((input: readonly SurfaceMessage[]) => {
       for (const message of input) {
@@ -282,6 +363,15 @@ export class DiscordSearchStore {
           selectVisibleDiscordAttachments(normalizeDiscordRaw(message.raw)),
         );
         const attachmentsHash = hashIndexedDiscordAttachments(attachments);
+        const existingAttachmentHash = this.db
+          .query<{ attachments_hash: string | null }, [string, string]>(
+            `
+            SELECT attachments_hash
+            FROM discord_search_messages
+            WHERE channel_id = ? AND message_id = ?
+            `,
+          )
+          .get(message.session.channelId, message.ref.messageId)?.attachments_hash;
 
         const result = this.db.run(
           `
@@ -334,7 +424,30 @@ export class DiscordSearchStore {
             attachmentsHash,
           ],
         );
-        if (result.changes > 0) {
+        if (result.changes > 0 && existingAttachmentHash !== attachmentsHash) {
+          const staleAttachmentRows = this.db
+            .query<RawIndexedAttachmentRow, [string, string]>(
+              `
+              SELECT
+                attachment_id,
+                filename,
+                mime_type,
+                size,
+                blob_ref_version,
+                blob_object_id,
+                blob_sha256,
+                blob_byte_length,
+                blob_expires_at,
+                blob_cached_at
+              FROM discord_search_message_attachments
+              WHERE channel_id = ? AND message_id = ?
+              `,
+            )
+            .all(message.session.channelId, message.ref.messageId);
+          for (const row of staleAttachmentRows) {
+            const cached = decodeCachedBlobReference(row);
+            if (cached) prunedCacheBlobs.set(cached.blob.objectId, cached.blob);
+          }
           this.db.run(
             "DELETE FROM discord_search_message_attachments WHERE channel_id = ? AND message_id = ?",
             [message.session.channelId, message.ref.messageId],
@@ -364,6 +477,9 @@ export class DiscordSearchStore {
     });
 
     tx(messages);
+    for (const blob of prunedCacheBlobs.values()) {
+      this.options.onAttachmentCachePruned?.(blob);
+    }
     return wrote;
   }
 
@@ -477,19 +593,128 @@ export class DiscordSearchStore {
     const rows = this.db
       .query<RawIndexedAttachmentRow, [string, string]>(
         `
-        SELECT attachment_id, filename, mime_type, size
+        SELECT
+          attachment_id,
+          filename,
+          mime_type,
+          size,
+          blob_ref_version,
+          blob_object_id,
+          blob_sha256,
+          blob_byte_length,
+          blob_expires_at,
+          blob_cached_at
         FROM discord_search_message_attachments
         WHERE channel_id = ? AND message_id = ?
         ORDER BY ordinal ASC
         `,
       )
       .all(channelId, messageId);
-    return rows.map((row) => ({
-      ...(row.attachment_id ? { id: row.attachment_id } : {}),
-      ...(row.filename ? { filename: row.filename } : {}),
-      ...(row.mime_type ? { mimeType: row.mime_type } : {}),
-      ...(row.size !== null ? { size: row.size } : {}),
-    }));
+    return rows.map((row) => {
+      const cache = decodeCachedBlobReference(row);
+      return {
+        ...(row.attachment_id ? { id: row.attachment_id } : {}),
+        ...(row.filename ? { filename: row.filename } : {}),
+        ...(row.mime_type ? { mimeType: row.mime_type } : {}),
+        ...(row.size !== null ? { size: row.size } : {}),
+        ...(cache ? { cache } : {}),
+      };
+    });
+  }
+
+  getAttachmentCache(input: DiscordAttachmentCacheKey): DiscordAttachmentCacheEntry | null {
+    const row = this.db
+      .query<RawIndexedAttachmentRow, [string, string, number, string | null]>(
+        `
+        SELECT
+          attachment_id,
+          filename,
+          mime_type,
+          size,
+          blob_ref_version,
+          blob_object_id,
+          blob_sha256,
+          blob_byte_length,
+          blob_expires_at,
+          blob_cached_at
+        FROM discord_search_message_attachments
+        WHERE channel_id = ?
+          AND message_id = ?
+          AND ordinal = ?
+          AND attachment_id IS ?
+        `,
+      )
+      .get(input.channelId, input.messageId, input.ordinal, input.attachmentId ?? null);
+    return row ? decodeCachedBlobReference(row) : null;
+  }
+
+  putAttachmentCache(input: DiscordAttachmentCacheKey & DiscordAttachmentCacheEntry): void {
+    this.db.run(
+      `
+      UPDATE discord_search_message_attachments
+      SET blob_ref_version = ?,
+          blob_object_id = ?,
+          blob_sha256 = ?,
+          blob_byte_length = ?,
+          blob_expires_at = ?,
+          blob_cached_at = ?
+      WHERE channel_id = ?
+        AND message_id = ?
+        AND ordinal = ?
+        AND attachment_id IS ?
+      `,
+      [
+        input.blob.version,
+        input.blob.objectId,
+        input.blob.sha256,
+        input.blob.byteLength,
+        input.blob.expiresAt ?? null,
+        input.cachedAt,
+        input.channelId,
+        input.messageId,
+        input.ordinal,
+        input.attachmentId ?? null,
+      ],
+    );
+  }
+
+  clearAttachmentCache(
+    input: DiscordAttachmentCacheKey & { readonly expected: BlobRefV1 },
+  ): BlobRefV1 | null {
+    const cached = this.getAttachmentCache(input);
+    if (cached?.blob.objectId !== input.expected.objectId) return null;
+    const cleared = this.db.run(
+      `
+      UPDATE discord_search_message_attachments
+      SET blob_ref_version = NULL,
+          blob_object_id = NULL,
+          blob_sha256 = NULL,
+          blob_byte_length = NULL,
+          blob_expires_at = NULL,
+          blob_cached_at = NULL
+      WHERE channel_id = ?
+        AND message_id = ?
+        AND ordinal = ?
+        AND attachment_id IS ?
+        AND blob_object_id = ?
+      `,
+      [
+        input.channelId,
+        input.messageId,
+        input.ordinal,
+        input.attachmentId ?? null,
+        input.expected.objectId,
+      ],
+    );
+    return cleared.changes > 0 ? cached.blob : null;
+  }
+
+  attachmentCacheAccess(): DiscordAttachmentCacheAccess {
+    return {
+      get: (input) => this.getAttachmentCache(input),
+      put: (input) => this.putAttachmentCache(input),
+      clear: (input) => this.clearAttachmentCache(input),
+    };
   }
 
   searchChannel(input: { channelId: string; query: string; limit?: number }): DiscordSearchHit[] {
@@ -561,6 +786,10 @@ export class DiscordSearchService {
     },
   ) {}
 
+  attachmentCacheAccess(): DiscordAttachmentCacheAccess {
+    return this.params.store.attachmentCacheAccess();
+  }
+
   async onMessageCreated(message: SurfaceMessage): Promise<void> {
     if (!isDiscordMessage(message)) return;
 
@@ -602,7 +831,10 @@ export class DiscordSearchService {
     sessionRef: DiscordSessionRef;
     query: string;
     limit?: number;
-  }): Promise<{ hits: DiscordSearchHit[]; heal: DiscordSearchHealResult | null }> {
+  }): Promise<{
+    hits: DiscordSearchHit[];
+    heal: DiscordSearchHealResult | null;
+  }> {
     const indexed = this.params.store.countMessagesByChannel(input.sessionRef.channelId);
 
     let heal: DiscordSearchHealResult | null = null;
@@ -678,7 +910,13 @@ export class DiscordSearchService {
                 limit,
                 ...formatTaggedErrorForLog(error),
               });
-              return { attempted: true, skipped: false, limit, fetched: 0, indexed: 0 };
+              return {
+                attempted: true,
+                skipped: false,
+                limit,
+                fetched: 0,
+                indexed: 0,
+              };
             },
             ok: (value) => () => {
               const indexed = this.params.store.upsertMessages(value);
@@ -703,7 +941,9 @@ export class DiscordSearchService {
           channelId: input.sessionRef.channelId,
           limit,
           ...formatTaggedErrorForLog(
-            new DiscordSearchHealFailed({ message: "Discord search heal failed" }),
+            new DiscordSearchHealFailed({
+              message: "Discord search heal failed",
+            }),
           ),
         });
         return {

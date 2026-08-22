@@ -87,6 +87,7 @@ export function createAgentOutputPublisher(params: {
   let cancelScheduledFlush: (() => void) | null = null;
   let publicationTail: Promise<ResultType<void, never>> = Promise.resolve(Result.ok(undefined));
   let reportedPanic: Panic | null = null;
+  let finalReplayDeadline: number | undefined;
 
   const enqueue = (
     label: string,
@@ -272,12 +273,21 @@ export function createAgentOutputPublisher(params: {
   const publishResponseText = (data: ResponseTextData): Promise<void> => {
     flushPending();
     return enqueueForHost("final response", async () => {
-      return toAgentOutputPublishResult(
-        "final response",
-        await params.bus.publish(lilacEventTypes.EvtAgentOutputResponseText, data, {
-          headers: params.headers,
-        }),
-      );
+      const published = await params.bus.publish(lilacEventTypes.EvtAgentOutputResponseText, data, {
+        headers: params.headers,
+      });
+      published.match({
+        ok: (receipt) => {
+          if (receipt.replayDeadline !== undefined) {
+            finalReplayDeadline = Math.max(
+              finalReplayDeadline ?? receipt.replayDeadline,
+              receipt.replayDeadline,
+            );
+          }
+        },
+        err: () => undefined,
+      });
+      return toAgentOutputPublishResult("final response", published);
     });
   };
 
@@ -294,6 +304,7 @@ export function createAgentOutputPublisher(params: {
     publishToolCall,
     publishActivity,
     publishResponseText,
+    getFinalReplayDeadline: () => finalReplayDeadline,
     flush: flushPending,
     drain,
   };

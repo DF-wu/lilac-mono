@@ -314,6 +314,7 @@ export async function startHeartbeatServiceResult(params: {
 
   async function publishHeartbeatRequest(reason: HeartbeatWakeReason): Promise<void> {
     const requestId = `heartbeat:${now()}`;
+    const requestDeliveryId = crypto.randomUUID();
     const modelOverride = resolveHeartbeatModelOverride(cfg);
     const messages = buildHeartbeatRequestMessages({
       reason,
@@ -324,6 +325,7 @@ export async function startHeartbeatServiceResult(params: {
     });
 
     const data: CmdRequestMessageData = {
+      requestDeliveryId,
       queue: "prompt",
       runPolicy: "idle_only_global",
       origin: { kind: "heartbeat", reason },

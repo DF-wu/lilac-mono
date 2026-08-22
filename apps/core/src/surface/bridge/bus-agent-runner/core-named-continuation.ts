@@ -1,7 +1,7 @@
 import { captureError } from "../../../shared/error-capture";
 import { createHash } from "node:crypto";
 
-import type { ModelMessage } from "ai";
+import { modelMessageSchema, type ModelMessage } from "ai";
 import {
   canonicalJsonStringify,
   hashCanonicalMessagesV1,
@@ -26,10 +26,20 @@ import {
   type TranscriptSnapshot,
   type TranscriptStore,
 } from "../../../transcript/transcript-store";
+import { hashCanonicalStoredMessagesV2 } from "../../../transcript/transcript-persistence-codec";
+import { projectStoredMessagesV1 } from "../../../transcript/stored-message-materialization";
+import type { StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 import type { BridgeLogContext } from "../bridge-log";
 
 const TEXT_REPLAY_TOOL_INPUT_CHARS = 20_000;
 const TEXT_REPLAY_TOOL_RESULT_CHARS = 40_000;
+
+function decodeStoredContinuationModelMessages(
+  messages: readonly StoredMessageV1[],
+): ModelMessage[] | null {
+  const decoded = modelMessageSchema.array().safeParse(messages);
+  return decoded.success ? decoded.data : null;
+}
 
 function adaptContinuationResultToHost<T, E extends Error>(result: ResultType<T, E>): T {
   return result.match<() => T>({
@@ -68,6 +78,7 @@ export type CoreNamedClaudeRuntime = {
   finalize(input: {
     readonly terminalTranscript: TranscriptSnapshot;
     readonly canonicalMessages: readonly ModelMessage[];
+    readonly storedCanonicalMessages?: readonly StoredMessageV1[];
     readonly providerState: HistoryProviderState;
     readonly isCancellationRequested: () => boolean;
   }): Promise<boolean>;
@@ -233,12 +244,22 @@ export function createCoreNamedClaudeRuntime(input: {
   readonly executionScopeHash: string;
   readonly executionCwd: string;
   readonly sourceTranscript: TranscriptSnapshot | null;
+  readonly sourceMessages?: readonly ModelMessage[];
   readonly getCurrentTurnMessages?: () => readonly ModelMessage[];
   readonly materialize: (start: ClaudeNativeSessionStart) => Promise<MaterializedClaudeCodeRun>;
   readonly onDiagnostic?: (event: string, detail: BridgeLogContext, error?: AnyTaggedError) => void;
 }): ResultType<CoreNamedClaudeRuntime, CoreClaudeAttemptMutationError> {
-  const sourceMessages = input.sourceTranscript?.messages ?? [];
-  const sourceHash = hashCanonicalMessagesV1(sourceMessages).hash;
+  const sourceMessages =
+    input.sourceMessages ??
+    decodeStoredContinuationModelMessages(input.sourceTranscript?.messages ?? []) ??
+    [];
+  const sourceModelHash = hashCanonicalMessagesV1(sourceMessages).hash;
+  const sourceStoredHash = hashCanonicalStoredMessagesV2(
+    input.sourceTranscript?.messages ?? [],
+  ).match({
+    ok: (digest) => digest.hash,
+    err: () => "invalid-stored-source-transcript",
+  });
   const sourceBindingResult = input.store.getCoreNamedClaudeSessionBinding({
     providerId: input.providerId,
     requestClient: input.requestClient,
@@ -280,14 +301,14 @@ export function createCoreNamedClaudeRuntime(input: {
         binding !== null &&
         input.sourceTranscript?.providerState?.lastFamily === "claude-code" &&
         binding.terminalRequestId === input.sourceTranscript.requestId &&
-        binding.canonicalHeadHash === sourceHash &&
+        binding.canonicalHeadHash === sourceStoredHash &&
         binding.canonicalMessageCount === sourceMessages.length &&
         binding.executionScopeHashVersion === 1 &&
         binding.executionScopeHash === input.executionScopeHash &&
         binding.nativeCwd === input.executionCwd &&
         binding.canonicalMessageCount <= canonicalMessages.length &&
         hashCanonicalMessagesV1(canonicalMessages.slice(0, binding.canonicalMessageCount)).hash ===
-          binding.canonicalHeadHash;
+          sourceModelHash;
 
       const recordAttemptOutcome = (state: "failed" | "cancelled" | "uncertain"): void => {
         const attempt = currentAttempt;
@@ -367,7 +388,13 @@ export function createCoreNamedClaudeRuntime(input: {
           if (attempt.isErr()) {
             const error = attempt.error.cause;
             recordAttemptOutcome("failed");
-            throw error;
+            return adaptContinuationResultToHost(
+              Result.err(
+                error instanceof Error
+                  ? error
+                  : new Error("Claude continuation materialization failed"),
+              ),
+            );
           }
           return attempt.value;
         }
@@ -416,7 +443,15 @@ export function createCoreNamedClaudeRuntime(input: {
               });
               if (attempt.isErr()) {
                 const error = attempt.error.cause;
-                if (!(error instanceof ClaudeNativeSessionPreflightError)) throw error;
+                if (!(error instanceof ClaudeNativeSessionPreflightError)) {
+                  return adaptContinuationResultToHost(
+                    Result.err(
+                      error instanceof Error
+                        ? error
+                        : new Error("Claude continuation candidate creation failed"),
+                    ),
+                  );
+                }
                 diagnostic("native-source-invalid", {
                   issues: error.issues.map((issue) => issue.code).join(","),
                   mode: "fresh",
@@ -486,7 +521,7 @@ export function createCoreNamedClaudeRuntime(input: {
             cursorMatches &&
             binding !== null &&
             cursor.canonicalMessageCount === binding.canonicalMessageCount &&
-            cursor.canonicalPrefixHash === binding.canonicalHeadHash;
+            cursor.canonicalPrefixHash === sourceModelHash;
           let storedNativeContextTokens = binding?.nativeContextTokens;
           if (cursorMatches && !cursorIsBindingHead) {
             storedNativeContextTokens = undefined;
@@ -534,6 +569,7 @@ export function createCoreNamedClaudeRuntime(input: {
         finalize: async ({
           terminalTranscript,
           canonicalMessages,
+          storedCanonicalMessages,
           providerState,
           isCancellationRequested,
         }) => {
@@ -541,6 +577,26 @@ export function createCoreNamedClaudeRuntime(input: {
           const candidate = owner.currentCandidate;
           const cursor = owner.state.cursor;
           const canonicalHash = hashCanonicalMessagesV1(canonicalMessages).hash;
+          const terminalStoredHash = (
+            storedCanonicalMessages
+              ? Result.ok(storedCanonicalMessages)
+              : projectStoredMessagesV1(canonicalMessages)
+          )
+            .andThen((messages) => hashCanonicalStoredMessagesV2(messages))
+            .match({
+              ok: (digest) => digest.hash,
+              err: () => "invalid-stored-terminal-transcript",
+            });
+          const terminalTranscriptMatches = storedCanonicalMessages
+            ? hashCanonicalStoredMessagesV2(terminalTranscript.messages).match({
+                ok: (terminalDigest) =>
+                  hashCanonicalStoredMessagesV2(storedCanonicalMessages).match({
+                    ok: (canonicalDigest) => canonicalDigest.hash === terminalDigest.hash,
+                    err: () => false,
+                  }),
+                err: () => false,
+              })
+            : true;
           if (
             !attempt ||
             !candidate?.run.nativeSession ||
@@ -548,7 +604,7 @@ export function createCoreNamedClaudeRuntime(input: {
             cursor.canonicalMessageCount !== canonicalMessages.length ||
             cursor.canonicalPrefixHash !== canonicalHash ||
             terminalTranscript.messages.length !== canonicalMessages.length ||
-            hashCanonicalMessagesV1(terminalTranscript.messages).hash !== canonicalHash
+            !terminalTranscriptMatches
           ) {
             recordAttemptOutcome("failed");
             return false;
@@ -604,7 +660,7 @@ export function createCoreNamedClaudeRuntime(input: {
                 requestId: input.requestId,
                 attemptIndex: attempt.attemptIndex,
                 terminalRequestId: terminalTranscript.requestId,
-                terminalCanonicalHeadHash: canonicalHash,
+                terminalCanonicalHeadHash: terminalStoredHash,
                 terminalCanonicalMessageCount: canonicalMessages.length,
                 providerState,
                 nativeCwd: finalized.candidate!.cwd,

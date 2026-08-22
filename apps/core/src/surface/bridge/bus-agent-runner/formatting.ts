@@ -1,6 +1,5 @@
 /* oxlint-disable eslint/no-control-regex */
 
-import { Buffer } from "node:buffer";
 import { Result } from "better-result";
 
 export function formatInt(n: number): string {
@@ -26,23 +25,56 @@ export function debugJsonStringify(value: unknown): string {
   const seen = new WeakSet<object>();
   return JSON.stringify(
     value,
-    (_key, v) => {
+    function redactDebugValue(key, v) {
+      const source = key === "" ? value : this[key];
       if (typeof v === "bigint") return v.toString();
-      if (v instanceof URL) return v.toString();
-      if (v instanceof Error) {
+      if (source instanceof URL) {
+        const serializedUrl = source.toString();
+        if (serializedUrl.toLowerCase().startsWith("data:")) {
+          return {
+            __type: "inline-data-url",
+            redacted: true,
+            charLength: serializedUrl.length,
+          };
+        }
+        return serializedUrl;
+      }
+      if (source instanceof Error) {
         return {
-          name: v.name,
-          message: v.message,
-          stack: v.stack,
+          name: source.name,
+          message: source.message,
+          stack: source.stack,
         };
       }
 
-      // Bun/Node Buffers are Uint8Array. Preserve byte identity as base64.
-      if (v instanceof Uint8Array) {
+      // Context dumps are durable operator files. Never copy hydrated managed
+      // blob bytes into them, including Buffers whose toJSON() has already run.
+      if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) {
         return {
-          __type: "Uint8Array",
-          base64: Buffer.from(v).toString("base64"),
-          byteLength: v.byteLength,
+          __type: source.constructor.name,
+          redacted: true,
+          byteLength: source.byteLength,
+        };
+      }
+
+      const parentType = typeof this.type === "string" ? this.type : undefined;
+      const isBinaryText =
+        typeof v === "string" &&
+        ((key === "data" &&
+          (parentType === "file" ||
+            parentType === "reasoning-file" ||
+            parentType === "image" ||
+            parentType === "file-data" ||
+            parentType === "image-data" ||
+            parentType === "data" ||
+            parentType === "base64")) ||
+          (key === "image" && parentType === "image") ||
+          v.toLowerCase().startsWith("data:"));
+      if (isBinaryText) {
+        return {
+          __type: v.toLowerCase().startsWith("data:") ? "inline-data-url" : "base64",
+          redacted: true,
+          charLength: v.length,
         };
       }
 

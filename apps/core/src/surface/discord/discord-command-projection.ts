@@ -7,7 +7,7 @@ type DiscordCommandInvokedEvent = Extract<AdapterEvent, { type: "adapter.command
 
 export function toBusDiscordCommandInvokedData(
   evt: DiscordCommandInvokedEvent,
-): CmdRequestMessageData {
+): Omit<CmdRequestMessageData, "requestDeliveryId"> {
   const header = formatSurfaceMetadataLine({
     platform: evt.platform,
     ...(evt.userId ? { user_id: evt.userId } : {}),

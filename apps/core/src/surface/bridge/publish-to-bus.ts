@@ -220,10 +220,12 @@ export async function bridgeAdapterToBus(params: {
       case "adapter.request.cancel": {
         const cancelScope = evt.cancelScope ?? "active_only";
         const cancelQueued = cancelScope === "active_or_queued";
+        const requestDeliveryId = crypto.randomUUID();
 
         const published = await bus.publish(
           lilacEventTypes.CmdRequestMessage,
           {
+            requestDeliveryId,
             queue: "interrupt",
             messages: [],
             raw: {
@@ -257,9 +259,10 @@ export async function bridgeAdapterToBus(params: {
       }
 
       case "adapter.command.invoked": {
+        const requestDeliveryId = crypto.randomUUID();
         const published = await bus.publish(
           lilacEventTypes.CmdRequestMessage,
-          toBusDiscordCommandInvokedData(evt),
+          { ...toBusDiscordCommandInvokedData(evt), requestDeliveryId },
           {
             headers: {
               request_id: evt.requestId,

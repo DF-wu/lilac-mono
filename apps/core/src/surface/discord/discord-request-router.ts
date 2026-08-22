@@ -9,8 +9,8 @@ import {
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import {
-  buildCoreLineageManifestV1,
-  createCorePrimaryLineageFreshOnlyV1,
+  buildCoreLineageManifestV2,
+  createCorePrimaryLineageFreshOnlyV2,
   lilacEventTypes,
   type DeliveryDisposition,
   type EventDeliveryDoneError,
@@ -18,8 +18,9 @@ import {
   type EventDeliveryStopFailed,
   type EvtAdapterMessageCreatedData,
   type LilacBus,
-  type CorePrimaryLineageV1,
+  type CorePrimaryLineageV2,
 } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
@@ -36,14 +37,15 @@ import {
 import {
   composeRequestMessages,
   composeSingleMessageWithLineage,
+  DiscordRequestCompositionAndCleanupFailed,
   type RequestCompositionError,
   type RequestCompositionResult,
 } from "../bridge/request-composition";
+import { deleteDiscordRequestBlobHandles } from "../bridge/request-composition/attachments";
 import { formatDiscordMessageRequestId } from "../bridge/request-ids";
 
 import {
   type SessionMode,
-  type RouterConfigOverride,
   previewText,
   resolveBotMentionNames,
   normalizeGateText,
@@ -64,7 +66,6 @@ import {
   resolveSessionModelOverride,
   buildDiscordUserAliasById,
   getDiscordFlags,
-  withDefaultToolsConfig,
 } from "./discord-request-router/common";
 
 import {
@@ -82,6 +83,9 @@ import {
 } from "./discord-request-router/pending-batch";
 import {
   type PublishBusRequestInput,
+  DiscordRequestDeliveryFailed,
+  type DiscordRequestDeliveryPort,
+  type DiscordRequestPublishError,
   publishActiveChannelPrompt as publishActiveChannelPromptImpl,
   publishBusRequest as publishBusRequestImpl,
   publishComposedRequest as publishComposedRequestImpl,
@@ -89,6 +93,7 @@ import {
   publishSingleMessageToActiveRequest as publishSingleMessageToActiveRequestImpl,
   publishSurfaceOutputReanchor as publishSurfaceOutputReanchorImpl,
 } from "./discord-request-router/publish";
+import type { DiscordAttachmentCacheAccess } from "./discord-attachment";
 import {
   resolvePreviousBatchMessageText as resolvePreviousBatchMessageTextImpl,
   resolvePreviousMessageText as resolvePreviousMessageTextImpl,
@@ -115,13 +120,13 @@ function continueResult<T, E, ROk, RErr>(
 function createFreshOnlyLineage(
   reason: string,
   currentCanonicalStart: number,
-): CorePrimaryLineageV1 {
-  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+): CorePrimaryLineageV2 {
+  const created = createCorePrimaryLineageFreshOnlyV2(reason, currentCanonicalStart);
   return created.match({
     ok: (value) => value,
     err: () => ({
       state: "fresh-only",
-      lineageVersion: 1,
+      lineageVersion: 2,
       currentCanonicalStart: 0,
       reason: "lineage-fallback-construction-failed",
     }),
@@ -142,6 +147,21 @@ export function discordRequestCompositionFailurePolicy(
 ): DiscordRequestCompositionFailurePolicy {
   if (error instanceof CoreOwnedBlobIntegrityError) {
     return { disposition: "drop-integrity-failure", level: "error", retryable: false };
+  }
+  if (
+    error._tag === "DiscordRequestCompositionAndCleanupFailed" ||
+    error._tag === "DiscordStoredBlobPreparationAndCleanupFailed" ||
+    error._tag === "DiscordStoredBlobPreparationFailed" ||
+    error._tag === "StoredMessageValidationError"
+  ) {
+    return { disposition: "drop-integrity-failure", level: "error", retryable: false };
+  }
+  if (error._tag === "DiscordAttachmentPreparationFailed") {
+    return {
+      disposition: "drop-transient-gateway-event",
+      level: "warn",
+      retryable: true,
+    };
   }
   return discordSurfaceCompositionFailurePolicy(error);
 }
@@ -189,6 +209,31 @@ function logDiscordRequestCompositionFailure(
     });
     return;
   }
+  if (
+    error._tag === "DiscordRequestCompositionAndCleanupFailed" ||
+    error._tag === "DiscordStoredBlobPreparationAndCleanupFailed" ||
+    error._tag === "DiscordStoredBlobPreparationFailed" ||
+    error._tag === "StoredMessageValidationError"
+  ) {
+    logger.error("request composition failed", {
+      requestId,
+      sessionId,
+      disposition: "drop-integrity-failure",
+      retryable: false,
+      ...formatTaggedErrorForLog(error),
+    });
+    return;
+  }
+  if (error._tag === "DiscordAttachmentPreparationFailed") {
+    logger.warn("request composition failed", {
+      requestId,
+      sessionId,
+      disposition: "drop-transient-gateway-event",
+      retryable: true,
+      ...formatTaggedErrorForLog(error),
+    });
+    return;
+  }
   switch (error._tag) {
     case "SurfaceRateLimited":
     case "SurfaceUnavailable":
@@ -216,6 +261,33 @@ function logDiscordRequestCompositionFailure(
       });
       return;
   }
+}
+
+function logDiscordRequestPublishFailure(
+  logger: Logger,
+  requestId: string,
+  sessionId: string,
+  error: DiscordRequestPublishError,
+): void {
+  if (error instanceof DiscordRequestDeliveryFailed) {
+    logger.error("request delivery failed", {
+      requestId,
+      sessionId,
+      ...formatTaggedErrorForLog(error),
+    });
+    return;
+  }
+  logDiscordRequestCompositionFailure(logger, requestId, sessionId, error);
+}
+
+function requestPublishRoutingError(
+  error: DiscordRequestPublishError,
+): BusRequestRouterRoutingError {
+  return new BusRequestRouterRoutingError({
+    topic: "evt.adapter",
+    cause: error,
+    message: "Bus request router failed while handling evt.adapter",
+  });
 }
 
 type ActiveSessionState = {
@@ -564,22 +636,6 @@ async function adaptRouterSubscriptionStart(
   return Result.flatten(captured);
 }
 
-function adaptRouterConfigResult(result: ReturnType<typeof withDefaultToolsConfig>): CoreConfig {
-  return result.match<() => CoreConfig>({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      switch (error._tag) {
-        case "CoreConfigV1Invalid":
-        case "CoreConfigV2Invalid":
-          throw error.cause;
-        case "CoreConfigVersionInvalid":
-        case "CoreConfigMustBeObject":
-          throw new Error(error.message);
-      }
-    },
-  })();
-}
-
 function superviseRouterSubscriptionsDone(
   subscriptions: readonly RouterDeliverySubscription[],
 ): Promise<ResultType<void, EventDeliveryDoneError>> {
@@ -755,10 +811,13 @@ type DebounceBuffer = {
 export type StartDiscordRequestRouterInput = {
   adapter: SurfaceAdapter;
   bus: LilacBus;
+  blobStore: BlobStore;
+  attachmentCache?: DiscordAttachmentCacheAccess;
+  requestDelivery: DiscordRequestDeliveryPort;
   subscriptionId: string;
   customCommands?: CustomCommandManager;
   /** Optionally inject config; defaults to getCoreConfig(). */
-  config?: RouterConfigOverride;
+  config?: CoreConfig;
   transcriptStore?: TranscriptStore;
   /**
    * Optionally suppress routing for specific adapter events.
@@ -801,9 +860,7 @@ export async function startDiscordRequestRouter(
       module: "discord-request-router",
     });
 
-  let cfg = params.config
-    ? adaptRouterConfigResult(withDefaultToolsConfig(params.config))
-    : await getCoreConfig();
+  let cfg = params.config ?? (await getCoreConfig());
   let coreConfigReloadHadError = false;
   let lastCoreConfigReloadError: string | null = null;
 
@@ -1129,10 +1186,12 @@ export async function startDiscordRequestRouter(
             recordTerminalLifecycleTombstone(requestId, sessionId);
             const cur = activeBySession.get(sessionId);
             if (cur?.requestId === requestId) {
-              await flushPendingMentionReplyBatchAsPrompt({
+              const flushed = await flushPendingMentionReplyBatchAsPrompt({
                 sessionId,
                 sourceRequestId: requestId,
               });
+              const flushError = flushed.match({ ok: () => null, err: (error) => error });
+              if (flushError) return Result.err(flushError);
               activeBySession.delete(sessionId);
             }
           }
@@ -1502,7 +1561,7 @@ export async function startDiscordRequestRouter(
 
           if (mode === "active") {
             if (isDm) {
-              await handleActiveDmMode({
+              return handleActiveDmMode({
                 adapter,
                 bus,
                 cfg,
@@ -1522,7 +1581,7 @@ export async function startDiscordRequestRouter(
                 botMentionNames,
               });
             } else {
-              await handleActiveChannelMode({
+              return handleActiveChannelMode({
                 adapter,
                 bus,
                 cfg,
@@ -1546,8 +1605,6 @@ export async function startDiscordRequestRouter(
                 botMentionNames,
               });
             }
-
-            return;
           }
 
           return handleMentionMode({
@@ -1681,15 +1738,21 @@ export async function startDiscordRequestRouter(
   async function flushPendingMentionReplyBatchAsPrompt(input: {
     sessionId: string;
     sourceRequestId: string;
-  }) {
+  }): Promise<ResultType<void, BusRequestRouterRoutingError>> {
     const batch = takePendingMentionReplyBatch(input);
-    if (!batch || batch.items.length === 0) return;
+    if (!batch || batch.items.length === 0) return Result.ok(undefined);
+    const restoreBatch = (): void => {
+      if (!pendingMentionReplyBatchBySession.has(input.sessionId)) {
+        pendingMentionReplyBatchBySession.set(input.sessionId, batch);
+      }
+    };
 
     const last = batch.items[batch.items.length - 1]!;
     const requestId = formatDiscordMessageRequestId({
       channelId: input.sessionId,
       messageId: last.msgRef.messageId,
     });
+    const requestDeliveryId = crypto.randomUUID();
 
     const self = await adapter.getSelf();
     const discordUserAliasById = buildDiscordUserAliasById(cfg);
@@ -1699,6 +1762,8 @@ export async function startDiscordRequestRouter(
       botUserId: self.userId,
       botName: cfg.surface.discord.botName,
       transcriptStore: params.transcriptStore,
+      blobStore: params.blobStore,
+      attachmentCache: params.attachmentCache,
       currentRequestId: requestId,
       currentMessageIds: batch.items.map((item) => item.msgRef.messageId),
       discordUserAliasById,
@@ -1712,10 +1777,20 @@ export async function startDiscordRequestRouter(
     const compositionError = composed.match({ ok: () => null, err: (error) => error });
     if (compositionError) {
       logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, compositionError);
-      return;
+      restoreBatch();
+      return Result.err(requestPublishRoutingError(compositionError));
     }
     const composition = composed.match({ ok: (value) => value, err: () => null });
-    if (!composition) return;
+    if (!composition) {
+      restoreBatch();
+      return Result.err(
+        new BusRequestRouterRoutingError({
+          topic: "evt.request",
+          cause: null,
+          message: "Deferred Discord request composition returned no result",
+        }),
+      );
+    }
 
     const chainMessageIds = new Set(composition.chainMessageIds);
     const extraCompositions: RequestCompositionResult[] = [];
@@ -1733,12 +1808,28 @@ export async function startDiscordRequestRouter(
         msgRef: item.msgRef,
         discordUserAliasById,
         transcriptStore: params.transcriptStore,
+        blobStore: params.blobStore,
+        attachmentCache: params.attachmentCache,
         transformUserText: transformPendingUserText(item),
       });
       const extraError = extra.match({ ok: () => null, err: (error) => error });
       if (extraError) {
-        logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, extraError);
-        return;
+        const cleanup = await deleteDiscordRequestBlobHandles(params.blobStore, [
+          ...composition.inputHandles,
+          ...extraCompositions.flatMap((value) => value.inputHandles),
+        ]);
+        const finalError = cleanup.match<RequestCompositionError>({
+          ok: () => extraError,
+          err: (cleanupError) =>
+            new DiscordRequestCompositionAndCleanupFailed({
+              primary: extraError,
+              cleanup: cleanupError,
+              message: "Deferred Discord request composition and input handle cleanup failed",
+            }),
+        });
+        logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, finalError);
+        restoreBatch();
+        return Result.err(requestPublishRoutingError(finalError));
       }
       const extraValue = extra.match({ ok: (value) => value, err: () => null });
       if (!extraValue) continue;
@@ -1809,7 +1900,7 @@ export async function startDiscordRequestRouter(
           : baseCurrentSegment +
               (insertSegmentIndex <= baseCurrentSegment ? extraSegments.length : 0),
       );
-      const built = buildCoreLineageManifestV1(
+      const built = buildCoreLineageManifestV2(
         combinedSegments.map((segment) => ({
           atoms: segment.atoms,
           canonicalMessages: segment.canonicalMessages,
@@ -1827,7 +1918,8 @@ export async function startDiscordRequestRouter(
       });
     })();
 
-    await publishBusRequest({
+    const published = await publishBusRequest({
+      requestDeliveryId,
       requestId,
       sessionId: input.sessionId,
       sessionConfigId: batch.sessionConfigId,
@@ -1837,6 +1929,10 @@ export async function startDiscordRequestRouter(
       sessionMode: batch.sessionMode,
       modelOverride: batch.modelOverride,
       messages: finalMessages,
+      inputHandles: [
+        ...composition.inputHandles,
+        ...extraCompositions.flatMap((value) => value.inputHandles),
+      ],
       corePrimaryLineage: finalLineage,
       raw: {
         triggerType: "reply",
@@ -1855,6 +1951,9 @@ export async function startDiscordRequestRouter(
         },
       },
     });
+    const publishError = published.match({ ok: () => null, err: (error) => error });
+    if (publishError) restoreBatch();
+    return published;
   }
 
   async function handleActiveDmMode(input: {
@@ -1909,7 +2008,7 @@ export async function startDiscordRequestRouter(
     });
 
     if (active && requestModelOverride) {
-      await publishActiveChannelPrompt({
+      return publishActiveChannelPrompt({
         adapter,
         bus,
         cfg,
@@ -1931,7 +2030,6 @@ export async function startDiscordRequestRouter(
         transformUserTextForMessageId: msgRef.messageId,
         markActive: false,
       });
-      return;
     }
 
     if (active) {
@@ -1963,7 +2061,7 @@ export async function startDiscordRequestRouter(
           });
           active.activeOutputMessageIds.clear();
 
-          await publishSingleMessageToActiveRequest({
+          return publishSingleMessageToActiveRequest({
             adapter,
             bus,
             cfg,
@@ -1986,10 +2084,9 @@ export async function startDiscordRequestRouter(
                 : undefined,
             ),
           });
-          return;
         }
 
-        await publishSingleMessageToActiveRequest({
+        return publishSingleMessageToActiveRequest({
           adapter,
           bus,
           cfg,
@@ -2005,7 +2102,6 @@ export async function startDiscordRequestRouter(
             continueDirectiveTransform,
           ),
         });
-        return;
       }
 
       if (replyToBot) {
@@ -2014,7 +2110,7 @@ export async function startDiscordRequestRouter(
           messageId: msgRef.messageId,
         });
 
-        await publishActiveChannelPrompt({
+        return publishActiveChannelPrompt({
           adapter,
           bus,
           cfg,
@@ -2033,10 +2129,9 @@ export async function startDiscordRequestRouter(
           transformUserTextForMessageId: msgRef.messageId,
           markActive: false,
         });
-        return;
       }
 
-      await publishSingleMessageToActiveRequest({
+      return publishSingleMessageToActiveRequest({
         adapter,
         bus,
         cfg,
@@ -2049,7 +2144,6 @@ export async function startDiscordRequestRouter(
         modelOverride,
         transformUserText: continueDirectiveTransform,
       });
-      return;
     }
 
     const requestId = formatDiscordMessageRequestId({
@@ -2060,7 +2154,7 @@ export async function startDiscordRequestRouter(
     const triggerType = resolveTriggerType({ replyToBot, mentionsBot });
 
     // DMs are ungated: start a new request immediately.
-    await publishActiveChannelPrompt({
+    return publishActiveChannelPrompt({
       adapter,
       bus,
       cfg,
@@ -2143,7 +2237,7 @@ export async function startDiscordRequestRouter(
     });
 
     if (active && requestModelOverride) {
-      await publishActiveChannelPrompt({
+      return publishActiveChannelPrompt({
         adapter,
         bus,
         cfg,
@@ -2166,7 +2260,6 @@ export async function startDiscordRequestRouter(
         transformUserTextForMessageId: msgRef.messageId,
         markActive: false,
       });
-      return;
     }
 
     if (active) {
@@ -2201,7 +2294,7 @@ export async function startDiscordRequestRouter(
           });
           active.activeOutputMessageIds.clear();
 
-          await publishSingleMessageToActiveRequest({
+          return publishSingleMessageToActiveRequest({
             adapter,
             bus,
             cfg,
@@ -2225,11 +2318,10 @@ export async function startDiscordRequestRouter(
                 : undefined,
             ),
           });
-          return;
         }
         case "active_output_follow_up":
         case "plain_follow_up": {
-          await publishSingleMessageToActiveRequest({
+          return publishSingleMessageToActiveRequest({
             adapter,
             bus,
             cfg,
@@ -2246,7 +2338,6 @@ export async function startDiscordRequestRouter(
               continueDirectiveTransform,
             ),
           });
-          return;
         }
         case "fork_reply_prompt": {
           const requestId = formatDiscordMessageRequestId({
@@ -2254,7 +2345,7 @@ export async function startDiscordRequestRouter(
             messageId: msgRef.messageId,
           });
 
-          await publishActiveChannelPrompt({
+          return publishActiveChannelPrompt({
             adapter,
             bus,
             cfg,
@@ -2274,10 +2365,9 @@ export async function startDiscordRequestRouter(
             modelOverride,
             markActive: false,
           });
-          return;
         }
         case "buffered_prompt": {
-          await publishSingleMessagePrompt({
+          return publishSingleMessagePrompt({
             adapter,
             bus,
             cfg,
@@ -2296,7 +2386,6 @@ export async function startDiscordRequestRouter(
               bufferedForActiveRequestId: active.requestId,
             },
           });
-          return;
         }
       }
     }
@@ -2305,7 +2394,7 @@ export async function startDiscordRequestRouter(
     if (continueCount !== undefined && !mentionsBot && !replyToBot && !hasReplyTarget) {
       clearDebounceBuffer(sessionId);
 
-      await publishActiveChannelPrompt({
+      return publishActiveChannelPrompt({
         adapter,
         bus,
         cfg,
@@ -2325,7 +2414,6 @@ export async function startDiscordRequestRouter(
         transformUserTextForMessageId: msgRef.messageId,
         markActive: true,
       });
-      return;
     }
 
     if (mentionsBot || replyToBot) {
@@ -2339,7 +2427,7 @@ export async function startDiscordRequestRouter(
         messageId: msgRef.messageId,
       });
 
-      await publishActiveChannelPrompt({
+      return publishActiveChannelPrompt({
         adapter,
         bus,
         cfg,
@@ -2359,7 +2447,6 @@ export async function startDiscordRequestRouter(
         transformUserTextForMessageId: msgRef.messageId,
         markActive: true,
       });
-      return;
     }
 
     bufferActiveChannelMessage({
@@ -2631,7 +2718,7 @@ export async function startDiscordRequestRouter(
     });
 
     if (active && requestModelOverride) {
-      await publishComposedRequest({
+      return publishComposedRequest({
         adapter,
         bus,
         cfg,
@@ -2651,7 +2738,6 @@ export async function startDiscordRequestRouter(
         ),
         transformUserTextForMessageId: msgRef.messageId,
       });
-      return Result.ok(undefined);
     }
 
     // Special case: if the user is replying to the currently active output message chain,
@@ -2679,7 +2765,7 @@ export async function startDiscordRequestRouter(
         });
         active.activeOutputMessageIds.clear();
 
-        await publishSingleMessageToActiveRequest({
+        const published = await publishSingleMessageToActiveRequest({
           adapter,
           bus,
           cfg,
@@ -2703,12 +2789,13 @@ export async function startDiscordRequestRouter(
               : undefined,
           ),
         });
+        const publishError = published.match({ ok: () => null, err: (error) => error });
+        if (publishError) return Result.err(publishError);
 
-        await flushPendingMentionReplyBatchAsFollowUp({
+        return flushPendingMentionReplyBatchAsFollowUp({
           sessionId,
           sourceRequestId: active.requestId,
         });
-        return Result.ok(undefined);
       } else {
         return enqueuePendingMentionReplyBatch({
           sessionId,
@@ -2736,7 +2823,7 @@ export async function startDiscordRequestRouter(
     }
 
     // Triggers always start a new request. If a request is running, the runner will queue it.
-    await publishComposedRequest({
+    return publishComposedRequest({
       adapter,
       bus,
       cfg,
@@ -2756,11 +2843,21 @@ export async function startDiscordRequestRouter(
       ),
       transformUserTextForMessageId: msgRef.messageId,
     });
-    return Result.ok(undefined);
   }
 
   async function publishBusRequest(input: PublishBusRequestInput) {
-    await publishBusRequestImpl({ logger, bus, input });
+    const published = await publishBusRequestImpl({
+      logger,
+      blobStore: params.blobStore,
+      requestDelivery: params.requestDelivery,
+      input,
+    });
+    published.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () =>
+        logDiscordRequestPublishFailure(logger, input.requestId, input.sessionId, error),
+    })();
+    return published.mapError(requestPublishRoutingError);
   }
 
   type PublishComposedLocalInput = Parameters<typeof publishComposedRequestImpl>[0]["input"] & {
@@ -2770,11 +2867,13 @@ export async function startDiscordRequestRouter(
   };
 
   async function publishComposedRequest(input: PublishComposedLocalInput) {
-    const { adapter, bus, cfg, ...requestInput } = input;
+    const { adapter, bus: _bus, cfg, ...requestInput } = input;
     const published = await publishComposedRequestImpl({
       adapter,
-      bus,
       cfg,
+      blobStore: params.blobStore,
+      attachmentCache: params.attachmentCache,
+      requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
       input: requestInput,
@@ -2782,8 +2881,9 @@ export async function startDiscordRequestRouter(
     published.match<() => void>({
       ok: () => () => undefined,
       err: (error) => () =>
-        logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, error),
+        logDiscordRequestPublishFailure(logger, input.requestId, input.sessionId, error),
     })();
+    return published.mapError(requestPublishRoutingError);
   }
 
   type PublishActiveChannelPromptLocalInput = Parameters<
@@ -2796,27 +2896,29 @@ export async function startDiscordRequestRouter(
   };
 
   async function publishActiveChannelPrompt(input: PublishActiveChannelPromptLocalInput) {
-    const { adapter, bus, cfg, markActive, ...requestInput } = input;
+    const { adapter, bus: _bus, cfg, markActive, ...requestInput } = input;
     const published = await publishActiveChannelPromptImpl({
       adapter,
-      bus,
       cfg,
+      blobStore: params.blobStore,
+      attachmentCache: params.attachmentCache,
+      requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
       input: requestInput,
     });
     const publishError = published.match({ ok: () => null, err: (error) => error });
     if (publishError) {
-      logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, publishError);
-      return;
+      logDiscordRequestPublishFailure(logger, input.requestId, input.sessionId, publishError);
+      return Result.err(requestPublishRoutingError(publishError));
     }
-
     if (markActive) {
       activeBySession.set(input.sessionId, {
         requestId: input.requestId,
         activeOutputMessageIds: new Set(),
       });
     }
+    return Result.ok(undefined);
   }
 
   type PublishSingleMessageToActiveRequestLocalInput = Parameters<
@@ -2830,11 +2932,13 @@ export async function startDiscordRequestRouter(
   async function publishSingleMessageToActiveRequest(
     input: PublishSingleMessageToActiveRequestLocalInput,
   ) {
-    const { adapter, bus, cfg, ...requestInput } = input;
+    const { adapter, bus: _bus, cfg, ...requestInput } = input;
     const published = await publishSingleMessageToActiveRequestImpl({
       adapter,
-      bus,
       cfg,
+      blobStore: params.blobStore,
+      attachmentCache: params.attachmentCache,
+      requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
       input: requestInput,
@@ -2842,9 +2946,9 @@ export async function startDiscordRequestRouter(
     published.match<() => void>({
       ok: () => () => undefined,
       err: (error) => () =>
-        logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, error),
+        logDiscordRequestPublishFailure(logger, input.requestId, input.sessionId, error),
     })();
-    return published;
+    return published.mapError(requestPublishRoutingError);
   }
 
   type PublishSingleMessagePromptLocalInput = Parameters<
@@ -2856,11 +2960,13 @@ export async function startDiscordRequestRouter(
   };
 
   async function publishSingleMessagePrompt(input: PublishSingleMessagePromptLocalInput) {
-    const { adapter, bus, cfg, ...requestInput } = input;
+    const { adapter, bus: _bus, cfg, ...requestInput } = input;
     const published = await publishSingleMessagePromptImpl({
       adapter,
-      bus,
       cfg,
+      blobStore: params.blobStore,
+      attachmentCache: params.attachmentCache,
+      requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
       input: requestInput,
@@ -2868,8 +2974,9 @@ export async function startDiscordRequestRouter(
     published.match<() => void>({
       ok: () => () => undefined,
       err: (error) => () =>
-        logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, error),
+        logDiscordRequestPublishFailure(logger, input.requestId, input.sessionId, error),
     })();
+    return published.mapError(requestPublishRoutingError);
   }
 
   async function publishSurfaceOutputReanchor(

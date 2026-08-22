@@ -22,8 +22,10 @@ import {
   type RawDeliveryAction,
   type RawDeliveryHandler,
   type SubscriptionOptions,
+  type BusMessageV2,
+  type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
-import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
+import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Logger } from "@stanley2058/simple-module-logger";
 
 import {
@@ -32,17 +34,25 @@ import {
   DiscordRequestRouterStartupAndCleanupFailed,
   DiscordRequestRouterSubscriptionStopRejected,
   discordRequestCompositionFailurePolicy,
-  startDiscordRequestRouter,
+  startDiscordRequestRouter as startDiscordRequestRouterImpl,
   type StartDiscordRequestRouterInput,
 } from "../../../src/surface/discord/discord-request-router";
+import {
+  withDefaultToolsConfig,
+  type RouterConfigOverride,
+} from "../../../src/surface/discord/discord-request-router/common";
 import {
   resolvePreviousMessageText,
   resolveRepliedToMessageText,
 } from "../../../src/surface/discord/discord-request-router/context";
 import { formatBufferedMessageForGateTranscript } from "../../../src/surface/discord/discord-request-router/gate";
-import { publishSingleMessagePrompt } from "../../../src/surface/discord/discord-request-router/publish";
+import {
+  DiscordRequestDeliveryFailed,
+  publishSingleMessagePrompt,
+} from "../../../src/surface/discord/discord-request-router/publish";
 import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
 import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
+import { getTestBlobStore } from "../../helpers/blob-store";
 import {
   GRACEFUL_RESTART_SNAPSHOT_VERSION,
   GracefulRestartDispositionConflict,
@@ -91,12 +101,55 @@ type TestRawBus = RawBus & {
   finishDelivery(topic: string, error: EventDeliveryDoneError): void;
 };
 
+type TestDiscordRequestRouterInput = Omit<
+  StartDiscordRequestRouterInput,
+  "blobStore" | "requestDelivery" | "config"
+> &
+  Partial<Pick<StartDiscordRequestRouterInput, "blobStore" | "requestDelivery">> & {
+    config?: CoreConfig | RouterConfigOverride;
+  };
+
+function normalizeTestRouterConfig(
+  config: CoreConfig | RouterConfigOverride | undefined,
+): CoreConfig | undefined {
+  if (!config) return undefined;
+  if ("configVersion" in config) return config as CoreConfig;
+  const parsed = withDefaultToolsConfig(config);
+  if (parsed.status === "ok") return parsed.value;
+  throw parsed.error;
+}
+
+async function startDiscordRequestRouter(input: TestDiscordRequestRouterInput) {
+  return startDiscordRequestRouterImpl({
+    ...input,
+    config: normalizeTestRouterConfig(input.config),
+    blobStore: input.blobStore ?? (await getTestBlobStore()),
+    requestDelivery: input.requestDelivery ?? {
+      async prepareAndPublish({ envelope }) {
+        return (
+          await input.bus.publish(lilacEventTypes.CmdRequestMessage, envelope.data, {
+            headers: envelope.headers,
+          })
+        )
+          .map(() => undefined)
+          .mapError(
+            (cause) =>
+              new DiscordRequestDeliveryFailed({
+                cause,
+                message: "Test request publication failed",
+              }),
+          );
+      },
+    },
+  });
+}
+
 class RouterTestHookFailure extends TaggedError("RouterTestHookFailure")<{
   readonly cause: unknown;
   readonly message: string;
 }> {}
 
-async function startBusRequestRouter(input: StartDiscordRequestRouterInput) {
+async function startBusRequestRouter(input: TestDiscordRequestRouterInput) {
   return adaptDiscordRequestRouterStartOutcomeToHost(
     await startDiscordRequestRouter(input),
     () => {},
@@ -506,7 +559,7 @@ class FakeAdapter extends SurfaceAdapterTestBase {
   }
 }
 
-function collectUserText(messages: readonly ModelMessage[]): string {
+function collectUserText(messages: readonly (ModelMessage | BusMessageV2)[]): string {
   const parts: string[] = [];
 
   for (const msg of messages) {
@@ -586,6 +639,19 @@ describe("Discord authenticated-origin publication", () => {
       userId: "authenticated-user",
       text: "hello",
       ts: 1,
+      raw: {
+        discord: {
+          attachments: [
+            {
+              id: "attachment-1",
+              url: "https://cdn.discordapp.com/attachments/1/2/image.png",
+              filename: "image.png",
+              mimeType: "image/png",
+              size: 4,
+            },
+          ],
+        },
+      },
     };
     const adapter = new FakeAdapter({ "channel:message": message });
     const failure = new SurfaceUnavailable({
@@ -599,11 +665,26 @@ describe("Discord authenticated-origin publication", () => {
       return reads === 1 ? Result.ok(message) : Result.err(failure);
     });
     const publish = spyOn(raw, "publish");
+    const fetchAttachment = spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(new Uint8Array([1, 2, 3, 4]), {
+        headers: { "content-type": "image/png" },
+      }),
+    );
+    const blobStore = await getTestBlobStore();
+    const deletedRequestHandles: string[] = [];
+    const originalDelete = blobStore.delete.bind(blobStore);
+    const deleteBlob = spyOn(blobStore, "delete").mockImplementation(async (target) => {
+      if (!("sha256" in target)) deletedRequestHandles.push(target.objectId);
+      return originalDelete(target);
+    });
 
     try {
       const result = await publishSingleMessagePrompt({
         adapter,
-        bus,
+        blobStore,
+        requestDelivery: {
+          prepareAndPublish: async () => Result.ok(undefined),
+        },
         cfg: parseCoreConfigV1ToUniversal({}),
         logger,
         input: {
@@ -617,8 +698,11 @@ describe("Discord authenticated-origin publication", () => {
 
       expect(result).toEqual(Result.err(failure));
       expect(reads).toBe(2);
+      expect(deletedRequestHandles).toHaveLength(1);
       expect(publish).not.toHaveBeenCalled();
     } finally {
+      deleteBlob.mockRestore();
+      fetchAttachment.mockRestore();
       await bus.close();
     }
   });
@@ -1523,7 +1607,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    const baseTranscript: ModelMessage[] = [
+    const baseTranscript: StoredMessageV1[] = [
       { role: "assistant", content: "stored assistant context" },
     ];
 
@@ -1616,7 +1700,7 @@ describe("startBusRequestRouter", () => {
     expect(received[0].data.queue).toBe("prompt");
     expect(received[0].data.corePrimaryLineage).toEqual({
       state: "fresh-only",
-      lineageVersion: 1,
+      lineageVersion: 2,
       currentCanonicalStart: 1,
       reason: "projection-store-unavailable",
     });
@@ -4502,6 +4586,7 @@ describe("startBusRequestRouter", () => {
       let activatedGeneration: Parameters<typeof router.restoreActiveOutputChains>[0] | null = null;
       const relay = await bridgeBusToAdapter({
         adapter,
+        blobStore: await getTestBlobStore(),
         bus,
         platform: "discord",
         policy: createDiscordRelayPolicy(adapter, {
@@ -4697,6 +4782,7 @@ describe("startBusRequestRouter", () => {
     });
     const relay = await bridgeBusToAdapter({
       adapter,
+      blobStore: await getTestBlobStore(),
       bus,
       platform: "discord",
       policy: createDiscordRelayPolicy(adapter, {
@@ -4887,6 +4973,7 @@ describe("startBusRequestRouter", () => {
     });
     const relay = await bridgeBusToAdapter({
       adapter,
+      blobStore: await getTestBlobStore(),
       bus,
       platform: "discord",
       policy: createDiscordRelayPolicy(adapter, {
@@ -5139,6 +5226,7 @@ describe("startBusRequestRouter", () => {
     });
     const relay = await bridgeBusToAdapter({
       adapter,
+      blobStore: await getTestBlobStore(),
       bus,
       platform: "discord",
       policy: createDiscordRelayPolicy(adapter, {
@@ -6647,8 +6735,9 @@ describe("startBusRequestRouter", () => {
           discord: {
             attachments: [
               {
-                url: "https://cdn.discordapp.com/attachments/1/2/file.txt",
-                filename: "file.txt",
+                url: "https://cdn.discordapp.com/attachments/1/2/file.png",
+                filename: "file.png",
+                mimeType: "image/png",
               },
             ],
           },
@@ -6688,8 +6777,11 @@ describe("startBusRequestRouter", () => {
           ? Result.err(new CoreOwnedBlobIntegrityError("forced typed composition failure"))
           : putCoreOwnedBlob(input),
     );
-    const fetchStub = spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response("attachment", { headers: { "content-type": "text/plain" } }),
+    const fetchStub = spyOn(globalThis, "fetch").mockImplementation(
+      (async () =>
+        new Response("attachment", {
+          headers: { "content-type": "image/png" },
+        })) as unknown as typeof fetch,
     );
     const logger = new Logger({ module: "typed-composition-source-handoff-test" });
     const debugStub = spyOn(logger, "debug").mockImplementation(() => undefined);

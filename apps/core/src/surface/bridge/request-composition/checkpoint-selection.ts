@@ -1,5 +1,5 @@
-import type { ModelMessage } from "ai";
 import { createLogger } from "@stanley2058/lilac-utils";
+import type { StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 
 import type { TranscriptSnapshot, TranscriptStore } from "../../../transcript/transcript-store";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "../bridge-log";
@@ -8,7 +8,7 @@ const logger = createLogger({ module: "request-composition:checkpoint" });
 
 export type CheckpointSelection<T> = {
   checkpoint: TranscriptSnapshot | null;
-  checkpointMessages: ModelMessage[];
+  checkpointMessages: StoredMessageV1[];
   descendants: T[];
   discardedSurfaceCount: number;
   resolvedSnapshotsBySurfaceMessageId: ReadonlyMap<string, TranscriptSnapshot | null>;

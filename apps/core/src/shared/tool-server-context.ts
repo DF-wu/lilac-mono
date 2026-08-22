@@ -6,6 +6,7 @@ import { isAdapterPlatform } from "./is-adapter-platform";
 
 export type RequiredToolServerHeaders = {
   request_id: string;
+  request_delivery_id?: string;
   session_id: string;
   request_client: AdapterPlatform;
 };
@@ -43,6 +44,7 @@ export function decodeToolServerHeaders(
 
   return Result.ok({
     request_id: requestId,
+    ...(ctx.requestDeliveryId ? { request_delivery_id: ctx.requestDeliveryId } : {}),
     session_id: sessionId,
     request_client: requestClient,
   });

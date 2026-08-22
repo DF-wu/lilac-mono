@@ -6,6 +6,7 @@ import { isAdapterPlatform } from "./is-adapter-platform";
 
 export type RequiredRequestContext = {
   requestId: string;
+  requestDeliveryId?: string;
   sessionId: string;
   requestClient: AdapterPlatform;
 };
@@ -21,6 +22,7 @@ export function decodeRequiredRequestContext(
 ): ResultType<RequiredRequestContext, RequestContextInvalidError> {
   if (isRecord(ctx)) {
     const requestId = ctx["requestId"];
+    const requestDeliveryId = ctx["requestDeliveryId"];
     const sessionId = ctx["sessionId"];
     const requestClient = ctx["requestClient"];
     if (
@@ -28,7 +30,12 @@ export function decodeRequiredRequestContext(
       typeof sessionId === "string" &&
       isAdapterPlatform(requestClient)
     ) {
-      return Result.ok({ requestId, sessionId, requestClient });
+      return Result.ok({
+        requestId,
+        ...(typeof requestDeliveryId === "string" ? { requestDeliveryId } : {}),
+        sessionId,
+        requestClient,
+      });
     }
   }
 

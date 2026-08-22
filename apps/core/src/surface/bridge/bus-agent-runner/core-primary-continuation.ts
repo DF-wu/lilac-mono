@@ -14,7 +14,7 @@ import {
   type ClaudeNativeSessionStart,
   type MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
-import type { CorePrimaryLineageV1 } from "@stanley2058/lilac-event-bus";
+import type { CorePrimaryLineageV2 } from "@stanley2058/lilac-event-bus";
 import { Result, type AnyTaggedError, type Result as ResultType } from "better-result";
 import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
 
@@ -26,6 +26,7 @@ import {
   type TranscriptSnapshot,
   type TranscriptStore,
 } from "../../../transcript/transcript-store";
+import { projectStoredMessagesV1 } from "../../../transcript/stored-message-materialization";
 import type { BridgeLogContext } from "../bridge-log";
 
 const TEXT_REPLAY_TOOL_INPUT_CHARS = 20_000;
@@ -115,7 +116,7 @@ export function supportsCorePrimaryContinuationStore(
 }
 
 export function selectCorePrimaryClaudePrefix(input: {
-  readonly lineage: CorePrimaryLineageV1 | undefined;
+  readonly lineage: CorePrimaryLineageV2 | undefined;
   readonly canonicalMessages: readonly ModelMessage[];
   readonly binding: CorePrimaryClaudeSessionBinding | null;
   readonly executionScopeHash: string;
@@ -161,7 +162,7 @@ export function selectCorePrimaryClaudePrefix(input: {
 }
 
 export function shouldReplayCorePrimaryHistory(input: {
-  readonly lineage: CorePrimaryLineageV1 | undefined;
+  readonly lineage: CorePrimaryLineageV2 | undefined;
   readonly historicalEnd: number;
   readonly store: Pick<TranscriptStore, "getRequestTranscript">;
   readonly targetFamily: "claude-code" | "ai-sdk";
@@ -201,7 +202,7 @@ export function shouldReplayCorePrimaryHistory(input: {
 
 export function prepareCorePrimaryHistoryView(input: {
   readonly canonicalMessages: readonly ModelMessage[];
-  readonly lineage: CorePrimaryLineageV1 | undefined;
+  readonly lineage: CorePrimaryLineageV2 | undefined;
   readonly replayHistoricalPrefix: boolean;
   readonly targetFamily: "claude-code" | "ai-sdk";
   readonly modelSpecifier: string;
@@ -274,7 +275,7 @@ function completedToolExchangeStart(messages: readonly ModelMessage[], end: numb
   return unresolved.size === 0 ? assistantIndex : null;
 }
 
-function lineageFingerprint(lineage: CorePrimaryLineageV1 | undefined): string {
+function lineageFingerprint(lineage: CorePrimaryLineageV2 | undefined): string {
   if (!lineage) return "missing";
   if (lineage.state === "fresh-only") {
     return `fresh-only:${lineage.reason}:${lineage.currentCanonicalStart}`;
@@ -294,7 +295,7 @@ export function createCorePrimaryClaudeRuntime(input: {
   readonly reasoning: string;
   readonly executionScopeHash: string;
   readonly executionCwd: string;
-  readonly getLineage: () => CorePrimaryLineageV1 | undefined;
+  readonly getLineage: () => CorePrimaryLineageV2 | undefined;
   readonly materialize: (start: ClaudeNativeSessionStart) => Promise<MaterializedClaudeCodeRun>;
   readonly onDiagnostic?: (event: string, detail: BridgeLogContext, error?: AnyTaggedError) => void;
 }): ResultType<CorePrimaryClaudeRuntime, CoreClaudeAttemptMutationError> {
@@ -308,8 +309,10 @@ export function createCorePrimaryClaudeRuntime(input: {
   >({
     err: (error) => () => Result.err(error),
     ok: (sourceBinding) => () => {
-      let selectedPayload: { readonly mode: "full" | "suffix"; readonly fresh: boolean } | null =
-        null;
+      let selectedPayload: {
+        readonly mode: "full" | "suffix";
+        readonly fresh: boolean;
+      } | null = null;
       let currentAttempt: CorePrimaryClaudeSessionAttempt | null = null;
       let currentAttemptLineageFingerprint: string | null = null;
       const diagnostic = (event: string, detail: BridgeLogContext = {}, error?: AnyTaggedError) =>
@@ -349,7 +352,10 @@ export function createCorePrimaryClaudeRuntime(input: {
           attemptIndex: attempt.attemptIndex,
           state,
         });
-        const recordError = recorded.match({ ok: () => null, err: (error) => error });
+        const recordError = recorded.match({
+          ok: () => null,
+          err: (error) => error,
+        });
         if (recordError) {
           diagnostic("attempt-outcome-failed", { outcome: state }, recordError);
           return;
@@ -633,7 +639,10 @@ export function createCorePrimaryClaudeRuntime(input: {
           const manifest = input.store.getCorePrimaryLineageManifest({
             requestId: terminalTranscript.requestId,
           });
-          const manifestValue = manifest.match({ ok: (value) => value, err: () => null });
+          const manifestValue = manifest.match({
+            ok: (value) => value,
+            err: () => null,
+          });
           if (
             !attempt ||
             !candidate?.run.nativeSession ||
@@ -651,7 +660,14 @@ export function createCorePrimaryClaudeRuntime(input: {
             ...manifestValue.segments.flatMap((segment) => segment.canonicalMessages),
             ...terminalTranscript.messages,
           ];
-          if (!isDeepStrictEqual(expectedCanonicalMessages, canonicalMessages)) {
+          const storedCanonicalMessages = projectStoredMessagesV1(canonicalMessages).match({
+            ok: (messages) => messages,
+            err: () => null,
+          });
+          if (
+            storedCanonicalMessages === null ||
+            !isDeepStrictEqual(expectedCanonicalMessages, storedCanonicalMessages)
+          ) {
             recordAttemptOutcome("failed");
             return false;
           }
@@ -662,7 +678,10 @@ export function createCorePrimaryClaudeRuntime(input: {
             responseMessageCount: terminalTranscript.messages.length,
             providerState,
           });
-          const terminalHeadValue = terminalHead.match({ ok: (value) => value, err: () => null });
+          const terminalHeadValue = terminalHead.match({
+            ok: (value) => value,
+            err: () => null,
+          });
           if (
             !terminalHeadValue ||
             terminalHeadValue.canonicalMessageCount !== canonicalMessages.length
@@ -689,7 +708,10 @@ export function createCorePrimaryClaudeRuntime(input: {
             );
             return false;
           }
-          const finalized = finalizedResult.match({ ok: (value) => value, err: () => null });
+          const finalized = finalizedResult.match({
+            ok: (value) => value,
+            err: () => null,
+          });
           if (!finalized) return false;
           if (isCancellationRequested()) {
             recordAttemptOutcome("cancelled");
@@ -738,7 +760,10 @@ export function createCorePrimaryClaudeRuntime(input: {
               let message = "Unknown continuation failure";
               if (typeof error === "string") message = error;
               else if (error instanceof Error) message = error.message;
-              return { message, captured: error instanceof Error ? undefined : error };
+              return {
+                message,
+                captured: error instanceof Error ? undefined : error,
+              };
             },
           });
           const publicationOutcome = attemptedPublication.match<
@@ -820,7 +845,10 @@ export function createCorePrimaryClaudeRuntime(input: {
             requestId: input.requestId,
             attemptIndex: attempt.attemptIndex,
           });
-          const promotionError = promotion.match({ ok: () => null, err: (error) => error });
+          const promotionError = promotion.match({
+            ok: () => null,
+            err: (error) => error,
+          });
           if (promotionError) {
             diagnostic(
               "promotion-failed",
@@ -832,7 +860,10 @@ export function createCorePrimaryClaudeRuntime(input: {
             );
             return false;
           }
-          const promoted = promotion.match({ ok: (value) => value, err: () => false });
+          const promoted = promotion.match({
+            ok: (value) => value,
+            err: () => false,
+          });
           if (!promoted) {
             diagnostic("promotion-rejected", {
               mode: "cas",

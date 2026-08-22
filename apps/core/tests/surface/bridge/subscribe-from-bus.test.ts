@@ -55,6 +55,11 @@ import {
 } from "../../../src/runtime/graceful-restart-store";
 
 import {
+  createMemoryBlobStore,
+  type BlobHandleV1,
+  type BlobStore,
+} from "@stanley2058/lilac-blob-storage";
+import {
   createLilacBus,
   EventDeliveryStopFailed,
   lilacEventTypes,
@@ -294,20 +299,61 @@ class FakeAdapter extends SurfaceAdapterTestBase {
 }
 
 async function bridgeBusToAdapter(
-  params: Omit<Parameters<typeof bridgeBusToAdapterImpl>[0], "policy">,
+  params: Omit<Parameters<typeof bridgeBusToAdapterImpl>[0], "policy" | "blobStore"> & {
+    readonly blobStore?: BlobStore;
+  },
 ) {
+  const blobStore = params.blobStore ?? (await defaultBlobStore());
   if (params.platform === "discord") {
     return bridgeBusToAdapterImpl({
       ...params,
+      blobStore,
       platform: "discord",
       policy: createDiscordRelayPolicy(params.adapter),
     });
   }
   return bridgeBusToAdapterImpl({
     ...params,
+    blobStore,
     platform: "github",
     policy: createGithubRelayPolicy(),
   });
+}
+
+let sharedBlobStore: BlobStore | undefined;
+
+async function defaultBlobStore(): Promise<BlobStore> {
+  if (sharedBlobStore) return sharedBlobStore;
+  const created = await createMemoryBlobStore();
+  sharedBlobStore = created.match({
+    ok: (store) => store,
+    err: (error) => {
+      throw error;
+    },
+  });
+  return sharedBlobStore;
+}
+
+async function uploadTestBlob(bytes: Uint8Array): Promise<BlobHandleV1> {
+  const started = await (
+    await defaultBlobStore()
+  ).startUpload({
+    source: bytes,
+    retention: { kind: "durable" },
+  });
+  const upload = started.match({
+    ok: (value) => value,
+    err: (error) => {
+      throw error;
+    },
+  });
+  (await upload.completion).match({
+    ok: () => undefined,
+    err: (error) => {
+      throw error;
+    },
+  });
+  return upload.handle;
 }
 
 function createInMemoryRawBusWithOutputStopFailure() {
@@ -727,7 +773,11 @@ describe("bridgeBusToAdapter", () => {
     );
     await bus.publish(
       lilacEventTypes.EvtAgentOutputResponseBinary,
-      { mimeType: "text/plain", dataBase64: "aGk=", filename: "result.txt" },
+      {
+        blob: await uploadTestBlob(new TextEncoder().encode("hi")),
+        mimeType: "text/plain",
+        filename: "result.txt",
+      },
       { headers: { request_id: requestId } },
     );
     await bus.publish(
@@ -744,6 +794,98 @@ describe("bridgeBusToAdapter", () => {
       "text.set",
     ]);
     await bridge.stop();
+  });
+
+  it("fully verifies a generated blob before pushing a Discord attachment", async () => {
+    const created = await createMemoryBlobStore();
+    const blobStore = created.match({
+      ok: (store) => store,
+      err: (error) => {
+        throw error;
+      },
+    });
+    const sourceController = Promise.withResolvers<ReadableStreamDefaultController<Uint8Array>>();
+    const uploadStarted = await blobStore.startUpload({
+      source: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("verified output"));
+          sourceController.resolve(controller);
+        },
+      }),
+      retention: { kind: "durable" },
+    });
+    const controlledSource = await sourceController.promise;
+    const upload = uploadStarted.match({
+      ok: (value) => value,
+      err: (error) => {
+        throw error;
+      },
+    });
+    const resolveStarted = Promise.withResolvers<{ readonly timeoutMs: number }>();
+    const observedBlobStore = new Proxy(blobStore, {
+      get(target, property, receiver) {
+        if (property === "resolve") {
+          return (
+            handle: Parameters<BlobStore["resolve"]>[0],
+            options: Parameters<BlobStore["resolve"]>[1],
+          ) => {
+            resolveStarted.resolve(options);
+            return target.resolve(handle, options);
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const requestId = `discord:chan:${crypto.randomUUID()}`;
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      blobStore: observedBlobStore,
+      bus,
+      platform: "discord",
+      subscriptionId: `discord-verified-output-${crypto.randomUUID()}`,
+      idleTimeoutMs: 10_000,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    const publishing = bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseBinary,
+      { blob: upload.handle, mimeType: "text/plain", filename: "verified.txt" },
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+
+    expect(await resolveStarted.promise).toEqual({ timeoutMs: 60_000 });
+    expect(adapter.stream?.parts).toEqual([]);
+
+    controlledSource.close();
+    await publishing;
+    const attachmentPart = adapter.stream?.parts.find((part) => part.type === "attachment.add");
+    expect(attachmentPart?.type).toBe("attachment.add");
+    if (attachmentPart?.type === "attachment.add") {
+      expect(attachmentPart.attachment.filename).toBe("verified.txt");
+      expect(new TextDecoder().decode(attachmentPart.attachment.bytes)).toBe("verified output");
+    }
+
+    await bridge.stop();
+    await blobStore.close({ deadlineAtMs: Date.now() + 1_000 });
   });
 
   it("preserves rich subagent trees and terminal status across delayed updates and reanchor", async () => {
@@ -1929,6 +2071,7 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.CmdRequestMessage,
       {
+        requestDeliveryId: crypto.randomUUID(),
         queue: "interrupt",
         messages: [],
         raw: { cancel: true, requiresActive: true },
@@ -1986,6 +2129,7 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.CmdRequestMessage,
       {
+        requestDeliveryId: crypto.randomUUID(),
         queue: "interrupt",
         messages: [],
         raw: hostileRaw,
@@ -2612,8 +2756,8 @@ describe("bridgeBusToAdapter", () => {
         await bus.publish(
           lilacEventTypes.EvtAgentOutputResponseBinary,
           {
+            blob: await uploadTestBlob(new TextEncoder().encode("result")),
             mimeType: "text/plain",
-            dataBase64: Buffer.from("result").toString("base64"),
             filename: "result.txt",
           },
           { headers: { request_id: requestId } },
@@ -4136,6 +4280,7 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.CmdRequestMessage,
       {
+        requestDeliveryId: crypto.randomUUID(),
         queue: "interrupt",
         messages: [],
         raw: { cancel: true, requiresActive: true },
@@ -4170,6 +4315,7 @@ describe("bridgeBusToAdapter", () => {
     await bus.publish(
       lilacEventTypes.CmdRequestMessage,
       {
+        requestDeliveryId: crypto.randomUUID(),
         queue: "interrupt",
         messages: [],
         raw: { cancel: true, requiresActive: true },
@@ -4223,7 +4369,12 @@ describe("bridgeBusToAdapter", () => {
     );
     await bus.publish(
       lilacEventTypes.CmdRequestMessage,
-      { queue: "interrupt", messages: [], raw: { cancel: true } },
+      {
+        requestDeliveryId: crypto.randomUUID(),
+        queue: "interrupt",
+        messages: [],
+        raw: { cancel: true },
+      },
       {
         headers: {
           request_id: requestId,
@@ -4256,7 +4407,12 @@ describe("bridgeBusToAdapter", () => {
     );
     await bus.publish(
       lilacEventTypes.CmdRequestMessage,
-      { queue: "interrupt", messages: [], raw: { cancel: true } },
+      {
+        requestDeliveryId: crypto.randomUUID(),
+        queue: "interrupt",
+        messages: [],
+        raw: { cancel: true },
+      },
       { headers: { request_id: requestId, request_client: "discord" } },
     );
     await bus.publish(
@@ -4397,7 +4553,7 @@ describe("bridgeBusToAdapter", () => {
 
     await bus.publish(
       lilacEventTypes.CmdRequestMessage,
-      { queue: "prompt", messages: [] },
+      { requestDeliveryId: crypto.randomUUID(), queue: "prompt", messages: [] },
       { headers: { request_id: "missing-client-cmd", session_id: "chan" } },
     );
     await bus.publish(
@@ -4498,6 +4654,7 @@ describe("bridgeBusToAdapter", () => {
     });
     const bridge = await bridgeBusToAdapterImpl({
       adapter,
+      blobStore: await defaultBlobStore(),
       bus,
       platform: "github",
       policy,

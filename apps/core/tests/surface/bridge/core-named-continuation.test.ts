@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import type { ModelMessage } from "ai";
+import { modelMessageSchema, type ModelMessage } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { Result, type Result as ResultType } from "better-result";
 import type {
@@ -23,6 +23,7 @@ import {
   SqliteTranscriptStore,
   TranscriptStoreSqliteDriverFailure,
 } from "../../../src/transcript/transcript-store";
+import { projectStoredMessagesV1 } from "../../../src/transcript/stored-message-materialization";
 
 const directories: string[] = [];
 
@@ -177,12 +178,14 @@ async function commitRuntime(input: {
   messages: readonly ModelMessage[];
 }) {
   await input.runtime.recordSuccessfulModelCall(input.messages);
-  input.store.saveRequestTranscript({
-    requestId: input.requestId,
-    sessionId: input.sessionId,
-    requestClient: "unknown",
-    messages: input.messages,
-  });
+  resultValue(
+    input.store.saveRequestTranscript({
+      requestId: input.requestId,
+      sessionId: input.sessionId,
+      requestClient: "unknown",
+      messages: resultValue(projectStoredMessagesV1(input.messages)),
+    }),
+  );
   const terminal = getRequestTranscript(input.store, { requestId: input.requestId });
   if (!terminal) throw new Error("terminal transcript missing");
   return await input.runtime.finalize({
@@ -373,10 +376,9 @@ describe("Core named Claude continuation", () => {
           return fakeMaterializedRun(start, "sonnet");
         },
       });
-      const canonical = [
-        ...selectedSource.messages,
-        { role: "user", content: "next" },
-      ] satisfies ModelMessage[];
+      const canonical = modelMessageSchema
+        .array()
+        .parse([...selectedSource.messages, { role: "user", content: "next" }]);
       expect((await runtime.prepareModelCall(prepareContext(canonical))).payload).toEqual({
         mode: "full",
       });

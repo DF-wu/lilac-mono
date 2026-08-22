@@ -51,6 +51,7 @@ import {
   type GracefulRestartSnapshotInput,
 } from "../../src/runtime/graceful-restart-store";
 import { createInMemoryDeliveryBus } from "../helpers/in-memory-delivery-bus";
+import { getTestBlobStore } from "../helpers/blob-store";
 
 type ProtocolLog = {
   readonly creates: string[];
@@ -278,9 +279,10 @@ const DISCORD_REFERENCE: ReferenceContract = {
       }),
     }),
   createRelayPolicy: (adapter) => createDiscordRelayPolicy(adapter),
-  createBridge: (adapter, bus) =>
+  createBridge: async (adapter, bus) =>
     bridgeBusToAdapter({
       adapter,
+      blobStore: await getTestBlobStore(),
       bus,
       platform: "discord",
       policy: createDiscordRelayPolicy(adapter),
@@ -362,9 +364,10 @@ const GITHUB_REFERENCE: ReferenceContract = {
       }),
     }),
   createRelayPolicy: () => createGithubRelayPolicy(),
-  createBridge: (adapter, bus) =>
+  createBridge: async (adapter, bus) =>
     bridgeBusToAdapter({
       adapter,
+      blobStore: await getTestBlobStore(),
       bus,
       platform: "github",
       policy: createGithubRelayPolicy(),
@@ -657,6 +660,7 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
         await bus.publish(
           lilacEventTypes.CmdRequestMessage,
           {
+            requestDeliveryId: crypto.randomUUID(),
             queue: "interrupt",
             messages: [],
             raw: { cancel: true, requiresActive: true },

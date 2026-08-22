@@ -39,6 +39,8 @@ import {
   type TestRawSubscriptionHost,
 } from "../../helpers/result-raw-bus";
 
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
 function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
   const topics = new Map<string, Array<Message<unknown>>>();
   const subs = new Set<{
@@ -517,6 +519,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const msg = published[0]!;
     expect(msg.type).toBe(lilacEventTypes.CmdRequestMessage);
     expect(msg.data).toEqual({
+      requestDeliveryId: expect.stringMatching(UUID_V4_PATTERN),
       queue: "interrupt",
       messages: [],
       raw: {
@@ -577,6 +580,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     const msg = published[0]!;
     expect(msg.type).toBe(lilacEventTypes.CmdRequestMessage);
     expect(msg.data).toEqual({
+      requestDeliveryId: expect.stringMatching(UUID_V4_PATTERN),
       queue: "interrupt",
       messages: [],
       raw: {
@@ -649,6 +653,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       request_client: "discord",
     });
     expect(msg.data).toEqual({
+      requestDeliveryId: expect.stringMatching(UUID_V4_PATTERN),
       queue: "prompt",
       messages: [
         {

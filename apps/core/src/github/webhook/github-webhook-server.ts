@@ -1,11 +1,10 @@
 import { captureError } from "../../shared/error-capture.js";
 import crypto from "node:crypto";
 import Elysia from "elysia";
-import type { LilacBus } from "@stanley2058/lilac-event-bus";
+import type { BusMessageV2, LilacBus } from "@stanley2058/lilac-event-bus";
 import { lilacEventTypes } from "@stanley2058/lilac-event-bus";
 import { createLogger, env, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
-import type { ModelMessage } from "ai";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
@@ -765,7 +764,7 @@ async function onIssueCommentCreated(input: {
     })),
   });
 
-  const messages: ModelMessage[] = [{ role: "user", content: prompt }];
+  const messages: BusMessageV2[] = [{ role: "user", content: prompt }];
 
   setGithubRequestMeta({
     requestId,
@@ -780,6 +779,7 @@ async function onIssueCommentCreated(input: {
     await input.bus.publish(
       lilacEventTypes.CmdRequestMessage,
       {
+        requestDeliveryId: crypto.randomUUID(),
         queue: "prompt",
         messages,
         raw: {
@@ -883,7 +883,7 @@ async function onReviewRequested(input: {
         prUrl: prData.html_url,
         headSha: prData.head.sha,
       });
-      const messages: ModelMessage[] = [{ role: "user", content: prompt }];
+      const messages: BusMessageV2[] = [{ role: "user", content: prompt }];
 
       setGithubRequestMeta({
         requestId,
@@ -899,6 +899,7 @@ async function onReviewRequested(input: {
         await input.bus.publish(
           lilacEventTypes.CmdRequestMessage,
           {
+            requestDeliveryId: crypto.randomUUID(),
             queue: "prompt",
             messages,
             raw: {
@@ -986,7 +987,7 @@ async function onPullRequestSynchronize(input: {
       headSha: prData.head.sha,
     });
 
-    const messages: ModelMessage[] = [{ role: "user", content: prompt }];
+    const messages: BusMessageV2[] = [{ role: "user", content: prompt }];
 
     const acknowledgementClaim = claimGithubAcknowledgement(meta.requestId, requestId);
 
@@ -1009,6 +1010,7 @@ async function onPullRequestSynchronize(input: {
         await input.bus.publish(
           lilacEventTypes.CmdRequestMessage,
           {
+            requestDeliveryId: crypto.randomUUID(),
             queue: "prompt",
             messages,
             raw: {
@@ -1040,6 +1042,7 @@ async function onPullRequestSynchronize(input: {
         await input.bus.publish(
           lilacEventTypes.CmdRequestMessage,
           {
+            requestDeliveryId: crypto.randomUUID(),
             queue: "interrupt",
             messages: [
               {

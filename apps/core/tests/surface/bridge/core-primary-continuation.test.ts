@@ -3,20 +3,19 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import type { ModelMessage } from "ai";
+import { modelMessageSchema, type ModelMessage } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { Result, type Result as ResultType } from "better-result";
-import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
 import type {
   ClaudeNativeAttemptObservation,
   ClaudeNativeSessionStart,
   MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
 import {
-  buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1,
-  createCorePrimaryLineageFreshOnlyV1 as createCorePrimaryLineageFreshOnlyResultV1,
-  type CoreLineageManifestV1,
-  type CorePrimaryLineageV1,
+  buildCoreLineageManifestV2 as buildCoreLineageManifestResultV2,
+  createCorePrimaryLineageFreshOnlyV2 as createCorePrimaryLineageFreshOnlyResultV2,
+  type CoreLineageManifestV2,
+  type CorePrimaryLineageV2,
 } from "@stanley2058/lilac-event-bus";
 
 import {
@@ -32,6 +31,8 @@ import {
   TranscriptStoreSqliteDriverFailure,
   type CorePrimaryClaudeSessionBinding,
 } from "../../../src/transcript/transcript-store";
+import { projectStoredMessagesV1 } from "../../../src/transcript/stored-message-materialization";
+import { hashCanonicalStoredMessagesV2 } from "../../../src/transcript/transcript-persistence-codec";
 
 const directories: string[] = [];
 
@@ -64,14 +65,14 @@ function getPrimaryBinding(
   return bindingValue(store.getCorePrimaryClaudeSessionBinding(input));
 }
 
-function buildCoreLineageManifestV1(...args: Parameters<typeof buildCoreLineageManifestResultV1>) {
-  return resultValue(buildCoreLineageManifestResultV1(...args));
+function buildCoreLineageManifestV2(...args: Parameters<typeof buildCoreLineageManifestResultV2>) {
+  return resultValue(buildCoreLineageManifestResultV2(...args));
 }
 
-function createCorePrimaryLineageFreshOnlyV1(
-  ...args: Parameters<typeof createCorePrimaryLineageFreshOnlyResultV1>
+function createCorePrimaryLineageFreshOnlyV2(
+  ...args: Parameters<typeof createCorePrimaryLineageFreshOnlyResultV2>
 ) {
-  return resultValue(createCorePrimaryLineageFreshOnlyResultV1(...args));
+  return resultValue(createCorePrimaryLineageFreshOnlyResultV2(...args));
 }
 
 function getRequestTranscript(
@@ -99,16 +100,21 @@ async function createStore(dbPath?: string) {
   return new SqliteTranscriptStore(path.join(directory, "transcripts.db"));
 }
 
-function syntheticSegment(source: string, messages: readonly ModelMessage[]) {
+function syntheticSegment(
+  source: string,
+  messages: readonly ModelMessage[],
+  canonicalMessages = resultValue(projectStoredMessagesV1(messages)),
+) {
+  const storedMessages = canonicalMessages;
   return {
     atoms: [
       {
         kind: "synthetic" as const,
         source,
-        messageDigest: hashCanonicalMessagesV1(messages).hash,
+        messageDigest: resultValue(hashCanonicalStoredMessagesV2(storedMessages)).hash,
       },
     ],
-    canonicalMessages: messages,
+    canonicalMessages: storedMessages,
   };
 }
 
@@ -196,7 +202,7 @@ function prepareContext(messages: readonly ModelMessage[]) {
   };
 }
 
-function bindingFor(manifest: CoreLineageManifestV1): CorePrimaryClaudeSessionBinding {
+function bindingFor(manifest: CoreLineageManifestV2): CorePrimaryClaudeSessionBinding {
   const segment = manifest.segments[0]!;
   return {
     bindingProtocolVersion: 1,
@@ -205,7 +211,7 @@ function bindingFor(manifest: CoreLineageManifestV1): CorePrimaryClaudeSessionBi
     requestClient: "discord",
     lilacSessionId: "channel",
     terminalRequestId: "terminal",
-    lineageVersion: 1,
+    lineageVersion: 2,
     atomCount: segment.cumulativeAtomCount,
     prefixDigest: segment.cumulativePrefixDigest,
     canonicalMessageCount: segment.canonicalEnd,
@@ -228,13 +234,13 @@ describe("Core primary Claude continuation", () => {
     const first = [{ role: "user", content: "one" }] satisfies ModelMessage[];
     const second = [{ role: "assistant", content: "two" }] satisfies ModelMessage[];
     const current = [{ role: "user", content: "three" }] satisfies ModelMessage[];
-    const manifest = buildCoreLineageManifestV1([
+    const manifest = buildCoreLineageManifestV2([
       syntheticSegment("one", first),
       syntheticSegment("two", second),
       syntheticSegment("three", current),
     ]);
     const binding = bindingFor(
-      buildCoreLineageManifestV1([syntheticSegment("one", first), syntheticSegment("two", second)]),
+      buildCoreLineageManifestV2([syntheticSegment("one", first), syntheticSegment("two", second)]),
     );
     const exactBinding = {
       ...binding,
@@ -290,7 +296,7 @@ describe("Core primary Claude continuation", () => {
     ).toEqual({ mode: "fresh", reason: "canonical-alignment-mismatch" });
     expect(
       selectCorePrimaryClaudePrefix({
-        lineage: createCorePrimaryLineageFreshOnlyV1("malformed-manifest"),
+        lineage: createCorePrimaryLineageFreshOnlyV2("malformed-manifest"),
         canonicalMessages: current,
         binding: exactBinding,
         executionScopeHash: "scope",
@@ -302,7 +308,7 @@ describe("Core primary Claude continuation", () => {
   it("does not search another segment or slice a partial segment after reorder/delete/window changes", () => {
     const merged = [{ role: "user", content: "one\n\ntwo" }] satisfies ModelMessage[];
     const current = [{ role: "user", content: "current" }] satisfies ModelMessage[];
-    const base = buildCoreLineageManifestV1([
+    const base = buildCoreLineageManifestV2([
       {
         atoms: [
           {
@@ -324,7 +330,7 @@ describe("Core primary Claude continuation", () => {
       },
     ]);
     const binding = bindingFor(base);
-    const changed = buildCoreLineageManifestV1([
+    const changed = buildCoreLineageManifestV2([
       syntheticSegment("other", [{ role: "user", content: "other" }]),
       syntheticSegment("current", current),
       syntheticSegment("later", [{ role: "user", content: "later" }]),
@@ -332,7 +338,9 @@ describe("Core primary Claude continuation", () => {
     expect(
       selectCorePrimaryClaudePrefix({
         lineage: changed,
-        canonicalMessages: changed.segments.flatMap((segment) => segment.canonicalMessages),
+        canonicalMessages: modelMessageSchema
+          .array()
+          .parse(changed.segments.flatMap((segment) => segment.canonicalMessages)),
         binding,
         executionScopeHash: "scope",
         executionCwd: "/workspace",
@@ -360,7 +368,27 @@ describe("Core primary Claude continuation", () => {
     const secondCurrent = [
       { role: "user", content: "another current message" },
     ] satisfies ModelMessage[];
-    const lineage = buildCoreLineageManifestV1(
+    const firstCurrentStored = resultValue(
+      projectStoredMessagesV1([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "new question" },
+            {
+              type: "blob",
+              blob: {
+                version: 1,
+                objectId: `b1_${"11".repeat(16)}`,
+                sha256: "22".repeat(32),
+                byteLength: 1,
+              },
+              mediaType: "image/png",
+            },
+          ],
+        },
+      ]),
+    );
+    const lineage = buildCoreLineageManifestV2(
       [
         {
           atoms: [
@@ -384,7 +412,7 @@ describe("Core primary Claude continuation", () => {
           },
           canonicalMessages: historical,
         },
-        syntheticSegment("current-one", firstCurrent),
+        syntheticSegment("current-one", firstCurrent, firstCurrentStored),
         syntheticSegment("current-two", secondCurrent),
       ],
       { currentSegmentIndex: 1 },
@@ -397,7 +425,7 @@ describe("Core primary Claude continuation", () => {
         targetFamily: "claude-code",
       }),
     ).toBe(true);
-    const returningToAi = buildCoreLineageManifestV1(
+    const returningToAi = buildCoreLineageManifestV2(
       [
         {
           ...lineage.segments[0]!,
@@ -411,7 +439,7 @@ describe("Core primary Claude continuation", () => {
             },
           ],
         },
-        syntheticSegment("current-return", firstCurrent),
+        syntheticSegment("current-return", firstCurrent, firstCurrentStored),
         syntheticSegment("current-return-two", secondCurrent),
       ],
       { currentSegmentIndex: 1 },
@@ -485,7 +513,7 @@ describe("Core primary Claude continuation", () => {
         ],
       },
     ] satisfies ModelMessage[];
-    const lineage = createCorePrimaryLineageFreshOnlyV1(
+    const lineage = createCorePrimaryLineageFreshOnlyV2(
       "deferred-result-insertion",
       messages.length,
     );
@@ -551,7 +579,7 @@ describe("Core primary Claude continuation", () => {
       },
       { role: "user", content: "focus on the failures" },
     ] satisfies ModelMessage[];
-    const lineage = createCorePrimaryLineageFreshOnlyV1("steering-transform", end);
+    const lineage = createCorePrimaryLineageFreshOnlyV2("steering-transform", end);
 
     const prepared = prepareCorePrimaryHistoryView({
       canonicalMessages: messages,
@@ -572,7 +600,7 @@ describe("Core primary Claude continuation", () => {
     const diagnostics: Array<{ event: string; detail: Readonly<Record<string, unknown>> }> = [];
     const sessionId = "channel";
     const firstInput = [{ role: "user", content: "first" }] satisfies ModelMessage[];
-    const firstManifest = buildCoreLineageManifestV1([syntheticSegment("first", firstInput)]);
+    const firstManifest = buildCoreLineageManifestV2([syntheticSegment("first", firstInput)]);
     let firstLineage = firstManifest;
     const firstRuntime = createCorePrimaryClaudeRuntime({
       store,
@@ -598,13 +626,15 @@ describe("Core primary Claude continuation", () => {
       { role: "assistant", content: "answer" },
     ] satisfies ModelMessage[];
     await firstRuntime.recordSuccessfulModelCall(firstTerminal);
-    store.saveRequestTranscript({
-      requestId: "request-1",
-      sessionId,
-      requestClient: "discord",
-      messages: [firstTerminal[1]!],
-      corePrimaryLineage: firstManifest,
-    });
+    resultValue(
+      store.saveRequestTranscript({
+        requestId: "request-1",
+        sessionId,
+        requestClient: "discord",
+        messages: resultValue(projectStoredMessagesV1([firstTerminal[1]!])),
+        corePrimaryLineage: firstManifest,
+      }),
+    );
     const firstTranscript = getRequestTranscript(store, { requestId: "request-1" });
     if (!firstTranscript) throw new Error("first transcript missing");
     expect(
@@ -624,7 +654,7 @@ describe("Core primary Claude continuation", () => {
     if (!clean) throw new Error("clean binding missing");
 
     const earlyInput = [{ role: "user", content: "early" }] satisfies ModelMessage[];
-    const earlyLineage = buildCoreLineageManifestV1([syntheticSegment("early", earlyInput)]);
+    const earlyLineage = buildCoreLineageManifestV2([syntheticSegment("early", earlyInput)]);
     expect(
       selectCorePrimaryClaudePrefix({
         lineage: earlyLineage,
@@ -679,7 +709,7 @@ describe("Core primary Claude continuation", () => {
     const metadata = getCoreRequestAtomMetadata(store, { requestId: "request-1" });
     if (!metadata) throw new Error("request metadata missing");
     const secondCurrent = [{ role: "user", content: "second" }] satisfies ModelMessage[];
-    const secondManifest = buildCoreLineageManifestV1([
+    const secondManifest = buildCoreLineageManifestV2([
       syntheticSegment("first", firstInput),
       {
         atoms: [{ kind: "request", ...metadata }],
@@ -770,7 +800,7 @@ describe("Core primary Claude continuation", () => {
   it("retires a compacted candidate and preserves the clean base on cancellation", async () => {
     const store = await createStore();
     const messages = [{ role: "user", content: "candidate" }] satisfies ModelMessage[];
-    let lineage: CorePrimaryLineageV1 = buildCoreLineageManifestV1([
+    let lineage: CorePrimaryLineageV2 = buildCoreLineageManifestV2([
       syntheticSegment("candidate", messages),
     ]);
     const runtime = createCorePrimaryClaudeRuntime({
@@ -786,7 +816,7 @@ describe("Core primary Claude continuation", () => {
       materialize: async (start) => fakeMaterializedRun(start),
     });
     await runtime.prepareModelCall(prepareContext(messages));
-    lineage = createCorePrimaryLineageFreshOnlyV1("compaction-checkpoint-transform");
+    lineage = createCorePrimaryLineageFreshOnlyV2("compaction-checkpoint-transform");
     await runtime.retireForCanonicalReplacement();
     expect(
       store.getCorePrimaryClaudeSessionAttempt({
@@ -824,7 +854,7 @@ describe("Core primary Claude continuation", () => {
     const diagnostics: Array<{ event: string; detail: Readonly<Record<string, unknown>> }> = [];
     const sessionId = "promotion-error-channel";
     const inputMessages = [{ role: "user", content: "publish first" }] satisfies ModelMessage[];
-    const manifest = buildCoreLineageManifestV1([
+    const manifest = buildCoreLineageManifestV2([
       syntheticSegment("promotion-error", inputMessages),
     ]);
     const runtime = createCorePrimaryClaudeRuntime({
@@ -844,13 +874,15 @@ describe("Core primary Claude continuation", () => {
     const responseMessages = [{ role: "assistant", content: "published" }] satisfies ModelMessage[];
     const canonicalMessages = [...inputMessages, ...responseMessages];
     await runtime.recordSuccessfulModelCall(canonicalMessages);
-    store.saveRequestTranscript({
-      requestId: "promotion-error",
-      sessionId,
-      requestClient: "discord",
-      messages: responseMessages,
-      corePrimaryLineage: manifest,
-    });
+    resultValue(
+      store.saveRequestTranscript({
+        requestId: "promotion-error",
+        sessionId,
+        requestClient: "discord",
+        messages: resultValue(projectStoredMessagesV1(responseMessages)),
+        corePrimaryLineage: manifest,
+      }),
+    );
     const terminal = getRequestTranscript(store, { requestId: "promotion-error" });
     if (!terminal) throw new Error("terminal transcript missing");
     store.promoteCorePrimaryClaudeSessionBinding = () =>

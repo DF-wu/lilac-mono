@@ -161,6 +161,7 @@ function toRestrictedTerminationError(
 
 type RestrictedBashContext = {
   requestId?: string;
+  requestDeliveryId?: string;
   sessionId?: string;
   requestClient?: string;
   controlCapability?: string;
@@ -620,6 +621,9 @@ function buildToolServerHeaders(
     "x-lilac-safety-mode": "restricted",
   };
   if (context.requestId) headers["x-lilac-request-id"] = context.requestId;
+  if (context.requestDeliveryId) {
+    headers["x-lilac-request-delivery-id"] = context.requestDeliveryId;
+  }
   if (context.sessionId) headers["x-lilac-session-id"] = context.sessionId;
   if (context.requestClient) headers["x-lilac-request-client"] = context.requestClient;
   if (context.controlCapability) {
@@ -1164,6 +1168,7 @@ async function getRestrictedBash(params: {
   const cacheKey = JSON.stringify([
     params.context.sessionId ?? "",
     params.requestId,
+    params.context.requestDeliveryId ?? "",
     params.workspaceRoot,
     params.context.toolCallId ?? "",
     params.context.currentTurnUserId ?? "",

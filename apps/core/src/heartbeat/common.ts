@@ -1,5 +1,5 @@
 import { captureError } from "../shared/error-capture.js";
-import type { ModelMessage } from "ai";
+import type { BusMessageV2 } from "@stanley2058/lilac-event-bus";
 import { isPanic, resolveHeartbeatPromptPaths, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Result } from "better-result";
 
@@ -120,7 +120,7 @@ export function buildHeartbeatRequestMessages(params: {
   lastActivityAt?: number;
   heartbeat: CoreConfig["surface"]["heartbeat"];
   dataDir?: string;
-}): ModelMessage[] {
+}): BusMessageV2[] {
   const paths = resolveHeartbeatPromptPaths({ dataDir: params.dataDir });
   const quietState = getHeartbeatQuietState({
     nowMs: params.nowMs,

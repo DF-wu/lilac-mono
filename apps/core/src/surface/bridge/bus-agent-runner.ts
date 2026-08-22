@@ -56,15 +56,15 @@ import {
   withModelPlanReasoning,
 } from "@stanley2058/lilac-utils";
 import {
-  corePrimaryLineageV1Schema,
-  createCorePrimaryLineageFreshOnlyV1,
-  decodeCorePrimaryLineageV1,
+  corePrimaryLineageV2Schema,
+  createCorePrimaryLineageFreshOnlyV2,
+  decodeCorePrimaryLineageV2,
   EventDeliveryStopped,
-  extendCoreLineagePrefixDigestV1,
+  extendCoreLineagePrefixDigestV2,
   lilacEventTypes,
   type AdapterPlatform,
-  type CoreLineageManifestV1,
-  type CorePrimaryLineageV1,
+  type CoreLineageManifestV2,
+  type CorePrimaryLineageV2,
   type DecodedLilacMessageForTopic,
   type DeliveryDisposition,
   type LilacBus,
@@ -72,6 +72,7 @@ import {
   type RequestOrigin,
   type RequestQueueMode,
   type RequestRunPolicy,
+  type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
 import {
   advanceHistoryProviderState,
@@ -86,7 +87,6 @@ import {
   createRetryBackoffBudget,
   hasMatchingOpenAIServerCompaction,
   hasOpenAIServerCompaction,
-  hashCanonicalMessagesV1,
   materializeOpenAIServerCompaction,
   type AiSdkPiAgentOptions,
   type AiSdkPiAgentEvent,
@@ -158,6 +158,19 @@ import type {
   ConversationThreadSearchResult,
   ConversationThreadToolService,
 } from "../../conversation/thread-service";
+import {
+  materializeStoredMessagesV1,
+  projectStoredMessagesV1,
+} from "../../transcript/stored-message-materialization";
+import { hashCanonicalStoredMessagesV2 } from "../../transcript/transcript-persistence-codec";
+import type {
+  CoreAcceptedRequestWork,
+  CorePreparedRequestEnvelope,
+  CoreRequestOutputMetadata,
+  RequestDeliveryCoordinator,
+  RequestDeliveryTerminalOutcome,
+} from "./request-delivery";
+import type { AcceptedRequestDelivery } from "./request-delivery/types";
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
 import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
@@ -169,6 +182,7 @@ import {
   buildExperimentalDownloadForAnthropicFallback,
   isAnthropicModelSpec,
   withStableAnthropicUpstreamOrder,
+  type AnthropicFallbackBlobStore,
 } from "./bus-agent-runner/anthropic-fallback-media";
 import { formatUnknownErrorForDisplay } from "./bus-agent-runner/error-display";
 import {
@@ -321,7 +335,7 @@ export function shouldUsePersistentCoreClaudeRuntime(input: {
   runProfile: AgentRunProfile;
   requestClient: AdapterPlatform;
   stableNamedContinuation: NonNullable<WorkflowRequestPolicy["stableNamedContinuation"]> | null;
-  corePrimaryLineage?: CorePrimaryLineageV1;
+  corePrimaryLineage?: CorePrimaryLineageV2;
 }): boolean {
   if (input.runProfile === "primary") return input.requestClient === "discord";
   return input.stableNamedContinuation !== null;
@@ -431,10 +445,16 @@ export function toIdleRetryDecision(
   backoff: ResultType<RetryBackoffAttempt | null, RetryBackoffAborted | RetryBackoffDelayFailed>,
 ):
   | { readonly status: "retry"; readonly attempt: RetryBackoffAttempt }
-  | { readonly status: "fail"; readonly reason: "aborted" | "delay-failed" | "exhausted" } {
+  | {
+      readonly status: "fail";
+      readonly reason: "aborted" | "delay-failed" | "exhausted";
+    } {
   return backoff.match<
     | { readonly status: "retry"; readonly attempt: RetryBackoffAttempt }
-    | { readonly status: "fail"; readonly reason: "aborted" | "delay-failed" | "exhausted" }
+    | {
+        readonly status: "fail";
+        readonly reason: "aborted" | "delay-failed" | "exhausted";
+      }
   >({
     ok: (attempt) =>
       attempt === null ? { status: "fail", reason: "exhausted" } : { status: "retry", attempt },
@@ -1264,7 +1284,10 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
       : autoInject.minTextUnits;
   if (
     !latestInput.hasAttachment &&
-    !shouldRunAutoInjectedThreadSearch({ text: latestInput.authoredText, minTextUnits })
+    !shouldRunAutoInjectedThreadSearch({
+      text: latestInput.authoredText,
+      minTextUnits,
+    })
   ) {
     return [];
   }
@@ -1622,11 +1645,25 @@ function persistHeartbeatSurfaceHandoffs(params: {
     const handoff = extracted[i] ?? fallback;
     const handoffRequestId = buildHeartbeatHandoffRequestId(params.requestId, i);
 
+    const storedHandoff = projectStoredMessagesV1(handoff.messages);
+    const storedHandoffError = storedHandoff.match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (storedHandoffError) {
+      params.logger.warn(
+        "heartbeat handoff transcript projection failed",
+        formatBridgeTaggedErrorForLog(storedHandoffError, {
+          requestId: handoffRequestId,
+        }),
+      );
+      continue;
+    }
     const saved = params.transcriptStore.saveRequestTranscript({
       requestId: handoffRequestId,
       sessionId: HEARTBEAT_HANDOFF_SESSION_ID,
       requestClient: params.requestClient,
-      messages: handoff.messages,
+      messages: storedHandoff.match({ ok: (messages) => messages, err: () => [] }),
       finalText: handoff.finalText,
       modelLabel: params.modelLabel,
     });
@@ -1652,6 +1689,7 @@ function persistHeartbeatSurfaceHandoffs(params: {
 
 type Enqueued = {
   queueEntryId: string;
+  requestDeliveryId?: string;
   requestId: string;
   sessionId: string;
   requestClient: AdapterPlatform;
@@ -1659,7 +1697,8 @@ type Enqueued = {
   runPolicy: RequestRunPolicy;
   origin?: RequestOrigin;
   messages: ModelMessage[];
-  corePrimaryLineage?: CorePrimaryLineageV1;
+  storedMessages: StoredMessageV1[];
+  corePrimaryLineage?: CorePrimaryLineageV2;
   modelOverride?: string;
   raw?: AgentRunnerRaw;
   authenticatedOrigin?: AuthenticatedSurfaceOrigin;
@@ -1671,6 +1710,8 @@ type Enqueued = {
     checkpointMessages: ModelMessage[];
     partialText: string;
   };
+  storedRecoveryCheckpoint?: StoredMessageV1[];
+  retainedRequestDeliveries?: readonly AgentRunnerRetainedRequestDelivery[];
 };
 
 type QueueCancellationGroup = {
@@ -1727,6 +1768,7 @@ export type AgentRunnerQueueAttempt = {
 
 export type AgentRunnerRecoveryEntry = {
   queueEntryId?: string;
+  requestDeliveryId?: string;
   kind: "active" | "queued";
   requestId: string;
   sessionId: string;
@@ -1734,22 +1776,37 @@ export type AgentRunnerRecoveryEntry = {
   queue: RequestQueueMode;
   runPolicy?: RequestRunPolicy;
   origin?: RequestOrigin;
-  messages: ModelMessage[];
-  corePrimaryLineage?: CorePrimaryLineageV1;
+  messages: StoredMessageV1[];
+  corePrimaryLineage?: CorePrimaryLineageV2;
   modelOverride?: string;
   currentTurnUserId?: string;
   raw?: AgentRunnerRaw;
   recovery?: {
-    checkpointMessages: ModelMessage[];
+    checkpointMessages: StoredMessageV1[];
     partialText: string;
   };
   identity?: AgentRunnerRecoveryIdentity;
+  retainedRequestDeliveries?: readonly AgentRunnerRetainedRequestDelivery[];
+};
+
+export type AgentRunnerRetainedRequestDelivery = {
+  readonly requestDeliveryId: string;
+  readonly outcome: RequestDeliveryTerminalOutcome;
 };
 
 export type AgentRunnerRecoveryState = {
   readonly entries: readonly AgentRunnerRecoveryEntry[];
   readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
 };
+
+export type BusAgentRunnerRequestDelivery = Pick<
+  RequestDeliveryCoordinator<
+    CorePreparedRequestEnvelope,
+    CoreAcceptedRequestWork,
+    CoreRequestOutputMetadata
+  >,
+  "handleDelivery" | "replaceAcceptedWork" | "terminalize"
+>;
 
 export class AgentRecoveryUnavailable extends TaggedError("AgentRecoveryUnavailable")<{
   readonly requestId: string;
@@ -1776,13 +1833,13 @@ export function isWorkflowAgentRecoveryEntry(entry: AgentRunnerRecoveryEntry): b
   );
 }
 
-function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
-  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
-  const selectLineage = created.match<() => CorePrimaryLineageV1>({
+function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV2 {
+  const created = createCorePrimaryLineageFreshOnlyV2(reason, currentCanonicalStart);
+  const selectLineage = created.match<() => CorePrimaryLineageV2>({
     ok: (lineage) => () => lineage,
     err: () => () => ({
       state: "fresh-only",
-      lineageVersion: 1,
+      lineageVersion: 2,
       currentCanonicalStart: 0,
       reason: "lineage-fallback-construction-failed",
     }),
@@ -1797,7 +1854,7 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
   messages: readonly ModelMessage[];
   corePrimaryLineage: unknown;
   transcriptStore?: TranscriptStore;
-}): CorePrimaryLineageV1 | undefined {
+}): CorePrimaryLineageV2 | undefined {
   if (input.requestClient !== "discord" || input.runProfile !== "primary") return undefined;
   const fallbackCurrentCanonicalStart = Math.max(
     0,
@@ -1806,8 +1863,8 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
   if (input.corePrimaryLineage === undefined) {
     return createFreshOnlyLineage("missing-manifest", fallbackCurrentCanonicalStart);
   }
-  const decoded = decodeCorePrimaryLineageV1(input.corePrimaryLineage, input.messages);
-  const continueDecoded = decoded.match<() => CorePrimaryLineageV1>({
+  const decoded = decodeCorePrimaryLineageV2(input.corePrimaryLineage, input.messages);
+  const continueDecoded = decoded.match<() => CorePrimaryLineageV2>({
     err: () => () =>
       createFreshOnlyLineage("malformed-or-unaligned-manifest", fallbackCurrentCanonicalStart),
     ok: (lineage) => () => {
@@ -1824,7 +1881,7 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
         sessionId: input.sessionId,
         surfaceId: `discord:${input.sessionId}`,
       });
-      const continueValidation = invalidReason.match<() => CorePrimaryLineageV1>({
+      const continueValidation = invalidReason.match<() => CorePrimaryLineageV2>({
         err: () => () =>
           createFreshOnlyLineage("lineage-store-unavailable", lineage.currentCanonicalStart),
         ok: (storedInvalidReason) => () =>
@@ -1841,7 +1898,7 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
 export function degradeCorePrimaryLineageForMutation(
   reason: string,
   currentCanonicalStart = 0,
-): CorePrimaryLineageV1 {
+): CorePrimaryLineageV2 {
   return createFreshOnlyLineage(reason, currentCanonicalStart);
 }
 
@@ -1851,8 +1908,8 @@ export function appendAutoInjectedThreadSearchLineage(input: {
   lineage: unknown;
   canonicalMessages: readonly ModelMessage[];
   injectedMessages: readonly ModelMessage[];
-}): CorePrimaryLineageV1 {
-  const parsedShape = corePrimaryLineageV1Schema.safeParse(input.lineage);
+}): CorePrimaryLineageV2 {
+  const parsedShape = corePrimaryLineageV2Schema.safeParse(input.lineage);
   const fallbackCurrentCanonicalStart = parsedShape.success
     ? parsedShape.data.currentCanonicalStart
     : Math.max(
@@ -1865,8 +1922,8 @@ export function appendAutoInjectedThreadSearchLineage(input: {
       fallbackCurrentCanonicalStart,
     );
 
-  const decoded = decodeCorePrimaryLineageV1(input.lineage, input.canonicalMessages);
-  const continueDecoded = decoded.match<() => CorePrimaryLineageV1>({
+  const decoded = decodeCorePrimaryLineageV2(input.lineage, input.canonicalMessages);
+  const continueDecoded = decoded.match<() => CorePrimaryLineageV2>({
     err: () => failClosed,
     ok: (lineage) => () => {
       if (lineage.state !== "complete" || input.injectedMessages.length === 0) {
@@ -1877,18 +1934,29 @@ export function appendAutoInjectedThreadSearchLineage(input: {
         return failClosed();
       }
 
+      const preparedInjected = projectStoredMessagesV1(input.injectedMessages).andThen((messages) =>
+        hashCanonicalStoredMessagesV2(messages).map((digest) => ({
+          messages,
+          messageDigest: digest.hash,
+        })),
+      );
+      const prepared = preparedInjected.match({
+        ok: (value) => value,
+        err: () => null,
+      });
+      if (!prepared) return failClosed();
       const atom = {
         kind: "synthetic" as const,
         source: AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE,
-        messageDigest: hashCanonicalMessagesV1(input.injectedMessages).hash,
+        messageDigest: prepared.messageDigest,
       };
       const cumulativeAtomCount = previous.cumulativeAtomCount + 1;
-      const extended = extendCoreLineagePrefixDigestV1(
+      const extended = extendCoreLineagePrefixDigestV2(
         previous.cumulativePrefixDigest,
         cumulativeAtomCount,
         atom,
       );
-      const continueExtended = extended.match<() => CorePrimaryLineageV1>({
+      const continueExtended = extended.match<() => CorePrimaryLineageV2>({
         err: () => failClosed,
         ok: (cumulativePrefixDigest) => () => {
           const candidate = {
@@ -1897,7 +1965,7 @@ export function appendAutoInjectedThreadSearchLineage(input: {
               ...lineage.segments,
               {
                 atoms: [atom],
-                canonicalMessages: [...input.injectedMessages],
+                canonicalMessages: prepared.messages,
                 canonicalStart: previous.canonicalEnd,
                 canonicalEnd: previous.canonicalEnd + input.injectedMessages.length,
                 cumulativeAtomCount,
@@ -1905,11 +1973,11 @@ export function appendAutoInjectedThreadSearchLineage(input: {
               },
             ],
           };
-          const parsed = decodeCorePrimaryLineageV1(candidate, [
+          const parsed = decodeCorePrimaryLineageV2(candidate, [
             ...input.canonicalMessages,
-            ...input.injectedMessages,
+            ...prepared.messages,
           ]);
-          const continueParsed = parsed.match<() => CorePrimaryLineageV1>({
+          const continueParsed = parsed.match<() => CorePrimaryLineageV2>({
             ok: (value) => () => (value.state === "complete" ? value : failClosed()),
             err: () => failClosed,
           });
@@ -1939,15 +2007,22 @@ export function mapCorePrimaryCompactionCurrentCanonicalStart(input: {
   );
 }
 
-function persistedCompleteLineage(lineage: CorePrimaryLineageV1 | undefined): {
-  corePrimaryLineage?: CoreLineageManifestV1;
+function persistedCompleteLineage(lineage: CorePrimaryLineageV2 | undefined): {
+  corePrimaryLineage?: CoreLineageManifestV2;
 } {
   return lineage?.state === "complete" ? { corePrimaryLineage: lineage } : {};
 }
 
+function requireStoredMessageHash(messages: readonly StoredMessageV1[]): string {
+  return hashCanonicalStoredMessagesV2(messages).match({
+    ok: (digest) => () => digest.hash,
+    err: (error) => () => signalBusAgentRunnerHostFailure(error),
+  })();
+}
+
 export function resolveCorePrimaryTranscriptProviderState(input: {
   targetFamily: HistoryProviderState["lastFamily"];
-  lineage?: CorePrimaryLineageV1;
+  lineage?: CorePrimaryLineageV2;
   transcriptStore?: TranscriptStore;
 }): HistoryProviderState {
   const lineage = input.lineage;
@@ -2067,7 +2142,10 @@ function groupQueueCancellationEntries(entries: readonly Enqueued[]): QueueCance
   for (const entry of entries) {
     const existing = groups.get(entry.requestId);
     if (existing) {
-      groups.set(entry.requestId, { ...existing, entries: [...existing.entries, entry] });
+      groups.set(entry.requestId, {
+        ...existing,
+        entries: [...existing.entries, entry],
+      });
       continue;
     }
     groups.set(entry.requestId, {
@@ -2105,8 +2183,8 @@ async function maybeBuildSkillsSectionForPrimary(): Promise<string | null> {
   }
 }
 
-export function buildPersistedHeartbeatMessages(finalText: string): ModelMessage[] {
-  return [{ role: "assistant", content: finalText } satisfies ModelMessage];
+export function buildPersistedHeartbeatMessages(finalText: string): StoredMessageV1[] {
+  return [{ role: "assistant", content: finalText }];
 }
 
 function toolCallIdsFromMessages(messages: readonly ModelMessage[]): Set<string> {
@@ -2287,7 +2365,10 @@ function resolveAgentRunFallbackSource(params: {
 
   if (params.requestModelOverride) {
     if (params.requestModelOverride.includes("/")) {
-      return { entries: [], source: "cmd.request.message.modelOverride.fallback" };
+      return {
+        entries: [],
+        source: "cmd.request.message.modelOverride.fallback",
+      };
     }
     const preset = params.cfg.models.def[params.requestModelOverride];
     if (!preset) return null;
@@ -2366,7 +2447,10 @@ export function resolveAgentRunModelFallbacksResult(params: {
       });
     }
     return params.reasoningOverride
-      ? fallbacks.map((fallback) => ({ ...fallback, reasoning: params.reasoningOverride }))
+      ? fallbacks.map((fallback) => ({
+          ...fallback,
+          reasoning: params.reasoningOverride,
+        }))
       : fallbacks;
   });
 }
@@ -2388,7 +2472,9 @@ export function selectNextNativeModelFallback(params: {
   const candidates = [params.plan.head, ...params.plan.fallbacks];
   const current = candidates[params.activeIndex];
   if (!current) return null;
-  const latchedFamily = classifyHistoryProviderFamily({ type: params.plan.head.provider });
+  const latchedFamily = classifyHistoryProviderFamily({
+    type: params.plan.head.provider,
+  });
   if (latchedFamily === "claude-code") return null;
 
   for (let index = params.activeIndex + 1; index < candidates.length; index += 1) {
@@ -2493,6 +2579,7 @@ type SessionQueue = {
   queue: Enqueued[];
   activeRequestId: string | null;
   activeRun: {
+    requestDeliveryId?: string;
     requestId: string;
     sessionId: string;
     requestClient: AdapterPlatform;
@@ -2501,7 +2588,8 @@ type SessionQueue = {
     runPolicy: RequestRunPolicy;
     origin?: RequestOrigin;
     messages: ModelMessage[];
-    corePrimaryLineage?: CorePrimaryLineageV1;
+    storedMessages: StoredMessageV1[];
+    corePrimaryLineage?: CorePrimaryLineageV2;
     modelOverride?: string;
     currentTurnUserId?: string;
     raw?: AgentRunnerRaw;
@@ -2518,6 +2606,7 @@ type SessionQueue = {
     started: boolean;
     startedAt: number;
     activeTools: Map<string, { toolName: string; startedAt: number }>;
+    retainedRequestDeliveries: Map<string, RequestDeliveryTerminalOutcome>;
   } | null;
   /** Track toolCallIds whose outputs are compacted in the model-facing view. */
   compactedToolCallIds: Set<string>;
@@ -2637,6 +2726,8 @@ export function formatBusAgentRunnerDrainFailureForLog(
 
 export async function startBusAgentRunner(params: {
   bus: LilacBus;
+  blobStore: AnthropicFallbackBlobStore;
+  requestDelivery?: BusAgentRunnerRequestDelivery;
   subscriptionId: string;
   config?: CoreConfig;
   pluginManager: CoreToolPluginManager;
@@ -2722,7 +2813,9 @@ export async function startBusAgentRunner(params: {
         if (!coreConfigReloadHadError || lastCoreConfigReloadError !== message) {
           logger.warn(
             "core-config reload failed; using last known config",
-            formatBridgeTaggedErrorForLog(loadError, { path: "core-config.yaml" }),
+            formatBridgeTaggedErrorForLog(loadError, {
+              path: "core-config.yaml",
+            }),
           );
         }
         coreConfigReloadHadError = true;
@@ -2805,6 +2898,26 @@ export async function startBusAgentRunner(params: {
         state: "cancelled",
         detail: attempt.detail,
       });
+      if (params.requestDelivery) {
+        for (const queued of group.entries) {
+          if (!queued.requestDeliveryId) continue;
+          const terminalized = await params.requestDelivery.terminalize({
+            requestDeliveryId: queued.requestDeliveryId,
+            outcome: {
+              kind: "cancelled",
+              code:
+                attempt.kind === "buffered-absorption"
+                  ? "absorbed-into-active-control"
+                  : "cancelled-while-queued",
+            },
+            transportCommitRequired: true,
+          });
+          terminalized.match({
+            ok: () => undefined,
+            err: (error) => signalBusAgentRunnerHostFailure(error),
+          });
+        }
+      }
       removeQueuedEntriesByReference(state.queue, group.entries);
       for (const queued of group.entries) {
         reservedQueueEntries.delete(queued);
@@ -2848,7 +2961,10 @@ export async function startBusAgentRunner(params: {
         try: () => drainSessionQueue(sessionId, state),
         catch: captureError,
       });
-      const failure = drained.match({ ok: () => null, err: ({ cause }) => ({ cause }) });
+      const failure = drained.match({
+        ok: () => null,
+        err: ({ cause }) => ({ cause }),
+      });
       if (failure) superviseDetachedDrain(failure.cause);
     }
   }
@@ -2868,9 +2984,9 @@ export async function startBusAgentRunner(params: {
         }),
       );
     }
-    const requestId = msg.headers?.request_id;
-    const sessionId = msg.headers?.session_id;
-    const requestClient = msg.headers?.request_client ?? "unknown";
+    let requestId = msg.headers?.request_id;
+    let sessionId = msg.headers?.session_id;
+    let requestClient = msg.headers?.request_client ?? "unknown";
     const pendingAttempt = queueLifecycleAttempts.get(msg.id);
     if (
       pendingAttempt &&
@@ -2898,8 +3014,92 @@ export async function startBusAgentRunner(params: {
       );
     }
 
+    const acceptedDelivery = params.requestDelivery
+      ? await params.requestDelivery.handleDelivery(msg.data.requestDeliveryId)
+      : null;
+    const acceptedOutcome = acceptedDelivery?.match({
+      ok: (value) => value,
+      err: () => null,
+    });
+    if (acceptedOutcome?.disposition === "commit") {
+      return Result.ok(undefined);
+    }
+    if (acceptedOutcome?.disposition === "park") {
+      return Result.err(
+        new BusAgentRunnerIntakeFailed({
+          cause: acceptedOutcome.error,
+          message: "Durable request delivery admission is pending",
+        }),
+      );
+    }
+    const acceptedRecord =
+      acceptedOutcome?.disposition === "accepted" ? acceptedOutcome.record : null;
+    const reconcileAcceptedProjectionFailure = async (
+      error: BusAgentRunnerDeliveryError,
+    ): Promise<ResultType<void, BusAgentRunnerDeliveryError>> => {
+      if (!acceptedRecord) return Result.err(error);
+      const resumed = await resumeAcceptedDelivery(acceptedRecord);
+      return resumed.match<() => ResultType<void, BusAgentRunnerDeliveryError>>({
+        ok: () => () => Result.ok(undefined),
+        err: (cause) => () =>
+          Result.err(
+            new BusAgentRunnerIntakeFailed({
+              cause,
+              message: "Accepted durable work could not enter the recovery queue",
+            }),
+          ),
+      })();
+    };
+    const intakeMessage: CmdRequestMessage = msg;
+    if (!requestId || !sessionId) {
+      return Result.err(
+        new BusAgentRunnerRequestHeadersInvalid({
+          missing: [
+            ...(!requestId ? ["request_id" as const] : []),
+            ...(!sessionId ? ["session_id" as const] : []),
+          ],
+          message: "Accepted request delivery is missing durable request/session identity",
+        }),
+      );
+    }
+    const storedMessages = acceptedRecord
+      ? [...acceptedRecord.work.data.messages]
+      : projectStoredMessagesV1(msg.data.messages).match({
+          ok: (messages) => messages,
+          err: () => null,
+        });
+    if (storedMessages === null) {
+      return Result.err(
+        new BusAgentRunnerIntakeFailed({
+          cause: new Error("Request messages are not durable stored messages"),
+          message: "cmd.request.message durable projection failed",
+        }),
+      );
+    }
+    const materializedMessages = await materializeStoredMessagesV1({
+      messages: storedMessages,
+      blobStore: params.blobStore,
+    });
+    const messageMaterializationError = materializedMessages.match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (messageMaterializationError) {
+      return reconcileAcceptedProjectionFailure(
+        new BusAgentRunnerIntakeFailed({
+          cause: messageMaterializationError,
+          message: "Durable request message materialization failed",
+        }),
+      );
+    }
+    const messages = materializedMessages.match({
+      ok: (value) => value,
+      err: () => [],
+    });
+    const deliveryData = acceptedRecord?.work.data ?? msg.data;
+
     const projectedRequest = (params.projectAuthenticatedRequest ?? projectAuthenticatedRequest)(
-      msg,
+      intakeMessage,
     );
     let projectionFailure: BusAgentRunnerAuthenticationProjectionInvalid | null = null;
     const selectRequestProjection = projectedRequest.match<
@@ -2917,13 +3117,21 @@ export async function startBusAgentRunner(params: {
     const requestProjection = selectRequestProjection();
     if (projectionFailure) {
       if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
-      return Result.err(projectionFailure);
+      return reconcileAcceptedProjectionFailure(projectionFailure);
     }
     if (!requestProjection) {
       if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
+      if (acceptedRecord) {
+        return reconcileAcceptedProjectionFailure(
+          new BusAgentRunnerIntakeFailed({
+            cause: new Error("Accepted request has no authenticated runtime projection"),
+            message: "Accepted durable work must enter restricted recovery",
+          }),
+        );
+      }
       return Result.ok(undefined);
     }
-    const raw = preserveAgentRunnerRaw(msg);
+    const raw = preserveAgentRunnerRaw({ data: deliveryData });
     let cacheAdmitted = false;
     let identityError:
       | RequestIdentitySourceMissing
@@ -2932,10 +3140,12 @@ export async function startBusAgentRunner(params: {
       | undefined;
     let intakeError: BusAgentRunnerOperationFailed | undefined;
     let parkPending = false;
-    return await (async () => {
+    const intakeResult: ResultType<void, BusAgentRunnerDeliveryError> = await (async (): Promise<
+      ResultType<void, BusAgentRunnerDeliveryError>
+    > => {
       const attempted = await Result.tryPromise({
         try: async () => {
-          const cachedExternal = requestMessageCache.cacheMessage(msg, requestProjection);
+          const cachedExternal = requestMessageCache.cacheMessage(intakeMessage, requestProjection);
           let cachedExternalError: RequestMessageCacheAdmissionError | null = null;
           const selectExternalProjection = cachedExternal.match<
             () => AuthenticatedRequestProjection | undefined
@@ -2966,7 +3176,7 @@ export async function startBusAgentRunner(params: {
             raw,
             store: params.durableWorkflowStore,
           });
-          const cachedTrusted = requestMessageCache.cacheMessage(msg, trustedProjection);
+          const cachedTrusted = requestMessageCache.cacheMessage(intakeMessage, trustedProjection);
           let cachedTrustedError: RequestMessageCacheAdmissionError | null = null;
           const selectAuthenticatedRequest = cachedTrusted.match<
             () => AuthenticatedRequestProjection | undefined
@@ -2993,7 +3203,7 @@ export async function startBusAgentRunner(params: {
             return { status: "return", value: Result.ok(undefined) } as const;
           await (async () => {
             rethrowBusAgentRunnerPanic(terminalPanic);
-            await params.beforeRequestIntake?.(msg);
+            await params.beforeRequestIntake?.(intakeMessage);
 
             if (env.perf.log) {
               const lagMs = Date.now() - msg.ts;
@@ -3001,37 +3211,46 @@ export async function startBusAgentRunner(params: {
               const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
               if (shouldWarn || shouldSample) {
                 if (shouldWarn) {
-                  logger.warn("perf.bus_lag", {
-                    stage: "cmd.request->agent_runner",
-                    lagMs,
-                    requestId,
-                    sessionId,
-                    requestClient,
-                    queue: msg.data.queue,
-                  });
+                  logger.warn(
+                    "perf.bus_lag",
+                    formatBridgeLogContext({
+                      stage: "cmd.request->agent_runner",
+                      lagMs,
+                      requestId,
+                      sessionId,
+                      requestClient,
+                      queue: deliveryData.queue,
+                    }),
+                  );
                 } else {
-                  logger.info("perf.bus_lag", {
-                    stage: "cmd.request->agent_runner",
-                    lagMs,
-                    requestId,
-                    sessionId,
-                    requestClient,
-                    queue: msg.data.queue,
-                  });
+                  logger.info(
+                    "perf.bus_lag",
+                    formatBridgeLogContext({
+                      stage: "cmd.request->agent_runner",
+                      lagMs,
+                      requestId,
+                      sessionId,
+                      requestClient,
+                      queue: deliveryData.queue,
+                    }),
+                  );
                 }
               }
             }
 
-            logger.debug("cmd.request.message received", {
-              requestId,
-              sessionId,
-              requestClient,
-              queue: msg.data.queue,
-              runPolicy: msg.data.runPolicy ?? "normal",
-              originKind: msg.data.origin?.kind,
-              modelOverride: msg.data.modelOverride,
-              messageCount: msg.data.messages.length,
-            });
+            logger.debug(
+              "cmd.request.message received",
+              formatBridgeLogContext({
+                requestId,
+                sessionId,
+                requestClient,
+                queue: deliveryData.queue,
+                runPolicy: deliveryData.runPolicy ?? "normal",
+                originKind: deliveryData.origin?.kind,
+                modelOverride: deliveryData.modelOverride,
+                messageCount: storedMessages.length,
+              }),
+            );
 
             // reload config opportunistically (mtime cached in getCoreConfig).
             // If reload fails, keep using the last known good config.
@@ -3040,22 +3259,26 @@ export async function startBusAgentRunner(params: {
             const intakeRunProfile = parseSubagentMetaFromRaw(raw).profile;
             const entry: Enqueued = {
               queueEntryId: msg.id,
+              ...(acceptedRecord ? { requestDeliveryId: acceptedRecord.requestDeliveryId } : {}),
               requestId,
               sessionId,
               requestClient,
-              queue: msg.data.queue,
-              runPolicy: msg.data.runPolicy ?? "normal",
-              origin: msg.data.origin,
-              messages: msg.data.messages,
-              corePrimaryLineage: validateCorePrimaryLineageAtRunnerIntake({
-                requestClient,
-                sessionId,
-                runProfile: intakeRunProfile,
-                messages: msg.data.messages,
-                corePrimaryLineage: msg.data.corePrimaryLineage,
-                transcriptStore: params.transcriptStore,
-              }),
-              modelOverride: msg.data.modelOverride,
+              queue: deliveryData.queue,
+              runPolicy: deliveryData.runPolicy ?? "normal",
+              origin: deliveryData.origin,
+              messages,
+              storedMessages,
+              corePrimaryLineage:
+                acceptedRecord?.work.data.corePrimaryLineage ??
+                validateCorePrimaryLineageAtRunnerIntake({
+                  requestClient,
+                  sessionId,
+                  runProfile: intakeRunProfile,
+                  messages,
+                  corePrimaryLineage: deliveryData.corePrimaryLineage,
+                  transcriptStore: params.transcriptStore,
+                }),
+              modelOverride: deliveryData.modelOverride,
               raw,
               authenticatedOrigin: authenticatedRequest?.authenticatedOrigin,
               currentTurnUserId: trustedProjection.authenticatedOrigin?.userId,
@@ -3108,10 +3331,6 @@ export async function startBusAgentRunner(params: {
               });
             };
 
-            if (pendingAttempt) {
-              await resumeQueueLifecycleAttempt(pendingAttempt, state);
-              return;
-            }
             const enqueueWithLifecycle = async (
               queuedEntry: Enqueued,
               detail: string,
@@ -3131,7 +3350,10 @@ export async function startBusAgentRunner(params: {
                     detail,
                   }),
               );
-              const publishError = published.match({ ok: () => null, err: (error) => error });
+              const publishError = published.match({
+                ok: () => null,
+                err: (error) => error,
+              });
               if (publishError) {
                 removeQueuedEntriesByReference(state.queue, [queuedEntry]);
                 if (queuedEntry.identityOwner) {
@@ -3141,6 +3363,58 @@ export async function startBusAgentRunner(params: {
               }
               return Result.ok(undefined);
             };
+            const terminalizeProjectedDelivery = async (
+              kind: "completed" | "cancelled" | "abandoned",
+              code: string,
+            ): Promise<boolean> => {
+              if (!entry.requestDeliveryId || !params.requestDelivery) return true;
+              const terminalized = await params.requestDelivery.terminalize({
+                requestDeliveryId: entry.requestDeliveryId,
+                outcome: { kind, code },
+                transportCommitRequired: true,
+              });
+              const terminalError = terminalized.match({
+                ok: () => null,
+                err: (error) => error,
+              });
+              if (!terminalError) return true;
+              intakeError = new BusAgentRunnerOperationFailed({
+                cause: terminalError,
+                operation: "request delivery projection terminalization",
+                failureKind: "other",
+                displayMessage: terminalError.message,
+                message: "Applied request delivery could not be terminalized",
+              });
+              return false;
+            };
+            const retainProjectedDeliveryUntilRunTerminal = (
+              kind: "completed" | "cancelled" | "abandoned",
+              code: string,
+            ): void => {
+              if (!entry.requestDeliveryId || !params.requestDelivery || !state.activeRun) return;
+              if (state.activeRun.retainedRequestDeliveries.has(entry.requestDeliveryId)) return;
+              state.activeRun.retainedRequestDeliveries.set(entry.requestDeliveryId, {
+                kind,
+                code,
+              });
+              state.activeRun.storedMessages = [
+                ...state.activeRun.storedMessages,
+                ...entry.storedMessages,
+              ];
+            };
+
+            if (pendingAttempt) {
+              await resumeQueueLifecycleAttempt(pendingAttempt, state);
+              if (pendingAttempt.kind === "buffered-absorption") {
+                retainProjectedDeliveryUntilRunTerminal(
+                  "completed",
+                  "active-control-projection-recovered",
+                );
+              } else {
+                await terminalizeProjectedDelivery("completed", "control-projection-recovered");
+              }
+              return;
+            }
 
             if (
               !requestControl.cancel &&
@@ -3172,21 +3446,26 @@ export async function startBusAgentRunner(params: {
                     ? "idle_only_session_busy"
                     : "idle_only_global_busy",
               });
+              await terminalizeProjectedDelivery("cancelled", "idle-run-policy-drop");
               return;
             }
 
             if (draining) {
-              logger.debug("dropping request message while draining", {
-                requestId,
-                sessionId,
-                queue: msg.data.queue,
-              });
+              logger.debug(
+                "dropping request message while draining",
+                formatBridgeLogContext({
+                  requestId,
+                  sessionId,
+                  queue: deliveryData.queue,
+                }),
+              );
               logQueueTransition({
                 action: "drop",
                 queueDepthBefore: state.queue.length,
                 queueDepthAfter: state.queue.length,
                 reason: "draining",
               });
+              await terminalizeProjectedDelivery("abandoned", "runner-draining-drop");
               return;
             }
 
@@ -3207,6 +3486,7 @@ export async function startBusAgentRunner(params: {
                 queueDepthAfter: state.queue.length,
                 reason,
               });
+              await terminalizeProjectedDelivery("abandoned", "control-target-absent");
             };
 
             if (requestControl.cancel && requestControl.cancelQueued) {
@@ -3261,6 +3541,7 @@ export async function startBusAgentRunner(params: {
                   reason: "cancel_queued",
                 });
 
+                await terminalizeProjectedDelivery("completed", "queued-cancel-applied");
                 return;
               }
 
@@ -3302,6 +3583,7 @@ export async function startBusAgentRunner(params: {
                     ? "cancel_active_by_message_id"
                     : "cancel_active_by_request_id",
                 });
+                retainProjectedDeliveryUntilRunTerminal("completed", "active-cancel-applied");
                 return;
               }
 
@@ -3331,6 +3613,7 @@ export async function startBusAgentRunner(params: {
                   queueDepthAfter: state.queue.length,
                   reason: "requires_active_without_run",
                 });
+                await terminalizeProjectedDelivery("abandoned", "active-run-required");
                 return;
               }
 
@@ -3368,6 +3651,7 @@ export async function startBusAgentRunner(params: {
                   queueDepthAfter: state.queue.length,
                   reason: "cancel_active_before_agent_start",
                 });
+                retainProjectedDeliveryUntilRunTerminal("completed", "active-cancel-applied");
                 return;
               }
 
@@ -3437,12 +3721,56 @@ export async function startBusAgentRunner(params: {
                       ownerId: alias.ownerId,
                     },
                   };
+                  if (acceptedRecord && params.requestDelivery) {
+                    const projectedWork = {
+                      ...acceptedRecord.work,
+                      requestId: aliasProjection.requestId,
+                      sessionId: aliasProjection.sessionId,
+                      requestClient: aliasProjection.requestClient,
+                      headers: {
+                        ...acceptedRecord.work.headers,
+                        request_id: aliasProjection.requestId,
+                        session_id: aliasProjection.sessionId,
+                        request_client: aliasProjection.requestClient,
+                      },
+                      data: {
+                        ...acceptedRecord.work.data,
+                        queue: "prompt" as const,
+                      },
+                    } satisfies CoreAcceptedRequestWork;
+                    const replaced = params.requestDelivery.replaceAcceptedWork({
+                      requestDeliveryId: acceptedRecord.requestDeliveryId,
+                      requestId: projectedWork.requestId,
+                      work: projectedWork,
+                    });
+                    const replaceError = replaced.match({
+                      ok: () => null,
+                      err: (error) => error,
+                    });
+                    if (replaceError) {
+                      requestMessageCache.releaseOwner({
+                        requestId: alias.requestId,
+                        ownerId: alias.ownerId,
+                      });
+                      intakeError = new BusAgentRunnerOperationFailed({
+                        operation: "durable incompatible-model queue projection",
+                        cause: replaceError,
+                        failureKind: "other",
+                        displayMessage: replaceError.message,
+                        message: "Incompatible-model queue projection could not be persisted",
+                      });
+                      return;
+                    }
+                  }
                   const queueDepthBefore = state.queue.length;
                   const enqueued = await enqueueWithLifecycle(
                     queuedEntry,
                     "queued for incompatible model or reasoning selection",
                   );
-                  const enqueueError = enqueued.match({ ok: () => null, err: (error) => error });
+                  const enqueueError = enqueued.match({
+                    ok: () => null,
+                    err: (error) => error,
+                  });
                   if (enqueueError) {
                     intakeError = enqueueError;
                     return;
@@ -3481,6 +3809,10 @@ export async function startBusAgentRunner(params: {
                           ...bufferedPrompts.flatMap((queuedPrompt) => queuedPrompt.messages),
                           ...entry.messages,
                         ],
+                        storedMessages: [
+                          ...bufferedPrompts.flatMap((queuedPrompt) => queuedPrompt.storedMessages),
+                          ...entry.storedMessages,
+                        ],
                         corePrimaryLineage: degradeCorePrimaryLineageForMutation(
                           "queued-buffer-absorbed-into-steering",
                           runningAgent.state.messages.length,
@@ -3518,7 +3850,10 @@ export async function startBusAgentRunner(params: {
                         state.activeRun,
                       ),
                   );
-                  const applyError = applied.match({ ok: () => null, err: (error) => error });
+                  const applyError = applied.match({
+                    ok: () => null,
+                    err: (error) => error,
+                  });
                   if (applyError) {
                     for (const bufferedPrompt of bufferedPrompts) {
                       reservedQueueEntries.delete(bufferedPrompt);
@@ -3546,6 +3881,7 @@ export async function startBusAgentRunner(params: {
                       ? `same_request_id_absorbed_${bufferedPrompts.length}`
                       : "same_request_id",
                 });
+                retainProjectedDeliveryUntilRunTerminal("completed", "active-input-applied");
               } else {
                 // Prevent stale surface controls (e.g. Cancel button) from enqueueing behind
                 // an unrelated active request.
@@ -3565,6 +3901,7 @@ export async function startBusAgentRunner(params: {
                     queueDepthAfter: state.queue.length,
                     reason: "requires_active_different_request_id",
                   });
+                  await terminalizeProjectedDelivery("abandoned", "active-request-mismatch");
                   return;
                 }
 
@@ -3582,7 +3919,10 @@ export async function startBusAgentRunner(params: {
                 if (!identityOwner) return;
                 entry.identityOwner = identityOwner;
                 const enqueued = await enqueueWithLifecycle(entry, "queued behind active request");
-                const enqueueError = enqueued.match({ ok: () => null, err: (error) => error });
+                const enqueueError = enqueued.match({
+                  ok: () => null,
+                  err: (error) => error,
+                });
                 if (enqueueError) {
                   intakeError = enqueueError;
                   return;
@@ -3640,7 +3980,10 @@ export async function startBusAgentRunner(params: {
             readonly operation: import("better-result").InferOk<typeof attempted>;
           }
         | { readonly kind: "panic"; readonly panic: Panic }
-        | { readonly kind: "failure"; readonly error: BusAgentRunnerIntakeFailed }
+        | {
+            readonly kind: "failure";
+            readonly error: BusAgentRunnerIntakeFailed;
+          }
       >({
         ok: (operation) => ({ kind: "success", operation }),
         err: (failure) => failure,
@@ -3669,6 +4012,10 @@ export async function startBusAgentRunner(params: {
         });
       }
     });
+    return intakeResult.match<() => Promise<ResultType<void, BusAgentRunnerDeliveryError>>>({
+      ok: () => async () => Result.ok(undefined),
+      err: (error) => () => reconcileAcceptedProjectionFailure(error),
+    })();
   }
 
   let stopStartedSubscription: (() => Promise<void>) | null = null;
@@ -3676,7 +4023,9 @@ export async function startBusAgentRunner(params: {
   const superviseAgentRunnerBackgroundFailure = <Cause>(cause: Cause): void => {
     rethrowBusAgentRunnerPanic(cause, reportFatalPanic);
     const error = projectBusAgentRunnerError(cause, "agent runner background operation failed");
-    logger.error("agent runner background operation failed", { error: error.message });
+    logger.error("agent runner background operation failed", {
+      error: error.message,
+    });
   };
   const ignoreDetachedFailure = async (operation: Promise<unknown>): Promise<void> => {
     await Result.tryPromise({ try: () => operation, catch: () => undefined });
@@ -3724,7 +4073,10 @@ export async function startBusAgentRunner(params: {
           try: () => subscriptionDone,
           catch: captureError,
         });
-        const failure = completed.match({ ok: () => null, err: ({ cause }) => ({ cause }) });
+        const failure = completed.match({
+          ok: () => null,
+          err: ({ cause }) => ({ cause }),
+        });
         if (failure) superviseAgentRunnerBackgroundFailure(failure.cause);
       }
       stopStartedSubscription = async () => {
@@ -3804,6 +4156,9 @@ export async function startBusAgentRunner(params: {
     if (!state.agent) {
       return {
         queueEntryId: `active:${state.activeRun.requestId}`,
+        ...(state.activeRun.requestDeliveryId
+          ? { requestDeliveryId: state.activeRun.requestDeliveryId }
+          : {}),
         kind: "active",
         requestId: state.activeRun.requestId,
         sessionId: state.activeRun.sessionId,
@@ -3811,12 +4166,15 @@ export async function startBusAgentRunner(params: {
         queue: "prompt",
         runPolicy: state.activeRun.runPolicy,
         origin: state.activeRun.origin,
-        messages: state.activeRun.messages,
+        messages: state.activeRun.storedMessages,
         corePrimaryLineage: state.activeRun.corePrimaryLineage,
         ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
         currentTurnUserId: state.activeRun.currentTurnUserId,
         raw: state.activeRun.raw,
         identity: buildRecoveryIdentity(state.activeRun),
+        retainedRequestDeliveries: [...state.activeRun.retainedRequestDeliveries].map(
+          ([requestDeliveryId, outcome]) => ({ requestDeliveryId, outcome }),
+        ),
       };
     }
 
@@ -3824,9 +4182,16 @@ export async function startBusAgentRunner(params: {
       state.agent.getRecoverableMessages(),
       "server restarted",
     );
+    const storedCheckpoint = projectStoredMessagesV1(checkpointMessages).match({
+      ok: (messages) => messages,
+      err: () => state.activeRun?.storedMessages ?? [],
+    });
 
     return {
       queueEntryId: `active:${state.activeRun.requestId}`,
+      ...(state.activeRun.requestDeliveryId
+        ? { requestDeliveryId: state.activeRun.requestDeliveryId }
+        : {}),
       kind: "active",
       requestId: state.activeRun.requestId,
       sessionId: state.activeRun.sessionId,
@@ -3840,8 +4205,11 @@ export async function startBusAgentRunner(params: {
       currentTurnUserId: state.activeRun.currentTurnUserId,
       raw: state.activeRun.raw,
       identity: buildRecoveryIdentity(state.activeRun),
+      retainedRequestDeliveries: [...state.activeRun.retainedRequestDeliveries].map(
+        ([requestDeliveryId, outcome]) => ({ requestDeliveryId, outcome }),
+      ),
       recovery: {
-        checkpointMessages,
+        checkpointMessages: storedCheckpoint,
         partialText: state.activeRun.partialText,
       },
     };
@@ -3896,6 +4264,7 @@ export async function startBusAgentRunner(params: {
       for (const queued of state.queue) {
         out.push({
           queueEntryId: queued.queueEntryId,
+          ...(queued.requestDeliveryId ? { requestDeliveryId: queued.requestDeliveryId } : {}),
           kind: "queued",
           requestId: queued.requestId,
           sessionId: queued.sessionId,
@@ -3903,12 +4272,15 @@ export async function startBusAgentRunner(params: {
           queue: queued.queue,
           runPolicy: queued.runPolicy,
           origin: queued.origin,
-          messages: queued.messages,
+          messages: queued.storedMessages,
           corePrimaryLineage: queued.corePrimaryLineage,
           ...(queued.modelOverride ? { modelOverride: queued.modelOverride } : {}),
           currentTurnUserId: queued.currentTurnUserId,
           raw: queued.raw,
           identity: buildRecoveryIdentity(queued),
+          ...(queued.retainedRequestDeliveries
+            ? { retainedRequestDeliveries: queued.retainedRequestDeliveries }
+            : {}),
         });
       }
     }
@@ -4055,7 +4427,11 @@ export async function startBusAgentRunner(params: {
         );
       }
       return Result.ok({
-        projection: { ...projection, authenticatedOrigin, verifiedIngress: false },
+        projection: {
+          ...projection,
+          authenticatedOrigin,
+          verifiedIngress: false,
+        },
         safetyMode,
         parkedEventIds: identity.parkedEventIds,
       });
@@ -4240,7 +4616,10 @@ export async function startBusAgentRunner(params: {
       apply: () => {
         if (applied) return Result.ok(undefined);
         const cached = restoreCache.apply();
-        const cacheError = cached.match({ ok: () => null, err: (error) => error });
+        const cacheError = cached.match({
+          ok: () => null,
+          err: (error) => error,
+        });
         if (cacheError) {
           return Result.err(
             new AgentRecoveryUnavailable({
@@ -4278,23 +4657,33 @@ export async function startBusAgentRunner(params: {
           }
           const queued: Enqueued = {
             queueEntryId,
+            ...(entry.requestDeliveryId ? { requestDeliveryId: entry.requestDeliveryId } : {}),
             requestId: entry.requestId,
             sessionId: entry.sessionId,
             requestClient: entry.requestClient,
             queue: entry.queue,
             runPolicy: entry.runPolicy ?? "normal",
             origin: entry.origin,
-            messages: entry.messages,
+            messages: [],
+            storedMessages: [...entry.messages],
             corePrimaryLineage: entry.recovery
               ? degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint")
               : entry.corePrimaryLineage,
             modelOverride: entry.modelOverride,
             currentTurnUserId: entry.currentTurnUserId,
             raw: entry.raw,
-            recovery: entry.recovery,
+            recovery: entry.recovery
+              ? { checkpointMessages: [], partialText: entry.recovery.partialText }
+              : undefined,
+            storedRecoveryCheckpoint: entry.recovery
+              ? [...entry.recovery.checkpointMessages]
+              : undefined,
             authenticatedOrigin: identity?.projection?.authenticatedOrigin,
             verifiedIngress: identity?.projection?.verifiedIngress,
             restoredSafetyMode: identity?.safetyMode ?? "restricted",
+            ...(entry.retainedRequestDeliveries
+              ? { retainedRequestDeliveries: entry.retainedRequestDeliveries }
+              : {}),
             ...(identityOwner ? { identityOwner } : {}),
           };
           const state =
@@ -4363,6 +4752,40 @@ export async function startBusAgentRunner(params: {
     if (reservedQueueEntries.has(next)) return;
     state.queue.shift();
 
+    if (next.messages.length === 0 && next.storedMessages.length > 0) {
+      const materialized = await materializeStoredMessagesV1({
+        messages: next.storedMessages,
+        blobStore: params.blobStore,
+      });
+      const materializationError = materialized.match({
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (materializationError) {
+        state.queue.unshift(next);
+        return signalBusAgentRunnerHostFailure(materializationError);
+      }
+      next.messages = materialized.match({ ok: (value) => value, err: () => [] });
+    }
+    if (next.recovery && next.storedRecoveryCheckpoint) {
+      const materialized = await materializeStoredMessagesV1({
+        messages: next.storedRecoveryCheckpoint,
+        blobStore: params.blobStore,
+      });
+      const materializationError = materialized.match({
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (materializationError) {
+        state.queue.unshift(next);
+        return signalBusAgentRunnerHostFailure(materializationError);
+      }
+      next.recovery.checkpointMessages = materialized.match({
+        ok: (value) => value,
+        err: () => [],
+      });
+    }
+
     logger.debug("agent.queue.transition", {
       requestId: next.requestId,
       sessionId,
@@ -4410,7 +4833,10 @@ export async function startBusAgentRunner(params: {
       corePrimaryClaudeRuntime;
     let activeRunOperation: Promise<unknown> | null = null;
     let customCommandAbortController: AbortController | null = null;
-    let activeCustomCommandTool: { toolCallId: string; display: string } | null = null;
+    let activeCustomCommandTool: {
+      toolCallId: string;
+      display: string;
+    } | null = null;
     let rejectPreAgentCancellation: ((error: PreAgentRunCancelledError) => void) | null = null;
     const preAgentCancellationPromise = new Promise<never>((_, reject) => {
       rejectPreAgentCancellation = reject;
@@ -4426,12 +4852,14 @@ export async function startBusAgentRunner(params: {
       request_id: string;
       session_id: string;
       request_client: AdapterPlatform;
+      request_delivery_id?: string;
       workflow_dispatch_epoch?: string;
       router_session_mode?: "mention" | "active";
     } = {
       request_id: next.requestId,
       session_id: next.sessionId,
       request_client: next.requestClient,
+      ...(next.requestDeliveryId ? { request_delivery_id: next.requestDeliveryId } : {}),
       ...(workflowDispatchEpoch ? { workflow_dispatch_epoch: workflowDispatchEpoch } : {}),
       ...(routerSessionMode ? { router_session_mode: routerSessionMode } : {}),
     };
@@ -4690,6 +5118,7 @@ export async function startBusAgentRunner(params: {
     };
 
     state.activeRun = {
+      ...(next.requestDeliveryId ? { requestDeliveryId: next.requestDeliveryId } : {}),
       requestId: next.requestId,
       sessionId: next.sessionId,
       requestClient: next.requestClient,
@@ -4698,6 +5127,7 @@ export async function startBusAgentRunner(params: {
       runPolicy: next.runPolicy,
       origin: next.origin,
       messages: next.messages,
+      storedMessages: next.storedMessages,
       corePrimaryLineage: next.corePrimaryLineage,
       modelOverride: next.modelOverride,
       currentTurnUserId: next.currentTurnUserId,
@@ -4720,6 +5150,11 @@ export async function startBusAgentRunner(params: {
       started: false,
       startedAt: runStartedAt,
       activeTools: new Map(),
+      retainedRequestDeliveries: new Map(
+        next.retainedRequestDeliveries?.map(
+          ({ requestDeliveryId, outcome }) => [requestDeliveryId, outcome] as const,
+        ),
+      ),
     };
 
     let initialMessages: ModelMessage[] = [];
@@ -4749,6 +5184,8 @@ export async function startBusAgentRunner(params: {
 
     let resolvedModelLabel = "unknown";
     let resolvedProviderFamily: HistoryProviderState["lastFamily"] = "ai-sdk";
+    let requestTerminalKind: "completed" | "failed" | "cancelled" = "failed";
+    let shouldTerminalizeRequest = true;
     const outcome = await (async () => {
       const runResult = await captureBusAgentRunnerOperation(
         "agent queue run",
@@ -4843,7 +5280,9 @@ export async function startBusAgentRunner(params: {
               detail,
               output: `Error: ${detail}`,
             });
-            await outputPublisher.publishResponseText({ finalText: `Error: ${detail}` });
+            await outputPublisher.publishResponseText({
+              finalText: `Error: ${detail}`,
+            });
             return;
           }
 
@@ -4955,6 +5394,7 @@ export async function startBusAgentRunner(params: {
             const customCancelled = cancelledByRequestId.has(headers.request_id);
 
             if (customCancelled) {
+              requestTerminalKind = "cancelled";
               const finalText = "Cancelled.";
               await outputPublisher.publishToolCall({
                 toolCallId,
@@ -5013,17 +5453,23 @@ export async function startBusAgentRunner(params: {
               resolvedModelLabel = CUSTOM_COMMAND_TOOL_NAME;
 
               if (params.transcriptStore) {
-                const persisted = params.transcriptStore.saveRequestTranscript({
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                  requestClient: headers.request_client,
-                  messages: [
-                    ...customCommandMessages,
-                    { role: "assistant", content: finalText } satisfies ModelMessage,
-                  ],
-                  finalText,
-                  modelLabel: resolvedModelLabel,
-                });
+                const storedCustomMessages = projectStoredMessagesV1([
+                  ...customCommandMessages,
+                  {
+                    role: "assistant",
+                    content: finalText,
+                  } satisfies ModelMessage,
+                ]);
+                const persisted = storedCustomMessages.andThen((messages) =>
+                  params.transcriptStore!.saveRequestTranscript({
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    requestClient: headers.request_client,
+                    messages,
+                    finalText,
+                    modelLabel: resolvedModelLabel,
+                  }),
+                );
                 const persistError = persisted.match({
                   ok: () => null,
                   err: (error) => error,
@@ -5221,7 +5667,10 @@ export async function startBusAgentRunner(params: {
             };
             const baseSystemPrompt =
               runProfile === "primary"
-                ? buildSystemPromptForProfile({ ...profilePrompt, profile: "primary" })
+                ? buildSystemPromptForProfile({
+                    ...profilePrompt,
+                    profile: "primary",
+                  })
                 : buildSystemPromptForProfile({
                     ...profilePrompt,
                     profile: runProfile,
@@ -5249,6 +5698,7 @@ export async function startBusAgentRunner(params: {
           };
 
           let seededSessionMessages: ModelMessage[] = [];
+          let seededStoredMessages: StoredMessageV1[] = [];
           let seededSessionTranscript: TranscriptSnapshot | null = null;
           if (!next.recovery && runProfile !== "primary" && params.transcriptStore) {
             const loadedTranscript = await captureBusAgentRunnerOperation(
@@ -5277,7 +5727,7 @@ export async function startBusAgentRunner(params: {
                 const applyDecodedTranscript = transcript?.match<() => void>({
                   ok: (latest) => () => {
                     if (!latest || latest.messages.length === 0) return;
-                    seededSessionMessages = latest.messages;
+                    seededStoredMessages = [...latest.messages];
                     seededSessionTranscript = latest;
                     logger.info(
                       "subagent continuation seeded from transcript",
@@ -5303,6 +5753,27 @@ export async function startBusAgentRunner(params: {
               },
             });
             applyLoadedTranscript();
+            if (seededStoredMessages.length > 0) {
+              const materialized = await materializeStoredMessagesV1({
+                messages: seededStoredMessages,
+                blobStore: params.blobStore,
+              });
+              materialized.match({
+                ok: (messages) => {
+                  seededSessionMessages = messages;
+                },
+                err: (error) => {
+                  logger.warn(
+                    "failed to materialize subagent continuation transcript",
+                    formatBridgeTaggedErrorForLog(error, {
+                      requestId: next.requestId,
+                      sessionId: next.sessionId,
+                    }),
+                  );
+                  seededSessionTranscript = null;
+                },
+              });
+            }
           }
 
           const fallbackSurfaceForDelegation = trustedFallbackSurface;
@@ -5393,12 +5864,14 @@ export async function startBusAgentRunner(params: {
                 }
               : systemPrompt;
             const experimentalDownload = buildExperimentalDownloadForAnthropicFallback({
+              blobStore: params.blobStore,
               spec: resolved.spec,
               provider: resolved.provider,
               providerOptions: providerOptionsForAgent,
             });
             const level1RequestContext = {
               requestId: next.requestId,
+              ...(next.requestDeliveryId ? { requestDeliveryId: next.requestDeliveryId } : {}),
               sessionId: next.sessionId,
               requestClient: next.requestClient,
               subagentDepth: subagentMeta.depth,
@@ -5777,6 +6250,7 @@ export async function startBusAgentRunner(params: {
                   executionScopeHash: executionScope.hash,
                   executionCwd,
                   sourceTranscript: seededSessionTranscript,
+                  sourceMessages: seededSessionMessages,
                   getCurrentTurnMessages: () => initialMessages,
                   materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
                   onDiagnostic: (event, detail, error) => {
@@ -5869,6 +6343,7 @@ export async function startBusAgentRunner(params: {
             agent?.setContext({
               sessionId: next.sessionId,
               requestId: next.requestId,
+              ...(next.requestDeliveryId ? { requestDeliveryId: next.requestDeliveryId } : {}),
               requestClient: next.requestClient,
               subagentDepth: subagentMeta.depth,
               subagentProfile: runProfile,
@@ -6467,7 +6942,9 @@ export async function startBusAgentRunner(params: {
                 err: (error) => {
                   logger.warn(
                     "workflow subagent completion publish failed",
-                    formatBridgeTaggedErrorForLog(error, { runId: completion.runId }),
+                    formatBridgeTaggedErrorForLog(error, {
+                      runId: completion.runId,
+                    }),
                   );
                 },
               });
@@ -6598,7 +7075,11 @@ export async function startBusAgentRunner(params: {
               previous.delta += delta;
               return;
             }
-            pendingNoReplyTurnOutputs.push({ delta, phase, phaseBoundaryPrefixChars });
+            pendingNoReplyTurnOutputs.push({
+              delta,
+              phase,
+              phaseBoundaryPrefixChars,
+            });
           };
           const publishPendingNoReplyOutputs = (): void => {
             for (const output of pendingNoReplyTurnOutputs) {
@@ -6977,7 +7458,10 @@ export async function startBusAgentRunner(params: {
             ) {
               const chunkId = event.assistantMessageEvent.id;
               retryAttemptHadReasoning = true;
-              consumeReasoningChunkEvent(reasoningChunkState, { type: "start", chunkId });
+              consumeReasoningChunkEvent(reasoningChunkState, {
+                type: "start",
+                chunkId,
+              });
 
               void publishAuxiliaryOutput("failed to publish reasoning start", () =>
                 outputPublisher.publishReasoningBoundary({ delta: "" }),
@@ -7012,7 +7496,10 @@ export async function startBusAgentRunner(params: {
               event.assistantMessageEvent.type === "thinking_end"
             ) {
               const chunkId = event.assistantMessageEvent.id;
-              consumeReasoningChunkEvent(reasoningChunkState, { type: "end", chunkId });
+              consumeReasoningChunkEvent(reasoningChunkState, {
+                type: "end",
+                chunkId,
+              });
               outputPublisher.flush();
             }
 
@@ -7163,6 +7650,22 @@ export async function startBusAgentRunner(params: {
             const mergedInitial = coalesced.messages;
             state.activeRun?.setCurrentTurnUserId(next.currentTurnUserId);
             for (const discarded of coalesced.discarded) {
+              if (discarded.requestDeliveryId && state.activeRun) {
+                state.activeRun.retainedRequestDeliveries.set(discarded.requestDeliveryId, {
+                  kind: "completed",
+                  code: "coalesced-into-active-run",
+                });
+                for (const retained of discarded.retainedRequestDeliveries ?? []) {
+                  state.activeRun.retainedRequestDeliveries.set(
+                    retained.requestDeliveryId,
+                    retained.outcome,
+                  );
+                }
+                state.activeRun.storedMessages = [
+                  ...state.activeRun.storedMessages,
+                  ...discarded.storedMessages,
+                ];
+              }
               if (discarded.identityOwner)
                 requestMessageCache.releaseOwner(discarded.identityOwner);
             }
@@ -7235,6 +7738,7 @@ export async function startBusAgentRunner(params: {
           }
 
           if (cancelledByRequestId.has(headers.request_id)) {
+            requestTerminalKind = "cancelled";
             const finalText = "Cancelled.";
             await publishCurrentLifecycle({
               state: "cancelled",
@@ -7357,7 +7861,7 @@ export async function startBusAgentRunner(params: {
                   completedCompactionCount,
                 });
                 const isCompactionCheckpoint = checkpointMeta !== undefined;
-                const persistedMessages = (() => {
+                const persistenceCandidates = (() => {
                   if (isHeartbeatSessionId(headers.session_id)) {
                     return buildPersistedHeartbeatMessages(finalText);
                   }
@@ -7368,6 +7872,10 @@ export async function startBusAgentRunner(params: {
                     isPrimary: runProfile === "primary",
                     didCompact: isCompactionCheckpoint,
                   });
+                })();
+                const persistedMessages = projectStoredMessagesV1(persistenceCandidates).match({
+                  ok: (messages) => () => messages,
+                  err: (error) => () => signalBusAgentRunnerHostFailure(error),
                 })();
                 const targetProviderFamily = classifyHistoryProviderFamily({
                   type: activeBinding.resolved.provider,
@@ -7426,7 +7934,9 @@ export async function startBusAgentRunner(params: {
                     ? persistedCompleteLineage(terminalPrimaryLineage)
                     : {}),
                   ...(stableNamedContinuation && !isCancelled && !coreNamedClaudeRuntime
-                    ? { stableNamedRequestClient: stableNamedContinuation.requestClient }
+                    ? {
+                        stableNamedRequestClient: stableNamedContinuation.requestClient,
+                      }
                     : {}),
                 });
                 const saveError = savedTranscript.match({
@@ -7457,20 +7967,33 @@ export async function startBusAgentRunner(params: {
                     requestId: headers.request_id,
                   });
                   const verifiedTranscript =
-                    verified?.match({ ok: (value) => value, err: () => null }) ?? null;
-                  const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
+                    verified?.match({
+                      ok: (value) => value,
+                      err: () => null,
+                    }) ?? null;
+                  const expectedHash = requireStoredMessageHash(persistedMessages);
                   if (
                     !verifiedTranscript ||
                     verifiedTranscript.messages.length !== persistedMessages.length ||
-                    hashCanonicalMessagesV1(verifiedTranscript.messages).hash !== expectedHash
+                    requireStoredMessageHash(verifiedTranscript.messages) !== expectedHash
                   ) {
                     return signalBusAgentRunnerHostFailure(
                       new Error("persisted Core named transcript failed canonical re-read"),
                     );
                   }
+                  const canonicalMessages = await materializeStoredMessagesV1({
+                    messages: persistedMessages,
+                    blobStore: params.blobStore,
+                  }).then((result) =>
+                    result.match({
+                      ok: (messages) => () => messages,
+                      err: (error) => () => signalBusAgentRunnerHostFailure(error),
+                    })(),
+                  );
                   const promoted = await coreNamedClaudeRuntime.finalize({
                     terminalTranscript: verifiedTranscript,
-                    canonicalMessages: persistedMessages,
+                    canonicalMessages,
+                    storedCanonicalMessages: persistedMessages,
                     providerState,
                     isCancellationRequested: () => cancelledByRequestId.has(headers.request_id),
                   });
@@ -7498,17 +8021,23 @@ export async function startBusAgentRunner(params: {
                     requestId: headers.request_id,
                   });
                   const verifiedTranscript =
-                    verified?.match({ ok: (value) => value, err: () => null }) ?? null;
+                    verified?.match({
+                      ok: (value) => value,
+                      err: () => null,
+                    }) ?? null;
                   const manifest =
-                    verifiedManifest?.match({ ok: (value) => value, err: () => null }) ?? null;
-                  const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
+                    verifiedManifest?.match({
+                      ok: (value) => value,
+                      err: () => null,
+                    }) ?? null;
+                  const expectedHash = requireStoredMessageHash(persistedMessages);
                   const terminalCanonicalMessages = runStats.finalMessages ?? agent.state.messages;
                   if (
                     !verifiedTranscript ||
                     !manifest ||
                     verifiedTranscript.providerState != null ||
                     verifiedTranscript.messages.length !== persistedMessages.length ||
-                    hashCanonicalMessagesV1(verifiedTranscript.messages).hash !== expectedHash
+                    requireStoredMessageHash(verifiedTranscript.messages) !== expectedHash
                   ) {
                     return signalBusAgentRunnerHostFailure(
                       new Error("persisted Core primary transcript failed canonical re-read"),
@@ -7668,6 +8197,7 @@ export async function startBusAgentRunner(params: {
                 }
               : undefined,
           });
+          requestTerminalKind = isCancelled ? "cancelled" : "completed";
 
           logger.info(
             "agent run resolved",
@@ -7700,7 +8230,10 @@ export async function startBusAgentRunner(params: {
           terminalPanic = panic;
         },
       );
-      const runFailure = runResult.match({ ok: () => null, err: (error) => error });
+      const runFailure = runResult.match({
+        ok: () => null,
+        err: (error) => error,
+      });
       if (runFailure) {
         const failure = runFailure;
         const failedCoreNamedRuntime = getCoreNamedClaudeRuntime();
@@ -7708,6 +8241,7 @@ export async function startBusAgentRunner(params: {
         runIdleWatchdog?.stop();
 
         if (failure.failureKind === "restart-draining") {
+          shouldTerminalizeRequest = false;
           failedCoreNamedRuntime?.markUncertain();
           failedCorePrimaryRuntime?.markUncertain();
         } else if (failure.failureKind === "pre-agent-cancelled") {
@@ -7786,6 +8320,7 @@ export async function startBusAgentRunner(params: {
         }
 
         if (failure.failureKind === "pre-agent-cancelled") {
+          requestTerminalKind = "cancelled";
           if (liveParentSession) {
             await captureBusAgentRunnerOperation("cancel deferred subagents", () =>
               liveParentSession.cancelAll("parent request cancelled"),
@@ -7819,12 +8354,16 @@ export async function startBusAgentRunner(params: {
                 "agent run failed",
               );
               const responseMessages = safeFinalMessages.slice(responseStartIndex);
-              const persistedMessages = (() => {
+              const persistenceCandidates = (() => {
                 if (isHeartbeatSessionId(headers.session_id)) {
                   return buildPersistedHeartbeatMessages(`Error: ${msg}`);
                 }
 
                 return runProfile === "primary" ? responseMessages : safeFinalMessages;
+              })();
+              const persistedMessages = projectStoredMessagesV1(persistenceCandidates).match({
+                ok: (messages) => () => messages,
+                err: (error) => () => signalBusAgentRunnerHostFailure(error),
               })();
 
               return failureTranscriptStore.saveRequestTranscript({
@@ -7948,7 +8487,9 @@ export async function startBusAgentRunner(params: {
               }
             : undefined,
         });
-        await outputPublisher.publishResponseText({ finalText: `Error: ${msg}` });
+        await outputPublisher.publishResponseText({
+          finalText: `Error: ${msg}`,
+        });
 
         const projectedError: BusAgentRunnerErrorProjection = {
           message: failure.message,
@@ -8013,7 +8554,10 @@ export async function startBusAgentRunner(params: {
         terminalCleanups.push(
           { label: "agent-unsubscribe", run: unsubscribe },
           { label: "compaction-unsubscribe", run: unsubscribeCompaction },
-          { label: "output-publisher-drain", run: () => outputPublisher.drain() },
+          {
+            label: "output-publisher-drain",
+            run: () => outputPublisher.drain(),
+          },
         );
         if (cleanupCoreNamedRuntime) {
           const runtime = cleanupCoreNamedRuntime;
@@ -8031,11 +8575,17 @@ export async function startBusAgentRunner(params: {
         }
         if (cleanupClaudeCodeRun) {
           const run = cleanupClaudeCodeRun;
-          terminalCleanups.push({ label: "claude-dispose", run: () => run.dispose() });
+          terminalCleanups.push({
+            label: "claude-dispose",
+            run: () => run.dispose(),
+          });
         }
         if (liveParentSession) {
           const session = liveParentSession;
-          terminalCleanups.push({ label: "live-close", run: () => session.close() });
+          terminalCleanups.push({
+            label: "live-close",
+            run: () => session.close(),
+          });
         }
         const cleanupBatch = startBusAgentRunnerTerminalCleanup(terminalCleanups);
         terminalCleanupOperations = [...terminalCleanupOperations, ...cleanupBatch.operations];
@@ -8115,6 +8665,59 @@ export async function startBusAgentRunner(params: {
         }
         await liveParentSession?.close();
       }
+      const finalReplayDeadline = outputPublisher.getFinalReplayDeadline();
+      if (
+        !terminalPanic &&
+        shouldTerminalizeRequest &&
+        next.requestDeliveryId &&
+        params.requestDelivery
+      ) {
+        const terminalized = await params.requestDelivery.terminalize({
+          requestDeliveryId: next.requestDeliveryId,
+          outcome: { kind: requestTerminalKind },
+          ...(finalReplayDeadline === undefined
+            ? {}
+            : {
+                finalReplayDeadline,
+              }),
+          transportCommitRequired: true,
+        });
+        terminalized.match({
+          ok: () => undefined,
+          err: (error) =>
+            logger.error(
+              "request delivery terminalization failed",
+              formatBridgeTaggedErrorForLog(error, {
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                requestDeliveryId: next.requestDeliveryId,
+              }),
+            ),
+        });
+      }
+      if (!terminalPanic && shouldTerminalizeRequest && params.requestDelivery) {
+        for (const [requestDeliveryId, retainedOutcome] of state.activeRun
+          ?.retainedRequestDeliveries ?? []) {
+          const terminalized = await params.requestDelivery.terminalize({
+            requestDeliveryId,
+            outcome: retainedOutcome,
+            ...(finalReplayDeadline === undefined ? {} : { finalReplayDeadline }),
+            transportCommitRequired: true,
+          });
+          terminalized.match({
+            ok: () => undefined,
+            err: (error) =>
+              logger.error(
+                "retained request delivery terminalization failed",
+                formatBridgeTaggedErrorForLog(error, {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  requestDeliveryId,
+                }),
+              ),
+          });
+        }
+      }
       state.agent = null;
       state.activeRequestId = null;
       state.activeRun = null;
@@ -8157,6 +8760,104 @@ export async function startBusAgentRunner(params: {
     return active;
   }
 
+  function discardPausedRecoveredDelivery(requestDeliveryId: string): ResultType<void, Error> {
+    for (const [sessionId, state] of bySession) {
+      if (
+        state.activeRun?.requestDeliveryId === requestDeliveryId ||
+        state.activeRun?.retainedRequestDeliveries.has(requestDeliveryId)
+      ) {
+        return Result.err(
+          new Error("A running recovery entry cannot be discarded before replay terminalization"),
+        );
+      }
+      const retainedOwner = state.queue.find((entry) =>
+        entry.retainedRequestDeliveries?.some(
+          (retained) => retained.requestDeliveryId === requestDeliveryId,
+        ),
+      );
+      if (retainedOwner) {
+        return Result.err(
+          new Error("A merged retained recovery delivery cannot be discarded independently"),
+        );
+      }
+      const matches = state.queue.filter((entry) => entry.requestDeliveryId === requestDeliveryId);
+      if (matches.some((entry) => reservedQueueEntries.has(entry))) {
+        return Result.err(
+          new Error("A reserved recovery entry cannot be discarded before replay terminalization"),
+        );
+      }
+      if (matches.length === 0) continue;
+      removeQueuedEntriesByReference(state.queue, matches);
+      for (const entry of matches) {
+        if (entry.identityOwner) requestMessageCache.releaseOwner(entry.identityOwner);
+      }
+      if (!state.running && state.queue.length === 0) bySession.delete(sessionId);
+      return Result.ok(undefined);
+    }
+    return Result.ok(undefined);
+  }
+
+  async function resumeAcceptedDelivery(
+    record: AcceptedRequestDelivery<CoreAcceptedRequestWork>,
+  ): Promise<ResultType<void, Error>> {
+    const work = record.work;
+    if (
+      work.requestDeliveryId !== record.requestDeliveryId ||
+      work.requestId !== record.requestId
+    ) {
+      return Result.err(
+        new Error("Accepted request delivery identity does not match its durable work"),
+      );
+    }
+    for (const state of bySession.values()) {
+      if (
+        state.activeRun?.requestDeliveryId === record.requestDeliveryId ||
+        state.activeRun?.retainedRequestDeliveries.has(record.requestDeliveryId) ||
+        state.queue.some(
+          (entry) =>
+            entry.requestDeliveryId === record.requestDeliveryId ||
+            entry.retainedRequestDeliveries?.some(
+              (retained) => retained.requestDeliveryId === record.requestDeliveryId,
+            ),
+        )
+      ) {
+        return Result.ok(undefined);
+      }
+    }
+    const entry: Enqueued = {
+      queueEntryId: record.publication?.streamId ?? `accepted:${record.requestDeliveryId}`,
+      requestDeliveryId: record.requestDeliveryId,
+      requestId: work.requestId,
+      sessionId: work.sessionId,
+      requestClient: work.requestClient,
+      queue: work.data.queue,
+      runPolicy: work.data.runPolicy ?? "normal",
+      origin: work.data.origin,
+      messages: [],
+      storedMessages: [...work.data.messages],
+      corePrimaryLineage: work.data.corePrimaryLineage,
+      modelOverride: work.data.modelOverride,
+      raw: preserveAgentRunnerRaw({ data: work.data }),
+      restoredSafetyMode: "restricted",
+    };
+    const state =
+      bySession.get(work.sessionId) ??
+      ({
+        running: false,
+        agent: null,
+        queue: [] as Enqueued[],
+        activeRequestId: null,
+        activeRun: null,
+        compactedToolCallIds: new Set<string>(),
+      } satisfies SessionQueue);
+    state.queue.push(entry);
+    bySession.set(work.sessionId, state);
+    if (runnerActivated && !state.running) {
+      startSessionQueueDrain(work.sessionId, state, work.requestId);
+    }
+    return Result.ok(undefined);
+  }
+
   await startSubscription();
   const activate = (): void => {
     activateRunnerAdmission();
@@ -8169,6 +8870,8 @@ export async function startBusAgentRunner(params: {
     snapshotRecoverables,
     snapshotQueueAttempts,
     prepareRecovery,
+    resumeAcceptedDelivery,
+    discardPausedRecoveredDelivery,
     getActiveDrainOperation: () => activeDrainOperation,
     getTerminalCleanupOperations: () => terminalCleanupOperations,
     stop: async () => {
@@ -8227,7 +8930,10 @@ function mergeQueuedForSameRequest(
   first: Enqueued,
   queue: Enqueued[],
   reservedQueueEntries: ReadonlySet<Enqueued>,
-): { readonly messages: ModelMessage[]; readonly discarded: readonly Enqueued[] } {
+): {
+  readonly messages: ModelMessage[];
+  readonly discarded: readonly Enqueued[];
+} {
   const merged: ModelMessage[] = [...first.messages];
   const discarded: Enqueued[] = [];
 

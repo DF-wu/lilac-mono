@@ -1,16 +1,17 @@
 import { captureError } from "../../shared/error-capture";
 import { isDeepStrictEqual } from "node:util";
 
-import type { ModelMessage, UserContent } from "ai";
-import { Result, type Result as ResultType } from "better-result";
-import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
-  buildCoreLineageManifestV1,
-  createCorePrimaryLineageFreshOnlyV1,
-  type CoreLineageAtomV1,
-  type CoreLineageSegmentInputV1,
-  type CorePrimaryLineageV1,
+  buildCoreLineageManifestV2,
+  createCorePrimaryLineageFreshOnlyV2,
+  type BusMessageV2,
+  type CoreLineageAtomV2,
+  type CoreLineageSegmentInputV2,
+  type CorePrimaryLineageV2,
+  type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
   withSurfaceRequestReadScope,
   type SurfaceAdapter,
@@ -39,12 +40,27 @@ import {
   type TranscriptStore,
 } from "../../transcript/transcript-store";
 import {
-  appendDiscordAttachmentsToUserContent,
+  hashCanonicalStoredMessagesV2,
+  StoredMessageValidationError,
+} from "../../transcript/transcript-persistence-codec";
+import {
+  appendDiscordAttachmentsToBusContent,
+  appendDiscordAttachmentsToStoredContent,
   createDiscordAttachmentState,
+  deleteDiscordRequestBlobHandles,
+  type DiscordAttachmentPreparationFailed,
+  type DiscordRequestBlobCleanupFailed,
   getDiscordAttachmentOwnershipError,
   getDiscordOwnedBlobReferences,
+  getDiscordRequestBlobHandles,
+  rememberDiscordRequestBlobHandles,
   takeDiscordCurrentBlobReferences,
 } from "./request-composition/attachments";
+import type { DiscordAttachmentCacheAccess } from "../discord/discord-attachment";
+import {
+  prepareStoredMessagesForBus,
+  type DiscordStoredBlobPreparationError,
+} from "./request-composition/prepare-bus-messages";
 import { selectNewestReachableCheckpoint } from "./request-composition/checkpoint-selection";
 import {
   formatDiscordAttributionHeader,
@@ -77,18 +93,39 @@ export type {
   RequestCompositionResult,
 } from "./request-composition/types";
 
-export type RequestCompositionError = CoreOwnedBlobIntegrityError | SurfaceOperationError;
+export type RequestCompositionPrimaryError =
+  | CoreOwnedBlobIntegrityError
+  | DiscordAttachmentPreparationFailed
+  | DiscordStoredBlobPreparationError
+  | StoredMessageValidationError
+  | SurfaceOperationError;
+
+export class DiscordRequestCompositionAndCleanupFailed extends TaggedError(
+  "DiscordRequestCompositionAndCleanupFailed",
+)<{
+  readonly primary: RequestCompositionError;
+  readonly cleanup: DiscordRequestBlobCleanupFailed;
+  readonly message: string;
+}> {}
+
+export type RequestCompositionError =
+  | RequestCompositionPrimaryError
+  | DiscordRequestCompositionAndCleanupFailed;
 
 const DISCORD_SURFACE_ID_PREFIX = "discord:";
 const ACTIVE_REQUEST_READ_SCOPE = Symbol("active-request-read-scope");
 
-function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
-  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
-  return created.match<CorePrimaryLineageV1>({
+type StoredLineageSegmentInputV2 = Omit<CoreLineageSegmentInputV2, "canonicalMessages"> & {
+  readonly canonicalMessages: readonly StoredMessageV1[];
+};
+
+function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV2 {
+  const created = createCorePrimaryLineageFreshOnlyV2(reason, currentCanonicalStart);
+  return created.match<CorePrimaryLineageV2>({
     ok: (value) => value,
     err: () => ({
       state: "fresh-only",
-      lineageVersion: 1,
+      lineageVersion: 2,
       currentCanonicalStart: 0,
       reason: "lineage-fallback-construction-failed",
     }),
@@ -133,7 +170,7 @@ function surfaceProjectionKey(sessionId: string, messageId: string) {
   };
 }
 
-function mergeProjectedSurfaceMessages(messages: readonly ModelMessage[]): ModelMessage[] {
+function mergeProjectedSurfaceMessages(messages: readonly StoredMessageV1[]): StoredMessageV1[] {
   if (messages.length <= 1) return [...messages];
   const role = messages[0]?.role;
   if (role === "assistant" && messages.every((message) => message.role === "assistant")) {
@@ -166,7 +203,49 @@ function mergeProjectedSurfaceMessages(messages: readonly ModelMessage[]): Model
     ];
   }
 
-  const parts: UserContent = [];
+  const parts: Exclude<Extract<StoredMessageV1, { role: "user" }>["content"], string> = [];
+  for (const [index, message] of messages.entries()) {
+    if (index > 0) parts.push({ type: "text", text: "\n\n" });
+    if (typeof message.content === "string") parts.push({ type: "text", text: message.content });
+    else parts.push(...message.content);
+  }
+  return [{ role: "user", content: parts }];
+}
+
+function mergeBusSurfaceMessages(messages: readonly BusMessageV2[]): BusMessageV2[] {
+  if (messages.length <= 1) return [...messages];
+  const role = messages[0]?.role;
+  if (role === "assistant" && messages.every((message) => message.role === "assistant")) {
+    const content = messages
+      .map((message) =>
+        typeof message.content === "string"
+          ? message.content
+          : message.content
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join("\n\n"),
+      )
+      .filter(Boolean)
+      .join("\n\n");
+    return [{ role: "assistant", content }];
+  }
+  if (role !== "user" || !messages.every((message) => message.role === "user")) {
+    return [...messages];
+  }
+
+  const multipart = messages.some((message) => typeof message.content !== "string");
+  if (!multipart) {
+    return [
+      {
+        role: "user",
+        content: messages
+          .map((message) => (typeof message.content === "string" ? message.content : ""))
+          .join("\n\n"),
+      },
+    ];
+  }
+
+  const parts: Exclude<Extract<BusMessageV2, { role: "user" }>["content"], string> = [];
   for (const [index, message] of messages.entries()) {
     if (index > 0) parts.push({ type: "text", text: "\n\n" });
     if (typeof message.content === "string") parts.push({ type: "text", text: message.content });
@@ -209,7 +288,10 @@ function collectStoredBoundaryBreaks(input: {
     const stored = input.transcriptStore?.getLatestCoreSurfaceSegment?.(
       surfaceProjectionKey(input.sessionId, message.messageId),
     );
-    const storedValue = stored?.match({ ok: (value) => value, err: () => null });
+    const storedValue = stored?.match({
+      ok: (value) => value,
+      err: () => null,
+    });
     if (storedValue) return `${storedValue.requestId}:${storedValue.segmentIndex}`;
     const admittedIds = storedProjectionSegmentIds(
       input.projections.get(message.messageId) ?? null,
@@ -228,7 +310,7 @@ function collectStoredBoundaryBreaks(input: {
 }
 
 function appendPersistedSyntheticSuffix(input: {
-  segmentInputs: CoreLineageSegmentInputV1[];
+  segmentInputs: StoredLineageSegmentInputV2[];
   requestId: string;
   transcriptStore?: TranscriptStore;
 }): boolean {
@@ -236,7 +318,10 @@ function appendPersistedSyntheticSuffix(input: {
     requestId: input.requestId,
   });
   if (!manifest) return true;
-  const manifestValue = manifest.match({ ok: (value) => value, err: () => null });
+  const manifestValue = manifest.match({
+    ok: (value) => value,
+    err: () => null,
+  });
   if (
     !manifestValue ||
     !manifestValue.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")
@@ -275,10 +360,20 @@ async function renderSurfaceProjectionCandidate(input: {
   reactions: readonly string[];
   discordUserAliasById?: ReadonlyMap<string, string>;
   attachmentState: ReturnType<typeof createDiscordAttachmentState>;
-}): Promise<{ messages: ModelMessage[]; ownedBlobs: CoreOwnedBlobReference[] }> {
+  streamRequestAttachments: boolean;
+}): Promise<
+  ResultType<
+    {
+      messages: StoredMessageV1[];
+      ownedBlobs: CoreOwnedBlobReference[];
+      directBusMessages?: BusMessageV2[];
+    },
+    RequestCompositionError
+  >
+> {
   const normalized = normalizeText(input.message.text, {});
   if (input.isBot) {
-    return {
+    return Result.ok({
       messages: [
         {
           role: "assistant",
@@ -286,7 +381,7 @@ async function renderSurfaceProjectionCandidate(input: {
         },
       ],
       ownedBlobs: [],
-    };
+    });
   }
 
   const header = formatDiscordAttributionHeader({
@@ -299,19 +394,49 @@ async function renderSurfaceProjectionCandidate(input: {
   });
   const mainText = `${header}\n${escapeSurfaceMetadataTags(normalized)}`.trimEnd();
   if (input.message.attachments.length === 0) {
-    return { messages: [{ role: "user", content: mainText }], ownedBlobs: [] };
+    return Result.ok({
+      messages: [{ role: "user", content: mainText }],
+      ownedBlobs: [],
+    });
   }
 
-  const parts: UserContent = [{ type: "text", text: mainText }];
-  await appendDiscordAttachmentsToUserContent(
+  if (!input.streamRequestAttachments) {
+    const storedParts: Exclude<Extract<StoredMessageV1, { role: "user" }>["content"], string> = [
+      { type: "text", text: mainText },
+    ];
+    const stored = await appendDiscordAttachmentsToStoredContent(
+      storedParts,
+      input.message.attachments,
+      input.attachmentState,
+      { channelId: input.sessionId, messageId: input.message.messageId },
+    );
+    const storedError = stored.match({ ok: () => null, err: (error) => error });
+    if (storedError) return Result.err(storedError);
+    return Result.ok({
+      messages: [{ role: "user", content: storedParts }],
+      ownedBlobs: takeDiscordCurrentBlobReferences(input.attachmentState),
+    });
+  }
+
+  const parts: Exclude<Extract<BusMessageV2, { role: "user" }>["content"], string> = [
+    { type: "text", text: mainText },
+  ];
+  const appended = await appendDiscordAttachmentsToBusContent(
     parts,
     input.message.attachments,
     input.attachmentState,
+    { channelId: input.sessionId, messageId: input.message.messageId },
   );
-  return {
-    messages: [{ role: "user", content: parts }],
-    ownedBlobs: takeDiscordCurrentBlobReferences(input.attachmentState),
-  };
+  const attachmentError = appended.match({
+    ok: () => null,
+    err: (error) => error,
+  });
+  if (attachmentError) return Result.err(attachmentError);
+  return Result.ok({
+    messages: [{ role: "user", content: mainText }],
+    ownedBlobs: [],
+    directBusMessages: [{ role: "user", content: parts }],
+  });
 }
 
 async function composeSelectedDiscordChain(input: {
@@ -323,12 +448,15 @@ async function composeSelectedDiscordChain(input: {
   currentMessageIds: readonly string[];
   transcriptStore?: TranscriptStore;
   discordUserAliasById?: ReadonlyMap<string, string>;
+  blobStore?: BlobStore;
+  attachmentCache?: DiscordAttachmentCacheAccess;
 }): Promise<
   ResultType<
     {
-      messages: ModelMessage[];
+      messages: RequestCompositionResult["messages"];
+      inputHandles: RequestCompositionResult["inputHandles"];
       mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
-      corePrimaryLineage: CorePrimaryLineageV1;
+      corePrimaryLineage: CorePrimaryLineageV2;
     },
     RequestCompositionError
   >
@@ -337,9 +465,15 @@ async function composeSelectedDiscordChain(input: {
     ? input.transcriptStore
     : undefined;
   const attachmentState = createDiscordAttachmentState({
-    ownBlob: projectionStore
-      ? ({ bytes, mediaType, filename }) => {
-          return projectionStore.putCoreOwnedBlob({ bytes, mediaType, filename });
+    blobStore: input.blobStore,
+    attachmentCache: input.attachmentCache,
+    ownStoredBlob: projectionStore
+      ? ({ blob, mediaType, filename }) => {
+          return projectionStore.putCoreOwnedBlob({
+            blob,
+            mediaType,
+            filename,
+          });
         }
       : undefined,
   });
@@ -402,7 +536,8 @@ async function composeSelectedDiscordChain(input: {
       ok: (value) => value,
       err: () => new Map<string, readonly string[]>(),
     });
-    const projectedByMessageId = new Map<string, readonly ModelMessage[]>();
+    const projectedByMessageId = new Map<string, readonly StoredMessageV1[]>();
+    const directBusMessagesByMessageId = new Map<string, readonly BusMessageV2[]>();
     const candidateOwnedBlobsByMessageId = new Map<string, readonly CoreOwnedBlobReference[]>();
     let lineageComplete = Boolean(projectionStore);
     const transcriptSnapshotByMessageId = new Map<string, TranscriptSnapshot>();
@@ -439,14 +574,46 @@ async function composeSelectedDiscordChain(input: {
         }
         // `merged` is derived from `immutableChain`, so every selected ID has this source entry.
         const source = messageById.get(messageId)!;
-        const candidate = await renderSurfaceProjectionCandidate({
+        const candidateResult = await renderSurfaceProjectionCandidate({
           message: source,
           isBot: source.authorId === input.botUserId,
           sessionId: input.sessionId,
           reactions: reactionValues.get(messageId) ?? [],
           discordUserAliasById: input.discordUserAliasById,
           attachmentState,
+          streamRequestAttachments: input.attachmentCache !== undefined,
         });
+        const candidateError = candidateResult.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (candidateError) {
+          return {
+            status: "return",
+            value: Result.err(candidateError),
+          } as const;
+        }
+        const candidate = candidateResult.match<{
+          messages: StoredMessageV1[];
+          ownedBlobs: CoreOwnedBlobReference[];
+          directBusMessages?: BusMessageV2[];
+        }>({
+          ok: (value) => value,
+          err: () => ({ messages: [], ownedBlobs: [] }),
+        });
+        if (candidate.directBusMessages) {
+          directBusMessagesByMessageId.set(messageId, candidate.directBusMessages);
+          projectedByMessageId.set(messageId, candidate.messages);
+          lineageComplete = false;
+          continue;
+        }
+        const candidateOwnershipError = getDiscordAttachmentOwnershipError(attachmentState);
+        if (candidateOwnershipError) {
+          return {
+            status: "return",
+            value: Result.err(candidateOwnershipError),
+          } as const;
+        }
         if (!projectionStore) {
           projectedByMessageId.set(messageId, candidate.messages);
           continue;
@@ -485,6 +652,21 @@ async function composeSelectedDiscordChain(input: {
         const segmentMessages = mergeProjectedSurfaceMessages(
           segmentMessageIds.flatMap((id) => projectedByMessageId.get(id) ?? []),
         );
+        const segmentDigestResult = hashCanonicalStoredMessagesV2(segmentMessages);
+        const segmentDigestError = segmentDigestResult.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (segmentDigestError) {
+          return {
+            status: "return",
+            value: Result.err(segmentDigestError),
+          } as const;
+        }
+        const segmentDigest = segmentDigestResult.match({
+          ok: (value) => value.hash,
+          err: () => "",
+        });
         const admitted = projectionStore.admitCoreSurfaceProjection({
           ...surfaceProjectionKey(input.sessionId, messageId),
           canonicalMessages: projectedByMessageId.get(messageId) ?? [],
@@ -493,13 +675,18 @@ async function composeSelectedDiscordChain(input: {
             authorName: source.authorName,
             messageTs: source.ts,
             reactions: [...(reactionValues.get(messageId) ?? [])],
-            attachments: source.attachments.map((attachment) => ({ ...attachment })),
+            attachments: source.attachments.map((attachment) => ({
+              ...attachment,
+            })),
             segmentMessageIds: [...segmentMessageIds],
-            segmentDigest: hashCanonicalMessagesV1(segmentMessages).hash,
+            segmentDigest,
           },
           ownedBlobs: candidateOwnedBlobsByMessageId.get(messageId) ?? [],
         });
-        const admittedValue = admitted.match({ ok: (value) => value, err: () => null });
+        const admittedValue = admitted.match({
+          ok: (value) => value,
+          err: () => null,
+        });
         if (!admittedValue) {
           lineageComplete = false;
           continue;
@@ -508,13 +695,35 @@ async function composeSelectedDiscordChain(input: {
       }
     }
 
-    const segmentInputs: CoreLineageSegmentInputV1[] = [];
+    const segmentInputs: StoredLineageSegmentInputV2[] = [];
+    const surfaceMessageIdsBySegment = new WeakMap<object, readonly string[]>();
     if (input.checkpointSelection.checkpoint) {
       const checkpoint = input.checkpointSelection.checkpoint;
+      const checkpointDigestResult = hashCanonicalStoredMessagesV2(checkpoint.messages);
+      const checkpointDigestError = checkpointDigestResult.match({
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (!checkpoint.transcriptDigest && checkpointDigestError) {
+        return {
+          status: "return",
+          value: Result.err(checkpointDigestError),
+        } as const;
+      }
       const digest =
-        checkpoint.transcriptDigest ?? hashCanonicalMessagesV1(checkpoint.messages).hash;
+        checkpoint.transcriptDigest ??
+        checkpointDigestResult.match({
+          ok: (value) => value.hash,
+          err: () => "",
+        });
       segmentInputs.push({
-        atoms: [{ kind: "checkpoint", requestId: checkpoint.requestId, transcriptDigest: digest }],
+        atoms: [
+          {
+            kind: "checkpoint",
+            requestId: checkpoint.requestId,
+            transcriptDigest: digest,
+          },
+        ],
         canonicalMessages: checkpoint.messages,
       });
     }
@@ -533,12 +742,14 @@ async function composeSelectedDiscordChain(input: {
               surfaceId: surfaceIdForDiscordSession(input.sessionId),
               sessionId: input.sessionId,
               messageId,
-            }) satisfies CoreLineageAtomV1,
+            }) satisfies CoreLineageAtomV2,
         );
         const canonicalMessages = mergeProjectedSurfaceMessages(
           messageIds.flatMap((messageId) => projectedByMessageId.get(messageId) ?? []),
         );
-        segmentInputs.push({ atoms, canonicalMessages });
+        const segment = { atoms, canonicalMessages };
+        segmentInputs.push(segment);
+        surfaceMessageIdsBySegment.set(segment, [...messageIds]);
       };
 
       const pendingSurfaceIds: string[] = [];
@@ -566,13 +777,27 @@ async function composeSelectedDiscordChain(input: {
         });
         const metadataValue = metadata?.match({ ok: (value) => value, err: () => null }) ?? null;
         if (!metadataValue) lineageComplete = false;
-        const requestAtom: CoreLineageAtomV1 = {
+        const snapshotDigestResult = hashCanonicalStoredMessagesV2(snapshot.messages);
+        const snapshotDigestError = snapshotDigestResult.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (!metadataValue?.transcriptDigest && !snapshot.transcriptDigest && snapshotDigestError) {
+          return {
+            status: "return",
+            value: Result.err(snapshotDigestError),
+          } as const;
+        }
+        const requestAtom: CoreLineageAtomV2 = {
           kind: "request",
           requestId: snapshot.requestId,
           transcriptDigest:
             metadataValue?.transcriptDigest ??
             snapshot.transcriptDigest ??
-            hashCanonicalMessagesV1(snapshot.messages).hash,
+            snapshotDigestResult.match({
+              ok: (value) => value.hash,
+              err: () => "",
+            }),
           providerFamily:
             metadataValue?.providerFamily ?? snapshot.providerState?.lastFamily ?? "ai-sdk",
           containsCrossFamilyTurns:
@@ -597,7 +822,9 @@ async function composeSelectedDiscordChain(input: {
       appendSurfaceSegment(pendingSurfaceIds);
     }
 
-    const messages = segmentInputs.flatMap((segment) => segment.canonicalMessages);
+    const messages: StoredMessageV1[] = segmentInputs.flatMap(
+      (segment) => segment.canonicalMessages,
+    );
     const currentSegmentIndex = segmentInputs.findIndex((segment) =>
       segment.atoms.some(
         (atom) => atom.kind === "surface" && currentMessageIds.has(atom.messageId),
@@ -616,15 +843,17 @@ async function composeSelectedDiscordChain(input: {
     const hasEmptyLineageSegment = segmentInputs.some(
       (segment) => segment.canonicalMessages.length === 0,
     );
-    let corePrimaryLineage: CorePrimaryLineageV1;
+    let corePrimaryLineage: CorePrimaryLineageV2;
     if (lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment) {
-      const built = buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex });
+      const built = buildCoreLineageManifestV2(segmentInputs, {
+        currentSegmentIndex,
+      });
       corePrimaryLineage = built.match({
         ok: (value) => value,
         err: () => createFreshOnlyLineage("lineage-manifest-build-failed", currentCanonicalStart),
       });
     } else {
-      let reason: Parameters<typeof createCorePrimaryLineageFreshOnlyV1>[0];
+      let reason: Parameters<typeof createCorePrimaryLineageFreshOnlyV2>[0];
       if (hasEmptyLineageSegment) {
         reason = "empty-lineage-segment";
       } else if (currentSegmentIndex < 0) {
@@ -638,10 +867,69 @@ async function composeSelectedDiscordChain(input: {
     }
     const ownershipError = getDiscordAttachmentOwnershipError(attachmentState);
     if (ownershipError) return { status: "return", value: Result.err(ownershipError) } as const;
+    const preparedMessages: BusMessageV2[] = [];
+    for (const segment of segmentInputs) {
+      const surfaceMessageIds = surfaceMessageIdsBySegment.get(segment);
+      if (surfaceMessageIds?.some((messageId) => directBusMessagesByMessageId.has(messageId))) {
+        const segmentMessages: BusMessageV2[] = [];
+        for (const messageId of surfaceMessageIds) {
+          const direct = directBusMessagesByMessageId.get(messageId);
+          if (direct) {
+            segmentMessages.push(...direct);
+            continue;
+          }
+          const prepared = await prepareStoredMessagesForBus({
+            blobStore: input.blobStore,
+            messages: projectedByMessageId.get(messageId) ?? [],
+          });
+          const preparationError = prepared.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (preparationError) {
+            return {
+              status: "return",
+              value: Result.err(preparationError),
+            } as const;
+          }
+          prepared.match({
+            ok: (value) => {
+              rememberDiscordRequestBlobHandles(attachmentState, value.inputHandles);
+              segmentMessages.push(...value.messages);
+            },
+            err: () => undefined,
+          });
+        }
+        preparedMessages.push(...mergeBusSurfaceMessages(segmentMessages));
+        continue;
+      }
+      const prepared = await prepareStoredMessagesForBus({
+        blobStore: input.blobStore,
+        messages: segment.canonicalMessages,
+      });
+      const preparationError = prepared.match({
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (preparationError) {
+        return {
+          status: "return",
+          value: Result.err(preparationError),
+        } as const;
+      }
+      prepared.match({
+        ok: (value) => {
+          rememberDiscordRequestBlobHandles(attachmentState, value.inputHandles);
+          preparedMessages.push(...value.messages);
+        },
+        err: () => undefined,
+      });
+    }
     return {
       status: "return",
       value: Result.ok({
-        messages,
+        messages: preparedMessages,
+        inputHandles: [...getDiscordRequestBlobHandles(attachmentState)],
         mergedGroups: merged.map((chunk) => ({
           authorId: chunk.authorId,
           messageIds: [...chunk.messageIds],
@@ -652,11 +940,58 @@ async function composeSelectedDiscordChain(input: {
   })().finally(() => {
     if (projectionStore) {
       for (const reference of getDiscordOwnedBlobReferences(attachmentState)) {
-        projectionStore.deleteCoreOwnedBlobIfUnreferenced({ sha256: reference.sha256 });
+        const deleted = projectionStore.deleteCoreOwnedBlobIfUnreferenced({
+          ownerId: reference.ownerId,
+        });
+        if (deleted && input.blobStore) void input.blobStore.delete(deleted);
       }
     }
   });
-  return outcome.value;
+  const compositionResult: ResultType<
+    {
+      messages: RequestCompositionResult["messages"];
+      inputHandles: RequestCompositionResult["inputHandles"];
+      mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
+      corePrimaryLineage: CorePrimaryLineageV2;
+    },
+    RequestCompositionPrimaryError
+  > = outcome.value;
+  const cleanupFailedComposition = compositionResult.match<
+    () => Promise<
+      ResultType<
+        {
+          messages: RequestCompositionResult["messages"];
+          inputHandles: RequestCompositionResult["inputHandles"];
+          mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
+          corePrimaryLineage: CorePrimaryLineageV2;
+        },
+        RequestCompositionError
+      >
+    >
+  >({
+    ok: (value) => async () => Result.ok(value),
+    err: (error) => async () => {
+      if (input.blobStore) {
+        const cleanup = await deleteDiscordRequestBlobHandles(
+          input.blobStore,
+          getDiscordRequestBlobHandles(attachmentState),
+        );
+        return cleanup.match<ResultType<never, RequestCompositionError>>({
+          ok: () => Result.err(error),
+          err: (cleanupError) =>
+            Result.err(
+              new DiscordRequestCompositionAndCleanupFailed({
+                primary: error,
+                cleanup: cleanupError,
+                message: "Discord request composition and input handle cleanup failed",
+              }),
+            ),
+        });
+      }
+      return Result.err(error);
+    },
+  });
+  return cleanupFailedComposition();
 }
 
 function resolveTranscriptSnapshot(input: {
@@ -1123,7 +1458,10 @@ async function findLastDiscordSessionDividerBefore(params: {
   beforeMessageId: string;
   stopAtMessageId?: string;
 }): Promise<SurfaceOperationResult<{ ts: number; messageId: string } | null>> {
-  const sessionRef = { platform: "discord", channelId: params.channelId } as const;
+  const sessionRef = {
+    platform: "discord",
+    channelId: params.channelId,
+  } as const;
   let cursor: string | undefined = params.beforeMessageId;
   let scanned = 0;
   const maxMessages = 2000;
@@ -1242,12 +1580,19 @@ export async function composeRequestMessages(
   // Step 1: fetch reply chain from the adapter store / platform.
   // Mention triggers get merge-window parity even if messages are not linked via reply references.
   const triggerMsg = await adapter.readMsg(opts.trigger.msgRef);
-  const triggerError = triggerMsg.match({ ok: () => null, err: (error) => error });
+  const triggerError = triggerMsg.match({
+    ok: () => null,
+    err: (error) => error,
+  });
   if (triggerError) return Result.err(triggerError);
-  const triggerValue = triggerMsg.match({ ok: (value) => value, err: () => null });
+  const triggerValue = triggerMsg.match({
+    ok: (value) => value,
+    err: () => null,
+  });
   if (!triggerValue) {
     return Result.ok({
       messages: [],
+      inputHandles: [],
       chainMessageIds: [],
       mergedGroups: [],
       corePrimaryLineage: createFreshOnlyLineage("empty-selection"),
@@ -1271,7 +1616,10 @@ export async function composeRequestMessages(
           startMsgRef: opts.trigger.msgRef,
           maxDepth: opts.maxDepth,
         });
-  const chainError = chainResult.match({ ok: () => null, err: (error) => error });
+  const chainError = chainResult.match({
+    ok: () => null,
+    err: (error) => error,
+  });
   if (chainError) return Result.err(chainError);
   const chain = chainResult.match({ ok: (value) => value, err: () => [] });
 
@@ -1321,9 +1669,12 @@ export async function composeRequestMessages(
     currentMessageIds: opts.currentMessageIds ?? [opts.trigger.msgRef.messageId],
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
+    blobStore: opts.blobStore,
+    attachmentCache: opts.attachmentCache,
   });
   return composed.map((value) => ({
     messages: value.messages,
+    inputHandles: value.inputHandles,
     chainMessageIds: transformedChain.map((m) => m.messageId),
     mergedGroups: value.mergedGroups,
     corePrimaryLineage: value.corePrimaryLineage,
@@ -1348,15 +1699,24 @@ export async function composeRecentChannelMessages(
   // A reply is a strong "continue" signal.
   if (opts.triggerMsgRef && opts.triggerType === "mention") {
     const triggerMsgResult = await adapter.readMsg(opts.triggerMsgRef);
-    const triggerError = triggerMsgResult.match({ ok: () => null, err: (error) => error });
+    const triggerError = triggerMsgResult.match({
+      ok: () => null,
+      err: (error) => error,
+    });
     if (triggerError) return Result.err(triggerError);
-    const triggerMsg = triggerMsgResult.match({ ok: (value) => value, err: () => null });
+    const triggerMsg = triggerMsgResult.match({
+      ok: (value) => value,
+      err: () => null,
+    });
     if (triggerMsg) {
       // "Merge block" = a user's short burst of consecutive messages.
       // If ANY message in the burst is a reply, treat the entire burst as a
       // continuation of that reply thread.
       const blockResult = await resolveMergeBlockEndingAt(adapter, triggerMsg);
-      const blockError = blockResult.match({ ok: () => null, err: (error) => error });
+      const blockError = blockResult.match({
+        ok: () => null,
+        err: (error) => error,
+      });
       if (blockError) return Result.err(blockError);
       const block = blockResult.match({ ok: (value) => value, err: () => [] });
       const anchor = findEarliestReplyAnchor(block);
@@ -1367,9 +1727,15 @@ export async function composeRecentChannelMessages(
           botName: opts.botName,
           triggerMsg,
         });
-        const anchoredError = anchoredResult.match({ ok: () => null, err: (error) => error });
+        const anchoredError = anchoredResult.match({
+          ok: () => null,
+          err: (error) => error,
+        });
         if (anchoredError) return Result.err(anchoredError);
-        const anchored = anchoredResult.match({ ok: (value) => value, err: () => [] });
+        const anchored = anchoredResult.match({
+          ok: (value) => value,
+          err: () => [],
+        });
 
         const oldestAnchoredMessageId = anchored[0]?.messageId;
         const dividerResult = oldestAnchoredMessageId
@@ -1381,7 +1747,10 @@ export async function composeRecentChannelMessages(
               stopAtMessageId: oldestAnchoredMessageId,
             })
           : Result.ok(null);
-        const divider = dividerResult.match({ ok: (value) => value, err: () => null });
+        const divider = dividerResult.match({
+          ok: (value) => value,
+          err: () => null,
+        });
         const anchoredAfterDivider = divider
           ? anchored.filter(
               (message) =>
@@ -1430,9 +1799,12 @@ export async function composeRecentChannelMessages(
           currentMessageIds: opts.currentMessageIds ?? [triggerMsg.ref.messageId],
           transcriptStore: opts.transcriptStore,
           discordUserAliasById: opts.discordUserAliasById,
+          blobStore: opts.blobStore,
+          attachmentCache: opts.attachmentCache,
         });
         return composed.map((value) => ({
           messages: value.messages,
+          inputHandles: value.inputHandles,
           chainMessageIds: transformedAnchored.map((m) => m.messageId),
           mergedGroups: value.mergedGroups,
           corePrimaryLineage: value.corePrimaryLineage,
@@ -1456,9 +1828,15 @@ export async function composeRecentChannelMessages(
 
   if (shouldApplyActiveBurstRules && opts.triggerMsgRef) {
     const triggerMsgResult = await adapter.readMsg(opts.triggerMsgRef);
-    const triggerError = triggerMsgResult.match({ ok: () => null, err: (error) => error });
+    const triggerError = triggerMsgResult.match({
+      ok: () => null,
+      err: (error) => error,
+    });
     if (triggerError) return Result.err(triggerError);
-    const triggerMsg = triggerMsgResult.match({ ok: (value) => value, err: () => null });
+    const triggerMsg = triggerMsgResult.match({
+      ok: (value) => value,
+      err: () => null,
+    });
     if (triggerMsg) {
       const recent = await listRecentMessagesEndingAt({
         adapter,
@@ -1493,7 +1871,10 @@ export async function composeRecentChannelMessages(
           });
         },
       });
-      const recentError = recent.match({ ok: () => null, err: (error) => error });
+      const recentError = recent.match({
+        ok: () => null,
+        err: (error) => error,
+      });
       if (recentError) return Result.err(recentError);
       orderedList = recent.match({ ok: (value) => value, err: () => [] });
     } else {
@@ -1509,9 +1890,15 @@ export async function composeRecentChannelMessages(
       const exists = orderedList.some((m) => m.ref.messageId === opts.triggerMsgRef!.messageId);
       if (!exists) {
         const fetchedTrigger = await adapter.readMsg(opts.triggerMsgRef);
-        const fetchError = fetchedTrigger.match({ ok: () => null, err: (error) => error });
+        const fetchError = fetchedTrigger.match({
+          ok: () => null,
+          err: (error) => error,
+        });
         if (fetchError) return Result.err(fetchError);
-        const fetchedValue = fetchedTrigger.match({ ok: (value) => value, err: () => null });
+        const fetchedValue = fetchedTrigger.match({
+          ok: (value) => value,
+          err: () => null,
+        });
         if (fetchedValue) orderedList.push(fetchedValue);
       }
     }
@@ -1618,9 +2005,12 @@ export async function composeRecentChannelMessages(
     currentMessageIds,
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
+    blobStore: opts.blobStore,
+    attachmentCache: opts.attachmentCache,
   });
   return composed.map((value) => ({
     messages: value.messages,
+    inputHandles: value.inputHandles,
     chainMessageIds: chain.map((m) => m.messageId),
     mergedGroups: value.mergedGroups,
     corePrimaryLineage: value.corePrimaryLineage,
@@ -1630,7 +2020,7 @@ export async function composeRecentChannelMessages(
 export async function composeSingleMessage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
-): Promise<ResultType<ModelMessage | null, RequestCompositionError>> {
+): Promise<ResultType<BusMessageV2 | null, RequestCompositionError>> {
   const composed = await composeSingleMessageWithLineage(adapter, opts);
   return composed.map((value) => value?.messages[0] ?? null);
 }
@@ -1690,9 +2080,12 @@ export async function composeSingleMessageWithLineage(
     currentMessageIds: opts.currentMessageIds ?? [message.ref.messageId],
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
+    blobStore: opts.blobStore,
+    attachmentCache: opts.attachmentCache,
   });
   return composed.map((value) => ({
     messages: value.messages,
+    inputHandles: value.inputHandles,
     chainMessageIds: [message.ref.messageId],
     mergedGroups: value.mergedGroups,
     corePrimaryLineage: value.corePrimaryLineage,

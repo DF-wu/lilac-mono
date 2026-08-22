@@ -1,10 +1,18 @@
 import { captureError } from "../../../shared/error-capture";
-import { Result } from "better-result";
+import { Result, TaggedError } from "better-result";
 import { Buffer } from "node:buffer";
 
 import type { UserContent } from "ai";
 import type { Result as ResultType } from "better-result";
 import { fileTypeFromBuffer } from "file-type";
+import type {
+  BlobDeleteError,
+  BlobHandleV1,
+  BlobRefV1,
+  BlobStore,
+  BlobUpload,
+} from "@stanley2058/lilac-blob-storage";
+import type { BusFilePartV2, StoredFilePartV1 } from "@stanley2058/lilac-event-bus";
 
 import { inferMimeTypeFromFilename } from "../../../shared/attachment-utils";
 import type {
@@ -12,10 +20,17 @@ import type {
   CoreOwnedBlobReference,
 } from "../../../transcript/transcript-store";
 
-import type { DiscordAttachmentMeta } from "../../discord/discord-attachment";
+import type {
+  DiscordAttachmentCacheAccess,
+  DiscordAttachmentCacheEntry,
+  DiscordAttachmentCacheKey,
+  DiscordAttachmentMeta,
+} from "../../discord/discord-attachment";
 
 const DEFAULT_INBOUND_MAX_FILE_BYTES = 25 * 1024 * 1024;
 const DEFAULT_INBOUND_MAX_TOTAL_BYTES = 50 * 1024 * 1024;
+
+export const DISCORD_ATTACHMENT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 const DISCORD_CDN_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
 
@@ -29,25 +44,99 @@ type DiscordAttachmentState = {
     mediaType: string;
     filename: string;
   }) => ResultType<CoreOwnedBlobReference, CoreOwnedBlobIntegrityError>;
+  ownStoredBlob?: (input: {
+    blob: BlobRefV1;
+    mediaType: string;
+    filename: string;
+  }) => ResultType<CoreOwnedBlobReference, CoreOwnedBlobIntegrityError>;
   ownershipError: CoreOwnedBlobIntegrityError | null;
   ownedBlobs: Map<string, CoreOwnedBlobReference>;
   currentBlobs: Map<string, CoreOwnedBlobReference>;
+  blobStore?: BlobStore;
+  attachmentCache?: DiscordAttachmentCacheAccess;
+  now: () => number;
+  requestHandles: BlobHandleV1[];
 };
 
 export function createDiscordAttachmentState(input?: {
   ownBlob?: DiscordAttachmentState["ownBlob"];
+  ownStoredBlob?: DiscordAttachmentState["ownStoredBlob"];
   inlineFileData?: boolean;
+  blobStore?: BlobStore;
+  attachmentCache?: DiscordAttachmentCacheAccess;
+  now?: () => number;
 }): DiscordAttachmentState {
   return {
     downloadedTotalBytes: 0,
     inlineFileData: input?.inlineFileData === true,
     cache: new Map(),
     ownBlob: input?.ownBlob,
+    ownStoredBlob: input?.ownStoredBlob,
     ownershipError: null,
     ownedBlobs: new Map(),
     currentBlobs: new Map(),
+    blobStore: input?.blobStore,
+    attachmentCache: input?.attachmentCache,
+    now: input?.now ?? Date.now,
+    requestHandles: [],
   };
 }
+
+export function getDiscordRequestBlobHandles(
+  state: DiscordAttachmentState,
+): readonly BlobHandleV1[] {
+  return state.requestHandles;
+}
+
+export function rememberDiscordRequestBlobHandles(
+  state: DiscordAttachmentState,
+  handles: readonly BlobHandleV1[],
+): void {
+  state.requestHandles.push(...handles);
+}
+
+export class DiscordRequestBlobCleanupFailed extends TaggedError(
+  "DiscordRequestBlobCleanupFailed",
+)<{
+  readonly failures: readonly BlobDeleteError[];
+  readonly objectIds: readonly string[];
+  readonly message: string;
+}> {}
+
+export async function deleteDiscordRequestBlobHandles(
+  blobStore: Pick<BlobStore, "delete">,
+  handles: readonly BlobHandleV1[],
+): Promise<ResultType<void, DiscordRequestBlobCleanupFailed>> {
+  const distinctHandles = new Map(handles.map((handle) => [handle.objectId, handle]));
+  const deletions = await Promise.all(
+    [...distinctHandles.values()].map(async (handle) => {
+      return blobStore.delete(handle);
+    }),
+  );
+  const failures = deletions.flatMap((deleted) =>
+    deleted.match<BlobDeleteError[]>({ ok: () => [], err: (error) => [error] }),
+  );
+  return failures.length === 0
+    ? Result.ok(undefined)
+    : Result.err(
+        new DiscordRequestBlobCleanupFailed({
+          failures,
+          objectIds: [...distinctHandles.keys()],
+          message: "Discord request input handle cleanup failed",
+        }),
+      );
+}
+
+export class DiscordAttachmentPreparationFailed extends TaggedError(
+  "DiscordAttachmentPreparationFailed",
+)<{
+  readonly attachment: string;
+  readonly message: string;
+}> {}
+
+export type DiscordBusUserContentPart = Exclude<UserContent, string>[number] | BusFilePartV2;
+
+export type DiscordStoredUserContentPart = Exclude<UserContent, string>[number] | StoredFilePartV1;
 
 export function getDiscordOwnedBlobReferences(
   state: DiscordAttachmentState,
@@ -204,8 +293,33 @@ function ownAttachmentBytes(input: {
       input.state.ownershipError ??= error;
     },
     ok: (value) => () => {
-      input.state.ownedBlobs.set(value.sha256, value);
-      input.state.currentBlobs.set(value.sha256, value);
+      input.state.ownedBlobs.set(value.ownerId, value);
+      input.state.currentBlobs.set(value.ownerId, value);
+    },
+  })();
+}
+
+function ownStoredAttachmentBlob(input: {
+  state: DiscordAttachmentState;
+  blob: BlobRefV1;
+  mediaType: string;
+  filename?: string;
+  url: URL;
+}): void {
+  if (!input.state.ownStoredBlob) return;
+  const owned = input.state.ownStoredBlob({
+    blob: input.blob,
+    mediaType: input.mediaType,
+    filename: input.filename ?? input.url.pathname.split("/").pop() ?? "attachment",
+  });
+  owned.match({
+    err: (error) => () => {
+      input.state.ownershipError ??= error;
+      if (input.state.blobStore) void input.state.blobStore.delete(input.blob);
+    },
+    ok: (value) => () => {
+      input.state.ownedBlobs.set(value.ownerId, value);
+      input.state.currentBlobs.set(value.ownerId, value);
     },
   })();
 }
@@ -588,7 +702,12 @@ export async function appendDiscordAttachmentsToUserContent(
         const fallback =
           bestEffortInferMimeType({ filename: att.filename, url }) ?? "application/octet-stream";
         if (isImageMimeType(fallback)) {
-          parts.push({ type: "file", data: url, filename: att.filename, mediaType: fallback });
+          parts.push({
+            type: "file",
+            data: url,
+            filename: att.filename,
+            mediaType: fallback,
+          });
           continue;
         }
         if (isPdfMimeType(fallback)) {
@@ -713,7 +832,10 @@ export async function appendDiscordAttachmentsToUserContent(
               url,
             });
 
-            state.cache.set(url.toString(), { bytes, mimeType: resolvedMimeType });
+            state.cache.set(url.toString(), {
+              bytes,
+              mimeType: resolvedMimeType,
+            });
 
             return { status: "fallthrough" } as const;
           },
@@ -755,7 +877,12 @@ export async function appendDiscordAttachmentsToUserContent(
     }
 
     if (isImageMimeType(mt)) {
-      parts.push({ type: "file", data: bytes, filename: att.filename, mediaType: mt });
+      parts.push({
+        type: "file",
+        data: bytes,
+        filename: att.filename,
+        mediaType: mt,
+      });
       continue;
     }
 
@@ -806,4 +933,704 @@ export async function appendDiscordAttachmentsToUserContent(
       text: `${header}\n(binary attachment; fetch via URL if needed)`,
     });
   }
+}
+
+function attachmentPreparationError(
+  attachment: DiscordAttachmentMeta,
+  message: string,
+): DiscordAttachmentPreparationFailed {
+  return new DiscordAttachmentPreparationFailed({
+    attachment: attachment.filename ?? attachment.id ?? attachment.url,
+    message,
+  });
+}
+
+function accountDownloadedBytes(input: {
+  state: DiscordAttachmentState;
+  attachment: DiscordAttachmentMeta;
+  fileBytes: number;
+  chunkBytes: number;
+}): ResultType<void, DiscordAttachmentPreparationFailed> {
+  if (input.fileBytes + input.chunkBytes > DEFAULT_INBOUND_MAX_FILE_BYTES) {
+    return Result.err(
+      attachmentPreparationError(input.attachment, "Discord attachment exceeds the per-file limit"),
+    );
+  }
+  if (input.state.downloadedTotalBytes + input.chunkBytes > DEFAULT_INBOUND_MAX_TOTAL_BYTES) {
+    return Result.err(
+      attachmentPreparationError(
+        input.attachment,
+        "Discord attachments exceed the total download limit",
+      ),
+    );
+  }
+  input.state.downloadedTotalBytes += input.chunkBytes;
+  return Result.ok(undefined);
+}
+
+function limitDiscordAttachmentStream(input: {
+  state: DiscordAttachmentState;
+  attachment: DiscordAttachmentMeta;
+  source: ReadableStream<Uint8Array>;
+}): ReadableStream<Uint8Array> {
+  let fileBytes = 0;
+  return input.source.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        const accounted = accountDownloadedBytes({
+          state: input.state,
+          attachment: input.attachment,
+          fileBytes,
+          chunkBytes: chunk.byteLength,
+        });
+        accounted.match({
+          ok: () => {
+            fileBytes += chunk.byteLength;
+            controller.enqueue(chunk);
+          },
+          err: (error) => controller.error(error),
+        });
+      },
+    }),
+  );
+}
+
+function attachmentCacheKey(input: {
+  channelId: string;
+  messageId: string;
+  ordinal: number;
+  attachment: DiscordAttachmentMeta;
+}): DiscordAttachmentCacheKey {
+  return {
+    channelId: input.channelId,
+    messageId: input.messageId,
+    ordinal: input.ordinal,
+    ...(input.attachment.id ? { attachmentId: input.attachment.id } : {}),
+  };
+}
+
+function readAttachmentCacheEntry(
+  state: DiscordAttachmentState,
+  key: DiscordAttachmentCacheKey,
+  attachment: DiscordAttachmentMeta,
+): DiscordAttachmentCacheEntry | null {
+  if (!state.attachmentCache) return attachment.cache ?? null;
+  const cached = Result.try({
+    try: () => state.attachmentCache!.get(key),
+    catch: captureError,
+  });
+  if (cached.isErr()) return attachment.cache ?? null;
+  return cached.value ?? attachment.cache ?? null;
+}
+
+function clearAttachmentCacheEntry(
+  state: DiscordAttachmentState,
+  key: DiscordAttachmentCacheKey,
+  fallback: BlobRefV1,
+): void {
+  const cleared = state.attachmentCache
+    ? Result.try({
+        try: () => state.attachmentCache!.clear({ ...key, expected: fallback }),
+        catch: captureError,
+      }).match({ ok: (value) => value, err: () => null })
+    : null;
+  if (state.blobStore) void state.blobStore.delete(cleared ?? fallback);
+}
+
+async function readVerifiedCacheBytes(input: {
+  state: DiscordAttachmentState;
+  key: DiscordAttachmentCacheKey;
+  attachment: DiscordAttachmentMeta;
+}): Promise<Uint8Array | null> {
+  const cached = readAttachmentCacheEntry(input.state, input.key, input.attachment);
+  if (!cached || !input.state.blobStore) return null;
+  if (cached.blob.expiresAt === undefined || cached.blob.expiresAt <= input.state.now()) {
+    clearAttachmentCacheEntry(input.state, input.key, cached.blob);
+    return null;
+  }
+
+  const opened = await input.state.blobStore.open(cached.blob);
+  const read = opened.match({ ok: (value) => value, err: () => null });
+  if (!read) {
+    clearAttachmentCacheEntry(input.state, input.key, cached.blob);
+    return null;
+  }
+  const consumed = await Result.tryPromise({
+    try: async () => new Uint8Array(await new Response(read.stream).arrayBuffer()),
+    catch: captureError,
+  });
+  const completion = await read.completion;
+  const verified = completion.match({ ok: () => true, err: () => false });
+  const bytes = consumed.match({ ok: (value) => value, err: () => null });
+  if (!bytes || !verified) {
+    clearAttachmentCacheEntry(input.state, input.key, cached.blob);
+    return null;
+  }
+  return bytes;
+}
+
+function rememberCompletedCacheUpload(input: {
+  state: DiscordAttachmentState;
+  key: DiscordAttachmentCacheKey;
+  upload: BlobUpload;
+  cachedAt: number;
+}): void {
+  void input.upload.completion.then((completed) => {
+    completed.match({
+      err: () => undefined,
+      ok: (blob) => {
+        if (!input.state.attachmentCache) return;
+        Result.try({
+          try: () =>
+            input.state.attachmentCache!.put({
+              ...input.key,
+              blob,
+              cachedAt: input.cachedAt,
+            }),
+          catch: captureError,
+        });
+      },
+    });
+  });
+}
+
+async function startCacheUpload(input: {
+  state: DiscordAttachmentState;
+  key: DiscordAttachmentCacheKey;
+  source: Uint8Array | ReadableStream<Uint8Array>;
+  expectedByteLength?: number;
+  expectedSha256?: string;
+}): Promise<void> {
+  if (!input.state.blobStore || !input.state.attachmentCache) return;
+  const cachedAt = input.state.now();
+  const started = await input.state.blobStore.startUpload({
+    source: input.source,
+    retention: {
+      kind: "expires",
+      expiresAt: cachedAt + DISCORD_ATTACHMENT_CACHE_TTL_MS,
+    },
+    ...(input.expectedByteLength !== undefined
+      ? { expectedByteLength: input.expectedByteLength }
+      : {}),
+    ...(input.expectedSha256 ? { expectedSha256: input.expectedSha256 } : {}),
+  });
+  started.match({
+    err: () => {
+      if (input.source instanceof ReadableStream) void input.source.cancel();
+    },
+    ok: (upload) => rememberCompletedCacheUpload({ ...input, upload, cachedAt }),
+  });
+}
+
+async function startDurableRequestUpload(input: {
+  state: DiscordAttachmentState;
+  metadata: DiscordAttachmentMeta;
+  source: Uint8Array | ReadableStream<Uint8Array>;
+  expectedByteLength?: number;
+  expectedSha256?: string;
+}): Promise<ResultType<BlobHandleV1, DiscordAttachmentPreparationFailed>> {
+  if (!input.state.blobStore) {
+    return Result.err(
+      attachmentPreparationError(
+        input.metadata,
+        "Blob storage is unavailable while preparing Discord media",
+      ),
+    );
+  }
+  const started = await input.state.blobStore.startUpload({
+    source: input.source,
+    retention: { kind: "durable" },
+    ...(input.expectedByteLength !== undefined
+      ? { expectedByteLength: input.expectedByteLength }
+      : {}),
+    ...(input.expectedSha256 ? { expectedSha256: input.expectedSha256 } : {}),
+  });
+  return started.match<ResultType<BlobHandleV1, DiscordAttachmentPreparationFailed>>({
+    err: (error) => {
+      if (input.source instanceof ReadableStream) void input.source.cancel();
+      return Result.err(
+        attachmentPreparationError(
+          input.metadata,
+          `Failed to reserve durable attachment upload: ${error.message}`,
+        ),
+      );
+    },
+    ok: (upload) => {
+      input.state.requestHandles.push(upload.handle);
+      return Result.ok(upload.handle);
+    },
+  });
+}
+
+async function uploadDurableStoredBlob(input: {
+  state: DiscordAttachmentState;
+  metadata: DiscordAttachmentMeta;
+  source: Uint8Array | ReadableStream<Uint8Array>;
+  expectedByteLength?: number;
+  expectedSha256?: string;
+}): Promise<ResultType<BlobRefV1, DiscordAttachmentPreparationFailed>> {
+  if (!input.state.blobStore) {
+    return Result.err(
+      attachmentPreparationError(
+        input.metadata,
+        "Blob storage is unavailable while preparing Discord media",
+      ),
+    );
+  }
+  const started = await input.state.blobStore.startUpload({
+    source: input.source,
+    retention: { kind: "durable" },
+    ...(input.expectedByteLength !== undefined
+      ? { expectedByteLength: input.expectedByteLength }
+      : {}),
+    ...(input.expectedSha256 ? { expectedSha256: input.expectedSha256 } : {}),
+  });
+  const upload = started.match({ ok: (value) => value, err: () => null });
+  if (!upload) {
+    if (input.source instanceof ReadableStream) void input.source.cancel();
+    const startError = started.match({
+      ok: () =>
+        attachmentPreparationError(
+          input.metadata,
+          "Durable attachment upload reservation returned no upload",
+        ),
+      err: (error) =>
+        attachmentPreparationError(
+          input.metadata,
+          `Failed to reserve durable attachment upload: ${error.message}`,
+        ),
+    });
+    return Result.err(startError);
+  }
+  const completed = await upload.completion;
+  return completed.mapError((error) =>
+    attachmentPreparationError(
+      input.metadata,
+      `Failed to store durable attachment: ${error.message}`,
+    ),
+  );
+}
+
+async function loadAttachmentBytes(input: {
+  state: DiscordAttachmentState;
+  key: DiscordAttachmentCacheKey;
+  attachment: DiscordAttachmentMeta;
+  url: URL;
+}): Promise<
+  ResultType<{ bytes: Uint8Array; contentType?: string }, DiscordAttachmentPreparationFailed>
+> {
+  const cached = await readVerifiedCacheBytes(input);
+  if (cached) {
+    const accounted = accountDownloadedBytes({
+      state: input.state,
+      attachment: input.attachment,
+      fileBytes: 0,
+      chunkBytes: cached.byteLength,
+    });
+    return accounted.map(() => ({
+      bytes: cached,
+      contentType: input.attachment.mimeType,
+    }));
+  }
+
+  if (
+    input.attachment.size !== undefined &&
+    input.attachment.size > DEFAULT_INBOUND_MAX_FILE_BYTES
+  ) {
+    return Result.err(
+      attachmentPreparationError(input.attachment, "Discord attachment exceeds the per-file limit"),
+    );
+  }
+  if (
+    input.attachment.size !== undefined &&
+    input.state.downloadedTotalBytes + input.attachment.size > DEFAULT_INBOUND_MAX_TOTAL_BYTES
+  ) {
+    return Result.err(
+      attachmentPreparationError(
+        input.attachment,
+        "Discord attachments exceed the total download limit",
+      ),
+    );
+  }
+
+  const downloaded = await Result.tryPromise({
+    try: async () => {
+      if (!DISCORD_CDN_HOSTS.has(input.url.hostname)) {
+        throw new Error(`Blocked attachment host '${input.url.hostname}'`);
+      }
+      const response = await fetch(input.url.toString(), {
+        redirect: "follow",
+      });
+      if (!response.ok) throw new Error(`Failed to download attachment (${response.status})`);
+      if (!response.body) throw new Error("Discord attachment response has no body");
+      const source = limitDiscordAttachmentStream({
+        state: input.state,
+        attachment: input.attachment,
+        source: response.body,
+      });
+      return {
+        bytes: new Uint8Array(await new Response(source).arrayBuffer()),
+        contentType: normalizeMimeType(response.headers.get("content-type") ?? undefined),
+      };
+    },
+    catch: captureError,
+  });
+  if (downloaded.isErr()) {
+    return Result.err(attachmentPreparationError(input.attachment, downloaded.error.cause.message));
+  }
+  const bytes = downloaded.value.bytes;
+  await startCacheUpload({
+    state: input.state,
+    key: input.key,
+    source: bytes,
+    expectedByteLength: bytes.byteLength,
+  });
+  return Result.ok(downloaded.value);
+}
+
+async function appendKnownBlobAttachment(input: {
+  parts: DiscordBusUserContentPart[];
+  state: DiscordAttachmentState;
+  key: DiscordAttachmentCacheKey;
+  attachment: DiscordAttachmentMeta;
+  url: URL;
+  mediaType: string;
+}): Promise<ResultType<void, DiscordAttachmentPreparationFailed>> {
+  const cached = await readVerifiedCacheBytes(input);
+  if (cached) {
+    const accounted = accountDownloadedBytes({
+      state: input.state,
+      attachment: input.attachment,
+      fileBytes: 0,
+      chunkBytes: cached.byteLength,
+    });
+    const accountingError = accounted.match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (accountingError) return Result.err(accountingError);
+    const cachedEntry = readAttachmentCacheEntry(input.state, input.key, input.attachment);
+    const started = await startDurableRequestUpload({
+      state: input.state,
+      metadata: input.attachment,
+      source: cached,
+      expectedByteLength: cached.byteLength,
+      ...(cachedEntry ? { expectedSha256: cachedEntry.blob.sha256 } : {}),
+    });
+    return started.map((handle) => {
+      input.parts.push({
+        type: "blob",
+        blob: handle,
+        mediaType: input.mediaType,
+        ...(input.attachment.filename ? { filename: input.attachment.filename } : {}),
+      });
+    });
+  }
+
+  if (
+    input.attachment.size !== undefined &&
+    input.attachment.size > DEFAULT_INBOUND_MAX_FILE_BYTES
+  ) {
+    return Result.err(
+      attachmentPreparationError(input.attachment, "Discord attachment exceeds the per-file limit"),
+    );
+  }
+
+  const responseAttempt = await Result.tryPromise({
+    try: async () => {
+      if (!DISCORD_CDN_HOSTS.has(input.url.hostname)) {
+        throw new Error(`Blocked attachment host '${input.url.hostname}'`);
+      }
+      const response = await fetch(input.url.toString(), {
+        redirect: "follow",
+      });
+      if (!response.ok) throw new Error(`Failed to download attachment (${response.status})`);
+      if (!response.body) throw new Error("Discord attachment response has no body");
+      return { body: response.body };
+    },
+    catch: captureError,
+  });
+  if (responseAttempt.isErr()) {
+    return Result.err(
+      attachmentPreparationError(input.attachment, responseAttempt.error.cause.message),
+    );
+  }
+
+  const expectedByteLength = input.attachment.size;
+  if (
+    expectedByteLength !== undefined &&
+    input.state.downloadedTotalBytes + expectedByteLength > DEFAULT_INBOUND_MAX_TOTAL_BYTES
+  ) {
+    void responseAttempt.value.body.cancel();
+    return Result.err(
+      attachmentPreparationError(
+        input.attachment,
+        "Discord attachments exceed the total download limit",
+      ),
+    );
+  }
+  const limitedSource = limitDiscordAttachmentStream({
+    state: input.state,
+    attachment: input.attachment,
+    source: responseAttempt.value.body,
+  });
+  const [requestSource, cacheSource] = input.state.attachmentCache
+    ? limitedSource.tee()
+    : [limitedSource, null];
+  const requestUpload = await startDurableRequestUpload({
+    state: input.state,
+    metadata: input.attachment,
+    source: requestSource,
+    ...(expectedByteLength !== undefined ? { expectedByteLength } : {}),
+  });
+  const handle = requestUpload.match({ ok: (value) => value, err: () => null });
+  if (!handle) {
+    if (cacheSource) void cacheSource.cancel();
+    return requestUpload.map(() => undefined);
+  }
+  if (cacheSource) {
+    await startCacheUpload({
+      state: input.state,
+      key: input.key,
+      source: cacheSource,
+      ...(expectedByteLength !== undefined ? { expectedByteLength } : {}),
+    });
+  }
+  input.parts.push({
+    type: "blob",
+    blob: handle,
+    mediaType: input.mediaType,
+    ...(input.attachment.filename ? { filename: input.attachment.filename } : {}),
+  });
+  return Result.ok(undefined);
+}
+
+/**
+ * Compose Discord attachments for the Redis request contract.
+ *
+ * Binary parts contain durable upload handles. This function waits only for storage reservations, not
+ * for upload completion. Text extraction still waits for the bounded attachment download because the
+ * extracted text itself is part of the request envelope.
+ */
+export async function appendDiscordAttachmentsToBusContent(
+  parts: DiscordBusUserContentPart[],
+  attachments: readonly DiscordAttachmentMeta[],
+  state: DiscordAttachmentState,
+  context: { readonly channelId: string; readonly messageId: string },
+): Promise<ResultType<void, DiscordAttachmentPreparationFailed>> {
+  for (const [ordinal, attachment] of attachments.entries()) {
+    const parsedUrl = Result.try({
+      try: () => new URL(attachment.url),
+      catch: captureError,
+    });
+    if (parsedUrl.isErr()) continue;
+    const url = parsedUrl.value;
+    const key = attachmentCacheKey({ ...context, ordinal, attachment });
+    const declaredMimeType = normalizeMimeType(attachment.mimeType);
+    const inferredMimeType = bestEffortInferMimeType({
+      filename: attachment.filename,
+      url,
+    });
+    const initialMimeType = declaredMimeType ?? inferredMimeType;
+
+    if (initialMimeType && (isImageMimeType(initialMimeType) || isPdfMimeType(initialMimeType))) {
+      const appended = await appendKnownBlobAttachment({
+        parts,
+        state,
+        key,
+        attachment,
+        url,
+        mediaType: initialMimeType,
+      });
+      const error = appended.match({ ok: () => null, err: (value) => value });
+      if (error) return Result.err(error);
+      continue;
+    }
+
+    if (declaredMimeType && !isTextExtractableMimeType(declaredMimeType)) {
+      const header = formatDiscordAttachmentHeader({
+        url,
+        filename: attachment.filename,
+        mimeType: declaredMimeType,
+        size: attachment.size,
+      });
+      parts.push({
+        type: "text",
+        text: `${header}\n(binary attachment; fetch via URL if needed)`,
+      });
+      continue;
+    }
+
+    const loaded = await loadAttachmentBytes({ state, key, attachment, url });
+    const loadError = loaded.match({ ok: () => null, err: (value) => value });
+    if (loadError) return Result.err(loadError);
+    const value = loaded.match({ ok: (bytes) => bytes, err: () => null });
+    if (!value) continue;
+    const detected = declaredMimeType
+      ? undefined
+      : await fileTypeFromBuffer(Buffer.from(value.bytes));
+    const mediaType =
+      declaredMimeType ??
+      detected?.mime ??
+      value.contentType ??
+      inferredMimeType ??
+      "application/octet-stream";
+
+    if (isImageMimeType(mediaType) || isPdfMimeType(mediaType)) {
+      const started = await startDurableRequestUpload({
+        state,
+        metadata: attachment,
+        source: value.bytes,
+        expectedByteLength: value.bytes.byteLength,
+      });
+      const handle = started.match({ ok: (blob) => blob, err: () => null });
+      if (!handle) return started.map(() => undefined);
+      parts.push({
+        type: "blob",
+        blob: handle,
+        mediaType,
+        ...(attachment.filename ? { filename: attachment.filename } : {}),
+      });
+      continue;
+    }
+
+    const header = formatDiscordAttachmentHeader({
+      url,
+      filename: attachment.filename,
+      mimeType: mediaType,
+      size: attachment.size,
+    });
+    if (!isTextExtractableMimeType(mediaType)) {
+      parts.push({
+        type: "text",
+        text: `${header}\n(binary attachment; fetch via URL if needed)`,
+      });
+      continue;
+    }
+    const decoded = decodeUtf8BestEffort(value.bytes);
+    if (!decoded.text) {
+      parts.push({
+        type: "text",
+        text: `${header}\n(text extraction failed: ${decoded.reason ?? "unknown"}; fetch via URL)`,
+      });
+      continue;
+    }
+    parts.push({
+      type: "text",
+      text: `${header}\n${decoded.text}${decoded.truncatedBytes ? "\n\n(truncated)" : ""}`,
+    });
+  }
+  return Result.ok(undefined);
+}
+
+/**
+ * Compose reference-bearing attachment parts for a durable surface projection.
+ *
+ * Each blob is independently owned from the request upload. Unlike the bus helper, this function waits
+ * for each upload to finish so the caller can commit only resolved references through
+ * `putCoreOwnedBlob({ blob, mediaType, filename })`.
+ */
+export async function appendDiscordAttachmentsToStoredContent(
+  parts: DiscordStoredUserContentPart[],
+  attachments: readonly DiscordAttachmentMeta[],
+  state: DiscordAttachmentState,
+  context: { readonly channelId: string; readonly messageId: string },
+): Promise<ResultType<void, DiscordAttachmentPreparationFailed>> {
+  for (const [ordinal, attachment] of attachments.entries()) {
+    const parsedUrl = Result.try({
+      try: () => new URL(attachment.url),
+      catch: captureError,
+    });
+    if (parsedUrl.isErr()) continue;
+    const url = parsedUrl.value;
+    const key = attachmentCacheKey({ ...context, ordinal, attachment });
+    const declaredMimeType = normalizeMimeType(attachment.mimeType);
+    const inferredMimeType = bestEffortInferMimeType({
+      filename: attachment.filename,
+      url,
+    });
+
+    if (declaredMimeType && !isTextExtractableMimeType(declaredMimeType)) {
+      if (!isImageMimeType(declaredMimeType) && !isPdfMimeType(declaredMimeType)) {
+        const header = formatDiscordAttachmentHeader({
+          url,
+          filename: attachment.filename,
+          mimeType: declaredMimeType,
+          size: attachment.size,
+        });
+        parts.push({
+          type: "text",
+          text: `${header}\n(binary attachment; fetch via URL if needed)`,
+        });
+        continue;
+      }
+    }
+
+    const loaded = await loadAttachmentBytes({ state, key, attachment, url });
+    const loadError = loaded.match({ ok: () => null, err: (value) => value });
+    if (loadError) return Result.err(loadError);
+    const value = loaded.match({ ok: (bytes) => bytes, err: () => null });
+    if (!value) continue;
+    const detected = declaredMimeType
+      ? undefined
+      : await fileTypeFromBuffer(Buffer.from(value.bytes));
+    const mediaType =
+      declaredMimeType ??
+      detected?.mime ??
+      value.contentType ??
+      inferredMimeType ??
+      "application/octet-stream";
+
+    if (isImageMimeType(mediaType) || isPdfMimeType(mediaType)) {
+      const stored = await uploadDurableStoredBlob({
+        state,
+        metadata: attachment,
+        source: value.bytes,
+        expectedByteLength: value.bytes.byteLength,
+      });
+      const blob = stored.match({ ok: (ref) => ref, err: () => null });
+      if (!blob) return stored.map(() => undefined);
+      ownStoredAttachmentBlob({
+        state,
+        blob,
+        mediaType,
+        filename: attachment.filename,
+        url,
+      });
+      parts.push({
+        type: "blob",
+        blob,
+        mediaType,
+        ...(attachment.filename ? { filename: attachment.filename } : {}),
+      });
+      continue;
+    }
+
+    const header = formatDiscordAttachmentHeader({
+      url,
+      filename: attachment.filename,
+      mimeType: mediaType,
+      size: attachment.size,
+    });
+    if (!isTextExtractableMimeType(mediaType)) {
+      parts.push({
+        type: "text",
+        text: `${header}\n(binary attachment; fetch via URL if needed)`,
+      });
+      continue;
+    }
+    const decoded = decodeUtf8BestEffort(value.bytes);
+    if (!decoded.text) {
+      parts.push({
+        type: "text",
+        text: `${header}\n(text extraction failed: ${decoded.reason ?? "unknown"}; fetch via URL)`,
+      });
+      continue;
+    }
+    parts.push({
+      type: "text",
+      text: `${header}\n${decoded.text}${decoded.truncatedBytes ? "\n\n(truncated)" : ""}`,
+    });
+  }
+  return Result.ok(undefined);
 }

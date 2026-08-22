@@ -1,19 +1,28 @@
-import type { ModelMessage } from "ai";
-import type { CorePrimaryLineageV1 } from "@stanley2058/lilac-event-bus";
+import type { BlobHandleV1, BlobStore } from "@stanley2058/lilac-blob-storage";
+import type { BusMessageV2, CorePrimaryLineageV2 } from "@stanley2058/lilac-event-bus";
 
 import type { MsgRef } from "../../types";
-import type { DiscordAttachmentMeta } from "../../discord/discord-attachment";
+import type {
+  DiscordAttachmentCacheAccess,
+  DiscordAttachmentMeta,
+} from "../../discord/discord-attachment";
 
 import type { TranscriptStore } from "../../../transcript/transcript-store";
 
 export type RequestCompositionResult = {
-  messages: ModelMessage[];
+  messages: BusMessageV2[];
+  inputHandles: readonly BlobHandleV1[];
   chainMessageIds: string[];
   mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
-  corePrimaryLineage: CorePrimaryLineageV1;
+  corePrimaryLineage: CorePrimaryLineageV2;
 };
 
-export type ComposeRecentChannelMessagesOpts = {
+type BlobCompositionOptions = {
+  blobStore?: BlobStore;
+  attachmentCache?: DiscordAttachmentCacheAccess;
+};
+
+export type ComposeRecentChannelMessagesOpts = BlobCompositionOptions & {
   platform: "discord";
   sessionId: string;
   botUserId: string;
@@ -32,7 +41,7 @@ export type ComposeRecentChannelMessagesOpts = {
   transformUserText?: (text: string) => string;
 };
 
-export type ComposeSingleMessageOpts = {
+export type ComposeSingleMessageOpts = BlobCompositionOptions & {
   platform: "discord";
   botUserId: string;
   botName: string;
@@ -43,7 +52,7 @@ export type ComposeSingleMessageOpts = {
   transformUserText?: (text: string) => string;
 };
 
-export type ComposeRequestOpts = {
+export type ComposeRequestOpts = BlobCompositionOptions & {
   platform: "discord";
   botUserId: string;
   botName: string;

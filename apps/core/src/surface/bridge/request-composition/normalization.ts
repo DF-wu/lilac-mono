@@ -1,4 +1,4 @@
-import type { ModelMessage } from "ai";
+import type { StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 
 import type { TranscriptSnapshot } from "../../../transcript/transcript-store";
 import { formatSurfaceMetadataLine, stripSurfaceMetadataLines } from "../surface-metadata";
@@ -18,7 +18,7 @@ export function normalizeAssistantContextText(text: string): string {
   return stripSurfaceMetadataLines(stripLeadingDiscordAttributionHeader(text)).trimEnd();
 }
 
-function extractAssistantTextFromContent(content: ModelMessage["content"]): string | null {
+function extractAssistantTextFromContent(content: StoredMessageV1["content"]): string | null {
   if (typeof content === "string") {
     return content;
   }
@@ -51,12 +51,12 @@ function extractAssistantTextFromContent(content: ModelMessage["content"]): stri
 
 export function buildAssistantOnlyMessageFromTranscript(
   snap: TranscriptSnapshot,
-): ModelMessage | null {
+): StoredMessageV1 | null {
   if (typeof snap.finalText === "string") {
     return {
       role: "assistant",
       content: normalizeAssistantContextText(snap.finalText),
-    } satisfies ModelMessage;
+    } satisfies StoredMessageV1;
   }
 
   for (let i = snap.messages.length - 1; i >= 0; i--) {
@@ -69,7 +69,7 @@ export function buildAssistantOnlyMessageFromTranscript(
     return {
       role: "assistant",
       content: normalizeAssistantContextText(text),
-    } satisfies ModelMessage;
+    } satisfies StoredMessageV1;
   }
 
   return null;

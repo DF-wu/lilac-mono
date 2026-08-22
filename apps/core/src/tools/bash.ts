@@ -95,6 +95,7 @@ export function bashToolWithCwd(
         const typedContext = context as
           | {
               requestId?: string;
+              requestDeliveryId?: string;
               sessionId?: string;
               requestClient?: string;
               safetyMode?: "trusted" | "restricted";

@@ -1,8 +1,11 @@
 import { describe, expect, it } from "bun:test";
+import { Result } from "better-result";
 
 import {
+  createLilacBus,
   EventDeliveryStopped,
   EventDeliveryTransportFailed,
+  lilacEventTypes,
   type Message,
   type PublishOptions,
   type RawBus,
@@ -36,6 +39,26 @@ async function publish(raw: RawBus): Promise<void> {
 }
 
 describe("RawBus retry test helpers", () => {
+  it("tracks absolute output replay expiry in the in-memory bus", async () => {
+    const bus = createLilacBus(createInMemoryDeliveryBus());
+    expect(await bus.getOutputStreamExpiry("missing-request")).toEqual(
+      Result.ok({ kind: "absent" }),
+    );
+
+    const published = await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "hello", seq: 1 },
+      { headers: { request_id: "output-expiry-request" } },
+    );
+    if (published.status === "error") throw published.error;
+    const replayDeadline = published.value.replayDeadline;
+    if (replayDeadline === undefined) throw new Error("Missing in-memory output replay deadline");
+
+    expect(await bus.getOutputStreamExpiry("output-expiry-request")).toEqual(
+      Result.ok({ kind: "present", expiresAt: replayDeadline }),
+    );
+  });
+
   it("redelivers durable in-memory delivery through the fifth attempt before failing explicitly", async () => {
     const raw = createInMemoryDeliveryBus();
     const attempts: number[] = [];
