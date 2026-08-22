@@ -3,6 +3,7 @@ import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { getTestBlobStore } from "../helpers/blob-store";
 import {
   createToolResultArtifactStore,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
@@ -30,7 +31,10 @@ describe("read tool-result resources", () => {
   });
 
   it("pages artifacts by Unicode character offset independent of cwd", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const created = resultValue(
       await store.create({
@@ -77,7 +81,10 @@ describe("read tool-result resources", () => {
   });
 
   it("supports line starts for artifacts and offset starts for ordinary files", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const created = resultValue(
       await store.create({
@@ -127,7 +134,10 @@ describe("read tool-result resources", () => {
   });
 
   it("allows artifact reads but rejects filesystem paths in artifact-only mode", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const created = resultValue(
       await store.create({
@@ -166,7 +176,10 @@ describe("read tool-result resources", () => {
   });
 
   it("does not reveal foreign or missing artifact existence", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const created = resultValue(
       await store.create({
@@ -201,7 +214,10 @@ describe("read tool-result resources", () => {
   });
 
   it("reports evicted artifacts as unavailable", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const first = resultValue(
       await store.create({
@@ -238,7 +254,10 @@ describe("read tool-result resources", () => {
   });
 
   it("greps artifacts inline without creating another artifact", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const created = resultValue(
       await store.create({

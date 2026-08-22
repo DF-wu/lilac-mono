@@ -3,6 +3,7 @@ import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { getTestBlobStore } from "../helpers/blob-store";
 import { createToolResultArtifactStore } from "../../src/artifacts/tool-result-artifact-store";
 import { createToolResultOutputNormalizer } from "../../src/artifacts/tool-result-output-normalizer";
 
@@ -18,7 +19,10 @@ describe("Core read output normalization", () => {
   });
 
   it("does not create overflow artifacts for direct or settled trusted reads", async () => {
-    const artifacts = createToolResultArtifactStore(path.join(root, "tool-results"));
+    const artifacts = createToolResultArtifactStore(
+      path.join(root, "tool-results"),
+      await getTestBlobStore(),
+    );
     await artifacts.init();
     const normalize = createToolResultOutputNormalizer({
       artifacts,

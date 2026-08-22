@@ -139,8 +139,17 @@ export function createBuiltinAttachmentPlugin(): CoreToolPlugin {
       if (!runtime.bus) {
         return signalBuiltinPluginSkip("attachment requires bus");
       }
+      if (!runtime.blobStore || !runtime.attachmentOutputLifecycle) {
+        return signalBuiltinPluginSkip("attachment requires blob output lifecycle");
+      }
       return {
-        level2: [new Attachment({ bus: runtime.bus })],
+        level2: [
+          new Attachment({
+            bus: runtime.bus,
+            blobStore: runtime.blobStore,
+            outputLifecycle: runtime.attachmentOutputLifecycle,
+          }),
+        ],
       };
     },
   };
@@ -155,6 +164,9 @@ export function createBuiltinWorkflowPlugin(): CoreToolPlugin {
       if (!runtime.bus) {
         return signalBuiltinPluginSkip("workflow requires bus");
       }
+      if (!runtime.blobStore) {
+        return signalBuiltinPluginSkip("workflow requires blob storage");
+      }
       const getConfig = runtime.getConfig;
       const config = runtime.config;
       let getMaxActiveRuns: (() => Promise<number>) | (() => number) | undefined;
@@ -167,6 +179,7 @@ export function createBuiltinWorkflowPlugin(): CoreToolPlugin {
         level2: [
           new ProgrammaticWorkflow({
             dataDir,
+            blobStore: runtime.blobStore,
             store: runtime.durableWorkflowStore,
             bus: runtime.bus,
             progressCards: runtime.workflowProgressCards,

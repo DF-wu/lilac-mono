@@ -4,6 +4,7 @@ import path from "node:path";
 import { env } from "@stanley2058/lilac-utils";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, type Result as ResultType } from "better-result";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
 import {
   serverToolFailure,
@@ -475,13 +476,14 @@ export class ProgrammaticWorkflow implements ServerTool {
   constructor(
     private readonly params: {
       dataDir?: string;
+      blobStore: BlobStore;
       dbPath?: string;
       now?: () => number;
       store?: DurableWorkflowStore;
       bus?: LilacBus;
       progressCards?: WorkflowProgressCardService;
       getMaxActiveRuns?: () => number | Promise<number>;
-    } = {},
+    },
   ) {
     this.serverTool = defineServerTool({
       id: this.id,
@@ -683,11 +685,19 @@ export class ProgrammaticWorkflow implements ServerTool {
   private async definitions(
     canonicalRoot: string,
   ): Promise<ResultType<WorkflowDefinitionStore, ServerToolFailure>> {
+    const workflowStore = this.durableStore;
+    if (!workflowStore) {
+      return Result.err(
+        workflowFailure("internal", "Programmatic workflow tool is not initialized"),
+      );
+    }
     let definitions = this.definitionsStores.get(canonicalRoot);
     if (!definitions) {
       definitions = WorkflowDefinitionStore.createResult({
         workspaceRoot: canonicalRoot,
         dataDir: this.params.dataDir ?? env.dataDir,
+        blobStore: this.params.blobStore,
+        workflowStore,
       }).then(workflowDefinitionResult);
       this.definitionsStores.set(canonicalRoot, definitions);
       definitions.then((result) =>
@@ -844,7 +854,7 @@ export class ProgrammaticWorkflow implements ServerTool {
         ...revisionIdentity,
         revisionId,
         name: definition.name,
-        snapshotArtifactId: snapshot.artifactId,
+        snapshotArtifact: snapshot.artifact,
         metadata: definition.validation.metadata,
         inputSchema: definition.validation.inputSchema,
         resources: definition.validation.resources,
@@ -1127,7 +1137,7 @@ export class ProgrammaticWorkflow implements ServerTool {
         ...revisionIdentity,
         revisionId,
         name: definition.name,
-        snapshotArtifactId: snapshot.artifactId,
+        snapshotArtifact: snapshot.artifact,
         metadata: definition.validation.metadata,
         inputSchema: definition.validation.inputSchema,
         resources: definition.validation.resources,
@@ -1174,7 +1184,7 @@ export class ProgrammaticWorkflow implements ServerTool {
         progressTarget,
         terminalDetail: null,
         result: null,
-        resultArtifactId: null,
+        resultArtifact: null,
         claimedBy: null,
         claimedAt: null,
         createdAt: now,
@@ -1300,10 +1310,10 @@ export class ProgrammaticWorkflow implements ServerTool {
         revision,
       });
       let resultArtifact;
-      if (input.includeResultArtifact && run.resultArtifactId) {
+      if (input.includeResultArtifact && run.resultArtifact) {
         const loaded = await readWorkflowValueArtifact({
-          dataDir: this.params.dataDir ?? env.dataDir,
-          artifactId: run.resultArtifactId,
+          blobStore: this.params.blobStore,
+          reference: run.resultArtifact,
           maxBytes: revision.limits.maxResultBytes,
         });
         resultArtifact = yield* loaded.mapError(workflowArtifactFailure);
@@ -1311,7 +1321,7 @@ export class ProgrammaticWorkflow implements ServerTool {
       const source = input.includeSource
         ? yield* Result.await(
             (yield* Result.await(this.definitions(projectScope.canonicalRoot)))
-              .readSnapshotResult(revision.sourceSha256)
+              .readSnapshotResult(revision.snapshotArtifact)
               .then(workflowDefinitionResult),
           )
         : undefined;
@@ -1386,7 +1396,12 @@ export class ProgrammaticWorkflow implements ServerTool {
             this.params.bus
               .publish(
                 lilacEventTypes.CmdRequestMessage,
-                { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
+                {
+                  requestDeliveryId: crypto.randomUUID(),
+                  queue: "interrupt",
+                  messages: [],
+                  raw: { cancel: true, cancelQueued: true },
+                },
                 {
                   headers: {
                     request_id: requestId,

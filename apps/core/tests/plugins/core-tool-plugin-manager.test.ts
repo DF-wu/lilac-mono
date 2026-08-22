@@ -17,6 +17,7 @@ import { McpRegistry } from "../../src/mcp";
 import { catalogToolStableId } from "../../src/mcp/catalog-identity";
 import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
+import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import type { SurfaceAdapter } from "../../src/surface/adapter";
 import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
 import { SurfaceRuntimeRegistry } from "../../src/surface/runtime-descriptor";
@@ -28,6 +29,7 @@ import {
   mcpToolDefinition,
   stdioDefinition,
 } from "../mcp/fixtures/registry-fixture";
+import { getTestBlobStore } from "../helpers/blob-store";
 
 function createCoreToolPluginManager(
   params: Parameters<typeof createCoreToolPluginManagerResult>[0],
@@ -216,8 +218,11 @@ async function writeExternalPlugin(params: {
 
 describe("core tool plugin manager", () => {
   let tmpRoot: string | null = null;
+  let workflowStore: DurableWorkflowStore | null = null;
 
   afterEach(async () => {
+    workflowStore?.close();
+    workflowStore = null;
     if (!tmpRoot) return;
     await fs.rm(tmpRoot, { recursive: true, force: true });
     tmpRoot = null;
@@ -425,7 +430,6 @@ describe("core tool plugin manager", () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
-
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
@@ -760,10 +764,18 @@ describe("core tool plugin manager", () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
+    const blobStore = await getTestBlobStore();
+    await fs.mkdir(dataDir, { recursive: true });
+    workflowStore = new DurableWorkflowStore(path.join(dataDir, "workflow.sqlite"));
 
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
+        blobStore,
+        durableWorkflowStore: workflowStore,
+        attachmentOutputLifecycle: {
+          registerOutputHandle: () => Result.ok(undefined),
+        },
         surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         conversationThreads: {} as ConversationThreadToolService,
@@ -772,7 +784,10 @@ describe("core tool plugin manager", () => {
       dataDir,
     });
 
-    await manager.init();
+    const initialized = await manager.init();
+    if (initialized.status === "error") {
+      throw new Error(initialized.error.message, { cause: initialized.error });
+    }
 
     const callableIds = (
       await Promise.all(

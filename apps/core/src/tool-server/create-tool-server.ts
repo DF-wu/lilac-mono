@@ -82,6 +82,7 @@ type FatalToolCallDefect = Panic | Error;
 type ToolRequestHeaders = {
   readonly operatorToken?: string;
   readonly requestId?: string;
+  readonly requestDeliveryId?: string;
   readonly sessionId?: string;
   readonly requestClient?: string;
   readonly cwd?: string;
@@ -111,6 +112,7 @@ const toolPayloadSchema: z.ZodType<ToolJsonObject> = z.record(z.string(), toolJs
 const toolRequestHeadersSchema = z.object({
   "x-lilac-operator-token": z.string().optional(),
   "x-lilac-request-id": z.string().optional(),
+  "x-lilac-request-delivery-id": z.string().optional(),
   "x-lilac-session-id": z.string().optional(),
   "x-lilac-request-client": z.string().optional(),
   "x-lilac-cwd": z.string().optional(),
@@ -231,6 +233,7 @@ function decodeToolRequestHeaders(
   return Result.ok({
     operatorToken: headerStr(decoded.data["x-lilac-operator-token"]),
     requestId: headerStr(decoded.data["x-lilac-request-id"]),
+    requestDeliveryId: headerStr(decoded.data["x-lilac-request-delivery-id"]),
     sessionId: headerStr(decoded.data["x-lilac-session-id"]),
     requestClient: headerStr(decoded.data["x-lilac-request-client"]),
     cwd: headerStr(decoded.data["x-lilac-cwd"]),
@@ -253,6 +256,7 @@ function decodeToolPayload(
 function parseRequestContext(headers: ToolRequestHeaders): RequestContext {
   return {
     requestId: headers.requestId,
+    requestDeliveryId: headers.requestDeliveryId,
     sessionId: headers.sessionId,
     requestClient: headers.requestClient,
     cwd: headers.cwd,

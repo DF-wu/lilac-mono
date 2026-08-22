@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import type { ModelMessage } from "ai";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
 import { isRecord } from "@stanley2058/lilac-utils";
 import { Panic, Result, type Result as ResultType } from "better-result";
@@ -35,6 +36,7 @@ import {
 } from "../../shared/attachment-utils";
 import { expandTilde } from "@stanley2058/lilac-fs";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
+import type { AttachmentOutputLifecycle } from "../../tools/attachment-output-lifecycle";
 
 function attachmentFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
   return serverToolFailure({
@@ -317,7 +319,13 @@ export class Attachment implements ServerTool {
   id = "attachment";
   private readonly tool: ServerTool;
 
-  constructor(private readonly params: { bus: LilacBus }) {
+  constructor(
+    private readonly params: {
+      bus: LilacBus;
+      blobStore: BlobStore;
+      outputLifecycle: AttachmentOutputLifecycle;
+    },
+  ) {
     this.tool = defineServerTool({
       id: this.id,
       callables: ({ callable }) => ({
@@ -471,12 +479,39 @@ export class Attachment implements ServerTool {
         typeFromBytes?.mime ||
         inferMimeTypeFromFilename(filename);
 
-      const dataBase64 = Buffer.from(bytes).toString("base64");
+      const uploadResult = (
+        await this.params.blobStore.startUpload({
+          source: bytes,
+          retention: { kind: "durable" },
+          expectedByteLength: bytes.byteLength,
+        })
+      ).mapError((error) =>
+        attachmentFailure("unavailable", `Failed to reserve attachment output: ${error.message}`),
+      );
+      const uploadBranch = resultBranch(uploadResult);
+      if ("failure" in uploadBranch) return Result.err(uploadBranch.failure);
+      const upload = uploadBranch.value;
+
+      const registered = (
+        await this.params.outputLifecycle.registerOutputHandle({
+          requestId: headers.request_id,
+          requestDeliveryId: headers.request_delivery_id,
+          handle: upload.handle,
+          mimeType,
+          filename,
+        })
+      ).mapError((error) => attachmentFailure("unavailable", error.message));
+      const registeredBranch = resultBranch(registered);
+      if ("failure" in registeredBranch) {
+        const deleted = await this.params.blobStore.delete(upload.handle);
+        deleted.match({ ok: () => undefined, err: () => undefined });
+        return Result.err(registeredBranch.failure);
+      }
 
       const published = (
         await this.params.bus.publish(
           lilacEventTypes.EvtAgentOutputResponseBinary,
-          { mimeType, dataBase64, filename },
+          { blob: upload.handle, mimeType, filename },
           { headers },
         )
       ).mapError((error) => attachmentFailure("unavailable", error.message));

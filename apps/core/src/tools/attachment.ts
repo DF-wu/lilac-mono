@@ -1,4 +1,5 @@
 import { tool, type FilePart, type ImagePart, type ModelMessage } from "ai";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
 import {
   createLogger,
@@ -26,6 +27,12 @@ import { adaptEventPublishResultToHost } from "../shared/event-bus-result";
 import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
+import type { AttachmentOutputLifecycle } from "./attachment-output-lifecycle";
+
+export {
+  AttachmentOutputLifecycleError,
+  type AttachmentOutputLifecycle,
+} from "./attachment-output-lifecycle";
 
 const DEFAULT_OUTBOUND_MAX_FILE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_OUTBOUND_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
@@ -284,8 +291,13 @@ async function downloadToBuffer(input: AttachmentData): Promise<{
   return { bytes: asBuffer(input) };
 }
 
-export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
-  const { bus, cwd } = params;
+export function attachmentTools(params: {
+  bus: LilacBus;
+  blobStore: BlobStore;
+  outputLifecycle: AttachmentOutputLifecycle;
+  cwd: string;
+}) {
+  const { bus, blobStore, outputLifecycle, cwd } = params;
   const logger = createLogger({
     module: "tool:attachment",
   });
@@ -353,12 +365,49 @@ export function attachmentTools(params: { bus: LilacBus; cwd: string }) {
               typeFromBytes?.mime ||
               inferMimeTypeFromFilename(filename);
 
-            const dataBase64 = Buffer.from(bytes).toString("base64");
+            const upload = (
+              await blobStore.startUpload({
+                source: bytes,
+                retention: { kind: "durable" },
+                expectedByteLength: bytes.byteLength,
+              })
+            ).match({
+              ok: (value) => value,
+              err: (error) =>
+                signalAttachmentFailure(
+                  "start_output_upload",
+                  opaqueErrorMessage(error, "Failed to reserve attachment output"),
+                ),
+            });
+
+            const registered = await outputLifecycle.registerOutputHandle({
+              requestId: ctx.requestId,
+              requestDeliveryId: ctx.requestDeliveryId,
+              handle: upload.handle,
+              mimeType,
+              filename,
+            });
+            await registered.match<() => Promise<void>>({
+              ok: () => async () => undefined,
+              err: (error) => async () => {
+                const deleted = await blobStore.delete(upload.handle);
+                deleted.match({ ok: () => undefined, err: () => undefined });
+                return adaptToolResultToHost(
+                  Result.err(
+                    new AttachmentOperationError({
+                      operation: "register_output_upload",
+                      cause: error,
+                      message: error.message,
+                    }),
+                  ),
+                );
+              },
+            })();
 
             adaptEventPublishResultToHost(
               await bus.publish(
                 lilacEventTypes.EvtAgentOutputResponseBinary,
-                { mimeType, dataBase64, filename },
+                { blob: upload.handle, mimeType, filename },
                 {
                   headers: {
                     request_id: ctx.requestId,

@@ -1409,6 +1409,7 @@ describe("createToolServer", () => {
       callableId: string;
       input: Record<string, unknown>;
       requestId?: string;
+      requestDeliveryId?: string;
       sessionId?: string;
       requestClient?: string;
       cwd?: string;
@@ -1436,6 +1437,7 @@ describe("createToolServer", () => {
           callableId,
           input,
           requestId: opts?.context?.requestId,
+          requestDeliveryId: opts?.context?.requestDeliveryId,
           sessionId: opts?.context?.sessionId,
           requestClient: opts?.context?.requestClient,
           cwd: opts?.context?.cwd,
@@ -1483,6 +1485,7 @@ describe("createToolServer", () => {
         headers: {
           "content-type": "application/json",
           "x-lilac-request-id": "req:1",
+          "x-lilac-request-delivery-id": "delivery-1",
           "x-lilac-session-id": "chan",
           "x-lilac-request-client": "discord",
           "x-lilac-cwd": "/tmp/work",
@@ -1502,6 +1505,7 @@ describe("createToolServer", () => {
     expect(captured.callableId).toBe("test.echo");
     expect(captured.input).toEqual({ hello: "world" });
     expect(captured.requestId).toBe("req:1");
+    expect(captured.requestDeliveryId).toBe("delivery-1");
     expect(captured.sessionId).toBe("chan");
     expect(captured.requestClient).toBe("discord");
     expect(captured.cwd).toBe("/tmp/work");

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { lilacEventTypes, type LilacMessageForTopic } from "@stanley2058/lilac-event-bus";
+import {
+  lilacEventTypes,
+  type BusMessageV2,
+  type LilacMessageForTopic,
+} from "@stanley2058/lilac-event-bus";
 
 import {
   createRequestMessageCache,
@@ -22,6 +26,7 @@ function requestMessage(input: {
   readonly text?: string;
   readonly raw?: Record<string, unknown>;
 }): LilacMessageForTopic<"cmd.request"> {
+  const messages: BusMessageV2[] = [{ role: "user", content: input.text ?? input.eventId }];
   return {
     id: input.eventId,
     topic: "cmd.request",
@@ -34,8 +39,9 @@ function requestMessage(input: {
       request_client: input.requestClient ?? "discord",
     },
     data: {
+      requestDeliveryId: crypto.randomUUID(),
       queue: "prompt",
-      messages: [{ role: "user", content: input.text ?? input.eventId }],
+      messages,
       ...(input.raw ? { raw: input.raw } : {}),
     },
   };

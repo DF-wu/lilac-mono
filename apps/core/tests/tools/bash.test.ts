@@ -12,6 +12,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { Panic } from "better-result";
 
+import { getTestBlobStore } from "../helpers/blob-store";
 import {
   BASH_NO_OUTPUT_TIMEOUT_MS,
   executeBash,
@@ -306,7 +307,10 @@ rmdir "$media_dir"`,
     const artifactDir = await fs.mkdtemp(
       path.join(await fs.realpath("/tmp"), "lilac-bash-artifact-"),
     );
-    const artifacts = createToolResultArtifactStore(path.join(artifactDir, "tool-results"));
+    const artifacts = createToolResultArtifactStore(
+      path.join(artifactDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await artifacts.init();
     const testId = crypto.randomUUID();
     const requestId = `bash-trunc-test-request-${testId}`;
@@ -507,7 +511,10 @@ rmdir "$media_dir"`,
     const artifactDir = await fs.mkdtemp(
       path.join(await fs.realpath("/tmp"), "lilac-bash-bounded-spill-"),
     );
-    const artifacts = createToolResultArtifactStore(path.join(artifactDir, "tool-results"));
+    const artifacts = createToolResultArtifactStore(
+      path.join(artifactDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await artifacts.init();
 
     try {
@@ -676,7 +683,7 @@ describe("executeRestrictedBash", () => {
       path.join(await fs.realpath("/tmp"), "lilac-restricted-sanitize-workspace-"),
     );
     const artifactRoot = path.join(workspace, ".artifacts");
-    const store = createToolResultArtifactStore(artifactRoot);
+    const store = createToolResultArtifactStore(artifactRoot, await getTestBlobStore());
     await store.init();
 
     try {
@@ -820,6 +827,7 @@ describe("executeRestrictedBash", () => {
       path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
     );
     let capturedCallInput: unknown;
+    const capturedRequestDeliveryIds: Array<string | null> = [];
 
     const restoreFetch = installMockFetch(async (input, init) => {
       const url = String(input);
@@ -827,6 +835,9 @@ describe("executeRestrictedBash", () => {
         return Response.json({ primaryPositional: { field: "paths", variadic: true } });
       }
       if (url.endsWith("/call")) {
+        capturedRequestDeliveryIds.push(
+          new Headers(init?.headers).get("x-lilac-request-delivery-id"),
+        );
         capturedCallInput = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
         return Response.json({ status: "ok", value: { ok: true } });
       }
@@ -843,6 +854,22 @@ describe("executeRestrictedBash", () => {
           workspaceRoot: workspace,
           context: {
             requestId: "restricted-tools-variadic-test-req",
+            requestDeliveryId: "delivery-1",
+            sessionId: "restricted-tools-variadic-test-session",
+            requestClient: "discord",
+          },
+        },
+      );
+      const nextDeliveryResult = await executeRestrictedBash(
+        {
+          command: "tools attachment.add_files a.png b.png",
+          cwd: workspace,
+        },
+        {
+          workspaceRoot: workspace,
+          context: {
+            requestId: "restricted-tools-variadic-test-req",
+            requestDeliveryId: "delivery-2",
             sessionId: "restricted-tools-variadic-test-session",
             requestClient: "discord",
           },
@@ -850,8 +877,10 @@ describe("executeRestrictedBash", () => {
       );
 
       expect(result.exitCode).toBe(0);
+      expect(nextDeliveryResult.exitCode).toBe(0);
       expect(result.stdout).toBe('{"ok":true}\n');
       expect(result.stderr).toBe("");
+      expect(capturedRequestDeliveryIds).toEqual(["delivery-1", "delivery-2"]);
       expect(capturedCallInput).toEqual({
         callableId: "attachment.add_files",
         input: { paths: ["a.png", "b.png"] },
