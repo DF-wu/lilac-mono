@@ -24,6 +24,7 @@ import path from "node:path";
 import { watch, type FSWatcher } from "node:fs";
 import fs from "node:fs/promises";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
   createLilacBus,
   createRedisStreamsBus,
@@ -67,6 +68,18 @@ import {
   type ConversationThreadToolService,
 } from "../conversation/thread-service";
 import { toReplyChainMessage } from "../surface/bridge/request-composition/reply-chain";
+import {
+  createCoreRequestDelivery,
+  createCoreRequestOutputReplayRecovery,
+  createDurableCoreRequestBus,
+  createLilacBusRequestDeliveryPublisher,
+  createRequestDeliveryPostCommitObserver,
+  type CoreRequestOutputMetadata,
+} from "../surface/bridge/request-delivery";
+import {
+  DiscordRequestDeliveryFailed,
+  type DiscordRequestDeliveryPort,
+} from "../surface/discord/discord-request-router/publish";
 import { ConversationThreadStore } from "../conversation/thread-store";
 import { createConversationThreadEmbeddingAdapterResolver } from "../conversation/thread-embedding";
 import {
@@ -159,11 +172,16 @@ import type { SurfaceRuntimeRegistry } from "../surface/runtime-descriptor";
 import { resolveAuthenticatedRequestSafetyMode } from "../surface/builtin-surface-protocols";
 import type { SurfacePrincipal } from "../surface/types";
 import { composeBuiltinSurfaceRuntimes } from "./compose-builtin-surface-runtimes";
+import { createCoreBlobStore, type CoreBlobStoreCreateError } from "./create-core-blob-store";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
 import {
   adaptToolResultArtifactStoreInitToHost,
   createToolResultArtifactStore,
 } from "../artifacts/tool-result-artifact-store";
+import {
+  AttachmentOutputLifecycleError,
+  type AttachmentOutputLifecycle,
+} from "../tools/attachment-output-lifecycle";
 import {
   createEmptyMcpConfig,
   createMcpRegistryResult,
@@ -203,7 +221,10 @@ export function resolveRequestCapabilityIdentity(input: {
         cachedOrigin.sessionRef.channelId === proposedOrigin.sessionRef.channelId));
   const authenticatedOrigin = cacheMatches ? proposedOrigin : null;
   const principal = authenticatedOrigin
-    ? { platform: authenticatedOrigin.platform, userId: authenticatedOrigin.userId }
+    ? {
+        platform: authenticatedOrigin.platform,
+        userId: authenticatedOrigin.userId,
+      }
     : null;
   const safetyMode = input.cachedRequest
     ? resolveAuthenticatedRequestSafetyMode({
@@ -217,7 +238,8 @@ export function resolveRequestCapabilityIdentity(input: {
 
 export type CoreRuntime = {
   start(): Promise<CoreRuntimeStartOutcome>;
-  stop(priorPanic?: Panic | null): Promise<void>;
+  stop(priorPanic?: Panic | null, hardDeadlineAtMs?: number): Promise<void>;
+  getBlobStore(): BlobStore | null;
   recordUnhandledRejection(reason: Error): void;
 };
 
@@ -228,8 +250,20 @@ class CoreRuntimeExternalFailure extends TaggedError("CoreRuntimeExternalFailure
 }> {}
 
 export class CoreRuntimeCreateFailed extends TaggedError("CoreRuntimeCreateFailed")<{
-  readonly operation: "event-bus" | "custom-commands" | "mcp-registry";
-  readonly cause: CoreEventBusSetupError | CustomCommandDiscoveryError | McpRegistryOptionsInvalid;
+  readonly operation:
+    | "config"
+    | "blob-storage"
+    | "request-delivery"
+    | "durable-stores"
+    | "event-bus"
+    | "custom-commands"
+    | "mcp-registry";
+  readonly cause:
+    | Error
+    | CoreBlobStoreCreateError
+    | CoreEventBusSetupError
+    | CustomCommandDiscoveryError
+    | McpRegistryOptionsInvalid;
   readonly message: string;
 }> {}
 
@@ -241,7 +275,7 @@ export type CoreRuntimeCreateOutcome =
   | { readonly kind: "panic"; readonly panic: Panic };
 
 export class CoreRuntimeStartFailed extends TaggedError("CoreRuntimeStartFailed")<{
-  readonly operation: "startup" | "heartbeat";
+  readonly operation: "startup" | "blob-storage" | "heartbeat";
   readonly cause: unknown;
   readonly message: string;
 }> {}
@@ -364,7 +398,10 @@ export async function superviseDetachedCoreConfigValidation(params: {
     return;
   }
   params.reportFatalError(
-    new Panic({ message: "Core config validation rejected", cause: settled.reason }),
+    new Panic({
+      message: "Core config validation rejected",
+      cause: settled.reason,
+    }),
   );
 }
 
@@ -393,7 +430,9 @@ export function superviseCoreRouterDone(params: {
     const fatalError = settled.value.match<Error>({
       err: (error) => error,
       ok: () =>
-        new Panic({ message: "Discord request router subscriptions completed unexpectedly" }),
+        new Panic({
+          message: "Discord request router subscriptions completed unexpectedly",
+        }),
     });
     params.reportFatalError(fatalError);
   }
@@ -528,7 +567,10 @@ export function settleCoreResidualDiscordRequestRouterDone(params: {
       params.deadlineMs,
     );
     const settled = await Promise.race([
-      params.supervision.then((outcome) => ({ kind: "outcome" as const, outcome })),
+      params.supervision.then((outcome) => ({
+        kind: "outcome" as const,
+        outcome,
+      })),
       deadline.promise,
     ]).finally(cancelDeadline);
     if (settled.kind === "deadline") {
@@ -563,6 +605,55 @@ export function settleCoreResidualDiscordRequestRouterDone(params: {
 
 export type CoreRuntimeStopPass = "none" | "full" | "residual-router";
 
+export const CORE_BLOB_STORE_CLEANUP_SLICE_MS = 1_000;
+const CORE_REQUEST_DELIVERY_MAINTENANCE_INTERVAL_MS = 60_000;
+
+export function scheduleCoreBlobStoreClose(params: {
+  readonly hardDeadlineAtMs: number;
+  readonly close: () => Promise<void>;
+  readonly now?: () => number;
+  readonly scheduleDeadline?: (callback: () => void, delayMs: number) => () => void;
+}): { readonly closeNow: () => Promise<void> } {
+  const now = params.now ?? Date.now;
+  const scheduleDeadline =
+    params.scheduleDeadline ??
+    ((callback: () => void, delayMs: number) => {
+      const timeout = setTimeout(callback, delayMs);
+      return () => clearTimeout(timeout);
+    });
+  let closeOperation: Promise<void> | null = null;
+  let cancelDeadline = (): void => undefined;
+
+  const closeNow = (): Promise<void> => {
+    if (closeOperation) return closeOperation;
+    cancelDeadline();
+    closeOperation = Promise.resolve().then(params.close);
+    return closeOperation;
+  };
+
+  cancelDeadline = scheduleDeadline(
+    () => {
+      void closeNow();
+    },
+    Math.max(0, params.hardDeadlineAtMs - CORE_BLOB_STORE_CLEANUP_SLICE_MS - now()),
+  );
+  return { closeNow };
+}
+
+export function resolveCoreGracefulDrainDeadlineMs(input: {
+  readonly nowMs: number;
+  readonly hardDeadlineAtMs: number;
+  readonly configuredDrainDeadlineMs: number;
+}): number {
+  return Math.max(
+    0,
+    Math.min(
+      input.configuredDrainDeadlineMs,
+      input.hardDeadlineAtMs - CORE_BLOB_STORE_CLEANUP_SLICE_MS - input.nowMs,
+    ),
+  );
+}
+
 export function selectCoreRuntimeStopPass(params: {
   readonly fullCleanupPending: boolean;
   readonly hasResidualRouter: boolean;
@@ -575,16 +666,20 @@ export function selectCoreRuntimeStopPass(params: {
 export function createCoreEventBusDeliveryOptions(params: {
   readonly redis: Redis;
   readonly deadLetterEncryptionKey: Uint8Array;
+  readonly evidenceBlobStore: Pick<BlobStore, "startUpload">;
   readonly logger: CoreEventBusLogSink;
   readonly reportFatalError: (error: Error) => void;
+  readonly postCommitObserver?: CreateLilacBusOptions["postCommitObserver"];
 }): CreateLilacBusOptions {
   return {
     deadLetter: new RedisEventDeadLetter({
       redis: params.redis,
       encryptionKey: params.deadLetterEncryptionKey,
+      evidenceBlobStore: params.evidenceBlobStore,
     }),
     logger: createCoreEventBusLogger(params.logger),
     reportFatal: createCoreEventBusFatalReporter(params.reportFatalError),
+    ...(params.postCommitObserver ? { postCommitObserver: params.postCommitObserver } : {}),
   };
 }
 
@@ -764,8 +859,10 @@ function captureCoreLilacBusConstruction(params: {
   readonly redis: Redis;
   readonly raw: CoreEventBusRaw;
   readonly deadLetterEncryptionKey: Uint8Array;
+  readonly evidenceBlobStore: Pick<BlobStore, "startUpload">;
   readonly logger: CoreEventBusLogSink;
   readonly reportFatalError: (error: Error) => void;
+  readonly postCommitObserver?: CreateLilacBusOptions["postCommitObserver"];
 }): ResultType<LilacBus, CoreEventBusSetupFailed> {
   {
     const captured = Result.try({
@@ -776,8 +873,12 @@ function captureCoreLilacBusConstruction(params: {
             createCoreEventBusDeliveryOptions({
               redis: params.redis,
               deadLetterEncryptionKey: params.deadLetterEncryptionKey,
+              evidenceBlobStore: params.evidenceBlobStore,
               logger: params.logger,
               reportFatalError: params.reportFatalError,
+              ...(params.postCommitObserver
+                ? { postCommitObserver: params.postCommitObserver }
+                : {}),
             }),
           ),
         );
@@ -864,8 +965,10 @@ export async function setupCoreEventBusResources(params: {
   readonly redisUrl: string;
   readonly cwd: string;
   readonly dataDir: string;
+  readonly evidenceBlobStore: Pick<BlobStore, "startUpload">;
   readonly logger: CoreEventBusLogSink;
   readonly reportFatalError: (error: Error) => void;
+  readonly postCommitObserver?: CreateLilacBusOptions["postCommitObserver"];
   readonly dependencies?: {
     readonly captureRedisConstruction?: typeof captureCoreRedisConstruction;
     readonly loadDeadLetterKey?: (options: {
@@ -886,7 +989,11 @@ export async function setupCoreEventBusResources(params: {
       ok: (value) => async () => Result.ok(value),
       err: (error) => async () => {
         cleanupAttempted = true;
-        return coreEventBusSetupFailureWithCleanup(error, { redis: ownedRedis, raw, bus });
+        return coreEventBusSetupFailureWithCleanup(error, {
+          redis: ownedRedis,
+          raw,
+          bus,
+        });
       },
     })();
 
@@ -963,8 +1070,12 @@ export async function setupCoreEventBusResources(params: {
               redis: ownedRedis,
               raw,
               deadLetterEncryptionKey: deadLetterKey,
+              evidenceBlobStore: params.evidenceBlobStore,
               logger: params.logger,
               reportFatalError: params.reportFatalError,
+              ...(params.postCommitObserver
+                ? { postCommitObserver: params.postCommitObserver }
+                : {}),
             });
             const busResult = await setupWithCleanup(busCreated, ownedRedis);
             const busFailure = busResult.match({
@@ -1190,20 +1301,16 @@ function subId(prefix: string, name: string): string {
   return `${prefix}:${name}`;
 }
 
-function surfaceAdapterLogContext(registry: SurfaceRuntimeRegistry) {
-  return { platforms: registry.entries().map((descriptor) => descriptor.platform) };
-}
-
 function staleRestartLogContext(input: {
   readonly createdAt: number;
   readonly ageMs: number;
   readonly deadlineMs: number;
 }) {
-  return { createdAt: input.createdAt, ageMs: input.ageMs, deadlineMs: input.deadlineMs };
-}
-
-function agentRunnerLogContext(subscriptionId: string, cwd: string) {
-  return { subscriptionId, cwd };
+  return {
+    createdAt: input.createdAt,
+    ageMs: input.ageMs,
+    deadlineMs: input.deadlineMs,
+  };
 }
 
 function runtimeFsDenyPaths(): readonly string[] {
@@ -1217,6 +1324,24 @@ function runtimeFsDenyPaths(): readonly string[] {
 
 function fffCacheDir(): string {
   return path.join(env.dataDir, ".cache", "fff");
+}
+
+export function openCoreDurableStoresInStartupOrder(input: {
+  readonly openGracefulRestart: () => void;
+  readonly openTranscript: () => void;
+  readonly openDiscordSearch: () => void;
+  readonly openDiscordSurface: () => void;
+  readonly openConversationThread: () => void;
+  readonly openDiscovery: () => void;
+  readonly openWorkflow: () => void;
+}): void {
+  input.openGracefulRestart();
+  input.openTranscript();
+  input.openDiscordSearch();
+  input.openDiscordSurface();
+  input.openConversationThread();
+  input.openDiscovery();
+  input.openWorkflow();
 }
 
 export async function createCoreRuntime(
@@ -1241,6 +1366,275 @@ export async function createCoreRuntime(
     subscriptionPrefix,
   });
 
+  const loadedCoreConfig = (
+    await Result.tryPromise({
+      try: () => getCoreConfig(),
+      catch: captureRuntimeError,
+    })
+  ).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Core config startup read failed"),
+  );
+  const coreConfigSelection = loadedCoreConfig.match<
+    | {
+        readonly ok: true;
+        readonly config: Awaited<ReturnType<typeof getCoreConfig>>;
+      }
+    | { readonly ok: false; readonly error: Error | Panic }
+  >({
+    ok: (config) => ({ ok: true, config }),
+    err: (error) => ({ ok: false, error }),
+  });
+  if (!coreConfigSelection.ok) {
+    if (isPanic(coreConfigSelection.error)) {
+      return { kind: "panic", panic: coreConfigSelection.error };
+    }
+    return {
+      kind: "result",
+      result: Result.err(
+        new CoreRuntimeCreateFailed({
+          operation: "config",
+          cause: coreConfigSelection.error,
+          message: coreConfigSelection.error.message,
+        }),
+      ),
+    };
+  }
+  const initialCoreConfig = coreConfigSelection.config;
+  const createdBlobStore = await createCoreBlobStore({
+    config: initialCoreConfig.blobStorage,
+    dataDir: env.dataDir,
+  });
+  const blobStoreCreation = createdBlobStore.match<
+    | { readonly ok: true; readonly store: BlobStore }
+    | { readonly ok: false; readonly error: CoreBlobStoreCreateError }
+  >({
+    ok: (store) => ({ ok: true, store }),
+    err: (error) => ({ ok: false, error }),
+  });
+  if (!blobStoreCreation.ok) {
+    return {
+      kind: "result",
+      result: Result.err(
+        new CoreRuntimeCreateFailed({
+          operation: "blob-storage",
+          cause: blobStoreCreation.error,
+          message: blobStoreCreation.error.message,
+        }),
+      ),
+    };
+  }
+  let blobStore: BlobStore | null = blobStoreCreation.store;
+  let requestDeliveryStore: ReturnType<typeof createCoreRequestDelivery>["store"] | null = null;
+  let durableWorkflowStore: DurableWorkflowStore | null = null;
+  let gracefulRestartStore: SqliteGracefulRestartStore | null = null;
+  let transcriptStore: SqliteTranscriptStore | null = null;
+  let discordSearchStore: DiscordSearchStore | null = null;
+  let discordSurfaceStore: DiscordSurfaceStore | null = null;
+  let conversationThreadStore: ConversationThreadStore | null = null;
+  let discoveryService: DiscoveryService | null = null;
+
+  async function finishCoreRuntimeCreateFailure(
+    outcome: CoreRuntimeCreateOutcome,
+    eventBusResources: CoreEventBusResources | null = null,
+  ): Promise<CoreRuntimeCreateOutcome> {
+    const priorPanic = outcome.kind === "panic" ? outcome.panic : null;
+    const cleanup = createCoreRuntimeCleanupSupervisor(priorPanic);
+    if (eventBusResources) {
+      await cleanup.run("eventBus.setup.close", async () => {
+        adaptCoreEventBusCleanupResultToHost(
+          await captureCoreEventBusCleanup({
+            redis: eventBusResources.redis,
+            raw: eventBusResources.raw,
+            bus: eventBusResources.bus,
+          }),
+        );
+      });
+    }
+    await cleanup.run(
+      "requestDeliveryStore.createFailure.close",
+      requestDeliveryStore
+        ? async () => {
+            requestDeliveryStore?.close();
+            requestDeliveryStore = null;
+          }
+        : undefined,
+    );
+    await cleanup.run("discoveryService.createFailure.close", async () => {
+      discoveryService?.close();
+      discoveryService = null;
+    });
+    await cleanup.run("conversationThreadStore.createFailure.close", async () => {
+      conversationThreadStore?.close();
+      conversationThreadStore = null;
+    });
+    await cleanup.run("discordSurfaceStore.createFailure.close", async () => {
+      discordSurfaceStore?.close();
+      discordSurfaceStore = null;
+    });
+    await cleanup.run("discordSearchStore.createFailure.close", async () => {
+      discordSearchStore?.close();
+      discordSearchStore = null;
+    });
+    await cleanup.run("transcriptStore.createFailure.close", async () => {
+      transcriptStore?.close();
+      transcriptStore = null;
+    });
+    await cleanup.run("gracefulRestartStore.createFailure.close", async () => {
+      gracefulRestartStore?.close();
+      gracefulRestartStore = null;
+    });
+    await cleanup.run("durableWorkflowStore.createFailure.close", async () => {
+      durableWorkflowStore?.close();
+      durableWorkflowStore = null;
+    });
+    const ownedBlobStore = blobStore;
+    blobStore = null;
+    if (ownedBlobStore) {
+      await cleanup.run("blobStore.createFailure.close.panic", async () => {
+        const closed = await ownedBlobStore.close({
+          deadlineAtMs: Date.now() + 1_000,
+        });
+        closed.match({
+          ok: () => undefined,
+          err: (error) => cleanup.record("blobStore.createFailure.close", error),
+        });
+      });
+    }
+    for (const failure of cleanup.failures) {
+      logger.error("Core runtime create cleanup failed", {
+        label: failure.label,
+        error: failure.error,
+        panic: failure.panic,
+      });
+    }
+    if (priorPanic) return outcome;
+    const cleanupPanic = cleanup.panics[0];
+    return cleanupPanic ? { kind: "panic", panic: cleanupPanic } : outcome;
+  }
+
+  const requestDeliveryCreation = (
+    await Result.tryPromise({
+      try: async () => {
+        await fs.mkdir(env.dataDir, { recursive: true });
+        return createCoreRequestDelivery({
+          dbPath: path.join(env.dataDir, "request-delivery.db"),
+          blobStore: blobStoreCreation.store,
+        });
+      },
+      catch: captureRuntimeError,
+    })
+  ).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Core request delivery store creation failed"),
+  );
+  const requestDeliverySelection = requestDeliveryCreation.match<
+    | {
+        readonly ok: true;
+        readonly delivery: ReturnType<typeof createCoreRequestDelivery>;
+      }
+    | { readonly ok: false; readonly error: Error | Panic }
+  >({
+    ok: (delivery) => ({ ok: true, delivery }),
+    err: (error) => ({ ok: false, error }),
+  });
+  if (!requestDeliverySelection.ok) {
+    if (isPanic(requestDeliverySelection.error)) {
+      return finishCoreRuntimeCreateFailure({
+        kind: "panic",
+        panic: requestDeliverySelection.error,
+      });
+    }
+    return finishCoreRuntimeCreateFailure({
+      kind: "result",
+      result: Result.err(
+        new CoreRuntimeCreateFailed({
+          operation: "request-delivery",
+          cause: requestDeliverySelection.error,
+          message: requestDeliverySelection.error.message,
+        }),
+      ),
+    });
+  }
+  const requestDeliveryCoordinator = requestDeliverySelection.delivery.coordinator;
+  requestDeliveryStore = requestDeliverySelection.delivery.store;
+  const durableStoresCreated = Result.try({
+    try: () => {
+      const discordSearchDbPath = resolveDiscordSearchDbPath();
+      const discordSurfaceDbPath = resolveDiscordDbPath(initialCoreConfig);
+      openCoreDurableStoresInStartupOrder({
+        openGracefulRestart: () => {
+          gracefulRestartStore = new SqliteGracefulRestartStore(
+            path.join(env.dataDir, "graceful-restart.db"),
+          );
+        },
+        openTranscript: () => {
+          transcriptStore = new SqliteTranscriptStore(
+            resolveTranscriptDbPath(),
+            undefined,
+            undefined,
+            { deferStartupRecovery: true },
+          );
+        },
+        openDiscordSearch: () => {
+          discordSearchStore = new DiscordSearchStore(discordSearchDbPath);
+        },
+        openDiscordSurface: () => {
+          discordSurfaceStore = new DiscordSurfaceStore(discordSurfaceDbPath);
+        },
+        openConversationThread: () => {
+          conversationThreadStore = new ConversationThreadStore(discordSearchDbPath, {
+            surfaceDbPath: discordSurfaceDbPath,
+            mainAgentUserNames: [initialCoreConfig.surface.discord.botName],
+          });
+        },
+        openDiscovery: () => {
+          discoveryService = new DiscoveryService({
+            dbPath: resolveDiscoveryDbPath(),
+            dataDir: env.dataDir,
+            discordSearchStore: discordSearchStore ?? undefined,
+            transcriptStore: transcriptStore ?? undefined,
+            getConfig: () => getCoreConfig(),
+          });
+        },
+        openWorkflow: () => {
+          durableWorkflowStore = new DurableWorkflowStore(undefined, {
+            deferStartupRecovery: true,
+          });
+        },
+      });
+      transcriptStore?.initializeStartupRecovery();
+      durableWorkflowStore?.initializeStartupRecovery();
+    },
+    catch: captureRuntimeError,
+  }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Core durable store preflight failed"),
+  );
+  const durableStoreCreationFailure = durableStoresCreated.match<Error | Panic | null>({
+    ok: () => null,
+    err: (error) => error,
+  });
+  if (durableStoreCreationFailure) {
+    if (isPanic(durableStoreCreationFailure)) {
+      return finishCoreRuntimeCreateFailure({
+        kind: "panic",
+        panic: durableStoreCreationFailure,
+      });
+    }
+    return finishCoreRuntimeCreateFailure({
+      kind: "result",
+      result: Result.err(
+        new CoreRuntimeCreateFailed({
+          operation: "durable-stores",
+          cause: durableStoreCreationFailure,
+          message: durableStoreCreationFailure.message,
+        }),
+      ),
+    });
+  }
+  const requestDeliveryPostCommitObserver = createRequestDeliveryPostCommitObserver({
+    observeTransportCommit: (requestDeliveryId, streamId) =>
+      requestDeliveryCoordinator.observeTransportCommit(requestDeliveryId, streamId),
+  });
+
   const redisUrl = env.redisUrl;
   let eventBusSetup: CoreEventBusSetupOutcome;
   if (!redisUrl) {
@@ -1260,14 +1654,21 @@ export async function createCoreRuntime(
       redisUrl,
       cwd,
       dataDir: env.dataDir,
+      evidenceBlobStore: blobStoreCreation.store,
       logger,
       reportFatalError,
+      postCommitObserver: requestDeliveryPostCommitObserver,
     });
   }
-  if (eventBusSetup.kind === "panic") return eventBusSetup;
-  const eventBusSetupError = eventBusSetup.result.match({ err: (error) => error, ok: () => null });
+  if (eventBusSetup.kind === "panic") {
+    return finishCoreRuntimeCreateFailure(eventBusSetup);
+  }
+  const eventBusSetupError = eventBusSetup.result.match({
+    err: (error) => error,
+    ok: () => null,
+  });
   if (eventBusSetupError) {
-    return {
+    return finishCoreRuntimeCreateFailure({
       kind: "result",
       result: Result.err(
         new CoreRuntimeCreateFailed({
@@ -1276,16 +1677,19 @@ export async function createCoreRuntime(
           message: eventBusSetupError.message,
         }),
       ),
-    };
+    });
   }
-  const eventBusResources = eventBusSetup.result.match({ ok: (value) => value, err: () => null });
+  const eventBusResources = eventBusSetup.result.match({
+    ok: (value) => value,
+    err: () => null,
+  });
   if (!eventBusResources) {
     const missingResources = new CoreEventBusSetupFailed({
       operation: "create-lilac-bus",
       cause: undefined,
       message: "Core event bus setup returned no resources",
     });
-    return {
+    return finishCoreRuntimeCreateFailure({
       kind: "result",
       result: Result.err(
         new CoreRuntimeCreateFailed({
@@ -1294,7 +1698,7 @@ export async function createCoreRuntime(
           message: "Core event bus setup returned no resources",
         }),
       ),
-    };
+    });
   }
   const { redis, raw, bus, canonicalWorkspaceRoot } = eventBusResources;
 
@@ -1315,7 +1719,9 @@ export async function createCoreRuntime(
       ),
     }),
   })();
-  if (customCommandFailure) return customCommandFailure;
+  if (customCommandFailure) {
+    return finishCoreRuntimeCreateFailure(customCommandFailure, eventBusResources);
+  }
   const customCommands = customCommandManager;
   const loadedCustomCommands = customCommands.list();
   const customCommandWarnings = customCommands.listWarnings();
@@ -1331,22 +1737,18 @@ export async function createCoreRuntime(
     logger.warn("custom command skipped", { warning });
   }
 
-  const adapter = new DiscordAdapter({ customCommands, reportFatalPanic: reportFatalError });
+  const adapter = new DiscordAdapter({
+    customCommands,
+    reportFatalPanic: reportFatalError,
+  });
   const githubAdapter = new GithubAdapter();
   const discordEventSource = createDescriptorBoundSurfaceEventSource("discord", adapter);
-  const durableWorkflowStore = new DurableWorkflowStore();
-
-  let transcriptStore: SqliteTranscriptStore | null = null;
-  let discordSearchStore: DiscordSearchStore | null = null;
-  let discordSurfaceStore: DiscordSurfaceStore | null = null;
   let discordSearchService: DiscordSearchService | null = null;
-  let discoveryService: DiscoveryService | null = null;
-  let conversationThreadStore: ConversationThreadStore | null = null;
   let conversationThreadService: ConversationThreadService | null = null;
   let conversationThreadMaterializer: ConversationThreadMaterializer | null = null;
 
   let started = false;
-  let fullCleanupPending = false;
+  let fullCleanupPending = true;
 
   const connectedSurfaceAdapters: ConnectedSurfaceAdapters = new Map();
   const surfaceAdapterIngressHandles: SurfaceAdapterIngressHandles = new Map();
@@ -1379,15 +1781,15 @@ export async function createCoreRuntime(
 
   let requestMessageCache: RequestMessageCache | null = null;
   const requestControlAuthority = new RequestControlAuthority();
-  let gracefulRestartStore: SqliteGracefulRestartStore | null = null;
   let pluginManager: CoreToolPluginManager | null = null;
-  const toolResultArtifacts = createToolResultArtifactStore(path.join(env.dataDir, "tool-results"));
   const mcpConfigPath = resolveMcpConfigPath({ dataDir: env.dataDir });
   const mcpOAuthProviders = new McpOAuthProviderService({
     dataDir: env.dataDir,
     configBaseDir: path.dirname(mcpConfigPath),
   });
-  const mcpOAuthCallback = new McpOAuthCallbackService({ providers: mcpOAuthProviders });
+  const mcpOAuthCallback = new McpOAuthCallbackService({
+    providers: mcpOAuthProviders,
+  });
   const mcpRegistryCreated = createMcpRegistryResult({
     configPath: mcpConfigPath,
     reportFatalError,
@@ -1412,7 +1814,9 @@ export async function createCoreRuntime(
       ),
     }),
   })();
-  if (mcpRegistryFailure) return mcpRegistryFailure;
+  if (mcpRegistryFailure) {
+    return finishCoreRuntimeCreateFailure(mcpRegistryFailure, eventBusResources);
+  }
   let surfaceRuntimeRegistry: SurfaceRuntimeRegistry | null = null;
   let pendingSurfaceRecovery: PausedSurfaceRecoveryOwnership | null = null;
   let runtimeFullyStarted = false;
@@ -1422,6 +1826,66 @@ export async function createCoreRuntime(
   let coreConfigValidationTimer: ReturnType<typeof setTimeout> | null = null;
   let coreConfigValidationHadError = false;
   let lastCoreConfigValidationError: string | null = null;
+  let requestDeliveryMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  let requestDeliveryMaintenanceOperation: Promise<void> | null = null;
+
+  function runDetachedRequestDeliveryMaintenance(): void {
+    if (requestDeliveryMaintenanceOperation) return;
+    const cycle = Promise.resolve().then(async () => {
+      const activeBlobStore = blobStore;
+      const [maintained, maintainedBlobs] = await Promise.all([
+        requestDeliveryCoordinator.maintain(),
+        activeBlobStore ? activeBlobStore.maintain() : Promise.resolve(null),
+      ]);
+      maintained.match({
+        err: (error) =>
+          logger.error("Core request delivery maintenance failed", {
+            ...formatTaggedErrorForLog(error),
+          }),
+        ok: (summary) => {
+          if (summary.failures.length === 0) return;
+          logger.warn(
+            "Core request delivery maintenance completed with deletion failures",
+            formatTaggedErrorForLog(summary.failures[0]!),
+          );
+        },
+      });
+      maintainedBlobs?.match({
+        err: (error) =>
+          logger.error("Core blob storage maintenance failed", {
+            ...formatTaggedErrorForLog(error),
+          }),
+        ok: () => undefined,
+      });
+    });
+    const supervision = Promise.allSettled([cycle]).then(([settled]) => {
+      if (settled.status !== "rejected") return;
+      const failure = projectRuntimeError(
+        settled.reason,
+        "Detached Core request delivery maintenance failed",
+      );
+      if (isPanic(failure)) {
+        reportFatalError(failure);
+        return;
+      }
+      logger.error("Detached Core request delivery maintenance failed");
+    });
+    requestDeliveryMaintenanceOperation = supervision;
+    void supervision.then(() => {
+      if (requestDeliveryMaintenanceOperation === supervision) {
+        requestDeliveryMaintenanceOperation = null;
+      }
+    });
+  }
+
+  function startRequestDeliveryMaintenance(): void {
+    if (requestDeliveryMaintenanceTimer) return;
+    requestDeliveryMaintenanceTimer = setInterval(
+      runDetachedRequestDeliveryMaintenance,
+      CORE_REQUEST_DELIVERY_MAINTENANCE_INTERVAL_MS,
+    );
+    requestDeliveryMaintenanceTimer.unref?.();
+  }
 
   async function readCoreConfigParserVersion(configPath: string): Promise<number | "unknown"> {
     const loaded = (
@@ -1458,6 +1922,7 @@ export async function createCoreRuntime(
 
   // How long shutdown waits for active runs/relays before forcing snapshot + exit.
   const GRACEFUL_DRAIN_DEADLINE_MS = 3_000;
+  const DEFAULT_HARD_SHUTDOWN_DEADLINE_MS = 5_000;
   // How long a saved snapshot remains valid for restore on next boot.
   const GRACEFUL_SNAPSHOT_TTL_MS = 120_000;
   const REDIS_HEALTH_TIMEOUT_MS = 1_000;
@@ -1713,8 +2178,145 @@ export async function createCoreRuntime(
     const startup = (
       await Result.tryPromise({
         try: async (): Promise<CoreRuntimeStartOutcome> => {
-          // Ensure data dir exists before creating sqlite-backed stores.
-          await fs.mkdir(env.dataDir, { recursive: true });
+          const activeBlobStore = blobStore;
+          if (!activeBlobStore) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "blob-storage",
+                  cause: undefined,
+                  message: "Core runtime cannot restart after its blob store has closed",
+                }),
+              ),
+            };
+          }
+          const startupConfig = initialCoreConfig;
+          const activeDurableWorkflowStore = durableWorkflowStore;
+          const activeTranscriptStore = transcriptStore;
+          const activeDiscordSearchStore = discordSearchStore;
+          const activeDiscordSurfaceStore = discordSurfaceStore;
+          const activeConversationThreadStore = conversationThreadStore;
+          if (
+            !activeDurableWorkflowStore ||
+            !gracefulRestartStore ||
+            !activeTranscriptStore ||
+            !activeDiscordSearchStore ||
+            !activeDiscordSurfaceStore ||
+            !activeConversationThreadStore ||
+            !discoveryService
+          ) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: undefined,
+                  message: "Core runtime cannot restart after its durable stores have closed",
+                }),
+              ),
+            };
+          }
+          const requestDeliveryPublisher = createLilacBusRequestDeliveryPublisher(bus);
+          const durableBus = createDurableCoreRequestBus({
+            transportBus: bus,
+            coordinator: requestDeliveryCoordinator,
+            publisher: requestDeliveryPublisher,
+          });
+          const preparedRecovery =
+            await requestDeliveryCoordinator.recoverPreparedPublications(requestDeliveryPublisher);
+          const preparedRecoveryFailure = preparedRecovery.match<Error | null>({
+            err: (error) => error,
+            ok: (summary) => summary.failures[0] ?? null,
+          });
+          if (preparedRecoveryFailure) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: preparedRecoveryFailure,
+                  message: "Core request publication recovery failed",
+                }),
+              ),
+            };
+          }
+          const initialRequestDeliveryMaintenance = await requestDeliveryCoordinator.maintain();
+          const initialRequestDeliveryMaintenanceFailure =
+            initialRequestDeliveryMaintenance.match<Error | null>({
+              err: (error) => error,
+              ok: () => null,
+            });
+          if (initialRequestDeliveryMaintenanceFailure) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: initialRequestDeliveryMaintenanceFailure,
+                  message: "Core request delivery startup maintenance failed",
+                }),
+              ),
+            };
+          }
+          initialRequestDeliveryMaintenance.match({
+            err: () => undefined,
+            ok: (summary) => {
+              if (summary.failures.length === 0) return;
+              logger.warn(
+                "Core request delivery startup maintenance completed with deletion failures",
+                formatTaggedErrorForLog(summary.failures[0]!),
+              );
+            },
+          });
+          startRequestDeliveryMaintenance();
+          const discordRequestDelivery: DiscordRequestDeliveryPort = {
+            async prepareAndPublish(input) {
+              return (
+                await requestDeliveryCoordinator.prepareAndPublish(input, requestDeliveryPublisher)
+              )
+                .map(() => undefined)
+                .mapError(
+                  (error) =>
+                    new DiscordRequestDeliveryFailed({
+                      cause: error,
+                      message: error.message,
+                    }),
+                );
+            },
+          };
+          const attachmentOutputLifecycle: AttachmentOutputLifecycle = {
+            registerOutputHandle(input) {
+              if (!input.requestDeliveryId) {
+                return Result.err(
+                  new AttachmentOutputLifecycleError({
+                    message: "Attachment output registration requires requestDeliveryId",
+                  }),
+                );
+              }
+              return requestDeliveryCoordinator
+                .registerOutputHandle({
+                  requestDeliveryId: input.requestDeliveryId,
+                  handle: input.handle,
+                  metadata: {
+                    mimeType: input.mimeType,
+                    ...(input.filename ? { filename: input.filename } : {}),
+                  } satisfies CoreRequestOutputMetadata,
+                })
+                .map(() => undefined)
+                .mapError(
+                  (error) =>
+                    new AttachmentOutputLifecycleError({
+                      message: error.message,
+                    }),
+                );
+            },
+          };
+
+          const toolResultArtifacts = createToolResultArtifactStore(
+            path.join(env.dataDir, "tool-results"),
+            activeBlobStore,
+          );
           const artifactStoreInit = await toolResultArtifacts.init();
           adaptToolResultArtifactStoreInitToHost(artifactStoreInit);
 
@@ -1730,7 +2332,6 @@ export async function createCoreRuntime(
           });
           mcpRegistryInitPromise = registryInitPromise;
 
-          const startupConfig = await getCoreConfig();
           const githubAppSecret = await readGithubAppSecretResult(env.dataDir);
           let githubAppCredentialsAvailable = false;
           const githubAppSecretError = githubAppSecret.match({
@@ -1757,17 +2358,21 @@ export async function createCoreRuntime(
             githubAdapter,
             descriptorBoundDiscordEventSource: discordEventSource,
             discordHealth: createDiscordRuntimeHealthPort(adapter),
-            bus,
+            bus: durableBus,
+            blobStore: activeBlobStore,
             subscriptionPrefix,
             webhookSecret: env.github.webhookSecret,
             githubAppCredentialsAvailable,
-            getTranscriptStore: () => transcriptStore ?? undefined,
+            getTranscriptStore: () => activeTranscriptStore,
             activateRestoredDiscordOutputChains: (generation, chains) =>
               stopRouter?.restoreActiveOutputChains(generation, chains),
             logger,
             reportFatalError,
           });
-          const registryError = registryCreated.match({ err: (error) => error, ok: () => null });
+          const registryError = registryCreated.match({
+            err: (error) => error,
+            ok: () => null,
+          });
           if (registryError) {
             return {
               kind: "result",
@@ -1780,7 +2385,10 @@ export async function createCoreRuntime(
               ),
             };
           }
-          const registry = registryCreated.match({ ok: (value) => value, err: () => null });
+          const registry = registryCreated.match({
+            ok: (value) => value,
+            err: () => null,
+          });
           if (!registry) {
             return {
               kind: "result",
@@ -1812,22 +2420,11 @@ export async function createCoreRuntime(
 
           await startCoreConfigWatcher();
 
-          gracefulRestartStore = new SqliteGracefulRestartStore(
-            path.join(env.dataDir, "graceful-restart.db"),
-          );
-
           const discordSearchDbPath = resolveDiscordSearchDbPath();
           const discordSurfaceDbPath = resolveDiscordDbPath(startupConfig);
-          transcriptStore = new SqliteTranscriptStore(resolveTranscriptDbPath());
-          discordSearchStore = new DiscordSearchStore(discordSearchDbPath);
-          discordSurfaceStore = new DiscordSurfaceStore(discordSurfaceDbPath);
-          conversationThreadStore = new ConversationThreadStore(discordSearchDbPath, {
-            surfaceDbPath: discordSurfaceDbPath,
-            mainAgentUserNames: [startupConfig.surface.discord.botName],
-          });
           const conversationThreadEntityMapper = createDiscordEntityMapper({
             cfg: startupConfig,
-            store: discordSurfaceStore,
+            store: activeDiscordSurfaceStore,
           });
           const getConversationThreadEmbeddingAdapter =
             createConversationThreadEmbeddingAdapterResolver(() => getCoreConfig());
@@ -1837,9 +2434,12 @@ export async function createCoreRuntime(
           });
           discordSearchService = new DiscordSearchService({
             adapter: surfaceAdapter,
-            store: discordSearchStore,
+            store: activeDiscordSearchStore,
             onMessagesIndexed(channelId) {
-              conversationThreadMaterializer?.markDirty({ channelId, kind: "topology" });
+              conversationThreadMaterializer?.markDirty({
+                channelId,
+                kind: "topology",
+              });
             },
           });
           const hydrateThreadAttachments: ConversationThreadAttachmentHydrator = async (input) => {
@@ -1853,7 +2453,10 @@ export async function createCoreRuntime(
             ): Promise<ResultType<typeof hydrated, ConversationThreadOperationFailed>> => {
               const ref = input.refs[index];
               if (!ref) return Result.ok(hydrated);
-              const read = await surfaceAdapter.readMsg({ platform: "discord", ...ref });
+              const read = await surfaceAdapter.readMsg({
+                platform: "discord",
+                ...ref,
+              });
               const continueRead = read.match<
                 () => Promise<ResultType<typeof hydrated, ConversationThreadOperationFailed>>
               >({
@@ -1885,7 +2488,7 @@ export async function createCoreRuntime(
             return await hydrateAt(0);
           };
           const threadService = new ConversationThreadService({
-            store: conversationThreadStore,
+            store: activeConversationThreadStore,
             getConfig: () => getCoreConfig(),
             getEmbeddingAdapter: getConversationThreadEmbeddingAdapter,
             entityMapper: conversationThreadEntityMapper,
@@ -1974,7 +2577,11 @@ export async function createCoreRuntime(
                         refreshed: { channels: 0, threads: 0, messages: 0 },
                         eligible: 0,
                         eligibleTotal: 0,
-                        eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
+                        eligibility: {
+                          summary: 0,
+                          embeddingOnly: 0,
+                          reasons: {},
+                        },
                         cleared: 0,
                         summarized: 0,
                         failed: 0,
@@ -1989,14 +2596,6 @@ export async function createCoreRuntime(
               return await continueFlushed();
             },
           };
-          discoveryService = new DiscoveryService({
-            dbPath: resolveDiscoveryDbPath(),
-            dataDir: env.dataDir,
-            discordSearchStore,
-            transcriptStore,
-            getConfig: () => getCoreConfig(),
-          });
-
           stopDiscordSearchIndexer = await startDiscordSearchIndexer({
             eventSource: discordEventSource,
             search: discordSearchService,
@@ -2019,16 +2618,16 @@ export async function createCoreRuntime(
           logger.debug("Request message cache initialized");
 
           stopWorkflowActionResolver = await startWorkflowActionResolver({
-            bus,
-            store: durableWorkflowStore,
+            bus: durableBus,
+            store: activeDurableWorkflowStore,
             subscriptionId: subId(subscriptionPrefix, "workflow-actions"),
             surfaceProtocolResolver: registry.protocolResolver(),
           });
 
           // Subscribe durably before adapter.connect() so replies around startup replay.
           workflowWaitResolver = new WorkflowWaitResolver({
-            bus,
-            store: durableWorkflowStore,
+            bus: durableBus,
+            store: activeDurableWorkflowStore,
             subscriptionId: subId(subscriptionPrefix, "workflow-waits"),
             confirmLegacyGroupSingleVersionRollout:
               process.env.LILAC_CONFIRM_SINGLE_VERSION_WORKFLOW_WAIT_RESOLVER === "1",
@@ -2040,11 +2639,11 @@ export async function createCoreRuntime(
             connected: connectedSurfaceAdapters,
           });
 
-          logger.debug("Surface adapters connected", surfaceAdapterLogContext(registry));
+          logger.debug("Surface adapters connected");
 
           workflowProgressProjector = new WorkflowProgressProjector({
-            bus,
-            store: durableWorkflowStore,
+            bus: durableBus,
+            store: activeDurableWorkflowStore,
             ports: workflowProgressPorts,
             subscriptionId: subId(subscriptionPrefix, "workflow-progress"),
             reportFatalPanic: reportFatalError,
@@ -2052,8 +2651,8 @@ export async function createCoreRuntime(
           await workflowProgressProjector.start();
 
           workflowTriggerScheduler = new WorkflowTriggerScheduler({
-            bus,
-            store: durableWorkflowStore,
+            bus: durableBus,
+            store: activeDurableWorkflowStore,
             progressCards: workflowProgressProjector,
             getMaxActiveRuns: async () => (await getCoreConfig()).workflows.maxActiveRuns,
             reportFatalPanic: reportFatalError,
@@ -2061,22 +2660,23 @@ export async function createCoreRuntime(
           await workflowTriggerScheduler.start();
 
           workflowLiveParentBridge = new WorkflowLiveParentBridge({
-            bus,
-            store: durableWorkflowStore,
+            bus: durableBus,
+            store: activeDurableWorkflowStore,
             subscriptionId: subId(subscriptionPrefix, "workflow-live-parents"),
-            dataDir: env.dataDir,
+            blobStore: activeBlobStore,
             toolResultArtifacts,
           });
           await workflowLiveParentBridge.start();
 
           workflowSubagentDispatcher = await WorkflowSubagentDispatcher.create({
-            store: durableWorkflowStore,
+            store: activeDurableWorkflowStore,
             dataDir: env.dataDir,
+            blobStore: activeBlobStore,
             toolResultArtifacts,
             getMaxActiveRuns: async () => (await getCoreConfig()).workflows.maxActiveRuns,
             onRunCreated: async (run) => {
               adaptEventPublishResultToHost(
-                await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+                await durableBus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
                   runId: run.runId,
                   revisionId: run.revisionId,
                   state: run.state,
@@ -2086,7 +2686,7 @@ export async function createCoreRuntime(
             },
             onRunCancelled: async (run, previousState) => {
               adaptEventPublishResultToHost(
-                await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
+                await durableBus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
                   runId: run.runId,
                   revisionId: run.revisionId,
                   state: "cancelled",
@@ -2096,7 +2696,7 @@ export async function createCoreRuntime(
                 }),
               );
               adaptEventPublishResultToHost(
-                await bus.publish(lilacEventTypes.EvtWorkflowResultReady, {
+                await durableBus.publish(lilacEventTypes.EvtWorkflowResultReady, {
                   runId: run.runId,
                   revisionId: run.revisionId,
                   state: "cancelled",
@@ -2110,11 +2710,17 @@ export async function createCoreRuntime(
           stopRouter = adaptDiscordRequestRouterStartOutcomeToHost(
             await startDiscordRequestRouter({
               adapter: surfaceAdapter,
-              bus,
+              bus: durableBus,
+              blobStore: activeBlobStore,
+              attachmentCache: discordSearchStore?.attachmentCacheAccess(),
+              requestDelivery: discordRequestDelivery,
               subscriptionId: subId(subscriptionPrefix, "router"),
               customCommands,
               shouldSuppressAdapterEvent: async ({ evt }) =>
-                shouldSuppressRouterForWorkflowReply({ store: durableWorkflowStore, event: evt }),
+                shouldSuppressRouterForWorkflowReply({
+                  store: activeDurableWorkflowStore,
+                  event: evt,
+                }),
               transcriptStore: transcriptStore ?? undefined,
             }),
             (retainedRouter) => {
@@ -2189,7 +2795,9 @@ export async function createCoreRuntime(
 
           pluginManager = createCoreToolPluginManager({
             runtime: {
-              bus,
+              bus: durableBus,
+              blobStore: activeBlobStore,
+              attachmentOutputLifecycle,
               surfaceAdapterResolver: registry.adapterResolver(),
               getConfig: () => getCoreConfig(),
               discovery: discoveryService ?? undefined,
@@ -2197,7 +2805,7 @@ export async function createCoreRuntime(
               discordSearch: discordSearchService ?? undefined,
               transcriptStore: transcriptStore ?? undefined,
               toolResultArtifacts,
-              durableWorkflowStore,
+              durableWorkflowStore: activeDurableWorkflowStore,
               workflowProgressCards: workflowProgressProjector,
               mcpRegistry,
               mcpOAuthProviders,
@@ -2254,10 +2862,15 @@ export async function createCoreRuntime(
             provenance: "missing-defaulted",
           };
           const restartLoadError: GracefulRestartLoadError | null =
-            restartLoadResult?.match({ err: (error) => error, ok: () => null }) ?? null;
+            restartLoadResult?.match({
+              err: (error) => error,
+              ok: () => null,
+            }) ?? null;
           const restartLoad =
-            restartLoadResult?.match({ ok: (value) => value, err: () => missingRestartLoad }) ??
-            missingRestartLoad;
+            restartLoadResult?.match({
+              ok: (value) => value,
+              err: () => missingRestartLoad,
+            }) ?? missingRestartLoad;
           if (restartLoadError) {
             logger.warn(
               "Graceful restart snapshot load failed",
@@ -2289,7 +2902,9 @@ export async function createCoreRuntime(
           }
           // Start agent runner last so it can't publish replies before relay is online.
           const startedAgentRunner = await startBusAgentRunner({
-            bus,
+            bus: durableBus,
+            blobStore: activeBlobStore,
+            requestDelivery: requestDeliveryCoordinator,
             subscriptionId: subId(subscriptionPrefix, "agent-runner"),
             reportFatalPanic: reportFatalError,
             pluginManager,
@@ -2300,11 +2915,11 @@ export async function createCoreRuntime(
             toolResultArtifacts,
             workflowLiveParentBridge,
             workflowSubagentDispatcher,
-            durableWorkflowStore,
+            durableWorkflowStore: activeDurableWorkflowStore,
             projectAuthenticatedRequest,
             requestMessageCache: requestMessageCache ?? undefined,
             surfaceProtocolResolver: registry.protocolResolver(),
-            startPaused: restartSnapshot !== null,
+            startPaused: true,
             issueControlCapability: async (input) => {
               const cachedRequest = requestMessageCache?.getOrigin(input.requestId);
               const identity = resolveRequestCapabilityIdentity({
@@ -2358,13 +2973,7 @@ export async function createCoreRuntime(
           });
           stopAgentRunner = startedAgentRunner;
 
-          logger.debug(
-            "Bus agent runner started",
-            agentRunnerLogContext(
-              subId(subscriptionPrefix, "agent-runner"),
-              canonicalWorkspaceRoot,
-            ),
-          );
+          logger.debug("Bus agent runner started");
 
           if (restartSnapshot && restartLoad.state === "loaded") {
             const prepared = prepareSurfaceRecovery({
@@ -2401,6 +3010,47 @@ export async function createCoreRuntime(
             }
           }
 
+          const acceptedRecovery = await requestDeliveryCoordinator.recoverAccepted(
+            (record) => startedAgentRunner.resumeAcceptedDelivery(record),
+            {
+              outputReplay: createCoreRequestOutputReplayRecovery(bus),
+              isOutputReplayEligible: (record) => record.work.data.queue === "prompt",
+              prepareTerminalRecovery: (record) =>
+                Promise.resolve(
+                  startedAgentRunner.discardPausedRecoveredDelivery(record.requestDeliveryId),
+                ),
+            },
+          );
+          const acceptedRecoveryFailure = acceptedRecovery.match<Error | null>({
+            err: (error) => error,
+            ok: (summary) => summary.failures[0] ?? null,
+          });
+          if (acceptedRecoveryFailure) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: acceptedRecoveryFailure,
+                  message: "Core accepted request recovery failed",
+                }),
+              ),
+            };
+          }
+          acceptedRecovery.match({
+            err: () => undefined,
+            ok: (summary) => {
+              const uncertainty = summary.uncertainties[0];
+              if (!uncertainty) return;
+              logger.warn("Core accepted request output replay recovery remains uncertain", {
+                error: safeRuntimeErrorText(
+                  uncertainty,
+                  "Core accepted request output replay recovery remains uncertain",
+                ),
+              });
+            },
+          });
+
           const committedSnapshot = recoveryPlan?.snapshot;
           const recoverableRootParentRequestIds =
             committedSnapshot?.agent
@@ -2432,9 +3082,10 @@ export async function createCoreRuntime(
           }
 
           workflowEngine = new WorkflowEngine({
-            bus,
-            store: durableWorkflowStore,
+            bus: durableBus,
+            store: activeDurableWorkflowStore,
             dataDir: env.dataDir,
+            blobStore: activeBlobStore,
             subscriptionId: subId(subscriptionPrefix, "workflow-engine"),
             reportFatalPanic: reportFatalError,
             validateAgentSelection: async ({ profile, model, reasoning }) => {
@@ -2470,7 +3121,7 @@ export async function createCoreRuntime(
           });
 
           const heartbeatStarted = await startHeartbeatServiceResult({
-            bus,
+            bus: durableBus,
             subscriptionId: subId(subscriptionPrefix, "heartbeat"),
             initialExternalState: initialHeartbeatExternalState,
           });
@@ -2488,7 +3139,10 @@ export async function createCoreRuntime(
             }),
           })();
           if (heartbeatFailure) return heartbeatFailure;
-          stopHeartbeat = heartbeatStarted.match({ ok: (heartbeat) => heartbeat, err: () => null });
+          stopHeartbeat = heartbeatStarted.match({
+            ok: (heartbeat) => heartbeat,
+            err: () => null,
+          });
 
           logger.debug("Heartbeat service started", {
             subscriptionId: subId(subscriptionPrefix, "heartbeat"),
@@ -2534,7 +3188,7 @@ export async function createCoreRuntime(
                 },
               })();
             }
-          } else if (restartSnapshot) {
+          } else {
             startedAgentRunner.activate();
           }
 
@@ -2581,7 +3235,10 @@ export async function createCoreRuntime(
     })();
   }
 
-  async function stop(priorPanic: Panic | null = null): Promise<void> {
+  async function stop(
+    priorPanic: Panic | null = null,
+    hardDeadlineAtMs = Date.now() + DEFAULT_HARD_SHUTDOWN_DEADLINE_MS,
+  ): Promise<void> {
     const stopPass = selectCoreRuntimeStopPass({
       fullCleanupPending,
       hasResidualRouter: residualRouter !== null,
@@ -2592,6 +3249,32 @@ export async function createCoreRuntime(
 
     const cleanup = createCoreRuntimeCleanupSupervisor(priorPanic);
     const safe = cleanup.run;
+    const ownedBlobStore = stopPass === "full" ? blobStore : null;
+    if (stopPass === "full") blobStore = null;
+    const gracefulAgentRunner = stopAgentRunner;
+    const gracefulSnapshotStore = gracefulRestartStore;
+    const gracefulSurfaceRegistry = surfaceRuntimeRegistry;
+    const gracefulBlobProducerDrainRequired =
+      stopPass === "full" &&
+      runtimeFullyStarted &&
+      gracefulAgentRunner !== null &&
+      gracefulSnapshotStore !== null &&
+      gracefulSurfaceRegistry !== null;
+    const blobStoreClose = ownedBlobStore
+      ? scheduleCoreBlobStoreClose({
+          hardDeadlineAtMs,
+          close: () =>
+            safe("blobStore.close.panic", async () => {
+              const closed = await ownedBlobStore.close({
+                deadlineAtMs: hardDeadlineAtMs,
+              });
+              closed.match({
+                ok: () => undefined,
+                err: (error) => cleanup.record("blobStore.close", error),
+              });
+            }),
+        })
+      : null;
 
     if (pendingSurfaceRecovery) {
       const pausedRecovery = pendingSurfaceRecovery;
@@ -2600,14 +3283,13 @@ export async function createCoreRuntime(
     }
 
     if (
-      stopPass === "full" &&
-      runtimeFullyStarted &&
-      stopAgentRunner &&
-      gracefulRestartStore &&
-      surfaceRuntimeRegistry
+      gracefulBlobProducerDrainRequired &&
+      gracefulAgentRunner &&
+      gracefulSnapshotStore &&
+      gracefulSurfaceRegistry
     ) {
-      const agentRunner = stopAgentRunner;
-      const registry = surfaceRuntimeRegistry;
+      const agentRunner = gracefulAgentRunner;
+      const registry = gracefulSurfaceRegistry;
 
       const recoverables = await stopIngressAndDrainSurfaceRecovery({
         registry,
@@ -2659,6 +3341,25 @@ export async function createCoreRuntime(
           });
         },
         stopRemainingRequestProducers: async () => {
+          await safe("graceful.toolServer.stop", () => toolServer?.stop() ?? Promise.resolve());
+          await safe(
+            "graceful.workflowLiveParentBridge.stop",
+            () => workflowLiveParentBridge?.stop() ?? Promise.resolve(),
+          );
+          workflowLiveParentBridge = null;
+          workflowSubagentDispatcher = null;
+
+          if (requestDeliveryMaintenanceTimer) {
+            clearInterval(requestDeliveryMaintenanceTimer);
+            requestDeliveryMaintenanceTimer = null;
+          }
+          const gracefulMaintenanceOperation = requestDeliveryMaintenanceOperation;
+          await safe(
+            "graceful.requestDeliveryMaintenance.stop",
+            gracefulMaintenanceOperation ? () => gracefulMaintenanceOperation : undefined,
+          );
+          requestDeliveryMaintenanceOperation = null;
+
           const gracefulHeartbeat = stopHeartbeat;
           await cleanup.runOutcome(
             "graceful.heartbeat.stop",
@@ -2679,7 +3380,11 @@ export async function createCoreRuntime(
           stopConversationThreadSummarizationWorker = null;
           conversationThreadSummarizationRunner = null;
         },
-        deadlineMs: GRACEFUL_DRAIN_DEADLINE_MS,
+        deadlineMs: resolveCoreGracefulDrainDeadlineMs({
+          nowMs: Date.now(),
+          hardDeadlineAtMs,
+          configuredDrainDeadlineMs: GRACEFUL_DRAIN_DEADLINE_MS,
+        }),
         runCleanup: safe,
         agentRunner,
         relays: surfaceRelayHandles,
@@ -2728,7 +3433,6 @@ export async function createCoreRuntime(
         });
       }
     }
-
     const registry = surfaceRuntimeRegistry;
     if (stopPass === "full") {
       // Stop in reverse order (best-effort).
@@ -2790,12 +3494,6 @@ export async function createCoreRuntime(
         () => conversationThreadMaterializer?.stop() ?? Promise.resolve(),
       );
       conversationThreadMaterializer = null;
-      await safe("mcpOAuthCallback.stop", () => mcpOAuthCallback.stop());
-      await safe("mcpRegistry.shutdown", () => mcpRegistry.shutdown());
-      await safe(
-        "requestMessageCache.stop",
-        () => requestMessageCache?.stop() ?? Promise.resolve(),
-      );
     }
 
     // Residual routers follow outputs and precede ingress/adapters because they own bus subscriptions.
@@ -2843,7 +3541,34 @@ export async function createCoreRuntime(
         });
         surfaceRuntimeRegistry = null;
       }
-      await safe("durableWorkflowStore.close", async () => durableWorkflowStore.close());
+      if (requestDeliveryMaintenanceTimer) {
+        clearInterval(requestDeliveryMaintenanceTimer);
+        requestDeliveryMaintenanceTimer = null;
+      }
+      const maintenanceOperation = requestDeliveryMaintenanceOperation;
+      await safe(
+        "requestDeliveryMaintenance.stop",
+        maintenanceOperation ? () => maintenanceOperation : undefined,
+      );
+      requestDeliveryMaintenanceOperation = null;
+      await safe("bus.close", async () => {
+        adaptCoreEventBusCleanupResultToHost(await captureCoreEventBusCleanup({ redis, raw, bus }));
+      });
+      await blobStoreClose?.closeNow();
+      await safe("mcpOAuthCallback.stop", () => mcpOAuthCallback.stop());
+      await safe("mcpRegistry.shutdown", () => mcpRegistry.shutdown());
+      await safe(
+        "requestMessageCache.stop",
+        () => requestMessageCache?.stop() ?? Promise.resolve(),
+      );
+      await safe("requestDeliveryStore.close", async () => {
+        requestDeliveryStore?.close();
+        requestDeliveryStore = null;
+      });
+      await safe("durableWorkflowStore.close", async () => {
+        durableWorkflowStore?.close();
+        durableWorkflowStore = null;
+      });
       await safe("discoveryService.close", async () => {
         discoveryService?.close();
         discoveryService = null;
@@ -2872,9 +3597,6 @@ export async function createCoreRuntime(
       });
       await safe("coreConfigWatcher.stop", async () => {
         stopCoreConfigWatcher();
-      });
-      await safe("bus.close", async () => {
-        adaptCoreEventBusCleanupResultToHost(await captureCoreEventBusCleanup({ redis, raw, bus }));
       });
       fullCleanupPending = false;
     }
@@ -2907,6 +3629,7 @@ export async function createCoreRuntime(
     result: Result.ok({
       start,
       stop,
+      getBlobStore: () => blobStore,
       recordUnhandledRejection(reason: Error) {
         toolServer?.recordUnhandledRejection(reason);
       },

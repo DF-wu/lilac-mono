@@ -522,6 +522,7 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
   readonly stopRemainingRequestProducers: () => Promise<void>;
   readonly registry: SurfaceRuntimeRegistry;
   readonly deadlineMs: number;
+  readonly now?: () => number;
   readonly runCleanup: CleanupRunner;
   readonly agentRunner: AgentRecovery;
   readonly relays: SurfaceRelayHandles;
@@ -530,6 +531,9 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
   readonly relays: BusToAdapterRelaySnapshot[];
   readonly queueAttempts: AgentRunnerQueueAttempt[];
 }> {
+  const now = input.now ?? Date.now;
+  const drainDeadlineAtMs = now() + input.deadlineMs;
+  const remainingDrainMs = (): number => Math.max(0, drainDeadlineAtMs - now());
   await input.stopAdapterIngress();
   await input.stopRouterIngress();
   await input.stopWorkflowRequestProducers();
@@ -537,7 +541,7 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
   await input.stopRemainingRequestProducers();
 
   await input.runCleanup("graceful.agentRunner.beginDrain", () =>
-    input.agentRunner.beginDrain({ deadlineMs: input.deadlineMs }),
+    input.agentRunner.beginDrain({ deadlineMs: remainingDrainMs() }),
   );
   for (const descriptor of input.registry.entries()) {
     const relay = input.relays.get(descriptor.platform);
@@ -554,10 +558,9 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
         operation: "beginDrain",
         graceful: true,
       }),
-      () => relay.beginDrain({ deadlineMs: input.deadlineMs }),
+      () => relay.beginDrain({ deadlineMs: remainingDrainMs() }),
     );
   }
-
   let agent: AgentRunnerRecoveryEntry[] = [];
   let queueAttempts: AgentRunnerQueueAttempt[] = [];
   await input.runCleanup("graceful.agentRunner.snapshotRecoverables", async () => {

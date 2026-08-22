@@ -1,4 +1,8 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { Panic, Result, type Result as ResultType } from "better-result";
 import {
@@ -10,6 +14,8 @@ import {
   type RawBus,
 } from "@stanley2058/lilac-event-bus";
 import Redis from "ioredis";
+import SuperJSON from "superjson";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 
 import {
   adaptCoreEventBusCleanupResultToHost,
@@ -23,8 +29,11 @@ import {
   createCoreEventBusLogger,
   createCoreRuntimeCleanupSupervisor,
   createCoreRuntimeFatalReporter,
+  openCoreDurableStoresInStartupOrder,
   resolveRequestCapabilityIdentity,
+  resolveCoreGracefulDrainDeadlineMs,
   retainCoreResidualDiscordRequestRouter,
+  scheduleCoreBlobStoreClose,
   selectCoreRuntimeStopPass,
   settleCoreResidualDiscordRequestRouterDone,
   stopCoreResidualDiscordRequestRouter,
@@ -32,6 +41,8 @@ import {
   superviseCoreResidualDiscordRequestRouterDone,
   superviseCoreRouterDone,
 } from "../../src/runtime/create-core-runtime";
+import { SqliteGracefulRestartStore } from "../../src/runtime/graceful-restart-store";
+import { SqliteTranscriptStore } from "../../src/transcript/transcript-store";
 import {
   ResidualDiscordRequestRouterStopFailed,
   type ResidualDiscordRequestRouter,
@@ -41,6 +52,14 @@ import {
   resolveBuiltinSurfaceProtocolSafetyMode,
 } from "../../src/surface/builtin-surface-protocols";
 import type { SurfaceProtocolRouting } from "../../src/surface/protocol";
+import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
+import { applyWorkflowSchemaMigrations } from "../../src/workflow/workflow-migrations";
+
+const unusedEvidenceBlobStore: Pick<BlobStore, "startUpload"> = {
+  startUpload: async () => {
+    throw new Error("unexpected dead-letter evidence upload");
+  },
+};
 
 describe("delegated request capability identity", () => {
   const authenticatedOrigin = {
@@ -88,7 +107,11 @@ describe("delegated request capability identity", () => {
           verifiedIngress: false,
         },
       }),
-    ).toEqual({ principal: null, authenticatedOrigin: null, safetyMode: "restricted" });
+    ).toEqual({
+      principal: null,
+      authenticatedOrigin: null,
+      safetyMode: "restricted",
+    });
   });
 
   it("does not grant principal or asserted trust from registered protocol membership", () => {
@@ -104,12 +127,20 @@ describe("delegated request capability identity", () => {
           source: "external",
           platform: "discord",
           sessionRef: { platform: "discord", channelId: "channel-1" },
-          messageRef: { platform: "discord", channelId: "channel-1", messageId: "message-1" },
+          messageRef: {
+            platform: "discord",
+            channelId: "channel-1",
+            messageId: "message-1",
+          },
           authenticationMetadataKind: "absent",
           verifiedIngress: false,
         },
       }),
-    ).toEqual({ principal: null, authenticatedOrigin: null, safetyMode: "restricted" });
+    ).toEqual({
+      principal: null,
+      authenticatedOrigin: null,
+      safetyMode: "restricted",
+    });
   });
 
   it("preserves asserted safety when a built-in protocol has no external override", () => {
@@ -136,6 +167,219 @@ describe("delegated request capability identity", () => {
 });
 
 describe("Core runtime startup", () => {
+  it("leaves workflow state unopened when a later legacy durable store fails validation", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-durable-preflight-"));
+    const workflowPath = path.join(dir, "workflow.sqlite3");
+    const gracefulPath = path.join(dir, "graceful-restart.db");
+    const seededWorkflow = new DurableWorkflowStore(workflowPath);
+    seededWorkflow.close();
+    const workflowBefore = await readFile(workflowPath);
+    const legacyGraceful = new Database(gracefulPath, { strict: true });
+    legacyGraceful.run(`
+      CREATE TABLE graceful_restart_state (
+        singleton_id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        updated_ts INTEGER NOT NULL,
+        payload_json TEXT NOT NULL
+      )
+    `);
+    legacyGraceful.run("INSERT INTO graceful_restart_state VALUES (?, ?, ?, ?)", [
+      1,
+      "completed",
+      1,
+      SuperJSON.stringify({
+        version: 2,
+        createdAt: 1,
+        deadlineMs: 1_000,
+        agent: [],
+        relays: [],
+      }),
+    ]);
+    legacyGraceful.close();
+    let workflowOpened = false;
+
+    try {
+      expect(() =>
+        openCoreDurableStoresInStartupOrder({
+          openGracefulRestart: () => {
+            new SqliteGracefulRestartStore(gracefulPath);
+          },
+          openTranscript: () => undefined,
+          openDiscordSearch: () => undefined,
+          openDiscordSurface: () => undefined,
+          openConversationThread: () => undefined,
+          openDiscovery: () => undefined,
+          openWorkflow: () => {
+            workflowOpened = true;
+            new DurableWorkflowStore(workflowPath).close();
+          },
+        }),
+      ).toThrow("requires offline blob migration");
+
+      expect(workflowOpened).toBe(false);
+      expect(await readFile(workflowPath)).toEqual(workflowBefore);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves recoverable transcript state unchanged when workflow schema validation fails", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-transcript-preflight-"));
+    const transcriptPath = path.join(dir, "transcripts.db");
+    const workflowPath = path.join(dir, "workflow.sqlite3");
+    const seededTranscript = new SqliteTranscriptStore(transcriptPath);
+    const reserved = seededTranscript.reserveCoreNamedClaudeSessionAttempt({
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: "session-1",
+      executionScopeHashVersion: 1,
+      executionScopeHash: "scope",
+      requestId: "request-1",
+      attemptIndex: 0,
+      candidateSessionId: crypto.randomUUID(),
+      sourceSessionId: null,
+      expectedBindingRevision: null,
+    });
+    if (reserved.status === "error") throw reserved.error;
+    seededTranscript.close();
+    const transcriptBefore = await readFile(transcriptPath);
+    const legacyWorkflow = new Database(workflowPath, { strict: true });
+    const migrated = applyWorkflowSchemaMigrations(legacyWorkflow, () => 1, 25);
+    if (migrated.status === "error") throw migrated.error;
+    legacyWorkflow.close();
+    const deferredTranscript: { store: SqliteTranscriptStore | null } = {
+      store: null,
+    };
+
+    try {
+      expect(() =>
+        openCoreDurableStoresInStartupOrder({
+          openGracefulRestart: () => undefined,
+          openTranscript: () => {
+            deferredTranscript.store = new SqliteTranscriptStore(
+              transcriptPath,
+              undefined,
+              undefined,
+              { deferStartupRecovery: true },
+            );
+          },
+          openDiscordSearch: () => undefined,
+          openDiscordSurface: () => undefined,
+          openConversationThread: () => undefined,
+          openDiscovery: () => undefined,
+          openWorkflow: () => {
+            new DurableWorkflowStore(workflowPath, {
+              deferStartupRecovery: true,
+            });
+          },
+        }),
+      ).toThrow("requires offline blob migration");
+
+      deferredTranscript.store?.close();
+      deferredTranscript.store = null;
+      expect(await readFile(transcriptPath)).toEqual(transcriptBefore);
+      using transcriptState = new Database(transcriptPath, {
+        readonly: true,
+        strict: true,
+      });
+      expect(
+        transcriptState
+          .query<{ state: string }, []>(
+            "SELECT state FROM core_named_claude_attempts WHERE request_id = 'request-1'",
+          )
+          .get(),
+      ).toEqual({ state: "active" });
+    } finally {
+      deferredTranscript.store?.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reserves the blob cleanup slice before the hard shutdown deadline", () => {
+    expect(
+      resolveCoreGracefulDrainDeadlineMs({
+        nowMs: 1_000,
+        hardDeadlineAtMs: 6_000,
+        configuredDrainDeadlineMs: 3_000,
+      }),
+    ).toBe(3_000);
+    expect(
+      resolveCoreGracefulDrainDeadlineMs({
+        nowMs: 3_500,
+        hardDeadlineAtMs: 6_000,
+        configuredDrainDeadlineMs: 3_000,
+      }),
+    ).toBe(1_500);
+    expect(
+      resolveCoreGracefulDrainDeadlineMs({
+        nowMs: 5_500,
+        hardDeadlineAtMs: 6_000,
+        configuredDrainDeadlineMs: 3_000,
+      }),
+    ).toBe(0);
+  });
+
+  it("starts blob fencing at the reserved cleanup slice even when earlier cleanup is pending", async () => {
+    let scheduledDelayMs = -1;
+    let deadlineCallback = (): void => {
+      throw new Error("Blob close deadline was not scheduled");
+    };
+    let cancelled = false;
+    let closeCount = 0;
+    const closed = Promise.withResolvers<void>();
+    const controller = scheduleCoreBlobStoreClose({
+      hardDeadlineAtMs: 6_000,
+      now: () => 1_000,
+      close: async () => {
+        closeCount += 1;
+        closed.resolve();
+      },
+      scheduleDeadline: (callback, delayMs) => {
+        deadlineCallback = callback;
+        scheduledDelayMs = delayMs;
+        return () => {
+          cancelled = true;
+        };
+      },
+    });
+
+    expect(scheduledDelayMs).toBe(4_000);
+    deadlineCallback();
+    await closed.promise;
+    await controller.closeNow();
+
+    expect(closeCount).toBe(1);
+    expect(cancelled).toBe(true);
+  });
+
+  it("closes blob storage early and cancels its reserved deadline", async () => {
+    let deadlineCallback = (): void => {
+      throw new Error("Blob close deadline was not scheduled");
+    };
+    let cancelled = false;
+    let closeCount = 0;
+    const controller = scheduleCoreBlobStoreClose({
+      hardDeadlineAtMs: 6_000,
+      now: () => 1_000,
+      close: async () => {
+        closeCount += 1;
+      },
+      scheduleDeadline: (callback) => {
+        deadlineCallback = callback;
+        return () => {
+          cancelled = true;
+        };
+      },
+    });
+
+    await controller.closeNow();
+    deadlineCallback();
+    await controller.closeNow();
+
+    expect(closeCount).toBe(1);
+    expect(cancelled).toBe(true);
+  });
+
   it.each([
     ["Error", () => new Error("cleanup failed")],
     ["Panic", () => new Panic({ message: "cleanup invariant failed" })],
@@ -176,7 +420,9 @@ describe("Core runtime startup", () => {
 
   it("continues cleanup before propagating the first cleanup Panic without a prior Panic", async () => {
     const firstPanic = new Panic({ message: "first cleanup invariant failed" });
-    const secondPanic = new Panic({ message: "second cleanup invariant failed" });
+    const secondPanic = new Panic({
+      message: "second cleanup invariant failed",
+    });
     const calls: string[] = [];
     const cleanup = createCoreRuntimeCleanupSupervisor(null);
 
@@ -230,14 +476,19 @@ describe("Core runtime startup", () => {
   });
 
   it("supervises typed cleanup outcomes without converting them back to rejections", async () => {
-    const cleanupPanic = new Panic({ message: "typed cleanup invariant failed" });
+    const cleanupPanic = new Panic({
+      message: "typed cleanup invariant failed",
+    });
     const cleanup = createCoreRuntimeCleanupSupervisor(null);
 
     await cleanup.runOutcome("ordinary", async () => ({
       kind: "result",
       result: Result.err(new Error("typed cleanup failed")),
     }));
-    await cleanup.runOutcome("panic", async () => ({ kind: "panic", panic: cleanupPanic }));
+    await cleanup.runOutcome("panic", async () => ({
+      kind: "panic",
+      panic: cleanupPanic,
+    }));
 
     expect(cleanup.failures).toEqual([
       { label: "ordinary", error: "typed cleanup failed", panic: false },
@@ -290,10 +541,18 @@ describe("Core runtime startup", () => {
       stop: async () => {
         calls.push("stop");
         if (calls.length === 1) {
-          return { kind: "result", result: Result.err(stopFailure), residualRouter: router };
+          return {
+            kind: "result",
+            result: Result.err(stopFailure),
+            residualRouter: router,
+          };
         }
         done.resolve(Result.ok(undefined));
-        return { kind: "result", result: Result.ok(undefined), residualRouter: null };
+        return {
+          kind: "result",
+          result: Result.ok(undefined),
+          residualRouter: null,
+        };
       },
     };
     const cleanup = createCoreRuntimeCleanupSupervisor(null);
@@ -312,7 +571,11 @@ describe("Core runtime startup", () => {
     expect(released).toBeNull();
     expect(calls).toEqual(["stop", "stop"]);
     expect(cleanup.failures).toEqual([
-      { label: "residualRouter.stop", error: stopFailure.message, panic: false },
+      {
+        label: "residualRouter.stop",
+        error: stopFailure.message,
+        panic: false,
+      },
     ]);
   });
 
@@ -371,7 +634,10 @@ describe("Core runtime startup", () => {
     let cancelled = false;
 
     await settleCoreResidualDiscordRequestRouterDone({
-      supervision: Promise.resolve({ kind: "result", result: Result.err(failure) }),
+      supervision: Promise.resolve({
+        kind: "result",
+        result: Result.err(failure),
+      }),
       cleanup,
       reportLatePanic: () => {},
       deadlineMs: 3_000,
@@ -426,16 +692,30 @@ describe("Core runtime startup", () => {
     expect(fatalReports).toEqual([]);
     expect(cleanup.panics).toEqual([firstPanic, secondPanic]);
     expect(cleanup.failures).toEqual([
-      { label: "residualRouter.stop.panic", error: firstPanic.message, panic: true },
-      { label: "residualRouter.stop.panic", error: secondPanic.message, panic: true },
-      { label: "residualRouter.stop", error: ordinaryFailure.message, panic: false },
+      {
+        label: "residualRouter.stop.panic",
+        error: firstPanic.message,
+        panic: true,
+      },
+      {
+        label: "residualRouter.stop.panic",
+        error: secondPanic.message,
+        panic: true,
+      },
+      {
+        label: "residualRouter.stop",
+        error: ordinaryFailure.message,
+        panic: false,
+      },
     ]);
     expect(() => cleanup.finish()).toThrow(firstPanic);
   });
 
   it("attaches done supervision immediately to a residual replacement", async () => {
     const replacementDone = Promise.withResolvers<ResultType<void, EventDeliveryDoneError>>();
-    const donePanic = new Panic({ message: "replacement done invariant failed" });
+    const donePanic = new Panic({
+      message: "replacement done invariant failed",
+    });
     const stopFailure = new ResidualDiscordRequestRouterStopFailed({
       failures: [
         new EventDeliveryStopFailed({
@@ -464,7 +744,9 @@ describe("Core runtime startup", () => {
     };
     const cleanup = createCoreRuntimeCleanupSupervisor(null);
     const supervisions: Array<Promise<CoreResidualDiscordRequestRouterDoneOutcome>> = [];
-    const ownership: { router: ResidualDiscordRequestRouter | null } = { router: null };
+    const ownership: { router: ResidualDiscordRequestRouter | null } = {
+      router: null,
+    };
 
     retainCoreResidualDiscordRequestRouter({
       router: initial,
@@ -549,6 +831,7 @@ describe("Core runtime startup", () => {
       "agentRunner.stop",
       "mcpOAuthCallback.stop",
       "mcpRegistry.shutdown",
+      "blobStore.close",
       "durableWorkflowStore.close",
       "transcriptStore.close",
       "bus.close",
@@ -607,10 +890,18 @@ describe("Core runtime startup", () => {
         const failure = failures[residualStopAttempts];
         residualStopAttempts += 1;
         if (!failure) {
-          return { kind: "result", result: Result.ok(undefined), residualRouter: null };
+          return {
+            kind: "result",
+            result: Result.ok(undefined),
+            residualRouter: null,
+          };
         }
         const replacement = createResidualRouter();
-        return { kind: "result", result: Result.err(failure), residualRouter: replacement };
+        return {
+          kind: "result",
+          result: Result.err(failure),
+          residualRouter: replacement,
+        };
       },
     });
     retainResidualRouter(createResidualRouter());
@@ -665,6 +956,7 @@ describe("Core runtime startup", () => {
       "agentRunner.stop": 1,
       "mcpOAuthCallback.stop": 1,
       "mcpRegistry.shutdown": 1,
+      "blobStore.close": 1,
       "durableWorkflowStore.close": 1,
       "transcriptStore.close": 1,
       "bus.close": 1,
@@ -673,8 +965,20 @@ describe("Core runtime startup", () => {
     expect(residualDoneSettlements).toBe(3);
     expect(residualRouter).toBeNull();
     expect(cleanupFailures).toEqual([
-      [{ label: "residualRouter.stop", error: failures[0].message, panic: false }],
-      [{ label: "residualRouter.stop", error: failures[1].message, panic: false }],
+      [
+        {
+          label: "residualRouter.stop",
+          error: failures[0].message,
+          panic: false,
+        },
+      ],
+      [
+        {
+          label: "residualRouter.stop",
+          error: failures[1].message,
+          panic: false,
+        },
+      ],
       [],
     ]);
   });
@@ -700,7 +1004,11 @@ describe("Core runtime event delivery", () => {
     });
 
     try {
-      const captured = await captureCoreEventBusCleanup({ redis, raw: null, bus: null });
+      const captured = await captureCoreEventBusCleanup({
+        redis,
+        raw: null,
+        bus: null,
+      });
       expect(captured.status).toBe("error");
       if (captured.status === "error") expect(captured.error.cause).toBe(cleanupError);
 
@@ -750,22 +1058,29 @@ describe("Core runtime event delivery", () => {
     const redis = new Redis({ lazyConnect: true });
     const reported: Error[] = [];
     const logs: unknown[] = [];
+    const postCommitObserver = {
+      observe: async () => Result.ok(undefined),
+    };
 
     try {
       const options = createCoreEventBusDeliveryOptions({
         redis,
         deadLetterEncryptionKey: Buffer.alloc(32, 0x42),
+        evidenceBlobStore: unusedEvidenceBlobStore,
         logger: {
           warn: (...args) => logs.push(args),
           error: (...args) => logs.push(args),
         },
         reportFatalError: (error) => reported.push(error),
+        postCommitObserver,
       });
 
       expect(options.deadLetter).toBeInstanceOf(RedisEventDeadLetter);
       expect(Reflect.get(options.deadLetter!, "redis")).toBe(redis);
+      expect(Reflect.get(options.deadLetter!, "evidenceBlobStore")).toBe(unusedEvidenceBlobStore);
       expect(options.logger).toBeDefined();
       expect(options.reportFatal).toBeDefined();
+      expect(options.postCommitObserver).toBe(postCommitObserver);
 
       const panic = new Panic({ message: "delivery invariant failed" });
       options.reportFatal!.report(panic, {

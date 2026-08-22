@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { createLilacBus } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { Panic } from "better-result";
 
 import { composeBuiltinSurfaceRuntimes } from "../../src/runtime/compose-builtin-surface-runtimes";
@@ -42,6 +43,7 @@ function createComposition(input: {
     ),
     ...(input.discordHealth ? { discordHealth: input.discordHealth } : {}),
     bus: createLilacBus(createInMemoryDeliveryBus()),
+    blobStore: {} as BlobStore,
     subscriptionPrefix: "focused",
     webhookSecret: input.webhookSecret,
     githubAppCredentialsAvailable: input.githubAppCredentialsAvailable,

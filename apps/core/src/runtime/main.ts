@@ -12,8 +12,8 @@ const logger = createLogger({
 let runtime: CoreRuntime | null = null;
 const handlers = createProcessHandlers({
   logger,
-  stop: async (fatalError) => {
-    await runtime?.stop(fatalError && Panic.is(fatalError) ? fatalError : null);
+  stop: async (fatalError, hardDeadlineAtMs) => {
+    await runtime?.stop(fatalError && Panic.is(fatalError) ? fatalError : null, hardDeadlineAtMs);
   },
   recordUnhandledRejection: (reason) => {
     runtime?.recordUnhandledRejection(reason);
@@ -61,7 +61,10 @@ const started = await Result.tryPromise({
   },
   catch: () => "Opaque core startup failure",
 });
-const runtimeStarted = started.match({ ok: (value) => value, err: () => false });
+const runtimeStarted = started.match({
+  ok: (value) => value,
+  err: () => false,
+});
 if (!runtimeStarted) {
   logger.error("Failed to start core runtime");
   process.exit(1);

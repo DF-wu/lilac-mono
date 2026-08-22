@@ -1,4 +1,5 @@
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 
 import type { TranscriptStore } from "../transcript/transcript-store";
 import type { SurfaceAdapter, SurfaceAdapterEventSource } from "../surface/adapter";
@@ -31,6 +32,7 @@ export type ComposeBuiltinSurfaceRuntimesInput = {
   readonly descriptorBoundDiscordEventSource: SurfaceAdapterEventSource;
   readonly discordHealth?: SurfaceRuntimeHealthPort;
   readonly bus: LilacBus;
+  readonly blobStore: BlobStore;
   readonly subscriptionPrefix: string;
   readonly webhookSecret: string | undefined;
   readonly githubAppCredentialsAvailable: boolean;
@@ -57,7 +59,9 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
             subscriptionId: id,
             transcriptStore: input.getTranscriptStore(),
           });
-          input.logger.debug("bridgeAdapterToBus started", { subscriptionId: id });
+          input.logger.debug("bridgeAdapterToBus started", {
+            subscriptionId: id,
+          });
           return { platform: "discord", stop: () => handle.stop() };
         },
       },
@@ -73,13 +77,16 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
               const id = subscriptionId("bus-to-adapter");
               const relay = await bridgeBusToAdapter({
                 adapter: guardedAdapter,
+                blobStore: input.blobStore,
                 bus: input.bus,
                 platform: "discord",
                 policy,
                 subscriptionId: id,
                 transcriptStore: input.getTranscriptStore(),
               });
-              input.logger.debug("bridgeBusToAdapter started", { subscriptionId: id });
+              input.logger.debug("bridgeBusToAdapter started", {
+                subscriptionId: id,
+              });
               return relay;
             },
           },
@@ -109,13 +116,16 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
               const id = subscriptionId("bus-to-github");
               const relay = await bridgeBusToAdapter({
                 adapter: guardedAdapter,
+                blobStore: input.blobStore,
                 bus: input.bus,
                 platform: "github",
                 policy,
                 subscriptionId: id,
                 transcriptStore: input.getTranscriptStore(),
               });
-              input.logger.debug("GitHub output relay started", { subscriptionId: id });
+              input.logger.debug("GitHub output relay started", {
+                subscriptionId: id,
+              });
               return relay;
             },
           },

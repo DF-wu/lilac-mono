@@ -26,6 +26,28 @@ function createExitCodeHooks() {
 }
 
 describe("createProcessHandlers", () => {
+  it("passes one absolute hard deadline to runtime shutdown", async () => {
+    const exitCodeHooks = createExitCodeHooks();
+    const deadlines: number[] = [];
+    const before = Date.now();
+    const handlers = createProcessHandlers({
+      logger: createLoggerStub(),
+      stop: async (_fatalError, hardDeadlineAtMs) => {
+        if (hardDeadlineAtMs !== undefined) deadlines.push(hardDeadlineAtMs);
+      },
+      getExitCode: exitCodeHooks.getExitCode,
+      setExitCode: exitCodeHooks.setExitCode,
+      exitTimeoutMs: 2_000,
+      exit: (() => undefined as never) as (code: number) => never,
+    });
+
+    await handlers.handleSignal("SIGTERM");
+
+    expect(deadlines).toHaveLength(1);
+    expect(deadlines[0]).toBeGreaterThanOrEqual(before + 2_000);
+    expect(deadlines[0]).toBeLessThanOrEqual(Date.now() + 2_000);
+  });
+
   it("redacts standalone provider and AWS credential formats", () => {
     const credentials = [
       "ghp_abcdefghijklmnopqrstuvwxyz123456",

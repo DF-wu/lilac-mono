@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { Panic, Result } from "better-result";
 
+import { scheduleCoreBlobStoreClose } from "../../src/runtime/create-core-runtime";
 import {
   activateSurfaceRecovery,
   applySurfaceRecovery,
@@ -300,6 +301,67 @@ function maps() {
 }
 
 describe("surface runtime lifecycle", () => {
+  it("starts the absolute blob fence while a producer stop remains hung", async () => {
+    const calls: string[] = [];
+    const registry = createRegistry({ calls });
+    const handles = maps();
+    const producerStopEntered = Promise.withResolvers<void>();
+    const releaseProducerStop = Promise.withResolvers<void>();
+    const blobCloseStarted = Promise.withResolvers<void>();
+    let deadlineCallback = (): void => {
+      throw new Error("Blob close deadline was not scheduled");
+    };
+    let closeCount = 0;
+    const closeController = scheduleCoreBlobStoreClose({
+      hardDeadlineAtMs: 6_000,
+      now: () => 1_000,
+      close: async () => {
+        closeCount += 1;
+        blobCloseStarted.resolve();
+      },
+      scheduleDeadline: (callback, delayMs) => {
+        expect(delayMs).toBe(4_000);
+        deadlineCallback = callback;
+        return () => undefined;
+      },
+    });
+    let drainSettled = false;
+    const draining = stopIngressAndDrainSurfaceRecovery({
+      registry,
+      stopAdapterIngress: async () => undefined,
+      stopRouterIngress: async () => {
+        producerStopEntered.resolve();
+        await releaseProducerStop.promise;
+      },
+      stopWorkflowRequestProducers: async () => undefined,
+      stopRequestIngress: async () => undefined,
+      stopRemainingRequestProducers: async () => undefined,
+      deadlineMs: 3_000,
+      runCleanup: async (_label, cleanup) => cleanup?.(),
+      agentRunner: {
+        ...testAgentRecovery(),
+        beginDrain: async () => undefined,
+        snapshotRecoverables: () => [],
+        snapshotQueueAttempts: () => [],
+      },
+      relays: handles.relays,
+    }).then(() => {
+      drainSettled = true;
+    });
+
+    await producerStopEntered.promise;
+    deadlineCallback();
+    await blobCloseStarted.promise;
+
+    expect(drainSettled).toBe(false);
+    expect(closeCount).toBe(1);
+
+    releaseProducerStop.resolve();
+    await draining;
+    await closeController.closeNow();
+    expect(closeCount).toBe(1);
+  });
+
   it("derives workflow progress ports from unique registry entries", () => {
     const calls: string[] = [];
     const registry = createRegistry({
@@ -498,6 +560,7 @@ describe("surface runtime lifecycle", () => {
 
   it("stops ingress and request producers before registry-ordered drain and snapshot", async () => {
     const calls: string[] = [];
+    let nowMs = 0;
     const registry = createRegistry({
       calls,
       githubRelayStart: async () => emptyRelayHandle("github"),
@@ -512,6 +575,7 @@ describe("surface runtime lifecycle", () => {
       platform,
       beginDrain: async ({ deadlineMs }) => {
         calls.push(`${platform}-drain:${deadlineMs}`);
+        nowMs += 1_000;
       },
       snapshotRelays: () => {
         calls.push(`${platform}-snapshot`);
@@ -550,6 +614,7 @@ describe("surface runtime lifecycle", () => {
         calls.push("remaining-producers-stop");
       },
       deadlineMs: 3_000,
+      now: () => nowMs,
       runCleanup: async (label, cleanup) => {
         calls.push(label);
         await cleanup?.();
@@ -557,6 +622,7 @@ describe("surface runtime lifecycle", () => {
       agentRunner: {
         beginDrain: async ({ deadlineMs }) => {
           calls.push(`agent-drain:${deadlineMs}`);
+          nowMs += 1_000;
         },
         snapshotRecoverables: () => {
           calls.push("agent-snapshot");
@@ -577,9 +643,9 @@ describe("surface runtime lifecycle", () => {
       "graceful.agentRunner.beginDrain",
       "agent-drain:3000",
       "graceful.surface.discord.relay.beginDrain",
-      "discord-drain:3000",
+      "discord-drain:2000",
       "graceful.surface.github.relay.beginDrain",
-      "github-drain:3000",
+      "github-drain:1000",
       "graceful.agentRunner.snapshotRecoverables",
       "agent-snapshot",
       "graceful.surface.discord.relay.snapshotRelays",
