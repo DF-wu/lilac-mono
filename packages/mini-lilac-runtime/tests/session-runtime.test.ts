@@ -891,7 +891,7 @@ describe("MiniLilacSqliteStore", () => {
     temporaryDirectories.push(directory);
     const databasePath = path.join(directory, "runtime.sqlite");
     const original = new MiniLilacSqliteStore(databasePath);
-    original.database.exec("PRAGMA user_version = 9;");
+    original.database.run("PRAGMA user_version = 9;");
     original.close();
 
     expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(MiniLilacDatabaseVersionError);
@@ -1702,7 +1702,7 @@ describe("SessionService", () => {
       );
     const firstStore = stores[0];
     if (firstStore === undefined) throw new Error("First workspace history store was not created");
-    first.store.database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    first.store.database.run("PRAGMA wal_checkpoint(TRUNCATE)");
     first.close();
     await copyFile(firstDatabase, copiedDatabase);
 
@@ -7076,7 +7076,7 @@ describe("SessionService", () => {
   it("atomically rolls back transcript, run, session state, and prompt command", async () => {
     const model = new MockLanguageModelV4({ doStream: textResult("answer", "done") });
     const { service, session } = await temporaryRuntime(model, "reader", true);
-    service.store.database.exec(`
+    service.store.database.run(`
       CREATE TRIGGER fail_prompt_command BEFORE UPDATE OF run_id ON commands
       WHEN NEW.kind = 'prompt' AND NEW.run_id IS NOT NULL
       BEGIN
@@ -7105,7 +7105,7 @@ describe("SessionService", () => {
         .get(),
     ).toEqual({ count: 0 });
 
-    service.store.database.exec("DROP TRIGGER fail_prompt_command;");
+    service.store.database.run("DROP TRIGGER fail_prompt_command;");
     const retried = await service.startPrompt(
       session.id,
       userMessage("retry succeeds"),

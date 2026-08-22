@@ -375,7 +375,7 @@ describe("mini-lilac server CLI", () => {
     const { databasePath } = await temporaryDatabase();
     await mkdir(path.dirname(databasePath), { recursive: true });
     const legacy = new Database(databasePath, { create: true, strict: true });
-    legacy.exec("PRAGMA user_version = 4");
+    legacy.run("PRAGMA user_version = 4");
     legacy.close();
     const before = await readFile(databasePath);
 

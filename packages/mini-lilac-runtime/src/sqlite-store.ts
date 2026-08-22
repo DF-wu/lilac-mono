@@ -2213,7 +2213,7 @@ export class MiniLilacSqliteStore {
     const initialized = sqliteCaptureOutcome(
       Result.try<void, OpaqueMiniLilacSqliteValue>({
         try: () => {
-          this.database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+          this.database.run("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
           this.secureDatabaseFiles();
           this.initializeSchema();
         },
@@ -2314,7 +2314,7 @@ export class MiniLilacSqliteStore {
 
           // Session and run composite ownership require SQLite's documented table
           // rebuild. These pragmas cannot be changed from inside the transaction.
-          this.database.exec("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
+          this.database.run("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;");
           let migrated: ResultType<
             void,
             MiniLilacSchemaMigrationFailure | MiniLilacSqliteDriverFailure | PersistedDataError
@@ -2365,7 +2365,7 @@ export class MiniLilacSqliteStore {
                         }),
                       );
                     }
-                    this.database.exec(
+                    this.database.run(
                       `PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION};`,
                     );
                     return Result.ok(undefined);
@@ -2475,7 +2475,7 @@ export class MiniLilacSqliteStore {
   private restoreSchemaMigrationPragmas(): ResultType<void, MiniLilacSqliteDriverFailure> {
     const restored = sqliteCaptureOutcome(
       Result.try<void, OpaqueMiniLilacSqliteValue>({
-        try: () => this.database.exec("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;"),
+        try: () => this.database.run("PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;"),
         catch: (cause) => cause,
       }),
     );
@@ -2491,7 +2491,7 @@ export class MiniLilacSqliteStore {
   }
 
   private createSchemaV6(): void {
-    this.database.exec(`
+    this.database.run(`
         CREATE TABLE history_store_metadata (
           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
           namespace_id TEXT NOT NULL,
@@ -2593,7 +2593,7 @@ export class MiniLilacSqliteStore {
   }
 
   private createHistorySchemaTables(): void {
-    this.database.exec(`
+    this.database.run(`
       CREATE TABLE workspace_snapshots (
         id TEXT PRIMARY KEY,
         workspace_id TEXT NOT NULL REFERENCES workspaces(id),
@@ -2770,7 +2770,7 @@ export class MiniLilacSqliteStore {
   }
 
   private migrateSchemaV5ToV6(): void {
-    this.database.exec(`
+    this.database.run(`
       CREATE TABLE history_states_v6 (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
@@ -2874,7 +2874,7 @@ export class MiniLilacSqliteStore {
   }
 
   private migrateSchemaV6ToV7(): void {
-    this.database.exec(`
+    this.database.run(`
       ALTER TABLE history_states ADD COLUMN last_provider_family TEXT
         CHECK(last_provider_family IN ('claude-code', 'ai-sdk'));
       ALTER TABLE history_states ADD COLUMN contains_cross_family_turns INTEGER
@@ -2954,7 +2954,7 @@ export class MiniLilacSqliteStore {
   }
 
   private migrateSchemaV7ToV8(): void {
-    this.database.exec(`
+    this.database.run(`
       ALTER TABLE pending_run_finalizations
         ADD COLUMN named_claude_binding_promotion_json TEXT;
 
@@ -3041,7 +3041,7 @@ export class MiniLilacSqliteStore {
     if (!decodedSessionsOutcome.ok) return Result.err(decodedSessionsOutcome.error);
     const sessions = decodedSessionsOutcome.value.value;
     const now = new Date().toISOString();
-    this.database.exec(`
+    this.database.run(`
       CREATE TABLE history_store_metadata (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         namespace_id TEXT NOT NULL,
@@ -3075,7 +3075,7 @@ export class MiniLilacSqliteStore {
       }
     }
 
-    this.database.exec(`
+    this.database.run(`
       CREATE TABLE sessions_v5 (
         id TEXT PRIMARY KEY,
         active_run_id TEXT,
@@ -3130,7 +3130,7 @@ export class MiniLilacSqliteStore {
         session.updated_at,
       );
     }
-    this.database.exec(`
+    this.database.run(`
       DROP TABLE sessions;
       ALTER TABLE sessions_v5 RENAME TO sessions;
       CREATE INDEX sessions_workspace ON sessions(workspace_id);
@@ -3201,7 +3201,7 @@ export class MiniLilacSqliteStore {
       const migrationError = migrated.match({ ok: () => null, err: (error) => error });
       if (migrationError !== null) return Result.err(migrationError);
     }
-    this.database.exec("DROP TABLE user_checkpoints;");
+    this.database.run("DROP TABLE user_checkpoints;");
     return Result.ok(undefined);
   }
 
@@ -3635,7 +3635,7 @@ export class MiniLilacSqliteStore {
    * SQLite cannot alter a CHECK constraint in place, so the table is rebuilt.
    */
   private migrateSchemaV3ToV4(): void {
-    this.database.exec(`
+    this.database.run(`
       CREATE TABLE sessions_v4 (
         id TEXT PRIMARY KEY,
         active_run_id TEXT,
@@ -3664,7 +3664,7 @@ export class MiniLilacSqliteStore {
   }
 
   private migrateSchemaV2ToV3(): ResultType<void, PersistedDataError> {
-    this.database.exec(`
+    this.database.run(`
       CREATE TABLE transcript_nodes (
         id INTEGER PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -3830,7 +3830,7 @@ export class MiniLilacSqliteStore {
       );
     }
 
-    this.database.exec(`
+    this.database.run(`
       DROP TABLE run_chunks;
       DROP TABLE user_checkpoints;
       DROP TABLE model_transcript;

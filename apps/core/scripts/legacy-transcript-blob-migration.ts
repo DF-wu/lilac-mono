@@ -3171,7 +3171,7 @@ export function applyTranscriptBlobStorageSchema6Migration(
     for (const table of existingNativeTables) {
       database.run(`ALTER TABLE ${table} RENAME TO legacy_${table}`);
     }
-    database.exec(`
+    database.run(`
         CREATE TABLE core_owned_blobs (owner_id TEXT PRIMARY KEY CHECK (length(owner_id) > 0), blob_ref_json TEXT NOT NULL, media_type TEXT NOT NULL CHECK (length(media_type) > 0), filename TEXT NOT NULL CHECK (length(filename) > 0), byte_length INTEGER NOT NULL CHECK (byte_length >= 0), created_ts INTEGER NOT NULL);
         CREATE TABLE core_surface_projection_blobs (request_client TEXT NOT NULL, surface_id TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, projection_format_version INTEGER NOT NULL, position INTEGER NOT NULL CHECK (position >= 0), blob_owner_id TEXT NOT NULL REFERENCES core_owned_blobs(owner_id) ON DELETE RESTRICT, PRIMARY KEY (request_client, surface_id, session_id, message_id, projection_format_version, position), FOREIGN KEY (request_client, surface_id, session_id, message_id, projection_format_version) REFERENCES core_surface_projections (request_client, surface_id, session_id, message_id, projection_format_version) ON DELETE CASCADE);
         CREATE TABLE core_primary_lineage_manifests (request_id TEXT PRIMARY KEY REFERENCES request_transcripts(request_id) ON DELETE CASCADE, lineage_version INTEGER NOT NULL CHECK (lineage_version = 2), manifest_json TEXT NOT NULL, created_ts INTEGER NOT NULL);
@@ -3381,7 +3381,7 @@ export function applyTranscriptBlobStorageSchema6Migration(
     database.run(
       "UPDATE core_lineage_request_refs SET transcript_digest = (SELECT transcript_digest FROM request_transcripts WHERE request_id = referenced_request_id)",
     );
-    database.exec(
+    database.run(
       "DROP TABLE legacy_core_surface_projection_blobs; DROP TABLE legacy_core_owned_blobs; DROP TABLE legacy_core_primary_lineage_manifests;",
     );
     for (const table of existingNativeTables) database.run(`DROP TABLE legacy_${table}`);

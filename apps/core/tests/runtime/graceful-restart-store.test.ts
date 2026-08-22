@@ -1584,7 +1584,7 @@ describe("SqliteGracefulRestartStore", () => {
     const { dbPath, store } = await makeStore();
     const database = new Database(dbPath, { strict: true });
     try {
-      database.exec(`
+      database.run(`
         CREATE TRIGGER reject_graceful_restart_save
         BEFORE INSERT ON graceful_restart_state
         BEGIN
@@ -1608,7 +1608,7 @@ describe("SqliteGracefulRestartStore", () => {
     expect(store.saveCompletedSnapshot(snapshot).status).toBe("ok");
     const database = new Database(dbPath, { strict: true });
     try {
-      database.exec("BEGIN EXCLUSIVE");
+      database.run("BEGIN EXCLUSIVE");
       const read = store.readCompletedSnapshot();
       expect(read.status).toBe("error");
       if (read.status === "error") {
@@ -1617,12 +1617,12 @@ describe("SqliteGracefulRestartStore", () => {
           expect(read.error.operation).toBe("read");
         }
       }
-      database.exec("ROLLBACK");
+      database.run("ROLLBACK");
       const retained = store.readCompletedSnapshot();
       expect(retained.status).toBe("ok");
       if (retained.status === "ok") expect(retained.value.state).toBe("loaded");
     } finally {
-      if (database.inTransaction) database.exec("ROLLBACK");
+      if (database.inTransaction) database.run("ROLLBACK");
       database.close();
       store.close();
     }
@@ -1661,7 +1661,7 @@ describe("SqliteGracefulRestartStore", () => {
     writePersistedRow(dbPath, fixture.status, fixture.payload_json);
     const database = new Database(dbPath, { strict: true });
     try {
-      database.exec(`
+      database.run(`
         CREATE TRIGGER reject_graceful_restart_consume
         BEFORE DELETE ON graceful_restart_state
         BEGIN

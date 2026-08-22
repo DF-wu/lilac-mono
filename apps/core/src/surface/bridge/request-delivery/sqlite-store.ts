@@ -299,9 +299,9 @@ export class SqliteRequestDeliveryStore<TEnvelope, TWork, TOutputMetadata> {
   }) {
     this.#database = new Database(input.dbPath, { create: true, strict: true });
     this.#codecs = input.codecs;
-    this.#database.exec("PRAGMA foreign_keys = ON");
-    this.#database.exec("PRAGMA journal_mode = WAL");
-    this.#database.exec(`
+    this.#database.run("PRAGMA foreign_keys = ON");
+    this.#database.run("PRAGMA journal_mode = WAL");
+    this.#database.run(`
       CREATE TABLE IF NOT EXISTS request_delivery_records (
         request_delivery_id TEXT PRIMARY KEY NOT NULL,
         request_id TEXT NOT NULL,

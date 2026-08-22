@@ -16,7 +16,7 @@ export type TranscriptSchemaMigrationFixture = {
 };
 
 function createV2Layout(database: Database): void {
-  database.exec(`
+  database.run(`
     CREATE TABLE core_owned_blobs (
       sha256 TEXT PRIMARY KEY
         CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
@@ -98,7 +98,7 @@ function createV2Layout(database: Database): void {
 }
 
 function createV3Layout(database: Database): void {
-  database.exec(`
+  database.run(`
     CREATE TABLE core_lineage_request_alias_refs (
       request_id TEXT NOT NULL
         REFERENCES core_primary_lineage_manifests(request_id) ON DELETE CASCADE,
@@ -126,7 +126,7 @@ function createV3Layout(database: Database): void {
 }
 
 function createV4Layout(database: Database): void {
-  database.exec(`
+  database.run(`
     CREATE TABLE core_primary_claude_bindings (
       request_client TEXT NOT NULL CHECK (request_client = 'discord'),
       session_id TEXT NOT NULL,
@@ -188,7 +188,7 @@ function createV4Layout(database: Database): void {
 }
 
 function createV5Layout(database: Database): void {
-  database.exec(`
+  database.run(`
     ALTER TABLE core_primary_claude_bindings
       ADD COLUMN terminal_request_id TEXT
         REFERENCES request_transcripts(request_id) ON DELETE CASCADE;
@@ -276,7 +276,7 @@ export function createTranscriptSchemaMigrationFixture(
   });
 
   try {
-    database.exec(`
+    database.run(`
       PRAGMA foreign_keys = ON;
       CREATE TABLE transcript_schema_migrations (
         version INTEGER PRIMARY KEY,

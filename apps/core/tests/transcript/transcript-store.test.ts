@@ -1084,7 +1084,7 @@ describe("SqliteTranscriptStore", () => {
       last: { platform: "discord", channelId: "chan", messageId: "output" },
     });
     const raw = new Database(dbPath);
-    raw.exec("CREATE TABLE diagnostic_observations (record_id TEXT NOT NULL)");
+    raw.run("CREATE TABLE diagnostic_observations (record_id TEXT NOT NULL)");
     raw.run("UPDATE request_transcripts SET context_meta_json = ?", ["{"]);
 
     const unlink = store.unlinkSurfaceMessage({
@@ -1222,7 +1222,7 @@ describe("SqliteTranscriptStore", () => {
       finalText: "before corruption",
     });
     const raw = new Database(dbPath);
-    raw.exec(`
+    raw.run(`
       CREATE TABLE save_diagnostic_observations (
         record_id TEXT NOT NULL,
         field TEXT NOT NULL
@@ -1338,7 +1338,7 @@ describe("SqliteTranscriptStore", () => {
       contextMeta: { type: "compaction", formatVersion: 1 },
     });
     const raw = new Database(dbPath);
-    raw.exec("CREATE TABLE prune_diagnostic_observations (record_id TEXT NOT NULL)");
+    raw.run("CREATE TABLE prune_diagnostic_observations (record_id TEXT NOT NULL)");
     raw.run(
       `UPDATE request_transcripts
        SET context_meta_json = ?, updated_ts = ?
@@ -1871,7 +1871,7 @@ describe("SqliteTranscriptStore", () => {
     const store = new SqliteTranscriptStore(dbPath);
     const promotion = prepareNamedBindingPromotion(store, "promotion-failure", "named-session");
     const raw = new Database(dbPath);
-    raw.exec(`
+    raw.run(`
       CREATE TABLE named_promotion_probe (marker TEXT NOT NULL);
       CREATE TRIGGER reject_named_promotion
       BEFORE INSERT ON core_named_claude_bindings
@@ -1912,7 +1912,7 @@ describe("SqliteTranscriptStore", () => {
     prepareNamedBindingPromotion(first, "named-recovery-panic", "named-recovery-session");
     first.close();
     const raw = new Database(dbPath);
-    raw.exec(`
+    raw.run(`
       CREATE TRIGGER reject_named_recovery_promotion
       BEFORE INSERT ON core_named_claude_bindings
       BEGIN
@@ -2235,7 +2235,7 @@ describe("SqliteTranscriptStore", () => {
     ).toBe("active");
 
     const fence = new Database(dbPath);
-    fence.exec(`
+    fence.run(`
       DROP TRIGGER reject_core_named_success;
       CREATE TRIGGER steal_core_named_success_fence
       AFTER UPDATE OF provider_state_json ON request_transcripts
@@ -2486,7 +2486,7 @@ describe("SqliteTranscriptStore", () => {
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
     const raw = new Database(dbPath);
-    raw.exec(`
+    raw.run(`
       CREATE TABLE projection_admission_audit (message_id TEXT NOT NULL);
       CREATE TRIGGER discard_admitted_projection
       AFTER INSERT ON core_surface_projections
@@ -3444,7 +3444,7 @@ describe("SqliteTranscriptStore", () => {
     });
     first.close();
     const raw = new Database(dbPath);
-    raw.exec(`
+    raw.run(`
       CREATE TRIGGER reject_primary_recovery_promotion
       BEFORE INSERT ON core_primary_claude_bindings
       BEGIN
@@ -3651,7 +3651,7 @@ describe("SqliteTranscriptStore", () => {
     ).toBeNull();
 
     const fence = new Database(dbPath);
-    fence.exec(`
+    fence.run(`
       DROP TRIGGER reject_core_primary_success;
       CREATE TRIGGER steal_core_primary_success_fence
       AFTER UPDATE OF provider_state_json ON request_transcripts

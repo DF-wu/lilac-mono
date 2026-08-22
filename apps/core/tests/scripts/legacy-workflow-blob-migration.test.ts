@@ -22,7 +22,7 @@ afterEach(async () => {
 });
 
 function installInertLegacyWorkflowState(db: Database): void {
-  db.exec(`
+  db.run(`
     CREATE TABLE workflows (
       workflow_id TEXT PRIMARY KEY,
       state TEXT NOT NULL,

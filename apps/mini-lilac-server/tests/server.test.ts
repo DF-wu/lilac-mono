@@ -854,7 +854,7 @@ describe("createMiniLilacServer", () => {
       },
     });
 
-    service.store.database.exec("DROP TABLE session_todos");
+    service.store.database.run("DROP TABLE session_todos");
     const driver = service.getTodosResult(session.id);
     expect(driver.status).toBe("error");
     if (driver.status === "error") {
