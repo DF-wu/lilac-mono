@@ -742,9 +742,8 @@ async function cleanupMiniLilacStreamReader(
   }
 
   if (cleanupSource !== undefined) {
-    const cleaned = await captureMiniLilacPromiseOutcome(
-      "Clean up Mini Lilac response body",
-      cleanupSource,
+    const cleaned = await captureMiniLilacPromiseOutcome("Clean up Mini Lilac response body", () =>
+      cleanupSource(),
     );
     if (cleaned.kind === "panic") {
       cancelPanic ??= cleaned.panic;
