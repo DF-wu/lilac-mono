@@ -9,6 +9,9 @@ facts are incorporated into those documents and remain available in Git history.
 
 - [`redis-event-delivery-reliability.md`](redis-event-delivery-reliability.md): pending-entry reclamation,
   fenced retries, idempotent dead-letter finalization, and transactional inbox/outbox processing.
+- [`unified-blob-storage-clean-break.md`](unified-blob-storage-clean-break.md): Core adapter-neutral blob
+  references, local and S3-compatible storage, reference-only Redis and domain persistence, and an
+  operator-run clean-break migration.
 
 Only plans listed under **Active** are repository-wide implementation plans. A task-specific plan is
 authoritative only when the user explicitly approves it for that task.
