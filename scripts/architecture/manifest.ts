@@ -386,6 +386,7 @@ export const BLOB_STORAGE_ARCHITECTURE_POLICY = {
   ],
   closeOwnerModules: [
     { workspace: "apps/core", module: "src/runtime/main" },
+    { workspace: "apps/core", module: "scripts/bench-blob-storage" },
     { workspace: "apps/core", module: "scripts/migrate-blob-storage" },
   ],
   materializationModules: [
@@ -415,6 +416,7 @@ export const BLOB_STORAGE_ARCHITECTURE_POLICY = {
       module: "src/transcript/stored-message-materialization",
     },
     { workspace: "apps/core", module: "scripts/blob-migration-target" },
+    { workspace: "apps/core", module: "scripts/bench-blob-storage" },
     {
       workspace: "apps/core",
       module: "scripts/legacy-workflow-blob-migration",

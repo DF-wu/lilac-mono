@@ -10,6 +10,7 @@
   "scripts": {
     "build:info": "bun scripts/write-build-info.ts",
     "build:remote-fs": "bun --cwd=apps/core run build:remote-runner && bun --cwd=packages/remote-fs-runner run build",
+    "bench:blob-storage": "bun apps/core/scripts/bench-blob-storage.ts",
     "codegen:model-options": "bun scripts/generate-provider-option-shapes.ts",
     "codegen:model-options:check": "bun scripts/generate-provider-option-shapes.ts --check",
     "docker:build": "bun scripts/docker-build.ts build",
