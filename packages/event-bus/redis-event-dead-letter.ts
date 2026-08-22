@@ -4,6 +4,14 @@ import type Redis from "ioredis";
 import SuperJSON from "superjson";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
+import {
+  blobRefV1Schema,
+  type BlobStore,
+  type BlobUpload,
+  type BlobUploadStartError,
+  type BlobRefV1,
+  type BlobWriteError,
+} from "@stanley2058/lilac-blob-storage";
 
 import {
   captureDeadLetterAcceptance,
@@ -47,12 +55,13 @@ export type RedisEventDeadLetterOptions = {
   readonly recordTtlSeconds?: number;
   /** Exact maximum number of payload-free metadata entries retained in the index sorted set. */
   readonly indexMaxLen?: number;
+  /** Shared managed blob store used for complete controlled source evidence. */
+  readonly evidenceBlobStore?: Pick<BlobStore, "startUpload">;
 };
 
 export type PreparedRedisEventDeadLetter = {
   readonly id: string;
   readonly record: { readonly key: string; readonly value: string };
-  readonly evidence?: { readonly key: string; readonly value: string };
   readonly index: {
     readonly key: string;
     readonly fields: readonly string[];
@@ -375,10 +384,31 @@ export function decryptRedisEventDeadLetterRecoveryValue(options: {
   );
 }
 
+const redisWireEvidencePathSchema = z.string().regex(/^fields\[(?:[0-9]|[12][0-9]|3[01])\]$/u);
+
 const redisWireValueEvidenceSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("string"), value: z.string(), truncated: z.boolean() }),
+  z.strictObject({
+    kind: z.literal("string"),
+    path: redisWireEvidencePathSchema,
+    role: z.enum(["entry", "field-name", "field-value"]),
+    field: z.enum(["type", "ts", "data", "headers", "key"]).optional(),
+    valueKind: z.enum([
+      "empty",
+      "known-field-name",
+      "unknown-field-name",
+      "data-url",
+      "base64",
+      "managed-binary-field",
+      "structured",
+      "text",
+    ]),
+    charLength: z.number().int().nonnegative().safe(),
+  }),
   z.strictObject({
     kind: z.literal("non-string"),
+    path: redisWireEvidencePathSchema,
+    role: z.enum(["entry", "field-name", "field-value"]),
+    field: z.enum(["type", "ts", "data", "headers", "key"]).optional(),
     valueType: z.enum([
       "array",
       "bigint",
@@ -403,7 +433,10 @@ const redisEvidenceSourceSchema = z.strictObject({
 const eventTransportEvidenceSchema = z.strictObject({
   source: redisEvidenceSourceSchema,
   wire: z.discriminatedUnion("kind", [
-    z.strictObject({ kind: z.literal("bounded-complete"), fields: z.array(z.string()) }),
+    z.strictObject({
+      kind: z.literal("bounded-complete"),
+      fields: z.array(redisWireValueEvidenceSchema).max(32),
+    }),
     z.strictObject({
       kind: z.literal("controlled-reference"),
       locator: z.discriminatedUnion("kind", [
@@ -412,22 +445,18 @@ const eventTransportEvidenceSchema = z.strictObject({
           streamKey: z.string(),
           messageId: z.string(),
         }),
-        z.strictObject({
-          kind: z.literal("redis-key"),
-          key: z.string(),
-          expiresAt: z.number(),
-        }),
+        z.strictObject({ kind: z.literal("blob-ref"), blob: blobRefV1Schema }),
       ]),
       preview: z.strictObject({
-        fields: z.array(redisWireValueEvidenceSchema),
-        omittedValueCount: z.number().int().nonnegative(),
+        fields: z.array(redisWireValueEvidenceSchema).max(32),
+        omittedValueCount: z.number().int().nonnegative().safe(),
       }),
     }),
   ]),
 });
 
 const eventDeadLetterRecordSchema: z.ZodType<EventDeadLetterRecord> = z.strictObject({
-  version: z.literal(2),
+  version: z.literal(3),
   deadLetterId: z.string(),
   recordedAt: z.number(),
   source: z.strictObject({
@@ -814,7 +843,7 @@ export function decryptRedisEventDeadLetterRecord(options: {
   return Result.ok(record.value);
 }
 
-/** Redis adapter that durably accepts an encrypted v2 record before source acknowledgement. */
+/** Redis adapter that durably accepts an encrypted v3 record before source acknowledgement. */
 export class RedisEventDeadLetter implements EventDeadLetter {
   private readonly redis: Redis;
   private readonly encryptionKey: Uint8Array;
@@ -823,13 +852,14 @@ export class RedisEventDeadLetter implements EventDeadLetter {
   private readonly evidencePrefix: string;
   private readonly recordTtlSeconds: number;
   private readonly indexMaxLen: number;
+  private readonly evidenceBlobStore: Pick<BlobStore, "startUpload"> | undefined;
 
   constructor(options: RedisEventDeadLetterOptions) {
     const keyPrefix = options.keyPrefix ?? "lilac:event-bus:dead-letter";
     this.redis = options.redis;
-    this.indexKey = `${keyPrefix}:v2:records`;
-    this.recordPrefix = `${keyPrefix}:v2:record`;
-    this.evidencePrefix = `${keyPrefix}:v2:evidence`;
+    this.indexKey = `${keyPrefix}:v3:records`;
+    this.recordPrefix = `${keyPrefix}:v3:record`;
+    this.evidencePrefix = `${keyPrefix}:v3:evidence`;
     const config = validateRedisEventDeadLetterConfig({
       recordTtlSeconds: options.recordTtlSeconds ?? DEFAULT_RECORD_TTL_SECONDS,
       indexMaxLen: options.indexMaxLen ?? DEFAULT_INDEX_MAX_LEN,
@@ -843,6 +873,7 @@ export class RedisEventDeadLetter implements EventDeadLetter {
     this.recordTtlSeconds = validated.recordTtlSeconds;
     this.indexMaxLen = validated.indexMaxLen;
     this.encryptionKey = validated.encryptionKey;
+    this.evidenceBlobStore = options.evidenceBlobStore;
   }
 
   accept(
@@ -851,9 +882,6 @@ export class RedisEventDeadLetter implements EventDeadLetter {
     return captureDeadLetterAcceptance(async () => {
       const prepared = await this.prepare(record);
       const transaction = this.redis.multi();
-      if (prepared.evidence !== undefined) {
-        transaction.set(prepared.evidence.key, prepared.evidence.value, "EX", prepared.ttlSeconds);
-      }
       transaction.set(prepared.record.key, prepared.record.value, "EX", prepared.ttlSeconds);
       transaction.zadd(
         prepared.index.key,
@@ -862,7 +890,7 @@ export class RedisEventDeadLetter implements EventDeadLetter {
       );
       transaction.zremrangebyrank(prepared.index.key, 0, -prepared.index.maxLen - 1);
       const results = await transaction.exec();
-      const receipt = decodeRedisDeadLetterTransactionId(results, prepared.evidence !== undefined);
+      const receipt = decodeRedisDeadLetterTransactionId(results, false);
       if (receipt.status === "error") throw receipt.cause;
       return { id: prepared.id };
     });
@@ -882,7 +910,6 @@ export class RedisEventDeadLetter implements EventDeadLetter {
     const evidenceKey = `${this.evidencePrefix}:${record.deadLetterId}`;
     const expiresAt = (await this.serverTimeMs()) + this.recordTtlSeconds * 1000;
     let persistedRecord = record;
-    let evidenceMaterial: PreparedRedisEventDeadLetter["evidence"];
 
     if (record.evidence.wire.kind === "controlled-reference") {
       const locator = record.evidence.wire.locator;
@@ -904,16 +931,12 @@ export class RedisEventDeadLetter implements EventDeadLetter {
         const evidence = decodeRedisDeadLetterEvidenceEntry(entries, locator.messageId);
         if (evidence.status === "error") throw new Error(evidence.message);
         evidencePlaintext = SuperJSON.stringify({
-          version: 2,
+          version: 3,
           source: record.evidence.source,
           fields: evidence.fields,
         });
       } else {
-        const existingEvidence = await this.redis.get(locator.key);
-        if (existingEvidence === null) {
-          throw new Error("Referenced Redis key evidence is no longer available");
-        }
-        evidencePlaintext = existingEvidence;
+        throw new Error("Blob-referenced source evidence is already finalized");
       }
       const encryptedEvidence = encryptRedisEventDeadLetterRecoveryValue({
         encryptionKey: this.encryptionKey,
@@ -928,14 +951,31 @@ export class RedisEventDeadLetter implements EventDeadLetter {
         err: (error) => error,
       });
       if (TaggedError.is(encryptedEvidenceValue)) throw encryptedEvidenceValue;
-      evidenceMaterial = { key: evidenceKey, value: encryptedEvidenceValue };
+      if (this.evidenceBlobStore === undefined) {
+        throw new Error("Controlled source evidence requires the managed blob store");
+      }
+      const uploadResult = await this.evidenceBlobStore.startUpload({
+        source: Buffer.from(encryptedEvidenceValue, "utf8"),
+        retention: { kind: "expires", expiresAt },
+      });
+      const upload = uploadResult.match<BlobUpload | BlobUploadStartError>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (TaggedError.is(upload)) throw upload;
+      const completed = await upload.completion;
+      const evidenceRef = completed.match<BlobRefV1 | BlobWriteError>({
+        ok: (value) => value,
+        err: (error) => error,
+      });
+      if (TaggedError.is(evidenceRef)) throw evidenceRef;
       persistedRecord = {
         ...record,
         evidence: {
           source: record.evidence.source,
           wire: {
             kind: "controlled-reference",
-            locator: { kind: "redis-key", key: evidenceKey, expiresAt },
+            locator: { kind: "blob-ref", blob: evidenceRef },
             preview: record.evidence.wire.preview,
           },
         },
@@ -957,7 +997,7 @@ export class RedisEventDeadLetter implements EventDeadLetter {
     if (TaggedError.is(encryptedRecordValue)) throw encryptedRecordValue;
     const indexFields = [
       "version",
-      "2",
+      "3",
       "deadLetterId",
       record.deadLetterId,
       "recordedAt",
@@ -982,7 +1022,6 @@ export class RedisEventDeadLetter implements EventDeadLetter {
     return {
       id: record.deadLetterId,
       record: { key: recordKey, value: encryptedRecordValue },
-      ...(evidenceMaterial === undefined ? {} : { evidence: evidenceMaterial }),
       index: {
         key: this.indexKey,
         fields: indexFields,

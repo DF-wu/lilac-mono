@@ -3,6 +3,13 @@ import type {
   FetchOptions,
   PublishMessage,
   PublishOptions,
+  PublishReceipt,
+  RawClaimedRequestPublishOutcome,
+  RawOutputStreamExpiry,
+  RequestPublicationClaim,
+  RequestPublicationClaimAbandonment,
+  RequestPublicationClaimAcquisition,
+  RequestPublicationConfirmation,
   RawMessageDecodeOutcome,
   SubscriptionOptions,
   Topic,
@@ -25,10 +32,33 @@ import type {
  */
 export interface RawBus {
   /** Append a message to a topic/stream. */
-  publish<TData>(
+  publish<TData>(msg: PublishMessage<TData>, opts: PublishOptions): Promise<PublishReceipt>;
+
+  /** Acquire a finite, transport-owned request publication fence. */
+  acquireRequestPublicationClaim?(
+    requestDeliveryId: string,
+  ): Promise<RequestPublicationClaimAcquisition>;
+
+  /** Append or observe one request entry only while the exact claim remains live. */
+  publishClaimedRequest?<TData>(
     msg: PublishMessage<TData>,
     opts: PublishOptions,
-  ): Promise<{ id: string; cursor: Cursor }>;
+    claim: RequestPublicationClaim,
+  ): Promise<RawClaimedRequestPublishOutcome>;
+
+  /** Confirm the exact marker and atomically remove it with the live claim. */
+  confirmRequestPublication?(
+    claim: RequestPublicationClaim,
+    expectedStreamId: string,
+  ): Promise<RequestPublicationConfirmation>;
+
+  /** Release the exact claim only when publication has not created a marker. */
+  abandonRequestPublicationClaim?(
+    claim: RequestPublicationClaim,
+  ): Promise<RequestPublicationClaimAbandonment>;
+
+  /** Read the Redis-owned absolute expiry for a request output stream. */
+  readOutputStreamExpiry?(topic: Topic): Promise<RawOutputStreamExpiry>;
 
   /**
    * Subscribe to a topic. The transport owns acknowledgement and applies the

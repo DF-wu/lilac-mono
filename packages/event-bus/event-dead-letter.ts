@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
 
 import { Err, Ok, Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import type { BlobRefV1 } from "@stanley2058/lilac-blob-storage";
 
 import { panic as signalEventBusPanic } from "./redis-managed-delivery";
 import type { RedisMessageDecodeIssue, RedisWireValueEvidence, Topic } from "./types";
 
-export const EVENT_DEAD_LETTER_VERSION = 2 as const;
+export const EVENT_DEAD_LETTER_VERSION = 3 as const;
 export const EVENT_DEAD_LETTER_MAX_ATTEMPTS = 5 as const;
 
 export type RedisEvidenceSource = {
@@ -20,7 +21,7 @@ export type EventTransportEvidence = {
   readonly wire:
     | {
         readonly kind: "bounded-complete";
-        readonly fields: readonly string[];
+        readonly fields: readonly RedisWireValueEvidence[];
       }
     | {
         readonly kind: "controlled-reference";
@@ -31,9 +32,8 @@ export type EventTransportEvidence = {
               readonly messageId: string;
             }
           | {
-              readonly kind: "redis-key";
-              readonly key: string;
-              readonly expiresAt: number;
+              readonly kind: "blob-ref";
+              readonly blob: BlobRefV1;
             };
         readonly preview: {
           readonly fields: readonly RedisWireValueEvidence[];

@@ -25,11 +25,39 @@ export type DecodedMessage<TData = unknown> = {
   data: TData;
 };
 
-/** A bounded projection of one value from the flat Redis stream field array. */
+export type RedisWireKnownField = "type" | "ts" | "data" | "headers" | "key";
+
+/**
+ * A bounded structural projection of one value from the flat Redis stream field array.
+ *
+ * This intentionally records no string content. Redis values can contain managed binary
+ * payloads, data URLs, credentials, or other opaque application data even when the entry
+ * is malformed. The path, role, known field name, broad content class, and length are
+ * enough to diagnose the wire shape without copying that content into diagnostics or a
+ * dead-letter preview.
+ */
 export type RedisWireValueEvidence =
-  | { kind: "string"; value: string; truncated: boolean }
+  | {
+      kind: "string";
+      path: string;
+      role: "entry" | "field-name" | "field-value";
+      field?: RedisWireKnownField;
+      valueKind:
+        | "empty"
+        | "known-field-name"
+        | "unknown-field-name"
+        | "data-url"
+        | "base64"
+        | "managed-binary-field"
+        | "structured"
+        | "text";
+      charLength: number;
+    }
   | {
       kind: "non-string";
+      path: string;
+      role: "entry" | "field-name" | "field-value";
+      field?: RedisWireKnownField;
       valueType:
         | "array"
         | "bigint"
@@ -103,6 +131,50 @@ export type PublishOptions = {
   /** Optional metadata (string->string). */
   headers?: Record<string, string>;
 };
+
+/** A finite Redis lease fencing one request publication producer. */
+export type RequestPublicationClaim = {
+  readonly requestDeliveryId: string;
+  readonly token: string;
+};
+
+export type RequestPublicationClaimAcquisition =
+  | { readonly status: "acquired"; readonly claim: RequestPublicationClaim }
+  | { readonly status: "contended" };
+
+export type RawClaimedRequestPublishOutcome =
+  | { readonly status: "published"; readonly receipt: PublishReceipt }
+  | { readonly status: "fenced" };
+
+export type RequestPublicationConfirmation = "absent" | "confirmed" | "fenced" | "mismatch";
+
+export type RequestPublicationClaimAbandonment =
+  | "abandoned"
+  | "absent"
+  | "fenced"
+  | "marker-present";
+
+export type PublishReceipt = {
+  readonly id: string;
+  readonly cursor: Cursor;
+  /** True when request publication observed the stream entry created by an earlier attempt. */
+  readonly duplicate?: boolean;
+  /** Conservative absolute expiry for a sliding output replay stream. */
+  readonly replayDeadline?: number;
+};
+
+/** Absolute Redis-owned replay expiry for one request output stream. */
+export type OutputStreamExpiry =
+  | { readonly kind: "present"; readonly expiresAt: number }
+  | { readonly kind: "absent" };
+
+/** Raw transport result when the stream exists but its expiry cannot be established. */
+export type RawOutputStreamExpiry =
+  | OutputStreamExpiry
+  | {
+      readonly kind: "uncertain";
+      readonly reason: "stream-has-no-expiry" | "invalid-transport-response";
+    };
 
 /** Flow control options shared by subscription read loops. */
 export type SubscriptionWaitOptions = {

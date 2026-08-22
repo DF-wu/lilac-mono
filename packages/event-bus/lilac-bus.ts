@@ -10,7 +10,17 @@ import {
 import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 
 import type { RawBus } from "./raw-bus";
-import type { Cursor, FetchOptions, RedisMessageDecodeFailure, SubscriptionOptions } from "./types";
+import type {
+  Cursor,
+  FetchOptions,
+  OutputStreamExpiry,
+  RedisMessageDecodeFailure,
+  RequestPublicationClaim,
+  RequestPublicationClaimAbandonment,
+  RequestPublicationClaimAcquisition,
+  RequestPublicationConfirmation,
+  SubscriptionOptions,
+} from "./types";
 import {
   createContractInvalidDeadLetterReason,
   createHandlerErrorDeadLetterReason,
@@ -26,8 +36,15 @@ import {
   type EventDeliveryStopFailed,
   EventFetchContractInvalid,
   EventFetchTransportFailed,
+  EventOutputStreamExpiryUnavailable,
   EventPublishContractInvalid,
   EventPublishTransportFailed,
+  EventPostCommitObservationFailed,
+  EventRequestPublicationClaimFailed,
+  EventRequestPublicationClaimFenced,
+  EventRequestPublicationClaimUnsupported,
+  EventRequestPublicationConfirmationFailed,
+  EventRequestPublicationConfirmationUnsupported,
   EventTopicOperationFailed,
   EventTopicOperationUnsupported,
   type DeliveryDisposition,
@@ -37,6 +54,7 @@ import {
   type RawDeliveryAction,
 } from "./event-delivery";
 import {
+  decodeLilacMessage,
   decodeLilacMessageForTopic,
   lilacEventCodecRegistry,
   type DecodedLilacMessage,
@@ -45,6 +63,7 @@ import {
 import { panic as signalEventBusPanic } from "./redis-managed-delivery";
 import {
   lilacEventTypes,
+  outReqTopic,
   type AdapterPlatform,
   type LilacDataForType,
   type LilacEventType,
@@ -79,6 +98,13 @@ export type CreateLilacBusOptions = {
   readonly deadLetter?: RedisEventDeadLetter;
   readonly logger?: EventDeliveryLogger;
   readonly reportFatal?: EventDeliveryFatalReporter;
+  /** Called only after Redis durably commits a managed delivery. */
+  readonly postCommitObserver?: {
+    observe(
+      message: DecodedLilacMessage,
+      context: Extract<EventDeliveryContext, { mode: "work" | "fanout" }>,
+    ): Promise<ResultType<void, EventPostCommitObservationFailed>>;
+  };
 };
 
 const KNOWN_EVENT_TYPES = new Set<string>(Object.values(lilacEventTypes));
@@ -95,7 +121,10 @@ function captureLilacBusFailure(cause: unknown): LilacBusFailureSettlement {
       try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),
       catch: () => undefined,
     });
-    const panic = inspected.match({ ok: (value) => value, err: () => undefined });
+    const panic = inspected.match({
+      ok: (value) => value,
+      err: () => undefined,
+    });
     return panic ? { kind: "panic", panic } : { kind: "ordinary", restoreCause: () => cause };
   };
 }
@@ -225,7 +254,9 @@ function checkedHandlerResult<TError extends AnyTaggedError>(
       payload.value !== undefined
     ) {
       return signalEventBusPanic(
-        new Panic({ message: "Event handler returned an incomplete Ok<void> Result" }),
+        new Panic({
+          message: "Event handler returned an incomplete Ok<void> Result",
+        }),
       );
     }
     return value;
@@ -242,7 +273,9 @@ function checkedHandlerResult<TError extends AnyTaggedError>(
       !("value" in error)
     ) {
       return signalEventBusPanic(
-        new Panic({ message: "Event handler returned an incomplete Err Result" }),
+        new Panic({
+          message: "Event handler returned an incomplete Err Result",
+        }),
       );
     }
     if (Panic.is(error.value)) return signalEventBusPanic(error.value);
@@ -256,14 +289,18 @@ function checkedHandlerResult<TError extends AnyTaggedError>(
       typeof error.value.message !== "string"
     ) {
       return signalEventBusPanic(
-        new Panic({ message: "Event handler returned an incomplete Err Result" }),
+        new Panic({
+          message: "Event handler returned an incomplete Err Result",
+        }),
       );
     }
     return value;
   }
 
   return signalEventBusPanic(
-    new Panic({ message: "Event handler returned a forged or malformed Result" }),
+    new Panic({
+      message: "Event handler returned a forged or malformed Result",
+    }),
   );
 }
 
@@ -287,10 +324,73 @@ export interface LilacBus {
     },
   ): Promise<
     ResultType<
-      { id: string; cursor: Cursor; topic: LilacTopicForType<TType> },
+      {
+        id: string;
+        cursor: Cursor;
+        topic: LilacTopicForType<TType>;
+        duplicate?: boolean;
+        replayDeadline?: number;
+      },
       EventPublishContractInvalid | EventPublishTransportFailed
     >
   >;
+
+  acquireRequestPublicationClaim(
+    requestDeliveryId: string,
+  ): Promise<
+    ResultType<
+      RequestPublicationClaimAcquisition,
+      EventRequestPublicationClaimUnsupported | EventRequestPublicationClaimFailed
+    >
+  >;
+
+  publishClaimedRequest(
+    data: LilacDataForType<typeof lilacEventTypes.CmdRequestMessage>,
+    claim: RequestPublicationClaim,
+    options?: {
+      headers?: Record<string, string> & Partial<LilacEnvelopeHeaders>;
+      topic?: LilacTopicForType<typeof lilacEventTypes.CmdRequestMessage>;
+      key?: string;
+    },
+  ): Promise<
+    ResultType<
+      {
+        id: string;
+        cursor: Cursor;
+        topic: LilacTopicForType<typeof lilacEventTypes.CmdRequestMessage>;
+        duplicate?: boolean;
+      },
+      | EventPublishContractInvalid
+      | EventPublishTransportFailed
+      | EventRequestPublicationClaimFenced
+      | EventRequestPublicationClaimUnsupported
+    >
+  >;
+
+  /** Confirm the recorded stream id under the exact live publication claim. */
+  confirmRequestPublication(
+    claim: RequestPublicationClaim,
+    expectedStreamId: string,
+  ): Promise<
+    ResultType<
+      RequestPublicationConfirmation,
+      EventRequestPublicationConfirmationUnsupported | EventRequestPublicationConfirmationFailed
+    >
+  >;
+
+  abandonRequestPublicationClaim(
+    claim: RequestPublicationClaim,
+  ): Promise<
+    ResultType<
+      RequestPublicationClaimAbandonment,
+      EventRequestPublicationClaimUnsupported | EventRequestPublicationClaimFailed
+    >
+  >;
+
+  /** Read the Redis-owned absolute replay expiry for a request output stream. */
+  getOutputStreamExpiry(
+    requestId: string,
+  ): Promise<ResultType<OutputStreamExpiry, EventOutputStreamExpiryUnavailable>>;
 
   subscribeTopic<TTopic extends LilacTopic, TError extends AnyTaggedError>(
     topic: TTopic,
@@ -317,7 +417,10 @@ export interface LilacBus {
   ): Promise<
     ResultType<
       {
-        messages: Array<{ msg: DecodedLilacMessageForTopic<TTopic>; cursor: Cursor }>;
+        messages: Array<{
+          msg: DecodedLilacMessageForTopic<TTopic>;
+          cursor: Cursor;
+        }>;
         next?: Cursor;
       },
       EventFetchContractInvalid | EventFetchTransportFailed
@@ -384,6 +487,28 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
         key = resolvedKey;
       }
 
+      const validated = decodeLilacMessage({
+        topic,
+        id: "publish-validation",
+        type,
+        ts: Date.now(),
+        key,
+        headers: options?.headers,
+        data,
+      });
+      const validationError = validated.match({
+        ok: () => undefined,
+        err: (error) => error,
+      });
+      if (validationError !== undefined) {
+        return Result.err(
+          new EventPublishContractInvalid({
+            eventType: type,
+            message: `publish(${type}) failed ${validationError.stage} validation`,
+          }),
+        );
+      }
+
       const published = settleLilacBusCapture(
         await Result.tryPromise({
           try: () =>
@@ -424,6 +549,218 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
       return Result.ok({ ...res, topic });
     },
 
+    acquireRequestPublicationClaim: async (requestDeliveryId) => {
+      const acquire = raw.acquireRequestPublicationClaim?.bind(raw);
+      if (acquire === undefined) {
+        return Result.err(
+          new EventRequestPublicationClaimUnsupported({
+            operation: "acquire",
+            message: "The configured raw bus does not support request publication claims",
+          }),
+        );
+      }
+      const captured = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () => acquire(requestDeliveryId),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const outcome = lilacBusOutcome(captured);
+      if (outcome.kind === "ok") return Result.ok(outcome.value);
+      if (outcome.error.kind === "panic") return signalEventBusPanic(outcome.error.panic);
+      return Result.err(
+        new EventRequestPublicationClaimFailed({
+          cause: outcome.error.restoreCause(),
+          operation: "acquire",
+          requestDeliveryId,
+          message: "Request publication claim acquisition failed",
+        }),
+      );
+    },
+
+    publishClaimedRequest: async (data, claim, options) => {
+      const type = lilacEventTypes.CmdRequestMessage;
+      if (data.requestDeliveryId !== claim.requestDeliveryId) {
+        return Result.err(
+          new EventPublishContractInvalid({
+            eventType: type,
+            message: "The request publication claim does not match data.requestDeliveryId",
+          }),
+        );
+      }
+      const topicResult = getTopicForType(type, options?.headers);
+      const topicOutcome = lilacBusOutcome(topicResult);
+      if (topicOutcome.kind === "error") return Result.err(topicOutcome.error);
+      const topic = options?.topic ?? topicOutcome.value;
+      const keyResult = getKeyForType(type, options?.headers, data);
+      const keyOutcome = lilacBusOutcome(keyResult);
+      if (keyOutcome.kind === "error") return Result.err(keyOutcome.error);
+      const key = options?.key ?? keyOutcome.value;
+      const validated = decodeLilacMessage({
+        topic,
+        id: "publish-validation",
+        type,
+        ts: Date.now(),
+        key,
+        headers: options?.headers,
+        data,
+      });
+      const validationError = validated.match({
+        ok: () => undefined,
+        err: (error) => error,
+      });
+      if (validationError !== undefined) {
+        return Result.err(
+          new EventPublishContractInvalid({
+            eventType: type,
+            message: `publishClaimedRequest failed ${validationError.stage} validation`,
+          }),
+        );
+      }
+      const publishClaimed = raw.publishClaimedRequest?.bind(raw);
+      if (publishClaimed === undefined) {
+        return Result.err(
+          new EventRequestPublicationClaimUnsupported({
+            operation: "publish",
+            message: "The configured raw bus does not support claimed request publication",
+          }),
+        );
+      }
+      const captured = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () =>
+            publishClaimed(
+              { topic, type, key, headers: options?.headers, data },
+              { topic, type, key, headers: options?.headers },
+              claim,
+            ),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const outcome = lilacBusOutcome(captured);
+      if (outcome.kind === "error") {
+        if (outcome.error.kind === "panic") return signalEventBusPanic(outcome.error.panic);
+        return Result.err(
+          new EventPublishTransportFailed({
+            cause: outcome.error.restoreCause(),
+            eventType: type,
+            topic,
+            message: "Claimed request publication failed",
+          }),
+        );
+      }
+      if (outcome.value.status === "fenced") {
+        return Result.err(
+          new EventRequestPublicationClaimFenced({
+            requestDeliveryId: claim.requestDeliveryId,
+            message: "The request publication claim is no longer live",
+          }),
+        );
+      }
+      return Result.ok({ ...outcome.value.receipt, topic });
+    },
+
+    confirmRequestPublication: async (claim, expectedStreamId) => {
+      if (raw.confirmRequestPublication === undefined) {
+        return Result.err(
+          new EventRequestPublicationConfirmationUnsupported({
+            message: "The configured raw bus does not support request publication confirmation",
+          }),
+        );
+      }
+      const confirmed = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () => raw.confirmRequestPublication!(claim, expectedStreamId),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const outcome = lilacBusOutcome(confirmed);
+      if (outcome.kind === "ok") return Result.ok(outcome.value);
+      if (outcome.error.kind === "panic") return signalEventBusPanic(outcome.error.panic);
+      return Result.err(
+        new EventRequestPublicationConfirmationFailed({
+          cause: outcome.error.restoreCause(),
+          requestDeliveryId: claim.requestDeliveryId,
+          expectedStreamId,
+          message: "Request publication confirmation failed",
+        }),
+      );
+    },
+
+    abandonRequestPublicationClaim: async (claim) => {
+      const abandon = raw.abandonRequestPublicationClaim?.bind(raw);
+      if (abandon === undefined) {
+        return Result.err(
+          new EventRequestPublicationClaimUnsupported({
+            operation: "abandon",
+            message:
+              "The configured raw bus does not support abandoning request publication claims",
+          }),
+        );
+      }
+      const captured = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () => abandon(claim),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const outcome = lilacBusOutcome(captured);
+      if (outcome.kind === "ok") return Result.ok(outcome.value);
+      if (outcome.error.kind === "panic") return signalEventBusPanic(outcome.error.panic);
+      return Result.err(
+        new EventRequestPublicationClaimFailed({
+          cause: outcome.error.restoreCause(),
+          operation: "abandon",
+          requestDeliveryId: claim.requestDeliveryId,
+          message: "Request publication claim abandon failed",
+        }),
+      );
+    },
+
+    getOutputStreamExpiry: async (requestId) => {
+      const topic = outReqTopic(requestId);
+      const readOutputStreamExpiry = raw.readOutputStreamExpiry?.bind(raw);
+      if (readOutputStreamExpiry === undefined) {
+        return Result.err(
+          new EventOutputStreamExpiryUnavailable({
+            reason: "unsupported",
+            requestId,
+            topic,
+            message: "The configured raw bus cannot read output stream expiry",
+          }),
+        );
+      }
+      const captured = settleLilacBusCapture(
+        await Result.tryPromise({
+          try: () => readOutputStreamExpiry(topic),
+          catch: captureLilacBusFailure,
+        }),
+      );
+      const outcome = lilacBusOutcome(captured);
+      if (outcome.kind === "error") {
+        if (outcome.error.kind === "panic") return signalEventBusPanic(outcome.error.panic);
+        return Result.err(
+          new EventOutputStreamExpiryUnavailable({
+            reason: "transport-unavailable",
+            requestId,
+            topic,
+            message: "Output stream expiry read failed",
+          }),
+        );
+      }
+      if (outcome.value.kind === "uncertain") {
+        return Result.err(
+          new EventOutputStreamExpiryUnavailable({
+            reason: "expiry-uncertain",
+            requestId,
+            topic,
+            message: "The output stream exists without an absolute expiry",
+          }),
+        );
+      }
+      return Result.ok(outcome.value);
+    },
+
     subscribeTopic: async <TTopic extends LilacTopic, TError extends AnyTaggedError>(
       topic: TTopic,
       opts: SubscriptionOptions,
@@ -458,7 +795,15 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
               ok: (decoded) => async () => {
                 const handled = checkedHandlerResult(await handler(decoded, context));
                 const continueHandled = handled.match<() => RawDeliveryAction>({
-                  ok: () => () => ({ disposition: "commit" }),
+                  ok: () => () => ({
+                    disposition: "commit",
+                    ...(options.postCommitObserver !== undefined && context.mode !== "tail"
+                      ? {
+                          observePostCommit: () =>
+                            options.postCommitObserver!.observe(decoded, context),
+                        }
+                      : {}),
+                  }),
                   err: (error) => () => {
                     const disposition = checkedDisposition(deliveryPolicy(error));
                     const formatted = formatTaggedErrorForLog(error);
@@ -493,7 +838,9 @@ export function createLilacBus(raw: RawBus, options: CreateLilacBusOptions = {})
           }
 
           if (contractError === undefined) {
-            throw new Panic({ message: "Event contract failure was not captured" });
+            throw new Panic({
+              message: "Event contract failure was not captured",
+            });
           }
           logContractInvalid(options.logger, topic, context.cursor, contractError);
           const disposition = applyEventDeliveryPolicy(contractError);

@@ -2,17 +2,17 @@ import { describe, expect, it } from "bun:test";
 import { Panic, type Result as ResultType } from "better-result";
 
 import {
-  CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V1,
-  buildCoreLineageManifestV1,
-  canonicalizeCoreLineageAtomV1,
-  computeCoreLineagePrefixDigestV1,
-  coreLineageManifestV1Schema,
-  createCorePrimaryLineageFreshOnlyV1,
-  decodeCorePrimaryLineageV1,
-  extendCoreLineagePrefixDigestV1,
+  CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V2,
+  buildCoreLineageManifestV2,
+  canonicalizeCoreLineageAtomV2,
+  computeCoreLineagePrefixDigestV2,
+  coreLineageManifestV2Schema,
+  createCorePrimaryLineageFreshOnlyV2,
+  decodeCorePrimaryLineageV2,
+  extendCoreLineagePrefixDigestV2,
   parseCmdRequestMessageData,
-  type CoreLineageAtomV1,
-  type CoreLineageManifestV1,
+  type CoreLineageAtomV2,
+  type CoreLineageManifestV2,
 } from "../index";
 
 function requireOk<TValue, TError>(result: ResultType<TValue, TError>): TValue {
@@ -45,7 +45,7 @@ const ATOMS = [
     requestId: "request-2",
     transcriptDigest: "33".repeat(32),
   },
-] as const satisfies readonly CoreLineageAtomV1[];
+] as const satisfies readonly CoreLineageAtomV2[];
 
 const MESSAGES = [
   { role: "user", content: "hello" },
@@ -55,16 +55,16 @@ const MESSAGES = [
 ] as const;
 
 const PREFIX_DIGESTS = [
-  "f539523f73602b1c24c7a27665d87778ff5a71c133780de2fd9d6ddc4bf3d28a",
-  "80ec83c7179813804bf1eddc3d5316a9e815e5fb9f7aae65c35ace25c542d5ec",
-  "664e1f9e57024688e2aafde001a30346b1e6ac0527809347cff43a2af15d7235",
-  "4d150080d79d04144a19b6a02d166e7f9fa11d3ea7d44776cbfe7b2038326752",
+  "d1c9999403b46d6217163706e86e95e61740d185997b67f7aa784691f4893772",
+  "a226c950ad75aa08593cea241058264a03bcf1b40b8949dbcf6a7c98859dd697",
+  "a19c48888fe8215407c10ed383b6310910c62c1615f7f928ea4ed13308762ef2",
+  "8d9819353cf5938c04d773778a4d19d68a8bdc7230e59087223c35e369a3fe90",
 ] as const;
 
-function manifestFixture(): CoreLineageManifestV1 {
-  return coreLineageManifestV1Schema.parse({
+function manifestFixture(): CoreLineageManifestV2 {
+  return coreLineageManifestV2Schema.parse({
     state: "complete",
-    lineageVersion: 1,
+    lineageVersion: 2,
     currentCanonicalStart: 3,
     segments: ATOMS.map((atom, index) => ({
       atoms: [atom],
@@ -91,30 +91,31 @@ function manifestFixture(): CoreLineageManifestV1 {
   });
 }
 
-describe("Core primary lineage v1", () => {
+describe("Core primary lineage v2", () => {
   it("uses stable canonical atoms and golden rolling SHA-256 digests", () => {
-    expect(CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V1).toBe(
-      "be2c6d557c38e467a191a1a8be0f941accdea02cda13fe833c294d803f4b3bd6",
+    expect(CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V2).toBe(
+      "f840749255afa84f08861d9e7de3f84a64aa6b0a82154cc6a12bf5ee33639496",
     );
-    expect(canonicalizeCoreLineageAtomV1(ATOMS[0])).toBe(
+    expect(canonicalizeCoreLineageAtomV2(ATOMS[0])).toBe(
       '{"kind":"surface","messageId":"message-1","requestClient":"discord","sessionId":"channel-1","surfaceId":"discord"}',
     );
 
-    let digest = CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V1;
+    let digest = CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V2;
     for (const [index, atom] of ATOMS.entries()) {
-      digest = requireOk(extendCoreLineagePrefixDigestV1(digest, index + 1, atom));
+      digest = requireOk(extendCoreLineagePrefixDigestV2(digest, index + 1, atom));
       expect(digest).toBe(PREFIX_DIGESTS[index]!);
     }
-    expect(computeCoreLineagePrefixDigestV1(ATOMS)).toBe(PREFIX_DIGESTS[3]);
+    expect(computeCoreLineagePrefixDigestV2(ATOMS)).toBe(PREFIX_DIGESTS[3]);
   });
 
   it("accepts complete contiguous segment boundaries aligned to request messages", () => {
     const manifest = manifestFixture();
-    const decoded = decodeCorePrimaryLineageV1(manifest, MESSAGES);
+    const decoded = decodeCorePrimaryLineageV2(manifest, MESSAGES);
     expect(decoded.status).toBe("ok");
     if (decoded.status === "ok") expect(decoded.value).toEqual(manifest);
     expect(
       parseCmdRequestMessageData({
+        requestDeliveryId: crypto.randomUUID(),
         queue: "prompt",
         messages: MESSAGES,
         corePrimaryLineage: manifest,
@@ -125,28 +126,28 @@ describe("Core primary lineage v1", () => {
   it("rejects non-canonical ranges, cumulative counts, and rolling digests", () => {
     const rangeGap = structuredClone(manifestFixture());
     rangeGap.segments[1]!.canonicalStart = 0;
-    expect(() => coreLineageManifestV1Schema.parse(rangeGap)).toThrow("canonicalStart");
+    expect(() => coreLineageManifestV2Schema.parse(rangeGap)).toThrow("canonicalStart");
 
     const incompleteRange = structuredClone(manifestFixture());
     incompleteRange.segments[2]!.canonicalEnd = 4;
-    expect(() => coreLineageManifestV1Schema.parse(incompleteRange)).toThrow("canonicalEnd");
+    expect(() => coreLineageManifestV2Schema.parse(incompleteRange)).toThrow("canonicalEnd");
 
     const staleCount = structuredClone(manifestFixture());
     staleCount.segments[3]!.cumulativeAtomCount = 3;
-    expect(() => coreLineageManifestV1Schema.parse(staleCount)).toThrow("cumulativeAtomCount");
+    expect(() => coreLineageManifestV2Schema.parse(staleCount)).toThrow("cumulativeAtomCount");
 
     const staleDigest = structuredClone(manifestFixture());
     staleDigest.segments[2]!.cumulativePrefixDigest = "00".repeat(32);
-    expect(() => coreLineageManifestV1Schema.parse(staleDigest)).toThrow(
+    expect(() => coreLineageManifestV2Schema.parse(staleDigest)).toThrow(
       "Cumulative prefix digest",
     );
   });
 
   it("rejects empty contracts and exact message misalignment", () => {
     expect(() =>
-      coreLineageManifestV1Schema.parse({
+      coreLineageManifestV2Schema.parse({
         state: "complete",
-        lineageVersion: 1,
+        lineageVersion: 2,
         currentCanonicalStart: 0,
         segments: [],
       }),
@@ -154,10 +155,10 @@ describe("Core primary lineage v1", () => {
 
     const emptyAtoms = structuredClone(manifestFixture());
     emptyAtoms.segments[0]!.atoms = [];
-    expect(() => coreLineageManifestV1Schema.parse(emptyAtoms)).toThrow();
+    expect(() => coreLineageManifestV2Schema.parse(emptyAtoms)).toThrow();
 
     expect(
-      decodeCorePrimaryLineageV1(manifestFixture(), [
+      decodeCorePrimaryLineageV2(manifestFixture(), [
         { role: "user", content: "edited" },
         ...MESSAGES.slice(1),
       ]).status,
@@ -165,19 +166,19 @@ describe("Core primary lineage v1", () => {
 
     const midSegmentBoundary = structuredClone(manifestFixture());
     midSegmentBoundary.currentCanonicalStart = 2.5;
-    expect(() => coreLineageManifestV1Schema.parse(midSegmentBoundary)).toThrow();
+    expect(() => coreLineageManifestV2Schema.parse(midSegmentBoundary)).toThrow();
   });
 
   it("requires exact segment variants and globally unique source claims", () => {
     const mixed = structuredClone(manifestFixture());
     mixed.segments[0]!.atoms.push(ATOMS[2]);
-    expect(() => coreLineageManifestV1Schema.parse(mixed)).toThrow(
+    expect(() => coreLineageManifestV2Schema.parse(mixed)).toThrow(
       "must contain only surface atoms",
     );
 
     const requestWithoutSource = structuredClone(manifestFixture());
     delete requestWithoutSource.segments[1]!.requestSource;
-    expect(() => coreLineageManifestV1Schema.parse(requestWithoutSource)).toThrow(
+    expect(() => coreLineageManifestV2Schema.parse(requestWithoutSource)).toThrow(
       "request output alias",
     );
 
@@ -192,7 +193,7 @@ describe("Core primary lineage v1", () => {
         },
       ],
     };
-    expect(() => coreLineageManifestV1Schema.parse(checkpointWithSource)).toThrow(
+    expect(() => coreLineageManifestV2Schema.parse(checkpointWithSource)).toThrow(
       "Only a request segment",
     );
 
@@ -203,21 +204,21 @@ describe("Core primary lineage v1", () => {
       sessionId: "channel-1",
       messageId: "message-1",
     };
-    expect(() => coreLineageManifestV1Schema.parse(duplicateSurface)).toThrow("already claimed");
+    expect(() => coreLineageManifestV2Schema.parse(duplicateSurface)).toThrow("already claimed");
   });
 
   it("requires malformed lineage to be replaced explicitly with fresh-only state", () => {
     const malformed = structuredClone(manifestFixture());
     malformed.segments[0]!.cumulativePrefixDigest = "ff".repeat(32);
-    expect(decodeCorePrimaryLineageV1(malformed, MESSAGES).status).toBe("error");
+    expect(decodeCorePrimaryLineageV2(malformed, MESSAGES).status).toBe("error");
 
-    const freshOnly = requireOk(createCorePrimaryLineageFreshOnlyV1("malformed-manifest"));
-    const decoded = decodeCorePrimaryLineageV1(freshOnly, MESSAGES);
+    const freshOnly = requireOk(createCorePrimaryLineageFreshOnlyV2("malformed-manifest"));
+    const decoded = decodeCorePrimaryLineageV2(freshOnly, MESSAGES);
     expect(decoded.status).toBe("ok");
     if (decoded.status === "ok") {
       expect(decoded.value).toEqual({
         state: "fresh-only",
-        lineageVersion: 1,
+        lineageVersion: 2,
         currentCanonicalStart: 0,
         reason: "malformed-manifest",
       });
@@ -225,21 +226,21 @@ describe("Core primary lineage v1", () => {
   });
 
   it("returns owned Results for invalid digest and constructor inputs", () => {
-    expect(extendCoreLineagePrefixDigestV1("invalid", 1, ATOMS[0]).status).toBe("error");
+    expect(extendCoreLineagePrefixDigestV2("invalid", 1, ATOMS[0]).status).toBe("error");
     expect(
-      extendCoreLineagePrefixDigestV1(CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V1, 0, ATOMS[0]).status,
+      extendCoreLineagePrefixDigestV2(CORE_PRIMARY_LINEAGE_INITIAL_DIGEST_V2, 0, ATOMS[0]).status,
     ).toBe("error");
-    expect(createCorePrimaryLineageFreshOnlyV1("").status).toBe("error");
-    expect(createCorePrimaryLineageFreshOnlyV1("valid", -1).status).toBe("error");
-    expect(buildCoreLineageManifestV1([]).status).toBe("error");
+    expect(createCorePrimaryLineageFreshOnlyV2("").status).toBe("error");
+    expect(createCorePrimaryLineageFreshOnlyV2("valid", -1).status).toBe("error");
+    expect(buildCoreLineageManifestV2([]).status).toBe("error");
     expect(
-      buildCoreLineageManifestV1([{ atoms: [ATOMS[2]], canonicalMessages: [MESSAGES[2]] }]).status,
+      buildCoreLineageManifestV2([{ atoms: [ATOMS[2]], canonicalMessages: [MESSAGES[2]] }]).status,
     ).toBe("ok");
   });
 
-  it("projects lineage mismatch into Result and command-schema issues", () => {
+  it("defers content-dependent request lineage mismatch until after blob resolution", () => {
     const editedMessages = [{ role: "user" as const, content: "edited" }, ...MESSAGES.slice(1)];
-    const decoded = decodeCorePrimaryLineageV1(manifestFixture(), editedMessages);
+    const decoded = decodeCorePrimaryLineageV2(manifestFixture(), editedMessages);
     expect(decoded.status).toBe("error");
     if (decoded.status === "error") {
       expect(decoded.error.issues).toContainEqual({
@@ -247,13 +248,54 @@ describe("Core primary lineage v1", () => {
         message: "Core primary lineage does not exactly align with canonical messages",
       });
     }
-    expect(() =>
+    expect(
       parseCmdRequestMessageData({
+        requestDeliveryId: crypto.randomUUID(),
         queue: "prompt",
         messages: editedMessages,
         corePrimaryLineage: manifestFixture(),
-      }),
-    ).toThrow("does not exactly align");
+      }).corePrimaryLineage,
+    ).toEqual(manifestFixture());
+  });
+
+  it("compares resolved blob content identity without object ownership or expiry", () => {
+    const atom = ATOMS[2];
+    const firstMessage = {
+      role: "user" as const,
+      content: [
+        {
+          type: "blob" as const,
+          blob: {
+            version: 1 as const,
+            objectId: `b1_${"11".repeat(16)}`,
+            sha256: "aa".repeat(32),
+            byteLength: 5,
+          },
+          mediaType: "text/plain",
+          filename: "note.txt",
+        },
+      ],
+    };
+    const lineage = requireOk(
+      buildCoreLineageManifestV2([{ atoms: [atom], canonicalMessages: [firstMessage] }]),
+    );
+    const independentOwner = {
+      ...firstMessage,
+      content: [
+        {
+          ...firstMessage.content[0]!,
+          blob: {
+            ...firstMessage.content[0]!.blob,
+            objectId: `b1_${"22".repeat(16)}`,
+            expiresAt: 9_999_999_999_999,
+          },
+        },
+      ],
+    };
+    expect(decodeCorePrimaryLineageV2(lineage, [independentOwner]).status).toBe("ok");
+
+    independentOwner.content[0]!.blob.sha256 = "bb".repeat(32);
+    expect(decodeCorePrimaryLineageV2(lineage, [independentOwner]).status).toBe("error");
   });
 
   it("maps ordinary decoder exceptions and preserves Panic at the exact boundary", () => {
@@ -262,7 +304,7 @@ describe("Core primary lineage v1", () => {
         throw new Error("ordinary getter failure");
       },
     });
-    const decoded = decodeCorePrimaryLineageV1(ordinaryFailure, MESSAGES);
+    const decoded = decodeCorePrimaryLineageV2(ordinaryFailure, MESSAGES);
     expect(decoded.status).toBe("error");
     if (decoded.status === "error") {
       expect(decoded.error.issues).toEqual([
@@ -277,7 +319,7 @@ describe("Core primary lineage v1", () => {
         throw proxy;
       },
     });
-    expect(decodeCorePrimaryLineageV1(revokedFailure, MESSAGES).status).toBe("error");
+    expect(decodeCorePrimaryLineageV2(revokedFailure, MESSAGES).status).toBe("error");
 
     const panic = new Panic({ message: "lineage invariant" });
     const panicFailure = Object.defineProperty({}, "state", {
@@ -285,6 +327,6 @@ describe("Core primary lineage v1", () => {
         throw panic;
       },
     });
-    expect(() => decodeCorePrimaryLineageV1(panicFailure, MESSAGES)).toThrow(panic);
+    expect(() => decodeCorePrimaryLineageV2(panicFailure, MESSAGES)).toThrow(panic);
   });
 });
