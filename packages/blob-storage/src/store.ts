@@ -8,6 +8,8 @@ import {
   blobRefV1Schema,
   type BlobCloseSummary,
   type BlobHandleV1,
+  type BlobLifecycleLogContext,
+  type BlobLifecycleLogger,
   type BlobMaintenanceSummary,
   type BlobRead,
   type BlobReadComplete,
@@ -139,6 +141,7 @@ type ActiveUpload = {
   readonly completion: Deferred<ResultType<BlobRefV1, BlobWriteError>>;
   readonly reservationCreated: Promise<ResultType<void, BlobAdapterFailure>>;
   phase: "reserving" | "uploading" | "completed" | "interrupted" | "deleted";
+  observedByteLength?: number;
   sink?: BlobSink;
   readyPublication?: Promise<ResultType<boolean, BlobAdapterFailure>>;
 };
@@ -222,16 +225,34 @@ function handleIssues(value: BlobRefV1 | BlobHandleV1): readonly string[] {
   return decoded.success ? [] : decoded.error.issues.map((issue) => issue.message);
 }
 
+function uploadFailureReason(error: BlobWriteError): BlobUploadFailed["reason"] | undefined {
+  if (error instanceof BlobUploadFailed) return error.reason;
+  if (error instanceof BlobOperationAndCleanupFailed && error.primary instanceof BlobUploadFailed) {
+    return error.primary.reason;
+  }
+  return undefined;
+}
+
 export class SupervisedBlobStore implements BlobStore {
   readonly #backend: BlobBackend;
+  readonly #logger?: BlobLifecycleLogger;
   readonly #active = new Map<string, ActiveUpload>();
   readonly #objectLocks = new Map<string, Promise<void>>();
   #closed = false;
   #closeResult?: Promise<ResultType<BlobCloseSummary, BlobCloseError>>;
   #completedUploads = 0;
 
-  constructor(backend: BlobBackend) {
+  constructor(backend: BlobBackend, logger?: BlobLifecycleLogger) {
     this.#backend = backend;
+    this.#logger = logger;
+  }
+
+  #debug(message: string, context: BlobLifecycleLogContext): void {
+    this.#logger?.debug(message, { adapter: this.#backend.kind, ...context });
+  }
+
+  #error(message: string, context: BlobLifecycleLogContext): void {
+    this.#logger?.error(message, { adapter: this.#backend.kind, ...context });
   }
 
   async startUpload(input: {
@@ -308,6 +329,14 @@ export class SupervisedBlobStore implements BlobStore {
       phase: "reserving",
     };
     this.#active.set(objectId, active);
+    this.#debug("blob upload reservation started", {
+      objectId,
+      retention: reservation.retention.kind,
+      ...(input.expectedByteLength === undefined
+        ? {}
+        : { expectedByteLength: input.expectedByteLength }),
+      expectedSha256: input.expectedSha256 !== undefined,
+    });
 
     const created = await reservationCreated;
     const outcome = created.match<ReadOutcome<void>>({
@@ -316,6 +345,10 @@ export class SupervisedBlobStore implements BlobStore {
     });
     if (!outcome.ok) {
       this.#active.delete(objectId);
+      this.#error("blob upload reservation failed", {
+        objectId,
+        durationMs: Date.now() - reservation.createdAt,
+      });
       return created.match<ResultType<BlobUpload, BlobUploadStartError>>({
         ok: () =>
           Result.err(
@@ -336,6 +369,10 @@ export class SupervisedBlobStore implements BlobStore {
 
     if (active.phase === "reserving") {
       active.phase = "uploading";
+      this.#debug("blob upload started", {
+        objectId,
+        durationMs: Date.now() - reservation.createdAt,
+      });
       void this.#superviseUpload(active);
     }
 
@@ -852,8 +889,37 @@ export class SupervisedBlobStore implements BlobStore {
       active.phase === "interrupted" ||
       active.phase === "deleted" ||
       active.phase === "completed"
-    )
+    ) {
+      this.#debug("blob upload settlement ignored", {
+        objectId: active.reservation.objectId,
+        phase: active.phase,
+        durationMs: Date.now() - active.reservation.createdAt,
+      });
       return;
+    }
+    if (settled.ok) {
+      this.#debug("blob upload completed", {
+        objectId: active.reservation.objectId,
+        byteLength: settled.value.byteLength,
+        retention: active.reservation.retention.kind,
+        durationMs: Date.now() - active.reservation.createdAt,
+      });
+    } else {
+      const failureReason = uploadFailureReason(settled.error);
+      this.#error("blob upload failed", {
+        objectId: active.reservation.objectId,
+        errorClass: settled.error.name,
+        errorMessage: settled.error.message,
+        ...(failureReason === undefined ? {} : { failureReason }),
+        ...(active.expectedByteLength === undefined
+          ? {}
+          : { expectedByteLength: active.expectedByteLength }),
+        ...(active.observedByteLength === undefined
+          ? {}
+          : { observedByteLength: active.observedByteLength }),
+        durationMs: Date.now() - active.reservation.createdAt,
+      });
+    }
     active.phase = settled.ok ? "completed" : active.phase;
     active.completion.resolve(settled.ok ? Result.ok(settled.value) : Result.err(settled.error));
     if (settled.ok) this.#completedUploads += 1;
@@ -872,6 +938,12 @@ export class SupervisedBlobStore implements BlobStore {
       err: (panic) => ({ kind: "panic", panic }),
     });
     if (outcome.kind === "complete") return;
+    this.#error("blob upload crashed", {
+      objectId: active.reservation.objectId,
+      errorClass: outcome.panic.name,
+      errorMessage: outcome.panic.message,
+      durationMs: Date.now() - active.reservation.createdAt,
+    });
     active.phase = "interrupted";
     active.abortController.abort();
     const fenced = await this.#persistDefectFence(active);
@@ -927,9 +999,19 @@ export class SupervisedBlobStore implements BlobStore {
       err: (failure) => ({ failure }),
     });
     if ("failure" in sinkOutcome) {
+      this.#error("blob upload sink open failed", {
+        objectId: active.reservation.objectId,
+        operation: sinkOutcome.failure.operation,
+        failureKind: sinkOutcome.failure.kind,
+        errorMessage: sinkOutcome.failure.message,
+      });
       return this.#recordUploadFailure(active, "write", sinkOutcome.failure);
     }
     active.sink = sinkOutcome.sink;
+    this.#debug("blob upload sink opened", {
+      objectId: active.reservation.objectId,
+      durationMs: Date.now() - active.reservation.createdAt,
+    });
     const hash = createHash("sha256");
     let byteLength = 0;
     const writeChunk = async (chunk: Uint8Array): Promise<ResultType<void, BlobWriteError>> => {
@@ -1005,6 +1087,12 @@ export class SupervisedBlobStore implements BlobStore {
       err: (failure) => ({ ok: false, failure }),
     });
     if (!finishOutcome.ok) {
+      this.#error("blob upload sink finish failed", {
+        objectId: active.reservation.objectId,
+        operation: finishOutcome.failure.operation,
+        failureKind: finishOutcome.failure.kind,
+        errorMessage: finishOutcome.failure.message,
+      });
       const aborted = await sinkOutcome.sink.abort();
       const cleanupFailure = aborted.match<BlobAdapterFailure | null>({
         ok: () => null,
@@ -1024,13 +1112,30 @@ export class SupervisedBlobStore implements BlobStore {
     }
 
     const sha256 = hash.digest("hex");
+    active.observedByteLength = byteLength;
+    this.#debug("blob upload source consumed", {
+      objectId: active.reservation.objectId,
+      byteLength,
+      durationMs: Date.now() - active.reservation.createdAt,
+    });
     if (active.expectedSha256 !== undefined && active.expectedSha256 !== sha256) {
+      this.#error("blob upload digest verification failed", {
+        objectId: active.reservation.objectId,
+        failureReason: "expected_sha256",
+        byteLength,
+      });
       await this.#backend.deleteKeys([
         temporaryKey(active.reservation.objectId, active.reservation.generation),
       ]);
       return this.#recordUploadFailure(active, "expected_sha256");
     }
     if (active.expectedByteLength !== undefined && active.expectedByteLength !== byteLength) {
+      this.#error("blob upload length verification failed", {
+        objectId: active.reservation.objectId,
+        failureReason: "expected_byte_length",
+        expectedByteLength: active.expectedByteLength,
+        observedByteLength: byteLength,
+      });
       await this.#backend.deleteKeys([
         temporaryKey(active.reservation.objectId, active.reservation.generation),
       ]);
@@ -1079,6 +1184,12 @@ export class SupervisedBlobStore implements BlobStore {
         err: (failure) => ({ ok: false, failure }),
       });
       if (!commitOutcome.ok) {
+        this.#error("blob upload content commit failed", {
+          objectId: active.reservation.objectId,
+          operation: commitOutcome.failure.operation,
+          failureKind: commitOutcome.failure.kind,
+          errorMessage: commitOutcome.failure.message,
+        });
         const cleaned = await this.#backend.deleteKeys([
           contentKey,
           metadataKey(contentKey),
@@ -1100,6 +1211,11 @@ export class SupervisedBlobStore implements BlobStore {
               }),
             );
       }
+      this.#debug("blob upload content committed", {
+        objectId: active.reservation.objectId,
+        byteLength,
+        durationMs: Date.now() - active.reservation.createdAt,
+      });
       const afterCommitPhase = this.#uploadPhase(active);
       if (afterCommitPhase === "interrupted" || afterCommitPhase === "deleted") {
         await this.#backend.deleteKeys([contentKey, metadataKey(contentKey)]);
@@ -1136,7 +1252,21 @@ export class SupervisedBlobStore implements BlobStore {
         ok: (applied) => ({ ok: true, applied }),
         err: (failure) => ({ ok: false, failure }),
       });
-      if (publishState.ok && publishState.applied) return Result.ok(ref);
+      if (publishState.ok && publishState.applied) {
+        this.#debug("blob upload reference published", {
+          objectId: active.reservation.objectId,
+          durationMs: Date.now() - active.reservation.createdAt,
+        });
+        return Result.ok(ref);
+      }
+      if (!publishState.ok) {
+        this.#error("blob upload reference publication failed", {
+          objectId: active.reservation.objectId,
+          operation: publishState.failure.operation,
+          failureKind: publishState.failure.kind,
+          errorMessage: publishState.failure.message,
+        });
+      }
       const cleaned = await this.#backend.deleteKeys([contentKey, metadataKey(contentKey)]);
       const cleanupFailure = cleaned.match<BlobAdapterFailure | null>({
         ok: () => null,

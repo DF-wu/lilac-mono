@@ -1351,6 +1351,14 @@ export async function createCoreRuntime(
     logLevel: opts.logLevel,
     module: "core-runtime",
   });
+  const blobStorageLogger = createLogger({
+    logLevel: opts.logLevel,
+    module: "blob-storage",
+  });
+  const requestDeliveryLogger = createLogger({
+    logLevel: opts.logLevel,
+    module: "request-delivery",
+  });
 
   const subscriptionPrefix = opts.subscriptionPrefix ?? "core";
   const cwd =
@@ -1403,6 +1411,7 @@ export async function createCoreRuntime(
   const createdBlobStore = await createCoreBlobStore({
     config: initialCoreConfig.blobStorage,
     dataDir: env.dataDir,
+    logger: blobStorageLogger,
   });
   const blobStoreCreation = createdBlobStore.match<
     | { readonly ok: true; readonly store: BlobStore }
@@ -1519,6 +1528,7 @@ export async function createCoreRuntime(
         return createCoreRequestDelivery({
           dbPath: path.join(env.dataDir, "request-delivery.db"),
           blobStore: blobStoreCreation.store,
+          logger: requestDeliveryLogger,
         });
       },
       catch: captureRuntimeError,

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   BlobIntegrityFailure,
   BlobResolveTimeout,
+  BlobUploadFailed,
   createMemoryBlobStore,
   materializeBlobRead,
   type BlobHandleV1,
@@ -103,12 +104,17 @@ function coordinator(input: {
   store: ReturnType<typeof createStore>;
   blobStore: Pick<BlobStore, "resolve" | "open" | "delete">;
   now?: () => number;
+  logger?: {
+    debug(message: string, context: Readonly<Record<string, string | number | boolean>>): void;
+    error(message: string, context: Readonly<Record<string, string | number | boolean>>): void;
+  };
 }) {
   return new RequestDeliveryCoordinator({
     store: input.store,
     blobStore: input.blobStore,
     admission: createCoreRequestDeliveryAdmission(input.blobStore),
     ...(input.now ? { now: input.now } : {}),
+    ...(input.logger ? { logger: input.logger } : {}),
   });
 }
 
@@ -918,7 +924,16 @@ describe("durable request delivery", () => {
         throw new Error(`Unexpected open for ${reference.objectId}`);
       },
     };
-    const delivery = coordinator({ store, blobStore: blobPort, now: () => 2 });
+    const errors: Array<{ message: string; context: Record<string, unknown> }> = [];
+    const delivery = coordinator({
+      store,
+      blobStore: blobPort,
+      now: () => 2,
+      logger: {
+        debug: () => undefined,
+        error: (message, context) => errors.push({ message, context }),
+      },
+    });
     const outcome = value(await delivery.handleDelivery(requestDeliveryId));
     expect(outcome).toEqual({ disposition: "commit", reason: "terminalized" });
     expect(observedTimeout).toBe(60_000);
@@ -928,6 +943,89 @@ describe("durable request delivery", () => {
       expect(terminal.outcome.kind).toBe("upload-timeout");
       expect(terminal.inputCleanupPending).toEqual([]);
     }
+    expect(errors).toEqual([
+      {
+        message: "request canceled after input blob upload failed",
+        context: {
+          requestDeliveryId,
+          requestId: "request-3",
+          objectId: handle.objectId,
+          outcome: "upload-timeout",
+          errorClass: "BlobResolveTimeout",
+          errorMessage: "controlled timeout",
+        },
+      },
+    ]);
+    store.close();
+  });
+
+  test("logs an error when upload failure cancels a request", async () => {
+    const store = createStore();
+    const requestDeliveryId = crypto.randomUUID();
+    const handle = {
+      version: 1,
+      objectId: "b1_22222222222222222222222222222222",
+    } as const;
+    const preparedEnvelope = envelope({
+      requestDeliveryId,
+      requestId: "request-upload-failed",
+      handle,
+    });
+    value(
+      store.prepare({
+        requestDeliveryId,
+        requestId: "request-upload-failed",
+        envelope: preparedEnvelope,
+        inputHandles: [handle],
+        createdAt: 1,
+      }),
+    );
+    const errors: Array<{ message: string; context: Record<string, unknown> }> = [];
+    const delivery = coordinator({
+      store,
+      blobStore: {
+        resolve: async () =>
+          Result.err(
+            new BlobUploadFailed({
+              objectId: handle.objectId,
+              reason: "expected_byte_length",
+              message: "controlled upload failure",
+            }),
+          ),
+        delete: async () => Result.ok("deleted"),
+        open: (reference) => {
+          throw new Error(`Unexpected open for ${reference.objectId}`);
+        },
+      },
+      now: () => 2,
+      logger: {
+        debug: () => undefined,
+        error: (message, context) => errors.push({ message, context }),
+      },
+    });
+
+    expect(value(await delivery.handleDelivery(requestDeliveryId))).toEqual({
+      disposition: "commit",
+      reason: "terminalized",
+    });
+    const terminal = value(store.load(requestDeliveryId));
+    expect(terminal).toMatchObject({
+      state: "terminal",
+      outcome: { kind: "upload-failed", code: "BlobUploadFailed" },
+    });
+    expect(errors).toEqual([
+      {
+        message: "request canceled after input blob upload failed",
+        context: {
+          requestDeliveryId,
+          requestId: "request-upload-failed",
+          objectId: handle.objectId,
+          outcome: "upload-failed",
+          errorClass: "BlobUploadFailed",
+          errorMessage: "controlled upload failure",
+        },
+      },
+    ]);
     store.close();
   });
 

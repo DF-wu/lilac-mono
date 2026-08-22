@@ -170,6 +170,62 @@ async function upload(store: BlobStore, bytes: Uint8Array, expiresAt?: number): 
 }
 
 describe("blob storage contract", () => {
+  test("logs successful and failed upload lifecycles", async () => {
+    const debug: Array<{ message: string; context: Record<string, unknown> }> = [];
+    const errors: Array<{ message: string; context: Record<string, unknown> }> = [];
+    const store = success(
+      await createMemoryBlobStore({
+        logger: {
+          debug: (message, context) => debug.push({ message, context }),
+          error: (message, context) => errors.push({ message, context }),
+        },
+      }),
+    );
+    const completed = success(
+      await store.startUpload({
+        source: new Uint8Array([1, 2, 3]),
+        retention: { kind: "durable" },
+      }),
+    );
+    success(await completed.completion);
+    const failed = success(
+      await store.startUpload({
+        source: new Uint8Array([1, 2, 3]),
+        retention: { kind: "durable" },
+        expectedByteLength: 4,
+      }),
+    );
+    expect(failure(await failed.completion)).toBeInstanceOf(BlobUploadFailed);
+
+    expect(debug.map((entry) => entry.message)).toEqual([
+      "blob upload reservation started",
+      "blob upload started",
+      "blob upload sink opened",
+      "blob upload source consumed",
+      "blob upload content committed",
+      "blob upload reference published",
+      "blob upload completed",
+      "blob upload reservation started",
+      "blob upload started",
+      "blob upload sink opened",
+      "blob upload source consumed",
+    ]);
+    expect(errors.map((entry) => entry.message)).toEqual([
+      "blob upload length verification failed",
+      "blob upload failed",
+    ]);
+    expect(errors[1]).toMatchObject({
+      message: "blob upload failed",
+      context: {
+        adapter: "memory",
+        errorClass: "BlobUploadFailed",
+        failureReason: "expected_byte_length",
+        expectedByteLength: 4,
+        observedByteLength: 3,
+      },
+    });
+  });
+
   test("returns a reservation while a streaming source remains pending", async () => {
     const store = await memoryStore();
     const controlled = controlledStream();

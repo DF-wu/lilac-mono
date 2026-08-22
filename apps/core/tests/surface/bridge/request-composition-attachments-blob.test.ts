@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+
 import { afterEach, describe, expect, it } from "bun:test";
 
 import { Result } from "better-result";
@@ -29,6 +31,12 @@ import type {
 } from "../../../src/surface/discord/discord-attachment";
 
 const originalFetch = globalThis.fetch;
+const PNG_BYTES = new Uint8Array(
+  Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  ),
+);
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -83,6 +91,7 @@ function createBlobStore(input: {
   const uploads: Array<{
     retention: BlobRetention;
     source: Uint8Array | ReadableStream<Uint8Array>;
+    expectedByteLength?: number;
     upload: BlobUpload;
     complete(ref: BlobRefV1): void;
   }> = [];
@@ -100,6 +109,9 @@ function createBlobStore(input: {
       uploads.push({
         retention: start.retention,
         source: start.source,
+        ...(start.expectedByteLength === undefined
+          ? {}
+          : { expectedByteLength: start.expectedByteLength }),
         upload,
         complete: (ref) => complete(Result.ok(ref)),
       });
@@ -313,6 +325,49 @@ describe("Discord request attachment blob composition", () => {
     });
   });
 
+  it("trusts downloaded bytes over conflicting Discord type and size metadata", async () => {
+    globalThis.fetch = (async () =>
+      new Response(PNG_BYTES, {
+        headers: { "content-type": "image/webp" },
+      })) as unknown as typeof fetch;
+    const cache = createCache();
+    const blobs = createBlobStore({});
+    const state = createDiscordAttachmentState({
+      blobStore: blobs.store,
+      attachmentCache: cache.access,
+    });
+    const parts: DiscordBusUserContentPart[] = [];
+
+    const appended = await appendDiscordAttachmentsToBusContent(
+      parts,
+      [
+        {
+          id: "a1",
+          url: "https://cdn.discordapp.com/attachments/1/2/image.png",
+          filename: "image.png",
+          mimeType: "image/webp",
+          size: PNG_BYTES.byteLength + 920,
+        },
+      ],
+      state,
+      { channelId: "c1", messageId: "m1" },
+    );
+
+    expect(appended.status).toBe("ok");
+    expect(parts).toEqual([
+      {
+        type: "blob",
+        blob: blobs.uploads[0]!.upload.handle,
+        mediaType: "image/png",
+        filename: "image.png",
+      },
+    ]);
+    expect(blobs.uploads.map((upload) => upload.expectedByteLength)).toEqual([
+      undefined,
+      undefined,
+    ]);
+  });
+
   it("stops a streaming attachment when observed bytes exceed a dishonest declared size", async () => {
     const oversized = new Uint8Array(25 * 1024 * 1024 + 1);
     globalThis.fetch = (async () => new Response(oversized)) as unknown as typeof fetch;
@@ -473,7 +528,9 @@ describe("Discord request attachment blob composition", () => {
 
   it("waits for a separate durable reference before returning projection content", async () => {
     globalThis.fetch = (async () =>
-      new Response(new Uint8Array([1, 2, 3, 4, 5]))) as unknown as typeof fetch;
+      new Response(PNG_BYTES, {
+        headers: { "content-type": "image/webp" },
+      })) as unknown as typeof fetch;
     const cache = createCache();
     const blobs = createBlobStore({});
     const state = createDiscordAttachmentState({
@@ -491,15 +548,15 @@ describe("Discord request attachment blob composition", () => {
           id: "a1",
           url: "https://cdn.discordapp.com/attachments/1/2/image.png",
           filename: "image.png",
-          mimeType: "image/png",
-          size: 5,
+          mimeType: "image/webp",
+          size: PNG_BYTES.byteLength + 920,
         },
       ],
       state,
       { channelId: "c1", messageId: "m1" },
     );
     while (blobs.uploads.length < 2) await Promise.resolve();
-    const storedRef = blobRef(30, { byteLength: 5 });
+    const storedRef = blobRef(30, { byteLength: PNG_BYTES.byteLength });
     blobs.uploads[1]!.complete(storedRef);
     const appended = await pending;
 

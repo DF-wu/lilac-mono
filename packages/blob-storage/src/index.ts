@@ -3,6 +3,8 @@ export {
   blobRefV1Schema,
   type BlobCloseSummary,
   type BlobHandleV1,
+  type BlobLifecycleLogContext,
+  type BlobLifecycleLogger,
   type BlobMaintenanceSummary,
   type BlobRead,
   type BlobReadComplete,

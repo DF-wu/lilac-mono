@@ -1,6 +1,7 @@
 import {
   createLocalBlobStore,
   createS3BlobStore,
+  type BlobLifecycleLogger,
   type BlobStore,
   type BlobStoreCreateError,
 } from "@stanley2058/lilac-blob-storage";
@@ -23,10 +24,12 @@ export async function createCoreBlobStore(input: {
   readonly config: BlobStorageConfig;
   readonly dataDir: string;
   readonly environment?: CoreBlobStoreEnvironment;
+  readonly logger?: BlobLifecycleLogger;
 }): Promise<ResultType<BlobStore, CoreBlobStoreCreateError>> {
   if (input.config.kind === "local") {
     return createLocalBlobStore({
       root: input.config.root ?? path.resolve(input.dataDir, "blobs"),
+      ...(input.logger ? { logger: input.logger } : {}),
     });
   }
 
@@ -70,5 +73,6 @@ export async function createCoreBlobStore(input: {
     secretAccessKey,
     ...(sessionToken ? { sessionToken } : {}),
     forcePathStyle: input.config.forcePathStyle,
+    ...(input.logger ? { logger: input.logger } : {}),
   });
 }

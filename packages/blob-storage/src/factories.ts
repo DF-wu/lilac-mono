@@ -4,7 +4,7 @@ import path from "node:path";
 import { Result, type Result as ResultType } from "better-result";
 
 import { captureAdapterOperation, LAYOUT_MARKER, signalRetainedBlobPanic } from "./backend";
-import type { BlobStore } from "./contracts";
+import type { BlobLifecycleLogger, BlobStore } from "./contracts";
 import {
   BlobAdapterFailure,
   BlobAdapterLayoutInvalid,
@@ -22,9 +22,12 @@ import { SupervisedBlobStore } from "./store";
 
 export type LocalBlobStoreOptions = {
   readonly root: string;
+  readonly logger?: BlobLifecycleLogger;
 };
 
-export type S3BlobStoreOptions = Omit<S3BackendOptions, "client" | "clientFactory" | "fetch">;
+export type S3BlobStoreOptions = Omit<S3BackendOptions, "client" | "clientFactory" | "fetch"> & {
+  readonly logger?: BlobLifecycleLogger;
+};
 
 export type BlobStorePreflight = {
   readonly status: "ready" | "absent";
@@ -38,7 +41,7 @@ export async function createLocalBlobStore(
     ok: async () => {
       const preflight = await preflightLocalBlobStore(options);
       return preflight.match<Promise<ResultType<BlobStore, BlobStoreCreateError>>>({
-        ok: async () => initializeBackend(new LocalBlobBackend(options.root)),
+        ok: async () => initializeBackend(new LocalBlobBackend(options.root), options.logger),
         err: async (error) => Result.err(error),
       });
     },
@@ -54,7 +57,10 @@ export async function createS3BlobStore(
     ok: async () => {
       const preflight = await preflightS3BlobStore(options);
       return preflight.match<Promise<ResultType<BlobStore, BlobStoreCreateError>>>({
-        ok: async () => initializeBackend(new S3BlobBackend(options)),
+        ok: async () => {
+          const { logger, ...backendOptions } = options;
+          return initializeBackend(new S3BlobBackend(backendOptions), logger);
+        },
         err: async (error) => Result.err(error),
       });
     },
@@ -62,10 +68,10 @@ export async function createS3BlobStore(
   });
 }
 
-export async function createMemoryBlobStore(): Promise<
-  ResultType<BlobStore, BlobStoreCreateError>
-> {
-  return initializeBackend(new MemoryBlobBackend());
+export async function createMemoryBlobStore(options?: {
+  readonly logger?: BlobLifecycleLogger;
+}): Promise<ResultType<BlobStore, BlobStoreCreateError>> {
+  return initializeBackend(new MemoryBlobBackend(), options?.logger);
 }
 
 export async function preflightLocalBlobStore(
@@ -257,9 +263,10 @@ export async function preflightS3BlobStore(
 
 async function initializeBackend(
   backend: LocalBlobBackend | S3BlobBackend | MemoryBlobBackend,
+  logger?: BlobLifecycleLogger,
 ): Promise<ResultType<BlobStore, BlobStoreCreateError>> {
   const initialized = await backend.initialize({ createIfMissing: true });
-  return initialized.map(() => new SupervisedBlobStore(backend));
+  return initialized.map(() => new SupervisedBlobStore(backend, logger));
 }
 
 function validateLocalOptions(

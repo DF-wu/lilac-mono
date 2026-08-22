@@ -39,6 +39,15 @@ export type BlobRetention =
 
 export type BlobSource = Uint8Array | ReadableStream<Uint8Array>;
 
+export type BlobLifecycleLogContext = Readonly<
+  Record<string, string | number | boolean | undefined>
+>;
+
+export type BlobLifecycleLogger = {
+  debug(message: string, context: BlobLifecycleLogContext): void;
+  error(message: string, context: BlobLifecycleLogContext): void;
+};
+
 export type BlobReadComplete = {
   readonly sha256: string;
   readonly byteLength: number;

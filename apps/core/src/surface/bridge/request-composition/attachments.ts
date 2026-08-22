@@ -4,7 +4,7 @@ import { Buffer } from "node:buffer";
 
 import type { UserContent } from "ai";
 import type { Result as ResultType } from "better-result";
-import { fileTypeFromBuffer } from "file-type";
+import { fileTypeFromBuffer, fileTypeStream } from "file-type";
 import type {
   BlobDeleteError,
   BlobHandleV1,
@@ -1221,6 +1221,7 @@ async function loadAttachmentBytes(input: {
 > {
   const cached = await readVerifiedCacheBytes(input);
   if (cached) {
+    const detected = await fileTypeFromBuffer(Buffer.from(cached));
     const accounted = accountDownloadedBytes({
       state: input.state,
       attachment: input.attachment,
@@ -1229,7 +1230,7 @@ async function loadAttachmentBytes(input: {
     });
     return accounted.map(() => ({
       bytes: cached,
-      contentType: input.attachment.mimeType,
+      contentType: normalizeMimeType(detected?.mime ?? input.attachment.mimeType),
     }));
   }
 
@@ -1298,6 +1299,19 @@ async function appendKnownBlobAttachment(input: {
 }): Promise<ResultType<void, DiscordAttachmentPreparationFailed>> {
   const cached = await readVerifiedCacheBytes(input);
   if (cached) {
+    const detected = await fileTypeFromBuffer(Buffer.from(cached));
+    const cachedMediaType = normalizeMimeType(detected?.mime ?? input.mediaType);
+    if (
+      !cachedMediaType ||
+      (!isImageMimeType(cachedMediaType) && !isPdfMimeType(cachedMediaType))
+    ) {
+      return Result.err(
+        attachmentPreparationError(
+          input.attachment,
+          `Cached attachment type '${cachedMediaType ?? "unknown"}' is not supported as direct media`,
+        ),
+      );
+    }
     const accounted = accountDownloadedBytes({
       state: input.state,
       attachment: input.attachment,
@@ -1321,7 +1335,7 @@ async function appendKnownBlobAttachment(input: {
       input.parts.push({
         type: "blob",
         blob: handle,
-        mediaType: input.mediaType,
+        mediaType: cachedMediaType,
         ...(input.attachment.filename ? { filename: input.attachment.filename } : {}),
       });
     });
@@ -1346,7 +1360,10 @@ async function appendKnownBlobAttachment(input: {
       });
       if (!response.ok) throw new Error(`Failed to download attachment (${response.status})`);
       if (!response.body) throw new Error("Discord attachment response has no body");
-      return { body: response.body };
+      return {
+        body: response.body,
+        responseMimeType: normalizeMimeType(response.headers.get("content-type") ?? undefined),
+      };
     },
     catch: captureError,
   });
@@ -1369,10 +1386,49 @@ async function appendKnownBlobAttachment(input: {
       ),
     );
   }
+  const [inspectionSource, downloadedStream] = responseAttempt.value.body.tee();
+  const detectedType = await Result.tryPromise({
+    try: async () => {
+      const inspected = await fileTypeStream(inspectionSource);
+      void inspected.cancel();
+      return inspected.fileType;
+    },
+    catch: captureError,
+  });
+  const detectionError = detectedType.match({
+    ok: () => null,
+    err: (error) => error,
+  });
+  if (detectionError) {
+    void downloadedStream.cancel();
+    return Result.err(
+      attachmentPreparationError(
+        input.attachment,
+        `Failed to inspect downloaded attachment type: ${detectionError.cause.message}`,
+      ),
+    );
+  }
+  const downloadedMediaType = normalizeMimeType(
+    detectedType.match({ ok: (detected) => detected?.mime, err: () => undefined }) ??
+      responseAttempt.value.responseMimeType ??
+      input.mediaType,
+  );
+  if (
+    !downloadedMediaType ||
+    (!isImageMimeType(downloadedMediaType) && !isPdfMimeType(downloadedMediaType))
+  ) {
+    void downloadedStream.cancel();
+    return Result.err(
+      attachmentPreparationError(
+        input.attachment,
+        `Downloaded attachment type '${downloadedMediaType ?? "unknown"}' is not supported as direct media`,
+      ),
+    );
+  }
   const limitedSource = limitDiscordAttachmentStream({
     state: input.state,
     attachment: input.attachment,
-    source: responseAttempt.value.body,
+    source: downloadedStream,
   });
   const [requestSource, cacheSource] = input.state.attachmentCache
     ? limitedSource.tee()
@@ -1381,7 +1437,6 @@ async function appendKnownBlobAttachment(input: {
     state: input.state,
     metadata: input.attachment,
     source: requestSource,
-    ...(expectedByteLength !== undefined ? { expectedByteLength } : {}),
   });
   const handle = requestUpload.match({ ok: (value) => value, err: () => null });
   if (!handle) {
@@ -1393,13 +1448,12 @@ async function appendKnownBlobAttachment(input: {
       state: input.state,
       key: input.key,
       source: cacheSource,
-      ...(expectedByteLength !== undefined ? { expectedByteLength } : {}),
     });
   }
   input.parts.push({
     type: "blob",
     blob: handle,
-    mediaType: input.mediaType,
+    mediaType: downloadedMediaType,
     ...(input.attachment.filename ? { filename: input.attachment.filename } : {}),
   });
   return Result.ok(undefined);
@@ -1466,13 +1520,11 @@ export async function appendDiscordAttachmentsToBusContent(
     if (loadError) return Result.err(loadError);
     const value = loaded.match({ ok: (bytes) => bytes, err: () => null });
     if (!value) continue;
-    const detected = declaredMimeType
-      ? undefined
-      : await fileTypeFromBuffer(Buffer.from(value.bytes));
+    const detected = await fileTypeFromBuffer(Buffer.from(value.bytes));
     const mediaType =
-      declaredMimeType ??
       detected?.mime ??
       value.contentType ??
+      declaredMimeType ??
       inferredMimeType ??
       "application/octet-stream";
 
@@ -1571,13 +1623,11 @@ export async function appendDiscordAttachmentsToStoredContent(
     if (loadError) return Result.err(loadError);
     const value = loaded.match({ ok: (bytes) => bytes, err: () => null });
     if (!value) continue;
-    const detected = declaredMimeType
-      ? undefined
-      : await fileTypeFromBuffer(Buffer.from(value.bytes));
+    const detected = await fileTypeFromBuffer(Buffer.from(value.bytes));
     const mediaType =
-      declaredMimeType ??
       detected?.mime ??
       value.contentType ??
+      declaredMimeType ??
       inferredMimeType ??
       "application/octet-stream";
 

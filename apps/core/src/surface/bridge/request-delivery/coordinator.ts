@@ -53,6 +53,12 @@ export type RequestDeliveryCoordinatorOptions<TEnvelope, TWork, TOutputMetadata>
   readonly admission: RequestDeliveryAdmission<TEnvelope, TWork>;
   readonly now?: () => number;
   readonly isResolveTimeout?: (error: BlobResolveError) => boolean;
+  readonly logger?: RequestDeliveryLogger;
+};
+
+export type RequestDeliveryLogger = {
+  debug(message: string, context: Readonly<Record<string, string | number | boolean>>): void;
+  error(message: string, context: Readonly<Record<string, string | number | boolean>>): void;
 };
 
 function taggedErrorName(error: Error): string {
@@ -73,6 +79,7 @@ export class RequestDeliveryCoordinator<
   readonly #admission: RequestDeliveryAdmission<TEnvelope, TWork>;
   readonly #now: () => number;
   readonly #isResolveTimeout: (error: BlobResolveError) => boolean;
+  readonly #logger?: RequestDeliveryLogger;
 
   constructor(options: RequestDeliveryCoordinatorOptions<TEnvelope, TWork, TOutputMetadata>) {
     this.#store = options.store;
@@ -80,6 +87,7 @@ export class RequestDeliveryCoordinator<
     this.#admission = options.admission;
     this.#now = options.now ?? Date.now;
     this.#isResolveTimeout = options.isResolveTimeout ?? defaultIsResolveTimeout;
+    this.#logger = options.logger;
   }
 
   async prepareAndPublish(
@@ -694,6 +702,14 @@ export class RequestDeliveryCoordinator<
         const kind = this.#isResolveTimeout(error.resolutionError)
           ? "upload-timeout"
           : "upload-failed";
+        this.#logger?.error("request canceled after input blob upload failed", {
+          requestDeliveryId: record.requestDeliveryId,
+          requestId: record.requestId,
+          objectId: error.objectId,
+          outcome: kind,
+          errorClass: taggedErrorName(error.resolutionError),
+          errorMessage: error.resolutionError.message,
+        });
         const terminalized = await this.terminalize({
           requestDeliveryId: record.requestDeliveryId,
           outcome: { kind, code: taggedErrorName(error.resolutionError) },
@@ -709,6 +725,11 @@ export class RequestDeliveryCoordinator<
         });
       },
       ok: (inputReferences) => async () => {
+        this.#logger?.debug("request input blobs resolved", {
+          requestDeliveryId: record.requestDeliveryId,
+          requestId: record.requestId,
+          inputBlobCount: inputReferences.length,
+        });
         const admitted = await this.#admission.validateAndBuildWork({
           requestDeliveryId: record.requestDeliveryId,
           requestId: record.requestId,

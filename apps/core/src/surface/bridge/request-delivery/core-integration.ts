@@ -32,6 +32,7 @@ import { verifyStoredBlobReferencesV1 } from "../../../transcript/stored-message
 import type { RequestDeliveryCodecs } from "./sqlite-store";
 import { SqliteRequestDeliveryStore } from "./sqlite-store";
 import { RequestDeliveryCoordinator } from "./coordinator";
+import type { RequestDeliveryLogger } from "./coordinator";
 import {
   RequestDeliveryAdmissionRejected,
   type RequestDeliveryAdmission,
@@ -485,6 +486,7 @@ export function createCoreRequestDelivery(input: {
   readonly dbPath: string;
   readonly blobStore: Pick<BlobStore, "resolve" | "open" | "delete">;
   readonly now?: () => number;
+  readonly logger?: RequestDeliveryLogger;
 }) {
   const store = new SqliteRequestDeliveryStore({
     dbPath: input.dbPath,
@@ -495,6 +497,7 @@ export function createCoreRequestDelivery(input: {
     blobStore: input.blobStore,
     admission: createCoreRequestDeliveryAdmission(input.blobStore),
     ...(input.now ? { now: input.now } : {}),
+    ...(input.logger ? { logger: input.logger } : {}),
   });
   return { store, coordinator } as const;
 }
