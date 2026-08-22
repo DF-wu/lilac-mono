@@ -199,6 +199,8 @@ const REQUIRED_SCHEMA5_INDEXES = [
   "idx_core_primary_claude_attempts_owner",
 ] as const;
 
+// These digests describe SQLite's schema text after the deployed migrations ran in order. In
+// particular, ALTER TABLE preserves historical text that differs from a freshly created final table.
 const LEGACY_TRANSCRIPT_SCHEMA5_OBJECT_CATALOG = [
   {
     type: "index",
@@ -237,22 +239,46 @@ const LEGACY_TRANSCRIPT_SCHEMA5_OBJECT_CATALOG = [
     sqlSha256: "75f70cb3068b69742137ec780804d19bc7a8481e3165504a9ddedc8a01a00411",
   },
   {
+    type: "index",
+    name: "idx_request_transcripts_client_session",
+    tableName: "request_transcripts",
+    sqlSha256: "4783e8f02f7e642f1501781e01e033a190533281bfddeec28317af3f89653817",
+  },
+  {
+    type: "index",
+    name: "idx_request_transcripts_session",
+    tableName: "request_transcripts",
+    sqlSha256: "aab740ebce435ef43cdb39429b0df75a9568c976f03c378bf0a3c1bd0415f657",
+  },
+  {
+    type: "index",
+    name: "idx_session_loaded_tools_session",
+    tableName: "session_loaded_tools",
+    sqlSha256: "6814f266eb42ffe26df9e0aed35aedcf38b95de7de028bc38cd6facd51d658e8",
+  },
+  {
+    type: "index",
+    name: "idx_surface_message_to_request_request",
+    tableName: "surface_message_to_request",
+    sqlSha256: "09d7d5f09e024b6994e202ae5da0a7142fba4a1a546190dabf0a2f99f5e7b475",
+  },
+  {
     type: "table",
     name: "core_lineage_projection_refs",
     tableName: "core_lineage_projection_refs",
-    sqlSha256: "8b9456a3f2f8b8681c45ad3906124e97975821e99a2149d19519f55cee2b6afe",
+    sqlSha256: "81b983521050164301b01557e1b94627148664eea66688c96e55fda3a5e63b64",
   },
   {
     type: "table",
     name: "core_lineage_request_alias_refs",
     tableName: "core_lineage_request_alias_refs",
-    sqlSha256: "31157021b567bc1e8b0f618a98917b110f30d5b408c7bae59f7c10b472aac546",
+    sqlSha256: "db1ec323085ffa4420f457c91b6014fd53a6f6138b4ae8779016277bb7b4c635",
   },
   {
     type: "table",
     name: "core_lineage_request_refs",
     tableName: "core_lineage_request_refs",
-    sqlSha256: "8c3d694a145d151aee9809334b896640b0f66a9d5acf651d39dd53e1ae215fcb",
+    sqlSha256: "da7303512645625b1b89e423fcaa0fd26dd8022ea59e18c97725e41b10ad6c88",
   },
   {
     type: "table",
@@ -270,7 +296,7 @@ const LEGACY_TRANSCRIPT_SCHEMA5_OBJECT_CATALOG = [
     type: "table",
     name: "core_owned_blobs",
     tableName: "core_owned_blobs",
-    sqlSha256: "ada09f8286a21440b4a10a1de019db30c114701b7373849839a6dac3304d25c6",
+    sqlSha256: "03dfa8a79f7e3aae7aca363be358c01437abed5bf37bb7e407f07a72ce98a1a1",
   },
   {
     type: "table",
@@ -288,25 +314,37 @@ const LEGACY_TRANSCRIPT_SCHEMA5_OBJECT_CATALOG = [
     type: "table",
     name: "core_primary_lineage_manifests",
     tableName: "core_primary_lineage_manifests",
-    sqlSha256: "6fb72f59e91e517d5511c38cadecd976e1783d5949e62f647d298d54af43a6da",
+    sqlSha256: "f743c544c27330112ae71c71db4d2a5d485be8a297cfc9c147cb1ac9498dcf46",
   },
   {
     type: "table",
     name: "core_surface_projection_blobs",
     tableName: "core_surface_projection_blobs",
-    sqlSha256: "4c0fd0b3405352b964b5b47da673c3fcf276d7bfb826d5a85809909e9d4a078a",
+    sqlSha256: "f19e225b81c716b69d3b57dcdc97007c063781014a1a68ab43c0323cc5d974d4",
   },
   {
     type: "table",
     name: "core_surface_projections",
     tableName: "core_surface_projections",
-    sqlSha256: "15f401b925bf148d1bca1c337c65b486d7211937c85036dc049e74535737f171",
+    sqlSha256: "0cb33474df66022cf4b8538d25fb8326179eabc5fc866eaabe086c5f8f51a252",
   },
   {
     type: "table",
     name: "request_transcripts",
     tableName: "request_transcripts",
-    sqlSha256: "87eae97bf8615825a519462454f9a5c0b119dddb84c218864fb721bdf5aafffb",
+    sqlSha256: "9835c3beebc57b64028229cb03d244dd0098ceb0ced14e0b3c73be4fec8feb3d",
+  },
+  {
+    type: "table",
+    name: "session_loaded_tools",
+    tableName: "session_loaded_tools",
+    sqlSha256: "285e6b7f02e59bd85d48084cac43c24ecd40a5e33813c8b323f3e8dbc06c3d43",
+  },
+  {
+    type: "table",
+    name: "surface_message_to_request",
+    tableName: "surface_message_to_request",
+    sqlSha256: "2ef5eb095f4998ac1c7f35ede497ec80a57d5f71038f4ca2a79c5c48355f82b3",
   },
   {
     type: "table",

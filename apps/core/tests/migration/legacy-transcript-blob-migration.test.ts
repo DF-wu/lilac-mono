@@ -111,7 +111,7 @@ function legacyTerminalPrefixDigest(input: {
 }
 
 describe("legacy transcript blob migration", () => {
-  it("preflights exact schema-5 BLOB, base64, and SuperJSON byte sources read-only", async () => {
+  it("preflights the production-evolved schema-5 and all durable byte sources read-only", async () => {
     const dbPath = await schema5Fixture();
     using database = new Database(dbPath, { strict: true });
     const transcriptMessages = [
