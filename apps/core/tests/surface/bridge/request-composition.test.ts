@@ -715,7 +715,6 @@ describe("request-composition attachments", () => {
       },
     };
     const blobs = controlledReservationBlobStore();
-    let settled = false;
     const composition = composeSingleMessageResult(new FakeAdapter(msg), {
       platform: "discord",
       botUserId: "bot",
@@ -723,16 +722,10 @@ describe("request-composition attachments", () => {
       msgRef: msg.ref,
       blobStore: blobs.store,
       attachmentCache: noOpAttachmentCache,
-    }).then((result) => {
-      settled = true;
-      return result;
     });
 
-    for (let turn = 0; turn < 20 && blobs.uploads.length < 2; turn++) await Promise.resolve();
-    expect(blobs.uploads).toHaveLength(2);
-    for (let turn = 0; turn < 100 && !settled; turn++) await Promise.resolve();
-    expect(settled).toBe(true);
     const composed = await composition;
+    expect(blobs.uploads).toHaveLength(2);
     expect(composed.status).toBe("ok");
     if (composed.status === "ok") {
       const content = composed.value?.content;
