@@ -58,6 +58,13 @@ const LEGACY_WORKFLOW_MIGRATION_LEDGER = [
 
 type LegacyWorkflowSchemaObjectType = "index" | "table" | "trigger";
 
+type LegacyWorkflowSchemaCatalogEntry = {
+  readonly type: LegacyWorkflowSchemaObjectType;
+  readonly name: string;
+  readonly tableName: string;
+  readonly sqlSha256: string;
+};
+
 const LEGACY_WORKFLOW_SCHEMA_25_OBJECT_CATALOG = [
   {
     type: "index",
@@ -311,12 +318,56 @@ const LEGACY_WORKFLOW_SCHEMA_25_OBJECT_CATALOG = [
     tableName: "workflow_runs",
     sqlSha256: "e84e8c03737eb071380285904665f09effee4bde8394d432dac39a65cbc88ff0",
   },
-] as const satisfies readonly {
-  readonly type: LegacyWorkflowSchemaObjectType;
-  readonly name: string;
-  readonly tableName: string;
-  readonly sqlSha256: string;
-}[];
+] as const satisfies readonly LegacyWorkflowSchemaCatalogEntry[];
+
+// The pre-unified WorkflowDefinitionV2/V3 runtime used the same SQLite database. Its two tables and
+// three indexes are documented as inert state that may remain on disk after the runtime clean break.
+const LEGACY_INERT_WORKFLOW_OBJECT_CATALOG = [
+  {
+    type: "index",
+    name: "idx_workflow_tasks_discord_wait",
+    tableName: "workflow_tasks",
+    sqlSha256: "c361bad8486d755ef7242b088e90e99ec48f0904ae8fe1d80fba682c013591f6",
+  },
+  {
+    type: "index",
+    name: "idx_workflow_tasks_timeout",
+    tableName: "workflow_tasks",
+    sqlSha256: "70dd34cd4a68f336304f47f435473ff17e5affd1505bc042e73c40249ffe2799",
+  },
+  {
+    type: "index",
+    name: "idx_workflow_tasks_wid_state",
+    tableName: "workflow_tasks",
+    sqlSha256: "1a084d0a882b17ec0430642b1b7080b703a3a9cd72f25a6610c62cd50dd5a667",
+  },
+  {
+    type: "table",
+    name: "workflow_tasks",
+    tableName: "workflow_tasks",
+    sqlSha256: "697df90827654ec2616711e4db035708a66b3211ce1816a3afcb9f3a4023e516",
+  },
+  {
+    type: "table",
+    name: "workflows",
+    tableName: "workflows",
+    sqlSha256: "c55b5faf88eefc6dfadd8245ada1d18ffac652306a851aff159d6379510a330a",
+  },
+] as const satisfies readonly LegacyWorkflowSchemaCatalogEntry[];
+
+const LEGACY_WORKFLOW_SCHEMA_25_OBJECT_CATALOGS: readonly (readonly LegacyWorkflowSchemaCatalogEntry[])[] =
+  [
+    LEGACY_WORKFLOW_SCHEMA_25_OBJECT_CATALOG,
+    [...LEGACY_WORKFLOW_SCHEMA_25_OBJECT_CATALOG, ...LEGACY_INERT_WORKFLOW_OBJECT_CATALOG].sort(
+      (left, right) => {
+        const leftKey = `${left.type}:${left.name}`;
+        const rightKey = `${right.type}:${right.name}`;
+        if (leftKey < rightKey) return -1;
+        if (leftKey > rightKey) return 1;
+        return 0;
+      },
+    ),
+  ];
 
 type WorkflowArtifactSurface = "revision" | "run" | "operation" | "receipt";
 type WorkflowArtifactKind = "source" | "value";
@@ -458,6 +509,29 @@ function migrationFailureFromCaptured(input: {
   });
 }
 
+function matchesSchema25Catalog(
+  actual: readonly {
+    readonly type: string;
+    readonly name: string;
+    readonly tbl_name: string;
+    readonly sql: string | null;
+  }[],
+  expected: readonly LegacyWorkflowSchemaCatalogEntry[],
+): boolean {
+  if (actual.length !== expected.length) return false;
+  return actual.every((object, index) => {
+    const expectedObject = expected[index];
+    return (
+      expectedObject !== undefined &&
+      object.type === expectedObject.type &&
+      object.name === expectedObject.name &&
+      object.tbl_name === expectedObject.tableName &&
+      object.sql !== null &&
+      sha256(object.sql.replace(/\s+/g, " ").trim()) === expectedObject.sqlSha256
+    );
+  });
+}
+
 function inspectLegacyDatabase(
   dbPath: string,
 ): ResultType<readonly LegacyWorkflowArtifactRow[], LegacyWorkflowBlobMigrationFailed> {
@@ -537,28 +611,16 @@ function inspectLegacyDatabase(
            ORDER BY type, name`,
         )
         .all();
-      if (schemaObjects.length !== LEGACY_WORKFLOW_SCHEMA_25_OBJECT_CATALOG.length) {
+      if (
+        !LEGACY_WORKFLOW_SCHEMA_25_OBJECT_CATALOGS.some((catalog) =>
+          matchesSchema25Catalog(schemaObjects, catalog),
+        )
+      ) {
         throw failure({
           source: "schema",
           code: "schema-25-catalog-mismatch",
           message: "Workflow schema 25 object catalog does not match the supported contract",
         });
-      }
-      for (const [index, expected] of LEGACY_WORKFLOW_SCHEMA_25_OBJECT_CATALOG.entries()) {
-        const actual = schemaObjects[index];
-        if (
-          actual?.type !== expected.type ||
-          actual.name !== expected.name ||
-          actual.tbl_name !== expected.tableName ||
-          actual.sql === null ||
-          sha256(actual.sql.replace(/\s+/g, " ").trim()) !== expected.sqlSha256
-        ) {
-          throw failure({
-            source: "schema",
-            code: "schema-25-catalog-mismatch",
-            message: "Workflow schema 25 object catalog does not match the supported contract",
-          });
-        }
       }
       const foreignKeyFailure = db
         .query<Record<string, unknown>, []>("PRAGMA foreign_key_check")

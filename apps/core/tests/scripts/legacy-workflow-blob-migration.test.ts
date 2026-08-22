@@ -21,7 +21,76 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
 });
 
-async function legacyFixture(): Promise<{
+function installInertLegacyWorkflowState(db: Database): void {
+  db.exec(`
+    CREATE TABLE workflows (
+      workflow_id TEXT PRIMARY KEY,
+      state TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      resolved_at INTEGER,
+      resume_published_at INTEGER,
+      definition_json TEXT NOT NULL,
+      resume_seq INTEGER NOT NULL
+    );
+    CREATE TABLE workflow_tasks (
+      workflow_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      description TEXT NOT NULL,
+      state TEXT NOT NULL,
+      input_json TEXT,
+      result_json TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      resolved_at INTEGER,
+      resolved_by TEXT,
+      discord_channel_id TEXT,
+      discord_message_id TEXT,
+      discord_from_user_id TEXT,
+      timeout_at INTEGER,
+
+      PRIMARY KEY (workflow_id, task_id)
+    );
+    CREATE INDEX idx_workflow_tasks_wid_state
+      ON workflow_tasks(workflow_id, state);
+    CREATE INDEX idx_workflow_tasks_discord_wait
+      ON workflow_tasks(kind, discord_channel_id, state);
+    CREATE INDEX idx_workflow_tasks_timeout
+      ON workflow_tasks(timeout_at, state);
+  `);
+  db.run("INSERT INTO workflows VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+    "legacy-workflow",
+    "resolved",
+    1,
+    2,
+    2,
+    null,
+    "{}",
+    0,
+  ]);
+  db.run("INSERT INTO workflow_tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+    "legacy-workflow",
+    "legacy-task",
+    "sleep",
+    "inert fixture",
+    "resolved",
+    null,
+    null,
+    1,
+    2,
+    2,
+    "fixture",
+    null,
+    null,
+    null,
+    null,
+  ]);
+}
+
+async function legacyFixture(
+  options: { readonly includeInertLegacyState?: boolean } = {},
+): Promise<{
   root: string;
   dbPath: string;
   sourceArtifactId: string;
@@ -49,6 +118,7 @@ async function legacyFixture(): Promise<{
   const db = new Database(dbPath, { create: true, strict: true });
   const migrated = applyWorkflowSchemaMigrations(db, () => 1, 25);
   expect(migrated.status).toBe("ok");
+  if (options.includeInertLegacyState === true) installInertLegacyWorkflowState(db);
   const limits = JSON.stringify({
     maxSourceBytes: 256 * 1024,
     maxInputBytes: 256 * 1024,
@@ -240,6 +310,38 @@ describe("legacy workflow blob migration", () => {
     expect(await fs.readFile(fixture.dbPath)).toEqual(before);
     expect(await fs.readdir(path.join(fixture.root, "workflow-snapshots"))).toHaveLength(1);
     expect(await fs.readdir(path.join(fixture.root, "workflow-artifacts"))).toHaveLength(2);
+  });
+
+  it("preflights and migrates the exact inert pre-unified workflow tables", async () => {
+    const fixture = await legacyFixture({ includeInertLegacyState: true });
+    const before = await fs.readFile(fixture.dbPath);
+
+    const result = await preflightLegacyWorkflowBlobMigration({
+      dbPath: fixture.dbPath,
+      dataDir: fixture.root,
+    });
+
+    expect(result.status).toBe("ok");
+    expect(await fs.readFile(fixture.dbPath)).toEqual(before);
+
+    const created = await createMemoryBlobStore();
+    if (created.status === "error") throw created.error;
+    const migrated = await applyLegacyWorkflowBlobMigration({
+      dbPath: fixture.dbPath,
+      dataDir: fixture.root,
+      blobStore: created.value,
+      now: () => 100,
+    });
+    expect(migrated.status).toBe("ok");
+    using database = new Database(fixture.dbPath, { readonly: true, strict: true });
+    expect(
+      database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM workflows").get(),
+    ).toEqual({ count: 1 });
+    expect(
+      database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM workflow_tasks").get(),
+    ).toEqual({ count: 1 });
+    database.close();
+    await created.value.close({ deadlineAtMs: Date.now() + 1_000 });
   });
 
   it("uploads a shared value once, rewrites schema 26, and removes legacy state", async () => {
