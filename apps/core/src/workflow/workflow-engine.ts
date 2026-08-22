@@ -1,9 +1,9 @@
 import { captureError } from "../shared/error-capture";
-import fs from "node:fs/promises";
 import path from "node:path";
 
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
   type DecodedLilacMessageForTopic,
   type DeliveryDisposition,
@@ -41,6 +41,7 @@ import {
   jsonValueSchema,
   type JsonValue,
   type WorkflowOperation,
+  type WorkflowArtifactReference,
   type WorkflowOperationState,
   type WorkflowRevision,
   type WorkflowRun,
@@ -56,6 +57,7 @@ import {
 import { compileWorkflowSourceResult } from "./workflow-source-compiler";
 import {
   adaptWorkflowArtifactResultToException,
+  readWorkflowSourceArtifact,
   readWorkflowValueArtifact,
   WORKFLOW_INLINE_VALUE_BYTES,
   writeWorkflowValueArtifact,
@@ -155,8 +157,8 @@ async function cancelWorkflowSandboxForEngineHost(sandbox: WorkflowSandboxRun): 
 }
 
 async function loadWorkflowValueArtifact(input: {
-  readonly dataDir: string;
-  readonly artifactId: string;
+  readonly blobStore: BlobStore;
+  readonly reference: WorkflowArtifactReference;
   readonly maxBytes: number;
 }): Promise<JsonValue> {
   const loaded = await readWorkflowValueArtifact(input);
@@ -344,6 +346,8 @@ function eventDeliveryDoneDetail(label: string, error: EventDeliveryDoneError): 
       return `${label} delivery failed during ${error.operation}`;
     case "EventDeliveryStopped":
       return `${label} delivery stopped: ${error.reason}`;
+    case "EventPostCommitObservationFailed":
+      return `${label} delivery post-commit observation failed`;
   }
 }
 
@@ -434,7 +438,12 @@ export async function captureWorkflowIdleCancellationPublication(
 ): Promise<ResultType<void, WorkflowIdleCancellationPublishFailed>> {
   const published = await bus.publish(
     lilacEventTypes.CmdRequestMessage,
-    { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
+    {
+      requestDeliveryId: crypto.randomUUID(),
+      queue: "interrupt",
+      messages: [],
+      raw: { cancel: true, cancelQueued: true },
+    },
     {
       headers: {
         request_id: input.requestId,
@@ -527,6 +536,7 @@ export class WorkflowEngine {
       bus: LilacBus;
       store: DurableWorkflowStore;
       dataDir: string;
+      blobStore: BlobStore;
       subscriptionId: string;
       now?: () => number;
       pollMs?: number;
@@ -814,28 +824,13 @@ export class WorkflowEngine {
   private async loadSnapshot(revision: WorkflowRevision): Promise<WorkflowExecutionResult<string>> {
     if (this.input.loadSnapshot)
       return await captureWorkflowExternal(() => this.input.loadSnapshot!(revision));
-    const snapshotPath = path.join(
-      this.input.dataDir,
-      "workflow-snapshots",
-      `${revision.sourceSha256}.js`,
-    );
-    const loaded = await captureWorkflowExternal(async () => {
-      const stats = await fs.lstat(snapshotPath);
-      const source = await fs.readFile(snapshotPath, "utf8");
-      return { stats, source };
-    });
-    return loaded.andThen(({ stats, source }) => {
-      if (!stats.isFile() || stats.isSymbolicLink()) {
-        return Result.err(workflowExecutionFailure("Invalid workflow snapshot file"));
-      }
-      if (sha256(source) !== revision.sourceSha256) {
-        return Result.err(workflowExecutionFailure("Workflow snapshot hash mismatch"));
-      }
-      if (revision.snapshotArtifactId !== `workflow-source:${revision.sourceSha256}`) {
-        return Result.err(workflowExecutionFailure("Workflow snapshot artifact identity mismatch"));
-      }
-      return Result.ok(source);
-    });
+    return (
+      await readWorkflowSourceArtifact({
+        blobStore: this.input.blobStore,
+        reference: revision.snapshotArtifact,
+        maxBytes: revision.limits.maxSourceBytes,
+      })
+    ).mapError((error) => workflowExecutionFailure(error.message));
   }
 
   private async createSandbox(
@@ -1102,10 +1097,10 @@ export class WorkflowEngine {
         );
       }
       if (existing.state === "succeeded") {
-        if (existing.resultArtifactId) {
+        if (existing.resultArtifact) {
           const loaded = await readWorkflowValueArtifact({
-            dataDir: this.input.dataDir,
-            artifactId: existing.resultArtifactId,
+            blobStore: this.input.blobStore,
+            reference: existing.resultArtifact,
             maxBytes: revision.limits.maxOperationOutputBytes,
           });
           return loaded.mapError((error) => workflowExecutionFailure(error.message));
@@ -1182,7 +1177,7 @@ export class WorkflowEngine {
       attempt: 0,
       requestId: null,
       output: null,
-      resultArtifactId: null,
+      resultArtifact: null,
       error: null,
       usage: null,
       claimedBy: null,
@@ -1878,11 +1873,12 @@ export class WorkflowEngine {
           ),
         );
       }
-      let resultArtifactId: string | null = null;
+      let resultArtifact: WorkflowArtifactReference | null = null;
       if (result.state === "resolved" && outputBytes > WORKFLOW_INLINE_VALUE_BYTES) {
-        resultArtifactId = yield* Result.await(
+        resultArtifact = yield* Result.await(
           writeWorkflowValueArtifact({
-            dataDir: this.input.dataDir,
+            blobStore: this.input.blobStore,
+            workflowStore: this.input.store,
             value: result.output,
             maxBytes: revision.limits.maxOperationOutputBytes,
           }).then((persisted) =>
@@ -1917,8 +1913,8 @@ export class WorkflowEngine {
         from: terminalFrom,
         to: nextState,
         now: this.now(),
-        output: resultArtifactId ? null : result.output || null,
-        resultArtifactId,
+        output: resultArtifact ? null : result.output || null,
+        resultArtifact,
         error: result.state === "resolved" ? null : (result.detail ?? result.state),
         usage: result.usage,
       });
@@ -2532,6 +2528,7 @@ export class WorkflowEngine {
                 await this.input.bus.publish(
                   lilacEventTypes.CmdRequestMessage,
                   {
+                    requestDeliveryId: crypto.randomUUID(),
                     queue: "prompt",
                     messages: [{ role: "user", content: input.prompt }],
                     ...(input.model ? { modelOverride: input.model } : {}),
@@ -2632,10 +2629,10 @@ export class WorkflowEngine {
     receipt: WorkflowRequestTerminalReceipt,
     revision: WorkflowRevision,
   ): Promise<AgentRequestResult> {
-    const storedOutput = receipt.resultArtifactId
+    const storedOutput = receipt.resultArtifact
       ? await loadWorkflowValueArtifact({
-          dataDir: this.input.dataDir,
-          artifactId: receipt.resultArtifactId,
+          blobStore: this.input.blobStore,
+          reference: receipt.resultArtifact,
           maxBytes: revision.limits.maxOperationOutputBytes,
         })
       : receipt.output;
@@ -2685,6 +2682,7 @@ export class WorkflowEngine {
           this.input.bus.publish(
             lilacEventTypes.CmdRequestMessage,
             {
+              requestDeliveryId: crypto.randomUUID(),
               queue: "interrupt",
               messages: [],
               raw: { cancel: true, cancelQueued: true, requiresActive: false },
@@ -2765,11 +2763,12 @@ export class WorkflowEngine {
         finalDetail = "Workflow returned with outstanding unawaited host operations";
       }
       const resultBytes = Buffer.byteLength(canonicalJson(finalResult), "utf8");
-      let resultArtifactId: string | null = null;
+      let resultArtifact: WorkflowArtifactReference | null = null;
       if (finalState === "succeeded" && resultBytes > WORKFLOW_INLINE_VALUE_BYTES) {
-        resultArtifactId = yield* Result.await(
+        resultArtifact = yield* Result.await(
           writeWorkflowValueArtifact({
-            dataDir: this.input.dataDir,
+            blobStore: this.input.blobStore,
+            workflowStore: this.input.store,
             value: finalResult,
             maxBytes: revision.limits.maxResultBytes,
           }).then((persisted) =>
@@ -2784,8 +2783,8 @@ export class WorkflowEngine {
         ownerId: this.workerId,
         now: this.now(),
         detail: finalDetail,
-        result: resultArtifactId ? null : finalResult,
-        resultArtifactId,
+        result: resultArtifact ? null : finalResult,
+        resultArtifact,
       });
       if (!changed) {
         return Result.err(
@@ -2797,7 +2796,12 @@ export class WorkflowEngine {
           if (!operation.requestId) continue;
           const cancelled = await this.input.bus.publish(
             lilacEventTypes.CmdRequestMessage,
-            { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
+            {
+              requestDeliveryId: crypto.randomUUID(),
+              queue: "interrupt",
+              messages: [],
+              raw: { cancel: true, cancelQueued: true },
+            },
             {
               headers: {
                 request_id: operation.requestId,

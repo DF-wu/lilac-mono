@@ -1,36 +1,44 @@
-import { captureError } from "../shared/error-capture";
-import fs from "node:fs/promises";
-import path from "node:path";
+import {
+  materializeBlobRead,
+  type BlobDeleteError,
+  type BlobReadError,
+  type BlobReadTerminalError,
+  type BlobRefV1,
+  type BlobStore,
+  type BlobUploadStartError,
+  type BlobWriteError,
+} from "@stanley2058/lilac-blob-storage";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
-
-import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
-import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
-import type { JsonValue } from "./workflow-domain";
+import { adaptToolResultToHost } from "../tools/tool-result-adapters";
+import {
+  DurableWorkflowInvariantViolation,
+  type DurableWorkflowReadError,
+  type DurableWorkflowStore,
+} from "./durable-workflow-store";
 import {
   decodeWorkflowValueArtifact,
+  encodeWorkflowArtifactReference,
   encodeWorkflowValueArtifact,
   workflowValueArtifactFileByteLimit,
   type WorkflowArtifactCodecError,
 } from "./workflow-artifact-persistence-codec";
+import { sha256 } from "./workflow-definition";
+import type { JsonValue, WorkflowArtifactReference } from "./workflow-domain";
 
 export const WORKFLOW_INLINE_VALUE_BYTES = 64 * 1024;
-const WORKFLOW_ARTIFACT_PREFIX = "workflow-value:";
+const WORKFLOW_VALUE_ARTIFACT_PREFIX = "workflow-value:";
+const WORKFLOW_SOURCE_ARTIFACT_PREFIX = "workflow-source:";
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
 
 type WorkflowArtifactIoOperation =
-  | "create-root"
-  | "inspect-root"
-  | "resolve-root"
-  | "inspect-artifact"
-  | "resolve-artifact"
+  | "lookup-artifact"
+  | "register-artifact"
+  | "start-upload"
+  | "complete-upload"
+  | "open-artifact"
   | "read-artifact"
-  | "open-temporary"
-  | "write-temporary"
-  | "sync-temporary"
-  | "close-temporary"
-  | "rename-temporary"
-  | "remove-temporary";
+  | "delete-artifact";
 
 export class WorkflowArtifactInvalidId extends TaggedError("WorkflowArtifactInvalidId")<{
   readonly message: string;
@@ -101,236 +109,194 @@ export function adaptWorkflowArtifactResultToException<
   return adaptToolResultToHost(result);
 }
 
-function artifactHash(artifactId: string): ResultType<string, WorkflowArtifactInvalidId> {
-  if (!artifactId.startsWith(WORKFLOW_ARTIFACT_PREFIX)) {
+function artifactHash(
+  artifactId: string,
+  prefix: typeof WORKFLOW_VALUE_ARTIFACT_PREFIX | typeof WORKFLOW_SOURCE_ARTIFACT_PREFIX,
+): ResultType<string, WorkflowArtifactInvalidId> {
+  if (!artifactId.startsWith(prefix)) {
     return Result.err(
-      new WorkflowArtifactInvalidId({ message: "Unsupported workflow value artifact ID" }),
+      new WorkflowArtifactInvalidId({ message: "Unsupported workflow artifact ID" }),
     );
   }
-  const hash = artifactId.slice(WORKFLOW_ARTIFACT_PREFIX.length);
-  if (!HASH_PATTERN.test(hash)) {
-    return Result.err(
-      new WorkflowArtifactInvalidId({ message: "Invalid workflow value artifact ID" }),
-    );
-  }
-  return Result.ok(hash);
+  const hash = artifactId.slice(prefix.length);
+  return HASH_PATTERN.test(hash)
+    ? Result.ok(hash)
+    : Result.err(new WorkflowArtifactInvalidId({ message: "Invalid workflow artifact ID" }));
 }
 
-type FilesystemFailureProjection = {
-  readonly code: string;
-  readonly missing: boolean;
-};
+type BlobFailure =
+  | BlobDeleteError
+  | BlobReadError
+  | BlobReadTerminalError
+  | BlobUploadStartError
+  | BlobWriteError
+  | DurableWorkflowReadError
+  | DurableWorkflowInvariantViolation;
 
-function projectFilesystemFailure(cause: unknown): FilesystemFailureProjection {
-  let code = "UNKNOWN";
-  if (
-    cause instanceof Error &&
-    "code" in cause &&
-    typeof cause.code === "string" &&
-    cause.code.length <= 40
-  ) {
-    code = cause.code;
-  }
-  return { code, missing: code === "ENOENT" || code === "ENOTDIR" };
-}
-
-function rethrowWorkflowArtifactPanic(cause: unknown): void {
-  if (Panic.is(cause)) throw cause;
-}
-
-async function captureIo<T>(input: {
-  readonly artifactId: string;
-  readonly operation: WorkflowArtifactIoOperation;
-  readonly run: () => Promise<T>;
-}): Promise<ResultType<T, WorkflowArtifactIoFailed>> {
-  const captured = (
-    await Result.tryPromise({ try: input.run, catch: captureRuntimeError })
-  ).mapError((error) =>
-    projectCapturedRuntimeError(error, `Opaque workflow artifact ${input.operation} failure`),
-  );
-  const finishCapture = captured.match<() => ResultType<T, WorkflowArtifactIoFailed>>({
-    ok: (value) => () => Result.ok(value),
-    err: (error) => () => {
-      const cause = preserveToolPanic(error);
-      const failure = projectFilesystemFailure(cause);
-      return Result.err(
-        new WorkflowArtifactIoFailed({
-          artifactId: input.artifactId,
-          operation: input.operation,
-          code: failure.code,
-          message: `Workflow value artifact I/O failed during ${input.operation}`,
-        }),
-      );
-    },
-  });
-  return finishCapture();
-}
-
-async function lstatOrMissing(input: {
-  readonly artifactId: string;
-  readonly filePath: string;
-}): Promise<ResultType<Awaited<ReturnType<typeof fs.lstat>> | null, WorkflowArtifactIoFailed>> {
-  {
-    const attempt = await Result.tryPromise({
-      try: async () => {
-        return Result.ok(await fs.lstat(input.filePath));
-      },
-      catch: captureError,
-    });
-
-    if (attempt.isErr()) {
-      const cause = attempt.error.cause;
-      rethrowWorkflowArtifactPanic(cause);
-      const failure = projectFilesystemFailure(cause);
-      if (failure.missing) return Result.ok(null);
-      return Result.err(
-        new WorkflowArtifactIoFailed({
-          artifactId: input.artifactId,
-          operation: "inspect-artifact",
-          code: failure.code,
-          message: "Workflow value artifact I/O failed during inspect-artifact",
-        }),
-      );
-    }
-    return attempt.value;
-  }
-}
-
-async function artifactRoot(input: {
-  readonly dataDir: string;
-  readonly artifactId: string;
-  readonly create: boolean;
-}): Promise<
-  ResultType<string, WorkflowArtifactAbsent | WorkflowArtifactUnsafePath | WorkflowArtifactIoFailed>
-> {
-  const root = path.resolve(input.dataDir, "workflow-artifacts");
-  if (input.create) {
-    const created = await captureIo({
-      artifactId: input.artifactId,
-      operation: "create-root",
-      run: () => fs.mkdir(root, { recursive: true, mode: 0o700 }),
-    });
-    const createError = created.match({
-      ok: () => null,
-      err: (error) => error,
-    });
-    if (createError) return Result.err(createError);
-  }
-  const inspected = await Result.tryPromise({
-    try: () => fs.lstat(root),
-    catch: (cause) => {
-      if (Panic.is(cause)) return { kind: "panic", panic: cause } as const;
-      const failure = projectFilesystemFailure(cause);
-      return {
-        kind: "failure",
-        error:
-          !input.create && failure.missing
-            ? new WorkflowArtifactAbsent({
-                artifactId: input.artifactId,
-                message: "Workflow value artifact is absent",
-              })
-            : new WorkflowArtifactIoFailed({
-                artifactId: input.artifactId,
-                operation: "inspect-root",
-                code: failure.code,
-                message: "Workflow value artifact I/O failed during inspect-root",
-              }),
-      } as const;
-    },
-  }).then((result) =>
-    result.match<
-      | { readonly kind: "success"; readonly stats: import("node:fs").Stats }
-      | { readonly kind: "panic"; readonly panic: Panic }
-      | {
-          readonly kind: "failure";
-          readonly error: WorkflowArtifactAbsent | WorkflowArtifactIoFailed;
-        }
-    >({
-      ok: (stats) => ({ kind: "success", stats }),
-      err: (failure) => failure,
-    }),
-  );
-  if (inspected.kind === "panic") {
-    rethrowWorkflowArtifactPanic(inspected.panic);
-    return Result.err(
-      new WorkflowArtifactIoFailed({
-        artifactId: input.artifactId,
-        operation: "inspect-root",
-        code: "UNKNOWN",
-        message: "Workflow value artifact I/O failed during inspect-root",
-      }),
-    );
-  }
-  if (inspected.kind === "failure") return Result.err(inspected.error);
-  const { stats } = inspected;
-  if (stats.isSymbolicLink()) {
-    return Result.err(
-      new WorkflowArtifactUnsafePath({
-        artifactId: input.artifactId,
-        location: "root",
-        issue: "symlink",
-        message: "Workflow value artifact root cannot be a symlink",
-      }),
-    );
-  }
-  if (!stats.isDirectory()) {
-    return Result.err(
-      new WorkflowArtifactUnsafePath({
-        artifactId: input.artifactId,
-        location: "root",
-        issue: "not-directory",
-        message: "Workflow value artifact root is not a directory",
-      }),
-    );
-  }
-  return captureIo({
-    artifactId: input.artifactId,
-    operation: "resolve-root",
-    run: () => fs.realpath(root),
+function ioFailure(
+  artifactId: string,
+  operation: WorkflowArtifactIoOperation,
+  error: BlobFailure,
+): WorkflowArtifactIoFailed {
+  return new WorkflowArtifactIoFailed({
+    artifactId,
+    operation,
+    code: error._tag,
+    message: `Workflow artifact ${operation} failed`,
   });
 }
 
-async function removeTemporary(
-  artifactId: string,
-  temporaryPath: string,
-): Promise<ResultType<void, WorkflowArtifactIoFailed>> {
-  return (
-    await captureIo({
-      artifactId,
-      operation: "remove-temporary",
-      run: () => fs.rm(temporaryPath, { force: true }),
-    })
-  ).map(() => undefined);
+async function readArtifactBytes(input: {
+  readonly blobStore: BlobStore;
+  readonly reference: WorkflowArtifactReference;
+  readonly maxBytes: number;
+}): Promise<ResultType<Uint8Array, WorkflowArtifactReadError>> {
+  if (input.reference.blobRef.byteLength > input.maxBytes) {
+    return Result.err(
+      new WorkflowArtifactFileTooLarge({
+        artifactId: input.reference.artifactId,
+        maxBytes: input.maxBytes,
+        message: "Workflow artifact exceeds its bounded size",
+      }),
+    );
+  }
+  const opened = await input.blobStore.open(input.reference.blobRef);
+  return opened
+    .mapError((error) => ioFailure(input.reference.artifactId, "open-artifact", error))
+    .andThenAsync(async function materialize(read) {
+      return (await materializeBlobRead(read)).mapError((error) =>
+        ioFailure(input.reference.artifactId, "read-artifact", error),
+      );
+    });
 }
 
-function combineWriteAndCleanup(
-  artifactId: string,
-  primary: WorkflowArtifactIoFailed,
-  cleanup: ResultType<void, WorkflowArtifactIoFailed>,
-): ResultType<never, WorkflowArtifactIoFailed | WorkflowArtifactWriteAndCleanupFailed> {
-  return cleanup.match<
-    ResultType<never, WorkflowArtifactIoFailed | WorkflowArtifactWriteAndCleanupFailed>
-  >({
-    ok: () => Result.err(primary),
-    err: (cleanupError) =>
+async function deleteUploadedAfterFailure(input: {
+  readonly blobStore: BlobStore;
+  readonly reference: WorkflowArtifactReference;
+  readonly primary: WorkflowArtifactIoFailed;
+}): Promise<ResultType<never, WorkflowArtifactWriteError>> {
+  const deleted = await input.blobStore.delete(input.reference.blobRef);
+  return deleted.match<ResultType<never, WorkflowArtifactWriteError>>({
+    ok: () => Result.err(input.primary),
+    err: (error) =>
       Result.err(
         new WorkflowArtifactWriteAndCleanupFailed({
-          artifactId,
-          primary,
-          cleanup: cleanupError,
-          message: "Workflow value artifact write and temporary-file cleanup both failed",
+          artifactId: input.reference.artifactId,
+          primary: input.primary,
+          cleanup: ioFailure(input.reference.artifactId, "delete-artifact", error),
+          message: "Workflow artifact write and cleanup both failed",
         }),
       ),
   });
 }
 
+async function publishArtifact(input: {
+  readonly blobStore: BlobStore;
+  readonly workflowStore: DurableWorkflowStore;
+  readonly artifactId: string;
+  readonly bytes: Uint8Array;
+  readonly createdAt: number;
+  readonly verify: (
+    reference: WorkflowArtifactReference,
+  ) => Promise<ResultType<void, WorkflowArtifactReadError>>;
+}): Promise<ResultType<WorkflowArtifactReference, WorkflowArtifactWriteError>> {
+  const existing = input.workflowStore
+    .getWorkflowArtifact(input.artifactId)
+    .mapError((error) => ioFailure(input.artifactId, "lookup-artifact", error));
+  const existingOutcome = existing.match<
+    | { readonly kind: "existing"; readonly reference: WorkflowArtifactReference }
+    | { readonly kind: "missing" }
+    | { readonly kind: "error"; readonly error: WorkflowArtifactIoFailed }
+  >({
+    ok: (reference) => (reference === null ? { kind: "missing" } : { kind: "existing", reference }),
+    err: (error) => ({ kind: "error", error }),
+  });
+  if (existingOutcome.kind === "error") return Result.err(existingOutcome.error);
+  if (existingOutcome.kind === "existing") {
+    return (await input.verify(existingOutcome.reference)).map(() => existingOutcome.reference);
+  }
+
+  const started = await input.blobStore.startUpload({
+    source: input.bytes,
+    retention: { kind: "durable" },
+    expectedSha256: sha256(input.bytes),
+    expectedByteLength: input.bytes.byteLength,
+  });
+  const uploadOutcome = started.match<
+    | {
+        readonly kind: "ok";
+        readonly completion: Promise<ResultType<BlobRefV1, BlobWriteError>>;
+      }
+    | { readonly kind: "error"; readonly error: WorkflowArtifactIoFailed }
+  >({
+    ok: (value) => ({ kind: "ok", completion: value.completion }),
+    err: (error) => ({ kind: "error", error: ioFailure(input.artifactId, "start-upload", error) }),
+  });
+  if (uploadOutcome.kind === "error") return Result.err(uploadOutcome.error);
+  const completed = (await uploadOutcome.completion).mapError((error) =>
+    ioFailure(input.artifactId, "complete-upload", error),
+  );
+  const completeOutcome = completed.match<
+    | { readonly kind: "ok"; readonly reference: WorkflowArtifactReference }
+    | { readonly kind: "error"; readonly error: WorkflowArtifactIoFailed }
+  >({
+    ok: (blobRef) => ({ kind: "ok", reference: { artifactId: input.artifactId, blobRef } }),
+    err: (error) => ({ kind: "error", error }),
+  });
+  if (completeOutcome.kind === "error") return Result.err(completeOutcome.error);
+
+  const registered = input.workflowStore
+    .registerWorkflowArtifact(completeOutcome.reference, input.createdAt)
+    .mapError((error) => ioFailure(input.artifactId, "register-artifact", error));
+  const registerOutcome = registered.match<
+    | { readonly kind: "ok"; readonly reference: WorkflowArtifactReference }
+    | { readonly kind: "error"; readonly error: WorkflowArtifactIoFailed }
+  >({
+    ok: (reference) => ({ kind: "ok", reference }),
+    err: (error) => ({ kind: "error", error }),
+  });
+  if (registerOutcome.kind === "error") {
+    return deleteUploadedAfterFailure({
+      blobStore: input.blobStore,
+      reference: completeOutcome.reference,
+      primary: registerOutcome.error,
+    });
+  }
+  if (
+    encodeWorkflowArtifactReference(registerOutcome.reference) !==
+    encodeWorkflowArtifactReference(completeOutcome.reference)
+  ) {
+    const deleted = await input.blobStore.delete(completeOutcome.reference.blobRef);
+    const cleanupError = deleted.match({ ok: () => null, err: (error) => error });
+    if (cleanupError) {
+      return Result.err(
+        new WorkflowArtifactWriteAndCleanupFailed({
+          artifactId: input.artifactId,
+          primary: ioFailure(
+            input.artifactId,
+            "register-artifact",
+            new DurableWorkflowInvariantViolation({
+              message: "Concurrent workflow artifact registration reused the canonical object",
+            }),
+          ),
+          cleanup: ioFailure(input.artifactId, "delete-artifact", cleanupError),
+          message: "Workflow artifact deduplication cleanup failed",
+        }),
+      );
+    }
+  }
+  return (await input.verify(registerOutcome.reference)).map(() => registerOutcome.reference);
+}
+
 export async function writeWorkflowValueArtifact(input: {
-  dataDir: string;
-  value: JsonValue;
-  maxBytes: number;
-}): Promise<ResultType<string, WorkflowArtifactWriteError>> {
+  readonly blobStore: BlobStore;
+  readonly workflowStore: DurableWorkflowStore;
+  readonly value: JsonValue;
+  readonly maxBytes: number;
+  readonly now?: () => number;
+}): Promise<ResultType<WorkflowArtifactReference, WorkflowArtifactWriteError>> {
   const encoded = encodeWorkflowValueArtifact(input.value);
-  const artifactId = `${WORKFLOW_ARTIFACT_PREFIX}${encoded.payloadHash}`;
+  const artifactId = `${WORKFLOW_VALUE_ARTIFACT_PREFIX}${encoded.payloadHash}`;
   if (encoded.payloadBytes > input.maxBytes) {
     return Result.err(
       new WorkflowArtifactValueTooLarge({
@@ -340,258 +306,130 @@ export async function writeWorkflowValueArtifact(input: {
       }),
     );
   }
-  const rootResult = await artifactRoot({ dataDir: input.dataDir, artifactId, create: true });
-  const publishAtRoot = rootResult.match<
-    () => Promise<ResultType<boolean, WorkflowArtifactWriteError>>
-  >({
-    err: (error) => async () => Result.err(error),
-    ok: (root) => async () => {
-      const artifactPath = path.join(root, `${encoded.payloadHash}.json`);
-      const existingResult = await lstatOrMissing({ artifactId, filePath: artifactPath });
-      const continueWithExisting = existingResult.match<
-        () => Promise<ResultType<boolean, WorkflowArtifactWriteError>>
-      >({
-        err: (error) => async () => Result.err(error),
-        ok: (existing) => async () => {
-          if (existing !== null) {
-            return (
-              await readWorkflowValueArtifact({
-                dataDir: input.dataDir,
-                artifactId,
-                maxBytes: input.maxBytes,
-              })
-            ).map(() => false);
-          }
-
-          const temporaryPath = path.join(
-            root,
-            `.${encoded.payloadHash}.${crypto.randomUUID()}.tmp`,
-          );
-          const opened = await captureIo({
-            artifactId,
-            operation: "open-temporary",
-            run: () => fs.open(temporaryPath, "wx", 0o600),
-          });
-          const continueWithHandle = opened.match<
-            () => Promise<ResultType<boolean, WorkflowArtifactWriteError>>
-          >({
-            err: (error) => async () => Result.err(error),
-            ok: (handle) => async () => {
-              const written = await captureIo({
-                artifactId,
-                operation: "write-temporary",
-                run: () => handle.writeFile(encoded.encoded, "utf8"),
-              });
-              let primaryError = written.match({
-                ok: () => null,
-                err: (error) => error,
-              });
-              if (!primaryError) {
-                const synced = await captureIo({
-                  artifactId,
-                  operation: "sync-temporary",
-                  run: () => handle.sync(),
-                });
-                primaryError = synced.match({
-                  ok: () => null,
-                  err: (error) => error,
-                });
-              }
-              const closed = await captureIo({
-                artifactId,
-                operation: "close-temporary",
-                run: () => handle.close(),
-              });
-              primaryError ??= closed.match({
-                ok: () => null,
-                err: (error) => error,
-              });
-              if (primaryError) {
-                return combineWriteAndCleanup(
-                  artifactId,
-                  primaryError,
-                  await removeTemporary(artifactId, temporaryPath),
-                );
-              }
-              const renamed = await captureIo({
-                artifactId,
-                operation: "rename-temporary",
-                run: () => fs.rename(temporaryPath, artifactPath),
-              });
-              const renameError = renamed.match({
-                ok: () => null,
-                err: (error) => error,
-              });
-              if (renameError) {
-                return combineWriteAndCleanup(
-                  artifactId,
-                  renameError,
-                  await removeTemporary(artifactId, temporaryPath),
-                );
-              }
-              return Result.ok(true);
-            },
-          });
-          return continueWithHandle();
-        },
-      });
-      return continueWithExisting();
-    },
+  const bytes = new TextEncoder().encode(encoded.encoded);
+  return publishArtifact({
+    blobStore: input.blobStore,
+    workflowStore: input.workflowStore,
+    artifactId,
+    bytes,
+    createdAt: (input.now ?? Date.now)(),
+    verify: async (reference) =>
+      (
+        await readWorkflowValueArtifact({
+          blobStore: input.blobStore,
+          reference,
+          maxBytes: input.maxBytes,
+        })
+      ).map(() => undefined),
   });
-  const publication = await publishAtRoot();
-  const publicationError = publication.match({
-    err: (error) => error,
-    ok: () => null,
-  });
-  if (publicationError) return Result.err(publicationError);
-  const verify = publication.match({ ok: (value) => value, err: () => false });
-  if (verify) {
-    const verified = await readWorkflowValueArtifact({
-      dataDir: input.dataDir,
-      artifactId,
-      maxBytes: input.maxBytes,
-    });
-    adaptToolResultToHost(
-      verified.mapError(
-        (cause) =>
-          new Panic({
-            message: "Atomic workflow value artifact publication could not be verified",
-            cause,
-          }),
-      ),
-    );
-  }
-  return Result.ok(artifactId);
 }
 
 export async function readWorkflowValueArtifact(input: {
-  dataDir: string;
-  artifactId: string;
-  maxBytes: number;
+  readonly blobStore: BlobStore;
+  readonly reference: WorkflowArtifactReference;
+  readonly maxBytes: number;
 }): Promise<ResultType<JsonValue, WorkflowArtifactReadError>> {
-  const continueWithHash = artifactHash(input.artifactId).match<
-    () => Promise<ResultType<JsonValue, WorkflowArtifactReadError>>
-  >({
-    err: (error) => async () => Result.err(error),
-    ok: (hash) => async () => {
-      const rootResult = await artifactRoot({
-        dataDir: input.dataDir,
-        artifactId: input.artifactId,
-        create: false,
-      });
-      const continueWithRoot = rootResult.match<
-        () => Promise<ResultType<JsonValue, WorkflowArtifactReadError>>
-      >({
-        err: (error) => async () => Result.err(error),
-        ok: (root) => async () => {
-          const artifactPath = path.join(root, `${hash}.json`);
-          const inspectedResult = await lstatOrMissing({
-            artifactId: input.artifactId,
-            filePath: artifactPath,
-          });
-          const continueWithInspection = inspectedResult.match<
-            () => Promise<ResultType<JsonValue, WorkflowArtifactReadError>>
-          >({
-            err: (error) => async () => Result.err(error),
-            ok: (inspected) => async () => {
-              if (inspected === null) {
-                return Result.err(
-                  new WorkflowArtifactAbsent({
-                    artifactId: input.artifactId,
-                    message: "Workflow value artifact is absent",
-                  }),
-                );
-              }
-              if (inspected.isSymbolicLink()) {
-                return Result.err(
-                  new WorkflowArtifactUnsafePath({
-                    artifactId: input.artifactId,
-                    location: "artifact",
-                    issue: "symlink",
-                    message: "Workflow value artifact cannot be a symlink",
-                  }),
-                );
-              }
-              if (!inspected.isFile()) {
-                return Result.err(
-                  new WorkflowArtifactUnsafePath({
-                    artifactId: input.artifactId,
-                    location: "artifact",
-                    issue: "not-file",
-                    message: "Workflow value artifact is not a regular file",
-                  }),
-                );
-              }
-              if (inspected.size > workflowValueArtifactFileByteLimit(input.maxBytes)) {
-                return Result.err(
-                  new WorkflowArtifactFileTooLarge({
-                    artifactId: input.artifactId,
-                    maxBytes: input.maxBytes,
-                    message: "Workflow value artifact file exceeds its bounded size",
-                  }),
-                );
-              }
-              const canonicalResult = await captureIo({
-                artifactId: input.artifactId,
-                operation: "resolve-artifact",
-                run: () => fs.realpath(artifactPath),
-              });
-              const continueWithCanonical = canonicalResult.match<
-                () => Promise<ResultType<JsonValue, WorkflowArtifactReadError>>
-              >({
-                err: (error) => async () => Result.err(error),
-                ok: (canonical) => async () => {
-                  if (path.dirname(canonical) !== root) {
-                    return Result.err(
-                      new WorkflowArtifactUnsafePath({
-                        artifactId: input.artifactId,
-                        location: "artifact",
-                        issue: "escaped-root",
-                        message: "Workflow value artifact escapes its canonical root",
-                      }),
-                    );
-                  }
-                  const sourceResult = await captureIo({
-                    artifactId: input.artifactId,
-                    operation: "read-artifact",
-                    run: () => fs.readFile(canonical, "utf8"),
-                  });
-                  const continueWithSource = sourceResult.match<
-                    () => Promise<ResultType<JsonValue, WorkflowArtifactReadError>>
-                  >({
-                    err: (error) => async () => Result.err(error),
-                    ok: (source) => async () => {
-                      if (
-                        Buffer.byteLength(source, "utf8") >
-                        workflowValueArtifactFileByteLimit(input.maxBytes)
-                      ) {
-                        return Result.err(
-                          new WorkflowArtifactFileTooLarge({
-                            artifactId: input.artifactId,
-                            maxBytes: input.maxBytes,
-                            message: "Workflow value artifact file exceeds its bounded size",
-                          }),
-                        );
-                      }
-                      return decodeWorkflowValueArtifact({
-                        encoded: source,
-                        expectedHash: hash,
-                        maxValueBytes: input.maxBytes,
-                        artifactId: input.artifactId,
-                      }).map((decoded) => decoded.value);
-                    },
-                  });
-                  return continueWithSource();
-                },
-              });
-              return continueWithCanonical();
-            },
-          });
-          return continueWithInspection();
-        },
-      });
-      return continueWithRoot();
-    },
+  const expectedHash = artifactHash(input.reference.artifactId, WORKFLOW_VALUE_ARTIFACT_PREFIX);
+  return expectedHash.andThenAsync(async function readValue(hash) {
+    const bytes = await readArtifactBytes({
+      blobStore: input.blobStore,
+      reference: input.reference,
+      maxBytes: workflowValueArtifactFileByteLimit(input.maxBytes),
+    });
+    return bytes.andThen((content) =>
+      decodeWorkflowValueArtifact({
+        encoded: new TextDecoder().decode(content),
+        expectedHash: hash,
+        maxValueBytes: input.maxBytes,
+        artifactId: input.reference.artifactId,
+      }).map((decoded) => decoded.value),
+    );
   });
-  return continueWithHash();
+}
+
+export async function writeWorkflowSourceArtifact(input: {
+  readonly blobStore: BlobStore;
+  readonly workflowStore: DurableWorkflowStore;
+  readonly source: string;
+  readonly sourceSha256: string;
+  readonly maxBytes: number;
+  readonly now?: () => number;
+}): Promise<ResultType<WorkflowArtifactReference, WorkflowArtifactWriteError>> {
+  const artifactId = `${WORKFLOW_SOURCE_ARTIFACT_PREFIX}${input.sourceSha256}`;
+  if (sha256(input.source) !== input.sourceSha256) {
+    return Result.err(new WorkflowArtifactInvalidId({ message: "Workflow source hash mismatch" }));
+  }
+  const bytes = new TextEncoder().encode(input.source);
+  if (bytes.byteLength > input.maxBytes) {
+    return Result.err(
+      new WorkflowArtifactValueTooLarge({
+        artifactId,
+        maxBytes: input.maxBytes,
+        message: `Workflow source exceeds ${input.maxBytes} bytes`,
+      }),
+    );
+  }
+  return publishArtifact({
+    blobStore: input.blobStore,
+    workflowStore: input.workflowStore,
+    artifactId,
+    bytes,
+    createdAt: (input.now ?? Date.now)(),
+    verify: async (reference) =>
+      (
+        await readWorkflowSourceArtifact({
+          blobStore: input.blobStore,
+          reference,
+          maxBytes: input.maxBytes,
+        })
+      ).map(() => undefined),
+  });
+}
+
+export async function readWorkflowSourceArtifact(input: {
+  readonly blobStore: BlobStore;
+  readonly reference: WorkflowArtifactReference;
+  readonly maxBytes: number;
+}): Promise<ResultType<string, WorkflowArtifactReadError>> {
+  const expectedHash = artifactHash(input.reference.artifactId, WORKFLOW_SOURCE_ARTIFACT_PREFIX);
+  return expectedHash.andThenAsync(async function readSource(hash) {
+    const bytes = await readArtifactBytes(input);
+    return bytes.andThen((content) => {
+      const source = new TextDecoder().decode(content);
+      return sha256(source) === hash
+        ? Result.ok(source)
+        : Result.err(
+            new WorkflowArtifactIoFailed({
+              artifactId: input.reference.artifactId,
+              operation: "read-artifact",
+              code: "WORKFLOW_HASH_MISMATCH",
+              message: "Workflow source artifact hash does not match its identity",
+            }),
+          );
+    });
+  });
+}
+
+export async function deleteWorkflowArtifactIfUnreferenced(input: {
+  readonly blobStore: BlobStore;
+  readonly workflowStore: DurableWorkflowStore;
+  readonly artifactId: string;
+}): Promise<ResultType<"deleted" | "retained" | "absent", WorkflowArtifactIoFailed>> {
+  const released = input.workflowStore
+    .releaseWorkflowArtifactIfUnreferenced(input.artifactId)
+    .mapError((error) => ioFailure(input.artifactId, "lookup-artifact", error));
+  const releaseOutcome = released.match<
+    | { readonly kind: "released"; readonly reference: WorkflowArtifactReference }
+    | { readonly kind: "retained" }
+    | { readonly kind: "error"; readonly error: WorkflowArtifactIoFailed }
+  >({
+    ok: (reference) =>
+      reference === null ? { kind: "retained" } : { kind: "released", reference },
+    err: (error) => ({ kind: "error", error }),
+  });
+  if (releaseOutcome.kind === "error") return Result.err(releaseOutcome.error);
+  if (releaseOutcome.kind === "retained") return Result.ok("retained");
+  return (await input.blobStore.delete(releaseOutcome.reference.blobRef))
+    .map((status) => (status === "absent" ? "absent" : "deleted"))
+    .mapError((error) => ioFailure(input.artifactId, "delete-artifact", error));
 }

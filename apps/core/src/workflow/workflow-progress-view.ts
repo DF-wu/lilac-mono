@@ -470,7 +470,7 @@ export function renderWorkflowProgressView(input: {
       if (result.truncated) {
         lines.push("Result shortened for this card. Ask Lilac for the full workflow result.");
       }
-    } else if (view.run.state === "succeeded" && view.run.resultArtifactId) {
+    } else if (view.run.state === "succeeded" && view.run.resultArtifact) {
       lines.push(
         "",
         "**Result**",

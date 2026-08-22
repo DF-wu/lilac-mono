@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { Database } from "bun:sqlite";
-import { buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1 } from "@stanley2058/lilac-event-bus";
+import {
+  buildCoreLineageManifestV2 as buildCoreLineageManifestResultV2,
+  type StoredMessageV1,
+} from "@stanley2058/lilac-event-bus";
 import { Result, type Result as ResultType } from "better-result";
 import {
   CorruptPersistedFields,
@@ -39,8 +42,8 @@ function resultValue<T, E>(result: ResultType<T, E>): T {
   return result.value;
 }
 
-function buildCoreLineageManifestV1(...args: Parameters<typeof buildCoreLineageManifestResultV1>) {
-  return resultValue(buildCoreLineageManifestResultV1(...args));
+function buildCoreLineageManifestV2(...args: Parameters<typeof buildCoreLineageManifestResultV2>) {
+  return resultValue(buildCoreLineageManifestResultV2(...args));
 }
 
 afterEach(async () => {
@@ -81,17 +84,10 @@ function buildSnapshot(
   overrides?: Partial<Pick<GracefulRestartSnapshotInput, "createdAt" | "deadlineMs">>,
 ): GracefulRestartSnapshotInput {
   const queuedMessage = {
-    role: "user" as const,
-    content: [
-      { type: "text" as const, text: "check this file" },
-      {
-        type: "file" as const,
-        data: new URL("https://example.com/a.txt"),
-        mediaType: "text/plain",
-      },
-    ],
-  };
-  const lineage = buildCoreLineageManifestV1([
+    role: "user",
+    content: "check this file",
+  } satisfies StoredMessageV1;
+  const lineage = buildCoreLineageManifestV2([
     {
       atoms: [
         {
@@ -405,6 +401,7 @@ describe("graceful restart persisted codec", () => {
       } else {
         const expectedError = {
           "corrupt-fields": CorruptPersistedFields,
+          legacy: UnsupportedVersion,
           "malformed-serialization": MalformedSerialization,
           "unsupported-version": UnsupportedVersion,
         }[name];
@@ -414,13 +411,10 @@ describe("graceful restart persisted codec", () => {
     }
   });
 
-  it("migrates the shipped v1 envelope and rejects every other version", () => {
+  it("rejects the shipped v1 envelope and every unsupported version", () => {
     const legacy = decodeGracefulRestartSnapshot(gracefulRestartSnapshotCodecCases.legacy.input);
-    expect(legacy.status).toBe("ok");
-    if (legacy.status === "ok") {
-      expect(legacy.value.provenance).toBe("migrated");
-      expect(legacy.value.value?.version).toBe(GRACEFUL_RESTART_SNAPSHOT_VERSION);
-    }
+    expect(legacy.status).toBe("error");
+    if (legacy.status === "error") expect(legacy.error).toBeInstanceOf(UnsupportedVersion);
 
     const unsupported = decodeGracefulRestartSnapshot(
       gracefulRestartSnapshotCodecCases["unsupported-version"].input,
@@ -430,96 +424,71 @@ describe("graceful restart persisted codec", () => {
       expect(unsupported.error).toBeInstanceOf(UnsupportedVersion);
   });
 
-  it.each([1, 2] as const)(
-    "migrates a populated v%s snapshot without rewriting and defaults missing relay clients",
-    (version) => {
-      const current = buildSnapshot();
-      const {
-        queueAttemptProof: _queueAttemptProof,
-        queueAttempts: _queueAttempts,
-        ...legacyBase
-      } = current;
-      const legacy = {
-        ...legacyBase,
-        version,
-        agent: current.agent.map(
-          ({
-            identity: _identity,
-            queueEntryId: _queueEntryId,
-            currentTurnUserId: _currentTurnUserId,
-            ...entry
-          }) => entry,
-        ),
-        relays: current.relays.map(({ requestClient: _requestClient, ...relay }) => relay),
-      };
-      const decoded = decodeGracefulRestartSnapshot({
-        status: "completed",
-        payload_json: SuperJSON.stringify(legacy),
-      });
-      expect(decoded.status).toBe("ok");
-      if (decoded.status !== "ok" || !decoded.value.value) return;
-      expect(decoded.value.provenance).toBe("migrated");
-      expect(decoded.value.value.relays[0]?.requestClient).toBe("discord");
-      expect(
-        decoded.value.value.agent.every((entry) => entry.identity.state === "restricted"),
-      ).toBe(true);
-      expect(decoded.value.value.queueAttemptProof).toBe("legacy-ambiguous");
-    },
-  );
+  it.each([1, 2] as const)("rejects a populated legacy v%s snapshot", (version) => {
+    const current = buildSnapshot();
+    const {
+      queueAttemptProof: _queueAttemptProof,
+      queueAttempts: _queueAttempts,
+      ...legacyBase
+    } = current;
+    const legacy = {
+      ...legacyBase,
+      version,
+      agent: current.agent.map(
+        ({
+          identity: _identity,
+          queueEntryId: _queueEntryId,
+          currentTurnUserId: _currentTurnUserId,
+          ...entry
+        }) => entry,
+      ),
+      relays: current.relays.map(({ requestClient: _requestClient, ...relay }) => relay),
+    };
+    const decoded = decodeGracefulRestartSnapshot({
+      status: "completed",
+      payload_json: SuperJSON.stringify(legacy),
+    });
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "error") expect(decoded.error).toBeInstanceOf(UnsupportedVersion);
+  });
 
   it.each([SHIPPED_POPULATED_V1_FIXTURE, SHIPPED_POPULATED_V2_FIXTURE])(
-    "migrates frozen populated shipped v$version literals",
+    "rejects frozen populated shipped v$version literals",
     (fixture) => {
       const decoded = decodeGracefulRestartSnapshot({
         status: "completed",
         payload_json: SuperJSON.stringify(fixture),
       });
-      expect(decoded.status).toBe("ok");
-      if (decoded.status === "error" || !decoded.value.value) return;
-      expect(decoded.value).toMatchObject({
-        provenance: "migrated",
-        value: {
-          queueAttemptProof: "legacy-ambiguous",
-          agent: [{ kind: "queued", identity: { state: "restricted" } }],
-          relays: [{ requestClient: "discord" }],
-        },
-      });
+      expect(decoded.status).toBe("error");
+      if (decoded.status === "error") expect(decoded.error).toBeInstanceOf(UnsupportedVersion);
     },
   );
 
-  it.each([1, 2] as const)(
-    "migrates an active-only v%s snapshot with complete queue-attempt proof",
-    (version) => {
-      const current = buildSnapshot();
-      const active = current.agent.find((entry) => entry.kind === "active");
-      if (!active) throw new Error("Expected active fixture");
-      const {
-        identity: _identity,
-        queueEntryId: _queueEntryId,
-        currentTurnUserId: _currentTurnUserId,
-        ...legacyActive
-      } = active;
-      const decoded = decodeGracefulRestartSnapshot({
-        status: "completed",
-        payload_json: SuperJSON.stringify({
-          version,
-          createdAt: current.createdAt,
-          deadlineMs: current.deadlineMs,
-          agent: [legacyActive],
-          relays: current.relays.map(({ requestClient: _requestClient, ...relay }) => relay),
-        }),
-      });
-      expect(decoded.status).toBe("ok");
-      if (decoded.status !== "ok") return;
-      expect(decoded.value.value?.queueAttemptProof).toBe("complete");
-      expect(decoded.value.value?.agent[0]?.identity).toEqual({
-        state: "restricted",
-        reason: "legacy-no-durable-proof",
-      });
-    },
-  );
+  it.each([1, 2] as const)("rejects an active-only legacy v%s snapshot", (version) => {
+    const current = buildSnapshot();
+    const active = current.agent.find((entry) => entry.kind === "active");
+    if (!active) throw new Error("Expected active fixture");
+    const {
+      identity: _identity,
+      queueEntryId: _queueEntryId,
+      currentTurnUserId: _currentTurnUserId,
+      ...legacyActive
+    } = active;
+    const decoded = decodeGracefulRestartSnapshot({
+      status: "completed",
+      payload_json: SuperJSON.stringify({
+        version,
+        createdAt: current.createdAt,
+        deadlineMs: current.deadlineMs,
+        agent: [legacyActive],
+        relays: current.relays.map(({ requestClient: _requestClient, ...relay }) => relay),
+      }),
+    });
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "error") expect(decoded.error).toBeInstanceOf(UnsupportedVersion);
+  });
 
-  it("rejects missing current relay clients and explicit current or legacy disagreement", () => {
+  it("rejects missing current relay clients and explicit current disagreement", () => {
     const current = buildSnapshot();
     const missing = {
       ...current,
@@ -529,25 +498,7 @@ describe("graceful restart persisted codec", () => {
       ...current,
       relays: current.relays.map((relay) => ({ ...relay, requestClient: "github" })),
     };
-    const {
-      queueAttemptProof: _queueAttemptProof,
-      queueAttempts: _queueAttempts,
-      ...legacyBase
-    } = current;
-    const legacyMismatch = {
-      ...legacyBase,
-      version: 2,
-      agent: current.agent.map(
-        ({
-          identity: _identity,
-          queueEntryId: _queueEntryId,
-          currentTurnUserId: _currentTurnUserId,
-          ...entry
-        }) => entry,
-      ),
-      relays: current.relays.map((relay) => ({ ...relay, requestClient: "github" })),
-    };
-    for (const value of [missing, currentMismatch, legacyMismatch]) {
+    for (const value of [missing, currentMismatch]) {
       const decoded = decodeGracefulRestartSnapshot({
         status: "completed",
         payload_json: SuperJSON.stringify(value),
@@ -1092,23 +1043,16 @@ describe("graceful restart persisted codec", () => {
     });
   });
 
-  it("migrates frozen v3 entries without inferring currentTurnUserId from the initiator", () => {
+  it("rejects frozen v3 entries at the runtime boundary", () => {
     const decoded = decodeGracefulRestartSnapshot({
       status: "completed",
       payload_json: SuperJSON.stringify(SHIPPED_POPULATED_V3_FIXTURE),
     });
-    expect(decoded.status).toBe("ok");
-    if (decoded.status === "error" || !decoded.value.value) return;
-    expect(decoded.value.provenance).toBe("migrated");
-    expect(decoded.value.value.version).toBe(GRACEFUL_RESTART_SNAPSHOT_VERSION);
-    expect(decoded.value.value.agent.map((entry) => entry.currentTurnUserId)).toEqual([undefined]);
-    expect(decoded.value.value.agent[0]?.identity).toMatchObject({
-      state: "durable",
-      projection: { authenticatedOrigin: { userId: "v3-initiator" } },
-    });
+    expect(decoded.status).toBe("error");
+    if (decoded.status === "error") expect(decoded.error).toBeInstanceOf(UnsupportedVersion);
   });
 
-  it("strictly rejects empty v4 currentTurnUserId and the v4 field in a v3 entry", () => {
+  it("strictly rejects empty v5 currentTurnUserId and a legacy v3 envelope", () => {
     const snapshot = buildSnapshot();
     const active = snapshot.agent[0];
     if (!active) throw new Error("Expected active fixture");
@@ -1122,7 +1066,11 @@ describe("graceful restart persisted codec", () => {
         payload_json: SuperJSON.stringify(value),
       });
       expect(decoded.status).toBe("error");
-      if (decoded.status === "error") expect(decoded.error).toBeInstanceOf(CorruptPersistedFields);
+      if (decoded.status === "error") {
+        expect(decoded.error).toBeInstanceOf(
+          value.version === 3 ? UnsupportedVersion : CorruptPersistedFields,
+        );
+      }
     }
   });
 
@@ -1310,6 +1258,32 @@ describe("graceful restart persisted codec", () => {
 });
 
 describe("SqliteGracefulRestartStore", () => {
+  it("stops startup on legacy state with the exact offline command", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-graceful-legacy-"));
+    tempDirs.push(dir);
+    const dbPath = path.join(dir, "graceful-restart.db");
+    const database = new Database(dbPath, { strict: true });
+    database.run(`
+      CREATE TABLE graceful_restart_state (
+        singleton_id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        updated_ts INTEGER NOT NULL,
+        payload_json TEXT NOT NULL
+      )
+    `);
+    database.run("INSERT INTO graceful_restart_state VALUES (?, ?, ?, ?)", [
+      1,
+      "completed",
+      1,
+      SuperJSON.stringify(SHIPPED_POPULATED_V3_FIXTURE),
+    ]);
+    database.close();
+
+    expect(() => new SqliteGracefulRestartStore(dbPath)).toThrow(
+      "Graceful restart state requires offline blob migration. Run: bun run migrate:blob-storage -- --config /path/to/core-config.yaml --data-dir /path/to/data",
+    );
+  });
+
   it("preserves rich opaque raw values in a current snapshot", async () => {
     const { store } = await makeStore();
     const snapshot = buildSnapshot();
@@ -1335,6 +1309,65 @@ describe("SqliteGracefulRestartStore", () => {
         throw new Error("Expected a loaded current snapshot");
       }
       expect(isDeepStrictEqual(loaded.value.snapshot.agent[0]?.raw, opaque)).toBeTrue();
+    } finally {
+      store.close();
+    }
+  });
+
+  it("rejects managed bytes nested in current opaque raw state", async () => {
+    const { store } = await makeStore();
+    const snapshot = buildSnapshot();
+    const first = snapshot.agent[0];
+    if (!first) throw new Error("Expected an agent fixture");
+    try {
+      const byteSnapshot = {
+        ...snapshot,
+        agent: [
+          { ...first, raw: { nested: new Uint8Array([1, 2, 3]) } },
+          ...snapshot.agent.slice(1),
+        ],
+      };
+      expect(
+        decodeGracefulRestartSnapshot({
+          status: "completed",
+          payload_json: SuperJSON.stringify(byteSnapshot),
+        }).status,
+      ).toBe("error");
+      expect(store.saveCompletedSnapshot(byteSnapshot).status).toBe("error");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("roundtrips retained request-delivery terminal outcomes", async () => {
+    const { store } = await makeStore();
+    const snapshot = buildSnapshot();
+    const first = snapshot.agent[0];
+    if (!first) throw new Error("Expected an agent fixture");
+    try {
+      const retained = {
+        ...snapshot,
+        agent: [
+          {
+            ...first,
+            retainedRequestDeliveries: [
+              {
+                requestDeliveryId: "b258d276-bca4-4a82-bf7d-b0ea7a14f584",
+                outcome: { kind: "upload-failed" as const, code: "integrity" },
+              },
+            ],
+          },
+          ...snapshot.agent.slice(1),
+        ],
+      };
+      expect(store.saveCompletedSnapshot(retained).status).toBe("ok");
+      const loaded = store.readCompletedSnapshot();
+      expect(loaded.status).toBe("ok");
+      if (loaded.status === "ok" && loaded.value.state === "loaded") {
+        expect(loaded.value.snapshot.agent[0]?.retainedRequestDeliveries).toEqual(
+          retained.agent[0]?.retainedRequestDeliveries,
+        );
+      }
     } finally {
       store.close();
     }
@@ -1366,15 +1399,7 @@ describe("SqliteGracefulRestartStore", () => {
         JSON.stringify(snapshot.agent.find((entry) => entry.kind === "queued")?.corePrimaryLineage),
       );
       const queuedMessage = queued?.messages[0];
-      if (
-        !queuedMessage ||
-        queuedMessage.role !== "user" ||
-        !Array.isArray(queuedMessage.content)
-      ) {
-        throw new Error("Expected queued user content");
-      }
-      const file = queuedMessage.content.find((part) => part.type === "file");
-      expect(file?.data).toBeInstanceOf(URL);
+      expect(queuedMessage).toEqual({ role: "user", content: "check this file" });
 
       expect(store.consumeCompletedSnapshot(loaded.value.rowToken).status).toBe("ok");
       const secondLoad = store.readCompletedSnapshot();

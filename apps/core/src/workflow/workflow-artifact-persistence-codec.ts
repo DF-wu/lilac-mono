@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { DecodedPersistedValue } from "@stanley2058/lilac-utils";
 
 import { canonicalJson, sha256 } from "./workflow-definition";
-import { jsonValueSchema, type JsonValue } from "./workflow-domain";
+import { jsonValueSchema, type JsonValue, type WorkflowArtifactReference } from "./workflow-domain";
 
 export const WORKFLOW_VALUE_ARTIFACT_FORMAT_VERSION = 1;
 
@@ -98,6 +98,21 @@ export function encodeWorkflowValueArtifact(value: JsonValue): {
     payloadHash: sha256(payload),
     payloadBytes: Buffer.byteLength(payload, "utf8"),
   };
+}
+
+export function encodeWorkflowArtifactReference(reference: WorkflowArtifactReference): string {
+  return canonicalJson({
+    artifactId: reference.artifactId,
+    blobRef: {
+      byteLength: reference.blobRef.byteLength,
+      ...(reference.blobRef.expiresAt === undefined
+        ? {}
+        : { expiresAt: reference.blobRef.expiresAt }),
+      objectId: reference.blobRef.objectId,
+      sha256: reference.blobRef.sha256,
+      version: reference.blobRef.version,
+    },
+  });
 }
 
 export function workflowValueArtifactFileByteLimit(maxValueBytes: number): number {

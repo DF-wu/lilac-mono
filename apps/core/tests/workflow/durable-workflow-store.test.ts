@@ -14,15 +14,18 @@ import {
   type WorkflowOperation,
   type WorkflowRevision,
   type WorkflowRun,
-  type WorkflowTrigger,
 } from "../../src/workflow/workflow-domain";
 import {
+  applyWorkflowBlobStorageSchema26Migration,
   applyWorkflowSchemaMigrations,
+  WorkflowBlobStorageMigrationRequired,
   WorkflowMigrationInvalidTimestamp,
+  WORKFLOW_BLOB_MIGRATION_COMMAND,
   WORKFLOW_MIGRATION_VERSIONS,
   WORKFLOW_SCHEMA_VERSION,
 } from "../../src/workflow/workflow-migrations";
 import { workflowResolvedModelRequestSchema } from "../../src/workflow/workflow-request-authority";
+import { workflowSourceArtifactReferenceForTest } from "./workflow-test-blob-store";
 function dbPath(label: string): string {
   return join(tmpdir(), `lilac-workflow-${label}-${crypto.randomUUID()}.sqlite`);
 }
@@ -47,7 +50,7 @@ function revision(id = "revision-1"): WorkflowRevision {
     scope: "project",
     normalizedPath: "audit.js",
     name: "audit",
-    snapshotArtifactId: `artifact-${id}`,
+    snapshotArtifact: workflowSourceArtifactReferenceForTest(`artifact-${id}`),
     sourceSha256: "a".repeat(64),
     inputSchemaSha256: "b".repeat(64),
     resourcePolicySha256: canonicalJsonSha256({ resources, limits }),
@@ -78,7 +81,7 @@ function run(id = "run-1", revisionId = "revision-1"): WorkflowRun {
     progressTarget: null,
     terminalDetail: null,
     result: null,
-    resultArtifactId: null,
+    resultArtifact: null,
     claimedBy: null,
     claimedAt: null,
     createdAt: 10,
@@ -128,7 +131,7 @@ function operation(runId: string, operationId: string): WorkflowOperation {
     attempt: 0,
     requestId: null,
     output: null,
-    resultArtifactId: null,
+    resultArtifact: null,
     error: null,
     usage: null,
     claimedBy: null,
@@ -139,116 +142,9 @@ function operation(runId: string, operationId: string): WorkflowOperation {
     terminalAt: null,
   };
 }
-function downgradeSchemaToV21(db: Database): void {
-  db.run("PRAGMA foreign_keys = OFF");
-  db.run("ALTER TABLE workflow_request_dispatches RENAME TO workflow_request_dispatches_v23");
-  db.run(`CREATE TABLE workflow_request_dispatches (
-    request_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    operation_id TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    platform TEXT NOT NULL,
-    policy_json TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    owner_id TEXT,
-    owner_heartbeat_at INTEGER,
-    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    prompt_published_at INTEGER,
-    dispatch_epoch TEXT NOT NULL,
-    UNIQUE (run_id, operation_id)
-  )`);
-  db.run(`INSERT INTO workflow_request_dispatches (
-    request_id, run_id, operation_id, session_id, platform, policy_json, expires_at,
-    owner_id, owner_heartbeat_at, active, created_at, updated_at, prompt_published_at,
-    dispatch_epoch
-  ) SELECT request_id, run_id, operation_id, session_id, platform, policy_json,
-    9007199254740991, owner_id, owner_heartbeat_at, active, created_at, updated_at,
-    prompt_published_at, dispatch_epoch FROM workflow_request_dispatches_v23`);
-  db.run("DROP TABLE workflow_request_dispatches_v23");
-  db.run(`CREATE INDEX idx_workflow_request_dispatches_active
-    ON workflow_request_dispatches(active, owner_heartbeat_at, expires_at)`);
-  db.run("DROP TRIGGER workflow_completion_delivery_after_run_insert");
-  db.run("ALTER TABLE workflow_completion_deliveries RENAME TO workflow_completion_deliveries_v22");
-  db.run(`CREATE TABLE workflow_completion_deliveries (
-    run_id TEXT PRIMARY KEY REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
-    parent_request_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('pending', 'delivered', 'fallback')),
-    delivered_at INTEGER,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-  )`);
-  db.run(`INSERT INTO workflow_completion_deliveries (
-    run_id, parent_request_id, state, delivered_at, created_at, updated_at
-  ) SELECT run_id, parent_request_id, state, delivered_at, created_at, updated_at
-    FROM workflow_completion_deliveries_v22`);
-  db.run("DROP TABLE workflow_completion_deliveries_v22");
-  db.run(`CREATE INDEX idx_workflow_completion_deliveries_parent_state
-    ON workflow_completion_deliveries(parent_request_id, state, created_at, run_id)`);
-  db.run(`CREATE TRIGGER workflow_completion_delivery_after_run_insert
-    AFTER INSERT ON workflow_runs
-    WHEN json_extract(NEW.completion_target_json, '$.kind') = 'live_parent'
-    BEGIN
-      INSERT INTO workflow_completion_deliveries (
-        run_id, parent_request_id, state, delivered_at, created_at, updated_at
-      ) VALUES (
-        NEW.run_id,
-        json_extract(NEW.completion_target_json, '$.parentRequestId'),
-        'pending',
-        NULL,
-        NEW.created_at,
-        NEW.created_at
-      );
-    END`);
-  db.run("ALTER TABLE workflow_surface_bindings DROP COLUMN permanent_failure_json");
-  db.run("DELETE FROM workflow_schema_migrations WHERE version >= 22");
-}
 function downgradeSchemaToV24(db: Database): void {
   db.run("ALTER TABLE workflow_surface_bindings DROP COLUMN permanent_failure_json");
   db.run("DELETE FROM workflow_schema_migrations WHERE version = 25");
-}
-function downgradeSchemaToV20(db: Database): void {
-  downgradeSchemaToV21(db);
-  db.run("DELETE FROM workflow_schema_migrations WHERE version = 21");
-  db.run(`CREATE TABLE workflow_approvals (
-    approval_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL, state TEXT NOT NULL
-  )`);
-  db.run("ALTER TABLE workflow_runs ADD COLUMN approval_id TEXT");
-  db.run("ALTER TABLE workflow_runs ADD COLUMN origin_safety_mode TEXT NOT NULL DEFAULT 'trusted'");
-  db.run("CREATE INDEX idx_workflow_runs_approval_state ON workflow_runs(approval_id, state)");
-  db.run("ALTER TABLE workflow_surface_actions ADD COLUMN approval_id TEXT");
-  db.run("ALTER TABLE workflow_request_dispatches RENAME TO workflow_request_dispatches_v21");
-  db.run(`CREATE TABLE workflow_request_dispatches (
-    request_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    operation_id TEXT NOT NULL,
-    token_sha256 TEXT NOT NULL UNIQUE,
-    session_id TEXT NOT NULL,
-    platform TEXT NOT NULL,
-    canonical_cwd TEXT NOT NULL,
-    policy_json TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    owner_id TEXT,
-    owner_heartbeat_at INTEGER,
-    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    prompt_published_at INTEGER,
-    dispatch_epoch TEXT,
-    UNIQUE (run_id, operation_id)
-  )`);
-  db.run("DROP TABLE workflow_request_dispatches_v21");
-  db.run(`CREATE TABLE workflow_worktree_outputs (
-    run_id TEXT NOT NULL, operation_id TEXT NOT NULL, state TEXT NOT NULL,
-    worktree_path TEXT NOT NULL, base_commit TEXT, artifact_id TEXT, patch_sha256 TEXT,
-    bytes INTEGER, cleanup_error TEXT, prepared_at INTEGER NOT NULL, captured_at INTEGER,
-    cleaned_at INTEGER, PRIMARY KEY (run_id, operation_id)
-  )`);
-  db.run(`UPDATE workflow_revisions SET
-    capabilities_json = json_set(capabilities_json, '$.safety', json('{"originatingMode":"trusted","escalation":"none"}')),
-    limits_json = json_set(limits_json, '$.maxRuntimeMemoryBytes', 268435456),
-    runtime_version = 'lilac-workflow-js-v3'`);
 }
 describe("durable workflow store minimal dispatch schema", () => {
   it("keeps the reported schema version aligned with the latest migration", () => {
@@ -301,8 +197,84 @@ describe("durable workflow store minimal dispatch schema", () => {
     ).toEqual([]);
     db.close();
   });
+  it("requires the offline command for schema 25 and atomically installs artifact references", () => {
+    const db = new Database(":memory:");
+    try {
+      const legacy = applyWorkflowSchemaMigrations(db, () => 25, 25);
+      expect(legacy.status).toBe("ok");
+      const reference = workflowSourceArtifactReferenceForTest("legacy workflow source");
+      db.run(
+        `INSERT INTO workflow_revisions (
+           revision_id, canonical_project_id, canonical_workspace_root, scope,
+           normalized_path, name, snapshot_artifact_id, source_sha256,
+           input_schema_sha256, capability_sha256, metadata_json, input_schema_json,
+           capabilities_json, limits_json, runtime_version, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          "legacy-revision",
+          "legacy-project",
+          "/legacy",
+          "project",
+          "legacy.ts",
+          "legacy",
+          reference.artifactId,
+          "a".repeat(64),
+          "b".repeat(64),
+          "c".repeat(64),
+          '{"name":"legacy","description":"Legacy workflow"}',
+          "{}",
+          '{"agents":{"maxConcurrent":1,"maxTotal":1},"maxNestingDepth":1,"operationIdleTimeoutMs":1000,"waits":[]}',
+          '{"maxSourceBytes":100,"maxInputBytes":100,"maxOperationOutputBytes":100,"maxResultBytes":100}',
+          WORKFLOW_RUNTIME_VERSION,
+          10,
+        ],
+      );
+
+      const runtimeOpen = applyWorkflowSchemaMigrations(db, () => 26);
+      expect(runtimeOpen.status).toBe("error");
+      if (runtimeOpen.status === "error") {
+        expect(runtimeOpen.error).toBeInstanceOf(WorkflowBlobStorageMigrationRequired);
+        expect(runtimeOpen.error.message).toContain(WORKFLOW_BLOB_MIGRATION_COMMAND);
+      }
+      expect(
+        db
+          .query<{ count: number }, []>(
+            "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'workflow_artifacts'",
+          )
+          .get()?.count,
+      ).toBe(0);
+
+      const migrated = applyWorkflowBlobStorageSchema26Migration(
+        db,
+        [{ reference, createdAt: 10 }],
+        () => 26,
+      );
+      expect(migrated.status).toBe("ok");
+      expect(
+        db
+          .query<{ version: number }, []>(
+            "SELECT version FROM workflow_schema_migrations ORDER BY version DESC LIMIT 1",
+          )
+          .get()?.version,
+      ).toBe(WORKFLOW_SCHEMA_VERSION);
+      const migratedRevision = db
+        .query<{ snapshot_artifact_id: string }, []>(
+          "SELECT snapshot_artifact_id FROM workflow_revisions WHERE revision_id = 'legacy-revision'",
+        )
+        .get();
+      expect(JSON.parse(migratedRevision?.snapshot_artifact_id ?? "null")).toEqual(reference);
+      const artifact = db
+        .query<{ blob_ref_json: string }, [string]>(
+          "SELECT blob_ref_json FROM workflow_artifacts WHERE artifact_id = ?",
+        )
+        .get(reference.artifactId);
+      expect(JSON.parse(artifact?.blob_ref_json ?? "null")).toEqual(reference.blobRef);
+    } finally {
+      db.close();
+    }
+  });
   for (const historicalVersion of WORKFLOW_MIGRATION_VERSIONS) {
-    it(`upgrades a valid v${historicalVersion} migration-prefix layout through v${WORKFLOW_SCHEMA_VERSION}`, () => {
+    it(`opens v${historicalVersion} only when it is the current clean-break schema`, () => {
       const db = new Database(":memory:");
       try {
         const historical = applyWorkflowSchemaMigrations(
@@ -323,7 +295,15 @@ describe("durable workflow store minimal dispatch schema", () => {
           WORKFLOW_MIGRATION_VERSIONS.filter((version) => version <= historicalVersion),
         );
         const upgraded = applyWorkflowSchemaMigrations(db, () => WORKFLOW_SCHEMA_VERSION);
-        expect(upgraded.status).toBe("ok");
+        if (historicalVersion < WORKFLOW_SCHEMA_VERSION) {
+          expect(upgraded.status).toBe("error");
+          if (upgraded.status === "error") {
+            expect(upgraded.error).toBeInstanceOf(WorkflowBlobStorageMigrationRequired);
+            expect(upgraded.error.message).toContain(WORKFLOW_BLOB_MIGRATION_COMMAND);
+          }
+        } else {
+          expect(upgraded.status).toBe("ok");
+        }
         const complete = db
           .query<
             {
@@ -332,7 +312,9 @@ describe("durable workflow store minimal dispatch schema", () => {
             []
           >("SELECT version FROM workflow_schema_migrations ORDER BY version")
           .all();
-        expect(complete.map(({ version }) => version)).toEqual([...WORKFLOW_MIGRATION_VERSIONS]);
+        expect(complete.map(({ version }) => version)).toEqual(
+          WORKFLOW_MIGRATION_VERSIONS.filter((version) => version <= historicalVersion),
+        );
       } finally {
         db.close();
       }
@@ -594,7 +576,7 @@ describe("durable workflow store minimal dispatch schema", () => {
       );
       expect(store.listMigrations().at(-1)).toMatchObject({
         version: WORKFLOW_SCHEMA_VERSION,
-        name: "durable workflow progress permanent failure gate",
+        name: "unified durable workflow artifact references",
       });
     } finally {
       store.close();
@@ -763,29 +745,6 @@ describe("durable workflow store minimal dispatch schema", () => {
       rmSync(file, { force: true });
     }
   });
-  it("retires previously committed live-parent surface fallbacks during migration", () => {
-    const file = dbPath("retire-live-parent-fallback");
-    const initial = new DurableWorkflowStore(file);
-    initial.createRevision(revision());
-    expect(initial.createRun(liveParentRun("legacy-fallback", "missing-parent"))).toBe(true);
-    initial.close();
-    const db = new Database(file);
-    db.run(`UPDATE workflow_completion_deliveries SET state = 'fallback', delivered_at = 20
-       WHERE run_id = 'legacy-fallback'`);
-    db.run(`UPDATE workflow_runs SET progress_target_json = ? WHERE run_id = 'legacy-fallback'`, [
-      JSON.stringify({ platform: "discord", channelId: "session-1", replyToMessageId: null }),
-    ]);
-    downgradeSchemaToV21(db);
-    db.close();
-    const migrated = new DurableWorkflowStore(file);
-    try {
-      expect(migrated.getLiveParentDeliveryState("legacy-fallback")).toBe("orphaned");
-      expect(workflowStoreValue(migrated.getRun("legacy-fallback"))?.progressTarget).toBeNull();
-    } finally {
-      migrated.close();
-      rmSync(file, { force: true });
-    }
-  });
   it("atomically enforces the global active-run cap and admits after terminalization", () => {
     const file = dbPath("active-run-cap");
     const store = new DurableWorkflowStore(file);
@@ -896,222 +855,6 @@ describe("durable workflow store minimal dispatch schema", () => {
       ).toBe(1);
     } finally {
       db.close();
-      rmSync(file, { force: true });
-    }
-  });
-  it("migrates v20 through the current schema and archives incompatible execution history", () => {
-    const file = dbPath("v20-minimal-contract");
-    const store = new DurableWorkflowStore(file);
-    const rev = revision();
-    store.createInvocation({ revision: rev, run: run("active-run") });
-    store.tryClaimRun({ runId: "active-run", claimerId: "old-worker", now: 20 });
-    store.createOperation(operation("active-run", "active-operation"), "old-worker");
-    store.createInvocation({ revision: rev, run: run("terminal-run") });
-    store.tryClaimRun({ runId: "terminal-run", claimerId: "old-worker", now: 20 });
-    store.createOperation(operation("terminal-run", "terminal-operation"), "old-worker");
-    store.transitionOperation({
-      runId: "terminal-run",
-      operationId: "terminal-operation",
-      from: "queued",
-      to: "dispatched",
-      runOwnerId: "old-worker",
-      now: 21,
-    });
-    store.transitionOperation({
-      runId: "terminal-run",
-      operationId: "terminal-operation",
-      from: "dispatched",
-      to: "running",
-      runOwnerId: "old-worker",
-      now: 22,
-    });
-    store.transitionOperation({
-      runId: "terminal-run",
-      operationId: "terminal-operation",
-      from: "running",
-      to: "succeeded",
-      runOwnerId: "old-worker",
-      now: 23,
-      output: "complete",
-    });
-    store.terminalizeRun({
-      runId: "terminal-run",
-      from: "running",
-      to: "succeeded",
-      ownerId: "old-worker",
-      now: 24,
-      detail: "complete",
-      result: { ok: true },
-      resultArtifactId: null,
-    });
-    store.createInvocation({ revision: rev, run: run("rejected-run") });
-    const trigger: WorkflowTrigger = {
-      triggerId: "active-trigger",
-      revisionId: rev.revisionId,
-      state: "active",
-      definition: { kind: "timestamp", at: 100 },
-      args: {},
-      argsSha256: canonicalJsonSha256({}),
-      schedulingPolicy: { skipMissed: true, overlap: "coalesce" },
-      origin: run().origin,
-      completionTarget: { kind: "detached" },
-      progressTarget: null,
-      nextFireAt: 100,
-      lastFireAt: null,
-      lastRunId: null,
-      claimedBy: null,
-      claimedAt: null,
-      createdAt: 10,
-      updatedAt: 10,
-    };
-    store.createTriggerInvocation({
-      trigger,
-      idempotency: { key: "active-trigger", fingerprintSha256: "c".repeat(64) },
-    });
-    store.close();
-    const legacy = new Database(file);
-    downgradeSchemaToV20(legacy);
-    legacy.run(`UPDATE workflow_runs
-       SET state = 'rejected', terminal_detail = 'approval rejected', terminal_at = 25
-       WHERE run_id = 'rejected-run'`);
-    legacy.run(`UPDATE workflow_operations SET state = 'running', request_id = 'active-request',
-       claimed_by = 'old-worker', claimed_at = 20 WHERE run_id = 'active-run'`);
-    legacy.run(
-      `INSERT INTO workflow_request_dispatches (
-         request_id, run_id, operation_id, token_sha256, session_id, platform,
-         canonical_cwd, policy_json, expires_at, owner_id, owner_heartbeat_at,
-         active, created_at, updated_at, prompt_published_at, dispatch_epoch
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1000, ?, 20, 1, 20, 20, 20, ?)`,
-      [
-        "active-request",
-        "active-run",
-        "active-operation",
-        "0".repeat(64),
-        "workflow:active",
-        "unknown",
-        "/workspace",
-        JSON.stringify({
-          profile: "general",
-          model: null,
-          reasoning: null,
-          resolvedModelRequest: {
-            spec: "profile-native:general",
-            provider: "test",
-            modelId: "general",
-            reasoningDisplay: "simple",
-          },
-          canonicalCwd: "/workspace",
-        }),
-        "runner-old",
-        "old-dispatch-epoch",
-      ],
-    );
-    legacy.run(`INSERT INTO workflow_request_terminal_receipts (
-         request_id, run_id, operation_id, dispatch_epoch, state, detail, created_at,
-         output_json, result_artifact_id, usage_json
-       ) VALUES ('terminal-request', 'terminal-run', 'terminal-operation', 'terminal-epoch',
-          'resolved', 'complete', 24, '"complete"', NULL, NULL)`);
-    legacy.run(
-      `INSERT INTO workflow_request_dispatches (
-         request_id, run_id, operation_id, token_sha256, session_id, platform,
-         canonical_cwd, policy_json, expires_at, active, created_at, updated_at,
-         prompt_published_at, dispatch_epoch
-       ) VALUES ('legacy-terminal-dispatch', 'terminal-run', 'terminal-operation', ?,
-         'workflow:terminal', 'unknown', '/workspace', '{not-json', 24, 0, 20, 24, 20,
-         'legacy-terminal-epoch')`,
-      ["1".repeat(64)],
-    );
-    legacy.close();
-    const migrated = new DurableWorkflowStore(file);
-    try {
-      expect(workflowStoreValue(migrated.getRun("active-run"))).toBeNull();
-      expect(
-        workflowStoreValue(migrated.getOperation("active-run", "active-operation")),
-      ).toBeNull();
-      expect(workflowStoreValue(migrated.getTrigger("active-trigger"))).toBeNull();
-      expect(workflowStoreValue(migrated.getRun("terminal-run"))).toBeNull();
-      expect(workflowStoreValue(migrated.getRun("rejected-run"))).toBeNull();
-      expect(
-        workflowStoreValue(migrated.getWorkflowRequestTerminalReceipt("terminal-request")),
-      ).toBeNull();
-      expect(
-        workflowStoreValue(migrated.getWorkflowRequestDispatchPolicy("active-request")),
-      ).toBeNull();
-      expect(
-        workflowStoreValue(migrated.getWorkflowRequestDispatchPolicy("legacy-terminal-dispatch")),
-      ).toBeNull();
-    } finally {
-      migrated.close();
-    }
-    const inspected = new Database(file);
-    try {
-      expect(
-        inspected
-          .query<
-            {
-              version: number;
-            },
-            []
-          >("SELECT version FROM workflow_schema_migrations ORDER BY version DESC LIMIT 1")
-          .get()?.version,
-      ).toBe(WORKFLOW_SCHEMA_VERSION);
-      const quarantine = inspected
-        .query<
-          {
-            record_kind: string;
-            record_id: string;
-          },
-          []
-        >("SELECT record_kind, record_id FROM workflow_quarantine")
-        .all();
-      expect(quarantine).toEqual(
-        expect.arrayContaining([
-          { record_kind: "run", record_id: "active-run" },
-          { record_kind: "operation", record_id: "active-run:active-operation" },
-          { record_kind: "trigger", record_id: "active-trigger" },
-        ]),
-      );
-      const audit = inspected
-        .query<
-          {
-            record_kind: string;
-            record_id: string;
-          },
-          []
-        >("SELECT record_kind, record_id FROM workflow_legacy_audit_records")
-        .all();
-      expect(audit).toEqual(
-        expect.arrayContaining([
-          { record_kind: "revision", record_id: "revision-1" },
-          { record_kind: "run", record_id: "active-run" },
-          { record_kind: "run", record_id: "terminal-run" },
-          { record_kind: "trigger", record_id: "active-trigger" },
-          { record_kind: "terminal_receipt", record_id: "terminal-request" },
-        ]),
-      );
-      expect(
-        inspected
-          .query<
-            {
-              active: number;
-            },
-            []
-          >("SELECT active FROM workflow_request_dispatches WHERE request_id = 'active-request'")
-          .get()?.active,
-      ).toBeUndefined();
-      expect(
-        inspected
-          .query<
-            {
-              name: string;
-            },
-            []
-          >("PRAGMA table_info(workflow_request_dispatches)")
-          .all()
-          .map((column) => column.name),
-      ).not.toContain("expires_at");
-    } finally {
-      inspected.close();
       rmSync(file, { force: true });
     }
   });

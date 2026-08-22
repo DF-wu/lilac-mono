@@ -1,4 +1,5 @@
 import { workflowStoreValue } from "./workflow-store-test-helpers";
+import { createWorkflowTestBlobStore } from "./workflow-test-blob-store";
 import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -19,6 +20,8 @@ import {
   type RawBus,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
+
+const blobStore = await createWorkflowTestBlobStore();
 import {
   okResultForTest,
   startResultForTest,
@@ -282,6 +285,7 @@ describe("unified workflow integration", () => {
       surfaceProtocolResolver: TEST_SURFACE_PROTOCOL_RESOLVER,
     });
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir,
       store,
       bus,
@@ -374,6 +378,7 @@ describe("unified workflow integration", () => {
       | undefined;
     const runner = await startBusAgentRunner({
       bus,
+      blobStore,
       subscriptionId: "integration-runner",
       config,
       pluginManager,
@@ -452,6 +457,7 @@ describe("unified workflow integration", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir,
       subscriptionId: "integration-engine",
       pollMs: 5,
@@ -612,6 +618,7 @@ describe("unified workflow integration", () => {
       minEditIntervalMs: 0,
     });
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir,
       store,
       bus,
@@ -642,6 +649,7 @@ describe("unified workflow integration", () => {
     const firstEngine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir,
       subscriptionId: "restart-engine-first",
       pollMs: 5,
@@ -687,6 +695,7 @@ describe("unified workflow integration", () => {
       restartedEngine = new WorkflowEngine({
         bus,
         store,
+        blobStore,
         dataDir,
         subscriptionId: "restart-engine-second",
         pollMs: 5,

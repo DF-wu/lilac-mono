@@ -24,6 +24,7 @@ import type { WorkflowTrigger } from "../../src/workflow/workflow-domain";
 import type { WorkflowProgressCardService } from "../../src/workflow/workflow-progress-projector";
 import { formatWorkflowErrorForLog } from "../../src/workflow/workflow-error-log";
 import { WorkflowTriggerScheduler } from "../../src/workflow/workflow-trigger-scheduler";
+import { workflowArtifactReferenceForTest } from "./workflow-test-blob-store";
 
 class SchedulerLogFailure extends TaggedError("SchedulerLogFailure")<{
   readonly cause: unknown;
@@ -66,7 +67,7 @@ function createRevision(store: DurableWorkflowStore): void {
     scope: "project",
     normalizedPath: "scheduled.js",
     name: "scheduled",
-    snapshotArtifactId: `workflow-source:${"a".repeat(64)}`,
+    snapshotArtifact: workflowArtifactReferenceForTest(`workflow-source:${"a".repeat(64)}`),
     sourceSha256: "a".repeat(64),
     inputSchemaSha256: "b".repeat(64),
     resourcePolicySha256: canonicalJsonSha256({ resources, limits }),
@@ -353,7 +354,7 @@ describe("workflow trigger scheduler", () => {
         progressTarget: null,
         terminalDetail: null,
         result: null,
-        resultArtifactId: null,
+        resultArtifact: null,
         claimedBy: null,
         claimedAt: null,
         createdAt: 1,

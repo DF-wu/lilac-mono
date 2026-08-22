@@ -203,7 +203,7 @@ export class WorkflowTriggerScheduler {
       progressTarget: trigger.progressTarget,
       terminalDetail: null,
       result: null,
-      resultArtifactId: null,
+      resultArtifact: null,
       claimedBy: null,
       claimedAt: null,
       createdAt: now,

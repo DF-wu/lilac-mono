@@ -17,7 +17,8 @@ import {
   type LilacBus,
   type OutReqTopic,
 } from "@stanley2058/lilac-event-bus";
-import { createLogger, env, formatTaggedErrorForLog, isPanic } from "@stanley2058/lilac-utils";
+import { createLogger, formatTaggedErrorForLog, isPanic } from "@stanley2058/lilac-utils";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
@@ -269,7 +270,7 @@ function toCompletionIdentity(
 async function toCompletion(
   run: WorkflowRun,
   store: DurableWorkflowStore,
-  dataDir: string,
+  blobStore: BlobStore,
   toolResultArtifacts?: ToolResultArtifactStore,
 ): Promise<WorkflowLiveParentCompletion> {
   const identity = toCompletionIdentity(run, store);
@@ -286,10 +287,10 @@ async function toCompletion(
   }
   const revision = adaptToolResultToHost(store.getRevision(run.revisionId));
   let result = run.result;
-  if (run.state === "succeeded" && run.resultArtifactId && revision) {
+  if (run.state === "succeeded" && run.resultArtifact && revision) {
     const loaded = await readWorkflowValueArtifact({
-      dataDir,
-      artifactId: run.resultArtifactId,
+      blobStore,
+      reference: run.resultArtifact,
       maxBytes: revision.limits.maxResultBytes,
     });
     result = adaptWorkflowArtifactResultToException(loaded);
@@ -322,7 +323,7 @@ export class WorkflowLiveParentBridge {
       bus: LilacBus;
       store: DurableWorkflowStore;
       subscriptionId: string;
-      dataDir?: string;
+      blobStore: BlobStore;
       toolResultArtifacts?: ToolResultArtifactStore;
       now?: () => number;
     },
@@ -494,7 +495,7 @@ export class WorkflowLiveParentBridge {
         });
         const runs = readRuns();
         return runs.map((run) => {
-          if (run.resultArtifactId) {
+          if (run.resultArtifact) {
             throw new Error("Artifact-backed completion requires listPendingAsync");
           }
           if (
@@ -541,7 +542,7 @@ export class WorkflowLiveParentBridge {
               await toCompletion(
                 run,
                 this.input.store,
-                this.input.dataDir ?? env.dataDir,
+                this.input.blobStore,
                 this.input.toolResultArtifacts,
               ),
           ),
@@ -585,7 +586,7 @@ export class WorkflowLiveParentBridge {
               toCompletion(
                 run,
                 this.input.store,
-                this.input.dataDir ?? env.dataDir,
+                this.input.blobStore,
                 this.input.toolResultArtifacts,
               ),
             ]);

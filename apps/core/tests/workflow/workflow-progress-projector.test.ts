@@ -16,6 +16,7 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import { Panic, Result } from "better-result";
 import { subscribeForTest, type TestRawMessageHandler } from "../helpers/result-raw-bus";
+import { workflowArtifactReferenceForTest } from "./workflow-test-blob-store";
 import {
   SurfaceMessageNotFound,
   SurfaceOperationPartiallyCompleted,
@@ -413,7 +414,7 @@ function createInvocation(
       scope: "project",
       normalizedPath: "audit.js",
       name: "audit",
-      snapshotArtifactId: `workflow-source:${HASH_A}`,
+      snapshotArtifact: workflowArtifactReferenceForTest(`workflow-source:${HASH_A}`),
       sourceSha256: HASH_A,
       inputSchemaSha256: HASH_B,
       resourcePolicySha256: "c".repeat(64),
@@ -462,7 +463,7 @@ function createInvocation(
         : null,
       terminalDetail: null,
       result: null,
-      resultArtifactId: null,
+      resultArtifact: null,
       claimedBy: null,
       claimedAt: null,
       createdAt: 10,

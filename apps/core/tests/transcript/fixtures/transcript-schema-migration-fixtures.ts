@@ -179,6 +179,77 @@ function createV4Layout(database: Database): void {
   `);
 }
 
+function createV5Layout(database: Database): void {
+  database.exec(`
+    ALTER TABLE core_primary_claude_bindings
+      ADD COLUMN terminal_request_id TEXT
+        REFERENCES request_transcripts(request_id) ON DELETE CASCADE;
+    CREATE TABLE core_named_claude_bindings (
+      request_client TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      provider_id TEXT NOT NULL,
+      binding_protocol_version INTEGER NOT NULL CHECK (binding_protocol_version = 1),
+      provider_family TEXT NOT NULL CHECK (provider_family = 'claude-code'),
+      terminal_request_id TEXT NOT NULL
+        REFERENCES request_transcripts(request_id) ON DELETE CASCADE,
+      canonical_hash_version INTEGER NOT NULL CHECK (canonical_hash_version = 1),
+      canonical_head_hash TEXT NOT NULL,
+      canonical_message_count INTEGER NOT NULL CHECK (canonical_message_count >= 0),
+      execution_scope_hash_version INTEGER NOT NULL CHECK (execution_scope_hash_version = 1),
+      execution_scope_hash TEXT NOT NULL,
+      claude_session_id TEXT NOT NULL,
+      native_cwd TEXT NOT NULL,
+      native_last_modified REAL NOT NULL CHECK (native_last_modified >= 0),
+      native_context_tokens INTEGER NOT NULL CHECK (native_context_tokens >= 0),
+      native_context_max_tokens INTEGER NOT NULL CHECK (native_context_max_tokens > 0),
+      last_model_specifier TEXT NOT NULL,
+      last_reasoning TEXT NOT NULL,
+      revision INTEGER NOT NULL CHECK (revision > 0),
+      updated_ts INTEGER NOT NULL,
+      PRIMARY KEY (request_client, session_id, provider_id)
+    );
+    CREATE TABLE core_named_claude_attempts (
+      product TEXT NOT NULL CHECK (product = 'core-named'),
+      request_client TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      provider_id TEXT NOT NULL,
+      source_terminal_request_id TEXT
+        REFERENCES request_transcripts(request_id) ON DELETE SET NULL,
+      source_canonical_head_hash TEXT,
+      source_canonical_message_count INTEGER CHECK (source_canonical_message_count >= 0),
+      execution_scope_hash_version INTEGER NOT NULL CHECK (execution_scope_hash_version = 1),
+      execution_scope_hash TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      attempt_index INTEGER NOT NULL CHECK (attempt_index >= 0),
+      candidate_session_id TEXT NOT NULL,
+      source_session_id TEXT,
+      expected_binding_revision INTEGER CHECK (expected_binding_revision > 0),
+      state TEXT NOT NULL
+        CHECK (state IN ('active', 'succeeded', 'failed', 'cancelled', 'uncertain')),
+      terminal_request_id TEXT REFERENCES request_transcripts(request_id) ON DELETE CASCADE,
+      terminal_canonical_head_hash TEXT,
+      terminal_canonical_message_count INTEGER CHECK (terminal_canonical_message_count >= 0),
+      native_cwd TEXT,
+      native_last_modified REAL CHECK (native_last_modified >= 0),
+      native_context_tokens INTEGER CHECK (native_context_tokens >= 0),
+      native_context_max_tokens INTEGER CHECK (native_context_max_tokens > 0),
+      last_model_specifier TEXT,
+      last_reasoning TEXT,
+      created_ts INTEGER NOT NULL,
+      updated_ts INTEGER NOT NULL,
+      PRIMARY KEY (request_client, session_id, provider_id, request_id, attempt_index)
+    );
+    CREATE INDEX idx_core_named_claude_attempts_owner
+      ON core_named_claude_attempts(request_client, session_id, provider_id, updated_ts);
+    CREATE INDEX idx_core_lineage_projection_refs_projection
+      ON core_lineage_projection_refs(
+        request_client, surface_id, session_id, message_id, projection_format_version
+      );
+    CREATE INDEX idx_core_surface_projection_blobs_blob
+      ON core_surface_projection_blobs(blob_sha256);
+  `);
+}
+
 export function createTranscriptSchemaMigrationFixture(
   dbPath: string,
   startVersion: SupportedTranscriptSchemaStart,
@@ -247,13 +318,7 @@ export function createTranscriptSchemaMigrationFixture(
     if (startVersion >= 2) createV2Layout(database);
     if (startVersion >= 3) createV3Layout(database);
     if (startVersion >= 4) createV4Layout(database);
-    if (startVersion >= 5) {
-      database.run(
-        `ALTER TABLE core_primary_claude_bindings
-         ADD COLUMN terminal_request_id TEXT
-           REFERENCES request_transcripts(request_id) ON DELETE CASCADE`,
-      );
-    }
+    if (startVersion >= 5) createV5Layout(database);
   } finally {
     database.close();
   }

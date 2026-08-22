@@ -1,48 +1,43 @@
 import SuperJSON from "superjson";
 import { createHash } from "node:crypto";
 import {
-  modelMessageSchema,
-  type FilePart,
-  type SystemModelMessage,
-  type TextPart,
-  type ToolApprovalRequest,
-  type ToolModelMessage,
-  type ToolResultPart,
-  type UserModelMessage,
-} from "ai";
-import {
-  hashCanonicalMessagesV1,
+  canonicalJsonStringify,
   historyProviderStateSchema,
   type HistoryProviderState,
 } from "@stanley2058/lilac-agent";
+import { blobRefV1Schema, type BlobRefV1 } from "@stanley2058/lilac-blob-storage";
 import {
-  coreLineageManifestV1Schema,
-  computeCoreLineagePrefixDigestV1,
-  decodeCorePrimaryLineageV1,
+  coreLineageManifestV2Schema,
+  computeCoreLineagePrefixDigestV2,
+  decodeCorePrimaryLineageV2,
+  storedFilePartV1Schema as eventStoredFilePartV1Schema,
+  storedMessageV1Schema as eventStoredMessageV1Schema,
+  storedMessagesV1Schema,
   type AdapterPlatform,
-  type CoreLineageAtomV1,
-  type CoreRequestAliasV1,
+  type CoreLineageAtomV2,
+  type CoreRequestAliasV2,
+  type StoredFilePartV1 as EventStoredFilePartV1,
+  type StoredMessageV1 as EventStoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
 import {
   CorruptPersistedFields,
   MalformedSerialization,
   UnsupportedVersion,
   isRecord,
-  normalizeReplayMessages,
   type DecodedPersistedValue,
   type PersistedDataError,
   type PersistedDataIssueCode,
   type PersistenceProvenance,
 } from "@stanley2058/lilac-utils";
-import { Panic, Result, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
-export const TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION = 5 as const;
+export const TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION = 6 as const;
 export const COMPACTION_CHECKPOINT_FORMAT_VERSION = 1 as const;
 export const CORE_SURFACE_PROJECTION_FORMAT_VERSION = 1 as const;
-export const CORE_TRANSCRIPT_DIGEST_VERSION = 1 as const;
+export const CORE_TRANSCRIPT_DIGEST_VERSION = 2 as const;
 
 const TRANSCRIPT_TABLE = "request_transcripts";
 const PROJECTION_TABLE = "core_surface_projections";
@@ -58,7 +53,6 @@ const adapterPlatformSchema = z.enum([
   "web",
   "unknown",
 ]);
-const modelMessagesSchema = z.array(modelMessageSchema);
 const sha256HexSchema = z.string().regex(/^[0-9a-f]{64}$/u);
 const nonNegativeIntegerSchema = z.number().int().nonnegative();
 const compactionCheckpointMetaSchema = z.strictObject({
@@ -92,65 +86,10 @@ export type CoreProjectionSourceFact =
   | CoreProjectionSourceFact[]
   | CoreProjectionSourceFactObject;
 
-interface DecodedProviderObject extends Record<string, DecodedProviderValue | undefined> {}
-type DecodedProviderValue =
-  | null
-  | boolean
-  | number
-  | string
-  | DecodedProviderValue[]
-  | DecodedProviderObject;
-type DecodedProviderOptions = Record<string, DecodedProviderObject>;
-
-type DecodedToolCallPart = {
-  readonly type: "tool-call";
-  readonly toolCallId: string;
-  readonly toolName: string;
-  readonly input: CoreProjectionSourceFact;
-  readonly providerOptions?: DecodedProviderOptions;
-  readonly providerExecuted?: boolean;
-};
-type DecodedCustomPart = {
-  readonly type: "custom";
-  readonly kind: `${string}.${string}`;
-  readonly providerOptions?: DecodedProviderOptions;
-};
-type DecodedReasoningPart = {
-  readonly type: "reasoning";
-  readonly text: string;
-  readonly providerOptions?: DecodedProviderOptions;
-};
-type DecodedReasoningFilePart = {
-  readonly type: "reasoning-file";
-  readonly data:
-    | string
-    | Uint8Array
-    | ArrayBuffer
-    | URL
-    | { readonly type: "data"; readonly data: string | Uint8Array | ArrayBuffer }
-    | { readonly type: "url"; readonly url: URL };
-  readonly mediaType: string;
-  readonly providerOptions?: DecodedProviderOptions;
-};
-type DecodedAssistantContentPart =
-  | TextPart
-  | DecodedCustomPart
-  | FilePart
-  | DecodedReasoningPart
-  | DecodedReasoningFilePart
-  | DecodedToolCallPart
-  | ToolResultPart
-  | ToolApprovalRequest;
-type DecodedAssistantModelMessage = {
-  readonly role: "assistant";
-  readonly content: string | DecodedAssistantContentPart[];
-  readonly providerOptions?: DecodedProviderOptions;
-};
-export type DecodedModelMessage =
-  | SystemModelMessage
-  | UserModelMessage
-  | ToolModelMessage
-  | DecodedAssistantModelMessage;
+export const storedFilePartV1Schema = eventStoredFilePartV1Schema;
+export type StoredFilePartV1 = EventStoredFilePartV1;
+export type StoredMessageV1 = EventStoredMessageV1;
+export type DecodedModelMessage = StoredMessageV1;
 
 const coreProjectionSourceFactSchema: z.ZodType<CoreProjectionSourceFact> = z.lazy(() =>
   z.union([
@@ -218,11 +157,10 @@ export type DecodedCoreSurfaceProjectionRow = {
 };
 
 export type DecodedCoreOwnedBlobRow = {
-  readonly sha256: string;
+  readonly ownerId: string;
+  readonly blob: BlobRefV1;
   readonly mediaType: string;
   readonly filename: string;
-  readonly byteLength: number;
-  readonly bytes: Uint8Array;
   readonly createdAt: number;
 };
 
@@ -233,7 +171,7 @@ export type DecodedCoreNamedClaudeBindingRow = {
   readonly requestClient: AdapterPlatform;
   readonly lilacSessionId: string;
   readonly terminalRequestId: string;
-  readonly canonicalHashVersion: 1;
+  readonly canonicalHashVersion: 2;
   readonly canonicalHeadHash: string;
   readonly canonicalMessageCount: number;
   readonly executionScopeHashVersion: 1;
@@ -285,7 +223,7 @@ export type DecodedCorePrimaryClaudeBindingRow = {
   readonly requestClient: "discord";
   readonly lilacSessionId: string;
   readonly terminalRequestId: string;
-  readonly lineageVersion: 1;
+  readonly lineageVersion: 2;
   readonly atomCount: number;
   readonly prefixDigest: string;
   readonly canonicalMessageCount: number;
@@ -307,7 +245,7 @@ export type DecodedCorePrimaryClaudeAttemptRow = {
   readonly providerId: string;
   readonly requestClient: "discord";
   readonly lilacSessionId: string;
-  readonly sourceLineageVersion: 1 | null;
+  readonly sourceLineageVersion: 2 | null;
   readonly sourceAtomCount: number | null;
   readonly sourcePrefixDigest: string | null;
   readonly sourceCanonicalMessageCount: number | null;
@@ -320,7 +258,7 @@ export type DecodedCorePrimaryClaudeAttemptRow = {
   readonly expectedBindingRevision: number | null;
   readonly state: z.output<typeof coreClaudeAttemptStateSchema>;
   readonly terminalRequestId: string | null;
-  readonly terminalLineageVersion: 1 | null;
+  readonly terminalLineageVersion: 2 | null;
   readonly terminalAtomCount: number | null;
   readonly terminalPrefixDigest: string | null;
   readonly terminalCanonicalMessageCount: number | null;
@@ -427,11 +365,11 @@ export type PersistedCoreLineageManifestRow = {
   readonly manifest_json: string;
 };
 
-type DecodedCoreLineageSegmentV1 = {
-  readonly atoms: CoreLineageAtomV1[];
+export type CoreStoredLineageSegmentV2 = {
+  readonly atoms: CoreLineageAtomV2[];
   readonly canonicalMessages: DecodedModelMessage[];
   readonly requestSource?: {
-    readonly aliases: CoreRequestAliasV1[];
+    readonly aliases: CoreRequestAliasV2[];
   };
   readonly canonicalStart: number;
   readonly canonicalEnd: number;
@@ -439,15 +377,15 @@ type DecodedCoreLineageSegmentV1 = {
   readonly cumulativePrefixDigest: string;
 };
 
-export type DecodedCoreLineageManifestV1 = {
+export type CoreStoredLineageManifestV2 = {
   readonly state: "complete";
-  readonly lineageVersion: 1;
+  readonly lineageVersion: 2;
   readonly currentCanonicalStart: number;
-  readonly segments: DecodedCoreLineageSegmentV1[];
+  readonly segments: CoreStoredLineageSegmentV2[];
 };
 
 type DecodedSchemaVersion = {
-  readonly version: 1 | 2 | 3 | 4 | 5;
+  readonly version: 1 | 2 | 3 | 4 | 5 | 6;
   readonly provenance: "current" | "migrated";
 };
 
@@ -467,11 +405,11 @@ const transcriptBlobMetricsRowSchema = z.strictObject({
   unreferenced_bytes: nonNegativeIntegerSchema,
 });
 const coreOwnedBlobRowSchema = z.strictObject({
-  sha256: sha256HexSchema,
+  owner_id: z.string().min(1),
+  blob_ref_json: z.string(),
   media_type: z.string().min(1),
   filename: z.string().min(1),
   byte_length: nonNegativeIntegerSchema,
-  bytes: z.instanceof(Uint8Array),
   created_ts: nonNegativeIntegerSchema,
 });
 const coreNamedClaudeBindingRowSchema = z.strictObject({
@@ -481,7 +419,7 @@ const coreNamedClaudeBindingRowSchema = z.strictObject({
   binding_protocol_version: z.literal(1),
   provider_family: z.literal("claude-code"),
   terminal_request_id: z.string().min(1),
-  canonical_hash_version: z.literal(1),
+  canonical_hash_version: z.literal(2),
   canonical_head_hash: sha256HexSchema,
   canonical_message_count: nonNegativeIntegerSchema,
   execution_scope_hash_version: z.literal(1),
@@ -531,7 +469,7 @@ const corePrimaryClaudeBindingRowSchema = z.strictObject({
   binding_protocol_version: z.literal(1),
   provider_family: z.literal("claude-code"),
   terminal_request_id: z.string().min(1),
-  lineage_version: z.literal(1),
+  lineage_version: z.literal(2),
   atom_count: positiveIntegerSchema,
   prefix_digest: sha256HexSchema,
   canonical_message_count: positiveIntegerSchema,
@@ -552,7 +490,7 @@ const corePrimaryClaudeAttemptRowSchema = z.strictObject({
   request_client: z.literal("discord"),
   session_id: z.string().min(1),
   provider_id: z.string().min(1),
-  source_lineage_version: z.literal(1).nullable(),
+  source_lineage_version: z.literal(2).nullable(),
   source_atom_count: nullablePositiveIntegerSchema,
   source_prefix_digest: sha256HexSchema.nullable(),
   source_canonical_message_count: nullablePositiveIntegerSchema,
@@ -565,7 +503,7 @@ const corePrimaryClaudeAttemptRowSchema = z.strictObject({
   expected_binding_revision: nullablePositiveIntegerSchema,
   state: coreClaudeAttemptStateSchema,
   terminal_request_id: z.string().min(1).nullable(),
-  terminal_lineage_version: z.literal(1).nullable(),
+  terminal_lineage_version: z.literal(2).nullable(),
   terminal_atom_count: nullablePositiveIntegerSchema,
   terminal_prefix_digest: sha256HexSchema.nullable(),
   terminal_canonical_message_count: nullablePositiveIntegerSchema,
@@ -673,6 +611,7 @@ function decodeSchemaVersion(
     case 3:
     case 4:
     case 5:
+    case 6:
       return Result.ok({
         version,
         provenance: version === TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION ? "current" : "migrated",
@@ -742,6 +681,134 @@ function adaptTranscriptPersistenceDecodeResult<T>(
   return adapt();
 }
 
+export const storedMessageV1Schema = eventStoredMessageV1Schema;
+
+const CORE_TRANSCRIPT_DIGEST_DOMAIN_V2 = "lilac:core-transcript:v2";
+
+export class StoredMessageValidationError extends TaggedError("StoredMessageValidationError")<{
+  readonly message: string;
+}> {}
+
+type StoredAssistantMessage = Extract<StoredMessageV1, { readonly role: "assistant" }>;
+type StoredToolMessage = Extract<StoredMessageV1, { readonly role: "tool" }>;
+type StoredAssistantPart = Exclude<StoredAssistantMessage["content"], string>[number];
+type StoredToolPart = StoredToolMessage["content"][number];
+type StoredToolResultPart = Extract<StoredAssistantPart | StoredToolPart, { type: "tool-result" }>;
+
+function projectStoredBlobIdentity(part: StoredFilePartV1) {
+  return {
+    type: "blob" as const,
+    sha256: part.blob.sha256,
+    byteLength: part.blob.byteLength,
+    mediaType: part.mediaType,
+    ...(part.filename === undefined ? {} : { filename: part.filename }),
+  };
+}
+
+function projectStoredToolResult(part: StoredToolResultPart) {
+  if (part.output.type !== "content") return part;
+  return {
+    ...part,
+    output: {
+      ...part.output,
+      value: part.output.value.map((value) =>
+        value.type === "blob" ? projectStoredBlobIdentity(value) : value,
+      ),
+    },
+  };
+}
+
+function projectStoredMessageIdentity(message: StoredMessageV1) {
+  if (typeof message.content === "string") return message;
+  return {
+    ...message,
+    content: message.content.map((part) => {
+      if (part.type === "blob") return projectStoredBlobIdentity(part);
+      if (part.type === "tool-result") return projectStoredToolResult(part);
+      return part;
+    }),
+  };
+}
+
+export function hashCanonicalStoredMessagesV2(
+  messages: readonly StoredMessageV1[],
+): ResultType<
+  { readonly version: 2; readonly hash: string; readonly serialized: string },
+  StoredMessageValidationError
+> {
+  const normalized = normalizeStoredMessagesV1(messages);
+  if (normalized === null) {
+    return Result.err(
+      new StoredMessageValidationError({
+        message: "Stored messages contain invalid or non-JSON content",
+      }),
+    );
+  }
+  const projection = {
+    version: CORE_TRANSCRIPT_DIGEST_VERSION,
+    messages: normalized.map(projectStoredMessageIdentity),
+  };
+  const serialized = canonicalJsonStringify(projection);
+  return Result.ok({
+    version: CORE_TRANSCRIPT_DIGEST_VERSION,
+    hash: createHash("sha256")
+      .update(CORE_TRANSCRIPT_DIGEST_DOMAIN_V2)
+      .update("\0")
+      .update(serialized)
+      .digest("hex"),
+    serialized,
+  });
+}
+
+export function decodeStoredBlobRefV1(value: unknown): BlobRefV1 | null {
+  const decoded = blobRefV1Schema.safeParse(value);
+  return decoded.success ? decoded.data : null;
+}
+
+function decodeCoreOwnedBlobValue(input: {
+  readonly row: z.output<typeof coreOwnedBlobRowSchema>;
+  readonly version: DecodedSchemaVersion;
+  readonly recordId: string;
+}): ResultType<DecodedPersistedValue<DecodedCoreOwnedBlobRow>, PersistedDataError> {
+  return adaptTranscriptPersistenceDecodeResult(
+    Result.gen(function* () {
+      const serialized = yield* decodeSerialized({
+        raw: input.row.blob_ref_json,
+        table: "core_owned_blobs",
+        field: "blob_ref_json",
+        version: input.version.version,
+        recordId: input.recordId,
+      });
+      const blob = decodeStoredBlobRefV1(serialized);
+      if (
+        blob === null ||
+        blob.objectId !== input.row.owner_id ||
+        blob.byteLength !== input.row.byte_length
+      ) {
+        return Result.err(
+          corrupt({
+            table: "core_owned_blobs",
+            field: "blob_ref_json",
+            version: input.version.version,
+            issueCode: "invalid-transcript-row",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      return Result.ok({
+        value: {
+          ownerId: input.row.owner_id,
+          blob,
+          mediaType: input.row.media_type,
+          filename: input.row.filename,
+          createdAt: input.row.created_ts,
+        },
+        provenance: input.version.provenance,
+      });
+    }),
+  );
+}
+
 function decodeNormalizedMessagesValue(
   value: unknown,
   input: {
@@ -751,45 +818,24 @@ function decodeNormalizedMessagesValue(
     readonly recordId: string;
   },
 ): ResultType<DecodedModelMessage[], CorruptPersistedFields> {
-  const messages = modelMessagesSchema.safeParse(value);
-  if (!messages.success) {
+  const messages = normalizeStoredMessagesV1(value);
+  if (messages === null) {
     return Result.err(corrupt({ ...input, issueCode: "invalid-transcript-messages" }));
   }
-  const normalized = modelMessagesSchema.safeParse(normalizeReplayMessages(messages.data));
-  if (!normalized.success) {
-    return Result.err(corrupt({ ...input, issueCode: "invalid-transcript-messages" }));
-  }
-  const decodedMessages: DecodedModelMessage[] = [];
-  for (const message of normalized.data) {
-    if (message.role !== "assistant") {
-      decodedMessages.push(message);
-      continue;
-    }
-    if (typeof message.content === "string") {
-      decodedMessages.push({
-        role: "assistant",
-        content: message.content,
-        ...(message.providerOptions === undefined
-          ? {}
-          : { providerOptions: message.providerOptions }),
-      });
-      continue;
-    }
-    const content: DecodedAssistantContentPart[] = [];
-    for (const part of message.content) {
-      if (part.type !== "tool-call") {
-        content.push(part);
-        continue;
-      }
-      const toolInput = coreProjectionSourceFactSchema.safeParse(part.input);
-      if (!toolInput.success) {
-        return Result.err(corrupt({ ...input, issueCode: "invalid-transcript-messages" }));
-      }
-      content.push({ ...part, input: toolInput.data });
-    }
-    decodedMessages.push({ ...message, content });
-  }
-  return Result.ok(decodedMessages);
+  return Result.ok(messages);
+}
+
+/** Validate and normalize the current reference-bearing stored-message representation. */
+export function normalizeStoredMessagesV1(value: unknown): StoredMessageV1[] | null {
+  const decoded = storedMessagesV1Schema.safeParse(value);
+  if (!decoded.success) return null;
+  const normalized = Result.try<unknown, { readonly cause: unknown }>({
+    try: () => globalThis.JSON.parse(globalThis.JSON.stringify(decoded.data)),
+    catch: (cause) => ({ cause }),
+  });
+  if (normalized.isErr()) return null;
+  const reparsed = storedMessagesV1Schema.safeParse(normalized.value);
+  return reparsed.success ? reparsed.data : null;
 }
 
 export function decodeTranscriptMessages(input: {
@@ -1186,19 +1232,10 @@ export function decodeTranscriptRow(
             case "owned-blob": {
               const decoded = coreOwnedBlobRowSchema.safeParse(input.row);
               if (!decoded.success) return invalidRow();
-              if (decoded.data.bytes.byteLength !== decoded.data.byte_length) return invalidRow();
-              const digest = createHash("sha256").update(decoded.data.bytes).digest("hex");
-              if (digest !== decoded.data.sha256) return invalidRow();
-              return Result.ok({
-                value: {
-                  sha256: decoded.data.sha256,
-                  mediaType: decoded.data.media_type,
-                  filename: decoded.data.filename,
-                  byteLength: decoded.data.byte_length,
-                  bytes: new Uint8Array(decoded.data.bytes),
-                  createdAt: decoded.data.created_ts,
-                },
-                provenance: version.provenance,
+              return decodeCoreOwnedBlobValue({
+                row: decoded.data,
+                version,
+                recordId: input.recordId,
               });
             }
             case "named-binding": {
@@ -1398,51 +1435,65 @@ export function decodeTranscriptRow(
               >({
                 err: (error) => () => Result.err(error),
                 ok: (providerState) => () => {
-                  const computedDigest = hashCanonicalMessagesV1(messages.value).hash;
-                  if (rowSchema.data.transcript_digest !== null) {
-                    const digest = sha256HexSchema.safeParse(rowSchema.data.transcript_digest);
-                    if (!digest.success || digest.data !== computedDigest) {
-                      return Result.err(
-                        corrupt({
-                          table: TRANSCRIPT_TABLE,
-                          field: "transcript_digest",
-                          version: version.version,
-                          issueCode: "digest-mismatch",
-                          recordId,
-                        }),
-                      );
-                    }
-                  }
-                  return Result.ok({
-                    value: {
-                      requestId: rowSchema.data.request_id,
-                      sessionId: rowSchema.data.session_id,
-                      requestClient: rowSchema.data.request_client,
-                      createdTs: rowSchema.data.created_ts,
-                      updatedTs: rowSchema.data.updated_ts,
-                      messages: messages.value,
-                      ...(rowSchema.data.final_text === null
-                        ? {}
-                        : { finalText: rowSchema.data.final_text }),
-                      ...(rowSchema.data.model_label === null
-                        ? {}
-                        : { modelLabel: rowSchema.data.model_label }),
-                      ...(contextMeta.value === undefined
-                        ? {}
-                        : { contextMeta: contextMeta.value }),
-                      providerState: providerState.value,
-                      ...(rowSchema.data.stable_named_request_client === null
-                        ? {}
-                        : { stableNamedRequestClient: rowSchema.data.stable_named_request_client }),
-                      canonicalHashVersion: CORE_TRANSCRIPT_DIGEST_VERSION,
-                      transcriptDigest: computedDigest,
-                    },
-                    provenance: aggregateProvenance(version, [
-                      messages,
-                      contextMeta,
-                      providerState,
-                    ]),
-                  });
+                  return hashCanonicalStoredMessagesV2(messages.value)
+                    .andThen((computed) => {
+                      if (rowSchema.data.transcript_digest !== null) {
+                        const digest = sha256HexSchema.safeParse(rowSchema.data.transcript_digest);
+                        if (!digest.success || digest.data !== computed.hash) {
+                          return Result.err(
+                            corrupt({
+                              table: TRANSCRIPT_TABLE,
+                              field: "transcript_digest",
+                              version: version.version,
+                              issueCode: "digest-mismatch",
+                              recordId,
+                            }),
+                          );
+                        }
+                      }
+                      return Result.ok({
+                        value: {
+                          requestId: rowSchema.data.request_id,
+                          sessionId: rowSchema.data.session_id,
+                          requestClient: rowSchema.data.request_client,
+                          createdTs: rowSchema.data.created_ts,
+                          updatedTs: rowSchema.data.updated_ts,
+                          messages: messages.value,
+                          ...(rowSchema.data.final_text === null
+                            ? {}
+                            : { finalText: rowSchema.data.final_text }),
+                          ...(rowSchema.data.model_label === null
+                            ? {}
+                            : { modelLabel: rowSchema.data.model_label }),
+                          ...(contextMeta.value === undefined
+                            ? {}
+                            : { contextMeta: contextMeta.value }),
+                          providerState: providerState.value,
+                          ...(rowSchema.data.stable_named_request_client === null
+                            ? {}
+                            : {
+                                stableNamedRequestClient:
+                                  rowSchema.data.stable_named_request_client,
+                              }),
+                          canonicalHashVersion: CORE_TRANSCRIPT_DIGEST_VERSION,
+                          transcriptDigest: computed.hash,
+                        },
+                        provenance: aggregateProvenance(version, [
+                          messages,
+                          contextMeta,
+                          providerState,
+                        ]),
+                      });
+                    })
+                    .mapError(() =>
+                      corrupt({
+                        table: TRANSCRIPT_TABLE,
+                        field: "messages_json",
+                        version: version.version,
+                        issueCode: "invalid-transcript-row",
+                        recordId,
+                      }),
+                    );
                 },
               });
               return continueWithProviderState();
@@ -1553,7 +1604,7 @@ export function decodeCoreSurfaceProjectionRow(input: {
 export function decodeCoreLineageManifestRow(input: {
   readonly row: PersistedCoreLineageManifestRow;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<DecodedCoreLineageManifestV1>, PersistedDataError>;
+}): ResultType<DecodedPersistedValue<CoreStoredLineageManifestV2>, PersistedDataError>;
 export function decodeCoreLineageManifestRow(input: {
   readonly row: null;
   readonly schemaVersion: number;
@@ -1561,18 +1612,18 @@ export function decodeCoreLineageManifestRow(input: {
 export function decodeCoreLineageManifestRow(input: {
   readonly row: PersistedCoreLineageManifestRow | null;
   readonly schemaVersion: number;
-}): ResultType<DecodedPersistedValue<DecodedCoreLineageManifestV1 | null>, PersistedDataError> {
+}): ResultType<DecodedPersistedValue<CoreStoredLineageManifestV2 | null>, PersistedDataError> {
   return adaptTranscriptPersistenceDecodeResult(
     Result.gen(function* () {
       if (input.row === null)
-        return Result.ok<DecodedPersistedValue<DecodedCoreLineageManifestV1 | null>>({
+        return Result.ok<DecodedPersistedValue<CoreStoredLineageManifestV2 | null>>({
           value: null,
           provenance: "missing-defaulted",
         });
       const recordId =
         typeof input.row.request_id === "string" ? input.row.request_id : "unknown-record";
       const version = yield* decodeSchemaVersion(input.schemaVersion, LINEAGE_TABLE, recordId);
-      if (input.row.lineage_version !== 1 || typeof input.row.manifest_json !== "string") {
+      if (input.row.lineage_version !== 2 || typeof input.row.manifest_json !== "string") {
         return Result.err(
           corrupt({
             table: LINEAGE_TABLE,
@@ -1590,7 +1641,7 @@ export function decodeCoreLineageManifestRow(input: {
         version: version.version,
         recordId,
       });
-      const parsed = coreLineageManifestV1Schema.safeParse(serialized);
+      const parsed = coreLineageManifestV2Schema.safeParse(serialized);
       if (!parsed.success) {
         return Result.err(
           corrupt({
@@ -1602,7 +1653,7 @@ export function decodeCoreLineageManifestRow(input: {
           }),
         );
       }
-      const segments: DecodedCoreLineageSegmentV1[] = [];
+      const segments: CoreStoredLineageSegmentV2[] = [];
       for (const segment of parsed.data.segments) {
         const canonicalMessages = yield* decodeNormalizedMessagesValue(segment.canonicalMessages, {
           table: LINEAGE_TABLE,
@@ -1612,11 +1663,11 @@ export function decodeCoreLineageManifestRow(input: {
         });
         segments.push({ ...segment, canonicalMessages });
       }
-      const decodedManifest: DecodedCoreLineageManifestV1 = { ...parsed.data, segments };
+      const decodedManifest: CoreStoredLineageManifestV2 = { ...parsed.data, segments };
       const canonicalMessages = decodedManifest.segments.flatMap(
         (segment) => segment.canonicalMessages,
       );
-      const lineage = yield* decodeCorePrimaryLineageV1(
+      const lineage = yield* decodeCorePrimaryLineageV2(
         decodedManifest,
         canonicalMessages,
       ).mapError(() =>
@@ -1645,7 +1696,7 @@ export function decodeCoreLineageManifestRow(input: {
 }
 
 const fixtureMessages = '[{"role":"assistant","content":"fixture"}]';
-const fixtureDigest = hashCanonicalMessagesV1([{ role: "assistant", content: "fixture" }]).hash;
+const fixtureDigest = "93c6db2d3011fde9a57ceeace848a7457cd75442c516f82a7d966f60553b9614";
 const fixtureTranscriptRow = {
   request_id: "fixture",
   session_id: "session",
@@ -1679,7 +1730,7 @@ const fixtureSurfaceMessageLinkRow = {
 
 export const surfaceMessageLinkRowCodecCases = {
   current: {
-    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 5, recordId: "current" },
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 6, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -1689,17 +1740,17 @@ export const surfaceMessageLinkRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 5, recordId: "missing" },
+    input: { row: null, schemaVersion: 6, recordId: "missing" },
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 6, recordId: "unsupported" },
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 7, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
     input: {
       row: { ...fixtureSurfaceMessageLinkRow, request_id: 1 },
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "malformed",
     },
     outcome: "error",
@@ -1707,7 +1758,7 @@ export const surfaceMessageLinkRowCodecCases = {
   "corrupt-fields": {
     input: {
       row: { ...fixtureSurfaceMessageLinkRow, platform: "future" },
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -1716,7 +1767,7 @@ export const surfaceMessageLinkRowCodecCases = {
 
 export const recentAgentWriteRowCodecCases = {
   current: {
-    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 5, recordId: "current" },
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 6, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -1726,17 +1777,17 @@ export const recentAgentWriteRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 5, recordId: "missing" },
+    input: { row: null, schemaVersion: 6, recordId: "missing" },
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 6, recordId: "unsupported" },
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 7, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
     input: {
       row: { ...fixtureRecentAgentWriteRow, updated_ts: "{" },
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "malformed",
     },
     outcome: "error",
@@ -1744,7 +1795,7 @@ export const recentAgentWriteRowCodecCases = {
   "corrupt-fields": {
     input: {
       row: { ...fixtureRecentAgentWriteRow, platform: "future" },
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -1765,7 +1816,7 @@ const fixtureDiscoveryRecordRow = {
 
 export const discoveryRecordRowCodecCases = {
   current: {
-    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 5, recordId: "current" },
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 6, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -1775,17 +1826,17 @@ export const discoveryRecordRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 5, recordId: "missing" },
+    input: { row: null, schemaVersion: 6, recordId: "missing" },
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 6, recordId: "unsupported" },
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 7, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
     input: {
       row: { ...fixtureDiscoveryRecordRow, updated_ts: "{" },
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "malformed",
     },
     outcome: "error",
@@ -1793,7 +1844,7 @@ export const discoveryRecordRowCodecCases = {
   "corrupt-fields": {
     input: {
       row: { ...fixtureDiscoveryRecordRow, surface_message_id: null },
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -1804,7 +1855,7 @@ export const transcriptCompactionContextCodecCases = {
   current: {
     input: {
       raw: '{"type":"compaction","formatVersion":1}',
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "current",
     },
     outcome: "ok",
@@ -1816,22 +1867,22 @@ export const transcriptCompactionContextCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { raw: null, schemaVersion: 5, recordId: "missing" },
+    input: { raw: null, schemaVersion: 6, recordId: "missing" },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { raw: null, schemaVersion: 6, recordId: "unsupported" },
+    input: { raw: null, schemaVersion: 7, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { raw: "{", schemaVersion: 5, recordId: "malformed" },
+    input: { raw: "{", schemaVersion: 6, recordId: "malformed" },
     outcome: "error",
   },
   "corrupt-fields": {
     input: {
       raw: '{"type":"compaction","formatVersion":2}',
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -1842,7 +1893,7 @@ export const transcriptProviderStateCodecCases = {
   current: {
     input: {
       raw: '{"lastFamily":"ai-sdk","containsCrossFamilyTurns":false}',
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "current",
     },
     outcome: "ok",
@@ -1858,20 +1909,20 @@ export const transcriptProviderStateCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { raw: null, schemaVersion: 5, recordId: "missing" },
+    input: { raw: null, schemaVersion: 6, recordId: "missing" },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { raw: null, schemaVersion: 6, recordId: "unsupported" },
+    input: { raw: null, schemaVersion: 7, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { raw: "{", schemaVersion: 5, recordId: "malformed" },
+    input: { raw: "{", schemaVersion: 6, recordId: "malformed" },
     outcome: "error",
   },
   "corrupt-fields": {
-    input: { raw: '{"lastFamily":"future"}', schemaVersion: 5, recordId: "corrupt" },
+    input: { raw: '{"lastFamily":"future"}', schemaVersion: 6, recordId: "corrupt" },
     outcome: "error",
   },
 } as const;
@@ -1884,7 +1935,7 @@ export const transcriptRowCodecCases = {
         context_meta_json: '{"type":"compaction","formatVersion":1}',
         provider_state_json: '{"lastFamily":"ai-sdk","containsCrossFamilyTurns":false}',
       },
-      schemaVersion: 5,
+      schemaVersion: 6,
     },
     outcome: "ok",
     provenance: "current",
@@ -1895,22 +1946,22 @@ export const transcriptRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: fixtureTranscriptRow, schemaVersion: 5 },
+    input: { row: fixtureTranscriptRow, schemaVersion: 6 },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { row: fixtureTranscriptRow, schemaVersion: 6 },
+    input: { row: fixtureTranscriptRow, schemaVersion: 7 },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { row: { ...fixtureTranscriptRow, messages_json: "{" }, schemaVersion: 5 },
+    input: { row: { ...fixtureTranscriptRow, messages_json: "{" }, schemaVersion: 6 },
     outcome: "error",
   },
   "corrupt-fields": {
     input: {
       row: { ...fixtureTranscriptRow, transcript_digest: "00".repeat(32) },
-      schemaVersion: 5,
+      schemaVersion: 6,
     },
     outcome: "error",
   },
@@ -1923,7 +1974,7 @@ const fixtureNamedBindingRow = {
   binding_protocol_version: 1,
   provider_family: "claude-code",
   terminal_request_id: "request",
-  canonical_hash_version: 1,
+  canonical_hash_version: 2,
   canonical_head_hash: "11".repeat(32),
   canonical_message_count: 1,
   execution_scope_hash_version: 1,
@@ -1944,7 +1995,7 @@ export const transcriptStoreRowFixtures = {
     input: {
       storeKind: "named-binding",
       row: fixtureNamedBindingRow,
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "current-binding",
     },
     outcome: "ok",
@@ -1964,7 +2015,7 @@ export const transcriptStoreRowFixtures = {
     input: {
       storeKind: "named-binding",
       row: { ...fixtureNamedBindingRow, provider_family: "future-provider" },
-      schemaVersion: 5,
+      schemaVersion: 6,
       recordId: "corrupt-binding",
     },
     outcome: "error",
@@ -1984,7 +2035,7 @@ const fixtureProjectionRow = {
 
 export const coreSurfaceProjectionRowCodecCases = {
   current: {
-    input: { row: fixtureProjectionRow, schemaVersion: 5 },
+    input: { row: fixtureProjectionRow, schemaVersion: 6 },
     outcome: "ok",
     provenance: "current",
   },
@@ -1994,16 +2045,16 @@ export const coreSurfaceProjectionRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 5 },
+    input: { row: null, schemaVersion: 6 },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { row: fixtureProjectionRow, schemaVersion: 6 },
+    input: { row: fixtureProjectionRow, schemaVersion: 7 },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { row: { ...fixtureProjectionRow, source_facts_json: "{" }, schemaVersion: 5 },
+    input: { row: { ...fixtureProjectionRow, source_facts_json: "{" }, schemaVersion: 6 },
     outcome: "error",
   },
   "corrupt-fields": {
@@ -2013,7 +2064,7 @@ export const coreSurfaceProjectionRowCodecCases = {
         source_facts_json: '{"bad":null,"nested":{"bad":null}}',
         projection_format_version: 2,
       },
-      schemaVersion: 5,
+      schemaVersion: 6,
     },
     outcome: "error",
   },
@@ -2026,7 +2077,7 @@ const fixtureLineageAtom = {
 } as const;
 const fixtureManifest = {
   state: "complete",
-  lineageVersion: 1,
+  lineageVersion: 2,
   currentCanonicalStart: 0,
   segments: [
     {
@@ -2035,19 +2086,19 @@ const fixtureManifest = {
       canonicalStart: 0,
       canonicalEnd: 1,
       cumulativeAtomCount: 1,
-      cumulativePrefixDigest: computeCoreLineagePrefixDigestV1([fixtureLineageAtom]),
+      cumulativePrefixDigest: computeCoreLineagePrefixDigestV2([fixtureLineageAtom]),
     },
   ],
 } as const;
 const fixtureLineageRow = {
   request_id: "fixture",
-  lineage_version: 1,
+  lineage_version: 2,
   manifest_json: JSON.stringify(fixtureManifest),
 } as const;
 
 export const coreLineageManifestRowCodecCases = {
   current: {
-    input: { row: fixtureLineageRow, schemaVersion: 5 },
+    input: { row: fixtureLineageRow, schemaVersion: 6 },
     outcome: "ok",
     provenance: "current",
   },
@@ -2057,17 +2108,17 @@ export const coreLineageManifestRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 5 },
+    input: { row: null, schemaVersion: 6 },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
-  "unsupported-version": { input: { row: fixtureLineageRow, schemaVersion: 6 }, outcome: "error" },
+  "unsupported-version": { input: { row: fixtureLineageRow, schemaVersion: 7 }, outcome: "error" },
   "malformed-serialization": {
-    input: { row: { ...fixtureLineageRow, manifest_json: "{" }, schemaVersion: 5 },
+    input: { row: { ...fixtureLineageRow, manifest_json: "{" }, schemaVersion: 6 },
     outcome: "error",
   },
   "corrupt-fields": {
-    input: { row: { ...fixtureLineageRow, manifest_json: "{}" }, schemaVersion: 5 },
+    input: { row: { ...fixtureLineageRow, manifest_json: "{}" }, schemaVersion: 6 },
     outcome: "error",
   },
 } as const;
