@@ -2,8 +2,15 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "bun:test";
 
-import { type ArchitectureManifest, type ExceptionAdapter } from "../architecture/manifest.ts";
 import {
+  BLOB_STORAGE_ARCHITECTURE_POLICY,
+  architectureManifest,
+  type ArchitectureManifest,
+  type BlobStorageArchitecturePolicy,
+  type ExceptionAdapter,
+} from "../architecture/manifest.ts";
+import {
+  findBlobStorageSeamViolations,
   findExceptionFlowViolations,
   findExceptionFlowViolationsInSourceFile,
   findDirectSqliteTransactionViolations,
@@ -251,6 +258,105 @@ describe("parsed production syntax finders", () => {
     ).toEqual(
       findDirectSqliteTransactionViolations(sqliteSource, storePath, policyWith(), storeManifest),
     );
+  });
+});
+
+describe("unified blob-storage seam syntax", () => {
+  const findings = (
+    source: string,
+    filePath: string,
+    policy: BlobStorageArchitecturePolicy = BLOB_STORAGE_ARCHITECTURE_POLICY,
+  ) => findBlobStorageSeamViolations(source, filePath, policyWith(), architectureManifest, policy);
+
+  it("keeps Bun S3 operations and Lilac domain dependencies inside the storage package", () => {
+    expect(
+      findings('import { S3Client } from "bun"; new S3Client({});', "apps/core/src/s3.ts").map(
+        ({ kind }) => kind,
+      ),
+    ).toEqual(["s3-storage-import", "s3-storage-import"]);
+    expect(
+      findings(
+        'import { RedisStreamsBus } from "@stanley2058/lilac-event-bus";',
+        "packages/blob-storage/src/adapter.ts",
+      ).map(({ kind }) => kind),
+    ).toEqual(["blob-domain-import"]);
+    expect(
+      findings(
+        'import { secret } from "../../../apps/core/src/runtime/private";',
+        "packages/blob-storage/src/adapter.ts",
+      ).map(({ kind }) => kind),
+    ).toEqual(["blob-domain-import"]);
+    expect(
+      findings(
+        'import { S3Client } from "bun"; new S3Client({});',
+        "packages/blob-storage/src/s3.ts",
+      ),
+    ).toEqual([]);
+  });
+
+  it("allows adapter construction only at composition and rejects current inline wire bytes", () => {
+    const factoryImport = 'import { createLocalBlobStore } from "@stanley2058/lilac-blob-storage";';
+    expect(
+      findings(factoryImport, "apps/core/src/surface/leaf.ts").map(({ kind }) => kind),
+    ).toEqual(["adapter-construction-import"]);
+    expect(findings(factoryImport, "apps/core/src/runtime/create-core-blob-store.ts")).toEqual([]);
+    expect(
+      findings(
+        'import * as blobs from "@stanley2058/lilac-blob-storage"; blobs.createLocalBlobStore({});',
+        "apps/core/src/surface/leaf.ts",
+      ).map(({ kind }) => kind),
+    ).toEqual(["adapter-construction-import"]);
+    expect(
+      findings(
+        "const binarySchema = z.strictObject({ dataBase64: z.string() });",
+        "packages/event-bus/lilac-spec.ts",
+      ).map(({ kind }) => kind),
+    ).toEqual(["current-inline-blob-value"]);
+  });
+
+  it("rejects managed SQLite BLOB columns but keeps structured embeddings", () => {
+    expect(
+      findings(
+        "db.exec(`CREATE TABLE artifacts (payload BLOB NOT NULL, embedding BLOB NOT NULL)`);",
+        "apps/core/src/workflow/store.ts",
+      ).map(({ kind, message }) => ({ kind, message })),
+    ).toEqual([
+      {
+        kind: "core-inline-blob-column",
+        message: expect.stringContaining("payload"),
+      },
+    ]);
+  });
+
+  it("localizes BlobStore open and close ownership and legacy decoder imports", () => {
+    const blobCalls = `
+      import type { BlobStore } from "@stanley2058/lilac-blob-storage";
+      export async function leaf(blobStore: BlobStore) {
+        await blobStore.open(ref);
+        await blobStore.close({ deadlineAtMs: Date.now() });
+      }
+    `;
+    expect(findings(blobCalls, "apps/core/src/surface/leaf.ts").map(({ kind }) => kind)).toEqual([
+      "blob-materialization-locality",
+      "blob-store-close-ownership",
+    ]);
+    const materializationPolicy = {
+      ...BLOB_STORAGE_ARCHITECTURE_POLICY,
+      materializationModules: [{ workspace: "apps/core", module: "src/surface/blob-materializer" }],
+    } satisfies BlobStorageArchitecturePolicy;
+    expect(
+      findings(
+        blobCalls.replace("await blobStore.close({ deadlineAtMs: Date.now() });", ""),
+        "apps/core/src/surface/blob-materializer.ts",
+        materializationPolicy,
+      ),
+    ).toEqual([]);
+
+    const legacyImport = 'import { decodeLegacyBlobRow } from "./legacy-blob-codec";';
+    expect(findings(legacyImport, "apps/core/src/runtime/main.ts").map(({ kind }) => kind)).toEqual(
+      ["legacy-blob-decoder-import"],
+    );
+    expect(findings(legacyImport, "apps/core/scripts/migrate-blob-storage.ts")).toEqual([]);
   });
 });
 

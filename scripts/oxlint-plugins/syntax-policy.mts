@@ -19,6 +19,7 @@ export interface SyntacticPolicy {
 }
 
 export const ACTIVE_SYNTAX_RULES = [
+  "lilac/blob-storage-seam",
   "lilac/no-exception-flow",
   "lilac/no-inline-async-result-callback",
   "lilac/no-presentation-decoder-import",

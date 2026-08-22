@@ -86,10 +86,30 @@ exported and operational Result error contracts cannot contain `Panic` or `unkno
 remains invalid because it exposes `UnhandledException`.
 
 The syntax gate rejects every production `TryStatement` without a manifest exemption, as well as
-unregistered host exception flow, inline async Result callbacks, presentation decoder
-imports, store-owned inline decoding, and direct SQLite transactions. Oxlint also applies the permanent
-package-wide nested-ternary and local-record-guard rules. Syntax registrations use the same exact manifest
-identities as semantic analysis; there is no separate syntax exception catalog.
+unregistered host exception flow, inline async Result callbacks, presentation decoder imports,
+store-owned inline decoding, direct SQLite transactions, and violations of the unified managed-blob
+seam. Oxlint also applies the permanent package-wide nested-ternary and local-record-guard rules. Syntax
+registrations use the same exact manifest identities as semantic analysis; there is no separate syntax
+exception catalog.
+
+### Unified blob storage
+
+`BLOB_STORAGE_ARCHITECTURE_POLICY` registers the storage workspace, adapter construction owners, Core
+close owner, materialization modules, current event schema, and offline migration modules. The syntax
+gate enforces these contracts:
+
+- only `packages/blob-storage` imports Bun S3 storage operations;
+- `packages/blob-storage` does not import another Lilac workspace domain;
+- only registered composition and migration modules construct adapters;
+- current event schemas and Core databases do not store managed inline bytes;
+- only the Core runtime owner closes the runtime-composed `BlobStore`; the offline migration entrypoint
+  closes the separate store it constructs;
+- `BlobStore.open` stays in registered hydration or materialization modules; and
+- legacy blob decoder imports stay in the registered offline migration task.
+
+The Core BLOB-column check has one registered structured-data exception: conversation-thread vector
+embeddings. Migration modules are exact registrations because their job is to read and remove legacy byte
+formats; runtime modules receive no compatibility exemption.
 
 Production tests, generated output, and the generated Core remote-runner bundle are excluded by
 `source-policy.ts` and `syntax-policy.mts`; their TypeScript source remains enforced.
@@ -98,14 +118,16 @@ Production tests, generated output, and the generated Core remote-runner bundle 
 
 Each `persistedCodecs` registration names one exact Result-returning callable, its persisted input
 parameter, one exact fixture catalog, and its complete success-provenance union. Success has the shape
-`{ value: Decoded; provenance }`; `current` and `migrated` are required, while
-`missing-defaulted` is allowed only for a genuine missing-value default contract. Decoded values and
-owned errors recursively exclude `any`, `unknown`, and `never`.
+`{ value: Decoded; provenance }`; `current` is required. A normal compatibility codec also requires
+`migrated`. A clean-break codec declares `legacyOutcome: "rejected"`, omits `migrated`, and must reject
+its legacy fixture. `missing-defaulted` is allowed only for a genuine missing-value default contract.
+Decoded values and owned errors recursively exclude `any`, `unknown`, and `never`.
 
 The fixture catalog contains exactly `current`, `legacy`, `missing-defaulted`, `unsupported-version`,
-`malformed-serialization`, and `corrupt-fields`. Current and legacy fixtures succeed with their matching
-provenance. The missing fixture succeeds with `missing-defaulted` only when registered; otherwise it
-fails. Unsupported, malformed, and corrupt fixtures fail without provenance.
+`malformed-serialization`, and `corrupt-fields`. The current fixture succeeds with current provenance.
+The legacy fixture either succeeds with migrated provenance or fails under a registered clean break.
+The missing fixture succeeds with `missing-defaulted` only when registered; otherwise it fails.
+Unsupported, malformed, and corrupt fixtures fail without provenance.
 
 Every codec is also an `operationalResultApis` entry. `persistedStoreConsumers` binds store policy to
 the complete codec set each consumer must call, and each consumer is likewise an operational Result API.

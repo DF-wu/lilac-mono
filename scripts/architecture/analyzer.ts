@@ -5653,7 +5653,10 @@ function analyzePersistedCodec(
   const actualCases = new Set(cases.keys());
   const expectedOutcomes = new Map<string, readonly [string, string | undefined]>([
     ["current", ["ok", "current"]],
-    ["legacy", ["ok", "migrated"]],
+    [
+      "legacy",
+      registration.legacyOutcome === "rejected" ? ["error", undefined] : ["ok", "migrated"],
+    ],
     [
       "missing-defaulted",
       registration.provenance.includes("missing-defaulted")

@@ -5,8 +5,10 @@ import { defineRule } from "@oxlint/plugins";
 import ts from "typescript-codegen";
 
 import {
+  BLOB_STORAGE_ARCHITECTURE_POLICY,
   architectureManifest,
   type ArchitectureManifest,
+  type BlobStorageArchitecturePolicy,
   type ExceptionDirection,
 } from "../architecture/manifest.ts";
 import {
@@ -30,6 +32,15 @@ export type StoreInlineDecodingKind = "store-inline-json-decoding" | "store-inli
 export type DirectSqliteTransactionKind =
   | "direct-sqlite-transaction"
   | "manual-sqlite-transaction-control";
+export type BlobStorageSeamKind =
+  | "adapter-construction-import"
+  | "blob-domain-import"
+  | "blob-materialization-locality"
+  | "blob-store-close-ownership"
+  | "core-inline-blob-column"
+  | "current-inline-blob-value"
+  | "legacy-blob-decoder-import"
+  | "s3-storage-import";
 
 export function parseProductionSyntaxSource(sourceText: string, filePath: string): ts.SourceFile {
   return ts.createSourceFile(
@@ -1248,6 +1259,366 @@ function importedWorkspaceModule(
   return { ...(suffix ? { module: moduleWithoutExtension(suffix) } : {}), workspace };
 }
 
+function staticPropertyName(name: ts.PropertyName | ts.BindingName): string | undefined {
+  return ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)
+    ? name.text
+    : undefined;
+}
+
+function registeredPackageModule(
+  workspace: string,
+  module: string,
+  registrations: readonly { readonly workspace: string; readonly module: string }[],
+): boolean {
+  return registrations.some(
+    (registration) =>
+      registration.workspace === workspace &&
+      moduleWithoutExtension(registration.module) === moduleWithoutExtension(module),
+  );
+}
+
+function importedNames(statement: ts.ImportDeclaration): readonly string[] {
+  const clause = statement.importClause;
+  if (!clause || clause.isTypeOnly) return [];
+  const bindings = clause.namedBindings;
+  if (!bindings || ts.isNamespaceImport(bindings)) return [];
+  return bindings.elements
+    .filter((specifier) => !specifier.isTypeOnly)
+    .map((specifier) => (specifier.propertyName ?? specifier.name).text);
+}
+
+function localImportedName(
+  statement: ts.ImportDeclaration,
+  importedName: string,
+): string | undefined {
+  const bindings = statement.importClause?.namedBindings;
+  if (!bindings || !ts.isNamedImports(bindings)) return undefined;
+  const specifier = bindings.elements.find(
+    (candidate) => (candidate.propertyName ?? candidate.name).text === importedName,
+  );
+  return specifier?.name.text;
+}
+
+function bindingNames(name: ts.BindingName): readonly string[] {
+  if (ts.isIdentifier(name)) return [name.text];
+  return name.elements.flatMap((element) =>
+    ts.isOmittedExpression(element) ? [] : bindingNames(element.name),
+  );
+}
+
+function expressionContainsOwnedName(
+  expression: ts.Expression,
+  ownedNames: ReadonlySet<string>,
+): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isIdentifier(node) && ownedNames.has(node.text)) found = true;
+    if (!found) ts.forEachChild(node, visit);
+  };
+  visit(expression);
+  return found;
+}
+
+export function findBlobStorageSeamViolations(
+  sourceText: string,
+  filePath = "apps/example/src/blob-consumer.ts",
+  policy: SyntacticPolicy = SYNTACTIC_POLICY,
+  manifest: ArchitectureManifest = architectureManifest,
+  blobPolicy: BlobStorageArchitecturePolicy = BLOB_STORAGE_ARCHITECTURE_POLICY,
+): SyntacticFinding<BlobStorageSeamKind>[] {
+  if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
+  return findBlobStorageSeamViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+    manifest,
+    blobPolicy,
+  );
+}
+
+export function findBlobStorageSeamViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+  manifest: ArchitectureManifest = architectureManifest,
+  blobPolicy: BlobStorageArchitecturePolicy = BLOB_STORAGE_ARCHITECTURE_POLICY,
+): SyntacticFinding<BlobStorageSeamKind>[] {
+  if (!manifest.workspaces.some(({ name }) => name === blobPolicy.storageWorkspace)) return [];
+  const identity = sourceIdentity(filePath);
+  const normalizedFile = normalizeFilePath(filePath).replace(/\.(?:[cm]?[jt]sx?)$/iu, "");
+  const migrationEntrypoint = normalizeFilePath(blobPolicy.migrationEntrypoint);
+  const isMigrationEntrypoint =
+    normalizedFile === migrationEntrypoint || normalizedFile.endsWith(`/${migrationEntrypoint}`);
+  const isMigrationModule =
+    isMigrationEntrypoint ||
+    registeredPackageModule(identity.workspace, identity.module, blobPolicy.migrationModules);
+  const findings: SyntacticFinding<BlobStorageSeamKind>[] = [];
+  const add = (node: ts.Node, kind: BlobStorageSeamKind, message: string): void => {
+    findings.push(createFinding(sourceFile, filePath, node, kind, message));
+  };
+
+  const blobStoreTypeNames = new Set<string>();
+  const blobStoreValueNames = new Set<string>();
+  const s3ValueNames = new Set<string>();
+  const blobPackageNamespaces = new Set<string>();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) {
+      continue;
+    }
+    const specifier = statement.moduleSpecifier.text;
+    const names = importedNames(statement);
+    if (specifier === "bun") {
+      const s3Imports = names.filter((name) => name === "S3Client" || name === "S3File");
+      if (s3Imports.length > 0 && identity.workspace !== blobPolicy.storageWorkspace) {
+        add(
+          statement,
+          "s3-storage-import",
+          "Only the blob-storage package may import Bun S3 storage operations",
+        );
+      }
+      for (const name of s3Imports) {
+        s3ValueNames.add(localImportedName(statement, name) ?? name);
+      }
+    }
+
+    const target = importedWorkspaceModule(
+      `${identity.module}.ts`,
+      identity.workspace,
+      specifier,
+      manifest,
+    );
+    const relativeImportEscapesStorage =
+      identity.workspace === blobPolicy.storageWorkspace &&
+      specifier.startsWith(".") &&
+      path.posix
+        .normalize(path.posix.join(path.posix.dirname(identity.module), specifier))
+        .startsWith("../");
+    if (
+      identity.workspace === blobPolicy.storageWorkspace &&
+      ((target && target.workspace.name !== blobPolicy.storageWorkspace) ||
+        relativeImportEscapesStorage)
+    ) {
+      add(
+        statement,
+        "blob-domain-import",
+        "The blob-storage package cannot import another Lilac workspace domain",
+      );
+    }
+
+    if (specifier === blobPolicy.storagePackage) {
+      const bindings = statement.importClause?.namedBindings;
+      if (bindings && ts.isNamespaceImport(bindings) && !statement.importClause?.isTypeOnly) {
+        blobPackageNamespaces.add(bindings.name.text);
+      }
+      const typeBindings = statement.importClause?.namedBindings;
+      if (typeBindings && ts.isNamedImports(typeBindings)) {
+        for (const binding of typeBindings.elements) {
+          const imported = (binding.propertyName ?? binding.name).text;
+          if (imported === "BlobStore") blobStoreTypeNames.add(binding.name.text);
+        }
+      }
+      const importedFactories = names.filter((name) =>
+        blobPolicy.adapterFactoryExports.includes(name),
+      );
+      if (
+        importedFactories.length > 0 &&
+        !registeredPackageModule(
+          identity.workspace,
+          identity.module,
+          blobPolicy.adapterFactoryOwners,
+        ) &&
+        !isMigrationEntrypoint
+      ) {
+        add(
+          statement,
+          "adapter-construction-import",
+          "Construct blob adapters only in the registered Core composition module or offline migration task",
+        );
+      }
+    }
+
+    const legacyNames = names.filter((name) => name.startsWith("decodeLegacy"));
+    const legacyModule =
+      /legacy/iu.test(specifier) && /blob|attachment|artifact|binary|media/iu.test(specifier);
+    if (!isMigrationModule && (legacyNames.length > 0 || legacyModule)) {
+      add(
+        statement,
+        "legacy-blob-decoder-import",
+        "Legacy blob decoders may be imported only by apps/core/scripts/migrate-blob-storage.ts",
+      );
+    }
+  }
+
+  const typeMentionsBlobStore = (type: ts.TypeNode | undefined): boolean =>
+    !!type &&
+    [...blobStoreTypeNames].some((name) => new RegExp(`\\b${name}\\b`, "u").test(type.getText()));
+  const collectBlobStoreBindings = (node: ts.Node): void => {
+    if (
+      (ts.isParameter(node) || ts.isVariableDeclaration(node)) &&
+      typeMentionsBlobStore(node.type)
+    ) {
+      for (const name of bindingNames(node.name)) blobStoreValueNames.add(name);
+    } else if (ts.isPropertyDeclaration(node) && typeMentionsBlobStore(node.type)) {
+      const name = staticPropertyName(node.name);
+      if (name) blobStoreValueNames.add(name);
+    } else if (ts.isPropertySignature(node) && typeMentionsBlobStore(node.type)) {
+      const name = staticPropertyName(node.name);
+      if (name) blobStoreValueNames.add(name);
+    }
+    ts.forEachChild(node, collectBlobStoreBindings);
+  };
+  collectBlobStoreBindings(sourceFile);
+
+  const eventSchemaModule = registeredPackageModule(
+    identity.workspace,
+    identity.module,
+    blobPolicy.eventSchemaModules,
+  );
+  const allowedBlobColumns = new Set(blobPolicy.allowedCoreBlobColumns);
+  const managedFieldNames = new Set(["bytes", "content", "data", "payload"]);
+  const visit = (node: ts.Node): void => {
+    if (ts.isNewExpression(node)) {
+      const constructed = unwrappedExpression(node.expression);
+      const directS3 = ts.isIdentifier(constructed) && s3ValueNames.has(constructed.text);
+      const bunS3 =
+        ts.isPropertyAccessExpression(constructed) &&
+        ts.isIdentifier(constructed.expression) &&
+        constructed.expression.text === "Bun" &&
+        (constructed.name.text === "S3Client" || constructed.name.text === "S3File");
+      if ((directS3 || bunS3) && identity.workspace !== blobPolicy.storageWorkspace) {
+        add(
+          node,
+          "s3-storage-import",
+          "Only the blob-storage package may construct Bun S3 clients",
+        );
+      }
+    }
+
+    if (eventSchemaModule && ts.isPropertyAssignment(node)) {
+      const name = staticPropertyName(node.name);
+      const text = node.initializer.getText();
+      if (
+        name === "dataBase64" ||
+        (name && managedFieldNames.has(name) && /\b(?:ArrayBuffer|Buffer|Uint8Array)\b/u.test(text))
+      ) {
+        add(
+          node,
+          "current-inline-blob-value",
+          "Current event schemas must carry BlobHandleV1 or BlobRefV1 instead of managed inline bytes",
+        );
+      }
+    }
+    if (
+      eventSchemaModule &&
+      (ts.isStringLiteralLike(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+      /^data:[^,]*,/iu.test(node.text)
+    ) {
+      add(
+        node,
+        "current-inline-blob-value",
+        "Current event schemas cannot persist managed data URLs",
+      );
+    }
+
+    if (
+      identity.workspace === blobPolicy.coreWorkspace &&
+      !isMigrationModule &&
+      (ts.isStringLiteralLike(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+      /\b(?:ADD\s+COLUMN|ALTER\s+TABLE|CREATE\s+TABLE)\b/iu.test(node.text)
+    ) {
+      const columnPattern = /\b([A-Za-z_][A-Za-z0-9_]*)\s+BLOB\b/giu;
+      for (const match of node.text.matchAll(columnPattern)) {
+        const column = match[1];
+        if (column && !allowedBlobColumns.has(column)) {
+          add(
+            node,
+            "core-inline-blob-column",
+            `Core SQLite column '${column}' cannot store managed opaque bytes; persist a BlobRefV1 instead`,
+          );
+        }
+      }
+    }
+
+    if (
+      identity.workspace === blobPolicy.coreWorkspace &&
+      /(?:^|\/)(?:[^/]*persistence-codec|[^/]*store|migrations?)(?:$|\/)/u.test(identity.module) &&
+      ts.isPropertyAssignment(node)
+    ) {
+      const name = staticPropertyName(node.name);
+      const text = node.initializer.getText();
+      if (
+        name === "dataBase64" ||
+        (name &&
+          managedFieldNames.has(name) &&
+          /\b(?:ArrayBuffer|Buffer|Uint8Array)\b/u.test(text)) ||
+        /^data:[^,]*,/iu.test(text.replaceAll(/["'`]/gu, ""))
+      ) {
+        add(
+          node,
+          "current-inline-blob-value",
+          "Current Core persistence must store BlobRefV1 metadata instead of managed inline bytes",
+        );
+      }
+    }
+
+    if (ts.isCallExpression(node)) {
+      const called = propertyAccessParts(node.expression);
+      if (
+        called &&
+        ts.isIdentifier(called[0]) &&
+        blobPackageNamespaces.has(called[0].text) &&
+        blobPolicy.adapterFactoryExports.includes(called[1]) &&
+        !registeredPackageModule(
+          identity.workspace,
+          identity.module,
+          blobPolicy.adapterFactoryOwners,
+        ) &&
+        !isMigrationEntrypoint
+      ) {
+        add(
+          node,
+          "adapter-construction-import",
+          "Construct blob adapters only in the registered Core composition module or offline migration task",
+        );
+      }
+      if (called && (called[1] === "close" || called[1] === "open")) {
+        const receiver = called[0];
+        if (expressionContainsOwnedName(receiver, blobStoreValueNames)) {
+          if (
+            called[1] === "close" &&
+            !registeredPackageModule(
+              identity.workspace,
+              identity.module,
+              blobPolicy.closeOwnerModules,
+            )
+          ) {
+            add(
+              node,
+              "blob-store-close-ownership",
+              "Only the registered Core runtime owner may close the composed BlobStore",
+            );
+          }
+          if (
+            called[1] === "open" &&
+            !registeredPackageModule(
+              identity.workspace,
+              identity.module,
+              blobPolicy.materializationModules,
+            )
+          ) {
+            add(
+              node,
+              "blob-materialization-locality",
+              "Open BlobRefV1 content only in a registered hydration or materialization module",
+            );
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return findings;
+}
+
 export function findPresentationDecoderImportViolations(
   sourceText: string,
   filePath = "apps/example/src/render.ts",
@@ -1972,6 +2343,10 @@ function ruleFromFinder<Kind extends string>(
 export const noExceptionFlowRule = ruleFromFinder(
   "Disallow production exception flow outside exactly registered adapters",
   findExceptionFlowViolations,
+);
+export const blobStorageSeamRule = ruleFromFinder(
+  "Keep managed opaque bytes behind the unified blob-storage seam",
+  findBlobStorageSeamViolations,
 );
 export const noLocalIsRecordRule = ruleFromFinder(
   "Disallow local duplicates of canonical record guards",

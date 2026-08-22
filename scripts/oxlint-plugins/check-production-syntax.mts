@@ -1,9 +1,11 @@
+import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { architectureManifest, type ArchitectureManifest } from "../architecture/manifest.ts";
 import { validateWorkspaceInventory } from "../architecture/workspace-inventory.ts";
 import {
+  findBlobStorageSeamViolationsInSourceFile,
   findDirectSqliteTransactionViolationsInSourceFile,
   findExceptionFlowViolationsInSourceFile,
   findInlineAsyncResultCallbackViolationsInSourceFile,
@@ -79,6 +81,10 @@ export async function scanSyntaxFindings(
       const sourceFile = parseProductionSyntaxSource(source, filePath);
       findings.push(
         ...toSyntaxFindings(
+          "lilac/blob-storage-seam",
+          findBlobStorageSeamViolationsInSourceFile(sourceFile, filePath, manifest),
+        ),
+        ...toSyntaxFindings(
           "lilac/no-exception-flow",
           findExceptionFlowViolationsInSourceFile(sourceFile, filePath, manifest),
         ),
@@ -97,6 +103,25 @@ export async function scanSyntaxFindings(
         ...toSyntaxFindings(
           "lilac/no-direct-sqlite-transaction",
           findDirectSqliteTransactionViolationsInSourceFile(sourceFile, filePath, manifest),
+        ),
+      );
+    }
+  }
+  const scriptsDirectory = join(rootDirectory, "scripts");
+  if (existsSync(scriptsDirectory)) {
+    const paths = (await productionFiles(scriptsDirectory, "scripts")).sort((left, right) =>
+      left.filePath.localeCompare(right.filePath),
+    );
+    for (const { filePath, physicalPath } of paths) {
+      const source = await readFile(physicalPath, "utf8");
+      findings.push(
+        ...toSyntaxFindings(
+          "lilac/blob-storage-seam",
+          findBlobStorageSeamViolationsInSourceFile(
+            parseProductionSyntaxSource(source, filePath),
+            filePath,
+            manifest,
+          ),
         ),
       );
     }

@@ -40,6 +40,11 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
       "signalMissingGracefulRestartDispositionToken",
       "signal",
     ],
+    [
+      "src/runtime/graceful-restart-store.ts",
+      "signalGracefulRestartOfflineMigrationRequired",
+      "signal",
+    ],
     ["src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter.startRelay", "signal"],
     [
       "src/surface/bridge/subscribe-from-bus.ts",
@@ -256,16 +261,6 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ],
     [
       "src/surface/bridge/bus-agent-runner/core-named-continuation.ts",
-      "createCoreNamedClaudeRuntime.ok.<callback>.createCandidate",
-      "signal",
-    ],
-    [
-      "src/surface/bridge/bus-agent-runner/core-named-continuation.ts",
-      "createCoreNamedClaudeRuntime.ok.<callback>.materializeAttempt",
-      "signal",
-    ],
-    [
-      "src/surface/bridge/bus-agent-runner/core-named-continuation.ts",
       "createCoreNamedClaudeRuntime.ok.<callback>.recordSuccessfulModelCall",
       "signal",
     ],
@@ -297,11 +292,6 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     [
       "src/surface/bridge/bus-agent-runner/prompt-overlays.ts",
       "resolveSessionAdditionalPrompts",
-      "signal",
-    ],
-    [
-      "src/surface/discord/discord-request-router.ts",
-      "adaptRouterConfigResult.err.<callback>",
       "signal",
     ],
     [
@@ -504,6 +494,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["src/rules-filesystem.ts", "readGitMetadataFile", "signal"],
     ["src/rules-rm.ts", "resolveRmPaths", "signal"],
   ],
+  "packages/blob-storage": [],
   "packages/claude-code-bridge": [
     ["claude-attempt-runtime-owner.ts", "ClaudeAttemptRuntimeOwner.prepare", "signal"],
     [

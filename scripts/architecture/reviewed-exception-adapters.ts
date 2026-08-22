@@ -4,19 +4,6 @@ export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly Excep
   "apps/core": [
     {
       identity: {
-        module: "src/workflow/workflow-artifact-store.ts",
-        exportName: "rethrowWorkflowArtifactPanic",
-      },
-      category: "defect-supervisor",
-      externalApi: {
-        package: "better-result",
-        exportName: "Panic.is",
-      },
-      direction: "observe-panic",
-      reason: "Preserves Panic identity while workflow artifact I/O is mapped to Results.",
-    },
-    {
-      identity: {
         module: "src/conversation/thread-service.ts",
         exportName:
           "createConversationThreadToolService.resolvePersistenceOperation.err.<callback>",
@@ -188,6 +175,20 @@ export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly Excep
     },
     {
       identity: {
+        module: "src/surface/bridge/request-composition/attachments.ts",
+        exportName: "limitDiscordAttachmentStream.transform.err",
+      },
+      category: "result-to-framework",
+      externalApi: {
+        package: "global",
+        exportName: "TransformStreamDefaultController.error",
+      },
+      direction: "signal-host",
+      reason:
+        "Signals a typed Discord attachment limit failure through the TransformStream host contract.",
+    },
+    {
+      identity: {
         module: "src/surface/discord/discord-adapter.ts",
         exportName: "DiscordAdapter.reportDetachedPanic.queueMicrotask.<callback@1>",
       },
@@ -295,6 +296,87 @@ export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly Excep
       },
       direction: "signal-host",
       reason: "Signals invalid internal CLI projection through the list host contract.",
+    },
+  ],
+  "packages/blob-storage": [
+    {
+      identity: {
+        module: "src/backend.ts",
+        exportName: "signalBlobAdapterFailure",
+      },
+      category: "compatibility",
+      externalApi: {
+        package: "global",
+        exportName: "language host failure signal",
+      },
+      direction: "signal-host",
+      reason: "Signals a package-owned adapter failure only inside its immediate Result capture.",
+    },
+    {
+      identity: {
+        module: "src/backend.ts",
+        exportName: "signalRetainedBlobPanic",
+      },
+      category: "defect-supervisor",
+      externalApi: { package: "better-result", exportName: "Panic.is" },
+      direction: "observe-panic",
+      reason: "Preserves the exact Panic after an external blob adapter or stream capture.",
+    },
+    {
+      identity: {
+        module: "src/backend.ts",
+        exportName: "signalBlobDefect",
+      },
+      category: "defect-supervisor",
+      externalApi: {
+        package: "global",
+        exportName: "language host failure signal",
+      },
+      direction: "signal-host",
+      reason: "Escalates an unexpected rejected serialization or lock value as a retained Panic.",
+    },
+    {
+      identity: {
+        module: "src/store.ts",
+        exportName: "createVerifiedRead.pull",
+      },
+      category: "result-to-framework",
+      externalApi: {
+        package: "global",
+        exportName: "ReadableStreamDefaultController.error",
+      },
+      direction: "signal-host",
+      reason: "Signals a settled BlobReadSourceFailure through the ReadableStream host contract.",
+    },
+    {
+      identity: {
+        module: "src/local-backend.ts",
+        exportName: "normalizeNodeFileReadableStream.pull",
+      },
+      category: "result-to-framework",
+      externalApi: {
+        package: "global",
+        exportName: "ReadableStreamDefaultController.error",
+      },
+      direction: "signal-host",
+      reason:
+        "Signals a settled local file read failure or non-byte host value through the ReadableStream contract.",
+    },
+  ],
+  "packages/tool-results": [
+    {
+      identity: {
+        module: "src/blob-tool-result-artifact-store.ts",
+        exportName: "rethrowBlobToolResultPanic",
+      },
+      category: "defect-supervisor",
+      externalApi: {
+        package: "global",
+        exportName: "language host failure signal",
+      },
+      direction: "signal-host",
+      reason:
+        "Narrow typed helper preserves Panic identity after blob-backed artifact operations leave their Result capture.",
     },
   ],
   "packages/utils": [

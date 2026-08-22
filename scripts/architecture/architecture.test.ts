@@ -2093,6 +2093,48 @@ describe("Stage 6 persistence and SQLite architecture", () => {
     expect(findings.some(({ message }) => message.includes("missing-defaulted"))).toBeTrue();
   });
 
+  test("allows clean-break persisted codecs to reject legacy values explicitly", () => {
+    const cleanBreakCodec = {
+      ...persistedCodec("decodeRequiredFixture", "requiredFixtureCases", ["current"]),
+      legacyOutcome: "rejected" as const,
+    };
+    const workspace = {
+      ...realWorkspaceBase,
+      ruleZones: {
+        ...PERMANENT_RULE_ZONES,
+        "architecture/persisted-codec-contract": [{ include: "stage6-persistence.ts" }],
+        "architecture/persisted-codec-fixture-catalog": [{ include: "stage6-persistence.ts" }],
+      },
+      persistedCodecs: [cleanBreakCodec],
+      operationalResultApis: [cleanBreakCodec.identity],
+    } satisfies WorkspaceArchitecture;
+    expect(() =>
+      assertArchitectureManifestIntegrity({ version: 1, workspaces: [workspace] }),
+    ).not.toThrow();
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...workspace,
+            persistedCodecs: [{ ...cleanBreakCodec, provenance: ["current", "migrated"] }],
+          },
+        ],
+      }),
+    ).toThrow("cannot declare 'migrated' provenance");
+    expect(() =>
+      assertArchitectureManifestIntegrity({
+        version: 1,
+        workspaces: [
+          {
+            ...workspace,
+            persistedCodecs: [{ ...cleanBreakCodec, legacyOutcome: undefined }],
+          },
+        ],
+      }),
+    ).toThrow("must declare 'migrated' provenance");
+  });
+
   test("fails closed for aliased unregistered persisted consumers and fixture catalogs", () => {
     const codec = persistedCodec("decodeFixtureStringArray", "fixtureStringArrayCases");
     const unregisteredConsumerWorkspace = {
