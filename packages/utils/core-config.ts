@@ -69,6 +69,7 @@ export {
 };
 export { MODEL_REASONING_EFFORTS } from "./core-config/types";
 export type {
+  BlobStorageConfig,
   ConfiguredModelChainEntry,
   ConfiguredModelRef,
   ConfigParser,

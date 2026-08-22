@@ -106,8 +106,27 @@ export type ModelCapabilityOverride = {
   };
 };
 
+export type BlobStorageConfig =
+  | {
+      kind: "local";
+      root?: string;
+    }
+  | {
+      kind: "s3";
+      bucket: string;
+      prefix: string;
+      endpoint: string;
+      region: string;
+      accessKeyIdEnv: string;
+      secretAccessKeyEnv: string;
+      sessionTokenEnv?: string;
+      forcePathStyle: boolean;
+    };
+
 export type UniversalCoreConfig = {
   configVersion: CoreConfigVersion;
+
+  blobStorage: BlobStorageConfig;
 
   tools: {
     fsBackend: "fff" | "node-rg";

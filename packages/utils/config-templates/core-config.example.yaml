@@ -1,5 +1,24 @@
 configVersion: 2
 
+# Managed opaque bytes use local storage below the runtime data directory by default.
+# Set an absolute local root when the blob store lives elsewhere:
+# blobStorage:
+#   kind: local
+#   root: /var/lib/lilac/blobs
+#
+# Or select an existing private S3-compatible bucket. Credential fields name
+# environment variables; never put literal credentials in this file.
+# blobStorage:
+#   kind: s3
+#   bucket: lilac
+#   prefix: production/blobs
+#   endpoint: https://s3.example.com
+#   region: us-east-1
+#   accessKeyIdEnv: LILAC_S3_ACCESS_KEY_ID
+#   secretAccessKeyEnv: LILAC_S3_SECRET_ACCESS_KEY
+#   sessionTokenEnv: LILAC_S3_SESSION_TOKEN
+#   forcePathStyle: true
+
 basePrompt: "You are Lilac."
 
 tools:

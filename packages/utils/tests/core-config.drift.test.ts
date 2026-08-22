@@ -46,6 +46,7 @@ describe("core config drift coverage", () => {
 
     const expectedTopLevel = [
       "agent",
+      "blobStorage",
       "configVersion",
       "conversation",
       "entity",
@@ -82,6 +83,7 @@ describe("core config drift coverage", () => {
     const cfg = await parseCoreConfig(parsedYaml);
 
     expect(cfg.configVersion).toBe(2);
+    expect(cfg.blobStorage).toEqual({ kind: "local" });
     expect(cfg.tools.fsBackend).toBe("fff");
     expect(cfg.tools.inspect.model).toBe("google/gemini-3.5-flash");
     expect(cfg.tools.editFile.hashline).toBe(true);

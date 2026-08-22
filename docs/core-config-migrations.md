@@ -51,6 +51,11 @@ Removed v2 fields:
 
 New v2 fields:
 
+- `blobStorage`: one Core managed-blob adapter. Omit it for the local store rooted below `DATA_DIR`, or
+  configure `kind: local` with a required absolute `root`, or `kind: s3` with required `bucket`,
+  `prefix`, `endpoint`, `region`, and environment-variable names for credentials. S3 also accepts an
+  optional session-token environment-variable name and optional path-style addressing. Frozen v1
+  configs receive the same universal local default but cannot set this field.
 - `workflows.maxActiveRuns`: principal-blind global admission cap across all nonterminal workflow runs,
   including scheduled and generated subagent runs; defaults to `64`. Frozen v1 configs receive the same
   universal fallback but cannot override it.
@@ -123,6 +128,37 @@ New v2 fields:
 - `surface.discord.markdownMathRender`: Discord markdown math rendering policy. Defaults to
   `{ enabled: false, maxWidth: 50, fallbackMode: source }`; frozen v1 configs receive this disabled
   universal fallback but cannot configure it.
+
+Local example:
+
+```yaml
+configVersion: 2
+blobStorage:
+  kind: local
+  root: /var/lib/lilac/blobs
+```
+
+S3-compatible example:
+
+```yaml
+configVersion: 2
+blobStorage:
+  kind: s3
+  bucket: lilac
+  prefix: production/blobs
+  endpoint: https://s3.example.com
+  region: us-east-1
+  accessKeyIdEnv: LILAC_S3_ACCESS_KEY_ID
+  secretAccessKeyEnv: LILAC_S3_SECRET_ACCESS_KEY
+  # sessionTokenEnv: LILAC_S3_SESSION_TOKEN
+  # forcePathStyle: true
+```
+
+The bucket must already exist. Core does not create it or manage its lifecycle policy. Credentials are
+read only from the named environment variables. To move an existing Core data set between local and S3,
+stop Core, copy the whole blob store while preserving object IDs, verify all durable references, and
+switch config only after verification. The persisted-data cutover is documented in
+[`MIGRATIONS.md`](../MIGRATIONS.md#core-unified-blob-storage-clean-break).
 
 Changed v2 fields:
 

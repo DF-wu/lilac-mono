@@ -34,6 +34,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
+    "@stanley2058/lilac-blob-storage": "workspace:*",
     "@stanley2058/lilac-utils": "workspace:*",
     "ai": "^7.0.22",
     "better-result": "catalog:",

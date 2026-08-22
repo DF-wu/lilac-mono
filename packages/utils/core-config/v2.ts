@@ -1,4 +1,5 @@
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import path from "node:path";
 import { z } from "zod";
 
 import { cloneDefaultWorkingIndicators } from "../working-indicators";
@@ -37,6 +38,44 @@ export const SUPPORTED_CORE_CONFIG_VERSIONS = [
 ] as const satisfies readonly CoreConfigVersion[];
 
 const configVersionSchema = z.literal(V2_CORE_CONFIG_VERSION).default(V2_CORE_CONFIG_VERSION);
+
+const environmentVariableNameSchema = z
+  .string()
+  .regex(/^[A-Za-z_][A-Za-z0-9_]*$/u, "expected an environment variable name");
+
+const blobStorageSchemaV2 = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("local"),
+      root: z
+        .string()
+        .trim()
+        .min(1)
+        .refine((value) => path.isAbsolute(value), "root must be an absolute path"),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("s3"),
+      bucket: z.string().trim().min(1),
+      prefix: z.string().trim().min(1),
+      endpoint: z.url().superRefine((value, ctx) => {
+        const endpoint = new URL(value);
+        if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
+          ctx.addIssue({ code: "custom", message: "endpoint must use http or https" });
+        }
+        if (endpoint.username || endpoint.password) {
+          ctx.addIssue({ code: "custom", message: "endpoint must not contain credentials" });
+        }
+      }),
+      region: z.string().trim().min(1),
+      accessKeyIdEnv: environmentVariableNameSchema,
+      secretAccessKeyEnv: environmentVariableNameSchema,
+      sessionTokenEnv: environmentVariableNameSchema.optional(),
+      forcePathStyle: z.boolean().default(false),
+    })
+    .strict(),
+]);
 
 const pluginsSchemaV2 = z
   .object({
@@ -628,6 +667,8 @@ const modelsSchemaV2 = z
 export const coreConfigInputSchemaV2 = z.object({
   configVersion: configVersionSchema,
 
+  blobStorage: blobStorageSchemaV2.optional(),
+
   tools: toolsSchema,
   plugins: pluginsSchemaV2,
   conversation: conversationSchemaV2,
@@ -758,13 +799,17 @@ function coreConfigV2ToUniversal(
       options.onUnknownKey(path);
     }
   }
-  const { artifactTtl, ...output } = parsed.tools.output;
-  const { firecrawl, ...web } = parsed.tools.web;
+  // Zod default objects may be reused between parses. Isolate the decoded
+  // config so runtime/test mutations cannot change a later parse's defaults.
+  const isolated = structuredClone(parsed);
+  const { artifactTtl, ...output } = isolated.tools.output;
+  const { firecrawl, ...web } = isolated.tools.web;
 
   return {
-    ...parsed,
+    ...isolated,
+    blobStorage: isolated.blobStorage ?? { kind: "local" },
     tools: {
-      ...parsed.tools,
+      ...isolated.tools,
       web: firecrawl
         ? {
             ...web,
@@ -780,13 +825,13 @@ function coreConfigV2ToUniversal(
       },
     },
     agent: {
-      ...parsed.agent,
+      ...isolated.agent,
       subagents: {
-        ...parsed.agent.subagents,
+        ...isolated.agent.subagents,
         profiles: {
-          explore: normalizeProfileToolNames(parsed.agent.subagents.profiles.explore),
-          general: normalizeProfileToolNames(parsed.agent.subagents.profiles.general),
-          self: normalizeProfileToolNames(parsed.agent.subagents.profiles.self),
+          explore: normalizeProfileToolNames(isolated.agent.subagents.profiles.explore),
+          general: normalizeProfileToolNames(isolated.agent.subagents.profiles.general),
+          self: normalizeProfileToolNames(isolated.agent.subagents.profiles.self),
         },
       },
       systemPrompt: "",

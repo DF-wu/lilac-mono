@@ -693,6 +693,7 @@ function coreConfigV1ToUniversal(
 
   return {
     ...parsed,
+    blobStorage: { kind: "local" },
     plugins: parsed.plugins,
     tools: {
       ...toolsRest,

@@ -27,6 +27,7 @@
     "@octokit/auth-app": "^8.2.0",
     "@stanley2058/lilac-agent": "workspace:*",
     "@stanley2058/lilac-bash-safety": "workspace:*",
+    "@stanley2058/lilac-blob-storage": "workspace:*",
     "@stanley2058/lilac-claude-code-bridge": "workspace:*",
     "@stanley2058/lilac-coding-tools": "workspace:*",
     "@stanley2058/lilac-event-bus": "workspace:*",
