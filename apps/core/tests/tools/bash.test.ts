@@ -245,6 +245,23 @@ rmdir "$media_dir"`,
     expect(lines[1]).toBe(path.join(env.dataDir, "secret", "gnupg"));
   });
 
+  it("forwards request delivery identity to trusted Bash", async () => {
+    const res = await executeBash(
+      { command: 'printf "%s" "$LILAC_REQUEST_DELIVERY_ID"' },
+      {
+        context: {
+          requestId: "request-123",
+          requestDeliveryId: "delivery-456",
+          sessionId: "session-789",
+          requestClient: "discord",
+        },
+      },
+    );
+
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe("delivery-456");
+  });
+
   it("does not set executionError for command failures", async () => {
     const res = await executeBash({ command: "exit 2" });
 

@@ -181,6 +181,7 @@ function lilacRequestHeaders(includeJson = false): Record<string, string> {
   const headers: Record<string, string> = includeJson ? { "Content-Type": "application/json" } : {};
   const values = [
     ["x-lilac-request-id", process.env.LILAC_REQUEST_ID],
+    ["x-lilac-request-delivery-id", process.env.LILAC_REQUEST_DELIVERY_ID],
     ["x-lilac-session-id", process.env.LILAC_SESSION_ID],
     ["x-lilac-request-client", process.env.LILAC_REQUEST_CLIENT],
     ["x-lilac-cwd", process.env.LILAC_CWD],

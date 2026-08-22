@@ -772,6 +772,7 @@ function buildBashChildEnv(params: {
   vcsEnv: Record<string, string>;
   context?: {
     requestId: string;
+    requestDeliveryId?: string;
     sessionId: string;
     requestClient: string;
     currentTurnUserId?: string;
@@ -787,6 +788,7 @@ function buildBashChildEnv(params: {
     ...params.githubEnv,
     ...params.vcsEnv,
     LILAC_REQUEST_ID: params.context?.requestId,
+    LILAC_REQUEST_DELIVERY_ID: params.context?.requestDeliveryId,
     LILAC_SESSION_ID: params.context?.sessionId,
     LILAC_REQUEST_CLIENT: params.context?.requestClient,
     LILAC_CURRENT_TURN_USER_ID: params.context?.currentTurnUserId,
@@ -829,6 +831,7 @@ export async function executeBash(
   }: {
     context?: {
       requestId: string;
+      requestDeliveryId?: string;
       sessionId: string;
       requestClient: string;
       currentTurnUserId?: string;
