@@ -2,9 +2,12 @@ import { describe, expect, it } from "bun:test";
 import { Panic } from "better-result";
 
 import {
+  getSessionMode,
   getDiscordFlags,
   parseLeadingContinueDirective,
   resolveSessionConfigId,
+  resolveSessionGateEnabled,
+  resolveSessionModelOverride,
   stripLeadingContinueDirective,
   withDefaultToolsConfig,
 } from "../../../src/surface/discord/discord-request-router/common";
@@ -174,6 +177,30 @@ describe("additional prompt config resolution", () => {
       }),
     ).toBe("guild");
     expect(resolveSessionConfigId({ cfg, sessionId: "unconfigured" })).toBe("unconfigured");
+  });
+});
+
+describe("guild session config resolution", () => {
+  it("applies guild mode, gate, and model unless a narrower scope overrides the property", () => {
+    const parsed = withDefaultToolsConfig({
+      surface: {
+        router: {
+          sessionModes: {
+            guild: { mode: "active", gate: false, model: "guild-model" },
+            parent: { gate: true },
+            channel: { model: "channel-model" },
+          },
+        },
+      },
+    });
+    expect(parsed.status).toBe("ok");
+    if (parsed.status === "error") return;
+
+    expect(getSessionMode(parsed.value, "channel", "parent", "guild")).toBe("active");
+    expect(resolveSessionGateEnabled(parsed.value, "channel", "parent", "guild")).toBe(true);
+    expect(resolveSessionModelOverride(parsed.value, "channel", "parent", "guild")).toBe(
+      "channel-model",
+    );
   });
 });
 

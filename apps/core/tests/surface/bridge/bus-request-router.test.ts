@@ -2348,7 +2348,7 @@ describe("startBusRequestRouter", () => {
     await router.stop();
   });
 
-  it("inherits parent mode and guild additionalPrompts for Discord threads", async () => {
+  it("inherits guild mode, gate, and additionalPrompts for Discord threads", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
 
@@ -2390,8 +2390,12 @@ describe("startBusRequestRouter", () => {
           router: {
             defaultMode: "mention",
             sessionModes: {
-              [parentChannelId]: { mode: "active", gate: false },
-              [guildId]: { additionalPrompts: ["guild memo"] },
+              [parentChannelId]: { model: "parent-model" },
+              [guildId]: {
+                mode: "active",
+                gate: false,
+                additionalPrompts: ["guild memo"],
+              },
             },
             activeDebounceMs: 5,
             activeGate: { enabled: true, timeoutMs: 2500 },

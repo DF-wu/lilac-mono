@@ -24,6 +24,16 @@ These rules apply to all tasks. Use the linked documents for detailed rules and 
 - Use `ref/` only as a read-only upstream reference.
 - Do not put credentials, tokens, private transcripts, or sensitive command data in outputs or files.
 
+## Control Flow
+
+- Keep workflows flat. Keep the happy path at the function's base indentation.
+- Handle terminal branches immediately with `return`. Handle loop-only branches immediately with
+  `continue` or `break`. A branch, callback, or handler must not contain the remainder of the workflow.
+- Extract a named function when a branch needs multiple steps.
+- Keep a single guard as an `if`. When ordered branching would otherwise chain several predicates with
+  `&&` or `||` inside an `if`/`else` tree, use `switch (true)` with one decision per case. Name compound
+  predicates when that keeps each case to one idea, and make each case terminal or delegate it.
+
 ## Repository Information
 
 - Use `bun` in this Bun workspace. The workspace packages are in `apps/*` and `packages/*`.

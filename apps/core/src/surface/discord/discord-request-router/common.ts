@@ -5,6 +5,7 @@ import {
   isPanic,
   isRecord,
   parseCoreConfigResult,
+  resolveRouterSessionConfig,
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import { Result } from "better-result";
@@ -274,53 +275,33 @@ export function getSessionMode(
   cfg: CoreConfig,
   sessionId: string,
   parentChannelId?: string,
+  guildId?: string,
 ): SessionMode {
-  const threadMode = cfg.surface.router.sessionModes[sessionId]?.mode;
-  if (threadMode) return threadMode;
-
-  const parentId = parentChannelId?.trim();
-  if (parentId) {
-    const parentMode = cfg.surface.router.sessionModes[parentId]?.mode;
-    if (parentMode) return parentMode;
-  }
-
-  return cfg.surface.router.defaultMode;
+  return (
+    resolveRouterSessionConfig(cfg, { sessionId, parentChannelId, guildId }).mode ??
+    cfg.surface.router.defaultMode
+  );
 }
 
 export function resolveSessionGateEnabled(
   cfg: CoreConfig,
   sessionId: string,
   parentChannelId?: string,
+  guildId?: string,
 ): boolean {
-  const threadGate = cfg.surface.router.sessionModes[sessionId]?.gate;
-  if (typeof threadGate === "boolean") return threadGate;
-
-  const parentId = parentChannelId?.trim();
-  const parentGate = parentId ? cfg.surface.router.sessionModes[parentId]?.gate : undefined;
-  if (typeof parentGate === "boolean") return parentGate;
-
-  return cfg.surface.router.activeGate.enabled;
+  return (
+    resolveRouterSessionConfig(cfg, { sessionId, parentChannelId, guildId }).gate ??
+    cfg.surface.router.activeGate.enabled
+  );
 }
 
 export function resolveSessionModelOverride(
   cfg: CoreConfig,
   sessionId: string,
   parentChannelId?: string,
+  guildId?: string,
 ): string | undefined {
-  const threadModel = cfg.surface.router.sessionModes[sessionId]?.model;
-  if (typeof threadModel === "string" && threadModel.trim().length > 0) {
-    return threadModel.trim();
-  }
-
-  const parentId = parentChannelId?.trim();
-  if (!parentId) return undefined;
-
-  const parentModel = cfg.surface.router.sessionModes[parentId]?.model;
-  if (typeof parentModel === "string" && parentModel.trim().length > 0) {
-    return parentModel.trim();
-  }
-
-  return undefined;
+  return resolveRouterSessionConfig(cfg, { sessionId, parentChannelId, guildId }).model;
 }
 
 export function buildDiscordUserAliasById(cfg: CoreConfig): Map<string, string> {

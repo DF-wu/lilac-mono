@@ -30,6 +30,8 @@ export function toBusDiscordCommandInvokedData(
         : {}),
       sessionMode: evt.sessionMode,
       sessionConfigId: evt.sessionConfigId,
+      ...(evt.parentChannelId ? { parentChannelId: evt.parentChannelId } : {}),
+      ...(evt.guildId ? { guildId: evt.guildId } : {}),
       ...(evt.modelOverride ? { modelOverride: evt.modelOverride } : {}),
       customCommand: {
         name: evt.commandName,

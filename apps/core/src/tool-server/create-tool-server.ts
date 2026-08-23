@@ -57,6 +57,7 @@ import {
 import type { RequestContext, ServerTool } from "./types";
 import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../surface/types";
 import { resolveAuthenticatedRequestSafetyMode } from "../surface/builtin-surface-protocols";
+import { resolveSessionSafetyMode } from "../surface/session-policy";
 import type { AuthenticatedRequestOrigin } from "./request-message-cache";
 
 type ToolPluginManagerLike = {
@@ -840,8 +841,7 @@ export function createToolServer(options: ToolServerOptions) {
         const loaded = await captureSafetyModeProvider(ctx, "config", options.getConfig);
         const loadedValue = loaded.match({ ok: (value) => value, err: () => null });
         if (!loadedValue) return loaded.map(() => "restricted");
-        assertedSafetyMode =
-          loadedValue.surface.router.sessionModes[sessionId]?.safetyMode ?? "trusted";
+        assertedSafetyMode = resolveSessionSafetyMode(loadedValue, sessionId);
       }
     }
     return Result.ok(

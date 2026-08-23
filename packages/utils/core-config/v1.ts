@@ -114,7 +114,7 @@ export const routerSchema = z
   .object({
     /** Default behavior for channels unless overridden by sessionModes. */
     defaultMode: z.enum(["mention", "active"]).default("mention"),
-    /** Per-session overrides. Discord guild keys provide additionalPrompts fallback only. */
+    /** Per-session overrides. Discord guild keys provide fallback values for every option. */
     sessionModes: z
       .record(
         z.string().min(1),

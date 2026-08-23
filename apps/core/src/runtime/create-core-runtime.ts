@@ -170,6 +170,7 @@ import {
 
 import type { SurfaceRuntimeRegistry } from "../surface/runtime-descriptor";
 import { resolveAuthenticatedRequestSafetyMode } from "../surface/builtin-surface-protocols";
+import { resolveSessionSafetyMode } from "../surface/session-policy";
 import type { SurfacePrincipal } from "../surface/types";
 import { composeBuiltinSurfaceRuntimes } from "./compose-builtin-surface-runtimes";
 import { createCoreBlobStore, type CoreBlobStoreCreateError } from "./create-core-blob-store";
@@ -2847,12 +2848,11 @@ export async function createCoreRuntime(
               const config = await getCoreConfig();
               const session = discordSurfaceStore?.getSession(context.sessionId);
               if (!session) return "restricted";
-              return (
-                config.surface.router.sessionModes[context.sessionId]?.safetyMode ??
-                (session.parent_channel_id
-                  ? config.surface.router.sessionModes[session.parent_channel_id]?.safetyMode
-                  : undefined) ??
-                "trusted"
+              return resolveSessionSafetyMode(
+                config,
+                context.sessionId,
+                session.parent_channel_id ?? undefined,
+                session.guild_id ?? undefined,
               );
             },
           });
@@ -2976,9 +2976,13 @@ export async function createCoreRuntime(
                 expiresAt: input.expiresAt,
               }),
             expireControlCapability: (requestId) => requestControlAuthority.expire(requestId),
-            resolveParentChannelId: (sessionId) => {
+            resolveDiscordSessionContext: (sessionId) => {
               const session = discordSurfaceStore?.getSession(sessionId);
-              return session ? session.parent_channel_id : undefined;
+              if (!session) return undefined;
+              return {
+                parentChannelId: session.parent_channel_id,
+                guildId: session.guild_id,
+              };
             },
           });
           stopAgentRunner = startedAgentRunner;

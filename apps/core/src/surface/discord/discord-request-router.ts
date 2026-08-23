@@ -804,6 +804,7 @@ type DebounceBuffer = {
   sessionId: string;
   sessionConfigId: string;
   parentChannelId?: string;
+  guildId?: string;
   messages: BufferedMessage[];
   timer: ReturnType<typeof setTimeout> | null;
 };
@@ -1353,6 +1354,7 @@ export async function startDiscordRequestRouter(
             cfg,
             sessionId,
             parentChannelId,
+            flags.guildId,
           );
           const modelOverride =
             requestModelOverride ?? flags.sessionModelOverride ?? configuredSessionModelOverride;
@@ -1367,8 +1369,13 @@ export async function startDiscordRequestRouter(
 
           const mode: SessionMode = isDm
             ? "active"
-            : getSessionMode(cfg, sessionId, parentChannelId);
-          const gateEnabled = resolveSessionGateEnabled(cfg, sessionId, parentChannelId);
+            : getSessionMode(cfg, sessionId, parentChannelId, flags.guildId);
+          const gateEnabled = resolveSessionGateEnabled(
+            cfg,
+            sessionId,
+            parentChannelId,
+            flags.guildId,
+          );
 
           const active = activeBySession.get(sessionId);
 
@@ -1596,6 +1603,7 @@ export async function startDiscordRequestRouter(
                 replyToMessageId: flags.replyToMessageId,
                 botUserId: flags.botUserId,
                 parentChannelId,
+                guildId: flags.guildId,
                 active,
                 sessionMode: mode,
                 sessionConfigId,
@@ -2190,6 +2198,7 @@ export async function startDiscordRequestRouter(
     replyToMessageId?: string;
     botUserId?: string;
     parentChannelId?: string;
+    guildId?: string;
     active: ActiveSessionState | undefined;
     sessionMode: SessionMode;
     sessionConfigId: string;
@@ -2212,6 +2221,7 @@ export async function startDiscordRequestRouter(
       replyToBot,
       botUserId,
       parentChannelId,
+      guildId,
       active,
       sessionMode,
       sessionConfigId,
@@ -2455,6 +2465,7 @@ export async function startDiscordRequestRouter(
       sessionId,
       sessionConfigId,
       parentChannelId,
+      guildId,
       message: {
         msgRef,
         userId,
@@ -2475,9 +2486,10 @@ export async function startDiscordRequestRouter(
     sessionId: string;
     sessionConfigId: string;
     parentChannelId?: string;
+    guildId?: string;
     message: BufferedMessage;
   }) {
-    const { buffers, cfg, sessionId, sessionConfigId, parentChannelId, message } = input;
+    const { buffers, cfg, sessionId, sessionConfigId, parentChannelId, guildId, message } = input;
 
     const existing = buffers.get(sessionId);
     if (!existing) {
@@ -2490,6 +2502,7 @@ export async function startDiscordRequestRouter(
         sessionId,
         sessionConfigId,
         parentChannelId,
+        guildId,
         messages: [message],
         timer: null,
       };
@@ -2527,7 +2540,7 @@ export async function startDiscordRequestRouter(
     clearDebounceBuffer(sessionId);
 
     // Gate is only for active channels with no running request.
-    const gateEnabled = resolveSessionGateEnabled(cfg, b.sessionId, b.parentChannelId);
+    const gateEnabled = resolveSessionGateEnabled(cfg, b.sessionId, b.parentChannelId, b.guildId);
     const previousMessageText = gateEnabled
       ? await resolvePreviousBatchMessageText(b.messages)
       : undefined;

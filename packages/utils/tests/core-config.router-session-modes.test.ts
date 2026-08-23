@@ -1,8 +1,75 @@
 import { describe, expect, it } from "bun:test";
 
-import { coreConfigSchema } from "../core-config";
+import {
+  coreConfigSchema,
+  parseCoreConfigV1ToUniversal,
+  resolveRouterSessionConfig,
+} from "../core-config";
 
 describe("coreConfigSchema surface.router.sessionModes", () => {
+  it("inherits every option independently from guild through parent and channel", () => {
+    const parsed = parseCoreConfigV1ToUniversal({
+      surface: {
+        router: {
+          sessionModes: {
+            guild: {
+              mode: "active",
+              gate: false,
+              model: "guild-model",
+              safetyMode: "restricted",
+              additionalPrompts: ["guild memo"],
+            },
+            parent: {
+              gate: true,
+              model: "parent-model",
+            },
+            channel: {
+              model: "channel-model",
+              additionalPrompts: [],
+            },
+          },
+        },
+      },
+    });
+
+    expect(
+      resolveRouterSessionConfig(parsed, {
+        sessionId: "channel",
+        parentChannelId: "parent",
+        guildId: "guild",
+      }),
+    ).toEqual({
+      mode: "active",
+      gate: true,
+      model: "channel-model",
+      safetyMode: "restricted",
+      additionalPrompts: [],
+    });
+  });
+
+  it("inherits fields added after the resolver", () => {
+    const parsed = parseCoreConfigV1ToUniversal({
+      surface: {
+        router: {
+          sessionModes: {
+            guild: { gate: false },
+            channel: { mode: "active" },
+          },
+        },
+      },
+    });
+    Object.assign(parsed.surface.router.sessionModes.guild!, {
+      futureOption: "guild-value",
+    });
+
+    const resolved = resolveRouterSessionConfig(parsed, {
+      sessionId: "channel",
+      guildId: "guild",
+    }) as Record<string, unknown>;
+
+    expect(resolved.futureOption).toBe("guild-value");
+  });
+
   it("accepts gate-only session overrides", () => {
     const parsed = coreConfigSchema.parse({
       surface: {

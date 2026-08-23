@@ -3264,7 +3264,7 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      resolveParentChannelId: () => null,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
       issueControlCapability: (input) => {
         issuedOrigin = input.authenticatedOrigin;
         return {
@@ -3374,7 +3374,7 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      resolveParentChannelId: () => null,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
       issueControlCapability: (input) => ({
         capability: "current-turn-capability",
         principal: input.authenticatedOrigin
@@ -3552,7 +3552,7 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      resolveParentChannelId: () => null,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
       startPaused: true,
       issueControlCapability: (input) => {
         capabilityIssued.resolve({
@@ -3926,7 +3926,7 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      resolveParentChannelId: () => null,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
       startPaused: true,
       issueControlCapability: (input) => {
         capabilityIssued.resolve({
@@ -4271,7 +4271,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      resolveParentChannelId: (sessionId) => sessionId,
+      resolveDiscordSessionContext: (sessionId) => ({
+        parentChannelId: sessionId,
+        guildId: null,
+      }),
       issueControlCapability: () => ({ capability: "rollback-capability", principal: null }),
       createAgent: (options) =>
         new AiSdkPiAgent({
@@ -4352,7 +4355,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      resolveParentChannelId: (sessionId) => sessionId,
+      resolveDiscordSessionContext: (sessionId) => ({
+        parentChannelId: sessionId,
+        guildId: null,
+      }),
       issueControlCapability: () => ({ capability: "coalesced-capability", principal: null }),
       createAgent: (options) =>
         new AiSdkPiAgent({
@@ -5384,7 +5390,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      resolveParentChannelId: (sessionId) => sessionId,
+      resolveDiscordSessionContext: (sessionId) => ({
+        parentChannelId: sessionId,
+        guildId: null,
+      }),
       issueControlCapability: (input) => {
         capabilityInputs.push(input);
         return {
@@ -5679,7 +5688,10 @@ describe("startBusAgentRunner production path", () => {
         config,
         pluginManager,
         requestMessageCache,
-        resolveParentChannelId: (sessionId) => sessionId,
+        resolveDiscordSessionContext: (sessionId) => ({
+          parentChannelId: sessionId,
+          guildId: null,
+        }),
         issueControlCapability: (input) => ({
           capability: `self-alias-${testCase.platform}`,
           principal: input.authenticatedOrigin

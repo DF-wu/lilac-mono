@@ -41,6 +41,7 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/surface/bridge/bus-agent-runner/raw.ts", "parseRouterSessionModeFromRaw"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "parseSessionConfigIdFromRaw"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "parseParentChannelIdFromRaw"],
+  ["src/surface/bridge/bus-agent-runner/raw.ts", "parseGuildIdFromRaw"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "parseRequestModelOverrideFromRaw"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "parseBufferedForActiveRequestIdFromRaw"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "getChainMessageIdsFromRaw"],

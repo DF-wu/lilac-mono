@@ -87,6 +87,7 @@ const routerRawSchema = z
     sessionMode: sessionModeSchema,
     sessionConfigId: optionalNonEmptyStringSchema,
     parentChannelId: optionalNonEmptyStringSchema,
+    guildId: optionalNonEmptyStringSchema,
     modelOverride: optionalNonEmptyStringSchema,
     bufferedForActiveRequestId: optionalNonEmptyStringSchema,
     chainMessageIds: stringArraySchema,
@@ -162,6 +163,10 @@ export function parseSessionConfigIdFromRaw(raw: unknown): string | null {
 
 export function parseParentChannelIdFromRaw(raw: unknown): string | null {
   return parseRouterRaw(raw)?.parentChannelId ?? null;
+}
+
+export function parseGuildIdFromRaw(raw: unknown): string | null {
+  return parseRouterRaw(raw)?.guildId ?? null;
 }
 
 export function parseRequestModelOverrideFromRaw(raw: unknown): string | null {

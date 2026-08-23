@@ -327,6 +327,14 @@ export type UniversalCoreConfig = {
 
 export type CoreConfig = UniversalCoreConfig;
 
+export type RouterSessionConfig = CoreConfig["surface"]["router"]["sessionModes"][string];
+
+export type RouterSessionConfigScope = {
+  sessionId: string;
+  parentChannelId?: string | null;
+  guildId?: string | null;
+};
+
 export interface ConfigParser {
   readonly version: CoreConfigVersion;
   parse(input: object, options?: CoreConfigParseOptions): Promise<UniversalCoreConfig>;

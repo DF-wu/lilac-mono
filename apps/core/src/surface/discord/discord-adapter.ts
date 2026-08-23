@@ -32,6 +32,7 @@ import {
   createLogger,
   formatTaggedErrorForLog,
   getCoreConfig,
+  resolveRouterSessionConfig,
   resolveModelRefResult,
   resolveDiscordDbPath,
   resolveDiscordTokenResult,
@@ -2733,6 +2734,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     cfg?: CoreConfig;
     sessionId: string;
     parentChannelId?: string | null;
+    guildId?: string | null;
   }): string | undefined {
     const inMemoryOverride = this.getInMemorySessionModelOverride({
       sessionId: input.sessionId,
@@ -2742,21 +2744,7 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     const cfg = input.cfg;
     if (!cfg) return undefined;
-
-    const threadModel = cfg.surface.router.sessionModes[input.sessionId]?.model;
-    if (typeof threadModel === "string" && threadModel.trim().length > 0) {
-      return threadModel.trim();
-    }
-
-    const parentId = input.parentChannelId?.trim();
-    if (!parentId) return undefined;
-
-    const parentModel = cfg.surface.router.sessionModes[parentId]?.model;
-    if (typeof parentModel === "string" && parentModel.trim().length > 0) {
-      return parentModel.trim();
-    }
-
-    return undefined;
+    return resolveRouterSessionConfig(cfg, input).model;
   }
 
   private getInMemorySessionModelOverride(input: {
@@ -2774,12 +2762,14 @@ export class DiscordAdapter implements SurfaceAdapter {
     cfg: CoreConfig;
     sessionId: string;
     parentChannelId?: string | null;
+    guildId?: string | null;
   }): string {
     return (
       this.getEffectiveSessionModelOverride({
         cfg: input.cfg,
         sessionId: input.sessionId,
         parentChannelId: input.parentChannelId,
+        guildId: input.guildId,
       }) ?? input.cfg.models.main.model
     );
   }
@@ -3242,7 +3232,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     const parsed = selectResultValue(parsedResult);
     const preview = customCommands.formatPreview(parsed);
     const parentChannelId = this.getParentChannelIdFromInteractionChannel(interaction);
-    const sessionMode = getSessionMode(cfg, channelId, parentChannelId);
+    const sessionMode = getSessionMode(cfg, channelId, parentChannelId, guildId ?? undefined);
     const sessionConfigId = resolveSessionConfigId({
       cfg,
       sessionId: channelId,
@@ -3253,6 +3243,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       cfg,
       sessionId: channelId,
       parentChannelId,
+      guildId,
     });
 
     this.superviseDiscordCallback("custom-command-preview", async () => {
@@ -3299,6 +3290,8 @@ export class DiscordAdapter implements SurfaceAdapter {
         undefined,
       sessionMode,
       sessionConfigId,
+      ...(parentChannelId ? { parentChannelId } : {}),
+      ...(guildId ? { guildId } : {}),
       modelOverride,
     });
   }
@@ -3343,6 +3336,7 @@ export class DiscordAdapter implements SurfaceAdapter {
           cfg,
           sessionId,
           parentChannelId,
+          guildId: interaction.guildId,
         })
       : cfg.models.main.model;
 
@@ -3391,6 +3385,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       cfg,
       sessionId: channelId,
       parentChannelId,
+      guildId,
     });
 
     const modelInput = interaction.options.getString("model");

@@ -57,9 +57,15 @@ describe("Discord command actor projection", () => {
       ts: 1,
       sessionMode: "mention",
       sessionConfigId: "channel",
+      parentChannelId: "parent",
+      guildId: "guild",
     });
 
     expect(Object.hasOwn(projected.raw ?? {}, "authenticatedActor")).toBe(false);
+    expect(projected.raw).toMatchObject({
+      parentChannelId: "parent",
+      guildId: "guild",
+    });
   });
 });
 

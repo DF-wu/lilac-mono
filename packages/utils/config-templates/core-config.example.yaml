@@ -118,10 +118,10 @@ surface:
     # - active: treat the channel like a DM (respond to everything)
     defaultMode: mention
 
-    # Per-session overrides. Key is the session/channel id.
-    # A Discord server/guild id can provide additionalPrompts as a fallback for
-    # its channels. Prompt precedence is thread/channel, parent channel, then guild.
-    # An explicit additionalPrompts: [] disables broader prompt inheritance.
+    # Per-session overrides. Key is a session/channel id or Discord server/guild id.
+    # Every option inherits independently. Precedence is thread/channel, parent
+    # channel, guild, then the option's global default. An explicit value such as
+    # additionalPrompts: [] disables broader inheritance for that option.
     # Reserved internal keys: "__heartbeat__" (canonical) and "heartbeat" (alias)
     # target the autonomous heartbeat lane.
     sessionModes: {}
@@ -144,7 +144,11 @@ surface:
     #     additionalPrompts:
     #       - "Keep replies concise for this session."
     #       - "file:///abs/path/to/session-memo.md"
-    #   "234567890123456789": # Discord server/guild id
+    #   "234567890123456789": # Discord server/guild defaults
+    #     mode: active
+    #     gate: false
+    #     model: "haiku"
+    #     safetyMode: restricted
     #     additionalPrompts:
     #       - "Default memo for channels in this server."
     #   "__heartbeat__":

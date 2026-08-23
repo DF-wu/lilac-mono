@@ -53,6 +53,7 @@ import {
   resolveModelChainResult,
   resolveModelPlanResult,
   resolveNativeSubagentProfile,
+  resolveRouterSessionConfig,
   withModelPlanReasoning,
 } from "@stanley2058/lilac-utils";
 import {
@@ -206,6 +207,8 @@ import {
   getParticipantUserIdsFromRaw,
   parseRequestControlFromRaw,
   parseRequestModelOverrideFromRaw,
+  parseParentChannelIdFromRaw,
+  parseGuildIdFromRaw,
   parseRouterSessionModeFromRaw,
   parseSessionConfigIdFromRaw,
   parseSubagentMetaFromRaw,
@@ -2755,7 +2758,13 @@ export async function startBusAgentRunner(params: {
   beforeRequestIntake?: (
     message: DecodedLilacMessageForTopic<"cmd.request">,
   ) => void | Promise<void>;
-  resolveParentChannelId?: (sessionId: string) => string | null | undefined;
+  /** Resolve trusted stored Discord hierarchy for config inheritance and safety policy. */
+  resolveDiscordSessionContext?: (sessionId: string) =>
+    | {
+        parentChannelId: string | null;
+        guildId: string | null;
+      }
+    | undefined;
   issueControlCapability?: (input: {
     requestId: string;
     sessionId: string;
@@ -4331,12 +4340,13 @@ export async function startBusAgentRunner(params: {
   }): SessionSafetyMode {
     let assertedSafetyMode: SessionSafetyMode = "restricted";
     if (input.platform === "discord") {
-      const parentResolution = params.resolveParentChannelId?.(input.sessionId);
-      if (parentResolution !== undefined) {
+      const sessionContext = params.resolveDiscordSessionContext?.(input.sessionId);
+      if (sessionContext !== undefined) {
         assertedSafetyMode = resolveSessionSafetyMode(
           cfg,
           input.sessionId,
-          parentResolution ?? undefined,
+          sessionContext.parentChannelId ?? undefined,
+          sessionContext.guildId ?? undefined,
         );
       }
     }
@@ -5549,14 +5559,32 @@ export async function startBusAgentRunner(params: {
               : await waitForPreAgent(maybeBuildSkillsSectionForPrimary());
 
           const sessionConfigId = parseSessionConfigIdFromRaw(next.raw) ?? sessionId;
-          const parentChannelResolution =
-            next.requestClient === "discord" ? params.resolveParentChannelId?.(sessionId) : null;
-          const parentChannelId = parentChannelResolution ?? undefined;
+          const discordSessionContext =
+            next.requestClient === "discord"
+              ? params.resolveDiscordSessionContext?.(sessionId)
+              : null;
+          const rawParentChannelId = parseParentChannelIdFromRaw(next.raw);
+          const rawGuildId = parseGuildIdFromRaw(next.raw);
+          const parentChannelId =
+            rawParentChannelId ?? discordSessionContext?.parentChannelId ?? undefined;
+          const guildId = rawGuildId ?? discordSessionContext?.guildId ?? undefined;
+          const legacyConfigFallbackId =
+            sessionConfigId === sessionId ? undefined : sessionConfigId;
+          const sessionConfig = resolveRouterSessionConfig(cfg, {
+            sessionId,
+            parentChannelId,
+            guildId: guildId ?? legacyConfigFallbackId,
+          });
           let safetyMode: SessionSafetyMode =
             next.restoredSafetyMode ??
-            (next.requestClient === "discord" && parentChannelResolution === undefined
+            (next.requestClient === "discord" && discordSessionContext === undefined
               ? "restricted"
-              : resolveSessionSafetyMode(cfg, sessionId, parentChannelId));
+              : resolveSessionSafetyMode(
+                  cfg,
+                  sessionId,
+                  discordSessionContext?.parentChannelId ?? undefined,
+                  discordSessionContext?.guildId ?? undefined,
+                ));
           if (runProfile === "primary" && !workflowPolicy && isHeartbeatSessionId(next.sessionId)) {
             controlCapability =
               (await params.issueHeartbeatCapability?.({
@@ -5618,7 +5646,7 @@ export async function startBusAgentRunner(params: {
 
           const additionalSessionPrompts = await waitForPreAgent(
             resolveSessionAdditionalPrompts({
-              entries: cfg.surface.router.sessionModes[sessionConfigId]?.additionalPrompts,
+              entries: sessionConfig.additionalPrompts,
               onWarn: (warning) => {
                 logger.warn("skipping invalid session additionalPrompts entry", {
                   requestId: next.requestId,
