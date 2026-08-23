@@ -27,7 +27,10 @@ import type {
   SurfaceSelf,
   SurfaceSession,
 } from "../../../src/surface/types";
-import { SqliteTranscriptStore } from "../../../src/transcript/transcript-store";
+import {
+  CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+  SqliteTranscriptStore,
+} from "../../../src/transcript/transcript-store";
 import { hashCanonicalStoredMessagesV2 } from "../../../src/transcript/transcript-persistence-codec";
 import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 import { getTestBlobStore } from "../../helpers/blob-store";
@@ -176,6 +179,261 @@ function surfaceMessage(input: {
     raw: input.raw ?? { reference: {} },
   };
 }
+
+function admitSurfaceProjection(input: {
+  store: SqliteTranscriptStore;
+  messageId: string;
+  authorId: string;
+  authorName: string;
+  ts: number;
+  messages: readonly StoredMessageV1[];
+}): void {
+  resultValue(
+    input.store.admitCoreSurfaceProjection({
+      requestClient: "discord",
+      surfaceId: "discord:channel",
+      sessionId: "channel",
+      messageId: input.messageId,
+      projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+      canonicalMessages: input.messages,
+      sourceFacts: {
+        authorId: input.authorId,
+        authorName: input.authorName,
+        messageTs: input.ts,
+        reactions: [],
+        attachments: [],
+        segmentMessageIds: [input.messageId],
+      },
+      ownedBlobs: [],
+    }),
+  );
+}
+
+class LayeredCompositionAdapter extends MutableAdapter {
+  readonly readMessageIds: string[] = [];
+  listMessageCalls = 0;
+  activeReads = 0;
+  maximumActiveReads = 0;
+
+  constructor(
+    messages: SurfaceMessage[],
+    private readonly replyChain: readonly MsgRef[],
+  ) {
+    super(messages);
+  }
+
+  override async readMsg(ref: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
+    this.readMessageIds.push(ref.messageId);
+    this.activeReads += 1;
+    this.maximumActiveReads = Math.max(this.maximumActiveReads, this.activeReads);
+    const read = await super.readMsg(ref);
+    this.activeReads -= 1;
+    return read;
+  }
+
+  override async listMsg(
+    session: SessionRef,
+    opts?: LimitOpts,
+  ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
+    this.listMessageCalls += 1;
+    return super.listMsg(session, opts);
+  }
+
+  override async planReplyChain(): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
+    return Result.ok(this.replyChain);
+  }
+
+  override async planMergeBlockEndingAt(
+    ref: MsgRef,
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
+    return Result.ok([ref]);
+  }
+}
+
+describe("layered Discord composition enrichment", () => {
+  it("uses ingress, projections, and a linked bot transcript without reading Discord", async () => {
+    const { store } = await createStore();
+    const now = Date.now();
+    admitSurfaceProjection({
+      store,
+      messageId: "root",
+      authorId: "user",
+      authorName: "User",
+      ts: now - 1_000,
+      messages: [{ role: "user", content: "stored root" }],
+    });
+    store.saveRequestTranscript({
+      requestId: "answer-request",
+      sessionId: "channel",
+      requestClient: "discord",
+      messages: [{ role: "assistant", content: "stored answer" }],
+      finalText: "stored answer",
+    });
+    store.linkSurfaceMessagesToRequest({
+      requestId: "answer-request",
+      created: [{ platform: "discord", channelId: "channel", messageId: "answer" }],
+      last: { platform: "discord", channelId: "channel", messageId: "answer" },
+    });
+    const trigger = surfaceMessage({
+      id: "trigger",
+      text: "follow up",
+      ts: now + 1_000,
+      raw: { reference: { messageId: "answer", channelId: "channel" } },
+    });
+    const refs = ["root", "answer", "trigger"].map(
+      (messageId) => ({ platform: "discord", channelId: "channel", messageId }) satisfies MsgRef,
+    );
+    const adapter = new LayeredCompositionAdapter([], refs);
+
+    const composed = await composeRequestMessages(adapter, {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      transcriptStore: store,
+      ingressMessages: [trigger],
+      trigger: { type: "reply", msgRef: trigger.ref },
+    });
+
+    expect(adapter.readMessageIds).toEqual([]);
+    expect(composed.chainMessageIds).toEqual(["root", "answer", "trigger"]);
+    expect(JSON.stringify(composed.messages)).toContain("stored root");
+    expect(JSON.stringify(composed.messages)).toContain("stored answer");
+    expect(JSON.stringify(composed.messages)).toContain("follow up");
+    store.close();
+  });
+
+  it("concurrently fetches only projection misses", async () => {
+    const { store } = await createStore();
+    admitSurfaceProjection({
+      store,
+      messageId: "root",
+      authorId: "user",
+      authorName: "User",
+      ts: 1,
+      messages: [{ role: "user", content: "stored root" }],
+    });
+    const missingOne = surfaceMessage({ id: "missing-1", text: "one", ts: 2, userId: "bot" });
+    const missingTwo = surfaceMessage({ id: "missing-2", text: "two", ts: 3, userId: "bot" });
+    const trigger = surfaceMessage({
+      id: "trigger",
+      text: "follow up",
+      ts: 4,
+      raw: { reference: { messageId: "missing-2", channelId: "channel" } },
+    });
+    const refs = ["root", "missing-1", "missing-2", "trigger"].map(
+      (messageId) => ({ platform: "discord", channelId: "channel", messageId }) satisfies MsgRef,
+    );
+    const adapter = new LayeredCompositionAdapter([missingOne, missingTwo], refs);
+
+    await composeRequestMessages(adapter, {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      transcriptStore: store,
+      ingressMessages: [trigger],
+      trigger: { type: "reply", msgRef: trigger.ref },
+    });
+
+    expect(adapter.readMessageIds.toSorted()).toEqual(["missing-1", "missing-2"]);
+    expect(adapter.maximumActiveReads).toBe(2);
+    store.close();
+  });
+
+  it("checks an active ingress message for an effective reply before recent-channel selection", async () => {
+    const { store } = await createStore();
+    admitSurfaceProjection({
+      store,
+      messageId: "root",
+      authorId: "other-user",
+      authorName: "Other user",
+      ts: 1,
+      messages: [{ role: "user", content: "stored thread root" }],
+    });
+    const trigger = surfaceMessage({
+      id: "trigger",
+      text: "active reply",
+      ts: 2,
+      raw: {},
+    });
+    const refs = ["root", "trigger"].map(
+      (messageId) => ({ platform: "discord", channelId: "channel", messageId }) satisfies MsgRef,
+    );
+    const adapter = new LayeredCompositionAdapter([], refs);
+
+    const composed = await composeRecentChannelMessages(adapter, {
+      platform: "discord",
+      sessionId: "channel",
+      botUserId: "bot",
+      botName: "lilac",
+      limit: 8,
+      transcriptStore: store,
+      messageCache: {
+        getIndexedMessage: () => null,
+        listIndexedMessagesBefore: () => [],
+      },
+      ingressMessages: [trigger],
+      triggerMsgRef: trigger.ref,
+      triggerType: undefined,
+    });
+
+    expect(adapter.readMessageIds).toEqual([]);
+    expect(adapter.listMessageCalls).toBe(0);
+    expect(composed.chainMessageIds).toEqual(["root", "trigger"]);
+    expect(JSON.stringify(composed.messages)).toContain("stored thread root");
+    expect(JSON.stringify(composed.messages)).toContain("active reply");
+    store.close();
+  });
+
+  it("applies a cached divider to an active reply without listing Discord messages", async () => {
+    const { store } = await createStore();
+    admitSurfaceProjection({
+      store,
+      messageId: "root",
+      authorId: "other-user",
+      authorName: "Other user",
+      ts: 1,
+      messages: [{ role: "user", content: "stored thread root" }],
+    });
+    const trigger = surfaceMessage({ id: "trigger", text: "active reply", ts: 3, raw: {} });
+    const refs = ["root", "trigger"].map(
+      (messageId) => ({ platform: "discord", channelId: "channel", messageId }) satisfies MsgRef,
+    );
+    const adapter = new LayeredCompositionAdapter([], refs);
+
+    const composed = await composeRecentChannelMessages(adapter, {
+      platform: "discord",
+      sessionId: "channel",
+      botUserId: "bot",
+      botName: "lilac",
+      limit: 8,
+      transcriptStore: store,
+      messageCache: {
+        getIndexedMessage: () => null,
+        listIndexedMessagesBefore: () => [
+          {
+            ref: { platform: "discord", channelId: "channel", messageId: "divider" },
+            session: { platform: "discord", channelId: "channel" },
+            userId: "bot",
+            text: "[LILAC_SESSION_DIVIDER]",
+            ts: 2,
+            deleted: false,
+            updatedTs: 2,
+            attachments: [],
+          },
+        ],
+      },
+      ingressMessages: [trigger],
+      triggerMsgRef: trigger.ref,
+      triggerType: undefined,
+    });
+
+    expect(adapter.readMessageIds).toEqual([]);
+    expect(adapter.listMessageCalls).toBe(0);
+    expect(composed.chainMessageIds).toEqual(["trigger"]);
+    expect(JSON.stringify(composed.messages)).not.toContain("stored thread root");
+    store.close();
+  });
+});
 
 describe("Core primary lineage composition", () => {
   it("reuses first-seen text, attribution, reactions, forwarded content, and owned attachments", async () => {

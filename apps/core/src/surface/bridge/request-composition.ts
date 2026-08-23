@@ -57,12 +57,14 @@ import {
   takeDiscordCurrentBlobReferences,
 } from "./request-composition/attachments";
 import type { DiscordAttachmentCacheAccess } from "../discord/discord-attachment";
+import type { DiscordMessageCacheAccess } from "../store/discord-search-store";
 import {
   prepareStoredMessagesForBus,
   type DiscordStoredBlobPreparationError,
 } from "./request-composition/prepare-bus-messages";
 import { selectNewestReachableCheckpoint } from "./request-composition/checkpoint-selection";
 import {
+  buildAssistantOnlyMessageFromTranscript,
   formatDiscordAttributionHeader,
   normalizeAssistantContextText,
   normalizeText,
@@ -71,11 +73,12 @@ import { escapeSurfaceMetadataTags } from "./surface-metadata";
 import {
   fetchMentionThreadContext,
   fetchReplyChainFrom,
-  findEarliestReplyAnchor,
+  findEarliestEffectiveReplyAnchor,
   getForwardSnapshotTextFromRaw,
   mergeChainByDiscordWindow,
   resolveMergeBlockEndingAt,
   toReplyChainMessage,
+  type ResolveDiscordMessagesByRefs,
 } from "./request-composition/reply-chain";
 import type {
   ComposeRecentChannelMessagesOpts,
@@ -278,6 +281,190 @@ function storedNumberFact(
   return typeof value === "number" ? value : fallback;
 }
 
+function storedProjectionText(projection: CoreSurfaceProjection): string {
+  return projection.canonicalMessages
+    .flatMap((message) => {
+      if (typeof message.content === "string") return [message.content];
+      if (!Array.isArray(message.content)) return [];
+      return message.content.flatMap((part) =>
+        part.type === "text" && typeof part.text === "string" ? [part.text] : [],
+      );
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function surfaceMessageFromStoredProjection(input: {
+  projection: CoreSurfaceProjection;
+  sessionId: string;
+  messageId: string;
+}): SurfaceMessage | null {
+  const authorId = input.projection.sourceFacts["authorId"];
+  const messageTs = input.projection.sourceFacts["messageTs"];
+  if (typeof authorId !== "string" || typeof messageTs !== "number") return null;
+
+  const authorName = input.projection.sourceFacts["authorName"];
+  return {
+    ref: {
+      platform: "discord",
+      channelId: input.sessionId,
+      messageId: input.messageId,
+    },
+    session: { platform: "discord", channelId: input.sessionId },
+    userId: authorId,
+    ...(typeof authorName === "string" ? { userName: authorName } : {}),
+    text: storedProjectionText(input.projection),
+    ts: messageTs,
+    raw: { discord: { isChat: true, attachments: [] } },
+  };
+}
+
+function surfaceMessageFromLinkedTranscript(input: {
+  snapshot: TranscriptSnapshot;
+  sessionId: string;
+  messageId: string;
+  botUserId: string;
+  botName: string;
+}): SurfaceMessage | null {
+  const assistant = buildAssistantOnlyMessageFromTranscript(input.snapshot);
+  if (!assistant || typeof assistant.content !== "string") return null;
+
+  return {
+    ref: {
+      platform: "discord",
+      channelId: input.sessionId,
+      messageId: input.messageId,
+    },
+    session: { platform: "discord", channelId: input.sessionId },
+    userId: input.botUserId,
+    userName: input.botName,
+    text: assistant.content,
+    ts: input.snapshot.updatedTs,
+    raw: { discord: { isChat: true, attachments: [] } },
+  };
+}
+
+function createLayeredDiscordMessageResolver(input: {
+  adapter: SurfaceAdapter;
+  sessionId: string;
+  botUserId: string;
+  botName: string;
+  transcriptStore?: TranscriptStore;
+  ingressMessages?: readonly SurfaceMessage[];
+  currentMessageIds?: readonly string[];
+}): {
+  resolveMessagesByRefs: ResolveDiscordMessagesByRefs;
+  projections: ReadonlyMap<string, CoreSurfaceProjection | null>;
+} {
+  const projectionStore = isProjectionCapableStore(input.transcriptStore)
+    ? input.transcriptStore
+    : undefined;
+  const ingressByMessageId = new Map(
+    (input.ingressMessages ?? [])
+      .filter(
+        (message) =>
+          message.ref.platform === "discord" && message.ref.channelId === input.sessionId,
+      )
+      .map((message) => [message.ref.messageId, message]),
+  );
+  const projections = new Map<string, CoreSurfaceProjection | null>();
+  const linkedTranscripts = new Map<string, TranscriptSnapshot | null>();
+  const currentMessageIds = new Set(input.currentMessageIds ?? []);
+
+  const getProjection = (messageId: string): CoreSurfaceProjection | null => {
+    if (projections.has(messageId)) return projections.get(messageId) ?? null;
+    const stored = projectionStore?.getCoreSurfaceProjection(
+      surfaceProjectionKey(input.sessionId, messageId),
+    );
+    const projection = stored?.match({ ok: (value) => value, err: () => null }) ?? null;
+    projections.set(messageId, projection);
+    return projection;
+  };
+
+  const getLinkedTranscript = (messageId: string): TranscriptSnapshot | null => {
+    if (linkedTranscripts.has(messageId)) return linkedTranscripts.get(messageId) ?? null;
+    const stored = input.transcriptStore?.getTranscriptBySurfaceMessage({
+      platform: "discord",
+      channelId: input.sessionId,
+      messageId,
+    });
+    const snapshot =
+      stored?.match({
+        ok: (value) =>
+          value?.requestClient === "discord" && value.sessionId === input.sessionId ? value : null,
+        err: () => null,
+      }) ?? null;
+    linkedTranscripts.set(messageId, snapshot);
+    return snapshot;
+  };
+
+  const resolveMessagesByRefs: ResolveDiscordMessagesByRefs = async (refs) => {
+    const resolvedByMessageId = new Map<string, SurfaceMessage>();
+    const refsToFetch: MsgRef[] = [];
+
+    for (const ref of refs) {
+      const ingress = ingressByMessageId.get(ref.messageId);
+      if (ingress) {
+        resolvedByMessageId.set(ref.messageId, ingress);
+        continue;
+      }
+
+      const projection = getProjection(ref.messageId);
+      const projected = projection
+        ? surfaceMessageFromStoredProjection({
+            projection,
+            sessionId: input.sessionId,
+            messageId: ref.messageId,
+          })
+        : null;
+      if (projected) {
+        resolvedByMessageId.set(ref.messageId, projected);
+        continue;
+      }
+
+      const snapshot = currentMessageIds.has(ref.messageId)
+        ? null
+        : getLinkedTranscript(ref.messageId);
+      const linked = snapshot
+        ? surfaceMessageFromLinkedTranscript({
+            snapshot,
+            sessionId: input.sessionId,
+            messageId: ref.messageId,
+            botUserId: input.botUserId,
+            botName: input.botName,
+          })
+        : null;
+      if (linked) {
+        resolvedByMessageId.set(ref.messageId, linked);
+        continue;
+      }
+      refsToFetch.push(ref);
+    }
+
+    const fetched = await mapWithConcurrency({
+      items: refsToFetch,
+      concurrency: 8,
+      run: (ref) => input.adapter.readMsg(ref),
+    });
+    const fetchedResult = Result.all(fetched);
+    const fetchedError = fetchedResult.match({ ok: () => null, err: (error) => error });
+    if (fetchedError) return Result.err(fetchedError);
+    const fetchedMessages = fetchedResult.match({ ok: (messages) => messages, err: () => [] });
+    for (const message of fetchedMessages) {
+      if (message) resolvedByMessageId.set(message.ref.messageId, message);
+    }
+
+    return Result.ok(
+      refs.flatMap((ref) => {
+        const message = resolvedByMessageId.get(ref.messageId);
+        return message ? [message] : [];
+      }),
+    );
+  };
+
+  return { resolveMessagesByRefs, projections };
+}
+
 function collectStoredBoundaryBreaks(input: {
   chain: readonly ReplyChainMessage[];
   sessionId: string;
@@ -450,6 +637,7 @@ async function composeSelectedDiscordChain(input: {
   discordUserAliasById?: ReadonlyMap<string, string>;
   blobStore?: BlobStore;
   attachmentCache?: DiscordAttachmentCacheAccess;
+  resolvedProjections?: ReadonlyMap<string, CoreSurfaceProjection | null>;
 }): Promise<
   ResultType<
     {
@@ -480,6 +668,13 @@ async function composeSelectedDiscordChain(input: {
   const outcome = await (async () => {
     const projections = new Map<string, CoreSurfaceProjection | null>();
     for (const message of input.chain) {
+      if (input.resolvedProjections?.has(message.messageId)) {
+        projections.set(
+          message.messageId,
+          input.resolvedProjections.get(message.messageId) ?? null,
+        );
+        continue;
+      }
       const stored = projectionStore?.getCoreSurfaceProjection(
         surfaceProjectionKey(input.sessionId, message.messageId),
       );
@@ -1453,11 +1648,50 @@ function applyDiscordSessionDividerCutoffToReplyChain(params: {
 
 async function findLastDiscordSessionDividerBefore(params: {
   adapter: SurfaceAdapter;
+  messageCache?: DiscordMessageCacheAccess;
   channelId: string;
   botUserId: string;
   beforeMessageId: string;
-  stopAtMessageId?: string;
+  beforeTs: number;
+  stopAt?: { messageId: string; ts: number };
 }): Promise<SurfaceOperationResult<{ ts: number; messageId: string } | null>> {
+  if (params.messageCache) {
+    let before = { messageId: params.beforeMessageId, ts: params.beforeTs };
+    let scanned = 0;
+    const maxMessages = 2000;
+    const pageSize = 200;
+
+    while (scanned < maxMessages) {
+      const page = params.messageCache.listIndexedMessagesBefore({
+        channelId: params.channelId,
+        before,
+        limit: Math.min(pageSize, maxMessages - scanned),
+      });
+      if (page.length === 0) return Result.ok(null);
+      scanned += page.length;
+
+      let newestDivider: { ts: number; messageId: string } | null = null;
+      for (const message of page) {
+        if (message.userId !== params.botUserId || !isDiscordSessionDividerText(message.text)) {
+          continue;
+        }
+        const position = { ts: message.ts, messageId: message.ref.messageId };
+        if (params.stopAt && compareDiscordMsgPosition(position, params.stopAt) <= 0) continue;
+        if (!newestDivider || compareDiscordMsgPosition(newestDivider, position) < 0) {
+          newestDivider = position;
+        }
+      }
+      if (newestDivider) return Result.ok(newestDivider);
+
+      const oldest = page[0]!;
+      before = { ts: oldest.ts, messageId: oldest.ref.messageId };
+      if (params.stopAt && compareDiscordMsgPosition(before, params.stopAt) <= 0) {
+        return Result.ok(null);
+      }
+    }
+    return Result.ok(null);
+  }
+
   const sessionRef = {
     platform: "discord",
     channelId: params.channelId,
@@ -1488,8 +1722,8 @@ async function findLastDiscordSessionDividerBefore(params: {
     }
     if (newestDivider) return Result.ok(newestDivider);
     if (
-      params.stopAtMessageId &&
-      pageValues.some((message) => message.ref.messageId === params.stopAtMessageId)
+      params.stopAt &&
+      pageValues.some((message) => message.ref.messageId === params.stopAt?.messageId)
     ) {
       return Result.ok(null);
     }
@@ -1577,9 +1811,18 @@ export async function composeRequestMessages(
       composeRequestMessages(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
     );
   }
-  // Step 1: fetch reply chain from the adapter store / platform.
-  // Mention triggers get merge-window parity even if messages are not linked via reply references.
-  const triggerMsg = await adapter.readMsg(opts.trigger.msgRef);
+  const layered = createLayeredDiscordMessageResolver({
+    adapter,
+    sessionId: opts.trigger.msgRef.channelId,
+    botUserId: opts.botUserId,
+    botName: opts.botName,
+    transcriptStore: opts.transcriptStore,
+    ingressMessages: opts.ingressMessages,
+    currentMessageIds: opts.currentMessageIds ?? [opts.trigger.msgRef.messageId],
+  });
+  const triggerMsg = await layered
+    .resolveMessagesByRefs([opts.trigger.msgRef])
+    .then((resolved) => resolved.map((messages) => messages[0] ?? null));
   const triggerError = triggerMsg.match({
     ok: () => null,
     err: (error) => error,
@@ -1607,6 +1850,7 @@ export async function composeRequestMessages(
           botName: opts.botName,
           triggerMsg: triggerValue,
           maxDepth: opts.maxDepth,
+          resolveMessagesByRefs: layered.resolveMessagesByRefs,
         })
       : await fetchReplyChainFrom(adapter, {
           platform: opts.platform,
@@ -1615,6 +1859,7 @@ export async function composeRequestMessages(
           trigger: opts.trigger,
           startMsgRef: opts.trigger.msgRef,
           maxDepth: opts.maxDepth,
+          resolveMessagesByRefs: layered.resolveMessagesByRefs,
         });
   const chainError = chainResult.match({
     ok: () => null,
@@ -1671,6 +1916,7 @@ export async function composeRequestMessages(
     discordUserAliasById: opts.discordUserAliasById,
     blobStore: opts.blobStore,
     attachmentCache: opts.attachmentCache,
+    resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({
     messages: value.messages,
@@ -1691,14 +1937,25 @@ export async function composeRecentChannelMessages(
       composeRecentChannelMessages(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
     );
   }
-  // Reply precedence: if the trigger is a Discord reply (even when the router
-  // classified it as a "mention" trigger because it wasn't a reply-to-bot),
-  // treat it as an explicit reply-chain continuation.
+  const layered = createLayeredDiscordMessageResolver({
+    adapter,
+    sessionId: opts.sessionId,
+    botUserId: opts.botUserId,
+    botName: opts.botName,
+    transcriptStore: opts.transcriptStore,
+    ingressMessages: opts.ingressMessages,
+    currentMessageIds:
+      opts.currentMessageIds ?? (opts.triggerMsgRef ? [opts.triggerMsgRef.messageId] : []),
+  });
+  // Reply precedence: a mention burst keeps its existing "any reply in the
+  // burst" behavior. An active-channel trigger only checks the ingress head.
   //
   // IMPORTANT: this bypasses active-burst guardrails (age/gap/transcript-age).
   // A reply is a strong "continue" signal.
-  if (opts.triggerMsgRef && opts.triggerType === "mention") {
-    const triggerMsgResult = await adapter.readMsg(opts.triggerMsgRef);
+  if (opts.triggerMsgRef && opts.triggerType !== "reply") {
+    const triggerMsgResult = await layered
+      .resolveMessagesByRefs([opts.triggerMsgRef])
+      .then((resolved) => resolved.map((messages) => messages[0] ?? null));
     const triggerError = triggerMsgResult.match({
       ok: () => null,
       err: (error) => error,
@@ -1709,23 +1966,28 @@ export async function composeRecentChannelMessages(
       err: () => null,
     });
     if (triggerMsg) {
-      // "Merge block" = a user's short burst of consecutive messages.
-      // If ANY message in the burst is a reply, treat the entire burst as a
-      // continuation of that reply thread.
-      const blockResult = await resolveMergeBlockEndingAt(adapter, triggerMsg);
-      const blockError = blockResult.match({
-        ok: () => null,
-        err: (error) => error,
-      });
-      if (blockError) return Result.err(blockError);
-      const block = blockResult.match({ ok: (value) => value, err: () => [] });
-      const anchor = findEarliestReplyAnchor(block);
+      let anchor: SurfaceMessage | null;
+      if (opts.triggerType === undefined) {
+        anchor = await findEarliestEffectiveReplyAnchor(adapter, [triggerMsg]);
+      } else {
+        // "Merge block" = a user's short burst of consecutive messages.
+        // Mention mode treats the entire burst as a continuation when any
+        // message in that burst is a reply.
+        const blockResult = await resolveMergeBlockEndingAt(adapter, triggerMsg, {
+          resolveMessagesByRefs: layered.resolveMessagesByRefs,
+        });
+        const blockError = blockResult.match({ ok: () => null, err: (error) => error });
+        if (blockError) return Result.err(blockError);
+        const block = blockResult.match({ ok: (value) => value, err: () => [] });
+        anchor = await findEarliestEffectiveReplyAnchor(adapter, block);
+      }
       if (anchor) {
         const anchoredResult = await fetchMentionThreadContext(adapter, {
           platform: opts.platform,
           botUserId: opts.botUserId,
           botName: opts.botName,
           triggerMsg,
+          resolveMessagesByRefs: layered.resolveMessagesByRefs,
         });
         const anchoredError = anchoredResult.match({
           ok: () => null,
@@ -1741,10 +2003,14 @@ export async function composeRecentChannelMessages(
         const dividerResult = oldestAnchoredMessageId
           ? await findLastDiscordSessionDividerBefore({
               adapter,
+              messageCache: opts.messageCache,
               channelId: opts.sessionId,
               botUserId: opts.botUserId,
               beforeMessageId: triggerMsg.ref.messageId,
-              stopAtMessageId: oldestAnchoredMessageId,
+              beforeTs: triggerMsg.ts,
+              stopAt: anchored[0]
+                ? { messageId: anchored[0].messageId, ts: anchored[0].ts }
+                : undefined,
             })
           : Result.ok(null);
         const divider = dividerResult.match({
@@ -1801,6 +2067,7 @@ export async function composeRecentChannelMessages(
           discordUserAliasById: opts.discordUserAliasById,
           blobStore: opts.blobStore,
           attachmentCache: opts.attachmentCache,
+          resolvedProjections: layered.projections,
         });
         return composed.map((value) => ({
           messages: value.messages,
@@ -1827,7 +2094,9 @@ export async function composeRecentChannelMessages(
   let orderedList: SurfaceMessage[];
 
   if (shouldApplyActiveBurstRules && opts.triggerMsgRef) {
-    const triggerMsgResult = await adapter.readMsg(opts.triggerMsgRef);
+    const triggerMsgResult = await layered
+      .resolveMessagesByRefs([opts.triggerMsgRef])
+      .then((resolved) => resolved.map((messages) => messages[0] ?? null));
     const triggerError = triggerMsgResult.match({
       ok: () => null,
       err: (error) => error,
@@ -1889,7 +2158,9 @@ export async function composeRecentChannelMessages(
     if (opts.triggerMsgRef) {
       const exists = orderedList.some((m) => m.ref.messageId === opts.triggerMsgRef!.messageId);
       if (!exists) {
-        const fetchedTrigger = await adapter.readMsg(opts.triggerMsgRef);
+        const fetchedTrigger = await layered
+          .resolveMessagesByRefs([opts.triggerMsgRef])
+          .then((resolved) => resolved.map((messages) => messages[0] ?? null));
         const fetchError = fetchedTrigger.match({
           ok: () => null,
           err: (error) => error,
@@ -2007,6 +2278,7 @@ export async function composeRecentChannelMessages(
     discordUserAliasById: opts.discordUserAliasById,
     blobStore: opts.blobStore,
     attachmentCache: opts.attachmentCache,
+    resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({
     messages: value.messages,
@@ -2035,7 +2307,18 @@ export async function composeSingleMessageWithLineage(
       composeSingleMessageWithLineage(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
     );
   }
-  const m = await adapter.readMsg(opts.msgRef);
+  const layered = createLayeredDiscordMessageResolver({
+    adapter,
+    sessionId: opts.msgRef.channelId,
+    botUserId: opts.botUserId,
+    botName: opts.botName,
+    transcriptStore: opts.transcriptStore,
+    ingressMessages: opts.ingressMessages,
+    currentMessageIds: opts.currentMessageIds ?? [opts.msgRef.messageId],
+  });
+  const m = await layered
+    .resolveMessagesByRefs([opts.msgRef])
+    .then((resolved) => resolved.map((messages) => messages[0] ?? null));
   const readError = m.match({ ok: () => null, err: (error) => error });
   if (readError) return Result.err(readError);
   const message = m.match({ ok: (value) => value, err: () => null });
@@ -2082,6 +2365,7 @@ export async function composeSingleMessageWithLineage(
     discordUserAliasById: opts.discordUserAliasById,
     blobStore: opts.blobStore,
     attachmentCache: opts.attachmentCache,
+    resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({
     messages: value.messages,

@@ -22,6 +22,33 @@ class FakeSearchAdapter {
 }
 
 describe("discord search store", () => {
+  it("lists cached messages before an exact Discord position", () => {
+    const store = new DiscordSearchStore(":memory:");
+    const message = (messageId: string, ts: number): SurfaceMessage => ({
+      ref: { platform: "discord", channelId: "123", messageId },
+      session: { platform: "discord", channelId: "123" },
+      userId: "u1",
+      text: messageId,
+      ts,
+      raw: {},
+    });
+
+    try {
+      store.upsertMessages([message("m1", 1), message("m2", 2), message("m3", 3)]);
+      expect(
+        store
+          .listIndexedMessagesBefore({
+            channelId: "123",
+            before: { messageId: "m3", ts: 3 },
+            limit: 2,
+          })
+          .map((entry) => entry.ref.messageId),
+      ).toEqual(["m1", "m2"]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("persists an expiring attachment cache reference without changing message freshness", () => {
     const originalDateNow = Date.now;
     let now = 1_000;

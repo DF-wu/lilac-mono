@@ -54,6 +54,18 @@ export type DiscordSearchIndexedMessage = {
   attachments: DiscordIndexedAttachmentMeta[];
 };
 
+export type DiscordMessageCacheAccess = {
+  getIndexedMessage(input: {
+    channelId: string;
+    messageId: string;
+  }): DiscordSearchIndexedMessage | null;
+  listIndexedMessagesBefore(input: {
+    channelId: string;
+    before: { messageId: string; ts: number };
+    limit: number;
+  }): DiscordSearchIndexedMessage[];
+};
+
 export type DiscordSearchMessageMutation = {
   before: DiscordSearchIndexedMessage | null;
   after: DiscordSearchIndexedMessage | null;
@@ -534,6 +546,46 @@ export class DiscordSearchStore {
           this.listMessageAttachments(row.channel_id, row.message_id),
         )
       : null;
+  }
+
+  listIndexedMessagesBefore(input: {
+    channelId: string;
+    before: { messageId: string; ts: number };
+    limit: number;
+  }): DiscordSearchIndexedMessage[] {
+    const safeLimit = Math.min(500, Math.max(1, Math.floor(input.limit)));
+    const rows = this.db
+      .query<RawIndexedRow, [string, number, number, string, number]>(
+        `
+        SELECT
+          channel_id,
+          guild_id,
+          message_id,
+          user_id,
+          user_name,
+          text,
+          ts,
+          edited_ts,
+          deleted,
+          updated_ts,
+          attachments_hash
+        FROM discord_search_messages
+        WHERE channel_id = ?
+          AND deleted = 0
+          AND (ts < ? OR (ts = ? AND message_id < ?))
+        ORDER BY ts DESC, message_id DESC
+        LIMIT ?
+        `,
+      )
+      .all(input.channelId, input.before.ts, input.before.ts, input.before.messageId, safeLimit);
+
+    rows.reverse();
+    return rows.map((row) =>
+      asDiscordSearchIndexedMessage(
+        row,
+        this.listMessageAttachments(row.channel_id, row.message_id),
+      ),
+    );
   }
 
   listMessagesForDiscovery(sinceUpdatedTs?: number): DiscordSearchIndexedMessage[] {

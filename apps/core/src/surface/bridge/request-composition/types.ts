@@ -1,11 +1,12 @@
 import type { BlobHandleV1, BlobStore } from "@stanley2058/lilac-blob-storage";
 import type { BusMessageV2, CorePrimaryLineageV2 } from "@stanley2058/lilac-event-bus";
 
-import type { MsgRef } from "../../types";
+import type { MsgRef, SurfaceMessage } from "../../types";
 import type {
   DiscordAttachmentCacheAccess,
   DiscordAttachmentMeta,
 } from "../../discord/discord-attachment";
+import type { DiscordMessageCacheAccess } from "../../store/discord-search-store";
 
 import type { TranscriptStore } from "../../../transcript/transcript-store";
 
@@ -20,6 +21,9 @@ export type RequestCompositionResult = {
 type BlobCompositionOptions = {
   blobStore?: BlobStore;
   attachmentCache?: DiscordAttachmentCacheAccess;
+  messageCache?: DiscordMessageCacheAccess;
+  /** Trusted messages already carried by the admitted adapter event. */
+  ingressMessages?: readonly SurfaceMessage[];
 };
 
 export type ComposeRecentChannelMessagesOpts = BlobCompositionOptions & {

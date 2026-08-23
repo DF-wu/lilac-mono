@@ -628,6 +628,61 @@ describe("Discord request composition failure policy", () => {
 });
 
 describe("Discord authenticated-origin publication", () => {
+  it("rejects an ingress identity whose complete message ref does not match", async () => {
+    const logger = new Logger({ module: "discord-origin-correlation-test" });
+    const msgRef = { platform: "discord" as const, channelId: "channel", messageId: "message" };
+    const message: SurfaceMessage = {
+      ref: msgRef,
+      session: { platform: "discord", channelId: "channel" },
+      userId: "authenticated-user",
+      text: "hello",
+      ts: 1,
+      raw: { discord: { isChat: true } },
+    };
+    const mismatchedIngress: SurfaceMessage = {
+      ...message,
+      ref: { ...msgRef, channelId: "other-channel" },
+      session: { platform: "discord", channelId: "other-channel" },
+      userId: "uncorrelated-user",
+    };
+    const adapter = new FakeAdapter({ "channel:message": message });
+    const readMsg = spyOn(adapter, "readMsg").mockResolvedValue(Result.ok(message));
+    const blobStore = await getTestBlobStore();
+    let publishedRaw: unknown;
+
+    const result = await publishSingleMessagePrompt({
+      adapter,
+      blobStore,
+      requestDelivery: {
+        prepareAndPublish: async (input) => {
+          publishedRaw = input.envelope.data.raw;
+          return Result.ok(undefined);
+        },
+      },
+      cfg: parseCoreConfigV1ToUniversal({}),
+      logger,
+      input: {
+        requestId: "discord:channel:message",
+        sessionId: "channel",
+        sessionConfigId: "channel",
+        msgRef,
+        ingressMessage: mismatchedIngress,
+        sessionMode: "mention",
+      },
+    });
+
+    expect(result).toEqual(Result.ok(undefined));
+    expect(readMsg).toHaveBeenCalledTimes(2);
+    expect(publishedRaw).toMatchObject({
+      authenticatedOrigin: {
+        platform: "discord",
+        userId: "authenticated-user",
+        messageRef: msgRef,
+      },
+    });
+    readMsg.mockRestore();
+  });
+
   it("does not publish when the authenticated-origin re-read fails", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
@@ -730,6 +785,77 @@ describe("formatBufferedMessageForGateTranscript", () => {
 });
 
 describe("Discord request router context fallbacks", () => {
+  it("uses cached neighboring context without calling Discord", async () => {
+    const adapter = new FakeAdapter({});
+    const getReplyContext = spyOn(adapter, "getReplyContext").mockRejectedValue(
+      new Panic({ message: "live context should not be read" }),
+    );
+    const input = {
+      msgRef: { platform: "discord" as const, channelId: "channel", messageId: "message" },
+      triggerTs: 2,
+    };
+
+    const resolved = await resolvePreviousMessageText({
+      adapter,
+      messageCache: {
+        getIndexedMessage: () => null,
+        listIndexedMessagesBefore: () => [
+          {
+            ref: { platform: "discord", channelId: "channel", messageId: "previous" },
+            session: { platform: "discord", channelId: "channel" },
+            userId: "user",
+            text: "cached previous",
+            ts: 1,
+            deleted: false,
+            updatedTs: 1,
+            attachments: [],
+          },
+        ],
+      },
+      input,
+    });
+
+    expect(resolved).toBe("cached previous");
+    expect(getReplyContext).not.toHaveBeenCalled();
+    getReplyContext.mockRestore();
+  });
+
+  it("uses a linked bot transcript for replied-message context without calling Discord", async () => {
+    const adapter = new FakeAdapter({});
+    const readMsg = spyOn(adapter, "readMsg").mockRejectedValue(
+      new Panic({ message: "live message should not be read" }),
+    );
+    const transcriptStore = new SqliteTranscriptStore(":memory:");
+    transcriptStore.saveRequestTranscript({
+      requestId: "request",
+      sessionId: "channel",
+      requestClient: "discord",
+      messages: [{ role: "assistant", content: "stored answer" }],
+      finalText: "stored answer",
+    });
+    const replyRef = {
+      platform: "discord" as const,
+      channelId: "channel",
+      messageId: "answer",
+    };
+    transcriptStore.linkSurfaceMessagesToRequest({
+      requestId: "request",
+      created: [replyRef],
+      last: replyRef,
+    });
+
+    const resolved = await resolveRepliedToMessageText({
+      adapter,
+      transcriptStore,
+      input: { sessionId: "channel", replyToMessageId: "answer" },
+    });
+
+    expect(resolved).toBe("stored answer");
+    expect(readMsg).not.toHaveBeenCalled();
+    transcriptStore.close();
+    readMsg.mockRestore();
+  });
+
   it("preserves Panic from previous-message context and falls back for a typed failure", async () => {
     const adapter = new FakeAdapter({});
     const panic = new Panic({ message: "reply context invariant failed" });
@@ -3000,7 +3126,6 @@ describe("startBusRequestRouter", () => {
         raw: { reference: {} },
       },
     });
-
     let gateInput: any = null;
     const router = await startBusRequestRouter({
       adapter,
@@ -3698,11 +3823,39 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
+    const getReplyContext = spyOn(adapter, "getReplyContext");
+    const readMsg = spyOn(adapter, "readMsg");
 
     let gateInput: any = null;
     const router = await startBusRequestRouter({
       adapter,
       bus,
+      messageCache: {
+        getIndexedMessage: () => ({
+          ref: { platform: "discord", channelId: sessionId, messageId: repliedToId },
+          session: { platform: "discord", channelId: sessionId },
+          userId: "bot",
+          userName: "lilac",
+          text: "bot answer to prior question",
+          ts: now - 20,
+          deleted: false,
+          updatedTs: now - 20,
+          attachments: [],
+        }),
+        listIndexedMessagesBefore: () => [
+          {
+            ref: { platform: "discord", channelId: sessionId, messageId: beforeId },
+            session: { platform: "discord", channelId: sessionId },
+            userId: "u2",
+            userName: "user2",
+            text: "side note before the new reply",
+            ts: now - 5,
+            deleted: false,
+            updatedTs: now - 5,
+            attachments: [],
+          },
+        ],
+      },
       subscriptionId: "router-test",
       routerGate: async (input) => {
         gateInput = input;
@@ -3780,9 +3933,13 @@ describe("startBusRequestRouter", () => {
     expect(gateInput.context?.triggerMessageText).toContain("@otherbot what do you think?");
     expect(gateInput.context?.repliedToMessageText).toContain("bot answer");
     expect(gateInput.context?.previousMessageText).toContain("side note");
+    expect(getReplyContext).not.toHaveBeenCalled();
+    expect(readMsg).not.toHaveBeenCalled();
 
     await sub.stop();
     await router.stop();
+    getReplyContext.mockRestore();
+    readMsg.mockRestore();
   });
 
   it("routes in-flight active channel non-reply messages as buffered prompts", async () => {
@@ -6869,6 +7026,11 @@ describe("startBusRequestRouter", () => {
       readonly userId: string;
       readonly text: string;
       readonly ts: number;
+      readonly attachments?: readonly {
+        readonly url: string;
+        readonly filename: string;
+        readonly mimeType: string;
+      }[];
     }) => {
       await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
         platform: "discord",
@@ -6878,11 +7040,13 @@ describe("startBusRequestRouter", () => {
         text: input.text,
         ts: input.ts,
         raw: {
+          ...(input.attachments ? { attachments: input.attachments } : {}),
           discord: {
             isDMBased: false,
             mentionsBot: false,
             replyToBot: true,
             replyToMessageId: input.outputMessageId,
+            ...(input.attachments ? { attachments: input.attachments } : {}),
           },
         },
       });
@@ -6897,6 +7061,13 @@ describe("startBusRequestRouter", () => {
         userId: "user-one",
         text: "first deferred reply A",
         ts: now + 1,
+        attachments: [
+          {
+            url: "https://cdn.discordapp.com/attachments/1/2/file.png",
+            filename: "file.png",
+            mimeType: "image/png",
+          },
+        ],
       });
       await publishReply({
         messageId: replyOneB,

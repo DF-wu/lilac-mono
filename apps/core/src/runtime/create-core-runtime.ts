@@ -2724,6 +2724,7 @@ export async function createCoreRuntime(
               bus: durableBus,
               blobStore: activeBlobStore,
               attachmentCache: discordSearchStore?.attachmentCacheAccess(),
+              messageCache: discordSearchStore ?? undefined,
               requestDelivery: discordRequestDelivery,
               subscriptionId: subId(subscriptionPrefix, "router"),
               customCommands,

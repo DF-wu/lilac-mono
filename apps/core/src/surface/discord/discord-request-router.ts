@@ -29,7 +29,8 @@ import type {
   SurfaceRecoveryGeneration,
   SurfaceRestoredOutputChain,
 } from "../runtime-descriptor";
-import type { MsgRef, SurfaceSelf } from "../types";
+import type { MsgRef, SurfaceMessage, SurfaceSelf } from "../types";
+import { normalizeDiscordRaw, type NormalizedDiscordRaw } from "./discord-raw-normalizer";
 import {
   CoreOwnedBlobIntegrityError,
   type TranscriptStore,
@@ -95,6 +96,7 @@ import {
   publishSurfaceOutputReanchor as publishSurfaceOutputReanchorImpl,
 } from "./discord-request-router/publish";
 import type { DiscordAttachmentCacheAccess } from "./discord-attachment";
+import type { DiscordMessageCacheAccess } from "../store/discord-search-store";
 import {
   resolvePreviousBatchMessageText as resolvePreviousBatchMessageTextImpl,
   resolvePreviousMessageText as resolvePreviousMessageTextImpl,
@@ -787,6 +789,41 @@ function resolveTriggerType(input: {
   return undefined;
 }
 
+function surfaceMessageFromIngress(input: {
+  event: EvtAdapterMessageCreatedData;
+  raw: NormalizedDiscordRaw | null;
+  parentChannelId?: string;
+  guildId?: string;
+}): SurfaceMessage {
+  const normalizedRaw = input.raw;
+  const reference = normalizedRaw?.reference ?? normalizedRaw?.replyReference;
+  return {
+    ref: parseDiscordMsgRefFromAdapterEvent(input.event),
+    session: {
+      platform: "discord",
+      channelId: input.event.channelId,
+      ...(input.guildId ? { guildId: input.guildId } : {}),
+      ...(input.parentChannelId ? { parentChannelId: input.parentChannelId } : {}),
+    },
+    userId: input.event.userId,
+    ...(input.event.userName ? { userName: input.event.userName } : {}),
+    text: input.event.text,
+    ts: input.event.ts,
+    raw: normalizedRaw
+      ? {
+          ...(normalizedRaw.content ? { content: normalizedRaw.content } : {}),
+          embeds: normalizedRaw.embeds,
+          attachments: normalizedRaw.attachments,
+          ...(reference ? { reference } : {}),
+          ...(normalizedRaw.forwardSnapshot
+            ? { messageSnapshots: [{ message: normalizedRaw.forwardSnapshot.raw }] }
+            : {}),
+          discord: normalizedRaw.isChat === undefined ? {} : { isChat: normalizedRaw.isChat },
+        }
+      : {},
+  };
+}
+
 function uniqueParticipantUserIds(input: {
   values: readonly (string | undefined)[];
   exclude: string;
@@ -815,6 +852,7 @@ export type StartDiscordRequestRouterInput = {
   bus: LilacBus;
   blobStore: BlobStore;
   attachmentCache?: DiscordAttachmentCacheAccess;
+  messageCache?: DiscordMessageCacheAccess;
   requestDelivery: DiscordRequestDeliveryPort;
   subscriptionId: string;
   customCommands?: CustomCommandManager;
@@ -996,20 +1034,29 @@ export async function startDiscordRequestRouter(
     msgRef: MsgRef;
     triggerTs: number;
   }): Promise<string | undefined> {
-    return resolvePreviousMessageTextImpl({ adapter, input });
+    return resolvePreviousMessageTextImpl({ adapter, messageCache: params.messageCache, input });
   }
 
   async function resolveRepliedToMessageText(input: {
     sessionId: string;
     replyToMessageId?: string;
   }): Promise<string | undefined> {
-    return resolveRepliedToMessageTextImpl({ adapter, input });
+    return resolveRepliedToMessageTextImpl({
+      adapter,
+      messageCache: params.messageCache,
+      transcriptStore: params.transcriptStore,
+      input,
+    });
   }
 
   async function resolvePreviousBatchMessageText(
     messages: readonly BufferedMessage[],
   ): Promise<string | undefined> {
-    return resolvePreviousBatchMessageTextImpl({ adapter, messages });
+    return resolvePreviousBatchMessageTextImpl({
+      adapter,
+      messageCache: params.messageCache,
+      messages,
+    });
   }
 
   function combineTextTransforms(
@@ -1346,6 +1393,12 @@ export async function startDiscordRequestRouter(
           const flags = getDiscordFlags(msg.data.raw);
           const isDm = flags.isDMBased === true;
           const parentChannelId = flags.parentChannelId;
+          const ingressMessage = surfaceMessageFromIngress({
+            event: msg.data,
+            raw: normalizeDiscordRaw(msg.data.raw),
+            parentChannelId,
+            guildId: flags.guildId,
+          });
           const botMentionNames = resolveBotMentionNames({
             cfg,
             botUserId: flags.botUserId ?? (await adapter.getSelf()).userId,
@@ -1506,6 +1559,7 @@ export async function startDiscordRequestRouter(
               sessionConfigId,
               parentChannelId,
               msgRef,
+              ingressMessage,
               sessionMode: mode,
               modelOverride,
               raw,
@@ -1582,6 +1636,7 @@ export async function startDiscordRequestRouter(
                 cfg,
                 sessionId,
                 msgRef,
+                ingressMessage,
                 userId: msg.data.userId,
                 userText: msg.data.text,
                 mentionsBot: flags.mentionsBot === true,
@@ -1603,6 +1658,7 @@ export async function startDiscordRequestRouter(
                 buffers,
                 sessionId,
                 msgRef,
+                ingressMessage,
                 userId: msg.data.userId,
                 userText: msg.data.text,
                 messageTs: msg.data.ts,
@@ -1630,7 +1686,7 @@ export async function startDiscordRequestRouter(
             activeBySession,
             sessionId,
             msgRef,
-            userId: msg.data.userId,
+            ingressMessage,
             userText: msg.data.text,
             mentionsBot: flags.mentionsBot,
             replyToBot: flags.replyToBot,
@@ -1728,6 +1784,7 @@ export async function startDiscordRequestRouter(
         parentChannelId: batch.parentChannelId,
         queue: "followUp",
         msgRef: item.msgRef,
+        ingressMessage: item.ingressMessage,
         sessionMode: batch.sessionMode,
         modelOverride: batch.modelOverride,
         transformUserText: transformPendingUserText(item),
@@ -1780,6 +1837,10 @@ export async function startDiscordRequestRouter(
       transcriptStore: params.transcriptStore,
       blobStore: params.blobStore,
       attachmentCache: params.attachmentCache,
+      messageCache: params.messageCache,
+      ingressMessages: batch.items.flatMap((item) =>
+        item.ingressMessage ? [item.ingressMessage] : [],
+      ),
       currentRequestId: requestId,
       currentMessageIds: batch.items.map((item) => item.msgRef.messageId),
       discordUserAliasById,
@@ -1813,7 +1874,9 @@ export async function startDiscordRequestRouter(
     const batchParticipantUserIds: string[] = [];
 
     for (const item of batch.items) {
-      const surfaceMessage = await adapter.readMsg(item.msgRef);
+      const surfaceMessage = item.ingressMessage
+        ? Result.ok(item.ingressMessage)
+        : await adapter.readMsg(item.msgRef);
       const userId = surfaceMessage.match({ ok: (value) => value?.userId, err: () => undefined });
       if (userId) batchParticipantUserIds.push(userId);
       if (chainMessageIds.has(item.msgRef.messageId)) continue;
@@ -1826,6 +1889,8 @@ export async function startDiscordRequestRouter(
         transcriptStore: params.transcriptStore,
         blobStore: params.blobStore,
         attachmentCache: params.attachmentCache,
+        messageCache: params.messageCache,
+        ingressMessages: item.ingressMessage ? [item.ingressMessage] : undefined,
         transformUserText: transformPendingUserText(item),
       });
       const extraError = extra.match({ ok: () => null, err: (error) => error });
@@ -1978,6 +2043,7 @@ export async function startDiscordRequestRouter(
     cfg: CoreConfig;
     sessionId: string;
     msgRef: MsgRef;
+    ingressMessage: SurfaceMessage;
     userId: string;
     userText: string;
     mentionsBot: boolean;
@@ -1997,6 +2063,7 @@ export async function startDiscordRequestRouter(
       cfg,
       sessionId,
       msgRef,
+      ingressMessage,
       userText,
       userId: _userId,
       mentionsBot,
@@ -2034,6 +2101,7 @@ export async function startDiscordRequestRouter(
         }),
         sessionId,
         triggerMsgRef: msgRef,
+        ingressMessages: [ingressMessage],
         triggerType: resolveTriggerType({ replyToBot, mentionsBot }),
         sessionMode,
         sessionConfigId,
@@ -2085,6 +2153,7 @@ export async function startDiscordRequestRouter(
             sessionId,
             queue: steerMode,
             msgRef,
+            ingressMessage,
             sessionMode,
             sessionConfigId,
             modelOverride,
@@ -2110,6 +2179,7 @@ export async function startDiscordRequestRouter(
           sessionId,
           queue: "followUp",
           msgRef,
+          ingressMessage,
           sessionMode,
           sessionConfigId,
           modelOverride,
@@ -2133,6 +2203,7 @@ export async function startDiscordRequestRouter(
           requestId,
           sessionId,
           triggerMsgRef: msgRef,
+          ingressMessages: [ingressMessage],
           triggerType: "reply",
           sessionMode,
           sessionConfigId,
@@ -2155,6 +2226,7 @@ export async function startDiscordRequestRouter(
         sessionId,
         queue: "followUp",
         msgRef,
+        ingressMessage,
         sessionMode,
         sessionConfigId,
         modelOverride,
@@ -2177,6 +2249,7 @@ export async function startDiscordRequestRouter(
       requestId,
       sessionId,
       triggerMsgRef: msgRef,
+      ingressMessages: [ingressMessage],
       triggerType,
       sessionMode,
       sessionConfigId,
@@ -2198,6 +2271,7 @@ export async function startDiscordRequestRouter(
     buffers: Map<string, DebounceBuffer>;
     sessionId: string;
     msgRef: MsgRef;
+    ingressMessage: SurfaceMessage;
     userId: string;
     userText: string;
     messageTs: number;
@@ -2222,6 +2296,7 @@ export async function startDiscordRequestRouter(
       buffers,
       sessionId,
       msgRef,
+      ingressMessage,
       userId,
       userText,
       messageTs,
@@ -2265,6 +2340,7 @@ export async function startDiscordRequestRouter(
         }),
         sessionId,
         triggerMsgRef: msgRef,
+        ingressMessages: [ingressMessage],
         triggerType: resolveTriggerType({ replyToBot, mentionsBot }),
         sessionMode,
         sessionConfigId,
@@ -2320,6 +2396,7 @@ export async function startDiscordRequestRouter(
             sessionId,
             queue: routeDecision.queue,
             msgRef,
+            ingressMessage,
             sessionMode,
             sessionConfigId,
             parentChannelId,
@@ -2347,6 +2424,7 @@ export async function startDiscordRequestRouter(
             sessionId,
             queue: "followUp",
             msgRef,
+            ingressMessage,
             sessionMode,
             sessionConfigId,
             parentChannelId,
@@ -2370,6 +2448,7 @@ export async function startDiscordRequestRouter(
             requestId,
             sessionId,
             triggerMsgRef: msgRef,
+            ingressMessages: [ingressMessage],
             triggerType: "reply",
             sessionMode,
             sessionConfigId,
@@ -2394,6 +2473,7 @@ export async function startDiscordRequestRouter(
             sessionConfigId,
             parentChannelId,
             msgRef,
+            ingressMessage,
             sessionMode,
             modelOverride,
             transformUserText: combineTextTransforms(
@@ -2419,6 +2499,7 @@ export async function startDiscordRequestRouter(
         requestId: randomRequestId(),
         sessionId,
         triggerMsgRef: msgRef,
+        ingressMessages: [ingressMessage],
         triggerType: undefined,
         sessionMode,
         sessionConfigId,
@@ -2452,6 +2533,7 @@ export async function startDiscordRequestRouter(
         requestId,
         sessionId,
         triggerMsgRef: msgRef,
+        ingressMessages: [ingressMessage],
         triggerType,
         sessionMode,
         sessionConfigId,
@@ -2476,6 +2558,7 @@ export async function startDiscordRequestRouter(
       guildId,
       message: {
         msgRef,
+        ingressMessage,
         userId,
         text: userText,
         ts: messageTs,
@@ -2632,6 +2715,7 @@ export async function startDiscordRequestRouter(
     const modelOverride =
       overrideCarrier?.model ?? b.messages[b.messages.length - 1]?.sessionModelOverride;
     const self = await adapter.getSelf();
+    const newestBufferedMessage = b.messages[b.messages.length - 1];
 
     // Gate-forwarded prompt: do NOT reply-to a message.
     // Use newest message as the context anchor.
@@ -2644,7 +2728,10 @@ export async function startDiscordRequestRouter(
       sessionConfigId: b.sessionConfigId,
       parentChannelId: b.parentChannelId,
       // Use newest message as the context anchor (not a reply trigger).
-      triggerMsgRef: b.messages[b.messages.length - 1]?.msgRef,
+      triggerMsgRef: newestBufferedMessage?.msgRef,
+      ingressMessages: b.messages.flatMap((message) =>
+        message.ingressMessage ? [message.ingressMessage] : [],
+      ),
       currentMessageIds: b.messages.map((message) => message.msgRef.messageId),
       triggerType: undefined,
       sessionMode: "active",
@@ -2673,7 +2760,7 @@ export async function startDiscordRequestRouter(
     activeBySession: Map<string, ActiveSessionState>;
     sessionId: string;
     msgRef: MsgRefFor<"discord">;
-    userId: string;
+    ingressMessage: SurfaceMessage;
     userText: string;
     mentionsBot?: boolean;
     replyToBot?: boolean;
@@ -2694,7 +2781,7 @@ export async function startDiscordRequestRouter(
       activeBySession,
       sessionId,
       msgRef,
-      userId,
+      ingressMessage,
       userText,
       mentionsBot,
       replyToBot,
@@ -2748,7 +2835,7 @@ export async function startDiscordRequestRouter(
         queue: "prompt",
         triggerType,
         msgRef,
-        userId,
+        ingressMessages: [ingressMessage],
         sessionMode: input.sessionMode,
         sessionConfigId: input.sessionConfigId,
         parentChannelId,
@@ -2794,6 +2881,7 @@ export async function startDiscordRequestRouter(
           sessionId,
           queue: steerMode,
           msgRef,
+          ingressMessage,
           sessionMode: input.sessionMode,
           sessionConfigId: input.sessionConfigId,
           parentChannelId,
@@ -2827,6 +2915,7 @@ export async function startDiscordRequestRouter(
           modelOverride: input.modelOverride,
           item: {
             msgRef,
+            ingressMessage,
             requestModelOverride,
             continueCount,
             botMentionNames,
@@ -2853,7 +2942,7 @@ export async function startDiscordRequestRouter(
       queue: "prompt",
       triggerType,
       msgRef,
-      userId,
+      ingressMessages: [ingressMessage],
       sessionMode: input.sessionMode,
       sessionConfigId: input.sessionConfigId,
       parentChannelId,
@@ -2894,6 +2983,7 @@ export async function startDiscordRequestRouter(
       cfg,
       blobStore: params.blobStore,
       attachmentCache: params.attachmentCache,
+      messageCache: params.messageCache,
       requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
@@ -2923,6 +3013,7 @@ export async function startDiscordRequestRouter(
       cfg,
       blobStore: params.blobStore,
       attachmentCache: params.attachmentCache,
+      messageCache: params.messageCache,
       requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
@@ -2959,6 +3050,7 @@ export async function startDiscordRequestRouter(
       cfg,
       blobStore: params.blobStore,
       attachmentCache: params.attachmentCache,
+      messageCache: params.messageCache,
       requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
@@ -2987,6 +3079,7 @@ export async function startDiscordRequestRouter(
       cfg,
       blobStore: params.blobStore,
       attachmentCache: params.attachmentCache,
+      messageCache: params.messageCache,
       requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,

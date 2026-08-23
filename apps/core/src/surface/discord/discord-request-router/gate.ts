@@ -10,7 +10,7 @@ import {
   type ResolvedModelSlot,
 } from "@stanley2058/lilac-utils";
 import type { Logger } from "@stanley2058/simple-module-logger";
-import type { MsgRef } from "../../types";
+import type { MsgRef, SurfaceMessage } from "../../types";
 import { formatBridgeTaggedErrorForLog } from "../../bridge/bridge-log";
 import {
   escapeSurfaceMetadataTags,
@@ -21,6 +21,7 @@ export type RouterGateContextMode = "active-batch" | "direct-reply-mention-disam
 
 export type BufferedMessage = {
   msgRef: MsgRef;
+  ingressMessage?: SurfaceMessage;
   userId: string;
   text: string;
   ts: number;

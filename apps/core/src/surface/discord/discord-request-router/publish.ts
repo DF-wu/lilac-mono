@@ -16,6 +16,7 @@ import type { MsgRef, SurfaceMessage } from "../../types";
 import type { TranscriptStore } from "../../../transcript/transcript-store";
 import { adaptEventPublishResultToHost } from "../../../shared/event-bus-result";
 import type { DiscordAttachmentCacheAccess } from "../discord-attachment";
+import type { DiscordMessageCacheAccess } from "../../store/discord-search-store";
 import {
   collectCoreRequestInputHandles,
   corePreparedEnvelopeFromCommand,
@@ -79,8 +80,26 @@ export type DiscordRequestPublishError =
 type DiscordRequestBlobDependencies = {
   readonly blobStore: BlobStore;
   readonly attachmentCache?: DiscordAttachmentCacheAccess;
+  readonly messageCache?: DiscordMessageCacheAccess;
   readonly requestDelivery: DiscordRequestDeliveryPort;
 };
+
+function isExactMessageRef(message: SurfaceMessage, ref: MsgRef): boolean {
+  return (
+    message.ref.platform === ref.platform &&
+    message.ref.channelId === ref.channelId &&
+    message.ref.messageId === ref.messageId
+  );
+}
+
+async function resolveCorrelatedOriginMessage(input: {
+  adapter: SurfaceAdapter;
+  ref: MsgRef;
+  ingressMessages?: readonly SurfaceMessage[];
+}): Promise<ResultType<SurfaceMessage | null, RequestCompositionError>> {
+  const ingress = input.ingressMessages?.find((message) => isExactMessageRef(message, input.ref));
+  return ingress ? Result.ok(ingress) : input.adapter.readMsg(input.ref);
+}
 
 function getLastUserPreview(messages: readonly BusMessageV2[]): string | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -217,7 +236,7 @@ export async function publishComposedRequest(
       queue: RequestQueueMode;
       triggerType: "mention" | "reply" | "active";
       msgRef: MsgRef;
-      userId: string;
+      ingressMessages?: readonly SurfaceMessage[];
       sessionMode: SessionMode;
       modelOverride?: string;
       currentMessageIds?: readonly string[];
@@ -237,6 +256,8 @@ export async function publishComposedRequest(
     transcriptStore: params.transcriptStore,
     blobStore: params.blobStore,
     attachmentCache: params.attachmentCache,
+    messageCache: params.messageCache,
+    ingressMessages: params.input.ingressMessages,
     currentRequestId: params.input.requestId,
     currentMessageIds: params.input.currentMessageIds ?? [params.input.msgRef.messageId],
     discordUserAliasById,
@@ -252,39 +273,60 @@ export async function publishComposedRequest(
   >({
     err: (error) => async () => Result.err(error),
     ok: (composition) => async () => {
-      return publishBusRequest({
-        logger: params.logger,
-        blobStore: params.blobStore,
-        requestDelivery: params.requestDelivery,
-        input: {
-          requestDeliveryId,
-          requestId: params.input.requestId,
-          sessionId: params.input.sessionId,
-          sessionConfigId: params.input.sessionConfigId,
-          parentChannelId: params.input.parentChannelId,
-          queue: params.input.queue,
-          triggerType: params.input.triggerType,
-          sessionMode: params.input.sessionMode,
-          modelOverride: params.input.modelOverride,
-          messages: composition.messages,
-          inputHandles: composition.inputHandles,
-          corePrimaryLineage: composition.corePrimaryLineage,
-          raw: {
-            authenticatedOrigin: {
-              platform: "discord",
-              userId: params.input.userId,
-              messageRef: params.input.msgRef,
-            },
-            triggerType: params.input.triggerType,
-            chainMessageIds: composition.chainMessageIds,
-            mergedGroups: composition.mergedGroups,
-            participantUserIds: uniqueNonEmptyStrings(
-              composition.mergedGroups.map((group) => group.authorId),
-              { exclude: self.userId },
-            ),
-          },
-        },
+      const originMessageResult = await resolveCorrelatedOriginMessage({
+        adapter: params.adapter,
+        ref: params.input.msgRef,
+        ingressMessages: params.input.ingressMessages,
       });
+      const continueOrigin = originMessageResult.match<
+        () => Promise<ResultType<void, DiscordRequestPublishError>>
+      >({
+        err: (error) => async () =>
+          failDiscordRequestAfterHandleCleanup({
+            blobStore: params.blobStore,
+            handles: composition.inputHandles,
+            primary: error,
+          }),
+        ok: (originMessage) => async () =>
+          publishBusRequest({
+            logger: params.logger,
+            blobStore: params.blobStore,
+            requestDelivery: params.requestDelivery,
+            input: {
+              requestDeliveryId,
+              requestId: params.input.requestId,
+              sessionId: params.input.sessionId,
+              sessionConfigId: params.input.sessionConfigId,
+              parentChannelId: params.input.parentChannelId,
+              queue: params.input.queue,
+              triggerType: params.input.triggerType,
+              sessionMode: params.input.sessionMode,
+              modelOverride: params.input.modelOverride,
+              messages: composition.messages,
+              inputHandles: composition.inputHandles,
+              corePrimaryLineage: composition.corePrimaryLineage,
+              raw: {
+                ...(originMessage
+                  ? {
+                      authenticatedOrigin: {
+                        platform: "discord" as const,
+                        userId: originMessage.userId,
+                        messageRef: params.input.msgRef,
+                      },
+                    }
+                  : {}),
+                triggerType: params.input.triggerType,
+                chainMessageIds: composition.chainMessageIds,
+                mergedGroups: composition.mergedGroups,
+                participantUserIds: uniqueNonEmptyStrings(
+                  composition.mergedGroups.map((group) => group.authorId),
+                  { exclude: self.userId },
+                ),
+              },
+            },
+          }),
+      });
+      return continueOrigin();
     },
   });
   return continuePublish();
@@ -302,6 +344,7 @@ export async function publishActiveChannelPrompt(
       sessionConfigId: string;
       parentChannelId?: string;
       triggerMsgRef: MsgRef | undefined;
+      ingressMessages?: readonly SurfaceMessage[];
       triggerType: "mention" | "reply" | undefined;
       sessionMode: SessionMode;
       modelOverride?: string;
@@ -325,6 +368,8 @@ export async function publishActiveChannelPrompt(
           transcriptStore: params.transcriptStore,
           blobStore: params.blobStore,
           attachmentCache: params.attachmentCache,
+          messageCache: params.messageCache,
+          ingressMessages: params.input.ingressMessages,
           currentRequestId: params.input.requestId,
           currentMessageIds:
             params.input.currentMessageIds ??
@@ -347,6 +392,8 @@ export async function publishActiveChannelPrompt(
           transcriptStore: params.transcriptStore,
           blobStore: params.blobStore,
           attachmentCache: params.attachmentCache,
+          messageCache: params.messageCache,
+          ingressMessages: params.input.ingressMessages,
           currentRequestId: params.input.requestId,
           currentMessageIds:
             params.input.currentMessageIds ??
@@ -364,7 +411,11 @@ export async function publishActiveChannelPrompt(
     ok: (composition) => async () => {
       const originMessageResult: ResultType<SurfaceMessage | null, RequestCompositionError> = params
         .input.triggerMsgRef
-        ? await params.adapter.readMsg(params.input.triggerMsgRef)
+        ? await resolveCorrelatedOriginMessage({
+            adapter: params.adapter,
+            ref: params.input.triggerMsgRef,
+            ingressMessages: params.input.ingressMessages,
+          })
         : Result.ok<SurfaceMessage | null>(null);
       const continueOrigin = originMessageResult.match<
         () => Promise<ResultType<void, DiscordRequestPublishError>>
@@ -435,6 +486,7 @@ export async function publishSingleMessageToActiveRequest(
       parentChannelId?: string;
       queue: "followUp" | "steer" | "interrupt";
       msgRef: MsgRef;
+      ingressMessage?: SurfaceMessage;
       sessionMode: SessionMode;
       modelOverride?: string;
       transformUserText?: (text: string) => string;
@@ -444,6 +496,11 @@ export async function publishSingleMessageToActiveRequest(
   const requestDeliveryId = crypto.randomUUID();
   const self = await params.adapter.getSelf();
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
+  const ingressMessage =
+    params.input.ingressMessage &&
+    isExactMessageRef(params.input.ingressMessage, params.input.msgRef)
+      ? params.input.ingressMessage
+      : undefined;
 
   const composed = await composeSingleMessageWithLineage(params.adapter, {
     platform: "discord",
@@ -454,6 +511,8 @@ export async function publishSingleMessageToActiveRequest(
     transcriptStore: params.transcriptStore,
     blobStore: params.blobStore,
     attachmentCache: params.attachmentCache,
+    messageCache: params.messageCache,
+    ingressMessages: ingressMessage ? [ingressMessage] : undefined,
     transformUserText: params.input.transformUserText,
   });
   const continueComposition = composed.match<
@@ -462,7 +521,9 @@ export async function publishSingleMessageToActiveRequest(
     err: (error) => async () => Result.err(error),
     ok: (composition) => async () => {
       if (!composition) return Result.ok(undefined);
-      const surfaceMessageResult = await params.adapter.readMsg(params.input.msgRef);
+      const surfaceMessageResult = ingressMessage
+        ? Result.ok(ingressMessage)
+        : await params.adapter.readMsg(params.input.msgRef);
       const continueMessage = surfaceMessageResult.match<
         () => Promise<ResultType<void, DiscordRequestPublishError>>
       >({
@@ -528,6 +589,7 @@ export async function publishSingleMessagePrompt(
       sessionConfigId: string;
       parentChannelId?: string;
       msgRef: MsgRef;
+      ingressMessage?: SurfaceMessage;
       sessionMode: SessionMode;
       modelOverride?: string;
       transformUserText?: (text: string) => string;
@@ -538,6 +600,11 @@ export async function publishSingleMessagePrompt(
   const requestDeliveryId = crypto.randomUUID();
   const self = await params.adapter.getSelf();
   const discordUserAliasById = buildDiscordUserAliasById(params.cfg);
+  const ingressMessage =
+    params.input.ingressMessage &&
+    isExactMessageRef(params.input.ingressMessage, params.input.msgRef)
+      ? params.input.ingressMessage
+      : undefined;
 
   const composed = await composeSingleMessageWithLineage(params.adapter, {
     platform: "discord",
@@ -548,6 +615,8 @@ export async function publishSingleMessagePrompt(
     transcriptStore: params.transcriptStore,
     blobStore: params.blobStore,
     attachmentCache: params.attachmentCache,
+    messageCache: params.messageCache,
+    ingressMessages: ingressMessage ? [ingressMessage] : undefined,
     transformUserText: params.input.transformUserText,
   });
   const continueComposition = composed.match<
@@ -556,7 +625,9 @@ export async function publishSingleMessagePrompt(
     err: (error) => async () => Result.err(error),
     ok: (composition) => async () => {
       if (!composition) return Result.ok(undefined);
-      const surfaceMessageResult = await params.adapter.readMsg(params.input.msgRef);
+      const surfaceMessageResult = ingressMessage
+        ? Result.ok(ingressMessage)
+        : await params.adapter.readMsg(params.input.msgRef);
       const continueMessage = surfaceMessageResult.match<
         () => Promise<ResultType<void, DiscordRequestPublishError>>
       >({
