@@ -241,6 +241,7 @@ export type UniversalCoreConfig = {
       memberPresence?: boolean;
       outputMode: "inline" | "preview";
       outputPreviewModeFinalStyle: "embed" | "plain";
+      outputPreviewModeFinalText: "flat" | "reply-chain";
       outputNotification?: boolean;
       workingIndicators: string[];
       attachmentCache: {

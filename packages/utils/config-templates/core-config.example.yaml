@@ -201,6 +201,12 @@ surface:
     # Only applies when outputMode is preview.
     outputPreviewModeFinalStyle: plain
 
+    # Final plain-text grouping used after preview mode finishes:
+    # - flat: reply with the first final-answer chunk, then send later chunks directly
+    # - reply-chain: repost commentary + final answer as a reply chain
+    # Only applies when outputMode is preview and outputPreviewModeFinalStyle is plain.
+    outputPreviewModeFinalText: flat
+
     # Global override for Discord notifications on output messages.
     # - true: allow reply ping + @user mentions to notify
     # - false: suppress notifications by default

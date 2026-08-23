@@ -1443,11 +1443,12 @@ describe("bridgeBusToAdapter", () => {
           error: undefined,
         },
       },
-      { type: "text.delta", delta: "NO_ " },
-      { type: "text.delta", delta: "\n\nFinal answer." },
+      { type: "text.delta", delta: "NO_ ", phase: "final_answer" },
+      { type: "text.delta", delta: "\n\nFinal answer.", phase: "final_answer" },
       {
         type: "text.set",
         text: "NO_ \n\nFinal answer.",
+        phase: "final_answer",
         finalSegments: ["NO_", " Final answer."],
       },
     ]);
@@ -1523,14 +1524,19 @@ describe("bridgeBusToAdapter", () => {
 
     expect(adapter.streams).toHaveLength(1);
     expect(adapter.streams[0]?.parts).toEqual([
-      { type: "text.delta", delta: "Retained commentary." },
-      { type: "text.delta", delta: "Transient commentary." },
-      { type: "text.set", text: "Retained commentary." },
-      { type: "text.delta", delta: " \n\nVisible final answer." },
-      { type: "text.set", text: "Retained commentary. \n\nVisible final answer." },
+      { type: "text.delta", delta: "Retained commentary.", phase: "commentary" },
+      { type: "text.delta", delta: "Transient commentary.", phase: "commentary" },
+      { type: "text.set", text: "Retained commentary.", phase: "commentary" },
+      { type: "text.delta", delta: " \n\nVisible final answer.", phase: "final_answer" },
       {
         type: "text.set",
         text: "Retained commentary. \n\nVisible final answer.",
+        phase: "final_answer",
+      },
+      {
+        type: "text.set",
+        text: "Retained commentary. \n\nVisible final answer.",
+        phase: "final_answer",
         finalSegments: ["Retained commentary.", " Visible final answer."],
       },
     ]);
@@ -3658,9 +3664,14 @@ describe("bridgeBusToAdapter", () => {
     // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
     await new Promise((resolve) => setTimeout(resolve, 0));
 
+    expect(adapter.stream?.hydratedParts).toEqual([
+      { type: "text.set", text: "C", phase: "commentary" },
+      { type: "text.set", text: "CF", phase: "final_answer" },
+    ]);
     expect(adapter.stream?.parts.at(-1)).toEqual({
       type: "text.set",
       text: "CF!",
+      phase: "final_answer",
       finalSegments: ["C", "F!"],
     });
     await bridge.stop();
@@ -3711,6 +3722,58 @@ describe("bridgeBusToAdapter", () => {
     expect(adapter.stream?.parts.at(-1)).toEqual({
       type: "text.set",
       text: "Corrected response.",
+      phase: "final_answer",
+    });
+    await bridge.stop();
+  });
+
+  it("keeps final-answer segmentation when terminal text corrects only the final answer", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:msg_terminal_final_answer_correction";
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+    });
+
+    await applyAndActivateRelayRecovery(bridge, [
+      {
+        requestId,
+        sessionId: "chan",
+        requestClient: "discord",
+        platform: "discord",
+        createdOutputRefs: [],
+        visibleText: "C\n\nF",
+        totalTextChars: 4,
+        textPhase: "final_answer",
+        commentaryText: "C",
+        finalAnswerText: "F",
+        streamPhaseBoundaryPrefixChars: 2,
+        streamPhaseBoundaryOffsetChars: 1,
+        streamPhaseBoundaryPrefix: "\n\n",
+        toolStatus: [],
+      },
+    ]);
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "C\n\nG" },
+      {
+        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
+      },
+    );
+
+    // test-wait-justification: drains the output relay's in-memory bus callbacks triggered above
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(adapter.stream?.parts.at(-1)).toEqual({
+      type: "text.set",
+      text: "C\n\nG",
+      phase: "final_answer",
+      finalSegments: ["C", "G"],
     });
     await bridge.stop();
   });
@@ -3756,6 +3819,7 @@ describe("bridgeBusToAdapter", () => {
     expect(adapter.stream?.parts.at(-1)).toEqual({
       type: "text.set",
       text: "Corrected response.",
+      phase: "commentary",
     });
     await bridge.stop();
   });

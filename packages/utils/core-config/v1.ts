@@ -762,6 +762,7 @@ function coreConfigV1ToUniversal(
           ttlMs: { kind: "bounded", value: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
         },
         outputPreviewModeFinalStyle: previewFinalOutputStyle,
+        outputPreviewModeFinalText: "reply-chain",
         markdownTableRender: experimental.markdownTableRender,
         markdownMathRender: {
           enabled: false,

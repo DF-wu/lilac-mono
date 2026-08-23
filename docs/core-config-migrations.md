@@ -51,6 +51,10 @@ Removed v2 fields:
 
 New v2 fields:
 
+- `surface.discord.outputPreviewModeFinalText`: final plain-text grouping after a preview. `flat`
+  replies with the first final-answer chunk and sends later chunks directly; `reply-chain` preserves
+  the v1 commentary-plus-final reply chain. It applies only when `outputMode: preview` and
+  `outputPreviewModeFinalStyle: plain`. The v2 default is `flat`; frozen v1 configs use `reply-chain`.
 - `agent.transcriptRetention.maxAge` and `.maxRequests`: completed request transcript retention limits;
   defaults to `180d` and `10000`. Each accepts a positive duration/count or `"unlimited"`. Changes are
   hot-reloaded and apply on the next transcript save. Frozen v1 configs receive the same universal
@@ -194,6 +198,7 @@ Default changes from v1:
   `google/gemini-3-flash`)
 - `surface.discord.outputMode: preview`
 - `surface.discord.outputPreviewModeFinalStyle: plain`
+- `surface.discord.outputPreviewModeFinalText: flat`
 - `surface.discord.outputNotification: true`
 - `surface.discord.markdownTableRender: { enabled: true, style: unicode, maxWidth: 50, fallbackMode: list }`
 - `agent.reasoningDisplay: detailed`

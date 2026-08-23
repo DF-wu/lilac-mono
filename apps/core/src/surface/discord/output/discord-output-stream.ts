@@ -195,6 +195,7 @@ function finalDiscordMessageResult(
 
 type DiscordOutputMode = "inline" | "preview";
 type DiscordPreviewFinalOutputStyle = "embed" | "plain";
+type DiscordPreviewFinalText = "flat" | "reply-chain";
 const NOTIFY_PARSE_USERS = ["users"] as const;
 
 function clampWithEllipsis(text: string, maxChars: number): string {
@@ -533,11 +534,28 @@ export function buildDiscordProgressLines(input: {
     .map((line) => clampWithEllipsis(line, PROGRESS_LINE_MAX_CHARS));
 }
 
-export function toPreviewTail(text: string, maxChars = PREVIEW_TEXT_TAIL_CHARS): string {
+export function toPreviewTail(
+  text: string,
+  maxChars = PREVIEW_TEXT_TAIL_CHARS,
+  preferCompleteBlock = false,
+): string {
   if (maxChars <= 0) return "";
   if (text.length <= maxChars) return text;
   if (maxChars <= 3) return "...".slice(0, maxChars);
-  return `...${text.slice(text.length - (maxChars - 3))}`;
+
+  const tailLength = maxChars - 3;
+  const rawStart = text.length - tailLength;
+  if (!preferCompleteBlock) return `...${text.slice(rawStart)}`;
+
+  const completeBlockStart = text.indexOf("\n\n", rawStart);
+  if (completeBlockStart >= 0) {
+    const completeBlocks = text.slice(completeBlockStart + 2);
+    if (completeBlocks.length > 0 && completeBlocks.length <= tailLength) {
+      return `...${completeBlocks}`;
+    }
+  }
+
+  return `...${text.slice(rawStart)}`;
 }
 
 export function buildOutputAllowedMentions(input: {
@@ -693,6 +711,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   private pendingTaskDrivenIndicatorChange = false;
 
   private textAcc = "";
+  private previewTextAcc = "";
   private pendingAttachments: SurfaceAttachment[] = [];
 
   private firstMsg: Message | null = null;
@@ -719,6 +738,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       markdownMathRender?: DiscordMarkdownMathRenderOptions;
       outputMode: DiscordOutputMode;
       outputPreviewModeFinalStyle?: DiscordPreviewFinalOutputStyle;
+      outputPreviewModeFinalText?: DiscordPreviewFinalText;
       outputNotification?: boolean;
       reasoningDisplayMode: "none" | "simple" | "detailed";
       workingIndicators: readonly string[];
@@ -763,6 +783,14 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     return this.deps.outputMode === "preview";
   }
 
+  private usesFlatPreviewFinalText(): boolean {
+    return (
+      this.isPreviewMode() &&
+      this.deps.outputPreviewModeFinalStyle === "plain" &&
+      this.deps.outputPreviewModeFinalText === "flat"
+    );
+  }
+
   private trackTransientPreviewRef(ref: MsgRef): void {
     if (!this.isPreviewMode()) return;
 
@@ -804,9 +832,12 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   }
 
   private getStreamingDisplayText(isStreaming: boolean): string {
-    const rendered = this.getRenderedText(isStreaming ? "streaming" : "terminal");
+    const phase = isStreaming ? "streaming" : "terminal";
+    const rendered = this.usesFlatPreviewFinalText()
+      ? this.renderText(this.previewTextAcc, phase)
+      : this.getRenderedText(phase);
     if (!this.isPreviewMode()) return rendered;
-    return toPreviewTail(rendered);
+    return toPreviewTail(rendered, PREVIEW_TEXT_TAIL_CHARS, this.usesFlatPreviewFinalText());
   }
 
   private getAllowedMentions(input: {
@@ -1036,10 +1067,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       this.lastMsg = resumedMessages[resumedMessages.length - 1] ?? null;
     }
 
-    // Special case: attachments-only output (no text and no tool lines).
-    // In this case we don't start the embed pusher at all.
+    // When the preview has no displayable text or progress, use one placeholder instead of
+    // starting an embed pusher that has nothing to create yet.
+    const hasInitialDisplayText = this.usesFlatPreviewFinalText()
+      ? this.getStreamingDisplayText(true).length > 0
+      : this.textAcc.length > 0;
     if (
-      this.textAcc.length === 0 &&
+      !hasInitialDisplayText &&
       this.toolLines.length === 0 &&
       this.subagentLines.length === 0 &&
       !this.hasReasoningStatus &&
@@ -1199,10 +1233,23 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       case "text.delta":
         this.finalTextSegments = null;
         this.textAcc += part.delta;
+        if (!this.usesFlatPreviewFinalText() || part.phase !== "final_answer") {
+          this.previewTextAcc += part.delta;
+        }
         return "visible";
       case "text.set":
         this.textAcc = part.text;
         this.finalTextSegments = part.finalSegments?.slice() ?? null;
+        if (
+          this.usesFlatPreviewFinalText() &&
+          part.phase === "final_answer" &&
+          part.finalSegments &&
+          part.finalSegments.length > 1
+        ) {
+          this.previewTextAcc = part.finalSegments[0] ?? this.previewTextAcc;
+        } else if (!this.usesFlatPreviewFinalText() || part.phase !== "final_answer") {
+          this.previewTextAcc = part.text;
+        }
         return "visible";
       case "meta.stats":
         this.statsForNerdsLine = part.line.trim().length > 0 ? part.line : null;
@@ -1407,9 +1454,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const { CLOSING_TAG_BUFFER } = getEmbedPusherConstants();
     const maxChunkLength =
       DISCORD_CONTENT_MAX_CHARS - (this.deps.useSmartSplitting ? CLOSING_TAG_BUFFER : 0);
+    const selectedFinalTexts =
+      this.usesFlatPreviewFinalText() && this.finalTextSegments
+        ? this.finalTextSegments.slice(-1)
+        : this.finalTextSegments;
     const finalTexts =
-      this.finalTextSegments && this.finalTextSegments.length > 0
-        ? this.finalTextSegments.map((segment) => this.renderText(segment, "terminal"))
+      selectedFinalTexts && selectedFinalTexts.length > 0
+        ? selectedFinalTexts.map((segment) => this.renderText(segment, "terminal"))
         : [this.getRenderedText("terminal")];
     const chunks = finalTexts.flatMap((text) =>
       chunkMarkdownForEmbeds(text.length > 0 ? text : "*<empty_string>*", {
@@ -1429,6 +1480,29 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const createdMsgs: Message[] = [];
     let parent: Message | null = null;
 
+    const sendChunk = async (options: MessageCreateOptions): Promise<Message> => {
+      if (parent === null) {
+        return await channel.send({
+          ...options,
+          reply:
+            this.deps.opts?.replyTo && this.deps.opts.replyTo.platform === "discord"
+              ? { messageReference: this.deps.opts.replyTo.messageId }
+              : undefined,
+          allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: true }),
+        });
+      }
+      if (this.usesFlatPreviewFinalText()) {
+        return await channel.send({
+          ...options,
+          allowedMentions: this.getAllowedMentions({ isReply: false, isFinalLane: true }),
+        });
+      }
+      return await parent.reply({
+        ...options,
+        allowedMentions: this.getAllowedMentions({ isReply: false, isFinalLane: true }),
+      });
+    };
+
     for (let i = 0; i < displayChunks.length; i++) {
       const chunk = displayChunks[i] ?? "";
       const isLast = i === displayChunks.length - 1;
@@ -1444,24 +1518,11 @@ export class DiscordOutputStream implements SurfaceOutputStream {
             ]
           : undefined;
 
-      const msg: Message =
-        parent === null
-          ? await channel.send({
-              content: contentChunk,
-              embeds,
-              files: isLast ? toDiscordFiles(filesForLastMessage) : undefined,
-              reply:
-                this.deps.opts?.replyTo && this.deps.opts.replyTo.platform === "discord"
-                  ? { messageReference: this.deps.opts.replyTo.messageId }
-                  : undefined,
-              allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: true }),
-            })
-          : await parent.reply({
-              content: contentChunk,
-              embeds,
-              files: isLast ? toDiscordFiles(filesForLastMessage) : undefined,
-              allowedMentions: this.getAllowedMentions({ isReply: false, isFinalLane: true }),
-            });
+      const msg = await sendChunk({
+        content: contentChunk,
+        embeds,
+        files: isLast ? toDiscordFiles(filesForLastMessage) : undefined,
+      });
 
       createdMsgs.push(msg);
       const ref = asDiscordMsgRef(discordSessionRef.channelId, msg.id);
@@ -1595,6 +1656,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const isReanchor = reason === "reanchor" || reason === "reanchor_interrupt";
     const isInterruptReanchor = reason === "reanchor_interrupt";
     const isCancel = reason === "cancel";
+    const reanchorPlaceholder = isInterruptReanchor ? "*Interrupted...*" : "*Steering...*";
 
     if (isCancel && this.textAcc.trim().length === 0) {
       this.textAcc = "Cancelled.";
@@ -1609,7 +1671,10 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       // Freeze the current message chain in a coherent state.
       // If we have not produced any text yet, replace emptiness with a placeholder.
       if (this.textAcc.trim().length === 0) {
-        this.textAcc = isInterruptReanchor ? "*Interrupted...*" : "*Steering...*";
+        this.textAcc = reanchorPlaceholder;
+      }
+      if (this.usesFlatPreviewFinalText() && this.previewTextAcc.trim().length === 0) {
+        this.previewTextAcc = reanchorPlaceholder;
       }
 
       // Ensure the placeholder message exists so we can "freeze" it.
@@ -1619,12 +1684,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     this.done.resolve();
     await this.running;
 
-    // Best-effort: if we never started the embed pusher, the first message is still
-    // the placeholder "Replying...". For cancels, rewrite it so the thread isn't left
-    // in a confusing state.
-    if (isCancel && this.firstMsg && !this.usedEmbedPusher) {
+    // Best-effort: if we never started the embed pusher, rewrite the initial
+    // "Replying..." placeholder to the terminal abort state.
+    if ((isReanchor || isCancel) && this.firstMsg && !this.usedEmbedPusher) {
       await safeEdit(this.firstMsg, {
-        content: this.textAcc || "Cancelled.",
+        content: isReanchor
+          ? this.getStreamingDisplayText(false) || reanchorPlaceholder
+          : this.textAcc || "Cancelled.",
       });
     }
 

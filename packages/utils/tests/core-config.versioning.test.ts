@@ -56,6 +56,7 @@ describe("core config versioning", () => {
     expect(parsed.configVersion).toBe(1);
     expect(parsed.surface.discord.outputMode).toBe("inline");
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("embed");
+    expect(parsed.surface.discord.outputPreviewModeFinalText).toBe("reply-chain");
     expect(parsed.surface.discord.markdownTableRender.enabled).toBe(false);
     expect(parsed.surface.discord.markdownMathRender).toEqual({
       enabled: false,
@@ -108,6 +109,7 @@ describe("core config versioning", () => {
     expect(parsed.tools.editFile.hashline).toBe(true);
     expect(parsed.surface.discord.outputMode).toBe("preview");
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("plain");
+    expect(parsed.surface.discord.outputPreviewModeFinalText).toBe("flat");
     expect(parsed.surface.discord.outputNotification).toBe(true);
     expect(parsed.surface.discord.markdownTableRender).toEqual({
       enabled: true,
@@ -489,6 +491,7 @@ describe("core config versioning", () => {
       surface: {
         discord: {
           outputPreviewModeFinalStyle: "embed",
+          outputPreviewModeFinalText: "reply-chain",
           markdownTableRender: {
             enabled: false,
             style: "ascii",
@@ -509,6 +512,7 @@ describe("core config versioning", () => {
     expect(parsed.tools.inspect.model).toBe("google/gemini-3-pro");
     expect(parsed.tools.editFile.hashline).toBe(false);
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("embed");
+    expect(parsed.surface.discord.outputPreviewModeFinalText).toBe("reply-chain");
     expect(parsed.surface.discord.markdownTableRender).toEqual({
       enabled: false,
       style: "ascii",
@@ -569,6 +573,7 @@ describe("core config versioning", () => {
     expect(parsed.tools.inspect.model).toBe("google/gemini-3-flash");
     expect(parsed.tools.editFile.hashline).toBe(true);
     expect(parsed.surface.discord.outputPreviewModeFinalStyle).toBe("plain");
+    expect(parsed.surface.discord.outputPreviewModeFinalText).toBe("reply-chain");
     expect(parsed.surface.discord.markdownTableRender).toEqual({
       enabled: true,
       style: "ascii",

@@ -165,9 +165,16 @@ export type SurfaceReasoningStatusUpdate = {
   detailText?: string;
 };
 
+export type SurfaceTextPhase = "commentary" | "final_answer";
+
 export type SurfaceOutputPart =
-  | { type: "text.delta"; delta: string }
-  | { type: "text.set"; text: string; finalSegments?: readonly string[] }
+  | { type: "text.delta"; delta: string; phase?: SurfaceTextPhase }
+  | {
+      type: "text.set";
+      text: string;
+      phase?: SurfaceTextPhase;
+      finalSegments?: readonly string[];
+    }
   | { type: "reasoning.status"; update: SurfaceReasoningStatusUpdate }
   | { type: "meta.stats"; line: string }
   | { type: "tool.status"; update: SurfaceToolStatusUpdate }

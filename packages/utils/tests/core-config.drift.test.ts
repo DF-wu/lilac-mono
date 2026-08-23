@@ -94,6 +94,7 @@ describe("core config drift coverage", () => {
     expect(cfg.tools.media.maxInlineBytesTotal).toBe(20 * 1024 * 1024);
     expect(cfg.surface.discord.outputMode).toBe("preview");
     expect(cfg.surface.discord.outputPreviewModeFinalStyle).toBe("plain");
+    expect(cfg.surface.discord.outputPreviewModeFinalText).toBe("flat");
     expect(cfg.surface.discord.outputNotification).toBe(true);
     expect(cfg.surface.discord.attachmentCache.ttlMs).toEqual({
       kind: "bounded",

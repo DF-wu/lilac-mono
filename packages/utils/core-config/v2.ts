@@ -364,6 +364,7 @@ const discordSurfaceSchema = z
     memberPresence: z.boolean().optional(),
     outputMode: z.enum(["inline", "preview"]).default("preview"),
     outputPreviewModeFinalStyle: z.enum(["embed", "plain"]).default("plain"),
+    outputPreviewModeFinalText: z.enum(["flat", "reply-chain"]).default("flat"),
     outputNotification: z.boolean().default(true),
     attachmentCache: discordAttachmentCacheSchema,
     workingIndicators: z
@@ -380,6 +381,7 @@ const discordSurfaceSchema = z
     botName: "lilac",
     outputMode: "preview",
     outputPreviewModeFinalStyle: "plain",
+    outputPreviewModeFinalText: "flat",
     outputNotification: true,
     attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
     workingIndicators: cloneDefaultWorkingIndicators(),
@@ -723,6 +725,7 @@ export const coreConfigInputSchemaV2 = z.object({
         botName: "lilac",
         outputMode: "preview",
         outputPreviewModeFinalStyle: "plain",
+        outputPreviewModeFinalText: "flat",
         outputNotification: true,
         attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
         workingIndicators: cloneDefaultWorkingIndicators(),

@@ -1249,8 +1249,11 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     const hydrateRestoredState = (): void => {
       if (!input.restore) return;
       const parts: SurfaceOutputPart[] = [];
+      if (textPhase === "final_answer" && commentaryText.trim().length > 0) {
+        parts.push({ type: "text.set", text: commentaryText, phase: "commentary" });
+      }
       if (visibleTextAcc.trim().length > 0) {
-        parts.push({ type: "text.set", text: visibleTextAcc });
+        parts.push({ type: "text.set", text: visibleTextAcc, phase: textPhase });
       }
       if (textPhase !== "final_answer" && typeof reasoningStartedAtMs === "number") {
         parts.push({
@@ -1693,7 +1696,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                 }
 
                 if (!bufferNoReplyPrefix) {
-                  part = { type: "text.delta", delta: visibleDelta };
+                  part = { type: "text.delta", delta: visibleDelta, phase: incomingPhase };
                   visibleTextAcc += visibleDelta;
                   break;
                 }
@@ -1704,7 +1707,11 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                 }
 
                 bufferNoReplyPrefix = false;
-                part = { type: "text.delta", delta: pendingNoReplyPrefix };
+                part = {
+                  type: "text.delta",
+                  delta: pendingNoReplyPrefix,
+                  phase: incomingPhase,
+                };
                 visibleTextAcc += pendingNoReplyPrefix;
                 pendingNoReplyPrefix = "";
                 break;
@@ -1746,7 +1753,7 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                   streamPhaseBoundaryPrefix = undefined;
                 }
                 awaitingFinalPhaseBoundaryPrefix = false;
-                part = { type: "text.set", text: laneText };
+                part = { type: "text.set", text: laneText, phase: outMsg.data.phase };
                 break;
               }
 
@@ -1939,17 +1946,29 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
                       commentaryText.length,
                     )
                   : "";
+                const preservesKnownPhaseBoundary =
+                  preservesCommentaryPrefix &&
+                  streamPhaseBoundaryPrefixChars > 0 &&
+                  streamPhaseBoundaryPrefix !== undefined &&
+                  streamFinalText.slice(
+                    commentaryText.length,
+                    commentaryText.length + streamPhaseBoundaryPrefixChars,
+                  ) === streamPhaseBoundaryPrefix;
+                const preservesFinalAnswerSplit =
+                  authoritativeFinalAnswer.startsWith(finalAnswerText) ||
+                  preservesKnownPhaseBoundary;
                 const finalSegments =
                   phaseSegmentsValid &&
                   commentaryText.trim().length > 0 &&
                   finalAnswerText.trim().length > 0 &&
-                  authoritativeFinalAnswer.startsWith(finalAnswerText) &&
+                  preservesFinalAnswerSplit &&
                   authoritativeFinalAnswer.trim().length > 0
                     ? [commentaryText, authoritativeFinalAnswer]
                     : undefined;
                 const pushedFinal = await pushOutputPart({
                   type: "text.set",
                   text: streamFinalText,
+                  phase: textPhase,
                   ...(finalSegments === undefined ? {} : { finalSegments }),
                 });
                 const pushedFinalError = pushedFinal.match({
