@@ -179,10 +179,20 @@ async function downloadToBuffer(
     return fetched.andThenAsync(async (res) => {
       if (!res.ok) {
         let category: ServerToolFailure["kind"] = "unavailable";
-        if (res.status === 404) category = "not_found";
-        else if (res.status === 401 || res.status === 403) category = "denied";
-        else if (res.status === 408 || res.status === 504) category = "timeout";
-        else if (res.status === 409) category = "conflict";
+        switch (true) {
+          case res.status === 404:
+            category = "not_found";
+            break;
+          case res.status === 401 || res.status === 403:
+            category = "denied";
+            break;
+          case res.status === 408 || res.status === 504:
+            category = "timeout";
+            break;
+          case res.status === 409:
+            category = "conflict";
+            break;
+        }
         return Result.err(
           attachmentFailure(category, `Failed to download attachment (${res.status}): ${safeUrl}`),
         );

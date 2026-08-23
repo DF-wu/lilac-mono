@@ -660,7 +660,8 @@ export function startWorkflowSandbox(input: {
           return Result.err(new WorkflowSandboxCancelled({ message: cause.message }));
         }
         return Result.err(new WorkflowSandboxExecutionFailed({ message: cause.message }));
-      } else if (attempt.value.status === "return") return attempt.value.value;
+      }
+      if (attempt.value.status === "return") return attempt.value.value;
     }
     return undefined as never;
   })();

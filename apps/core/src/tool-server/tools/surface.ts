@@ -121,10 +121,20 @@ function surfaceExternalFailure(
   const message = errorMessage(cause);
   const normalized = message.toLowerCase();
   let category: ServerToolFailure["kind"] = "unavailable";
-  if (signal?.aborted || /\babort(?:ed)?\b/.test(normalized)) category = "cancelled";
-  else if (/\b(?:timeout|timed out)\b/.test(normalized)) category = "timeout";
-  else if (code === "ENOENT") category = "not_found";
-  else if (code === "EACCES" || code === "EPERM") category = "denied";
+  switch (true) {
+    case signal?.aborted || /\babort(?:ed)?\b/.test(normalized):
+      category = "cancelled";
+      break;
+    case /\b(?:timeout|timed out)\b/.test(normalized):
+      category = "timeout";
+      break;
+    case code === "ENOENT":
+      category = "not_found";
+      break;
+    case code === "EACCES" || code === "EPERM":
+      category = "denied";
+      break;
+  }
   return surfaceFailure(category, message);
 }
 

@@ -15,11 +15,15 @@ import {
   findExceptionFlowViolationsInSourceFile,
   findDirectSqliteTransactionViolations,
   findDirectSqliteTransactionViolationsInSourceFile,
+  findElseAfterTerminalViolations,
+  findElseAfterTerminalViolationsInSourceFile,
   findInlineAsyncResultCallbackViolations,
   findInlineAsyncResultCallbackViolationsInSourceFile,
   findLocalRecordGuardViolations,
   findPresentationDecoderImportViolations,
   findPresentationDecoderImportViolationsInSourceFile,
+  findPreferSwitchTrueChainViolations,
+  findPreferSwitchTrueChainViolationsInSourceFile,
   findStoreInlineDecodingViolations,
   findStoreInlineDecodingViolationsInSourceFile,
   parseProductionSyntaxSource,
@@ -217,6 +221,22 @@ describe("parsed production syntax finders", () => {
       ),
     ).toEqual(findInlineAsyncResultCallbackViolations(resultSource, resultPath));
 
+    const controlFlowSource = `
+      function classify() {
+        if (a || b) return 1;
+        else if (c || d) return 2;
+        else if (e) return 3;
+      }
+    `;
+    const controlFlowPath = "apps/example/src/control-flow.ts";
+    const controlFlowSourceFile = parseProductionSyntaxSource(controlFlowSource, controlFlowPath);
+    expect(
+      findPreferSwitchTrueChainViolationsInSourceFile(controlFlowSourceFile, controlFlowPath),
+    ).toEqual(findPreferSwitchTrueChainViolations(controlFlowSource, controlFlowPath));
+    expect(
+      findElseAfterTerminalViolationsInSourceFile(controlFlowSourceFile, controlFlowPath),
+    ).toEqual(findElseAfterTerminalViolations(controlFlowSource, controlFlowPath));
+
     const presentationSource = `import { z } from "zod"; z.string().parse("value");`;
     const presentationPath = "apps/example/src/render.ts";
     const presentationManifest = manifestWithUnknownFreeModule();
@@ -258,6 +278,91 @@ describe("parsed production syntax finders", () => {
     ).toEqual(
       findDirectSqliteTransactionViolations(sqliteSource, storePath, policyWith(), storeManifest),
     );
+  });
+});
+
+describe("flat control flow syntax", () => {
+  const filePath = "apps/example/src/control-flow.ts";
+
+  it("prefers switch true for ordered chains with multiple disjunctive arms", () => {
+    const violations = findPreferSwitchTrueChainViolations(
+      `
+        if (a || b || c) first();
+        else if (d || e) second();
+        else if (f) third();
+        else fallback();
+
+        if (a || b) first();
+        else fallback();
+
+        if (a || b) first();
+        else if (c) second();
+        else if (d) fallback();
+
+        if (a || b) first();
+        else if (c || d) second();
+        else if (e) third();
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind }) => kind)).toEqual([
+      "prefer-switch-true-chain",
+      "prefer-switch-true-chain",
+    ]);
+  });
+
+  it("removes else branches after direct terminal statements", () => {
+    const violations = findElseAfterTerminalViolations(
+      `
+        function returned() {
+          if (ready) return value;
+          else return fallback;
+        }
+        function thrown() {
+          if (failed) { throw error; }
+          else recover();
+        }
+        function loop() {
+          while (active) {
+            if (skip) { continue; }
+            else visit();
+            if (done) break;
+            else advance();
+          }
+        }
+        function retainedElse() {
+          if (ready) prepare();
+          else fallback();
+        }
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind }) => kind)).toEqual([
+      "else-after-terminal",
+      "else-after-terminal",
+      "else-after-terminal",
+      "else-after-terminal",
+    ]);
+  });
+
+  it("excludes test modules from production control-flow rules", () => {
+    const source = `
+      if (a || b) first();
+      else if (c || d) second();
+      else if (e) fallback();
+      if (ready) returnValue();
+      else fallback();
+    `;
+    expect(
+      findPreferSwitchTrueChainViolations(source, "apps/example/tests/control-flow.test.ts"),
+    ).toEqual([]);
+    expect(
+      findElseAfterTerminalViolations(source, "apps/example/tests/control-flow.test.ts"),
+    ).toEqual([]);
   });
 });
 
@@ -1144,6 +1249,8 @@ describe("Oxlint production syntax activation", () => {
       files: expect.arrayContaining(["packages/**/*.{js,jsx,cjs,mjs,ts,tsx}"]),
       rules: {
         "@typescript-eslint/no-explicit-any": "error",
+        "lilac/no-else-after-terminal": "error",
+        "lilac/prefer-switch-true-chain": "error",
         "no-nested-ternary": "error",
         "lilac/no-local-is-record": "error",
       },

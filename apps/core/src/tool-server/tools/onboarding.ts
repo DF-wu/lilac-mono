@@ -1046,11 +1046,19 @@ export class Onboarding implements ServerTool {
         ({ cause, code, name }) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
           let classifiedKind = kind;
-          if (code === "EACCES" || code === "EPERM") classifiedKind = "denied";
-          else if (code === "ENOENT") classifiedKind = "not_found";
-          else if (name === "AbortError") classifiedKind = "cancelled";
-          else if (name === "TimeoutError" || name === "timeout" || code === "ETIMEDOUT") {
-            classifiedKind = "timeout";
+          switch (true) {
+            case code === "EACCES" || code === "EPERM":
+              classifiedKind = "denied";
+              break;
+            case code === "ENOENT":
+              classifiedKind = "not_found";
+              break;
+            case name === "AbortError":
+              classifiedKind = "cancelled";
+              break;
+            case name === "TimeoutError" || name === "timeout" || code === "ETIMEDOUT":
+              classifiedKind = "timeout";
+              break;
           }
           return onboardingFailure(
             classifiedKind,

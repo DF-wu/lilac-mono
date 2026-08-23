@@ -3505,24 +3505,23 @@ class SessionActor {
           );
           if (waited.ok) {
             break;
-          } else {
-            const error = waited.error;
-            const recovery = idleRecovery.promise;
-            if (!(error instanceof AgentIdleTimeoutError) || !recovery)
-              return signalSessionFailure(error);
-            const result = await recovery;
-            if (idleRecovery.promise === recovery) idleRecovery.promise = null;
-            if (
-              result.status !== "retried" &&
-              !(
-                result.status === "superseded" &&
-                (result.reason === "cancel" || result.reason === "interrupt")
-              )
-            ) {
-              return signalSessionFailure(error);
-            }
-            idleWatchdog.restart();
           }
+          const error = waited.error;
+          const recovery = idleRecovery.promise;
+          if (!(error instanceof AgentIdleTimeoutError) || !recovery)
+            return signalSessionFailure(error);
+          const result = await recovery;
+          if (idleRecovery.promise === recovery) idleRecovery.promise = null;
+          if (
+            result.status !== "retried" &&
+            !(
+              result.status === "superseded" &&
+              (result.reason === "cancel" || result.reason === "interrupt")
+            )
+          ) {
+            return signalSessionFailure(error);
+          }
+          idleWatchdog.restart();
         }
       }),
     );
@@ -3962,7 +3961,8 @@ class SessionActor {
       case "message_start":
         if (event.message.role === "user") {
           return;
-        } else if (event.message.role === "tool") {
+        }
+        if (event.message.role === "tool") {
           for (const part of event.message.content) {
             if (part.type !== "tool-result") continue;
             await this.appendToolResultChunk(runId, projection, part);

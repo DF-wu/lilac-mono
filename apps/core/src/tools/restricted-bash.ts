@@ -703,15 +703,25 @@ async function fetchNestedToolsJson(params: {
       kind: "internal",
       retryable: false,
     };
-    if (status === 400 || status === 422) projection = { kind: "usage", retryable: false };
-    else if (status === 401 || status === 403) {
-      projection = { kind: "denied", retryable: false };
-    } else if (status === 404) projection = { kind: "not_found", retryable: false };
-    else if (status === 408 || status === 504) {
-      projection = { kind: "timeout", retryable: true };
-    } else if (status === 409) projection = { kind: "conflict", retryable: false };
-    else if (status === 429 || status >= 500) {
-      projection = { kind: "unavailable", retryable: true };
+    switch (true) {
+      case status === 400 || status === 422:
+        projection = { kind: "usage", retryable: false };
+        break;
+      case status === 401 || status === 403:
+        projection = { kind: "denied", retryable: false };
+        break;
+      case status === 404:
+        projection = { kind: "not_found", retryable: false };
+        break;
+      case status === 408 || status === 504:
+        projection = { kind: "timeout", retryable: true };
+        break;
+      case status === 409:
+        projection = { kind: "conflict", retryable: false };
+        break;
+      case status === 429 || status >= 500:
+        projection = { kind: "unavailable", retryable: true };
+        break;
     }
     return signalNestedToolsFailure(
       createNestedToolsFailure({

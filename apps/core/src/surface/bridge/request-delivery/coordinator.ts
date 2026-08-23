@@ -548,10 +548,12 @@ export class RequestDeliveryCoordinator<
             if (inspection.kind === "error") {
               uncertainties.push(inspection.error);
               continue;
-            } else if (inspection.value.disposition === "retain-terminal") {
+            }
+            if (inspection.value.disposition === "retain-terminal") {
               uncertainties.push(inspection.value.uncertainty);
               continue;
-            } else if (inspection.value.disposition === "terminalize") {
+            }
+            if (inspection.value.disposition === "terminalize") {
               if (input.prepareTerminalRecovery) {
                 const prepared = await input.prepareTerminalRecovery(record);
                 const prepareError = prepared.match({

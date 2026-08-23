@@ -920,11 +920,12 @@ export async function captureCoreEventBusCleanup(
                 }),
               ),
           });
-        } else if (ownership.raw) {
-          await ownership.raw.close();
-        } else {
-          await ownership.redis.quit();
         }
+        if (ownership.raw) {
+          await ownership.raw.close();
+          return Result.ok(undefined);
+        }
+        await ownership.redis.quit();
         return Result.ok(undefined);
       },
       catch: captureError,

@@ -26,7 +26,9 @@ import {
 } from "./syntax-rule-utils.mts";
 
 export type LocalRecordGuardKind = "local-record-guard";
+export type ElseAfterTerminalKind = "else-after-terminal";
 export type PresentationDecoderImportKind = "presentation-decoder-import";
+export type PreferSwitchTrueChainKind = "prefer-switch-true-chain";
 export type ResultCallbackKind = "inline-async-result-callback";
 export type StoreInlineDecodingKind = "store-inline-json-decoding" | "store-inline-schema-decoding";
 export type DirectSqliteTransactionKind =
@@ -2319,6 +2321,134 @@ export function findDirectSqliteTransactionViolationsInSourceFile(
   return findings;
 }
 
+function isConditionalChainRoot(node: ts.IfStatement): boolean {
+  return !(ts.isIfStatement(node.parent) && node.parent.elseStatement === node);
+}
+
+function topLevelOrTermCount(expression: ts.Expression): number {
+  const unwrapped = unwrappedExpression(expression);
+  if (
+    !ts.isBinaryExpression(unwrapped) ||
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.BarBarToken
+  ) {
+    return 1;
+  }
+  return topLevelOrTermCount(unwrapped.left) + topLevelOrTermCount(unwrapped.right);
+}
+
+function conditionalChainExpressions(root: ts.IfStatement): readonly ts.Expression[] {
+  const expressions: ts.Expression[] = [];
+  let current: ts.IfStatement | undefined = root;
+  while (current) {
+    expressions.push(current.expression);
+    current =
+      current.elseStatement && ts.isIfStatement(current.elseStatement)
+        ? current.elseStatement
+        : undefined;
+  }
+  return expressions;
+}
+
+export function findPreferSwitchTrueChainViolations(
+  sourceText: string,
+  filePath = "apps/example/src/service.ts",
+  policy: SyntacticPolicy = SYNTACTIC_POLICY,
+): SyntacticFinding<PreferSwitchTrueChainKind>[] {
+  if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
+  return findPreferSwitchTrueChainViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+  );
+}
+
+export function findPreferSwitchTrueChainViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+): SyntacticFinding<PreferSwitchTrueChainKind>[] {
+  const findings: SyntacticFinding<PreferSwitchTrueChainKind>[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isIfStatement(node) && isConditionalChainRoot(node)) {
+      const expressions = conditionalChainExpressions(node);
+      const disjunctiveArms = expressions.filter(
+        (expression) => topLevelOrTermCount(expression) > 1,
+      ).length;
+      if (expressions.length >= 3 && disjunctiveArms >= 2) {
+        findings.push(
+          createFinding(
+            sourceFile,
+            filePath,
+            node,
+            "prefer-switch-true-chain",
+            "Use switch (true) with one ordered predicate group per case instead of this disjunctive if/else-if chain",
+          ),
+        );
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return findings;
+}
+
+function terminalBranchStatement(statement: ts.Statement): ts.Statement | undefined {
+  if (
+    ts.isReturnStatement(statement) ||
+    ts.isThrowStatement(statement) ||
+    ts.isContinueStatement(statement) ||
+    ts.isBreakStatement(statement)
+  ) {
+    return statement;
+  }
+  if (!ts.isBlock(statement)) return undefined;
+  const last = statement.statements.at(-1);
+  return last ? terminalBranchStatement(last) : undefined;
+}
+
+function terminalBranchKeyword(statement: ts.Statement): string {
+  if (ts.isReturnStatement(statement)) return "return";
+  if (ts.isThrowStatement(statement)) return "throw";
+  if (ts.isContinueStatement(statement)) return "continue";
+  return "break";
+}
+
+export function findElseAfterTerminalViolations(
+  sourceText: string,
+  filePath = "apps/example/src/service.ts",
+  policy: SyntacticPolicy = SYNTACTIC_POLICY,
+): SyntacticFinding<ElseAfterTerminalKind>[] {
+  if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
+  return findElseAfterTerminalViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+  );
+}
+
+export function findElseAfterTerminalViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+): SyntacticFinding<ElseAfterTerminalKind>[] {
+  const findings: SyntacticFinding<ElseAfterTerminalKind>[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isIfStatement(node) && node.elseStatement) {
+      const terminal = terminalBranchStatement(node.thenStatement);
+      if (terminal) {
+        findings.push(
+          createFinding(
+            sourceFile,
+            filePath,
+            node.elseStatement,
+            "else-after-terminal",
+            `Remove this else and continue the workflow after the terminal ${terminalBranchKeyword(terminal)}`,
+          ),
+        );
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return findings;
+}
+
 function ruleFromFinder<Kind extends string>(
   description: string,
   finder: (sourceText: string, filePath: string) => readonly SyntacticFinding<Kind>[],
@@ -2344,6 +2474,10 @@ export const noExceptionFlowRule = ruleFromFinder(
   "Disallow production exception flow outside exactly registered adapters",
   findExceptionFlowViolations,
 );
+export const noElseAfterTerminalRule = ruleFromFinder(
+  "Keep the workflow flat after terminal branches",
+  findElseAfterTerminalViolations,
+);
 export const blobStorageSeamRule = ruleFromFinder(
   "Keep managed opaque bytes behind the unified blob-storage seam",
   findBlobStorageSeamViolations,
@@ -2359,6 +2493,10 @@ export const noInlineAsyncResultCallbackRule = ruleFromFinder(
 export const noPresentationDecoderImportRule = ruleFromFinder(
   "Disallow Zod parser imports in activated unknown-free presentation modules",
   findPresentationDecoderImportViolations,
+);
+export const preferSwitchTrueChainRule = ruleFromFinder(
+  "Use switch (true) for ordered disjunctive branch chains",
+  findPreferSwitchTrueChainViolations,
 );
 export const noStoreInlineDecodingRule = ruleFromFinder(
   "Disallow inline JSON and schema decoding in exact registered store scopes",

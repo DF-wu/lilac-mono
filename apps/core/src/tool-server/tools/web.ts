@@ -257,20 +257,24 @@ function webFailure(error: unknown, signal?: AbortSignal): ServerToolFailure {
   const status = getErrorStatus(error);
   const normalized = message.toLowerCase();
   let category: ServerToolFailure["kind"] = "unavailable";
-  if (signal?.aborted || /\babort(?:ed)?\b/.test(normalized)) {
-    category = "cancelled";
-  } else if (status === 408 || /\b(?:timeout|timed out)\b/.test(normalized)) {
-    category = "timeout";
-  } else if (
-    status === 401 ||
-    status === 403 ||
-    /\b(?:401|403|unauthori[sz]ed|forbidden)\b/.test(normalized)
-  ) {
-    category = "denied";
-  } else if (status === 404 || /\b(?:404|not found)\b/.test(normalized)) {
-    category = "not_found";
-  } else if (/unsupported|invalid (?:url|format|content)|response too large/.test(normalized)) {
-    category = "usage";
+  switch (true) {
+    case signal?.aborted || /\babort(?:ed)?\b/.test(normalized):
+      category = "cancelled";
+      break;
+    case status === 408 || /\b(?:timeout|timed out)\b/.test(normalized):
+      category = "timeout";
+      break;
+    case status === 401 ||
+      status === 403 ||
+      /\b(?:401|403|unauthori[sz]ed|forbidden)\b/.test(normalized):
+      category = "denied";
+      break;
+    case status === 404 || /\b(?:404|not found)\b/.test(normalized):
+      category = "not_found";
+      break;
+    case /unsupported|invalid (?:url|format|content)|response too large/.test(normalized):
+      category = "usage";
+      break;
   }
   return serverToolFailure({
     kind: category,

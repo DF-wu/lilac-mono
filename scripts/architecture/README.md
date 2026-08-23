@@ -87,10 +87,11 @@ remains invalid because it exposes `UnhandledException`.
 
 The syntax gate rejects every production `TryStatement` without a manifest exemption, as well as
 unregistered host exception flow, inline async Result callbacks, presentation decoder imports,
-store-owned inline decoding, direct SQLite transactions, and violations of the unified managed-blob
-seam. Oxlint also applies the permanent package-wide nested-ternary and local-record-guard rules. Syntax
-registrations use the same exact manifest identities as semantic analysis; there is no separate syntax
-exception catalog.
+store-owned inline decoding, direct SQLite transactions, `else` branches after terminal statements,
+ordered disjunctive `if`/`else if` chains that should use `switch (true)`, and violations of the unified
+managed-blob seam. Oxlint also applies the permanent package-wide nested-ternary and local-record-guard
+rules. Syntax registrations use the same exact manifest identities as semantic analysis; there is no
+separate syntax exception catalog.
 
 ### Unified blob storage
 

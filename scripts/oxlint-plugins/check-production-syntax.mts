@@ -7,9 +7,11 @@ import { validateWorkspaceInventory } from "../architecture/workspace-inventory.
 import {
   findBlobStorageSeamViolationsInSourceFile,
   findDirectSqliteTransactionViolationsInSourceFile,
+  findElseAfterTerminalViolationsInSourceFile,
   findExceptionFlowViolationsInSourceFile,
   findInlineAsyncResultCallbackViolationsInSourceFile,
   findPresentationDecoderImportViolationsInSourceFile,
+  findPreferSwitchTrueChainViolationsInSourceFile,
   findStoreInlineDecodingViolationsInSourceFile,
   parseProductionSyntaxSource,
 } from "./production-syntax.mts";
@@ -85,6 +87,10 @@ export async function scanSyntaxFindings(
           findBlobStorageSeamViolationsInSourceFile(sourceFile, filePath, manifest),
         ),
         ...toSyntaxFindings(
+          "lilac/no-else-after-terminal",
+          findElseAfterTerminalViolationsInSourceFile(sourceFile, filePath),
+        ),
+        ...toSyntaxFindings(
           "lilac/no-exception-flow",
           findExceptionFlowViolationsInSourceFile(sourceFile, filePath, manifest),
         ),
@@ -103,6 +109,10 @@ export async function scanSyntaxFindings(
         ...toSyntaxFindings(
           "lilac/no-direct-sqlite-transaction",
           findDirectSqliteTransactionViolationsInSourceFile(sourceFile, filePath, manifest),
+        ),
+        ...toSyntaxFindings(
+          "lilac/prefer-switch-true-chain",
+          findPreferSwitchTrueChainViolationsInSourceFile(sourceFile, filePath),
         ),
       );
     }

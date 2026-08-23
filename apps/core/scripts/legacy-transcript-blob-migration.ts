@@ -849,7 +849,7 @@ function inspectBinaryData(input: {
   readonly mediaType: string;
   readonly filename?: string;
 }): InlineBlobIdentity | null | LegacyTranscriptDecodeFailure {
-  let bytes: Uint8Array;
+  let bytes: Uint8Array | undefined;
   let mediaType = input.mediaType;
   const value = input.value;
   if (typeof value === "string") {
@@ -867,7 +867,8 @@ function inspectBinaryData(input: {
     if (isDecodeFailure(decodedBytes)) return decodedBytes;
     bytes = decodedBytes;
     mediaType = dataUrl?.mediaType ?? mediaType;
-  } else if (value instanceof URL) {
+  }
+  if (value instanceof URL) {
     if (value.protocol === "http:" || value.protocol === "https:") {
       return fail({
         kind: input.kind,
@@ -888,22 +889,28 @@ function inspectBinaryData(input: {
     }
     bytes = dataUrl.bytes;
     mediaType = dataUrl.mediaType ?? mediaType;
-  } else if (value instanceof ArrayBuffer) {
+  }
+  if (value instanceof ArrayBuffer) {
     bytes = new Uint8Array(value);
-  } else if (ArrayBuffer.isView(value)) {
+  }
+  if (ArrayBuffer.isView(value)) {
     bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  } else if (isRecord(value) && value["type"] === "data") {
+  }
+  if (isRecord(value) && value["type"] === "data") {
     return inspectBinaryData({ ...input, value: value["data"] });
-  } else if (isRecord(value) && value["type"] === "url") {
+  }
+  if (isRecord(value) && value["type"] === "url") {
     return inspectBinaryData({ ...input, value: value["url"] });
-  } else if (isRecord(value) && (value["type"] === "reference" || value["type"] === "text")) {
+  }
+  if (isRecord(value) && (value["type"] === "reference" || value["type"] === "text")) {
     return fail({
       kind: input.kind,
       recordId: input.recordId,
       field: input.path,
       reason: "A legacy provider file reference has no schema-6 stored-message representation",
     });
-  } else if (
+  }
+  if (
     isRecord(value) &&
     ("providerReference" in value || "fileId" in value || "reference" in value)
   ) {
@@ -913,7 +920,8 @@ function inspectBinaryData(input: {
       field: input.path,
       reason: "A legacy provider file reference has no schema-6 stored-message representation",
     });
-  } else {
+  }
+  if (bytes === undefined) {
     return fail({
       kind: input.kind,
       recordId: input.recordId,
@@ -944,43 +952,47 @@ function inspectToolResult(input: {
     if (!isRecord(item) || typeof item["type"] !== "string") continue;
     const path = `${input.path}.value[${index}]`;
     let candidate: InlineBlobIdentity | null | LegacyTranscriptDecodeFailure = null;
-    if (item["type"] === "file") {
-      candidate = inspectBinaryData({
-        value: item["data"],
-        kind: input.kind,
-        recordId: input.recordId,
-        path: `${path}.data`,
-        mediaType:
-          typeof item["mediaType"] === "string" ? item["mediaType"] : "application/octet-stream",
-        ...(typeof item["filename"] === "string" ? { filename: item["filename"] } : {}),
-      });
-    } else if (item["type"] === "file-data" || item["type"] === "image-data") {
-      candidate = inspectBinaryData({
-        value: item["data"],
-        kind: input.kind,
-        recordId: input.recordId,
-        path: `${path}.data`,
-        mediaType:
-          typeof item["mediaType"] === "string" ? item["mediaType"] : "application/octet-stream",
-        ...(typeof item["filename"] === "string" ? { filename: item["filename"] } : {}),
-      });
-    } else if (item["type"] === "file-url" || item["type"] === "image-url") {
-      candidate = inspectBinaryData({
-        value: item["url"],
-        kind: input.kind,
-        recordId: input.recordId,
-        path: `${path}.url`,
-        mediaType:
-          typeof item["mediaType"] === "string" ? item["mediaType"] : "application/octet-stream",
-        ...(typeof item["filename"] === "string" ? { filename: item["filename"] } : {}),
-      });
-    } else if (item["type"] === "blob") {
-      return fail({
-        kind: input.kind,
-        recordId: input.recordId,
-        field: path,
-        reason: "Schema-5 state contains a partially migrated blob reference",
-      });
+    switch (true) {
+      case item["type"] === "file":
+        candidate = inspectBinaryData({
+          value: item["data"],
+          kind: input.kind,
+          recordId: input.recordId,
+          path: `${path}.data`,
+          mediaType:
+            typeof item["mediaType"] === "string" ? item["mediaType"] : "application/octet-stream",
+          ...(typeof item["filename"] === "string" ? { filename: item["filename"] } : {}),
+        });
+        break;
+      case item["type"] === "file-data" || item["type"] === "image-data":
+        candidate = inspectBinaryData({
+          value: item["data"],
+          kind: input.kind,
+          recordId: input.recordId,
+          path: `${path}.data`,
+          mediaType:
+            typeof item["mediaType"] === "string" ? item["mediaType"] : "application/octet-stream",
+          ...(typeof item["filename"] === "string" ? { filename: item["filename"] } : {}),
+        });
+        break;
+      case item["type"] === "file-url" || item["type"] === "image-url":
+        candidate = inspectBinaryData({
+          value: item["url"],
+          kind: input.kind,
+          recordId: input.recordId,
+          path: `${path}.url`,
+          mediaType:
+            typeof item["mediaType"] === "string" ? item["mediaType"] : "application/octet-stream",
+          ...(typeof item["filename"] === "string" ? { filename: item["filename"] } : {}),
+        });
+        break;
+      case item["type"] === "blob":
+        return fail({
+          kind: input.kind,
+          recordId: input.recordId,
+          field: path,
+          reason: "Schema-5 state contains a partially migrated blob reference",
+        });
     }
     if (isDecodeFailure(candidate)) return candidate;
     if (candidate) input.blobs.push(candidate);
@@ -2123,7 +2135,7 @@ function decodeBinaryPayload(input: {
   LegacyTranscriptMigrationApplyFailed
 > {
   const value = input.value;
-  let bytes: Uint8Array | LegacyTranscriptDecodeFailure;
+  let bytes: Uint8Array | LegacyTranscriptDecodeFailure | undefined;
   let mediaType = input.mediaType;
   if (typeof value === "string") {
     if (/^https?:\/\//iu.test(value)) {
@@ -2149,17 +2161,23 @@ function decodeBinaryPayload(input: {
     }
     bytes = dataUrl?.bytes ?? strictBase64Bytes({ ...input, value });
     mediaType = dataUrl?.mediaType ?? mediaType;
-  } else if (value instanceof ArrayBuffer) {
+  }
+  if (value instanceof ArrayBuffer) {
     bytes = new Uint8Array(value);
-  } else if (ArrayBuffer.isView(value)) {
+  }
+  if (ArrayBuffer.isView(value)) {
     bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-  } else if (value instanceof URL) {
+  }
+  if (value instanceof URL) {
     return decodeBinaryPayload({ ...input, value: value.href });
-  } else if (isRecord(value) && value["type"] === "data") {
+  }
+  if (isRecord(value) && value["type"] === "data") {
     return decodeBinaryPayload({ ...input, value: value["data"] });
-  } else if (isRecord(value) && value["type"] === "url") {
+  }
+  if (isRecord(value) && value["type"] === "url") {
     return decodeBinaryPayload({ ...input, value: value["url"] });
-  } else {
+  }
+  if (bytes === undefined) {
     return Result.err(
       applyFailure({
         stage: "plan-validation",

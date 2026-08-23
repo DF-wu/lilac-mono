@@ -1650,33 +1650,32 @@ export async function startDiscordRequestRouter(
                 continueCount,
                 botMentionNames,
               });
-            } else {
-              return handleActiveChannelMode({
-                adapter,
-                bus,
-                cfg,
-                buffers,
-                sessionId,
-                msgRef,
-                ingressMessage,
-                userId: msg.data.userId,
-                userText: msg.data.text,
-                messageTs: msg.data.ts,
-                mentionsBot: flags.mentionsBot === true,
-                replyToBot: flags.replyToBot === true,
-                replyToMessageId: flags.replyToMessageId,
-                botUserId: flags.botUserId,
-                parentChannelId,
-                guildId: flags.guildId,
-                active,
-                sessionMode: mode,
-                sessionConfigId,
-                modelOverride,
-                requestModelOverride,
-                continueCount,
-                botMentionNames,
-              });
             }
+            return handleActiveChannelMode({
+              adapter,
+              bus,
+              cfg,
+              buffers,
+              sessionId,
+              msgRef,
+              ingressMessage,
+              userId: msg.data.userId,
+              userText: msg.data.text,
+              messageTs: msg.data.ts,
+              mentionsBot: flags.mentionsBot === true,
+              replyToBot: flags.replyToBot === true,
+              replyToMessageId: flags.replyToMessageId,
+              botUserId: flags.botUserId,
+              parentChannelId,
+              guildId: flags.guildId,
+              active,
+              sessionMode: mode,
+              sessionConfigId,
+              modelOverride,
+              requestModelOverride,
+              continueCount,
+              botMentionNames,
+            });
           }
 
           return handleMentionMode({
@@ -2905,23 +2904,22 @@ export async function startDiscordRequestRouter(
           sessionId,
           sourceRequestId: active.requestId,
         });
-      } else {
-        return enqueuePendingMentionReplyBatch({
-          sessionId,
-          sourceRequestId: active.requestId,
-          sessionConfigId: input.sessionConfigId,
-          parentChannelId,
-          sessionMode: input.sessionMode,
-          modelOverride: input.modelOverride,
-          item: {
-            msgRef,
-            ingressMessage,
-            requestModelOverride,
-            continueCount,
-            botMentionNames,
-          },
-        });
       }
+      return enqueuePendingMentionReplyBatch({
+        sessionId,
+        sourceRequestId: active.requestId,
+        sessionConfigId: input.sessionConfigId,
+        parentChannelId,
+        sessionMode: input.sessionMode,
+        modelOverride: input.modelOverride,
+        item: {
+          msgRef,
+          ingressMessage,
+          requestModelOverride,
+          continueCount,
+          botMentionNames,
+        },
+      });
     }
 
     if (!active) {

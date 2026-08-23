@@ -822,22 +822,27 @@ function outputText(output: unknown): {
       }
       const parts: string[] = [];
       for (const item of output["value"]) {
-        if (!isRecord(item) || typeof item["type"] !== "string") {
-          parts.push(toolOutputValueText(item));
-        } else if (item["type"] === "text" && typeof item["text"] === "string") {
-          parts.push(item["text"]);
-        } else if (item["type"].includes("file") || item["type"].startsWith("image")) {
-          parts.push(
-            fileDescription({
-              mediaType:
-                typeof item["mediaType"] === "string"
-                  ? item["mediaType"]
-                  : "application/octet-stream",
-              ...(typeof item["filename"] === "string" ? { filename: item["filename"] } : {}),
-            }),
-          );
-        } else if (item["type"] !== "custom") {
-          parts.push(toolOutputValueText(item));
+        switch (true) {
+          case !isRecord(item) || typeof item["type"] !== "string":
+            parts.push(toolOutputValueText(item));
+            break;
+          case item["type"] === "text" && typeof item["text"] === "string":
+            parts.push(item["text"]);
+            break;
+          case item["type"].includes("file") || item["type"].startsWith("image"):
+            parts.push(
+              fileDescription({
+                mediaType:
+                  typeof item["mediaType"] === "string"
+                    ? item["mediaType"]
+                    : "application/octet-stream",
+                ...(typeof item["filename"] === "string" ? { filename: item["filename"] } : {}),
+              }),
+            );
+            break;
+          case item["type"] !== "custom":
+            parts.push(toolOutputValueText(item));
+            break;
         }
       }
       return parts.length === 0
@@ -1021,60 +1026,75 @@ function lowerAssistantExchange(
     const part: unknown = rawPart;
     if (!isRecord(part) || typeof part["type"] !== "string") {
       addMalformedToolActivity(ensureActivityGroup(segments), {});
-    } else if (part["type"] === "text" && typeof part["text"] === "string") {
-      appendSegment(segments, { kind: "text", text: part["text"] });
-    } else if (part["type"] === "file") {
-      appendSegment(segments, {
-        kind: "text",
-        text: fileDescription({
-          mediaType: typeof part["mediaType"] === "string" ? part["mediaType"] : "image",
-          ...(typeof part["filename"] === "string" ? { filename: part["filename"] } : {}),
-        }),
-      });
-    } else if (part["type"] === "tool-call") {
-      const toolCallId = typeof part["toolCallId"] === "string" ? part["toolCallId"] : null;
-      if (toolCallId === null || typeof part["toolName"] !== "string") {
-        addMalformedToolActivity(ensureActivityGroup(segments), part);
-        continue;
+      continue;
+    }
+    switch (true) {
+      case part["type"] === "text" && typeof part["text"] === "string": {
+        appendSegment(segments, { kind: "text", text: part["text"] });
+        break;
       }
-      const activity: MutableActivity = {
-        toolCallId,
-        tool: part["toolName"],
-        ...(part["input"] === undefined ? {} : { input: part["input"] }),
-        outcome: "unknown",
-      };
-      ensureActivityGroup(segments).activities.push(activity);
-      const queue = pending.get(toolCallId) ?? [];
-      queue.push(activity);
-      pending.set(toolCallId, queue);
-    } else if (part["type"] === "tool-result") {
-      applyToolResultPart(ensureActivityGroup(segments), pending, part);
-    } else if (part["type"] === "tool-approval-request") {
-      const toolCallId = part["toolCallId"];
-      const queue = typeof toolCallId === "string" ? pending.get(toolCallId) : undefined;
-      const activity = queue?.[0];
-      const approvalId = part["approvalId"];
-      if (activity !== undefined && typeof approvalId === "string") {
-        approvals.set(approvalId, activity);
-      } else {
-        const orphan: MutableActivity = {
-          toolCallId: typeof toolCallId === "string" ? toolCallId : null,
-          tool: "unknown",
+      case part["type"] === "file": {
+        appendSegment(segments, {
+          kind: "text",
+          text: fileDescription({
+            mediaType: typeof part["mediaType"] === "string" ? part["mediaType"] : "image",
+            ...(typeof part["filename"] === "string" ? { filename: part["filename"] } : {}),
+          }),
+        });
+        break;
+      }
+      case part["type"] === "tool-call": {
+        const toolCallId = typeof part["toolCallId"] === "string" ? part["toolCallId"] : null;
+        if (toolCallId === null || typeof part["toolName"] !== "string") {
+          addMalformedToolActivity(ensureActivityGroup(segments), part);
+          continue;
+        }
+        const activity: MutableActivity = {
+          toolCallId,
+          tool: part["toolName"],
+          ...(part["input"] === undefined ? {} : { input: part["input"] }),
           outcome: "unknown",
         };
-        ensureActivityGroup(segments).activities.push(orphan);
-        if (typeof approvalId === "string") approvals.set(approvalId, orphan);
+        ensureActivityGroup(segments).activities.push(activity);
+        const queue = pending.get(toolCallId) ?? [];
+        queue.push(activity);
+        pending.set(toolCallId, queue);
+        break;
       }
-    } else if (part["type"] === "tool-approval-response") {
-      applyApprovalResponsePart(ensureActivityGroup(segments), approvals, part);
-    } else if (
-      part["type"].startsWith("tool-") ||
-      "toolCallId" in part ||
-      "approvalId" in part ||
-      "approved" in part ||
-      "output" in part
-    ) {
-      addMalformedToolActivity(ensureActivityGroup(segments), part);
+      case part["type"] === "tool-result": {
+        applyToolResultPart(ensureActivityGroup(segments), pending, part);
+        break;
+      }
+      case part["type"] === "tool-approval-request": {
+        const toolCallId = part["toolCallId"];
+        const queue = typeof toolCallId === "string" ? pending.get(toolCallId) : undefined;
+        const activity = queue?.[0];
+        const approvalId = part["approvalId"];
+        if (activity !== undefined && typeof approvalId === "string") {
+          approvals.set(approvalId, activity);
+        } else {
+          const orphan: MutableActivity = {
+            toolCallId: typeof toolCallId === "string" ? toolCallId : null,
+            tool: "unknown",
+            outcome: "unknown",
+          };
+          ensureActivityGroup(segments).activities.push(orphan);
+          if (typeof approvalId === "string") approvals.set(approvalId, orphan);
+        }
+        break;
+      }
+      case part["type"] === "tool-approval-response": {
+        applyApprovalResponsePart(ensureActivityGroup(segments), approvals, part);
+        break;
+      }
+      case (typeof part["type"] === "string" && part["type"].startsWith("tool-")) ||
+        "toolCallId" in part ||
+        "approvalId" in part ||
+        "approved" in part ||
+        "output" in part: {
+        addMalformedToolActivity(ensureActivityGroup(segments), part);
+        break;
+      }
     }
   }
 

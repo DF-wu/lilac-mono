@@ -30,9 +30,10 @@ These rules apply to all tasks. Use the linked documents for detailed rules and 
 - Handle terminal branches immediately with `return`. Handle loop-only branches immediately with
   `continue` or `break`. A branch, callback, or handler must not contain the remainder of the workflow.
 - Extract a named function when a branch needs multiple steps.
-- Keep a single guard as an `if`. When ordered branching would otherwise chain several predicates with
-  `&&` or `||` inside an `if`/`else` tree, use `switch (true)` with one decision per case. Name compound
-  predicates when that keeps each case to one idea, and make each case terminal or delegate it.
+- Keep a single guard or two-way branch as an `if`. When an `if`/`else if` chain has at least three
+  conditional arms and multiple arms group alternatives with `||`, use `switch (true)` with one decision
+  per case. Name compound predicates when that keeps each case to one idea, and make each case terminal or
+  delegate it.
 
 ## Repository Information
 
