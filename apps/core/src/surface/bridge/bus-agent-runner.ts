@@ -174,6 +174,7 @@ import type {
 import type { AcceptedRequestDelivery } from "./request-delivery/types";
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
+import { recordRequestLatencyStage } from "./request-latency-trace";
 import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
 import {
   formatToolLogPreview,
@@ -2986,6 +2987,15 @@ export async function startBusAgentRunner(params: {
   async function handleCmdRequestMessage(
     msg: CmdRequestMessage,
   ): Promise<ResultType<void, BusAgentRunnerDeliveryError>> {
+    const runnerReceivedAt = Date.now();
+    let requestId = msg.headers?.request_id;
+    let sessionId = msg.headers?.session_id;
+    let requestClient = msg.headers?.request_client ?? "unknown";
+    if (requestId && requestClient === "discord") {
+      recordRequestLatencyStage(requestId, "requestPublishedAt", msg.ts);
+      recordRequestLatencyStage(requestId, "runnerReceivedAt", runnerReceivedAt);
+    }
+
     if ((await runnerActivation) === "stopped") {
       return Result.err(
         new BusAgentRunnerRecoveryStopped({
@@ -2993,9 +3003,6 @@ export async function startBusAgentRunner(params: {
         }),
       );
     }
-    let requestId = msg.headers?.request_id;
-    let sessionId = msg.headers?.session_id;
-    let requestClient = msg.headers?.request_client ?? "unknown";
     const pendingAttempt = queueLifecycleAttempts.get(msg.id);
     if (
       pendingAttempt &&

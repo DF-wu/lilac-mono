@@ -330,6 +330,8 @@ describe("DiscordAdapter typing", () => {
     const config = testConfigWithStatusMessage();
     const typingStarted = Promise.withResolvers<void>();
     const typingRelease = Promise.withResolvers<void>();
+    const typingConfirmed = Promise.withResolvers<void>();
+    let confirmed = false;
     const adapter = createTestDiscordAdapter({ config });
     Object.assign(adapter, {
       client: {
@@ -345,14 +347,24 @@ describe("DiscordAdapter typing", () => {
       cfg: config,
     });
 
-    const started = await adapter.startTyping({ platform: "discord", channelId: "c1" });
+    const started = await adapter.startTyping(
+      { platform: "discord", channelId: "c1" },
+      {
+        onStarted: () => {
+          confirmed = true;
+          typingConfirmed.resolve();
+        },
+      },
+    );
     expect(started.status).toBe("ok");
     if (started.status === "error") throw started.error;
     await typingStarted.promise;
+    expect(confirmed).toBe(false);
 
     expect(await started.value.stop()).toEqual(Result.ok(undefined));
     typingRelease.resolve();
-    await typingRelease.promise;
+    await typingConfirmed.promise;
+    expect(confirmed).toBe(true);
   });
 
   it("reports a detached typing Panic to the fatal supervisor", async () => {

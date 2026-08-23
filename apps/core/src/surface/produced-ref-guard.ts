@@ -339,8 +339,8 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
     })();
   }
 
-  async startTyping(sessionRef: SessionRef) {
-    const started = await this.adapter.startTyping(sessionRef);
+  async startTyping(sessionRef: SessionRef, opts?: Parameters<SurfaceAdapter["startTyping"]>[1]) {
+    const started = await this.adapter.startTyping(sessionRef, opts);
     requireOperationResult(this.descriptorPlatform, started, "startTyping", sessionRef.channelId);
     return started.match<() => Awaited<ReturnType<SurfaceAdapter["startTyping"]>>>({
       err: (error) => () => Result.err(error),

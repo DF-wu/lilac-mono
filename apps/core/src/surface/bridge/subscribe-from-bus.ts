@@ -55,6 +55,10 @@ import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import { adaptToolResultToHost } from "../../tools/tool-result-adapters";
 import { formatBridgeTaggedErrorForLog } from "./bridge-log";
 import {
+  finishDiscordMessageLatencyTrace,
+  recordRequestLatencyStage,
+} from "./request-latency-trace";
+import {
   materializeSurfaceOutputAttachment,
   type SurfaceOutputBlobMaterializationFailed,
 } from "./generated-output-materialization";
@@ -903,6 +907,11 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
           messageType: msg.type,
         });
         return Result.ok(undefined);
+      }
+
+      if (requestClient === "discord") {
+        recordRequestLatencyStage(requestId, "replyPublishedAt", msg.ts);
+        recordRequestLatencyStage(requestId, "relayReceivedAt");
       }
 
       if (env.perf.log) {
@@ -2053,8 +2062,22 @@ export async function bridgeBusToAdapter<P extends RegisteredSurfacePlatform>(pa
     async function startTyping(): Promise<void> {
       if (typing || typingAttempted) return;
       typingAttempted = true;
+      recordRequestLatencyStage(requestId, "typingRequestedAt");
       const captured = await captureBusToAdapterEffect("start-typing", () =>
-        adapter.startTyping(sessionRef),
+        adapter.startTyping(sessionRef, {
+          onStarted: () => {
+            const timing = finishDiscordMessageLatencyTrace(requestId);
+            if (!timing || !env.perf.log) return;
+
+            const shouldWarn = timing.totalMs >= env.perf.lagWarnMs;
+            const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
+            if (shouldWarn) {
+              logger.warn("perf.discord_message_to_typing", timing);
+              return;
+            }
+            if (shouldSample) logger.info("perf.discord_message_to_typing", timing);
+          },
+        }),
       );
       const capturedError = captured.match({ ok: () => null, err: (error) => error });
       if (capturedError) {

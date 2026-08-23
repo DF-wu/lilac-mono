@@ -43,6 +43,7 @@ import {
 } from "../bridge/request-composition";
 import { deleteDiscordRequestBlobHandles } from "../bridge/request-composition/attachments";
 import { formatDiscordMessageRequestId } from "../bridge/request-ids";
+import { recordRequestLatencyStage } from "../bridge/request-latency-trace";
 
 import {
   type SessionMode,
@@ -1290,6 +1291,13 @@ export async function startDiscordRequestRouter(
         if (msg.data.platform !== "discord") {
           return Result.ok(undefined);
         }
+
+        const latencyRequestId = formatDiscordMessageRequestId({
+          channelId: msg.data.channelId,
+          messageId: msg.data.messageId,
+        });
+        recordRequestLatencyStage(latencyRequestId, "adapterEventPublishedAt", msg.ts);
+        recordRequestLatencyStage(latencyRequestId, "routerReceivedAt");
 
         return captureRouterRouting("evt.adapter", async () => {
           if (env.perf.log) {

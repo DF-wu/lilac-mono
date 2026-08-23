@@ -70,6 +70,7 @@ import {
   type SurfaceReplyChainPlanOptions,
   type SurfaceSendPreparationInput,
   type StartOutputOpts,
+  type StartTypingOpts,
   type SurfaceAdapter,
 } from "../adapter";
 import { settleSurfaceFallback, type SurfaceFallbackCapture } from "../adapter";
@@ -191,6 +192,7 @@ export function classifyDiscordSurfaceNotFound(
 }
 import { buildDiscordSessionDividerText } from "./discord-session-divider";
 import { formatDiscordMessageRequestId, formatDiscordSlashRequestId } from "../bridge/request-ids";
+import { beginDiscordMessageLatencyTrace } from "../bridge/request-latency-trace";
 import {
   isExplicitDiscordUserMention,
   isRoutableDiscordUserMessage,
@@ -892,7 +894,8 @@ export class DiscordAdapter implements SurfaceAdapter {
     });
 
     client.on("messageCreate", (msg) => {
-      this.superviseDiscordCallback("messageCreate", () => this.onMessageCreate(msg));
+      const receivedAt = Date.now();
+      this.superviseDiscordCallback("messageCreate", () => this.onMessageCreate(msg, receivedAt));
     });
 
     client.on("messageUpdate", (_old, next) => {
@@ -1313,6 +1316,7 @@ export class DiscordAdapter implements SurfaceAdapter {
 
   async startTyping(
     sessionRef: SessionRef,
+    opts?: StartTypingOpts,
   ): Promise<SurfaceOperationResult<import("../adapter").TypingIndicatorSubscription>> {
     const refResult = discordSessionRefResult("start-typing", sessionRef);
     const refError = refResult.match({ ok: () => null, err: (error) => error });
@@ -1405,6 +1409,7 @@ export class DiscordAdapter implements SurfaceAdapter {
         );
         return;
       }
+      opts?.onStarted?.();
       if (stopped) return;
       timer = setInterval(() => {
         this.superviseDiscordCallback("typing-indicator", tick);
@@ -3726,7 +3731,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     });
   }
 
-  private async onMessageCreate(msg: Message | PartialMessage) {
+  private async onMessageCreate(msg: Message | PartialMessage, receivedAt: number = Date.now()) {
     if (msg.partial) {
       const fetched = settleSurfaceFallback(
         await Result.tryPromise({
@@ -3736,7 +3741,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       );
       const full = selectResultValueOr(fetched, null);
       if (!full) return;
-      await this.onMessageCreate(full);
+      await this.onMessageCreate(full, receivedAt);
       return;
     }
 
@@ -3762,6 +3767,15 @@ export class DiscordAdapter implements SurfaceAdapter {
         userId: msg.author.id,
       });
       return;
+    }
+
+    if (shouldEmitAdapterEvent) {
+      beginDiscordMessageLatencyTrace({
+        requestId: formatDiscordMessageRequestId({ channelId, messageId: msg.id }),
+        sessionId: channelId,
+        messageId: msg.id,
+        receivedAt,
+      });
     }
 
     this.upsertMessageRelationFromDiscordMessage(msg);

@@ -237,6 +237,11 @@ export interface SurfaceAdapterEventSource {
   subscribe(handler: AdapterEventHandler): Promise<AdapterSubscription>;
 }
 
+export type StartTypingOpts = {
+  /** Called after the surface confirms the first typing indicator request. */
+  onStarted?: () => void;
+};
+
 export interface SurfaceAdapter {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
@@ -252,7 +257,10 @@ export interface SurfaceAdapter {
     sessionRef: SessionRef,
     opts?: StartOutputOpts,
   ): Promise<SurfaceOperationResult<SurfaceOutputStream>>;
-  startTyping(sessionRef: SessionRef): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
+  startTyping(
+    sessionRef: SessionRef,
+    opts?: StartTypingOpts,
+  ): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
 
   prepareSendMsg(
     sessionRef: SessionRef,
