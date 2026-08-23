@@ -23,6 +23,10 @@ ruleTester.run("lilac/no-fixed-test-wait", noFixedTestWaitRule, {
       code: "await Bun.sleep(5);",
       errors: [{ message: /fixed Bun\.sleep progression delay/u, line: 1, column: 6 }],
     },
+    {
+      code: "// test-wait-justification: event-loop yield\nawait Bun.sleep(0);",
+      errors: [{ message: /zero-duration progression timers cannot be justified/u, line: 2 }],
+    },
   ],
 });
 

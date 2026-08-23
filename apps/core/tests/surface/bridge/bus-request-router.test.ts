@@ -1665,9 +1665,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     const evt = received[0];
     expect(evt.data.queue).toBe("prompt");
@@ -1819,9 +1816,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
     expect(received[0].data.corePrimaryLineage).toEqual({
@@ -1919,9 +1913,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
     expect(received[0].headers?.session_id).toBe(sessionId);
@@ -2015,9 +2006,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: false, mentionsBot: true, replyToBot: false },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(0);
 
@@ -3612,9 +3600,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(collectUserText(received[0].data.messages as ModelMessage[])).toContain("tell me more");
     expect(collectUserText(received[0].data.messages as ModelMessage[])).not.toContain("!cont=");
@@ -3924,9 +3909,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(0);
     expect(gateInput).not.toBeNull();
     expect(gateInput.context?.mode).toBe("direct-reply-mention-disambiguation");
@@ -4038,9 +4020,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
     expect(received[0].headers?.request_id).toBe(`queued:${requestId}`);
@@ -4148,9 +4127,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: true, mentionsBot: false, replyToBot: false },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("followUp");
@@ -4318,9 +4294,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(3);
     expect(received.map((m) => m.data.queue)).toEqual(["prompt", "prompt", "steer"]);
     expect(received[0].headers?.request_id).toBe(`queued:${activeRequestId}`);
@@ -4472,9 +4445,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: false, mentionsBot: true, replyToBot: false },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(2);
     expect(received[0].data.queue).toBe("prompt");
@@ -4643,9 +4613,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: false, mentionsBot: true, replyToBot: false },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(2);
     expect(received[0].data.queue).toBe("prompt");
@@ -5656,9 +5623,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(2);
     expect(received[0].data.queue).toBe("followUp");
     expect(received[0].headers?.request_id).toBe(requestId);
@@ -5793,9 +5757,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: false, mentionsBot: true, replyToBot: false },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("interrupt");
@@ -5951,9 +5912,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("interrupt");
@@ -6119,9 +6077,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("interrupt");
     expect(received[0].headers?.request_id).toBe(requestId);
@@ -6263,9 +6218,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
     expect(received[0].headers?.request_id).toBe(`discord:${sessionId}:${msgMention}`);
@@ -6401,8 +6353,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(0);
 
     await bus.publish(
@@ -6416,9 +6366,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     );
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -6585,8 +6532,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(0);
 
     await bus.publish(
@@ -6600,9 +6545,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     );
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -7359,9 +7301,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(3);
     expect(received.map((m) => m.data.queue)).toEqual(["steer", "followUp", "followUp"]);
     expect(received.map((m) => m.headers?.request_id)).toEqual([
@@ -7393,8 +7332,6 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(3);
 
     await subSurface.stop();
@@ -7574,9 +7511,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(2);
     expect(received[0].data.queue).toBe("interrupt");
     expect(received[1].data.queue).toBe("followUp");
@@ -7603,8 +7537,6 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(2);
 
     await subSurface.stop();
@@ -7695,9 +7627,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe("sonnet");
@@ -7791,9 +7720,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe(oneShot);
@@ -7891,9 +7817,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe(oneShot);
@@ -7994,9 +7917,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe("sonnet");
 
@@ -8092,9 +8012,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe("sonnet");
@@ -8274,9 +8191,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(4);
     expect(received[0].data.modelOverride).toBe("one-shot");

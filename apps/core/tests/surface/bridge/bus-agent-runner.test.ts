@@ -1880,6 +1880,9 @@ describe("agent run activity", () => {
     );
     if (subResult.status === "error") throw subResult.error;
     const sub = subResult.value;
+    const firstPublished = Promise.withResolvers<void>();
+    const secondPublished = Promise.withResolvers<void>();
+    let publishCount = 0;
     const publishActivity = createAgentOutputActivityPublisher({
       publish: async (source) => {
         await bus.publish(
@@ -1887,21 +1890,28 @@ describe("agent run activity", () => {
           { source },
           { headers: { request_id: requestId } },
         );
+        publishCount += 1;
+        if (publishCount === 1) firstPublished.resolve();
+        if (publishCount === 2) secondPublished.resolve();
       },
       intervalMs: 25,
     });
 
-    publishActivity("model");
-    publishActivity("tool");
-    // test-wait-justification: crosses the activity publisher's real throttle interval before the next publish
-    await Bun.sleep(30);
-    publishActivity("subagent");
-    // test-wait-justification: drains the throttled activity publication through the in-memory bus subscriber
-    await Bun.sleep(0);
+    jest.useFakeTimers({ now: 0 });
+    try {
+      publishActivity("model");
+      publishActivity("tool");
+      await firstPublished.promise;
+      jest.advanceTimersByTime(25);
+      publishActivity("subagent");
+      await secondPublished.promise;
 
-    expect(sources).toEqual(["model", "subagent"]);
-    const stopped = await sub.stop();
-    if (stopped.status === "error") throw stopped.error;
+      expect(sources).toEqual(["model", "subagent"]);
+      const stopped = await sub.stop();
+      if (stopped.status === "error") throw stopped.error;
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 

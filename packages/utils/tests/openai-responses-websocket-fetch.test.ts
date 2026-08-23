@@ -19,6 +19,7 @@ class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
   static openOnConstruct = true;
   static onConstruct: (() => void) | undefined;
+  static onSend: (() => void) | undefined;
 
   readonly url: string;
   readonly init?: WebSocketInit;
@@ -44,6 +45,7 @@ class FakeWebSocket {
     FakeWebSocket.instances.length = 0;
     FakeWebSocket.openOnConstruct = true;
     FakeWebSocket.onConstruct = undefined;
+    FakeWebSocket.onSend = undefined;
   }
 
   addEventListener(type: string, listener: (event: Event) => void): void {
@@ -60,6 +62,7 @@ class FakeWebSocket {
 
   send(data: string): void {
     this.sent.push(data);
+    FakeWebSocket.onSend?.();
   }
 
   close(): void {
@@ -418,6 +421,8 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
 
     const wsFetch = createOpenAIResponsesWebSocketFetch({ mode: "websocket" });
     const openai = createOpenAI({ apiKey: "test-token", fetch: wsFetch });
+    const requestSent = Promise.withResolvers<void>();
+    FakeWebSocket.onSend = requestSent.resolve;
 
     const result = streamText({
       model: openai.responses("gpt-5-mini"),
@@ -438,8 +443,7 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
       })(),
     );
 
-    // test-wait-justification: lets stream consumption create the fake websocket before injecting its error event
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await requestSent.promise;
 
     const socket = FakeWebSocket.instances[0];
     expect(socket).toBeDefined();

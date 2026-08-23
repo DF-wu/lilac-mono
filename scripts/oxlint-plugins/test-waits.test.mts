@@ -121,6 +121,25 @@ describe("test wait policy", () => {
     expect(violations.map((violation) => violation.line)).toEqual([5, 8]);
   });
 
+  it("never accepts a justification for zero-duration progression timers", () => {
+    const violations = findTestWaitViolations(`
+      import { setTimeout as delay } from "node:timers/promises";
+      // test-wait-justification: a zero timer used to be accepted as an event-loop yield
+      await Bun.sleep(0);
+      // test-wait-justification: a callback timer is still a zero-duration progression wait
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // test-wait-justification: promise timers have the same scheduling race
+      await delay(0);
+    `);
+
+    expect(violations).toHaveLength(3);
+    expect(violations.map((violation) => violation.message)).toEqual([
+      expect.stringContaining("cannot be justified"),
+      expect.stringContaining("cannot be justified"),
+      expect.stringContaining("cannot be justified"),
+    ]);
+  });
+
   it("does not flag rejection guards, abort timers, dynamic waits, or fixture text", () => {
     const violations = findTestWaitViolations(`
       await Promise.race([

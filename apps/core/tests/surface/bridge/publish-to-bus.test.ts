@@ -280,16 +280,13 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       transcriptStore,
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.message.deleted",
       platform: "discord",
       ts: Date.now(),
       messageRef: { platform: "discord", channelId: "chan", messageId: "m1" },
       session: { platform: "discord", channelId: "chan" },
     });
-    // test-wait-justification: drains the adapter event listener and transcript unlink callback triggered above
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
     expect(unlinked).toEqual([{ platform: "discord", channelId: "chan", messageId: "m1" }]);
   });
 
@@ -333,16 +330,13 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       transcriptStore,
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.message.deleted",
       platform: "discord",
       ts: Date.now(),
       messageRef: { platform: "discord", channelId: "chan", messageId: "m1" },
       session: { platform: "discord", channelId: "chan" },
     });
-    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
     expect(publishedTypes).toContain(lilacEventTypes.EvtAdapterMessageDeleted);
     const stopped = await evtSub.stop();
     if (stopped.status === "error") throw stopped.error;
@@ -387,14 +381,14 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       raw: { discord: { mentionsBot: false } },
     };
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.message.created",
       platform: "discord",
       ts: Date.now(),
       message,
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.message.updated",
       platform: "discord",
       ts: Date.now(),
@@ -404,7 +398,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       },
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.message.deleted",
       platform: "discord",
       ts: Date.now(),
@@ -413,7 +407,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       raw: { reason: "deleted" },
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.reaction.added",
       platform: "discord",
       ts: Date.now(),
@@ -424,7 +418,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       userName: "bob",
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.reaction.removed",
       platform: "discord",
       ts: Date.now(),
@@ -434,9 +428,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       userId: "u2",
       userName: "bob",
     });
-
-    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(published.map((m) => m.type)).toEqual([
       lilacEventTypes.EvtAdapterMessageCreated,
@@ -503,7 +494,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     if (subResult.status === "error") throw subResult.error;
     const sub = subResult.value;
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.request.cancel",
       platform: "discord",
       ts: Date.now(),
@@ -511,9 +502,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       sessionId: "chan",
       cancelScope: "active_only",
     });
-
-    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(published.length).toBe(1);
     const msg = published[0]!;
@@ -562,7 +550,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     if (subResult.status === "error") throw subResult.error;
     const sub = subResult.value;
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.request.cancel",
       platform: "discord",
       ts: Date.now(),
@@ -572,9 +560,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       userId: "u1",
       messageId: "m2",
     });
-
-    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(published.length).toBe(1);
     const msg = published[0]!;
@@ -625,7 +610,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     if (subResult.status === "error") throw subResult.error;
     const sub = subResult.value;
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.command.invoked",
       platform: "discord",
       ts: 1_234,
@@ -640,9 +625,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       sessionMode: "mention",
       sessionConfigId: "chan",
     });
-
-    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(published.length).toBe(1);
     const msg = published[0]!;

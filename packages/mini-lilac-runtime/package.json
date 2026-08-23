@@ -8,7 +8,8 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "bun test --parallel=4",
+    "test": "bun test --parallel=4 --timings=test-timings.json",
+    "test:update-timings": "bun test --parallel=4 --timings=test-timings.json --update-timings",
     "typecheck": "bunx tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

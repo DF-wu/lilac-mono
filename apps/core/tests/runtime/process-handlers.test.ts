@@ -101,6 +101,7 @@ describe("createProcessHandlers", () => {
 
   it("treats uncaught exceptions as fatal and exits after stop", async () => {
     const exitCalls: number[] = [];
+    const exited = Promise.withResolvers<void>();
     let stopCalls = 0;
     const exitCodeHooks = createExitCodeHooks();
     const handlers = createProcessHandlers({
@@ -112,13 +113,13 @@ describe("createProcessHandlers", () => {
       setExitCode: exitCodeHooks.setExitCode,
       exit: ((code: number) => {
         exitCalls.push(code);
+        exited.resolve();
         return undefined as never;
       }) as (code: number) => never,
     });
 
     handlers.handleUncaughtException(new Error("fatal"));
-    // test-wait-justification: yields until the fatal handler's asynchronous stop and exit sequence completes
-    await Bun.sleep(0);
+    await exited.promise;
 
     expect(stopCalls).toBe(1);
     expect(exitCalls).toEqual([1]);
@@ -158,9 +159,11 @@ describe("createProcessHandlers", () => {
     const stopPromise = new Promise<void>((resolve) => {
       resolveStop = () => resolve();
     });
+    const stopEntered = Promise.withResolvers<void>();
     const handlers = createProcessHandlers({
       logger: createLoggerStub(),
       stop: async () => {
+        stopEntered.resolve();
         await stopPromise;
       },
       getExitCode: exitCodeHooks.getExitCode,
@@ -171,15 +174,13 @@ describe("createProcessHandlers", () => {
       }) as (code: number) => never,
     });
 
-    void handlers.handleSignal("SIGTERM");
+    const shutdown = handlers.handleSignal("SIGTERM");
+    await stopEntered.promise;
     handlers.handleUncaughtException(new Error("fatal during shutdown"));
-    // test-wait-justification: yields until the concurrently started signal shutdown enters its pending stop
-    await Bun.sleep(0);
 
     expect(exitCalls).toEqual([1]);
 
     resolveStop();
-    // test-wait-justification: drains the released asynchronous shutdown before the test returns
-    await Bun.sleep(0);
+    await shutdown;
   });
 });

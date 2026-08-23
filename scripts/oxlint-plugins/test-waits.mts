@@ -304,10 +304,17 @@ function hasNonnegativeFixedArgument(
   index: number,
   aliases: AliasSets,
 ): boolean {
-  const argument = call.arguments[index];
-  if (!argument) return false;
-  const value = evaluateFixedNumber(argument, aliases.fixedNumbers);
+  const value = fixedArgumentValue(call, index, aliases);
   return value !== undefined && Number.isFinite(value) && value >= 0;
+}
+
+function fixedArgumentValue(
+  call: ts.CallExpression,
+  index: number,
+  aliases: AliasSets,
+): number | undefined {
+  const argument = call.arguments[index];
+  return argument ? evaluateFixedNumber(argument, aliases.fixedNumbers) : undefined;
 }
 
 function calledName(expression: ts.Expression): string | undefined {
@@ -454,6 +461,17 @@ function promiseUsesFixedResolvingTimeout(
   });
 }
 
+function promiseUsesZeroResolvingTimeout(
+  expression: ts.NewExpression,
+  aliases: AliasSets,
+): boolean {
+  return promiseUsesResolvingTimeout(
+    expression,
+    aliases,
+    (duration) => evaluateFixedNumber(duration, aliases.fixedNumbers) === 0,
+  );
+}
+
 function isWithResolversCallback(expression: ts.Expression, aliases: AliasSets): boolean {
   if (ts.isIdentifier(expression)) return aliases.withResolversCallbacks.has(expression.text);
   const parts = propertyAccessParts(expression);
@@ -594,9 +612,15 @@ export function findTestWaitViolations(
   const violations: TestWaitViolation[] = [];
   const reportedStatements = new Set<number>();
 
-  const report = (node: ts.Node, kind: TestWaitKind, description: string): void => {
+  const report = (
+    node: ts.Node,
+    kind: TestWaitKind,
+    description: string,
+    allowJustification: boolean,
+  ): void => {
     const statement = containingStatement(node);
-    if (!statement || hasAdjacentJustification(statement, sourceFile)) return;
+    if (!statement) return;
+    if (allowJustification && hasAdjacentJustification(statement, sourceFile)) return;
     const statementStart = statement.getStart(sourceFile);
     if (reportedStatements.has(statementStart)) return;
     reportedStatements.add(statementStart);
@@ -606,7 +630,9 @@ export function findTestWaitViolations(
       line: location.line + 1,
       column: location.character + 1,
       kind,
-      message: `${description}; add an immediately preceding // ${JUSTIFICATION_PREFIX} <specific reason> comment`,
+      message: allowJustification
+        ? `${description}; add an immediately preceding // ${JUSTIFICATION_PREFIX} <specific reason> comment`
+        : `${description}; zero-duration progression timers cannot be justified, await an observable completion signal instead`,
     });
   };
 
@@ -617,13 +643,23 @@ export function findTestWaitViolations(
         hasNonnegativeFixedArgument(node, 0, aliases) &&
         !isRejectionOrAbortGuard(node)
       ) {
-        report(node, "bun-sleep", "fixed Bun.sleep progression delay");
+        report(
+          node,
+          "bun-sleep",
+          "fixed Bun.sleep progression delay",
+          fixedArgumentValue(node, 0, aliases) !== 0,
+        );
       } else if (
         isPromiseTimerCall(node, aliases) &&
         hasNonnegativeFixedArgument(node, 0, aliases) &&
         !isRejectionOrAbortGuard(node)
       ) {
-        report(node, "node-timer-promise", "fixed node:timers/promises progression delay");
+        report(
+          node,
+          "node-timer-promise",
+          "fixed node:timers/promises progression delay",
+          fixedArgumentValue(node, 0, aliases) !== 0,
+        );
       } else {
         const wrapper = ts.isIdentifier(node.expression)
           ? aliases.localWaitWrappers.get(node.expression.text)
@@ -633,18 +669,33 @@ export function findTestWaitViolations(
           hasNonnegativeFixedArgument(node, wrapper.durationParameterIndex, aliases) &&
           !isRejectionOrAbortGuard(node)
         ) {
-          report(node, wrapper.kind, "fixed local sleep/wait wrapper progression delay");
+          report(
+            node,
+            wrapper.kind,
+            "fixed local sleep/wait wrapper progression delay",
+            fixedArgumentValue(node, wrapper.durationParameterIndex, aliases) !== 0,
+          );
         } else if (
           isCallbackTimerCall(node, aliases) &&
           node.arguments[0] &&
           timerCallbackUsesWithResolvers(node.arguments[0], aliases) &&
           hasNonnegativeFixedArgument(node, 1, aliases)
         ) {
-          report(node, "promise-timeout", "fixed setTimeout-backed Promise progression delay");
+          report(
+            node,
+            "promise-timeout",
+            "fixed setTimeout-backed Promise progression delay",
+            fixedArgumentValue(node, 1, aliases) !== 0,
+          );
         }
       }
     } else if (ts.isNewExpression(node) && promiseUsesFixedResolvingTimeout(node, aliases)) {
-      report(node, "promise-timeout", "fixed setTimeout-backed Promise progression delay");
+      report(
+        node,
+        "promise-timeout",
+        "fixed setTimeout-backed Promise progression delay",
+        !promiseUsesZeroResolvingTimeout(node, aliases),
+      );
     }
     ts.forEachChild(node, visit);
   };

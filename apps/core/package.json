@@ -11,7 +11,8 @@
     "bench:blob-storage": "bun scripts/bench-blob-storage.ts",
     "bench:fs-search": "bun scripts/bench-fs-search.ts",
     "build:remote-runner": "bun run build-remote-runner.ts",
-    "test": "bun run build:remote-runner && bun test --parallel=${CORE_TEST_PARALLEL:-16}"
+    "test": "bun run build:remote-runner && bun test --parallel=${CORE_TEST_PARALLEL:-16} --timings=test-timings.json",
+    "test:update-timings": "bun run build:remote-runner && bun test --parallel=${CORE_TEST_PARALLEL:-16} --timings=test-timings.json --update-timings"
   },
   "devDependencies": {
     "@types/bun": "^1.4.0",
