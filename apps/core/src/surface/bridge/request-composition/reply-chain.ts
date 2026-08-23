@@ -357,10 +357,6 @@ export async function fetchReplyChainFrom(
         ok: (resolvedGroups) => {
           const flattened = resolvedGroups.flat();
           if (flattened.length === 0) return null;
-          flattened.sort((a, b) => {
-            if (a.ts !== b.ts) return a.ts - b.ts;
-            return compareDiscordSnowflakeLike(a.ref.messageId, b.ref.messageId);
-          });
           return Result.ok(dedupeByMessageId(flattened.map((m) => toReplyChainMessage(m))));
         },
       });

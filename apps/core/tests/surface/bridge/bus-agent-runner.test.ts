@@ -176,6 +176,7 @@ import {
   type CoreAcceptedRequestWork,
 } from "../../../src/surface/bridge/request-delivery";
 import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
+import { normalizeDiscordRaw } from "../../../src/surface/discord/discord-raw-normalizer";
 import { getTestBlobStore } from "../../helpers/blob-store";
 import { getBuiltinSurfaceProtocol } from "../../../src/surface/builtin-surface-protocols";
 import type {
@@ -2466,6 +2467,25 @@ class ProductionPathDiscordAdapter extends SurfaceAdapterTestBase {
   }
   async getReplyContext(): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
     return Result.ok([]);
+  }
+  override async planReplyChain(
+    msgRef: MsgRef,
+  ): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
+    const refs: MsgRef[] = [];
+    const seen = new Set<string>();
+    let cursor = msgRef;
+
+    while (!seen.has(cursor.messageId)) {
+      seen.add(cursor.messageId);
+      refs.push(cursor);
+      const reply = normalizeDiscordRaw(this.messages.get(cursor.messageId)?.raw)?.replyReference;
+      if (!reply?.messageId) break;
+      const channelId = reply.channelId ?? cursor.channelId;
+      if (channelId !== msgRef.channelId) break;
+      cursor = { platform: "discord", channelId, messageId: reply.messageId };
+    }
+
+    return Result.ok(refs.reverse());
   }
   async addReaction(): Promise<SurfaceOperationResult<void>> {
     return Result.ok(undefined);

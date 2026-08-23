@@ -49,6 +49,7 @@ These rules apply to all tasks. Use the linked documents for detailed rules and 
 
 - Use focused tests and the typecheck for each changed workspace.
 - Run architecture checks when the change is in code that these checks control.
-- Run full repository checks only for broad changes, the final plan check, or a user request.
+- Run `bun run check` at least once against the final changes before every commit. Also run full
+  repository checks for broad changes, the final plan check, or a user request.
 - Do not use fixed waits to synchronize tests. Follow the `lilac/no-fixed-test-wait` rule.
 - Commit or create a pull request only when the user requests it.
