@@ -13,6 +13,11 @@ import type {
   JSONValue,
   UniversalCoreConfig,
 } from "./types";
+import {
+  DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
+} from "./types";
 
 export const jsonValueSchema: z.ZodType<JSONValue> = z.lazy(() =>
   z.union([
@@ -753,6 +758,9 @@ function coreConfigV1ToUniversal(
       ...parsed.surface,
       discord: {
         ...discordRest,
+        attachmentCache: {
+          ttlMs: { kind: "bounded", value: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
+        },
         outputPreviewModeFinalStyle: previewFinalOutputStyle,
         markdownTableRender: experimental.markdownTableRender,
         markdownMathRender: {
@@ -766,6 +774,13 @@ function coreConfigV1ToUniversal(
       ...agentRest,
       systemPrompt: "",
       idleTimeoutMs: 15 * 60 * 1000,
+      transcriptRetention: {
+        maxAgeMs: { kind: "bounded", value: DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS },
+        maxRequests: {
+          kind: "bounded",
+          value: DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
+        },
+      },
       retry: { ...DEFAULT_AGENT_RETRY },
       subagents: {
         enabled: subagents.enabled,

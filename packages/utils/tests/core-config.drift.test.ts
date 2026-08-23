@@ -95,6 +95,10 @@ describe("core config drift coverage", () => {
     expect(cfg.surface.discord.outputMode).toBe("preview");
     expect(cfg.surface.discord.outputPreviewModeFinalStyle).toBe("plain");
     expect(cfg.surface.discord.outputNotification).toBe(true);
+    expect(cfg.surface.discord.attachmentCache.ttlMs).toEqual({
+      kind: "bounded",
+      value: 30 * 24 * 60 * 60 * 1000,
+    });
     expect(cfg.surface.discord.markdownTableRender).toEqual({
       enabled: true,
       style: "unicode",
@@ -108,6 +112,10 @@ describe("core config drift coverage", () => {
     });
     expect(cfg.agent.reasoningDisplay).toBe("detailed");
     expect(cfg.agent.idleTimeoutMs).toBe(15 * 60 * 1000);
+    expect(cfg.agent.transcriptRetention).toEqual({
+      maxAgeMs: { kind: "bounded", value: 180 * 24 * 60 * 60 * 1000 },
+      maxRequests: { kind: "bounded", value: 10_000 },
+    });
     expect(cfg.agent.subagents.profiles.explore.execution).toBe("restricted");
     expect(cfg.agent.subagents.profiles.general.execution).toBe("native");
     expect(cfg.agent.subagents.profiles.self.execution).toBe("native");

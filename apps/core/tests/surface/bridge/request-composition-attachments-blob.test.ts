@@ -12,12 +12,12 @@ import type {
   BlobUpload,
 } from "@stanley2058/lilac-blob-storage";
 import { BlobInvalidReference } from "@stanley2058/lilac-blob-storage";
+import { DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS } from "@stanley2058/lilac-utils";
 
 import {
   appendDiscordAttachmentsToBusContent,
   appendDiscordAttachmentsToStoredContent,
   createDiscordAttachmentState,
-  DISCORD_ATTACHMENT_CACHE_TTL_MS,
   getDiscordRequestBlobHandles,
   takeDiscordCurrentBlobReferences,
   type DiscordBusUserContentPart,
@@ -268,7 +268,7 @@ describe("Discord request attachment blob composition", () => {
     expect(blobs.deleted).toEqual([blobs.uploads[0]!.upload.handle]);
   });
 
-  it("publishes a durable handle after reservations and fills the 24-hour cache asynchronously", async () => {
+  it("publishes a durable handle after reservations and fills the default cache asynchronously", async () => {
     globalThis.fetch = (async () =>
       new Response(new Uint8Array([1, 2, 3, 4, 5]), {
         headers: { "content-type": "image/png" },
@@ -309,12 +309,12 @@ describe("Discord request attachment blob composition", () => {
     expect(getDiscordRequestBlobHandles(state)).toEqual([blobs.uploads[0]!.upload.handle]);
     expect(blobs.uploads.map((upload) => upload.retention)).toEqual([
       { kind: "durable" },
-      { kind: "expires", expiresAt: 1_000 + DISCORD_ATTACHMENT_CACHE_TTL_MS },
+      { kind: "expires", expiresAt: 1_000 + DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
     ]);
     expect(cache.entries.size).toBe(0);
 
     const completedCacheRef = blobRef(20, {
-      expiresAt: 1_000 + DISCORD_ATTACHMENT_CACHE_TTL_MS,
+      expiresAt: 1_000 + DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
     });
     blobs.uploads[1]!.complete(completedCacheRef);
     await Promise.resolve();
@@ -323,6 +323,40 @@ describe("Discord request attachment blob composition", () => {
       blob: completedCacheRef,
       cachedAt: 1_000,
     });
+  });
+
+  it("stores new cache entries durably when retention is unlimited", async () => {
+    globalThis.fetch = (async () =>
+      new Response(new Uint8Array([1, 2, 3, 4, 5]), {
+        headers: { "content-type": "image/png" },
+      })) as unknown as typeof fetch;
+    const cache = createCache();
+    const blobs = createBlobStore({});
+    const state = createDiscordAttachmentState({
+      blobStore: blobs.store,
+      attachmentCache: cache.access,
+      attachmentCacheTtl: { kind: "unlimited" },
+      now: () => 1_000,
+    });
+
+    const appended = await appendDiscordAttachmentsToBusContent(
+      [],
+      [
+        {
+          id: "a1",
+          url: "https://cdn.discordapp.com/attachments/1/2/image.png",
+          mimeType: "image/png",
+        },
+      ],
+      state,
+      { channelId: "c1", messageId: "m1" },
+    );
+
+    expect(appended.status).toBe("ok");
+    expect(blobs.uploads.map((upload) => upload.retention)).toEqual([
+      { kind: "durable" },
+      { kind: "durable" },
+    ]);
   });
 
   it("trusts downloaded bytes over conflicting Discord type and size metadata", async () => {
@@ -524,6 +558,42 @@ describe("Discord request attachment blob composition", () => {
     expect(cache.cleared).toEqual([cachedRef]);
     expect(blobs.deleted).toEqual([cachedRef]);
     expect(blobs.uploads.map((upload) => upload.retention.kind)).toEqual(["durable", "expires"]);
+  });
+
+  it("clears a durable entry after a newly configured finite TTL elapses", async () => {
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return new Response(new Uint8Array([1, 2, 3, 4, 5]));
+    }) as unknown as typeof fetch;
+    const cachedRef = blobRef(1, { byteLength: 5 });
+    const cache = createCache();
+    cache.entries.set("c1:m1:0:a1", { blob: cachedRef, cachedAt: 1_000 });
+    const blobs = createBlobStore({});
+    const state = createDiscordAttachmentState({
+      blobStore: blobs.store,
+      attachmentCache: cache.access,
+      attachmentCacheTtl: { kind: "bounded", value: 1_000 },
+      now: () => 2_000,
+    });
+
+    const appended = await appendDiscordAttachmentsToBusContent(
+      [],
+      [
+        {
+          id: "a1",
+          url: "https://cdn.discordapp.com/attachments/1/2/image.png",
+          mimeType: "image/png",
+        },
+      ],
+      state,
+      { channelId: "c1", messageId: "m1" },
+    );
+
+    expect(appended.status).toBe("ok");
+    expect(fetchCalls).toBe(1);
+    expect(cache.cleared).toEqual([cachedRef]);
+    expect(blobs.deleted).toEqual([cachedRef]);
   });
 
   it("waits for a separate durable reference before returning projection content", async () => {

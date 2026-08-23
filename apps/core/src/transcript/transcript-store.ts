@@ -15,10 +15,13 @@ import {
   classifyBunSqliteError,
   createLogger,
   CorruptPersistedFields,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
   runBunSqliteTransaction,
   type DecodedPersistedValue,
   type PersistedDataError,
   type PersistedDataIssueCode,
+  type RetentionLimit,
 } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
@@ -1063,6 +1066,10 @@ export type TranscriptStore = {
 
 export class SqliteTranscriptStore implements TranscriptStore {
   private readonly db: Database;
+  private readonly getRetention: () => {
+    readonly maxAgeMs: RetentionLimit;
+    readonly maxRequests: RetentionLimit;
+  };
   private startupRecoveryInitialized = false;
 
   constructor(
@@ -1073,9 +1080,24 @@ export class SqliteTranscriptStore implements TranscriptStore {
     ) => void = (diagnostic) => {
       logger.warn("transcript persisted value decode failed", diagnostic);
     },
-    options: { readonly deferStartupRecovery?: boolean } = {},
+    options: {
+      readonly deferStartupRecovery?: boolean;
+      readonly retention?: {
+        readonly maxAgeMs: RetentionLimit;
+        readonly maxRequests: RetentionLimit;
+      };
+      readonly getRetention?: () => {
+        readonly maxAgeMs: RetentionLimit;
+        readonly maxRequests: RetentionLimit;
+      };
+    } = {},
   ) {
     this.db = new Database(dbPath);
+    const retention = options.retention ?? {
+      maxAgeMs: { kind: "bounded", value: DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS },
+      maxRequests: { kind: "bounded", value: DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS },
+    };
+    this.getRetention = options.getRetention ?? (() => retention);
     this.migrate();
     if (options.deferStartupRecovery !== true) this.initializeStartupRecovery();
   }
@@ -5224,11 +5246,9 @@ export class SqliteTranscriptStore implements TranscriptStore {
   }
 
   private pruneRetention(now: number): readonly DeferredTranscriptEvent[] {
-    const TTL_MS = 30 * 24 * 60 * 60 * 1000;
-    const MAX_REQUESTS = 10_000;
     const events: DeferredTranscriptEvent[] = [];
+    const retention = this.getRetention();
 
-    const cutoff = now - TTL_MS;
     const checkpointCandidateCutoff = now - 24 * 60 * 60 * 1000;
     const candidates = this.db
       .query<{ request_id: string; context_meta_json: string }, [number]>(
@@ -5275,53 +5295,57 @@ export class SqliteTranscriptStore implements TranscriptStore {
         },
       });
     }
-    this.db.run(
-      `DELETE FROM request_transcripts
-       WHERE updated_ts < ?
-         AND NOT EXISTS (
-           SELECT 1 FROM core_lineage_request_refs lineage_ref
-           WHERE lineage_ref.referenced_request_id = request_transcripts.request_id
-         )`,
-      [cutoff],
-    );
-
-    // Clamp max rows by deleting oldest.
-    const countRow = this.db
-      .query<{ c: number }, []>("SELECT COUNT(1) as c FROM request_transcripts")
-      .get();
-    const count = typeof countRow?.c === "number" ? countRow.c : 0;
-    if (count > MAX_REQUESTS) {
-      const toDelete = count - MAX_REQUESTS;
-      const victims = this.db
-        .query<{ request_id: string }, [number]>(
-          `SELECT request_id FROM request_transcripts
-           WHERE NOT EXISTS (
+    if (retention.maxAgeMs.kind === "bounded") {
+      const cutoff = now - retention.maxAgeMs.value;
+      this.db.run(
+        `DELETE FROM request_transcripts
+         WHERE updated_ts < ?
+           AND NOT EXISTS (
              SELECT 1 FROM core_lineage_request_refs lineage_ref
              WHERE lineage_ref.referenced_request_id = request_transcripts.request_id
-           )
-           ORDER BY updated_ts ASC LIMIT ?`,
-        )
-        .all(toDelete);
-
-      for (const v of victims) {
-        this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [v.request_id]);
-        this.db.run("DELETE FROM surface_message_to_request WHERE request_id = ?", [v.request_id]);
-      }
+           )`,
+        [cutoff],
+      );
+      this.db.run(
+        `DELETE FROM session_loaded_tools
+         WHERE selected_ts < ?
+           AND NOT EXISTS (
+             SELECT 1
+             FROM request_transcripts
+             WHERE request_transcripts.request_client = session_loaded_tools.request_client
+               AND request_transcripts.session_id = session_loaded_tools.session_id
+           )`,
+        [cutoff],
+      );
     }
 
-    this.db.run(
-      `
-      DELETE FROM session_loaded_tools
-      WHERE selected_ts < ?
-        AND NOT EXISTS (
-        SELECT 1
-        FROM request_transcripts
-        WHERE request_transcripts.request_client = session_loaded_tools.request_client
-          AND request_transcripts.session_id = session_loaded_tools.session_id
-      )
-    `,
-      [cutoff],
-    );
+    // Clamp max rows by deleting oldest.
+    if (retention.maxRequests.kind === "bounded") {
+      const countRow = this.db
+        .query<{ c: number }, []>("SELECT COUNT(1) as c FROM request_transcripts")
+        .get();
+      const count = typeof countRow?.c === "number" ? countRow.c : 0;
+      if (count > retention.maxRequests.value) {
+        const toDelete = count - retention.maxRequests.value;
+        const victims = this.db
+          .query<{ request_id: string }, [number]>(
+            `SELECT request_id FROM request_transcripts
+             WHERE NOT EXISTS (
+               SELECT 1 FROM core_lineage_request_refs lineage_ref
+               WHERE lineage_ref.referenced_request_id = request_transcripts.request_id
+             )
+             ORDER BY updated_ts ASC LIMIT ?`,
+          )
+          .all(toDelete);
+
+        for (const v of victims) {
+          this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [v.request_id]);
+          this.db.run("DELETE FROM surface_message_to_request WHERE request_id = ?", [
+            v.request_id,
+          ]);
+        }
+      }
+    }
     return events;
   }
 

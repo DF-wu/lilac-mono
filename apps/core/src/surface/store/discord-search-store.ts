@@ -183,9 +183,8 @@ function decodeCachedBlobReference(
   )
     return null;
   if (
-    typeof row.blob_expires_at !== "number" ||
-    !Number.isSafeInteger(row.blob_expires_at) ||
-    row.blob_expires_at < 0
+    row.blob_expires_at !== null &&
+    (!Number.isSafeInteger(row.blob_expires_at) || row.blob_expires_at < 0)
   )
     return null;
   return {
@@ -194,7 +193,7 @@ function decodeCachedBlobReference(
       objectId: row.blob_object_id,
       sha256: row.blob_sha256,
       byteLength: row.blob_byte_length,
-      expiresAt: row.blob_expires_at,
+      ...(row.blob_expires_at === null ? {} : { expiresAt: row.blob_expires_at }),
     },
     cachedAt: row.blob_cached_at,
   };

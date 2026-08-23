@@ -51,6 +51,13 @@ Removed v2 fields:
 
 New v2 fields:
 
+- `agent.transcriptRetention.maxAge` and `.maxRequests`: completed request transcript retention limits;
+  defaults to `180d` and `10000`. Each accepts a positive duration/count or `"unlimited"`. Changes are
+  hot-reloaded and apply on the next transcript save. Frozen v1 configs receive the same universal
+  defaults but cannot override them.
+- `surface.discord.attachmentCache.ttl`: Discord ingress attachment cache lifetime; defaults to `30d`
+  and accepts a positive duration or `"unlimited"`. Changes are hot-reloaded. Frozen v1 configs receive
+  the same universal default but cannot override it.
 - `blobStorage`: one Core managed-blob adapter. Omit it for the local store rooted below `DATA_DIR`, or
   configure `kind: local` with a required absolute `root`, or `kind: s3` with required `bucket`,
   `prefix`, `endpoint`, `region`, and environment-variable names for credentials. S3 also accepts an

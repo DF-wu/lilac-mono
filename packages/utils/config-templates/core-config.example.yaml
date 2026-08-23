@@ -168,6 +168,11 @@ surface:
   discord:
     tokenEnv: "DISCORD_TOKEN"
 
+    # Reuse downloaded Discord ingress attachments for this long. Set ttl to
+    # "unlimited" to keep new cache objects without an expiry.
+    attachmentCache:
+      ttl: 30d
+
     # If both lists are empty, the bot will ignore all Discord traffic.
     allowedChannelIds: []
     allowedGuildIds: []
@@ -251,6 +256,12 @@ surface:
     #   timezone: "Asia/Taipei"
 
 agent:
+  # Retain completed request transcripts by age and count. Each limit can be
+  # set independently to "unlimited".
+  transcriptRetention:
+    maxAge: 180d
+    maxRequests: 10000
+
   # Optional: include token/model timing stats in final response metadata.
   # - false: disable stats metadata on response events
   # - true: enable concise stats line ([M], [T], [TTFT], [TPS])

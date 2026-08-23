@@ -36,6 +36,11 @@ Existing rows retain an unknown attachment fingerprint and are not backfilled. N
 messages record known empty or populated attachment state; attachment bytes and signed Discord CDN URLs
 are not persisted.
 
+Discord attachment cache references now interpret `blob_expires_at IS NULL` as durable when the other
+reference fields and `blob_cached_at` form a valid cache entry. No table rewrite or backfill runs. A
+finite `surface.discord.attachmentCache.ttl` still rejects a durable entry after its recorded cache time
+crosses the configured lifetime, then clears that reference lazily when the attachment is next read.
+
 ## Core Unified Blob Storage Clean Break
 
 Core now stores managed opaque bytes through `packages/blob-storage`. Current Redis messages and Core

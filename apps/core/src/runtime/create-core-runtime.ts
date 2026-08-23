@@ -1410,6 +1410,7 @@ export async function createCoreRuntime(
     };
   }
   const initialCoreConfig = coreConfigSelection.config;
+  let activeTranscriptRetention = initialCoreConfig.agent.transcriptRetention;
   const createdBlobStore = await createCoreBlobStore({
     config: initialCoreConfig.blobStorage,
     dataDir: env.dataDir,
@@ -1583,7 +1584,10 @@ export async function createCoreRuntime(
             resolveTranscriptDbPath(),
             undefined,
             undefined,
-            { deferStartupRecovery: true },
+            {
+              deferStartupRecovery: true,
+              getRetention: () => activeTranscriptRetention,
+            },
           );
         },
         openDiscordSearch: () => {
@@ -2055,6 +2059,7 @@ export async function createCoreRuntime(
     ).mapError((captured) => projectCapturedRuntimeError(captured, "Core config reload failed"));
     await loaded.match({
       ok: (config) => async () => {
+        activeTranscriptRetention = config.agent.transcriptRetention;
         if (coreConfigValidationHadError) {
           logger.info("core-config hot-reload validation recovered", {
             reason,

@@ -19,6 +19,14 @@ export type CoreConfigParseOptions = {
   onUnknownModelOption?: (warning: CoreConfigModelOptionWarning, source: string) => void;
 };
 
+export type RetentionLimit =
+  | { readonly kind: "bounded"; readonly value: number }
+  | { readonly kind: "unlimited" };
+
+export const DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
+export const DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS = 10_000;
+export const DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
 export type DiscordUserAliasConfig = {
   discord: string;
   comment?: string;
@@ -235,6 +243,9 @@ export type UniversalCoreConfig = {
       outputPreviewModeFinalStyle: "embed" | "plain";
       outputNotification?: boolean;
       workingIndicators: string[];
+      attachmentCache: {
+        ttlMs: RetentionLimit;
+      };
       markdownTableRender: {
         enabled: boolean;
         style: "unicode" | "ascii";
@@ -267,6 +278,10 @@ export type UniversalCoreConfig = {
     statsForNerds: boolean | { verbose: boolean };
     reasoningDisplay: "none" | "simple" | "detailed";
     idleTimeoutMs: number;
+    transcriptRetention: {
+      maxAgeMs: RetentionLimit;
+      maxRequests: RetentionLimit;
+    };
     retry: {
       enabled: boolean;
       maxRetries: number;

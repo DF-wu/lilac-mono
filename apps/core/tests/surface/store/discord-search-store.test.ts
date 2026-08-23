@@ -109,6 +109,29 @@ describe("discord search store", () => {
         },
       ]);
 
+      const durableBlob: BlobRefV1 = {
+        version: 1,
+        objectId: `b1_${"2".repeat(32)}`,
+        sha256: "b".repeat(64),
+        byteLength: 123,
+      };
+      store.putAttachmentCache({
+        channelId: "123",
+        messageId: "m1",
+        ordinal: 0,
+        attachmentId: "a1",
+        blob: durableBlob,
+        cachedAt: now,
+      });
+      expect(
+        store.getAttachmentCache({
+          channelId: "123",
+          messageId: "m1",
+          ordinal: 0,
+          attachmentId: "a1",
+        }),
+      ).toEqual({ blob: durableBlob, cachedAt: 1_000 });
+
       now = 2_000;
       expect(store.upsertMessages([{ ...message, text: "edited text" }])).toBe(1);
       expect(
@@ -118,7 +141,7 @@ describe("discord search store", () => {
           ordinal: 0,
           attachmentId: "a1",
         }),
-      ).toEqual({ blob, cachedAt: 1_000 });
+      ).toEqual({ blob: durableBlob, cachedAt: 1_000 });
     } finally {
       store.close();
       Date.now = originalDateNow;

@@ -12,6 +12,7 @@ import {
   type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
+import type { RetentionLimit } from "@stanley2058/lilac-utils";
 import {
   withSurfaceRequestReadScope,
   type SurfaceAdapter,
@@ -637,6 +638,7 @@ async function composeSelectedDiscordChain(input: {
   discordUserAliasById?: ReadonlyMap<string, string>;
   blobStore?: BlobStore;
   attachmentCache?: DiscordAttachmentCacheAccess;
+  attachmentCacheTtl?: RetentionLimit;
   resolvedProjections?: ReadonlyMap<string, CoreSurfaceProjection | null>;
 }): Promise<
   ResultType<
@@ -655,6 +657,7 @@ async function composeSelectedDiscordChain(input: {
   const attachmentState = createDiscordAttachmentState({
     blobStore: input.blobStore,
     attachmentCache: input.attachmentCache,
+    attachmentCacheTtl: input.attachmentCacheTtl,
     ownStoredBlob: projectionStore
       ? ({ blob, mediaType, filename }) => {
           return projectionStore.putCoreOwnedBlob({
@@ -1916,6 +1919,7 @@ export async function composeRequestMessages(
     discordUserAliasById: opts.discordUserAliasById,
     blobStore: opts.blobStore,
     attachmentCache: opts.attachmentCache,
+    attachmentCacheTtl: opts.attachmentCacheTtl,
     resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({
@@ -2067,6 +2071,7 @@ export async function composeRecentChannelMessages(
           discordUserAliasById: opts.discordUserAliasById,
           blobStore: opts.blobStore,
           attachmentCache: opts.attachmentCache,
+          attachmentCacheTtl: opts.attachmentCacheTtl,
           resolvedProjections: layered.projections,
         });
         return composed.map((value) => ({
@@ -2278,6 +2283,7 @@ export async function composeRecentChannelMessages(
     discordUserAliasById: opts.discordUserAliasById,
     blobStore: opts.blobStore,
     attachmentCache: opts.attachmentCache,
+    attachmentCacheTtl: opts.attachmentCacheTtl,
     resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({
@@ -2365,6 +2371,7 @@ export async function composeSingleMessageWithLineage(
     discordUserAliasById: opts.discordUserAliasById,
     blobStore: opts.blobStore,
     attachmentCache: opts.attachmentCache,
+    attachmentCacheTtl: opts.attachmentCacheTtl,
     resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({

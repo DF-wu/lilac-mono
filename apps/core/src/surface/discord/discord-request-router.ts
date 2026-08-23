@@ -1836,6 +1836,7 @@ export async function startDiscordRequestRouter(
       transcriptStore: params.transcriptStore,
       blobStore: params.blobStore,
       attachmentCache: params.attachmentCache,
+      attachmentCacheTtl: cfg.surface.discord.attachmentCache.ttlMs,
       messageCache: params.messageCache,
       ingressMessages: batch.items.flatMap((item) =>
         item.ingressMessage ? [item.ingressMessage] : [],
@@ -1888,6 +1889,7 @@ export async function startDiscordRequestRouter(
         transcriptStore: params.transcriptStore,
         blobStore: params.blobStore,
         attachmentCache: params.attachmentCache,
+        attachmentCacheTtl: cfg.surface.discord.attachmentCache.ttlMs,
         messageCache: params.messageCache,
         ingressMessages: item.ingressMessage ? [item.ingressMessage] : undefined,
         transformUserText: transformPendingUserText(item),

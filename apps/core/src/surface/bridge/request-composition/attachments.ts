@@ -13,6 +13,10 @@ import type {
   BlobUpload,
 } from "@stanley2058/lilac-blob-storage";
 import type { BusFilePartV2, StoredFilePartV1 } from "@stanley2058/lilac-event-bus";
+import {
+  DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
+  type RetentionLimit,
+} from "@stanley2058/lilac-utils";
 
 import { inferMimeTypeFromFilename } from "../../../shared/attachment-utils";
 import type {
@@ -29,8 +33,6 @@ import type {
 
 const DEFAULT_INBOUND_MAX_FILE_BYTES = 25 * 1024 * 1024;
 const DEFAULT_INBOUND_MAX_TOTAL_BYTES = 50 * 1024 * 1024;
-
-export const DISCORD_ATTACHMENT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 const DISCORD_CDN_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
 
@@ -54,6 +56,7 @@ type DiscordAttachmentState = {
   currentBlobs: Map<string, CoreOwnedBlobReference>;
   blobStore?: BlobStore;
   attachmentCache?: DiscordAttachmentCacheAccess;
+  attachmentCacheTtl: RetentionLimit;
   now: () => number;
   requestHandles: BlobHandleV1[];
 };
@@ -64,6 +67,7 @@ export function createDiscordAttachmentState(input?: {
   inlineFileData?: boolean;
   blobStore?: BlobStore;
   attachmentCache?: DiscordAttachmentCacheAccess;
+  attachmentCacheTtl?: RetentionLimit;
   now?: () => number;
 }): DiscordAttachmentState {
   return {
@@ -77,6 +81,10 @@ export function createDiscordAttachmentState(input?: {
     currentBlobs: new Map(),
     blobStore: input?.blobStore,
     attachmentCache: input?.attachmentCache,
+    attachmentCacheTtl: input?.attachmentCacheTtl ?? {
+      kind: "bounded",
+      value: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
+    },
     now: input?.now ?? Date.now,
     requestHandles: [],
   };
@@ -1044,7 +1052,12 @@ async function readVerifiedCacheBytes(input: {
 }): Promise<Uint8Array | null> {
   const cached = readAttachmentCacheEntry(input.state, input.key, input.attachment);
   if (!cached || !input.state.blobStore) return null;
-  if (cached.blob.expiresAt === undefined || cached.blob.expiresAt <= input.state.now()) {
+  const now = input.state.now();
+  const physicallyExpired = cached.blob.expiresAt !== undefined && cached.blob.expiresAt <= now;
+  const olderThanConfiguredTtl =
+    input.state.attachmentCacheTtl.kind === "bounded" &&
+    cached.cachedAt + input.state.attachmentCacheTtl.value <= now;
+  if (physicallyExpired || olderThanConfiguredTtl) {
     clearAttachmentCacheEntry(input.state, input.key, cached.blob);
     return null;
   }
@@ -1103,12 +1116,16 @@ async function startCacheUpload(input: {
 }): Promise<void> {
   if (!input.state.blobStore || !input.state.attachmentCache) return;
   const cachedAt = input.state.now();
+  const retention =
+    input.state.attachmentCacheTtl.kind === "unlimited"
+      ? ({ kind: "durable" } as const)
+      : ({
+          kind: "expires",
+          expiresAt: cachedAt + input.state.attachmentCacheTtl.value,
+        } as const);
   const started = await input.state.blobStore.startUpload({
     source: input.source,
-    retention: {
-      kind: "expires",
-      expiresAt: cachedAt + DISCORD_ATTACHMENT_CACHE_TTL_MS,
-    },
+    retention,
     ...(input.expectedByteLength !== undefined
       ? { expectedByteLength: input.expectedByteLength }
       : {}),

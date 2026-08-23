@@ -17,6 +17,7 @@ import {
   type CoreRequestAliasV2,
   type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
+import type { RetentionLimit } from "@stanley2058/lilac-utils";
 
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
@@ -1370,6 +1371,154 @@ describe("SqliteTranscriptStore", () => {
         .all(),
     ).toEqual([{ record_id: "malformed-prune-candidate" }]);
 
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("applies configured transcript age retention", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-age-retention-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      retention: {
+        maxAgeMs: { kind: "bounded", value: 1_000 },
+        maxRequests: { kind: "unlimited" },
+      },
+    });
+    store.saveRequestTranscript({
+      requestId: "expired",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "expired" }],
+    });
+    const raw = new Database(dbPath);
+    raw.run("UPDATE request_transcripts SET updated_ts = 0 WHERE request_id = ?", ["expired"]);
+
+    store.saveRequestTranscript({
+      requestId: "current",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "current" }],
+    });
+
+    expect(
+      raw
+        .query<{ request_id: string }, []>(
+          "SELECT request_id FROM request_transcripts ORDER BY request_id",
+        )
+        .all(),
+    ).toEqual([{ request_id: "current" }]);
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("disables transcript age and count pruning when configured as unlimited", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-unlimited-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      retention: {
+        maxAgeMs: { kind: "unlimited" },
+        maxRequests: { kind: "unlimited" },
+      },
+    });
+    store.saveRequestTranscript({
+      requestId: "old",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "old" }],
+    });
+    const raw = new Database(dbPath);
+    raw.run("UPDATE request_transcripts SET updated_ts = 0 WHERE request_id = ?", ["old"]);
+    store.saveRequestTranscript({
+      requestId: "new",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "new" }],
+    });
+
+    expect(
+      raw.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM request_transcripts").get(),
+    ).toEqual({ count: 2 });
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("applies configured transcript count retention independently", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-count-retention-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      retention: {
+        maxAgeMs: { kind: "unlimited" },
+        maxRequests: { kind: "bounded", value: 1 },
+      },
+    });
+    store.saveRequestTranscript({
+      requestId: "first",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "first" }],
+    });
+    const ordering = new Database(dbPath);
+    ordering.run("UPDATE request_transcripts SET updated_ts = 0 WHERE request_id = ?", ["first"]);
+    ordering.close();
+    store.saveRequestTranscript({
+      requestId: "second",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "second" }],
+    });
+
+    const raw = new Database(dbPath);
+    expect(
+      raw.query<{ request_id: string }, []>("SELECT request_id FROM request_transcripts").all(),
+    ).toEqual([{ request_id: "second" }]);
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("reads transcript retention again before each prune", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-live-retention-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    let retention: {
+      readonly maxAgeMs: RetentionLimit;
+      readonly maxRequests: RetentionLimit;
+    } = {
+      maxAgeMs: { kind: "unlimited" },
+      maxRequests: { kind: "unlimited" },
+    };
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      getRetention: () => retention,
+    });
+    store.saveRequestTranscript({
+      requestId: "old",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "old" }],
+    });
+    const raw = new Database(dbPath);
+    raw.run("UPDATE request_transcripts SET updated_ts = 0 WHERE request_id = ?", ["old"]);
+
+    retention = {
+      maxAgeMs: { kind: "bounded", value: 1_000 },
+      maxRequests: { kind: "unlimited" },
+    };
+    store.saveRequestTranscript({
+      requestId: "current",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "current" }],
+    });
+
+    expect(
+      raw
+        .query<{ request_id: string }, []>(
+          "SELECT request_id FROM request_transcripts ORDER BY request_id",
+        )
+        .all(),
+    ).toEqual([{ request_id: "current" }]);
     raw.close();
     store.close();
     await fs.rm(dir, { recursive: true, force: true });

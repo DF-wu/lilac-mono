@@ -1,5 +1,6 @@
 import type { BlobHandleV1, BlobStore } from "@stanley2058/lilac-blob-storage";
 import type { BusMessageV2, CorePrimaryLineageV2 } from "@stanley2058/lilac-event-bus";
+import type { RetentionLimit } from "@stanley2058/lilac-utils";
 
 import type { MsgRef, SurfaceMessage } from "../../types";
 import type {
@@ -21,6 +22,7 @@ export type RequestCompositionResult = {
 type BlobCompositionOptions = {
   blobStore?: BlobStore;
   attachmentCache?: DiscordAttachmentCacheAccess;
+  attachmentCacheTtl?: RetentionLimit;
   messageCache?: DiscordMessageCacheAccess;
   /** Trusted messages already carried by the admitted adapter event. */
   ingressMessages?: readonly SurfaceMessage[];

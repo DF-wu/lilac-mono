@@ -29,6 +29,12 @@ import type {
   SubagentProfileConfig,
   UniversalCoreConfig,
 } from "./types";
+import {
+  DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
+  type RetentionLimit,
+} from "./types";
 
 export const V2_CORE_CONFIG_VERSION = 2 satisfies CoreConfigVersion;
 export const CURRENT_CORE_CONFIG_VERSION = V2_CORE_CONFIG_VERSION;
@@ -322,6 +328,27 @@ const discordMarkdownMathRenderSchema = z
     fallbackMode: "source",
   });
 
+const positiveDurationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
+const retentionDurationSchema = z.union([z.literal("unlimited"), positiveDurationMsSchema]);
+
+const retentionCountSchema = z.union([z.number().int().positive(), z.literal("unlimited")]);
+
+const discordAttachmentCacheSchema = z
+  .object({
+    ttl: retentionDurationSchema.default(DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS),
+  })
+  .default({ ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS });
+
+const transcriptRetentionSchema = z
+  .object({
+    maxAge: retentionDurationSchema.default(DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS),
+    maxRequests: retentionCountSchema.default(DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS),
+  })
+  .default({
+    maxAge: DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
+    maxRequests: DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
+  });
+
 const discordSurfaceSchema = z
   .object({
     tokenEnv: z.string().min(1).default("DISCORD_TOKEN"),
@@ -338,6 +365,7 @@ const discordSurfaceSchema = z
     outputMode: z.enum(["inline", "preview"]).default("preview"),
     outputPreviewModeFinalStyle: z.enum(["embed", "plain"]).default("plain"),
     outputNotification: z.boolean().default(true),
+    attachmentCache: discordAttachmentCacheSchema,
     workingIndicators: z
       .array(z.string().trim().min(1))
       .min(1)
@@ -353,6 +381,7 @@ const discordSurfaceSchema = z
     outputMode: "preview",
     outputPreviewModeFinalStyle: "plain",
     outputNotification: true,
+    attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
     workingIndicators: cloneDefaultWorkingIndicators(),
     markdownTableRender: {
       enabled: true,
@@ -695,6 +724,7 @@ export const coreConfigInputSchemaV2 = z.object({
         outputMode: "preview",
         outputPreviewModeFinalStyle: "plain",
         outputNotification: true,
+        attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
         workingIndicators: cloneDefaultWorkingIndicators(),
         markdownTableRender: {
           enabled: true,
@@ -728,6 +758,7 @@ export const coreConfigInputSchemaV2 = z.object({
         .min(1_500)
         .default(15 * 60 * 1000),
       retry: agentRetrySchema,
+      transcriptRetention: transcriptRetentionSchema,
       subagents: subagentsSchemaV2.default({
         enabled: true,
         maxDepth: 2,
@@ -747,6 +778,10 @@ export const coreConfigInputSchemaV2 = z.object({
         maxRetries: 3,
         baseDelayMs: 2_000,
         maxDelayMs: 30_000,
+      },
+      transcriptRetention: {
+        maxAge: DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
+        maxRequests: DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
       },
       subagents: {
         enabled: true,
@@ -804,6 +839,11 @@ function coreConfigV2ToUniversal(
   const isolated = structuredClone(parsed);
   const { artifactTtl, ...output } = isolated.tools.output;
   const { firecrawl, ...web } = isolated.tools.web;
+  const { attachmentCache, ...discord } = isolated.surface.discord;
+  const { transcriptRetention, ...agent } = isolated.agent;
+
+  const retentionLimit = (value: number | "unlimited"): RetentionLimit =>
+    value === "unlimited" ? { kind: "unlimited" } : { kind: "bounded", value };
 
   return {
     ...isolated,
@@ -824,8 +864,21 @@ function coreConfigV2ToUniversal(
         artifactTtlMs: artifactTtl,
       },
     },
+    surface: {
+      ...isolated.surface,
+      discord: {
+        ...discord,
+        attachmentCache: {
+          ttlMs: retentionLimit(attachmentCache.ttl),
+        },
+      },
+    },
     agent: {
-      ...isolated.agent,
+      ...agent,
+      transcriptRetention: {
+        maxAgeMs: retentionLimit(transcriptRetention.maxAge),
+        maxRequests: retentionLimit(transcriptRetention.maxRequests),
+      },
       subagents: {
         ...isolated.agent.subagents,
         profiles: {

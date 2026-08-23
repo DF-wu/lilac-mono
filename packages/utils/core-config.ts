@@ -69,7 +69,12 @@ export {
   parseCoreConfigV2,
   parseCoreConfigV2ToUniversal,
 };
-export { MODEL_REASONING_EFFORTS } from "./core-config/types";
+export {
+  DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
+  MODEL_REASONING_EFFORTS,
+} from "./core-config/types";
 export type {
   BlobStorageConfig,
   ConfiguredModelChainEntry,
@@ -88,6 +93,7 @@ export type {
   ModelReasoningEffort,
   RouterSessionConfig,
   RouterSessionConfigScope,
+  RetentionLimit,
   SubagentExecution,
   SubagentProfileConfig,
   UniversalCoreConfig,
