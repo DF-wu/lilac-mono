@@ -1487,6 +1487,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       ...[
         ["src/transcript/transcript-persistence-codec.ts", "normalizeStoredMessagesV1"],
         ["src/transcript/transcript-persistence-codec.ts", "decodeStoredBlobRefV1"],
+        [
+          "src/transcript/stored-message-materialization.ts",
+          "projectResourceReadResultsForStorage",
+        ],
         ["src/transcript/stored-message-materialization.ts", "projectStoredMessagesV1"],
         ["src/transcript/stored-message-materialization.ts", "materializeStoredMessage"],
         ["src/transcript/transcript-store.ts", "parseNormalizedCanonicalMessages"],

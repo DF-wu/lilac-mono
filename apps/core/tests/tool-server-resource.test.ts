@@ -16,6 +16,7 @@ import {
 } from "../src/resource";
 import { resolveRestrictedSessionTmpDir } from "../src/shared/attachment-utils";
 import { Resource } from "../src/tool-server/tools/resource";
+import { bindRequestInvocationCwd } from "../src/tool-server/request-invocation-cwd";
 
 const URIS = [
   "resource://r1_00000000000000000000000000000001",
@@ -148,9 +149,39 @@ describe("tool-server resource", () => {
     }
   });
 
-  it("maps restricted requests into the session-private tmp directory", async () => {
+  it("materializes into the tools CLI cwd while retaining the capability cwd", async () => {
+    const capabilityCwd = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-resource-capability-"));
+    const invocationCwd = path.join(capabilityCwd, "nested", "working-directory");
+    let receivedTarget: string | undefined;
+    try {
+      await fs.mkdir(invocationCwd, { recursive: true });
+      const tool = new Resource({
+        access: fakeAccess(async (uri, options) => {
+          receivedTarget = options.targetDirectory;
+          return Result.ok(materialized(uri, options.targetDirectory, 3));
+        }),
+      });
+      const context = {
+        cwd: capabilityCwd,
+        safetyMode: "trusted" as const,
+      };
+      bindRequestInvocationCwd(context, invocationCwd);
+
+      const value = await callValue(tool, { uris: [URIS[0]] }, { context });
+
+      expect(receivedTarget).toBe(invocationCwd);
+      expect(value).toMatchObject({
+        results: [{ status: "ok", path: path.join(invocationCwd, "01.txt") }],
+      });
+    } finally {
+      await fs.rm(capabilityCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("maps a restricted tools CLI tmp cwd into the matching session-private directory", async () => {
     const sessionId = "resource-restricted-session";
     const physicalTmp = resolveRestrictedSessionTmpDir(sessionId);
+    const invocationCwd = "/tmp/nested/working-directory";
     let receivedTarget: string | undefined;
     try {
       const tool = new Resource({
@@ -159,24 +190,45 @@ describe("tool-server resource", () => {
           return Result.ok(materialized(uri, options.targetDirectory, 3));
         }),
       });
+      const context = {
+        cwd: "/workspace",
+        sessionId,
+        safetyMode: "restricted" as const,
+      };
+      bindRequestInvocationCwd(context, invocationCwd);
 
-      const value = await callValue(
-        tool,
-        { uris: [URIS[0]] },
-        {
-          context: {
-            cwd: "/workspace",
-            sessionId,
-            safetyMode: "restricted",
-          },
-        },
-      );
+      const value = await callValue(tool, { uris: [URIS[0]] }, { context });
 
-      expect(receivedTarget).toBe(physicalTmp);
-      expect(value).toMatchObject({ results: [{ status: "ok", path: "/tmp/01.txt" }] });
+      expect(receivedTarget).toBe(path.join(physicalTmp, "nested", "working-directory"));
+      expect(value).toMatchObject({
+        results: [{ status: "ok", path: "/tmp/nested/working-directory/01.txt" }],
+      });
     } finally {
       await fs.rm(physicalTmp, { recursive: true, force: true });
     }
+  });
+
+  it("rejects a restricted tools CLI cwd outside its private tmp mapping", async () => {
+    let materializeCalls = 0;
+    const tool = new Resource({
+      access: fakeAccess(async (uri, options) => {
+        materializeCalls += 1;
+        return Result.ok(materialized(uri, options.targetDirectory, 3));
+      }),
+    });
+    const context = {
+      cwd: "/canonical/workspace",
+      sessionId: "resource-restricted-outside-tmp",
+      safetyMode: "restricted" as const,
+    };
+    bindRequestInvocationCwd(context, "/workspace/project");
+
+    const value = await callValue(tool, { uris: [URIS[0]] }, { context });
+
+    expect(materializeCalls).toBe(0);
+    expect(value).toMatchObject({
+      failure: { kind: "denied", code: "resource_target_denied" },
+    });
   });
 
   it("returns a call-level failure when request cwd is missing", async () => {

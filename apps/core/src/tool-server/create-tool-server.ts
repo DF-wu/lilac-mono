@@ -55,6 +55,7 @@ import {
   type ToolServerLagIncident,
 } from "./health-state";
 import type { RequestContext, ServerTool } from "./types";
+import { bindRequestInvocationCwd } from "./request-invocation-cwd";
 import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../surface/types";
 import { resolveAuthenticatedRequestSafetyMode } from "../surface/builtin-surface-protocols";
 import { resolveSessionSafetyMode } from "../surface/session-policy";
@@ -960,19 +961,19 @@ export function createToolServer(options: ToolServerOptions) {
           }),
         );
       }
-      return Result.ok({
-        context: {
-          requestId: headers.requestId,
-          toolCallId: headers.toolCallId,
-          cwd: options.canonicalWorkspaceRoot,
-          safetyMode: "trusted",
-          serverOwnedRequest: true,
-          operator: true,
-        },
-        messages: undefined,
-      });
+      const operatorContext: RequestContext = {
+        requestId: headers.requestId,
+        toolCallId: headers.toolCallId,
+        cwd: options.canonicalWorkspaceRoot,
+        safetyMode: "trusted",
+        serverOwnedRequest: true,
+        operator: true,
+      };
+      bindRequestInvocationCwd(operatorContext, headers.cwd);
+      return Result.ok({ context: operatorContext, messages: undefined });
     }
     const context = parseRequestContext(headers);
+    bindRequestInvocationCwd(context, context.cwd);
     const cachedMessages = await captureAuthenticationOperation(() =>
       authenticateRequestContext(context, options.requestMessageCache),
     );

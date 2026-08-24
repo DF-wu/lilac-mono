@@ -29,6 +29,7 @@ import {
   type ServerTool,
   type ServerToolCallOptions,
 } from "../types";
+import { requestInvocationCwd } from "../request-invocation-cwd";
 
 type ResourceMaterializeErrorCode =
   | "invalid_uri"
@@ -137,12 +138,14 @@ async function establishTargetDirectory(
     );
   }
 
+  const invocationCwd = requestInvocationCwd(ctx) ?? ctx.cwd;
+
   const targetResult: ResultType<string, ServerToolFailure> =
     ctx.safetyMode !== "restricted"
-      ? Result.ok(resolve(ctx.cwd))
+      ? Result.ok(resolve(invocationCwd))
       : resolveToolPathForRequestContextResult({
-          cwd: ctx.cwd,
-          inputPath: "/tmp",
+          cwd: invocationCwd,
+          inputPath: ".",
           context: ctx,
         }).mapError((error) =>
           resourceToolFailure("denied", "resource_target_denied", error.message),
@@ -204,7 +207,7 @@ export class Resource implements ServerTool {
       callables: ({ callable }) => ({
         "resource.materialize": callable({
           name: "Resource Materialize",
-          description: "Write inbound resources into the request working directory.",
+          description: "Write inbound resources into the invoking tools CLI working directory.",
           inputSchema: resourceMaterializeInputSchema,
           primaryPositional: {
             field: "uris",

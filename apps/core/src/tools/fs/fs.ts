@@ -80,6 +80,7 @@ const warningZod = z.object({
 const REMOTE_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.gnupg"] as const;
 const FFF_CACHE_DIR = path.join(env.dataDir, ".cache", "fff");
 const RESOURCE_URI_PREFIX = "resource://";
+const REDACTED_RESOURCE_LOG_PATH = "resource://[redacted]";
 
 function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
   const select = result.match<() => T>({
@@ -1631,6 +1632,16 @@ export function fsTool(
       execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: ReadFileInput, options) => {
         if (opts?.enforceDenylist) dangerouslyAllow = false;
         if (input.path.startsWith(RESOURCE_URI_PREFIX)) {
+          logger.info("fs.readFile", {
+            path: REDACTED_RESOURCE_LOG_PATH,
+            cwd: opCwd,
+            target: "resource",
+            start: input.start,
+            maxLines: input.maxLines,
+            maxCharacters: input.maxCharacters,
+            format: input.format ?? "raw",
+            dangerouslyAllow: dangerouslyAllow === true,
+          });
           return await executeResourceRead(input, options);
         }
         if (input.path.startsWith(TOOL_RESULT_URI_PREFIX)) {
@@ -2239,7 +2250,25 @@ export function fsTool(
         const mode = input.mode ?? "default";
         const targetPath = input.path;
         if (targetPath?.startsWith(RESOURCE_URI_PREFIX)) {
-          return await executeResourceGrep({ ...input, path: targetPath }, options);
+          logger.info("fs.grep", {
+            pattern: input.pattern,
+            path: REDACTED_RESOURCE_LOG_PATH,
+            target: "resource",
+            regex: input.regex,
+            fileExtensions: input.fileExtensions,
+            maxResults: input.maxResults,
+            mode,
+            dangerouslyAllow: dangerouslyAllow === true,
+          });
+          const result = await executeResourceGrep({ ...input, path: targetPath }, options);
+          logger.info("fs.grep done", {
+            resultCount: countGrepItems(result),
+            truncated: result.truncated,
+            failureMessage: result.error,
+            mode: result.mode,
+            effectiveBackend: "resource",
+          });
+          return result;
         }
         if (targetPath?.startsWith(TOOL_RESULT_URI_PREFIX)) {
           const sessionId = opts?.requestContext?.sessionId;

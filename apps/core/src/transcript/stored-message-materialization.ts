@@ -6,10 +6,12 @@ import {
 } from "@stanley2058/lilac-blob-storage";
 import {
   storedFilePartV1Schema,
+  storedResourcePartV1Schema,
   type StoredMessageV1,
   type StoredResourcePartV1,
 } from "@stanley2058/lilac-event-bus";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { z } from "zod";
 
 import {
   cancelVerifiedResourceRead,
@@ -52,6 +54,70 @@ export type StoredMessageIdentityProjectionV1 = {
   ): ResultType<StoredMessageV1[], StoredMessageProjectionError>;
 };
 
+type ModelAssistantMessage = Extract<ModelMessage, { readonly role: "assistant" }>;
+type ModelToolMessage = Extract<ModelMessage, { readonly role: "tool" }>;
+type ModelAssistantPart = Exclude<ModelAssistantMessage["content"], string>[number];
+type ModelToolPart = ModelToolMessage["content"][number];
+type ModelToolResultPart = Extract<
+  ModelAssistantPart | ModelToolPart,
+  { readonly type: "tool-result" }
+>;
+type ModelToolResultContentPart = Extract<
+  ModelToolResultPart["output"],
+  { readonly type: "content" }
+>["value"][number];
+
+const resourceReadInputSchema = z.object({ path: storedResourcePartV1Schema.shape.uri });
+
+function resourceFromReadFilePart(
+  value: ModelToolResultContentPart,
+  resource: StoredResourcePartV1,
+): ModelToolResultContentPart | StoredResourcePartV1 {
+  if (value.type !== "file") return value;
+  return {
+    ...resource,
+    ...(value.filename === undefined ? {} : { filename: value.filename }),
+    mediaType: value.mediaType,
+  };
+}
+
+function projectResourceReadResultsForStorage(
+  messages: readonly {
+    readonly message: unknown;
+    readonly reconstructResourceReads: boolean;
+  }[],
+): unknown[] {
+  const pendingResourcesByToolCallId = new Map<string, Array<StoredResourcePartV1 | undefined>>();
+
+  return messages.map(({ message, reconstructResourceReads }) => {
+    if (!reconstructResourceReads) return message;
+    const decoded = modelMessageSchema.safeParse(message);
+    if (!decoded.success || typeof decoded.data.content === "string") return message;
+
+    const content = decoded.data.content.map((part) => {
+      if (part.type === "tool-call" && part.toolName === "read") {
+        const input = resourceReadInputSchema.safeParse(part.input);
+        const pending = pendingResourcesByToolCallId.get(part.toolCallId) ?? [];
+        pending.push(
+          input.success ? { type: "resource" as const, uri: input.data.path } : undefined,
+        );
+        pendingResourcesByToolCallId.set(part.toolCallId, pending);
+        return part;
+      }
+      if (part.type !== "tool-result" || part.toolName !== "read") return part;
+
+      const pending = pendingResourcesByToolCallId.get(part.toolCallId);
+      const resource = pending?.shift();
+      if (pending?.length === 0) pendingResourcesByToolCallId.delete(part.toolCallId);
+      if (resource === undefined || part.output.type !== "content") return part;
+
+      const value = part.output.value.map((output) => resourceFromReadFilePart(output, resource));
+      return { ...part, output: { ...part.output, value } };
+    });
+    return { ...decoded.data, content };
+  });
+}
+
 /** Keeps structured durable identity beside provider-only message representations. */
 export function createStoredMessageIdentityProjectionV1(): StoredMessageIdentityProjectionV1 {
   const storedByProviderMessage = new WeakMap<object, StoredMessageV1>();
@@ -74,33 +140,14 @@ export function createStoredMessageIdentityProjectionV1(): StoredMessageIdentity
       return Result.ok(undefined);
     },
     project(providerMessages) {
-      const storedMessages: StoredMessageV1[] = [];
-      for (const providerMessage of providerMessages) {
+      const candidates = providerMessages.map((providerMessage) => {
         const remembered = storedByProviderMessage.get(providerMessage);
-        if (remembered) {
-          storedMessages.push(remembered);
-          continue;
-        }
-        const projected = projectStoredMessagesV1([providerMessage]);
-        const projectionFailure = projected.match({
-          ok: () => null,
-          err: (error) => error,
-        });
-        if (projectionFailure) return Result.err(projectionFailure);
-        const storedMessage = projected.match({
-          ok: ([message]) => message ?? null,
-          err: () => null,
-        });
-        if (!storedMessage) {
-          return Result.err(
-            new StoredMessageProjectionError({
-              message: "Provider message projection returned no stored message",
-            }),
-          );
-        }
-        storedMessages.push(storedMessage);
-      }
-      return Result.ok(storedMessages);
+        return {
+          message: remembered ?? providerMessage,
+          reconstructResourceReads: remembered === undefined,
+        };
+      });
+      return projectStoredMessagesV1(projectResourceReadResultsForStorage(candidates));
     },
   };
 }
@@ -290,15 +337,28 @@ async function materializeStoredResource(input: {
   readonly resourceAccess: Pick<ResourceAccess, "describe" | "open"> | undefined;
   readonly target: StoredResourceProviderTarget | undefined;
 }): Promise<object[]> {
-  const marker = { type: "text", text: formatStoredResourceMarkerV1(input.part) };
+  const marker = {
+    type: "text",
+    text: formatStoredResourceMarkerV1(input.part),
+  };
   if (!input.target) return [marker];
   if (!input.resourceAccess) {
-    return [marker, ...resourceInlineGuidance({ part: input.part, code: "access_unavailable" })];
+    return [
+      marker,
+      ...resourceInlineGuidance({
+        part: input.part,
+        code: "access_unavailable",
+      }),
+    ];
   }
 
   const described = resourceAccessDecision(input.resourceAccess.describe(input.part.uri));
   if (described.kind === "error") {
-    return expectedResourceErrorParts({ marker, part: input.part, error: described.error });
+    return expectedResourceErrorParts({
+      marker,
+      part: input.part,
+      error: described.error,
+    });
   }
   const descriptor = described.value;
 
@@ -314,7 +374,11 @@ async function materializeStoredResource(input: {
     }),
   );
   if (opened.kind === "error") {
-    return expectedResourceErrorParts({ marker, part: input.part, error: opened.error });
+    return expectedResourceErrorParts({
+      marker,
+      part: input.part,
+      error: opened.error,
+    });
   }
   const read = opened.value;
   const verifiedKind =
@@ -327,12 +391,22 @@ async function materializeStoredResource(input: {
   }
   if (!providerSupportsResourceKind(input.target, verifiedKind)) {
     await cancelVerifiedResourceRead(read);
-    return [marker, ...resourceInlineGuidance({ part: input.part, code: "unsupported_provider" })];
+    return [
+      marker,
+      ...resourceInlineGuidance({
+        part: input.part,
+        code: "unsupported_provider",
+      }),
+    ];
   }
 
   const consumed = resourceAccessDecision(await consumeVerifiedResourceRead(read));
   if (consumed.kind === "error") {
-    return expectedResourceErrorParts({ marker, part: input.part, error: consumed.error });
+    return expectedResourceErrorParts({
+      marker,
+      part: input.part,
+      error: consumed.error,
+    });
   }
   const verifiedMediaType = read.classification.mediaType;
   if (!verifiedMediaType) {
@@ -359,7 +433,10 @@ async function materializeStoredFile(input: {
   const cacheKey = `${part.blob.objectId}:${part.blob.sha256}:${part.blob.byteLength}`;
   let pending = input.cache.get(cacheKey);
   if (pending === undefined) {
-    pending = materializeBlobPart({ blobStore: input.blobStore, blob: part.blob });
+    pending = materializeBlobPart({
+      blobStore: input.blobStore,
+      blob: part.blob,
+    });
     input.cache.set(cacheKey, pending);
   }
   return (await pending).map((bytes) => ({
@@ -395,9 +472,15 @@ async function materializeToolResult(input: {
       continue;
     }
     const materialized = await materializeStoredFile({ ...input, part });
-    const failure = materialized.match({ ok: () => null, err: (error) => error });
+    const failure = materialized.match({
+      ok: () => null,
+      err: (error) => error,
+    });
     if (failure) return Result.err(failure);
-    materialized.match({ ok: (file) => value.push(file), err: () => undefined });
+    materialized.match({
+      ok: (file) => value.push(file),
+      err: () => undefined,
+    });
   }
   return Result.ok({ ...input.part, output: { ...input.part.output, value } });
 }
@@ -449,7 +532,10 @@ async function materializeStoredMessage(input: {
     const materialized = await materializeStoredPart({ ...input, part });
     const decision = materialized.match<
       | { readonly kind: "value"; readonly value: object[] }
-      | { readonly kind: "error"; readonly error: StoredMessageMaterializationError }
+      | {
+          readonly kind: "error";
+          readonly error: StoredMessageMaterializationError;
+        }
     >({
       ok: (value) => ({ kind: "value", value }),
       err: (error) => ({ kind: "error", error }),
@@ -476,12 +562,17 @@ export async function materializeStoredMessagesV1(input: {
   readonly resourceTarget?: StoredResourceProviderTarget;
 }): Promise<ResultType<ModelMessage[], StoredMessageMaterializationFailure>> {
   const projected = projectStoredMessagesV1(input.messages);
-  const projectionFailure = projected.match({ ok: () => null, err: (error) => error });
+  const projectionFailure = projected.match({
+    ok: () => null,
+    err: (error) => error,
+  });
   if (projectionFailure) return Result.err(projectionFailure);
   const messages = projected.match({ ok: (value) => value, err: () => null });
   if (messages === null) {
     return Result.err(
-      new StoredMessageProjectionError({ message: "Stored messages could not be projected" }),
+      new StoredMessageProjectionError({
+        message: "Stored messages could not be projected",
+      }),
     );
   }
 
@@ -498,12 +589,21 @@ export async function materializeStoredMessagesV1(input: {
       resourceAccess: input.resourceAccess,
       resourceTarget: input.resourceTarget,
     });
-    const failure = materialized.match({ ok: () => null, err: (error) => error });
+    const failure = materialized.match({
+      ok: () => null,
+      err: (error) => error,
+    });
     if (failure) return Result.err(failure);
-    materialized.match({ ok: (value) => output.push(value), err: () => undefined });
+    materialized.match({
+      ok: (value) => output.push(value),
+      err: () => undefined,
+    });
   }
   const remembered = input.identityProjection?.remember(output, messages);
-  const rememberFailure = remembered?.match({ ok: () => null, err: (error) => error });
+  const rememberFailure = remembered?.match({
+    ok: () => null,
+    err: (error) => error,
+  });
   if (rememberFailure) return Result.err(rememberFailure);
   return Result.ok(output);
 }

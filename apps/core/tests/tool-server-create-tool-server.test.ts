@@ -10,7 +10,6 @@ import {
   ToolPluginHookError,
   ToolPluginManager,
   type Level1ToolSpec,
-  type RequestContext,
 } from "@stanley2058/lilac-plugin-runtime";
 import { createLogger, parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError } from "better-result";
@@ -20,8 +19,9 @@ import {
   type ToolServerOptions,
   type ToolServerHealthSnapshot,
 } from "../src/tool-server/create-tool-server";
-import type { ServerTool } from "../src/tool-server/types";
+import type { RequestContext, ServerTool } from "../src/tool-server/types";
 import { RequestControlAuthority } from "../src/tool-server/request-control-authority";
+import { requestInvocationCwd } from "../src/tool-server/request-invocation-cwd";
 import { decodeToolInput } from "../src/tool-server/validation-error-message";
 import type { AuthenticatedRequestProjection } from "../src/surface/authenticated-request";
 
@@ -875,6 +875,7 @@ describe("createToolServer", () => {
       ).toMatchObject({ status: "ok", value: { ok: true } });
       expect(contexts).toHaveLength(1);
       expect(contexts[0]?.cwd).toBe("/workspace");
+      expect(contexts[0] && requestInvocationCwd(contexts[0])).toBe("/attacker-controlled");
       expect(
         (
           await server.app.handle(
@@ -1275,6 +1276,7 @@ describe("createToolServer", () => {
           operator: true,
         },
       ]);
+      expect(contexts.map(requestInvocationCwd)).toEqual([undefined, "/operator-selected-project"]);
     } finally {
       await server.stop();
     }
