@@ -305,6 +305,79 @@ describe("Core primary Claude continuation", () => {
     ).toEqual({ mode: "fresh", reason: "fresh-only" });
   });
 
+  it("uses parallel stored resource identity for exact prefix selection", () => {
+    const historicalStored = resultValue(
+      projectStoredMessagesV1([
+        {
+          role: "user",
+          content: [
+            {
+              type: "resource",
+              uri: "resource://r1_00000000000000000000000000000001",
+              filename: "image.png",
+              mediaType: "image/png",
+            },
+          ],
+        },
+      ]),
+    );
+    const historicalProvider = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: '[discord_attachment uri="resource://r1_00000000000000000000000000000001" filename="image.png" mime="image/png"]',
+          },
+          {
+            type: "file",
+            data: new Uint8Array([1, 2, 3]),
+            mediaType: "image/png",
+            filename: "image.png",
+          },
+        ],
+      },
+    ] satisfies ModelMessage[];
+    const current = [{ role: "user", content: "current" }] satisfies ModelMessage[];
+    const manifest = buildCoreLineageManifestV2([
+      syntheticSegment("resource", historicalProvider, historicalStored),
+      syntheticSegment("current", current),
+    ]);
+    const binding = {
+      ...bindingFor(
+        buildCoreLineageManifestV2([
+          syntheticSegment("resource", historicalProvider, historicalStored),
+        ]),
+      ),
+      atomCount: manifest.segments[0]!.cumulativeAtomCount,
+      prefixDigest: manifest.segments[0]!.cumulativePrefixDigest,
+      canonicalMessageCount: manifest.segments[0]!.canonicalEnd,
+    };
+
+    expect(
+      selectCorePrimaryClaudePrefix({
+        lineage: manifest,
+        canonicalMessages: [...historicalProvider, ...current],
+        canonicalStoredMessages: [
+          ...historicalStored,
+          ...resultValue(projectStoredMessagesV1(current)),
+        ],
+        binding,
+        executionScopeHash: "scope",
+        executionCwd: "/workspace",
+      }),
+    ).toEqual({ mode: "fork", canonicalEnd: 1 });
+    expect(
+      selectCorePrimaryClaudePrefix({
+        lineage: manifest,
+        canonicalMessages: [...historicalProvider, ...current],
+        binding,
+        executionScopeHash: "scope",
+        executionCwd: "/workspace",
+      }).mode,
+    ).toBe("fresh");
+  });
+
   it("does not search another segment or slice a partial segment after reorder/delete/window changes", () => {
     const merged = [{ role: "user", content: "one\n\ntwo" }] satisfies ModelMessage[];
     const current = [{ role: "user", content: "current" }] satisfies ModelMessage[];

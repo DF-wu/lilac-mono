@@ -160,9 +160,13 @@ import type {
   ConversationThreadToolService,
 } from "../../conversation/thread-service";
 import {
+  createStoredMessageIdentityProjectionV1,
   materializeStoredMessagesV1,
   projectStoredMessagesV1,
+  type StoredMessageProjectionError,
+  type StoredResourceProviderTarget,
 } from "../../transcript/stored-message-materialization";
+import type { ResourceAccess } from "../../resource";
 import { hashCanonicalStoredMessagesV2 } from "../../transcript/transcript-persistence-codec";
 import type {
   CoreAcceptedRequestWork,
@@ -345,11 +349,20 @@ export function shouldUsePersistentCoreClaudeRuntime(input: {
   return input.stableNamedContinuation !== null;
 }
 
-function supportsReadFileDirectAttachments(info: ModelCapabilityInfo | null): boolean {
-  if (info?.attachment !== true) return false;
-  const inputModalities = info?.modalities?.input;
-  if (!inputModalities) return false;
-  return inputModalities.includes("image") && inputModalities.includes("pdf");
+export function resolveStoredResourceProviderTarget(input: {
+  readonly provider: ResolvedModelRef["provider"];
+  readonly capability: ModelCapabilityInfo | null;
+}): StoredResourceProviderTarget {
+  if (input.provider === "claude-code") {
+    return { family: "claude-code", supportsImage: true, supportsPdf: false };
+  }
+  const supportsAttachments = input.capability?.attachment === true;
+  const inputModalities = input.capability?.modalities?.input ?? [];
+  return {
+    family: "ai-sdk",
+    supportsImage: supportsAttachments && inputModalities.includes("image"),
+    supportsPdf: supportsAttachments && inputModalities.includes("pdf"),
+  };
 }
 
 function consumerId(prefix: string): string {
@@ -477,6 +490,13 @@ export function signalBusAgentRunnerHostFailure(
   failure: Error | BusAgentRunnerOperationFailed,
 ): never {
   throw failure instanceof BusAgentRunnerOperationFailed ? failure.cause : failure;
+}
+
+export function settleStoredMessageIdentityRemember(
+  result: ResultType<void, StoredMessageProjectionError>,
+): void {
+  const failure = result.match({ ok: () => null, err: (error) => error });
+  if (failure) signalBusAgentRunnerHostFailure(failure);
 }
 
 function adaptModelResolutionToBusRunnerHost<T>(result: ResultType<T, ModelResolutionFailed>): T {
@@ -2603,6 +2623,13 @@ type SessionQueue = {
     partialText: string;
     liveParent: ReturnType<WorkflowLiveParentBridge["registerParent"]> | undefined;
     claudeCodeControl: ClaudeCodeRunControl | null;
+    materializeStoredMessages:
+      | ((messages: readonly StoredMessageV1[]) => Promise<ModelMessage[]>)
+      | null;
+    rememberStoredMessages: (
+      providerMessages: readonly ModelMessage[],
+      storedMessages: readonly StoredMessageV1[],
+    ) => void;
     notifyWaiters: () => void;
     flushOutput: () => void;
     setCurrentTurnUserId: (userId: string | undefined) => void;
@@ -2731,6 +2758,7 @@ export function formatBusAgentRunnerDrainFailureForLog(
 export async function startBusAgentRunner(params: {
   bus: LilacBus;
   blobStore: AnthropicFallbackBlobStore;
+  resourceAccess?: Pick<ResourceAccess, "describe" | "open">;
   requestDelivery?: BusAgentRunnerRequestDelivery;
   subscriptionId: string;
   config?: CoreConfig;
@@ -2808,6 +2836,7 @@ export async function startBusAgentRunner(params: {
   const logger = createLogger({
     module: "bus-agent-runner",
   });
+  const storedMessageIdentity = createStoredMessageIdentityProjectionV1();
 
   let cfg = params.config ?? (await getCoreConfig());
   let coreConfigReloadHadError = false;
@@ -3095,6 +3124,7 @@ export async function startBusAgentRunner(params: {
     const materializedMessages = await materializeStoredMessagesV1({
       messages: storedMessages,
       blobStore: params.blobStore,
+      identityProjection: storedMessageIdentity,
     });
     const messageMaterializationError = materializedMessages.match({
       ok: () => null,
@@ -4773,6 +4803,7 @@ export async function startBusAgentRunner(params: {
       const materialized = await materializeStoredMessagesV1({
         messages: next.storedMessages,
         blobStore: params.blobStore,
+        identityProjection: storedMessageIdentity,
       });
       const materializationError = materialized.match({
         ok: () => null,
@@ -4788,6 +4819,7 @@ export async function startBusAgentRunner(params: {
       const materialized = await materializeStoredMessagesV1({
         messages: next.storedRecoveryCheckpoint,
         blobStore: params.blobStore,
+        identityProjection: storedMessageIdentity,
       });
       const materializationError = materialized.match({
         ok: () => null,
@@ -5155,6 +5187,12 @@ export async function startBusAgentRunner(params: {
       partialText: next.recovery?.partialText ?? "",
       liveParent: liveParentSession,
       claudeCodeControl: null,
+      materializeStoredMessages: null,
+      rememberStoredMessages: (providerMessages, storedMessages) => {
+        settleStoredMessageIdentityRemember(
+          storedMessageIdentity.remember(providerMessages, storedMessages),
+        );
+      },
       notifyWaiters: notifyContinuationWaiters,
       flushOutput: outputPublisher.flush,
       setCurrentTurnUserId: () => undefined,
@@ -5792,6 +5830,7 @@ export async function startBusAgentRunner(params: {
               const materialized = await materializeStoredMessagesV1({
                 messages: seededStoredMessages,
                 blobStore: params.blobStore,
+                identityProjection: storedMessageIdentity,
               });
               materialized.match({
                 ok: (messages) => {
@@ -5904,6 +5943,10 @@ export async function startBusAgentRunner(params: {
               provider: resolved.provider,
               providerOptions: providerOptionsForAgent,
             });
+            const resourceProviderTarget = resolveStoredResourceProviderTarget({
+              provider: resolved.provider,
+              capability: capabilityInfo,
+            });
             const level1RequestContext = {
               requestId: next.requestId,
               ...(next.requestDeliveryId ? { requestDeliveryId: next.requestDeliveryId } : {}),
@@ -5924,8 +5967,8 @@ export async function startBusAgentRunner(params: {
               currentTurnUserId,
               metadata: {
                 controlCapability: controlCapability ?? undefined,
-                readFileDirectAttachmentSupported:
-                  supportsReadFileDirectAttachments(capabilityInfo),
+                readFileDirectImageSupported: resourceProviderTarget.supportsImage,
+                readFileDirectPdfSupported: resourceProviderTarget.supportsPdf,
                 onActivity: (source: "tool" | "subagent") => markRunActivity(source),
                 onSubagentDelegate:
                   workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
@@ -5987,6 +6030,43 @@ export async function startBusAgentRunner(params: {
             ok: (value) => () => value,
             err: (error) => () => signalBusAgentRunnerHostFailure(error),
           })();
+          const materializeForBinding = async (
+            storedMessages: readonly StoredMessageV1[],
+            binding: BuiltModelBinding,
+          ): Promise<ModelMessage[]> =>
+            await materializeStoredMessagesV1({
+              messages: storedMessages,
+              blobStore: params.blobStore,
+              identityProjection: storedMessageIdentity,
+              resourceAccess: params.resourceAccess,
+              resourceTarget: resolveStoredResourceProviderTarget({
+                provider: binding.resolved.provider,
+                capability: binding.capabilityInfo,
+              }),
+            }).then((materialized) =>
+              materialized.match({
+                ok: (messages) => () => messages,
+                err: (error) => () => signalBusAgentRunnerHostFailure(error),
+              })(),
+            );
+          next.messages = await materializeForBinding(next.storedMessages, activeBinding);
+          if (next.recovery && next.storedRecoveryCheckpoint) {
+            next.recovery.checkpointMessages = await materializeForBinding(
+              next.storedRecoveryCheckpoint,
+              activeBinding,
+            );
+          }
+          if (seededStoredMessages.length > 0) {
+            seededSessionMessages = await materializeForBinding(
+              seededStoredMessages,
+              activeBinding,
+            );
+          }
+          if (state.activeRun) {
+            state.activeRun.messages = next.messages;
+            state.activeRun.materializeStoredMessages = (messages) =>
+              materializeForBinding(messages, activeBinding);
+          }
           modelCapabilityInfo = activeBinding.capabilityInfo;
           costEstimateStatus = activeBinding.costEstimateStatus;
           costEstimateReason = activeBinding.costEstimateReason;
@@ -6031,6 +6111,17 @@ export async function startBusAgentRunner(params: {
               ok: (value) => () => value,
               err: (error) => () => signalBusAgentRunnerHostFailure(error),
             })();
+            const storedCanonicalMessages = storedMessageIdentity
+              .project(agent.state.messages)
+              .match({
+                ok: (messages) => () => messages,
+                err: (error) => () => signalBusAgentRunnerHostFailure(error),
+              })();
+            const reboundMessages = await materializeForBinding(
+              storedCanonicalMessages,
+              nextBinding,
+            );
+            agent.replaceMessages(reboundMessages);
             nextBinding.toolset.updateActiveBatchTools(nextBinding.activeToolNames);
             agent.setModel(
               nextBinding.resolved.model,
@@ -6246,6 +6337,8 @@ export async function startBusAgentRunner(params: {
                   executionScopeHash: executionScope.hash,
                   executionCwd,
                   getLineage: () => state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+                  projectCanonicalStoredMessages: (messages) =>
+                    storedMessageIdentity.project(messages),
                   materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
                   onDiagnostic: (event, detail, error) => {
                     const fields = formatClaudeLifecycleLogFields(event, detail, error);
@@ -7682,7 +7775,10 @@ export async function startBusAgentRunner(params: {
             // If additional messages for the same request id were queued before the run started,
             // merge them into the initial prompt so they don't become separate runs.
             const coalesced = mergeQueuedForSameRequest(next, state.queue, reservedQueueEntries);
-            const mergedInitial = coalesced.messages;
+            const mergedInitial = await materializeForBinding(
+              coalesced.storedMessages,
+              activeBinding,
+            );
             state.activeRun?.setCurrentTurnUserId(next.currentTurnUserId);
             for (const discarded of coalesced.discarded) {
               if (discarded.requestDeliveryId && state.activeRun) {
@@ -7908,10 +8004,12 @@ export async function startBusAgentRunner(params: {
                     didCompact: isCompactionCheckpoint,
                   });
                 })();
-                const persistedMessages = projectStoredMessagesV1(persistenceCandidates).match({
-                  ok: (messages) => () => messages,
-                  err: (error) => () => signalBusAgentRunnerHostFailure(error),
-                })();
+                const persistedMessages = storedMessageIdentity
+                  .project(persistenceCandidates)
+                  .match({
+                    ok: (messages) => () => messages,
+                    err: (error) => () => signalBusAgentRunnerHostFailure(error),
+                  })();
                 const targetProviderFamily = classifyHistoryProviderFamily({
                   type: activeBinding.resolved.provider,
                 });
@@ -8019,6 +8117,7 @@ export async function startBusAgentRunner(params: {
                   const canonicalMessages = await materializeStoredMessagesV1({
                     messages: persistedMessages,
                     blobStore: params.blobStore,
+                    identityProjection: storedMessageIdentity,
                   }).then((result) =>
                     result.match({
                       ok: (messages) => () => messages,
@@ -8396,7 +8495,7 @@ export async function startBusAgentRunner(params: {
 
                 return runProfile === "primary" ? responseMessages : safeFinalMessages;
               })();
-              const persistedMessages = projectStoredMessagesV1(persistenceCandidates).match({
+              const persistedMessages = storedMessageIdentity.project(persistenceCandidates).match({
                 ok: (messages) => () => messages,
                 err: (error) => () => signalBusAgentRunnerHostFailure(error),
               })();
@@ -8967,9 +9066,11 @@ function mergeQueuedForSameRequest(
   reservedQueueEntries: ReadonlySet<Enqueued>,
 ): {
   readonly messages: ModelMessage[];
+  readonly storedMessages: StoredMessageV1[];
   readonly discarded: readonly Enqueued[];
 } {
   const merged: ModelMessage[] = [...first.messages];
+  const storedMessages: StoredMessageV1[] = [...first.storedMessages];
   const discarded: Enqueued[] = [];
 
   // Pull in any already-queued items for the same request id so they become
@@ -8982,6 +9083,7 @@ function mergeQueuedForSameRequest(
     }
 
     merged.push(...next.messages);
+    storedMessages.push(...next.storedMessages);
     first.currentTurnUserId = next.currentTurnUserId;
     discarded.push(next);
     queue.splice(i, 1);
@@ -8994,7 +9096,7 @@ function mergeQueuedForSameRequest(
     );
   }
 
-  return { messages: merged, discarded };
+  return { messages: merged, storedMessages, discarded };
 }
 
 async function applyToRunningAgent(
@@ -9004,10 +9106,21 @@ async function applyToRunningAgent(
   activeRun: SessionQueue["activeRun"],
 ) {
   activeRun?.flushOutput();
-  const merged = mergeToSingleUserMessage(entry.messages);
   const liveParent = activeRun?.liveParent;
   const claudeCodeControl = activeRun?.claudeCodeControl;
   const notifyWaiters = activeRun?.notifyWaiters;
+  const cancel = parseRequestControlFromRaw(entry.raw).cancel;
+  const providerMessages =
+    !cancel && activeRun?.materializeStoredMessages
+      ? await activeRun.materializeStoredMessages(entry.storedMessages)
+      : entry.messages;
+  const merged = mergeToSingleUserMessage(providerMessages);
+  if (!cancel) {
+    activeRun?.rememberStoredMessages(
+      [merged],
+      [mergeToSingleStoredUserMessage(entry.storedMessages)],
+    );
+  }
   const queueWhileIdle = (mode: "followUp" | "steer") => {
     if (mode === "steer") {
       agent.steer(merged);
@@ -9030,7 +9143,6 @@ async function applyToRunningAgent(
     }
   };
 
-  const cancel = parseRequestControlFromRaw(entry.raw).cancel;
   if (!cancel) activeRun?.setCurrentTurnUserId(entry.currentTurnUserId);
   if (!cancel && activeRun?.runProfile === "primary" && activeRun.requestClient === "discord") {
     activeRun.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
@@ -9205,4 +9317,36 @@ export function mergeToSingleUserMessage(messages: ModelMessage[]): ModelMessage
     role: "user",
     content: parts.join("\n\n").trim(),
   };
+}
+
+function mergeToSingleStoredUserMessage(messages: readonly StoredMessageV1[]): StoredMessageV1 {
+  const userMessages = messages.filter(
+    (message): message is Extract<StoredMessageV1, { readonly role: "user" }> =>
+      message.role === "user",
+  );
+  if (userMessages.length === 0) return { role: "user", content: "" };
+  const hasMultipart = userMessages.some((message) => typeof message.content !== "string");
+  if (!hasMultipart) {
+    return {
+      role: "user",
+      content: userMessages
+        .flatMap((message) => (typeof message.content === "string" ? [message.content] : []))
+        .join("\n\n")
+        .trim(),
+    };
+  }
+
+  const content: Exclude<Extract<StoredMessageV1, { readonly role: "user" }>["content"], string> =
+    [];
+  for (let index = 0; index < userMessages.length; index += 1) {
+    const message = userMessages[index];
+    if (!message) continue;
+    if (index > 0) content.push({ type: "text", text: "\n\n" });
+    if (typeof message.content === "string") {
+      if (message.content.length > 0) content.push({ type: "text", text: message.content });
+      continue;
+    }
+    content.push(...message.content);
+  }
+  return { role: "user", content };
 }

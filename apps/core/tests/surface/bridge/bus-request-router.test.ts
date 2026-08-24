@@ -83,6 +83,8 @@ import {
 } from "../../../src/transcript/transcript-store";
 import type { ModelMessage } from "ai";
 import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
+import { createTestResourceRegistry } from "../../helpers/resource-registry";
+import { ResourceStoreFailure, type ResourceRegistry } from "../../../src/resource";
 
 type TestRawBus = RawBus & {
   readonly deliveryActions: Array<{ readonly topic: string; readonly action: RawDeliveryAction }>;
@@ -103,9 +105,11 @@ type TestRawBus = RawBus & {
 
 type TestDiscordRequestRouterInput = Omit<
   StartDiscordRequestRouterInput,
-  "blobStore" | "requestDelivery" | "config"
+  "blobStore" | "resourceRegistry" | "requestDelivery" | "config"
 > &
-  Partial<Pick<StartDiscordRequestRouterInput, "blobStore" | "requestDelivery">> & {
+  Partial<
+    Pick<StartDiscordRequestRouterInput, "blobStore" | "resourceRegistry" | "requestDelivery">
+  > & {
     config?: CoreConfig | RouterConfigOverride;
   };
 
@@ -124,6 +128,7 @@ async function startDiscordRequestRouter(input: TestDiscordRequestRouterInput) {
     ...input,
     config: normalizeTestRouterConfig(input.config),
     blobStore: input.blobStore ?? (await getTestBlobStore()),
+    resourceRegistry: input.resourceRegistry ?? createTestResourceRegistry(),
     requestDelivery: input.requestDelivery ?? {
       async prepareAndPublish({ envelope }) {
         return (
@@ -653,6 +658,7 @@ describe("Discord authenticated-origin publication", () => {
     const result = await publishSingleMessagePrompt({
       adapter,
       blobStore,
+      resourceRegistry: createTestResourceRegistry(),
       requestDelivery: {
         prepareAndPublish: async (input) => {
           publishedRaw = input.envelope.data.raw;
@@ -737,6 +743,7 @@ describe("Discord authenticated-origin publication", () => {
       const result = await publishSingleMessagePrompt({
         adapter,
         blobStore,
+        resourceRegistry: createTestResourceRegistry(),
         requestDelivery: {
           prepareAndPublish: async () => Result.ok(undefined),
         },
@@ -753,7 +760,8 @@ describe("Discord authenticated-origin publication", () => {
 
       expect(result).toEqual(Result.err(failure));
       expect(reads).toBe(2);
-      expect(deletedRequestHandles).toHaveLength(1);
+      expect(deletedRequestHandles).toHaveLength(0);
+      expect(fetchAttachment).not.toHaveBeenCalled();
       expect(publish).not.toHaveBeenCalled();
     } finally {
       deleteBlob.mockRestore();
@@ -6872,20 +6880,20 @@ describe("startBusRequestRouter", () => {
       },
     });
     const transcriptStore = new SqliteTranscriptStore(":memory:");
-    const putCoreOwnedBlob = transcriptStore.putCoreOwnedBlob.bind(transcriptStore);
     let failComposition = true;
-    const putCoreOwnedBlobStub = spyOn(transcriptStore, "putCoreOwnedBlob").mockImplementation(
-      (input) =>
-        failComposition
-          ? Result.err(new CoreOwnedBlobIntegrityError("forced typed composition failure"))
-          : putCoreOwnedBlob(input),
-    );
-    const fetchStub = spyOn(globalThis, "fetch").mockImplementation(
-      (async () =>
-        new Response("attachment", {
-          headers: { "content-type": "image/png" },
-        })) as unknown as typeof fetch,
-    );
+    const workingResourceRegistry = createTestResourceRegistry();
+    const resourceRegistry: ResourceRegistry = {
+      async register(input) {
+        return failComposition
+          ? Result.err(
+              new ResourceStoreFailure({
+                operation: "register",
+                message: "forced typed composition failure",
+              }),
+            )
+          : workingResourceRegistry.register(input);
+      },
+    };
     const logger = new Logger({ module: "typed-composition-source-handoff-test" });
     const debugStub = spyOn(logger, "debug").mockImplementation(() => undefined);
     const infoStub = spyOn(logger, "info").mockImplementation(() => undefined);
@@ -6896,6 +6904,7 @@ describe("startBusRequestRouter", () => {
       bus,
       subscriptionId: "router-typed-composition-source-handoff",
       transcriptStore,
+      resourceRegistry,
       logger,
       config: {
         surface: {
@@ -7092,8 +7101,6 @@ describe("startBusRequestRouter", () => {
       await sub.stop();
       await router.stop();
       transcriptStore.close();
-      putCoreOwnedBlobStub.mockRestore();
-      fetchStub.mockRestore();
       debugStub.mockRestore();
       infoStub.mockRestore();
       warnStub.mockRestore();

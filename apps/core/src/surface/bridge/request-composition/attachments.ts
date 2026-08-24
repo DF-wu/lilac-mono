@@ -12,7 +12,12 @@ import type {
   BlobStore,
   BlobUpload,
 } from "@stanley2058/lilac-blob-storage";
-import type { BusFilePartV2, StoredFilePartV1 } from "@stanley2058/lilac-event-bus";
+import type {
+  BusFilePartV2,
+  BusResourcePartV1,
+  StoredFilePartV1,
+  StoredResourcePartV1,
+} from "@stanley2058/lilac-event-bus";
 import {
   DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
   type RetentionLimit,
@@ -142,9 +147,15 @@ export class DiscordAttachmentPreparationFailed extends TaggedError(
   readonly message: string;
 }> {}
 
-export type DiscordBusUserContentPart = Exclude<UserContent, string>[number] | BusFilePartV2;
+export type DiscordBusUserContentPart =
+  | Exclude<UserContent, string>[number]
+  | BusFilePartV2
+  | BusResourcePartV1;
 
-export type DiscordStoredUserContentPart = Exclude<UserContent, string>[number] | StoredFilePartV1;
+export type DiscordStoredUserContentPart =
+  | Exclude<UserContent, string>[number]
+  | StoredFilePartV1
+  | StoredResourcePartV1;
 
 export function getDiscordOwnedBlobReferences(
   state: DiscordAttachmentState,

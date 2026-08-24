@@ -4,11 +4,13 @@ import { isDeepStrictEqual } from "node:util";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   buildCoreLineageManifestV2,
+  areCoreCanonicalMessagesIdentityEqualV2,
   createCorePrimaryLineageFreshOnlyV2,
   type BusMessageV2,
   type CoreLineageAtomV2,
   type CoreLineageSegmentInputV2,
   type CorePrimaryLineageV2,
+  type StoredResourcePartV1,
   type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
@@ -20,6 +22,12 @@ import {
   type SurfaceOperationResult,
 } from "../adapter";
 import type { MsgRef, SurfaceMessage } from "../types";
+import {
+  ResourceStoreFailure,
+  type ResourceDescriptor,
+  type ResourceRegistrationError,
+  type ResourceRegistry,
+} from "../../resource";
 
 import {
   parseLeadingContinueDirective,
@@ -45,8 +53,6 @@ import {
   StoredMessageValidationError,
 } from "../../transcript/transcript-persistence-codec";
 import {
-  appendDiscordAttachmentsToBusContent,
-  appendDiscordAttachmentsToStoredContent,
   createDiscordAttachmentState,
   deleteDiscordRequestBlobHandles,
   type DiscordAttachmentPreparationFailed,
@@ -55,7 +61,6 @@ import {
   getDiscordOwnedBlobReferences,
   getDiscordRequestBlobHandles,
   rememberDiscordRequestBlobHandles,
-  takeDiscordCurrentBlobReferences,
 } from "./request-composition/attachments";
 import type { DiscordAttachmentCacheAccess } from "../discord/discord-attachment";
 import type { DiscordMessageCacheAccess } from "../store/discord-search-store";
@@ -101,6 +106,7 @@ export type RequestCompositionPrimaryError =
   | CoreOwnedBlobIntegrityError
   | DiscordAttachmentPreparationFailed
   | DiscordStoredBlobPreparationError
+  | ResourceRegistrationError
   | StoredMessageValidationError
   | SurfaceOperationError;
 
@@ -208,48 +214,6 @@ function mergeProjectedSurfaceMessages(messages: readonly StoredMessageV1[]): St
   }
 
   const parts: Exclude<Extract<StoredMessageV1, { role: "user" }>["content"], string> = [];
-  for (const [index, message] of messages.entries()) {
-    if (index > 0) parts.push({ type: "text", text: "\n\n" });
-    if (typeof message.content === "string") parts.push({ type: "text", text: message.content });
-    else parts.push(...message.content);
-  }
-  return [{ role: "user", content: parts }];
-}
-
-function mergeBusSurfaceMessages(messages: readonly BusMessageV2[]): BusMessageV2[] {
-  if (messages.length <= 1) return [...messages];
-  const role = messages[0]?.role;
-  if (role === "assistant" && messages.every((message) => message.role === "assistant")) {
-    const content = messages
-      .map((message) =>
-        typeof message.content === "string"
-          ? message.content
-          : message.content
-              .filter((part) => part.type === "text")
-              .map((part) => part.text)
-              .join("\n\n"),
-      )
-      .filter(Boolean)
-      .join("\n\n");
-    return [{ role: "assistant", content }];
-  }
-  if (role !== "user" || !messages.every((message) => message.role === "user")) {
-    return [...messages];
-  }
-
-  const multipart = messages.some((message) => typeof message.content !== "string");
-  if (!multipart) {
-    return [
-      {
-        role: "user",
-        content: messages
-          .map((message) => (typeof message.content === "string" ? message.content : ""))
-          .join("\n\n"),
-      },
-    ];
-  }
-
-  const parts: Exclude<Extract<BusMessageV2, { role: "user" }>["content"], string> = [];
   for (const [index, message] of messages.entries()) {
     if (index > 0) parts.push({ type: "text", text: "\n\n" });
     if (typeof message.content === "string") parts.push({ type: "text", text: message.content });
@@ -523,7 +487,10 @@ function appendPersistedSyntheticSuffix(input: {
     return (
       stored !== undefined &&
       isDeepStrictEqual(segment.atoms, stored.atoms) &&
-      isDeepStrictEqual(segment.canonicalMessages, stored.canonicalMessages) &&
+      areCoreCanonicalMessagesIdentityEqualV2(
+        segment.canonicalMessages,
+        stored.canonicalMessages,
+      ) &&
       isDeepStrictEqual(segment.requestSource, stored.requestSource)
     );
   });
@@ -547,83 +514,107 @@ async function renderSurfaceProjectionCandidate(input: {
   sessionId: string;
   reactions: readonly string[];
   discordUserAliasById?: ReadonlyMap<string, string>;
-  attachmentState: ReturnType<typeof createDiscordAttachmentState>;
-  streamRequestAttachments: boolean;
+  resourceRegistry?: ResourceRegistry;
 }): Promise<
   ResultType<
     {
       messages: StoredMessageV1[];
       ownedBlobs: CoreOwnedBlobReference[];
-      directBusMessages?: BusMessageV2[];
     },
     RequestCompositionError
   >
 > {
   const normalized = normalizeText(input.message.text, {});
-  if (input.isBot) {
-    return Result.ok({
+  const registered = await registerDiscordResourceParts({
+    attachments: input.message.attachments,
+    channelId: input.sessionId,
+    messageId: input.message.messageId,
+    resourceRegistry: input.resourceRegistry,
+  });
+  return registered.map((resourceParts) => {
+    if (input.isBot) {
+      const assistantText = normalizeAssistantContextText(normalized);
+      return {
+        messages: [
+          resourceParts.length === 0
+            ? { role: "assistant" as const, content: assistantText }
+            : {
+                role: "assistant" as const,
+                content: [{ type: "text" as const, text: assistantText }, ...resourceParts],
+              },
+        ],
+        ownedBlobs: [],
+      };
+    }
+
+    const header = formatDiscordAttributionHeader({
+      authorId: input.message.authorId,
+      authorName: input.message.authorName,
+      userAlias: input.discordUserAliasById?.get(input.message.authorId),
+      messageId: input.message.messageId,
+      messageTs: input.message.ts,
+      reactions: input.reactions,
+    });
+    const mainText = `${header}\n${escapeSurfaceMetadataTags(normalized)}`.trimEnd();
+    return {
       messages: [
-        {
-          role: "assistant",
-          content: normalizeAssistantContextText(normalized),
-        },
+        resourceParts.length === 0
+          ? { role: "user" as const, content: mainText }
+          : {
+              role: "user" as const,
+              content: [{ type: "text" as const, text: mainText }, ...resourceParts],
+            },
       ],
       ownedBlobs: [],
-    });
-  }
-
-  const header = formatDiscordAttributionHeader({
-    authorId: input.message.authorId,
-    authorName: input.message.authorName,
-    userAlias: input.discordUserAliasById?.get(input.message.authorId),
-    messageId: input.message.messageId,
-    messageTs: input.message.ts,
-    reactions: input.reactions,
+    };
   });
-  const mainText = `${header}\n${escapeSurfaceMetadataTags(normalized)}`.trimEnd();
-  if (input.message.attachments.length === 0) {
-    return Result.ok({
-      messages: [{ role: "user", content: mainText }],
-      ownedBlobs: [],
-    });
-  }
+}
 
-  if (!input.streamRequestAttachments) {
-    const storedParts: Exclude<Extract<StoredMessageV1, { role: "user" }>["content"], string> = [
-      { type: "text", text: mainText },
-    ];
-    const stored = await appendDiscordAttachmentsToStoredContent(
-      storedParts,
-      input.message.attachments,
-      input.attachmentState,
-      { channelId: input.sessionId, messageId: input.message.messageId },
+async function registerDiscordResourceParts(input: {
+  attachments: Readonly<ReplyChainMessage["attachments"]>;
+  channelId: string;
+  messageId: string;
+  resourceRegistry?: ResourceRegistry;
+}): Promise<ResultType<StoredResourcePartV1[], ResourceRegistrationError>> {
+  if (input.attachments.length === 0) return Result.ok([]);
+  if (!input.resourceRegistry) {
+    return Result.err(
+      new ResourceStoreFailure({
+        operation: "register",
+        message: "Discord attachment composition requires a ResourceRegistry",
+      }),
     );
-    const storedError = stored.match({ ok: () => null, err: (error) => error });
-    if (storedError) return Result.err(storedError);
-    return Result.ok({
-      messages: [{ role: "user", content: storedParts }],
-      ownedBlobs: takeDiscordCurrentBlobReferences(input.attachmentState),
-    });
   }
-
-  const parts: Exclude<Extract<BusMessageV2, { role: "user" }>["content"], string> = [
-    { type: "text", text: mainText },
-  ];
-  const appended = await appendDiscordAttachmentsToBusContent(
-    parts,
-    input.message.attachments,
-    input.attachmentState,
-    { channelId: input.sessionId, messageId: input.message.messageId },
-  );
-  const attachmentError = appended.match({
-    ok: () => null,
-    err: (error) => error,
-  });
-  if (attachmentError) return Result.err(attachmentError);
-  return Result.ok({
-    messages: [{ role: "user", content: mainText }],
-    ownedBlobs: [],
-    directBusMessages: [{ role: "user", content: parts }],
+  const registry = input.resourceRegistry;
+  return Result.gen(async function* () {
+    const parts: StoredResourcePartV1[] = [];
+    for (const [ordinal, attachment] of input.attachments.entries()) {
+      const descriptor: ResourceDescriptor = yield* Result.await(
+        registry.register({
+          origin: {
+            version: 1,
+            kind: "discord-attachment",
+            channelId: input.channelId,
+            messageId: input.messageId,
+            ordinal,
+            ...(attachment.id ? { attachmentId: attachment.id } : {}),
+          },
+          ...(attachment.filename ? { filename: attachment.filename } : {}),
+          ...(attachment.mimeType ? { declaredMediaType: attachment.mimeType } : {}),
+          ...(attachment.size !== undefined ? { reportedByteLength: attachment.size } : {}),
+        }),
+      );
+      parts.push({
+        type: "resource",
+        uri: descriptor.uri,
+        ...(descriptor.filename ? { filename: descriptor.filename } : {}),
+        ...(descriptor.declaredMediaType ? { mediaType: descriptor.declaredMediaType } : {}),
+        ...(descriptor.reportedByteLength !== undefined
+          ? { size: descriptor.reportedByteLength }
+          : {}),
+      });
+    }
+    return Result.ok(parts);
   });
 }
 
@@ -639,6 +630,7 @@ async function composeSelectedDiscordChain(input: {
   blobStore?: BlobStore;
   attachmentCache?: DiscordAttachmentCacheAccess;
   attachmentCacheTtl?: RetentionLimit;
+  resourceRegistry?: ResourceRegistry;
   resolvedProjections?: ReadonlyMap<string, CoreSurfaceProjection | null>;
 }): Promise<
   ResultType<
@@ -735,7 +727,6 @@ async function composeSelectedDiscordChain(input: {
       err: () => new Map<string, readonly string[]>(),
     });
     const projectedByMessageId = new Map<string, readonly StoredMessageV1[]>();
-    const directBusMessagesByMessageId = new Map<string, readonly BusMessageV2[]>();
     const candidateOwnedBlobsByMessageId = new Map<string, readonly CoreOwnedBlobReference[]>();
     let lineageComplete = Boolean(projectionStore);
     const transcriptSnapshotByMessageId = new Map<string, TranscriptSnapshot>();
@@ -778,8 +769,7 @@ async function composeSelectedDiscordChain(input: {
           sessionId: input.sessionId,
           reactions: reactionValues.get(messageId) ?? [],
           discordUserAliasById: input.discordUserAliasById,
-          attachmentState,
-          streamRequestAttachments: input.attachmentCache !== undefined,
+          resourceRegistry: input.resourceRegistry,
         });
         const candidateError = candidateResult.match({
           ok: () => null,
@@ -794,17 +784,10 @@ async function composeSelectedDiscordChain(input: {
         const candidate = candidateResult.match<{
           messages: StoredMessageV1[];
           ownedBlobs: CoreOwnedBlobReference[];
-          directBusMessages?: BusMessageV2[];
         }>({
           ok: (value) => value,
           err: () => ({ messages: [], ownedBlobs: [] }),
         });
-        if (candidate.directBusMessages) {
-          directBusMessagesByMessageId.set(messageId, candidate.directBusMessages);
-          projectedByMessageId.set(messageId, candidate.messages);
-          lineageComplete = false;
-          continue;
-        }
         const candidateOwnershipError = getDiscordAttachmentOwnershipError(attachmentState);
         if (candidateOwnershipError) {
           return {
@@ -873,9 +856,6 @@ async function composeSelectedDiscordChain(input: {
             authorName: source.authorName,
             messageTs: source.ts,
             reactions: [...(reactionValues.get(messageId) ?? [])],
-            attachments: source.attachments.map((attachment) => ({
-              ...attachment,
-            })),
             segmentMessageIds: [...segmentMessageIds],
             segmentDigest,
           },
@@ -894,7 +874,6 @@ async function composeSelectedDiscordChain(input: {
     }
 
     const segmentInputs: StoredLineageSegmentInputV2[] = [];
-    const surfaceMessageIdsBySegment = new WeakMap<object, readonly string[]>();
     if (input.checkpointSelection.checkpoint) {
       const checkpoint = input.checkpointSelection.checkpoint;
       const checkpointDigestResult = hashCanonicalStoredMessagesV2(checkpoint.messages);
@@ -947,7 +926,6 @@ async function composeSelectedDiscordChain(input: {
         );
         const segment = { atoms, canonicalMessages };
         segmentInputs.push(segment);
-        surfaceMessageIdsBySegment.set(segment, [...messageIds]);
       };
 
       const pendingSurfaceIds: string[] = [];
@@ -1067,40 +1045,6 @@ async function composeSelectedDiscordChain(input: {
     if (ownershipError) return { status: "return", value: Result.err(ownershipError) } as const;
     const preparedMessages: BusMessageV2[] = [];
     for (const segment of segmentInputs) {
-      const surfaceMessageIds = surfaceMessageIdsBySegment.get(segment);
-      if (surfaceMessageIds?.some((messageId) => directBusMessagesByMessageId.has(messageId))) {
-        const segmentMessages: BusMessageV2[] = [];
-        for (const messageId of surfaceMessageIds) {
-          const direct = directBusMessagesByMessageId.get(messageId);
-          if (direct) {
-            segmentMessages.push(...direct);
-            continue;
-          }
-          const prepared = await prepareStoredMessagesForBus({
-            blobStore: input.blobStore,
-            messages: projectedByMessageId.get(messageId) ?? [],
-          });
-          const preparationError = prepared.match({
-            ok: () => null,
-            err: (error) => error,
-          });
-          if (preparationError) {
-            return {
-              status: "return",
-              value: Result.err(preparationError),
-            } as const;
-          }
-          prepared.match({
-            ok: (value) => {
-              rememberDiscordRequestBlobHandles(attachmentState, value.inputHandles);
-              segmentMessages.push(...value.messages);
-            },
-            err: () => undefined,
-          });
-        }
-        preparedMessages.push(...mergeBusSurfaceMessages(segmentMessages));
-        continue;
-      }
       const prepared = await prepareStoredMessagesForBus({
         blobStore: input.blobStore,
         messages: segment.canonicalMessages,
@@ -1920,6 +1864,7 @@ export async function composeRequestMessages(
     blobStore: opts.blobStore,
     attachmentCache: opts.attachmentCache,
     attachmentCacheTtl: opts.attachmentCacheTtl,
+    resourceRegistry: opts.resourceRegistry,
     resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({
@@ -2284,6 +2229,7 @@ export async function composeRecentChannelMessages(
     blobStore: opts.blobStore,
     attachmentCache: opts.attachmentCache,
     attachmentCacheTtl: opts.attachmentCacheTtl,
+    resourceRegistry: opts.resourceRegistry,
     resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({
@@ -2372,6 +2318,7 @@ export async function composeSingleMessageWithLineage(
     blobStore: opts.blobStore,
     attachmentCache: opts.attachmentCache,
     attachmentCacheTtl: opts.attachmentCacheTtl,
+    resourceRegistry: opts.resourceRegistry,
     resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({

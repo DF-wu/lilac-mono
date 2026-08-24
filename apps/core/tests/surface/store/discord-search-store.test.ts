@@ -193,6 +193,79 @@ describe("discord search store", () => {
     store.close();
   });
 
+  it("does not treat reported attachment MIME or size changes as identity changes", () => {
+    const pruned: BlobRefV1[] = [];
+    const store = new DiscordSearchStore(":memory:", {
+      onAttachmentCachePruned: (blob) => pruned.push(blob),
+    });
+    const message: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "123", messageId: "m1" },
+      session: { platform: "discord", channelId: "123" },
+      userId: "u1",
+      text: "attachment",
+      ts: 1,
+      raw: {
+        attachments: [
+          {
+            id: "a1",
+            url: "https://cdn.discordapp.com/attachments/1/2/diagram.webp",
+            filename: "diagram.webp",
+            mimeType: "image/webp",
+            size: 123,
+          },
+        ],
+      },
+    };
+    const blob: BlobRefV1 = {
+      version: 1,
+      objectId: `b1_${"3".repeat(32)}`,
+      sha256: "c".repeat(64),
+      byteLength: 456,
+    };
+
+    try {
+      expect(store.upsertMessages([message])).toBe(1);
+      store.putAttachmentCache({
+        channelId: "123",
+        messageId: "m1",
+        ordinal: 0,
+        attachmentId: "a1",
+        blob,
+        cachedAt: 1_000,
+      });
+
+      expect(
+        store.upsertMessages([
+          {
+            ...message,
+            raw: {
+              attachments: [
+                {
+                  id: "a1",
+                  url: "https://cdn.discordapp.com/attachments/1/2/diagram.webp",
+                  filename: "diagram.webp",
+                  mimeType: "image/png",
+                  size: 456,
+                },
+              ],
+            },
+          },
+        ]),
+      ).toBe(0);
+      expect(pruned).toEqual([]);
+      expect(
+        store.getAttachmentCache({
+          channelId: "123",
+          messageId: "m1",
+          ordinal: 0,
+          attachmentId: "a1",
+        }),
+      ).toEqual({ blob, cachedAt: 1_000 });
+    } finally {
+      store.close();
+    }
+  });
+
   it("does not advance freshness when re-upserting identical messages", () => {
     const originalDateNow = Date.now;
     let now = 1_000;

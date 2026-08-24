@@ -157,6 +157,65 @@ function createBlobStore(input: {
 }
 
 describe("Discord request attachment blob composition", () => {
+  it("passes structured resources from stored projections to the request bus unchanged", async () => {
+    const resource = {
+      type: "resource" as const,
+      uri: `resource://r1_${"ab".repeat(16)}`,
+      filename: "diagram.png",
+      mediaType: "image/png",
+      size: 321,
+    };
+    const prepared = await prepareStoredMessagesForBus({
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "inspect" }, resource],
+        },
+        {
+          role: "assistant",
+          content: [resource],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "call-1",
+              toolName: "inspect",
+              output: { type: "content", value: [resource] },
+            },
+          ],
+        },
+      ],
+    });
+
+    const value = prepared.match({
+      ok: (result) => result,
+      err: (error) => {
+        throw error;
+      },
+    });
+    expect(value.messages).toEqual([
+      {
+        role: "user",
+        content: [{ type: "text", text: "inspect" }, resource],
+      },
+      { role: "assistant", content: [resource] },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "inspect",
+            output: { type: "content", value: [resource] },
+          },
+        ],
+      },
+    ]);
+    expect(value.inputHandles).toEqual([]);
+  });
+
   it("materializes a stored reference into a request handle without awaiting upload completion", async () => {
     const storedRef = blobRef(1, { byteLength: 5 });
     const blobs = createBlobStore({

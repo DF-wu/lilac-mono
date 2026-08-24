@@ -26,7 +26,11 @@ import {
   SurfaceRateLimited,
   SurfaceUnavailable,
 } from "../../../src/surface/adapter";
-import type { TranscriptSnapshot, TranscriptStore } from "../../../src/transcript/transcript-store";
+import type {
+  AdmitCoreSurfaceProjection,
+  TranscriptSnapshot,
+  TranscriptStore,
+} from "../../../src/transcript/transcript-store";
 import type {
   ContentOpts,
   LimitOpts,
@@ -39,6 +43,8 @@ import type {
 } from "../../../src/surface/types";
 import { getTestBlobStore } from "../../helpers/blob-store";
 import type { DiscordAttachmentCacheAccess } from "../../../src/surface/discord/discord-attachment";
+import type { RegisterResourceInput, ResourceDescriptor } from "../../../src/resource/contracts";
+import { ResourceStoreFailure } from "../../../src/resource/errors";
 import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 
 async function composeRecentChannelMessages(
@@ -233,6 +239,48 @@ const noOpAttachmentCache: DiscordAttachmentCacheAccess = {
   put: () => undefined,
   clear: () => null,
 };
+
+function createRecordingResourceRegistry() {
+  const registrations: RegisterResourceInput[] = [];
+  return {
+    registrations,
+    registry: {
+      async register(input: RegisterResourceInput) {
+        registrations.push(input);
+        const descriptor: ResourceDescriptor = {
+          uri: `resource://r1_${registrations.length.toString(16).padStart(32, "0")}`,
+          ...(input.filename ? { filename: input.filename } : {}),
+          ...(input.declaredMediaType ? { declaredMediaType: input.declaredMediaType } : {}),
+          ...(input.reportedByteLength === undefined
+            ? {}
+            : { reportedByteLength: input.reportedByteLength }),
+        };
+        return Result.ok(descriptor);
+      },
+    },
+  };
+}
+
+function createProjectionCapturingStore(admitted: AdmitCoreSurfaceProjection[]): TranscriptStore {
+  return {
+    saveRequestTranscript: () => Result.ok(undefined),
+    linkSurfaceMessagesToRequest: () => undefined,
+    getTranscriptBySurfaceMessage: () => Result.ok(null),
+    putCoreOwnedBlob: () => {
+      throw new Error("unexpected blob ownership write");
+    },
+    getCoreOwnedBlob: () => {
+      throw new Error("unexpected blob ownership read");
+    },
+    deleteCoreOwnedBlobIfUnreferenced: () => null,
+    admitCoreSurfaceProjection(input) {
+      admitted.push(input);
+      return Result.ok({ ...input, createdAt: 0 });
+    },
+    getCoreSurfaceProjection: () => Result.ok(null),
+    close: () => undefined,
+  };
+}
 
 describe("request-composition attachments", () => {
   it("propagates message read failures instead of composing empty context", async () => {
@@ -439,6 +487,59 @@ describe("request-composition attachments", () => {
     expect(out!.content as string).not.toContain("[discord user_id=");
   });
 
+  it("registers visible attachments on assistant surface messages", async () => {
+    const msg: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "m" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "bot",
+      userName: "lilac",
+      text: "assistant_output",
+      ts: 0,
+      raw: {
+        discord: {
+          attachments: [
+            {
+              id: "attachment-1",
+              url: "https://cdn.discordapp.com/attachments/1/2/report.pdf",
+              filename: "report.pdf",
+              mimeType: "application/pdf",
+              size: 4,
+            },
+          ],
+        },
+      },
+    };
+    const resources = createRecordingResourceRegistry();
+
+    const out = await composeSingleMessage(new FakeAdapter(msg), {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: msg.ref,
+      resourceRegistry: resources.registry,
+    });
+
+    expect(out?.role).toBe("assistant");
+    expect(out?.content).toEqual([
+      { type: "text", text: "assistant_output" },
+      {
+        type: "resource",
+        uri: "resource://r1_00000000000000000000000000000001",
+        filename: "report.pdf",
+        mediaType: "application/pdf",
+        size: 4,
+      },
+    ]);
+    expect(resources.registrations[0]?.origin).toEqual({
+      version: 1,
+      kind: "discord-attachment",
+      channelId: "c",
+      messageId: "m",
+      ordinal: 0,
+      attachmentId: "attachment-1",
+    });
+  });
+
   it("keeps bot embed-only messages untagged", async () => {
     const msg: SurfaceMessage = {
       ref: { platform: "discord", channelId: "c", messageId: "m" },
@@ -543,7 +644,7 @@ describe("request-composition attachments", () => {
     expect(content).toContain("[discord_embed]");
   });
 
-  it("downloads discord attachment when mimeType is missing", async () => {
+  it("registers an unknown-size Discord attachment without fetching its bytes", async () => {
     let calls = 0;
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
@@ -573,11 +674,13 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
@@ -585,12 +688,110 @@ describe("request-composition attachments", () => {
     const content = out!.content as any[];
 
     expect(content.length).toBe(2);
-    expect(content[1].type).toBe("text");
-    expect(typeof content[1].text).toBe("string");
-    expect(content[1].text).toContain("[discord_attachment");
-    expect(content[1].text).toContain("file.txt");
-    expect(content[1].text).toContain("hello");
-    expect(calls).toBe(1);
+    expect(content[1]).toEqual({
+      type: "resource",
+      uri: "resource://r1_00000000000000000000000000000001",
+      filename: "file.txt",
+    });
+    expect(resources.registrations).toEqual([
+      {
+        origin: {
+          version: 1,
+          kind: "discord-attachment",
+          channelId: "c",
+          messageId: "m",
+          ordinal: 0,
+        },
+        filename: "file.txt",
+      },
+    ]);
+    expect(calls).toBe(0);
+  });
+
+  it("returns a closed registration failure when attachments have no registry", async () => {
+    const msg: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "m" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      userName: "user",
+      text: "hi",
+      ts: 0,
+      raw: {
+        discord: {
+          attachments: [
+            {
+              url: "https://cdn.discordapp.com/attachments/1/2/file.txt",
+              filename: "file.txt",
+            },
+          ],
+        },
+      },
+    };
+
+    const composed = await composeSingleMessageResult(new FakeAdapter(msg), {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: msg.ref,
+    });
+
+    expect(composed.status).toBe("error");
+    if (composed.status === "error") {
+      expect(composed.error).toBeInstanceOf(ResourceStoreFailure);
+    }
+  });
+
+  it("persists resource identity without signed URLs or attachment IDs in source facts", async () => {
+    const signedUrl = "https://cdn.discordapp.com/attachments/1/2/file.txt?sig=secret";
+    const attachmentId = "discord-attachment-id";
+    const msg: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "m" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      userName: "user",
+      text: "hi",
+      ts: 0,
+      raw: {
+        discord: {
+          attachments: [
+            {
+              id: attachmentId,
+              url: signedUrl,
+              filename: "file.txt",
+              mimeType: "text/plain",
+              size: 12,
+            },
+          ],
+        },
+      },
+    };
+    const admitted: AdmitCoreSurfaceProjection[] = [];
+    const resources = createRecordingResourceRegistry();
+
+    await composeSingleMessage(new FakeAdapter(msg), {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: msg.ref,
+      resourceRegistry: resources.registry,
+      transcriptStore: createProjectionCapturingStore(admitted),
+    });
+
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]?.canonicalMessages[0]?.content).toEqual([
+      expect.objectContaining({ type: "text" }),
+      {
+        type: "resource",
+        uri: "resource://r1_00000000000000000000000000000001",
+        filename: "file.txt",
+        mediaType: "text/plain",
+        size: 12,
+      },
+    ]);
+    const serializedFacts = JSON.stringify(admitted[0]?.sourceFacts);
+    expect(admitted[0]?.sourceFacts).not.toHaveProperty("attachments");
+    expect(serializedFacts).not.toContain(signedUrl);
+    expect(serializedFacts).not.toContain(attachmentId);
   });
 
   it("keeps labeled embed text before attachment-derived parts", async () => {
@@ -625,26 +826,28 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     expect(Array.isArray(out?.content)).toBe(true);
 
-    const content = out!.content as Array<{ type: string; text?: string }>;
+    const content = out!.content as Array<{ type: string; text?: string; filename?: string }>;
     expect(content[0]?.type).toBe("text");
     expect(content[0]?.text).toContain("look");
     expect(content[0]?.text).toContain("[discord_embed]");
-    expect(content[1]?.type).toBe("text");
-    expect(content[1]?.text).toContain("[discord_attachment");
-    expect(calls).toBe(1);
+    expect(content[1]?.type).toBe("resource");
+    expect(content[1]?.filename).toBe("file.txt");
+    expect(calls).toBe(0);
   });
 
-  it("downloads PDFs into durable request blob storage", async () => {
+  it("emits PDF metadata as a structured resource part", async () => {
     let calls = 0;
     globalThis.fetch = (async () => {
       calls++;
@@ -674,24 +877,26 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
       blobStore: await getTestBlobStore(),
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     const content = out!.content as any[];
-    expect(content[1].type).toBe("blob");
+    expect(content[1].type).toBe("resource");
+    expect(content[1].uri).toStartWith("resource://r1_");
     expect(content[1].mediaType).toBe("application/pdf");
     expect(content[1].filename).toBe("doc.pdf");
-    expect(content[1].blob.objectId).toStartWith("b1_");
-    expect(calls).toBe(1);
+    expect(calls).toBe(0);
   });
 
-  it("returns production request composition after upload reservations, before completion", async () => {
+  it("does not reserve request blobs for current Discord attachments", async () => {
     globalThis.fetch = (async () =>
       new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46]))) as unknown as typeof fetch;
     const msg: SurfaceMessage = {
@@ -715,6 +920,7 @@ describe("request-composition attachments", () => {
       },
     };
     const blobs = controlledReservationBlobStore();
+    const resources = createRecordingResourceRegistry();
     const composition = composeSingleMessageResult(new FakeAdapter(msg), {
       platform: "discord",
       botUserId: "bot",
@@ -722,20 +928,20 @@ describe("request-composition attachments", () => {
       msgRef: msg.ref,
       blobStore: blobs.store,
       attachmentCache: noOpAttachmentCache,
+      resourceRegistry: resources.registry,
     });
 
     const composed = await composition;
-    expect(blobs.uploads).toHaveLength(2);
+    expect(blobs.uploads).toHaveLength(0);
     expect(composed.status).toBe("ok");
     if (composed.status === "ok") {
       const content = composed.value?.content;
-      expect(Array.isArray(content) ? content[1]?.type : null).toBe("blob");
+      expect(Array.isArray(content) ? content[1]?.type : null).toBe("resource");
       expect(composed.value && "inputHandles" in composed.value).toBe(false);
     }
-    for (const upload of blobs.uploads) upload.complete();
   });
 
-  it("inlines plain text when mimeType is text/plain", async () => {
+  it("keeps text/plain attachments resource-only", async () => {
     let calls = 0;
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
@@ -766,21 +972,23 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     const content = out!.content as any[];
-    expect(content[1].type).toBe("text");
-    expect(content[1].text).toContain("hello");
-    expect(calls).toBe(1);
+    expect(content[1].type).toBe("resource");
+    expect(JSON.stringify(content)).not.toContain("hello");
+    expect(calls).toBe(0);
   });
 
-  it("inlines text when mimeType is application/x-yaml", async () => {
+  it("keeps YAML attachments resource-only", async () => {
     let calls = 0;
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
@@ -811,21 +1019,23 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     const content = out!.content as any[];
-    expect(content[1].type).toBe("text");
-    expect(content[1].text).toContain("name: lilac");
-    expect(calls).toBe(1);
+    expect(content[1].type).toBe("resource");
+    expect(JSON.stringify(content)).not.toContain("name: lilac");
+    expect(calls).toBe(0);
   });
 
-  it("inlines text when mimeType ends with +json", async () => {
+  it("keeps vendor JSON attachments resource-only", async () => {
     let calls = 0;
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
@@ -856,21 +1066,23 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     const content = out!.content as any[];
-    expect(content[1].type).toBe("text");
-    expect(content[1].text).toContain('{"status":"ok"}');
-    expect(calls).toBe(1);
+    expect(content[1].type).toBe("resource");
+    expect(JSON.stringify(content)).not.toContain('{"status":"ok"}');
+    expect(calls).toBe(0);
   });
 
-  it("treats non-text binary as URL-only text", async () => {
+  it("keeps signed URLs out of binary resource parts", async () => {
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
       throw new Error("should not fetch");
@@ -897,21 +1109,23 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     const content = out!.content as any[];
-    expect(content[1].type).toBe("text");
-    expect(content[1].text).toContain("doc.rtf");
-    expect(content[1].text).toContain("https://cdn.discordapp.com/");
+    expect(content[1].type).toBe("resource");
+    expect(content[1].filename).toBe("doc.rtf");
+    expect(JSON.stringify(content)).not.toContain("cdn.discordapp.com");
   });
 
-  it("fails composition when an attachment download fails", async () => {
+  it("does not download attachment bytes during composition", async () => {
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
       throw new Error("network down");
@@ -937,17 +1151,19 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessageResult(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
       blobStore: await getTestBlobStore(),
+      resourceRegistry: resources.registry,
     });
 
-    const error = out.match({ ok: () => null, err: (value) => value });
-    expect(error && "_tag" in error ? error._tag : null).toBe("DiscordAttachmentPreparationFailed");
-    expect(error instanceof Error ? error.message : null).toBe("network down");
+    expect(out.status).toBe("ok");
+    const content = out.match({ ok: (value) => value?.content, err: () => null });
+    expect(Array.isArray(content) ? content[1]?.type : null).toBe("resource");
   });
 
   it("uses forward snapshot content and visible attachments only", async () => {
@@ -994,6 +1210,7 @@ describe("request-composition attachments", () => {
               content: "Forwarded snapshot text",
               attachments: [
                 {
+                  id: "visible-id",
                   url: "https://cdn.discordapp.com/attachments/fwd/1/IMG_VISIBLE.png",
                   filename: "IMG_VISIBLE.png",
                   mimeType: "image/jpeg",
@@ -1007,12 +1224,14 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
       blobStore: await getTestBlobStore(),
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
@@ -1022,16 +1241,24 @@ describe("request-composition attachments", () => {
     expect(parts[0].type).toBe("text");
     expect(parts[0].text).toContain("Forwarded snapshot text");
 
-    const imageParts = parts.filter(
-      (p) =>
-        p &&
-        p.type === "blob" &&
-        typeof p.mediaType === "string" &&
-        p.mediaType.startsWith("image/"),
-    );
-    expect(imageParts.length).toBe(1);
-    expect(imageParts[0].filename).toBe("IMG_VISIBLE.png");
-    expect(imageParts[0].blob.objectId).toStartWith("b1_");
+    const resourceParts = parts.filter((part) => part?.type === "resource");
+    expect(resourceParts).toHaveLength(1);
+    expect(resourceParts[0].filename).toBe("IMG_VISIBLE.png");
+    expect(resources.registrations).toEqual([
+      {
+        origin: {
+          version: 1,
+          kind: "discord-attachment",
+          channelId: "c",
+          messageId: "m",
+          ordinal: 0,
+          attachmentId: "visible-id",
+        },
+        filename: "IMG_VISIBLE.png",
+        declaredMediaType: "image/jpeg",
+        reportedByteLength: 10,
+      },
+    ]);
   });
 
   it("falls back to top-level attachments when forward snapshot attachments are empty", async () => {
@@ -1072,28 +1299,30 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
       blobStore: await getTestBlobStore(),
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     expect(Array.isArray(out?.content)).toBe(true);
 
     const parts = out!.content as any[];
-    const imageParts = parts.filter(
-      (p) =>
-        p &&
-        p.type === "blob" &&
-        typeof p.mediaType === "string" &&
-        p.mediaType.startsWith("image/"),
-    );
-    expect(imageParts.length).toBe(1);
-    expect(imageParts[0].filename).toBe("IMG_TOP.png");
-    expect(imageParts[0].blob.objectId).toStartWith("b1_");
+    const resourceParts = parts.filter((part) => part?.type === "resource");
+    expect(resourceParts).toHaveLength(1);
+    expect(resourceParts[0].filename).toBe("IMG_TOP.png");
+    expect(resources.registrations[0]?.origin).toEqual({
+      version: 1,
+      kind: "discord-attachment",
+      channelId: "c",
+      messageId: "m",
+      ordinal: 0,
+    });
   });
 
   it("uses forward snapshot embed string description when content is empty", async () => {
@@ -1823,6 +2052,7 @@ describe("request-composition mention thread context", () => {
       [`${sessionId}:root`]: root,
       [`${sessionId}:fwd1`]: forwardMention,
     });
+    const resources = createRecordingResourceRegistry();
 
     const out = await composeRequestMessages(adapter, {
       platform: "discord",
@@ -1830,6 +2060,7 @@ describe("request-composition mention thread context", () => {
       botName: "lilac",
       trigger: { type: "mention", msgRef: forwardMention.ref },
       blobStore: await getTestBlobStore(),
+      resourceRegistry: resources.registry,
     });
 
     expect(out.chainMessageIds).toEqual(["fwd1"]);
@@ -1842,16 +2073,16 @@ describe("request-composition mention thread context", () => {
     expect(parts[0].type).toBe("text");
     expect(parts[0].text).toContain("Forwarded snapshot text");
 
-    const imageParts = parts.filter(
-      (p) =>
-        p &&
-        p.type === "blob" &&
-        typeof p.mediaType === "string" &&
-        p.mediaType.startsWith("image/"),
-    );
-    expect(imageParts.length).toBe(1);
-    expect(imageParts[0].filename).toBe("IMG_VISIBLE.png");
-    expect(imageParts[0].blob.objectId).toStartWith("b1_");
+    const resourceParts = parts.filter((part) => part?.type === "resource");
+    expect(resourceParts).toHaveLength(1);
+    expect(resourceParts[0].filename).toBe("IMG_VISIBLE.png");
+    expect(resources.registrations[0]?.origin).toEqual({
+      version: 1,
+      kind: "discord-attachment",
+      channelId: "c",
+      messageId: "fwd1",
+      ordinal: 0,
+    });
   });
 
   it("includes user alias in mention-thread attribution header when configured", async () => {

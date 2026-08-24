@@ -34,6 +34,7 @@ import {
 import { hashCanonicalStoredMessagesV2 } from "../../../src/transcript/transcript-persistence-codec";
 import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 import { getTestBlobStore } from "../../helpers/blob-store";
+import { CoreResourceService, ResourceOriginAdapterRegistry } from "../../../src/resource";
 
 const tempDirs: string[] = [];
 const originalFetch = globalThis.fetch;
@@ -439,6 +440,11 @@ describe("Core primary lineage composition", () => {
   it("reuses first-seen text, attribution, reactions, forwarded content, and owned attachments", async () => {
     const { store } = await createStore();
     const blobStore = await getTestBlobStore();
+    const resourceService = new CoreResourceService({
+      store,
+      blobStore,
+      originAdapters: new ResourceOriginAdapterRegistry([]),
+    });
     const message = surfaceMessage({
       id: "m1",
       text: "first text",
@@ -485,11 +491,13 @@ describe("Core primary lineage composition", () => {
       msgRef: message.ref,
       transcriptStore: store,
       blobStore,
+      resourceRegistry: resourceService,
       discordUserAliasById: new Map([["user", "First Alias"]]),
     });
     expect(first?.corePrimaryLineage.state).toBe("complete");
-    expect(fetches).toBe(3);
-    expect(JSON.stringify(first?.messages)).toContain("owned text");
+    expect(fetches).toBe(0);
+    expect(JSON.stringify(first?.messages)).toContain("resource://r1_");
+    expect(JSON.stringify(first?.messages)).not.toContain("owned text");
 
     message.text = "edited text";
     message.userId = "edited-user";
@@ -508,30 +516,29 @@ describe("Core primary lineage composition", () => {
       msgRef: message.ref,
       transcriptStore: store,
       blobStore,
+      resourceRegistry: resourceService,
       discordUserAliasById: new Map([["edited-user", "Edited Alias"]]),
     });
-    expect(
-      JSON.stringify(second?.messages, (key, value) =>
-        key === "objectId" ? "<request-blob-handle>" : value,
-      ),
-    ).toBe(
-      JSON.stringify(first?.messages, (key, value) =>
-        key === "objectId" ? "<request-blob-handle>" : value,
-      ),
-    );
-    expect(fetches).toBe(3);
+    expect(second?.messages).toEqual(first?.messages);
+    expect(fetches).toBe(0);
     const serialized = JSON.stringify(second?.messages);
     expect(serialized).toContain("first text");
     expect(serialized).toContain("First Author");
     expect(serialized).toContain("First Alias");
     expect(serialized).toContain("first");
     expect(serialized).not.toContain("edited");
+    await resourceService.close();
     store.close();
   });
 
-  it("fails composition when an admitted owned blob is missing", async () => {
+  it("reuses an admitted origin-backed resource without a cache blob", async () => {
     const { store } = await createStore();
     const blobStore = await getTestBlobStore();
+    const resourceService = new CoreResourceService({
+      store,
+      blobStore,
+      originAdapters: new ResourceOriginAdapterRegistry([]),
+    });
     const message = surfaceMessage({
       id: "m1",
       text: "image",
@@ -559,6 +566,7 @@ describe("Core primary lineage composition", () => {
       msgRef: message.ref,
       transcriptStore: store,
       blobStore,
+      resourceRegistry: resourceService,
     });
     const projection = resultValue(
       store.getCoreSurfaceProjection({
@@ -569,20 +577,20 @@ describe("Core primary lineage composition", () => {
         projectionFormatVersion: 1,
       }),
     );
-    const ownedBlob = projection?.ownedBlobs[0]?.blob;
-    if (!ownedBlob) throw new Error("expected admitted projection blob ownership");
-    expect(resultValue(await blobStore.delete(ownedBlob))).toBe("deleted");
+    expect(projection?.ownedBlobs).toEqual([]);
+    expect(JSON.stringify(projection?.canonicalMessages)).toContain("resource://r1_");
 
-    await expect(
-      composeSingleMessageWithLineage(adapter, {
-        platform: "discord",
-        botUserId: "bot",
-        botName: "lilac",
-        msgRef: message.ref,
-        transcriptStore: store,
-        blobStore,
-      }),
-    ).rejects.toThrow("is absent");
+    const second = await composeSingleMessageWithLineage(adapter, {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: message.ref,
+      transcriptStore: store,
+      blobStore,
+      resourceRegistry: resourceService,
+    });
+    expect(JSON.stringify(second?.messages)).toContain("resource://r1_");
+    await resourceService.close();
     store.close();
   });
 

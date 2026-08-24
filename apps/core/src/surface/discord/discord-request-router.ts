@@ -98,6 +98,11 @@ import {
 import type { DiscordAttachmentCacheAccess } from "./discord-attachment";
 import type { DiscordMessageCacheAccess } from "../store/discord-search-store";
 import {
+  ResourceIdCollisionExhausted,
+  ResourceStoreFailure,
+  type ResourceRegistry,
+} from "../../resource";
+import {
   resolvePreviousBatchMessageText as resolvePreviousBatchMessageTextImpl,
   resolvePreviousMessageText as resolvePreviousMessageTextImpl,
   resolveRepliedToMessageText as resolveRepliedToMessageTextImpl,
@@ -150,6 +155,13 @@ export function discordRequestCompositionFailurePolicy(
 ): DiscordRequestCompositionFailurePolicy {
   if (error instanceof CoreOwnedBlobIntegrityError) {
     return { disposition: "drop-integrity-failure", level: "error", retryable: false };
+  }
+  if (error instanceof ResourceStoreFailure || error instanceof ResourceIdCollisionExhausted) {
+    return {
+      disposition: "drop-transient-gateway-event",
+      level: "warn",
+      retryable: true,
+    };
   }
   if (
     error._tag === "DiscordRequestCompositionAndCleanupFailed" ||
@@ -851,6 +863,7 @@ export type StartDiscordRequestRouterInput = {
   adapter: SurfaceAdapter;
   bus: LilacBus;
   blobStore: BlobStore;
+  resourceRegistry: ResourceRegistry;
   attachmentCache?: DiscordAttachmentCacheAccess;
   messageCache?: DiscordMessageCacheAccess;
   requestDelivery: DiscordRequestDeliveryPort;
@@ -1835,6 +1848,7 @@ export async function startDiscordRequestRouter(
       botName: cfg.surface.discord.botName,
       transcriptStore: params.transcriptStore,
       blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
       attachmentCache: params.attachmentCache,
       attachmentCacheTtl: cfg.surface.discord.attachmentCache.ttlMs,
       messageCache: params.messageCache,
@@ -1888,6 +1902,7 @@ export async function startDiscordRequestRouter(
         discordUserAliasById,
         transcriptStore: params.transcriptStore,
         blobStore: params.blobStore,
+        resourceRegistry: params.resourceRegistry,
         attachmentCache: params.attachmentCache,
         attachmentCacheTtl: cfg.surface.discord.attachmentCache.ttlMs,
         messageCache: params.messageCache,
@@ -2982,6 +2997,7 @@ export async function startDiscordRequestRouter(
       adapter,
       cfg,
       blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
       attachmentCache: params.attachmentCache,
       messageCache: params.messageCache,
       requestDelivery: params.requestDelivery,
@@ -3012,6 +3028,7 @@ export async function startDiscordRequestRouter(
       adapter,
       cfg,
       blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
       attachmentCache: params.attachmentCache,
       messageCache: params.messageCache,
       requestDelivery: params.requestDelivery,
@@ -3049,6 +3066,7 @@ export async function startDiscordRequestRouter(
       adapter,
       cfg,
       blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
       attachmentCache: params.attachmentCache,
       messageCache: params.messageCache,
       requestDelivery: params.requestDelivery,
@@ -3078,6 +3096,7 @@ export async function startDiscordRequestRouter(
       adapter,
       cfg,
       blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
       attachmentCache: params.attachmentCache,
       messageCache: params.messageCache,
       requestDelivery: params.requestDelivery,

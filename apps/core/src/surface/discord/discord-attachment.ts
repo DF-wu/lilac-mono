@@ -60,13 +60,7 @@ export function hashIndexedDiscordAttachments(
     .update(
       attachments
         .map((attachment, ordinal) =>
-          [
-            ordinal,
-            attachment.id ?? "",
-            attachment.filename ?? "",
-            attachment.mimeType ?? "",
-            attachment.size ?? "",
-          ].join("\u001f"),
+          [ordinal, attachment.id ?? "", attachment.filename ?? ""].join("\u001f"),
         )
         .join("\u001e"),
     )

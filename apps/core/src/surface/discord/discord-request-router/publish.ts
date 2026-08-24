@@ -14,6 +14,7 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import type { SurfaceAdapter } from "../../adapter";
 import type { MsgRef, SurfaceMessage } from "../../types";
 import type { TranscriptStore } from "../../../transcript/transcript-store";
+import type { ResourceRegistry } from "../../../resource";
 import { adaptEventPublishResultToHost } from "../../../shared/event-bus-result";
 import type { DiscordAttachmentCacheAccess } from "../discord-attachment";
 import type { DiscordMessageCacheAccess } from "../../store/discord-search-store";
@@ -77,8 +78,9 @@ export type DiscordRequestPublishError =
   | DiscordRequestDeliveryFailed
   | DiscordRequestPublishAndCleanupFailed;
 
-type DiscordRequestBlobDependencies = {
+type DiscordRequestCompositionDependencies = {
   readonly blobStore: BlobStore;
+  readonly resourceRegistry: ResourceRegistry;
   readonly attachmentCache?: DiscordAttachmentCacheAccess;
   readonly messageCache?: DiscordMessageCacheAccess;
   readonly requestDelivery: DiscordRequestDeliveryPort;
@@ -243,7 +245,7 @@ export async function publishComposedRequest(
       transformTriggerUserText?: (text: string) => string;
       transformUserTextForMessageId?: string;
     };
-  } & DiscordRequestBlobDependencies,
+  } & DiscordRequestCompositionDependencies,
 ): Promise<ResultType<void, DiscordRequestPublishError>> {
   const requestDeliveryId = crypto.randomUUID();
   const self = await params.adapter.getSelf();
@@ -255,6 +257,7 @@ export async function publishComposedRequest(
     botName: params.cfg.surface.discord.botName,
     transcriptStore: params.transcriptStore,
     blobStore: params.blobStore,
+    resourceRegistry: params.resourceRegistry,
     attachmentCache: params.attachmentCache,
     attachmentCacheTtl: params.cfg.surface.discord.attachmentCache.ttlMs,
     messageCache: params.messageCache,
@@ -354,7 +357,7 @@ export async function publishActiveChannelPrompt(
       transformTriggerUserText?: (text: string) => string;
       transformUserTextForMessageId?: string;
     };
-  } & DiscordRequestBlobDependencies,
+  } & DiscordRequestCompositionDependencies,
 ): Promise<ResultType<void, DiscordRequestPublishError>> {
   const requestDeliveryId = crypto.randomUUID();
   const self = await params.adapter.getSelf();
@@ -368,6 +371,7 @@ export async function publishActiveChannelPrompt(
           botName: params.cfg.surface.discord.botName,
           transcriptStore: params.transcriptStore,
           blobStore: params.blobStore,
+          resourceRegistry: params.resourceRegistry,
           attachmentCache: params.attachmentCache,
           attachmentCacheTtl: params.cfg.surface.discord.attachmentCache.ttlMs,
           messageCache: params.messageCache,
@@ -393,6 +397,7 @@ export async function publishActiveChannelPrompt(
           limit: 8,
           transcriptStore: params.transcriptStore,
           blobStore: params.blobStore,
+          resourceRegistry: params.resourceRegistry,
           attachmentCache: params.attachmentCache,
           attachmentCacheTtl: params.cfg.surface.discord.attachmentCache.ttlMs,
           messageCache: params.messageCache,
@@ -494,7 +499,7 @@ export async function publishSingleMessageToActiveRequest(
       modelOverride?: string;
       transformUserText?: (text: string) => string;
     };
-  } & DiscordRequestBlobDependencies,
+  } & DiscordRequestCompositionDependencies,
 ): Promise<ResultType<void, DiscordRequestPublishError>> {
   const requestDeliveryId = crypto.randomUUID();
   const self = await params.adapter.getSelf();
@@ -513,6 +518,7 @@ export async function publishSingleMessageToActiveRequest(
     discordUserAliasById,
     transcriptStore: params.transcriptStore,
     blobStore: params.blobStore,
+    resourceRegistry: params.resourceRegistry,
     attachmentCache: params.attachmentCache,
     attachmentCacheTtl: params.cfg.surface.discord.attachmentCache.ttlMs,
     messageCache: params.messageCache,
@@ -599,7 +605,7 @@ export async function publishSingleMessagePrompt(
       transformUserText?: (text: string) => string;
       raw?: Record<string, unknown>;
     };
-  } & DiscordRequestBlobDependencies,
+  } & DiscordRequestCompositionDependencies,
 ): Promise<ResultType<void, DiscordRequestPublishError>> {
   const requestDeliveryId = crypto.randomUUID();
   const self = await params.adapter.getSelf();
@@ -618,6 +624,7 @@ export async function publishSingleMessagePrompt(
     discordUserAliasById,
     transcriptStore: params.transcriptStore,
     blobStore: params.blobStore,
+    resourceRegistry: params.resourceRegistry,
     attachmentCache: params.attachmentCache,
     attachmentCacheTtl: params.cfg.surface.discord.attachmentCache.ttlMs,
     messageCache: params.messageCache,

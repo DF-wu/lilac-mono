@@ -24,9 +24,12 @@ function requestMessage(input: {
   readonly sessionId?: string;
   readonly requestClient?: "discord" | "github" | "unknown";
   readonly text?: string;
+  readonly messages?: BusMessageV2[];
   readonly raw?: Record<string, unknown>;
 }): LilacMessageForTopic<"cmd.request"> {
-  const messages: BusMessageV2[] = [{ role: "user", content: input.text ?? input.eventId }];
+  const messages: BusMessageV2[] = input.messages ?? [
+    { role: "user", content: input.text ?? input.eventId },
+  ];
   return {
     id: input.eventId,
     topic: "cmd.request",
@@ -72,6 +75,40 @@ describe("request message cache", () => {
     const message = requestMessage({ eventId: "1-0", requestId: "request-1" });
     expect(cache.cacheMessage(message).status).toBe("ok");
     expect(cache.get("request-1")).toHaveLength(1);
+  });
+
+  it("preserves structured resources in current-request and alias message caches", () => {
+    const cache = createRequestMessageCache();
+    const resource = {
+      type: "resource" as const,
+      uri: `resource://r1_${"ab".repeat(16)}`,
+      filename: "diagram.png",
+      mediaType: "image/png",
+      size: 321,
+    };
+    const message = requestMessage({
+      eventId: "1-0",
+      requestId: "resource-source",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "inspect" }, resource],
+        },
+      ],
+    });
+
+    expect(cache.cacheMessage(message).status).toBe("ok");
+    const alias = cache.createAliasOwner({
+      sourceRequestId: "resource-source",
+      aliasRequestId: "resource-alias",
+      requestClient: "discord",
+      sessionId: "channel-1",
+    });
+    if (alias.status === "error") throw alias.error;
+
+    expect(cache.get("resource-source")).toEqual(message.data.messages);
+    expect(cache.get("resource-alias")).toEqual(message.data.messages);
+    expect(cache.releaseOwner(alias.value)).toBe(true);
   });
 
   it("keeps slow intake alive beyond TTL and releases it after committed handling", () => {

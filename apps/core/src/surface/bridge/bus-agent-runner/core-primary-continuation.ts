@@ -14,7 +14,7 @@ import {
   type ClaudeNativeSessionStart,
   type MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
-import type { CorePrimaryLineageV2 } from "@stanley2058/lilac-event-bus";
+import type { CorePrimaryLineageV2, StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 import { Result, type AnyTaggedError, type Result as ResultType } from "better-result";
 import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
 
@@ -26,7 +26,10 @@ import {
   type TranscriptSnapshot,
   type TranscriptStore,
 } from "../../../transcript/transcript-store";
-import { projectStoredMessagesV1 } from "../../../transcript/stored-message-materialization";
+import {
+  projectStoredMessagesV1,
+  type StoredMessageProjectionError,
+} from "../../../transcript/stored-message-materialization";
 import type { BridgeLogContext } from "../bridge-log";
 
 const TEXT_REPLAY_TOOL_INPUT_CHARS = 20_000;
@@ -118,6 +121,7 @@ export function supportsCorePrimaryContinuationStore(
 export function selectCorePrimaryClaudePrefix(input: {
   readonly lineage: CorePrimaryLineageV2 | undefined;
   readonly canonicalMessages: readonly ModelMessage[];
+  readonly canonicalStoredMessages?: readonly StoredMessageV1[];
   readonly binding: CorePrimaryClaudeSessionBinding | null;
   readonly executionScopeHash: string;
   readonly executionCwd: string;
@@ -153,7 +157,7 @@ export function selectCorePrimaryClaudePrefix(input: {
   if (
     !isDeepStrictEqual(
       input.lineage.segments.flatMap((candidate) => candidate.canonicalMessages),
-      input.canonicalMessages,
+      input.canonicalStoredMessages ?? input.canonicalMessages,
     )
   ) {
     return { mode: "fresh", reason: "canonical-alignment-mismatch" };
@@ -296,6 +300,9 @@ export function createCorePrimaryClaudeRuntime(input: {
   readonly executionScopeHash: string;
   readonly executionCwd: string;
   readonly getLineage: () => CorePrimaryLineageV2 | undefined;
+  readonly projectCanonicalStoredMessages?: (
+    messages: readonly ModelMessage[],
+  ) => ResultType<StoredMessageV1[], StoredMessageProjectionError>;
   readonly materialize: (start: ClaudeNativeSessionStart) => Promise<MaterializedClaudeCodeRun>;
   readonly onDiagnostic?: (event: string, detail: BridgeLogContext, error?: AnyTaggedError) => void;
 }): ResultType<CorePrimaryClaudeRuntime, CoreClaudeAttemptMutationError> {
@@ -332,14 +339,22 @@ export function createCorePrimaryClaudeRuntime(input: {
           error,
         );
 
-      const selectionFor = (canonicalMessages: readonly ModelMessage[]) =>
-        selectCorePrimaryClaudePrefix({
+      const projectCanonicalStoredMessages =
+        input.projectCanonicalStoredMessages ?? projectStoredMessagesV1;
+      const selectionFor = (canonicalMessages: readonly ModelMessage[]) => {
+        const canonicalStoredMessages = projectCanonicalStoredMessages(canonicalMessages).match({
+          ok: (messages) => messages,
+          err: () => undefined,
+        });
+        return selectCorePrimaryClaudePrefix({
           lineage: input.getLineage(),
           canonicalMessages,
+          canonicalStoredMessages,
           binding: sourceBinding,
           executionScopeHash: input.executionScopeHash,
           executionCwd: input.executionCwd,
         });
+      };
 
       const recordAttemptOutcome = (state: "failed" | "cancelled" | "uncertain"): void => {
         const attempt = currentAttempt;
@@ -660,7 +675,7 @@ export function createCorePrimaryClaudeRuntime(input: {
             ...manifestValue.segments.flatMap((segment) => segment.canonicalMessages),
             ...terminalTranscript.messages,
           ];
-          const storedCanonicalMessages = projectStoredMessagesV1(canonicalMessages).match({
+          const storedCanonicalMessages = projectCanonicalStoredMessages(canonicalMessages).match({
             ok: (messages) => messages,
             err: () => null,
           });

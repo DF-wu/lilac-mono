@@ -133,6 +133,7 @@ async function prepareToolContentPart(input: {
         handles: input.handles,
       });
     case "text":
+    case "resource":
     case "custom":
       return Result.ok(input.part);
   }
@@ -176,6 +177,7 @@ async function prepareUserPart(input: {
         handles: input.handles,
       });
     case "text":
+    case "resource":
       return Result.ok(input.part);
   }
 }
@@ -199,6 +201,7 @@ async function prepareAssistantPart(input: {
         handles: input.handles,
       });
     case "text":
+    case "resource":
     case "reasoning":
     case "custom":
     case "tool-call":

@@ -113,8 +113,10 @@ import {
   resolveCompactionCheckpointMeta,
   resolveCorePrimaryTranscriptProviderState,
   resolveCoreStableNamedContinuation,
+  resolveStoredResourceProviderTarget,
   rethrowBusAgentRunnerPanic,
   signalBusAgentRunnerHostFailure,
+  settleStoredMessageIdentityRemember,
   toIdleRetryDecision,
   toOpenAIPromptCacheKey,
   withReasoningDisplayDefaultForAnthropicModels,
@@ -155,7 +157,10 @@ import {
   type CoreClaudeBindingReadError,
   SqliteTranscriptStore,
 } from "../../../src/transcript/transcript-store";
-import { projectStoredMessagesV1 } from "../../../src/transcript/stored-message-materialization";
+import {
+  projectStoredMessagesV1,
+  StoredMessageProjectionError,
+} from "../../../src/transcript/stored-message-materialization";
 import { hashCanonicalStoredMessagesV2 } from "../../../src/transcript/transcript-persistence-codec";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
 import { createRequestMessageCache } from "../../../src/tool-server/request-message-cache";
@@ -178,6 +183,7 @@ import {
 import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
 import { normalizeDiscordRaw } from "../../../src/surface/discord/discord-raw-normalizer";
 import { getTestBlobStore } from "../../helpers/blob-store";
+import { createTestResourceRegistry } from "../../helpers/resource-registry";
 import { getBuiltinSurfaceProtocol } from "../../../src/surface/builtin-surface-protocols";
 import type {
   ResolvedSurfaceProtocol,
@@ -1020,6 +1026,25 @@ describe("deferred subagent result", () => {
 });
 
 describe("subagent model selection", () => {
+  it("maps model capabilities to resource image and PDF support", () => {
+    const capability = {
+      provider: "test",
+      model: "vision",
+      attachment: true,
+      limit: { context: 100_000, output: 4_000 },
+      modalities: { input: ["text" as const, "image" as const] },
+    };
+
+    expect(resolveStoredResourceProviderTarget({ provider: "openai", capability })).toEqual({
+      family: "ai-sdk",
+      supportsImage: true,
+      supportsPdf: false,
+    });
+    expect(
+      resolveStoredResourceProviderTarget({ provider: "claude-code", capability: null }),
+    ).toEqual({ family: "claude-code", supportsImage: true, supportsPdf: false });
+  });
+
   it("runtime-validates primary lineage, rejects stale proof, and omits it outside Discord", () => {
     const messages = [{ role: "user", content: "hello" }] satisfies ModelMessage[];
     const manifest = buildCoreLineageManifestV2([
@@ -2126,6 +2151,16 @@ describe("bus agent runner delivery policy", () => {
       message: ordinaryCause.message,
     });
     expect(() => signalBusAgentRunnerHostFailure(failure)).toThrow(ordinaryCause);
+  });
+
+  it("signals stored identity projection failure outside the protected Result callback", () => {
+    const projectionError = new StoredMessageProjectionError({
+      message: "parallel identity mismatch",
+    });
+
+    expect(() => settleStoredMessageIdentityRemember(Result.err(projectionError))).toThrow(
+      projectionError,
+    );
   });
 });
 
@@ -6336,6 +6371,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
         adapter,
         bus,
         blobStore: requestBlobStore,
+        resourceRegistry: createTestResourceRegistry(),
         requestDelivery: {
           async prepareAndPublish({ envelope }) {
             return (

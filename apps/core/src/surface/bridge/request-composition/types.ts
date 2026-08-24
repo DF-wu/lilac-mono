@@ -10,6 +10,7 @@ import type {
 import type { DiscordMessageCacheAccess } from "../../store/discord-search-store";
 
 import type { TranscriptStore } from "../../../transcript/transcript-store";
+import type { ResourceRegistry } from "../../../resource";
 
 export type RequestCompositionResult = {
   messages: BusMessageV2[];
@@ -19,8 +20,10 @@ export type RequestCompositionResult = {
   corePrimaryLineage: CorePrimaryLineageV2;
 };
 
-type BlobCompositionOptions = {
+type RequestCompositionDependencies = {
   blobStore?: BlobStore;
+  /** Required when a newly observed Discord message contains visible attachments. */
+  resourceRegistry?: ResourceRegistry;
   attachmentCache?: DiscordAttachmentCacheAccess;
   attachmentCacheTtl?: RetentionLimit;
   messageCache?: DiscordMessageCacheAccess;
@@ -28,7 +31,7 @@ type BlobCompositionOptions = {
   ingressMessages?: readonly SurfaceMessage[];
 };
 
-export type ComposeRecentChannelMessagesOpts = BlobCompositionOptions & {
+export type ComposeRecentChannelMessagesOpts = RequestCompositionDependencies & {
   platform: "discord";
   sessionId: string;
   botUserId: string;
@@ -47,7 +50,7 @@ export type ComposeRecentChannelMessagesOpts = BlobCompositionOptions & {
   transformUserText?: (text: string) => string;
 };
 
-export type ComposeSingleMessageOpts = BlobCompositionOptions & {
+export type ComposeSingleMessageOpts = RequestCompositionDependencies & {
   platform: "discord";
   botUserId: string;
   botName: string;
@@ -58,7 +61,7 @@ export type ComposeSingleMessageOpts = BlobCompositionOptions & {
   transformUserText?: (text: string) => string;
 };
 
-export type ComposeRequestOpts = BlobCompositionOptions & {
+export type ComposeRequestOpts = RequestCompositionDependencies & {
   platform: "discord";
   botUserId: string;
   botName: string;
