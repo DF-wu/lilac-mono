@@ -54,3 +54,4 @@ These rules apply to all tasks. Use the linked documents for detailed rules and 
   repository checks for broad changes, the final plan check, or a user request.
 - Do not use fixed waits to synchronize tests. Follow the `lilac/no-fixed-test-wait` rule.
 - Commit or create a pull request only when the user requests it.
+  - Read recent git history and follow the pattern when creating a commit.
