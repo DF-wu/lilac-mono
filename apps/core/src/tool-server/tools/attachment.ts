@@ -4,8 +4,19 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { basename, extname, join, resolve } from "node:path";
 import type { ModelMessage } from "ai";
-import type { BlobStore } from "@stanley2058/lilac-blob-storage";
-import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
+import {
+  blobHandleV1Schema,
+  blobRefV1Schema,
+  materializeBlobRead,
+  type BlobHandleV1,
+  type BlobRefV1,
+  type BlobStore,
+} from "@stanley2058/lilac-blob-storage";
+import {
+  lilacEventTypes,
+  storedResourcePartV1Schema,
+  type LilacBus,
+} from "@stanley2058/lilac-event-bus";
 import { isRecord } from "@stanley2058/lilac-utils";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import {
@@ -37,6 +48,12 @@ import {
 import { expandTilde } from "@stanley2058/lilac-fs";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
 import type { AttachmentOutputLifecycle } from "../../tools/attachment-output-lifecycle";
+import {
+  RESOURCE_MATERIALIZE_CALL_MAX_BYTES,
+  type MaterializedResource,
+  type ResourceAccess,
+  type ResourceAccessError,
+} from "../../resource";
 
 function attachmentFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
   return serverToolFailure({
@@ -62,6 +79,26 @@ function attachmentFailureFromUnknown(cause: unknown, fallbackMessage: string): 
     return attachmentFailure("denied", message);
   }
   return attachmentFailure("unavailable", message);
+}
+
+function attachmentFailureFromResource(error: ResourceAccessError): ServerToolFailure {
+  switch (error._tag) {
+    case "ResourceInvalidUri":
+    case "ResourceTooLarge":
+    case "ResourceUnsupportedClassification":
+      return attachmentFailure("usage", error.message);
+    case "ResourceNotFound":
+      return attachmentFailure("not_found", error.message);
+    case "ResourceAlreadyExists":
+      return attachmentFailure("conflict", error.message);
+    case "ResourceCancelled":
+      return attachmentFailure("cancelled", error.message);
+    case "ResourceOriginUnavailable":
+    case "ResourceCacheUnavailable":
+    case "ResourceIntegrityFailure":
+    case "ResourceWriteFailed":
+      return attachmentFailure("unavailable", error.message);
+  }
 }
 
 function attachmentUrlForFailure(url: URL): string {
@@ -259,6 +296,10 @@ const attachmentDownloadInputSchema = z.object({
     .describe("Directory to save downloaded files (default: ~/Downloads)"),
 });
 
+type LegacyBlobSource =
+  | { readonly kind: "handle"; readonly value: BlobHandleV1 }
+  | { readonly kind: "ref"; readonly value: BlobRefV1 };
+
 type DetectedAttachment =
   | {
       kind: "image";
@@ -273,6 +314,13 @@ type DetectedAttachment =
       mediaTypeHint: string;
       filenameHint?: string;
       data: unknown;
+    }
+  | {
+      kind: "blob";
+      source: string;
+      mediaTypeHint: string;
+      filenameHint?: string;
+      data: LegacyBlobSource;
     };
 
 function collectUserAttachments(messages: readonly ModelMessage[]): DetectedAttachment[] {
@@ -325,6 +373,90 @@ function collectUserAttachments(messages: readonly ModelMessage[]): DetectedAtta
   return out;
 }
 
+function collectUserResourceUris(messages: readonly unknown[]): string[] {
+  const uris: string[] = [];
+  for (const message of messages) {
+    if (!isRecord(message) || message.role !== "user" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      const decoded = storedResourcePartV1Schema.safeParse(part);
+      if (decoded.success) uris.push(decoded.data.uri);
+    }
+  }
+  return uris;
+}
+
+function collectUserBlobAttachments(messages: readonly unknown[]): DetectedAttachment[] {
+  const attachments: DetectedAttachment[] = [];
+  for (const message of messages) {
+    if (!isRecord(message) || message.role !== "user" || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (!isRecord(part) || part.type !== "blob") continue;
+      const stored = blobRefV1Schema.safeParse(part.blob);
+      const pending = stored.success ? null : blobHandleV1Schema.safeParse(part.blob);
+      let blob: LegacyBlobSource | null = null;
+      if (stored.success) blob = { kind: "ref", value: stored.data };
+      if (pending?.success) blob = { kind: "handle", value: pending.data };
+      if (!blob) continue;
+      const mediaTypeHint =
+        typeof part.mediaType === "string" && part.mediaType.length > 0
+          ? part.mediaType
+          : "application/octet-stream";
+      attachments.push({
+        kind: "blob",
+        source: "user-message",
+        mediaTypeHint,
+        ...(typeof part.filename === "string" ? { filenameHint: part.filename } : {}),
+        data: blob,
+      });
+    }
+  }
+  return attachments;
+}
+
+async function downloadLegacyBlobToBuffer(params: {
+  blobStore: BlobStore;
+  blob: LegacyBlobSource;
+  maxBytes: number;
+  signal?: AbortSignal;
+}): Promise<
+  ResultType<{ bytes: Buffer; sourceUrl?: string; contentType?: string }, ServerToolFailure>
+> {
+  if (params.signal?.aborted) {
+    return Result.err(attachmentFailure("cancelled", "Attachment download was cancelled"));
+  }
+  const refResult: ResultType<BlobRefV1, ServerToolFailure> =
+    params.blob.kind === "ref"
+      ? Result.ok(params.blob.value)
+      : (await params.blobStore.resolve(params.blob.value, { timeoutMs: 30_000 })).mapError(() =>
+          attachmentFailure("unavailable", "Unable to resolve attachment blob"),
+        );
+  const refOutcome = refResult.match<
+    { readonly ref: BlobRefV1 } | { readonly failure: ServerToolFailure }
+  >({
+    ok: (ref) => ({ ref }),
+    err: (failure) => ({ failure }),
+  });
+  if ("failure" in refOutcome) return Result.err(refOutcome.failure);
+  if (refOutcome.ref.byteLength > params.maxBytes) {
+    return Result.err(
+      attachmentFailure(
+        "usage",
+        `Attachment too large (${refOutcome.ref.byteLength} bytes). Max is ${params.maxBytes} bytes.`,
+      ),
+    );
+  }
+
+  const opened = (await params.blobStore.open(refOutcome.ref)).mapError(() =>
+    attachmentFailure("unavailable", "Unable to open attachment blob"),
+  );
+  const openedOutcome = resultBranch(opened);
+  if ("failure" in openedOutcome) return Result.err(openedOutcome.failure);
+  const bytes = (await materializeBlobRead(openedOutcome.value)).mapError(() =>
+    attachmentFailure("unavailable", "Unable to read attachment blob"),
+  );
+  return bytes.map((value) => ({ bytes: Buffer.from(value) }));
+}
+
 export class Attachment implements ServerTool {
   id = "attachment";
   private readonly tool: ServerTool;
@@ -334,6 +466,7 @@ export class Attachment implements ServerTool {
       bus: LilacBus;
       blobStore: BlobStore;
       outputLifecycle: AttachmentOutputLifecycle;
+      resourceAccess?: ResourceAccess;
     },
   ) {
     this.tool = defineServerTool({
@@ -359,15 +492,15 @@ export class Attachment implements ServerTool {
         }),
         "attachment.download": callable({
           name: "Attachment Download",
-          description:
-            "Download inbound user message attachments into the sandbox (from the current request prompt).",
+          description: "Deprecated: materialize inbound resources. Prefer resource.materialize.",
+          hidden: true,
           inputSchema: attachmentDownloadInputSchema,
           cli: {
             shortInput: [],
             input: ["--downloadDir=<string>"],
           },
           run: (input, opts) => {
-            const messages = opts?.messages as readonly ModelMessage[] | undefined;
+            const messages = opts?.messages;
             if (!messages) {
               return Result.err(
                 attachmentFailure(
@@ -536,7 +669,7 @@ export class Attachment implements ServerTool {
 
   private async callDownload(
     input: z.output<typeof attachmentDownloadInputSchema>,
-    messages: readonly ModelMessage[],
+    messages: readonly unknown[],
     ctx: RequestContext | undefined,
     signal: AbortSignal | undefined,
   ): Promise<ServerToolResult> {
@@ -552,9 +685,16 @@ export class Attachment implements ServerTool {
     if ("failure" in downloadDirBranch) return Result.err(downloadDirBranch.failure);
     const downloadDir = downloadDirBranch.value;
 
-    const attachments = collectUserAttachments(messages);
+    const resourceUris = collectUserResourceUris(messages);
+    const attachments =
+      resourceUris.length === 0
+        ? [
+            ...collectUserBlobAttachments(messages),
+            ...collectUserAttachments(messages as readonly ModelMessage[]),
+          ]
+        : [];
     const outputDownloadDir = formatToolPathForRequestContext({ path: downloadDir, context: ctx });
-    if (attachments.length === 0) {
+    if (resourceUris.length === 0 && attachments.length === 0) {
       return Result.ok({ ok: true as const, downloadDir: outputDownloadDir, files: [] });
     }
 
@@ -581,8 +721,63 @@ export class Attachment implements ServerTool {
 
     let totalBytes = 0;
 
+    if (resourceUris.length > 0) {
+      if (!this.params.resourceAccess) {
+        return Result.err(
+          attachmentFailure("unavailable", "Inbound resource access is unavailable"),
+        );
+      }
+
+      for (const uri of resourceUris) {
+        const remainingBytes = RESOURCE_MATERIALIZE_CALL_MAX_BYTES - totalBytes;
+        if (remainingBytes <= 0) {
+          return Result.err(
+            attachmentFailure(
+              "usage",
+              `Total resource bytes exceed ${RESOURCE_MATERIALIZE_CALL_MAX_BYTES} bytes.`,
+            ),
+          );
+        }
+        const materializedResult = await this.params.resourceAccess.materialize(uri, {
+          targetDirectory: downloadDir,
+          maxBytes: remainingBytes,
+          signal,
+        });
+        const materializedOutcome = materializedResult.match<
+          | { readonly materialized: MaterializedResource }
+          | { readonly failure: ResourceAccessError }
+        >({
+          ok: (materialized) => ({ materialized }),
+          err: (failure) => ({ failure }),
+        });
+        if ("failure" in materializedOutcome) {
+          return Result.err(attachmentFailureFromResource(materializedOutcome.failure));
+        }
+
+        const materialized = materializedOutcome.materialized;
+        totalBytes += materialized.bytes;
+        files.push({
+          path: formatToolPathForRequestContext({ path: materialized.path, context: ctx }),
+          sha10: materialized.sha256.slice(0, 10),
+          bytes: materialized.bytes,
+          sourceUrl: uri,
+          mimeType: materialized.mimeType,
+        });
+      }
+
+      return Result.ok({ ok: true as const, downloadDir: outputDownloadDir, files });
+    }
+
     for (const att of attachments) {
-      const downloadedResult = await downloadToBuffer(att.data, signal);
+      const downloadedResult =
+        att.kind === "blob"
+          ? await downloadLegacyBlobToBuffer({
+              blobStore: this.params.blobStore,
+              blob: att.data,
+              maxBytes: DEFAULT_INBOUND_MAX_FILE_BYTES,
+              signal,
+            })
+          : await downloadToBuffer(att.data, signal);
       const downloadedBranch = resultBranch(downloadedResult);
       if ("failure" in downloadedBranch) return Result.err(downloadedBranch.failure);
       const downloaded = downloadedBranch.value;

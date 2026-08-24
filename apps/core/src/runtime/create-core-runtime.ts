@@ -39,6 +39,7 @@ import {
 } from "@stanley2058/lilac-event-bus";
 
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
+import { createDiscordResourceOriginAdapter } from "../surface/discord/discord-resource-origin";
 import { GithubAdapter } from "../surface/github/github-adapter";
 import { createDiscordRuntimeHealthPort } from "../surface/discord/discord-runtime-health";
 import { createDescriptorBoundSurfaceEventSource } from "../surface/produced-ref-guard";
@@ -98,6 +99,7 @@ import {
 import { readGithubAppSecretResult } from "../github/github-app";
 
 import { SqliteTranscriptStore } from "../transcript/transcript-store";
+import { CoreResourceService, ResourceOriginAdapterRegistry } from "../resource";
 import { isHeartbeatSessionId } from "../heartbeat/common";
 import { startHeartbeatServiceResult, type HeartbeatService } from "../heartbeat/heartbeat-service";
 
@@ -1440,6 +1442,7 @@ export async function createCoreRuntime(
   let durableWorkflowStore: DurableWorkflowStore | null = null;
   let gracefulRestartStore: SqliteGracefulRestartStore | null = null;
   let transcriptStore: SqliteTranscriptStore | null = null;
+  let resourceService: CoreResourceService | null = null;
   let discordSearchStore: DiscordSearchStore | null = null;
   let discordSurfaceStore: DiscordSurfaceStore | null = null;
   let conversationThreadStore: ConversationThreadStore | null = null;
@@ -1849,9 +1852,10 @@ export async function createCoreRuntime(
     if (requestDeliveryMaintenanceOperation) return;
     const cycle = Promise.resolve().then(async () => {
       const activeBlobStore = blobStore;
-      const [maintained, maintainedBlobs] = await Promise.all([
+      const [maintained, maintainedBlobs, maintainedResources] = await Promise.all([
         requestDeliveryCoordinator.maintain(),
         activeBlobStore ? activeBlobStore.maintain() : Promise.resolve(null),
+        resourceService?.maintain({ limit: 64 }) ?? Promise.resolve(null),
       ]);
       maintained.match({
         err: (error) =>
@@ -1872,6 +1876,19 @@ export async function createCoreRuntime(
             ...formatTaggedErrorForLog(error),
           }),
         ok: () => undefined,
+      });
+      maintainedResources?.match({
+        err: (error) =>
+          logger.error("Core resource maintenance failed", {
+            ...formatTaggedErrorForLog(error),
+          }),
+        ok: (summary) => {
+          if (summary.failed === 0) return;
+          logger.warn("Core resource maintenance completed with blob deletion failures", {
+            failed: summary.failed,
+            inspected: summary.inspected,
+          });
+        },
       });
     });
     const supervision = Promise.allSettled([cycle]).then(([settled]) => {
@@ -2422,6 +2439,23 @@ export async function createCoreRuntime(
           const surfaceAdapter = registry
             .entries()
             .find((descriptor) => descriptor.platform === "discord")!.adapter;
+          resourceService = new CoreResourceService({
+            store: activeTranscriptStore,
+            blobStore: activeBlobStore,
+            originAdapters: new ResourceOriginAdapterRegistry([
+              createDiscordResourceOriginAdapter(surfaceAdapter),
+            ]),
+            logger: createLogger({ module: "core-resource" }),
+          });
+          const initialResourceMaintenance = await resourceService.maintain({ limit: 64 });
+          initialResourceMaintenance.match({
+            err: (error) =>
+              logger.warn(
+                "Core resource startup maintenance failed",
+                formatTaggedErrorForLog(error),
+              ),
+            ok: () => undefined,
+          });
           const workflowProgressPorts = createSurfaceWorkflowProgressPortMap(registry);
           if (startupConfig.tools.fsBackend === "fff") {
             void prewarmFffFinders({
@@ -2729,6 +2763,7 @@ export async function createCoreRuntime(
               adapter: surfaceAdapter,
               bus: durableBus,
               blobStore: activeBlobStore,
+              resourceRegistry: resourceService,
               attachmentCache: discordSearchStore?.attachmentCacheAccess(),
               messageCache: discordSearchStore ?? undefined,
               requestDelivery: discordRequestDelivery,
@@ -2822,6 +2857,7 @@ export async function createCoreRuntime(
               conversationThreads: conversationThreadToolService,
               discordSearch: discordSearchService ?? undefined,
               transcriptStore: transcriptStore ?? undefined,
+              resourceAccess: resourceService,
               toolResultArtifacts,
               durableWorkflowStore: activeDurableWorkflowStore,
               workflowProgressCards: workflowProgressProjector,
@@ -2928,6 +2964,7 @@ export async function createCoreRuntime(
             customCommands,
             cwd: canonicalWorkspaceRoot,
             transcriptStore: transcriptStore ?? undefined,
+            resourceAccess: resourceService,
             conversationThreads: conversationThreadToolService,
             toolResultArtifacts,
             workflowLiveParentBridge,
@@ -3574,6 +3611,10 @@ export async function createCoreRuntime(
       requestDeliveryMaintenanceOperation = null;
       await safe("bus.close", async () => {
         adaptCoreEventBusCleanupResultToHost(await captureCoreEventBusCleanup({ redis, raw, bus }));
+      });
+      await safe("resourceService.close", async () => {
+        await resourceService?.close();
+        resourceService = null;
       });
       await blobStoreClose?.closeNow();
       await safe("mcpOAuthCallback.stop", () => mcpOAuthCallback.stop());

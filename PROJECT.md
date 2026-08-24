@@ -32,7 +32,7 @@ Current Core configuration is documented in
 `docs/core-config-migrations.md`.
 
 1. Authenticated Discord gateway ingress publishes normalized adapter events to the typed bus. Verified GitHub webhooks can create request messages directly.
-2. The Discord router converts eligible adapter events into `cmd.request.message` commands. A request is the unit of agent work; `prompt`, `steer`, `followUp`, and `interrupt` describe admission into a session's active work.
+2. The Discord router converts eligible adapter events into `cmd.request.message` commands. Visible Discord attachments become structured `resource://` parts before publication. A request is the unit of agent work; `prompt`, `steer`, `followUp`, and `interrupt` describe admission into a session's active work.
 3. The bus agent runner serializes work per session, uses the shared AI SDK agent and a run-scoped toolset, publishes request lifecycle events, and streams output on `out.req.<request_id>`.
 4. A registered surface relay consumes the request output stream and renders it to Discord or GitHub. Relay state can be snapshotted for bounded graceful-restart recovery.
 5. The durable workflow engine uses the same request bus for child-agent operations while keeping journals, triggers, waits, receipts, and progress projection independent of a request's output relay.
@@ -139,6 +139,13 @@ clean-break migration.
 
 Request capabilities bind request context, cwd, profile, callable authority, and expiry. They constrain agent calls but are not general public HTTP authentication. The Core tool server belongs on a trusted host/network. Core also owns configured MCP clients process-wide; MCP tools join the run-scoped catalog only through the Core manager and profile policy.
 
+Core ingress resources use opaque `resource://r1_<128-bit-id>` capabilities. The shared Core resource
+module validates and resolves them for provider media, Level 1 `read` and `grep`, Level 2
+`resource.materialize`, and the hidden deprecated `attachment.download` compatibility callable.
+`resource.materialize` writes an ordered selection into the request's allowed cwd without overwriting
+existing files. Restricted requests use their private `/tmp` mapping. Text and unsupported binary
+attachments stay marker-only until a tool opens or materializes them.
+
 ### Level 3: Skills
 
 Skills are `SKILL.md` bundles discovered from product-owned state plus supported workspace/user compatibility roots. They are metadata-first instruction bundles loaded on demand; discovery does not execute scripts. Core parsing and broad compatibility discovery live in `packages/utils/skills.ts`; Mini's bounded catalog and Mini-specific roots live in `packages/mini-lilac-runtime/src/skills.ts`. See `docs/skill-authoring.md`.
@@ -182,6 +189,19 @@ At runtime, only the Core composition root constructs and closes the store. The 
 owns and closes its separate store. Providers and surfaces open references through registered
 materialization modules immediately before use.
 
+Core's transcript database also owns resource metadata and retained transcript or surface-projection
+references. A structured resource part contains only the opaque URI and display metadata. Discord
+attachment IDs, signed CDN URLs, and blob object IDs do not enter messages or model markers. The
+resource module refreshes an origin URL in memory, streams at most 512 MiB into BlobStore, verifies the
+result, and attaches the cache reference with compare-and-swap semantics. Images and PDFs no larger
+than 25 MiB may become verified byte-backed provider parts. Claude Code receives images only.
+
+Possession of an exact retained resource URI grants access without a session or principal comparison.
+Plain text containing a URI does not add retention or create a provider file part. When the final
+structured transcript or projection reference is deleted, the URI stops resolving. Maintenance first
+deletes any resource-owned cached blob, then removes the unretained resource row. Failed blob deletion
+leaves the row for a later retry.
+
 Graceful-restart persistence accepts only snapshot v5 with strict stored-message blob references and
 byte-free opaque raw state. Runtime startup never translates legacy snapshots. The single offline blob
 migration command validates and discards one exact v1-v4 graceful snapshot as the operator-approved
@@ -224,7 +244,7 @@ Run `bun run lint:architecture` for the semantic and production-syntax architect
 - **Expose output before execution:** connect and validate registered adapters, establish workflow projection and tool services, then start request ingress and relays before the agent runner can publish replies.
 - **Recover atomically:** when a graceful snapshot exists, start execution paused, preflight every required registered descriptor and live relay, apply restore behind rollbackable gates, conditionally consume the exact persisted row, and only then activate. Unavailable or failed targets leave the snapshot retained; unknown rollback atomicity is a Panic.
 - **Enable durable producers:** triggers, workflow execution, heartbeat, and background workers start only when the durable queues or consumers needed to avoid losing their work are available. Overall readiness waits for recovery and the remaining required services, and is withdrawn when critical subscriptions become unhealthy.
-- **Drain before release:** stop ingress and request producers first, drain agent/relay work to a bounded deadline, persist recoverable state, then stop consumers and release surface/store/bus resources. Surface lifecycle cleanup follows registry ownership and reverse-order release where required; cleanup is best-effort without hiding Panics.
+- **Drain before release:** stop ingress and request producers first, drain agent/relay work to a bounded deadline, persist recoverable state, then stop consumers and release surface/store/bus resources. Settle local resource cache fills before closing the shared BlobStore. Surface lifecycle cleanup follows registry ownership and reverse-order release where required; cleanup is best-effort without hiding Panics.
 
 These invariants matter more than a fragile numbered list. Update this section only when the lifecycle contract changes, not when independent setup calls move within a phase.
 
@@ -234,6 +254,9 @@ These invariants matter more than a fragile numbered list. Update this section o
 - Core process composition or lifecycle: `apps/core/src/runtime/create-core-runtime.ts`, `compose-builtin-surface-runtimes.ts`, and `surface-runtime-lifecycle.ts`.
 - Surface ref semantics versus executable participation: `apps/core/src/surface/builtin-surface-protocols.ts`, protocol modules, `runtime-descriptor.ts`, and the platform's runtime descriptor.
 - Discord request admission and queue selection: `apps/core/src/surface/discord/discord-request-router.ts`.
+- Core resource URI, origin, cache, classification, access, and materialization behavior:
+  `apps/core/src/resource`; Discord origin refresh belongs in
+  `apps/core/src/surface/discord/discord-resource-origin.ts`.
 - Shared agent turn, steering, interrupt, retry, or compaction behavior: `packages/agent`; Core bus/session policy stays in `apps/core/src/surface/bridge/bus-agent-runner.ts`.
 - Portable coding tools: `packages/coding-tools`, `packages/fs`, `packages/bash-safety`, and `packages/tool-results`. Core host adapters belong in `apps/core/src/tools`.
 - Core Level 1 or Level 2 exposure: `apps/core/src/plugins/builtin`, `apps/core/src/plugins/manager.ts`, and the implementation under `apps/core/src/tools` or `apps/core/src/tool-server/tools`.

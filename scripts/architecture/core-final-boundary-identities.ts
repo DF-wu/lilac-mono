@@ -3,6 +3,7 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/surface/adapter.ts", "surfaceExternalFallback.<callback>"],
   ["src/surface/discord/discord-embed-text.ts", "normalizeDiscordEmbeds"],
   ["src/surface/discord/discord-message-meta.ts", "normalizeFlagsNumber"],
+  ["src/surface/discord/discord-resource-origin.ts", "getVisibleDiscordResourceAttachments"],
   ["src/surface/discord/discord-request-router/common.ts", "withDefaultToolsConfig"],
   ["src/surface/discord/discord-adapter.ts", "discordNotFoundCode"],
   ["src/surface/discord/discord-adapter.ts", "classifyDiscordSurfaceError"],

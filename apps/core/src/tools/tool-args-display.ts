@@ -211,7 +211,7 @@ export const formatGrepToolArgs: ToolArgsFormatter = (args) => {
   if (!pattern) return "";
 
   const target = (
-    parsed.path?.startsWith("tool-result://")
+    parsed.path?.startsWith("tool-result://") || parsed.path?.startsWith("resource://")
       ? parsed.path
       : normalizeRemoteCwdDisplay(parsed.path ?? "")
   )

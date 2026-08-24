@@ -170,7 +170,8 @@ describe("read tool-result resources", () => {
       success: false,
       error: {
         code: "PERMISSION",
-        message: "Restricted sessions can use read only with tool-result:// artifacts.",
+        message:
+          "Restricted sessions can use read only with tool-result:// artifacts or resource:// resources.",
       },
     });
   });

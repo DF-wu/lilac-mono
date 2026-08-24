@@ -74,6 +74,8 @@ function isAgentActivityHandler(value: unknown): value is AgentActivityHandler {
 const coreToolRequestMetadataSchema = z
   .object({
     readFileDirectAttachmentSupported: z.boolean().optional(),
+    readFileDirectImageSupported: z.boolean().optional(),
+    readFileDirectPdfSupported: z.boolean().optional(),
     controlCapability: z.string().optional(),
     onSubagentDelegate: z.custom<DelegateHandler>(isDelegateHandler).optional(),
     onActivity: z.custom<AgentActivityHandler>(isAgentActivityHandler).optional(),
@@ -92,28 +94,36 @@ export function decodeCoreToolRequestMetadata(
   return decoded.success ? decoded.data : {};
 }
 
-function getReadFileDirectAttachmentSupported(context: CoreToolBuildContext): boolean {
-  return (
-    decodeCoreToolRequestMetadata(context.requestContext?.metadata)
-      .readFileDirectAttachmentSupported === true
-  );
+function getReadFileDirectMediaSupport(context: CoreToolBuildContext): {
+  readonly image: boolean;
+  readonly pdf: boolean;
+} {
+  const metadata = decodeCoreToolRequestMetadata(context.requestContext?.metadata);
+  const legacy = metadata.readFileDirectAttachmentSupported === true;
+  return {
+    image: metadata.readFileDirectImageSupported ?? legacy,
+    pdf: metadata.readFileDirectPdfSupported ?? legacy,
+  };
 }
 
 function getFsTools(context: CoreToolBuildContext): ReturnType<typeof fsTool> {
   const cached = localFsToolsByBuildContext.get(context);
   if (cached) return cached;
 
+  const directMediaSupport = getReadFileDirectMediaSupport(context);
   const tools = fsTool(context.cwd, {
     includeEditFile: true,
     experimentalHashlineEdit:
       context.editingToolMode === "edit_file" &&
       context.runtime.config?.tools.editFile.hashline === true,
     fsBackend: context.runtime.config?.tools.fsBackend,
-    readFileDirectAttachmentSupported: getReadFileDirectAttachmentSupported(context),
+    readFileDirectImageSupported: directMediaSupport.image,
+    readFileDirectPdfSupported: directMediaSupport.pdf,
     maxOutputBytes: context.runtime.config?.tools.output.maxPreviewBytes,
     maxInlineMediaBytesPerPart: context.runtime.config?.tools.media.maxInlineBytesPerPart,
     artifactOnly: context.requestContext?.safetyMode === "restricted",
     toolResultArtifacts: context.runtime.toolResultArtifacts,
+    resourceAccess: context.runtime.resourceAccess,
     requestContext: context.requestContext
       ? {
           requestId: context.requestContext.requestId,

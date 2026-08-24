@@ -406,6 +406,8 @@ export const BLOB_STORAGE_ARCHITECTURE_POLICY = {
       workspace: "apps/core",
       module: "src/surface/bridge/request-composition/prepare-bus-messages",
     },
+    { workspace: "apps/core", module: "src/resource/service" },
+    { workspace: "apps/core", module: "src/tool-server/tools/attachment" },
     { workspace: "apps/core", module: "src/workflow/workflow-artifact-store" },
     {
       workspace: "packages/tool-results",
@@ -953,6 +955,8 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     "asBuffer",
     "downloadToBuffer",
     "Attachment.callDownload",
+    "collectUserResourceUris",
+    "collectUserBlobAttachments",
   ].map((exportName) => ({
     identity: { module: "src/tool-server/tools/attachment.ts", exportName },
     category: "plugin" as const,
@@ -3392,6 +3396,28 @@ const CORE_TRANSCRIPT_PERSISTED_CODECS = [
   }),
 );
 
+const CORE_RESOURCE_PERSISTED_CODEC = {
+  identity: {
+    module: "src/transcript/transcript-persistence-codec.ts",
+    exportName: "decodeResourceRecordRow",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/transcript/transcript-persistence-codec.ts",
+    exportName: "resourceRecordRowCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_RESOURCE_PERSISTED_CONSUMER = {
+  identity: {
+    module: "src/transcript/transcript-store.ts",
+    exportName: "decodeResourceRecordRow",
+  },
+  codecs: [CORE_RESOURCE_PERSISTED_CODEC.identity],
+} as const satisfies PersistedStoreConsumerRegistration;
+
 const CORE_TRANSCRIPT_PERSISTED_CONSUMERS = [
   ["decodeTranscriptCompactionContext", [0]],
   ["decodeTranscriptProviderState", [1]],
@@ -3986,6 +4012,9 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
     "SqliteTranscriptStore.recordCorePrimaryClaudeSessionAttemptOutcome",
     "SqliteTranscriptStore.publishCorePrimaryClaudeSuccess",
     "SqliteTranscriptStore.promoteCorePrimaryClaudeSessionBinding",
+    "SqliteTranscriptStore.registerOrGet",
+    "SqliteTranscriptStore.compareAndSwapCache",
+    "SqliteTranscriptStore.finalizeUnretained",
   ].map((exportName) => ({
     module: "src/transcript/transcript-store.ts",
     exportName,
@@ -4362,6 +4391,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 ? [
                     ...CORE_THREAD_PERSISTED_CODECS,
                     ...CORE_TRANSCRIPT_PERSISTED_CODECS,
+                    CORE_RESOURCE_PERSISTED_CODEC,
                     CORE_GRACEFUL_RESTART_PERSISTED_CODEC,
                     CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC,
                     CORE_WORKFLOW_ROW_PERSISTED_CODEC,
@@ -4388,6 +4418,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 ? [
                     ...CORE_THREAD_PERSISTED_CONSUMERS,
                     ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS,
+                    CORE_RESOURCE_PERSISTED_CONSUMER,
                     CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER,
                     CORE_GRACEFUL_RESTART_STARTUP_CONSUMER,
                     CORE_GRACEFUL_RESTART_ENCODER_CONSUMER,
@@ -4673,6 +4704,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "decodeRecentAgentWriteRow",
               "decodeDiscoveryRecordRow",
               "decodeSurfaceMessageLinkRow",
+              "normalizeResourceRecordV1",
+              "normalizeResourceCacheV1",
+              "normalizeResourceDetectedMediaType",
+              "decodeResourceRecordRow",
             ].map((exportName) => ({
               identity: {
                 module: "src/transcript/transcript-persistence-codec.ts",
@@ -5208,6 +5243,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             ...CORE_THREAD_PERSISTED_CONSUMERS.map(({ identity }) => identity),
             ...CORE_TRANSCRIPT_PERSISTED_CODECS.map(({ identity }) => identity),
             ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS.map(({ identity }) => identity),
+            CORE_RESOURCE_PERSISTED_CODEC.identity,
+            CORE_RESOURCE_PERSISTED_CONSUMER.identity,
             CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity,
             CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER.identity,
             CORE_GRACEFUL_RESTART_STARTUP_CONSUMER.identity,
@@ -5256,6 +5293,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             ...[
               ["src/tool-server/tools/attachment.ts", "Attachment.call"],
+              ["src/tool-server/tools/attachment.ts", "downloadLegacyBlobToBuffer"],
               ["src/tool-server/tools/codex.ts", "Codex.call"],
               ["src/tool-server/tools/content-inspect.ts", "ContentInspect.call"],
               ["src/tool-server/tools/conversation-thread.ts", "ConversationThread.call"],
@@ -5264,6 +5302,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               ["src/tool-server/tools/mcp.ts", "McpManagement.call"],
               ["src/tool-server/tools/onboarding.ts", "Onboarding.call"],
               ["src/tool-server/tools/programmatic-workflow.ts", "ProgrammaticWorkflow.call"],
+              ["src/tool-server/tools/resource.ts", "Resource.call"],
               ["src/tool-server/tools/skills.ts", "Skills.call"],
               ["src/tool-server/tools/ssh.ts", "SSH.call"],
               ["src/tool-server/tools/surface.ts", "Surface.call"],

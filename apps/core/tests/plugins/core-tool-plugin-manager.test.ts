@@ -30,6 +30,7 @@ import {
   stdioDefinition,
 } from "../mcp/fixtures/registry-fixture";
 import { getTestBlobStore } from "../helpers/blob-store";
+import type { ResourceAccess } from "../../src/resource";
 
 function createCoreToolPluginManager(
   params: Parameters<typeof createCoreToolPluginManagerResult>[0],
@@ -58,6 +59,7 @@ const TEST_SURFACE_REGISTRY = SurfaceRuntimeRegistry.create([
 ]);
 if (TEST_SURFACE_REGISTRY.status === "error") throw TEST_SURFACE_REGISTRY.error;
 const TEST_SURFACE_ADAPTER_RESOLVER = TEST_SURFACE_REGISTRY.value.adapterResolver();
+const TEST_RESOURCE_ACCESS = {} as ResourceAccess;
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
@@ -142,6 +144,7 @@ const EXPECTED_STABLE_LEVEL2_CALLABLE_IDS = [
   "onboarding.reload_tools",
   "onboarding.restart",
   "onboarding.vcs_env",
+  "resource.materialize",
   "search",
   "skills.brief",
   "skills.full",
@@ -238,12 +241,16 @@ describe("core tool plugin manager", () => {
 
     const decoded = decodeCoreToolRequestMetadata({
       readFileDirectAttachmentSupported: false,
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: false,
       controlCapability: "level-2-control-capability",
       onSubagentDelegate,
       onActivity,
     });
 
     expect(decoded.readFileDirectAttachmentSupported).toBe(false);
+    expect(decoded.readFileDirectImageSupported).toBe(true);
+    expect(decoded.readFileDirectPdfSupported).toBe(false);
     expect(decoded.controlCapability).toBe("level-2-control-capability");
     expect(decoded.onSubagentDelegate).toBe(onSubagentDelegate);
     expect(decoded.onActivity).toBe(onActivity);
@@ -492,7 +499,8 @@ describe("core tool plugin manager", () => {
         subagentDepth: 0,
         subagentProfile: "primary",
         metadata: {
-          readFileDirectAttachmentSupported: true,
+          readFileDirectImageSupported: true,
+          readFileDirectPdfSupported: true,
         },
       },
     });
@@ -776,6 +784,7 @@ describe("core tool plugin manager", () => {
         attachmentOutputLifecycle: {
           registerOutputHandle: () => Result.ok(undefined),
         },
+        resourceAccess: TEST_RESOURCE_ACCESS,
         surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         conversationThreads: {} as ConversationThreadToolService,

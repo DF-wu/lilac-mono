@@ -304,6 +304,7 @@ const RESTRICTED_LEVEL2_ALLOWED = new Set([
   "generate.video",
   "attachment.add_files",
   "attachment.download",
+  "resource.materialize",
   "skills.list",
   "skills.brief",
   "skills.full",

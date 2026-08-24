@@ -10,6 +10,7 @@ import {
   McpManagement,
   Onboarding,
   ProgrammaticWorkflow,
+  Resource,
   SSH,
   Skills,
   Surface,
@@ -148,8 +149,25 @@ export function createBuiltinAttachmentPlugin(): CoreToolPlugin {
             bus: runtime.bus,
             blobStore: runtime.blobStore,
             outputLifecycle: runtime.attachmentOutputLifecycle,
+            ...(runtime.resourceAccess ? { resourceAccess: runtime.resourceAccess } : {}),
           }),
         ],
+      };
+    },
+  };
+}
+
+export function createBuiltinResourcePlugin(): CoreToolPlugin {
+  return {
+    meta: {
+      id: "resource",
+    },
+    create({ runtime }) {
+      if (!runtime.resourceAccess) {
+        return signalBuiltinPluginSkip("resource requires resource access");
+      }
+      return {
+        level2: [new Resource({ access: runtime.resourceAccess })],
       };
     },
   };

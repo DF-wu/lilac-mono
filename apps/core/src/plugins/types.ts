@@ -20,12 +20,14 @@ import type { McpOAuthProviderService } from "../mcp/oauth-provider";
 import type { McpOAuthCallbackControl } from "../mcp/oauth-callback";
 import type { RegisteredSurfacePlatform } from "../surface/types";
 import type { AttachmentOutputLifecycle } from "../tools/attachment-output-lifecycle";
+import type { ResourceAccess } from "../resource";
 
 export type CoreToolPluginRuntime = {
   dataDir?: string;
   bus?: LilacBus;
   blobStore?: BlobStore;
   attachmentOutputLifecycle?: AttachmentOutputLifecycle;
+  resourceAccess?: ResourceAccess;
   surfaceAdapterResolver?: SurfaceAdapterResolver;
   config?: CoreConfig;
   getConfig?: () => Promise<CoreConfig>;

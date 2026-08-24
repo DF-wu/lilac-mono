@@ -20,6 +20,11 @@ import type { RequestContext } from "../src/tool-server/types";
 import { Attachment } from "../src/tool-server/tools/attachment";
 import { resolveRestrictedSessionTmpDir } from "../src/shared/attachment-utils";
 import { Panic, Result } from "better-result";
+import {
+  ResourceOriginUnavailable,
+  type MaterializedResource,
+  type ResourceAccess,
+} from "../src/resource";
 
 type MockFetch = (
   input: Parameters<typeof fetch>[0],
@@ -136,6 +141,7 @@ function createAttachment(
     readonly requestDeliveryId?: string;
     readonly objectId: string;
   }) => void,
+  resourceAccess?: ResourceAccess,
 ): Attachment {
   let nextObjectId = 0;
   const blobStore: BlobStore = {
@@ -175,7 +181,12 @@ function createAttachment(
         return Result.ok(undefined);
       },
     },
+    ...(resourceAccess ? { resourceAccess } : {}),
   });
+}
+
+function fakeResourceAccess(materialize: ResourceAccess["materialize"]): ResourceAccess {
+  return { materialize } as ResourceAccess;
 }
 
 function isAddFilesResult(
@@ -205,6 +216,20 @@ describe("tool-server attachment", () => {
       field: "paths",
       variadic: true,
     });
+  });
+
+  it("keeps attachment.download callable but marks it deprecated and hidden", async () => {
+    const raw = createInMemoryRawBus();
+    const tool = createAttachment(createLilacBus(raw));
+
+    const entry = (await tool.list()).find(
+      (candidate) => candidate.callableId === "attachment.download",
+    );
+
+    expect(entry?.hidden).toBe(true);
+    expect(entry?.description).toBe(
+      "Deprecated: materialize inbound resources. Prefer resource.materialize.",
+    );
   });
 
   it("accepts scalar paths and filenames", async () => {
@@ -410,6 +435,174 @@ describe("tool-server attachment", () => {
     );
 
     expect(res).toEqual({ ok: true, downloadDir: "/tmp", files: [] });
+  });
+
+  it("materializes current request resources without exposing an origin URL", async () => {
+    const tmp = await fs.mkdtemp(join(tmpdir(), "lilac-att-resource-"));
+    const uri = "resource://r1_00000000000000000000000000000001";
+    try {
+      const resourceAccess = fakeResourceAccess(async (inputUri, options) =>
+        Result.ok({
+          uri: inputUri,
+          path: join(options.targetDirectory, "report.pdf"),
+          filename: "report.pdf",
+          mimeType: "application/pdf",
+          bytes: 7,
+          sha256: "a".repeat(64),
+        } as MaterializedResource),
+      );
+      const tool = createAttachment(
+        createLilacBus(createInMemoryRawBus()),
+        undefined,
+        resourceAccess,
+      );
+
+      const value = await callValue(
+        tool,
+        "attachment.download",
+        { downloadDir: tmp },
+        {
+          context: { cwd: tmp, safetyMode: "trusted" },
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "resource", uri, filename: "report.pdf", mediaType: "application/pdf" },
+              ],
+            },
+          ],
+        },
+      );
+
+      expect(value).toEqual({
+        ok: true,
+        downloadDir: tmp,
+        files: [
+          {
+            path: join(tmp, "report.pdf"),
+            sha10: "aaaaaaaaaa",
+            bytes: 7,
+            sourceUrl: uri,
+            mimeType: "application/pdf",
+          },
+        ],
+      });
+      expect(JSON.stringify(value)).not.toContain("discordapp.com");
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps earlier resource files when a later deprecated download item fails", async () => {
+    const tmp = await fs.mkdtemp(join(tmpdir(), "lilac-att-resource-"));
+    const firstUri = "resource://r1_00000000000000000000000000000001";
+    const secondUri = "resource://r1_00000000000000000000000000000002";
+    const calls: string[] = [];
+    try {
+      const resourceAccess = fakeResourceAccess(async (uri, options) => {
+        calls.push(uri);
+        if (uri === secondUri) {
+          return Result.err(
+            new ResourceOriginUnavailable({
+              uri,
+              retryable: true,
+              message: "origin is unavailable",
+            }),
+          );
+        }
+        await fs.writeFile(join(options.targetDirectory, "first.txt"), "first", "utf8");
+        return Result.ok({
+          uri,
+          path: join(options.targetDirectory, "first.txt"),
+          filename: "first.txt",
+          mimeType: "text/plain",
+          bytes: 5,
+          sha256: "b".repeat(64),
+        } as MaterializedResource);
+      });
+      const tool = createAttachment(
+        createLilacBus(createInMemoryRawBus()),
+        undefined,
+        resourceAccess,
+      );
+
+      const result = await tool.call(
+        "attachment.download",
+        { downloadDir: tmp },
+        {
+          context: { cwd: tmp, safetyMode: "trusted" },
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "resource", uri: firstUri },
+                { type: "resource", uri: secondUri },
+              ],
+            },
+          ],
+        },
+      );
+
+      expect(result.status).toBe("error");
+      if (result.status === "error") {
+        expect(result.error).toMatchObject({ kind: "unavailable" });
+      }
+      expect(calls).toEqual([firstUri, secondUri]);
+      expect(await fs.readFile(join(tmp, "first.txt"), "utf8")).toBe("first");
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the historical stored-blob download path", async () => {
+    const tmp = await fs.mkdtemp(join(tmpdir(), "lilac-att-blob-"));
+    const sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    try {
+      const tool = createAttachment(createLilacBus(createInMemoryRawBus()));
+
+      const value = await callValue(
+        tool,
+        "attachment.download",
+        { downloadDir: tmp },
+        {
+          context: { cwd: tmp, safetyMode: "trusted" },
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "blob",
+                  blob: {
+                    version: 1,
+                    objectId: "b1_00000000000000000000000000000001",
+                    sha256,
+                    byteLength: 0,
+                  },
+                  mediaType: "text/plain",
+                  filename: "legacy.txt",
+                },
+              ],
+            },
+          ],
+        },
+      );
+
+      expect(value).toEqual({
+        ok: true,
+        downloadDir: tmp,
+        files: [
+          {
+            path: join(tmp, "e3b0c44298.txt"),
+            sha10: "e3b0c44298",
+            bytes: 0,
+            sourceUrl: "inline",
+            mimeType: "text/plain",
+          },
+        ],
+      });
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
   });
 
   it("rejects attachment.download URLs outside Discord CDN hosts", async () => {
