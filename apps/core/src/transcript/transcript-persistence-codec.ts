@@ -32,9 +32,16 @@ import {
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
+import {
+  resourceCacheV1Schema,
+  resourceOriginV1Schema,
+  resourceRecordV1Schema,
+  type ResourceCacheV1,
+  type ResourceRecordV1,
+} from "../resource/contracts";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
-export const TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION = 6 as const;
+export const TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION = 7 as const;
 export const COMPACTION_CHECKPOINT_FORMAT_VERSION = 1 as const;
 export const CORE_SURFACE_PROJECTION_FORMAT_VERSION = 1 as const;
 export const CORE_TRANSCRIPT_DIGEST_VERSION = 2 as const;
@@ -43,6 +50,7 @@ const TRANSCRIPT_TABLE = "request_transcripts";
 const PROJECTION_TABLE = "core_surface_projections";
 const LINEAGE_TABLE = "core_primary_lineage_manifests";
 const SURFACE_LINK_TABLE = "surface_message_to_request";
+const RESOURCE_TABLE = "core_resources";
 
 const adapterPlatformSchema = z.enum([
   "discord",
@@ -162,6 +170,20 @@ export type DecodedCoreOwnedBlobRow = {
   readonly mediaType: string;
   readonly filename: string;
   readonly createdAt: number;
+};
+
+export type PersistedResourceRecordRow = {
+  readonly resource_id: string;
+  readonly record_version: number;
+  readonly origin_key: string;
+  readonly origin_json: string;
+  readonly filename: string | null;
+  readonly declared_media_type: string | null;
+  readonly detected_media_type: string | null;
+  readonly reported_byte_length: number | null;
+  readonly created_ts: number;
+  readonly cache_blob_ref_json: string | null;
+  readonly cache_cached_ts: number | null;
 };
 
 export type DecodedCoreNamedClaudeBindingRow = {
@@ -385,7 +407,7 @@ export type CoreStoredLineageManifestV2 = {
 };
 
 type DecodedSchemaVersion = {
-  readonly version: 1 | 2 | 3 | 4 | 5 | 6;
+  readonly version: 1 | 2 | 3 | 4 | 5 | 6 | 7;
   readonly provenance: "current" | "migrated";
 };
 
@@ -411,6 +433,19 @@ const coreOwnedBlobRowSchema = z.strictObject({
   filename: z.string().min(1),
   byte_length: nonNegativeIntegerSchema,
   created_ts: nonNegativeIntegerSchema,
+});
+const resourceRecordRowSchema = z.strictObject({
+  resource_id: z.string(),
+  record_version: z.literal(1),
+  origin_key: z.string().min(1),
+  origin_json: z.string(),
+  filename: z.string().min(1).nullable(),
+  declared_media_type: z.string().min(1).nullable(),
+  detected_media_type: z.string().min(1).nullable(),
+  reported_byte_length: nullableNonNegativeIntegerSchema,
+  created_ts: nonNegativeIntegerSchema,
+  cache_blob_ref_json: z.string().nullable(),
+  cache_cached_ts: nullableNonNegativeIntegerSchema,
 });
 const coreNamedClaudeBindingRowSchema = z.strictObject({
   request_client: adapterPlatformSchema,
@@ -612,6 +647,7 @@ function decodeSchemaVersion(
     case 4:
     case 5:
     case 6:
+    case 7:
       return Result.ok({
         version,
         provenance: version === TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION ? "current" : "migrated",
@@ -681,6 +717,170 @@ function adaptTranscriptPersistenceDecodeResult<T>(
   return adapt();
 }
 
+export function normalizeResourceRecordV1(value: unknown): ResourceRecordV1 | null {
+  const decoded = resourceRecordV1Schema.safeParse(value);
+  return decoded.success ? decoded.data : null;
+}
+
+export function normalizeResourceCacheV1(value: unknown): ResourceCacheV1 | null {
+  const decoded = resourceCacheV1Schema.safeParse(value);
+  return decoded.success ? decoded.data : null;
+}
+
+export function normalizeResourceDetectedMediaType(value: unknown): string | null {
+  const decoded = resourceRecordV1Schema.shape.detectedMediaType.safeParse(value);
+  return decoded.success && decoded.data !== undefined ? decoded.data : null;
+}
+
+/** Decode one schema-7 Core resource row through its strict versioned record codec. */
+export function decodeResourceRecordRow(input: {
+  readonly row: PersistedResourceRecordRow | null;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}): ResultType<
+  { readonly value: ResourceRecordV1; readonly provenance: "current" },
+  PersistedDataError
+> {
+  return adaptTranscriptPersistenceDecodeResult(
+    Result.gen(function* () {
+      const version = yield* decodeSchemaVersion(
+        input.schemaVersion,
+        RESOURCE_TABLE,
+        input.recordId,
+      );
+      if (version.version !== 7) {
+        return Result.err(
+          new UnsupportedVersion(
+            context({
+              table: RESOURCE_TABLE,
+              field: "record_version",
+              version: version.version,
+              issueCode: "unsupported-version",
+              recordId: input.recordId,
+            }),
+          ),
+        );
+      }
+      if (input.row === null) {
+        return Result.err(
+          corrupt({
+            table: RESOURCE_TABLE,
+            field: "row",
+            version: version.version,
+            issueCode: "missing-required-field",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      const decodedRow = resourceRecordRowSchema.safeParse(input.row);
+      if (!decodedRow.success) {
+        return Result.err(
+          corrupt({
+            table: RESOURCE_TABLE,
+            field: "row",
+            version: version.version,
+            issueCode: "invalid-row-field",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      const row = decodedRow.data;
+      const originValue = yield* decodeSerialized({
+        raw: row.origin_json,
+        table: RESOURCE_TABLE,
+        field: "origin_json",
+        version: version.version,
+        recordId: input.recordId,
+      });
+      const origin = resourceOriginV1Schema.safeParse(originValue);
+      if (!origin.success) {
+        return Result.err(
+          corrupt({
+            table: RESOURCE_TABLE,
+            field: "origin_json",
+            version: version.version,
+            issueCode: "invalid-row-field",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      if (row.origin_key !== canonicalJsonStringify(origin.data)) {
+        return Result.err(
+          corrupt({
+            table: RESOURCE_TABLE,
+            field: "origin_key",
+            version: version.version,
+            issueCode: "invalid-row-field",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      let cache: ResourceCacheV1 | undefined;
+      if (row.cache_blob_ref_json !== null || row.cache_cached_ts !== null) {
+        if (row.cache_blob_ref_json === null || row.cache_cached_ts === null) {
+          return Result.err(
+            corrupt({
+              table: RESOURCE_TABLE,
+              field: "cache_blob_ref_json",
+              version: version.version,
+              issueCode: "invalid-row-field",
+              recordId: input.recordId,
+            }),
+          );
+        }
+        const blobValue = yield* decodeSerialized({
+          raw: row.cache_blob_ref_json,
+          table: RESOURCE_TABLE,
+          field: "cache_blob_ref_json",
+          version: version.version,
+          recordId: input.recordId,
+        });
+        const decodedCache = resourceCacheV1Schema.safeParse({
+          blob: blobValue,
+          cachedAt: row.cache_cached_ts,
+        });
+        if (!decodedCache.success) {
+          return Result.err(
+            corrupt({
+              table: RESOURCE_TABLE,
+              field: "cache_blob_ref_json",
+              version: version.version,
+              issueCode: "invalid-row-field",
+              recordId: input.recordId,
+            }),
+          );
+        }
+        cache = decodedCache.data;
+      }
+      const decodedRecord = resourceRecordV1Schema.safeParse({
+        version: row.record_version,
+        resourceId: row.resource_id,
+        origin: origin.data,
+        ...(row.filename === null ? {} : { filename: row.filename }),
+        ...(row.declared_media_type === null ? {} : { declaredMediaType: row.declared_media_type }),
+        ...(row.detected_media_type === null ? {} : { detectedMediaType: row.detected_media_type }),
+        ...(row.reported_byte_length === null
+          ? {}
+          : { reportedByteLength: row.reported_byte_length }),
+        createdAt: row.created_ts,
+        ...(cache === undefined ? {} : { cache }),
+      });
+      if (!decodedRecord.success) {
+        return Result.err(
+          corrupt({
+            table: RESOURCE_TABLE,
+            field: "record",
+            version: version.version,
+            issueCode: "invalid-row-field",
+            recordId: input.recordId,
+          }),
+        );
+      }
+      return Result.ok({ value: decodedRecord.data, provenance: "current" as const });
+    }),
+  );
+}
+
 export const storedMessageV1Schema = eventStoredMessageV1Schema;
 
 const CORE_TRANSCRIPT_DIGEST_DOMAIN_V2 = "lilac:core-transcript:v2";
@@ -694,6 +894,10 @@ type StoredToolMessage = Extract<StoredMessageV1, { readonly role: "tool" }>;
 type StoredAssistantPart = Exclude<StoredAssistantMessage["content"], string>[number];
 type StoredToolPart = StoredToolMessage["content"][number];
 type StoredToolResultPart = Extract<StoredAssistantPart | StoredToolPart, { type: "tool-result" }>;
+type StoredToolResultContentPart = Extract<
+  StoredToolResultPart["output"],
+  { type: "content" }
+>["value"][number];
 
 function projectStoredBlobIdentity(part: StoredFilePartV1) {
   return {
@@ -705,15 +909,28 @@ function projectStoredBlobIdentity(part: StoredFilePartV1) {
   };
 }
 
+function projectStoredResourceIdentity(
+  part: Extract<StoredAssistantPart | StoredToolPart, { type: "resource" }>,
+) {
+  return {
+    type: "resource" as const,
+    uri: part.uri,
+  };
+}
+
+function projectStoredToolResultValue(value: StoredToolResultContentPart) {
+  if (value.type === "blob") return projectStoredBlobIdentity(value);
+  if (value.type === "resource") return projectStoredResourceIdentity(value);
+  return value;
+}
+
 function projectStoredToolResult(part: StoredToolResultPart) {
   if (part.output.type !== "content") return part;
   return {
     ...part,
     output: {
       ...part.output,
-      value: part.output.value.map((value) =>
-        value.type === "blob" ? projectStoredBlobIdentity(value) : value,
-      ),
+      value: part.output.value.map(projectStoredToolResultValue),
     },
   };
 }
@@ -724,6 +941,7 @@ function projectStoredMessageIdentity(message: StoredMessageV1) {
     ...message,
     content: message.content.map((part) => {
       if (part.type === "blob") return projectStoredBlobIdentity(part);
+      if (part.type === "resource") return projectStoredResourceIdentity(part);
       if (part.type === "tool-result") return projectStoredToolResult(part);
       return part;
     }),
@@ -1697,6 +1915,58 @@ export function decodeCoreLineageManifestRow(input: {
 
 const fixtureMessages = '[{"role":"assistant","content":"fixture"}]';
 const fixtureDigest = "93c6db2d3011fde9a57ceeace848a7457cd75442c516f82a7d966f60553b9614";
+const fixtureResourceRow = {
+  resource_id: `r1_${"12".repeat(16)}`,
+  record_version: 1,
+  origin_key:
+    '{"attachmentId":"attachment","channelId":"channel","kind":"discord-attachment","messageId":"message","ordinal":0,"version":1}',
+  origin_json:
+    '{"version":1,"kind":"discord-attachment","channelId":"channel","messageId":"message","ordinal":0,"attachmentId":"attachment"}',
+  filename: "fixture.txt",
+  declared_media_type: "text/plain",
+  detected_media_type: "text/plain",
+  reported_byte_length: 7,
+  created_ts: 1,
+  cache_blob_ref_json: `{"version":1,"objectId":"b1_${"34".repeat(16)}","sha256":"${"56".repeat(32)}","byteLength":7}`,
+  cache_cached_ts: 2,
+} as const satisfies PersistedResourceRecordRow;
+
+export const resourceRecordRowCodecCases = {
+  current: {
+    input: { row: fixtureResourceRow, schemaVersion: 7, recordId: "current-resource" },
+    outcome: "ok",
+    provenance: "current",
+  },
+  legacy: {
+    input: { row: fixtureResourceRow, schemaVersion: 6, recordId: "legacy-resource" },
+    outcome: "error",
+  },
+  "missing-defaulted": {
+    input: { row: null, schemaVersion: 7, recordId: "missing-resource" },
+    outcome: "error",
+  },
+  "unsupported-version": {
+    input: { row: fixtureResourceRow, schemaVersion: 8, recordId: "future-resource" },
+    outcome: "error",
+  },
+  "malformed-serialization": {
+    input: {
+      row: { ...fixtureResourceRow, origin_json: "{" },
+      schemaVersion: 7,
+      recordId: "malformed-resource",
+    },
+    outcome: "error",
+  },
+  "corrupt-fields": {
+    input: {
+      row: { ...fixtureResourceRow, declared_media_type: "TEXT/PLAIN" },
+      schemaVersion: 7,
+      recordId: "corrupt-resource",
+    },
+    outcome: "error",
+  },
+} as const;
+
 const fixtureTranscriptRow = {
   request_id: "fixture",
   session_id: "session",
@@ -1730,7 +2000,7 @@ const fixtureSurfaceMessageLinkRow = {
 
 export const surfaceMessageLinkRowCodecCases = {
   current: {
-    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 6, recordId: "current" },
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 7, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -1740,17 +2010,17 @@ export const surfaceMessageLinkRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 6, recordId: "missing" },
+    input: { row: null, schemaVersion: 7, recordId: "missing" },
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 7, recordId: "unsupported" },
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 8, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
     input: {
       row: { ...fixtureSurfaceMessageLinkRow, request_id: 1 },
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "malformed",
     },
     outcome: "error",
@@ -1758,7 +2028,7 @@ export const surfaceMessageLinkRowCodecCases = {
   "corrupt-fields": {
     input: {
       row: { ...fixtureSurfaceMessageLinkRow, platform: "future" },
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -1767,7 +2037,7 @@ export const surfaceMessageLinkRowCodecCases = {
 
 export const recentAgentWriteRowCodecCases = {
   current: {
-    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 6, recordId: "current" },
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 7, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -1777,17 +2047,17 @@ export const recentAgentWriteRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 6, recordId: "missing" },
+    input: { row: null, schemaVersion: 7, recordId: "missing" },
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 7, recordId: "unsupported" },
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 8, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
     input: {
       row: { ...fixtureRecentAgentWriteRow, updated_ts: "{" },
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "malformed",
     },
     outcome: "error",
@@ -1795,7 +2065,7 @@ export const recentAgentWriteRowCodecCases = {
   "corrupt-fields": {
     input: {
       row: { ...fixtureRecentAgentWriteRow, platform: "future" },
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -1816,7 +2086,7 @@ const fixtureDiscoveryRecordRow = {
 
 export const discoveryRecordRowCodecCases = {
   current: {
-    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 6, recordId: "current" },
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 7, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -1826,17 +2096,17 @@ export const discoveryRecordRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 6, recordId: "missing" },
+    input: { row: null, schemaVersion: 7, recordId: "missing" },
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 7, recordId: "unsupported" },
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 8, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
     input: {
       row: { ...fixtureDiscoveryRecordRow, updated_ts: "{" },
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "malformed",
     },
     outcome: "error",
@@ -1844,7 +2114,7 @@ export const discoveryRecordRowCodecCases = {
   "corrupt-fields": {
     input: {
       row: { ...fixtureDiscoveryRecordRow, surface_message_id: null },
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -1855,7 +2125,7 @@ export const transcriptCompactionContextCodecCases = {
   current: {
     input: {
       raw: '{"type":"compaction","formatVersion":1}',
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "current",
     },
     outcome: "ok",
@@ -1867,22 +2137,22 @@ export const transcriptCompactionContextCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { raw: null, schemaVersion: 6, recordId: "missing" },
+    input: { raw: null, schemaVersion: 7, recordId: "missing" },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { raw: null, schemaVersion: 7, recordId: "unsupported" },
+    input: { raw: null, schemaVersion: 8, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { raw: "{", schemaVersion: 6, recordId: "malformed" },
+    input: { raw: "{", schemaVersion: 7, recordId: "malformed" },
     outcome: "error",
   },
   "corrupt-fields": {
     input: {
       raw: '{"type":"compaction","formatVersion":2}',
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -1893,7 +2163,7 @@ export const transcriptProviderStateCodecCases = {
   current: {
     input: {
       raw: '{"lastFamily":"ai-sdk","containsCrossFamilyTurns":false}',
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "current",
     },
     outcome: "ok",
@@ -1909,20 +2179,20 @@ export const transcriptProviderStateCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { raw: null, schemaVersion: 6, recordId: "missing" },
+    input: { raw: null, schemaVersion: 7, recordId: "missing" },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { raw: null, schemaVersion: 7, recordId: "unsupported" },
+    input: { raw: null, schemaVersion: 8, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { raw: "{", schemaVersion: 6, recordId: "malformed" },
+    input: { raw: "{", schemaVersion: 7, recordId: "malformed" },
     outcome: "error",
   },
   "corrupt-fields": {
-    input: { raw: '{"lastFamily":"future"}', schemaVersion: 6, recordId: "corrupt" },
+    input: { raw: '{"lastFamily":"future"}', schemaVersion: 7, recordId: "corrupt" },
     outcome: "error",
   },
 } as const;
@@ -1935,7 +2205,7 @@ export const transcriptRowCodecCases = {
         context_meta_json: '{"type":"compaction","formatVersion":1}',
         provider_state_json: '{"lastFamily":"ai-sdk","containsCrossFamilyTurns":false}',
       },
-      schemaVersion: 6,
+      schemaVersion: 7,
     },
     outcome: "ok",
     provenance: "current",
@@ -1946,22 +2216,22 @@ export const transcriptRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: fixtureTranscriptRow, schemaVersion: 6 },
+    input: { row: fixtureTranscriptRow, schemaVersion: 7 },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { row: fixtureTranscriptRow, schemaVersion: 7 },
+    input: { row: fixtureTranscriptRow, schemaVersion: 8 },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { row: { ...fixtureTranscriptRow, messages_json: "{" }, schemaVersion: 6 },
+    input: { row: { ...fixtureTranscriptRow, messages_json: "{" }, schemaVersion: 7 },
     outcome: "error",
   },
   "corrupt-fields": {
     input: {
       row: { ...fixtureTranscriptRow, transcript_digest: "00".repeat(32) },
-      schemaVersion: 6,
+      schemaVersion: 7,
     },
     outcome: "error",
   },
@@ -1995,7 +2265,7 @@ export const transcriptStoreRowFixtures = {
     input: {
       storeKind: "named-binding",
       row: fixtureNamedBindingRow,
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "current-binding",
     },
     outcome: "ok",
@@ -2015,7 +2285,7 @@ export const transcriptStoreRowFixtures = {
     input: {
       storeKind: "named-binding",
       row: { ...fixtureNamedBindingRow, provider_family: "future-provider" },
-      schemaVersion: 6,
+      schemaVersion: 7,
       recordId: "corrupt-binding",
     },
     outcome: "error",
@@ -2035,7 +2305,7 @@ const fixtureProjectionRow = {
 
 export const coreSurfaceProjectionRowCodecCases = {
   current: {
-    input: { row: fixtureProjectionRow, schemaVersion: 6 },
+    input: { row: fixtureProjectionRow, schemaVersion: 7 },
     outcome: "ok",
     provenance: "current",
   },
@@ -2045,16 +2315,16 @@ export const coreSurfaceProjectionRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 6 },
+    input: { row: null, schemaVersion: 7 },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { row: fixtureProjectionRow, schemaVersion: 7 },
+    input: { row: fixtureProjectionRow, schemaVersion: 8 },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { row: { ...fixtureProjectionRow, source_facts_json: "{" }, schemaVersion: 6 },
+    input: { row: { ...fixtureProjectionRow, source_facts_json: "{" }, schemaVersion: 7 },
     outcome: "error",
   },
   "corrupt-fields": {
@@ -2064,7 +2334,7 @@ export const coreSurfaceProjectionRowCodecCases = {
         source_facts_json: '{"bad":null,"nested":{"bad":null}}',
         projection_format_version: 2,
       },
-      schemaVersion: 6,
+      schemaVersion: 7,
     },
     outcome: "error",
   },
@@ -2098,7 +2368,7 @@ const fixtureLineageRow = {
 
 export const coreLineageManifestRowCodecCases = {
   current: {
-    input: { row: fixtureLineageRow, schemaVersion: 6 },
+    input: { row: fixtureLineageRow, schemaVersion: 7 },
     outcome: "ok",
     provenance: "current",
   },
@@ -2108,17 +2378,17 @@ export const coreLineageManifestRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 6 },
+    input: { row: null, schemaVersion: 7 },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
-  "unsupported-version": { input: { row: fixtureLineageRow, schemaVersion: 7 }, outcome: "error" },
+  "unsupported-version": { input: { row: fixtureLineageRow, schemaVersion: 8 }, outcome: "error" },
   "malformed-serialization": {
-    input: { row: { ...fixtureLineageRow, manifest_json: "{" }, schemaVersion: 6 },
+    input: { row: { ...fixtureLineageRow, manifest_json: "{" }, schemaVersion: 7 },
     outcome: "error",
   },
   "corrupt-fields": {
-    input: { row: { ...fixtureLineageRow, manifest_json: "{}" }, schemaVersion: 6 },
+    input: { row: { ...fixtureLineageRow, manifest_json: "{}" }, schemaVersion: 7 },
     outcome: "error",
   },
 } as const;

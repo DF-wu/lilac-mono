@@ -1373,6 +1373,59 @@ describe("SqliteGracefulRestartStore", () => {
     }
   });
 
+  it("roundtrips structured resources in queued request messages and lineage", async () => {
+    const { store } = await makeStore();
+    const snapshot = buildSnapshot();
+    const resourceMessage = {
+      role: "user",
+      content: [
+        { type: "text", text: "inspect" },
+        {
+          type: "resource",
+          uri: `resource://r1_${"ab".repeat(16)}`,
+          filename: "diagram.png",
+          mediaType: "image/png",
+          size: 321,
+        },
+      ],
+    } satisfies StoredMessageV1;
+    const lineage = buildCoreLineageManifestV2([
+      {
+        atoms: [
+          {
+            kind: "synthetic",
+            source: "restart-resource-test",
+            messageDigest: "22".repeat(32),
+          },
+        ],
+        canonicalMessages: [resourceMessage],
+      },
+    ]);
+    const queued = snapshot.agent.find((entry) => entry.kind === "queued");
+    if (!queued) throw new Error("Expected a queued recovery fixture");
+    const resourceSnapshot = {
+      ...snapshot,
+      agent: snapshot.agent.map((entry) =>
+        entry === queued
+          ? { ...entry, messages: [resourceMessage], corePrimaryLineage: lineage }
+          : entry,
+      ),
+    };
+
+    try {
+      expect(store.saveCompletedSnapshot(resourceSnapshot).status).toBe("ok");
+      const loaded = store.readCompletedSnapshot();
+      expect(loaded.status).toBe("ok");
+      if (loaded.status === "ok" && loaded.value.state === "loaded") {
+        const loadedQueued = loaded.value.snapshot.agent.find((entry) => entry.kind === "queued");
+        expect(loadedQueued?.messages).toEqual([resourceMessage]);
+        expect(loadedQueued?.corePrimaryLineage).toEqual(lineage);
+      }
+    } finally {
+      store.close();
+    }
+  });
+
   it("saves and consumes a fully validated completed snapshot", async () => {
     const { store } = await makeStore();
     const snapshot = buildSnapshot();

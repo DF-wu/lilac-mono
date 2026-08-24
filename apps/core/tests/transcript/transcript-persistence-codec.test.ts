@@ -10,6 +10,7 @@ import { Panic } from "better-result";
 import {
   coreLineageManifestRowCodecCases,
   coreSurfaceProjectionRowCodecCases,
+  decodeResourceRecordRow,
   decodeCoreLineageManifestRow,
   decodeCoreSurfaceProjectionRow,
   decodeDiscoveryRecordRow,
@@ -21,6 +22,7 @@ import {
   decodeTranscriptRow,
   discoveryRecordRowCodecCases,
   recentAgentWriteRowCodecCases,
+  resourceRecordRowCodecCases,
   hashCanonicalStoredMessagesV2,
   normalizeStoredMessagesV1,
   surfaceMessageLinkRowCodecCases,
@@ -56,6 +58,19 @@ function expectCatalog(
 }
 
 describe("transcript persistence codecs", () => {
+  it("covers the strict schema-7 resource record persistence cases", () => {
+    expectCatalog(resourceRecordRowCodecCases, decodeResourceRecordRow as never);
+    expect(
+      decodeResourceRecordRow({
+        ...resourceRecordRowCodecCases.current.input,
+        row: {
+          ...resourceRecordRowCodecCases.current.input.row,
+          origin_key: '{"version":1}',
+        },
+      }).status,
+    ).toBe("error");
+  });
+
   it("omits explicit undefined optional fields before hashing or persistence", () => {
     const messages = [
       {
@@ -156,6 +171,65 @@ describe("transcript persistence codecs", () => {
     );
     expect(digest(messagesFor(`b1_${"01".repeat(16)}`, sha))).not.toBe(
       digest(messagesFor(`b1_${"01".repeat(16)}`, sha, "image/jpeg")),
+    );
+  });
+
+  it("round-trips resource marker metadata but hashes only resource URI identity", () => {
+    const messagesFor = (
+      uri: string,
+      metadata: { readonly filename: string; readonly mediaType: string; readonly size: number },
+    ): StoredMessageV1[] => [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "inspect" },
+          { type: "resource", uri, ...metadata },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "resource-call",
+            toolName: "inspect",
+            output: {
+              type: "content",
+              value: [{ type: "resource", uri, ...metadata }],
+            },
+          },
+        ],
+      },
+    ];
+    const first = messagesFor(`resource://r1_${"12".repeat(16)}`, {
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      size: 7,
+    });
+    expect(normalizeStoredMessagesV1(first)).toEqual(first);
+
+    const digest = (messages: readonly StoredMessageV1[]) => {
+      const result = hashCanonicalStoredMessagesV2(messages);
+      if (result.status === "error") throw result.error;
+      return result.value.hash;
+    };
+    expect(digest(first)).not.toBe(
+      digest(
+        messagesFor(`resource://r1_${"13".repeat(16)}`, {
+          filename: "notes.txt",
+          mediaType: "text/plain",
+          size: 7,
+        }),
+      ),
+    );
+    expect(digest(first)).toBe(
+      digest(
+        messagesFor(`resource://r1_${"12".repeat(16)}`, {
+          filename: "transformed.png",
+          mediaType: "image/png",
+          size: 83,
+        }),
+      ),
     );
   });
 

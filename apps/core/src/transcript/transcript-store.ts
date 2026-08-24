@@ -2,9 +2,14 @@ import { captureError } from "../shared/error-capture.js";
 import { Database } from "bun:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import JSON from "superjson";
-import { type HistoryProviderFamily, type HistoryProviderState } from "@stanley2058/lilac-agent";
+import {
+  canonicalJsonStringify,
+  type HistoryProviderFamily,
+  type HistoryProviderState,
+} from "@stanley2058/lilac-agent";
 import type { BlobRefV1 } from "@stanley2058/lilac-blob-storage";
 import {
+  areCoreCanonicalMessagesIdentityEqualV2,
   computeCoreLineagePrefixDigestV2,
   decodeCorePrimaryLineageV2,
   type AdapterPlatform,
@@ -25,6 +30,20 @@ import {
 } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
+import {
+  parseResourceUri,
+  type ResourceCacheV1,
+  type ResourceId,
+  type ResourceOriginV1,
+  type ResourceRecordV1,
+} from "../resource/contracts";
+import { ResourceStoreFailure } from "../resource/errors";
+import type {
+  ResourceCacheAttachDecision,
+  ResourceRegisterDecision,
+  ResourceStore,
+  ResourceUnretainedFinalization,
+} from "../resource/store";
 import type { MsgRef } from "../surface/types";
 import { projectBuiltinSurfaceMessageRef } from "../surface/builtin-surface-protocols";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
@@ -33,11 +52,15 @@ import {
   decodeCoreSurfaceProjectionRow as decodePersistedCoreSurfaceProjectionRow,
   decodeDiscoveryRecordRow as decodePersistedDiscoveryRecordRow,
   decodeRecentAgentWriteRow as decodePersistedRecentAgentWriteRow,
+  decodeResourceRecordRow as decodePersistedResourceRecordRow,
   decodeSurfaceMessageLinkRow as decodePersistedSurfaceMessageLinkRow,
   decodeTranscriptCompactionContext as decodePersistedTranscriptCompactionContext,
   decodeTranscriptProviderState as decodePersistedTranscriptProviderState,
   decodeTranscriptRow as decodePersistedTranscriptRow,
   hashCanonicalStoredMessagesV2,
+  normalizeResourceCacheV1,
+  normalizeResourceDetectedMediaType,
+  normalizeResourceRecordV1,
   normalizeStoredMessagesV1,
   StoredMessageValidationError,
   TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION,
@@ -61,6 +84,7 @@ import {
   type PersistedCoreSurfaceProjectionRow,
   type PersistedDiscoveryRecordRow,
   type PersistedRecentAgentWriteRow,
+  type PersistedResourceRecordRow,
   type PersistedSurfaceMessageLinkRow,
   type PersistedTranscriptRow,
   type StoredMessageV1,
@@ -179,6 +203,57 @@ function decodeCoreLineageManifestRow(input: {
   return input.row === null
     ? decodePersistedCoreLineageManifestRow({ ...input, row: null })
     : decodePersistedCoreLineageManifestRow({ ...input, row: input.row });
+}
+
+function decodeResourceRecordRow(input: {
+  readonly row: PersistedResourceRecordRow | null;
+  readonly schemaVersion: number;
+  readonly recordId: string;
+}) {
+  return decodePersistedResourceRecordRow(input);
+}
+
+function collectStoredResourceIds(
+  messages: readonly StoredMessageV1[],
+): ResultType<readonly ResourceId[], ResourceStoreFailure> {
+  const resourceIds = new Set<ResourceId>();
+  const parseUri = (uri: string): ResultType<ResourceId, ResourceStoreFailure> =>
+    parseResourceUri(uri).mapError(
+      () =>
+        new ResourceStoreFailure({
+          operation: "collect-resource-references",
+          message: "Stored resource part contains an invalid capability URI",
+        }),
+    );
+  const addUri = (uri: string): ResourceStoreFailure | null => {
+    const parsed = parseUri(uri).match<
+      | { readonly kind: "resource"; readonly resourceId: ResourceId }
+      | { readonly kind: "error"; readonly error: ResourceStoreFailure }
+    >({
+      ok: (resourceId) => ({ kind: "resource", resourceId }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (parsed.kind === "error") return parsed.error;
+    resourceIds.add(parsed.resourceId);
+    return null;
+  };
+  for (const message of messages) {
+    if (typeof message.content === "string") continue;
+    for (const part of message.content) {
+      if (part.type === "resource") {
+        const failure = addUri(part.uri);
+        if (failure) return Result.err(failure);
+        continue;
+      }
+      if (part.type !== "tool-result" || part.output.type !== "content") continue;
+      for (const output of part.output.value) {
+        if (output.type !== "resource") continue;
+        const failure = addUri(output.uri);
+        if (failure) return Result.err(failure);
+      }
+    }
+  }
+  return Result.ok([...resourceIds]);
 }
 
 export const CORE_SURFACE_PROJECTION_FORMAT_VERSION = 1 as const;
@@ -372,6 +447,10 @@ export type CoreSurfaceProjectionKey = {
   readonly messageId: string;
   readonly projectionFormatVersion: typeof CORE_SURFACE_PROJECTION_FORMAT_VERSION;
 };
+
+type ResourceReferenceOwner =
+  | { readonly kind: "transcript"; readonly requestId: string }
+  | { readonly kind: "projection"; readonly key: CoreSurfaceProjectionKey };
 
 export type CoreSurfaceProjection = CoreSurfaceProjectionKey & {
   readonly canonicalMessages: readonly StoredMessageV1[];
@@ -612,6 +691,7 @@ export type TranscriptStoreWriteError =
   | TranscriptStoreReadError
   | TranscriptRetainedByLineage
   | CoreOwnedBlobIntegrityError
+  | ResourceStoreFailure
   | TranscriptTransactionConflict;
 
 export type CoreClaudeAttemptMutationError =
@@ -674,6 +754,17 @@ function classifyTranscriptSqliteDriverFailure(
     operation,
     code: sqliteError.code,
     message: "Transcript SQLite operation failed",
+  });
+}
+
+function classifyResourceSqliteDriverFailure(
+  operation: string,
+  cause: Error,
+): ResourceStoreFailure | undefined {
+  if (classifyBunSqliteError(cause) === undefined) return undefined;
+  return new ResourceStoreFailure({
+    operation,
+    message: "Core resource SQLite operation failed",
   });
 }
 
@@ -892,7 +983,10 @@ export type TranscriptStore = {
     input: AdmitCoreSurfaceProjection,
   ): ResultType<
     CoreSurfaceProjection,
-    TranscriptStoreReadError | CoreOwnedBlobIntegrityError | TranscriptTransactionConflict
+    | TranscriptStoreReadError
+    | CoreOwnedBlobIntegrityError
+    | ResourceStoreFailure
+    | TranscriptTransactionConflict
   >;
 
   getCoreSurfaceProjection?(
@@ -1064,7 +1158,7 @@ export type TranscriptStore = {
   close(): void;
 };
 
-export class SqliteTranscriptStore implements TranscriptStore {
+export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
   private readonly db: Database;
   private readonly getRetention: () => {
     readonly maxAgeMs: RetentionLimit;
@@ -1244,7 +1338,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
       if (version > TRANSCRIPT_SCHEMA_VERSION) {
         throw new Error(`Unsupported transcript schema version ${version}`);
       }
-      if (version !== 0 && version < TRANSCRIPT_SCHEMA_VERSION) {
+      if (version !== 0 && version < 6) {
         throw new Error(
           `Core transcript schema ${version} requires offline blob migration. Run: bun run migrate:blob-storage -- --config /path/to/core-config.yaml --data-dir /path/to/data`,
         );
@@ -1622,6 +1716,73 @@ export class SqliteTranscriptStore implements TranscriptStore {
           [6, Date.now()],
         );
       }
+      if (version < 7) {
+        this.db.run(`
+          CREATE TABLE core_resources (
+            resource_id TEXT PRIMARY KEY
+              CHECK (
+                length(resource_id) = 35
+                AND substr(resource_id, 1, 3) = 'r1_'
+                AND substr(resource_id, 4) NOT GLOB '*[^0-9a-f]*'
+              ),
+            record_version INTEGER NOT NULL CHECK (record_version = 1),
+            origin_key TEXT NOT NULL UNIQUE CHECK (length(origin_key) > 0),
+            origin_json TEXT NOT NULL,
+            filename TEXT,
+            declared_media_type TEXT,
+            detected_media_type TEXT,
+            reported_byte_length INTEGER CHECK (reported_byte_length >= 0),
+            created_ts INTEGER NOT NULL,
+            cache_blob_ref_json TEXT,
+            cache_cached_ts INTEGER,
+            CHECK (
+              (cache_blob_ref_json IS NULL AND cache_cached_ts IS NULL)
+              OR (cache_blob_ref_json IS NOT NULL AND cache_cached_ts IS NOT NULL)
+            )
+          )
+        `);
+        this.db.run(`
+          CREATE TABLE core_transcript_resource_refs (
+            request_id TEXT NOT NULL
+              REFERENCES request_transcripts(request_id) ON DELETE CASCADE,
+            resource_id TEXT NOT NULL
+              REFERENCES core_resources(resource_id) ON DELETE RESTRICT,
+            PRIMARY KEY (request_id, resource_id)
+          )
+        `);
+        this.db.run(`
+          CREATE INDEX idx_core_transcript_resource_refs_resource
+          ON core_transcript_resource_refs(resource_id)
+        `);
+        this.db.run(`
+          CREATE TABLE core_surface_projection_resource_refs (
+            request_client TEXT NOT NULL,
+            surface_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            projection_format_version INTEGER NOT NULL,
+            resource_id TEXT NOT NULL
+              REFERENCES core_resources(resource_id) ON DELETE RESTRICT,
+            PRIMARY KEY (
+              request_client, surface_id, session_id, message_id,
+              projection_format_version, resource_id
+            ),
+            FOREIGN KEY (
+              request_client, surface_id, session_id, message_id, projection_format_version
+            ) REFERENCES core_surface_projections (
+              request_client, surface_id, session_id, message_id, projection_format_version
+            ) ON DELETE CASCADE
+          )
+        `);
+        this.db.run(`
+          CREATE INDEX idx_core_surface_projection_resource_refs_resource
+          ON core_surface_projection_resource_refs(resource_id)
+        `);
+        this.db.run(
+          "INSERT INTO transcript_schema_migrations (version, applied_ts) VALUES (?, ?)",
+          [7, Date.now()],
+        );
+      }
       const foreignKeyFailures = this.db
         .query<DecodedTranscriptForeignKeyFailureRow, []>("PRAGMA foreign_key_check")
         .all()
@@ -1714,9 +1875,12 @@ export class SqliteTranscriptStore implements TranscriptStore {
     corePrimaryLineage?: CoreLineageManifestV2;
   }): ResultType<void, TranscriptStoreWriteError> {
     const now = Date.now();
-    const preparedMessages = parseNormalizedCanonicalMessages(input.messages).andThen((messages) =>
-      hashCanonicalStoredMessagesV2(messages).map((digest) => ({ messages, digest })),
-    );
+    const preparedMessages = Result.gen(function* () {
+      const messages = yield* parseNormalizedCanonicalMessages(input.messages);
+      const digest = yield* hashCanonicalStoredMessagesV2(messages);
+      const resourceIds = yield* collectStoredResourceIds(messages);
+      return Result.ok({ messages, digest, resourceIds });
+    });
     const preparationError = preparedMessages.match({ err: (error) => error, ok: () => null });
     if (preparationError) return Result.err(preparationError);
     const preparation = preparedMessages.match({ ok: (value) => value, err: () => null });
@@ -1727,6 +1891,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
     }
     const normalizedMessages = preparation.messages;
     const transcriptDigest = preparation.digest.hash;
+    const resourceIds = preparation.resourceIds;
     const providerState = input.providerState ?? null;
     const stableNamedRequestClient = input.stableNamedRequestClient ?? null;
     const lineageResult: ResultType<CoreStoredLineageManifestV2 | null, TranscriptStoreWriteError> =
@@ -1774,6 +1939,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
       | TranscriptTransactionPersistenceFailure
       | TranscriptRetainedByLineage
       | CoreOwnedBlobIntegrityError
+      | ResourceStoreFailure
       | TranscriptStoreReadError
       | TranscriptTransactionConflict,
       TranscriptStoreSqliteDriverFailure
@@ -1785,6 +1951,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
           | TranscriptTransactionPersistenceFailure
           | TranscriptRetainedByLineage
           | CoreOwnedBlobIntegrityError
+          | ResourceStoreFailure
           | TranscriptStoreReadError
           | TranscriptTransactionConflict
         > => {
@@ -1822,18 +1989,37 @@ export class SqliteTranscriptStore implements TranscriptStore {
               transcriptDigest,
             ],
           );
-          if (!preparedLineage) return Result.ok(this.pruneRetention(now));
-          const savedLineage = this.saveCorePrimaryLineageManifestInTransaction(
-            preparedLineage,
-            "save-request-transcript",
-          );
-          const finish = savedLineage.match<
-            () => ResultType<readonly DeferredTranscriptEvent[], TranscriptTransactionConflict>
+          const references = this.replaceTranscriptResourceReferences(input.requestId, resourceIds);
+          const referenceDecision = references.match<
+            | { readonly kind: "retained" }
+            | { readonly kind: "error"; readonly error: ResourceStoreFailure }
           >({
-            err: (error) => () => Result.err(error),
-            ok: () => () => Result.ok(this.pruneRetention(now)),
+            ok: () => ({ kind: "retained" }),
+            err: (error) => ({ kind: "error", error }),
           });
-          return finish();
+          if (referenceDecision.kind === "error") return Result.err(referenceDecision.error);
+          if (preparedLineage) {
+            const lineage = this.saveCorePrimaryLineageManifestInTransaction(
+              preparedLineage,
+              "save-request-transcript",
+            );
+            const lineageDecision = lineage.match<
+              | { readonly kind: "saved" }
+              | {
+                  readonly kind: "error";
+                  readonly error:
+                    | TranscriptTransactionPersistenceFailure
+                    | TranscriptTransactionConflict
+                    | CoreOwnedBlobIntegrityError
+                    | TranscriptStoreReadError;
+                }
+            >({
+              ok: () => ({ kind: "saved" }),
+              err: (error) => ({ kind: "error", error }),
+            });
+            if (lineageDecision.kind === "error") return Result.err(lineageDecision.error);
+          }
+          return Result.ok(this.pruneRetention(now));
         };
 
         const existing = this.db
@@ -1857,26 +2043,33 @@ export class SqliteTranscriptStore implements TranscriptStore {
           .get(input.requestId);
         const digestIsRetained = digestRetained !== null;
         const requestMetadataIsRetained = requestMetadataRetained !== null;
-        let retainedByLineage = false;
-        const decodeFailure = decodeTranscriptProviderState({
+        const providerStateDecision = decodeTranscriptProviderState({
           raw: existing.provider_state_json,
           schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
           recordId: input.requestId,
         })
           .mapError(deferTranscriptPersistenceFailure)
-          .match({
-            err: (error) => error,
-            ok: (existingProviderState) => {
-              retainedByLineage = Boolean(
+          .match<
+            | {
+                readonly kind: "error";
+                readonly error: TranscriptTransactionPersistenceFailure;
+              }
+            | { readonly kind: "decoded"; readonly retainedByLineage: boolean }
+          >({
+            err: (error) => ({ kind: "error" as const, error }),
+            ok: (existingProviderState) => ({
+              kind: "decoded" as const,
+              retainedByLineage: Boolean(
                 (digestIsRetained && existing.transcript_digest !== transcriptDigest) ||
                 (requestMetadataIsRetained &&
                   !isDeepStrictEqual(existingProviderState.value, providerState)),
-              );
-              return null;
-            },
+              ),
+            }),
           });
-        if (decodeFailure) return Result.err(decodeFailure);
-        if (retainedByLineage) {
+        if (providerStateDecision.kind === "error") {
+          return Result.err(providerStateDecision.error);
+        }
+        if (providerStateDecision.retainedByLineage) {
           return Result.err(
             new TranscriptRetainedByLineage({
               requestId: input.requestId,
@@ -1897,6 +2090,390 @@ export class SqliteTranscriptStore implements TranscriptStore {
       },
     });
     return finish();
+  }
+
+  registerOrGet(inputValue: {
+    readonly candidateResourceId: ResourceId;
+    readonly origin: ResourceOriginV1;
+    readonly filename?: string;
+    readonly declaredMediaType?: string;
+    readonly reportedByteLength?: number;
+    readonly createdAt: number;
+  }): ResultType<ResourceRegisterDecision, ResourceStoreFailure> {
+    const candidate = normalizeResourceRecordV1({
+      version: 1,
+      resourceId: inputValue.candidateResourceId,
+      origin: inputValue.origin,
+      ...(inputValue.filename === undefined ? {} : { filename: inputValue.filename }),
+      ...(inputValue.declaredMediaType === undefined
+        ? {}
+        : { declaredMediaType: inputValue.declaredMediaType }),
+      ...(inputValue.reportedByteLength === undefined
+        ? {}
+        : { reportedByteLength: inputValue.reportedByteLength }),
+      createdAt: inputValue.createdAt,
+    });
+    if (candidate === null) {
+      return Result.err(
+        new ResourceStoreFailure({
+          operation: "register-resource",
+          message: "Core resource registration input is invalid",
+        }),
+      );
+    }
+    const originKey = canonicalJsonStringify(candidate.origin);
+    const registration = runBunSqliteTransaction<
+      ResourceRegisterDecision,
+      ResourceStoreFailure,
+      ResourceStoreFailure
+    >(
+      this.db,
+      () => {
+        const existing = this.readResourceByOriginKey(originKey, "register-resource");
+        const existingFailure = existing.match({ ok: () => null, err: (error) => error });
+        if (existingFailure) return Result.err(existingFailure);
+        const existingRecord = existing.match({ ok: (record) => record, err: () => null });
+        if (existingRecord) return Result.ok({ kind: "existing", record: existingRecord });
+
+        const inserted = this.db.run(
+          `INSERT OR IGNORE INTO core_resources (
+             resource_id, record_version, origin_key, origin_json, filename,
+             declared_media_type, detected_media_type, reported_byte_length, created_ts,
+             cache_blob_ref_json, cache_cached_ts
+           ) VALUES (?, 1, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL)`,
+          [
+            candidate.resourceId,
+            originKey,
+            JSON.stringify(candidate.origin),
+            candidate.filename ?? null,
+            candidate.declaredMediaType ?? null,
+            candidate.reportedByteLength ?? null,
+            candidate.createdAt,
+          ],
+        );
+        if (inserted.changes > 0) return Result.ok({ kind: "created", record: candidate });
+
+        const raced = this.readResourceByOriginKey(originKey, "register-resource");
+        const racedFailure = raced.match({ ok: () => null, err: (error) => error });
+        if (racedFailure) return Result.err(racedFailure);
+        const racedRecord = raced.match({ ok: (record) => record, err: () => null });
+        return racedRecord
+          ? Result.ok({ kind: "existing", record: racedRecord })
+          : Result.ok({ kind: "collision" });
+      },
+      (cause) => classifyResourceSqliteDriverFailure("register-resource", cause),
+    );
+    return registration;
+  }
+
+  getRetained(resourceId: ResourceId): ResultType<ResourceRecordV1 | null, ResourceStoreFailure> {
+    const read = this.readFromSqlite("get-retained-resource", () =>
+      this.db
+        .query<PersistedResourceRecordRow, [ResourceId]>(
+          `SELECT resource.* FROM core_resources AS resource
+           WHERE resource.resource_id = ?
+             AND (
+               EXISTS (
+                 SELECT 1 FROM core_transcript_resource_refs AS transcript_ref
+                 WHERE transcript_ref.resource_id = resource.resource_id
+               )
+               OR EXISTS (
+                 SELECT 1 FROM core_surface_projection_resource_refs AS projection_ref
+                 WHERE projection_ref.resource_id = resource.resource_id
+               )
+             )`,
+        )
+        .get(resourceId),
+    );
+    const decision = read.match<
+      | { readonly kind: "row"; readonly row: PersistedResourceRecordRow | null }
+      | { readonly kind: "error" }
+    >({
+      ok: (row) => ({ kind: "row", row }),
+      err: () => ({ kind: "error" }),
+    });
+    if (decision.kind === "error") {
+      return Result.err(
+        new ResourceStoreFailure({
+          operation: "get-retained-resource",
+          message: "Core resource record could not be read",
+        }),
+      );
+    }
+    if (decision.row === null) return Result.ok(null);
+    return this.decodeResourceRecord(decision.row, "get-retained-resource");
+  }
+
+  compareAndSwapCache(inputValue: {
+    readonly resourceId: ResourceId;
+    readonly expected?: ResourceCacheV1;
+    readonly next: ResourceCacheV1;
+    readonly detectedMediaType?: string;
+  }): ResultType<ResourceCacheAttachDecision, ResourceStoreFailure> {
+    let expected: ResourceCacheV1 | undefined;
+    if (inputValue.expected !== undefined) {
+      const normalizedExpected = normalizeResourceCacheV1(inputValue.expected);
+      if (normalizedExpected === null) {
+        return Result.err(
+          new ResourceStoreFailure({
+            operation: "attach-resource-cache",
+            message: "Core resource cache input is invalid",
+          }),
+        );
+      }
+      expected = normalizedExpected;
+    }
+    const next = normalizeResourceCacheV1(inputValue.next);
+    const detectedMediaType =
+      inputValue.detectedMediaType === undefined
+        ? undefined
+        : normalizeResourceDetectedMediaType(inputValue.detectedMediaType);
+    if (
+      next === null ||
+      (inputValue.detectedMediaType !== undefined && detectedMediaType === null)
+    ) {
+      return Result.err(
+        new ResourceStoreFailure({
+          operation: "attach-resource-cache",
+          message: "Core resource cache input is invalid",
+        }),
+      );
+    }
+    return runBunSqliteTransaction<
+      ResourceCacheAttachDecision,
+      ResourceStoreFailure,
+      ResourceStoreFailure
+    >(
+      this.db,
+      () => {
+        const updated = this.db.run(
+          `UPDATE core_resources
+           SET cache_blob_ref_json = ?, cache_cached_ts = ?,
+               detected_media_type = COALESCE(detected_media_type, ?)
+           WHERE resource_id = ?
+             AND ${
+               expected === undefined
+                 ? "cache_blob_ref_json IS NULL AND cache_cached_ts IS NULL"
+                 : "cache_blob_ref_json = ? AND cache_cached_ts = ?"
+             }
+             AND (? IS NULL OR detected_media_type IS NULL OR detected_media_type = ?)
+             AND (
+               EXISTS (
+                 SELECT 1 FROM core_transcript_resource_refs
+                 WHERE resource_id = core_resources.resource_id
+               )
+               OR EXISTS (
+                 SELECT 1 FROM core_surface_projection_resource_refs
+                 WHERE resource_id = core_resources.resource_id
+               )
+             )`,
+          [
+            JSON.stringify(next.blob),
+            next.cachedAt,
+            detectedMediaType ?? null,
+            inputValue.resourceId,
+            ...(expected === undefined ? [] : [JSON.stringify(expected.blob), expected.cachedAt]),
+            detectedMediaType ?? null,
+            detectedMediaType ?? null,
+          ],
+        );
+        const retained = this.getRetained(inputValue.resourceId);
+        const retainedFailure = retained.match({ ok: () => null, err: (error) => error });
+        if (retainedFailure) return Result.err(retainedFailure);
+        const record = retained.match({ ok: (value) => value, err: () => null });
+        return updated.changes > 0 && record
+          ? Result.ok({ kind: "attached", record })
+          : Result.ok({ kind: "lost", record });
+      },
+      (cause) => classifyResourceSqliteDriverFailure("attach-resource-cache", cause),
+    );
+  }
+
+  clearCache(inputValue: {
+    readonly resourceId: ResourceId;
+    readonly expected: ResourceCacheV1;
+  }): ResultType<boolean, ResourceStoreFailure> {
+    const expected = normalizeResourceCacheV1(inputValue.expected);
+    if (expected === null) {
+      return Result.err(
+        new ResourceStoreFailure({
+          operation: "clear-resource-cache",
+          message: "Core resource cache input is invalid",
+        }),
+      );
+    }
+    return this.readFromSqlite(
+      "clear-resource-cache",
+      () =>
+        this.db.run(
+          `UPDATE core_resources
+         SET cache_blob_ref_json = NULL, cache_cached_ts = NULL
+         WHERE resource_id = ? AND cache_blob_ref_json = ? AND cache_cached_ts = ?`,
+          [inputValue.resourceId, JSON.stringify(expected.blob), expected.cachedAt],
+        ).changes > 0,
+    ).mapError(
+      () =>
+        new ResourceStoreFailure({
+          operation: "clear-resource-cache",
+          message: "Core resource cache could not be cleared",
+        }),
+    );
+  }
+
+  recordDetectedMediaType(inputValue: {
+    readonly resourceId: ResourceId;
+    readonly expected?: string;
+    readonly next: string;
+  }): ResultType<boolean, ResourceStoreFailure> {
+    const expected =
+      inputValue.expected === undefined
+        ? undefined
+        : normalizeResourceDetectedMediaType(inputValue.expected);
+    const next = normalizeResourceDetectedMediaType(inputValue.next);
+    if (next === null || (inputValue.expected !== undefined && expected === null)) {
+      return Result.err(
+        new ResourceStoreFailure({
+          operation: "record-resource-media-type",
+          message: "Core resource media type is invalid",
+        }),
+      );
+    }
+    return this.readFromSqlite(
+      "record-resource-media-type",
+      () =>
+        this.db.run(
+          `UPDATE core_resources SET detected_media_type = ?
+         WHERE resource_id = ?
+           AND ${expected === undefined ? "detected_media_type IS NULL" : "detected_media_type = ?"}
+           AND (
+             EXISTS (
+               SELECT 1 FROM core_transcript_resource_refs
+               WHERE resource_id = core_resources.resource_id
+             )
+             OR EXISTS (
+               SELECT 1 FROM core_surface_projection_resource_refs
+               WHERE resource_id = core_resources.resource_id
+             )
+           )`,
+          [inputValue.next, inputValue.resourceId, ...(expected === undefined ? [] : [expected])],
+        ).changes > 0,
+    ).mapError(
+      () =>
+        new ResourceStoreFailure({
+          operation: "record-resource-media-type",
+          message: "Core resource media type could not be recorded",
+        }),
+    );
+  }
+
+  listUnretained(input: {
+    readonly limit: number;
+  }): ResultType<readonly ResourceRecordV1[], ResourceStoreFailure> {
+    if (!Number.isSafeInteger(input.limit) || input.limit <= 0 || input.limit > 10_000) {
+      return Result.err(
+        new ResourceStoreFailure({
+          operation: "list-unretained-resources",
+          message: "Core resource maintenance limit must be between 1 and 10000",
+        }),
+      );
+    }
+    const read = this.readFromSqlite("list-unretained-resources", () =>
+      this.db
+        .query<PersistedResourceRecordRow, [number]>(
+          `SELECT resource.* FROM core_resources AS resource
+           WHERE NOT EXISTS (
+             SELECT 1 FROM core_transcript_resource_refs AS transcript_ref
+             WHERE transcript_ref.resource_id = resource.resource_id
+           ) AND NOT EXISTS (
+             SELECT 1 FROM core_surface_projection_resource_refs AS projection_ref
+             WHERE projection_ref.resource_id = resource.resource_id
+           )
+           ORDER BY resource.created_ts ASC, resource.resource_id ASC
+           LIMIT ?`,
+        )
+        .all(input.limit),
+    );
+    const decision = read.match<
+      | { readonly kind: "rows"; readonly rows: readonly PersistedResourceRecordRow[] }
+      | { readonly kind: "error" }
+    >({
+      ok: (rows) => ({ kind: "rows", rows }),
+      err: () => ({ kind: "error" }),
+    });
+    if (decision.kind === "error") {
+      return Result.err(
+        new ResourceStoreFailure({
+          operation: "list-unretained-resources",
+          message: "Unretained Core resources could not be listed",
+        }),
+      );
+    }
+    const decodedRows: ResultType<ResourceRecordV1, ResourceStoreFailure>[] = [];
+    for (const row of decision.rows) {
+      decodedRows.push(this.decodeResourceRecord(row, "list-unretained-resources"));
+    }
+    return Result.all(decodedRows);
+  }
+
+  finalizeUnretained(inputValue: {
+    readonly resourceId: ResourceId;
+    readonly expectedCache?: ResourceCacheV1;
+  }): ResultType<ResourceUnretainedFinalization, ResourceStoreFailure> {
+    const expectedCache =
+      inputValue.expectedCache === undefined
+        ? undefined
+        : normalizeResourceCacheV1(inputValue.expectedCache);
+    if (inputValue.expectedCache !== undefined && expectedCache === null) {
+      return Result.err(
+        new ResourceStoreFailure({
+          operation: "finalize-unretained-resource",
+          message: "Core resource cache finalization input is invalid",
+        }),
+      );
+    }
+    return runBunSqliteTransaction<
+      ResourceUnretainedFinalization,
+      ResourceStoreFailure,
+      ResourceStoreFailure
+    >(
+      this.db,
+      () => {
+        const current = this.readResourceById(
+          inputValue.resourceId,
+          "finalize-unretained-resource",
+        );
+        const currentFailure = current.match({ ok: () => null, err: (error) => error });
+        if (currentFailure) return Result.err(currentFailure);
+        const record = current.match({ ok: (value) => value, err: () => null });
+        if (record === null) return Result.ok({ kind: "absent" });
+        if (!isDeepStrictEqual(record.cache, expectedCache)) {
+          return Result.ok({ kind: "changed", record });
+        }
+        const retained = this.resourceHasReferences(inputValue.resourceId);
+        if (retained) {
+          let retainedRecord = record;
+          if (expectedCache !== undefined) {
+            this.db.run(
+              `UPDATE core_resources
+               SET cache_blob_ref_json = NULL, cache_cached_ts = NULL
+               WHERE resource_id = ?`,
+              [inputValue.resourceId],
+            );
+            const { cache: _removedCache, ...recordWithoutCache } = record;
+            retainedRecord = recordWithoutCache;
+          }
+          return Result.ok({
+            kind: "retained",
+            record: retainedRecord,
+          });
+        }
+        const deleted = this.db.run("DELETE FROM core_resources WHERE resource_id = ?", [
+          inputValue.resourceId,
+        ]);
+        return Result.ok({ kind: deleted.changes > 0 ? "deleted" : "absent" });
+      },
+      (cause) => classifyResourceSqliteDriverFailure("finalize-unretained-resource", cause),
+    );
   }
 
   putCoreOwnedBlob(inputValue: {
@@ -1985,7 +2562,10 @@ export class SqliteTranscriptStore implements TranscriptStore {
     inputValue: AdmitCoreSurfaceProjection,
   ): ResultType<
     CoreSurfaceProjection,
-    TranscriptStoreReadError | CoreOwnedBlobIntegrityError | TranscriptTransactionConflict
+    | TranscriptStoreReadError
+    | CoreOwnedBlobIntegrityError
+    | ResourceStoreFailure
+    | TranscriptTransactionConflict
   > {
     return Result.gen(function* (this: SqliteTranscriptStore) {
       const input = {
@@ -1998,6 +2578,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
           filename: reference.filename,
         })),
       };
+      const resourceIds = yield* collectStoredResourceIds(input.canonicalMessages);
       const key: CoreSurfaceProjectionKey = {
         requestClient: input.requestClient,
         surfaceId: input.surfaceId,
@@ -2034,7 +2615,7 @@ export class SqliteTranscriptStore implements TranscriptStore {
       };
       const admission = runBunSqliteTransaction<
         CoreSurfaceProjectionAdmissionOutcome,
-        TranscriptTransactionConflict,
+        ResourceStoreFailure | TranscriptTransactionConflict,
         TranscriptStoreSqliteDriverFailure
       >(
         this.db,
@@ -2086,6 +2667,12 @@ export class SqliteTranscriptStore implements TranscriptStore {
               ],
             );
           }
+          const resourceReferences = this.insertProjectionResourceReferences(key, resourceIds);
+          const referenceFailure = resourceReferences.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (referenceFailure) return Result.err(referenceFailure);
           const stored = this.db
             .query<{ request_client: string }, [AdapterPlatform, string, string, string, number]>(
               `SELECT request_client FROM core_surface_projections
@@ -2668,7 +3255,9 @@ export class SqliteTranscriptStore implements TranscriptStore {
           ) {
             return Result.ok("stale-request-lineage");
           }
-          if (!isDeepStrictEqual(transcript.messages, segment.canonicalMessages)) {
+          if (
+            !areCoreCanonicalMessagesIdentityEqualV2(transcript.messages, segment.canonicalMessages)
+          ) {
             return Result.ok("transformed-request-lineage");
           }
           if (atom.kind === "request") {
@@ -2788,6 +3377,135 @@ export class SqliteTranscriptStore implements TranscriptStore {
       .get(ownerId);
     if (!row) return Result.ok(null);
     return decodeCoreOwnedBlobRow(row);
+  }
+
+  private decodeResourceRecord(
+    row: PersistedResourceRecordRow,
+    operation: string,
+  ): ResultType<ResourceRecordV1, ResourceStoreFailure> {
+    const decoded = decodeResourceRecordRow({
+      row,
+      schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
+      recordId: row.resource_id,
+    });
+    const decision = decoded.match<
+      | { readonly kind: "record"; readonly record: ResourceRecordV1 }
+      | { readonly kind: "error"; readonly error: PersistedDataError }
+    >({
+      ok: (value) => ({ kind: "record", record: value.value }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (decision.kind === "record") return Result.ok(decision.record);
+    this.reportPersistenceError(decision.error);
+    return Result.err(
+      new ResourceStoreFailure({
+        operation,
+        message: "Core resource record is corrupt",
+      }),
+    );
+  }
+
+  private readResourceById(
+    resourceId: ResourceId,
+    operation: string,
+  ): ResultType<ResourceRecordV1 | null, ResourceStoreFailure> {
+    const row = this.db
+      .query<PersistedResourceRecordRow, [ResourceId]>(
+        "SELECT * FROM core_resources WHERE resource_id = ?",
+      )
+      .get(resourceId);
+    return row === null ? Result.ok(null) : this.decodeResourceRecord(row, operation);
+  }
+
+  private readResourceByOriginKey(
+    originKey: string,
+    operation: string,
+  ): ResultType<ResourceRecordV1 | null, ResourceStoreFailure> {
+    const row = this.db
+      .query<PersistedResourceRecordRow, [string]>(
+        "SELECT * FROM core_resources WHERE origin_key = ?",
+      )
+      .get(originKey);
+    return row === null ? Result.ok(null) : this.decodeResourceRecord(row, operation);
+  }
+
+  private resourceHasReferences(resourceId: ResourceId): boolean {
+    return (
+      this.db
+        .query(
+          `SELECT 1
+           WHERE EXISTS (
+             SELECT 1 FROM core_transcript_resource_refs WHERE resource_id = ?
+           ) OR EXISTS (
+             SELECT 1 FROM core_surface_projection_resource_refs WHERE resource_id = ?
+           )`,
+        )
+        .get(resourceId, resourceId) !== null
+    );
+  }
+
+  private replaceTranscriptResourceReferences(
+    requestId: string,
+    resourceIds: readonly ResourceId[],
+  ): ResultType<void, ResourceStoreFailure> {
+    this.db.run("DELETE FROM core_transcript_resource_refs WHERE request_id = ?", [requestId]);
+    return this.insertResourceReferences({ kind: "transcript", requestId }, resourceIds);
+  }
+
+  private insertProjectionResourceReferences(
+    key: CoreSurfaceProjectionKey,
+    resourceIds: readonly ResourceId[],
+  ): ResultType<void, ResourceStoreFailure> {
+    return this.insertResourceReferences({ kind: "projection", key }, resourceIds);
+  }
+
+  private insertResourceReferences(
+    owner: ResourceReferenceOwner,
+    resourceIds: readonly ResourceId[],
+  ): ResultType<void, ResourceStoreFailure> {
+    for (const resourceId of resourceIds) {
+      const retained = this.db
+        .query("SELECT 1 FROM core_resources WHERE resource_id = ? LIMIT 1")
+        .get(resourceId);
+      if (!retained) {
+        return Result.err(
+          new ResourceStoreFailure({
+            operation:
+              owner.kind === "transcript"
+                ? "retain-transcript-resource"
+                : "retain-projection-resource",
+            message:
+              owner.kind === "transcript"
+                ? "Stored transcript refers to an unknown resource"
+                : "Stored surface projection refers to an unknown resource",
+          }),
+        );
+      }
+      if (owner.kind === "transcript") {
+        this.db.run(
+          `INSERT INTO core_transcript_resource_refs (request_id, resource_id)
+           VALUES (?, ?)`,
+          [owner.requestId, resourceId],
+        );
+        continue;
+      }
+      const key = owner.key;
+      this.db.run(
+        `INSERT INTO core_surface_projection_resource_refs (
+           request_client, surface_id, session_id, message_id,
+           projection_format_version, resource_id
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          key.requestClient,
+          key.surfaceId,
+          key.sessionId,
+          key.messageId,
+          key.projectionFormatVersion,
+          resourceId,
+        ],
+      );
+    }
+    return Result.ok(undefined);
   }
 
   unlinkSurfaceMessage(input: {

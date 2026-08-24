@@ -19,6 +19,7 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import type { RetentionLimit } from "@stanley2058/lilac-utils";
 
+import type { ResourceId } from "../../src/resource/contracts";
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
   computeCorePrimaryClaudeTerminalHead as computeCorePrimaryClaudeTerminalHeadResult,
@@ -1317,6 +1318,125 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("classifies lineage SQLite failures and rolls back the transcript write", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-lineage-save-rollback-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath);
+    const raw = new Database(dbPath);
+    raw.run(`
+      CREATE TABLE lineage_save_probe (marker TEXT NOT NULL);
+      CREATE TRIGGER reject_lineage_save
+      BEFORE INSERT ON core_primary_lineage_manifests
+      BEGIN
+        INSERT INTO lineage_save_probe (marker) VALUES ('touched');
+        SELECT RAISE(ABORT, 'reject lineage save');
+      END;
+    `);
+    const messages = [{ role: "user", content: "lineage input" }] satisfies StoredMessageV1[];
+    const manifest = buildCoreLineageManifestV2([syntheticManifestSegment(messages)]);
+
+    const saved = store.saveRequestTranscript({
+      requestId: "lineage-driver-failure",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages,
+      corePrimaryLineage: manifest,
+    });
+
+    expect(saved.status).toBe("error");
+    if (saved.status === "error") {
+      expect(saved.error).toBeInstanceOf(TranscriptStoreSqliteDriverFailure);
+      if (TranscriptStoreSqliteDriverFailure.is(saved.error)) {
+        expect(saved.error.operation).toBe("save-request-transcript");
+      }
+    }
+    expect(raw.query("SELECT * FROM lineage_save_probe").all()).toEqual([]);
+    expect(raw.query("SELECT * FROM request_transcripts").all()).toEqual([]);
+    expect(raw.query("SELECT * FROM core_primary_lineage_manifests").all()).toEqual([]);
+
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("classifies retention SQLite failures and rolls back the saved transcript", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-retention-save-rollback-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      retention: {
+        maxAgeMs: { kind: "unlimited" },
+        maxRequests: { kind: "bounded", value: 1 },
+      },
+    });
+    resultValue(
+      store.saveRequestTranscript({
+        requestId: "retained-before-failure",
+        sessionId: "chan",
+        requestClient: "discord",
+        messages: [{ role: "user", content: "first" }],
+      }),
+    );
+    const raw = new Database(dbPath);
+    raw.run(`
+      CREATE TABLE retention_save_probe (marker TEXT NOT NULL);
+      CREATE TRIGGER reject_retention_delete
+      BEFORE DELETE ON request_transcripts
+      BEGIN
+        INSERT INTO retention_save_probe (marker) VALUES ('touched');
+        SELECT RAISE(ABORT, 'reject retention delete');
+      END;
+    `);
+
+    const saved = store.saveRequestTranscript({
+      requestId: "rolled-back-after-failure",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "second" }],
+    });
+
+    expect(saved.status).toBe("error");
+    if (saved.status === "error") {
+      expect(saved.error).toBeInstanceOf(TranscriptStoreSqliteDriverFailure);
+      if (TranscriptStoreSqliteDriverFailure.is(saved.error)) {
+        expect(saved.error.operation).toBe("save-request-transcript");
+      }
+    }
+    expect(raw.query("SELECT * FROM retention_save_probe").all()).toEqual([]);
+    expect(
+      raw.query<{ request_id: string }, []>("SELECT request_id FROM request_transcripts").all(),
+    ).toEqual([{ request_id: "retained-before-failure" }]);
+
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("preserves retention Panic identity and rolls back the saved transcript", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-retention-save-panic-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const retentionPanic = new Panic({ message: "retention policy invariant failed" });
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      getRetention: () => {
+        throw retentionPanic;
+      },
+    });
+
+    expect(() =>
+      store.saveRequestTranscript({
+        requestId: "rolled-back-after-panic",
+        sessionId: "chan",
+        requestClient: "discord",
+        messages: [{ role: "user", content: "panic" }],
+      }),
+    ).toThrow(retentionPanic);
+    const raw = new Database(dbPath);
+    expect(raw.query("SELECT * FROM request_transcripts").all()).toEqual([]);
+
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("emits prune diagnostics after the save commits and releases its SQLite lock", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-prune-diagnostics-"));
     const dbPath = path.join(dir, "transcripts.db");
@@ -1845,7 +1965,7 @@ describe("SqliteTranscriptStore", () => {
     const version = migrated
       .query("SELECT MAX(version) AS version FROM transcript_schema_migrations")
       .get();
-    expect(version).toEqual({ version: 6 });
+    expect(version).toEqual({ version: 7 });
     expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
     const columns = migrated.query("PRAGMA table_info(request_transcripts)").all() as Array<{
       name: string;
@@ -2870,8 +2990,38 @@ describe("SqliteTranscriptStore", () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-stage6-"));
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
+    const sourceResourceId = `r1_${"61".repeat(16)}` as ResourceId;
+    const sourceResourceUri = `resource://${sourceResourceId}`;
+    resultValue(
+      store.registerOrGet({
+        candidateResourceId: sourceResourceId,
+        origin: {
+          version: 1,
+          kind: "discord-attachment",
+          channelId: "session",
+          messageId: "source-resource",
+          ordinal: 0,
+          attachmentId: "source-resource",
+        },
+        filename: "source.webp",
+        declaredMediaType: "image/webp",
+        reportedByteLength: 321,
+        createdAt: 1,
+      }),
+    );
     const sourceMessages = [
-      { role: "assistant", content: "source output" },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "resource",
+            uri: sourceResourceUri,
+            filename: "source.webp",
+            mediaType: "image/webp",
+            size: 321,
+          },
+        ],
+      },
     ] satisfies StoredMessageV1[];
     store.saveRequestTranscript({
       requestId: "source",
@@ -2925,6 +3075,38 @@ describe("SqliteTranscriptStore", () => {
     const storedCanonicalMessages: StoredMessageV1[] =
       storedManifest?.segments.flatMap((segment) => segment.canonicalMessages) ?? [];
     expect(storedCanonicalMessages).toEqual(sourceMessages);
+    const transformedMetadataMessages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "resource",
+            uri: sourceResourceUri,
+            filename: "downloaded.png",
+            mediaType: "image/png",
+            size: 999,
+          },
+        ],
+      },
+    ] satisfies StoredMessageV1[];
+    expect(
+      validateCorePrimaryLineageReferences(store, {
+        manifest: manifestFor([atom], transformedMetadataMessages, [requestAlias]),
+        requestClient: "discord",
+        sessionId: "session",
+        surfaceId: "discord:session",
+      }),
+    ).toBeNull();
+    const differentResourceMessages = structuredClone(transformedMetadataMessages);
+    differentResourceMessages[0]!.content[0]!.uri = `resource://r1_${"62".repeat(16)}`;
+    expect(
+      validateCorePrimaryLineageReferences(store, {
+        manifest: manifestFor([atom], differentResourceMessages, [requestAlias]),
+        requestClient: "discord",
+        sessionId: "session",
+        surfaceId: "discord:session",
+      }),
+    ).toBe("transformed-request-lineage");
     const constrained = new Database(dbPath);
     constrained.run("PRAGMA foreign_keys = ON");
     expect(() =>
