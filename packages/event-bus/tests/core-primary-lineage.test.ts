@@ -13,6 +13,7 @@ import {
   parseCmdRequestMessageData,
   type CoreLineageAtomV2,
   type CoreLineageManifestV2,
+  type StoredMessageV1,
 } from "../index";
 
 function requireOk<TValue, TError>(result: ResultType<TValue, TError>): TValue {
@@ -296,6 +297,74 @@ describe("Core primary lineage v2", () => {
 
     independentOwner.content[0]!.blob.sha256 = "bb".repeat(32);
     expect(decodeCorePrimaryLineageV2(lineage, [independentOwner]).status).toBe("error");
+  });
+
+  it("compares top-level and tool-result resources by URI without marker metadata", () => {
+    const atom = ATOMS[0];
+    const uri = `resource://r1_${"ab".repeat(16)}`;
+    const topLevelMessage = {
+      role: "user",
+      content: [
+        {
+          type: "resource",
+          uri,
+          filename: "diagram.webp",
+          mediaType: "image/webp",
+          size: 321,
+        },
+      ],
+    } satisfies StoredMessageV1;
+    const toolResultMessage = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "resource-call",
+          toolName: "inspect",
+          output: {
+            type: "content",
+            value: [
+              {
+                type: "resource",
+                uri,
+                filename: "diagram.webp",
+                mediaType: "image/webp",
+                size: 321,
+              },
+            ],
+          },
+        },
+      ],
+    } satisfies StoredMessageV1;
+    const messages: [typeof topLevelMessage, typeof toolResultMessage] = [
+      topLevelMessage,
+      toolResultMessage,
+    ];
+    const lineage = requireOk(
+      buildCoreLineageManifestV2([{ atoms: [atom], canonicalMessages: messages }]),
+    );
+
+    expect(decodeCorePrimaryLineageV2(lineage, structuredClone(messages)).status).toBe("ok");
+
+    const changedTopLevelMetadata = structuredClone(messages);
+    changedTopLevelMetadata[0]!.content[0]!.filename = "diagram.png";
+    changedTopLevelMetadata[0]!.content[0]!.mediaType = "image/png";
+    changedTopLevelMetadata[0]!.content[0]!.size = 999;
+    expect(decodeCorePrimaryLineageV2(lineage, changedTopLevelMetadata).status).toBe("ok");
+
+    const changedToolResultMetadata = structuredClone(messages);
+    changedToolResultMetadata[1]!.content[0]!.output.value[0]!.filename = "diagram.png";
+    changedToolResultMetadata[1]!.content[0]!.output.value[0]!.mediaType = "image/png";
+    changedToolResultMetadata[1]!.content[0]!.output.value[0]!.size = 999;
+    expect(decodeCorePrimaryLineageV2(lineage, changedToolResultMetadata).status).toBe("ok");
+
+    const changedTopLevelUri = structuredClone(messages);
+    changedTopLevelUri[0]!.content[0]!.uri = `resource://r1_${"cd".repeat(16)}`;
+    expect(decodeCorePrimaryLineageV2(lineage, changedTopLevelUri).status).toBe("error");
+
+    const changedToolResultUri = structuredClone(messages);
+    changedToolResultUri[1]!.content[0]!.output.value[0]!.uri = `resource://r1_${"cd".repeat(16)}`;
+    expect(decodeCorePrimaryLineageV2(lineage, changedToolResultUri).status).toBe("error");
   });
 
   it("maps ordinary decoder exceptions and preserves Panic at the exact boundary", () => {

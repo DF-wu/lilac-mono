@@ -8,6 +8,7 @@ import { z } from "zod";
 
 const nonemptyStringSchema = z.string().min(1);
 const providerOptionsSchema = z.record(z.string(), z.record(z.string(), z.json()));
+const resourceUriV1Schema = z.string().regex(/^resource:\/\/r1_[0-9a-f]{32}$/u);
 
 const textPartSchema = z.strictObject({
   type: z.literal("text"),
@@ -26,6 +27,21 @@ const customPartSchema = z.strictObject({
   kind: nonemptyStringSchema,
   providerOptions: providerOptionsSchema.optional(),
 });
+
+/** Stable capability reference for one retained Core ingress resource. */
+export const storedResourcePartV1Schema = z.strictObject({
+  type: z.literal("resource"),
+  uri: resourceUriV1Schema,
+  filename: z.string().optional(),
+  mediaType: nonemptyStringSchema.optional(),
+  size: z.number().int().nonnegative().optional(),
+});
+
+export type StoredResourcePartV1 = z.output<typeof storedResourcePartV1Schema>;
+
+/** Byte-free resource part accepted on the current Redis request wire. */
+export const busResourcePartV1Schema = storedResourcePartV1Schema;
+export type BusResourcePartV1 = StoredResourcePartV1;
 
 const toolCallPartSchema = z.strictObject({
   type: z.literal("tool-call"),
@@ -85,7 +101,9 @@ function createBlobMessageSchemas<TBlob>(blobSchema: z.ZodType<TBlob>) {
     }),
     z.strictObject({
       type: z.literal("content"),
-      value: z.array(z.union([textPartSchema, blobPartSchema, customPartSchema])),
+      value: z.array(
+        z.union([textPartSchema, blobPartSchema, storedResourcePartV1Schema, customPartSchema]),
+      ),
     }),
   ]);
 
@@ -104,7 +122,10 @@ function createBlobMessageSchemas<TBlob>(blobSchema: z.ZodType<TBlob>) {
   });
   const userMessageSchema = z.strictObject({
     role: z.literal("user"),
-    content: z.union([z.string(), z.array(z.union([textPartSchema, blobPartSchema]))]),
+    content: z.union([
+      z.string(),
+      z.array(z.union([textPartSchema, blobPartSchema, storedResourcePartV1Schema])),
+    ]),
     providerOptions: providerOptionsSchema.optional(),
   });
   const assistantMessageSchema = z.strictObject({
@@ -115,6 +136,7 @@ function createBlobMessageSchemas<TBlob>(blobSchema: z.ZodType<TBlob>) {
         z.union([
           textPartSchema,
           blobPartSchema,
+          storedResourcePartV1Schema,
           reasoningPartSchema,
           customPartSchema,
           toolCallPartSchema,

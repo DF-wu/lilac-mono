@@ -2949,6 +2949,13 @@ describe("RedisStreamsBus", () => {
               blob: { version: 1, objectId: `b1_${"11".repeat(16)}` },
               mediaType: "application/pdf",
             },
+            {
+              type: "resource",
+              uri: `resource://r1_${"ab".repeat(16)}`,
+              filename: "diagram.png",
+              mediaType: "image/png",
+              size: 321,
+            },
           ],
         },
       ] satisfies BusMessageV2[],

@@ -62,6 +62,13 @@ export type CoreLineageAtomV2 = z.infer<typeof coreLineageAtomV2Schema>;
 const canonicalMessageV2Schema = z.union([busMessageV2Schema, storedMessageV1Schema]);
 const canonicalMessagesV2Schema = z.array(canonicalMessageV2Schema);
 type CanonicalMessageV2 = BusMessageV2 | StoredMessageV1;
+type CanonicalUserMessageV2 = Extract<CanonicalMessageV2, { readonly role: "user" }>;
+type CanonicalAssistantMessageV2 = Extract<CanonicalMessageV2, { readonly role: "assistant" }>;
+type CanonicalToolMessageV2 = Extract<CanonicalMessageV2, { readonly role: "tool" }>;
+type CanonicalMessagePartV2 =
+  | Exclude<CanonicalUserMessageV2["content"], string>[number]
+  | Exclude<CanonicalAssistantMessageV2["content"], string>[number]
+  | CanonicalToolMessageV2["content"][number];
 
 export const coreLineageSegmentV2Schema = z
   .strictObject({
@@ -504,33 +511,60 @@ function normalizeResolvedCanonicalMessages(
   messages: readonly CanonicalMessageV2[],
 ): readonly unknown[] | null {
   const unresolved = { found: false };
-  const normalize = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(normalize);
-    if (value === null || typeof value !== "object") return value;
-    const record = value as Readonly<Record<string, unknown>>;
-    if (record["type"] === "blob") {
-      const blob = record["blob"];
-      if (blob === null || typeof blob !== "object" || !("sha256" in blob)) {
+  const normalizePart = (part: CanonicalMessagePartV2): unknown => {
+    if (part.type === "resource") {
+      return {
+        type: "resource",
+        uri: part.uri,
+      };
+    }
+    if (part.type === "blob") {
+      if (!("sha256" in part.blob)) {
         unresolved.found = true;
         return null;
       }
-      const ref = blob as Readonly<Record<string, unknown>>;
       return {
         type: "blob",
         blob: {
-          sha256: ref["sha256"],
-          byteLength: ref["byteLength"],
+          sha256: part.blob.sha256,
+          byteLength: part.blob.byteLength,
         },
-        mediaType: record["mediaType"],
-        ...(Object.hasOwn(record, "filename") ? { filename: record["filename"] } : {}),
+        mediaType: part.mediaType,
+        ...(part.filename === undefined ? {} : { filename: part.filename }),
       };
     }
-    return Object.fromEntries(
-      Object.entries(record).map(([key, entry]) => [key, normalize(entry)]),
-    );
+    if (part.type !== "tool-result" || part.output.type !== "content") return part;
+    return {
+      ...part,
+      output: {
+        ...part.output,
+        value: part.output.value.map(normalizePart),
+      },
+    };
   };
-  const normalized = messages.map(normalize);
+  const normalized = messages.map((message) =>
+    typeof message.content === "string"
+      ? message
+      : {
+          ...message,
+          content: message.content.map(normalizePart),
+        },
+  );
   return unresolved.found ? null : normalized;
+}
+
+/** Compare canonical messages while treating resource marker metadata as informational. */
+export function areCoreCanonicalMessagesIdentityEqualV2(
+  left: readonly (BusMessageV2 | StoredMessageV1)[],
+  right: readonly (BusMessageV2 | StoredMessageV1)[],
+): boolean {
+  const normalizedLeft = normalizeResolvedCanonicalMessages(left);
+  const normalizedRight = normalizeResolvedCanonicalMessages(right);
+  return (
+    normalizedLeft !== null &&
+    normalizedRight !== null &&
+    isDeepStrictEqual(normalizedLeft, normalizedRight)
+  );
 }
 
 export function createCorePrimaryLineageFreshOnlyV2(
