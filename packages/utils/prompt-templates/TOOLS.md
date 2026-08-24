@@ -61,7 +61,7 @@ cat payload.json | tools <tool> --stdin
 - `ssh.run` — Run a command on a remote host over SSH (StrictHostKeyChecking=yes, BatchMode=yes)
 - `ssh.probe` — Probe remote host OS + tool availability + git context
 - `attachment.add_files` — Reads local files and attaches them to the current reply.
-- `resource.materialize` — Write one or more inbound `resource://` attachments into the request working directory.
+- `resource.materialize` — Write one or more `resource://` references into the current working directory.
 - `discovery.search` — Lexical search over unified agent memory across conversations, prompts, and heartbeat files with grouped origins, time windows, and surrounding context.
   - When to use: Find exact phrases, identifiers, or nearby raw transcript/file context.
 - `conversation.thread.search` — (Template setup: remove this bullet and its sub-bullets if conversation thread indexing/summarization is not enabled in core config; if enabled, delete this parenthetical.) Search summarized Discord conversation threads by semantic queries.

@@ -92,7 +92,7 @@ export type ResourceDescriptor = {
 };
 
 export type MaterializedResource = {
-  readonly uri: ResourceUri;
+  readonly uri: string;
   readonly path: string;
   readonly filename: string;
   readonly mimeType?: string;

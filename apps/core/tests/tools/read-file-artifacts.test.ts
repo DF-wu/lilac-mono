@@ -6,6 +6,7 @@ import path from "node:path";
 import { getTestBlobStore } from "../helpers/blob-store";
 import {
   createToolResultArtifactStore,
+  legacyToolResultUri,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
 } from "../../src/artifacts/tool-result-artifact-store";
 import { fsTool } from "../../src/tools/fs/fs";
@@ -47,6 +48,7 @@ describe("read tool-result resources", () => {
         maxBytesPerSession: 1024,
       }),
     );
+    expect(created.uri).toMatch(/^resource:\/\/t1_[0-9a-f]{32}$/u);
     const readFile = fsTool(baseDir, {
       toolResultArtifacts: store,
       requestContext: { requestId: "request-a", sessionId: "session-a" },
@@ -78,6 +80,12 @@ describe("read tool-result resources", () => {
       { toolCallId: "read-next", messages: [], context: {} },
     );
     expect(next).toMatchObject({ content: "d", startOffset: 4, endOffset: 5, hasMore: false });
+
+    const legacy = await readFile.execute!(
+      { path: legacyToolResultUri(created.uri) },
+      { toolCallId: "read-legacy", messages: [], context: {} },
+    );
+    expect(legacy).toMatchObject({ success: true, content: "ab😀cd" });
   });
 
   it("supports line starts for artifacts and offset starts for ordinary files", async () => {
@@ -170,8 +178,7 @@ describe("read tool-result resources", () => {
       success: false,
       error: {
         code: "PERMISSION",
-        message:
-          "Restricted sessions can use read only with tool-result:// artifacts or resource:// resources.",
+        message: "Restricted sessions can use read only with resource:// references.",
       },
     });
   });
@@ -291,13 +298,23 @@ describe("read tool-result resources", () => {
     expect(Buffer.byteLength(JSON.stringify(output, null, 2), "utf8")).toBeLessThanOrEqual(512);
     expect(await readdir(store.rootDir)).toEqual(filesBefore);
 
+    const legacyUri = legacyToolResultUri(created.uri);
+    const legacy = await tools.grep.execute!(
+      { pattern: "needle", path: legacyUri },
+      { toolCallId: "grep-artifact-legacy", messages: [], context: {} },
+    );
+    expect(legacy).toMatchObject({
+      mode: "default",
+      results: [{ file: legacyUri, line: 2 }],
+    });
+
     const hashline = await tools.grep.execute!(
       { pattern: "needle", path: created.uri, mode: "hashline" },
       { toolCallId: "grep-artifact-hashline", messages: [], context: {} },
     );
     expect(hashline).toMatchObject({
       mode: "hashline",
-      error: expect.stringContaining("unavailable for tool-result://"),
+      error: expect.stringContaining("unavailable for transient resources"),
     });
 
     const foreignTools = fsTool(baseDir, {

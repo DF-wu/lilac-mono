@@ -7,6 +7,10 @@ import path from "node:path";
 import { Panic, Result } from "better-result";
 
 import {
+  createToolResultArtifactStore,
+  legacyToolResultUri,
+} from "../src/artifacts/tool-result-artifact-store";
+import {
   ResourceAlreadyExists,
   ResourceCancelled,
   ResourceInvalidUri,
@@ -14,6 +18,7 @@ import {
   type MaterializedResource,
   type ResourceAccess,
 } from "../src/resource";
+import { getTestBlobStore } from "./helpers/blob-store";
 import { resolveRestrictedSessionTmpDir } from "../src/shared/attachment-utils";
 import { Resource } from "../src/tool-server/tools/resource";
 import { bindRequestInvocationCwd } from "../src/tool-server/request-invocation-cwd";
@@ -54,6 +59,219 @@ async function callValue(
 }
 
 describe("tool-server resource", () => {
+  it("materializes scoped transient resources and accepts legacy artifact URIs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transient-resource-tool-"));
+    const firstCwd = path.join(root, "first");
+    const legacyCwd = path.join(root, "legacy");
+    const foreignCwd = path.join(root, "foreign");
+    await Promise.all(
+      [firstCwd, legacyCwd, foreignCwd].map((directory) =>
+        fs.mkdir(directory, { recursive: true }),
+      ),
+    );
+    try {
+      const artifacts = createToolResultArtifactStore(
+        path.join(root, "artifacts"),
+        await getTestBlobStore(),
+      );
+      await artifacts.init();
+      const created = (
+        await artifacts.create({
+          scopeId: "session-a",
+          requestId: "request-a",
+          toolCallId: "call-a",
+          toolName: "bash",
+          content: "transient content",
+          ttlMs: 60_000,
+          maxBytesPerScope: 1024,
+        })
+      ).match({
+        ok: (value) => value,
+        err: (error) => {
+          throw error;
+        },
+      });
+      let retainedCalls = 0;
+      const tool = new Resource({
+        toolResultArtifacts: artifacts,
+        access: fakeAccess(async () => {
+          retainedCalls += 1;
+          return Result.ok(materialized(URIS[0], firstCwd, 1));
+        }),
+      });
+
+      const current = await callValue(
+        tool,
+        { uris: [created.uri] },
+        { context: { cwd: firstCwd, sessionId: "session-a", safetyMode: "trusted" } },
+      );
+      const legacy = await callValue(
+        tool,
+        { uris: [legacyToolResultUri(created.uri)] },
+        { context: { cwd: legacyCwd, sessionId: "session-a", safetyMode: "trusted" } },
+      );
+      const foreign = await callValue(
+        tool,
+        { uris: [created.uri] },
+        { context: { cwd: foreignCwd, sessionId: "session-b", safetyMode: "trusted" } },
+      );
+
+      expect(current).toMatchObject({
+        results: [{ uri: created.uri, status: "ok", mimeType: "text/plain" }],
+      });
+      expect(legacy).toMatchObject({ results: [{ status: "ok", mimeType: "text/plain" }] });
+      expect(foreign).toMatchObject({
+        results: [{ uri: created.uri, status: "error", error: { code: "not_found" } }],
+      });
+      expect(retainedCalls).toBe(0);
+      const currentPath = (current as { results: [{ path: string }] }).results[0].path;
+      const legacyPath = (legacy as { results: [{ path: string }] }).results[0].path;
+      expect(await fs.readFile(currentPath, "utf8")).toBe("transient content");
+      expect(await fs.readFile(legacyPath, "utf8")).toBe("transient content");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces transient limits, strict URIs, and exclusive destinations", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transient-resource-errors-"));
+    try {
+      const artifacts = createToolResultArtifactStore(
+        path.join(root, "artifacts"),
+        await getTestBlobStore(),
+      );
+      await artifacts.init();
+      const created = (
+        await artifacts.create({
+          scopeId: "session-a",
+          requestId: "request-a",
+          toolCallId: "call-a",
+          toolName: "bash",
+          content: "12345",
+          ttlMs: 60_000,
+          maxBytesPerScope: 1024,
+        })
+      ).match({
+        ok: (value) => value,
+        err: (error) => {
+          throw error;
+        },
+      });
+      let retainedCalls = 0;
+      const access = fakeAccess(async () => {
+        retainedCalls += 1;
+        return Result.ok(materialized(URIS[0], root, 1));
+      });
+      const limited = new Resource({
+        access,
+        toolResultArtifacts: artifacts,
+        limits: { materializeCallMaxBytes: 4 },
+      });
+
+      const oversized = await callValue(
+        limited,
+        { uris: [created.uri] },
+        { context: { cwd: root, sessionId: "session-a", safetyMode: "trusted" } },
+      );
+      const malformed = await callValue(
+        limited,
+        { uris: ["resource://t1_bad"] },
+        { context: { cwd: root, sessionId: "session-a", safetyMode: "trusted" } },
+      );
+      expect(oversized).toMatchObject({
+        results: [{ status: "error", error: { code: "batch_limit" } }],
+      });
+      expect(malformed).toMatchObject({
+        results: [{ status: "error", error: { code: "invalid_uri" } }],
+      });
+
+      const transientId = created.uri.slice("resource://t1_".length);
+      const filename = `tool-result-${transientId.slice(0, 8)}.txt`;
+      await fs.writeFile(path.join(root, filename), "existing");
+      const exclusive = new Resource({ access, toolResultArtifacts: artifacts });
+      const conflict = await callValue(
+        exclusive,
+        { uris: [created.uri] },
+        { context: { cwd: root, sessionId: "session-a", safetyMode: "trusted" } },
+      );
+      expect(conflict).toMatchObject({
+        results: [{ status: "error", error: { code: "already_exists" } }],
+      });
+      expect(await fs.readFile(path.join(root, filename), "utf8")).toBe("existing");
+      expect(retainedCalls).toBe(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("removes a transient destination when writing is cancelled", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transient-resource-cancel-"));
+    const controller = new AbortController();
+    const realOpen = fs.open.bind(fs);
+    try {
+      const artifacts = createToolResultArtifactStore(
+        path.join(root, "artifacts"),
+        await getTestBlobStore(),
+      );
+      await artifacts.init();
+      const created = (
+        await artifacts.create({
+          scopeId: "session-a",
+          requestId: "request-a",
+          toolCallId: "call-a",
+          toolName: "bash",
+          content: "cancelled content",
+          ttlMs: 60_000,
+          maxBytesPerScope: 1024,
+        })
+      ).match({
+        ok: (value) => value,
+        err: (error) => {
+          throw error;
+        },
+      });
+      const transientId = created.uri.slice("resource://t1_".length);
+      const destination = path.join(root, `tool-result-${transientId.slice(0, 8)}.txt`);
+      const open = spyOn(fs, "open").mockImplementation(async (file, flags, mode) => {
+        const handle = await realOpen(file, flags, mode);
+        return {
+          writeFile: async () => {
+            controller.abort();
+            throw new Error("injected cancelled write");
+          },
+          close: () => handle.close(),
+        } as unknown as Awaited<ReturnType<typeof fs.open>>;
+      });
+      try {
+        const tool = new Resource({
+          toolResultArtifacts: artifacts,
+          access: fakeAccess(async () => Result.ok(materialized(URIS[0], root, 1))),
+        });
+        const outcome = await callValue(
+          tool,
+          { uris: [created.uri] },
+          {
+            context: { cwd: root, sessionId: "session-a", safetyMode: "trusted" },
+            signal: controller.signal,
+          },
+        );
+        expect(outcome).toMatchObject({
+          results: [{ status: "error", error: { code: "cancelled" } }],
+        });
+        expect(
+          await fs.stat(destination).then(
+            () => true,
+            () => false,
+          ),
+        ).toBe(false);
+      } finally {
+        open.mockRestore();
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("advertises resource URIs as a variadic primary positional input", async () => {
     const tool = new Resource({
       access: fakeAccess(async () => Result.ok(materialized(URIS[0], "/tmp", 1))),

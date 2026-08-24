@@ -622,8 +622,10 @@ Only the offline migrator knows how to decode and transform schema 5 blob state.
 
 ### Tool-result artifacts
 
-- `ToolResultArtifactStore` keeps its URI, scope checks, request and tool metadata, quotas, paging,
-  encryption policy, and public interface semantics.
+- `ToolResultArtifactStore` keeps its scope checks, request and tool metadata, quotas, paging,
+  encryption policy, and lifecycle semantics. Core emits `resource://t1_<128-bit-id>` while accepting
+  existing `tool-result://<uuid>` references as compatibility input; Mini Lilac keeps
+  `tool-result://`.
 - Content persistence delegates to `BlobStore`. Existing content encryption occurs before
   `startUpload`, and decryption occurs after `open`, so the generic store remains an opaque-byte module.
 - Tool artifact metadata changes to a new strict version that contains `BlobRefV1` instead of a content

@@ -89,6 +89,12 @@ Configuration remains version 2. An omitted `blobStorage` field, including the u
 frozen v1 config, selects the local default under `DATA_DIR`. Only v2 can set a local root or select S3.
 S3 credentials are names of environment variables in config; literal credentials are invalid.
 
+Core now emits transient tool-result references as `resource://t1_<128-bit-id>`. Existing
+`tool-result://<uuid>` references remain readable by Core until their ordinary TTL or eviction removes
+them, so this URI change needs no persisted-data migration. Tool-result metadata, session scope,
+encryption, quota accounting, and expiry remain separate from retained `resource://r1_` records. Mini
+Lilac continues to emit and consume `tool-result://` references.
+
 ## Redis Managed Event Delivery V2
 
 Durable event-bus subscriptions use new transport-owned physical consumer-group names and create missing

@@ -21,7 +21,10 @@ import { createLogger, formatTaggedErrorForLog, isPanic } from "@stanley2058/lil
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
+import {
+  CORE_TOOL_RESULT_RESOURCE_URI_PREFIX,
+  type ToolResultArtifactStore,
+} from "../artifacts/tool-result-artifact-store";
 import { type ChildToolState, renderSubagentDisplay } from "../tools/subagent";
 import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 import {
@@ -500,7 +503,8 @@ export class WorkflowLiveParentBridge {
           }
           if (
             typeof run.result === "string" &&
-            run.result.includes("Complete output: tool-result://")
+            (run.result.includes("Complete output: tool-result://") ||
+              run.result.includes(`Complete output: ${CORE_TOOL_RESULT_RESOURCE_URI_PREFIX}`))
           ) {
             throw new Error("Tool-result-backed completion requires listPendingAsync");
           }

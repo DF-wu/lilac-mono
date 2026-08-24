@@ -147,6 +147,12 @@ overwriting existing files. The server keeps the capability-authorized cwd separ
 invocation cwd, and restricted requests can materialize only under their private `/tmp` mapping. Text
 and unsupported binary attachments stay marker-only until a tool opens or materializes them.
 
+Core transient tool results use `resource://t1_<128-bit-id>` through the same `read`, `grep`, and
+`resource.materialize` entry points. The run-scoped transient adapter keeps session authority, TTL,
+quota eviction, encryption, and paging in `packages/tool-results`; it does not create retained resource
+rows or transcript references. Core still accepts `tool-result://<uuid>` as a compatibility input.
+Mini Lilac retains that older URI as its current contract.
+
 ### Level 3: Skills
 
 Skills are `SKILL.md` bundles discovered from product-owned state plus supported workspace/user compatibility roots. They are metadata-first instruction bundles loaded on demand; discovery does not execute scripts. Core parsing and broad compatibility discovery live in `packages/utils/skills.ts`; Mini's bounded catalog and Mini-specific roots live in `packages/mini-lilac-runtime/src/skills.ts`. See `docs/skill-authoring.md`.

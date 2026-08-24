@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import {
-  materializeBlobRead,
+  type BlobRead,
   type BlobRefV1,
   type BlobSource,
   type BlobStore,
@@ -25,6 +25,8 @@ import {
   ToolResultArtifactDecryptAuthenticationFailed,
   ToolResultArtifactInvalidInput,
   ToolResultArtifactMaintenanceAndCleanupFailure,
+  ToolResultArtifactReadCancelled,
+  ToolResultArtifactReadTooLarge,
   ToolResultArtifactStorageFailure,
   ToolResultArtifactTooLargeError,
   ToolResultArtifactUnavailable,
@@ -37,6 +39,7 @@ import {
   type ToolResultArtifactMaintenanceResult,
   type ToolResultArtifactMetadataReadError,
   type ToolResultArtifactReadOperationError,
+  type ToolResultArtifactReadOptions,
   type ToolResultArtifactStart,
   type ToolResultArtifactStore,
   type ToolResultArtifactStoreOptions,
@@ -107,6 +110,102 @@ function rethrowBlobToolResultPanic(panic: Panic): never {
   throw panic;
 }
 
+function cancelledRead(): ToolResultArtifactReadCancelled {
+  return new ToolResultArtifactReadCancelled({
+    message: "Tool result artifact read was cancelled",
+  });
+}
+
+function contentMismatch(): ToolResultArtifactContentMismatch {
+  return new ToolResultArtifactContentMismatch({
+    issueCode: "content-mismatch",
+    message: "Tool result artifact content does not match its metadata",
+  });
+}
+
+async function settleReaderCancellation(cancellation?: Promise<void>): Promise<boolean> {
+  if (!cancellation) return false;
+  const captured = await captureEffect(cancellation);
+  if (captured.kind === "panic") return rethrowBlobToolResultPanic(captured.panic);
+  return captured.kind === "defect";
+}
+
+async function materializeBlobReadWithSignal(
+  read: BlobRead,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<
+  ResultType<Uint8Array, ToolResultArtifactReadCancelled | ToolResultArtifactContentMismatch>
+> {
+  const reader = read.stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  let sourceFailed = false;
+  let overflowed = false;
+  let done = false;
+  const aborted = Promise.withResolvers<void>();
+  let signalCancellation: Promise<void> | undefined;
+  const cancelForSignal = () => {
+    signalCancellation ??= reader.cancel("Tool result artifact read was cancelled");
+    aborted.resolve();
+  };
+  signal?.addEventListener("abort", cancelForSignal, { once: true });
+  if (signal?.aborted) cancelForSignal();
+  while (!done && !sourceFailed && !overflowed && !signal?.aborted) {
+    const readStep = reader.read().then((result) => ({ kind: "read" as const, result }));
+    const raced = signal
+      ? Promise.race([readStep, aborted.promise.then(() => ({ kind: "cancelled" as const }))])
+      : readStep;
+    const captured = await captureEffect(raced);
+    if (captured.kind === "panic") return rethrowBlobToolResultPanic(captured.panic);
+    if (captured.kind === "defect") {
+      sourceFailed = true;
+      continue;
+    }
+    if (captured.value.kind === "cancelled") continue;
+    if (captured.value.result.done) {
+      done = true;
+      continue;
+    }
+    const chunk = captured.value.result.value;
+    if (byteLength + chunk.byteLength > maxBytes) {
+      overflowed = true;
+      continue;
+    }
+    chunks.push(chunk);
+    byteLength += chunk.byteLength;
+  }
+  signal?.removeEventListener("abort", cancelForSignal);
+  const overflowCancellation = overflowed
+    ? reader.cancel("Tool result artifact exceeded its limit")
+    : undefined;
+  const overflowCancellationFailed = await settleReaderCancellation(overflowCancellation);
+  const signalCancellationFailed = await settleReaderCancellation(signalCancellation);
+  sourceFailed = sourceFailed || overflowCancellationFailed || signalCancellationFailed;
+  reader.releaseLock();
+  const completed = await captureEffect(read.completion);
+  if (completed.kind === "panic") return rethrowBlobToolResultPanic(completed.panic);
+  if (signal?.aborted) return Result.err(cancelledRead());
+  if (overflowed || sourceFailed || completed.kind === "defect") {
+    return Result.err(contentMismatch());
+  }
+  const verified = outcome(completed.value);
+  if (!verified.ok || verified.value.byteLength !== byteLength) {
+    return Result.err(contentMismatch());
+  }
+  const joined = captureSyncEffect(() => {
+    const content = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      content.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return content;
+  });
+  if (joined.kind === "panic") return rethrowBlobToolResultPanic(joined.panic);
+  return joined.kind === "completed" ? Result.ok(joined.value) : Result.err(contentMismatch());
+}
+
 function outcome<T, E>(result: ResultType<T, E>): { ok: true; value: T } | { ok: false; error: E } {
   return result.match<{ ok: true; value: T } | { ok: false; error: E }>({
     ok: (value) => ({ ok: true as const, value }),
@@ -150,6 +249,22 @@ function validateHardLimit(
         }),
       )
     : Result.ok(undefined);
+}
+
+function validateReadOptions(
+  options: ToolResultArtifactReadOptions,
+): ResultType<void, ToolResultArtifactInvalidInput> {
+  if (
+    options.maxBytes === undefined ||
+    (Number.isSafeInteger(options.maxBytes) && options.maxBytes > 0)
+  ) {
+    return Result.ok(undefined);
+  }
+  return Result.err(
+    new ToolResultArtifactInvalidInput({
+      message: "Tool result artifact read maxBytes must be a positive safe integer",
+    }),
+  );
 }
 
 type WindowSelection = {
@@ -524,22 +639,23 @@ export function createBlobBackedToolResultArtifactStore(
 
   async function readContent(
     metadata: Metadata,
+    signal?: AbortSignal,
   ): Promise<ResultType<string, ToolResultArtifactReadOperationError>> {
+    if (signal?.aborted) return Result.err(cancelledRead());
     const opened = outcome(await blobStore.open(metadata.blob));
     if (!opened.ok) {
-      const mismatch = new ToolResultArtifactContentMismatch({
-        issueCode: "content-mismatch",
-        message: "Tool result artifact content does not match its metadata",
-      });
+      const mismatch = contentMismatch();
       report(mismatch);
       return Result.err(mismatch);
     }
-    const materialized = outcome(await materializeBlobRead(opened.value));
+    const materialized = outcome(
+      await materializeBlobReadWithSignal(opened.value, metadata.bytes + 28, signal),
+    );
+    if (!materialized.ok && materialized.error instanceof ToolResultArtifactReadCancelled) {
+      return Result.err(materialized.error);
+    }
     if (!materialized.ok || materialized.value.byteLength !== metadata.bytes + 28) {
-      const mismatch = new ToolResultArtifactContentMismatch({
-        issueCode: "content-mismatch",
-        message: "Tool result artifact content does not match its metadata",
-      });
+      const mismatch = contentMismatch();
       report(mismatch);
       return Result.err(mismatch);
     }
@@ -883,11 +999,23 @@ export function createBlobBackedToolResultArtifactStore(
         ),
       );
     },
-    read(uri, owner) {
+    read(uri, owner, options = {}) {
+      const validOptions = outcome(validateReadOptions(options));
+      if (!validOptions.ok) return Promise.resolve(Result.err(validOptions.error));
+      if (options.signal?.aborted) return Promise.resolve(Result.err(cancelledRead()));
       return exclusive(async () => {
         const metadata = outcome(await find(uri, owner));
         if (!metadata.ok) return Result.err(metadata.error);
-        const content = outcome(await readContent(metadata.value));
+        if (options.maxBytes !== undefined && metadata.value.bytes > options.maxBytes) {
+          return Result.err(
+            new ToolResultArtifactReadTooLarge({
+              maxBytes: options.maxBytes,
+              actualBytes: metadata.value.bytes,
+              message: `Tool result artifact exceeds the ${options.maxBytes}-byte read limit`,
+            }),
+          );
+        }
+        const content = outcome(await readContent(metadata.value, options.signal));
         if (!content.ok) return Result.err(content.error);
         return Result.ok({
           content: content.value,

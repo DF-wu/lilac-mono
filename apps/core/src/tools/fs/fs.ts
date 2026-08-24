@@ -41,7 +41,6 @@ import { Panic, Result, type Result as ResultType } from "better-result";
 import {
   adaptToolResultArtifactReadToUnavailablePolicy,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
-  TOOL_RESULT_URI_PREFIX,
   type ToolResultArtifactStore,
 } from "../../artifacts/tool-result-artifact-store";
 import type { ToolResultOutput } from "../../artifacts/tool-result-output-normalizer";
@@ -54,6 +53,7 @@ import {
 import type { ResourceAccessError } from "../../resource/errors";
 import { isResourceTextMediaType } from "../../resource/resource-mime";
 import type { ResourceAccess, VerifiedResourceRead } from "../../resource/service";
+import { bindTransientResourceAccess, isCoreToolResultResourceUri } from "../../resource/transient";
 import { adaptToolResultToHost } from "../tool-result-adapters";
 import { parseSshCwdTarget } from "../../ssh/ssh-cwd";
 import {
@@ -1182,6 +1182,11 @@ export function fsTool(
   );
   const maxOutputBytes = opts?.maxOutputBytes ?? 40 * 1024;
   const maxInlineMediaBytesPerPart = opts?.maxInlineMediaBytesPerPart ?? 10 * 1024 * 1024;
+  const toolResultArtifactStore = opts?.toolResultArtifacts;
+  const transientResourceAccess =
+    toolResultArtifactStore && opts?.requestContext?.sessionId
+      ? bindTransientResourceAccess(toolResultArtifactStore, opts.requestContext.sessionId)
+      : undefined;
   const readFileSchema = createReadFileInputSchema({
     hashlineEnabled,
     directAttachmentSupported: readFileDirectMediaSupported,
@@ -1190,8 +1195,8 @@ export function fsTool(
       .string()
       .describe(
         readFileDirectMediaSupported
-          ? `Filesystem path or retained resource:// URI to read. ${mediaDescription.schemaSubject} attached to your context for native visual or document analysis.`
-          : "Filesystem path, retained resource:// URI, or transient tool-result:// URI to read.",
+          ? `Filesystem path or resource:// URI to read. ${mediaDescription.schemaSubject} attached to your context for native visual or document analysis.`
+          : "Filesystem path or resource:// URI to read.",
       ),
   });
   const readFileOutputSchema = buildReadFileOutputZod(hashlineEnabled);
@@ -1200,7 +1205,7 @@ export function fsTool(
       .string()
       .optional()
       .describe(
-        "Optional filesystem path, retained resource:// URI, or transient tool-result:// URI to search. Defaults to the tool root.",
+        "Optional filesystem path or resource:// URI to search. Defaults to the tool root.",
       ),
   });
   const grepOutputSchema = buildGrepOutputZod(hashlineEnabled);
@@ -1538,13 +1543,13 @@ export function fsTool(
   function buildReadFileDescription(): string {
     let introduction: string;
     if (readFileDirectMediaSupported) {
-      introduction = `Reads files from the filesystem or a retained resource:// URI. For ${mediaDescription.supportedMedia}, calling read attaches the original file to your context for native visual or document analysis. Call read first for ${mediaDescription.mediaPaths}, either directly or as an independent batch child; use shell media processing only if read reports that the input is unsupported or oversized.`;
+      introduction = `Reads files from the filesystem or a resource:// URI. For ${mediaDescription.supportedMedia} in retained resources, calling read attaches the original file to your context for native visual or document analysis. Call read first for ${mediaDescription.mediaPaths}, either directly or as an independent batch child; use shell media processing only if read reports that the input is unsupported or oversized.`;
     } else if (hashlineEnabled) {
       introduction =
-        "Reads a file from the filesystem or a retained resource:// URI. Default format is raw to preserve indentation. Use format='hashline' before edit when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead.";
+        "Reads a file from the filesystem or a resource:// URI. Default format is raw to preserve indentation. Use format='hashline' before edit when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead.";
     } else {
       introduction =
-        "Reads a file from the filesystem or a retained resource:// URI. Default format is raw (no line numbers) to preserve indentation.";
+        "Reads a file from the filesystem or a resource:// URI. Default format is raw (no line numbers) to preserve indentation.";
     }
     const parts = [introduction];
 
@@ -1631,7 +1636,10 @@ export function fsTool(
       outputSchema: readFileOutputSchema,
       execute: async ({ cwd: opCwd, dangerouslyAllow, ...input }: ReadFileInput, options) => {
         if (opts?.enforceDenylist) dangerouslyAllow = false;
-        if (input.path.startsWith(RESOURCE_URI_PREFIX)) {
+        if (
+          input.path.startsWith(RESOURCE_URI_PREFIX) &&
+          !isCoreToolResultResourceUri(input.path)
+        ) {
           logger.info("fs.readFile", {
             path: REDACTED_RESOURCE_LOG_PATH,
             cwd: opCwd,
@@ -1644,13 +1652,12 @@ export function fsTool(
           });
           return await executeResourceRead(input, options);
         }
-        if (input.path.startsWith(TOOL_RESULT_URI_PREFIX)) {
-          const sessionId = opts?.requestContext?.sessionId;
+        if (isCoreToolResultResourceUri(input.path)) {
           const artifact =
-            opts?.toolResultArtifacts && sessionId
+            transientResourceAccess && toolResultArtifactStore
               ? await adaptToolResultArtifactReadToUnavailablePolicy(
-                  opts.toolResultArtifacts,
-                  await opts.toolResultArtifacts.readWindow(input.path, sessionId, {
+                  toolResultArtifactStore,
+                  await transientResourceAccess.readWindow(input.path, {
                     start: input.start ?? { type: "offset", offset: 0 },
                     maxCharacters: Math.max(1, input.maxCharacters ?? 10_000),
                     maxLines: Math.max(1, input.maxLines ?? 2_000),
@@ -1688,8 +1695,7 @@ export function fsTool(
             resolvedPath: input.path,
             error: {
               code: "PERMISSION" as const,
-              message:
-                "Restricted sessions can use read only with tool-result:// artifacts or resource:// resources.",
+              message: "Restricted sessions can use read only with resource:// references.",
             },
           };
         }
@@ -2241,15 +2247,18 @@ export function fsTool(
 
     grep: tool({
       description: hashlineEnabled
-        ? "Search a local file or directory, SSH path, retained resource:// URI, or transient tool-result:// resource. Recommended mode='default'; use mode='hashline' only for editable filesystem paths, or mode='detailed' for column/submatches metadata. Output always stays inline and may be truncated with narrowing guidance. Denylisted filesystem paths require dangerouslyAllow=true."
-        : "Search a local file or directory, SSH path, retained resource:// URI, or transient tool-result:// resource. Recommended mode='default'; use mode='detailed' only for column/submatches metadata. Output always stays inline and may be truncated with narrowing guidance. Denylisted filesystem paths require dangerouslyAllow=true.",
+        ? "Search a local file or directory, SSH path, or resource:// URI. Recommended mode='default'; use mode='hashline' only for editable filesystem paths, or mode='detailed' for column/submatches metadata. Output always stays inline and may be truncated with narrowing guidance. Denylisted filesystem paths require dangerouslyAllow=true."
+        : "Search a local file or directory, SSH path, or resource:// URI. Recommended mode='default'; use mode='detailed' only for column/submatches metadata. Output always stays inline and may be truncated with narrowing guidance. Denylisted filesystem paths require dangerouslyAllow=true.",
       inputSchema: grepInputSchema,
       outputSchema: grepOutputSchema,
       execute: async ({ dangerouslyAllow, ...input }: GrepInput, options): Promise<GrepOutput> => {
         if (opts?.enforceDenylist) dangerouslyAllow = false;
         const mode = input.mode ?? "default";
         const targetPath = input.path;
-        if (targetPath?.startsWith(RESOURCE_URI_PREFIX)) {
+        if (
+          targetPath?.startsWith(RESOURCE_URI_PREFIX) &&
+          !isCoreToolResultResourceUri(targetPath)
+        ) {
           logger.info("fs.grep", {
             pattern: input.pattern,
             path: REDACTED_RESOURCE_LOG_PATH,
@@ -2270,13 +2279,12 @@ export function fsTool(
           });
           return result;
         }
-        if (targetPath?.startsWith(TOOL_RESULT_URI_PREFIX)) {
-          const sessionId = opts?.requestContext?.sessionId;
+        if (targetPath && isCoreToolResultResourceUri(targetPath)) {
           const artifact =
-            opts?.toolResultArtifacts && sessionId
+            transientResourceAccess && toolResultArtifactStore
               ? await adaptToolResultArtifactReadToUnavailablePolicy(
-                  opts.toolResultArtifacts,
-                  await opts.toolResultArtifacts.read(targetPath, sessionId),
+                  toolResultArtifactStore,
+                  await transientResourceAccess.read(targetPath),
                 )
               : { ok: false as const };
           if (!artifact.ok) {
@@ -2289,7 +2297,7 @@ export function fsTool(
             return boundGrepOutput(
               grepFailure(
                 mode,
-                "grep mode='hashline' is unavailable for tool-result:// resources; use mode='default' or mode='detailed'.",
+                "grep mode='hashline' is unavailable for transient resources; use mode='default' or mode='detailed'.",
               ),
               maxOutputBytes,
             );

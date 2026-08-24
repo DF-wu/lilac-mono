@@ -105,6 +105,18 @@ export class ToolResultArtifactUnavailable extends TaggedError("ToolResultArtifa
   readonly message: string;
 }> {}
 
+export class ToolResultArtifactReadTooLarge extends TaggedError("ToolResultArtifactReadTooLarge")<{
+  readonly maxBytes: number;
+  readonly actualBytes: number;
+  readonly message: string;
+}> {}
+
+export class ToolResultArtifactReadCancelled extends TaggedError(
+  "ToolResultArtifactReadCancelled",
+)<{
+  readonly message: string;
+}> {}
+
 export class ToolResultArtifactMaintenanceAndCleanupFailure extends TaggedError(
   "ToolResultArtifactMaintenanceAndCleanupFailure",
 )<{
@@ -170,6 +182,8 @@ export type ToolResultArtifactWriteError =
 export type ToolResultArtifactReadOperationError =
   | ToolResultArtifactMetadataReadError
   | ToolResultArtifactContentMismatch
+  | ToolResultArtifactReadTooLarge
+  | ToolResultArtifactReadCancelled
   | ToolResultArtifactUnavailable;
 
 export type ToolResultArtifactReadError =
@@ -204,6 +218,11 @@ export type ToolResultArtifactReadWindow = ToolResultArtifactRead & {
   readonly nextStart?: ToolResultArtifactStart;
 };
 
+export type ToolResultArtifactReadOptions = {
+  readonly maxBytes?: number;
+  readonly signal?: AbortSignal;
+};
+
 export type ToolResultArtifactAvailability<T> =
   | ({ readonly ok: true } & T)
   | { readonly ok: false };
@@ -230,6 +249,7 @@ export type ToolResultArtifactStore = {
   read(
     uri: string,
     scopeId: string,
+    options?: ToolResultArtifactReadOptions,
   ): Promise<ResultType<ToolResultArtifactRead, ToolResultArtifactError>>;
   readWindow(
     uri: string,
@@ -277,7 +297,12 @@ export async function adaptToolResultArtifactReadToUnavailablePolicy<T extends o
 ): Promise<ToolResultArtifactAvailability<T>> {
   const unavailable = result.match({
     ok: () => false,
-    err: (error) => !(error instanceof ToolResultArtifactInvalidInput),
+    err: (error) =>
+      !(
+        error instanceof ToolResultArtifactInvalidInput ||
+        error instanceof ToolResultArtifactReadTooLarge ||
+        error instanceof ToolResultArtifactReadCancelled
+      ),
   });
   if (unavailable && policy.kind === "maintain-after-unavailable") {
     const maintained = await store.maintain();
@@ -390,6 +415,25 @@ function validateHardLimit(
     );
   }
   return Result.ok(undefined);
+}
+
+function validateReadMaxBytes(
+  maxBytes: number | undefined,
+): ResultType<void, ToolResultArtifactInvalidInput> {
+  if (maxBytes === undefined || (Number.isSafeInteger(maxBytes) && maxBytes > 0)) {
+    return Result.ok(undefined);
+  }
+  return Result.err(
+    new ToolResultArtifactInvalidInput({
+      message: "Tool result artifact read maxBytes must be a positive safe integer",
+    }),
+  );
+}
+
+function cancelledRead(): ToolResultArtifactReadCancelled {
+  return new ToolResultArtifactReadCancelled({
+    message: "Tool result artifact read was cancelled",
+  });
 }
 
 function artifactIdFromUri(uri: string): string | null {
@@ -1191,7 +1235,10 @@ export function createToolResultArtifactStore(
         writeEncryptedStreamAtomic(filePath, source, params.maxArtifactBytes),
       );
     },
-    async read(uri, scopeId) {
+    async read(uri, scopeId, options = {}) {
+      const configuredLimit = resultOutcome(validateReadMaxBytes(options.maxBytes));
+      if (!configuredLimit.ok) return Result.err(configuredLimit.error);
+      if (options.signal?.aborted) return Result.err(cancelledRead());
       return exclusive(async () => {
         const now = Date.now();
         const id = artifactIdFromUri(uri);
@@ -1231,10 +1278,22 @@ export function createToolResultArtifactStore(
           );
         }
 
+        if (options.maxBytes !== undefined && metadata.bytes > options.maxBytes) {
+          return Result.err(
+            new ToolResultArtifactReadTooLarge({
+              maxBytes: options.maxBytes,
+              actualBytes: metadata.bytes,
+              message: `Tool result artifact exceeds the ${options.maxBytes}-byte read limit`,
+            }),
+          );
+        }
+        if (options.signal?.aborted) return Result.err(cancelledRead());
+
         const content = resultOutcome(
           await readEncryptedContent(metadata.storageKey, metadata.bytes),
         );
         if (!content.ok) return Result.err(content.error);
+        if (options.signal?.aborted) return Result.err(cancelledRead());
         logger.info("tool.artifact.read", { bytes: metadata.bytes });
         return Result.ok({
           content: content.value,

@@ -8,7 +8,9 @@ reference keeps its resource record alive. One Core resource module resolves tho
 composition, `read`, `grep`, `resource.materialize`, and the deprecated `attachment.download`
 callable.
 
-The first surface adapter is Discord. Mini Lilac is unchanged.
+The first surface adapter is Discord. Core also exposes transient tool-result artifacts through the
+same model-facing URI scheme and tool resolver while retaining their separate lifecycle policy. Mini
+Lilac is unchanged.
 
 ## Goals
 
@@ -46,6 +48,12 @@ The shared resource path covers:
 - `grep({ path: "resource://..." })`;
 - `resource.materialize`; and
 - deprecated `attachment.download` calls for current resource-backed attachments.
+
+Core tool-result artifacts use `resource://t1_<random-128-bit-id>` and join the same `read`, `grep`,
+and `resource.materialize` dispatch path. Their metadata, scope checks, TTL, quota eviction,
+encryption, and paging remain owned by `ToolResultArtifactStore`. Existing `tool-result://<uuid>`
+references remain readable as a compatibility input, but Core emits only the new URI. Mini Lilac
+continues to emit and consume `tool-result://` references.
 
 Images and PDFs may appear as provider file parts. Text and other binary resources appear as metadata
 only until a tool accesses them.
@@ -87,6 +95,14 @@ only until a tool accesses them.
     the operation is running. The tool deletes that operation-owned file if streaming, verification,
     or cancellation fails.
 16. Expected resource and item failures use Results. Throws and Panics remain defects.
+17. The `resource://` scheme contains two strict identifier kinds. `r1_` identifies a retained
+    possession-capability resource. `t1_` identifies a transient tool result whose exact URI is still
+    subject to the invoking Core session scope. The scheme alone does not erase domain access policy.
+18. Core binds resource resolution to request context before exposing it to tools. The scoped resolver
+    routes retained resources and transient tool results without moving tool-result metadata into the
+    resource SQLite store.
+19. Existing `tool-result://<uuid>` references are a read-only compatibility input. New Core tool
+    results use `resource://t1_<128-bit-id>`. Mini Lilac keeps its existing URI contract.
 
 ## Fixed limits
 
@@ -116,6 +132,16 @@ retries a random-ID collision.
 
 The model-visible URI and marker never contain the database row ID, Discord attachment ID, Discord CDN
 URL, signed query parameters, or `BlobRefV1.objectId`.
+
+Transient Core tool results use this separate strict kind under the same scheme:
+
+```text
+resource://t1_<random-128-bit-id>
+```
+
+The `t1_` identifier maps only to `ToolResultArtifactStore`; it is never stored as a retained resource
+record or structured message part. The run-scoped resolver requires the current session scope before
+reading or materializing it.
 
 ## Durable records
 
@@ -638,7 +664,12 @@ Runtime composition performs these steps:
     Completion criterion: `PROJECT.md`, `MIGRATIONS.md`, tool prompts, stable callable tests, and required
     persistence, blob-open, and exception registrations describe the shipped behavior.
 
-15. **Run final verification.**
+15. **Unify transient tool-result access.**
+    Completion criterion: Core emits `resource://t1_` references; one session-scoped adapter preserves
+    tool-result authority and lifecycle policy across `read`, `grep`, and `resource.materialize`; legacy
+    `tool-result://` references remain readable; and Mini Lilac is unchanged.
+
+16. **Run final verification.**
     Completion criterion: every focused check, workspace typecheck, architecture check, lint, and
     `bun run check` passes against the final worktree.
 
@@ -713,4 +744,9 @@ This plan does not add:
 - overwrite, numbered filename selection, or atomic rename during materialization;
 - a cache TTL, global cache byte budget, LRU policy, cache worker, queue, or recovery journal;
 - new resource configuration fields; or
-- historical attachment rewrites.
+- historical attachment rewrites;
+- moving tool-result metadata, quota accounting, encryption, or expiry into the retained resource
+  store;
+- making transient tool results possession-only or retaining them through transcript resource
+  references; or
+- changing Mini Lilac's `tool-result://` contract.

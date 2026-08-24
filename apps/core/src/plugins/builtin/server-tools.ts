@@ -167,7 +167,14 @@ export function createBuiltinResourcePlugin(): CoreToolPlugin {
         return signalBuiltinPluginSkip("resource requires resource access");
       }
       return {
-        level2: [new Resource({ access: runtime.resourceAccess })],
+        level2: [
+          new Resource({
+            access: runtime.resourceAccess,
+            ...(runtime.toolResultArtifacts
+              ? { toolResultArtifacts: runtime.toolResultArtifacts }
+              : {}),
+          }),
+        ],
       };
     },
   };

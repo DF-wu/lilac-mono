@@ -5,10 +5,16 @@ import { resolve } from "node:path";
 import {
   RESOURCE_MATERIALIZE_CALL_MAX_BYTES,
   RESOURCE_MATERIALIZE_MAX_COUNT,
+  bindTransientResourceAccess,
+  isCoreToolResultResourceUri,
+  ResourceNotFound,
   type MaterializedResource,
   type ResourceAccess,
   type ResourceAccessError,
+  type ResourceMaterializeOptions,
+  type ScopedTransientResourceAccess,
 } from "../../resource";
+import type { ToolResultArtifactStore } from "../../artifacts/tool-result-artifact-store";
 import { captureError } from "../../shared/error-capture";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
 import {
@@ -125,6 +131,26 @@ function cancelledItem(uri: string): ResourceMaterializeItem {
   };
 }
 
+async function materializeSelectedResource(input: {
+  readonly uri: string;
+  readonly options: ResourceMaterializeOptions;
+  readonly retainedAccess: ResourceAccess;
+  readonly transientAccess?: ScopedTransientResourceAccess;
+}): Promise<ResultType<MaterializedResource, ResourceAccessError>> {
+  if (!isCoreToolResultResourceUri(input.uri)) {
+    return input.retainedAccess.materialize(input.uri, input.options);
+  }
+  if (!input.transientAccess) {
+    return Result.err(
+      new ResourceNotFound({
+        uri: input.uri,
+        message: "Transient resource is unavailable without a session scope",
+      }),
+    );
+  }
+  return input.transientAccess.materialize(input.uri, input.options);
+}
+
 async function establishTargetDirectory(
   ctx: RequestContext | undefined,
 ): Promise<ResultType<string, ServerToolFailure>> {
@@ -194,6 +220,7 @@ export class Resource implements ServerTool {
   constructor(
     private readonly params: {
       access: ResourceAccess;
+      toolResultArtifacts?: ToolResultArtifactStore;
       limits?: Partial<ResourceToolLimits>;
     },
   ) {
@@ -207,7 +234,8 @@ export class Resource implements ServerTool {
       callables: ({ callable }) => ({
         "resource.materialize": callable({
           name: "Resource Materialize",
-          description: "Write inbound resources into the invoking tools CLI working directory.",
+          description:
+            "Write retained or transient resources into the invoking tools CLI working directory.",
           inputSchema: resourceMaterializeInputSchema,
           primaryPositional: {
             field: "uris",
@@ -263,6 +291,11 @@ export class Resource implements ServerTool {
     });
     if ("failure" in targetOutcome) return Result.err(targetOutcome.failure);
 
+    const transientAccess =
+      this.params.toolResultArtifacts && ctx?.sessionId
+        ? bindTransientResourceAccess(this.params.toolResultArtifacts, ctx.sessionId)
+        : undefined;
+
     const results: ResourceMaterializeItem[] = [];
     let materializedBytes = 0;
 
@@ -289,10 +322,16 @@ export class Resource implements ServerTool {
         continue;
       }
 
-      const materialized = await this.params.access.materialize(uri, {
+      const materializeOptions = {
         targetDirectory: targetOutcome.targetDirectory,
         maxBytes: remainingBytes,
         signal,
+      };
+      const materialized = await materializeSelectedResource({
+        uri,
+        options: materializeOptions,
+        retainedAccess: this.params.access,
+        ...(transientAccess ? { transientAccess } : {}),
       });
       const outcome = materialized.match<
         { readonly materialized: MaterializedResource } | { readonly failure: ResourceAccessError }

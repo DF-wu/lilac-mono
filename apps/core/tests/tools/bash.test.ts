@@ -729,7 +729,7 @@ describe("executeRestrictedBash", () => {
 
       expect(result.stdout).not.toContain("\u001b");
       expect(result.stdout).not.toContain("abcdefghijklmnopqrstuvwxyz1234567890");
-      expect(result.truncation?.artifactUri).toStartWith("tool-result://");
+      expect(result.truncation?.artifactUri).toStartWith("resource://t1_");
       const stored = await store.read(
         result.truncation?.artifactUri ?? "",
         "restricted-sanitize-session",

@@ -4,3 +4,4 @@ export * from "./origin";
 export * from "./resource-mime";
 export * from "./service";
 export * from "./store";
+export * from "./transient";
