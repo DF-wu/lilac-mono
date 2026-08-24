@@ -7,6 +7,9 @@ facts are incorporated into those documents and remain available in Git history.
 
 ## Active
 
+- [`core-unified-ingress-resources.md`](core-unified-ingress-resources.md): stable capability-bearing
+  `resource://` references for Core ingress attachments, shared pull-through access for model
+  composition, `read`, `grep`, and materialization, and a bounded byte-backed model path.
 - [`redis-event-delivery-reliability.md`](redis-event-delivery-reliability.md): pending-entry reclamation,
   fenced retries, idempotent dead-letter finalization, and transactional inbox/outbox processing.
 - [`unified-blob-storage-clean-break.md`](unified-blob-storage-clean-break.md): Core adapter-neutral blob
