@@ -309,7 +309,7 @@ describe("tool-bridge CLI runtime", () => {
 
   it("posts stdin JSON and reports the live process cwd instead of the inherited cwd hint", async () => {
     const requests: Array<{ pathname: string; headers: Headers; body: unknown }> = [];
-    const invocationCwd = await fs.mkdtemp(path.join(import.meta.dir, ".tool-bridge-cwd-"));
+    const invocationCwd = await fs.mkdtemp(path.join(tmpdir(), "tool-bridge-cwd-"));
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",

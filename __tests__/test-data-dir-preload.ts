@@ -1,10 +1,26 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterAll } from "bun:test";
 import { tmpdir } from "node:os";
-import path from "node:path";
 
-const testDataDir = mkdtempSync(path.join(tmpdir(), "lilac-test-data-"));
-process.env.DATA_DIR = testDataDir;
+import {
+  createOwnedTestTempRoot,
+  reapStaleTestTempRoots,
+  removeOwnedTestTempRoot,
+  resolveTestTempBaseDirectory,
+  TEST_TEMP_ROOT_BASE_ENV,
+} from "./test-temp-root";
 
-process.once("exit", () => {
-  rmSync(testDataDir, { recursive: true, force: true });
-});
+const baseDirectory = resolveTestTempBaseDirectory(
+  process.env[TEST_TEMP_ROOT_BASE_ENV] ?? tmpdir(),
+);
+process.env[TEST_TEMP_ROOT_BASE_ENV] = baseDirectory;
+
+reapStaleTestTempRoots(baseDirectory);
+
+const testTempRoot = createOwnedTestTempRoot(baseDirectory);
+process.env.DATA_DIR = testTempRoot.dataDirectory;
+process.env.TMPDIR = testTempRoot.tempDirectory;
+
+const cleanup = () => removeOwnedTestTempRoot(testTempRoot);
+
+afterAll(cleanup);
+process.once("exit", cleanup);
