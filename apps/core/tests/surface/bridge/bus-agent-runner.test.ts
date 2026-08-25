@@ -117,6 +117,7 @@ import {
   rethrowBusAgentRunnerPanic,
   signalBusAgentRunnerHostFailure,
   settleStoredMessageIdentityRemember,
+  projectTranscriptMessagesForPersistence,
   toIdleRetryDecision,
   toOpenAIPromptCacheKey,
   withReasoningDisplayDefaultForAnthropicModels,
@@ -158,6 +159,7 @@ import {
   SqliteTranscriptStore,
 } from "../../../src/transcript/transcript-store";
 import {
+  createStoredMessageIdentityProjectionV1,
   projectStoredMessagesV1,
   StoredMessageProjectionError,
 } from "../../../src/transcript/stored-message-materialization";
@@ -2161,6 +2163,60 @@ describe("bus agent runner delivery policy", () => {
     expect(() => settleStoredMessageIdentityRemember(Result.err(projectionError))).toThrow(
       projectionError,
     );
+  });
+
+  it("uploads and reserves provider file bytes before transcript persistence", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "lilac-runner-provider-file-"));
+    const transcriptStore = new SqliteTranscriptStore(path.join(directory, "transcripts.db"));
+    const blobStore = transcriptResultValue(await createMemoryBlobStore());
+    const base64 = Buffer.from("local read output").toString("base64");
+    const providerMessages = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "read-local",
+            toolName: "read",
+            output: {
+              type: "content",
+              value: [
+                {
+                  type: "file",
+                  data: { type: "data", data: base64 },
+                  mediaType: "text/plain",
+                  filename: "local.txt",
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ] satisfies ModelMessage[];
+
+    const stored = await projectTranscriptMessagesForPersistence({
+      identityProjection: createStoredMessageIdentityProjectionV1(),
+      providerMessages: structuredClone(providerMessages) as ModelMessage[],
+      blobStore,
+      transcriptStore,
+    });
+    expect(stored[0]?.content[0]).toMatchObject({
+      type: "tool-result",
+      output: { type: "content", value: [{ type: "blob", filename: "local.txt" }] },
+    });
+    const blobPart =
+      typeof stored[0]?.content === "string"
+        ? undefined
+        : stored[0]?.content[0]?.type === "tool-result" &&
+            stored[0].content[0].output.type === "content"
+          ? stored[0].content[0].output.value[0]
+          : undefined;
+    if (blobPart?.type !== "blob") throw new Error("expected stored provider file blob");
+    expect(transcriptStore.getCoreOwnedBlob({ ownerId: blobPart.blob.objectId }).status).toBe("ok");
+
+    transcriptStore.close();
+    transcriptResultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+    await rm(directory, { recursive: true, force: true });
   });
 });
 

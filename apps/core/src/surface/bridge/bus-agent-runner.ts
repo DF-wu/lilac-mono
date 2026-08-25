@@ -163,11 +163,15 @@ import {
   createStoredMessageIdentityProjectionV1,
   materializeStoredMessagesV1,
   projectStoredMessagesV1,
-  type StoredMessageProjectionError,
+  StoredMessageProjectionError,
+  type StoredMessageIdentityProjectionV1,
   type StoredResourceProviderTarget,
 } from "../../transcript/stored-message-materialization";
 import type { ResourceAccess } from "../../resource";
-import { hashCanonicalStoredMessagesV2 } from "../../transcript/transcript-persistence-codec";
+import {
+  defaultStoredBlobFilename,
+  hashCanonicalStoredMessagesV2,
+} from "../../transcript/transcript-persistence-codec";
 import type {
   CoreAcceptedRequestWork,
   CorePreparedRequestEnvelope,
@@ -497,6 +501,43 @@ export function settleStoredMessageIdentityRemember(
 ): void {
   const failure = result.match({ ok: () => null, err: (error) => error });
   if (failure) signalBusAgentRunnerHostFailure(failure);
+}
+
+export async function projectTranscriptMessagesForPersistence(input: {
+  readonly identityProjection: StoredMessageIdentityProjectionV1;
+  readonly providerMessages: readonly (ModelMessage | StoredMessageV1)[];
+  readonly blobStore: AnthropicFallbackBlobStore;
+  readonly transcriptStore: TranscriptStore;
+}): Promise<StoredMessageV1[]> {
+  const retainUploadedFile = input.transcriptStore.putCoreOwnedBlob;
+  if (!retainUploadedFile) {
+    return signalBusAgentRunnerHostFailure(
+      new Error("Transcript store cannot retain provider file blobs"),
+    );
+  }
+  const projected = await input.identityProjection.projectForPersistence({
+    providerMessages: input.providerMessages,
+    blobStore: input.blobStore,
+    retainUploadedFile: (file) =>
+      retainUploadedFile
+        .call(input.transcriptStore, {
+          blob: file.blob,
+          mediaType: file.mediaType,
+          filename: defaultStoredBlobFilename(file),
+        })
+        .map(() => undefined)
+        .mapError(
+          (error) =>
+            new StoredMessageProjectionError({
+              message: `Provider file blob could not be retained: ${error.message}`,
+            }),
+        ),
+  });
+  const projection = projected.match({
+    ok: (value) => () => value,
+    err: (error) => () => signalBusAgentRunnerHostFailure(error),
+  })();
+  return projection.messages;
 }
 
 function adaptModelResolutionToBusRunnerHost<T>(result: ResultType<T, ModelResolutionFailed>): T {
@@ -8004,12 +8045,12 @@ export async function startBusAgentRunner(params: {
                     didCompact: isCompactionCheckpoint,
                   });
                 })();
-                const persistedMessages = storedMessageIdentity
-                  .project(persistenceCandidates)
-                  .match({
-                    ok: (messages) => () => messages,
-                    err: (error) => () => signalBusAgentRunnerHostFailure(error),
-                  })();
+                const persistedMessages = await projectTranscriptMessagesForPersistence({
+                  identityProjection: storedMessageIdentity,
+                  providerMessages: persistenceCandidates,
+                  blobStore: params.blobStore,
+                  transcriptStore,
+                });
                 const targetProviderFamily = classifyHistoryProviderFamily({
                   type: activeBinding.resolved.provider,
                 });
@@ -8480,7 +8521,7 @@ export async function startBusAgentRunner(params: {
         if (failureTranscriptStore) {
           const persistedFailure = await captureBusAgentRunnerOperation(
             "failed run transcript persistence",
-            () => {
+            async () => {
               const finalMessagesForPersistence =
                 runStats.finalMessages ?? activeAgent?.getRecoverableMessages() ?? [];
               const safeFinalMessages = buildSafeRecoveryCheckpoint(
@@ -8495,10 +8536,12 @@ export async function startBusAgentRunner(params: {
 
                 return runProfile === "primary" ? responseMessages : safeFinalMessages;
               })();
-              const persistedMessages = storedMessageIdentity.project(persistenceCandidates).match({
-                ok: (messages) => () => messages,
-                err: (error) => () => signalBusAgentRunnerHostFailure(error),
-              })();
+              const persistedMessages = await projectTranscriptMessagesForPersistence({
+                identityProjection: storedMessageIdentity,
+                providerMessages: persistenceCandidates,
+                blobStore: params.blobStore,
+                transcriptStore: failureTranscriptStore,
+              });
 
               return failureTranscriptStore.saveRequestTranscript({
                 requestId: headers.request_id,

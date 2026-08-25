@@ -7,6 +7,7 @@ import {
 import {
   storedFilePartV1Schema,
   storedResourcePartV1Schema,
+  type StoredFilePartV1,
   type StoredMessageV1,
   type StoredResourcePartV1,
 } from "@stanley2058/lilac-event-bus";
@@ -21,7 +22,10 @@ import {
   type ResourceAccess,
   type ResourceAccessError,
 } from "../resource";
-import { normalizeStoredMessagesV1 } from "./transcript-persistence-codec";
+import {
+  defaultStoredBlobFilename,
+  normalizeStoredMessagesV1,
+} from "./transcript-persistence-codec";
 
 export class StoredMessageProjectionError extends TaggedError("StoredMessageProjectionError")<{
   readonly message: string;
@@ -52,10 +56,24 @@ export type StoredMessageIdentityProjectionV1 = {
   project(
     providerMessages: readonly (ModelMessage | StoredMessageV1)[],
   ): ResultType<StoredMessageV1[], StoredMessageProjectionError>;
+  projectForPersistence(input: {
+    readonly providerMessages: readonly (ModelMessage | StoredMessageV1)[];
+    readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+    readonly retainUploadedFile: (
+      file: StoredFilePartV1,
+    ) => ResultType<void, StoredMessageProjectionError>;
+  }): Promise<ResultType<StoredMessagePersistenceProjectionV1, StoredMessageProjectionError>>;
+};
+
+export type StoredMessagePersistenceProjectionV1 = {
+  readonly messages: StoredMessageV1[];
+  readonly uploadedFiles: readonly StoredFilePartV1[];
 };
 
 type ModelAssistantMessage = Extract<ModelMessage, { readonly role: "assistant" }>;
+type ModelUserMessage = Extract<ModelMessage, { readonly role: "user" }>;
 type ModelToolMessage = Extract<ModelMessage, { readonly role: "tool" }>;
+type ModelUserPart = Exclude<ModelUserMessage["content"], string>[number];
 type ModelAssistantPart = Exclude<ModelAssistantMessage["content"], string>[number];
 type ModelToolPart = ModelToolMessage["content"][number];
 type ModelToolResultPart = Extract<
@@ -66,8 +84,36 @@ type ModelToolResultContentPart = Extract<
   ModelToolResultPart["output"],
   { readonly type: "content" }
 >["value"][number];
+type ModelPart = ModelUserPart | ModelAssistantPart | ModelToolPart;
+type ModelFilePart = Extract<
+  ModelUserPart | ModelAssistantPart | ModelToolResultContentPart,
+  {
+    readonly type: "file";
+  }
+>;
 
 const resourceReadInputSchema = z.object({ path: storedResourcePartV1Schema.shape.uri });
+type PendingResourcesByToolCallId = Map<string, Array<StoredResourcePartV1 | undefined>>;
+type ResourceReadCallDecision =
+  | { readonly kind: "not-read" }
+  | {
+      readonly kind: "read";
+      readonly toolCallId: string;
+      readonly resource: StoredResourcePartV1 | undefined;
+    };
+
+function decodeProviderMessageForPersistence(
+  value: unknown,
+): ResultType<ModelMessage, StoredMessageProjectionError> {
+  const decoded = modelMessageSchema.safeParse(value);
+  return decoded.success
+    ? Result.ok(decoded.data)
+    : Result.err(
+        new StoredMessageProjectionError({
+          message: "Provider message cannot be decoded for durable file projection",
+        }),
+      );
+}
 
 function resourceFromReadFilePart(
   value: ModelToolResultContentPart,
@@ -81,13 +127,56 @@ function resourceFromReadFilePart(
   };
 }
 
+function decodeResourceReadCallForStorage(part: ModelPart): ResourceReadCallDecision {
+  if (part.type !== "tool-call" || part.toolName !== "read") return { kind: "not-read" };
+  const input = resourceReadInputSchema.safeParse(part.input);
+  return {
+    kind: "read",
+    toolCallId: part.toolCallId,
+    resource: input.success ? { type: "resource", uri: input.data.path } : undefined,
+  };
+}
+
+function rememberResourceRead(
+  part: ModelPart,
+  pendingResourcesByToolCallId: PendingResourcesByToolCallId,
+): void {
+  const decision = decodeResourceReadCallForStorage(part);
+  if (decision.kind === "not-read") return;
+  const pending = pendingResourcesByToolCallId.get(decision.toolCallId) ?? [];
+  pending.push(decision.resource);
+  pendingResourcesByToolCallId.set(decision.toolCallId, pending);
+}
+
+function consumeResourceRead(
+  part: ModelPart,
+  pendingResourcesByToolCallId: PendingResourcesByToolCallId,
+): StoredResourcePartV1 | undefined {
+  if (part.type !== "tool-result" || part.toolName !== "read") return undefined;
+  const pending = pendingResourcesByToolCallId.get(part.toolCallId);
+  const resource = pending?.shift();
+  if (pending?.length === 0) pendingResourcesByToolCallId.delete(part.toolCallId);
+  return resource;
+}
+
+function restoreResourceReadResult(
+  part: ModelPart,
+  resource: StoredResourcePartV1 | undefined,
+): ModelPart | object {
+  if (part.type !== "tool-result" || resource === undefined || part.output.type !== "content") {
+    return part;
+  }
+  const value = part.output.value.map((output) => resourceFromReadFilePart(output, resource));
+  return { ...part, output: { ...part.output, value } };
+}
+
 function projectResourceReadResultsForStorage(
   messages: readonly {
     readonly message: unknown;
     readonly reconstructResourceReads: boolean;
   }[],
 ): unknown[] {
-  const pendingResourcesByToolCallId = new Map<string, Array<StoredResourcePartV1 | undefined>>();
+  const pendingResourcesByToolCallId: PendingResourcesByToolCallId = new Map();
 
   return messages.map(({ message, reconstructResourceReads }) => {
     if (!reconstructResourceReads) return message;
@@ -95,27 +184,247 @@ function projectResourceReadResultsForStorage(
     if (!decoded.success || typeof decoded.data.content === "string") return message;
 
     const content = decoded.data.content.map((part) => {
-      if (part.type === "tool-call" && part.toolName === "read") {
-        const input = resourceReadInputSchema.safeParse(part.input);
-        const pending = pendingResourcesByToolCallId.get(part.toolCallId) ?? [];
-        pending.push(
-          input.success ? { type: "resource" as const, uri: input.data.path } : undefined,
-        );
-        pendingResourcesByToolCallId.set(part.toolCallId, pending);
-        return part;
-      }
-      if (part.type !== "tool-result" || part.toolName !== "read") return part;
-
-      const pending = pendingResourcesByToolCallId.get(part.toolCallId);
-      const resource = pending?.shift();
-      if (pending?.length === 0) pendingResourcesByToolCallId.delete(part.toolCallId);
-      if (resource === undefined || part.output.type !== "content") return part;
-
-      const value = part.output.value.map((output) => resourceFromReadFilePart(output, resource));
-      return { ...part, output: { ...part.output, value } };
+      rememberResourceRead(part, pendingResourcesByToolCallId);
+      return restoreResourceReadResult(
+        part,
+        consumeResourceRead(part, pendingResourcesByToolCallId),
+      );
     });
     return { ...decoded.data, content };
   });
+}
+
+function byteBackedProviderFile(part: ModelFilePart): Uint8Array | null {
+  const fileData = part.data;
+  const data =
+    typeof fileData === "object" &&
+    fileData !== null &&
+    "type" in fileData &&
+    fileData.type === "data"
+      ? fileData.data
+      : fileData;
+  if (typeof data === "string") return Buffer.from(data, "base64");
+  if (data instanceof Uint8Array) return new Uint8Array(data);
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  return null;
+}
+
+async function persistProviderFile(input: {
+  readonly part: ModelFilePart;
+  readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly retainUploadedFile: (
+    file: StoredFilePartV1,
+  ) => ResultType<void, StoredMessageProjectionError>;
+}): Promise<ResultType<StoredFilePartV1, StoredMessageProjectionError>> {
+  const bytes = byteBackedProviderFile(input.part);
+  if (bytes === null) {
+    return Result.err(
+      new StoredMessageProjectionError({
+        message: "Provider file content is not backed by durable byte data",
+      }),
+    );
+  }
+  return Result.gen(async function* () {
+    const upload = yield* Result.await(
+      input.blobStore
+        .startUpload({ source: bytes, retention: { kind: "durable" } })
+        .then((started) =>
+          started.mapError(
+            (error) =>
+              new StoredMessageProjectionError({
+                message: `Provider file upload could not start: ${error.message}`,
+              }),
+          ),
+        ),
+    );
+    const blob = yield* Result.await(
+      upload.completion.then((completed) =>
+        completed.mapError(
+          (error) =>
+            new StoredMessageProjectionError({
+              message: `Provider file upload failed: ${error.message}`,
+            }),
+        ),
+      ),
+    );
+    const file = {
+      type: "blob" as const,
+      blob,
+      mediaType: input.part.mediaType,
+      filename: defaultStoredBlobFilename({ blob, filename: input.part.filename }),
+    };
+    const retentionError = input.retainUploadedFile(file).match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (retentionError) {
+      return Result.err(
+        await settleUnretainedProviderFile({
+          blobStore: input.blobStore,
+          file,
+          retentionError,
+        }),
+      );
+    }
+    return Result.ok(file);
+  });
+}
+
+async function settleUnretainedProviderFile(input: {
+  readonly blobStore: Pick<BlobStore, "delete">;
+  readonly file: StoredFilePartV1;
+  readonly retentionError: StoredMessageProjectionError;
+}): Promise<StoredMessageProjectionError> {
+  const deleted = await input.blobStore.delete(input.file.blob);
+  return deleted.match({
+    ok: () => input.retentionError,
+    err: (error) =>
+      new StoredMessageProjectionError({
+        message: `${input.retentionError.message}; uploaded blob cleanup failed: ${error.message}`,
+      }),
+  });
+}
+
+async function persistProviderToolResult(input: {
+  readonly part: ModelToolResultPart;
+  readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly retainUploadedFile: (
+    file: StoredFilePartV1,
+  ) => ResultType<void, StoredMessageProjectionError>;
+  readonly uploadedFiles: StoredFilePartV1[];
+}): Promise<ResultType<object, StoredMessageProjectionError>> {
+  if (input.part.output.type !== "content") return Result.ok(input.part);
+  const value: object[] = [];
+  for (const output of input.part.output.value) {
+    if (output.type !== "file") {
+      value.push(output);
+      continue;
+    }
+    const decision = await persistProviderFile({ ...input, part: output });
+    const failure = decision.match({ ok: () => null, err: (error) => error });
+    if (failure) return Result.err(failure);
+    decision.match({
+      ok: (file) => {
+        input.uploadedFiles.push(file);
+        value.push(file);
+      },
+      err: () => undefined,
+    });
+  }
+  return Result.ok({ ...input.part, output: { ...input.part.output, value } });
+}
+
+async function persistProviderPart(input: {
+  readonly part: ModelPart;
+  readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly retainUploadedFile: (
+    file: StoredFilePartV1,
+  ) => ResultType<void, StoredMessageProjectionError>;
+  readonly uploadedFiles: StoredFilePartV1[];
+}): Promise<ResultType<object, StoredMessageProjectionError>> {
+  if (input.part.type === "file") {
+    const stored = await persistProviderFile({ ...input, part: input.part });
+    const failure = stored.match({ ok: () => null, err: (error) => error });
+    if (failure) return Result.err(failure);
+    return stored.map((file) => {
+      input.uploadedFiles.push(file);
+      return file;
+    });
+  }
+  if (input.part.type === "tool-result") {
+    return persistProviderToolResult({ ...input, part: input.part });
+  }
+  return Result.ok(input.part);
+}
+
+async function persistProviderMessage(input: {
+  readonly message: ModelMessage | StoredMessageV1;
+  readonly reconstructResourceReads: boolean;
+  readonly pendingResourcesByToolCallId: PendingResourcesByToolCallId;
+  readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly retainUploadedFile: (
+    file: StoredFilePartV1,
+  ) => ResultType<void, StoredMessageProjectionError>;
+  readonly uploadedFiles: StoredFilePartV1[];
+}): Promise<ResultType<StoredMessageV1, StoredMessageProjectionError>> {
+  const alreadyStored = normalizeStoredMessagesV1([input.message]);
+  if (alreadyStored?.[0]) {
+    observeStoredProviderResourceReads(input);
+    return Result.ok(alreadyStored[0]);
+  }
+  const decoded = decodeProviderMessageForPersistence(input.message);
+  const decodeFailure = decoded.match({ ok: () => null, err: (error) => error });
+  if (decodeFailure) return Result.err(decodeFailure);
+  const providerMessage = decoded.match({ ok: (message) => message, err: () => null });
+  if (providerMessage === null) {
+    return Result.err(
+      new StoredMessageProjectionError({ message: "Provider message decoding returned no value" }),
+    );
+  }
+  if (typeof providerMessage.content === "string") {
+    return projectStoredMessagesV1([providerMessage]).map((messages) => messages[0]!);
+  }
+  const content: object[] = [];
+  for (const part of providerMessage.content) {
+    if (input.reconstructResourceReads) {
+      rememberResourceRead(part, input.pendingResourcesByToolCallId);
+      const resource = consumeResourceRead(part, input.pendingResourcesByToolCallId);
+      if (resource !== undefined) {
+        content.push(restoreResourceReadResult(part, resource));
+        continue;
+      }
+    }
+    const persisted = await persistProviderPart({ ...input, part });
+    const failure = persisted.match({ ok: () => null, err: (error) => error });
+    if (failure) return Result.err(failure);
+    persisted.match({ ok: (value) => content.push(value), err: () => undefined });
+  }
+  return projectStoredMessagesV1([{ ...providerMessage, content }]).map((messages) => messages[0]!);
+}
+
+function observeStoredProviderResourceReads(input: {
+  readonly message: ModelMessage | StoredMessageV1;
+  readonly reconstructResourceReads: boolean;
+  readonly pendingResourcesByToolCallId: PendingResourcesByToolCallId;
+}): void {
+  if (!input.reconstructResourceReads) return;
+  const provider = decodeProviderMessageForPersistence(input.message).match({
+    ok: (message) => message,
+    err: () => null,
+  });
+  if (!provider || typeof provider.content === "string") return;
+  for (const part of provider.content) {
+    rememberResourceRead(part, input.pendingResourcesByToolCallId);
+    consumeResourceRead(part, input.pendingResourcesByToolCallId);
+  }
+}
+
+async function projectMessagesWithDurableProviderFiles(input: {
+  readonly messages: readonly {
+    readonly message: ModelMessage | StoredMessageV1;
+    readonly reconstructResourceReads: boolean;
+  }[];
+  readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly retainUploadedFile: (
+    file: StoredFilePartV1,
+  ) => ResultType<void, StoredMessageProjectionError>;
+}): Promise<ResultType<StoredMessagePersistenceProjectionV1, StoredMessageProjectionError>> {
+  const uploadedFiles: StoredFilePartV1[] = [];
+  const pendingResourcesByToolCallId: PendingResourcesByToolCallId = new Map();
+  const candidates: StoredMessageV1[] = [];
+  for (const candidate of input.messages) {
+    const persisted = await persistProviderMessage({
+      ...candidate,
+      blobStore: input.blobStore,
+      retainUploadedFile: input.retainUploadedFile,
+      pendingResourcesByToolCallId,
+      uploadedFiles,
+    });
+    const failure = persisted.match({ ok: () => null, err: (error) => error });
+    if (failure) return Result.err(failure);
+    persisted.match({ ok: (value) => candidates.push(value), err: () => undefined });
+  }
+  return Result.ok({ messages: candidates, uploadedFiles });
 }
 
 /** Keeps structured durable identity beside provider-only message representations. */
@@ -148,6 +457,20 @@ export function createStoredMessageIdentityProjectionV1(): StoredMessageIdentity
         };
       });
       return projectStoredMessagesV1(projectResourceReadResultsForStorage(candidates));
+    },
+    async projectForPersistence(input) {
+      const candidates = input.providerMessages.map((providerMessage) => {
+        const remembered = storedByProviderMessage.get(providerMessage);
+        return {
+          message: remembered ?? providerMessage,
+          reconstructResourceReads: remembered === undefined,
+        };
+      });
+      return projectMessagesWithDurableProviderFiles({
+        messages: candidates,
+        blobStore: input.blobStore,
+        retainUploadedFile: input.retainUploadedFile,
+      });
     },
   };
 }
@@ -428,6 +751,7 @@ async function materializeStoredFile(input: {
   readonly part: ReturnType<typeof storedFilePartV1Schema.parse>;
   readonly blobStore: BlobStore;
   readonly cache: Map<string, Promise<ResultType<Uint8Array, StoredMessageMaterializationError>>>;
+  readonly toolResult?: boolean;
 }): Promise<ResultType<object, StoredMessageMaterializationError>> {
   const part = input.part;
   const cacheKey = `${part.blob.objectId}:${part.blob.sha256}:${part.blob.byteLength}`;
@@ -441,7 +765,9 @@ async function materializeStoredFile(input: {
   }
   return (await pending).map((bytes) => ({
     type: "file" as const,
-    data: bytes,
+    data: input.toolResult
+      ? { type: "data" as const, data: Buffer.from(bytes).toString("base64") }
+      : bytes,
     mediaType: part.mediaType,
     ...(part.filename === undefined ? {} : { filename: part.filename }),
   }));
@@ -471,7 +797,7 @@ async function materializeToolResult(input: {
       }
       continue;
     }
-    const materialized = await materializeStoredFile({ ...input, part });
+    const materialized = await materializeStoredFile({ ...input, part, toolResult: true });
     const failure = materialized.match({
       ok: () => null,
       err: (error) => error,

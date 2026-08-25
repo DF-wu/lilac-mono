@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 
 import type { ModelMessage } from "ai";
 import { createMemoryBlobStore } from "@stanley2058/lilac-blob-storage";
-import type { StoredMessageV1 } from "@stanley2058/lilac-event-bus";
+import type { StoredFilePartV1, StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 import { Result, type Result as ResultType } from "better-result";
 
 import {
@@ -375,6 +375,220 @@ describe("stored message materialization", () => {
       ],
     });
     expect(projected).toHaveLength(messages.length);
+  });
+
+  it("stores a local read file as a durable blob and restores the provider file on replay", async () => {
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    const base64 = bytes.toString("base64");
+    const providerMessages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "read-local-image",
+            toolName: "read",
+            input: { path: "/tmp/crop.png" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "read-local-image",
+            toolName: "read",
+            output: {
+              type: "content",
+              value: [
+                { type: "text", text: "Attached file from read: crop.png" },
+                {
+                  type: "file",
+                  data: { type: "data", data: base64 },
+                  mediaType: "image/png",
+                  filename: "crop.png",
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ] satisfies ModelMessage[];
+    const clonedMessages = structuredClone(providerMessages) as ModelMessage[];
+    const projected = resultValue(
+      await createStoredMessageIdentityProjectionV1().projectForPersistence({
+        providerMessages: clonedMessages,
+        blobStore,
+        retainUploadedFile: () => Result.ok(undefined),
+      }),
+    );
+
+    expect(projected.uploadedFiles).toHaveLength(1);
+    expect(projected.messages[1]).toEqual({
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "read-local-image",
+          toolName: "read",
+          output: {
+            type: "content",
+            value: [
+              { type: "text", text: "Attached file from read: crop.png" },
+              {
+                type: "blob",
+                blob: projected.uploadedFiles[0]!.blob,
+                mediaType: "image/png",
+                filename: "crop.png",
+              },
+            ],
+          },
+        },
+      ],
+    });
+    expect(JSON.stringify(projected.messages)).not.toContain(base64);
+
+    const replayed = resultValue(
+      await materializeStoredMessagesV1({ messages: projected.messages, blobStore }),
+    );
+    expect(replayed[1]).toEqual({
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "read-local-image",
+          toolName: "read",
+          output: {
+            type: "content",
+            value: [
+              { type: "text", text: "Attached file from read: crop.png" },
+              {
+                type: "file",
+                data: { type: "data", data: base64 },
+                mediaType: "image/png",
+                filename: "crop.png",
+              },
+            ],
+          },
+        },
+      ],
+    });
+
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
+  it("keeps cloned resource reads as resource references during durable projection", async () => {
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const uri = "resource://r1_00000000000000000000000000000001" as const;
+    const inlineImage = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString("base64");
+    const providerMessages = structuredClone([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "read-resource-image",
+            toolName: "read",
+            input: { path: uri },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "read-resource-image",
+            toolName: "read",
+            output: {
+              type: "content",
+              value: [
+                {
+                  type: "file",
+                  data: { type: "data", data: inlineImage },
+                  mediaType: "image/png",
+                  filename: "image.png",
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ] satisfies ModelMessage[]) as ModelMessage[];
+    const retainedFiles: unknown[] = [];
+
+    const projected = resultValue(
+      await createStoredMessageIdentityProjectionV1().projectForPersistence({
+        providerMessages,
+        blobStore,
+        retainUploadedFile: (file) => {
+          retainedFiles.push(file);
+          return Result.ok(undefined);
+        },
+      }),
+    );
+
+    expect(retainedFiles).toEqual([]);
+    expect(projected.uploadedFiles).toEqual([]);
+    expect(projected.messages[1]).toEqual({
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "read-resource-image",
+          toolName: "read",
+          output: {
+            type: "content",
+            value: [
+              {
+                type: "resource",
+                uri,
+                mediaType: "image/png",
+                filename: "image.png",
+              },
+            ],
+          },
+        },
+      ],
+    });
+
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
+  it("deletes a provider upload when durable ownership cannot be recorded", async () => {
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const providerMessages = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "file",
+            data: Buffer.from("unretained provider file").toString("base64"),
+            mediaType: "text/plain",
+            filename: "unretained.txt",
+          },
+        ],
+      },
+    ] satisfies ModelMessage[];
+    const uploadedFiles: StoredFilePartV1[] = [];
+
+    const projected = await createStoredMessageIdentityProjectionV1().projectForPersistence({
+      providerMessages,
+      blobStore,
+      retainUploadedFile: (file) => {
+        uploadedFiles.push(file);
+        return Result.err(new StoredMessageProjectionError({ message: "retention rejected" }));
+      },
+    });
+
+    expect(projected.status).toBe("error");
+    const uploadedFile = uploadedFiles[0];
+    if (!uploadedFile) throw new Error("expected provider upload");
+    expect((await blobStore.open(uploadedFile.blob)).status).toBe("error");
+
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
   });
 
   it("correlates reused read call IDs with their results in transcript order", () => {
