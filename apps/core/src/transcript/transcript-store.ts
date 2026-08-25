@@ -7,7 +7,7 @@ import {
   type HistoryProviderFamily,
   type HistoryProviderState,
 } from "@stanley2058/lilac-agent";
-import type { BlobRefV1 } from "@stanley2058/lilac-blob-storage";
+import type { BlobRefV1, BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
   areCoreCanonicalMessagesIdentityEqualV2,
   computeCoreLineagePrefixDigestV2,
@@ -55,8 +55,10 @@ import {
   decodeResourceRecordRow as decodePersistedResourceRecordRow,
   decodeSurfaceMessageLinkRow as decodePersistedSurfaceMessageLinkRow,
   decodeTranscriptCompactionContext as decodePersistedTranscriptCompactionContext,
+  decodeTranscriptMessages as decodePersistedTranscriptMessages,
   decodeTranscriptProviderState as decodePersistedTranscriptProviderState,
   decodeTranscriptRow as decodePersistedTranscriptRow,
+  defaultStoredBlobFilename,
   hashCanonicalStoredMessagesV2,
   normalizeResourceCacheV1,
   normalizeResourceDetectedMediaType,
@@ -98,6 +100,8 @@ const CORE_NAMED_CLAUDE_ACTIVE_ATTEMPT_LIMIT = 8;
 const CORE_PRIMARY_CLAUDE_ATTEMPT_RETENTION_LIMIT = 32;
 const CORE_PRIMARY_CLAUDE_ACTIVE_ATTEMPT_LIMIT = 8;
 const MAX_DEFERRED_TRANSCRIPT_EVENTS = 128;
+const TRANSCRIPT_OWNED_BLOB_RESERVATION_MS = 5 * 60 * 1_000;
+const CORE_OWNED_BLOB_DELETION_CLAIM_LEASE_MS = 30 * 60 * 1_000;
 
 export type { CoreStoredLineageManifestV2 } from "./transcript-persistence-codec";
 
@@ -256,6 +260,49 @@ function collectStoredResourceIds(
   return Result.ok([...resourceIds]);
 }
 
+function collectStoredBlobReferences(
+  messages: readonly StoredMessageV1[],
+): ResultType<readonly CoreOwnedBlobReference[], CoreOwnedBlobIntegrityError> {
+  const references = new Map<string, CoreOwnedBlobReference>();
+  const add = (part: {
+    readonly blob: BlobRefV1;
+    readonly mediaType: string;
+    readonly filename?: string;
+  }): CoreOwnedBlobIntegrityError | null => {
+    const reference = {
+      ownerId: part.blob.objectId,
+      blob: part.blob,
+      mediaType: part.mediaType,
+      filename: defaultStoredBlobFilename(part),
+    };
+    const existing = references.get(reference.ownerId);
+    if (existing && !isDeepStrictEqual(existing.blob, reference.blob)) {
+      return new CoreOwnedBlobIntegrityError(
+        `Stored blob '${reference.ownerId}' has conflicting durable references`,
+      );
+    }
+    if (!existing) references.set(reference.ownerId, reference);
+    return null;
+  };
+  for (const message of messages) {
+    if (typeof message.content === "string") continue;
+    for (const part of message.content) {
+      if (part.type === "blob") {
+        const failure = add(part);
+        if (failure) return Result.err(failure);
+        continue;
+      }
+      if (part.type !== "tool-result" || part.output.type !== "content") continue;
+      for (const output of part.output.value) {
+        if (output.type !== "blob") continue;
+        const failure = add(output);
+        if (failure) return Result.err(failure);
+      }
+    }
+  }
+  return Result.ok([...references.values()]);
+}
+
 export const CORE_SURFACE_PROJECTION_FORMAT_VERSION = 1 as const;
 export const CORE_TRANSCRIPT_DIGEST_VERSION = 2 as const;
 export type CoreProjectionSourceFact =
@@ -288,6 +335,7 @@ type CoreOwnedBlobRow = {
   filename: string;
   byte_length: number;
   created_ts: number;
+  deletion_claim_ts: number | null;
 };
 
 type CoreSurfaceProjectionRow = {
@@ -438,6 +486,13 @@ export type CoreOwnedBlobReference = {
 
 export type CoreOwnedBlob = CoreOwnedBlobReference & {
   readonly createdAt: number;
+};
+
+export type CoreOwnedBlobMaintenanceSummary = {
+  readonly inspected: number;
+  readonly deleted: number;
+  readonly retained: number;
+  readonly failed: number;
 };
 
 export type CoreSurfaceProjectionKey = {
@@ -978,6 +1033,12 @@ export type TranscriptStore = {
   }): ResultType<CoreOwnedBlob, CoreOwnedBlobIntegrityError>;
 
   deleteCoreOwnedBlobIfUnreferenced?(input: { ownerId: string }): BlobRefV1 | null;
+
+  maintainCoreOwnedBlobs?(input: {
+    blobStore: Pick<BlobStore, "delete">;
+    limit: number;
+    now?: number;
+  }): Promise<ResultType<CoreOwnedBlobMaintenanceSummary, CoreOwnedBlobIntegrityError>>;
 
   admitCoreSurfaceProjection?(
     input: AdmitCoreSurfaceProjection,
@@ -1783,6 +1844,50 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           [7, Date.now()],
         );
       }
+      if (version < 8) {
+        this.db.run(`
+          ALTER TABLE core_owned_blobs
+          ADD COLUMN deletion_claim_ts INTEGER CHECK (deletion_claim_ts >= 0)
+        `);
+        this.db.run(`
+          CREATE TABLE core_transcript_blob_refs (
+            request_id TEXT NOT NULL
+              REFERENCES request_transcripts(request_id) ON DELETE CASCADE,
+            position INTEGER NOT NULL CHECK (position >= 0),
+            blob_owner_id TEXT NOT NULL
+              REFERENCES core_owned_blobs(owner_id) ON DELETE RESTRICT,
+            PRIMARY KEY (request_id, position),
+            UNIQUE (request_id, blob_owner_id)
+          )
+        `);
+        this.db.run(`
+          CREATE INDEX idx_core_transcript_blob_refs_blob
+          ON core_transcript_blob_refs(blob_owner_id)
+        `);
+        const transcripts = this.db
+          .query<{ request_id: string; messages_json: string }, []>(
+            "SELECT request_id, messages_json FROM request_transcripts ORDER BY rowid",
+          )
+          .all();
+        for (const transcript of transcripts) {
+          const messages = adaptToolResultToHost(
+            decodePersistedTranscriptMessages({
+              raw: transcript.messages_json,
+              schemaVersion: 7,
+              recordId: transcript.request_id,
+            }),
+          ).value;
+          const references = adaptToolResultToHost(collectStoredBlobReferences(messages));
+          for (const reference of references) {
+            adaptToolResultToHost(this.ensureTranscriptOwnedBlob(reference));
+          }
+          this.replaceTranscriptBlobReferences(transcript.request_id, references);
+        }
+        this.db.run(
+          "INSERT INTO transcript_schema_migrations (version, applied_ts) VALUES (?, ?)",
+          [8, Date.now()],
+        );
+      }
       const foreignKeyFailures = this.db
         .query<DecodedTranscriptForeignKeyFailureRow, []>("PRAGMA foreign_key_check")
         .all()
@@ -1879,7 +1984,8 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       const messages = yield* parseNormalizedCanonicalMessages(input.messages);
       const digest = yield* hashCanonicalStoredMessagesV2(messages);
       const resourceIds = yield* collectStoredResourceIds(messages);
-      return Result.ok({ messages, digest, resourceIds });
+      const blobReferences = yield* collectStoredBlobReferences(messages);
+      return Result.ok({ messages, digest, resourceIds, blobReferences });
     });
     const preparationError = preparedMessages.match({ err: (error) => error, ok: () => null });
     if (preparationError) return Result.err(preparationError);
@@ -1892,6 +1998,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     const normalizedMessages = preparation.messages;
     const transcriptDigest = preparation.digest.hash;
     const resourceIds = preparation.resourceIds;
+    const blobReferences = preparation.blobReferences;
     const providerState = input.providerState ?? null;
     const stableNamedRequestClient = input.stableNamedRequestClient ?? null;
     const lineageResult: ResultType<CoreStoredLineageManifestV2 | null, TranscriptStoreWriteError> =
@@ -1998,6 +2105,12 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
             err: (error) => ({ kind: "error", error }),
           });
           if (referenceDecision.kind === "error") return Result.err(referenceDecision.error);
+          for (const reference of blobReferences) {
+            const retained = this.ensureTranscriptOwnedBlob(reference);
+            const retentionError = retained.match({ ok: () => null, err: (error) => error });
+            if (retentionError) return Result.err(retentionError);
+          }
+          this.replaceTranscriptBlobReferences(input.requestId, blobReferences);
           if (preparedLineage) {
             const lineage = this.saveCorePrimaryLineageManifestInTransaction(
               preparedLineage,
@@ -2484,14 +2597,14 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     return Result.gen(function* (this: SqliteTranscriptStore) {
       const input = inputValue;
       const ownerId = input.blob.objectId;
+      if (this.isCoreOwnedBlobDeletionClaimed(ownerId)) {
+        return Result.err(
+          new CoreOwnedBlobIntegrityError(`Owned blob '${ownerId}' is pending deletion`),
+        );
+      }
       const existing = yield* this.readCoreOwnedBlob(ownerId);
       if (existing) {
-        return isDeepStrictEqual(toCoreOwnedBlobReference(existing), {
-          ownerId,
-          blob: input.blob,
-          mediaType: input.mediaType,
-          filename: input.filename,
-        })
+        return isDeepStrictEqual(existing.blob, input.blob)
           ? Result.ok(existing)
           : Result.err(
               new CoreOwnedBlobIntegrityError(
@@ -2515,6 +2628,11 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         ],
       );
       const stored = yield* this.readCoreOwnedBlob(ownerId);
+      if (this.isCoreOwnedBlobDeletionClaimed(ownerId)) {
+        return Result.err(
+          new CoreOwnedBlobIntegrityError(`Owned blob '${ownerId}' is pending deletion`),
+        );
+      }
       return stored
         ? Result.ok(stored)
         : Result.err(new CoreOwnedBlobIntegrityError(`Owned blob '${ownerId}' was not retained`));
@@ -2543,10 +2661,14 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     const result = this.db.run(
       `DELETE FROM core_owned_blobs
        WHERE owner_id = ?
+         AND deletion_claim_ts IS NULL
          AND NOT EXISTS (
            SELECT 1 FROM core_surface_projection_blobs WHERE blob_owner_id = ?
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM core_transcript_blob_refs WHERE blob_owner_id = ?
          )`,
-      [ownerId, ownerId],
+      [ownerId, ownerId, ownerId],
     );
     const deleted = result.changes > 0;
     if (deleted) {
@@ -2556,6 +2678,94 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       });
     }
     return deleted ? ownedBlob.blob : null;
+  }
+
+  async maintainCoreOwnedBlobs(input: {
+    blobStore: Pick<BlobStore, "delete">;
+    limit: number;
+    now?: number;
+  }): Promise<ResultType<CoreOwnedBlobMaintenanceSummary, CoreOwnedBlobIntegrityError>> {
+    const now = input.now ?? Date.now();
+    const cutoff = now - TRANSCRIPT_OWNED_BLOB_RESERVATION_MS;
+    const staleClaimCutoff = now - CORE_OWNED_BLOB_DELETION_CLAIM_LEASE_MS;
+    const rows = this.db
+      .query<CoreOwnedBlobRow, [number, number, number]>(
+        `SELECT blob.* FROM core_owned_blobs AS blob
+         WHERE blob.created_ts <= ?
+           AND (blob.deletion_claim_ts IS NULL OR blob.deletion_claim_ts <= ?)
+           AND NOT EXISTS (
+             SELECT 1 FROM core_surface_projection_blobs AS projection_ref
+             WHERE projection_ref.blob_owner_id = blob.owner_id
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM core_transcript_blob_refs AS transcript_ref
+             WHERE transcript_ref.blob_owner_id = blob.owner_id
+           )
+         ORDER BY blob.created_ts ASC, blob.owner_id ASC
+         LIMIT ?`,
+      )
+      .all(cutoff, staleClaimCutoff, input.limit);
+    let deleted = 0;
+    let retained = 0;
+    let failed = 0;
+    for (const row of rows) {
+      const decoded = decodeCoreOwnedBlobRow(row);
+      const decodeError = decoded.match({ ok: () => null, err: (error) => error });
+      if (decodeError) return Result.err(decodeError);
+      const ownedBlob = decoded.match({ ok: (value) => value, err: () => null });
+      if (ownedBlob === null) {
+        return Result.err(new CoreOwnedBlobIntegrityError("Owned blob decoding returned no value"));
+      }
+      const claim = this.db.run(
+        `UPDATE core_owned_blobs
+         SET deletion_claim_ts = ?
+         WHERE owner_id = ?
+           AND (deletion_claim_ts IS NULL OR deletion_claim_ts <= ?)
+           AND NOT EXISTS (
+             SELECT 1 FROM core_surface_projection_blobs
+             WHERE blob_owner_id = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM core_transcript_blob_refs
+             WHERE blob_owner_id = ?
+           )`,
+        [now, row.owner_id, staleClaimCutoff, row.owner_id, row.owner_id],
+      );
+      if (claim.changes === 0) {
+        retained += 1;
+        continue;
+      }
+      const removed = await input.blobStore.delete(ownedBlob.blob);
+      const removalFailed = removed.match({ ok: () => false, err: () => true });
+      if (removalFailed) {
+        failed += 1;
+        continue;
+      }
+      const finalized = this.db.run(
+        `DELETE FROM core_owned_blobs
+         WHERE owner_id = ? AND deletion_claim_ts = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM core_surface_projection_blobs WHERE blob_owner_id = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM core_transcript_blob_refs WHERE blob_owner_id = ?
+           )`,
+        [row.owner_id, now, row.owner_id, row.owner_id],
+      );
+      if (finalized.changes === 0) {
+        return Result.err(
+          new CoreOwnedBlobIntegrityError(
+            `Owned blob '${row.owner_id}' changed while its deletion claim was held`,
+          ),
+        );
+      }
+      deleted += 1;
+      logger.info("core_retention.orphans_pruned", {
+        ownedBlobCount: 1,
+        reason: "unreferenced-owned-blob",
+      });
+    }
+    return Result.ok({ inspected: rows.length, deleted, retained, failed });
   }
 
   admitCoreSurfaceProjection(
@@ -2615,7 +2825,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       };
       const admission = runBunSqliteTransaction<
         CoreSurfaceProjectionAdmissionOutcome,
-        ResourceStoreFailure | TranscriptTransactionConflict,
+        ResourceStoreFailure | TranscriptTransactionConflict | CoreOwnedBlobIntegrityError,
         TranscriptStoreSqliteDriverFailure
       >(
         this.db,
@@ -2634,6 +2844,14 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
               key.projectionFormatVersion,
             );
           if (retained) return Result.ok({ kind: "existing" });
+          for (const reference of input.ownedBlobs) {
+            if (!this.isCoreOwnedBlobDeletionClaimed(reference.ownerId)) continue;
+            return Result.err(
+              new CoreOwnedBlobIntegrityError(
+                `Owned blob '${reference.ownerId}' is pending deletion`,
+              ),
+            );
+          }
           this.db.run(
             `INSERT INTO core_surface_projections (
            request_client, surface_id, session_id, message_id, projection_format_version,
@@ -3377,6 +3595,78 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       .get(ownerId);
     if (!row) return Result.ok(null);
     return decodeCoreOwnedBlobRow(row);
+  }
+
+  private isCoreOwnedBlobDeletionClaimed(ownerId: string): boolean {
+    const row = this.db
+      .query<{ deletion_claim_ts: number | null }, [string]>(
+        "SELECT deletion_claim_ts FROM core_owned_blobs WHERE owner_id = ?",
+      )
+      .get(ownerId);
+    return row?.deletion_claim_ts !== null && row?.deletion_claim_ts !== undefined;
+  }
+
+  private ensureTranscriptOwnedBlob(
+    reference: CoreOwnedBlobReference,
+  ): ResultType<CoreOwnedBlob, CoreOwnedBlobIntegrityError> {
+    return Result.gen(function* (this: SqliteTranscriptStore) {
+      if (this.isCoreOwnedBlobDeletionClaimed(reference.ownerId)) {
+        return Result.err(
+          new CoreOwnedBlobIntegrityError(`Owned blob '${reference.ownerId}' is pending deletion`),
+        );
+      }
+      const existing = yield* this.readCoreOwnedBlob(reference.ownerId);
+      if (existing) {
+        return isDeepStrictEqual(existing.blob, reference.blob)
+          ? Result.ok(existing)
+          : Result.err(
+              new CoreOwnedBlobIntegrityError(
+                `Owned blob '${reference.ownerId}' does not match its durable reference`,
+              ),
+            );
+      }
+      this.db.run(
+        `INSERT OR IGNORE INTO core_owned_blobs (
+           owner_id, blob_ref_json, media_type, filename, byte_length, created_ts
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          reference.ownerId,
+          JSON.stringify(reference.blob),
+          reference.mediaType,
+          reference.filename,
+          reference.blob.byteLength,
+          Date.now(),
+        ],
+      );
+      const retained = yield* this.readCoreOwnedBlob(reference.ownerId);
+      if (this.isCoreOwnedBlobDeletionClaimed(reference.ownerId)) {
+        return Result.err(
+          new CoreOwnedBlobIntegrityError(`Owned blob '${reference.ownerId}' is pending deletion`),
+        );
+      }
+      if (!retained || !isDeepStrictEqual(retained.blob, reference.blob)) {
+        return Result.err(
+          new CoreOwnedBlobIntegrityError(
+            `Owned blob '${reference.ownerId}' was not retained for its transcript`,
+          ),
+        );
+      }
+      return Result.ok(retained);
+    }, this);
+  }
+
+  private replaceTranscriptBlobReferences(
+    requestId: string,
+    references: readonly CoreOwnedBlobReference[],
+  ): void {
+    this.db.run("DELETE FROM core_transcript_blob_refs WHERE request_id = ?", [requestId]);
+    for (const [position, reference] of references.entries()) {
+      this.db.run(
+        `INSERT INTO core_transcript_blob_refs (request_id, position, blob_owner_id)
+         VALUES (?, ?, ?)`,
+        [requestId, position, reference.ownerId],
+      );
+    }
   }
 
   private decodeResourceRecord(
@@ -4331,9 +4621,15 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
                COALESCE(SUM(CASE WHEN NOT EXISTS (
                  SELECT 1 FROM core_surface_projection_blobs AS reference
                  WHERE reference.blob_owner_id = blob.owner_id
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM core_transcript_blob_refs AS reference
+                 WHERE reference.blob_owner_id = blob.owner_id
                ) THEN 1 ELSE 0 END), 0) AS unreferenced_count,
                COALESCE(SUM(CASE WHEN NOT EXISTS (
                  SELECT 1 FROM core_surface_projection_blobs AS reference
+                 WHERE reference.blob_owner_id = blob.owner_id
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM core_transcript_blob_refs AS reference
                  WHERE reference.blob_owner_id = blob.owner_id
                ) THEN blob.byte_length ELSE 0 END), 0) AS unreferenced_bytes
              FROM core_owned_blobs AS blob`,

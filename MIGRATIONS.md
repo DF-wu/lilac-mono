@@ -64,7 +64,7 @@ Use `--dry-run` for a read-only preflight. The normal command preflights and the
 invocation. It accepts only supported legacy schemas, verifies every copied object's SHA-256 and byte
 length, rewrites each database only after its required objects exist, and removes replaced legacy byte
 columns and files. The offline command emits transcript schema 6 and workflow schema 26; current Core
-then applies the additive transcript schema 7 migration during startup. Legacy or partially migrated
+then applies the additive transcript schema 7 and 8 migrations during startup. Legacy or partially migrated
 versions stop startup with the migration command.
 
 The migration copies durable transcript, projection, lineage, and workflow artifact content. It discards
@@ -228,7 +228,7 @@ in one transaction. Migration uses `foreign_keys = OFF` and `legacy_alter_table 
 table rebuilds, verifies foreign keys before setting `user_version = 8`, restores both pragmas, and
 does not expose an intermediate schema as the completed startup state.
 
-## Core Transcript Database Schemas 1-7
+## Core Transcript Database Schemas 1-8
 
 Core's `agent-transcripts.db` has its own `transcript_schema_migrations` sequence. These are internal
 SQLite migrations and do not change `core-config.yaml`; its current config contract remains
@@ -260,6 +260,12 @@ SQLite migrations and do not change `core-config.yaml`; its current config contr
   messages or blobs. A resource row uses one stable canonical-origin key and an optional verified
   BlobStore cache reference. Transcript and projection deletion cascades their reference rows;
   maintenance deletes a zero-reference cache before removing its resource row.
+- Transcript schema 8 adds transcript-to-blob ownership references. Provider file bytes are uploaded
+  to durable BlobStore objects before persistence, stored in messages as strict blob references, and
+  materialized back into provider files on replay. Migration backfills ownership for existing blob
+  parts. Transcript retention cascades reference rows. Maintenance claims an unreferenced owned blob
+  before deleting its object, which prevents a transcript or surface projection from attaching while
+  deletion is in progress.
 
 Core applies missing versions in one immediate transaction, validates foreign keys, marks interrupted
 native attempts uncertain during startup recovery, and promotes recovered pending successes only

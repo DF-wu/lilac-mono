@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
-import { Panic, type Result as ResultType } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import {
   buildCoreLineageManifestV2 as buildCoreLineageManifestResultV2,
   computeCoreLineagePrefixDigestV2,
@@ -17,6 +17,11 @@ import {
   type CoreRequestAliasV2,
   type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
+import {
+  BlobAdapterFailure,
+  BlobDeleteFailed,
+  createMemoryBlobStore,
+} from "@stanley2058/lilac-blob-storage";
 import type { RetentionLimit } from "@stanley2058/lilac-utils";
 
 import type { ResourceId } from "../../src/resource/contracts";
@@ -1965,7 +1970,7 @@ describe("SqliteTranscriptStore", () => {
     const version = migrated
       .query("SELECT MAX(version) AS version FROM transcript_schema_migrations")
       .get();
-    expect(version).toEqual({ version: 7 });
+    expect(version).toEqual({ version: 8 });
     expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
     const columns = migrated.query("PRAGMA table_info(request_transcripts)").all() as Array<{
       name: string;
@@ -2875,6 +2880,228 @@ describe("SqliteTranscriptStore", () => {
     ]);
     indexed.close();
     reopened.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("owns transcript blob references until transcript retention releases them", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-blobs-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const bytes = new TextEncoder().encode("local read output");
+    const upload = resultValue(
+      await blobStore.startUpload({ source: bytes, retention: { kind: "durable" } }),
+    );
+    const blob = resultValue(await upload.completion);
+    let store = new SqliteTranscriptStore(dbPath);
+
+    resultValue(
+      store.saveRequestTranscript({
+        requestId: "local-read",
+        sessionId: "session",
+        requestClient: "discord",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "blob",
+                blob,
+                mediaType: "text/plain",
+                filename: "local.txt",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    store.close();
+    const schema7 = new Database(dbPath);
+    schema7.run("DROP TABLE core_transcript_blob_refs");
+    schema7.run("ALTER TABLE core_owned_blobs DROP COLUMN deletion_claim_ts");
+    schema7.run("DELETE FROM transcript_schema_migrations WHERE version = 8");
+    schema7.close();
+    store = new SqliteTranscriptStore(dbPath);
+    expect(store.deleteCoreOwnedBlobIfUnreferenced({ ownerId: blob.objectId })).toBeNull();
+
+    const inspection = new Database(dbPath);
+    expect(
+      inspection
+        .query("SELECT request_id, position, blob_owner_id FROM core_transcript_blob_refs")
+        .all(),
+    ).toEqual([{ request_id: "local-read", position: 0, blob_owner_id: blob.objectId }]);
+    inspection.run("PRAGMA foreign_keys = ON");
+    inspection.run("DELETE FROM request_transcripts WHERE request_id = ?", ["local-read"]);
+    inspection.close();
+
+    expect(
+      resultValue(
+        await store.maintainCoreOwnedBlobs({
+          blobStore,
+          limit: 8,
+          now: Date.now() + 10 * 60 * 1_000,
+        }),
+      ),
+    ).toEqual({ inspected: 1, deleted: 1, retained: 0, failed: 0 });
+    expect((await blobStore.open(blob)).status).toBe("error");
+
+    store.close();
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("blocks new references while an unreferenced blob deletion is in progress", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-blob-claim-"));
+    const store = new SqliteTranscriptStore(path.join(dir, "transcripts.db"));
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const upload = resultValue(
+      await blobStore.startUpload({
+        source: new TextEncoder().encode("claimed local read"),
+        retention: { kind: "durable" },
+      }),
+    );
+    const blob = resultValue(await upload.completion);
+    const owned = putCoreOwnedBlob(store, {
+      blob,
+      mediaType: "text/plain",
+      filename: "claimed.txt",
+    });
+    let releaseDeletion: (() => void) | undefined;
+    const deletionReleased = new Promise<void>((resolve) => {
+      releaseDeletion = resolve;
+    });
+    let signalDeletionStarted: (() => void) | undefined;
+    const deletionStarted = new Promise<void>((resolve) => {
+      signalDeletionStarted = resolve;
+    });
+
+    const maintenance = store.maintainCoreOwnedBlobs({
+      blobStore: {
+        delete: async (target) => {
+          signalDeletionStarted?.();
+          await deletionReleased;
+          return blobStore.delete(target);
+        },
+      },
+      limit: 8,
+      now: Date.now() + 10 * 60 * 1_000,
+    });
+    await deletionStarted;
+
+    const transcriptFailure = resultError(
+      store.saveRequestTranscript({
+        requestId: "claimed-transcript",
+        sessionId: "session",
+        requestClient: "discord",
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "blob", blob, mediaType: "text/plain", filename: "claimed.txt" }],
+          },
+        ],
+      }),
+    );
+    expect(transcriptFailure).toBeInstanceOf(CoreOwnedBlobIntegrityError);
+    expect(transcriptFailure.message).toContain("pending deletion");
+
+    const projectionFailure = resultError(
+      store.admitCoreSurfaceProjection({
+        requestClient: "discord",
+        surfaceId: "surface",
+        sessionId: "session",
+        messageId: "claimed-message",
+        projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+        canonicalMessages: [{ role: "user", content: "claimed" }],
+        sourceFacts: {},
+        ownedBlobs: [owned],
+      }),
+    );
+    expect(projectionFailure).toBeInstanceOf(CoreOwnedBlobIntegrityError);
+    expect(projectionFailure.message).toContain("pending deletion");
+
+    releaseDeletion?.();
+    expect(resultValue(await maintenance)).toEqual({
+      inspected: 1,
+      deleted: 1,
+      retained: 0,
+      failed: 0,
+    });
+    expect((await blobStore.open(blob)).status).toBe("error");
+
+    store.close();
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("keeps a failed deletion claimed until maintenance can retry it", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-blob-retry-"));
+    const store = new SqliteTranscriptStore(path.join(dir, "transcripts.db"));
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const upload = resultValue(
+      await blobStore.startUpload({
+        source: new TextEncoder().encode("fenced local read"),
+        retention: { kind: "durable" },
+      }),
+    );
+    const blob = resultValue(await upload.completion);
+    putCoreOwnedBlob(store, {
+      blob,
+      mediaType: "text/plain",
+      filename: "fenced.txt",
+    });
+    const firstMaintenanceNow = Date.now() + 10 * 60 * 1_000;
+
+    expect(
+      resultValue(
+        await store.maintainCoreOwnedBlobs({
+          blobStore: {
+            delete: async () =>
+              Result.err(
+                new BlobDeleteFailed({
+                  objectId: blob.objectId,
+                  failure: new BlobAdapterFailure({
+                    adapter: "memory",
+                    kind: "io",
+                    operation: "delete",
+                    message: "physical deletion failed after fencing",
+                  }),
+                  message: "physical deletion failed after fencing",
+                }),
+              ),
+          },
+          limit: 8,
+          now: firstMaintenanceNow,
+        }),
+      ),
+    ).toEqual({ inspected: 1, deleted: 0, retained: 0, failed: 1 });
+
+    const referenceFailure = resultError(
+      store.saveRequestTranscript({
+        requestId: "fenced-transcript",
+        sessionId: "session",
+        requestClient: "discord",
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "blob", blob, mediaType: "text/plain", filename: "fenced.txt" }],
+          },
+        ],
+      }),
+    );
+    expect(referenceFailure).toBeInstanceOf(CoreOwnedBlobIntegrityError);
+    expect(referenceFailure.message).toContain("pending deletion");
+
+    expect(
+      resultValue(
+        await store.maintainCoreOwnedBlobs({
+          blobStore,
+          limit: 8,
+          now: firstMaintenanceNow + 31 * 60 * 1_000,
+        }),
+      ),
+    ).toEqual({ inspected: 1, deleted: 1, retained: 0, failed: 0 });
+
+    store.close();
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
     await fs.rm(dir, { recursive: true, force: true });
   });
 

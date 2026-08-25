@@ -58,7 +58,7 @@ function expectCatalog(
 }
 
 describe("transcript persistence codecs", () => {
-  it("covers the strict schema-7 resource record persistence cases", () => {
+  it("covers the strict current-schema resource record persistence cases", () => {
     expectCatalog(resourceRecordRowCodecCases, decodeResourceRecordRow as never);
     expect(
       decodeResourceRecordRow({

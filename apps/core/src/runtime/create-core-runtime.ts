@@ -1852,11 +1852,15 @@ export async function createCoreRuntime(
     if (requestDeliveryMaintenanceOperation) return;
     const cycle = Promise.resolve().then(async () => {
       const activeBlobStore = blobStore;
-      const [maintained, maintainedBlobs, maintainedResources] = await Promise.all([
-        requestDeliveryCoordinator.maintain(),
-        activeBlobStore ? activeBlobStore.maintain() : Promise.resolve(null),
-        resourceService?.maintain({ limit: 64 }) ?? Promise.resolve(null),
-      ]);
+      const [maintained, maintainedBlobs, maintainedResources, maintainedTranscriptBlobs] =
+        await Promise.all([
+          requestDeliveryCoordinator.maintain(),
+          activeBlobStore ? activeBlobStore.maintain() : Promise.resolve(null),
+          resourceService?.maintain({ limit: 64 }) ?? Promise.resolve(null),
+          activeBlobStore && transcriptStore
+            ? transcriptStore.maintainCoreOwnedBlobs({ blobStore: activeBlobStore, limit: 64 })
+            : Promise.resolve(null),
+        ]);
       maintained.match({
         err: (error) =>
           logger.error("Core request delivery maintenance failed", {
@@ -1885,6 +1889,20 @@ export async function createCoreRuntime(
         ok: (summary) => {
           if (summary.failed === 0) return;
           logger.warn("Core resource maintenance completed with blob deletion failures", {
+            failed: summary.failed,
+            inspected: summary.inspected,
+          });
+        },
+      });
+      maintainedTranscriptBlobs?.match({
+        err: (error) =>
+          logger.error("Core transcript blob maintenance failed", {
+            errorTag: error.name,
+            errorMessage: error.message,
+          }),
+        ok: (summary) => {
+          if (summary.failed === 0) return;
+          logger.warn("Core transcript blob maintenance completed with deletion failures", {
             failed: summary.failed,
             inspected: summary.inspected,
           });
@@ -2300,6 +2318,25 @@ export async function createCoreRuntime(
               logger.warn(
                 "Core request delivery startup maintenance completed with deletion failures",
                 formatTaggedErrorForLog(summary.failures[0]!),
+              );
+            },
+          });
+          const initialTranscriptBlobMaintenance =
+            await activeTranscriptStore.maintainCoreOwnedBlobs({
+              blobStore: activeBlobStore,
+              limit: 64,
+            });
+          initialTranscriptBlobMaintenance.match({
+            err: (error) =>
+              logger.warn("Core transcript blob startup maintenance failed", {
+                errorTag: error.name,
+                errorMessage: error.message,
+              }),
+            ok: (summary) => {
+              if (summary.failed === 0) return;
+              logger.warn(
+                "Core transcript blob startup maintenance completed with deletion failures",
+                { failed: summary.failed, inspected: summary.inspected },
               );
             },
           });

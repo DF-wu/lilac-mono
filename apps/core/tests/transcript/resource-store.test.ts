@@ -311,7 +311,7 @@ describe("Core resource SQLite store", () => {
   });
 
   it("migrates an exact schema-6 database additively and preserves old messages", async () => {
-    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-resource-schema-7-"));
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-resource-schema-8-"));
     const dbPath = path.join(directory, "transcripts.db");
     const initial = new SqliteTranscriptStore(dbPath);
     value(
@@ -325,10 +325,12 @@ describe("Core resource SQLite store", () => {
     initial.close();
 
     const schema6 = new Database(dbPath);
+    schema6.run("DROP TABLE core_transcript_blob_refs");
+    schema6.run("ALTER TABLE core_owned_blobs DROP COLUMN deletion_claim_ts");
     schema6.run("DROP TABLE core_surface_projection_resource_refs");
     schema6.run("DROP TABLE core_transcript_resource_refs");
     schema6.run("DROP TABLE core_resources");
-    schema6.run("DELETE FROM transcript_schema_migrations WHERE version = 7");
+    schema6.run("DELETE FROM transcript_schema_migrations WHERE version >= 7");
     schema6.close();
 
     const migrated = new SqliteTranscriptStore(dbPath);
@@ -340,7 +342,7 @@ describe("Core resource SQLite store", () => {
     const inspected = new Database(dbPath);
     expect(
       inspected.query("SELECT MAX(version) AS version FROM transcript_schema_migrations").get(),
-    ).toEqual({ version: 7 });
+    ).toEqual({ version: 8 });
     expect(inspected.query("PRAGMA foreign_key_check").all()).toEqual([]);
     inspected.close();
     await fs.rm(directory, { recursive: true, force: true });
