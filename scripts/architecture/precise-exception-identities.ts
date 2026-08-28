@@ -6,6 +6,7 @@ export type PreciseExceptionIdentity = readonly [
 
 export const CORE_REVIEWED_PANIC_IDENTITIES = [
   ["src/surface/adapter.ts", "preserveSurfacePanic"],
+  ["src/mcp/modern-result-validation.ts", "preserveTransportPanic"],
 ] as const;
 
 export const CORE_FATAL_SIGNAL_IDENTITIES = [
@@ -205,6 +206,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["src/mcp/registry.ts", "McpRegistry.init.runLifecycle.<callback@1>", "signal"],
     ["src/mcp/registry.ts", "McpRegistry.shutdown.runLifecycle.<callback@1>", "signal"],
     ["src/mcp/registry.ts", "McpRegistry.wrapToolExecution.execute", "signal"],
+    ["src/mcp/modern-result-validation.ts", "signalTransportCancellation", "signal"],
     [
       "src/mcp/oauth-provider.ts",
       "McpOAuthProvider.providerForAttempt.attemptProvider.codeVerifier",

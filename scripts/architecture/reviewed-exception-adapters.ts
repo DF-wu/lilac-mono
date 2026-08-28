@@ -45,6 +45,20 @@ export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly Excep
     },
     {
       identity: {
+        module: "src/mcp/modern-result-validation.ts",
+        exportName: "preserveTransportPanic",
+      },
+      category: "defect-supervisor",
+      externalApi: {
+        package: "better-result",
+        exportName: "Panic.is",
+      },
+      direction: "observe-panic",
+      reason:
+        "Preserves exact Panic identity while modern discovery owns ordinary transport failures.",
+    },
+    {
+      identity: {
         module: "src/mcp/oauth-provider.ts",
         exportName: "McpOAuthProvider.clientInformationForSdkAttempt.err.<callback>",
       },

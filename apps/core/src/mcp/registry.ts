@@ -17,6 +17,7 @@ import { catalogToolStableId, type CatalogToolIdentity } from "./catalog-identit
 import type { McpServerDefinition } from "./config-types";
 import { McpConfigError, readMcpConfigFile } from "./config-file";
 import { rethrowPanic, safeMcpErrorText } from "./error-format";
+import { enforceModernMcpResultContract, retainTransportPanic } from "./modern-result-validation";
 import type {
   McpCatalogTool,
   McpCatalogServer,
@@ -35,10 +36,19 @@ import type {
 import { resolveMcpValueSourceMap, validateHttpHeaders } from "./value-source";
 
 const DEFAULT_INIT_DEADLINE_MS = 30_000;
-const mcpApplicationErrorSchema = z.object({
-  name: z.literal("MCPClientError"),
-  code: z.number(),
-});
+const mcpNonTerminalExecutionErrorSchema = z.union([
+  z.object({
+    name: z.literal("MCPClientError"),
+    code: z.number(),
+  }),
+  // @ai-sdk/mcp 2.0.39 does not export a runtime error type for this limitation.
+  z.object({
+    name: z.literal("MCPClientError"),
+    message: z.literal(
+      "Server requested additional input, but multi round-trip requests are not supported yet",
+    ),
+  }),
+]);
 const optionalHttpInboundSseErrorSchema = z.object({
   name: z.literal("MCPClientError"),
   message: z.string().startsWith("MCP HTTP Transport Error: GET SSE failed:"),
@@ -689,6 +699,7 @@ export class McpRegistry implements McpRegistryApi {
     let client: McpRegistryClient | undefined;
     const holder: {
       client?: McpRegistryClient;
+      panic?: Panic;
       terminalFailure?: McpRegistryTerminalFailure;
       sessionExpired?: boolean;
     } = {};
@@ -709,11 +720,10 @@ export class McpRegistry implements McpRegistryApi {
             }),
             ok: (resolved) => async () => {
               sensitiveValues = resolved.sensitiveValues;
-              const transport = observeHttpSessionExpiration(
-                this.createTransport(resolved.input),
-                () => {
+              const transport = enforceModernMcpResultContract(
+                observeHttpSessionExpiration(this.createTransport(resolved.input), () => {
                   holder.sessionExpired = true;
-                },
+                }),
               );
               phase = "connection";
 
@@ -724,6 +734,7 @@ export class McpRegistry implements McpRegistryApi {
                     transport,
                     clientName: `lilac-mcp-${definition.id}`,
                     maxRetries: 0,
+                    protocolVersionDiscovery: true,
                     onUncaughtError: <TError>(error: TError) => {
                       if (
                         isOptionalHttpInboundSseError(
@@ -734,6 +745,7 @@ export class McpRegistry implements McpRegistryApi {
                       ) {
                         return;
                       }
+                      retainTransportPanic(error, holder);
                       rethrowPanic(error);
                       const failure = new McpRegistryTerminalFailure({
                         status: this.failureStatus(definition, error),
@@ -744,6 +756,7 @@ export class McpRegistry implements McpRegistryApi {
                         this.handleTerminalFailure(definition.id, holder.client, failure);
                     },
                   });
+                  rethrowPanic(holder.panic);
                   client = createdClient;
                   holder.client = createdClient;
                   this.observeTransportClose(definition.id, createdClient, transport);
@@ -800,7 +813,7 @@ export class McpRegistry implements McpRegistryApi {
       });
 
       if (captured.isErr()) {
-        const error = captured.error.cause;
+        const error = holder.panic ?? captured.error.cause;
         if (client) {
           this.closeClientInBackground(client);
         }
@@ -1091,7 +1104,7 @@ export class McpRegistry implements McpRegistryApi {
           if (outcome.kind === "success") return outcome.value;
           const cause = outcome.failure.cause;
           rethrowPanic(cause);
-          if (!mcpApplicationErrorSchema.safeParse(cause).success) {
+          if (!mcpNonTerminalExecutionErrorSchema.safeParse(cause).success) {
             const current = this.entries.get(serverId);
             if (current?.client === client) {
               this.handleTerminalFailure(
@@ -1121,7 +1134,7 @@ export class McpRegistry implements McpRegistryApi {
           if (captured.isErr()) {
             const error = captured.error.cause;
             rethrowPanic(error);
-            if (!mcpApplicationErrorSchema.safeParse(error).success) {
+            if (!mcpNonTerminalExecutionErrorSchema.safeParse(error).success) {
               const current = this.entries.get(serverId);
               if (current?.client === client) {
                 this.handleTerminalFailure(
