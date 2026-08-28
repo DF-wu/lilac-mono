@@ -3,6 +3,18 @@
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
 
+## MCP 2026-07-28 client and OAuth credentials
+
+Core's configured MCP clients negotiate the stateless `2026-07-28` tool protocol and fall back to the
+legacy initialization handshake. The MCP configuration contract remains version 1.
+
+OAuth credential files remain version 1 and now accept optional issuer pins on stored tokens, client
+information, and authorization-server information. Existing files need no rewrite and acquire the pin
+on their next authorization flow. Before rolling back to an older Core build, back up and delete each
+affected file under `DATA_DIR/secret/mcp-oauth`, or remove every `issuer` field from its stored tokens,
+client information, and authorization-server information. Run `mcp.auth` again after the older build
+starts.
+
 ## Level-2 Result, Wire, And CLI Clean Break
 
 Level-2 callable settlement is a clean break with no compatibility layer. Every external Level-2

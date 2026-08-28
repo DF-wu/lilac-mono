@@ -126,10 +126,12 @@ export class McpOAuthCallbackService {
 
     const codes = url.searchParams.getAll("code");
     const states = url.searchParams.getAll("state");
+    const issuers = url.searchParams.getAll("iss");
     if (
       url.searchParams.has("error") ||
       codes.length !== 1 ||
       states.length !== 1 ||
+      issuers.length > 1 ||
       !codes[0] ||
       !states[0]
     ) {
@@ -139,7 +141,7 @@ export class McpOAuthCallbackService {
     const provider = this.providers.getProviderForState(states[0]);
     if (!provider) return invalidCallbackResponse();
 
-    const completed = await provider.completeAuthorizationResult(codes[0], states[0]);
+    const completed = await provider.completeAuthorizationResult(codes[0], states[0], issuers[0]);
     return completed.match({
       ok: () =>
         new Response("OAuth authorization completed.\n", {

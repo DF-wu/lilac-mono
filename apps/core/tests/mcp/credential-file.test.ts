@@ -44,7 +44,16 @@ describe("MCP OAuth credential files", () => {
       serverUrl: "https://mcp.example.test/service",
       update: (credential) => ({
         ...credential,
-        clientInformation: { client_id: "registered-client", client_secret: "client-secret" },
+        clientInformation: {
+          client_id: "registered-client",
+          client_secret: "client-secret",
+          issuer: "https://auth.example.test",
+        },
+        authorizationServerInformation: {
+          issuer: "https://auth.example.test",
+          authorizationServerUrl: "https://auth.example.test",
+          tokenEndpoint: "https://auth.example.test/token",
+        },
       }),
     });
     await updateMcpOAuthCredentialFile({
@@ -57,6 +66,7 @@ describe("MCP OAuth credential files", () => {
           access_token: "access-token",
           token_type: "Bearer",
           refresh_token: "refresh-token",
+          issuer: "https://auth.example.test",
         },
       }),
     });
@@ -64,8 +74,20 @@ describe("MCP OAuth credential files", () => {
     expect(await readMcpOAuthCredentialFile({ dataDir, serverId: "docs" })).toMatchObject({
       version: 1,
       serverUrl: "https://mcp.example.test/service",
-      clientInformation: { client_id: "registered-client" },
-      tokens: { access_token: "access-token", refresh_token: "refresh-token" },
+      clientInformation: {
+        client_id: "registered-client",
+        issuer: "https://auth.example.test",
+      },
+      authorizationServerInformation: {
+        issuer: "https://auth.example.test",
+        authorizationServerUrl: "https://auth.example.test",
+        tokenEndpoint: "https://auth.example.test/token",
+      },
+      tokens: {
+        access_token: "access-token",
+        refresh_token: "refresh-token",
+        issuer: "https://auth.example.test",
+      },
     });
     expect((await stat(path.dirname(credentialPath))).mode & 0o777).toBe(0o700);
     expect((await stat(credentialPath)).mode & 0o777).toBe(0o600);

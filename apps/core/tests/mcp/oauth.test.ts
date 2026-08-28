@@ -146,7 +146,9 @@ describe("Core-owned MCP OAuth", () => {
       serverId: "docs",
     });
     expect(beforeCallback?.clientInformation?.client_id).toBe("registered-client");
+    expect(beforeCallback?.clientInformation?.issuer).toBe(ISSUER);
     expect(beforeCallback?.authorizationServerInformation).toEqual({
+      issuer: ISSUER,
       authorizationServerUrl: `${ISSUER}/`,
       tokenEndpoint: `${ISSUER}/token`,
     });
@@ -155,7 +157,9 @@ describe("Core-owned MCP OAuth", () => {
     expect(JSON.stringify(beforeCallback)).not.toContain(flow.state);
 
     const response = await flow.callbacks.handleRequest(
-      new Request(`${MCP_OAUTH_CALLBACK_URL}?code=callback-code&state=${flow.state}`),
+      new Request(
+        `${MCP_OAUTH_CALLBACK_URL}?code=callback-code&state=${flow.state}&iss=${encodeURIComponent(ISSUER)}`,
+      ),
     );
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("OAuth authorization completed.\n");
@@ -170,6 +174,7 @@ describe("Core-owned MCP OAuth", () => {
     expect(credential?.tokens).toMatchObject({
       access_token: "saved-access-token",
       refresh_token: "saved-refresh-token",
+      issuer: ISSUER,
       authorization_server: `${ISSUER}/`,
       token_endpoint: `${ISSUER}/token`,
     });
@@ -178,6 +183,27 @@ describe("Core-owned MCP OAuth", () => {
         .mode & 0o777,
     ).toBe(0o600);
     expect(flow.providers.getProviderForState(flow.state)).toBeUndefined();
+  });
+
+  it("rejects an OAuth callback whose issuer does not match the authorization server", async () => {
+    const flow = await startFlow();
+    const credentialBefore = await readMcpOAuthCredentialFile({
+      dataDir: flow.dataDir,
+      serverId: "docs",
+    });
+    const response = await flow.callbacks.handleRequest(
+      new Request(
+        `${MCP_OAUTH_CALLBACK_URL}?code=callback-code&state=${flow.state}&iss=https%3A%2F%2Fevil.example.test`,
+      ),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("OAuth authorization failed.\n");
+    expect(flow.tokenRequests).toHaveLength(0);
+    expect(await readMcpOAuthCredentialFile({ dataDir: flow.dataDir, serverId: "docs" })).toEqual(
+      credentialBefore,
+    );
+    expect(flow.providers.getProviderForState(flow.state)).toBeDefined();
   });
 
   it("retains multiple pending attempts and completes their callbacks in either order", async () => {
@@ -298,6 +324,36 @@ describe("Core-owned MCP OAuth", () => {
     expect(await provider.clientInformation()).toMatchObject({
       client_id: "registered-client",
       client_secret_expires_at: 0,
+    });
+  });
+
+  it("binds legacy dynamic client information to the authorization server", async () => {
+    const dataDir = await createDataDir();
+    await writeMcpOAuthCredentialFileAtomic({
+      dataDir,
+      serverId: "docs",
+      credential: {
+        version: 1,
+        serverUrl: SERVER_URL,
+        clientInformation: { client_id: "legacy-registered-client" },
+      },
+    });
+    const providers = new McpOAuthProviderService({
+      dataDir,
+      fetchFn: oauthFetch({ tokenRequests: [] }),
+    });
+    providers.reconcile(oauthConfig());
+
+    const started = await providers.startAuthorization("docs");
+
+    expect(started.status).toBe("authorization_required");
+    expect(
+      (await readMcpOAuthCredentialFile({ dataDir, serverId: "docs" }))?.clientInformation,
+    ).toMatchObject({
+      client_id: "legacy-registered-client",
+      issuer: ISSUER,
+      authorization_server: `${ISSUER}/`,
+      token_endpoint: `${ISSUER}/token`,
     });
   });
 
@@ -543,6 +599,7 @@ describe("Core-owned MCP OAuth", () => {
       `${MCP_OAUTH_CALLBACK_URL}?code=callback-code`,
       `${MCP_OAUTH_CALLBACK_URL}?code=callback-code&state=wrong-state`,
       `${MCP_OAUTH_CALLBACK_URL}?code=callback-code&state=${flow.state}&state=other`,
+      `${MCP_OAUTH_CALLBACK_URL}?code=callback-code&state=${flow.state}&iss=${encodeURIComponent(ISSUER)}&iss=https%3A%2F%2Fother.example.test`,
       `${MCP_OAUTH_CALLBACK_URL}?error=access_denied&error_description=private&state=${flow.state}`,
       `${MCP_OAUTH_CALLBACK_URL}/callback-code`,
     ];

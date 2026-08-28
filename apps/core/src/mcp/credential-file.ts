@@ -23,6 +23,7 @@ const oauthTokensSchema: z.ZodType<OAuthTokens> = z.strictObject({
   expires_in: z.number().optional(),
   scope: z.string().optional(),
   refresh_token: z.string().optional(),
+  issuer: z.url().optional(),
   authorization_server: z.url().optional(),
   token_endpoint: z.url().optional(),
 });
@@ -32,12 +33,14 @@ const oauthClientInformationSchema: z.ZodType<OAuthClientInformation> = z.object
   client_secret: z.string().optional(),
   client_id_issued_at: z.number().optional(),
   client_secret_expires_at: z.number().optional(),
+  issuer: z.url().optional(),
   authorization_server: z.url().optional(),
   token_endpoint: z.url().optional(),
 });
 
 const authorizationServerInformationSchema: z.ZodType<OAuthAuthorizationServerInformation> =
   z.strictObject({
+    issuer: z.url().optional(),
     authorizationServerUrl: z.url(),
     tokenEndpoint: z.url(),
   });
