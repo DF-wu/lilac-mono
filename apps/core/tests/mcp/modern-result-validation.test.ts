@@ -161,6 +161,48 @@ describe("modern MCP result validation", () => {
     ).rejects.toBe(panic);
   });
 
+  it("falls back after a custom transport returns an unknown discovery error", async () => {
+    const methods: string[] = [];
+    const customTransport: MCPTransport = {
+      supportsProtocolVersionDiscovery: true,
+      async start() {},
+      async send(message) {
+        if (!("method" in message)) return;
+        methods.push(message.method);
+        if (!("id" in message)) return;
+        if (message.method === "server/discover") {
+          customTransport.onmessage?.({
+            jsonrpc: "2.0",
+            id: message.id,
+            error: { code: -32000, message: "Server not initialized" },
+          });
+          return;
+        }
+        if (message.method !== "initialize") return;
+        customTransport.onmessage?.({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            protocolVersion: "2025-11-25",
+            capabilities: {},
+            serverInfo: { name: "legacy-custom-server", version: "1.0.0" },
+          },
+        });
+      },
+      async close() {},
+    };
+
+    const client = await createMCPClient({
+      transport: enforceModernMcpResultContract(customTransport),
+      protocolVersionDiscovery: true,
+      clientName: "custom-unknown-error-test",
+    });
+
+    expect(client.serverInfo.name).toBe("legacy-custom-server");
+    expect(methods).toEqual(["server/discover", "initialize", "notifications/initialized"]);
+    await client.close();
+  });
+
   it("preserves external cancellation of a modern HTTP discovery fetch", async () => {
     const cancellation = new Error("cancelled by caller");
     const controller = new AbortController();
@@ -212,6 +254,34 @@ describe("modern MCP result validation", () => {
     ).rejects.toThrow("Legacy initialization lacks valid discovery evidence");
     expect(methods).toEqual(["server/discover"]);
   });
+
+  for (const status of [401, 403, 407, 408, 429, 503]) {
+    it(`does not treat an unknown discovery error over HTTP ${status} as a downgrade`, async () => {
+      const transport = enforceModernMcpResultContract({
+        type: "http",
+        url: "https://mcp.example.test",
+        fetch: mockFetch(async () =>
+          Response.json(
+            {
+              jsonrpc: "2.0",
+              id: 1,
+              error: { code: -32000, message: "Unknown discovery failure" },
+            },
+            { status },
+          ),
+        ),
+      });
+      if ("start" in transport || transport.type !== "http" || !transport.fetch) {
+        throw new Error("Expected validating HTTP transport config");
+      }
+
+      const response = await transport.fetch(transport.url, modernRequestInit("server/discover"));
+
+      expect(await response.json()).toMatchObject({
+        error: { code: -32022, message: "Modern MCP discovery request failed" },
+      });
+    });
+  }
 
   for (const malformedResponse of [
     { name: "an empty batch", body: [] },

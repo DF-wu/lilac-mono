@@ -120,7 +120,7 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
   ["src/mcp/modern-result-validation.ts", "isValidModernDiscoverResult"],
   ["src/mcp/modern-result-validation.ts", "isLegacyDiscoverResult"],
   ["src/mcp/modern-result-validation.ts", "isValidModernCacheableCompleteResult"],
-  ["src/mcp/modern-result-validation.ts", "isLegacyDiscoverySignal"],
+  ["src/mcp/modern-result-validation.ts", "allowsLegacyFallback"],
   ["src/mcp/modern-result-validation.ts", "retainTransportPanic"],
   ["src/mcp/modern-result-validation.ts", "preserveTransportPanic"],
   ["src/mcp/modern-result-validation.ts", "signalTransportCancellation"],

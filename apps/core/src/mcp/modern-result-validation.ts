@@ -15,6 +15,7 @@ const MODERN_MCP_PROTOCOL_VERSION = "2026-07-28";
 // This local response normalization never goes on the wire. The AI SDK suppresses legacy fallback
 // only for errors carrying a recognized modern protocol code.
 const INVALID_MODERN_RESULT_ERROR_CODE = -32022;
+const MODERN_PROTOCOL_ERROR_CODES = [-32020, -32021, INVALID_MODERN_RESULT_ERROR_CODE] as const;
 const AI_SDK_SUPPORTED_LEGACY_PROTOCOL_VERSIONS = [
   "2025-11-25",
   "2025-06-18",
@@ -115,13 +116,15 @@ function legacyDiscoveryMessage(id: string | number | undefined): JSONRPCMessage
   };
 }
 
-function isLegacyDiscoverySignal(message: JSONRPCMessage): boolean {
+function allowsLegacyFallback(message: JSONRPCMessage): boolean {
   if (!("error" in message)) return false;
-  if (message.error.code === -32601) return true;
-  return (
+  const isStructuredLegacyOffer =
     message.error.code === INVALID_MODERN_RESULT_ERROR_CODE &&
-    unsupportedProtocolVersionDataSchema.safeParse(message.error.data).success
-  );
+    unsupportedProtocolVersionDataSchema.safeParse(message.error.data).success;
+  if (isStructuredLegacyOffer) return true;
+  // A completed server reply is era evidence. Transport, authentication, and infrastructure
+  // failures are classified separately and never reach this fallback decision.
+  return !MODERN_PROTOCOL_ERROR_CODES.some((code) => code === message.error.code);
 }
 
 function isValidModernDiscoverResult(message: JSONRPCMessage): boolean {
@@ -155,7 +158,7 @@ function enforceModernResultType(message: JSONRPCMessage, requestMethod?: string
   if ("error" in message) {
     if (requestMethod !== "server/discover") return message;
     if (message.error.code === -32601) return message;
-    if (isLegacyDiscoverySignal(message)) return legacyDiscoveryMessage(message.id);
+    if (allowsLegacyFallback(message)) return legacyDiscoveryMessage(message.id);
     return invalidModernResultMessage(message.id, "Modern MCP discovery request failed");
   }
   const resultType = message.result.resultType;
@@ -223,7 +226,7 @@ function enforceModernPayload(
 
 function classifyDiscoveryMessage(message: JSONRPCMessage): DiscoveryState {
   if ("method" in message) return "blocked";
-  if ("error" in message) return isLegacyDiscoverySignal(message) ? "allowed-legacy" : "blocked";
+  if ("error" in message) return allowsLegacyFallback(message) ? "allowed-legacy" : "blocked";
   if (isValidModernDiscoverResult(message)) return "modern";
   if (isLegacyDiscoverResult(message)) return "allowed-legacy";
   return "blocked";
@@ -249,18 +252,12 @@ function classifyHttpDiscoveryResponse(
   const classified = classifyDiscoveryPayload(payload, request, true);
   if (response.ok) return classified ?? "blocked";
   if (classified !== "allowed-legacy") return "blocked";
-  const message = payload.messages.find(isJsonRpcReply);
-  if (!message) return "blocked";
-  if (!("error" in message)) return "blocked";
-  if (response.status === 404 && message.error.code === -32601) return "allowed-legacy";
-  if (
-    response.status === 400 &&
-    message.error.code === INVALID_MODERN_RESULT_ERROR_CODE &&
-    isLegacyDiscoverySignal(message)
-  ) {
-    return "allowed-legacy";
-  }
-  return "blocked";
+  const isAuthenticationFailure =
+    response.status === 401 || response.status === 403 || response.status === 407;
+  const isOperationalFailure =
+    response.status === 408 || response.status === 429 || response.status >= 500;
+  if (isAuthenticationFailure || isOperationalFailure) return "blocked";
+  return response.status >= 400 && response.status < 500 ? "allowed-legacy" : "blocked";
 }
 
 function serializeJsonRpcPayload(payload: DecodedJsonRpcPayload): string {

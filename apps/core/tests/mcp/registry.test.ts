@@ -492,11 +492,13 @@ describe("McpRegistry startup and discovery", () => {
     "unsupported-version-error",
     "legacy-discover-result",
     "method-not-found",
+    "unknown-json-rpc-error",
   ] as const) {
     const responseKind = {
       "unsupported-version-error": "a structured unsupported-version error",
       "legacy-discover-result": "a legacy-only discovery result",
       "method-not-found": "an HTTP method-not-found response",
+      "unknown-json-rpc-error": "an unknown HTTP JSON-RPC error",
     }[downgrade];
     it(`falls back after ${responseKind}`, async () => {
       const methods: string[] = [];
@@ -529,6 +531,16 @@ describe("McpRegistry startup and discovery", () => {
                   error: { code: -32601, message: "Method not found" },
                 },
                 { status: 404 },
+              );
+            }
+            if (downgrade === "unknown-json-rpc-error") {
+              return Response.json(
+                {
+                  jsonrpc: "2.0",
+                  id: message.id,
+                  error: { code: -32000, message: "Server not initialized" },
+                },
+                { status: 400 },
               );
             }
             return Response.json(
@@ -639,10 +651,10 @@ describe("McpRegistry startup and discovery", () => {
   });
 
   for (const failure of [
-    "json-rpc",
     "http",
     "http-json-success",
     "http-method-not-found",
+    "modern-protocol-error",
   ] as const) {
     it(`does not fall back after a modern discovery ${failure} failure`, async () => {
       const methods: string[] = [];
@@ -680,11 +692,14 @@ describe("McpRegistry startup and discovery", () => {
                 { status: 503 },
               );
             }
-            return Response.json({
-              jsonrpc: "2.0",
-              id: message.id,
-              error: { code: -32603, message: "Internal error" },
-            });
+            return Response.json(
+              {
+                jsonrpc: "2.0",
+                id: message.id,
+                error: { code: -32020, message: "Modern request header mismatch" },
+              },
+              { status: 400 },
+            );
           }
           return Response.json({
             jsonrpc: "2.0",
