@@ -33,6 +33,15 @@ const unsupportedProtocolVersionDataSchema = z.object({
       ),
     ),
 });
+const discoveryErrorWithNullIdSchema = z.strictObject({
+  jsonrpc: z.literal("2.0"),
+  id: z.null(),
+  error: z.strictObject({
+    code: z.number().int(),
+    message: z.string(),
+    data: z.unknown().optional(),
+  }),
+});
 const modernCacheableCompleteResultSchema = z.looseObject({
   resultType: z.literal("complete"),
   ttlMs: z.number().int().min(0),
@@ -75,7 +84,10 @@ function isJsonRpcReply(message: JSONRPCMessage): message is JSONRPCReply {
   return !("method" in message);
 }
 
-function decodeJsonRpcPayload(text: string): DecodedJsonRpcPayload | undefined {
+function decodeJsonRpcPayload(
+  text: string,
+  expectedDiscoveryId?: string | number,
+): DecodedJsonRpcPayload | undefined {
   const decoded = Result.try({
     try: () => {
       const value: unknown = JSON.parse(text);
@@ -83,7 +95,12 @@ function decodeJsonRpcPayload(text: string): DecodedJsonRpcPayload | undefined {
       if (values.length === 0) throw new Error("JSON-RPC batches must not be empty");
       return {
         batched: Array.isArray(value),
-        messages: values.map((item) => validateJSONRPCMessage(item)),
+        messages: values.map((item) => {
+          if (expectedDiscoveryId === undefined) return validateJSONRPCMessage(item);
+          const nullIdError = discoveryErrorWithNullIdSchema.safeParse(item);
+          if (!nullIdError.success) return validateJSONRPCMessage(item);
+          return validateJSONRPCMessage({ ...nullIdError.data, id: expectedDiscoveryId });
+        }),
       } satisfies DecodedJsonRpcPayload;
     },
     catch: captureError,
@@ -309,7 +326,10 @@ async function enforceModernJsonResponse(
     };
   }
 
-  const decoded = decodeJsonRpcPayload(text);
+  const decoded = decodeJsonRpcPayload(
+    text,
+    request.method === "server/discover" ? request.id : undefined,
+  );
   if (!decoded) {
     return {
       discoveryState: request.method === "server/discover" ? "blocked" : undefined,
@@ -341,7 +361,7 @@ async function enforceModernDiscoveryFailureResponse(
     catch: captureError,
   });
   const decoded = read.match({
-    ok: decodeJsonRpcPayload,
+    ok: (text) => decodeJsonRpcPayload(text, request.id),
     err: () => undefined,
   });
   const discoveryState = decoded
@@ -448,7 +468,10 @@ function enforceModernSseEvent(
   const dataLines = lines.filter((line) => line.startsWith("data:"));
   if (dataLines.length === 0) return { eventBlock, responseSeen: false };
   const data = dataLines.map((line) => line.slice("data:".length).trimStart()).join("\n");
-  const decoded = decodeJsonRpcPayload(data);
+  const decoded = decodeJsonRpcPayload(
+    data,
+    request.method === "server/discover" ? request.id : undefined,
+  );
   const enforced = decoded ? enforceModernPayload(decoded, request, false) : undefined;
   const discoveryState =
     request.method === "server/discover" && decoded

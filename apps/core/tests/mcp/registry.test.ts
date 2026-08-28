@@ -537,7 +537,7 @@ describe("McpRegistry startup and discovery", () => {
               return Response.json(
                 {
                   jsonrpc: "2.0",
-                  id: message.id,
+                  id: null,
                   error: { code: -32000, message: "Server not initialized" },
                 },
                 { status: 400 },
