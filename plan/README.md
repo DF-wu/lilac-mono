@@ -7,7 +7,7 @@ facts are incorporated into those documents and remain available in Git history.
 
 ## Active
 
-There are no active repository-wide implementation plans.
+No repository-wide implementation plans are active.
 
 Only plans listed under **Active** are repository-wide implementation plans. A task-specific plan is
 authoritative only when the user explicitly approves it for that task.
