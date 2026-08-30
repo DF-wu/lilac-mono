@@ -33,9 +33,9 @@ Current Core configuration is documented in
 
 1. Authenticated Discord gateway ingress publishes normalized adapter events to the typed bus. Verified GitHub webhooks can create request messages directly.
 2. The Discord router converts eligible adapter events into `cmd.request.message` commands. Visible Discord attachments become structured `resource://` parts before publication. A request is the unit of agent work; `prompt`, `steer`, `followUp`, and `interrupt` describe admission into a session's active work.
-3. The bus agent runner serializes work per session, uses the shared AI SDK agent and a run-scoped toolset, publishes request lifecycle events, and streams output on `out.req.<request_id>`.
-4. A registered surface relay consumes the request output stream and renders it to Discord or GitHub. Relay state can be snapshotted for bounded graceful-restart recovery.
-5. The durable workflow engine uses the same request bus for child-agent operations while keeping journals, triggers, waits, receipts, and progress projection independent of a request's output relay.
+3. The request-delivery store durably accepts each prompt or control. The bus agent runner serializes accepted work per session, checkpoints every active primary or subagent run in the agent-run WAL, publishes request lifecycle events, and streams output on `out.req.<request_id>`.
+4. A registered surface relay consumes the request output stream and renders it to Discord or GitHub. Relay state is live and process-local. The relay durably links each created output message. A recovered Discord run edits the latest linked message when it still exists and remains editable, otherwise it publishes a fresh continuation. Stale partial output or duplicate terminal output is still possible after a crash.
+5. The durable workflow engine uses the same request-delivery and agent-runner path for child-agent operations. Workflow journals, triggers, waits, receipts, and progress remain owned by the workflow engine.
 
 `packages/event-bus/lilac-spec.ts` is the canonical event catalog and payload schema. `request_id`, `session_id`, and `request_client` are the correlation headers; request and output contracts require a request ID where specified by that catalog.
 
@@ -92,7 +92,7 @@ Three concepts must remain distinct:
 - `BUILTIN_SURFACE_PROTOCOLS` in `apps/core/src/surface/builtin-surface-protocols.ts` is the exhaustive static catalog for the closed `SessionRef`/`MsgRef` platforms, currently Discord and GitHub. It owns protocol-specific ref construction, request-ID interpretation, and tool target projection. Catalog membership does not enable a surface or grant trust.
 - `SurfaceRuntimeRegistry` in `apps/core/src/surface/runtime-descriptor.ts` contains the executable descriptors installed in one Core process. A descriptor explicitly contributes an adapter and optional adapter ingress, request ingress, relay, workflow-progress, and health ports. Resolution is exact; it is not inferred from the wire enum or static catalog.
 
-The registry binds one produced-ref-guarded adapter facade and passes that facade to descriptor ports. Caller refs and adapter-produced refs are checked before shared publication, persistence, relay recovery, or workflow progress. Workflow progress additionally gates exact target, binding, and ref correlation and persists permanent-versus-retryable operation policy. The registry is internal composition, not a dynamic surface plugin API.
+The registry binds one produced-ref-guarded adapter facade and passes that facade to descriptor ports. Caller refs and adapter-produced refs are checked before shared publication, persistence, or workflow progress. Workflow progress additionally gates exact target, binding, and ref correlation and persists permanent-versus-retryable operation policy. The registry is internal composition, not a dynamic surface plugin API.
 
 Discord owns its gateway ingress, allowlists, mention/active router, local cache/search/thread services, and Discord rendering. GitHub owns webhook verification, trigger parsing, API authentication, acknowledgement state, pagination, and GitHub rendering. Shared code must not infer that a wire-valid platform has those capabilities.
 
@@ -184,7 +184,7 @@ Workflow SQLite state is authoritative for execution and recovery. Do not reintr
 
 - Operator-managed configuration and extensions: Core/MCP config, prompt workspace, skills, plugins, custom commands, personal workflow definitions, and the default tool workspace.
 - Secrets and credentials under `secret/`. Tool denylists and redaction reduce accidents, but same-user native code can bypass them; the directory is not an OS security boundary.
-- SQLite state for Discord cache/search and conversation threads, discovery, agent transcripts and continuation bindings, workflows, and graceful-restart snapshots. The workflow database path may be selected separately by `SQLITE_URL`.
+- SQLite state for Discord cache/search and conversation threads, discovery, agent transcripts and continuation bindings, workflows, durable request delivery, and the agent-run WAL. The workflow database path may be selected separately by `SQLITE_URL`.
 - Transient or rebuildable artifacts and caches, including bounded tool-result artifacts and filesystem-search caches.
 
 Core-managed opaque bytes live behind `packages/blob-storage`. Domain databases, Redis messages, and
@@ -209,10 +209,20 @@ structured transcript or projection reference is deleted, the URI stops resolvin
 deletes any resource-owned cached blob, then removes the unretained resource row. Failed blob deletion
 leaves the row for a later retry.
 
-Graceful-restart persistence accepts only snapshot v5 with strict stored-message blob references and
-byte-free opaque raw state. Runtime startup never translates legacy snapshots. The single offline blob
-migration command validates and discards one exact v1-v4 graceful snapshot as the operator-approved
-preservation exception; malformed, future, or corrupt-current rows remain blocking evidence.
+`request-delivery.db` owns both accepted request work and the agent-run WAL. Accepted work is the recovery
+floor. The WAL stores only the latest replay-safe `StoredMessageV1` checkpoint, recovery-safe lineage,
+retained control outcomes, and active or terminal state. Startup joins both sources while the runner is
+paused, terminalizes terminal heads, restores active heads, and starts accepted work without a head from
+its original messages. Journal corruption resets only journal progress and never rewrites accepted work.
+
+Agent recovery is at-least-once. A crash can repeat model calls, tools, controls, external effects, or a
+terminal surface write. A run becomes terminal when Core initiates its terminal output write. Core does
+not wait for a Discord or GitHub acknowledgement. Discord recovery best-effort reconnects to the latest
+durably linked output message. A missing, deleted, or uneditable message falls back to a fresh reply.
+
+Runtime startup does not open `graceful-restart.db`. Existing files are inert. The offline unified blob
+migration keeps a frozen graceful-snapshot decoder only so it can classify and discard supported legacy
+blob-bearing snapshots; runtime code has no graceful-snapshot import path.
 
 Redis Streams is separate durable bus state. Project workflow source lives in each project's `.lilac/workflows`, outside `DATA_DIR`. The workspace operated on by tools is user data, not Lilac metadata.
 
@@ -249,9 +259,9 @@ Run `bun run lint:architecture` for the semantic and production-syntax architect
 - **Prepare:** establish `DATA_DIR`, configuration, stores, artifact/MCP services, and the built-in surface runtime registry before exposing dependent work.
 - **Admit safely:** install adapter-event and durable wait/action consumers before connecting producers that could emit matching events.
 - **Expose output before execution:** connect and validate registered adapters, establish workflow projection and tool services, then start request ingress and relays before the agent runner can publish replies.
-- **Recover atomically:** when a graceful snapshot exists, start execution paused, preflight every required registered descriptor and live relay, apply restore behind rollbackable gates, conditionally consume the exact persisted row, and only then activate. Unavailable or failed targets leave the snapshot retained; unknown rollback atomicity is a Panic.
+- **Recover accepted work:** start the agent runner paused, load agent-run journal heads, join them to accepted request deliveries, reconcile terminal heads, enqueue active checkpoints and original accepted work, then activate every recovered session queue. Journal failure resets progress or disables journaling for that boot without blocking request recovery.
 - **Enable durable producers:** triggers, workflow execution, heartbeat, and background workers start only when the durable queues or consumers needed to avoid losing their work are available. Overall readiness waits for recovery and the remaining required services, and is withdrawn when critical subscriptions become unhealthy.
-- **Drain before release:** stop ingress and request producers first, drain agent/relay work to a bounded deadline, persist recoverable state, then stop consumers and release surface/store/bus resources. Settle local resource cache fills before closing the shared BlobStore. Surface lifecycle cleanup follows registry ownership and reverse-order release where required; cleanup is best-effort without hiding Panics.
+- **Drain before release:** stop ingress and request producers first, drain agent and relay work to a bounded deadline, then stop consumers and release surface, store, and bus resources. A run interrupted at the drain deadline remains accepted and recovers from its WAL checkpoint or original work. Settle local resource cache fills before closing the shared BlobStore. Surface lifecycle cleanup follows registry ownership and reverse-order release where required; cleanup is best-effort without hiding Panics.
 
 These invariants matter more than a fragile numbered list. Update this section only when the lifecycle contract changes, not when independent setup calls move within a phase.
 

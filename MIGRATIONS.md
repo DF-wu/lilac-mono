@@ -42,6 +42,32 @@ callable itself failed to complete as expected.
 
 ## Core SQLite
 
+### Agent-run WAL and graceful-restart clean cut
+
+Core adds `agent_run_wal_metadata`, `agent_run_wal_events`, and `agent_run_wal_heads` to
+`request-delivery.db`. The request-delivery record remains the durable admission queue. The WAL stores
+replaceable execution progress for every primary and subagent run admitted through the Core bus runner.
+Existing accepted records have no WAL head and recover from their original accepted messages.
+
+This recovery contract is at-least-once. A crash may repeat model calls, tool calls, controls, workflow
+dispatches, external effects, or terminal output. Core records a terminal run after it initiates the
+terminal surface write. Surface delivery after that point is best effort, and recovery does not recreate
+the same Discord or GitHub message.
+
+Checkpoint write failure or a corrupt run payload deletes that run's journal progress. An incompatible
+journal contract recreates only the journal-owned tables. Neither case deletes or rewrites accepted
+request records, and neither blocks startup or new admission. If journal storage remains unavailable
+after a reset attempt, Core disables journaling for that boot and continues from accepted work.
+
+The former runtime graceful-restart snapshot subsystem is removed. Runtime startup does not open,
+import, migrate, or delete `graceful-restart.db`; existing files remain inert. The offline unified blob
+migration retains its frozen decoder only to classify supported historical snapshots during that explicit
+operator command.
+
+Before the first upgrade, stop and drain Core and back up `request-delivery.db` when avoiding duplicate
+effects matters. No graceful snapshot is imported. Work accepted by an older build may restart from its
+original messages if it has no agent-run WAL head.
+
 `discord-search.db` now records URL-free Discord attachment identity metadata in
 `discord_search_message_attachments` and an attachment fingerprint on `discord_search_messages`.
 Existing rows retain an unknown attachment fingerprint and are not backfilled. Newly indexed or updated
@@ -292,14 +318,12 @@ surface projections, total Core-owned blob bytes, and unreferenced blob counts/b
 pruning emits per-owner metadata-pruned diagnostics. These are internal retention/operational
 diagnostics and do not add a `core-config.yaml` key; the config contract remains `configVersion: 2`.
 
-## Graceful Restart Snapshot v5
+## Historical graceful restart snapshot v5
 
-Graceful restart snapshot v5 persists only strict `StoredMessageV1` messages and
-`CorePrimaryLineageV2`. Its opaque `raw` state may retain SuperJSON values such as maps, sets, dates,
-URLs, regular expressions, and bigints, but it rejects `Uint8Array`, `ArrayBuffer`, and other array-buffer
-views at any depth. The runtime reads only valid v5 rows. A v1, v2, v3, or v4 row stops startup with the
-single offline blob-migration command; the command's exact legacy codecs validate and discard that row.
-Malformed, future, corrupt-current, or correlation-invalid snapshots fail closed and remain on disk.
+Snapshot v5 used strict `StoredMessageV1` messages and `CorePrimaryLineageV2`. Runtime recovery no longer
+reads this database. Existing rows remain inert. The offline unified blob migration still recognizes its
+supported historical schemas for explicit discard; malformed, future, corrupt-current, or
+correlation-invalid rows remain blocking evidence for that offline command.
 
 ## Historical Workflow Schema 18
 
