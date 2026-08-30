@@ -1,7 +1,4 @@
-import { captureError } from "../shared/error-capture.js";
-import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
+// Frozen decoder retained only by the offline blob migration.
 import {
   adapterPlatformSchema,
   corePrimaryLineageV2Schema,
@@ -12,36 +9,58 @@ import {
   storedMessageV1Schema,
 } from "@stanley2058/lilac-event-bus";
 import {
-  classifyBunSqliteError,
   CorruptPersistedFields,
   isRecord,
   MalformedSerialization,
-  runBunSqliteTransaction,
   UnsupportedVersion,
   type PersistedDataError,
 } from "@stanley2058/lilac-utils";
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 import SuperJSON from "superjson";
 import { z } from "zod";
 
-import type {
-  AgentRunnerQueueAttempt,
-  AgentRunnerRecoveryEntry,
-  AgentRunnerRecoveryIdentity,
-  AgentRunnerRetainedRequestDelivery,
-} from "../surface/bridge/bus-agent-runner";
+import { captureError } from "../shared/error-capture.js";
 import { parseBufferedForActiveRequestIdFromRaw } from "../surface/bridge/bus-agent-runner/raw";
 import {
   isAuthenticatedRequestProjectionSemanticallyValid,
   isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid,
   type AuthenticatedRequestProjection,
 } from "../surface/authenticated-request";
-import type { BusToAdapterRelaySnapshot } from "../surface/bridge/subscribe-from-bus";
+import type { SurfaceToolStatusUpdate } from "../surface/adapter";
+import type { MsgRef, RegisteredSurfacePlatform } from "../surface/types";
 import { preserveToolPanic } from "../tools/tool-result-adapters";
 
+export type BusToAdapterRelaySnapshot = {
+  requestId: string;
+  sessionId: string;
+  requestClient?: string;
+  platform: RegisteredSurfacePlatform;
+  requestStartedAtMs?: number;
+  routerSessionMode?: "mention" | "active";
+  replyTo?: MsgRef;
+  createdOutputRefs: MsgRef[];
+  activeOutputRefs?: MsgRef[];
+  visibleText: string;
+  totalTextChars?: number;
+  streamTextPrefixChars?: number;
+  streamPhaseBoundaryPrefixChars?: number;
+  streamPhaseBoundaryOffsetChars?: number;
+  streamPhaseBoundaryPrefix?: string;
+  awaitingFinalPhaseBoundaryPrefix?: boolean;
+  textPhase?: "commentary" | "final_answer";
+  commentaryText?: string;
+  finalAnswerText?: string;
+  phaseSegmentsValid?: boolean;
+  reasoning?: {
+    startedAtMs: number;
+    frozenAtMs?: number;
+    detailText: string;
+  };
+  toolStatus: SurfaceToolStatusUpdate[];
+  outCursor?: string;
+};
+
 export const GRACEFUL_RESTART_SNAPSHOT_VERSION = 5 as const;
-export const GRACEFUL_RESTART_OFFLINE_MIGRATION_COMMAND =
-  "bun run migrate:blob-storage -- --config /path/to/core-config.yaml --data-dir /path/to/data";
 
 const GRACEFUL_RESTART_TABLE = "graceful_restart_state";
 const GRACEFUL_RESTART_RECORD_ID = "singleton";
@@ -49,6 +68,56 @@ const GRACEFUL_RESTART_RECORD_ID = "singleton";
 export type OpaqueSuperJsonValue = null | undefined | boolean | number | string | bigint | object;
 
 export type GracefulRestartRawValue = OpaqueSuperJsonValue;
+
+export type AgentRunnerRecoveryIdentity =
+  | {
+      readonly state: "durable";
+      readonly projection: AuthenticatedRequestProjection;
+      readonly assertedSafetyMode: "trusted" | "restricted";
+      readonly parkedEventIds: readonly string[];
+      readonly delegationProof?: {
+        readonly kind: "workflow";
+        readonly runId: string;
+        readonly operationId: string;
+        readonly dispatchEpoch: string;
+      };
+    }
+  | {
+      readonly state: "restricted";
+      readonly reason: "legacy-no-durable-proof" | "missing-cache-proof";
+    };
+
+export type AgentRunnerQueueAttempt = {
+  readonly eventId: string;
+  readonly controlRequestId: string;
+  readonly controlRequestClient: z.output<typeof adapterPlatformSchema>;
+  readonly sessionId: string;
+  readonly kind: "queued-cancellation" | "buffered-absorption";
+  readonly detail: string;
+  readonly controlApplied: boolean;
+  readonly controlIdentity: AgentRunnerRecoveryIdentity;
+  readonly pendingGroups: readonly {
+    readonly publicationIndex: number;
+    readonly requestId: string;
+    readonly requestClient: z.output<typeof adapterPlatformSchema>;
+    readonly targetQueueEntryIds: readonly string[];
+  }[];
+};
+
+type AgentRunnerRetainedRequestDelivery = {
+  readonly requestDeliveryId: string;
+  readonly outcome: {
+    readonly kind:
+      | "completed"
+      | "failed"
+      | "cancelled"
+      | "abandoned"
+      | "publication-failed"
+      | "upload-failed"
+      | "upload-timeout";
+    readonly code?: string;
+  };
+};
 
 export type PersistedGracefulRestartRow = {
   readonly status: string;
@@ -60,70 +129,6 @@ type DecodedGracefulRestartSnapshot = {
   readonly value: GracefulRestartSnapshot | null;
   readonly provenance: "current" | "missing-defaulted";
 };
-
-export type GracefulRestartRowToken = {
-  readonly updatedAt: number;
-  readonly payloadSha256: string;
-};
-
-export type GracefulRestartLoadOutcome =
-  | {
-      readonly state: "loaded";
-      readonly snapshot: GracefulRestartSnapshot;
-      readonly rowToken: GracefulRestartRowToken;
-      readonly provenance: "current";
-    }
-  | {
-      readonly state: "empty";
-      readonly rowToken: GracefulRestartRowToken;
-      readonly provenance: "current";
-    }
-  | {
-      readonly state: "absent";
-      readonly provenance: "missing-defaulted";
-    }
-  | {
-      readonly state: "stale";
-      readonly rowToken: GracefulRestartRowToken;
-      readonly createdAt: number;
-      readonly deadlineMs: number;
-      readonly ageMs: number;
-      readonly provenance: "current";
-    };
-
-export class GracefulRestartSqliteFailure extends TaggedError("GracefulRestartSqliteFailure")<{
-  readonly operation: "clear" | "consume" | "read" | "save";
-  readonly code: string;
-  readonly message: string;
-}> {}
-
-export class GracefulRestartSerializationFailure extends TaggedError(
-  "GracefulRestartSerializationFailure",
-)<{
-  readonly message: string;
-}> {}
-
-export class GracefulRestartDispositionConflict extends TaggedError(
-  "GracefulRestartDispositionConflict",
-)<{
-  readonly message: string;
-}> {}
-
-export class OpaqueSuperJsonValueUnsupported extends TaggedError(
-  "OpaqueSuperJsonValueUnsupported",
-)<{
-  readonly message: string;
-}> {}
-
-export type GracefulRestartSaveError =
-  | CorruptPersistedFields
-  | GracefulRestartSerializationFailure
-  | GracefulRestartSqliteFailure;
-
-export type GracefulRestartLoadError = PersistedDataError | GracefulRestartSqliteFailure;
-export type GracefulRestartConsumeError =
-  | GracefulRestartDispositionConflict
-  | GracefulRestartSqliteFailure;
 
 const finiteNonNegativeSchema = z.number().finite().nonnegative();
 const finitePositiveSchema = z.number().finite().positive();
@@ -189,57 +194,6 @@ function containsManagedOpaqueBytes(
       return true;
   }
   return false;
-}
-
-export function decodeOpaqueSuperJsonValue(
-  value: unknown,
-): ResultType<OpaqueSuperJsonValue, OpaqueSuperJsonValueUnsupported> {
-  if (!isOpaqueSuperJsonValue(value)) {
-    return Result.err(
-      new OpaqueSuperJsonValueUnsupported({
-        message: "Opaque graceful restart value is not supported by SuperJSON",
-      }),
-    );
-  }
-  {
-    const captured = Result.try({
-      try: () => {
-        if (containsManagedOpaqueBytes(value)) {
-          return Result.err(
-            new OpaqueSuperJsonValueUnsupported({
-              message: "Opaque graceful restart value cannot contain managed inline bytes",
-            }),
-          );
-        }
-        const serialized = SuperJSON.stringify(value);
-        const roundTripped: unknown = SuperJSON.parse(serialized);
-        if (
-          !isOpaqueSuperJsonValue(roundTripped) ||
-          containsManagedOpaqueBytes(roundTripped) ||
-          !isDeepStrictEqual(roundTripped, value)
-        ) {
-          return Result.err(
-            new OpaqueSuperJsonValueUnsupported({
-              message: "Opaque graceful restart value cannot be preserved exactly by SuperJSON",
-            }),
-          );
-        }
-        return Result.ok(value);
-      },
-      catch: captureError,
-    });
-
-    if (captured.isErr()) {
-      const cause = captured.error.cause;
-      preserveToolPanic(cause);
-      return Result.err(
-        new OpaqueSuperJsonValueUnsupported({
-          message: "Opaque graceful restart value cannot be serialized safely by SuperJSON",
-        }),
-      );
-    }
-    return captured.value;
-  }
 }
 
 const opaqueSuperJsonValueSchema = z.custom<OpaqueSuperJsonValue>(isOpaqueSuperJsonValue);
@@ -435,10 +389,6 @@ export type GracefulRestartSnapshot = {
   agent: GracefulRestartAgentRecoveryEntry[];
   queueAttempts: AgentRunnerQueueAttempt[];
   relays: BusToAdapterRelaySnapshot[];
-};
-
-export type GracefulRestartSnapshotInput = Omit<GracefulRestartSnapshot, "agent"> & {
-  readonly agent: AgentRunnerRecoveryEntry[];
 };
 
 const relayMsgRefSchema = z.strictObject({
@@ -783,305 +733,6 @@ export function decodeGracefulRestartSnapshot(
     },
   });
   return continueParsed();
-}
-
-function encodeGracefulRestartSnapshot(
-  snapshot: GracefulRestartSnapshotInput,
-): ResultType<string, CorruptPersistedFields | GracefulRestartSerializationFailure> {
-  {
-    const captured = Result.try({
-      try: () => {
-        for (const entry of snapshot.agent) {
-          if (entry.raw === undefined) continue;
-          const opaque = decodeOpaqueSuperJsonValue(entry.raw);
-          if (!opaque.match({ ok: () => true, err: () => false })) {
-            return {
-              kind: "result",
-              result: Result.err(
-                corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json"),
-              ),
-            } as const;
-          }
-        }
-        const payloadJson = SuperJSON.stringify(snapshot);
-        const validated = decodeGracefulRestartSnapshot({
-          status: "completed",
-          payload_json: payloadJson,
-        });
-        return validated.match<
-          | {
-              readonly kind: "result";
-              readonly result: ResultType<string, CorruptPersistedFields>;
-            }
-          | {
-              readonly kind: "panic";
-              readonly error: import("better-result").InferErr<typeof validated>;
-            }
-        >({
-          err: (error) =>
-            error instanceof CorruptPersistedFields
-              ? ({ kind: "result", result: Result.err(error) } as const)
-              : ({ kind: "panic", error } as const),
-          ok: (value) => ({
-            kind: "result",
-            result: isDeepStrictEqual(value.value, snapshot)
-              ? Result.ok(payloadJson)
-              : Result.err(corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json")),
-          }),
-        });
-      },
-      catch: captureError,
-    });
-
-    if (captured.isErr()) {
-      const cause = captured.error.cause;
-      preserveToolPanic(cause);
-      return Result.err(
-        new GracefulRestartSerializationFailure({
-          message: "Graceful restart snapshot serialization failed",
-        }),
-      );
-    }
-    const encoded = captured.value;
-    if (encoded.kind === "panic") {
-      preserveToolPanic(
-        new Panic({
-          message: "Graceful restart current snapshot encoding produced an invalid envelope",
-          cause: encoded.error,
-        }),
-      );
-    }
-    return encoded.result;
-  }
-}
-
-function classifySqliteFailure(
-  operation: GracefulRestartSqliteFailure["operation"],
-  cause: Error,
-): GracefulRestartSqliteFailure | undefined {
-  const sqliteError = classifyBunSqliteError(cause);
-  if (sqliteError === undefined) return undefined;
-  return new GracefulRestartSqliteFailure({
-    operation,
-    code: sqliteError.code,
-    message: `Graceful restart SQLite ${operation} failed`,
-  });
-}
-
-function loadOutcome(
-  decoded: DecodedGracefulRestartSnapshot,
-  nowMs: number,
-  rowToken?: GracefulRestartRowToken,
-): GracefulRestartLoadOutcome {
-  if (decoded.value === null) {
-    return { state: "absent", provenance: "missing-defaulted" };
-  }
-
-  const { value: snapshot } = decoded;
-  if (!rowToken) {
-    signalMissingGracefulRestartDispositionToken();
-  }
-  const provenance = "current" as const;
-  const ageMs = Math.max(0, nowMs - snapshot.createdAt);
-  if (nowMs - snapshot.createdAt > snapshot.deadlineMs) {
-    return {
-      state: "stale",
-      rowToken,
-      createdAt: snapshot.createdAt,
-      deadlineMs: snapshot.deadlineMs,
-      ageMs,
-      provenance,
-    };
-  }
-  if (snapshot.agent.length === 0 && snapshot.relays.length === 0) {
-    return { state: "empty", rowToken, provenance };
-  }
-  return { state: "loaded", snapshot, rowToken, provenance };
-}
-
-function signalMissingGracefulRestartDispositionToken(): never {
-  throw new Panic({
-    message: "Decoded graceful restart row is missing its disposition token",
-  });
-}
-
-function signalGracefulRestartOfflineMigrationRequired(): never {
-  throw new Error(
-    `Graceful restart state requires offline blob migration. Run: ${GRACEFUL_RESTART_OFFLINE_MIGRATION_COMMAND}`,
-  );
-}
-
-function rowToken(row: PersistedGracefulRestartRow): GracefulRestartRowToken | null {
-  if (row.updated_ts === undefined || !Number.isSafeInteger(row.updated_ts)) return null;
-  return {
-    updatedAt: row.updated_ts,
-    payloadSha256: createHash("sha256")
-      .update(row.status)
-      .update("\u0000")
-      .update(row.payload_json)
-      .digest("hex"),
-  };
-}
-
-export class SqliteGracefulRestartStore {
-  private readonly db: Database;
-
-  constructor(dbPath: string) {
-    this.db = new Database(dbPath);
-    this.migrate();
-    const acceptsCurrentSnapshot = this.acceptsCurrentSnapshot().match({
-      ok: () => true,
-      err: () => false,
-    });
-    if (!acceptsCurrentSnapshot) {
-      const closed = Result.try({ try: () => this.db.close(), catch: captureError });
-      const settleClose = closed.match<() => void>({
-        ok: () => () => undefined,
-        err: (failure) => () => preserveToolPanic(failure.cause),
-      });
-      settleClose();
-      signalGracefulRestartOfflineMigrationRequired();
-    }
-  }
-
-  close(): void {
-    this.db.close();
-  }
-
-  clear(): ResultType<void, GracefulRestartSqliteFailure> {
-    return runBunSqliteTransaction(
-      this.db,
-      () => {
-        this.db.run("DELETE FROM graceful_restart_state");
-        return Result.ok(undefined);
-      },
-      (cause) => classifySqliteFailure("clear", cause),
-    );
-  }
-
-  saveCompletedSnapshot(
-    snapshot: GracefulRestartSnapshotInput,
-  ): ResultType<void, GracefulRestartSaveError> {
-    return encodeGracefulRestartSnapshot(snapshot).andThen((encoded) =>
-      runBunSqliteTransaction(
-        this.db,
-        () => {
-          this.db.run(
-            `
-          INSERT INTO graceful_restart_state (
-            singleton_id,
-            status,
-            updated_ts,
-            payload_json
-          ) VALUES (?, ?, ?, ?)
-          ON CONFLICT(singleton_id) DO UPDATE SET
-            status=excluded.status,
-            updated_ts=excluded.updated_ts,
-            payload_json=excluded.payload_json
-          `,
-            [1, "completed", Date.now(), encoded],
-          );
-          return Result.ok(undefined);
-        },
-        (cause) => classifySqliteFailure("save", cause),
-      ),
-    );
-  }
-
-  readCompletedSnapshot(
-    nowMs: number = Date.now(),
-  ): ResultType<GracefulRestartLoadOutcome, GracefulRestartLoadError> {
-    const read = runBunSqliteTransaction(
-      this.db,
-      () => {
-        const row = this.db
-          .query<PersistedGracefulRestartRow, [number]>(
-            "SELECT status, updated_ts, payload_json FROM graceful_restart_state WHERE singleton_id = ?",
-          )
-          .get(1);
-        return Result.ok(row);
-      },
-      (cause) => classifySqliteFailure("read", cause),
-    );
-    const continueRead = read.match<
-      () => ResultType<GracefulRestartLoadOutcome, GracefulRestartLoadError>
-    >({
-      err: (error) => () => Result.err(error),
-      ok: (row) => () => {
-        const token = row ? rowToken(row) : undefined;
-        if (row && !token) return Result.err(corruptSnapshot(-1, "payload_json"));
-        const decoded = decodeGracefulRestartSnapshot(row);
-        const continueDecoded = decoded.match<
-          () => ResultType<GracefulRestartLoadOutcome, GracefulRestartLoadError>
-        >({
-          err: (error) => () => Result.err(error),
-          ok: (value) => () => Result.ok(loadOutcome(value, nowMs, token ?? undefined)),
-        });
-        return continueDecoded();
-      },
-    });
-    return continueRead();
-  }
-
-  consumeCompletedSnapshot(
-    token: GracefulRestartRowToken,
-  ): ResultType<void, GracefulRestartConsumeError> {
-    return runBunSqliteTransaction(
-      this.db,
-      () => {
-        const current = this.db
-          .query<PersistedGracefulRestartRow, [number]>(
-            "SELECT status, updated_ts, payload_json FROM graceful_restart_state WHERE singleton_id = ?",
-          )
-          .get(1);
-        const currentToken = current ? rowToken(current) : null;
-        if (
-          !currentToken ||
-          currentToken.updatedAt !== token.updatedAt ||
-          currentToken.payloadSha256 !== token.payloadSha256
-        ) {
-          return Result.err(
-            new GracefulRestartDispositionConflict({
-              message: "Graceful restart row changed before disposition",
-            }),
-          );
-        }
-        const deleted = this.db.run(
-          "DELETE FROM graceful_restart_state WHERE singleton_id = ? AND updated_ts = ?",
-          [1, token.updatedAt],
-        );
-        if (deleted.changes !== 1) {
-          return Result.err(
-            new GracefulRestartDispositionConflict({
-              message: "Graceful restart row changed during disposition",
-            }),
-          );
-        }
-        return Result.ok(undefined);
-      },
-      (cause) => classifySqliteFailure("consume", cause),
-    );
-  }
-
-  private migrate(): void {
-    this.db.run(`
-      CREATE TABLE IF NOT EXISTS graceful_restart_state (
-        singleton_id INTEGER PRIMARY KEY,
-        status TEXT NOT NULL,
-        updated_ts INTEGER NOT NULL,
-        payload_json TEXT NOT NULL
-      )
-    `);
-  }
-
-  private acceptsCurrentSnapshot(): ResultType<void, PersistedDataError> {
-    const row = this.db
-      .query<Pick<PersistedGracefulRestartRow, "payload_json" | "status">, [number]>(
-        "SELECT status, payload_json FROM graceful_restart_state WHERE singleton_id = ?",
-      )
-      .get(1);
-    return decodeGracefulRestartSnapshot(row).map(() => undefined);
-  }
 }
 
 const fixtureSnapshot = {

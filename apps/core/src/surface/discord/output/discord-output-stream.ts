@@ -55,11 +55,7 @@ import {
 import { renderMarkdownTablesAsCodeBlocks } from "../../../shared/markdown-table-renderer";
 import { buildCancelCustomId } from "../discord-cancel";
 import { isTextSendableChannel, type SendableDiscordChannel } from "../discord-channel-guards";
-import {
-  captureDiscordSurfaceError,
-  classifyDiscordSurfaceError,
-  classifyDiscordSurfaceNotFound,
-} from "../discord-adapter";
+import { captureDiscordSurfaceError, classifyDiscordSurfaceError } from "../discord-adapter";
 
 function asDiscordMsgRef(channelId: string, messageId: string): MsgRef {
   return { platform: "discord", channelId, messageId };
@@ -607,57 +603,6 @@ async function fetchTextChannelResult(
   return Result.ok(ch);
 }
 
-async function fetchExistingMessagesForResume(params: {
-  channel: Channel & SendableDiscordChannel;
-  channelId: string;
-  refs: readonly MsgRef[];
-}): Promise<Message[]> {
-  const { channel, channelId, refs } = params;
-  if (refs.length === 0) return [];
-
-  if (!("messages" in channel) || typeof channel.messages?.fetch !== "function") {
-    return [];
-  }
-  const messagesApi = channel.messages;
-
-  const out: Message[] = [];
-  const seen = new Set<string>();
-
-  for (const ref of refs) {
-    if (ref.platform !== "discord") continue;
-    if (ref.channelId !== channelId) continue;
-    if (seen.has(ref.messageId)) continue;
-
-    const fetched = await Result.tryPromise({
-      try: () => messagesApi.fetch(ref.messageId),
-      catch: captureDiscordSurfaceError,
-    });
-    const outcome = fetched.match<
-      | { readonly kind: "message"; readonly msg: Message }
-      | { readonly kind: "continue" }
-      | { readonly kind: "failure"; readonly cause: Error | Panic }
-    >({
-      ok: (msg) => ({ kind: "message", msg }),
-      err: (cause) => {
-        if (Panic.is(cause)) return { kind: "failure", cause };
-        if (classifyDiscordSurfaceNotFound(cause)) return { kind: "continue" };
-        return { kind: "failure", cause };
-      },
-    });
-    if (outcome.kind === "failure") {
-      adaptDiscordOutputResultToHost(Result.err(outcome.cause));
-      continue;
-    }
-    if (outcome.kind === "continue") continue;
-    const msg = outcome.msg;
-
-    seen.add(ref.messageId);
-    out.push(msg);
-  }
-
-  return out;
-}
-
 function toDiscordFiles(attachments: readonly SurfaceAttachment[]): MessageCreateOptions["files"] {
   if (attachments.length === 0) return undefined;
 
@@ -1020,6 +965,25 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
     const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
     const channel = adaptDiscordOutputResultToHost(channelResult);
+    let recoveredMessage: Message | null = null;
+    const resumeAt = this.deps.opts?.resumeAt;
+    if (
+      resumeAt?.platform === "discord" &&
+      resumeAt.channelId === discordSessionRef.channelId &&
+      "messages" in channel &&
+      channel.messages?.fetch
+    ) {
+      const fetched = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => channel.messages.fetch(resumeAt.messageId),
+          catch: (cause) =>
+            Panic.is(cause)
+              ? { kind: "panic", panic: cause, fallback: null }
+              : { kind: "fallback", fallback: null },
+        }),
+      );
+      recoveredMessage = fetched.match({ ok: (message) => message, err: () => null });
+    }
 
     // Delay creating the first message until either:
     // - we have something to display (text/action), or
@@ -1047,25 +1011,26 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       return [row];
     };
 
-    const resumedMessages = await fetchExistingMessagesForResume({
-      channel,
-      channelId: discordSessionRef.channelId,
-      refs: this.deps.opts?.resume?.created ?? [],
-    });
-    const resumed = resumedMessages.length > 0;
-    const resumedFirst = resumedMessages[0];
-    if (resumed) {
-      const seen = new Set<string>();
-      for (const m of resumedMessages) {
-        if (seen.has(m.id)) continue;
-        seen.add(m.id);
-        const ref = asDiscordMsgRef(discordSessionRef.channelId, m.id);
-        this.created.push(ref);
-        this.trackTransientPreviewRef(ref);
-      }
-      this.firstMsg = resumedFirst ?? null;
-      this.lastMsg = resumedMessages[resumedMessages.length - 1] ?? null;
-    }
+    const registerFirstMessage = (message: Message): void => {
+      const ref = asDiscordMsgRef(discordSessionRef.channelId, message.id);
+      this.created.push(ref);
+      this.trackTransientPreviewRef(ref);
+      this.notifyCreated(ref);
+      this.firstMsg = message;
+      this.lastMsg = message;
+    };
+
+    const claimRecoveredMessage = async (
+      options: Parameters<Message["edit"]>[0],
+    ): Promise<Message | null> => {
+      const message = recoveredMessage;
+      recoveredMessage = null;
+      if (!message) return null;
+      const edited = await safeEdit(message, options);
+      if (!edited) return null;
+      registerFirstMessage(message);
+      return message;
+    };
 
     // When the preview has no displayable text or progress, use one placeholder instead of
     // starting an embed pusher that has nothing to create yet.
@@ -1080,7 +1045,11 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       this.statsForNerdsLine === null
     ) {
       const first =
-        resumedFirst ??
+        (await claimRecoveredMessage({
+          content: "*Replying...*",
+          embeds: [],
+          components: buildCancelComponents(true),
+        })) ??
         (await channel.send({
           content: "*Replying...*",
           reply:
@@ -1090,14 +1059,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           components: buildCancelComponents(true),
           allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: false }),
         }));
-      if (!resumed) {
-        const ref = asDiscordMsgRef(discordSessionRef.channelId, first.id);
-        this.created.push(ref);
-        this.trackTransientPreviewRef(ref);
-        this.notifyCreated(ref);
-      }
-      this.firstMsg = first;
-      this.lastMsg = first;
+      if (!this.firstMsg) registerFirstMessage(first);
       this.running = Promise.resolve();
       return;
     }
@@ -1119,16 +1081,15 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     this.running = (async () => {
       const pushed = await startEmbedPusher({
         createFirst: async (emb) => {
-          if (resumedFirst) {
-            await safeEdit(resumedFirst, {
-              content: "",
-              embeds: [emb],
-              components: buildCancelComponents(true),
-            });
+          const recovered = await claimRecoveredMessage({
+            content: null,
+            embeds: [emb],
+            components: buildCancelComponents(true),
+          });
+          if (recovered) {
             firstMessageReady.resolve();
-            return resumedFirst;
+            return recovered;
           }
-
           const first = await channel.send({
             embeds: [emb],
             reply:
@@ -1138,11 +1099,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
             components: buildCancelComponents(true),
             allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: false }),
           });
-          const ref = asDiscordMsgRef(discordSessionRef.channelId, first.id);
-          this.firstMsg = first;
-          this.created.push(ref);
-          this.trackTransientPreviewRef(ref);
-          this.notifyCreated(ref);
+          registerFirstMessage(first);
           firstMessageReady.resolve();
           return first;
         },
@@ -1200,17 +1157,6 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     part: SurfaceOutputPart,
   ): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>> {
     return await captureDiscordOutputOperation("push-output", () => this.pushOutput(part));
-  }
-
-  hydrateRecovery(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition {
-    let disposition: SurfaceOutputPartDisposition = "ignored";
-    for (const part of parts) {
-      const applied = this.applyOutputPartLocally(part);
-      if (applied === "visible" || (applied === "terminal" && disposition === "ignored")) {
-        disposition = applied;
-      }
-    }
-    return disposition;
   }
 
   private async pushOutput(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition> {

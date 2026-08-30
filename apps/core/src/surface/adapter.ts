@@ -197,7 +197,6 @@ export type SurfaceMergeBlockPlanOptions = {
 };
 
 export interface SurfaceOutputStream {
-  hydrateRecovery?(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition;
   push(part: SurfaceOutputPart): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>>;
   finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>>;
   abort(reason?: string): Promise<SurfaceOperationResult<void>>;
@@ -210,9 +209,9 @@ export interface SurfaceOutputStream {
 }
 
 export type StartOutputOpts = {
-  /** Internal preparation mode for recovery admission before snapshot disposition. */
-  preparationMode?: "paused-recovery";
   replyTo?: MsgRef;
+  /** Existing output message to edit when reconnecting a recovered stream. */
+  resumeAt?: MsgRef;
   /** Disable all Discord notifications for this output stream (mentions + reply ping). */
   silent?: boolean;
   /** Router-derived session mode. Used for surface-specific behaviors (e.g. mention pings). */
@@ -223,11 +222,6 @@ export type StartOutputOpts = {
   requestStartedAtMs?: number;
   /** Optional hook invoked when the surface creates a message for this stream. */
   onMessageCreated?: (msgRef: MsgRef) => void;
-  /** Optional resume metadata used to continue editing an existing output chain. */
-  resume?: {
-    /** Previously created output messages for this request (oldest to newest). */
-    created: MsgRef[];
-  };
 };
 
 export type AdapterSubscription = {

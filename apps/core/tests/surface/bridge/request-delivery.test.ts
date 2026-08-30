@@ -17,7 +17,6 @@ import {
   type RawBus,
   type RawDeliveryHandler,
   type RawMessageDecodeOutcome,
-  type RawOutputStreamExpiry,
   type SubscriptionOptions,
 } from "@stanley2058/lilac-event-bus";
 import { Result, type Result as ResultType } from "better-result";
@@ -29,9 +28,9 @@ import {
   collectCoreRequestInputHandles,
   coreRequestDeliveryCodecs,
   createCoreRequestDeliveryAdmission,
-  createCoreRequestOutputReplayRecovery,
   createDurableCoreRequestBus,
   createLilacBusRequestDeliveryPublisher,
+  createRequestDeliveryPostCommitObserver,
   type CorePreparedRequestEnvelope,
   type CoreRequestOutputMetadata,
   type CoreAcceptedRequestWork,
@@ -136,102 +135,6 @@ function publicationClaimMethods() {
       return Result.ok("abandoned" as const);
     },
   };
-}
-
-function outputReplayBus(input: {
-  readonly requestId: string;
-  readonly terminalRequestDeliveryId: string;
-  readonly terminalOutput: boolean;
-  readonly fetchFailure?: Error;
-  readonly expiry?: RawOutputStreamExpiry;
-  readonly expiryFailure?: Error;
-}) {
-  const topic = `out.req.${input.requestId}` as const;
-  const raw: RawBus = {
-    async publish() {
-      return { id: "1-0", cursor: "1-0" };
-    },
-    async subscribe() {
-      return Result.ok({
-        done: Promise.resolve(Result.ok(undefined)),
-        stop: async () => Result.ok(undefined),
-      });
-    },
-    async fetch() {
-      if (input.fetchFailure) throw input.fetchFailure;
-      return {
-        messages: input.terminalOutput
-          ? [
-              {
-                cursor: "1-0",
-                msg: {
-                  topic,
-                  id: "1-0",
-                  type: lilacEventTypes.EvtAgentOutputResponseText,
-                  ts: 1,
-                  key: input.requestId,
-                  headers: {
-                    request_id: input.requestId,
-                    request_delivery_id: input.terminalRequestDeliveryId,
-                  },
-                  data: { finalText: "finished" },
-                },
-              },
-            ]
-          : [],
-      };
-    },
-    async readOutputStreamExpiry() {
-      if (input.expiryFailure) throw input.expiryFailure;
-      return input.expiry ?? { kind: "absent" };
-    },
-    async close() {},
-  };
-  return createLilacBus(raw);
-}
-
-async function acceptRequestWithOutput(input: {
-  readonly store: ReturnType<typeof createStore>;
-  readonly blobs: BlobStore;
-  readonly requestDeliveryId: string;
-  readonly requestId: string;
-}) {
-  const preparedEnvelope = envelope(input);
-  value(
-    input.store.prepare({
-      ...input,
-      envelope: preparedEnvelope,
-      inputHandles: [],
-      createdAt: 1,
-    }),
-  );
-  const delivery = coordinator({
-    store: input.store,
-    blobStore: input.blobs,
-    now: () => 2,
-  });
-  value(await delivery.handleDelivery(input.requestDeliveryId));
-  const upload = await resultValue(
-    input.blobs.startUpload({
-      source: new TextEncoder().encode("recovered output"),
-      retention: { kind: "durable" },
-    }),
-  );
-  value(
-    delivery.registerOutputHandle({
-      requestDeliveryId: input.requestDeliveryId,
-      handle: upload.handle,
-      metadata: { mimeType: "text/plain" },
-    }),
-  );
-  const reference = await resultValue(upload.completion);
-  value(
-    delivery.recordOutputReference({
-      requestDeliveryId: input.requestDeliveryId,
-      reference,
-    }),
-  );
-  return { delivery, reference };
 }
 
 describe("durable request delivery", () => {
@@ -508,7 +411,10 @@ describe("durable request delivery", () => {
       const preparedEnvelope = envelope({ requestDeliveryId, requestId });
       const delivery = coordinator({ store, blobStore: blobs, now: () => 2 });
       let publications = 0;
-      const confirmations: Array<{ requestDeliveryId: string; streamId: string }> = [];
+      const confirmations: Array<{
+        requestDeliveryId: string;
+        streamId: string;
+      }> = [];
       const streamId = `race:${terminalBeforeReceipt}`;
       const outcome = value(
         await delivery.prepareAndPublish(
@@ -1124,6 +1030,72 @@ describe("durable request delivery", () => {
     await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
   });
 
+  test("accepts a lagging fanout commit after terminal tombstone cleanup", async () => {
+    const store = createStore();
+    const blobs = await memoryBlobStore();
+    const requestDeliveryId = crypto.randomUUID();
+    const requestId = "request-lagging-fanout";
+    const streamId = "100-0";
+    const preparedEnvelope = envelope({ requestDeliveryId, requestId });
+    value(
+      store.prepare({
+        requestDeliveryId,
+        requestId,
+        envelope: preparedEnvelope,
+        inputHandles: [],
+        createdAt: 1,
+      }),
+    );
+    const delivery = coordinator({ store, blobStore: blobs, now: () => 2 });
+    value(await delivery.handleDelivery(requestDeliveryId));
+    value(
+      await delivery.terminalize({
+        requestDeliveryId,
+        outcome: { kind: "cancelled" },
+        transportCommitRequired: true,
+      }),
+    );
+    value(delivery.observeTransportCommit(requestDeliveryId, streamId));
+    expect(value(await delivery.maintain({ now: 10 })).tombstonesDeleted).toBe(1);
+
+    const observer = createRequestDeliveryPostCommitObserver({
+      observeTransportCommit: (deliveryId, observedStreamId) =>
+        delivery.observeTransportCommit(deliveryId, observedStreamId),
+    });
+    const observed = await observer.observe(
+      {
+        topic: "cmd.request",
+        id: streamId,
+        type: lilacEventTypes.CmdRequestMessage,
+        ts: 10,
+        key: requestId,
+        headers: preparedEnvelope.headers,
+        data: preparedEnvelope.data,
+      },
+      {
+        cursor: streamId,
+        mode: "fanout",
+        evidence: {
+          source: {
+            transport: "redis-streams",
+            streamKey: "cmd.request",
+            topic: "cmd.request",
+            messageId: streamId,
+          },
+          wire: { kind: "bounded-complete", fields: [] },
+        },
+        deliveryId: "0".repeat(64),
+        attempt: 1,
+        leaseDeadline: 1_000,
+        signal: new AbortController().signal,
+      },
+    );
+
+    expect(value(observed)).toBeUndefined();
+    store.close();
+    await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
+  });
+
   test("exhausts recovery pages without a published prefix starving later work", async () => {
     const store = createStore();
     const blobs = await memoryBlobStore();
@@ -1351,19 +1323,24 @@ describe("durable request delivery", () => {
     await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
   });
 
-  test("recovers a crash after final output XADD from the authoritative replay expiry", async () => {
+  test("uses a terminal journal head as execution authority without resuming the agent", async () => {
     const store = createStore();
     const blobs = await memoryBlobStore();
     const requestDeliveryId = crypto.randomUUID();
-    const requestId = "request-final-output-recovery";
-    const { delivery } = await acceptRequestWithOutput({
-      store,
-      blobs,
-      requestDeliveryId,
-      requestId,
-    });
-    value(delivery.observeTransportCommit(requestDeliveryId, "transport:final-output"));
+    const requestId = "request-terminal-journal-recovery";
+    value(
+      store.prepare({
+        requestDeliveryId,
+        requestId,
+        envelope: envelope({ requestDeliveryId, requestId }),
+        inputHandles: [],
+        createdAt: 1,
+      }),
+    );
+    const delivery = coordinator({ store, blobStore: blobs, now: () => 2 });
+    value(await delivery.handleDelivery(requestDeliveryId));
     let resumes = 0;
+
     const recovered = value(
       await delivery.recoverAccepted(
         async () => {
@@ -1371,15 +1348,13 @@ describe("durable request delivery", () => {
           return Result.ok(undefined);
         },
         {
-          outputReplay: createCoreRequestOutputReplayRecovery(
-            outputReplayBus({
-              requestId,
-              terminalRequestDeliveryId: requestDeliveryId,
-              terminalOutput: true,
-              expiry: { kind: "present", expiresAt: 5_000 },
-            }),
-          ),
-          isOutputReplayEligible: () => true,
+          terminalRecovery: (record) =>
+            record.requestDeliveryId === requestDeliveryId
+              ? {
+                  outcome: { kind: "completed", code: "journal-terminal" },
+                  finalReplayDeadline: 5_000,
+                }
+              : undefined,
         },
       ),
     );
@@ -1387,267 +1362,14 @@ describe("durable request delivery", () => {
     expect(recovered).toMatchObject({
       resumed: 0,
       terminalized: 1,
-      uncertainties: [],
+      failures: [],
     });
     expect(resumes).toBe(0);
-    const terminal = value(store.load(requestDeliveryId));
-    expect(terminal).toMatchObject({
+    expect(value(store.load(requestDeliveryId))).toMatchObject({
       state: "terminal",
-      outcome: { kind: "completed", code: "recovered-final-output" },
+      outcome: { kind: "completed", code: "journal-terminal" },
       finalReplayDeadline: 5_000,
     });
-    store.close();
-    await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
-  });
-
-  test("recovers terminal prompt work without outputs but never mistakes a control for that run", async () => {
-    const store = createStore();
-    const blobs = await memoryBlobStore();
-    const requestId = "request-shared-terminal-output";
-    const promptDeliveryId = crypto.randomUUID();
-    const controlDeliveryIds = [
-      crypto.randomUUID(),
-      crypto.randomUUID(),
-      crypto.randomUUID(),
-    ] as const;
-    for (const [requestDeliveryId, queue] of [
-      [promptDeliveryId, "prompt"],
-      [controlDeliveryIds[0], "steer"],
-      [controlDeliveryIds[1], "followUp"],
-      [controlDeliveryIds[2], "interrupt"],
-    ] as const) {
-      const preparedEnvelope = envelope({ requestDeliveryId, requestId });
-      preparedEnvelope.data.queue = queue;
-      value(
-        store.prepare({
-          requestDeliveryId,
-          requestId,
-          envelope: preparedEnvelope,
-          inputHandles: [],
-          createdAt: 1,
-        }),
-      );
-    }
-    const delivery = coordinator({ store, blobStore: blobs, now: () => 2 });
-    value(await delivery.handleDelivery(promptDeliveryId));
-    for (const controlDeliveryId of controlDeliveryIds) {
-      value(await delivery.handleDelivery(controlDeliveryId));
-    }
-    const resumed: string[] = [];
-    const recovered = value(
-      await delivery.recoverAccepted(
-        async (record) => {
-          resumed.push(record.requestDeliveryId);
-          return Result.ok(undefined);
-        },
-        {
-          outputReplay: createCoreRequestOutputReplayRecovery(
-            outputReplayBus({
-              requestId,
-              terminalRequestDeliveryId: promptDeliveryId,
-              terminalOutput: true,
-              expiry: { kind: "present", expiresAt: 5_000 },
-            }),
-          ),
-          isOutputReplayEligible: (record) => record.work.data.queue === "prompt",
-        },
-      ),
-    );
-
-    expect(recovered).toMatchObject({ resumed: 3, terminalized: 1 });
-    expect(resumed.toSorted()).toEqual(controlDeliveryIds.toSorted());
-    expect(value(store.load(promptDeliveryId)).state).toBe("terminal");
-    for (const controlDeliveryId of controlDeliveryIds) {
-      expect(value(store.load(controlDeliveryId)).state).toBe("accepted");
-    }
-    store.close();
-    await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
-  });
-
-  test("does not terminalize newer accepted work from an older shared-request response", async () => {
-    const store = createStore();
-    const blobs = await memoryBlobStore();
-    const requestId = "request-follow-up-after-old-response";
-    const oldDeliveryId = crypto.randomUUID();
-    const currentDeliveryId = crypto.randomUUID();
-    value(
-      store.prepare({
-        requestDeliveryId: currentDeliveryId,
-        requestId,
-        envelope: envelope({ requestDeliveryId: currentDeliveryId, requestId }),
-        inputHandles: [],
-        createdAt: 1,
-      }),
-    );
-    const delivery = coordinator({ store, blobStore: blobs, now: () => 2 });
-    value(await delivery.handleDelivery(currentDeliveryId));
-    const resumed: string[] = [];
-    const recovered = value(
-      await delivery.recoverAccepted(
-        async (record) => {
-          resumed.push(record.requestDeliveryId);
-          return Result.ok(undefined);
-        },
-        {
-          outputReplay: createCoreRequestOutputReplayRecovery(
-            outputReplayBus({
-              requestId,
-              terminalRequestDeliveryId: oldDeliveryId,
-              terminalOutput: true,
-              expiry: { kind: "present", expiresAt: 5_000 },
-            }),
-          ),
-          isOutputReplayEligible: () => true,
-        },
-      ),
-    );
-    expect(recovered).toMatchObject({ resumed: 1, terminalized: 0 });
-    expect(resumed).toEqual([currentDeliveryId]);
-    expect(value(store.load(currentDeliveryId)).state).toBe("accepted");
-    store.close();
-    await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
-  });
-
-  test("resumes without terminal output and immediately expires proven terminal output", async () => {
-    for (const terminalOutput of [false, true]) {
-      const store = createStore();
-      const blobs = await memoryBlobStore();
-      const requestDeliveryId = crypto.randomUUID();
-      const requestId = `request-safe-resume-${terminalOutput}`;
-      const { delivery, reference } = await acceptRequestWithOutput({
-        store,
-        blobs,
-        requestDeliveryId,
-        requestId,
-      });
-      let resumes = 0;
-      const recovered = value(
-        await delivery.recoverAccepted(
-          async () => {
-            resumes += 1;
-            return Result.ok(undefined);
-          },
-          {
-            outputReplay: createCoreRequestOutputReplayRecovery(
-              outputReplayBus({
-                requestId,
-                terminalRequestDeliveryId: requestDeliveryId,
-                terminalOutput,
-                expiry: { kind: "absent" },
-              }),
-            ),
-            isOutputReplayEligible: () => true,
-          },
-        ),
-      );
-
-      if (!terminalOutput) {
-        expect(recovered).toMatchObject({
-          resumed: 1,
-          terminalized: 0,
-          uncertainties: [],
-        });
-        expect(resumes).toBe(1);
-        expect(value(store.load(requestDeliveryId)).state).toBe("accepted");
-        expect((await blobs.open(reference)).status).toBe("ok");
-      } else {
-        expect(recovered).toMatchObject({
-          resumed: 0,
-          terminalized: 1,
-          uncertainties: [],
-        });
-        expect(resumes).toBe(0);
-        expect(value(store.load(requestDeliveryId))).toMatchObject({
-          state: "terminal",
-          finalReplayDeadline: 0,
-        });
-        expect(value(await delivery.maintain({ now: 2 })).outputObjectsDeleted).toBe(1);
-        expect((await blobs.open(reference)).status).toBe("error");
-      }
-      store.close();
-      await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
-    }
-  });
-
-  test("retains terminal output without resuming accepted work when Redis expiry is uncertain", async () => {
-    const store = createStore();
-    const blobs = await memoryBlobStore();
-    const requestDeliveryId = crypto.randomUUID();
-    const requestId = "request-uncertain-expiry";
-    const { delivery, reference } = await acceptRequestWithOutput({
-      store,
-      blobs,
-      requestDeliveryId,
-      requestId,
-    });
-    let resumes = 0;
-    const recovered = value(
-      await delivery.recoverAccepted(
-        async () => {
-          resumes += 1;
-          return Result.ok(undefined);
-        },
-        {
-          outputReplay: createCoreRequestOutputReplayRecovery(
-            outputReplayBus({
-              requestId,
-              terminalRequestDeliveryId: requestDeliveryId,
-              terminalOutput: true,
-              expiryFailure: new Error("Redis unavailable"),
-            }),
-          ),
-          isOutputReplayEligible: () => true,
-        },
-      ),
-    );
-
-    expect(recovered.resumed).toBe(0);
-    expect(recovered.terminalized).toBe(0);
-    expect(recovered.uncertainties).toHaveLength(1);
-    expect(resumes).toBe(0);
-    expect(value(store.load(requestDeliveryId)).state).toBe("accepted");
-    expect((await blobs.open(reference)).status).toBe("ok");
-    store.close();
-    await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
-  });
-
-  test("does not resume accepted work when terminal output inspection is uncertain", async () => {
-    const store = createStore();
-    const blobs = await memoryBlobStore();
-    const requestDeliveryId = crypto.randomUUID();
-    const requestId = "request-uncertain-output-inspection";
-    const { delivery, reference } = await acceptRequestWithOutput({
-      store,
-      blobs,
-      requestDeliveryId,
-      requestId,
-    });
-    let resumes = 0;
-    const recovered = value(
-      await delivery.recoverAccepted(
-        async () => {
-          resumes += 1;
-          return Result.ok(undefined);
-        },
-        {
-          outputReplay: createCoreRequestOutputReplayRecovery(
-            outputReplayBus({
-              requestId,
-              terminalRequestDeliveryId: requestDeliveryId,
-              terminalOutput: false,
-              fetchFailure: new Error("Redis unavailable"),
-            }),
-          ),
-          isOutputReplayEligible: () => true,
-        },
-      ),
-    );
-
-    expect(recovered).toMatchObject({ resumed: 0, terminalized: 0 });
-    expect(recovered.uncertainties).toHaveLength(1);
-    expect(resumes).toBe(0);
-    expect(value(store.load(requestDeliveryId)).state).toBe("accepted");
-    expect((await blobs.open(reference)).status).toBe("ok");
     store.close();
     await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
   });

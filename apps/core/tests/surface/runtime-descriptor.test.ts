@@ -193,14 +193,6 @@ function discordRelay(): SurfaceRelayDescriptor<"discord"> {
       start: async () => ({
         platform: "discord",
         beginDrain: async () => undefined,
-        snapshotRelays: () => [],
-        prepareRestoreRelays: () =>
-          Result.ok({
-            platform: "discord",
-            apply: async () => Result.ok(undefined),
-            rollback: async () => Result.ok(undefined),
-            activate: () => undefined,
-          }),
         stop: async () => undefined,
       }),
     },
@@ -215,14 +207,6 @@ function githubRelay(): SurfaceRelayDescriptor<"github"> {
       start: async () => ({
         platform: "github",
         beginDrain: async () => undefined,
-        snapshotRelays: () => [],
-        prepareRestoreRelays: () =>
-          Result.ok({
-            platform: "github",
-            apply: async () => Result.ok(undefined),
-            rollback: async () => Result.ok(undefined),
-            activate: () => undefined,
-          }),
         stop: async () => undefined,
       }),
     },

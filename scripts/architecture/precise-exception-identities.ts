@@ -31,27 +31,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ],
   ],
   "apps/core": [
-    [
-      "src/runtime/surface-runtime-lifecycle.ts",
-      "signalSurfaceRecoveryRollbackAtomicityUnknown",
-      "signal",
-    ],
-    [
-      "src/runtime/graceful-restart-store.ts",
-      "signalMissingGracefulRestartDispositionToken",
-      "signal",
-    ],
-    [
-      "src/runtime/graceful-restart-store.ts",
-      "signalGracefulRestartOfflineMigrationRequired",
-      "signal",
-    ],
     ["src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter.startRelay", "signal"],
-    [
-      "src/surface/bridge/subscribe-from-bus.ts",
-      "signalSurfaceRelayRecoveryAtomicityUnknown",
-      "signal",
-    ],
     [
       "src/conversation/thread-summarization-worker.ts",
       "runThreadSummarizationWorkerOperation",

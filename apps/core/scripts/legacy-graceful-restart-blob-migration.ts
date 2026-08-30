@@ -24,15 +24,13 @@ import { z } from "zod";
 
 import { captureError } from "../src/shared/error-capture";
 import {
+  type AgentRunnerQueueAttempt,
+  type AgentRunnerRecoveryIdentity,
   decodeGracefulRestartSnapshot as decodeCurrentGracefulRestartSnapshot,
   GRACEFUL_RESTART_SNAPSHOT_VERSION,
-} from "../src/runtime/graceful-restart-store";
-import type {
-  AgentRunnerQueueAttempt,
-  AgentRunnerRecoveryIdentity,
-} from "../src/surface/bridge/bus-agent-runner";
+  type BusToAdapterRelaySnapshot,
+} from "../src/migration/frozen-graceful-restart-store";
 import { parseBufferedForActiveRequestIdFromRaw } from "../src/surface/bridge/bus-agent-runner/raw";
-import type { BusToAdapterRelaySnapshot } from "../src/surface/bridge/subscribe-from-bus";
 import {
   isAuthenticatedRequestProjectionSemanticallyValid,
   isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid,

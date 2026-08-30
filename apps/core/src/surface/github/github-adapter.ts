@@ -486,26 +486,16 @@ export class GithubAdapter implements SurfaceAdapter {
     return continueResult(refResult, {
       err: (error) => Result.err(error),
       ok: (ref) => {
-        const nestedRefs = [
-          ...(opts?.replyTo
-            ? [
-                githubNestedMsgRefResult({
-                  operation: "start-output",
-                  sessionRef: ref,
-                  msgRef: opts.replyTo,
-                  refRole: "replyTo",
-                }),
-              ]
-            : []),
-          ...(opts?.resume?.created ?? []).map((created, index) =>
-            githubNestedMsgRefResult({
-              operation: "start-output",
-              sessionRef: ref,
-              msgRef: created,
-              refRole: `resume.created[${index}]`,
-            }),
-          ),
-        ];
+        const nestedRefs = opts?.replyTo
+          ? [
+              githubNestedMsgRefResult({
+                operation: "start-output",
+                sessionRef: ref,
+                msgRef: opts.replyTo,
+                refRole: "replyTo",
+              }),
+            ]
+          : [];
         return continueResult(Result.all(nestedRefs), {
           err: (error) => Result.err(error),
           ok: () => {

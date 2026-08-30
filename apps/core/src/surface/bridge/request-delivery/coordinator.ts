@@ -26,8 +26,6 @@ import {
   type RequestDeliveryStoreError,
   type RequestDeliveryTerminalOutcome,
   type RequestDeliveryTerminalizeResult,
-  type RequestOutputReplayRecovery,
-  type RequestOutputReplayRecoveryOutcome,
   type RequestOutputLifecycle,
   type RequestOutputLifecycleRegistrar,
 } from "./types";
@@ -43,7 +41,6 @@ export type PreparedPublicationRecoverySummary = {
 export type AcceptedRequestRecoverySummary = {
   readonly resumed: number;
   readonly terminalized: number;
-  readonly uncertainties: readonly Error[];
   readonly failures: readonly Error[];
 };
 
@@ -498,16 +495,19 @@ export class RequestDeliveryCoordinator<
     resume: (record: AcceptedRequestDelivery<TWork>) => Promise<ResultType<void, Error>>,
     input?: {
       readonly limit?: number;
-      readonly outputReplay?: RequestOutputReplayRecovery;
-      readonly isOutputReplayEligible?: (record: AcceptedRequestDelivery<TWork>) => boolean;
       readonly prepareTerminalRecovery?: (
         record: AcceptedRequestDelivery<TWork>,
       ) => Promise<ResultType<void, Error>>;
+      readonly terminalRecovery?: (record: AcceptedRequestDelivery<TWork>) =>
+        | {
+            readonly outcome: RequestDeliveryTerminalOutcome;
+            readonly finalReplayDeadline?: number;
+          }
+        | undefined;
     },
   ): Promise<ResultType<AcceptedRequestRecoverySummary, RequestDeliveryStoreError>> {
     let resumed = 0;
     let terminalized = 0;
-    const uncertainties: Error[] = [];
     const failures: Error[] = [];
     const limit = Math.max(1, Math.min(1_000, input?.limit ?? 100));
     let after: { readonly acceptedAt: number; readonly requestDeliveryId: string } | undefined;
@@ -528,61 +528,34 @@ export class RequestDeliveryCoordinator<
       });
       if (page.kind === "error") return Result.err(page.error);
       for (const record of page.records) {
-        if (input?.outputReplay) {
-          const shouldInspect = input.isOutputReplayEligible?.(record) ?? false;
-          if (shouldInspect) {
-            const inspected = await input.outputReplay.inspect({
-              requestId: record.requestId,
-              requestDeliveryId: record.requestDeliveryId,
+        const terminalRecovery = input?.terminalRecovery?.(record);
+        if (terminalRecovery) {
+          if (input?.prepareTerminalRecovery) {
+            const prepared = await input.prepareTerminalRecovery(record);
+            const prepareError = prepared.match({
+              ok: () => null,
+              err: (error) => error,
             });
-            const inspection = inspected.match<
-              | {
-                  readonly kind: "ok";
-                  readonly value: RequestOutputReplayRecoveryOutcome;
-                }
-              | { readonly kind: "error"; readonly error: Error }
-            >({
-              ok: (value) => ({ kind: "ok", value }),
-              err: (error) => ({ kind: "error", error }),
-            });
-            if (inspection.kind === "error") {
-              uncertainties.push(inspection.error);
-              continue;
-            }
-            if (inspection.value.disposition === "retain-terminal") {
-              uncertainties.push(inspection.value.uncertainty);
-              continue;
-            }
-            if (inspection.value.disposition === "terminalize") {
-              if (input.prepareTerminalRecovery) {
-                const prepared = await input.prepareTerminalRecovery(record);
-                const prepareError = prepared.match({
-                  ok: () => null,
-                  err: (error) => error,
-                });
-                if (prepareError) {
-                  failures.push(prepareError);
-                  continue;
-                }
-              }
-              const recoveredTerminal = await this.terminalize({
-                requestDeliveryId: record.requestDeliveryId,
-                outcome: { kind: "completed", code: "recovered-final-output" },
-                finalReplayDeadline: inspection.value.replayDeadline,
-                transportCommitRequired: true,
-              });
-              const terminalError = recoveredTerminal.match({
-                ok: () => null,
-                err: (error) => error,
-              });
-              if (terminalError) {
-                failures.push(terminalError);
-              } else {
-                terminalized += 1;
-              }
+            if (prepareError) {
+              failures.push(prepareError);
               continue;
             }
           }
+          const recoveredTerminal = await this.terminalize({
+            requestDeliveryId: record.requestDeliveryId,
+            outcome: terminalRecovery.outcome,
+            ...(terminalRecovery.finalReplayDeadline === undefined
+              ? {}
+              : { finalReplayDeadline: terminalRecovery.finalReplayDeadline }),
+            transportCommitRequired: true,
+          });
+          const terminalError = recoveredTerminal.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (terminalError) failures.push(terminalError);
+          else terminalized += 1;
+          continue;
         }
         const result = await resume(record);
         result.match({
@@ -599,7 +572,7 @@ export class RequestDeliveryCoordinator<
         requestDeliveryId: last.requestDeliveryId,
       };
     }
-    return Result.ok({ resumed, terminalized, uncertainties, failures });
+    return Result.ok({ resumed, terminalized, failures });
   }
 
   async maintain(input?: {

@@ -12,7 +12,6 @@ import {
   decodeCorePrimaryLineageV2,
   EventPostCommitObservationFailed,
   lilacEventTypes,
-  outReqTopic,
   requestOriginSchema,
   requestQueueModeSchema,
   requestRunPolicySchema,
@@ -37,9 +36,8 @@ import {
   RequestDeliveryAdmissionRejected,
   type RequestDeliveryAdmission,
   type RequestDeliveryPublisher,
+  type RequestDeliveryStoreError,
   type RequestDeliveryValueCodec,
-  type RequestOutputReplayRecovery,
-  type RequestOutputReplayRecoveryOutcome,
 } from "./types";
 
 const coreRequestHeadersSchema = z
@@ -374,7 +372,7 @@ export function createRequestDeliveryPostCommitObserver(input: {
   readonly observeTransportCommit: (
     requestDeliveryId: string,
     streamId: string,
-  ) => ResultType<void, Error>;
+  ) => ResultType<void, RequestDeliveryStoreError>;
 }) {
   return {
     async observe(
@@ -384,92 +382,21 @@ export function createRequestDeliveryPostCommitObserver(input: {
       if (message.type !== lilacEventTypes.CmdRequestMessage) return Result.ok(undefined);
       const request = cmdRequestMessageDataSchema.safeParse(message.data);
       if (!request.success) return Result.ok(undefined);
-      return input.observeTransportCommit(request.data.requestDeliveryId, context.cursor).mapError(
-        (cause) =>
-          new EventPostCommitObservationFailed({
-            cause,
-            topic: message.topic,
-            cursor: context.cursor,
-            message: "Could not durably observe the committed Core request delivery",
-          }),
-      );
-    },
-  };
-}
-
-/**
- * Finds durable evidence that output production reached its terminal response,
- * then reads the transport-owned replay deadline. Missing or incomplete output
- * remains resumable. Once terminal output is proven, an uncertain expiry is
- * returned as a successful retain decision so recovery cannot repeat request
- * side effects while Core retains every output lifecycle record.
- */
-export function createCoreRequestOutputReplayRecovery(
-  bus: Pick<LilacBus, "fetchTopic" | "getOutputStreamExpiry">,
-): RequestOutputReplayRecovery {
-  return {
-    async inspect(input) {
-      const { requestId, requestDeliveryId } = input;
-      const topic = outReqTopic(requestId);
-      let cursor: string | undefined;
-      let terminalOutputObserved = false;
-      for (;;) {
-        const fetched = await bus.fetchTopic(topic, {
-          offset: cursor ? { type: "cursor", cursor } : { type: "begin" },
-          limit: 1_000,
+      return input
+        .observeTransportCommit(request.data.requestDeliveryId, context.cursor)
+        .tryRecover((cause) => {
+          // Another fanout group can observe the same Redis commit first. Maintenance may then
+          // remove the terminal tombstone before this lagging group acknowledges its copy.
+          if (cause._tag === "RequestDeliveryNotFound") return Result.ok(undefined);
+          return Result.err(
+            new EventPostCommitObservationFailed({
+              cause,
+              topic: message.topic,
+              cursor: context.cursor,
+              message: "Could not durably observe the committed Core request delivery",
+            }),
+          );
         });
-        const batch = fetched.match<
-          | {
-              readonly kind: "ok";
-              readonly messages: readonly {
-                readonly msg: {
-                  readonly type: string;
-                  readonly headers?: Readonly<Record<string, string>>;
-                };
-              }[];
-              readonly next?: string;
-            }
-          | { readonly kind: "error"; readonly error: Error }
-        >({
-          ok: ({ messages, next }) => ({
-            kind: "ok",
-            messages,
-            ...(next === undefined ? {} : { next }),
-          }),
-          err: (error) => ({ kind: "error", error }),
-        });
-        if (batch.kind === "error") return Result.err(batch.error);
-        terminalOutputObserved = batch.messages.some(
-          ({ msg }) =>
-            msg.type === lilacEventTypes.EvtAgentOutputResponseText &&
-            msg.headers?.request_delivery_id === requestDeliveryId,
-        );
-        if (terminalOutputObserved) break;
-        const previous = cursor;
-        cursor = batch.next;
-        if (batch.messages.length < 1_000 || cursor === undefined || cursor === previous) break;
-      }
-
-      if (!terminalOutputObserved) {
-        return Result.ok({
-          disposition: "resume",
-          reason: "no-terminal-output",
-        });
-      }
-      return (await bus.getOutputStreamExpiry(requestId)).match<
-        ResultType<RequestOutputReplayRecoveryOutcome, Error>
-      >({
-        err: (uncertainty) => Result.ok({ disposition: "retain-terminal", uncertainty } as const),
-        ok: (expiry) =>
-          Result.ok(
-            expiry.kind === "absent"
-              ? ({ disposition: "terminalize", replayDeadline: 0 } as const)
-              : ({
-                  disposition: "terminalize",
-                  replayDeadline: expiry.expiresAt,
-                } as const),
-          ),
-      });
     },
   };
 }

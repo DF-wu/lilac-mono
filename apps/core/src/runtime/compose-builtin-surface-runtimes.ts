@@ -15,7 +15,6 @@ import {
 } from "../surface/github/github-runtime-descriptor";
 import {
   SurfaceRuntimeRegistry,
-  type SurfaceRelayRecovery,
   type SurfaceRuntimeHealthPort,
 } from "../surface/runtime-descriptor";
 import { startGithubWebhookServer } from "../github/webhook/github-webhook-server";
@@ -37,7 +36,6 @@ export type ComposeBuiltinSurfaceRuntimesInput = {
   readonly webhookSecret: string | undefined;
   readonly githubAppCredentialsAvailable: boolean;
   readonly getTranscriptStore: () => TranscriptStore | undefined;
-  readonly activateRestoredDiscordOutputChains: SurfaceRelayRecovery<"discord">["activateRestoredOutputChains"];
   readonly logger: BuiltinSurfaceRuntimeLogger;
   readonly reportFatalError: (error: Error) => void;
 };
@@ -66,9 +64,7 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
         },
       },
       createRelay: (guardedAdapter) => {
-        const policy = createDiscordRelayPolicy(guardedAdapter, {
-          activateRestoredOutputChains: input.activateRestoredDiscordOutputChains,
-        });
+        const policy = createDiscordRelayPolicy(guardedAdapter);
         return {
           ...policy,
           lifecycle: {

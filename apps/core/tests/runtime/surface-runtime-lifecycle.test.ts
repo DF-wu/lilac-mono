@@ -1,18 +1,14 @@
 import { describe, expect, it } from "bun:test";
-import { Panic, Result } from "better-result";
+import { Result } from "better-result";
 
 import { scheduleCoreBlobStoreClose } from "../../src/runtime/create-core-runtime";
 import {
-  activateSurfaceRecovery,
-  applySurfaceRecovery,
   connectAndValidateSurfaceAdapters,
-  createPausedSurfaceRecoveryOwnership,
   createSurfaceWorkflowProgressPortMap,
   disconnectSurfaceAdapters,
-  prepareSurfaceRecovery,
   startSurfaceAdapterIngress,
   startSurfaceOutputs,
-  stopIngressAndDrainSurfaceRecovery,
+  stopIngressAndDrainSurfaces,
   stopSurfaceAdapterIngress,
   stopSurfaceOutputs,
   stopSurfaceRequestIngress,
@@ -28,11 +24,6 @@ import type {
   SurfaceSendPreparationInput,
 } from "../../src/surface/adapter";
 import {
-  AgentRecoveryUnavailable,
-  type AgentRunnerRecoveryEntry,
-} from "../../src/surface/bridge/bus-agent-runner";
-import type { BusToAdapterRelaySnapshot } from "../../src/surface/bridge/subscribe-from-bus";
-import {
   createDiscordRelayPolicy,
   createDiscordSurfaceRuntimeDescriptor,
 } from "../../src/surface/discord/discord-runtime-descriptor";
@@ -41,8 +32,6 @@ import {
   createGithubSurfaceRuntimeDescriptor,
 } from "../../src/surface/github/github-runtime-descriptor";
 import {
-  SurfaceRelayRestoreApplyFailed,
-  SurfaceRelayRestoreRollbackFailed,
   SurfaceRuntimeRegistry,
   type SurfaceRelayHandle,
 } from "../../src/surface/runtime-descriptor";
@@ -55,43 +44,6 @@ import type {
   SurfacePlatform,
   SurfaceSelf,
 } from "../../src/surface/types";
-
-const agentEntry: AgentRunnerRecoveryEntry = {
-  queueEntryId: "agent-entry",
-  kind: "active",
-  requestId: "discord:session:request",
-  sessionId: "session",
-  requestClient: "discord",
-  queue: "prompt",
-  messages: [],
-};
-
-function recoverySnapshot(
-  agent: readonly AgentRunnerRecoveryEntry[],
-  relays: readonly BusToAdapterRelaySnapshot[],
-) {
-  return {
-    createdAt: 1,
-    deadlineMs: 1_000,
-    queueAttemptProof: "complete" as const,
-    agent,
-    queueAttempts: [],
-    relays,
-  };
-}
-
-function testAgentRecovery(
-  onActivate: (entries: readonly AgentRunnerRecoveryEntry[]) => void = () => undefined,
-) {
-  return {
-    prepareRecovery: (input: { readonly entries: readonly AgentRunnerRecoveryEntry[] }) =>
-      Result.ok({
-        apply: () => Result.ok(undefined),
-        rollback: () => undefined,
-        activate: () => onActivate(input.entries),
-      }),
-  };
-}
 
 class TestAdapter implements SurfaceAdapter {
   constructor(
@@ -202,41 +154,13 @@ class TestAdapter implements SurfaceAdapter {
   }
 }
 
-function relaySnapshot(
-  platform: "discord" | "github",
-  requestId: string,
-): BusToAdapterRelaySnapshot {
-  return {
-    requestId,
-    sessionId: "session",
-    requestClient: platform,
-    platform,
-    createdOutputRefs: [],
-    visibleText: platform,
-    toolStatus: [],
-  };
-}
-
 function emptyRelayHandle<P extends "discord" | "github">(
   platform: P,
   stop: () => Promise<void> = async () => undefined,
-  restore: (snapshots: readonly BusToAdapterRelaySnapshot[]) => Promise<void> = async () =>
-    undefined,
 ): SurfaceRelayHandle<P> {
   return {
     platform,
     beginDrain: async () => undefined,
-    snapshotRelays: () => [],
-    prepareRestoreRelays: (snapshots) =>
-      Result.ok({
-        platform,
-        apply: async () => {
-          await restore(snapshots);
-          return Result.ok(undefined);
-        },
-        rollback: async () => Result.ok(undefined),
-        activate: () => undefined,
-      }),
     stop,
   };
 }
@@ -326,7 +250,7 @@ describe("surface runtime lifecycle", () => {
       },
     });
     let drainSettled = false;
-    const draining = stopIngressAndDrainSurfaceRecovery({
+    const draining = stopIngressAndDrainSurfaces({
       registry,
       stopAdapterIngress: async () => undefined,
       stopRouterIngress: async () => {
@@ -338,12 +262,7 @@ describe("surface runtime lifecycle", () => {
       stopRemainingRequestProducers: async () => undefined,
       deadlineMs: 3_000,
       runCleanup: async (_label, cleanup) => cleanup?.(),
-      agentRunner: {
-        ...testAgentRecovery(),
-        beginDrain: async () => undefined,
-        snapshotRecoverables: () => [],
-        snapshotQueueAttempts: () => [],
-      },
+      agentRunner: { beginDrain: async () => undefined },
       relays: handles.relays,
     }).then(() => {
       drainSettled = true;
@@ -558,763 +477,101 @@ describe("surface runtime lifecycle", () => {
     ]);
   });
 
-  it("stops ingress and request producers before registry-ordered drain and snapshot", async () => {
+  it("stops every ingress producer before draining the runner and relays", async () => {
     const calls: string[] = [];
-    let nowMs = 0;
-    const registry = createRegistry({
-      calls,
-      githubRelayStart: async () => emptyRelayHandle("github"),
-    });
+    const registry = createRegistry({ calls });
     const handles = maps();
-    const discordSnapshot = relaySnapshot("discord", "discord-request");
-    const githubSnapshot = relaySnapshot("github", "github-request");
-    const relay = (
-      platform: "discord" | "github",
-      snapshot: BusToAdapterRelaySnapshot,
-    ): SurfaceRelayHandle<"discord" | "github"> => ({
-      platform,
+    let now = 100;
+    handles.relays.set("discord", {
+      platform: "discord",
       beginDrain: async ({ deadlineMs }) => {
-        calls.push(`${platform}-drain:${deadlineMs}`);
-        nowMs += 1_000;
+        calls.push(`relay:${deadlineMs}`);
       },
-      snapshotRelays: () => {
-        calls.push(`${platform}-snapshot`);
-        return [snapshot];
-      },
-      prepareRestoreRelays: (snapshots) =>
-        Result.ok({
-          platform,
-          apply: async () => {
-            await Promise.resolve(snapshots);
-            return Result.ok(undefined);
-          },
-          rollback: async () => Result.ok(undefined),
-          activate: () => undefined,
-        }),
       stop: async () => undefined,
     });
-    handles.relays.set("discord", relay("discord", discordSnapshot));
-    handles.relays.set("github", relay("github", githubSnapshot));
 
-    const snapshot = await stopIngressAndDrainSurfaceRecovery({
-      registry,
+    await stopIngressAndDrainSurfaces({
       stopAdapterIngress: async () => {
-        calls.push("adapter-ingress-stop");
+        calls.push("adapter-ingress");
+        now += 1;
       },
       stopRouterIngress: async () => {
-        calls.push("router-ingress-stop");
+        calls.push("router-ingress");
+        now += 1;
       },
       stopWorkflowRequestProducers: async () => {
-        calls.push("request-producers-stop");
+        calls.push("workflow-producers");
+        now += 1;
       },
       stopRequestIngress: async () => {
-        calls.push("github-request-ingress-stop");
+        calls.push("request-ingress");
+        now += 1;
       },
       stopRemainingRequestProducers: async () => {
-        calls.push("remaining-producers-stop");
+        calls.push("remaining-producers");
+        now += 1;
       },
-      deadlineMs: 3_000,
-      now: () => nowMs,
-      runCleanup: async (label, cleanup) => {
-        calls.push(label);
-        await cleanup?.();
-      },
+      registry,
+      deadlineMs: 20,
+      now: () => now,
+      runCleanup: async (_label, cleanup) => cleanup?.(),
       agentRunner: {
         beginDrain: async ({ deadlineMs }) => {
-          calls.push(`agent-drain:${deadlineMs}`);
-          nowMs += 1_000;
+          calls.push(`runner:${deadlineMs}`);
+          now += 1;
         },
-        snapshotRecoverables: () => {
-          calls.push("agent-snapshot");
-          return [agentEntry];
-        },
-        snapshotQueueAttempts: () => [],
-        prepareRecovery: testAgentRecovery().prepareRecovery,
       },
       relays: handles.relays,
     });
 
     expect(calls).toEqual([
-      "adapter-ingress-stop",
-      "router-ingress-stop",
-      "request-producers-stop",
-      "github-request-ingress-stop",
-      "remaining-producers-stop",
-      "graceful.agentRunner.beginDrain",
-      "agent-drain:3000",
-      "graceful.surface.discord.relay.beginDrain",
-      "discord-drain:2000",
-      "graceful.surface.github.relay.beginDrain",
-      "github-drain:1000",
-      "graceful.agentRunner.snapshotRecoverables",
-      "agent-snapshot",
-      "graceful.surface.discord.relay.snapshotRelays",
-      "discord-snapshot",
-      "graceful.surface.github.relay.snapshotRelays",
-      "github-snapshot",
-    ]);
-    expect(snapshot).toEqual({
-      agent: [agentEntry],
-      queueAttempts: [],
-      relays: [discordSnapshot, githubSnapshot],
-    });
-    expect(JSON.parse(JSON.stringify(snapshot))).toEqual(snapshot);
-  });
-
-  it("contains synchronous snapshot failures and continues later collection", async () => {
-    const calls: string[] = [];
-    const failures: Array<{ readonly label: string; readonly cause: unknown }> = [];
-    const registry = createRegistry({ calls });
-    const handles = maps();
-    const panic = new Panic({ message: "discord snapshot invariant failed" });
-    const githubSnapshot = relaySnapshot("github", "github-request");
-    handles.relays.set("discord", {
-      ...emptyRelayHandle("discord"),
-      snapshotRelays: () => {
-        throw panic;
-      },
-    });
-    handles.relays.set("github", {
-      ...emptyRelayHandle("github"),
-      snapshotRelays: () => [githubSnapshot],
-    });
-    const runCleanup = async (label: string, cleanup: (() => Promise<void>) | undefined) => {
-      calls.push(label);
-      const [settled] = await Promise.allSettled([Promise.resolve().then(() => cleanup?.())]);
-      if (settled?.status === "rejected") failures.push({ label, cause: settled.reason });
-    };
-
-    const snapshot = await stopIngressAndDrainSurfaceRecovery({
-      registry,
-      stopAdapterIngress: async () => undefined,
-      stopRouterIngress: async () => undefined,
-      stopWorkflowRequestProducers: async () => undefined,
-      stopRequestIngress: async () => undefined,
-      stopRemainingRequestProducers: async () => undefined,
-      deadlineMs: 3_000,
-      runCleanup,
-      agentRunner: {
-        beginDrain: async () => undefined,
-        snapshotRecoverables: () => {
-          throw new Error("agent snapshot failed");
-        },
-        snapshotQueueAttempts: () => [],
-        prepareRecovery: testAgentRecovery().prepareRecovery,
-      },
-      relays: handles.relays,
-    });
-
-    expect(snapshot).toEqual({ agent: [], queueAttempts: [], relays: [githubSnapshot] });
-    expect(failures.map(({ label }) => label)).toEqual([
-      "graceful.agentRunner.snapshotRecoverables",
-      "graceful.surface.discord.relay.snapshotRelays",
-    ]);
-    expect(failures[1]?.cause).toBe(panic);
-  });
-
-  it("contains rejected snapshot collection and contributes empty entries", async () => {
-    const calls: string[] = [];
-    const failures: string[] = [];
-    const registry = createRegistry({ calls });
-    const handles = maps();
-    const rejection = new Error("snapshot rejected");
-    const relay = emptyRelayHandle("discord");
-    Reflect.set(relay, "snapshotRelays", () => Promise.reject(rejection));
-    handles.relays.set("discord", relay);
-    const agentRunner = {
-      beginDrain: async () => undefined,
-      snapshotRecoverables: () => [agentEntry],
-      snapshotQueueAttempts: () => [],
-      prepareRecovery: testAgentRecovery().prepareRecovery,
-    };
-    Reflect.set(agentRunner, "snapshotRecoverables", () => Promise.reject(rejection));
-
-    const snapshot = await stopIngressAndDrainSurfaceRecovery({
-      registry,
-      stopAdapterIngress: async () => undefined,
-      stopRouterIngress: async () => undefined,
-      stopWorkflowRequestProducers: async () => undefined,
-      stopRequestIngress: async () => undefined,
-      stopRemainingRequestProducers: async () => undefined,
-      deadlineMs: 3_000,
-      runCleanup: async (label, cleanup) => {
-        const [settled] = await Promise.allSettled([Promise.resolve().then(() => cleanup?.())]);
-        if (settled?.status === "rejected") failures.push(label);
-      },
-      agentRunner,
-      relays: handles.relays,
-    });
-
-    expect(snapshot).toEqual({ agent: [], queueAttempts: [], relays: [] });
-    expect(failures).toEqual([
-      "graceful.agentRunner.snapshotRecoverables",
-      "graceful.surface.discord.relay.snapshotRelays",
+      "adapter-ingress",
+      "router-ingress",
+      "workflow-producers",
+      "request-ingress",
+      "remaining-producers",
+      "runner:15",
+      "relay:14",
     ]);
   });
 
-  it("activates every admitted relay and the agent synchronously in one total transition", () => {
-    const calls: string[] = [];
-    const plan = {
-      snapshot: recoverySnapshot([], []),
-      attempts: ["discord", "github"].map((platform) => ({
-        platform: platform as "discord" | "github",
-        apply: async () => Result.ok(undefined),
-        rollback: async () => Result.ok(undefined),
-        activate: () => {
-          calls.push(`${platform}-active`);
-        },
-      })),
-      agentAttempt: {
-        apply: () => Result.ok(undefined),
-        rollback: () => undefined,
-        activate: () => {
-          calls.push("agent-active");
-        },
-      },
-    };
-
-    expect(activateSurfaceRecovery(plan)).toBeUndefined();
-    expect(calls).toEqual(["discord-active", "github-active", "agent-active"]);
-    activateSurfaceRecovery(plan);
-    expect(calls).toEqual(["discord-active", "github-active", "agent-active"]);
-  });
-
-  it("rolls back paused recovery when startup fails before disposition", async () => {
-    const calls: string[] = [];
-    const ownership = createPausedSurfaceRecoveryOwnership({
-      snapshot: recoverySnapshot([], []),
-      attempts: ["discord", "github"].map((platform) => ({
-        platform: platform as "discord" | "github",
-        apply: async () => Result.ok(undefined),
-        rollback: async () => {
-          calls.push(`${platform}-rollback`);
-          return Result.ok(undefined);
-        },
-        activate: () => {
-          calls.push(`${platform}-active`);
-        },
-      })),
-      agentAttempt: {
-        apply: () => Result.ok(undefined),
-        rollback: () => {
-          calls.push("agent-rollback");
-        },
-        activate: () => {
-          calls.push("agent-active");
-        },
-      },
-    });
-
-    await ownership.rollback();
-    await ownership.rollback();
-    ownership.activate();
-    expect(calls).toEqual(["github-rollback", "discord-rollback", "agent-rollback"]);
-  });
-
-  it("performs successful final ownership activation synchronously and exactly once", () => {
-    const calls: string[] = [];
-    const ownership = createPausedSurfaceRecoveryOwnership({
-      snapshot: recoverySnapshot([], []),
-      attempts: [
-        {
-          platform: "discord",
-          apply: async () => Result.ok(undefined),
-          rollback: async () => Result.ok(undefined),
-          activate: () => {
-            calls.push("relay-active");
-          },
-        },
-      ],
-      agentAttempt: {
-        apply: () => Result.ok(undefined),
-        rollback: () => undefined,
-        activate: () => {
-          calls.push("agent-active");
-        },
-      },
-    });
-
-    expect(ownership.activate()).toBeUndefined();
-    ownership.activate();
-    expect(calls).toEqual(["relay-active", "agent-active"]);
-  });
-
-  it("preflights every descriptor and relay handle before applying any restore", () => {
-    const calls: string[] = [];
-    const registry = createRegistry({ calls });
-    const handles = maps();
-    handles.relays.set("discord", emptyRelayHandle("discord"));
-    const unavailable = prepareSurfaceRecovery({
-      registry,
-      snapshot: recoverySnapshot(
-        [],
-        [relaySnapshot("discord", "discord-request"), relaySnapshot("github", "github-request")],
-      ),
-      relays: handles.relays,
-      agentRunner: testAgentRecovery(),
-    });
-
-    expect(unavailable.status).toBe("error");
-    if (unavailable.status === "error") {
-      expect(unavailable.error._tag).toBe("SurfaceRecoveryUnavailable");
-    }
-    expect(calls).toEqual([]);
-  });
-
-  it("rejects ambiguous legacy agent queues before relay preparation", () => {
-    const calls: string[] = [];
-    const registry = createRegistry({ calls });
-    const handles = maps();
-    handles.relays.set("discord", emptyRelayHandle("discord"));
-    const prepared = prepareSurfaceRecovery({
-      registry,
-      snapshot: {
-        ...recoverySnapshot(
-          [{ ...agentEntry, kind: "queued" }],
-          [relaySnapshot("discord", "discord-request")],
-        ),
-        queueAttemptProof: "legacy-ambiguous",
-      },
-      relays: handles.relays,
-      agentRunner: {
-        prepareRecovery: () => {
-          calls.push("agent-prepared");
-          return testAgentRecovery().prepareRecovery({ entries: [] });
-        },
-      },
-    });
-    expect(prepared.status).toBe("error");
-    if (prepared.status === "error") expect(prepared.error._tag).toBe("SurfaceRecoveryUnavailable");
-    expect(calls).toEqual([]);
-  });
-
-  it("allows principal-less active-only legacy recovery while retaining legacy queues", () => {
-    const calls: string[] = [];
-    const registry = createRegistry({ calls });
-    const handles = maps();
-    handles.relays.set("discord", emptyRelayHandle("discord"));
-    const active = prepareSurfaceRecovery({
-      registry,
-      snapshot: {
-        ...recoverySnapshot(
-          [
-            {
-              ...agentEntry,
-              identity: { state: "restricted", reason: "legacy-no-durable-proof" },
-            },
-          ],
-          [],
-        ),
-        queueAttemptProof: "complete",
-      },
-      relays: handles.relays,
-      agentRunner: testAgentRecovery(),
-    });
-    expect(active.status).toBe("ok");
-
-    const queued = prepareSurfaceRecovery({
-      registry,
-      snapshot: {
-        ...recoverySnapshot(
-          [
-            {
-              ...agentEntry,
-              kind: "queued",
-              identity: { state: "restricted", reason: "legacy-no-durable-proof" },
-            },
-          ],
-          [],
-        ),
-        queueAttemptProof: "legacy-ambiguous",
-      },
-      relays: handles.relays,
-      agentRunner: testAgentRecovery(),
-    });
-    expect(queued.status).toBe("error");
-  });
-
-  it("rejects an agent-only unavailable surface before agent or relay mutation", () => {
-    const calls: string[] = [];
-    const registry = createRegistry({ calls });
-    const handles = maps();
-    const prepared = prepareSurfaceRecovery({
-      registry,
-      snapshot: recoverySnapshot([agentEntry], []),
-      relays: handles.relays,
-      agentRunner: {
-        prepareRecovery: () => {
-          calls.push("agent-prepared");
-          return testAgentRecovery().prepareRecovery({ entries: [] });
-        },
-      },
-    });
-    expect(prepared.status).toBe("error");
-    if (prepared.status === "error") {
-      expect(prepared.error).toMatchObject({
-        _tag: "SurfaceRecoveryUnavailable",
-        reason: "relay-handle-unavailable",
-      });
-    }
-    expect(calls).toEqual([]);
-  });
-
-  it("requires a catalog surface descriptor even when it is absent from the registry", () => {
-    const calls: string[] = [];
-    const created = SurfaceRuntimeRegistry.create([
-      createDiscordSurfaceRuntimeDescriptor({
-        adapter: new TestAdapter("discord", calls),
-        adapterIngress: {
-          start: async () => ({ platform: "discord", stop: async () => undefined }),
-        },
-        createRelay: (guardedAdapter) => ({
-          ...createDiscordRelayPolicy(guardedAdapter),
-          lifecycle: {
-            platform: "discord",
-            start: async () => emptyRelayHandle("discord"),
-          },
-        }),
-      }),
-    ]);
-    if (created.status === "error") throw created.error;
-    const handles = maps();
-    const prepared = prepareSurfaceRecovery({
-      registry: created.value,
-      snapshot: recoverySnapshot(
-        [
-          {
-            ...agentEntry,
-            requestId: "github:octo/repo:1:request",
-            sessionId: "octo/repo#1",
-            requestClient: "github",
-          },
-        ],
-        [],
-      ),
-      relays: handles.relays,
-      agentRunner: testAgentRecovery(),
-    });
-
-    expect(prepared.status).toBe("error");
-    if (prepared.status === "error") {
-      expect(prepared.error).toMatchObject({
-        _tag: "SurfaceRecoveryUnavailable",
-        platform: "github",
-        reason: "descriptor-unavailable",
-      });
-    }
-    expect(calls).toEqual([]);
-  });
-
-  it("rejects an agent-only cache conflict before relay preparation or apply", () => {
+  it("keeps draining relays when an earlier cleanup fails", async () => {
     const calls: string[] = [];
     const registry = createRegistry({ calls });
     const handles = maps();
     handles.relays.set("discord", {
-      ...emptyRelayHandle("discord"),
-      prepareRestoreRelays: () => {
-        calls.push("relay-prepared");
-        return emptyRelayHandle("discord").prepareRestoreRelays([]);
+      platform: "discord",
+      beginDrain: async ({ deadlineMs }) => {
+        calls.push(`relay:${deadlineMs}`);
       },
-    });
-    const prepared = prepareSurfaceRecovery({
-      registry,
-      snapshot: recoverySnapshot([agentEntry], [relaySnapshot("discord", "discord-request")]),
-      relays: handles.relays,
-      agentRunner: {
-        prepareRecovery: () =>
-          Result.err(
-            new AgentRecoveryUnavailable({
-              requestId: agentEntry.requestId,
-              reason: "cache-conflict",
-              message: "injected cache conflict",
-            }),
-          ),
-      },
-    });
-    expect(prepared.status).toBe("error");
-    if (prepared.status === "error")
-      expect(prepared.error).toBeInstanceOf(AgentRecoveryUnavailable);
-    expect(calls).toEqual([]);
-  });
-
-  it("rolls back every relay attempt when a later apply fails and does not restore agents", async () => {
-    const calls: string[] = [];
-    const registry = createRegistry({
-      calls,
-      githubRelayStart: async () => emptyRelayHandle("github"),
-    });
-    const handles = maps();
-    const attemptHandle = (
-      platform: "discord" | "github",
-      failApply: boolean,
-    ): SurfaceRelayHandle<"discord" | "github"> => ({
-      platform,
-      beginDrain: async () => undefined,
-      snapshotRelays: () => [],
-      prepareRestoreRelays: (snapshots) =>
-        Result.ok({
-          platform,
-          apply: async () => {
-            calls.push(`${platform}-apply`);
-            return failApply
-              ? Result.err(
-                  new SurfaceRelayRestoreApplyFailed({
-                    platform,
-                    requestId: snapshots[0]?.requestId ?? "missing",
-                    message: "injected apply failure",
-                  }),
-                )
-              : Result.ok(undefined);
-          },
-          rollback: async () => {
-            calls.push(`${platform}-rollback`);
-            return Result.ok(undefined);
-          },
-          activate: () => undefined,
-        }),
       stop: async () => undefined,
     });
-    handles.relays.set("discord", attemptHandle("discord", false));
-    handles.relays.set("github", attemptHandle("github", true));
-    const prepared = prepareSurfaceRecovery({
-      registry,
-      snapshot: recoverySnapshot(
-        [agentEntry],
-        [relaySnapshot("discord", "discord-request"), relaySnapshot("github", "github-request")],
-      ),
-      relays: handles.relays,
-      agentRunner: testAgentRecovery(),
-    });
-    if (prepared.status === "error") throw prepared.error;
 
-    const applied = await applySurfaceRecovery(prepared.value);
-    expect(applied.status).toBe("error");
-    expect(calls).toEqual(["discord-apply", "github-apply", "github-rollback", "discord-rollback"]);
-  });
-
-  it("reports the failed agent platform instead of the first relay platform", async () => {
-    const calls: string[] = [];
-    const registry = createRegistry({
-      calls,
-      githubRelayStart: async () => emptyRelayHandle("github"),
-    });
-    const handles = maps();
-    handles.relays.set("discord", emptyRelayHandle("discord"));
-    handles.relays.set("github", emptyRelayHandle("github"));
-    const githubEntry: AgentRunnerRecoveryEntry = {
-      ...agentEntry,
-      requestId: "github:octo/repo#1:request",
-      sessionId: "octo/repo#1",
-      requestClient: "github",
-    };
-    const prepared = prepareSurfaceRecovery({
-      registry,
-      snapshot: recoverySnapshot([githubEntry], [relaySnapshot("discord", "discord-request")]),
-      relays: handles.relays,
-      agentRunner: {
-        prepareRecovery: () =>
-          Result.ok({
-            apply: () =>
-              Result.err(
-                new AgentRecoveryUnavailable({
-                  requestId: githubEntry.requestId,
-                  reason: "cache-conflict",
-                  message: "injected agent apply failure",
-                }),
-              ),
-            rollback: () => undefined,
-            activate: () => undefined,
-          }),
-      },
-    });
-    if (prepared.status === "error") throw prepared.error;
-
-    const applied = await applySurfaceRecovery(prepared.value);
-    expect(applied.status).toBe("error");
-    if (applied.status === "error") {
-      expect(applied.error).toMatchObject({
-        platform: "github",
-        requestId: githubEntry.requestId,
-        message: "injected agent apply failure",
-      });
-    }
-  });
-
-  it("raises the registered Panic when relay rollback leaves atomicity unknown", async () => {
-    const calls: string[] = [];
-    const registry = createRegistry({ calls });
-    const handles = maps();
-    handles.relays.set("discord", {
-      ...emptyRelayHandle("discord"),
-      prepareRestoreRelays: (snapshots) =>
-        Result.ok({
-          platform: "discord",
-          apply: async () =>
-            Result.err(
-              new SurfaceRelayRestoreApplyFailed({
-                platform: "discord",
-                requestId: snapshots[0]?.requestId ?? "missing",
-                message: "injected apply failure",
-              }),
-            ),
-          rollback: async () =>
-            Result.err(
-              new SurfaceRelayRestoreRollbackFailed({
-                platform: "discord",
-                message: "injected rollback failure",
-              }),
-            ),
-          activate: () => undefined,
-        }),
-    });
-    const prepared = prepareSurfaceRecovery({
-      registry,
-      snapshot: recoverySnapshot([], [relaySnapshot("discord", "discord-request")]),
-      relays: handles.relays,
-      agentRunner: testAgentRecovery(),
-    });
-    if (prepared.status === "error") throw prepared.error;
-
-    const [settled] = await Promise.allSettled([applySurfaceRecovery(prepared.value)]);
-    expect(settled?.status).toBe("rejected");
-    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
-  });
-
-  it("continues reverse rollback after one relay cleanup fails", async () => {
-    const calls: string[] = [];
-    const registry = createRegistry({
-      calls,
-      githubRelayStart: async () => emptyRelayHandle("github"),
-    });
-    const handles = maps();
-    const attemptHandle = (
-      platform: "discord" | "github",
-      failApply: boolean,
-      failRollback: boolean,
-    ): SurfaceRelayHandle<"discord" | "github"> => ({
-      ...emptyRelayHandle(platform),
-      prepareRestoreRelays: (snapshots) =>
-        Result.ok({
-          platform,
-          apply: async () => {
-            calls.push(`${platform}-apply`);
-            return failApply
-              ? Result.err(
-                  new SurfaceRelayRestoreApplyFailed({
-                    platform,
-                    requestId: snapshots[0]?.requestId ?? "missing",
-                    message: "injected apply failure",
-                  }),
-                )
-              : Result.ok(undefined);
-          },
-          rollback: async () => {
-            calls.push(`${platform}-rollback`);
-            return failRollback
-              ? Result.err(
-                  new SurfaceRelayRestoreRollbackFailed({
-                    platform,
-                    message: "injected rollback failure",
-                  }),
-                )
-              : Result.ok(undefined);
-          },
-          activate: () => undefined,
-        }),
-    });
-    handles.relays.set("discord", attemptHandle("discord", false, false));
-    handles.relays.set("github", attemptHandle("github", true, true));
-    const prepared = prepareSurfaceRecovery({
-      registry,
-      snapshot: recoverySnapshot(
-        [],
-        [relaySnapshot("discord", "discord-request"), relaySnapshot("github", "github-request")],
-      ),
-      relays: handles.relays,
-      agentRunner: testAgentRecovery(),
-    });
-    if (prepared.status === "error") throw prepared.error;
-
-    const [settled] = await Promise.allSettled([applySurfaceRecovery(prepared.value)]);
-    expect(settled?.status).toBe("rejected");
-    if (settled?.status === "rejected") expect(Panic.is(settled.reason)).toBe(true);
-    expect(calls).toEqual(["discord-apply", "github-apply", "github-rollback", "discord-rollback"]);
-  });
-
-  it("rejects a faulty relay snapshot before it can be persisted", async () => {
-    const calls: string[] = [];
-    const registry = createRegistry({ calls });
-    const handles = maps();
-    const invalid = {
-      ...relaySnapshot("discord", "discord-request"),
-      createdOutputRefs: [
-        { platform: "discord" as const, channelId: "other", messageId: "invalid" },
-      ],
-    };
-    handles.relays.set("discord", {
-      ...emptyRelayHandle("discord"),
-      snapshotRelays: () => [invalid],
-    });
-    let persisted = false;
-
-    const collected = stopIngressAndDrainSurfaceRecovery({
-      registry,
+    await stopIngressAndDrainSurfaces({
       stopAdapterIngress: async () => undefined,
       stopRouterIngress: async () => undefined,
       stopWorkflowRequestProducers: async () => undefined,
       stopRequestIngress: async () => undefined,
       stopRemainingRequestProducers: async () => undefined,
-      deadlineMs: 3_000,
-      runCleanup: async (_label, cleanup) => cleanup?.(),
+      registry,
+      deadlineMs: 20,
+      now: () => 100,
+      runCleanup: async (_label, cleanup) => {
+        try {
+          await cleanup?.();
+        } catch {
+          calls.push("failure");
+        }
+      },
       agentRunner: {
-        beginDrain: async () => undefined,
-        snapshotRecoverables: () => [],
-        snapshotQueueAttempts: () => [],
-        prepareRecovery: testAgentRecovery().prepareRecovery,
+        beginDrain: async () => {
+          throw new Error("runner drain failed");
+        },
       },
       relays: handles.relays,
-    }).then(() => {
-      persisted = true;
     });
 
-    const [settled] = await Promise.allSettled([collected]);
-    expect(settled?.status).toBe("rejected");
-    if (settled?.status !== "rejected") return;
-    expect(Panic.is(settled.reason)).toBe(true);
-    expect(persisted).toBe(false);
-  });
-
-  it("rejects faulty recovery refs before relay or agent restoration", () => {
-    const calls: string[] = [];
-    const registry = createRegistry({ calls });
-    const handles = maps();
-    handles.relays.set("discord", {
-      ...emptyRelayHandle("discord"),
-      prepareRestoreRelays: () => {
-        calls.push("relay-prepared");
-        return emptyRelayHandle("discord").prepareRestoreRelays([]);
-      },
-    });
-    const invalid = {
-      ...relaySnapshot("discord", "discord-request"),
-      activeOutputRefs: [
-        { platform: "github" as const, channelId: "session", messageId: "invalid" },
-      ],
-    };
-
-    expect(() =>
-      prepareSurfaceRecovery({
-        registry,
-        snapshot: recoverySnapshot([agentEntry], [invalid]),
-        relays: handles.relays,
-        agentRunner: testAgentRecovery(() => {
-          calls.push("agent-restored");
-        }),
-      }),
-    ).toThrow(Panic);
-
-    expect(calls).not.toContain("relay-prepared");
-    expect(calls).not.toContain("agent-restored");
+    expect(calls).toEqual(["failure", "relay:20"]);
   });
 
   it("stops surface resources and disconnects adapters in reverse ownership order", async () => {

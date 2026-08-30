@@ -23,7 +23,6 @@ import type {
   WorkflowProgressOperationFailed,
 } from "./runtime-descriptor";
 import type { MsgRef, RegisteredSurfacePlatform, SessionRef, SurfaceMessage } from "./types";
-import type { BusToAdapterRelaySnapshot } from "./bridge/subscribe-from-bus";
 
 export function signalSurfaceAdapterContractViolation(input: {
   readonly descriptorPlatform: RegisteredSurfacePlatform;
@@ -228,12 +227,6 @@ function guardOutputStream(
       return aborted;
     },
   };
-  if (stream.hydrateRecovery) {
-    const hydrateRecovery = stream.hydrateRecovery.bind(stream);
-    Object.defineProperty(guarded, "hydrateRecovery", {
-      value: hydrateRecovery,
-    });
-  }
   if (stream.getFinalTextMode) {
     const getFinalTextMode = stream.getFinalTextMode.bind(stream);
     Object.defineProperty(guarded, "getFinalTextMode", {
@@ -835,34 +828,5 @@ export function requireSurfaceRelayPolicyRefs<P extends RegisteredSurfacePlatfor
       },
     },
     ...(policy.finalization ? { finalization: policy.finalization } : {}),
-    ...(policy.recovery ? { recovery: policy.recovery } : {}),
   };
-}
-
-export function requireSurfaceRelaySnapshot(
-  descriptorPlatform: RegisteredSurfacePlatform,
-  snapshot: BusToAdapterRelaySnapshot,
-  contract: string,
-): void {
-  requirePlatform({
-    descriptorPlatform,
-    contract: `${contract}.platform`,
-    producedPlatform: snapshot.platform,
-  });
-  for (const [index, ref] of snapshot.createdOutputRefs.entries()) {
-    requireProducedMsgRef(
-      descriptorPlatform,
-      ref,
-      `${contract}.createdOutputRefs[${index}]`,
-      snapshot.sessionId,
-    );
-  }
-  for (const [index, ref] of (snapshot.activeOutputRefs ?? []).entries()) {
-    requireProducedMsgRef(
-      descriptorPlatform,
-      ref,
-      `${contract}.activeOutputRefs[${index}]`,
-      snapshot.sessionId,
-    );
-  }
 }

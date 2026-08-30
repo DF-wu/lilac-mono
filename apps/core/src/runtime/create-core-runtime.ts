@@ -54,6 +54,13 @@ import {
   resolveAgentRunModelFallbacks,
   startBusAgentRunner,
 } from "../surface/bridge/bus-agent-runner";
+import {
+  parseRequestControlFromRaw,
+  parseWorkflowRequestHintFromRaw,
+  preserveAgentRunnerRaw,
+  requestRawReferencesMessage,
+  type AgentRunnerRaw,
+} from "../surface/bridge/bus-agent-runner/raw";
 import { startDiscordSearchIndexer } from "../surface/bridge/discord-search-indexer";
 import { adaptEventPublishResultToHost } from "../shared/event-bus-result";
 import { DiscordSearchService, DiscordSearchStore } from "../surface/store/discord-search-store";
@@ -71,10 +78,10 @@ import {
 import { toReplyChainMessage } from "../surface/bridge/request-composition/reply-chain";
 import {
   createCoreRequestDelivery,
-  createCoreRequestOutputReplayRecovery,
   createDurableCoreRequestBus,
   createLilacBusRequestDeliveryPublisher,
   createRequestDeliveryPostCommitObserver,
+  type CoreAcceptedRequestWork,
   type CoreRequestOutputMetadata,
 } from "../surface/bridge/request-delivery";
 import {
@@ -133,6 +140,12 @@ import {
   type AuthenticatedRequestProjection,
 } from "../surface/authenticated-request";
 import type { AuthenticatedSurfaceOrigin } from "../surface/types";
+import {
+  SqliteAgentRunJournal,
+  type AgentRunJournal,
+  type AgentRunJournalSqliteFailure,
+  type AgentRunRecoveryHead,
+} from "../surface/bridge/agent-run-journal";
 import { createCoreToolPluginManager, type CoreToolPluginManager } from "../plugins";
 import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
@@ -144,21 +157,12 @@ import {
   safeRuntimeErrorText,
 } from "./error-format";
 import {
-  GRACEFUL_RESTART_SNAPSHOT_VERSION,
-  SqliteGracefulRestartStore,
-  type GracefulRestartLoadError,
-  type GracefulRestartLoadOutcome,
-} from "./graceful-restart-store";
-import {
-  applySurfaceRecovery,
   connectAndValidateSurfaceAdapters,
-  createPausedSurfaceRecoveryOwnership,
   createSurfaceWorkflowProgressPortMap,
   disconnectSurfaceAdapters,
-  prepareSurfaceRecovery,
   startSurfaceAdapterIngress,
   startSurfaceOutputs,
-  stopIngressAndDrainSurfaceRecovery,
+  stopIngressAndDrainSurfaces,
   stopSurfaceAdapterIngress,
   stopSurfaceOutputs,
   stopSurfaceRequestIngress,
@@ -166,8 +170,6 @@ import {
   type SurfaceAdapterIngressHandles,
   type SurfaceRelayHandles,
   type SurfaceRequestIngressHandles,
-  type SurfaceRecoveryPlan,
-  type PausedSurfaceRecoveryOwnership,
 } from "./surface-runtime-lifecycle";
 
 import type { SurfaceRuntimeRegistry } from "../surface/runtime-descriptor";
@@ -237,6 +239,509 @@ export function resolveRequestCapabilityIdentity(input: {
       })
     : "restricted";
   return { principal, authenticatedOrigin, safetyMode };
+}
+
+type AgentRunRecoveryJoinLogger = {
+  warn(message: string, context: Readonly<Record<string, string | number | boolean>>): void;
+};
+
+type CoreRequestDeliveryStore = ReturnType<typeof createCoreRequestDelivery>["store"];
+
+function compareAgentRunRecoveryHeads(
+  left: AgentRunRecoveryHead,
+  right: AgentRunRecoveryHead,
+): number {
+  if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt;
+  if (left.handle.runId === right.handle.runId) return 0;
+  return left.handle.runId < right.handle.runId ? -1 : 1;
+}
+
+function settleAgentRunRecoveryHeadCleanup(input: {
+  readonly head: AgentRunRecoveryHead;
+  readonly operation: "reconcile" | "reset";
+  readonly reason:
+    | "owner-missing"
+    | "owner-terminal"
+    | "owner-not-accepted"
+    | "owner-load-failed"
+    | "incompatible-identity"
+    | "invalid-retained-delivery"
+    | "duplicate-active-session";
+  readonly journal: Pick<AgentRunJournal, "removeReconciled" | "resetRun">;
+  readonly logger: AgentRunRecoveryJoinLogger;
+}): AgentRunJournalSqliteFailure | null {
+  const result =
+    input.operation === "reconcile"
+      ? input.journal.removeReconciled(input.head.handle.runId)
+      : input.journal.resetRun(input.head.handle.runId);
+  const notice = result.match<
+    | { readonly kind: "completed" }
+    | {
+        readonly kind: "failed";
+        readonly error: AgentRunJournalSqliteFailure;
+        readonly errorTag: string;
+        readonly errorCode: string;
+      }
+  >({
+    ok: () => ({ kind: "completed" }),
+    err: (error) => ({
+      kind: "failed",
+      error,
+      errorTag: error.name,
+      errorCode: error.code,
+    }),
+  });
+  if (notice.kind === "failed") {
+    input.logger.warn("Agent run journal startup cleanup failed", {
+      requestDeliveryId: input.head.handle.runId,
+      operation: input.operation,
+      reason: input.reason,
+      errorTag: notice.errorTag,
+      errorCode: notice.errorCode,
+    });
+    return input.operation === "reset" ? notice.error : null;
+  }
+  input.logger.warn("Agent run journal startup progress discarded", {
+    requestDeliveryId: input.head.handle.runId,
+    operation: input.operation,
+    reason: input.reason,
+  });
+  return null;
+}
+
+type AgentRunRetainedRecoveryReference = NonNullable<
+  AgentRunRecoveryHead["checkpoint"]
+>["retainedRequestDeliveries"][number];
+
+type AgentRunRetainedRecoveryOwner = {
+  readonly ownerRunId: string;
+  readonly ownerState: AgentRunRecoveryHead["state"];
+  readonly outcome: AgentRunRetainedRecoveryReference["outcome"];
+  readonly finalReplayDeadline?: number;
+};
+
+type AgentRunRecoveryJoin = {
+  readonly heads: Map<string, AgentRunRecoveryHead>;
+  readonly retainedOwners: ReadonlyMap<string, AgentRunRetainedRecoveryOwner>;
+  readonly recoverableRootParentRequestIds: readonly string[];
+  readonly journalResetFailure?: AgentRunJournalSqliteFailure;
+};
+
+function emptyAgentRunRecoveryJoin(): AgentRunRecoveryJoin {
+  return {
+    heads: new Map(),
+    retainedOwners: new Map(),
+    recoverableRootParentRequestIds: [],
+  };
+}
+
+function failedAgentRunRecoveryJoin(error: AgentRunJournalSqliteFailure): AgentRunRecoveryJoin {
+  return {
+    ...emptyAgentRunRecoveryJoin(),
+    journalResetFailure: error,
+  };
+}
+
+function terminalOutcomesMatch(
+  left: AgentRunRetainedRecoveryReference["outcome"],
+  right: AgentRunRetainedRecoveryReference["outcome"],
+): boolean {
+  return left.kind === right.kind && left.code === right.code;
+}
+
+function resolveRetainedDeliveriesForRecovery(input: {
+  readonly head: AgentRunRecoveryHead;
+  readonly ownerRequestId: string;
+  readonly ownerSessionId: string;
+  readonly ownerRaw: AgentRunnerRaw | undefined;
+  readonly journalHeadRunIds: ReadonlySet<string>;
+  readonly requestDeliveryStore: Pick<CoreRequestDeliveryStore, "load">;
+}): readonly AgentRunRetainedRecoveryReference[] | null {
+  const retained = input.head.checkpoint?.retainedRequestDeliveries ?? [];
+  const observedDeliveryIds = new Set<string>();
+
+  for (const reference of retained) {
+    if (
+      reference.requestDeliveryId === input.head.handle.runId ||
+      input.journalHeadRunIds.has(reference.requestDeliveryId) ||
+      observedDeliveryIds.has(reference.requestDeliveryId)
+    ) {
+      return null;
+    }
+    observedDeliveryIds.add(reference.requestDeliveryId);
+
+    const retainedOwner = input.requestDeliveryStore.load(reference.requestDeliveryId).match<
+      | {
+          readonly kind: "accepted";
+          readonly requestDeliveryId: string;
+          readonly requestId: string;
+          readonly workRequestDeliveryId: string;
+          readonly workRequestId: string;
+          readonly sessionId: string;
+          readonly queue: CoreAcceptedRequestWork["data"]["queue"];
+          readonly raw: AgentRunnerRaw | undefined;
+        }
+      | {
+          readonly kind: "terminal";
+          readonly requestDeliveryId: string;
+          readonly requestId: string;
+          readonly outcome: AgentRunRetainedRecoveryReference["outcome"];
+        }
+      | { readonly kind: "invalid" }
+    >({
+      ok: (record) => {
+        if (record.state === "terminal") {
+          return {
+            kind: "terminal",
+            requestDeliveryId: record.requestDeliveryId,
+            requestId: record.requestId,
+            outcome: record.outcome,
+          };
+        }
+        return record.state === "accepted"
+          ? ({
+              kind: "accepted",
+              requestDeliveryId: record.requestDeliveryId,
+              requestId: record.requestId,
+              workRequestDeliveryId: record.work.requestDeliveryId,
+              workRequestId: record.work.requestId,
+              sessionId: record.work.sessionId,
+              queue: record.work.data.queue,
+              raw: preserveAgentRunnerRaw({ data: record.work.data }),
+            } as const)
+          : { kind: "invalid" };
+      },
+      err: () => ({ kind: "invalid" }),
+    });
+    if (retainedOwner.kind === "invalid") return null;
+
+    if (retainedOwner.kind === "terminal") {
+      if (input.head.state !== "terminal") return null;
+      const terminalIdentityMatches =
+        retainedOwner.requestDeliveryId === reference.requestDeliveryId &&
+        retainedOwner.requestId === input.ownerRequestId;
+      if (
+        !terminalIdentityMatches ||
+        !terminalOutcomesMatch(retainedOwner.outcome, reference.outcome)
+      ) {
+        return null;
+      }
+      continue;
+    }
+
+    const identityMatches =
+      retainedOwner.requestDeliveryId === reference.requestDeliveryId &&
+      retainedOwner.workRequestDeliveryId === retainedOwner.requestDeliveryId &&
+      retainedOwner.workRequestId === retainedOwner.requestId &&
+      retainedOwner.sessionId === input.ownerSessionId;
+    if (!identityMatches || retainedOwner.queue === "prompt") return null;
+
+    const control = parseRequestControlFromRaw(retainedOwner.raw);
+    const targetsOwnerRequest = retainedOwner.requestId === input.ownerRequestId;
+    const targetsOwnerMessage =
+      control.cancel &&
+      control.targetMessageId !== null &&
+      requestRawReferencesMessage(input.ownerRaw, control.targetMessageId);
+    if (!targetsOwnerRequest && !targetsOwnerMessage) return null;
+  }
+
+  return retained;
+}
+
+export function joinAgentRunRecoveryHeads(input: {
+  readonly heads: readonly AgentRunRecoveryHead[];
+  readonly requestDeliveryStore: Pick<CoreRequestDeliveryStore, "load">;
+  readonly journal: Pick<AgentRunJournal, "removeReconciled" | "resetRun">;
+  readonly workflowAuthority?: {
+    authorizeWorkflowRequest(input: {
+      readonly requestId: string;
+      readonly sessionId: string;
+      readonly platform: string;
+    }): {
+      readonly policy: {
+        readonly runId: string;
+        readonly operationId: string;
+        readonly dispatchEpoch: string;
+      };
+    } | null;
+  };
+  readonly logger: AgentRunRecoveryJoinLogger;
+}): AgentRunRecoveryJoin {
+  const validatedHeads = new Map<string, AgentRunRecoveryHead>();
+  const retainedOwners = new Map<string, AgentRunRetainedRecoveryOwner>();
+  const recoverableRootParentRequestIds: string[] = [];
+  const activeSessionOwners = new Set<string>();
+  const orderedHeads = [...input.heads].sort(compareAgentRunRecoveryHeads);
+  const journalHeadRunIds = new Set(orderedHeads.map((head) => head.handle.runId));
+
+  for (const head of orderedHeads) {
+    const ownership = input.requestDeliveryStore.load(head.handle.runId).match<
+      | {
+          readonly kind: "accepted";
+          readonly requestId: string;
+          readonly workRequestId: string;
+          readonly sessionId: string;
+          readonly requestClient: string;
+          readonly raw: AgentRunnerRaw | undefined;
+          readonly workflowHint: ReturnType<typeof parseWorkflowRequestHintFromRaw>;
+        }
+      | {
+          readonly kind: "discard";
+          readonly reason: "owner-terminal" | "owner-not-accepted";
+        }
+      | {
+          readonly kind: "terminal";
+          readonly requestId: string;
+          readonly outcome: AgentRunRetainedRecoveryReference["outcome"];
+          readonly finalReplayDeadline?: number;
+        }
+      | { readonly kind: "missing" }
+      | { readonly kind: "load-failed" }
+    >({
+      ok: (record) => {
+        if (record.state === "terminal") {
+          if (head.state !== "terminal") {
+            return { kind: "discard", reason: "owner-terminal" };
+          }
+          return {
+            kind: "terminal",
+            requestId: record.requestId,
+            outcome: record.outcome,
+            ...(record.finalReplayDeadline === undefined
+              ? {}
+              : { finalReplayDeadline: record.finalReplayDeadline }),
+          };
+        }
+        if (record.state !== "accepted") {
+          return { kind: "discard", reason: "owner-not-accepted" };
+        }
+        return {
+          kind: "accepted",
+          requestId: record.requestId,
+          workRequestId: record.work.requestId,
+          sessionId: record.work.sessionId,
+          requestClient: record.work.requestClient,
+          raw: preserveAgentRunnerRaw({ data: record.work.data }),
+          workflowHint: parseWorkflowRequestHintFromRaw(
+            preserveAgentRunnerRaw({ data: record.work.data }),
+          ),
+        };
+      },
+      err: (error) =>
+        error.name === "RequestDeliveryNotFound" ? { kind: "missing" } : { kind: "load-failed" },
+    });
+
+    if (ownership.kind === "missing") {
+      settleAgentRunRecoveryHeadCleanup({
+        head,
+        operation: "reconcile",
+        reason: "owner-missing",
+        journal: input.journal,
+        logger: input.logger,
+      });
+      continue;
+    }
+    if (ownership.kind === "load-failed") {
+      const resetFailure = settleAgentRunRecoveryHeadCleanup({
+        head,
+        operation: "reset",
+        reason: "owner-load-failed",
+        journal: input.journal,
+        logger: input.logger,
+      });
+      if (resetFailure) return failedAgentRunRecoveryJoin(resetFailure);
+      continue;
+    }
+    if (ownership.kind === "discard") {
+      const resetFailure = settleAgentRunRecoveryHeadCleanup({
+        head,
+        operation: ownership.reason === "owner-terminal" ? "reconcile" : "reset",
+        reason: ownership.reason,
+        journal: input.journal,
+        logger: input.logger,
+      });
+      if (resetFailure) return failedAgentRunRecoveryJoin(resetFailure);
+      continue;
+    }
+
+    if (ownership.kind === "terminal") {
+      const terminalIdentityMatches = head.handle.requestId === ownership.requestId;
+      const terminalStateMatches =
+        head.terminalOutcome !== undefined &&
+        terminalOutcomesMatch(head.terminalOutcome, ownership.outcome) &&
+        head.finalReplayDeadline === ownership.finalReplayDeadline;
+      if (!terminalIdentityMatches || !terminalStateMatches) {
+        const resetFailure = settleAgentRunRecoveryHeadCleanup({
+          head,
+          operation: "reset",
+          reason: "incompatible-identity",
+          journal: input.journal,
+          logger: input.logger,
+        });
+        if (resetFailure) return failedAgentRunRecoveryJoin(resetFailure);
+        continue;
+      }
+    }
+
+    const identityMatches =
+      ownership.kind === "terminal" ||
+      (head.handle.requestId === ownership.requestId &&
+        ownership.workRequestId === ownership.requestId &&
+        head.handle.sessionId === ownership.sessionId);
+    if (!identityMatches) {
+      const resetFailure = settleAgentRunRecoveryHeadCleanup({
+        head,
+        operation: "reset",
+        reason: "incompatible-identity",
+        journal: input.journal,
+        logger: input.logger,
+      });
+      if (resetFailure) return failedAgentRunRecoveryJoin(resetFailure);
+      continue;
+    }
+    const retainedReferences = resolveRetainedDeliveriesForRecovery({
+      head,
+      ownerRequestId: ownership.requestId,
+      ownerSessionId: ownership.kind === "terminal" ? head.handle.sessionId : ownership.sessionId,
+      ownerRaw: ownership.kind === "terminal" ? undefined : ownership.raw,
+      journalHeadRunIds,
+      requestDeliveryStore: input.requestDeliveryStore,
+    });
+    if (
+      retainedReferences === null ||
+      retainedReferences.some((reference) => retainedOwners.has(reference.requestDeliveryId))
+    ) {
+      const resetFailure = settleAgentRunRecoveryHeadCleanup({
+        head,
+        operation: "reset",
+        reason: "invalid-retained-delivery",
+        journal: input.journal,
+        logger: input.logger,
+      });
+      if (resetFailure) return failedAgentRunRecoveryJoin(resetFailure);
+      continue;
+    }
+    if (head.state === "active" && activeSessionOwners.has(head.handle.sessionId)) {
+      const resetFailure = settleAgentRunRecoveryHeadCleanup({
+        head,
+        operation: "reset",
+        reason: "duplicate-active-session",
+        journal: input.journal,
+        logger: input.logger,
+      });
+      if (resetFailure) return failedAgentRunRecoveryJoin(resetFailure);
+      continue;
+    }
+    if (head.state === "active") {
+      activeSessionOwners.add(head.handle.sessionId);
+      const authorizedWorkflow =
+        ownership.kind === "accepted" && ownership.workflowHint
+          ? (input.workflowAuthority?.authorizeWorkflowRequest({
+              requestId: ownership.requestId,
+              sessionId: ownership.sessionId,
+              platform: ownership.requestClient,
+            }) ?? null)
+          : null;
+      const isWorkflowOwned =
+        ownership.kind === "accepted" &&
+        ownership.workflowHint !== null &&
+        authorizedWorkflow !== null &&
+        authorizedWorkflow.policy.runId === ownership.workflowHint.runId &&
+        authorizedWorkflow.policy.operationId === ownership.workflowHint.operationId &&
+        authorizedWorkflow.policy.dispatchEpoch === ownership.workflowHint.dispatchEpoch;
+      if (!isHeartbeatSessionId(head.handle.sessionId) && !isWorkflowOwned) {
+        recoverableRootParentRequestIds.push(head.handle.requestId);
+      }
+    }
+    validatedHeads.set(head.handle.runId, head);
+    for (const reference of retainedReferences) {
+      retainedOwners.set(reference.requestDeliveryId, {
+        ownerRunId: head.handle.runId,
+        ownerState: head.state,
+        outcome: reference.outcome,
+        ...(head.finalReplayDeadline === undefined
+          ? {}
+          : { finalReplayDeadline: head.finalReplayDeadline }),
+      });
+    }
+  }
+
+  return {
+    heads: validatedHeads,
+    retainedOwners,
+    recoverableRootParentRequestIds,
+  };
+}
+
+export function removeFullyReconciledAgentRunTerminalHeads(input: {
+  readonly heads: ReadonlyMap<string, AgentRunRecoveryHead>;
+  readonly requestDeliveryStore: Pick<CoreRequestDeliveryStore, "load">;
+  readonly journal: Pick<AgentRunJournal, "removeReconciled">;
+}): void {
+  for (const [runId, head] of input.heads) {
+    if (head.state !== "terminal" || !head.terminalOutcome) continue;
+    const terminalOutcome = head.terminalOutcome;
+    const ownerIsTerminal = input.requestDeliveryStore.load(runId).match({
+      ok: (record) =>
+        record.state === "terminal" &&
+        terminalOutcomesMatch(record.outcome, terminalOutcome) &&
+        record.finalReplayDeadline === head.finalReplayDeadline,
+      err: () => false,
+    });
+    if (!ownerIsTerminal) continue;
+
+    const retainedAreTerminal = (head.checkpoint?.retainedRequestDeliveries ?? []).every(
+      (reference) =>
+        input.requestDeliveryStore.load(reference.requestDeliveryId).match({
+          ok: (record) =>
+            record.state === "terminal" &&
+            record.requestId === head.handle.requestId &&
+            terminalOutcomesMatch(record.outcome, reference.outcome),
+          err: () => false,
+        }),
+    );
+    if (!retainedAreTerminal) continue;
+    input.journal.removeReconciled(runId);
+  }
+}
+
+export type AgentRunAcceptedRecoveryDecision =
+  | { readonly kind: "resume"; readonly head?: AgentRunRecoveryHead }
+  | { readonly kind: "retained-active"; readonly ownerRunId: string }
+  | {
+      readonly kind: "terminal";
+      readonly outcome: AgentRunRetainedRecoveryReference["outcome"];
+      readonly finalReplayDeadline?: number;
+    };
+
+export function selectAgentRunAcceptedRecovery(
+  join: AgentRunRecoveryJoin,
+  requestDeliveryId: string,
+): AgentRunAcceptedRecoveryDecision {
+  const head = join.heads.get(requestDeliveryId);
+  if (head?.state === "terminal" && head.terminalOutcome) {
+    return {
+      kind: "terminal",
+      outcome: head.terminalOutcome,
+      ...(head.finalReplayDeadline === undefined
+        ? {}
+        : { finalReplayDeadline: head.finalReplayDeadline }),
+    };
+  }
+  const retainedOwner = join.retainedOwners.get(requestDeliveryId);
+  if (retainedOwner?.ownerState === "terminal") {
+    return {
+      kind: "terminal",
+      outcome: retainedOwner.outcome,
+      ...(retainedOwner.finalReplayDeadline === undefined
+        ? {}
+        : { finalReplayDeadline: retainedOwner.finalReplayDeadline }),
+    };
+  }
+  if (retainedOwner) {
+    return { kind: "retained-active", ownerRunId: retainedOwner.ownerRunId };
+  }
+  return { kind: "resume", ...(head ? { head } : {}) };
 }
 
 export type CoreRuntime = {
@@ -1150,18 +1655,6 @@ export type CoreRuntimeCleanupFailure = {
   readonly panic: boolean;
 };
 
-function logGracefulRestartSnapshotSaved(
-  logger: ReturnType<typeof createLogger>,
-  details: {
-    readonly drainDeadlineMs: number;
-    readonly snapshotTtlMs: number;
-    readonly agentEntries: number;
-    readonly relayEntries: number;
-  },
-): void {
-  logger.info("Saved graceful restart snapshot", details);
-}
-
 export type CoreRuntimeCleanupSupervisor = {
   readonly failures: readonly CoreRuntimeCleanupFailure[];
   readonly panics: readonly Panic[];
@@ -1305,18 +1798,6 @@ function subId(prefix: string, name: string): string {
   return `${prefix}:${name}`;
 }
 
-function staleRestartLogContext(input: {
-  readonly createdAt: number;
-  readonly ageMs: number;
-  readonly deadlineMs: number;
-}) {
-  return {
-    createdAt: input.createdAt,
-    ageMs: input.ageMs,
-    deadlineMs: input.deadlineMs,
-  };
-}
-
 function runtimeFsDenyPaths(): readonly string[] {
   const home = process.env.HOME;
   return [
@@ -1331,7 +1812,6 @@ function fffCacheDir(): string {
 }
 
 export function openCoreDurableStoresInStartupOrder(input: {
-  readonly openGracefulRestart: () => void;
   readonly openTranscript: () => void;
   readonly openDiscordSearch: () => void;
   readonly openDiscordSurface: () => void;
@@ -1339,7 +1819,6 @@ export function openCoreDurableStoresInStartupOrder(input: {
   readonly openDiscovery: () => void;
   readonly openWorkflow: () => void;
 }): void {
-  input.openGracefulRestart();
   input.openTranscript();
   input.openDiscordSearch();
   input.openDiscordSurface();
@@ -1439,8 +1918,8 @@ export async function createCoreRuntime(
   }
   let blobStore: BlobStore | null = blobStoreCreation.store;
   let requestDeliveryStore: ReturnType<typeof createCoreRequestDelivery>["store"] | null = null;
+  let agentRunJournal: SqliteAgentRunJournal | null = null;
   let durableWorkflowStore: DurableWorkflowStore | null = null;
-  let gracefulRestartStore: SqliteGracefulRestartStore | null = null;
   let transcriptStore: SqliteTranscriptStore | null = null;
   let resourceService: CoreResourceService | null = null;
   let discordSearchStore: DiscordSearchStore | null = null;
@@ -1465,6 +1944,15 @@ export async function createCoreRuntime(
         );
       });
     }
+    await cleanup.run(
+      "agentRunJournal.createFailure.close",
+      agentRunJournal
+        ? async () => {
+            agentRunJournal?.close();
+            agentRunJournal = null;
+          }
+        : undefined,
+    );
     await cleanup.run(
       "requestDeliveryStore.createFailure.close",
       requestDeliveryStore
@@ -1493,10 +1981,6 @@ export async function createCoreRuntime(
     await cleanup.run("transcriptStore.createFailure.close", async () => {
       transcriptStore?.close();
       transcriptStore = null;
-    });
-    await cleanup.run("gracefulRestartStore.createFailure.close", async () => {
-      gracefulRestartStore?.close();
-      gracefulRestartStore = null;
     });
     await cleanup.run("durableWorkflowStore.createFailure.close", async () => {
       durableWorkflowStore?.close();
@@ -1572,16 +2056,28 @@ export async function createCoreRuntime(
   }
   const requestDeliveryCoordinator = requestDeliverySelection.delivery.coordinator;
   requestDeliveryStore = requestDeliverySelection.delivery.store;
+  const journalCreation = Result.try({
+    try: () =>
+      new SqliteAgentRunJournal({
+        dbPath: path.join(env.dataDir, "request-delivery.db"),
+      }),
+    catch: captureRuntimeError,
+  });
+  journalCreation.match({
+    ok: (journal) => {
+      agentRunJournal = journal;
+    },
+    err: (captured) => {
+      logger.warn("Agent run journal disabled for this boot", {
+        error: safeRuntimeErrorText(captured, "Agent run journal creation failed"),
+      });
+    },
+  });
   const durableStoresCreated = Result.try({
     try: () => {
       const discordSearchDbPath = resolveDiscordSearchDbPath();
       const discordSurfaceDbPath = resolveDiscordDbPath(initialCoreConfig);
       openCoreDurableStoresInStartupOrder({
-        openGracefulRestart: () => {
-          gracefulRestartStore = new SqliteGracefulRestartStore(
-            path.join(env.dataDir, "graceful-restart.db"),
-          );
-        },
         openTranscript: () => {
           transcriptStore = new SqliteTranscriptStore(
             resolveTranscriptDbPath(),
@@ -1837,7 +2333,6 @@ export async function createCoreRuntime(
     return finishCoreRuntimeCreateFailure(mcpRegistryFailure, eventBusResources);
   }
   let surfaceRuntimeRegistry: SurfaceRuntimeRegistry | null = null;
-  let pendingSurfaceRecovery: PausedSurfaceRecoveryOwnership | null = null;
   let runtimeFullyStarted = false;
   let routerSubscriptionHealthy = true;
   let mcpRegistryInitPromise: Promise<void> | null = null;
@@ -1858,7 +2353,10 @@ export async function createCoreRuntime(
           activeBlobStore ? activeBlobStore.maintain() : Promise.resolve(null),
           resourceService?.maintain({ limit: 64 }) ?? Promise.resolve(null),
           activeBlobStore && transcriptStore
-            ? transcriptStore.maintainCoreOwnedBlobs({ blobStore: activeBlobStore, limit: 64 })
+            ? transcriptStore.maintainCoreOwnedBlobs({
+                blobStore: activeBlobStore,
+                limit: 64,
+              })
             : Promise.resolve(null),
         ]);
       maintained.match({
@@ -1971,11 +2469,9 @@ export async function createCoreRuntime(
     recordUnhandledRejection(reason: Error): void;
   } | null = null;
 
-  // How long shutdown waits for active runs/relays before forcing snapshot + exit.
+  // How long shutdown waits for active runs and relays before interrupting them.
   const GRACEFUL_DRAIN_DEADLINE_MS = 3_000;
   const DEFAULT_HARD_SHUTDOWN_DEADLINE_MS = 5_000;
-  // How long a saved snapshot remains valid for restore on next boot.
-  const GRACEFUL_SNAPSHOT_TTL_MS = 120_000;
   const REDIS_HEALTH_TIMEOUT_MS = 1_000;
 
   async function probeRedisHealth(): Promise<{
@@ -2251,7 +2747,6 @@ export async function createCoreRuntime(
           const activeConversationThreadStore = conversationThreadStore;
           if (
             !activeDurableWorkflowStore ||
-            !gracefulRestartStore ||
             !activeTranscriptStore ||
             !activeDiscordSearchStore ||
             !activeDiscordSurfaceStore ||
@@ -2435,8 +2930,6 @@ export async function createCoreRuntime(
             webhookSecret: env.github.webhookSecret,
             githubAppCredentialsAvailable,
             getTranscriptStore: () => activeTranscriptStore,
-            activateRestoredDiscordOutputChains: (generation, chains) =>
-              stopRouter?.restoreActiveOutputChains(generation, chains),
             logger,
             reportFatalError,
           });
@@ -2484,7 +2977,9 @@ export async function createCoreRuntime(
             ]),
             logger: createLogger({ module: "core-resource" }),
           });
-          const initialResourceMaintenance = await resourceService.maintain({ limit: 64 });
+          const initialResourceMaintenance = await resourceService.maintain({
+            limit: 64,
+          });
           initialResourceMaintenance.match({
             err: (error) =>
               logger.warn(
@@ -2946,55 +3441,87 @@ export async function createCoreRuntime(
             relays: surfaceRelayHandles,
           });
 
-          const restartLoadResult = gracefulRestartStore?.readCompletedSnapshot();
-          const missingRestartLoad: GracefulRestartLoadOutcome = {
-            state: "absent",
-            provenance: "missing-defaulted",
-          };
-          const restartLoadError: GracefulRestartLoadError | null =
-            restartLoadResult?.match({
-              err: (error) => error,
-              ok: () => null,
-            }) ?? null;
-          const restartLoad =
-            restartLoadResult?.match({
-              ok: (value) => value,
-              err: () => missingRestartLoad,
-            }) ?? missingRestartLoad;
-          if (restartLoadError) {
-            logger.warn(
-              "Graceful restart snapshot load failed",
-              formatTaggedErrorForLog(restartLoadError),
-            );
-          }
-          const restartSnapshot = restartLoad.state === "loaded" ? restartLoad.snapshot : null;
-          let recoveryPlan: SurfaceRecoveryPlan | null = null;
-          let initialHeartbeatExternalState:
-            | { readonly activeRequestIds: readonly string[] }
-            | undefined;
-
-          if (restartLoad.state === "stale") {
-            logger.warn(
-              "Graceful restart snapshot discarded (stale)",
-              staleRestartLogContext(restartLoad),
-            );
-          }
-          if (restartLoad.state === "empty" || restartLoad.state === "stale") {
-            const consumed = gracefulRestartStore?.consumeCompletedSnapshot(restartLoad.rowToken);
-            consumed?.match({
-              ok: () => undefined,
-              err: (error) =>
-                logger.warn(
-                  "Graceful restart snapshot disposition failed",
-                  formatTaggedErrorForLog(error),
-                ),
+          let loadedJournalHeads: readonly AgentRunRecoveryHead[] = [];
+          if (agentRunJournal) {
+            const loadedJournal = agentRunJournal.loadRecoveryHeads();
+            const loadDecision = loadedJournal.match<
+              | {
+                  readonly kind: "loaded";
+                  readonly heads: readonly AgentRunRecoveryHead[];
+                }
+              | {
+                  readonly kind: "reset";
+                  readonly error: AgentRunJournalSqliteFailure;
+                }
+            >({
+              ok: ({ heads, resets }) => {
+                for (const reset of resets) {
+                  logger.warn("Agent run journal progress reset", {
+                    scope: reset.scope,
+                    ...(reset.runId ? { requestDeliveryId: reset.runId } : {}),
+                    reason: reset.reason,
+                    errorTag: reset.errorName,
+                  });
+                }
+                return { kind: "loaded", heads };
+              },
+              err: (error) => ({ kind: "reset", error }),
             });
+            if (loadDecision.kind === "loaded") {
+              loadedJournalHeads = loadDecision.heads;
+            } else {
+              logger.warn("Agent run journal recovery reset for this boot", {
+                ...formatTaggedErrorForLog(loadDecision.error),
+              });
+              const resetFailure = agentRunJournal.resetAll().match({
+                ok: () => null,
+                err: (error) => error,
+              });
+              if (resetFailure) {
+                logger.warn("Agent run journal disabled after reset failure", {
+                  ...formatTaggedErrorForLog(resetFailure),
+                });
+                const disabledJournal = agentRunJournal;
+                Result.try({
+                  try: () => disabledJournal.close(),
+                  catch: captureRuntimeError,
+                });
+                agentRunJournal = null;
+              }
+            }
           }
+
+          let journalRecoveryJoin = emptyAgentRunRecoveryJoin();
+          if (agentRunJournal && requestDeliveryStore) {
+            const joined = joinAgentRunRecoveryHeads({
+              heads: loadedJournalHeads,
+              requestDeliveryStore,
+              journal: agentRunJournal,
+              workflowAuthority: activeDurableWorkflowStore,
+              logger,
+            });
+            if (joined.journalResetFailure) {
+              logger.warn("Agent run journal disabled after startup run reset failure", {
+                ...formatTaggedErrorForLog(joined.journalResetFailure),
+              });
+              const disabledJournal = agentRunJournal;
+              Result.try({
+                try: () => disabledJournal.close(),
+                catch: captureRuntimeError,
+              });
+              agentRunJournal = null;
+            } else {
+              journalRecoveryJoin = joined;
+            }
+          }
+          const journalRecoveryHeads = journalRecoveryJoin.heads;
+
           // Start agent runner last so it can't publish replies before relay is online.
           const startedAgentRunner = await startBusAgentRunner({
             bus: durableBus,
             blobStore: activeBlobStore,
             requestDelivery: requestDeliveryCoordinator,
+            ...(agentRunJournal ? { agentRunJournal } : {}),
             subscriptionId: subId(subscriptionPrefix, "agent-runner"),
             reportFatalPanic: reportFatalError,
             pluginManager,
@@ -3070,46 +3597,33 @@ export async function createCoreRuntime(
 
           logger.debug("Bus agent runner started");
 
-          if (restartSnapshot && restartLoad.state === "loaded") {
-            const prepared = prepareSurfaceRecovery({
-              registry,
-              snapshot: restartSnapshot,
-              relays: surfaceRelayHandles,
-              agentRunner: startedAgentRunner,
-            });
-            const plan = prepared.match({
-              err: (error) => {
-                logger.warn(
-                  "Graceful restart snapshot retained because recovery is unavailable",
-                  formatTaggedErrorForLog(error),
-                );
-                return null;
-              },
-              ok: (value) => value,
-            });
-            if (plan) {
-              recoveryPlan = plan;
-              const applied = await applySurfaceRecovery(plan);
-              applied.match({
-                err: (error) => {
-                  logger.warn(
-                    "Graceful restart snapshot retained after paused admission failure",
-                    formatTaggedErrorForLog(error),
-                  );
-                  recoveryPlan = null;
-                },
-                ok: () => {
-                  pendingSurfaceRecovery = createPausedSurfaceRecoveryOwnership(plan);
-                },
-              });
-            }
-          }
-
           const acceptedRecovery = await requestDeliveryCoordinator.recoverAccepted(
-            (record) => startedAgentRunner.resumeAcceptedDelivery(record),
+            (record) => {
+              const decision = selectAgentRunAcceptedRecovery(
+                journalRecoveryJoin,
+                record.requestDeliveryId,
+              );
+              return decision.kind === "retained-active"
+                ? Promise.resolve(Result.ok(undefined))
+                : startedAgentRunner.resumeAcceptedDelivery(
+                    record,
+                    decision.kind === "resume" ? decision.head : undefined,
+                  );
+            },
             {
-              outputReplay: createCoreRequestOutputReplayRecovery(bus),
-              isOutputReplayEligible: (record) => record.work.data.queue === "prompt",
+              terminalRecovery: (record) => {
+                const decision = selectAgentRunAcceptedRecovery(
+                  journalRecoveryJoin,
+                  record.requestDeliveryId,
+                );
+                if (decision.kind !== "terminal") return undefined;
+                return {
+                  outcome: decision.outcome,
+                  ...(decision.finalReplayDeadline === undefined
+                    ? {}
+                    : { finalReplayDeadline: decision.finalReplayDeadline }),
+                };
+              },
               prepareTerminalRecovery: (record) =>
                 Promise.resolve(
                   startedAgentRunner.discardPausedRecoveredDelivery(record.requestDeliveryId),
@@ -3132,49 +3646,23 @@ export async function createCoreRuntime(
               ),
             };
           }
-          acceptedRecovery.match({
-            err: () => undefined,
-            ok: (summary) => {
-              const uncertainty = summary.uncertainties[0];
-              if (!uncertainty) return;
-              logger.warn("Core accepted request output replay recovery remains uncertain", {
-                error: safeRuntimeErrorText(
-                  uncertainty,
-                  "Core accepted request output replay recovery remains uncertain",
-                ),
-              });
-            },
-          });
+          if (agentRunJournal && requestDeliveryStore) {
+            removeFullyReconciledAgentRunTerminalHeads({
+              heads: journalRecoveryHeads,
+              requestDeliveryStore,
+              journal: agentRunJournal,
+            });
+          }
 
-          const committedSnapshot = recoveryPlan?.snapshot;
           const recoverableRootParentRequestIds =
-            committedSnapshot?.agent
-              .filter(
-                (entry) =>
-                  entry.kind === "active" &&
-                  !isHeartbeatSessionId(entry.sessionId) &&
-                  !(
-                    entry.identity?.state === "durable" &&
-                    entry.identity.projection.source === "internal-delegated"
-                  ),
-              )
-              .map((entry) => entry.requestId) ?? [];
+            journalRecoveryJoin.recoverableRootParentRequestIds;
           await workflowLiveParentBridge.enableOrphanHandling({
             protectedParentRequestIds: recoverableRootParentRequestIds,
-            protectionMs: committedSnapshot
-              ? Math.max(1, committedSnapshot.createdAt + committedSnapshot.deadlineMs - Date.now())
-              : GRACEFUL_SNAPSHOT_TTL_MS,
+            protectionMs: GRACEFUL_DRAIN_DEADLINE_MS,
           });
-
-          if (recoveryPlan) {
-            initialHeartbeatExternalState = {
-              activeRequestIds: recoveryPlan.snapshot.agent
-                .filter(
-                  (entry) => entry.kind === "active" && !isHeartbeatSessionId(entry.sessionId),
-                )
-                .map((entry) => entry.requestId),
-            };
-          }
+          const initialHeartbeatExternalState = {
+            activeRequestIds: recoverableRootParentRequestIds,
+          };
 
           workflowEngine = new WorkflowEngine({
             bus: durableBus,
@@ -3251,41 +3739,7 @@ export async function createCoreRuntime(
             logger.debug("Conversation thread worker started");
           }
 
-          if (recoveryPlan && restartLoad.state === "loaded") {
-            const recoveryBeingCommitted = recoveryPlan;
-            const consumed = gracefulRestartStore?.consumeCompletedSnapshot(restartLoad.rowToken);
-            if (!consumed) {
-              await pendingSurfaceRecovery?.rollback();
-              pendingSurfaceRecovery = null;
-              logger.warn("Graceful restart snapshot retained because the store is unavailable");
-              recoveryPlan = null;
-              startedAgentRunner.activate();
-            } else {
-              await consumed.match({
-                err: (error) => async () => {
-                  await pendingSurfaceRecovery?.rollback();
-                  pendingSurfaceRecovery = null;
-                  logger.warn(
-                    "Graceful restart snapshot retained after conditional disposition failure",
-                    formatTaggedErrorForLog(error),
-                  );
-                  recoveryPlan = null;
-                  startedAgentRunner.activate();
-                },
-                ok: () => async () => {
-                  const recoveryOwnership = pendingSurfaceRecovery;
-                  pendingSurfaceRecovery = null;
-                  recoveryOwnership?.activate();
-                  logger.info("Graceful restart snapshot restored", {
-                    agentEntries: recoveryBeingCommitted.snapshot.agent.length,
-                    relayEntries: recoveryBeingCommitted.snapshot.relays.length,
-                  });
-                },
-              })();
-            }
-          } else {
-            startedAgentRunner.activate();
-          }
+          startedAgentRunner.activate();
 
           runtimeFullyStarted = routerSubscriptionHealthy;
 
@@ -3347,13 +3801,11 @@ export async function createCoreRuntime(
     const ownedBlobStore = stopPass === "full" ? blobStore : null;
     if (stopPass === "full") blobStore = null;
     const gracefulAgentRunner = stopAgentRunner;
-    const gracefulSnapshotStore = gracefulRestartStore;
     const gracefulSurfaceRegistry = surfaceRuntimeRegistry;
-    const gracefulBlobProducerDrainRequired =
+    const gracefulDrainRequired =
       stopPass === "full" &&
       runtimeFullyStarted &&
       gracefulAgentRunner !== null &&
-      gracefulSnapshotStore !== null &&
       gracefulSurfaceRegistry !== null;
     const blobStoreClose = ownedBlobStore
       ? scheduleCoreBlobStoreClose({
@@ -3371,22 +3823,11 @@ export async function createCoreRuntime(
         })
       : null;
 
-    if (pendingSurfaceRecovery) {
-      const pausedRecovery = pendingSurfaceRecovery;
-      pendingSurfaceRecovery = null;
-      await safe("startup.surfaceRecovery.rollback", () => pausedRecovery.rollback());
-    }
-
-    if (
-      gracefulBlobProducerDrainRequired &&
-      gracefulAgentRunner &&
-      gracefulSnapshotStore &&
-      gracefulSurfaceRegistry
-    ) {
+    if (gracefulDrainRequired && gracefulAgentRunner && gracefulSurfaceRegistry) {
       const agentRunner = gracefulAgentRunner;
       const registry = gracefulSurfaceRegistry;
 
-      const recoverables = await stopIngressAndDrainSurfaceRecovery({
+      await stopIngressAndDrainSurfaces({
         registry,
         stopAdapterIngress: async () => {
           await stopSurfaceAdapterIngress({
@@ -3484,49 +3925,6 @@ export async function createCoreRuntime(
         agentRunner,
         relays: surfaceRelayHandles,
       });
-      const agentRecoverables = recoverables.agent;
-      const queueAttempts = recoverables.queueAttempts;
-      const relayRecoverables = recoverables.relays;
-
-      if (
-        agentRecoverables.length > 0 ||
-        queueAttempts.length > 0 ||
-        relayRecoverables.length > 0
-      ) {
-        await safe("graceful.store.saveCompletedSnapshot", async () => {
-          const saved = gracefulRestartStore?.saveCompletedSnapshot({
-            version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
-            createdAt: Date.now(),
-            deadlineMs: GRACEFUL_SNAPSHOT_TTL_MS,
-            queueAttemptProof: "complete",
-            agent: agentRecoverables,
-            queueAttempts,
-            relays: relayRecoverables,
-          });
-          saved?.match({
-            err: (error) => {
-              logger.warn("Graceful restart snapshot save failed", formatTaggedErrorForLog(error));
-            },
-            ok: () => {
-              logGracefulRestartSnapshotSaved(logger, {
-                drainDeadlineMs: GRACEFUL_DRAIN_DEADLINE_MS,
-                snapshotTtlMs: GRACEFUL_SNAPSHOT_TTL_MS,
-                agentEntries: agentRecoverables.length,
-                relayEntries: relayRecoverables.length,
-              });
-            },
-          });
-        });
-      } else {
-        await safe("graceful.store.clear", async () => {
-          const cleared = gracefulRestartStore?.clear();
-          cleared?.match({
-            ok: () => undefined,
-            err: (error) =>
-              logger.warn("Graceful restart snapshot clear failed", formatTaggedErrorForLog(error)),
-          });
-        });
-      }
     }
     const registry = surfaceRuntimeRegistry;
     if (stopPass === "full") {
@@ -3660,6 +4058,10 @@ export async function createCoreRuntime(
         "requestMessageCache.stop",
         () => requestMessageCache?.stop() ?? Promise.resolve(),
       );
+      await safe("agentRunJournal.close", async () => {
+        agentRunJournal?.close();
+        agentRunJournal = null;
+      });
       await safe("requestDeliveryStore.close", async () => {
         requestDeliveryStore?.close();
         requestDeliveryStore = null;
@@ -3689,10 +4091,6 @@ export async function createCoreRuntime(
         conversationThreadStore?.close();
         conversationThreadStore = null;
         conversationThreadService = null;
-      });
-      await safe("gracefulRestartStore.close", async () => {
-        gracefulRestartStore?.close();
-        gracefulRestartStore = null;
       });
       await safe("coreConfigWatcher.stop", async () => {
         stopCoreConfigWatcher();

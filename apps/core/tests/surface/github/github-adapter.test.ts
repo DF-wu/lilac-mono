@@ -42,30 +42,6 @@ function createGithubApi(overrides: Partial<GithubAdapterApi> = {}): GithubAdapt
 }
 
 describe("GitHub adapter contract failures", () => {
-  it("starts a resumable output stream without invoking GitHub", async () => {
-    let providerCalls = 0;
-    const adapter = new GithubAdapter({
-      api: createGithubApi({
-        createIssueComment: async () => {
-          providerCalls += 1;
-          return { id: 1 };
-        },
-      }),
-    });
-
-    const result = await adapter.startOutput(
-      { platform: "github", channelId: "owner/repo#1" },
-      {
-        resume: {
-          created: [{ platform: "github", channelId: "owner/repo#1", messageId: "1" }],
-        },
-      },
-    );
-
-    expect(result.status).toBe("ok");
-    expect(providerCalls).toBe(0);
-  });
-
   it("returns a platform mismatch for a mismatched session platform", async () => {
     const adapter = new GithubAdapter();
 

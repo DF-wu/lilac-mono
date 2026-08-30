@@ -357,7 +357,7 @@ export function createCoreNamedClaudeRuntime(input: {
         diagnostic("attempt-materialized", {
           mode: binding ? "fork" : "fresh",
           reason: binding ? "exact-binding" : "fresh-selection",
-          attemptIndex,
+          attemptIndex: attempt.attemptIndex,
           candidateSessionId,
           sourceSessionId: binding?.claudeSessionId ?? null,
         });

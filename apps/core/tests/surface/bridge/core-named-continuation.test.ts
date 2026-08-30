@@ -80,7 +80,8 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true })));
 });
 
-async function createStore() {
+async function createStore(dbPath?: string) {
+  if (dbPath) return new SqliteTranscriptStore(dbPath);
   const directory = await mkdtemp(path.join(tmpdir(), "core-named-continuation-"));
   directories.push(directory);
   return new SqliteTranscriptStore(path.join(directory, "transcripts.db"));
@@ -197,6 +198,84 @@ async function commitRuntime(input: {
 }
 
 describe("Core named Claude continuation", () => {
+  it("recovers beside a crash-left uncertain attempt", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "core-named-continuation-recovery-"));
+    directories.push(directory);
+    const dbPath = path.join(directory, "transcripts.db");
+    const sessionId = "sub:parent:named:durable-recovery";
+    const requestId = "durable-recovery";
+    const messages = [{ role: "user", content: "recover" }] satisfies ModelMessage[];
+    const firstStore = await createStore(dbPath);
+    const firstRuntime = createCoreNamedClaudeRuntime({
+      store: firstStore,
+      requestClient: "discord",
+      sessionId,
+      requestId,
+      providerId: "claude-code",
+      modelSpecifier: "claude-code/sonnet",
+      reasoning: "medium",
+      executionScopeHash: "scope",
+      executionCwd: "/workspace",
+      sourceTranscript: null,
+      materialize: async (start) => fakeMaterializedRun(start, "sonnet"),
+    });
+    await firstRuntime.prepareModelCall(prepareContext(messages));
+    expect(
+      firstStore.getCoreNamedClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId,
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("active");
+    firstStore.close();
+
+    const diagnostics: Array<{ event: string; detail: Readonly<Record<string, unknown>> }> = [];
+    const recoveredStore = await createStore(dbPath);
+    const recoveredRuntime = createCoreNamedClaudeRuntime({
+      store: recoveredStore,
+      requestClient: "discord",
+      sessionId,
+      requestId,
+      providerId: "claude-code",
+      modelSpecifier: "claude-code/sonnet",
+      reasoning: "medium",
+      executionScopeHash: "scope",
+      executionCwd: "/workspace",
+      sourceTranscript: null,
+      materialize: async (start) => fakeMaterializedRun(start, "sonnet"),
+      onDiagnostic: (event, detail) => diagnostics.push({ event, detail }),
+    });
+    await recoveredRuntime.prepareModelCall(prepareContext(messages));
+
+    expect(
+      recoveredStore.getCoreNamedClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId,
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("uncertain");
+    expect(
+      recoveredStore.getCoreNamedClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId,
+        attemptIndex: 2,
+      })?.state,
+    ).toBe("active");
+    expect(
+      diagnostics.find((entry) => entry.event === "attempt-materialized")?.detail.attemptIndex,
+    ).toBe(2);
+
+    recoveredRuntime.markTerminalFailure(false);
+    await recoveredRuntime.retireAtRunEnd();
+    recoveredStore.close();
+  });
+
   it("starts fresh, forks after restart, and preserves model/reasoning changes", async () => {
     const store = await createStore();
     const sessionId = "sub:parent:named:audit";

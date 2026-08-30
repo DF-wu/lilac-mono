@@ -24,11 +24,7 @@ import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
-import type {
-  MsgRefFor,
-  SurfaceRecoveryGeneration,
-  SurfaceRestoredOutputChain,
-} from "../runtime-descriptor";
+import type { MsgRefFor } from "../runtime-descriptor";
 import type { MsgRef, SurfaceMessage, SurfaceSelf } from "../types";
 import { normalizeDiscordRaw, type NormalizedDiscordRaw } from "./discord-raw-normalizer";
 import {
@@ -311,8 +307,6 @@ type ActiveSessionState = {
   activeOutputMessageIds: Set<string>;
 };
 
-const MAX_TERMINAL_LIFECYCLE_TOMBSTONES = 2_048;
-
 export class BusRequestRouterMissingHeadersError extends TaggedError(
   "BusRequestRouterMissingHeadersError",
 )<{
@@ -367,10 +361,6 @@ type RouterDeliverySubscription = {
 
 export type DiscordRequestRouter = {
   readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
-  restoreActiveOutputChains(
-    generation: SurfaceRecoveryGeneration,
-    chains: readonly SurfaceRestoredOutputChain<"discord">[],
-  ): void;
   stop(): Promise<void>;
 };
 
@@ -881,7 +871,6 @@ export type StartDiscordRequestRouterInput = {
   }) => Promise<{ suppress: boolean; reason?: string }>;
   /** Optional injection for unit tests (bypasses real model call). */
   routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
-  recoveryTombstoneCapacity?: number;
   /** Optional structured logger injection for embedding and tests. */
   logger?: Logger;
 };
@@ -959,80 +948,11 @@ export async function startDiscordRequestRouter(
   }
 
   const activeBySession = new Map<string, ActiveSessionState>();
-  const finalizedRecoveryGenerations = new WeakSet<SurfaceRecoveryGeneration>();
-  const terminalLifecycleTombstones = new Map<
-    string,
-    {
-      readonly requestId: string;
-      readonly platform: "discord";
-      readonly sessionId: string;
-    }
-  >();
-  const terminalLifecycleTombstoneCapacity = Math.max(
-    1,
-    Math.floor(params.recoveryTombstoneCapacity ?? MAX_TERMINAL_LIFECYCLE_TOMBSTONES),
-  );
-  let terminalLifecycleTombstoneOverflow = false;
-  const terminalLifecycleTombstoneKey = (requestId: string, sessionId: string): string =>
-    `${requestId}\u0000discord\u0000${sessionId}`;
-  const recordTerminalLifecycleTombstone = (requestId: string, sessionId: string): void => {
-    const key = terminalLifecycleTombstoneKey(requestId, sessionId);
-    if (terminalLifecycleTombstones.has(key) || terminalLifecycleTombstoneOverflow) return;
-    if (terminalLifecycleTombstones.size >= terminalLifecycleTombstoneCapacity) {
-      terminalLifecycleTombstoneOverflow = true;
-      return;
-    }
-    terminalLifecycleTombstones.set(key, {
-      requestId,
-      platform: "discord",
-      sessionId,
-    });
-  };
   const activeSessionForRequest = (requestId: string): string | undefined => {
     for (const [sessionId, active] of activeBySession) {
       if (active.requestId === requestId) return sessionId;
     }
     return undefined;
-  };
-  const terminalSessionForRequest = (requestId: string): string | undefined => {
-    for (const tombstone of terminalLifecycleTombstones.values()) {
-      if (tombstone.requestId === requestId) return tombstone.sessionId;
-    }
-    return undefined;
-  };
-  const restoreActiveOutputChains = (
-    generation: SurfaceRecoveryGeneration,
-    chains: readonly SurfaceRestoredOutputChain<"discord">[],
-  ): void => {
-    if (finalizedRecoveryGenerations.has(generation)) return;
-    finalizedRecoveryGenerations.add(generation);
-    for (const chain of chains) {
-      if (terminalLifecycleTombstoneOverflow) {
-        const current = activeBySession.get(chain.sessionId);
-        if (current?.requestId === chain.requestId) activeBySession.delete(chain.sessionId);
-        continue;
-      }
-      const terminalKey = terminalLifecycleTombstoneKey(chain.requestId, chain.sessionId);
-      if (terminalLifecycleTombstones.has(terminalKey)) {
-        const current = activeBySession.get(chain.sessionId);
-        if (current?.requestId === chain.requestId) activeBySession.delete(chain.sessionId);
-        continue;
-      }
-      const current = activeBySession.get(chain.sessionId);
-      if (current && current.requestId !== chain.requestId) continue;
-      for (const [key, tombstone] of terminalLifecycleTombstones) {
-        if (tombstone.requestId === chain.requestId) terminalLifecycleTombstones.delete(key);
-      }
-      const active = current ?? {
-        requestId: chain.requestId,
-        activeOutputMessageIds: new Set<string>(),
-      };
-      const refs = chain.activeOutputRefs ?? chain.createdOutputRefs;
-      for (const ref of refs) active.activeOutputMessageIds.add(ref.messageId);
-      activeBySession.set(chain.sessionId, active);
-    }
-    terminalLifecycleTombstones.clear();
-    terminalLifecycleTombstoneOverflow = false;
   };
   const buffers = new Map<string, DebounceBuffer>();
   const pendingMentionReplyBatchBySession = new Map<string, PendingMentionReplyBatch>();
@@ -1204,9 +1124,8 @@ export async function startDiscordRequestRouter(
         }
 
         const activeSessionId = activeSessionForRequest(requestId);
-        const terminalSessionId = terminalSessionForRequest(requestId);
         if (requestClient !== "discord") {
-          if (activeSessionId !== undefined || terminalSessionId !== undefined) {
+          if (activeSessionId !== undefined) {
             return Result.err(
               new BusRequestRouterLifecycleCorrelationInvalid({
                 requestId,
@@ -1216,10 +1135,7 @@ export async function startDiscordRequestRouter(
           }
           return Result.ok(undefined);
         }
-        if (
-          (activeSessionId !== undefined && activeSessionId !== sessionId) ||
-          (terminalSessionId !== undefined && terminalSessionId !== sessionId)
-        ) {
+        if (activeSessionId !== undefined && activeSessionId !== sessionId) {
           return Result.err(
             new BusRequestRouterLifecycleCorrelationInvalid({
               requestId,
@@ -1230,7 +1146,6 @@ export async function startDiscordRequestRouter(
 
         return captureRouterRouting("evt.request", async () => {
           if (msg.data.state === "running") {
-            terminalLifecycleTombstones.delete(terminalLifecycleTombstoneKey(requestId, sessionId));
             const current = activeBySession.get(sessionId);
             if (current?.requestId !== requestId) {
               activeBySession.set(sessionId, {
@@ -1245,7 +1160,6 @@ export async function startDiscordRequestRouter(
             msg.data.state === "failed" ||
             msg.data.state === "cancelled"
           ) {
-            recordTerminalLifecycleTombstone(requestId, sessionId);
             const cur = activeBySession.get(sessionId);
             if (cur?.requestId === requestId) {
               const flushed = await flushPendingMentionReplyBatchAsPrompt({
@@ -3129,7 +3043,6 @@ export async function startDiscordRequestRouter(
     residualRouter: null,
     result: Result.ok({
       done,
-      restoreActiveOutputChains,
       stop: async () => {
         await adaptRouterSubscriptionsStop(subscriptions).finally(() => {
           for (const b of buffers.values()) {
@@ -3137,8 +3050,6 @@ export async function startDiscordRequestRouter(
           }
           buffers.clear();
           pendingMentionReplyBatchBySession.clear();
-          terminalLifecycleTombstones.clear();
-          terminalLifecycleTombstoneOverflow = false;
         });
       },
     }),

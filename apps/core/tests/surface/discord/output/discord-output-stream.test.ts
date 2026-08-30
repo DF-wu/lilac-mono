@@ -705,39 +705,68 @@ describe("Discord initial output", () => {
     expect(createdMessageId).toBe("m_1");
     await out.finish();
   });
-});
 
-describe("Discord recovery hydration", () => {
-  it("applies restored state without provider calls before the first live part", async () => {
+  it("edits a recovered output message instead of posting another reply", async () => {
     const { client, createdMessageIds, operations } = createFakeDiscordClient();
-    const out = new DiscordOutputStream({
+    const original = new DiscordOutputStream({
       client,
       sessionRef: { platform: "discord", channelId: "chan" },
       useSmartSplitting: false,
       outputMode: "inline",
-      reasoningDisplayMode: "simple",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+    await original.push({ type: "text.delta", delta: "before crash" });
+    const originalResult = resultValue(await original.finish());
+    const operationsBeforeRecovery = operations.length;
+    let recoveredMessageId: string | undefined;
+    const recovered = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      opts: {
+        requestId: "discord:chan:request",
+        resumeAt: originalResult.last,
+        onMessageCreated: (ref) => {
+          recoveredMessageId = ref.messageId;
+        },
+      },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
       workingIndicators: ["Working"],
     });
 
-    expect(
-      out.hydrateRecovery([
-        { type: "text.set", text: "restored" },
-        {
-          type: "reasoning.status",
-          update: { startedAtMs: 1, frozenAtMs: 2, detailText: "reasoning" },
-        },
-      ]),
-    ).toBe("visible");
-    expect(createdMessageIds).toEqual([]);
-    expect(operations).toEqual([]);
+    await recovered.push({ type: "text.delta", delta: "after recovery" });
 
-    await expect(out.push({ type: "text.delta", delta: " live" })).resolves.toEqual(
-      Result.ok("visible"),
-    );
     expect(createdMessageIds).toEqual(["m_1"]);
-    expect(operations.map((operation) => operation.kind)).toEqual(["send"]);
-    expect(hasEmbeds(operations[0]?.options)).toBe(true);
-    expect(contentFromOptions(operations[0]?.options)).not.toBe("*Replying...*");
+    expect(operations.slice(operationsBeforeRecovery)).toEqual([
+      expect.objectContaining({ kind: "edit", messageId: "m_1" }),
+    ]);
+    expect(recoveredMessageId).toBe("m_1");
+    expect(resultValue(await recovered.finish()).last).toEqual(originalResult.last);
+  });
+
+  it("posts a fresh message when the recovered output message is unavailable", async () => {
+    const { client, createdMessageIds, operations } = createFakeDiscordClient({
+      failResumeFetch: true,
+    });
+    const recovered = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      opts: {
+        resumeAt: { platform: "discord", channelId: "chan", messageId: "missing" },
+      },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await recovered.push({ type: "text.delta", delta: "after recovery" });
+
+    expect(createdMessageIds).toEqual(["m_1"]);
+    expect(operations[0]).toEqual(expect.objectContaining({ kind: "send", messageId: "m_1" }));
+    await recovered.finish();
   });
 });
 
@@ -1051,35 +1080,6 @@ describe("output operation failures", () => {
     await expect(out.finish()).rejects.toMatchObject({
       _tag: "DiscordEmbedPusherInvariant",
     });
-  });
-
-  it("classifies resume fetch failures instead of creating a duplicate chain", async () => {
-    const { client, createdMessageIds } = createFakeDiscordClient({
-      resumeFetchFailure: { status: 403 },
-    });
-    const out = new DiscordOutputStream({
-      client,
-      sessionRef: { platform: "discord", channelId: "chan" },
-      opts: {
-        resume: {
-          created: [{ platform: "discord", channelId: "chan", messageId: "existing" }],
-        },
-      },
-      useSmartSplitting: false,
-      outputMode: "inline",
-      reasoningDisplayMode: "none",
-      workingIndicators: ["Working"],
-    });
-
-    const result = await out.push({ type: "text.delta", delta: "hello" });
-
-    expect(result.status).toBe("error");
-    if (result.status === "ok") throw new Error("expected push failure");
-    expect(result.error).toMatchObject({
-      _tag: "SurfacePermissionDenied",
-      operation: "push-output",
-    });
-    expect(createdMessageIds).toEqual([]);
   });
 
   it("returns partial completion when a later final chunk fails", async () => {

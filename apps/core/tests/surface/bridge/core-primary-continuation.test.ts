@@ -230,6 +230,83 @@ function bindingFor(manifest: CoreLineageManifestV2): CorePrimaryClaudeSessionBi
 }
 
 describe("Core primary Claude continuation", () => {
+  it("recovers beside a crash-left uncertain attempt", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "core-primary-continuation-recovery-"));
+    directories.push(directory);
+    const dbPath = path.join(directory, "transcripts.db");
+    const sessionId = "durable-recovery-channel";
+    const requestId = "durable-recovery";
+    const messages = [{ role: "user", content: "recover" }] satisfies ModelMessage[];
+    const lineage = buildCoreLineageManifestV2([syntheticSegment("durable-recovery", messages)]);
+    const firstStore = await createStore(dbPath);
+    const firstRuntime = createCorePrimaryClaudeRuntime({
+      store: firstStore,
+      sessionId,
+      requestId,
+      providerId: "claude-code",
+      modelSpecifier: "claude-code/sonnet",
+      reasoning: "medium",
+      executionScopeHash: "scope",
+      executionCwd: "/workspace",
+      getLineage: () => lineage,
+      materialize: async (start) => fakeMaterializedRun(start),
+    });
+    await firstRuntime.prepareModelCall(prepareContext(messages));
+    expect(
+      firstStore.getCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId,
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("active");
+    firstStore.close();
+
+    const diagnostics: Array<{ event: string; detail: Readonly<Record<string, unknown>> }> = [];
+    const recoveredStore = await createStore(dbPath);
+    const recoveredRuntime = createCorePrimaryClaudeRuntime({
+      store: recoveredStore,
+      sessionId,
+      requestId,
+      providerId: "claude-code",
+      modelSpecifier: "claude-code/sonnet",
+      reasoning: "medium",
+      executionScopeHash: "scope",
+      executionCwd: "/workspace",
+      getLineage: () => lineage,
+      materialize: async (start) => fakeMaterializedRun(start),
+      onDiagnostic: (event, detail) => diagnostics.push({ event, detail }),
+    });
+    await recoveredRuntime.prepareModelCall(prepareContext(messages));
+
+    expect(
+      recoveredStore.getCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId,
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("uncertain");
+    expect(
+      recoveredStore.getCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId,
+        attemptIndex: 2,
+      })?.state,
+    ).toBe("active");
+    expect(
+      diagnostics.find((entry) => entry.event === "attempt-materialized")?.detail.attemptIndex,
+    ).toBe(2);
+
+    recoveredRuntime.markTerminalFailure(false);
+    await recoveredRuntime.retireAtRunEnd();
+    recoveredStore.close();
+  });
+
   it("selects only the exact ordered complete segment boundary", () => {
     const first = [{ role: "user", content: "one" }] satisfies ModelMessage[];
     const second = [{ role: "assistant", content: "two" }] satisfies ModelMessage[];

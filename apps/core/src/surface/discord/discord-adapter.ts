@@ -1255,14 +1255,14 @@ export class DiscordAdapter implements SurfaceAdapter {
       const replyError = reply.match({ ok: () => null, err: (error) => error });
       if (replyError) return Result.err(replyError);
     }
-    for (const [index, created] of (opts?.resume?.created ?? []).entries()) {
-      const resumed = discordNestedMsgRefResult({
+    if (opts?.resumeAt) {
+      const resume = discordNestedMsgRefResult({
         operation: "start-output",
         sessionRef: discordRef,
-        msgRef: created,
-        refRole: `resume.created[${index}]`,
+        msgRef: opts.resumeAt,
+        refRole: "resumeAt",
       });
-      const resumeError = resumed.match({ ok: () => null, err: (error) => error });
+      const resumeError = resume.match({ ok: () => null, err: (error) => error });
       if (resumeError) return Result.err(resumeError);
     }
     const cfg = this.cfg;

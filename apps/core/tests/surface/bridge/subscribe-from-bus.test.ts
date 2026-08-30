@@ -1,8 +1,5 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { Panic, Result } from "better-result";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 import {
   adaptSurfaceOperationToRelay,
@@ -10,7 +7,6 @@ import {
   BusToAdapterEffectFailed,
   captureBusToAdapterEffect,
   logIngressAcknowledgementCleanupFailure,
-  type BusToAdapterRelaySnapshot,
 } from "../../../src/surface/bridge/subscribe-from-bus";
 import {
   SurfaceInvalidInput,
@@ -43,27 +39,14 @@ import type {
 import type { MsgRef, SessionRef } from "../../../src/surface/types";
 import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
 import { createGithubRelayPolicy } from "../../../src/surface/github/github-runtime-descriptor";
-import {
-  SurfaceIngressAcknowledgementCleanupFailed,
-  SurfaceRelayRestoreApplyFailed,
-  type SurfaceRelayHandle,
-  type SurfaceRelaySnapshotFor,
-} from "../../../src/surface/runtime-descriptor";
-import {
-  GRACEFUL_RESTART_SNAPSHOT_VERSION,
-  SqliteGracefulRestartStore,
-} from "../../../src/runtime/graceful-restart-store";
+import { SurfaceIngressAcknowledgementCleanupFailed } from "../../../src/surface/runtime-descriptor";
 
 import {
   createMemoryBlobStore,
   type BlobHandleV1,
   type BlobStore,
 } from "@stanley2058/lilac-blob-storage";
-import {
-  createLilacBus,
-  EventDeliveryStopFailed,
-  lilacEventTypes,
-} from "@stanley2058/lilac-event-bus";
+import { createLilacBus, lilacEventTypes } from "@stanley2058/lilac-event-bus";
 import {
   clearGithubAck,
   getGithubAck,
@@ -78,7 +61,6 @@ import {
 import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 import {
   createInMemoryDeliveryBus as createInMemoryRawBus,
-  createInMemoryDeliveryBusWithBlockingTailStop as createInMemoryRawBusWithBlockingTailStop,
   type DeliveryObservation,
 } from "../../helpers/in-memory-delivery-bus";
 
@@ -89,6 +71,7 @@ class FakeOutputStream {
   public aborted: string | undefined;
   public nextPushFailure: Error | null = null;
   public nextAbortFailure: Error | null = null;
+  public finishResult: SurfaceOutputResult | null = null;
   private created = false;
 
   constructor(
@@ -144,6 +127,7 @@ class FakeOutputStream {
 
   async finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>> {
     this.finished = true;
+    if (this.finishResult) return Result.ok(this.finishResult);
     const last: MsgRef = { platform: "discord", channelId: "chan", messageId: "m_out" };
     return Result.ok({ created: [last], last });
   }
@@ -356,41 +340,6 @@ async function uploadTestBlob(bytes: Uint8Array): Promise<BlobHandleV1> {
   return upload.handle;
 }
 
-function createInMemoryRawBusWithOutputStopFailure() {
-  const raw = createInMemoryRawBus();
-  const subscribe = raw.subscribe;
-  raw.subscribe = async (topic, options, handler) => {
-    const started = await subscribe(topic, options, handler);
-    return started.map((subscription) =>
-      topic.startsWith("out.req.")
-        ? {
-            ...subscription,
-            stop: async () =>
-              Result.err(
-                new EventDeliveryStopFailed({
-                  cause: new Error("forced output subscription stop failure"),
-                  topic,
-                  message: "Forced output subscription stop failure",
-                }),
-              ),
-          }
-        : subscription,
-    );
-  };
-  return raw;
-}
-
-async function applyAndActivateRelayRecovery<P extends "discord" | "github">(
-  bridge: Pick<SurfaceRelayHandle<P>, "prepareRestoreRelays">,
-  snapshots: readonly SurfaceRelaySnapshotFor<P>[],
-): Promise<void> {
-  const prepared = bridge.prepareRestoreRelays(snapshots);
-  if (prepared.status === "error") throw prepared.error;
-  const applied = await prepared.value.apply();
-  if (applied.status === "error") throw applied.error;
-  prepared.value.activate();
-}
-
 function relayFailure(error: SurfaceOperationError): BusToAdapterEffectFailed {
   try {
     adaptSurfaceOperationToRelay("push-output", Result.err(error));
@@ -553,13 +502,11 @@ describe("bridgeBusToAdapter", () => {
 
     expect(adapter.stream?.aborted).toBeUndefined();
     expect(adapter.stream?.parts).toEqual([]);
-    expect(bridge.snapshotRelays()).toHaveLength(1);
 
     const refreshedTimeout = scheduled.shift();
     if (!refreshedTimeout) throw new Error("activity did not refresh the relay idle timeout");
     if (refreshedTimeout.active) refreshedTimeout.callback();
     expect(adapter.stream?.aborted).toBe("timeout");
-    expect(bridge.snapshotRelays()).toHaveLength(0);
 
     await bridge.stop();
   });
@@ -646,6 +593,141 @@ describe("bridgeBusToAdapter", () => {
     expect(adapter.typingStarts).toEqual([{ platform: "discord", channelId: "chan" }]);
     expect(adapter.typingStops).toBe(1);
 
+    await bridge.stop();
+  });
+
+  it("reuses the latest durable output ref and links a created message before terminal output", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:msg_recovery_stream";
+    const recoveredRef: MsgRef = {
+      platform: "discord",
+      channelId: "chan",
+      messageId: "m_before_crash",
+    };
+    const linked: MsgRef[] = [];
+    const transcriptStore: TranscriptStore = {
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
+      linkSurfaceMessagesToRequest(input) {
+        linked.push(...input.created);
+      },
+      getTranscriptBySurfaceMessage() {
+        return Result.ok(null);
+      },
+      listSurfaceMessagesForRequest() {
+        return [recoveredRef];
+      },
+      close() {},
+    };
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+      transcriptStore,
+    });
+
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+
+    expect(adapter.lastStart?.opts?.resumeAt).toEqual(recoveredRef);
+
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "continued" },
+      { headers: { request_id: requestId } },
+    );
+
+    expect(linked).toEqual([{ platform: "discord", channelId: "chan", messageId: "m_out_1" }]);
+
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "continued" },
+      { headers: { request_id: requestId } },
+    );
+    await bridge.stop();
+  });
+
+  it("unlinks a transient output ref that finish replaces with a final message", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const adapter = new FakeAdapter();
+    const requestId = "discord:chan:msg_preview_recovery";
+    const linked: MsgRef[] = [];
+    const unlinked: Array<{ platform: string; channelId: string; messageId: string }> = [];
+    const transcriptStore: TranscriptStore = {
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
+      linkSurfaceMessagesToRequest(input) {
+        linked.push(...input.created);
+      },
+      getTranscriptBySurfaceMessage() {
+        return Result.ok(null);
+      },
+      listSurfaceMessagesForRequest() {
+        return [];
+      },
+      unlinkSurfaceMessage(input) {
+        unlinked.push(input);
+        return Result.ok({ requestId, checkpointDeleted: false });
+      },
+      close() {},
+    };
+    const bridge = await bridgeBusToAdapter({
+      adapter,
+      bus,
+      platform: "discord",
+      subscriptionId: "discord-adapter",
+      idleTimeoutMs: 10_000,
+      transcriptStore,
+    });
+    await bus.publish(
+      lilacEventTypes.EvtRequestReply,
+      {},
+      {
+        headers: {
+          request_id: requestId,
+          session_id: "chan",
+          request_client: "discord",
+        },
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputDeltaText,
+      { delta: "preview" },
+      { headers: { request_id: requestId } },
+    );
+    const finalRef: MsgRef = {
+      platform: "discord",
+      channelId: "chan",
+      messageId: "m_final",
+    };
+    if (!adapter.stream) throw new Error("relay did not start an output stream");
+    adapter.stream.finishResult = { created: [finalRef], last: finalRef };
+
+    await bus.publish(
+      lilacEventTypes.EvtAgentOutputResponseText,
+      { finalText: "final" },
+      { headers: { request_id: requestId } },
+    );
+
+    expect(unlinked).toEqual([{ platform: "discord", channelId: "chan", messageId: "m_out_1" }]);
+    expect(linked).toEqual([
+      { platform: "discord", channelId: "chan", messageId: "m_out_1" },
+      finalRef,
+    ]);
     await bridge.stop();
   });
 
@@ -943,35 +1025,26 @@ describe("bridgeBusToAdapter", () => {
       { headers },
     );
 
-    const snapshot = bridge.snapshotRelays()[0];
-    expect(snapshot?.toolStatus).toEqual([
-      {
-        toolCallId: "agent-2",
-        status: "update",
-        display: "subagent (general; 0/1 done)\n`- > bash bun test",
-        ok: undefined,
-        error: undefined,
-      },
-      {
-        toolCallId: "agent-1",
-        status: "end",
-        display:
-          "subagent (explore; gpt-5.6-sol [high]; 2/2 done)\n|- + read_file a.ts\n`- + grep auth",
-        ok: true,
-        error: undefined,
-      },
-    ]);
-
     await bus.publish(
       lilacEventTypes.CmdSurfaceOutputReanchor,
       { inheritReplyTo: true },
       { headers },
     );
-    const canonical = snapshot?.toolStatus[0];
-    const canonicalAgentOne = snapshot?.toolStatus[1];
-    if (!canonical || !canonicalAgentOne) {
-      throw new Error("expected canonical subagent tool statuses");
-    }
+    const canonical = {
+      toolCallId: "agent-2",
+      status: "update" as const,
+      display: "subagent (general; 0/1 done)\n`- > bash bun test",
+      ok: undefined,
+      error: undefined,
+    };
+    const canonicalAgentOne = {
+      toolCallId: "agent-1",
+      status: "end" as const,
+      display:
+        "subagent (explore; gpt-5.6-sol [high]; 2/2 done)\n|- + read_file a.ts\n`- + grep auth",
+      ok: true,
+      error: undefined,
+    };
     expect(adapter.streams).toHaveLength(2);
     expect(adapter.streams[1]?.parts[0]).toEqual({
       type: "tool.status",
@@ -2171,6 +2244,30 @@ describe("bridgeBusToAdapter", () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
     const adapter = new FakeAdapter();
+    const linked: MsgRef[] = [];
+    const unlinked: Array<{ platform: string; channelId: string; messageId: string }> = [];
+    const transcriptStore: TranscriptStore = {
+      saveRequestTranscript() {
+        return Result.ok(undefined);
+      },
+      linkSurfaceMessagesToRequest(input) {
+        linked.push(...input.created);
+      },
+      getTranscriptBySurfaceMessage() {
+        return Result.ok(null);
+      },
+      listSurfaceMessagesForRequest() {
+        return [];
+      },
+      unlinkSurfaceMessage(input) {
+        unlinked.push(input);
+        return Result.ok({ requestId: "discord:chan:msg_skip", checkpointDeleted: false });
+      },
+      deleteUnlinkedCheckpointCandidate() {
+        return Result.ok(false);
+      },
+      close() {},
+    };
 
     const requestId = "discord:chan:msg_skip";
 
@@ -2180,6 +2277,7 @@ describe("bridgeBusToAdapter", () => {
       platform: "discord",
       subscriptionId: "discord-adapter",
       idleTimeoutMs: 10_000,
+      transcriptStore,
     });
 
     await bus.publish(
@@ -2215,6 +2313,8 @@ describe("bridgeBusToAdapter", () => {
       messageId: "m_out_1",
     });
     expect(adapter.stream?.parts).toEqual([{ type: "text.delta", delta: "working" }]);
+    expect(linked).toEqual([{ platform: "discord", channelId: "chan", messageId: "m_out_1" }]);
+    expect(unlinked).toEqual(linked);
 
     await bridge.stop();
   });
@@ -2271,7 +2371,6 @@ describe("bridgeBusToAdapter", () => {
     );
     expect(adapter.stream?.aborted).toBe("skip");
     expect(adapter.typingStops).toBe(1);
-    expect(bridge.snapshotRelays()).toEqual([]);
 
     await bridge.stop();
   });
@@ -2430,1736 +2529,6 @@ describe("bridgeBusToAdapter", () => {
       { type: "text.set", text: "NO_REPLY because ..." },
     ]);
     expect(adapter.stream?.finished).toBe(true);
-
-    await bridge.stop();
-  });
-
-  it("snapshots active relay state for graceful restart", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_snapshot";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await bus.publish(
-      lilacEventTypes.EvtRequestReply,
-      {},
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "chan",
-          request_client: "discord",
-        },
-      },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "hello" },
-      { headers: { request_id: requestId } },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputToolCall,
-      {
-        toolCallId: "tool-1",
-        status: "start",
-        display: "bash ls",
-      },
-      { headers: { request_id: requestId } },
-    );
-
-    const snapshots = bridge.snapshotRelays();
-    expect(snapshots).toHaveLength(1);
-
-    const snapshot = snapshots[0]!;
-    expect(snapshot.requestId).toBe(requestId);
-    expect(snapshot.requestStartedAtMs).toBeTypeOf("number");
-    expect(snapshot.visibleText).toBe("hello");
-    expect(snapshot.reasoning).toBeUndefined();
-    expect(snapshot.createdOutputRefs).toEqual([
-      {
-        platform: "discord",
-        channelId: "chan",
-        messageId: "m_out_1",
-      },
-    ]);
-    expect(snapshot.toolStatus).toEqual([
-      {
-        toolCallId: "tool-1",
-        status: "start",
-        display: "bash ls",
-        ok: undefined,
-        error: undefined,
-      },
-    ]);
-    expect(typeof snapshot.outCursor).toBe("string");
-
-    await bridge.stop();
-  });
-
-  it("snapshots reasoning frozen timestamp after text starts", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_snapshot_reasoning_frozen";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await bus.publish(
-      lilacEventTypes.EvtRequestReply,
-      {},
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "chan",
-          request_client: "discord",
-        },
-      },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaReasoning,
-      { delta: "", seq: 1 },
-      { headers: { request_id: requestId } },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "hello" },
-      { headers: { request_id: requestId } },
-    );
-
-    const snapshot = bridge.snapshotRelays()[0]!;
-    expect(snapshot.reasoning?.startedAtMs).toBeTypeOf("number");
-    expect(snapshot.reasoning?.frozenAtMs).toBeTypeOf("number");
-    expect((snapshot.reasoning?.frozenAtMs ?? 0) >= (snapshot.reasoning?.startedAtMs ?? 0)).toBe(
-      true,
-    );
-
-    await bridge.stop();
-  });
-
-  it("restores frozen reasoning timestamp from snapshot", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_restore_reasoning_frozen";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "already visible",
-        reasoning: {
-          startedAtMs: 10_000,
-          frozenAtMs: 10_250,
-          detailText: "**Summary**\nitem",
-        },
-        toolStatus: [],
-      },
-    ]);
-
-    const reasoningUpdates =
-      adapter.stream?.hydratedParts
-        .filter((p) => p.type === "reasoning.status")
-        .map((p) => p.update) ?? [];
-    expect(reasoningUpdates).toHaveLength(1);
-    expect(reasoningUpdates[0]).toEqual({
-      startedAtMs: 10_000,
-      frozenAtMs: 10_250,
-      detailText: "**Summary**\nitem",
-    });
-
-    await bridge.stop();
-  });
-
-  it.each([
-    ["discord", "discord", true, false],
-    ["discord reasoningDisplayMode none", "discord", true, true],
-    ["github", "github", false, false],
-  ] as const)(
-    "uses %s live reasoning completion disposition when final output is empty",
-    async (_case, platform, shouldFinish, terminalReasoning) => {
-      const bus = createLilacBus(createInMemoryRawBus());
-      const adapter = new FakeAdapter();
-      if (terminalReasoning) adapter.terminalPartTypes.add("reasoning.status");
-      const sessionId = platform === "discord" ? "chan" : `octo/live-${crypto.randomUUID()}#1`;
-      const requestId =
-        platform === "discord"
-          ? `discord:${sessionId}:reasoning-only`
-          : `github:${sessionId}:reasoning-only`;
-      const bridge = await bridgeBusToAdapter({
-        adapter,
-        bus,
-        platform,
-        subscriptionId: `${platform}-live-reasoning-${crypto.randomUUID()}`,
-        idleTimeoutMs: 10_000,
-      });
-
-      await bus.publish(
-        lilacEventTypes.EvtRequestReply,
-        {},
-        {
-          headers: {
-            request_id: requestId,
-            session_id: sessionId,
-            request_client: platform,
-          },
-        },
-      );
-      await bus.publish(
-        lilacEventTypes.EvtAgentOutputDeltaReasoning,
-        { delta: "thinking", seq: 1 },
-        { headers: { request_id: requestId } },
-      );
-      await bus.publish(
-        lilacEventTypes.EvtAgentOutputResponseText,
-        { finalText: "" },
-        { headers: { request_id: requestId, session_id: sessionId, request_client: platform } },
-      );
-
-      expect(adapter.stream?.finished).toBe(shouldFinish);
-      expect(adapter.stream?.aborted).toBe(shouldFinish ? undefined : "skip");
-      expect(bridge.snapshotRelays()).toEqual([]);
-      await bridge.stop();
-    },
-  );
-
-  it.each(["tool.status", "attachment.add"] as const)(
-    "finishes live GitHub %s-only output when final text is empty",
-    async (partType) => {
-      const bus = createLilacBus(createInMemoryRawBus());
-      const adapter = new FakeAdapter();
-      const sessionId = `octo/live-terminal-${crypto.randomUUID()}#1`;
-      const requestId = `github:${sessionId}:terminal-only`;
-      const bridge = await bridgeBusToAdapter({
-        adapter,
-        bus,
-        platform: "github",
-        subscriptionId: `github-live-terminal-${crypto.randomUUID()}`,
-        idleTimeoutMs: 10_000,
-      });
-
-      await bus.publish(
-        lilacEventTypes.EvtRequestReply,
-        {},
-        {
-          headers: {
-            request_id: requestId,
-            session_id: sessionId,
-            request_client: "github",
-          },
-        },
-      );
-      if (partType === "tool.status") {
-        await bus.publish(
-          lilacEventTypes.EvtAgentOutputToolCall,
-          { toolCallId: "tool-1", display: "bash pwd", status: "end", ok: true },
-          { headers: { request_id: requestId } },
-        );
-      } else {
-        await bus.publish(
-          lilacEventTypes.EvtAgentOutputResponseBinary,
-          {
-            blob: await uploadTestBlob(new TextEncoder().encode("result")),
-            mimeType: "text/plain",
-            filename: "result.txt",
-          },
-          { headers: { request_id: requestId } },
-        );
-      }
-      await bus.publish(
-        lilacEventTypes.EvtAgentOutputResponseText,
-        { finalText: "" },
-        { headers: { request_id: requestId, session_id: sessionId, request_client: "github" } },
-      );
-
-      expect(adapter.stream?.finished).toBe(true);
-      expect(adapter.stream?.aborted).toBeUndefined();
-      expect(bridge.snapshotRelays()).toEqual([]);
-      await bridge.stop();
-    },
-  );
-
-  it.each([
-    ["discord", "discord", true, false],
-    ["discord reasoningDisplayMode none", "discord", true, true],
-    ["github", "github", false, false],
-  ] as const)(
-    "uses %s restored reasoning completion disposition when final output is empty",
-    async (_case, platform, shouldFinish, terminalReasoning) => {
-      const bus = createLilacBus(createInMemoryRawBus());
-      const adapter = new FakeAdapter();
-      if (terminalReasoning) adapter.terminalPartTypes.add("reasoning.status");
-      const sessionId = platform === "discord" ? "chan" : `octo/restore-${crypto.randomUUID()}#1`;
-      const requestId =
-        platform === "discord"
-          ? `discord:${sessionId}:reasoning-only`
-          : `github:${sessionId}:reasoning-only`;
-      const bridge = await bridgeBusToAdapter({
-        adapter,
-        bus,
-        platform,
-        subscriptionId: `${platform}-restored-reasoning-${crypto.randomUUID()}`,
-        idleTimeoutMs: 10_000,
-      });
-
-      await applyAndActivateRelayRecovery(bridge, [
-        {
-          requestId,
-          sessionId,
-          requestClient: platform,
-          platform,
-          createdOutputRefs: [],
-          visibleText: "",
-          reasoning: { startedAtMs: 10, detailText: "thinking" },
-          toolStatus: [],
-        },
-      ]);
-      expect(adapter.starts[0]?.opts?.replyTo).toEqual({
-        platform,
-        channelId: sessionId,
-        messageId: "reasoning-only",
-      });
-
-      await bus.publish(
-        lilacEventTypes.EvtAgentOutputResponseText,
-        { finalText: "" },
-        { headers: { request_id: requestId, session_id: sessionId, request_client: platform } },
-      );
-
-      expect(adapter.stream?.finished).toBe(shouldFinish);
-      expect(adapter.stream?.aborted).toBe(shouldFinish ? undefined : "skip");
-      expect(bridge.snapshotRelays()).toEqual([]);
-      await bridge.stop();
-    },
-  );
-
-  it("finishes restored GitHub tool-only output when final text is empty", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const adapter = new FakeAdapter();
-    const sessionId = `octo/restored-terminal-${crypto.randomUUID()}#1`;
-    const requestId = `github:${sessionId}:terminal-only`;
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "github",
-      subscriptionId: `github-restored-terminal-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId,
-        requestClient: "github",
-        platform: "github",
-        createdOutputRefs: [],
-        visibleText: "",
-        toolStatus: [{ toolCallId: "tool-1", display: "bash pwd", status: "end", ok: true }],
-      },
-    ]);
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "" },
-      { headers: { request_id: requestId, session_id: sessionId, request_client: "github" } },
-    );
-
-    expect(adapter.stream?.finished).toBe(true);
-    expect(adapter.stream?.aborted).toBeUndefined();
-    expect(bridge.snapshotRelays()).toEqual([]);
-    await bridge.stop();
-  });
-
-  it.each([
-    ["GitHub tool status", "github"],
-    ["Discord hidden reasoning", "discord"],
-  ] as const)(
-    "roundtrips a real %s terminal-only relay snapshot through the restart store",
-    async (_case, platform) => {
-      const raw = createInMemoryRawBus();
-      const bus = createLilacBus(raw);
-      const sourceAdapter = new FakeAdapter();
-      const restoredAdapter = new FakeAdapter();
-      if (platform === "discord") {
-        sourceAdapter.terminalPartTypes.add("reasoning.status");
-        restoredAdapter.terminalPartTypes.add("reasoning.status");
-      }
-      const sessionId = platform === "github" ? `octo/codec-${crypto.randomUUID()}#1` : "chan";
-      const requestId = `${platform}:${sessionId}:terminal-only`;
-      const tempDir = mkdtempSync(join(tmpdir(), "lilac-relay-restart-codec-"));
-      const store = new SqliteGracefulRestartStore(join(tempDir, "graceful-restart.db"));
-      const sourceBridge = await bridgeBusToAdapter({
-        adapter: sourceAdapter,
-        bus,
-        platform,
-        subscriptionId: `${platform}-terminal-source-${crypto.randomUUID()}`,
-        idleTimeoutMs: 10_000,
-      });
-      let restoredBridge: Awaited<ReturnType<typeof bridgeBusToAdapter>> | null = null;
-
-      try {
-        await bus.publish(
-          lilacEventTypes.EvtRequestReply,
-          {},
-          {
-            headers: {
-              request_id: requestId,
-              session_id: sessionId,
-              request_client: platform,
-            },
-          },
-        );
-        if (platform === "github") {
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputToolCall,
-            { toolCallId: "tool-1", display: "bash pwd", status: "end", ok: true },
-            { headers: { request_id: requestId } },
-          );
-        } else {
-          await bus.publish(
-            lilacEventTypes.EvtAgentOutputDeltaReasoning,
-            { delta: "thinking", seq: 1 },
-            { headers: { request_id: requestId } },
-          );
-        }
-
-        const relaySnapshot = sourceBridge.snapshotRelays()[0];
-        if (!relaySnapshot) throw new Error("Expected a terminal-only relay snapshot");
-        expect(Object.keys(relaySnapshot)).not.toContain("streamHasTerminalOutput");
-        const saved = store.saveCompletedSnapshot({
-          version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
-          createdAt: Date.now(),
-          deadlineMs: 10_000,
-          queueAttemptProof: "complete",
-          agent: [],
-          queueAttempts: [],
-          relays: [relaySnapshot],
-        });
-        expect(saved.status).toBe("ok");
-
-        const loaded = store.readCompletedSnapshot();
-        expect(loaded.status).toBe("ok");
-        if (loaded.status !== "ok" || loaded.value.state !== "loaded") {
-          throw new Error("Expected the restart store to load the terminal-only relay snapshot");
-        }
-        expect(Object.keys(loaded.value.snapshot.relays[0] ?? {})).not.toContain(
-          "streamHasTerminalOutput",
-        );
-
-        await sourceBridge.stop();
-        restoredBridge = await bridgeBusToAdapter({
-          adapter: restoredAdapter,
-          bus,
-          platform,
-          subscriptionId: `${platform}-terminal-restored-${crypto.randomUUID()}`,
-          idleTimeoutMs: 10_000,
-        });
-        await applyAndActivateRelayRecovery(restoredBridge, loaded.value.snapshot.relays);
-        await bus.publish(
-          lilacEventTypes.EvtAgentOutputResponseText,
-          { finalText: "" },
-          { headers: { request_id: requestId } },
-        );
-
-        expect(restoredAdapter.stream?.finished).toBe(true);
-        expect(restoredAdapter.stream?.aborted).toBeUndefined();
-        expect(restoredBridge.snapshotRelays()).toEqual([]);
-      } finally {
-        await sourceBridge.stop();
-        await restoredBridge?.stop();
-        await bus.close();
-        store.close();
-        rmSync(tempDir, { recursive: true, force: true });
-      }
-    },
-  );
-
-  it("restores top-level output for a no-target request when replyTo is absent", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const adapter = new FakeAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-no-target-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-
-    const snapshot = {
-      requestId: "req:generic-restore",
-      sessionId: "chan",
-      requestClient: "discord",
-      platform: "discord",
-      createdOutputRefs: [],
-      visibleText: "partial",
-      toolStatus: [],
-    } satisfies BusToAdapterRelaySnapshot;
-    await applyAndActivateRelayRecovery(bridge, [snapshot]);
-    await applyAndActivateRelayRecovery(bridge, [snapshot]);
-
-    expect(adapter.starts).toHaveLength(1);
-    expect(adapter.starts[0]?.opts?.replyTo).toBeUndefined();
-    await bridge.stop();
-  });
-
-  it("cleans an output stream when restore subscription setup fails after startOutput", async () => {
-    const bus = createLilacBus(
-      createInMemoryRawBus(undefined, undefined, true, (topic) => topic.startsWith("out.req.")),
-    );
-    const adapter = new FakeAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-subscription-failure-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-    const prepared = bridge.prepareRestoreRelays([
-      {
-        requestId: "req:subscription-failure",
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "",
-        toolStatus: [],
-      },
-    ]);
-    if (prepared.status === "error") throw prepared.error;
-    const applied = await prepared.value.apply();
-    expect(applied.status).toBe("error");
-    expect(adapter.stream?.aborted).toBe("restore_start_failed");
-  });
-
-  it("fails paused restore rollback when output subscription stop returns Err", async () => {
-    const bus = createLilacBus(createInMemoryRawBusWithOutputStopFailure());
-    const adapter = new FakeAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-stop-result-failure-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-    const prepared = bridge.prepareRestoreRelays([
-      {
-        requestId: "req:restore-stop-result-failure",
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "",
-        toolStatus: [],
-      },
-    ]);
-    if (prepared.status === "error") throw prepared.error;
-
-    expect((await prepared.value.apply()).status).toBe("ok");
-    expect(await prepared.value.rollback()).toMatchObject({
-      status: "error",
-      error: { _tag: "SurfaceRelayRestoreRollbackFailed" },
-    });
-    expect(adapter.stream?.aborted).toBe("restore_rollback");
-
-    await bridge.stop();
-    await bus.close();
-  });
-
-  it("signals atomicity-unknown Panic when startup subscription stop returns Err", async () => {
-    const bus = createLilacBus(createInMemoryRawBusWithOutputStopFailure());
-    const startupPanic = new Panic({ message: "forced typing startup defect" });
-    class TypingPanicAdapter extends FakeAdapter {
-      override async startTyping(): Promise<never> {
-        throw startupPanic;
-      }
-    }
-    const adapter = new TypingPanicAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `startup-stop-result-failure-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-    let failure: unknown;
-    try {
-      await bus.publish(
-        lilacEventTypes.EvtRequestReply,
-        {},
-        {
-          headers: {
-            request_id: "discord:chan:startup-stop-result-failure",
-            session_id: "chan",
-            request_client: "discord",
-          },
-        },
-      );
-    } catch (cause) {
-      failure = cause;
-    }
-
-    expect(Panic.is(failure)).toBe(true);
-    expect(failure).not.toBe(startupPanic);
-    expect(failure).toMatchObject({
-      message: "Relay startup cleanup left recovery atomicity unknown",
-    });
-    expect(adapter.stream?.aborted).toBe("restore_start_failed");
-
-    await bridge.stop();
-    await bus.close();
-  });
-
-  it("rolls back earlier paused restores when a later relay admission fails", async () => {
-    let outputSubscriptionStarts = 0;
-    const bus = createLilacBus(
-      createInMemoryRawBus(undefined, undefined, true, (topic) => {
-        if (!topic.startsWith("out.req.")) return false;
-        outputSubscriptionStarts += 1;
-        return outputSubscriptionStarts === 2;
-      }),
-    );
-    const adapter = new FakeAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-direct-partial-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-
-    await expect(
-      applyAndActivateRelayRecovery(bridge, [
-        {
-          requestId: "discord:chan:restore-first",
-          sessionId: "chan",
-          requestClient: "discord",
-          platform: "discord",
-          createdOutputRefs: [],
-          visibleText: "",
-          toolStatus: [],
-        },
-        {
-          requestId: "discord:chan:restore-second",
-          sessionId: "chan",
-          requestClient: "discord",
-          platform: "discord",
-          createdOutputRefs: [],
-          visibleText: "",
-          toolStatus: [],
-        },
-      ]),
-    ).rejects.toBeInstanceOf(SurfaceRelayRestoreApplyFailed);
-    expect(adapter.streams).toHaveLength(2);
-    expect(adapter.streams.map((stream) => stream.aborted)).toEqual([
-      "restore_rollback",
-      "restore_start_failed",
-    ]);
-    expect(adapter.typingStarts).toEqual([]);
-    expect(bridge.snapshotRelays()).toEqual([]);
-    await bridge.stop();
-    await bus.close();
-  });
-
-  it("signals atomicity-unknown Panic when paused restore cleanup fails", async () => {
-    let outputSubscriptionStarts = 0;
-    const bus = createLilacBus(
-      createInMemoryRawBus(undefined, undefined, true, (topic) => {
-        if (!topic.startsWith("out.req.")) return false;
-        outputSubscriptionStarts += 1;
-        return outputSubscriptionStarts === 2;
-      }),
-    );
-    class RollbackFailureAdapter extends FakeAdapter {
-      override async startOutput(sessionRef: SessionRef, opts?: StartOutputOpts) {
-        const started = await super.startOutput(sessionRef, opts);
-        if (started.status === "ok" && this.streams.length === 1) {
-          started.value.nextAbortFailure = new Error("forced rollback failure");
-        }
-        return started;
-      }
-    }
-    const adapter = new RollbackFailureAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-direct-rollback-failure-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-    let failure: unknown;
-    try {
-      await applyAndActivateRelayRecovery(bridge, [
-        {
-          requestId: "discord:chan:restore-first",
-          sessionId: "chan",
-          requestClient: "discord",
-          platform: "discord",
-          createdOutputRefs: [],
-          visibleText: "",
-          toolStatus: [],
-        },
-        {
-          requestId: "discord:chan:restore-second",
-          sessionId: "chan",
-          requestClient: "discord",
-          platform: "discord",
-          createdOutputRefs: [],
-          visibleText: "",
-          toolStatus: [],
-        },
-      ]);
-    } catch (cause) {
-      failure = cause;
-    }
-    expect(Panic.is(failure)).toBe(true);
-    expect(adapter.streams).toHaveLength(2);
-    expect(adapter.streams[1]?.aborted).toBe("restore_start_failed");
-    expect(bridge.snapshotRelays()).toEqual([]);
-    await bridge.stop();
-    await bus.close();
-  });
-
-  it("hydrates restored output locally without invoking the provider push path", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const adapter = new FakeAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-prime-failure-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-    const prepared = bridge.prepareRestoreRelays([
-      {
-        requestId: "req:prime-failure",
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "restored text",
-        toolStatus: [],
-      },
-    ]);
-    if (prepared.status === "error") throw prepared.error;
-    adapter.nextStreamPushFailure = new Error("priming failed");
-    expect((await prepared.value.apply()).status).toBe("ok");
-    if (!adapter.stream) throw new Error("Expected admitted output stream");
-    expect(adapter.starts[0]?.opts?.preparationMode).toBe("paused-recovery");
-    expect(adapter.stream.parts).toEqual([]);
-    expect(adapter.stream.hydratedParts).toEqual([{ type: "text.set", text: "restored text" }]);
-    expect(adapter.typingStarts).toEqual([]);
-    expect((await prepared.value.rollback()).status).toBe("ok");
-    expect(adapter.stream.aborted).toBe("restore_rollback");
-    await bridge.stop();
-    await bus.close();
-  });
-
-  it("does not start typing during paused admission", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    class TypingFailureAdapter extends FakeAdapter {
-      override async startTyping(): Promise<never> {
-        throw new Error("typing setup failed");
-      }
-    }
-    const adapter = new TypingFailureAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-typing-failure-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-    const prepared = bridge.prepareRestoreRelays([
-      {
-        requestId: "req:typing-failure",
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "",
-        toolStatus: [],
-      },
-    ]);
-    if (prepared.status === "error") throw prepared.error;
-    expect((await prepared.value.apply()).status).toBe("ok");
-    expect(adapter.typingStarts).toEqual([]);
-    expect(adapter.stream?.aborted).toBeUndefined();
-    expect((await prepared.value.rollback()).status).toBe("ok");
-    await bridge.stop();
-    await bus.close();
-  });
-
-  it("rollback aborts and removes every resource created by paused relay admission", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const adapter = new FakeAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-rollback-resources-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-    const prepared = bridge.prepareRestoreRelays([
-      {
-        requestId: "req:rollback-resources",
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "",
-        toolStatus: [],
-      },
-    ]);
-    if (prepared.status === "error") throw prepared.error;
-    expect((await prepared.value.apply()).status).toBe("ok");
-    expect(adapter.typingStarts).toHaveLength(0);
-    expect(adapter.stream?.parts).toEqual([]);
-    expect((await prepared.value.rollback()).status).toBe("ok");
-    expect(adapter.stream?.aborted).toBe("restore_rollback");
-    expect(bridge.snapshotRelays()).toEqual([]);
-    await bridge.stop();
-    await bus.close();
-  });
-
-  it("retains output events without effects until total synchronous activation", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const adapter = new FakeAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-paused-events-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-    const requestId = "req:paused-events";
-    const prepared = bridge.prepareRestoreRelays([
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "",
-        toolStatus: [],
-      },
-    ]);
-    if (prepared.status === "error") throw prepared.error;
-    expect((await prepared.value.apply()).status).toBe("ok");
-    const publication = bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "retained" },
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "chan",
-          request_client: "discord",
-        },
-      },
-    );
-    await Promise.resolve();
-    expect(adapter.stream?.parts).toEqual([]);
-
-    expect(prepared.value.activate()).toBeUndefined();
-    await publication;
-    expect(adapter.stream?.parts).toEqual([{ type: "text.delta", delta: "retained" }]);
-    await bridge.stop();
-    await bus.close();
-  });
-
-  it.each([
-    ["discord:chan", "malformed"],
-    ["github:octo/repo#1:10", "cross-platform"],
-    ["discord:other:message", "cross-session"],
-  ] as const)(
-    "restores absent-replyTo snapshot with invalid %s request identity",
-    async (requestId) => {
-      const bus = createLilacBus(createInMemoryRawBus());
-      const adapter = new FakeAdapter();
-      const bridge = await bridgeBusToAdapter({
-        adapter,
-        bus,
-        platform: "discord",
-        subscriptionId: `restore-invalid-request-${crypto.randomUUID()}`,
-        idleTimeoutMs: 10_000,
-      });
-
-      await applyAndActivateRelayRecovery(bridge, [
-        {
-          requestId,
-          sessionId: "chan",
-          requestClient: "discord",
-          platform: "discord",
-          createdOutputRefs: [],
-          visibleText: "partial",
-          toolStatus: [],
-        },
-      ]);
-
-      expect(adapter.starts).toHaveLength(1);
-      expect(adapter.starts[0]?.opts?.replyTo).toBeUndefined();
-      expect(bridge.snapshotRelays()).toHaveLength(1);
-      await bridge.stop();
-    },
-  );
-
-  it("prefers a valid persisted replyTo over malformed request identity during restore", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const adapter = new FakeAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-persisted-target-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-    const replyTo = { platform: "discord" as const, channelId: "chan", messageId: "persisted" };
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId: "discord:malformed",
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        replyTo,
-        createdOutputRefs: [],
-        visibleText: "partial",
-        toolStatus: [],
-      },
-    ]);
-
-    expect(adapter.starts[0]?.opts?.replyTo).toEqual(replyTo);
-    await bridge.stop();
-  });
-
-  it.each([
-    { platform: "github" as const, channelId: "chan", messageId: "cross-platform" },
-    { platform: "discord" as const, channelId: "other", messageId: "cross-session" },
-  ])("restores invalid persisted target $messageId without a reply target", async (replyTo) => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const adapter = new FakeAdapter();
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: `restore-invalid-target-${crypto.randomUUID()}`,
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId: "discord:chan:valid-request",
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        replyTo,
-        createdOutputRefs: [],
-        visibleText: "partial",
-        toolStatus: [],
-      },
-    ]);
-
-    expect(adapter.starts).toHaveLength(1);
-    expect(adapter.starts[0]?.opts?.replyTo).toBeUndefined();
-    expect(bridge.snapshotRelays()).toHaveLength(1);
-    await bridge.stop();
-  });
-
-  it("restores relay from snapshot with cursor resume and primed output", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapterA = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_restore";
-
-    const bridgeA = await bridgeBusToAdapter({
-      adapter: adapterA,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter-a",
-      idleTimeoutMs: 10_000,
-    });
-
-    await bus.publish(
-      lilacEventTypes.EvtRequestReply,
-      {},
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "chan",
-          request_client: "discord",
-        },
-      },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "a" },
-      { headers: { request_id: requestId } },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputToolCall,
-      {
-        toolCallId: "tool-2",
-        status: "start",
-        display: "grep x",
-      },
-      { headers: { request_id: requestId } },
-    );
-
-    const snapshot = bridgeA.snapshotRelays()[0]!;
-    await bridgeA.stop();
-
-    const adapterB = new FakeAdapter();
-    const bridgeB = await bridgeBusToAdapter({
-      adapter: adapterB,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter-b",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridgeB, [snapshot]);
-
-    expect(adapterB.starts).toHaveLength(1);
-    expect(adapterB.starts[0]?.opts?.resume?.created).toEqual(snapshot.createdOutputRefs);
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "b" },
-      { headers: { request_id: requestId } },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "ab" },
-      { headers: { request_id: requestId } },
-    );
-
-    expect(adapterB.stream?.hydratedParts[0]).toEqual({ type: "text.set", text: "a" });
-    expect(
-      adapterB.stream?.hydratedParts.some(
-        (p) =>
-          p.type === "tool.status" &&
-          p.update.toolCallId === "tool-2" &&
-          p.update.status === "start",
-      ),
-    ).toBe(true);
-    expect(adapterB.stream?.parts.some((p) => p.type === "text.delta" && p.delta === "b")).toBe(
-      true,
-    );
-    expect(adapterB.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "ab" });
-
-    await bridgeB.stop();
-  });
-
-  it("keeps pre-restart visible text when resumed finalText is continuation-only", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_resume_suffix_only";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [
-          {
-            platform: "discord",
-            channelId: "chan",
-            messageId: "m_out_1",
-          },
-        ],
-        visibleText: "a",
-        totalTextChars: 1,
-        toolStatus: [],
-        outCursor: "10-0",
-      },
-    ]);
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "b" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    // Resume run may only emit the continuation suffix.
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "b" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    expect(adapter.stream?.hydratedParts[0]).toEqual({ type: "text.set", text: "a" });
-    expect(adapter.stream?.parts.some((p) => p.type === "text.delta" && p.delta === "b")).toBe(
-      true,
-    );
-    expect(adapter.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "ab" });
-
-    await bridge.stop();
-  });
-
-  it("keeps terminal continuation text in restored phase segments", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-    const requestId = "discord:chan:msg_resume_phased_suffix";
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "CF",
-        totalTextChars: 2,
-        textPhase: "final_answer",
-        commentaryText: "C",
-        finalAnswerText: "F",
-        toolStatus: [],
-      },
-    ]);
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "!" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    expect(adapter.stream?.hydratedParts).toEqual([
-      { type: "text.set", text: "C", phase: "commentary" },
-      { type: "text.set", text: "CF", phase: "final_answer" },
-    ]);
-    expect(adapter.stream?.parts.at(-1)).toEqual({
-      type: "text.set",
-      text: "CF!",
-      phase: "final_answer",
-      finalSegments: ["C", "F!"],
-    });
-    await bridge.stop();
-  });
-
-  it("does not emit stale phase segments after an authoritative terminal rewrite", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-    const requestId = "discord:chan:msg_terminal_phase_rewrite";
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "C\n\nF",
-        totalTextChars: 4,
-        textPhase: "final_answer",
-        commentaryText: "C",
-        finalAnswerText: "F",
-        streamPhaseBoundaryPrefixChars: 2,
-        streamPhaseBoundaryOffsetChars: 1,
-        streamPhaseBoundaryPrefix: "\n\n",
-        toolStatus: [],
-      },
-    ]);
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "Corrected response." },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    expect(adapter.stream?.parts.at(-1)).toEqual({
-      type: "text.set",
-      text: "Corrected response.",
-      phase: "final_answer",
-    });
-    await bridge.stop();
-  });
-
-  it("keeps final-answer segmentation when terminal text corrects only the final answer", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-    const requestId = "discord:chan:msg_terminal_final_answer_correction";
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "C\n\nF",
-        totalTextChars: 4,
-        textPhase: "final_answer",
-        commentaryText: "C",
-        finalAnswerText: "F",
-        streamPhaseBoundaryPrefixChars: 2,
-        streamPhaseBoundaryOffsetChars: 1,
-        streamPhaseBoundaryPrefix: "\n\n",
-        toolStatus: [],
-      },
-    ]);
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "C\n\nG" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    expect(adapter.stream?.parts.at(-1)).toEqual({
-      type: "text.set",
-      text: "C\n\nG",
-      phase: "final_answer",
-      finalSegments: ["C", "G"],
-    });
-    await bridge.stop();
-  });
-
-  it("does not split terminal text without a tracked final-answer phase", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-    const requestId = "discord:chan:msg_commentary_only_rewrite";
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "C",
-        totalTextChars: 1,
-        textPhase: "commentary",
-        commentaryText: "C",
-        toolStatus: [],
-      },
-    ]);
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "Corrected response." },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    expect(adapter.stream?.parts.at(-1)).toEqual({
-      type: "text.set",
-      text: "Corrected response.",
-      phase: "commentary",
-    });
-    await bridge.stop();
-  });
-
-  it("deduplicates overlap when resumed finalText is suffix-only", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_resume_suffix_overlap";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "abc",
-        totalTextChars: 3,
-        toolStatus: [],
-      },
-    ]);
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "def" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "cdef!" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    expect(adapter.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "abcdef!" });
-
-    await bridge.stop();
-  });
-
-  it("appends non-overlapping suffix when resumed finalText is continuation-only", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_resume_suffix_non_overlap";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "abc",
-        totalTextChars: 3,
-        toolStatus: [],
-      },
-    ]);
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "def" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "XYZ" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    expect(adapter.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "abcdefXYZ" });
-
-    await bridge.stop();
-  });
-
-  it("keeps prefix slicing semantics after restored reanchor snapshots", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_restore_reanchor_prefix";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        visibleText: "def",
-        totalTextChars: 6,
-        streamTextPrefixChars: 3,
-        toolStatus: [],
-      },
-    ]);
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "abcdefg" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    expect(adapter.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "defg" });
-
-    await bridge.stop();
-  });
-
-  it("keeps continuation suffix when restored prefix exceeds continuation finalText", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_restore_reanchor_continuation_suffix";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [],
-        // Full text before restart was 6 chars of old lane + current lane "g".
-        visibleText: "g",
-        totalTextChars: 7,
-        streamTextPrefixChars: 6,
-        toolStatus: [],
-      },
-    ]);
-
-    // Resume publisher emits continuation-only final text.
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "!" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    expect(adapter.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "g!" });
-
-    await bridge.stop();
-  });
-
-  it("does not replay consumed out events after cursor restore", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapterA = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_restore_no_duplicate_out";
-
-    const bridgeA = await bridgeBusToAdapter({
-      adapter: adapterA,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter-a",
-      idleTimeoutMs: 10_000,
-    });
-
-    await bus.publish(
-      lilacEventTypes.EvtRequestReply,
-      {},
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "chan",
-          request_client: "discord",
-        },
-      },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "a" },
-      { headers: { request_id: requestId } },
-    );
-
-    const snapshot = bridgeA.snapshotRelays()[0]!;
-    await bridgeA.stop();
-
-    const adapterB = new FakeAdapter();
-    const bridgeB = await bridgeBusToAdapter({
-      adapter: adapterB,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter-b",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridgeB, [snapshot]);
-
-    // No new deltas were published after restore; only final arrives.
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "a" },
-      { headers: { request_id: requestId } },
-    );
-
-    const replayedA =
-      adapterB.stream?.parts.filter((p) => p.type === "text.delta" && p.delta === "a") ?? [];
-    expect(replayedA).toHaveLength(0);
-    expect(adapterB.stream?.parts.at(-1)).toEqual({ type: "text.set", text: "a" });
-
-    await bridgeB.stop();
-  });
-
-  it("deletes restored preview-chain refs when resumed delivery is skip", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_restore_skip_deletes_refs";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        createdOutputRefs: [
-          {
-            platform: "discord",
-            channelId: "chan",
-            messageId: "m_old_1",
-          },
-          {
-            platform: "discord",
-            channelId: "chan",
-            messageId: "m_old_2",
-          },
-        ],
-        visibleText: "partial",
-        totalTextChars: 7,
-        toolStatus: [],
-      },
-    ]);
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "ignored", delivery: "skip" },
-      {
-        headers: { request_id: requestId, session_id: "chan", request_client: "discord" },
-      },
-    );
-
-    expect(adapter.stream?.aborted).toBe("skip");
-    expect(adapter.stream?.finished).toBe(false);
-    expect(adapter.deletedMsgs.map((m) => m.messageId)).toEqual(["m_old_2", "m_old_1"]);
-    expect(bridge.snapshotRelays()).toHaveLength(0);
-
-    await bridge.stop();
-  });
-
-  it("removes finished relay before blocking output subscription stop", async () => {
-    const { raw, releaseTailStops } = createInMemoryRawBusWithBlockingTailStop();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_finish_blocking_tail_stop";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await bus.publish(
-      lilacEventTypes.EvtRequestReply,
-      {},
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "chan",
-          request_client: "discord",
-        },
-      },
-    );
-
-    await bus.publish(
-      lilacEventTypes.EvtAgentOutputDeltaText,
-      { delta: "hello" },
-      { headers: { request_id: requestId } },
-    );
-
-    const publishFinal = bus.publish(
-      lilacEventTypes.EvtAgentOutputResponseText,
-      { finalText: "hello" },
-      { headers: { request_id: requestId } },
-    );
-
-    // test-wait-justification: bounds the final publish while the test deliberately blocks relay shutdown
-    const settled = await Promise.race([
-      publishFinal.then(() => "resolved" as const),
-      new Promise<"timeout">((resolve) => {
-        setTimeout(() => resolve("timeout"), 200);
-      }),
-    ]);
-
-    expect(settled).toBe("resolved");
-    expect(bridge.snapshotRelays()).toHaveLength(0);
-
-    releaseTailStops();
-    await bridge.stop();
-  });
-
-  it("uses resume metadata only for first restored startOutput", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const adapter = new FakeAdapter();
-
-    const requestId = "discord:chan:msg_resume_once";
-
-    const bridge = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      subscriptionId: "discord-adapter",
-      idleTimeoutMs: 10_000,
-    });
-
-    await applyAndActivateRelayRecovery(bridge, [
-      {
-        requestId,
-        sessionId: "chan",
-        requestClient: "discord",
-        platform: "discord",
-        routerSessionMode: "active",
-        replyTo: {
-          platform: "discord",
-          channelId: "chan",
-          messageId: "msg_resume_once",
-        },
-        createdOutputRefs: [
-          {
-            platform: "discord",
-            channelId: "chan",
-            messageId: "m_out_1",
-          },
-        ],
-        visibleText: "partial",
-        toolStatus: [],
-        outCursor: "100-0",
-      },
-    ]);
-
-    expect(adapter.starts).toHaveLength(1);
-    expect(adapter.starts[0]?.opts?.resume?.created).toEqual([
-      {
-        platform: "discord",
-        channelId: "chan",
-        messageId: "m_out_1",
-      },
-    ]);
-
-    await bus.publish(
-      lilacEventTypes.CmdSurfaceOutputReanchor,
-      {
-        inheritReplyTo: false,
-        replyTo: {
-          platform: "discord",
-          channelId: "chan",
-          messageId: "new_anchor",
-        },
-      },
-      {
-        headers: {
-          request_id: requestId,
-          session_id: "chan",
-          request_client: "discord",
-        },
-      },
-    );
-
-    expect(adapter.starts).toHaveLength(2);
-    expect(adapter.starts[1]?.opts?.resume).toBeUndefined();
-    expect(adapter.starts[1]?.opts?.replyTo).toEqual({
-      platform: "discord",
-      channelId: "chan",
-      messageId: "new_anchor",
-    });
 
     await bridge.stop();
   });
@@ -4622,7 +2991,6 @@ describe("bridgeBusToAdapter", () => {
       );
 
       expect(adapter.stream?.finished).toBe(true);
-      expect(bridge.snapshotRelays()).toEqual([]);
       expect(getGithubAck(requestId)).toBeUndefined();
     } finally {
       clearGithubAck(requestId);
@@ -4741,7 +3109,6 @@ describe("bridgeBusToAdapter", () => {
     );
     if (acceptedResult.status === "error") throw acceptedResult.error;
     const accepted = acceptedResult.value;
-    expect(bridge.snapshotRelays()[0]?.outCursor).toBe(accepted.cursor);
 
     if (!adapter.stream) throw new Error("relay output stream was not started");
     adapter.stream.nextPushFailure = new Error("forced output push failure");
@@ -4757,7 +3124,7 @@ describe("bridgeBusToAdapter", () => {
       disposition: "stop",
       contextHasCommit: false,
     });
-    expect(bridge.snapshotRelays()[0]?.outCursor).toBe(accepted.cursor);
+    expect(accepted.cursor).not.toBe(failed.cursor);
 
     await bridge.stop();
   });
@@ -4840,7 +3207,6 @@ describe("bridgeBusToAdapter", () => {
       ),
     ).rejects.toBe(panic);
 
-    expect(bridge.snapshotRelays()).toHaveLength(0);
     expect(adapter.deletedMsgs.map((message) => message.messageId)).toEqual(["m_out_1"]);
 
     await bridge.stop();

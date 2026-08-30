@@ -2291,6 +2291,29 @@ describe("SqliteTranscriptStore", () => {
         attemptIndex: 0,
       })?.state,
     ).toBe("uncertain");
+    const recoveredAttempt = reserveNamedAttempt(recovered, {
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: "sub:parent:named:crashed",
+      executionScopeHashVersion: 1,
+      executionScopeHash: "scope",
+      requestId: "crash-left",
+      attemptIndex: 0,
+      candidateSessionId: crypto.randomUUID(),
+      sourceSessionId: null,
+      expectedBindingRevision: null,
+    });
+    expect(recoveredAttempt.attemptIndex).toBe(2);
+    expect(recoveredAttempt.state).toBe("active");
+    expect(
+      recovered.getCoreNamedClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: "sub:parent:named:crashed",
+        requestId: "crash-left",
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("uncertain");
     expect(
       getLatestCompleteNamedTranscript(recovered, {
         requestClient: "discord",
@@ -3936,6 +3959,107 @@ describe("SqliteTranscriptStore", () => {
         attemptIndex: 0,
       })?.state,
     ).toBe("uncertain");
+    const recoveredAttempt = reservePrimaryAttempt(recovered, {
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: "crashed-owner",
+      executionScopeHashVersion: 1,
+      executionScopeHash: "scope",
+      requestId: "crashed",
+      attemptIndex: 0,
+      candidateSessionId: crypto.randomUUID(),
+      sourceSessionId: null,
+      expectedBindingRevision: null,
+    });
+    expect(recoveredAttempt.attemptIndex).toBe(2);
+    expect(recoveredAttempt.state).toBe("active");
+    expect(
+      recovered.getCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: "crashed-owner",
+        requestId: "crashed",
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("uncertain");
+    recovered.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("preserves primary fork and fresh-fallback parity across recovery collisions", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-primary-recovery-parity-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const owner = {
+      providerId: "claude-code",
+      requestClient: "discord" as const,
+      lilacSessionId: "primary-recovery-parity",
+      executionScopeHashVersion: 1 as const,
+      executionScopeHash: "scope",
+      requestId: "recovered-request",
+      sourceSessionId: null,
+      expectedBindingRevision: null,
+    };
+    const first = new SqliteTranscriptStore(dbPath);
+    reservePrimaryAttempt(first, {
+      ...owner,
+      attemptIndex: 0,
+      candidateSessionId: crypto.randomUUID(),
+    });
+    recordPrimaryAttemptOutcome(first, {
+      providerId: owner.providerId,
+      requestClient: owner.requestClient,
+      lilacSessionId: owner.lilacSessionId,
+      requestId: owner.requestId,
+      attemptIndex: 0,
+      state: "failed",
+    });
+    reservePrimaryAttempt(first, {
+      ...owner,
+      attemptIndex: 1,
+      candidateSessionId: crypto.randomUUID(),
+    });
+    first.close();
+
+    const recovered = new SqliteTranscriptStore(dbPath);
+    expect(
+      recovered.getCorePrimaryClaudeSessionAttempt({
+        providerId: owner.providerId,
+        requestClient: owner.requestClient,
+        lilacSessionId: owner.lilacSessionId,
+        requestId: owner.requestId,
+        attemptIndex: 1,
+      })?.state,
+    ).toBe("uncertain");
+    const fork = reservePrimaryAttempt(recovered, {
+      ...owner,
+      attemptIndex: 0,
+      candidateSessionId: crypto.randomUUID(),
+    });
+    expect(fork.attemptIndex).toBe(2);
+    recordPrimaryAttemptOutcome(recovered, {
+      providerId: owner.providerId,
+      requestClient: owner.requestClient,
+      lilacSessionId: owner.lilacSessionId,
+      requestId: owner.requestId,
+      attemptIndex: fork.attemptIndex,
+      state: "failed",
+    });
+    const freshFallback = reservePrimaryAttempt(recovered, {
+      ...owner,
+      attemptIndex: 1,
+      candidateSessionId: crypto.randomUUID(),
+    });
+    expect(freshFallback.attemptIndex).toBe(3);
+    expect(
+      recovered.getCorePrimaryClaudeSessionAttempt({
+        providerId: owner.providerId,
+        requestClient: owner.requestClient,
+        lilacSessionId: owner.lilacSessionId,
+        requestId: owner.requestId,
+        attemptIndex: 1,
+      })?.state,
+    ).toBe("uncertain");
+
     recovered.close();
     await fs.rm(dir, { recursive: true, force: true });
   });

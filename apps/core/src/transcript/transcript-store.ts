@@ -4218,6 +4218,31 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
             ),
           );
         }
+        const collidedAttempt = this.getCoreNamedClaudeSessionAttempt({
+          providerId: input.providerId,
+          requestClient: input.requestClient,
+          lilacSessionId: input.lilacSessionId,
+          requestId: input.requestId,
+          attemptIndex: input.attemptIndex,
+        });
+        let allocatedAttemptIndex = input.attemptIndex;
+        if (collidedAttempt !== null) {
+          const latestMatchingParity = this.db
+            .query<{ attempt_index: number }, [AdapterPlatform, string, string, string, number]>(
+              `SELECT attempt_index FROM core_named_claude_attempts
+               WHERE request_client = ? AND session_id = ? AND provider_id = ?
+                 AND request_id = ? AND attempt_index % 2 = ?
+               ORDER BY attempt_index DESC LIMIT 1`,
+            )
+            .get(
+              input.requestClient,
+              input.lilacSessionId,
+              input.providerId,
+              input.requestId,
+              input.attemptIndex % 2,
+            );
+          allocatedAttemptIndex = (latestMatchingParity?.attempt_index ?? input.attemptIndex) + 2;
+        }
         const now = Date.now();
         this.db.run(
           `INSERT INTO core_named_claude_attempts (
@@ -4236,7 +4261,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
             binding?.canonicalMessageCount ?? null,
             input.executionScopeHash,
             input.requestId,
-            input.attemptIndex,
+            allocatedAttemptIndex,
             input.candidateSessionId,
             input.sourceSessionId,
             input.expectedBindingRevision,
@@ -4250,7 +4275,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           requestClient: input.requestClient,
           lilacSessionId: input.lilacSessionId,
           requestId: input.requestId,
-          attemptIndex: input.attemptIndex,
+          attemptIndex: allocatedAttemptIndex,
         });
         if (!attempt) {
           return Result.err(
@@ -4829,6 +4854,32 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
                     ),
                   );
                 }
+                const collidedAttempt = this.getCorePrimaryClaudeSessionAttempt({
+                  providerId: input.providerId,
+                  requestClient: input.requestClient,
+                  lilacSessionId: input.lilacSessionId,
+                  requestId: input.requestId,
+                  attemptIndex: input.attemptIndex,
+                });
+                let allocatedAttemptIndex = input.attemptIndex;
+                if (collidedAttempt !== null) {
+                  const latestMatchingParity = this.db
+                    .query<{ attempt_index: number }, ["discord", string, string, string, number]>(
+                      `SELECT attempt_index FROM core_primary_claude_attempts
+                       WHERE request_client = ? AND session_id = ? AND provider_id = ?
+                         AND request_id = ? AND attempt_index % 2 = ?
+                       ORDER BY attempt_index DESC LIMIT 1`,
+                    )
+                    .get(
+                      input.requestClient,
+                      input.lilacSessionId,
+                      input.providerId,
+                      input.requestId,
+                      input.attemptIndex % 2,
+                    );
+                  allocatedAttemptIndex =
+                    (latestMatchingParity?.attempt_index ?? input.attemptIndex) + 2;
+                }
                 const now = Date.now();
                 this.db.run(
                   `INSERT INTO core_primary_claude_attempts (
@@ -4848,7 +4899,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
                     binding?.canonicalMessageCount ?? null,
                     input.executionScopeHash,
                     input.requestId,
-                    input.attemptIndex,
+                    allocatedAttemptIndex,
                     input.candidateSessionId,
                     input.sourceSessionId,
                     input.expectedBindingRevision,
@@ -4862,7 +4913,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
                   requestClient: input.requestClient,
                   lilacSessionId: input.lilacSessionId,
                   requestId: input.requestId,
-                  attemptIndex: input.attemptIndex,
+                  attemptIndex: allocatedAttemptIndex,
                 });
                 if (!attempt) {
                   return Result.err(

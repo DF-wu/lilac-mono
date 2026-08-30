@@ -217,34 +217,6 @@ describe("classifyDiscordSurfaceError", () => {
 });
 
 describe("DiscordAdapter nested refs", () => {
-  it("starts a resumable output stream without invoking Discord", async () => {
-    let providerCalls = 0;
-    const config = testConfigWithStatusMessage();
-    const adapter = createTestDiscordAdapter({ config });
-    const internals = adapter as unknown as { client: unknown; cfg: CoreConfig };
-    internals.client = {
-      channels: {
-        fetch: async () => {
-          providerCalls += 1;
-          return null;
-        },
-      },
-    };
-    internals.cfg = config;
-
-    const result = await adapter.startOutput(
-      { platform: "discord", channelId: "c1" },
-      {
-        resume: {
-          created: [{ platform: "discord", channelId: "c1", messageId: "existing" }],
-        },
-      },
-    );
-
-    expect(result.status).toBe("ok");
-    expect(providerCalls).toBe(0);
-  });
-
   it("threads enabled math options into output streams and omits disabled options", async () => {
     const base = testConfigWithStatusMessage();
     const enabledConfig: CoreConfig = {
@@ -307,22 +279,6 @@ describe("DiscordAdapter nested refs", () => {
       expect(result.error).toMatchObject({ operation: "start-output", refRole });
     },
   );
-
-  it("identifies the mismatched resumed ref", async () => {
-    const result = await createTestDiscordAdapter().startOutput(
-      { platform: "discord", channelId: "c1" },
-      {
-        resume: {
-          created: [{ platform: "discord", channelId: "c2", messageId: "m1" }],
-        },
-      },
-    );
-
-    expect(result.status).toBe("error");
-    if (result.status === "ok") throw new Error("expected nested-ref failure");
-    expect(result.error).toBeInstanceOf(SurfaceSessionMismatch);
-    expect(result.error).toMatchObject({ refRole: "resume.created[0]" });
-  });
 });
 
 describe("DiscordAdapter typing", () => {
@@ -1364,27 +1320,6 @@ describe("DiscordAdapter.refreshCoreConfig", () => {
     internals.cfg = previousConfig;
     internals.appliedStatusMessage = "previous presence";
     cfg = changedConfig;
-
-    const prepared = await adapter.startOutput(
-      { platform: "discord", channelId: "c1" },
-      {
-        preparationMode: "paused-recovery",
-        resume: {
-          created: [{ platform: "discord", channelId: "c1", messageId: "restored-output" }],
-        },
-      },
-    );
-    expect(prepared.status).toBe("ok");
-    if (prepared.status === "error") throw prepared.error;
-    expect(
-      prepared.value.hydrateRecovery?.([{ type: "text.set", text: "restored response" }]),
-    ).toBe("visible");
-    await expect(prepared.value.abort("restore_rollback")).resolves.toEqual(Result.ok(undefined));
-    expect({ configReads, channelFetches, providerMutations }).toEqual({
-      configReads: 0,
-      channelFetches: 0,
-      providerMutations: [],
-    });
 
     const normal = await adapter.startOutput({ platform: "discord", channelId: "c1" });
     expect(normal.status).toBe("ok");

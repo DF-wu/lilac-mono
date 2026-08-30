@@ -86,7 +86,6 @@ import {
   buildPersistedHeartbeatMessages,
   buildSurfaceMetadataOverlay,
   isActiveRuntimeModelCompatible,
-  isWorkflowAgentRecoveryEntry,
   markAssistantTextPartEnded,
   markAssistantTextPartStarted,
   mapCorePrimaryCompactionCurrentCanonicalStart,
@@ -125,7 +124,7 @@ import {
   withReasoningSummaryDefaultForOpenAIModels,
   WORKFLOW_REQUEST_CLAIM_HEARTBEAT_MS,
   validateCorePrimaryLineageAtRunnerIntake,
-  type AgentRunnerRecoveryState,
+  type BusAgentRunnerRequestDelivery,
   type BusAgentRunnerTerminalCleanup,
 } from "../../../src/surface/bridge/bus-agent-runner";
 import {
@@ -166,7 +165,6 @@ import {
 import { hashCanonicalStoredMessagesV2 } from "../../../src/transcript/transcript-persistence-codec";
 import { createAgentOutputActivityPublisher } from "../../../src/shared/agent-output-activity";
 import { createRequestMessageCache } from "../../../src/tool-server/request-message-cache";
-import { DurableWorkflowStore } from "../../../src/workflow/durable-workflow-store";
 import {
   adaptDiscordRequestRouterStartOutcomeToHost,
   startDiscordRequestRouter,
@@ -174,6 +172,12 @@ import {
 import { DiscordRequestDeliveryFailed } from "../../../src/surface/discord/discord-request-router/publish";
 import { bridgeAdapterToBus } from "../../../src/surface/bridge/publish-to-bus";
 import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
+import {
+  AgentRunJournalConflict,
+  AgentRunJournalSqliteFailure,
+  type AgentRunCheckpointV1,
+  type AgentRunRecoveryHead,
+} from "../../../src/surface/bridge/agent-run-journal";
 import {
   RequestDeliveryCoordinator,
   SqliteRequestDeliveryStore,
@@ -201,6 +205,7 @@ import type {
 } from "../../../src/surface/adapter";
 import type {
   ContentOpts,
+  AuthenticatedSurfaceOrigin,
   LimitOpts,
   MsgRef,
   SendOpts,
@@ -287,17 +292,6 @@ function bindingValue<T>(result: ResultType<T, CoreClaudeBindingReadError>): T {
   }
 }
 
-function applyAndActivateAgentRecovery(
-  runner: Pick<Awaited<ReturnType<typeof startBusAgentRunner>>, "prepareRecovery">,
-  recovery: AgentRunnerRecoveryState,
-): void {
-  const prepared = runner.prepareRecovery(recovery);
-  if (prepared.status === "error") throw prepared.error;
-  const applied = prepared.value.apply();
-  if (applied.status === "error") throw applied.error;
-  prepared.value.activate();
-}
-
 function getPrimaryBinding(
   store: SqliteTranscriptStore,
   input: Parameters<SqliteTranscriptStore["getCorePrimaryClaudeSessionBinding"]>[0],
@@ -382,7 +376,11 @@ function level1TestToolset(params?: {
         modelName: "deferred_tool",
         title: "Deferred tool",
         description: "Deferred metadata",
-        identity: { source: "mcp", sourceId: "server", rawToolName: "raw_tool" },
+        identity: {
+          source: "mcp",
+          sourceId: "server",
+          rawToolName: "raw_tool",
+        },
         stableId: "catalog-id",
         tool: catalogTool,
       },
@@ -429,26 +427,44 @@ function level1PhasedTextStep(finalText = "Final answer.") {
   const commentaryMetadata = {
     openai: { itemId: "msg_commentary", phase: "commentary" },
   } as const;
-  const finalMetadata = { openai: { itemId: "msg_final", phase: "final_answer" } } as const;
+  const finalMetadata = {
+    openai: { itemId: "msg_final", phase: "final_answer" },
+  } as const;
   return {
     stream: simulateReadableStream({
       chunks: [
-        { type: "text-start" as const, id: "commentary", providerMetadata: commentaryMetadata },
+        {
+          type: "text-start" as const,
+          id: "commentary",
+          providerMetadata: commentaryMetadata,
+        },
         {
           type: "text-delta" as const,
           id: "commentary",
           delta: "Commentary.",
           providerMetadata: commentaryMetadata,
         },
-        { type: "text-end" as const, id: "commentary", providerMetadata: commentaryMetadata },
-        { type: "text-start" as const, id: "final", providerMetadata: finalMetadata },
+        {
+          type: "text-end" as const,
+          id: "commentary",
+          providerMetadata: commentaryMetadata,
+        },
+        {
+          type: "text-start" as const,
+          id: "final",
+          providerMetadata: finalMetadata,
+        },
         {
           type: "text-delta" as const,
           id: "final",
           delta: finalText,
           providerMetadata: finalMetadata,
         },
-        { type: "text-end" as const, id: "final", providerMetadata: finalMetadata },
+        {
+          type: "text-end" as const,
+          id: "final",
+          providerMetadata: finalMetadata,
+        },
         {
           type: "finish" as const,
           finishReason: { unified: "stop" as const, raw: "stop" },
@@ -463,7 +479,11 @@ function level1ToolCallStep(calls: readonly { toolCallId: string; toolName: stri
   return {
     stream: simulateReadableStream({
       chunks: [
-        ...calls.map((call) => ({ type: "tool-call" as const, ...call, input: "{}" })),
+        ...calls.map((call) => ({
+          type: "tool-call" as const,
+          ...call,
+          input: "{}",
+        })),
         {
           type: "finish" as const,
           finishReason: { unified: "tool-calls" as const, raw: "tool-calls" },
@@ -670,7 +690,11 @@ describe("runner Level 1 catalog selection", () => {
       batch: level1TestTool(
         () =>
           new ToolExpansion("expanded", [
-            { toolCallId: "selected-child", toolName: "selected_tool", input: {} },
+            {
+              toolCallId: "selected-child",
+              toolName: "selected_tool",
+              input: {},
+            },
             { toolCallId: "hidden-child", toolName: "hidden_tool", input: {} },
           ]),
       ),
@@ -688,7 +712,11 @@ describe("runner Level 1 catalog selection", () => {
           sourceId: "selected-plugin",
           rawName: "selected",
           modelName: "selected_tool",
-          identity: { source: "plugin", sourceId: "selected-plugin", rawToolName: "selected" },
+          identity: {
+            source: "plugin",
+            sourceId: "selected-plugin",
+            rawToolName: "selected",
+          },
           stableId: "selected-id",
           tool: selectedTool,
         },
@@ -697,7 +725,11 @@ describe("runner Level 1 catalog selection", () => {
           sourceId: "hidden-plugin",
           rawName: "hidden",
           modelName: "hidden_tool",
-          identity: { source: "plugin", sourceId: "hidden-plugin", rawToolName: "hidden" },
+          identity: {
+            source: "plugin",
+            sourceId: "hidden-plugin",
+            rawToolName: "hidden",
+          },
           stableId: "hidden-id",
           tool: hiddenTool,
         },
@@ -795,7 +827,11 @@ describe("reasoning chunk streaming", () => {
     const state = { chunks: new Map<string, string>(), seq: 0 };
 
     expect(
-      consumeReasoningChunkEvent(state, { type: "delta", chunkId: "reasoning-1", delta: "" }),
+      consumeReasoningChunkEvent(state, {
+        type: "delta",
+        chunkId: "reasoning-1",
+        delta: "",
+      }),
     ).toEqual({ publishStart: true, snapshot: null });
     expect(
       consumeReasoningChunkEvent(state, {
@@ -817,7 +853,12 @@ describe("reasoning chunk streaming", () => {
       publishStart: false,
       snapshot: { delta: "**Inspecting**\n\nChecking the stream.", seq: 2 },
     });
-    expect(consumeReasoningChunkEvent(state, { type: "end", chunkId: "reasoning-1" })).toEqual({
+    expect(
+      consumeReasoningChunkEvent(state, {
+        type: "end",
+        chunkId: "reasoning-1",
+      }),
+    ).toEqual({
       publishStart: false,
       snapshot: null,
     });
@@ -908,7 +949,10 @@ describe("deferred subagent result", () => {
     }
     const emittedToolCallId = emittedAssistant.content[0].toolCallId;
     expect(emittedToolCallId).toBe(
-      buildSyntheticToolCallId({ prefix: "subagent_result", seed: completion.runId }),
+      buildSyntheticToolCallId({
+        prefix: "subagent_result",
+        seed: completion.runId,
+      }),
     );
     expect(emittedToolCallId).not.toBe(legacyToolCallId);
     expect(hasDeferredSubagentResult(emitted, completion)).toBe(true);
@@ -994,7 +1038,10 @@ describe("deferred subagent result", () => {
             toolName: "subagent_result",
             output: {
               type: "json",
-              value: { workflowRunId: completion.runId, finalText: "normalized result" },
+              value: {
+                workflowRunId: completion.runId,
+                finalText: "normalized result",
+              },
             },
           },
         ],
@@ -1043,8 +1090,15 @@ describe("subagent model selection", () => {
       supportsPdf: false,
     });
     expect(
-      resolveStoredResourceProviderTarget({ provider: "claude-code", capability: null }),
-    ).toEqual({ family: "claude-code", supportsImage: true, supportsPdf: false });
+      resolveStoredResourceProviderTarget({
+        provider: "claude-code",
+        capability: null,
+      }),
+    ).toEqual({
+      family: "claude-code",
+      supportsImage: true,
+      supportsPdf: false,
+    });
   });
 
   it("runtime-validates primary lineage, rejects stale proof, and omits it outside Discord", () => {
@@ -1606,7 +1660,10 @@ describe("subagent model selection", () => {
   it("inherits alias fallback for a direct profile and slot fallback for a slot profile", () => {
     const cfg = parseCoreConfigV2ToUniversal({});
     cfg.models.def = {
-      direct: { model: "openai/direct", fallback: ["openai/direct-alias-backup"] },
+      direct: {
+        model: "openai/direct",
+        fallback: ["openai/direct-alias-backup"],
+      },
       slot: { model: "openai/slot", fallback: ["openai/slot-alias-backup"] },
     };
     cfg.models.fast = { model: "slot", fallback: ["openai/slot-backup"] };
@@ -1682,10 +1739,19 @@ describe("subagent model selection", () => {
     });
 
     expect(skipped).toEqual(["claude-code/sonnet"]);
-    expect(first).toMatchObject({ index: 2, candidate: { spec: "openai/backup" } });
-    expect(second).toMatchObject({ index: 3, candidate: { spec: "openai/backup" } });
+    expect(first).toMatchObject({
+      index: 2,
+      candidate: { spec: "openai/backup" },
+    });
+    expect(second).toMatchObject({
+      index: 3,
+      candidate: { spec: "openai/backup" },
+    });
 
-    cfg.models.main = { model: "claude-code/sonnet", fallback: ["openai/backup"] };
+    cfg.models.main = {
+      model: "claude-code/sonnet",
+      fallback: ["openai/backup"],
+    };
     expect(
       selectNextNativeModelFallback({
         plan: resolveAgentRunModel({ cfg, runProfile: "primary" }),
@@ -1948,35 +2014,6 @@ describe("workflow request claim pacing", () => {
   });
 });
 
-describe("agent recovery ownership", () => {
-  it("does not treat workflow-owned recovery entries as root parent requests", () => {
-    const base = {
-      kind: "active" as const,
-      requestId: "request-1",
-      sessionId: "session-1",
-      requestClient: "discord" as const,
-      queue: "prompt" as const,
-      messages: [] as StoredMessageV1[],
-    };
-
-    expect(isWorkflowAgentRecoveryEntry(base)).toBe(false);
-    expect(
-      isWorkflowAgentRecoveryEntry({
-        ...base,
-        requestId: "wfr:run:operation:0",
-        requestClient: "unknown",
-        raw: {
-          workflow: {
-            runId: "run-1",
-            operationId: "operation-1",
-            dispatchEpoch: "1234567890abcdef",
-          },
-        },
-      }),
-    ).toBe(true);
-  });
-});
-
 describe("selectPersistedTranscriptMessages", () => {
   const finalMessages = [
     { role: "user", content: "compacted summary" },
@@ -2043,7 +2080,10 @@ describe("selectPersistedTranscriptMessages", () => {
     expect(resolveCompactionCheckpointMeta({ ...base, runSucceeded: false })).toBeUndefined();
     expect(resolveCompactionCheckpointMeta({ ...base, isCancelled: true })).toBeUndefined();
     expect(
-      resolveCompactionCheckpointMeta({ ...base, shouldSkipSurfaceReply: true }),
+      resolveCompactionCheckpointMeta({
+        ...base,
+        shouldSkipSurfaceReply: true,
+      }),
     ).toBeUndefined();
     expect(
       resolveCompactionCheckpointMeta({ ...base, completedCompactionCount: 0 }),
@@ -2202,7 +2242,10 @@ describe("bus agent runner delivery policy", () => {
     });
     expect(stored[0]?.content[0]).toMatchObject({
       type: "tool-result",
-      output: { type: "content", value: [{ type: "blob", filename: "local.txt" }] },
+      output: {
+        type: "content",
+        value: [{ type: "blob", filename: "local.txt" }],
+      },
     });
     const blobPart =
       typeof stored[0]?.content === "string"
@@ -2238,6 +2281,7 @@ function createInMemoryRawBus(
   options: {
     readonly waitForActiveHandlersOnStop?: boolean;
     readonly onWorkDeliveryStarted?: () => void;
+    readonly onPublish?: (eventType: string) => void;
   } = {},
 ): RunnerTestRawBus {
   const topics = new Map<string, Array<Message<unknown>>>();
@@ -2253,6 +2297,7 @@ function createInMemoryRawBus(
   const raw: RunnerTestRawBus = {
     subscribe: subscribeForTest,
     publish: async <TData>(msg: Omit<Message<TData>, "id" | "ts">, opts: PublishOptions) => {
+      options.onPublish?.(opts.type);
       if (
         rejectNextQueuedLifecycle &&
         opts.type === lilacEventTypes.EvtRequestLifecycleChanged &&
@@ -2310,7 +2355,12 @@ function createInMemoryRawBus(
       opts: SubscriptionOptions,
       handler: TestRawMessageHandler,
     ) => {
-      const entry = { topic, opts, handler, activeHandlers: new Set<Promise<void>>() };
+      const entry = {
+        topic,
+        opts,
+        handler,
+        activeHandlers: new Set<Promise<void>>(),
+      };
       subs.add(entry);
 
       const offset = opts.mode === "tail" ? opts.offset : undefined;
@@ -2492,7 +2542,11 @@ class ProductionPathDiscordAdapter extends SurfaceAdapterTestBase {
     const ensureOutputMessage = (): SurfaceMessage => {
       if (outputMessage) return outputMessage;
       outputMessage = {
-        ref: { platform: "discord", channelId: sessionRef.channelId, messageId },
+        ref: {
+          platform: "discord",
+          channelId: sessionRef.channelId,
+          messageId,
+        },
         session: { platform: "discord", channelId: sessionRef.channelId },
         userId: "bot",
         userName: "lilac",
@@ -2500,7 +2554,10 @@ class ProductionPathDiscordAdapter extends SurfaceAdapterTestBase {
         ts: this.timestamp++,
         raw: {
           reference: opts?.replyTo
-            ? { messageId: opts.replyTo.messageId, channelId: opts.replyTo.channelId }
+            ? {
+                messageId: opts.replyTo.messageId,
+                channelId: opts.replyTo.channelId,
+              }
             : {},
           discord: { isChat: true },
         },
@@ -2659,8 +2716,9 @@ async function observeResponseAfterOutputRelay(
   requestId: string,
 ) {
   const relayed = deferred<void>();
-  let outputSubscription: { stop(): Promise<ResultType<void, EventDeliveryStopFailed>> } | null =
-    null;
+  let outputSubscription: {
+    stop(): Promise<ResultType<void, EventDeliveryStopFailed>>;
+  } | null = null;
   const lifecycleSubscriptionResult = await bus.subscribeTopic(
     "evt.request",
     { mode: "tail", offset: { type: "now" } },
@@ -2745,15 +2803,18 @@ function acceptedRunnerDelivery(input: {
   readonly requestDeliveryId: string;
   readonly requestId: string;
   readonly sessionId: string;
+  readonly requestClient?: "discord" | "github";
   readonly queue: CoreAcceptedRequestWork["data"]["queue"];
   readonly messages: readonly StoredMessageV1[];
+  readonly corePrimaryLineage?: CorePrimaryLineageV2;
   readonly inputReferences?: AcceptedRequestDelivery<CoreAcceptedRequestWork>["inputReferences"];
   readonly raw?: unknown;
 }): AcceptedRequestDelivery<CoreAcceptedRequestWork> {
+  const requestClient = input.requestClient ?? "github";
   const headers = {
     request_id: input.requestId,
     session_id: input.sessionId,
-    request_client: "github" as const,
+    request_client: requestClient,
   };
   return {
     state: "accepted",
@@ -2763,12 +2824,13 @@ function acceptedRunnerDelivery(input: {
       requestDeliveryId: input.requestDeliveryId,
       requestId: input.requestId,
       sessionId: input.sessionId,
-      requestClient: "github",
+      requestClient,
       headers,
       data: {
         requestDeliveryId: input.requestDeliveryId,
         queue: input.queue,
         messages: [...input.messages],
+        ...(input.corePrimaryLineage ? { corePrimaryLineage: input.corePrimaryLineage } : {}),
         ...(input.raw === undefined ? {} : { raw: input.raw }),
       },
     },
@@ -2779,6 +2841,75 @@ function acceptedRunnerDelivery(input: {
 }
 
 describe("durable accepted runner recovery", () => {
+  it.each(["handler-throw", "result-error", "already-accepted"] as const)(
+    "does not start provider work for durable admission outcome %s",
+    async (failureKind) => {
+      const rawBus = createInMemoryRawBus();
+      testDeliveriesRemainOpenOnPolicyStop.add(rawBus);
+      const bus = createLilacBus(rawBus);
+      const pluginManager = corePrimaryTestPluginManager();
+      let modelCalls = 0;
+      const requestDelivery = {
+        handleDelivery: async () => {
+          if (failureKind === "handler-throw") {
+            throw new Error("injected delivery handler rejection");
+          }
+          if (failureKind === "result-error") {
+            return Result.err(new Error("injected delivery handler failure"));
+          }
+          return Result.ok({
+            disposition: "commit" as const,
+            reason: "already-accepted" as const,
+          });
+        },
+        replaceAcceptedWork: () => {
+          throw new Error("unowned work must not be replaced");
+        },
+        terminalize: async () => {
+          throw new Error("unowned work must not be terminalized");
+        },
+      } as unknown as BusAgentRunnerRequestDelivery;
+      const runner = await startBusAgentRunner({
+        bus,
+        subscriptionId: `durable-admission-${failureKind}`,
+        reportFatalPanic: () => undefined,
+        config: parseCoreConfigV2ToUniversal({}),
+        pluginManager,
+        requestDelivery,
+        issueControlCapability: () => ({
+          capability: "durable-admission",
+          principal: null,
+        }),
+        createAgent: (options) => {
+          modelCalls += 1;
+          return new AiSdkPiAgent({
+            ...options,
+            model: new MockLanguageModelV4({
+              modelId: "must-not-run",
+              doStream: async () => level1TextStep("must not run"),
+            }),
+          });
+        },
+      });
+      try {
+        await publishRunnerRequest({
+          bus,
+          requestDeliveryId: crypto.randomUUID(),
+          requestId: `github:durable-admission:${failureKind}`,
+          sessionId: `durable-admission-${failureKind}`,
+          text: "must remain parked",
+        });
+        expect(runner.getActiveDrainOperation()).toBeNull();
+        expect(modelCalls).toBe(0);
+      } finally {
+        testDeliveriesRemainOpenOnPolicyStop.delete(rawBus);
+        await runner.stop();
+        await pluginManager.destroy();
+        await bus.close();
+      }
+    },
+  );
+
   it("reconciles accepted work immediately after a post-accept intake failure", async () => {
     const rawBus = createInMemoryRawBus();
     const bus = createLilacBus(rawBus);
@@ -2829,7 +2960,10 @@ describe("durable accepted runner recovery", () => {
         intakeAttempts += 1;
         throw new Error("fail after accepted commit");
       },
-      issueControlCapability: () => ({ capability: "reconcile", principal: null }),
+      issueControlCapability: () => ({
+        capability: "reconcile",
+        principal: null,
+      }),
       createAgent: (options) =>
         new AiSdkPiAgent({
           ...options,
@@ -2853,7 +2987,10 @@ describe("durable accepted runner recovery", () => {
       });
       await expect(lifecycle.terminal).resolves.toBe("resolved");
       await runner.getActiveDrainOperation();
-      expect({ intakeAttempts, modelCalls }).toEqual({ intakeAttempts: 1, modelCalls: 1 });
+      expect({ intakeAttempts, modelCalls }).toEqual({
+        intakeAttempts: 1,
+        modelCalls: 1,
+      });
       expect(transcriptResultValue(store.load(requestDeliveryId)).state).toBe("terminal");
     } finally {
       await lifecycle.stop();
@@ -2946,6 +3083,37 @@ describe("durable accepted runner recovery", () => {
     const firstStarted = deferred<void>();
     const releaseFirst = deferred<void>();
     const steerApplied = deferred<void>();
+    const reconciledControlStates: string[] = [];
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) =>
+        Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        }),
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      resetRun: () => Result.ok(undefined),
+      removeReconciled: () => {
+        reconciledControlStates.push(transcriptResultValue(store.load(controlDeliveryId)).state);
+        return Result.ok(undefined);
+      },
+    };
     let modelCalls = 0;
     const runner = await startBusAgentRunner({
       bus,
@@ -2954,7 +3122,11 @@ describe("durable accepted runner recovery", () => {
       config: parseCoreConfigV2ToUniversal({}),
       pluginManager,
       requestDelivery,
-      issueControlCapability: () => ({ capability: "retained-control", principal: null }),
+      agentRunJournal: journal,
+      issueControlCapability: () => ({
+        capability: "retained-control",
+        principal: null,
+      }),
       createAgent: (options) => {
         const agent = new AiSdkPiAgent({
           ...options,
@@ -3009,16 +3181,13 @@ describe("durable accepted runner recovery", () => {
       );
       await steerApplied.promise;
       expect(transcriptResultValue(store.load(controlDeliveryId)).state).toBe("accepted");
-      expect(runner.snapshotRecoverables()[0]?.retainedRequestDeliveries).toContainEqual({
-        requestDeliveryId: controlDeliveryId,
-        outcome: { kind: "completed", code: "active-input-applied" },
-      });
       expect((await TEST_BLOB_STORE.open(reference)).status).toBe("ok");
 
       releaseFirst.resolve(undefined);
       await expect(lifecycle.terminal).resolves.toBe("resolved");
       await runner.getActiveDrainOperation();
       expect(transcriptResultValue(store.load(controlDeliveryId)).state).toBe("terminal");
+      expect(reconciledControlStates).toEqual(["terminal"]);
       expect((await TEST_BLOB_STORE.open(reference)).status).toBe("error");
     } finally {
       releaseFirst.resolve(undefined);
@@ -3030,124 +3199,9 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
-  it("recovers an attached control after a hard crash and deduplicates its graceful owner", async () => {
-    const uploaded = transcriptResultValue(
-      await TEST_BLOB_STORE.startUpload({
-        source: new TextEncoder().encode("attached control"),
-        retention: { kind: "durable" },
-      }),
-    );
-    const reference = transcriptResultValue(await uploaded.completion);
-    const controlDeliveryId = crypto.randomUUID();
-    const activeDeliveryId = crypto.randomUUID();
-    const requestId = "github:durable-control:active";
-    const sessionId = "durable-control";
-    const controlMessages = [
-      {
-        role: "user",
-        content: [
-          { type: "text", text: "steer with this attachment" },
-          {
-            type: "blob",
-            blob: reference,
-            mediaType: "text/plain",
-            filename: "control.txt",
-          },
-        ],
-      },
-    ] as const satisfies readonly StoredMessageV1[];
-    const controlRecord = acceptedRunnerDelivery({
-      requestDeliveryId: controlDeliveryId,
-      requestId,
-      sessionId,
-      queue: "steer",
-      messages: controlMessages,
-      inputReferences: [reference],
-      raw: { requiresActive: true },
-    });
-
-    const hardBus = createLilacBus(createInMemoryRawBus());
-    const hardPlugins = corePrimaryTestPluginManager();
-    const hardRunner = await startBusAgentRunner({
-      bus: hardBus,
-      subscriptionId: "hard-control-recovery",
-      reportFatalPanic: () => undefined,
-      config: parseCoreConfigV2ToUniversal({}),
-      pluginManager: hardPlugins,
-      startPaused: true,
-    });
-    try {
-      transcriptResultValue(await hardRunner.resumeAcceptedDelivery(controlRecord));
-      expect(hardRunner.snapshotRecoverables()).toEqual([
-        expect.objectContaining({
-          requestDeliveryId: controlDeliveryId,
-          requestId,
-          messages: controlMessages,
-        }),
-      ]);
-    } finally {
-      await hardRunner.stop();
-      await hardPlugins.destroy();
-      await hardBus.close();
-    }
-
-    const gracefulBus = createLilacBus(createInMemoryRawBus());
-    const gracefulPlugins = corePrimaryTestPluginManager();
-    const gracefulRunner = await startBusAgentRunner({
-      bus: gracefulBus,
-      subscriptionId: "graceful-control-recovery",
-      reportFatalPanic: () => undefined,
-      config: parseCoreConfigV2ToUniversal({}),
-      pluginManager: gracefulPlugins,
-      startPaused: true,
-    });
-    try {
-      const recovery: AgentRunnerRecoveryState = {
-        entries: [
-          {
-            queueEntryId: "active:durable-control",
-            requestDeliveryId: activeDeliveryId,
-            kind: "active",
-            requestId,
-            sessionId,
-            requestClient: "github",
-            queue: "prompt",
-            messages: [{ role: "user", content: "active request" }, ...controlMessages],
-            retainedRequestDeliveries: [
-              {
-                requestDeliveryId: controlDeliveryId,
-                outcome: { kind: "completed", code: "active-input-applied" },
-              },
-            ],
-          },
-        ],
-        queueAttempts: [],
-      };
-      const prepared = transcriptResultValue(gracefulRunner.prepareRecovery(recovery));
-      transcriptResultValue(prepared.apply());
-      transcriptResultValue(await gracefulRunner.resumeAcceptedDelivery(controlRecord));
-      const snapshots = gracefulRunner.snapshotRecoverables();
-      expect(snapshots).toHaveLength(1);
-      expect(snapshots[0]).toMatchObject({
-        requestDeliveryId: activeDeliveryId,
-        retainedRequestDeliveries: [
-          {
-            requestDeliveryId: controlDeliveryId,
-            outcome: { kind: "completed", code: "active-input-applied" },
-          },
-        ],
-      });
-    } finally {
-      await gracefulRunner.stop();
-      await gracefulPlugins.destroy();
-      await gracefulBus.close();
-      transcriptResultValue(await TEST_BLOB_STORE.delete(reference));
-    }
-  });
-
-  it("discards a paused graceful owner before terminal output replay deletes its inputs", async () => {
-    const bus = createLilacBus(createInMemoryRawBus());
-    const pluginManager = corePrimaryTestPluginManager();
+  it("checkpoints a queued control and its retained delivery in the same transition", async () => {
+    const rawBus = createInMemoryRawBus();
+    const bus = createLilacBus(rawBus);
     const store = new SqliteRequestDeliveryStore({
       dbPath: ":memory:",
       codecs: coreRequestDeliveryCodecs,
@@ -3157,16 +3211,219 @@ describe("durable accepted runner recovery", () => {
       blobStore: TEST_BLOB_STORE,
       admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
     });
-    const uploaded = transcriptResultValue(
-      await TEST_BLOB_STORE.startUpload({
-        source: new TextEncoder().encode("finalized graceful input"),
-        retention: { kind: "durable" },
+    const pluginManager = corePrimaryTestPluginManager();
+    const activeDeliveryId = crypto.randomUUID();
+    const controlDeliveryId = crypto.randomUUID();
+    const requestId = "github:checkpointed-control:active";
+    const sessionId = "checkpointed-control";
+    transcriptResultValue(
+      store.prepare({
+        requestDeliveryId: activeDeliveryId,
+        requestId,
+        envelope: {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "github",
+          },
+          data: {
+            requestDeliveryId: activeDeliveryId,
+            queue: "prompt",
+            messages: [{ role: "user", content: "stay active" }],
+          },
+        },
+        inputHandles: [],
+        createdAt: 1,
       }),
     );
-    const reference = transcriptResultValue(await uploaded.completion);
+    const controlMessages = [{ role: "user" as const, content: "apply queued steer" }];
+    transcriptResultValue(
+      store.prepare({
+        requestDeliveryId: controlDeliveryId,
+        requestId,
+        envelope: {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "github",
+          },
+          data: {
+            requestDeliveryId: controlDeliveryId,
+            queue: "steer",
+            messages: controlMessages,
+            raw: { requiresActive: true },
+          },
+        },
+        inputHandles: [],
+        createdAt: 2,
+      }),
+    );
+    const firstStarted = deferred<void>();
+    const releaseFirst = deferred<void>();
+    const steerApplied = deferred<void>();
+    const checkpoints: AgentRunCheckpointV1[] = [];
+    let crashBoundaryCheckpoint: AgentRunCheckpointV1 | undefined;
+    let controlQueued = false;
+    let journalSequence = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) => {
+        journalSequence += 1;
+        return Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: journalSequence,
+        });
+      },
+      writeCheckpoint: (
+        handle: {
+          readonly runId: string;
+          readonly requestId: string;
+          readonly sessionId: string;
+          readonly sequence: number;
+        },
+        checkpoint: AgentRunCheckpointV1,
+      ) => {
+        checkpoints.push(checkpoint);
+        if (
+          controlQueued &&
+          !JSON.stringify(checkpoint.messages).includes("apply queued steer") &&
+          !crashBoundaryCheckpoint
+        ) {
+          crashBoundaryCheckpoint = checkpoint;
+        }
+        journalSequence = handle.sequence + 1;
+        return Result.ok({ ...handle, sequence: journalSequence });
+      },
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      resetRun: () => Result.ok(undefined),
+      removeReconciled: () => Result.ok(undefined),
+    };
+    let modelCalls = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "checkpointed-control",
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      requestDelivery,
+      agentRunJournal: journal,
+      issueControlCapability: () => ({
+        capability: "checkpointed-control",
+        principal: null,
+      }),
+      createAgent: (options) => {
+        const agent = new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "checkpointed-control",
+            doStream: async () => {
+              modelCalls += 1;
+              if (modelCalls === 1) {
+                firstStarted.resolve(undefined);
+                await releaseFirst.promise;
+              }
+              return level1TextStep("done");
+            },
+          }),
+        });
+        const steer = agent.steer.bind(agent);
+        agent.steer = (message) => {
+          const id = steer(message);
+          controlQueued = true;
+          steerApplied.resolve(undefined);
+          return id;
+        };
+        return agent;
+      },
+    });
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestDeliveryId: activeDeliveryId,
+        requestId,
+        sessionId,
+        text: "stay active",
+      });
+      await firstStarted.promise;
+      transcriptResultValue(
+        await bus.publish(
+          lilacEventTypes.CmdRequestMessage,
+          {
+            requestDeliveryId: controlDeliveryId,
+            queue: "steer",
+            messages: controlMessages,
+            raw: { requiresActive: true },
+          },
+          {
+            headers: {
+              request_id: requestId,
+              session_id: sessionId,
+              request_client: "github",
+            },
+          },
+        ),
+      );
+      await steerApplied.promise;
+      expect(transcriptResultValue(store.load(controlDeliveryId)).state).toBe("accepted");
+
+      releaseFirst.resolve(undefined);
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+      await runner.getActiveDrainOperation();
+      expect(crashBoundaryCheckpoint).toBeDefined();
+      expect(crashBoundaryCheckpoint?.retainedRequestDeliveries).toEqual([]);
+      expect(
+        checkpoints.some(
+          (checkpoint) =>
+            JSON.stringify(checkpoint.messages).includes("apply queued steer") &&
+            checkpoint.retainedRequestDeliveries.filter(
+              (retained) => retained.requestDeliveryId === controlDeliveryId,
+            ).length === 1,
+        ),
+      ).toBe(true);
+      expect(modelCalls).toBe(2);
+      expect(transcriptResultValue(store.load(controlDeliveryId)).state).toBe("terminal");
+    } finally {
+      releaseFirst.resolve(undefined);
+      await lifecycle.stop();
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+    }
+  });
+
+  it("checkpoints before provider work and marks terminal after the surface write starts", async () => {
+    const order: string[] = [];
+    const rawBus = createInMemoryRawBus({
+      onPublish: (eventType) => {
+        if (eventType === lilacEventTypes.EvtAgentOutputResponseText) order.push("surface-write");
+      },
+    });
+    const bus = createLilacBus(rawBus);
+    const store = new SqliteRequestDeliveryStore({
+      dbPath: ":memory:",
+      codecs: coreRequestDeliveryCodecs,
+    });
+    const requestDelivery = new RequestDeliveryCoordinator({
+      store,
+      blobStore: TEST_BLOB_STORE,
+      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+    });
+    const pluginManager = corePrimaryTestPluginManager();
     const requestDeliveryId = crypto.randomUUID();
-    const requestId = "github:graceful-final-output:request";
-    const sessionId = "graceful-final-output";
+    const requestId = "github:journal-order:request";
+    const sessionId = "journal-order";
     transcriptResultValue(
       store.prepare({
         requestDeliveryId,
@@ -3180,85 +3437,1313 @@ describe("durable accepted runner recovery", () => {
           data: {
             requestDeliveryId,
             queue: "prompt",
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "blob",
-                    blob: uploaded.handle,
-                    mediaType: "text/plain",
-                  },
-                ],
-              },
-            ],
+            messages: [{ role: "user", content: "persist before work" }],
           },
         },
-        inputHandles: [uploaded.handle],
+        inputHandles: [],
         createdAt: 1,
       }),
     );
-    const accepted = transcriptResultValue(await requestDelivery.handleDelivery(requestDeliveryId));
-    if (accepted.disposition !== "accepted") throw new Error("expected accepted request");
-    let modelCalls = 0;
+    let sequence = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) => {
+        order.push("open");
+        sequence += 1;
+        return Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence,
+        });
+      },
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        order.push("checkpoint");
+        sequence = handle.sequence + 1;
+        return Result.ok({ ...handle, sequence });
+      },
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        order.push("terminal");
+        return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+      },
+      resetRun: () => Result.ok(undefined),
+      removeReconciled: () => Result.ok(undefined),
+    };
     const runner = await startBusAgentRunner({
       bus,
-      subscriptionId: "graceful-final-output",
+      subscriptionId: "journal-order",
       reportFatalPanic: () => undefined,
       config: parseCoreConfigV2ToUniversal({}),
       pluginManager,
       requestDelivery,
-      startPaused: true,
-      createAgent: (options) => {
-        modelCalls += 1;
-        return new AiSdkPiAgent({
+      agentRunJournal: journal,
+      issueControlCapability: () => ({
+        capability: "journal-order",
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
           ...options,
           model: new MockLanguageModelV4({
-            modelId: "must-not-rerun",
-            doStream: async () => level1TextStep("must not run"),
-          }),
-        });
-      },
-    });
-    try {
-      const recovery = transcriptResultValue(
-        runner.prepareRecovery({
-          entries: [
-            {
-              queueEntryId: "active:graceful-final-output",
-              requestDeliveryId,
-              kind: "active",
-              requestId,
-              sessionId,
-              requestClient: "github",
-              queue: "prompt",
-              messages: accepted.record.work.data.messages,
+            modelId: "journal-order",
+            doStream: async () => {
+              order.push("model");
+              return level1TextStep("journalled");
             },
-          ],
-          queueAttempts: [],
+          }),
         }),
-      );
-      transcriptResultValue(recovery.apply());
-      const summary = transcriptResultValue(
-        await requestDelivery.recoverAccepted((record) => runner.resumeAcceptedDelivery(record), {
-          outputReplay: {
-            inspect: async () => Result.ok({ disposition: "terminalize", replayDeadline: 5_000 }),
-          },
-          isOutputReplayEligible: () => true,
-          prepareTerminalRecovery: (record) =>
-            Promise.resolve(runner.discardPausedRecoveredDelivery(record.requestDeliveryId)),
-        }),
-      );
-      recovery.activate();
-      expect(summary).toMatchObject({ terminalized: 1, resumed: 0, failures: [] });
-      expect(runner.snapshotRecoverables()).toEqual([]);
-      expect(modelCalls).toBe(0);
-      expect((await TEST_BLOB_STORE.open(reference)).status).toBe("error");
+    });
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestDeliveryId,
+        requestId,
+        sessionId,
+        text: "persist before work",
+      });
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+      await runner.getActiveDrainOperation();
+      expect(order.indexOf("open")).toBeLessThan(order.indexOf("checkpoint"));
+      expect(order.indexOf("checkpoint")).toBeLessThan(order.indexOf("model"));
+      expect(order.indexOf("surface-write")).toBeLessThan(order.indexOf("terminal"));
     } finally {
+      await lifecycle.stop();
       await runner.stop();
       await pluginManager.destroy();
       store.close();
       await bus.close();
+    }
+  });
+
+  it("keeps recovery ownership when both terminal surface publications fail", async () => {
+    let terminalSurfaceAttempts = 0;
+    const rawBus = createInMemoryRawBus({
+      onPublish: (eventType) => {
+        if (eventType !== lilacEventTypes.EvtAgentOutputResponseText) return;
+        terminalSurfaceAttempts += 1;
+        throw new Error("injected terminal surface publication failure");
+      },
+    });
+    const bus = createLilacBus(rawBus);
+    const store = new SqliteRequestDeliveryStore({
+      dbPath: ":memory:",
+      codecs: coreRequestDeliveryCodecs,
+    });
+    const requestDelivery = new RequestDeliveryCoordinator({
+      store,
+      blobStore: TEST_BLOB_STORE,
+      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+    });
+    const pluginManager = corePrimaryTestPluginManager();
+    const requestDeliveryId = crypto.randomUUID();
+    const requestId = "github:journal-terminal-publication-failure:request";
+    const sessionId = "journal-terminal-publication-failure";
+    transcriptResultValue(
+      store.prepare({
+        requestDeliveryId,
+        requestId,
+        envelope: {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "github",
+          },
+          data: {
+            requestDeliveryId,
+            queue: "prompt",
+            messages: [{ role: "user", content: "retain recovery ownership" }],
+          },
+        },
+        inputHandles: [],
+        createdAt: 1,
+      }),
+    );
+    let terminalMarks = 0;
+    let reconciliations = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) =>
+        Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        }),
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        terminalMarks += 1;
+        return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+      },
+      resetRun: () => Result.ok(undefined),
+      removeReconciled: () => {
+        reconciliations += 1;
+        return Result.ok(undefined);
+      },
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "journal-terminal-publication-failure",
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      requestDelivery,
+      agentRunJournal: journal,
+      issueControlCapability: () => ({
+        capability: "terminal-publication",
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "journal-terminal-publication-failure",
+            doStream: async () => level1TextStep("surface must accept this"),
+          }),
+        }),
+    });
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestDeliveryId,
+        requestId,
+        sessionId,
+        text: "retain recovery ownership",
+      });
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+      await runner.getActiveDrainOperation();
+
+      expect(terminalSurfaceAttempts).toBe(2);
+      expect(terminalMarks).toBe(0);
+      expect(reconciliations).toBe(0);
+      expect(transcriptResultValue(store.load(requestDeliveryId)).state).toBe("accepted");
+    } finally {
+      await lifecycle.stop();
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+    }
+  });
+
+  it("marks the terminal journal head before a blocked live-parent cleanup", async () => {
+    const order: string[] = [];
+    const cleanupStarted = deferred<void>();
+    const releaseCleanup = deferred<void>();
+    const terminalMarked = deferred<void>();
+    const rawBus = createInMemoryRawBus({
+      onPublish: (eventType) => {
+        if (eventType === lilacEventTypes.EvtAgentOutputResponseText) order.push("surface-write");
+      },
+    });
+    const bus = createLilacBus(rawBus);
+    const store = new SqliteRequestDeliveryStore({
+      dbPath: ":memory:",
+      codecs: coreRequestDeliveryCodecs,
+    });
+    const requestDelivery = new RequestDeliveryCoordinator({
+      store,
+      blobStore: TEST_BLOB_STORE,
+      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+    });
+    const pluginManager = corePrimaryTestPluginManager();
+    const requestDeliveryId = crypto.randomUUID();
+    const requestId = "github:journal-cleanup-order:request";
+    const sessionId = "journal-cleanup-order";
+    transcriptResultValue(
+      store.prepare({
+        requestDeliveryId,
+        requestId,
+        envelope: {
+          headers: {
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "github",
+          },
+          data: {
+            requestDeliveryId,
+            queue: "prompt",
+            messages: [{ role: "user", content: "mark before cleanup" }],
+          },
+        },
+        inputHandles: [],
+        createdAt: 1,
+      }),
+    );
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) =>
+        Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        }),
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        order.push("terminal");
+        terminalMarked.resolve(undefined);
+        return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+      },
+      resetRun: () => Result.ok(undefined),
+      removeReconciled: () => Result.ok(undefined),
+    };
+    const workflowLiveParentBridge = {
+      registerParent: () => ({
+        ready: Promise.resolve(),
+        snapshot: () => ({
+          signalVersion: 0,
+          hasPendingCompletions: false,
+          hasOutstandingRuns: false,
+        }),
+        waitForSignalSince: async () => undefined,
+        listPendingIdentities: () => [],
+        listPendingSettledAsync: async () => [],
+        acknowledge: async () => undefined,
+        isPending: () => false,
+        clearMaterializationFailure: () => undefined,
+        recordMaterializationFailure: () => 0,
+        cancelAll: async () => undefined,
+        close: async () => {
+          order.push("cleanup");
+          cleanupStarted.resolve(undefined);
+          await releaseCleanup.promise;
+        },
+      }),
+    } as unknown as NonNullable<
+      Parameters<typeof startBusAgentRunner>[0]["workflowLiveParentBridge"]
+    >;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "journal-cleanup-order",
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      requestDelivery,
+      agentRunJournal: journal,
+      workflowLiveParentBridge,
+      issueControlCapability: () => ({
+        capability: "journal-cleanup-order",
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "journal-cleanup-order",
+            doStream: async () => level1TextStep("marked"),
+          }),
+        }),
+    });
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestDeliveryId,
+        requestId,
+        sessionId,
+        text: "mark before cleanup",
+      });
+      await terminalMarked.promise;
+      await cleanupStarted.promise;
+      expect(order).toEqual(["surface-write", "terminal", "cleanup"]);
+      expect(transcriptResultValue(store.load(requestDeliveryId)).state).toBe("accepted");
+      releaseCleanup.resolve(undefined);
+      await runner.getActiveDrainOperation();
+      expect(transcriptResultValue(store.load(requestDeliveryId)).state).toBe("terminal");
+    } finally {
+      releaseCleanup.resolve(undefined);
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+    }
+  });
+
+  it("resets one failed checkpoint, continues that run, and admits a later request", async () => {
+    const rawBus = createInMemoryRawBus();
+    const bus = createLilacBus(rawBus);
+    const store = new SqliteRequestDeliveryStore({
+      dbPath: ":memory:",
+      codecs: coreRequestDeliveryCodecs,
+    });
+    const requestDelivery = new RequestDeliveryCoordinator({
+      store,
+      blobStore: TEST_BLOB_STORE,
+      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+    });
+    const pluginManager = corePrimaryTestPluginManager();
+    let failCheckpoint = true;
+    let resets = 0;
+    let modelCalls = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) =>
+        Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        }),
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        if (failCheckpoint) {
+          failCheckpoint = false;
+          return Result.err(
+            new AgentRunJournalConflict({
+              runId: handle.runId,
+              message: "injected checkpoint failure",
+            }),
+          );
+        }
+        return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+      },
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      resetRun: () => {
+        resets += 1;
+        return Result.ok(undefined);
+      },
+      removeReconciled: () => Result.ok(undefined),
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "journal-failure",
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      requestDelivery,
+      agentRunJournal: journal,
+      issueControlCapability: () => ({
+        capability: "journal-failure",
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "journal-failure",
+            doStream: async () => {
+              modelCalls += 1;
+              return level1TextStep("continued");
+            },
+          }),
+        }),
+    });
+    const firstId = "github:journal-failure:first";
+    const secondId = "github:journal-failure:second";
+    const firstDeliveryId = crypto.randomUUID();
+    const secondDeliveryId = crypto.randomUUID();
+    for (const [requestDeliveryId, requestId, sessionId, content] of [
+      [firstDeliveryId, firstId, "journal-failure-first", "first"],
+      [secondDeliveryId, secondId, "journal-failure-second", "second"],
+    ] as const) {
+      transcriptResultValue(
+        store.prepare({
+          requestDeliveryId,
+          requestId,
+          envelope: {
+            headers: {
+              request_id: requestId,
+              session_id: sessionId,
+              request_client: "github",
+            },
+            data: {
+              requestDeliveryId,
+              queue: "prompt",
+              messages: [{ role: "user", content }],
+            },
+          },
+          inputHandles: [],
+          createdAt: 1,
+        }),
+      );
+    }
+    const firstLifecycle = await observeRequestLifecycle(bus, firstId);
+    const secondLifecycle = await observeRequestLifecycle(bus, secondId);
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestDeliveryId: firstDeliveryId,
+        requestId: firstId,
+        sessionId: "journal-failure-first",
+        text: "first",
+      });
+      await expect(firstLifecycle.terminal).resolves.toBe("resolved");
+      await publishRunnerRequest({
+        bus,
+        requestDeliveryId: secondDeliveryId,
+        requestId: secondId,
+        sessionId: "journal-failure-second",
+        text: "second",
+      });
+      await expect(secondLifecycle.terminal).resolves.toBe("resolved");
+      expect(resets).toBe(1);
+      expect(modelCalls).toBe(2);
+    } finally {
+      await firstLifecycle.stop();
+      await secondLifecycle.stop();
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+    }
+  });
+
+  it("disables the journal for the runner boot when reset fails", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const store = new SqliteRequestDeliveryStore({
+      dbPath: ":memory:",
+      codecs: coreRequestDeliveryCodecs,
+    });
+    const requestDelivery = new RequestDeliveryCoordinator({
+      store,
+      blobStore: TEST_BLOB_STORE,
+      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+    });
+    const pluginManager = corePrimaryTestPluginManager();
+    const journalCalls = {
+      open: 0,
+      checkpoint: 0,
+      reset: 0,
+      terminal: 0,
+      remove: 0,
+    };
+    let modelCalls = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) => {
+        journalCalls.open += 1;
+        return Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        });
+      },
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        journalCalls.checkpoint += 1;
+        return Result.err(
+          new AgentRunJournalConflict({
+            runId: handle.runId,
+            message: "injected checkpoint failure",
+          }),
+        );
+      },
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        journalCalls.terminal += 1;
+        return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+      },
+      resetRun: (runId: string) => {
+        journalCalls.reset += 1;
+        return Result.err(
+          new AgentRunJournalSqliteFailure({
+            operation: `reset ${runId}`,
+            code: "SQLITE_IOERR",
+            message: "injected reset failure",
+          }),
+        );
+      },
+      removeReconciled: () => {
+        journalCalls.remove += 1;
+        return Result.ok(undefined);
+      },
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "journal-reset-failure",
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      requestDelivery,
+      agentRunJournal: journal,
+      issueControlCapability: () => ({
+        capability: "journal-reset-failure",
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "journal-reset-failure",
+            doStream: async () => {
+              modelCalls += 1;
+              return level1TextStep("continued without journal");
+            },
+          }),
+        }),
+    });
+    const requests = [
+      {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "github:journal-reset-failure:first",
+        sessionId: "journal-reset-failure-first",
+      },
+      {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "github:journal-reset-failure:second",
+        sessionId: "journal-reset-failure-second",
+      },
+    ] as const;
+    for (const [index, request] of requests.entries()) {
+      transcriptResultValue(
+        store.prepare({
+          requestDeliveryId: request.requestDeliveryId,
+          requestId: request.requestId,
+          envelope: {
+            headers: {
+              request_id: request.requestId,
+              session_id: request.sessionId,
+              request_client: "github",
+            },
+            data: {
+              requestDeliveryId: request.requestDeliveryId,
+              queue: "prompt",
+              messages: [{ role: "user", content: `request ${index + 1}` }],
+            },
+          },
+          inputHandles: [],
+          createdAt: index + 1,
+        }),
+      );
+    }
+    const lifecycles = await Promise.all(
+      requests.map((request) => observeRequestLifecycle(bus, request.requestId)),
+    );
+    try {
+      for (const [index, request] of requests.entries()) {
+        await publishRunnerRequest({
+          bus,
+          requestDeliveryId: request.requestDeliveryId,
+          requestId: request.requestId,
+          sessionId: request.sessionId,
+          text: `request ${index + 1}`,
+        });
+        await expect(lifecycles[index]!.terminal).resolves.toBe("resolved");
+      }
+      expect(modelCalls).toBe(2);
+      expect(journalCalls).toEqual({
+        open: 1,
+        checkpoint: 1,
+        reset: 1,
+        terminal: 0,
+        remove: 0,
+      });
+    } finally {
+      await Promise.all(lifecycles.map((lifecycle) => lifecycle.stop()));
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+    }
+  });
+
+  it.each(["reopen", "checkpoint-retry"] as const)(
+    "disables the journal for later runs when the bounded %s attempt fails",
+    async (failureStage) => {
+      const bus = createLilacBus(createInMemoryRawBus());
+      const store = new SqliteRequestDeliveryStore({
+        dbPath: ":memory:",
+        codecs: coreRequestDeliveryCodecs,
+      });
+      const requestDelivery = new RequestDeliveryCoordinator({
+        store,
+        blobStore: TEST_BLOB_STORE,
+        admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+      });
+      const pluginManager = corePrimaryTestPluginManager();
+      const journalCalls = { open: 0, checkpoint: 0, reset: 0, terminal: 0 };
+      let modelCalls = 0;
+      const journal = {
+        openRun: (owner: {
+          readonly requestDeliveryId: string;
+          readonly requestId: string;
+          readonly sessionId: string;
+        }) => {
+          journalCalls.open += 1;
+          if (failureStage === "reopen" && journalCalls.open === 2) {
+            return Result.err(
+              new AgentRunJournalConflict({
+                runId: owner.requestDeliveryId,
+                message: "injected journal reopen failure",
+              }),
+            );
+          }
+          return Result.ok({
+            runId: owner.requestDeliveryId,
+            requestId: owner.requestId,
+            sessionId: owner.sessionId,
+            sequence: 1,
+          });
+        },
+        writeCheckpoint: (handle: {
+          readonly runId: string;
+          readonly requestId: string;
+          readonly sessionId: string;
+          readonly sequence: number;
+        }) => {
+          journalCalls.checkpoint += 1;
+          return Result.err(
+            new AgentRunJournalConflict({
+              runId: handle.runId,
+              message: "injected journal checkpoint failure",
+            }),
+          );
+        },
+        markTerminal: (handle: {
+          readonly runId: string;
+          readonly requestId: string;
+          readonly sessionId: string;
+          readonly sequence: number;
+        }) => {
+          journalCalls.terminal += 1;
+          return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+        },
+        resetRun: () => {
+          journalCalls.reset += 1;
+          return Result.ok(undefined);
+        },
+        removeReconciled: () => Result.ok(undefined),
+      };
+      const runner = await startBusAgentRunner({
+        bus,
+        subscriptionId: `journal-bounded-${failureStage}`,
+        reportFatalPanic: () => undefined,
+        config: parseCoreConfigV2ToUniversal({}),
+        pluginManager,
+        requestDelivery,
+        agentRunJournal: journal,
+        issueControlCapability: () => ({
+          capability: `journal-bounded-${failureStage}`,
+          principal: null,
+        }),
+        createAgent: (options) =>
+          new AiSdkPiAgent({
+            ...options,
+            model: new MockLanguageModelV4({
+              modelId: `journal-bounded-${failureStage}`,
+              doStream: async () => {
+                modelCalls += 1;
+                return level1TextStep("continued without journal");
+              },
+            }),
+          }),
+      });
+      const requests = [
+        {
+          requestDeliveryId: crypto.randomUUID(),
+          requestId: `github:journal-bounded-${failureStage}:first`,
+          sessionId: `journal-bounded-${failureStage}-first`,
+        },
+        {
+          requestDeliveryId: crypto.randomUUID(),
+          requestId: `github:journal-bounded-${failureStage}:second`,
+          sessionId: `journal-bounded-${failureStage}-second`,
+        },
+      ] as const;
+      for (const [index, request] of requests.entries()) {
+        transcriptResultValue(
+          store.prepare({
+            requestDeliveryId: request.requestDeliveryId,
+            requestId: request.requestId,
+            envelope: {
+              headers: {
+                request_id: request.requestId,
+                session_id: request.sessionId,
+                request_client: "github",
+              },
+              data: {
+                requestDeliveryId: request.requestDeliveryId,
+                queue: "prompt",
+                messages: [{ role: "user", content: `request ${index + 1}` }],
+              },
+            },
+            inputHandles: [],
+            createdAt: index + 1,
+          }),
+        );
+      }
+      const lifecycles = await Promise.all(
+        requests.map((request) => observeRequestLifecycle(bus, request.requestId)),
+      );
+      try {
+        for (const [index, request] of requests.entries()) {
+          await publishRunnerRequest({
+            bus,
+            requestDeliveryId: request.requestDeliveryId,
+            requestId: request.requestId,
+            sessionId: request.sessionId,
+            text: `request ${index + 1}`,
+          });
+          await expect(lifecycles[index]!.terminal).resolves.toBe("resolved");
+        }
+        expect(modelCalls).toBe(2);
+        expect(journalCalls).toEqual(
+          failureStage === "reopen"
+            ? { open: 2, checkpoint: 1, reset: 1, terminal: 0 }
+            : { open: 2, checkpoint: 2, reset: 2, terminal: 0 },
+        );
+      } finally {
+        await Promise.all(lifecycles.map((lifecycle) => lifecycle.stop()));
+        await runner.stop();
+        await pluginManager.destroy();
+        store.close();
+        await bus.close();
+      }
+    },
+  );
+
+  it("reconstructs original and checkpointed work across sessions and skips terminal heads", async () => {
+    const rawBus = createInMemoryRawBus();
+    const bus = createLilacBus(rawBus);
+    const pluginManager = corePrimaryTestPluginManager();
+    const observedModelPrompts: string[] = [];
+    const bothCalled = deferred<void>();
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "journal-reconstruction",
+      startPaused: true,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      issueControlCapability: () => ({
+        capability: "journal-reconstruction",
+        principal: null,
+      }),
+      createAgent: (options) => {
+        const agent = new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "journal-reconstruction",
+            doStream: async (call) => {
+              observedModelPrompts.push(JSON.stringify(call.prompt));
+              if (observedModelPrompts.length === 2) bothCalled.resolve(undefined);
+              return level1TextStep("recovered");
+            },
+          }),
+        });
+        return agent;
+      },
+    });
+    const original = acceptedRunnerDelivery({
+      requestDeliveryId: crypto.randomUUID(),
+      requestId: "github:journal-reconstruction:original",
+      sessionId: "journal-reconstruction-original",
+      queue: "prompt",
+      messages: [{ role: "user", content: "original floor" }],
+    });
+    const checkpointed = acceptedRunnerDelivery({
+      requestDeliveryId: crypto.randomUUID(),
+      requestId: "github:journal-reconstruction:checkpoint",
+      sessionId: "journal-reconstruction-checkpoint",
+      queue: "prompt",
+      messages: [{ role: "user", content: "stale accepted input" }],
+    });
+    const terminal = acceptedRunnerDelivery({
+      requestDeliveryId: crypto.randomUUID(),
+      requestId: "github:journal-reconstruction:terminal",
+      sessionId: "journal-reconstruction-terminal",
+      queue: "prompt",
+      messages: [{ role: "user", content: "must not rerun" }],
+    });
+    const activeHead: AgentRunRecoveryHead = {
+      handle: {
+        runId: checkpointed.requestDeliveryId,
+        requestId: checkpointed.requestId,
+        sessionId: checkpointed.work.sessionId,
+        sequence: 2,
+      },
+      state: "active",
+      checkpoint: {
+        version: 1,
+        messages: [{ role: "user", content: "durable checkpoint" }],
+        retainedRequestDeliveries: [],
+      },
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const terminalHead: AgentRunRecoveryHead = {
+      handle: {
+        runId: terminal.requestDeliveryId,
+        requestId: terminal.requestId,
+        sessionId: terminal.work.sessionId,
+        sequence: 3,
+      },
+      state: "terminal",
+      terminalOutcome: { kind: "completed" },
+      createdAt: 1,
+      updatedAt: 3,
+    };
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(original));
+      transcriptResultValue(await runner.resumeAcceptedDelivery(checkpointed, activeHead));
+      transcriptResultValue(await runner.resumeAcceptedDelivery(terminal, terminalHead));
+      runner.activate();
+      await bothCalled.promise;
+      expect(observedModelPrompts).toHaveLength(2);
+      expect(observedModelPrompts.some((messages) => messages.includes("original floor"))).toBe(
+        true,
+      );
+      expect(observedModelPrompts.some((messages) => messages.includes("durable checkpoint"))).toBe(
+        true,
+      );
+      expect(
+        observedModelPrompts.some((messages) => messages.includes("stale accepted input")),
+      ).toBe(false);
+      expect(observedModelPrompts.some((messages) => messages.includes("must not rerun"))).toBe(
+        false,
+      );
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("restores trusted Discord authority and its live cache owner from durable accepted work", async () => {
+    const sessionId = "recovered-authority-session";
+    const messageId = "recovered-authority-message";
+    const requestId = `discord:${sessionId}:${messageId}`;
+    const requestDeliveryId = crypto.randomUUID();
+    const requestMessageCache = createRequestMessageCache();
+    const bus = createLilacBus(createInMemoryRawBus());
+    let issuedSafetyMode: string | undefined;
+    let issuedOrigin: AuthenticatedSurfaceOrigin | undefined;
+    let cachedOriginAtIssue: ReturnType<typeof requestMessageCache.getOrigin>;
+    const pluginManager = corePrimaryTestPluginManager();
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "recovered-authority",
+      startPaused: true,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      requestMessageCache,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
+      issueControlCapability: (input) => {
+        issuedSafetyMode = input.safetyMode;
+        issuedOrigin = input.authenticatedOrigin;
+        cachedOriginAtIssue = requestMessageCache.getOrigin(requestId);
+        return {
+          capability: "recovered-authority",
+          principal: input.authenticatedOrigin
+            ? {
+                platform: input.authenticatedOrigin.platform,
+                userId: input.authenticatedOrigin.userId,
+              }
+            : null,
+          authenticatedOrigin: input.authenticatedOrigin ?? null,
+          safetyMode: input.safetyMode,
+        };
+      },
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "recovered-authority",
+            doStream: async () => level1TextStep("trusted recovery"),
+          }),
+        }),
+    });
+    const accepted = acceptedRunnerDelivery({
+      requestDeliveryId,
+      requestId,
+      sessionId,
+      requestClient: "discord",
+      queue: "prompt",
+      messages: [{ role: "user", content: "recover trusted authority" }],
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "recovered-authority-user",
+          messageRef: { platform: "discord", channelId: sessionId, messageId },
+        },
+      },
+    });
+    const activeHead: AgentRunRecoveryHead = {
+      handle: { runId: requestDeliveryId, requestId, sessionId, sequence: 2 },
+      state: "active",
+      checkpoint: {
+        version: 1,
+        messages: [{ role: "user", content: "durable trusted checkpoint" }],
+        currentTurnUserId: "recovered-authority-user",
+        retainedRequestDeliveries: [],
+      },
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, activeHead));
+      runner.activate();
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+
+      expect(issuedSafetyMode).toBe("trusted");
+      expect(issuedOrigin).toEqual({
+        platform: "discord",
+        userId: "recovered-authority-user",
+        sessionRef: { platform: "discord", channelId: sessionId },
+        messageRef: { platform: "discord", channelId: sessionId, messageId },
+      });
+      expect(cachedOriginAtIssue).toEqual(expect.objectContaining({ requestId, sessionId }));
+      expect(requestMessageCache.getOrigin(requestId)).toBeUndefined();
+    } finally {
+      await lifecycle.stop();
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("keeps recovered Discord work restricted when its durable message proof is invalid", async () => {
+    const sessionId = "invalid-recovered-authority-session";
+    const requestId = `discord:${sessionId}:expected-message`;
+    const requestDeliveryId = crypto.randomUUID();
+    const requestMessageCache = createRequestMessageCache();
+    const bus = createLilacBus(createInMemoryRawBus());
+    let issuedSafetyMode: string | undefined;
+    let issuedOrigin: AuthenticatedSurfaceOrigin | undefined;
+    const pluginManager = corePrimaryTestPluginManager();
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "invalid-recovered-authority",
+      startPaused: true,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      requestMessageCache,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
+      issueControlCapability: (input) => {
+        issuedSafetyMode = input.safetyMode;
+        issuedOrigin = input.authenticatedOrigin;
+        return {
+          capability: "invalid-recovered-authority",
+          principal: null,
+          authenticatedOrigin: input.authenticatedOrigin ?? null,
+          safetyMode: input.safetyMode,
+        };
+      },
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "invalid-recovered-authority",
+            doStream: async () => level1TextStep("restricted recovery"),
+          }),
+        }),
+    });
+    const accepted = acceptedRunnerDelivery({
+      requestDeliveryId,
+      requestId,
+      sessionId,
+      requestClient: "discord",
+      queue: "prompt",
+      messages: [{ role: "user", content: "reject invalid durable authority" }],
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "invalid-recovered-authority-user",
+          messageRef: {
+            platform: "discord",
+            channelId: sessionId,
+            messageId: "different-message",
+          },
+        },
+      },
+    });
+    const activeHead: AgentRunRecoveryHead = {
+      handle: { runId: requestDeliveryId, requestId, sessionId, sequence: 2 },
+      state: "active",
+      checkpoint: {
+        version: 1,
+        messages: [{ role: "user", content: "durable restricted checkpoint" }],
+        retainedRequestDeliveries: [],
+      },
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, activeHead));
+      runner.activate();
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+
+      expect(issuedSafetyMode).toBe("restricted");
+      expect(issuedOrigin).toBeUndefined();
+      expect(requestMessageCache.getOrigin(requestId)).toBeUndefined();
+    } finally {
+      await lifecycle.stop();
+      await runner.stop();
+      await requestMessageCache.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("recovers a Core-primary Claude WAL checkpoint without resuming the crash-left native attempt", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-primary-wal-recovery-"));
+    const dbPath = path.join(dataDir, "transcripts.db");
+    const sessionId = "primary-wal-recovery";
+    const requestId = "discord:primary-wal-recovery:input";
+    const requestDeliveryId = crypto.randomUUID();
+    const crashedCandidateSessionId = crypto.randomUUID();
+    const portableMessages = [
+      { role: "user", content: "portable WAL checkpoint" },
+    ] satisfies ModelMessage[];
+    const firstStore = new SqliteTranscriptStore(dbPath);
+    const lineage = buildCoreLineageManifestV2([
+      admitPrimarySurface(firstStore, sessionId, "portable-input", portableMessages),
+    ]);
+    attemptMutationValue(
+      firstStore.reserveCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        executionScopeHashVersion: 1,
+        executionScopeHash: "crash-left-scope",
+        requestId,
+        attemptIndex: 0,
+        candidateSessionId: crashedCandidateSessionId,
+        sourceSessionId: null,
+        expectedBindingRevision: null,
+      }),
+    );
+    firstStore.close();
+
+    const store = new SqliteTranscriptStore(dbPath);
+    expect(
+      store.getCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: sessionId,
+        requestId,
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("uncertain");
+
+    const rawBus = createInMemoryRawBus();
+    const bus = createLilacBus(rawBus);
+    const pluginManager = corePrimaryTestPluginManager();
+    const starts: ClaudeNativeSessionStart[] = [];
+    const modelPrompts: ModelMessage[][] = [];
+    const config = parseCoreConfigV2ToUniversal({});
+    config.models.main = { model: "claude-code/sonnet", fallback: [] };
+    config.agent.retry = {
+      enabled: false,
+      maxRetries: 0,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "primary-wal-recovery",
+      startPaused: true,
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      cwd: dataDir,
+      transcriptStore: store,
+      issueControlCapability: () => ({
+        capability: "primary-wal-recovery",
+        principal: null,
+      }),
+      materializeClaudeCodeRun: async (options) => {
+        const start = options.nativeSession;
+        if (!start || start.mode === "ephemeral") {
+          throw new Error("expected persistent Claude start");
+        }
+        starts.push(start);
+        const observation: ClaudeNativeAttemptObservation = {
+          requestedSessionId: start.sessionId,
+          sourceSessionId: start.mode === "fork" ? start.baseSessionId : null,
+          initSessionId: start.sessionId,
+          resultSessionId: start.sessionId,
+          contextTokens: 100,
+          contextMaxTokens: 4_000,
+          requestedModel: options.modelId,
+          initializedModel: options.modelId,
+          requestedReasoning: options.reasoning ?? null,
+          providerWarnings: [],
+          invoked: true,
+          requiredObservabilityError: null,
+          callbackError: null,
+        };
+        const model = new MockLanguageModelV4({
+          modelId: options.modelId,
+          doStream: async (call) => {
+            modelPrompts.push([...call.prompt]);
+            return level1TextStep("recovered from portable checkpoint");
+          },
+        });
+        return {
+          agentModel: model,
+          continuationModel: model,
+          createUtilityModelResult: () => Result.ok(model),
+          createUtilityModel: () => model,
+          control: {
+            inject: () => false,
+            interrupt: async () => false,
+            async interruptResult() {
+              return Result.ok(await this.interrupt());
+            },
+            clear: () => {},
+            clearResult() {
+              this.clear();
+              return Result.ok();
+            },
+          },
+          nativeSession: {
+            getObservation: () => observation,
+            waitForObservation: async () => observation,
+            recordWarning: () => {},
+            finalize: async () => ({
+              status: "promotable" as const,
+              issues: [] as const,
+              observations: observation,
+              candidate: {
+                sessionId: start.sessionId,
+                cwd: options.cwd,
+                lastModified: 1,
+              },
+              sourcePreflight: null,
+              sourceFinal: null,
+            }),
+            async finalizeResult() {
+              return Result.ok(await this.finalize());
+            },
+          },
+          dispose: async () => {},
+          disposeResult: async () => Result.ok(),
+        };
+      },
+    });
+    const accepted = acceptedRunnerDelivery({
+      requestDeliveryId,
+      requestId,
+      sessionId,
+      requestClient: "discord",
+      queue: "prompt",
+      messages: [{ role: "user", content: "stale accepted input" }],
+      corePrimaryLineage: lineage,
+    });
+    const activeHead: AgentRunRecoveryHead = {
+      handle: { runId: requestDeliveryId, requestId, sessionId, sequence: 2 },
+      state: "active",
+      checkpoint: {
+        version: 1,
+        messages: transcriptResultValue(projectStoredMessagesV1(portableMessages)),
+        corePrimaryLineage: lineage,
+        retainedRequestDeliveries: [],
+      },
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, activeHead));
+      runner.activate();
+      await expect(lifecycle.terminal).resolves.toBe("resolved");
+
+      expect(starts).toHaveLength(1);
+      expect(starts[0]).toMatchObject({ mode: "fresh" });
+      if (!starts[0] || starts[0].mode === "ephemeral") {
+        throw new Error("recovered Claude start is missing");
+      }
+      expect(starts[0].sessionId).not.toBe(crashedCandidateSessionId);
+      expect(JSON.stringify(modelPrompts)).toContain("portable WAL checkpoint");
+      expect(JSON.stringify(modelPrompts)).not.toContain("stale accepted input");
+      expect(
+        store.getCorePrimaryClaudeSessionAttempt({
+          providerId: "claude-code",
+          requestClient: "discord",
+          lilacSessionId: sessionId,
+          requestId,
+          attemptIndex: 0,
+        })?.state,
+      ).toBe("uncertain");
+      expect(
+        store.getCorePrimaryClaudeSessionAttempt({
+          providerId: "claude-code",
+          requestClient: "discord",
+          lilacSessionId: sessionId,
+          requestId,
+          attemptIndex: 2,
+        }),
+      ).toMatchObject({
+        attemptIndex: 2,
+        candidateSessionId: starts[0].sessionId,
+      });
+    } finally {
+      await lifecycle.stop();
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+      await rm(dataDir, { recursive: true, force: true });
     }
   });
 });
@@ -3282,7 +4767,9 @@ describe("bus agent runner terminal cleanup", () => {
       `captures ${failingLabel} throwing %s without preventing cleanup`,
       async (_, cause) => {
         const failure = cause();
-        const originalPanic = new Panic({ message: "custom command invariant failed" });
+        const originalPanic = new Panic({
+          message: "custom command invariant failed",
+        });
         const started: BusAgentRunnerTerminalCleanup["label"][] = [];
         let nextQueueStarts = 0;
         let operations: ReturnType<typeof startBusAgentRunnerTerminalCleanup>["operations"] = [];
@@ -3385,7 +4872,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
+      resolveDiscordSessionContext: () => ({
+        parentChannelId: null,
+        guildId: null,
+      }),
       issueControlCapability: (input) => {
         issuedOrigin = input.authenticatedOrigin;
         return {
@@ -3495,7 +4985,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
+      resolveDiscordSessionContext: () => ({
+        parentChannelId: null,
+        guildId: null,
+      }),
       issueControlCapability: (input) => ({
         capability: "current-turn-capability",
         principal: input.authenticatedOrigin
@@ -3577,9 +5070,6 @@ describe("startBusAgentRunner production path", () => {
       });
       expect(requestMessageCache.getOrigin(requestId)?.authenticatedOrigin?.userId).toBe("user-a");
       await followUpApplied.promise;
-      expect(
-        runner.snapshotRecoverables().find((entry) => entry.requestId === requestId),
-      ).toMatchObject({ kind: "active", currentTurnUserId: "user-b" });
       releaseFirstCall.resolve(undefined);
 
       await expect(lifecycle.terminal).resolves.toBe("resolved");
@@ -3605,486 +5095,6 @@ describe("startBusAgentRunner production path", () => {
     }
   });
 
-  it("re-admits restored identity into the cache before Level-2 capability issuance", async () => {
-    const config = parseCoreConfigV2ToUniversal({});
-    config.models.main = { model: "openai/restored-identity" };
-    const bus = createLilacBus(createInMemoryRawBus());
-    const requestMessageCache = createRequestMessageCache();
-    const recoveredCurrentTurnUserId = deferred<string | undefined>();
-    const pluginManager = corePrimaryTestPluginManager((context) =>
-      recoveredCurrentTurnUserId.resolve(context?.currentTurnUserId),
-    );
-    const capabilityIssued = deferred<{
-      readonly safetyMode: string;
-      readonly userId: string | undefined;
-      readonly cachedUserId: string | undefined;
-    }>();
-    const releaseModel = deferred<void>();
-    const requestId = "discord:restored-identity:message";
-    const recovery = {
-      entries: [
-        {
-          queueEntryId: "restored-identity-entry",
-          kind: "active",
-          requestId,
-          sessionId: "restored-identity",
-          requestClient: "discord",
-          queue: "prompt",
-          messages: [{ role: "user", content: "restored" }],
-          currentTurnUserId: "later-restored-user",
-          identity: {
-            state: "durable",
-            projection: {
-              requestId,
-              requestClient: "discord",
-              sessionId: "restored-identity",
-              source: "external",
-              platform: "discord",
-              sessionRef: { platform: "discord", channelId: "restored-identity" },
-              authenticatedOrigin: {
-                platform: "discord",
-                userId: "restored-user",
-                sessionRef: { platform: "discord", channelId: "restored-identity" },
-                messageRef: {
-                  platform: "discord",
-                  channelId: "restored-identity",
-                  messageId: "message",
-                },
-              },
-              messageRef: {
-                platform: "discord",
-                channelId: "restored-identity",
-                messageId: "message",
-              },
-              authenticationMetadataKind: "origin",
-              verifiedIngress: true,
-            },
-            assertedSafetyMode: "trusted",
-            parkedEventIds: [],
-          },
-        },
-      ],
-      queueAttempts: [],
-    } satisfies AgentRunnerRecoveryState;
-    const runner = await startBusAgentRunner({
-      bus,
-      subscriptionId: "restored-identity",
-      reportFatalPanic: () => undefined,
-      config,
-      pluginManager,
-      requestMessageCache,
-      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
-      startPaused: true,
-      issueControlCapability: (input) => {
-        capabilityIssued.resolve({
-          safetyMode: input.safetyMode,
-          userId: input.authenticatedOrigin?.userId,
-          cachedUserId: requestMessageCache.getOrigin(requestId)?.authenticatedOrigin?.userId,
-        });
-        return {
-          capability: "restored-identity-capability",
-          principal: input.authenticatedOrigin
-            ? {
-                platform: input.authenticatedOrigin.platform,
-                userId: input.authenticatedOrigin.userId,
-              }
-            : null,
-          authenticatedOrigin: input.authenticatedOrigin ?? null,
-          safetyMode: input.safetyMode,
-        };
-      },
-      createAgent: (options) =>
-        new AiSdkPiAgent({
-          ...options,
-          model: new MockLanguageModelV4({
-            modelId: "restored-identity",
-            doStream: async () => {
-              await releaseModel.promise;
-              return level1TextStep("restored");
-            },
-          }),
-        }),
-    });
-    applyAndActivateAgentRecovery(runner, recovery);
-    try {
-      await expect(capabilityIssued.promise).resolves.toEqual({
-        safetyMode: "trusted",
-        userId: "restored-user",
-        cachedUserId: "restored-user",
-      });
-      await expect(recoveredCurrentTurnUserId.promise).resolves.toBe("later-restored-user");
-      expect(
-        runner.snapshotRecoverables().find((entry) => entry.requestId === requestId),
-      ).toMatchObject({ kind: "active", currentTurnUserId: "later-restored-user" });
-    } finally {
-      releaseModel.resolve(undefined);
-      await runner.getActiveDrainOperation();
-      await runner.stop();
-      await requestMessageCache.stop();
-      await pluginManager.destroy();
-      await bus.close();
-    }
-  });
-
-  it("recomputes restored GitHub safety and accepts a matching persisted assertion", async () => {
-    const config = parseCoreConfigV2ToUniversal({});
-    config.models.main = { model: "openai/restored-github-policy" };
-    const bus = createLilacBus(createInMemoryRawBus());
-    const requestMessageCache = createRequestMessageCache();
-    const pluginManager = corePrimaryTestPluginManager();
-    const capabilityIssued = deferred<string>();
-    const requestId = "github:octo/repo#1:restored-policy";
-    const recovery = {
-      entries: [
-        {
-          queueEntryId: "restored-github-policy-entry",
-          kind: "queued",
-          requestId,
-          sessionId: "octo/repo#1",
-          requestClient: "github",
-          queue: "prompt",
-          messages: [{ role: "user", content: "restored" }],
-          identity: {
-            state: "durable",
-            projection: {
-              requestId,
-              requestClient: "github",
-              sessionId: "octo/repo#1",
-              source: "external",
-              platform: "github",
-              sessionRef: { platform: "github", channelId: "octo/repo#1" },
-              messageRef: {
-                platform: "github",
-                channelId: "octo/repo#1",
-                messageId: "restored-policy",
-              },
-              authenticationMetadataKind: "absent",
-              verifiedIngress: false,
-            },
-            assertedSafetyMode: "restricted",
-            parkedEventIds: [],
-          },
-        },
-      ],
-      queueAttempts: [],
-    } satisfies AgentRunnerRecoveryState;
-    const runner = await startBusAgentRunner({
-      bus,
-      subscriptionId: "restored-github-policy",
-      reportFatalPanic: () => undefined,
-      config,
-      pluginManager,
-      requestMessageCache,
-      startPaused: true,
-      issueControlCapability: (input) => {
-        capabilityIssued.resolve(input.safetyMode);
-        return {
-          capability: "restored-github-policy-capability",
-          principal: null,
-          safetyMode: input.safetyMode,
-        };
-      },
-      createAgent: (options) =>
-        new AiSdkPiAgent({
-          ...options,
-          model: new MockLanguageModelV4({
-            modelId: "restored-github-policy",
-            doStream: async () => level1TextStep("restricted"),
-          }),
-        }),
-    });
-    applyAndActivateAgentRecovery(runner, recovery);
-    try {
-      await expect(capabilityIssued.promise).resolves.toBe("restricted");
-    } finally {
-      await runner.getActiveDrainOperation();
-      await runner.stop();
-      await requestMessageCache.stop();
-      await pluginManager.destroy();
-      await bus.close();
-    }
-  });
-
-  it("rejects a restored external safety assertion that conflicts with current policy", async () => {
-    const config = parseCoreConfigV2ToUniversal({});
-    const bus = createLilacBus(createInMemoryRawBus());
-    const requestMessageCache = createRequestMessageCache();
-    const pluginManager = corePrimaryTestPluginManager();
-    const requestId = "github:octo/repo#1:restricted-assertion";
-    const runner = await startBusAgentRunner({
-      bus,
-      subscriptionId: "conflicting-restored-safety",
-      reportFatalPanic: () => undefined,
-      config,
-      pluginManager,
-      requestMessageCache,
-      startPaused: true,
-      issueControlCapability: () => ({ capability: "unused", principal: null }),
-    });
-    try {
-      const prepared = runner.prepareRecovery({
-        entries: [
-          {
-            queueEntryId: "conflicting-restored-safety-entry",
-            kind: "queued",
-            requestId,
-            sessionId: "octo/repo#1",
-            requestClient: "github",
-            queue: "prompt",
-            messages: [],
-            identity: {
-              state: "durable",
-              projection: {
-                requestId,
-                requestClient: "github",
-                sessionId: "octo/repo#1",
-                source: "external",
-                platform: "github",
-                sessionRef: { platform: "github", channelId: "octo/repo#1" },
-                authenticationMetadataKind: "absent",
-                verifiedIngress: false,
-              },
-              assertedSafetyMode: "trusted",
-              parkedEventIds: [],
-            },
-          },
-        ],
-        queueAttempts: [],
-      });
-      expect(prepared.status).toBe("error");
-      if (prepared.status === "error") {
-        expect(prepared.error).toMatchObject({ reason: "identity-conflict" });
-      }
-    } finally {
-      await runner.stop();
-      await requestMessageCache.stop();
-      await pluginManager.destroy();
-      await bus.close();
-    }
-  });
-
-  it("rejects a delegated recovery proof that conflicts with durable workflow authority", async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), "lilac-recovery-delegation-proof-"));
-    const durableWorkflowStore = new DurableWorkflowStore(path.join(directory, "workflow.db"));
-    const config = parseCoreConfigV2ToUniversal({});
-    const bus = createLilacBus(createInMemoryRawBus());
-    const requestMessageCache = createRequestMessageCache();
-    const pluginManager = corePrimaryTestPluginManager();
-    const requestId = "wfr:run:operation:1";
-    const sessionId = "workflow:run";
-    let authorizedRunId = "different-run";
-    durableWorkflowStore.authorizeWorkflowRequest = () => ({
-      requestId,
-      sessionId,
-      platform: "unknown",
-      policy: {
-        runId: authorizedRunId,
-        operationId: "operation",
-        dispatchEpoch: "dispatch-epoch-0001",
-        profile: "general",
-        model: null,
-        reasoning: null,
-        resolvedModelRequest: {
-          spec: "openai/test",
-          provider: "openai",
-          modelId: "test",
-          reasoningDisplay: "simple",
-        },
-        cwd: "/workspace",
-        originSession: {
-          requestId: "origin-request",
-          sessionId: "octo/repo#1",
-          client: "github",
-          userId: "workflow-user",
-        },
-      },
-    });
-    const runner = await startBusAgentRunner({
-      bus,
-      subscriptionId: "conflicting-delegation-proof",
-      reportFatalPanic: () => undefined,
-      config,
-      pluginManager,
-      requestMessageCache,
-      durableWorkflowStore,
-      startPaused: true,
-      issueControlCapability: () => ({ capability: "unused", principal: null }),
-    });
-    try {
-      const prepared = runner.prepareRecovery({
-        entries: [
-          {
-            queueEntryId: "delegated-entry",
-            kind: "queued",
-            requestId,
-            sessionId,
-            requestClient: "unknown",
-            queue: "prompt",
-            messages: [],
-            identity: {
-              state: "durable",
-              projection: {
-                requestId,
-                requestClient: "unknown",
-                sessionId,
-                source: "internal-delegated",
-                authenticatedOrigin: {
-                  platform: "github",
-                  userId: "workflow-user",
-                  sessionRef: { platform: "github", channelId: "octo/repo#1" },
-                },
-                authenticationMetadataKind: "origin",
-                verifiedIngress: false,
-              },
-              assertedSafetyMode: "restricted",
-              parkedEventIds: [],
-              delegationProof: {
-                kind: "workflow",
-                runId: "run",
-                operationId: "operation",
-                dispatchEpoch: "dispatch-epoch-0001",
-              },
-            },
-          },
-        ],
-        queueAttempts: [],
-      });
-      expect(prepared.status).toBe("error");
-      if (prepared.status === "error") {
-        expect(prepared.error).toMatchObject({
-          _tag: "AgentRecoveryUnavailable",
-          reason: "delegation-proof-unavailable",
-        });
-      }
-      authorizedRunId = "run";
-      const authorized = runner.prepareRecovery({
-        entries: [
-          {
-            queueEntryId: "delegated-entry",
-            kind: "queued",
-            requestId,
-            sessionId,
-            requestClient: "unknown",
-            queue: "prompt",
-            messages: [],
-            identity: {
-              state: "durable",
-              projection: {
-                requestId,
-                requestClient: "unknown",
-                sessionId,
-                source: "internal-delegated",
-                authenticatedOrigin: {
-                  platform: "github",
-                  userId: "workflow-user",
-                  sessionRef: { platform: "github", channelId: "octo/repo#1" },
-                },
-                authenticationMetadataKind: "origin",
-                verifiedIngress: false,
-              },
-              assertedSafetyMode: "restricted",
-              parkedEventIds: [],
-              delegationProof: {
-                kind: "workflow",
-                runId: "run",
-                operationId: "operation",
-                dispatchEpoch: "dispatch-epoch-0001",
-              },
-            },
-          },
-        ],
-        queueAttempts: [],
-      });
-      expect(authorized.status).toBe("ok");
-      if (authorized.status === "ok") {
-        expect(authorized.value.apply().status).toBe("ok");
-        expect(requestMessageCache.getOrigin(requestId)).toMatchObject({
-          authenticatedOrigin: { platform: "github", userId: "workflow-user" },
-          verifiedIngress: false,
-        });
-        authorized.value.rollback();
-      }
-    } finally {
-      await runner.stop();
-      await requestMessageCache.stop();
-      await pluginManager.destroy();
-      await bus.close();
-      durableWorkflowStore.close();
-      await rm(directory, { recursive: true, force: true });
-    }
-  });
-
-  it("restores legacy identity without durable proof as principal-less and restricted", async () => {
-    const config = parseCoreConfigV2ToUniversal({});
-    config.models.main = { model: "openai/restricted-legacy" };
-    const bus = createLilacBus(createInMemoryRawBus());
-    const requestMessageCache = createRequestMessageCache();
-    const pluginManager = corePrimaryTestPluginManager();
-    const capabilityIssued = deferred<{
-      readonly safetyMode: string;
-      readonly hasOrigin: boolean;
-    }>();
-    const requestId = "discord:restricted-legacy:message";
-    const recovery = {
-      entries: [
-        {
-          queueEntryId: "restricted-legacy-entry",
-          kind: "active",
-          requestId,
-          sessionId: "restricted-legacy",
-          requestClient: "discord",
-          queue: "prompt",
-          messages: [{ role: "user", content: "legacy" }],
-          identity: { state: "restricted", reason: "legacy-no-durable-proof" },
-        },
-      ],
-      queueAttempts: [],
-    } satisfies AgentRunnerRecoveryState;
-    const runner = await startBusAgentRunner({
-      bus,
-      subscriptionId: "restricted-legacy",
-      reportFatalPanic: () => undefined,
-      config,
-      pluginManager,
-      requestMessageCache,
-      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
-      startPaused: true,
-      issueControlCapability: (input) => {
-        capabilityIssued.resolve({
-          safetyMode: input.safetyMode,
-          hasOrigin: input.authenticatedOrigin !== undefined,
-        });
-        return {
-          capability: "restricted-legacy-capability",
-          principal: null,
-          safetyMode: input.safetyMode,
-        };
-      },
-      createAgent: (options) =>
-        new AiSdkPiAgent({
-          ...options,
-          model: new MockLanguageModelV4({
-            modelId: "restricted-legacy",
-            doStream: async () => level1TextStep("restricted"),
-          }),
-        }),
-    });
-    applyAndActivateAgentRecovery(runner, recovery);
-    try {
-      await expect(capabilityIssued.promise).resolves.toEqual({
-        safetyMode: "restricted",
-        hasOrigin: false,
-      });
-      expect(requestMessageCache.getOrigin(requestId)).toBeUndefined();
-    } finally {
-      await runner.getActiveDrainOperation();
-      await runner.stop();
-      await requestMessageCache.stop();
-      await pluginManager.destroy();
-      await bus.close();
-    }
-  });
-
   it("admits the work subscription while paused and releases retained delivery synchronously", async () => {
     const config = parseCoreConfigV2ToUniversal({});
     config.models.main = { model: "openai/paused-admission" };
@@ -4100,7 +5110,10 @@ describe("startBusAgentRunner production path", () => {
       pluginManager,
       requestMessageCache,
       startPaused: true,
-      issueControlCapability: () => ({ capability: "paused-admission", principal: null }),
+      issueControlCapability: () => ({
+        capability: "paused-admission",
+        principal: null,
+      }),
       createAgent: (options) =>
         new AiSdkPiAgent({
           ...options,
@@ -4157,7 +5170,10 @@ describe("startBusAgentRunner production path", () => {
       pluginManager,
       requestMessageCache,
       startPaused: true,
-      issueControlCapability: () => ({ capability: "paused-stop", principal: null }),
+      issueControlCapability: () => ({
+        capability: "paused-stop",
+        principal: null,
+      }),
       createAgent: (agentOptions) =>
         new AiSdkPiAgent({
           ...agentOptions,
@@ -4193,126 +5209,6 @@ describe("startBusAgentRunner production path", () => {
     }
   });
 
-  it.each([
-    ["queued-cancellation", true],
-    ["buffered-absorption", true],
-    ["buffered-absorption", false],
-  ] as const)(
-    "reconstructs parked %s reservations with controlApplied=%s before queue drain",
-    async (kind, controlApplied) => {
-      const config = parseCoreConfigV2ToUniversal({});
-      config.models.main = { model: "openai/restored-reservation" };
-      const bus = createLilacBus(createInMemoryRawBus());
-      const requestMessageCache = createRequestMessageCache();
-      const pluginManager = corePrimaryTestPluginManager();
-      const requestId = `github:restored-reservation:${kind}:${controlApplied}`;
-      const controlRequestId = `${requestId}:control`;
-      const eventId = `pel:${kind}:${controlApplied}`;
-      let modelCalls = 0;
-      const recovery = {
-        entries: [
-          {
-            queueEntryId: "restored-target-entry",
-            kind: "queued",
-            requestId,
-            sessionId: "restored-reservation",
-            requestClient: "github",
-            queue: "prompt",
-            messages: [{ role: "user", content: "must remain reserved" }],
-            identity: {
-              state: "durable",
-              projection: {
-                requestId,
-                requestClient: "github",
-                sessionId: "restored-reservation",
-                source: "external",
-                platform: "github",
-                sessionRef: { platform: "github", channelId: "restored-reservation" },
-                authenticationMetadataKind: "absent",
-                verifiedIngress: false,
-              },
-              assertedSafetyMode: "restricted",
-              parkedEventIds: [],
-            },
-          },
-        ],
-        queueAttempts: [
-          {
-            eventId,
-            controlRequestId,
-            controlRequestClient: "github",
-            sessionId: "restored-reservation",
-            kind,
-            detail: "restored pending cancellation",
-            controlApplied,
-            controlIdentity: {
-              state: "durable",
-              projection: {
-                requestId: controlRequestId,
-                requestClient: "github",
-                sessionId: "restored-reservation",
-                source: "external",
-                platform: "github",
-                sessionRef: { platform: "github", channelId: "restored-reservation" },
-                authenticationMetadataKind: "absent",
-                verifiedIngress: false,
-              },
-              assertedSafetyMode: "restricted",
-              parkedEventIds: [eventId],
-            },
-            pendingGroups: [
-              {
-                publicationIndex: 1,
-                requestId,
-                requestClient: "github",
-                targetQueueEntryIds: ["restored-target-entry"],
-              },
-            ],
-          },
-        ],
-      } satisfies AgentRunnerRecoveryState;
-      const runner = await startBusAgentRunner({
-        bus,
-        subscriptionId: `restored-reservation-${kind}-${controlApplied}`,
-        reportFatalPanic: () => undefined,
-        config,
-        pluginManager,
-        requestMessageCache,
-        startPaused: true,
-        issueControlCapability: () => ({ capability: "unused", principal: null }),
-        createAgent: (options) =>
-          new AiSdkPiAgent({
-            ...options,
-            model: new MockLanguageModelV4({
-              modelId: "restored-reservation",
-              doStream: async () => {
-                modelCalls += 1;
-                return level1TextStep("must not run");
-              },
-            }),
-          }),
-      });
-      applyAndActivateAgentRecovery(runner, recovery);
-      try {
-        await Promise.resolve();
-        expect(modelCalls).toBe(0);
-        expect(runner.snapshotQueueAttempts()[0]).toMatchObject({
-          eventId,
-          kind,
-          controlApplied,
-          pendingGroups: [{ publicationIndex: 0 }],
-        });
-        expect(requestMessageCache.snapshot(controlRequestId)?.parkedEventIds).toEqual([eventId]);
-        expect(requestMessageCache.snapshot(requestId)?.parkedEventIds).toEqual([]);
-      } finally {
-        await runner.stop();
-        await requestMessageCache.stop();
-        await pluginManager.destroy();
-        await bus.close();
-      }
-    },
-  );
-
   it("retains identity and cache state across park-pending intake redelivery", async () => {
     const config = parseCoreConfigV2ToUniversal({});
     config.models.main = { model: "openai/park-redelivery" };
@@ -4329,7 +5225,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      issueControlCapability: () => ({ capability: "park-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "park-capability",
+        principal: null,
+      }),
       beforeRequestIntake: () => {
         intakeAttempts += 1;
         if (intakeAttempts === 1) throw new Error("transient intake failure");
@@ -4396,7 +5295,10 @@ describe("startBusAgentRunner production path", () => {
         parentChannelId: sessionId,
         guildId: null,
       }),
-      issueControlCapability: () => ({ capability: "rollback-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "rollback-capability",
+        principal: null,
+      }),
       createAgent: (options) =>
         new AiSdkPiAgent({
           ...options,
@@ -4434,18 +5336,12 @@ describe("startBusAgentRunner production path", () => {
         requestClient: "discord",
         text: "queued",
       });
-      expect(
-        runner.snapshotRecoverables().some((entry) => entry.requestId === queuedRequestId),
-      ).toBe(false);
       expect(requestMessageCache.snapshot(queuedRequestId)).toMatchObject({
         ownerCount: 0,
         parkedEventIds: [expect.any(String)],
       });
 
       await rawBus.redeliverRequest(queuedRequestId);
-      expect(
-        runner.snapshotRecoverables().filter((entry) => entry.requestId === queuedRequestId),
-      ).toHaveLength(1);
       expect(requestMessageCache.snapshot(queuedRequestId)?.ownerCount).toBe(1);
       releaseFirst.resolve(undefined);
       await secondStarted.promise;
@@ -4480,7 +5376,10 @@ describe("startBusAgentRunner production path", () => {
         parentChannelId: sessionId,
         guildId: null,
       }),
-      issueControlCapability: () => ({ capability: "coalesced-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "coalesced-capability",
+        principal: null,
+      }),
       createAgent: (options) =>
         new AiSdkPiAgent({
           ...options,
@@ -4527,11 +5426,6 @@ describe("startBusAgentRunner production path", () => {
         queue: "steer",
         text: "absorb buffered",
       });
-      expect(
-        runner
-          .snapshotRecoverables()
-          .filter((entry) => bufferedRequestIds.includes(entry.requestId)),
-      ).toHaveLength(0);
       for (const requestId of bufferedRequestIds) {
         expect(requestMessageCache.get(requestId)).toBeUndefined();
       }
@@ -4570,7 +5464,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      issueControlCapability: () => ({ capability: "steer-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "steer-capability",
+        principal: null,
+      }),
       createAgent: (options) =>
         new AiSdkPiAgent({
           ...options,
@@ -4793,7 +5690,10 @@ describe("startBusAgentRunner production path", () => {
         config,
         pluginManager,
         requestMessageCache,
-        issueControlCapability: () => ({ capability: "cancel-capability", principal: null }),
+        issueControlCapability: () => ({
+          capability: "cancel-capability",
+          principal: null,
+        }),
         createAgent: (options) =>
           new AiSdkPiAgent({
             ...options,
@@ -4846,12 +5746,6 @@ describe("startBusAgentRunner production path", () => {
             (requestId) => requestMessageCache.snapshot(requestId)?.ownerCount ?? 0,
           ),
         ).toEqual(failAfter === 0 ? [1, 1] : [0, 1]);
-        expect(
-          runner
-            .snapshotRecoverables()
-            .filter((entry) => targetRequestIds.includes(entry.requestId)),
-        ).toHaveLength(2 - failAfter);
-
         await rawBus.redeliverRequest(cancellationRequestId);
         for (const requestId of targetRequestIds) {
           expect(requestMessageCache.get(requestId)).toBeUndefined();
@@ -4860,11 +5754,6 @@ describe("startBusAgentRunner production path", () => {
         expect(
           lifecycles.map((lifecycle) => lifecycle.states.filter((state) => state === "cancelled")),
         ).toEqual([["cancelled"], ["cancelled"]]);
-        expect(
-          runner
-            .snapshotRecoverables()
-            .filter((entry) => targetRequestIds.includes(entry.requestId)),
-        ).toHaveLength(0);
       } finally {
         releaseActive.resolve(undefined);
         for (const lifecycle of lifecycles) await lifecycle.stop();
@@ -4899,7 +5788,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      issueControlCapability: () => ({ capability: "absorb-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "absorb-capability",
+        principal: null,
+      }),
       createAgent: (options) => {
         const agent = new AiSdkPiAgent({
           ...options,
@@ -4991,175 +5883,6 @@ describe("startBusAgentRunner production path", () => {
     }
   });
 
-  it.each(["queued-cancellation", "buffered-absorption"] as const)(
-    "resumes a real parked %s delivery after runner process replacement",
-    async (kind) => {
-      const config = parseCoreConfigV2ToUniversal({});
-      config.models.main = { model: `openai/replaced-${kind}` };
-      const rawBus = createInMemoryRawBus();
-      testDeliveriesRemainOpenOnPolicyStop.add(rawBus);
-      const bus = createLilacBus(rawBus);
-      const firstCache = createRequestMessageCache();
-      const firstPluginManager = corePrimaryTestPluginManager();
-      const activeStarted = deferred<void>();
-      const releaseActive = deferred<void>();
-      let firstModelCalls = 0;
-      let firstSteerCalls = 0;
-      const firstRunner = await startBusAgentRunner({
-        bus,
-        subscriptionId: `replacement-source-${kind}`,
-        reportFatalPanic: () => undefined,
-        config,
-        pluginManager: firstPluginManager,
-        requestMessageCache: firstCache,
-        issueControlCapability: () => ({ capability: "replacement-source", principal: null }),
-        createAgent: (options) => {
-          const agent = new AiSdkPiAgent({
-            ...options,
-            model: new MockLanguageModelV4({
-              modelId: `replaced-${kind}`,
-              doStream: async () => {
-                firstModelCalls += 1;
-                activeStarted.resolve(undefined);
-                await releaseActive.promise;
-                return level1TextStep("active complete");
-              },
-            }),
-          });
-          const steer = agent.steer.bind(agent);
-          agent.steer = (message) => {
-            firstSteerCalls += 1;
-            return steer(message);
-          };
-          return agent;
-        },
-      });
-      const sessionId = `replacement-${kind}`;
-      const activeRequestId = `github:${sessionId}:active`;
-      const targetRequestIds = [`github:${sessionId}:target-a`, `github:${sessionId}:target-b`];
-      const remainingTargetRequestId = targetRequestIds[1]!;
-      const controlRequestId =
-        kind === "buffered-absorption" ? activeRequestId : `github:${sessionId}:control`;
-      const lifecycles = await Promise.all(
-        targetRequestIds.map((requestId) => observeRequestLifecycle(bus, requestId)),
-      );
-      let secondRunner: Awaited<ReturnType<typeof startBusAgentRunner>> | null = null;
-      let secondCache: ReturnType<typeof createRequestMessageCache> | null = null;
-      let secondPluginManager: ReturnType<typeof corePrimaryTestPluginManager> | null = null;
-      try {
-        await publishRunnerRequest({ bus, requestId: activeRequestId, sessionId, text: "active" });
-        await activeStarted.promise;
-        for (const requestId of targetRequestIds) {
-          await publishRunnerRequest({
-            bus,
-            requestId,
-            sessionId,
-            text: requestId,
-            raw:
-              kind === "queued-cancellation"
-                ? { chainMessageIds: ["replacement-target"] }
-                : { bufferedForActiveRequestId: activeRequestId },
-          });
-        }
-        rawBus.failCancelledLifecycleAfter(1);
-        await publishRunnerRequest({
-          bus,
-          requestId: controlRequestId,
-          sessionId,
-          queue: kind === "queued-cancellation" ? "interrupt" : "steer",
-          text: "apply control",
-          raw:
-            kind === "queued-cancellation"
-              ? { cancel: true, cancelQueued: true, messageId: "replacement-target" }
-              : undefined,
-        });
-
-        const recovery = {
-          entries: firstRunner
-            .snapshotRecoverables()
-            .filter((entry) => targetRequestIds.includes(entry.requestId)),
-          queueAttempts: firstRunner.snapshotQueueAttempts(),
-        };
-        expect({
-          entries: recovery.entries.map((entry) => entry.requestId),
-          pending: recovery.queueAttempts.flatMap((attempt) =>
-            attempt.pendingGroups.map((group) => group.requestId),
-          ),
-        }).toEqual({ entries: [remainingTargetRequestId], pending: [remainingTargetRequestId] });
-        expect(recovery.queueAttempts).toHaveLength(1);
-        expect(recovery.queueAttempts[0]).toMatchObject({
-          controlRequestId,
-          kind,
-          controlApplied: true,
-        });
-        const eventId = recovery.queueAttempts[0]?.eventId;
-        if (!eventId) throw new Error("Expected persisted parked control event");
-
-        releaseActive.resolve(undefined);
-        await firstRunner.getActiveDrainOperation();
-        await firstRunner.stop();
-        await firstCache.stop();
-        await firstPluginManager.destroy();
-
-        rawBus.suppressNextWorkReplay();
-        secondCache = createRequestMessageCache();
-        secondPluginManager = corePrimaryTestPluginManager();
-        let replacementModelCalls = 0;
-        secondRunner = await startBusAgentRunner({
-          bus,
-          subscriptionId: `replacement-target-${kind}`,
-          reportFatalPanic: () => undefined,
-          config,
-          pluginManager: secondPluginManager,
-          requestMessageCache: secondCache,
-          startPaused: true,
-          issueControlCapability: () => ({ capability: "replacement-target", principal: null }),
-          createAgent: (options) =>
-            new AiSdkPiAgent({
-              ...options,
-              model: new MockLanguageModelV4({
-                modelId: `replacement-target-${kind}`,
-                doStream: async () => {
-                  replacementModelCalls += 1;
-                  return level1TextStep("must not run");
-                },
-              }),
-            }),
-        });
-        applyAndActivateAgentRecovery(secondRunner, recovery);
-        await rawBus.redeliverRequestEventWithHeaders(eventId, {
-          request_id: `${controlRequestId}:wrong`,
-          session_id: sessionId,
-          request_client: "github",
-        });
-        expect(secondRunner.snapshotQueueAttempts()).toHaveLength(1);
-        expect(secondRunner.snapshotRecoverables()).toHaveLength(1);
-        expect(replacementModelCalls).toBe(0);
-        await rawBus.redeliverRequestEvent(eventId);
-
-        expect(replacementModelCalls).toBe(0);
-        expect(firstModelCalls).toBe(kind === "buffered-absorption" ? 2 : 1);
-        expect(firstSteerCalls).toBe(kind === "buffered-absorption" ? 1 : 0);
-        expect(secondRunner.snapshotQueueAttempts()).toEqual([]);
-        expect(secondRunner.snapshotRecoverables()).toEqual([]);
-        expect(
-          lifecycles.map((lifecycle) => lifecycle.states.filter((state) => state === "cancelled")),
-        ).toEqual([["cancelled"], ["cancelled"]]);
-      } finally {
-        releaseActive.resolve(undefined);
-        for (const lifecycle of lifecycles) await lifecycle.stop();
-        await secondRunner?.stop();
-        await secondCache?.stop();
-        await secondPluginManager?.destroy();
-        await firstRunner.stop();
-        await firstCache.stop();
-        await firstPluginManager.destroy();
-        await bus.close();
-        testDeliveriesRemainOpenOnPolicyStop.delete(rawBus);
-      }
-    },
-  );
-
   it("rolls back buffered reservations when control application fails before mutation", async () => {
     const config = parseCoreConfigV2ToUniversal({});
     config.models.main = { model: "openai/buffered-control-rollback" };
@@ -5180,7 +5903,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      issueControlCapability: () => ({ capability: "rollback-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "rollback-capability",
+        principal: null,
+      }),
       createAgent: (options) => {
         const agent = new AiSdkPiAgent({
           ...options,
@@ -5213,7 +5939,12 @@ describe("startBusAgentRunner production path", () => {
     const activeLifecycle = await observeRequestLifecycle(bus, activeRequestId);
     const bufferedLifecycle = await observeRequestLifecycle(bus, bufferedRequestId);
     try {
-      await publishRunnerRequest({ bus, requestId: activeRequestId, sessionId, text: "active" });
+      await publishRunnerRequest({
+        bus,
+        requestId: activeRequestId,
+        sessionId,
+        text: "active",
+      });
       await activeStarted.promise;
       await publishRunnerRequest({
         bus,
@@ -5230,14 +5961,16 @@ describe("startBusAgentRunner production path", () => {
         text: "absorb",
       });
 
-      expect({ steerAttempts, appliedSteers }).toEqual({ steerAttempts: 1, appliedSteers: 0 });
+      expect({ steerAttempts, appliedSteers }).toEqual({
+        steerAttempts: 1,
+        appliedSteers: 0,
+      });
       expect(requestMessageCache.snapshot(bufferedRequestId)?.ownerCount).toBe(1);
-      expect(
-        runner.snapshotRecoverables().filter((entry) => entry.requestId === bufferedRequestId),
-      ).toHaveLength(1);
-
       await rawBus.redeliverRequest(activeRequestId);
-      expect({ steerAttempts, appliedSteers }).toEqual({ steerAttempts: 2, appliedSteers: 1 });
+      expect({ steerAttempts, appliedSteers }).toEqual({
+        steerAttempts: 2,
+        appliedSteers: 1,
+      });
       expect(requestMessageCache.get(bufferedRequestId)).toBeUndefined();
       expect(bufferedLifecycle.states.filter((state) => state === "cancelled")).toEqual([
         "cancelled",
@@ -5284,7 +6017,10 @@ describe("startBusAgentRunner production path", () => {
         seenEventIds.add(message.id);
         throw new Error("park each initial delivery");
       },
-      issueControlCapability: () => ({ capability: "two-pel-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "two-pel-capability",
+        principal: null,
+      }),
       createAgent: (options) =>
         new AiSdkPiAgent({
           ...options,
@@ -5305,8 +6041,18 @@ describe("startBusAgentRunner production path", () => {
     const requestId = `github:${sessionId}:request`;
     const lifecycle = await observeRequestLifecycle(bus, requestId);
     try {
-      await publishRunnerRequest({ bus, requestId, sessionId, text: "first" });
-      await publishRunnerRequest({ bus, requestId, sessionId, text: "second" });
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        sessionId,
+        text: "first",
+      });
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        sessionId,
+        text: "second",
+      });
       const eventIds = rawBus.requestEventIds(requestId);
       expect(eventIds).toHaveLength(2);
       expect(requestMessageCache.snapshot(requestId)).toMatchObject({
@@ -5385,7 +6131,10 @@ describe("startBusAgentRunner production path", () => {
         config,
         pluginManager,
         customCommands,
-        issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+        issueControlCapability: () => ({
+          capability: "test-capability",
+          principal: null,
+        }),
         expireControlCapability: () => {
           throw cleanupFailure;
         },
@@ -5663,7 +6412,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       requestMessageCache,
-      issueControlCapability: () => ({ capability: "alias-rollback", principal: null }),
+      issueControlCapability: () => ({
+        capability: "alias-rollback",
+        principal: null,
+      }),
       createAgent: (options) =>
         new AiSdkPiAgent({
           ...options,
@@ -5716,9 +6468,6 @@ describe("startBusAgentRunner production path", () => {
         raw,
       });
       expect(requestMessageCache.get(aliasRequestId)).toBeUndefined();
-      expect(
-        runner.snapshotRecoverables().some((entry) => entry.requestId === aliasRequestId),
-      ).toBe(false);
       expect(requestMessageCache.snapshot(requestId)).toMatchObject({
         ownerCount: 1,
         parkedEventIds: [expect.any(String)],
@@ -5726,9 +6475,6 @@ describe("startBusAgentRunner production path", () => {
 
       await rawBus.redeliverRequest(requestId);
       expect(requestMessageCache.snapshot(aliasRequestId)?.ownerCount).toBe(1);
-      expect(
-        runner.snapshotRecoverables().filter((entry) => entry.requestId === aliasRequestId),
-      ).toHaveLength(1);
       releaseFirst.resolve(undefined);
       await secondStarted.promise;
       await runner.getActiveDrainOperation();
@@ -5786,7 +6532,10 @@ describe("startBusAgentRunner production path", () => {
               },
             }
           : {
-              authenticatedActor: { platform: "github" as const, userId: "self-alias-user" },
+              authenticatedActor: {
+                platform: "github" as const,
+                userId: "self-alias-user",
+              },
               authenticatedOrigin: {
                 platform: "github" as const,
                 userId: "self-alias-user",
@@ -5872,7 +6621,10 @@ describe("startBusAgentRunner production path", () => {
         expect(contexts[1]).toMatchObject({
           requestId: testCase.requestId,
           safetyMode: "trusted",
-          requestInitiator: { platform: testCase.platform, userId: "self-alias-user" },
+          requestInitiator: {
+            platform: testCase.platform,
+            userId: "self-alias-user",
+          },
           requestInitiatorSessionId: testCase.sessionId,
         });
       } finally {
@@ -5889,7 +6641,10 @@ describe("startBusAgentRunner production path", () => {
     const config = parseCoreConfigV2ToUniversal({});
     config.models.main = { model: "openai/cancellable" };
     const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-cancel-"));
-    const pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
+    const pluginManager = createCoreToolPluginManager({
+      runtime: { config },
+      dataDir,
+    });
     const bus = createLilacBus(createInMemoryRawBus());
     const modelCallStarted = deferred<void>();
     const runner = await startBusAgentRunner({
@@ -5898,7 +6653,10 @@ describe("startBusAgentRunner production path", () => {
       reportFatalPanic: () => undefined,
       config,
       pluginManager,
-      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "test-capability",
+        principal: null,
+      }),
       createAgent: (options) =>
         new AiSdkPiAgent({
           ...options,
@@ -5907,9 +6665,13 @@ describe("startBusAgentRunner production path", () => {
             doStream: async ({ abortSignal }) => {
               modelCallStarted.resolve(undefined);
               await new Promise<void>((resolve) => {
-                abortSignal?.addEventListener("abort", () => resolve(), { once: true });
+                abortSignal?.addEventListener("abort", () => resolve(), {
+                  once: true,
+                });
               });
-              throw Object.assign(new Error("cancelled"), { name: "AbortError" });
+              throw Object.assign(new Error("cancelled"), {
+                name: "AbortError",
+              });
             },
           }),
         }),
@@ -5917,7 +6679,12 @@ describe("startBusAgentRunner production path", () => {
     const requestId = "github:cancel-session:request";
     const lifecycle = await observeRequestLifecycle(bus, requestId);
 
-    await publishRunnerRequest({ bus, requestId, sessionId: "cancel-session", text: "start" });
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId: "cancel-session",
+      text: "start",
+    });
     expect(
       await Promise.race([
         modelCallStarted.promise.then(() => "model-started" as const),
@@ -5946,10 +6713,21 @@ describe("startBusAgentRunner production path", () => {
 
   it("advances the live agent to the configured fallback transport", async () => {
     const config = parseCoreConfigV2ToUniversal({});
-    config.models.main = { model: "openai/primary", fallback: ["openai/fallback"] };
-    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    config.models.main = {
+      model: "openai/primary",
+      fallback: ["openai/fallback"],
+    };
+    config.agent.retry = {
+      enabled: false,
+      maxRetries: 0,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    };
     const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-fallback-"));
-    const pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
+    const pluginManager = createCoreToolPluginManager({
+      runtime: { config },
+      dataDir,
+    });
     const bus = createLilacBus(createInMemoryRawBus());
     const switchedSpecs: Array<string | undefined> = [];
     const successModel = new MockLanguageModelV4({
@@ -5962,14 +6740,19 @@ describe("startBusAgentRunner production path", () => {
       reportFatalPanic: () => undefined,
       config,
       pluginManager,
-      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "test-capability",
+        principal: null,
+      }),
       createAgent: (options) => {
         const agent = new AiSdkPiAgent({
           ...options,
           model: new MockLanguageModelV4({
             modelId: "primary",
             doStream: async () => {
-              throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+              throw Object.assign(new Error("connection reset"), {
+                code: "ECONNRESET",
+              });
             },
           }),
         });
@@ -5984,9 +6767,17 @@ describe("startBusAgentRunner production path", () => {
     const requestId = "github:fallback-session:request";
     const lifecycle = await observeRequestLifecycle(bus, requestId);
 
-    await publishRunnerRequest({ bus, requestId, sessionId: "fallback-session", text: "start" });
+    await publishRunnerRequest({
+      bus,
+      requestId,
+      sessionId: "fallback-session",
+      text: "start",
+    });
 
-    expect({ terminal: await lifecycle.terminal, details: lifecycle.details }).toEqual({
+    expect({
+      terminal: await lifecycle.terminal,
+      details: lifecycle.details,
+    }).toEqual({
       terminal: "resolved",
       details: [undefined, undefined],
     });
@@ -6003,7 +6794,10 @@ describe("startBusAgentRunner production path", () => {
     const config = parseCoreConfigV2ToUniversal({});
     config.models.main = { model: "openai/phased" };
     const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-phased-output-"));
-    const pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
+    const pluginManager = createCoreToolPluginManager({
+      runtime: { config },
+      dataDir,
+    });
     const bus = createLilacBus(createInMemoryRawBus());
     let createdAgents = 0;
     const runner = await startBusAgentRunner({
@@ -6012,7 +6806,10 @@ describe("startBusAgentRunner production path", () => {
       reportFatalPanic: () => undefined,
       config,
       pluginManager,
-      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "test-capability",
+        principal: null,
+      }),
       createAgent: (options) => {
         createdAgents += 1;
         return new AiSdkPiAgent({
@@ -6126,7 +6923,12 @@ describe("startBusAgentRunner production path", () => {
   it("silences an intermediate NO_REPLY turn while preserving its tool exchange", async () => {
     const config = parseCoreConfigV2ToUniversal({});
     config.models.main = { model: "openai/silent-turn" };
-    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    config.agent.retry = {
+      enabled: false,
+      maxRetries: 0,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    };
     const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-silent-turn-"));
     const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
     const bus = createLilacBus(createInMemoryRawBus());
@@ -6140,7 +6942,10 @@ describe("startBusAgentRunner production path", () => {
       config,
       pluginManager,
       transcriptStore: store,
-      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "test-capability",
+        principal: null,
+      }),
       createAgent: (options) =>
         new AiSdkPiAgent({
           ...options,
@@ -6280,8 +7085,12 @@ function extendPrimaryManifest(input: {
   currentMessageId: string;
   currentMessages: readonly ModelMessage[];
 }): CoreLineageManifestV2 {
-  const transcript = getRequestTranscript(input.store, { requestId: input.completedRequestId });
-  const metadata = getCoreRequestAtomMetadata(input.store, { requestId: input.completedRequestId });
+  const transcript = getRequestTranscript(input.store, {
+    requestId: input.completedRequestId,
+  });
+  const metadata = getCoreRequestAtomMetadata(input.store, {
+    requestId: input.completedRequestId,
+  });
   if (!transcript || !metadata) throw new Error("completed primary request metadata is missing");
   input.store.admitCoreSurfaceProjection({
     requestClient: "discord",
@@ -6296,9 +7105,17 @@ function extendPrimaryManifest(input: {
   input.store.linkSurfaceMessagesToRequest({
     requestId: input.completedRequestId,
     created: [
-      { platform: "discord", channelId: input.sessionId, messageId: input.outputMessageId },
+      {
+        platform: "discord",
+        channelId: input.sessionId,
+        messageId: input.outputMessageId,
+      },
     ],
-    last: { platform: "discord", channelId: input.sessionId, messageId: input.outputMessageId },
+    last: {
+      platform: "discord",
+      channelId: input.sessionId,
+      messageId: input.outputMessageId,
+    },
   });
   const currentSegment = admitPrimarySurface(
     input.store,
@@ -6337,7 +7154,12 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
   it("promotes an auto-injected first turn and forks the exact linked reply with suffix-only input", async () => {
     const config = parseCoreConfigV2ToUniversal({});
     config.models.main = { model: "claude-code/sonnet" };
-    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    config.agent.retry = {
+      enabled: false,
+      maxRetries: 0,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    };
     config.conversation.thread.autoInject = {
       ...config.conversation.thread.autoInject,
       enabled: true,
@@ -6448,7 +7270,10 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
         subscriptionId: "production-primary-auto-inject-router",
         config,
         transcriptStore: store,
-        routerGate: async () => ({ forward: true, reason: "deterministic integration route" }),
+        routerGate: async () => ({
+          forward: true,
+          reason: "deterministic integration route",
+        }),
       }),
       () => {},
       () => {},
@@ -6470,7 +7295,10 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       pluginManager: corePrimaryTestPluginManager(),
       cwd: dataDir,
       transcriptStore: store,
-      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "test-capability",
+        principal: null,
+      }),
       conversationThreads: {
         planAutoInjectSearch: async () => {
           plannedSearches += 1;
@@ -6635,7 +7463,10 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     );
     expect(firstInputManifest.segments).toEqual(persistedFirstManifest.segments.slice(0, -1));
     expect(persistedFirstManifest.segments.at(-1)?.atoms).toEqual([
-      expect.objectContaining({ kind: "synthetic", source: "conversation-thread-auto-inject" }),
+      expect.objectContaining({
+        kind: "synthetic",
+        source: "conversation-thread-auto-inject",
+      }),
     ]);
     expect(
       persistedFirstManifest.segments.at(-1)?.canonicalMessages.map((message) => message.role),
@@ -6649,7 +7480,10 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     ).toEqual(["start", "end"]);
     expect(firstOutput.parts[0]).toMatchObject({
       type: "tool.status",
-      update: { status: "start", display: "conversation_thread_search auto-injected metadata" },
+      update: {
+        status: "start",
+        display: "conversation_thread_search auto-injected metadata",
+      },
     });
     expect(
       adapter.updatedOutputMessageIds.filter((id) => id === firstOutput.messageId).length,
@@ -6670,7 +7504,9 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       requestClient: "discord",
       lilacSessionId: sessionId,
     });
-    const firstTranscript = getRequestTranscript(store, { requestId: firstRequestId });
+    const firstTranscript = getRequestTranscript(store, {
+      requestId: firstRequestId,
+    });
     if (!firstBinding || !firstTranscript?.transcriptDigest || !firstTranscript.providerState) {
       throw new Error("auto-injected first turn did not promote");
     }
@@ -6737,7 +7573,10 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
     expect(secondManifest.currentCanonicalStart).toBe(secondCurrentSegment.canonicalStart);
 
     expect(plannedSearches).toBe(1);
-    expect(starts[0]).toMatchObject({ mode: "fresh", sessionId: firstBinding.claudeSessionId });
+    expect(starts[0]).toMatchObject({
+      mode: "fresh",
+      sessionId: firstBinding.claudeSessionId,
+    });
     expect(starts[1]).toMatchObject({
       mode: "fork",
       baseSessionId: firstBinding.claudeSessionId,
@@ -6782,7 +7621,12 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       model: "claude-code/sonnet",
       fallback: ["openai/must-not-run"],
     };
-    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    config.agent.retry = {
+      enabled: false,
+      maxRetries: 0,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    };
     const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-primary-claude-"));
     const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
     const bus = createLilacBus(createInMemoryRawBus());
@@ -6901,7 +7745,10 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       pluginManager: corePrimaryTestPluginManager(),
       cwd: dataDir,
       transcriptStore: store,
-      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "test-capability",
+        principal: null,
+      }),
       materializeClaudeCodeRun: materialize,
       createAgent: (options) => {
         const agent = new AiSdkPiAgent(options);
@@ -6935,16 +7782,24 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       lilacSessionId: sessionId,
     });
     if (!firstBinding) throw new Error("first binding was not promoted");
-    const firstTranscript = getRequestTranscript(store, { requestId: firstRequestId });
+    const firstTranscript = getRequestTranscript(store, {
+      requestId: firstRequestId,
+    });
     if (!firstTranscript?.transcriptDigest) throw new Error("first transcript digest is missing");
     const firstHead = computeCorePrimaryClaudeTerminalHead({
       manifest: firstManifest,
       requestId: firstRequestId,
       transcriptDigest: firstTranscript.transcriptDigest,
       responseMessageCount: firstTranscript.messages.length,
-      providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
+      providerState: {
+        lastFamily: "claude-code",
+        containsCrossFamilyTurns: false,
+      },
     });
-    expect(starts[0]).toMatchObject({ mode: "fresh", sessionId: firstBinding.claudeSessionId });
+    expect(starts[0]).toMatchObject({
+      mode: "fresh",
+      sessionId: firstBinding.claudeSessionId,
+    });
     expect(firstBinding).toMatchObject(firstHead);
 
     const secondRequestId = "discord:primary-claude-session:input-2";
@@ -6968,7 +7823,10 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       messages: secondManifest.segments.flatMap((segment) => segment.canonicalMessages),
       corePrimaryLineage: secondManifest,
     });
-    expect({ terminal: await secondLifecycle.terminal, details: secondLifecycle.details }).toEqual({
+    expect({
+      terminal: await secondLifecycle.terminal,
+      details: secondLifecycle.details,
+    }).toEqual({
       terminal: "resolved",
       details: [undefined, undefined],
     });
@@ -6978,14 +7836,19 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       lilacSessionId: sessionId,
     });
     if (!secondBinding) throw new Error("second binding was not promoted");
-    const secondTranscript = getRequestTranscript(store, { requestId: secondRequestId });
+    const secondTranscript = getRequestTranscript(store, {
+      requestId: secondRequestId,
+    });
     if (!secondTranscript?.transcriptDigest) throw new Error("second transcript digest is missing");
     const secondHead = computeCorePrimaryClaudeTerminalHead({
       manifest: secondManifest,
       requestId: secondRequestId,
       transcriptDigest: secondTranscript.transcriptDigest,
       responseMessageCount: secondTranscript.messages.length,
-      providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
+      providerState: {
+        lastFamily: "claude-code",
+        containsCrossFamilyTurns: false,
+      },
     });
     expect(starts[1]).toMatchObject({
       mode: "fork",
@@ -7119,7 +7982,9 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       messages: [{ role: "assistant", content: "competitor response" }],
       corePrimaryLineage: raceManifest,
     });
-    const competitorTranscript = getRequestTranscript(store, { requestId: competitorRequestId });
+    const competitorTranscript = getRequestTranscript(store, {
+      requestId: competitorRequestId,
+    });
     if (!competitorTranscript?.transcriptDigest)
       throw new Error("competitor transcript is missing");
     const competitorHead = computeCorePrimaryClaudeTerminalHead({
@@ -7127,7 +7992,10 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       requestId: competitorRequestId,
       transcriptDigest: competitorTranscript.transcriptDigest,
       responseMessageCount: competitorTranscript.messages.length,
-      providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
+      providerState: {
+        lastFamily: "claude-code",
+        containsCrossFamilyTurns: false,
+      },
     });
     store.publishCorePrimaryClaudeSuccess({
       providerId: "claude-code",
@@ -7140,7 +8008,10 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       terminalAtomCount: competitorHead.atomCount,
       terminalPrefixDigest: competitorHead.prefixDigest,
       terminalCanonicalMessageCount: competitorHead.canonicalMessageCount,
-      providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
+      providerState: {
+        lastFamily: "claude-code",
+        containsCrossFamilyTurns: false,
+      },
       nativeCwd: dataDir,
       nativeLastModified: 9_999,
       nativeContextTokens: 999,
@@ -7213,7 +8084,12 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       model: "claude-code/sonnet",
       fallback: ["openai/must-not-run"],
     };
-    config.agent.retry = { enabled: false, maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    config.agent.retry = {
+      enabled: false,
+      maxRetries: 0,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+    };
     const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-primary-fallback-"));
     const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
     const bus = createLilacBus(createInMemoryRawBus());
@@ -7228,7 +8104,10 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       pluginManager: corePrimaryTestPluginManager(),
       cwd: dataDir,
       transcriptStore: store,
-      issueControlCapability: () => ({ capability: "test-capability", principal: null }),
+      issueControlCapability: () => ({
+        capability: "test-capability",
+        principal: null,
+      }),
       materializeClaudeCodeRun: async (options) => {
         materializations += 1;
         const start = options.nativeSession;
@@ -7252,7 +8131,9 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
         const failingModel = new MockLanguageModelV4({
           modelId: options.modelId,
           doStream: async () => {
-            throw Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+            throw Object.assign(new Error("connection reset"), {
+              code: "ECONNRESET",
+            });
           },
         });
         return {
@@ -7280,7 +8161,11 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
               status: "promotable" as const,
               issues: [] as const,
               observations: observation,
-              candidate: { sessionId: start.sessionId, cwd: options.cwd, lastModified: 1 },
+              candidate: {
+                sessionId: start.sessionId,
+                cwd: options.cwd,
+                lastModified: 1,
+              },
               sourcePreflight: null,
               sourceFinal: null,
             }),
@@ -7377,7 +8262,14 @@ describe("Core-primary local compaction replacement", () => {
       { role: "user", content: "retained historical question" },
       {
         role: "assistant",
-        content: [{ type: "tool-call", toolCallId: "old-tool", toolName: "builtin", input: {} }],
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "old-tool",
+            toolName: "builtin",
+            input: {},
+          },
+        ],
       },
       {
         role: "tool",
@@ -7397,7 +8289,11 @@ describe("Core-primary local compaction replacement", () => {
         role: "user",
         content: [
           { type: "text", text: "current question" },
-          { type: "file", data: new Uint8Array([1, 2, 3]), mediaType: "image/png" },
+          {
+            type: "file",
+            data: new Uint8Array([1, 2, 3]),
+            mediaType: "image/png",
+          },
         ],
       },
     ] satisfies ModelMessage[];
@@ -7536,7 +8432,10 @@ describe("Core-primary local compaction replacement", () => {
             finalize: async () => ({
               status: "unpromotable" as const,
               issues: [
-                { code: "candidate-missing" as const, message: "not finalized in this test" },
+                {
+                  code: "candidate-missing" as const,
+                  message: "not finalized in this test",
+                },
               ],
               observations: observation,
               candidate: null,
@@ -7904,7 +8803,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       requestId: "attachment-only",
       raw: {},
       userMessages: [
-        { role: "user", content: "This older message must not be used for planning." },
+        {
+          role: "user",
+          content: "This older message must not be used for planning.",
+        },
         {
           role: "user",
           content: [
@@ -8004,9 +8906,21 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             vectorAvailable: false,
           },
           results: [
-            { threadId: "thread-1", title: "Below display", brief: belowDisplayBrief },
-            { threadId: "thread-2", title: "Near threshold", brief: nearThresholdBrief },
-            { threadId: "thread-3", title: "Over threshold", brief: overThresholdBrief },
+            {
+              threadId: "thread-1",
+              title: "Below display",
+              brief: belowDisplayBrief,
+            },
+            {
+              threadId: "thread-2",
+              title: "Near threshold",
+              brief: nearThresholdBrief,
+            },
+            {
+              threadId: "thread-3",
+              title: "Over threshold",
+              brief: overThresholdBrief,
+            },
           ],
         }),
         metadata: async () => {
@@ -8033,8 +8947,16 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       type: "json",
       value: {
         entries: [
-          { threadId: "thread-1", title: "Below display", brief: belowDisplayBrief },
-          { threadId: "thread-2", title: "Near threshold", brief: nearThresholdBrief },
+          {
+            threadId: "thread-1",
+            title: "Below display",
+            brief: belowDisplayBrief,
+          },
+          {
+            threadId: "thread-2",
+            title: "Near threshold",
+            brief: nearThresholdBrief,
+          },
           {
             threadId: "thread-3",
             title: "Over threshold",
@@ -8312,18 +9234,48 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
           searchQueries.push(query);
           const resultsByQuery: Record<
             string,
-            Array<{ threadId: string; title: string; brief: string; score: number }>
+            Array<{
+              threadId: string;
+              title: string;
+              brief: string;
+              score: number;
+            }>
           > = {
             "auth cookies": [
-              { threadId: "shared", title: "Shared top", brief: "", score: 0.99 },
-              { threadId: "auth-second", title: "Auth second", brief: "", score: 0.4 },
+              {
+                threadId: "shared",
+                title: "Shared top",
+                brief: "",
+                score: 0.99,
+              },
+              {
+                threadId: "auth-second",
+                title: "Auth second",
+                brief: "",
+                score: 0.4,
+              },
             ],
             "workplace context": [
-              { threadId: "shared", title: "Shared top", brief: "", score: 0.98 },
-              { threadId: "work-second", title: "Work second", brief: "", score: 0.3 },
+              {
+                threadId: "shared",
+                title: "Shared top",
+                brief: "",
+                score: 0.98,
+              },
+              {
+                threadId: "work-second",
+                title: "Work second",
+                brief: "",
+                score: 0.3,
+              },
             ],
             "project architecture": [
-              { threadId: "project-top", title: "Project top", brief: "", score: 0.2 },
+              {
+                threadId: "project-top",
+                title: "Project top",
+                brief: "",
+                score: 0.2,
+              },
             ],
           };
           return {
@@ -8512,16 +9464,36 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
           requestedLimits.push(requestedLimit);
           const resultsByQuery: Record<
             string,
-            Array<{ threadId: string; title: string; brief: string; score: number }>
+            Array<{
+              threadId: string;
+              title: string;
+              brief: string;
+              score: number;
+            }>
           > = {
             "first category": [
               { threadId: "shared-1", title: "Shared 1", brief: "", score: 1 },
-              { threadId: "shared-2", title: "Shared 2", brief: "", score: 0.9 },
+              {
+                threadId: "shared-2",
+                title: "Shared 2",
+                brief: "",
+                score: 0.9,
+              },
             ],
             "second category": [
               { threadId: "shared-1", title: "Shared 1", brief: "", score: 1 },
-              { threadId: "shared-2", title: "Shared 2", brief: "", score: 0.9 },
-              { threadId: "second-unique", title: "Second unique", brief: "", score: 0.8 },
+              {
+                threadId: "shared-2",
+                title: "Shared 2",
+                brief: "",
+                score: 0.9,
+              },
+              {
+                threadId: "second-unique",
+                title: "Second unique",
+                brief: "",
+                score: 0.8,
+              },
             ],
           };
           const results = resultsByQuery[query]?.slice(0, requestedLimit) ?? [];
@@ -8624,7 +9596,13 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               count: 1,
               vectorAvailable: false,
             },
-            results: [{ threadId: "working-thread", title: "Working thread", brief: "" }],
+            results: [
+              {
+                threadId: "working-thread",
+                title: "Working thread",
+                brief: "",
+              },
+            ],
           };
         },
         metadata: async () => {
@@ -8794,7 +9772,13 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             count: 1,
             vectorAvailable: false,
           },
-          results: [{ threadId: "thread-1", title: "Cookie callback thread", brief: "" }],
+          results: [
+            {
+              threadId: "thread-1",
+              title: "Cookie callback thread",
+              brief: "",
+            },
+          ],
         }),
         metadata: async () => {
           throw new Error("not used");
@@ -8878,7 +9862,13 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               count: 1,
               vectorAvailable: false,
             },
-            results: [{ threadId: "thread-2", title: "Cookie callback thread", brief: "" }],
+            results: [
+              {
+                threadId: "thread-2",
+                title: "Cookie callback thread",
+                brief: "",
+              },
+            ],
           };
         },
         metadata: async () => {
@@ -8961,7 +9951,13 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             count: 1,
             vectorAvailable: false,
           },
-          results: [{ threadId: "thread-2", title: "Edge middleware host header", brief: "" }],
+          results: [
+            {
+              threadId: "thread-2",
+              title: "Edge middleware host header",
+              brief: "",
+            },
+          ],
         }),
         metadata: async () => {
           throw new Error("not used");
@@ -9242,7 +10238,9 @@ describe("transient model retry", () => {
     expect(isRetryableTransientModelError(new Error(message))).toBe(true);
     expect(
       isRetryableTransientModelError({
-        cause: Object.assign(new Error("connection reset"), { code: "ConnectionClosed" }),
+        cause: Object.assign(new Error("connection reset"), {
+          code: "ConnectionClosed",
+        }),
       }),
     ).toBe(true);
   });
@@ -10303,9 +11301,13 @@ describe("silent assistant turn removal", () => {
       { role: "assistant", content: "later answer" },
     ] satisfies ModelMessage[];
 
-    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 1, messageCount: 1 })).toEqual(
-      [messages[0]!, messages[2]!],
-    );
+    expect(
+      removeSilentAssistantTurnMessages({
+        messages,
+        startIndex: 1,
+        messageCount: 1,
+      }),
+    ).toEqual([messages[0]!, messages[2]!]);
   });
 
   it("removes sentinel text but preserves structural assistant parts", () => {
@@ -10316,7 +11318,12 @@ describe("silent assistant turn removal", () => {
         content: [
           { type: "reasoning", text: "private" },
           { type: "text", text: "NO_REPLY" },
-          { type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} },
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "builtin",
+            input: {},
+          },
         ],
       },
       {
@@ -10332,19 +11339,28 @@ describe("silent assistant turn removal", () => {
       },
     ] satisfies ModelMessage[];
 
-    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 1, messageCount: 1 })).toEqual(
-      [
-        messages[0]!,
-        {
-          role: "assistant",
-          content: [
-            { type: "reasoning", text: "private" },
-            { type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} },
-          ],
-        },
-        messages[2]!,
-      ],
-    );
+    expect(
+      removeSilentAssistantTurnMessages({
+        messages,
+        startIndex: 1,
+        messageCount: 1,
+      }),
+    ).toEqual([
+      messages[0]!,
+      {
+        role: "assistant",
+        content: [
+          { type: "reasoning", text: "private" },
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "builtin",
+            input: {},
+          },
+        ],
+      },
+      messages[2]!,
+    ]);
   });
 
   it("drops reasoning when no structural assistant parts remain", () => {
@@ -10358,9 +11374,13 @@ describe("silent assistant turn removal", () => {
       },
     ] satisfies ModelMessage[];
 
-    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 0, messageCount: 1 })).toEqual(
-      [],
-    );
+    expect(
+      removeSilentAssistantTurnMessages({
+        messages,
+        startIndex: 0,
+        messageCount: 1,
+      }),
+    ).toEqual([]);
   });
 
   it("uses final-answer phase text when commentary precedes the sentinel", () => {
@@ -10378,19 +11398,35 @@ describe("silent assistant turn removal", () => {
             text: "NO_REPLY",
             providerOptions: { openai: { phase: "final_answer" } },
           },
-          { type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} },
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "builtin",
+            input: {},
+          },
         ],
       },
     ] satisfies ModelMessage[];
 
-    expect(removeSilentAssistantTurnMessages({ messages, startIndex: 0, messageCount: 1 })).toEqual(
-      [
-        {
-          role: "assistant",
-          content: [{ type: "tool-call", toolCallId: "call-1", toolName: "builtin", input: {} }],
-        },
-      ],
-    );
+    expect(
+      removeSilentAssistantTurnMessages({
+        messages,
+        startIndex: 0,
+        messageCount: 1,
+      }),
+    ).toEqual([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-1",
+            toolName: "builtin",
+            input: {},
+          },
+        ],
+      },
+    ]);
   });
 });
 
@@ -10519,13 +11555,19 @@ describe("buildAutoInjectedThreadSearchOverlay", () => {
       },
     };
 
-    const overlay = buildAutoInjectedThreadSearchOverlay({ cfg, runProfile: "primary" });
+    const overlay = buildAutoInjectedThreadSearchOverlay({
+      cfg,
+      runProfile: "primary",
+    });
 
     expect(overlay).toBe(
       "Notice on auto-injected possibly related threads:\nThese search results may appear before your reply, treat them as retrieval hints only, and use them when relevant to the current context.",
     );
     expect(
-      buildAutoInjectedThreadSearchOverlay({ cfg: baseCfg, runProfile: "primary" }),
+      buildAutoInjectedThreadSearchOverlay({
+        cfg: baseCfg,
+        runProfile: "primary",
+      }),
     ).toBeNull();
     expect(buildAutoInjectedThreadSearchOverlay({ cfg, runProfile: "explore" })).toBeNull();
   });
@@ -10535,7 +11577,10 @@ describe("buildSurfaceMetadataOverlay", () => {
   it("returns null when no user message starts with surface metadata", () => {
     const overlay = buildSurfaceMetadataOverlay([
       { role: "user", content: "plain user text" },
-      { role: "assistant", content: '<LILAC_META:v1>{"platform":"discord"}</LILAC_META:v1>' },
+      {
+        role: "assistant",
+        content: '<LILAC_META:v1>{"platform":"discord"}</LILAC_META:v1>',
+      },
     ] satisfies ModelMessage[]);
 
     expect(overlay).toBeNull();
@@ -10615,7 +11660,11 @@ describe("mergeToSingleUserMessage", () => {
         role: "user",
         content: [
           { type: "text", text: "B with image" },
-          { type: "file", data: new Uint8Array([1, 2, 3]), mediaType: "image/png" },
+          {
+            type: "file",
+            data: new Uint8Array([1, 2, 3]),
+            mediaType: "image/png",
+          },
         ],
       },
       { role: "user", content: "D steer" },
@@ -10643,7 +11692,11 @@ describe("mergeToSingleUserMessage", () => {
         role: "user",
         content: [
           { type: "text", text: "D interrupt with image" },
-          { type: "file", data: new Uint8Array([7, 8]), mediaType: "image/jpeg" },
+          {
+            type: "file",
+            data: new Uint8Array([7, 8]),
+            mediaType: "image/jpeg",
+          },
         ],
       },
     ] satisfies ModelMessage[]);

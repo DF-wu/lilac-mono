@@ -14,7 +14,6 @@ import {
   type RawBus,
 } from "@stanley2058/lilac-event-bus";
 import Redis from "ioredis";
-import SuperJSON from "superjson";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 
 import {
@@ -29,11 +28,14 @@ import {
   createCoreEventBusLogger,
   createCoreRuntimeCleanupSupervisor,
   createCoreRuntimeFatalReporter,
+  joinAgentRunRecoveryHeads,
   openCoreDurableStoresInStartupOrder,
+  removeFullyReconciledAgentRunTerminalHeads,
   resolveRequestCapabilityIdentity,
   resolveCoreGracefulDrainDeadlineMs,
   retainCoreResidualDiscordRequestRouter,
   scheduleCoreBlobStoreClose,
+  selectAgentRunAcceptedRecovery,
   selectCoreRuntimeStopPass,
   settleCoreResidualDiscordRequestRouterDone,
   stopCoreResidualDiscordRequestRouter,
@@ -41,7 +43,17 @@ import {
   superviseCoreResidualDiscordRequestRouterDone,
   superviseCoreRouterDone,
 } from "../../src/runtime/create-core-runtime";
-import { SqliteGracefulRestartStore } from "../../src/runtime/graceful-restart-store";
+import {
+  AgentRunJournalSqliteFailure,
+  SqliteAgentRunJournal,
+} from "../../src/surface/bridge/agent-run-journal";
+import {
+  coreRequestDeliveryCodecs,
+  SqliteRequestDeliveryStore,
+  type CoreAcceptedRequestWork,
+  type CorePreparedRequestEnvelope,
+  type CoreRequestOutputMetadata,
+} from "../../src/surface/bridge/request-delivery";
 import { SqliteTranscriptStore } from "../../src/transcript/transcript-store";
 import {
   ResidualDiscordRequestRouterStopFailed,
@@ -59,6 +71,81 @@ const unusedEvidenceBlobStore: Pick<BlobStore, "startUpload"> = {
   startUpload: async () => {
     throw new Error("unexpected dead-letter evidence upload");
   },
+};
+
+function resultValue<T, TError extends Error>(result: ResultType<T, TError>): T {
+  return result.match({
+    ok: (value) => value,
+    err: (error) => {
+      throw error;
+    },
+  });
+}
+
+type RecoveryJoinStore = SqliteRequestDeliveryStore<
+  CorePreparedRequestEnvelope,
+  CoreAcceptedRequestWork,
+  CoreRequestOutputMetadata
+>;
+
+function acceptRecoveryJoinOwner(
+  store: RecoveryJoinStore,
+  input: {
+    readonly requestDeliveryId: string;
+    readonly requestId: string;
+    readonly sessionId: string;
+    readonly requestClient?: "discord" | "unknown";
+    readonly queue?: CoreAcceptedRequestWork["data"]["queue"];
+    readonly raw?: unknown;
+  },
+): void {
+  const requestClient = input.requestClient ?? "discord";
+  const headers = {
+    request_id: input.requestId,
+    session_id: input.sessionId,
+    request_client: requestClient,
+  };
+  const data = {
+    requestDeliveryId: input.requestDeliveryId,
+    queue: input.queue ?? "prompt",
+    messages: [{ role: "user" as const, content: "recover me" }],
+    ...(input.raw === undefined ? {} : { raw: input.raw }),
+  };
+  resultValue(
+    store.prepare({
+      requestDeliveryId: input.requestDeliveryId,
+      requestId: input.requestId,
+      envelope: { headers, data },
+      inputHandles: [],
+      createdAt: 1,
+    }),
+  );
+  resultValue(
+    store.accept({
+      requestDeliveryId: input.requestDeliveryId,
+      work: {
+        requestDeliveryId: input.requestDeliveryId,
+        requestId: input.requestId,
+        sessionId: input.sessionId,
+        requestClient,
+        headers,
+        data,
+      },
+      inputReferences: [],
+      acceptedAt: 2,
+    }),
+  );
+}
+
+function createRecoveryJoinStore(dbPath: string): RecoveryJoinStore {
+  return new SqliteRequestDeliveryStore({
+    dbPath,
+    codecs: coreRequestDeliveryCodecs,
+  });
+}
+
+const noWorkflowRecoveryAuthority = {
+  authorizeWorkflowRequest: () => null,
 };
 
 describe("delegated request capability identity", () => {
@@ -167,58 +254,690 @@ describe("delegated request capability identity", () => {
 });
 
 describe("Core runtime startup", () => {
-  it("leaves workflow state unopened when a later legacy durable store fails validation", async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-durable-preflight-"));
-    const workflowPath = path.join(dir, "workflow.sqlite3");
-    const gracefulPath = path.join(dir, "graceful-restart.db");
-    const seededWorkflow = new DurableWorkflowStore(workflowPath);
-    seededWorkflow.close();
-    const workflowBefore = await readFile(workflowPath);
-    const legacyGraceful = new Database(gracefulPath, { strict: true });
-    legacyGraceful.run(`
-      CREATE TABLE graceful_restart_state (
-        singleton_id INTEGER PRIMARY KEY,
-        status TEXT NOT NULL,
-        updated_ts INTEGER NOT NULL,
-        payload_json TEXT NOT NULL
-      )
-    `);
-    legacyGraceful.run("INSERT INTO graceful_restart_state VALUES (?, ?, ?, ?)", [
-      1,
-      "completed",
-      1,
-      SuperJSON.stringify({
-        version: 2,
-        createdAt: 1,
-        deadlineMs: 1_000,
-        agent: [],
-        relays: [],
-      }),
-    ]);
-    legacyGraceful.close();
-    let workflowOpened = false;
+  it("stops WAL recovery after a run reset fails and falls every accepted owner back to original work", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-recovery-join-"));
+    const dbPath = path.join(dir, "request-delivery.db");
+    const store = createRecoveryJoinStore(dbPath);
+    const journal = new SqliteAgentRunJournal({ dbPath, now: () => 10 });
 
     try {
-      expect(() =>
-        openCoreDurableStoresInStartupOrder({
-          openGracefulRestart: () => {
-            new SqliteGracefulRestartStore(gracefulPath);
+      const owners = [
+        {
+          requestDeliveryId: "11111111-1111-4111-8111-111111111111",
+          requestId: "request-reset-fails",
+          sessionId: "session-reset-fails",
+        },
+        {
+          requestDeliveryId: "22222222-2222-4222-8222-222222222222",
+          requestId: "request-later-invalid",
+          sessionId: "session-later-invalid",
+        },
+        {
+          requestDeliveryId: "33333333-3333-4333-8333-333333333333",
+          requestId: "request-later-valid",
+          sessionId: "session-later-valid",
+        },
+      ] as const;
+      for (const owner of owners) {
+        acceptRecoveryJoinOwner(store, owner);
+        resultValue(journal.openRun(owner));
+      }
+      const loaded = resultValue(journal.loadRecoveryHeads()).heads;
+      const heads = loaded.map((head, index) =>
+        index < 2
+          ? {
+              ...head,
+              handle: { ...head.handle, requestId: `incompatible-${index}` },
+            }
+          : head,
+      );
+      const resetCalls: string[] = [];
+      const removeCalls: string[] = [];
+      const resetFailure = new AgentRunJournalSqliteFailure({
+        operation: "reset-run",
+        code: "SQLITE_IOERR",
+        message: "injected startup reset failure",
+      });
+      const joined = joinAgentRunRecoveryHeads({
+        heads,
+        requestDeliveryStore: store,
+        journal: {
+          resetRun: (runId) => {
+            resetCalls.push(runId);
+            return Result.err(resetFailure);
           },
-          openTranscript: () => undefined,
-          openDiscordSearch: () => undefined,
-          openDiscordSurface: () => undefined,
-          openConversationThread: () => undefined,
-          openDiscovery: () => undefined,
-          openWorkflow: () => {
-            workflowOpened = true;
-            new DurableWorkflowStore(workflowPath).close();
+          removeReconciled: (runId) => {
+            removeCalls.push(runId);
+            return Result.ok(undefined);
           },
-        }),
-      ).toThrow("requires offline blob migration");
+        },
+        workflowAuthority: noWorkflowRecoveryAuthority,
+        logger: { warn: () => undefined },
+      });
 
-      expect(workflowOpened).toBe(false);
-      expect(await readFile(workflowPath)).toEqual(workflowBefore);
+      expect(joined.journalResetFailure).toBe(resetFailure);
+      expect(joined.heads.size).toBe(0);
+      expect(joined.retainedOwners.size).toBe(0);
+      expect(joined.recoverableRootParentRequestIds).toEqual([]);
+      expect(resetCalls).toEqual([owners[0].requestDeliveryId]);
+      expect(removeCalls).toEqual([]);
+      for (const owner of owners) {
+        expect(selectAgentRunAcceptedRecovery(joined, owner.requestDeliveryId)).toEqual({
+          kind: "resume",
+        });
+      }
     } finally {
+      journal.close();
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resets active WAL heads with incompatible accepted request identity", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-recovery-join-"));
+    const dbPath = path.join(dir, "request-delivery.db");
+    const store = createRecoveryJoinStore(dbPath);
+    const journal = new SqliteAgentRunJournal({ dbPath, now: () => 10 });
+    const notices: Array<{
+      readonly message: string;
+      readonly context: Readonly<Record<string, string | number | boolean>>;
+    }> = [];
+
+    try {
+      const requestMismatch = {
+        requestDeliveryId: "11111111-1111-4111-8111-111111111111",
+        requestId: "request-1",
+        sessionId: "session-1",
+      };
+      const sessionMismatch = {
+        requestDeliveryId: "22222222-2222-4222-8222-222222222222",
+        requestId: "request-2",
+        sessionId: "session-2",
+      };
+      acceptRecoveryJoinOwner(store, requestMismatch);
+      acceptRecoveryJoinOwner(store, sessionMismatch);
+      resultValue(journal.openRun(requestMismatch));
+      resultValue(
+        journal.openRun({
+          ...sessionMismatch,
+          sessionId: "wrong-session",
+        }),
+      );
+      const loaded = resultValue(journal.loadRecoveryHeads()).heads;
+      const requestMismatchHead = loaded.find(
+        (head) => head.handle.runId === requestMismatch.requestDeliveryId,
+      );
+      if (!requestMismatchHead) throw new Error("expected request mismatch recovery head");
+      const joined = joinAgentRunRecoveryHeads({
+        heads: loaded.map((head) =>
+          head === requestMismatchHead
+            ? {
+                ...head,
+                handle: { ...head.handle, requestId: "wrong-request" },
+              }
+            : head,
+        ),
+        requestDeliveryStore: store,
+        journal,
+        workflowAuthority: noWorkflowRecoveryAuthority,
+        logger: {
+          warn: (message, context) => notices.push({ message, context }),
+        },
+      });
+
+      expect(joined.heads.size).toBe(0);
+      expect(resultValue(journal.loadRecoveryHeads()).heads).toEqual([]);
+      expect(notices.map(({ context }) => context.reason)).toEqual([
+        "incompatible-identity",
+        "incompatible-identity",
+      ]);
+      expect(JSON.stringify(notices)).not.toContain("recover me");
+    } finally {
+      journal.close();
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("admits only owned accepted control deliveries retained by checkpoints", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-recovery-join-"));
+    const dbPath = path.join(dir, "request-delivery.db");
+    const store = createRecoveryJoinStore(dbPath);
+    const journal = new SqliteAgentRunJournal({ dbPath, now: () => 10 });
+    const notices: Array<Readonly<Record<string, string | number | boolean>>> = [];
+    const invalidOwnerIds: string[] = [];
+
+    try {
+      const writeRetainedCheckpoint = (
+        owner: {
+          readonly requestDeliveryId: string;
+          readonly requestId: string;
+          readonly sessionId: string;
+        },
+        retainedRequestDeliveryIds: readonly string[],
+      ) => {
+        const handle = resultValue(journal.openRun(owner));
+        return resultValue(
+          journal.writeCheckpoint(handle, {
+            version: 1,
+            messages: [{ role: "user", content: `checkpoint for ${owner.requestId}` }],
+            retainedRequestDeliveries: retainedRequestDeliveryIds.map((requestDeliveryId) => ({
+              requestDeliveryId,
+              outcome: { kind: "completed" },
+            })),
+          }),
+        );
+      };
+      const acceptControl = (input: {
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly queue?: CoreAcceptedRequestWork["data"]["queue"];
+      }) => {
+        const control = {
+          requestDeliveryId: crypto.randomUUID(),
+          requestId: input.requestId,
+          sessionId: input.sessionId,
+          queue: input.queue ?? ("steer" as const),
+          raw: { requiresActive: true },
+        };
+        acceptRecoveryJoinOwner(store, control);
+        return control;
+      };
+
+      const validOwner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-valid-retained",
+        sessionId: "session-valid-retained",
+      };
+      acceptRecoveryJoinOwner(store, validOwner);
+      const validControl = acceptControl({
+        requestId: validOwner.requestId,
+        sessionId: validOwner.sessionId,
+      });
+      writeRetainedCheckpoint(validOwner, [validControl.requestDeliveryId]);
+
+      const terminalParent = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-terminal-parent",
+        sessionId: "session-terminal-parent",
+      };
+      acceptRecoveryJoinOwner(store, terminalParent);
+      const terminalParentControl = acceptControl({
+        requestId: terminalParent.requestId,
+        sessionId: terminalParent.sessionId,
+      });
+      const terminalParentHandle = writeRetainedCheckpoint(terminalParent, [
+        terminalParentControl.requestDeliveryId,
+      ]);
+      resultValue(
+        journal.markTerminal(terminalParentHandle, {
+          outcome: { kind: "completed", code: "terminal-parent-recovered" },
+          finalReplayDeadline: 99,
+        }),
+      );
+
+      const missingOwner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-missing-retained",
+        sessionId: "session-missing-retained",
+      };
+      acceptRecoveryJoinOwner(store, missingOwner);
+      invalidOwnerIds.push(missingOwner.requestDeliveryId);
+      writeRetainedCheckpoint(missingOwner, [crypto.randomUUID()]);
+
+      const terminalOwner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-terminal-retained",
+        sessionId: "session-terminal-retained",
+      };
+      acceptRecoveryJoinOwner(store, terminalOwner);
+      const terminalControl = acceptControl({
+        requestId: terminalOwner.requestId,
+        sessionId: terminalOwner.sessionId,
+      });
+      resultValue(
+        store.terminalize({
+          requestDeliveryId: terminalControl.requestDeliveryId,
+          outcome: { kind: "completed" },
+          terminalAt: 3,
+          transportCommitRequired: false,
+        }),
+      );
+      invalidOwnerIds.push(terminalOwner.requestDeliveryId);
+      writeRetainedCheckpoint(terminalOwner, [terminalControl.requestDeliveryId]);
+
+      const wrongKindOwner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-wrong-kind-retained",
+        sessionId: "session-wrong-kind-retained",
+      };
+      acceptRecoveryJoinOwner(store, wrongKindOwner);
+      const promptReference = acceptControl({
+        requestId: wrongKindOwner.requestId,
+        sessionId: wrongKindOwner.sessionId,
+        queue: "prompt",
+      });
+      invalidOwnerIds.push(wrongKindOwner.requestDeliveryId);
+      writeRetainedCheckpoint(wrongKindOwner, [promptReference.requestDeliveryId]);
+
+      const unrelatedOwner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-unrelated-owner",
+        sessionId: "session-unrelated-retained",
+      };
+      acceptRecoveryJoinOwner(store, unrelatedOwner);
+      const unrelatedControl = acceptControl({
+        requestId: "request-unrelated-control",
+        sessionId: unrelatedOwner.sessionId,
+      });
+      invalidOwnerIds.push(unrelatedOwner.requestDeliveryId);
+      writeRetainedCheckpoint(unrelatedOwner, [unrelatedControl.requestDeliveryId]);
+
+      const duplicateOwner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-duplicate-retained",
+        sessionId: "session-duplicate-retained",
+      };
+      acceptRecoveryJoinOwner(store, duplicateOwner);
+      const duplicateControl = acceptControl({
+        requestId: duplicateOwner.requestId,
+        sessionId: duplicateOwner.sessionId,
+      });
+      invalidOwnerIds.push(duplicateOwner.requestDeliveryId);
+      writeRetainedCheckpoint(duplicateOwner, [
+        duplicateControl.requestDeliveryId,
+        duplicateControl.requestDeliveryId,
+      ]);
+
+      const joined = joinAgentRunRecoveryHeads({
+        heads: resultValue(journal.loadRecoveryHeads()).heads,
+        requestDeliveryStore: store,
+        journal,
+        workflowAuthority: noWorkflowRecoveryAuthority,
+        logger: { warn: (_message, context) => notices.push(context) },
+      });
+
+      expect(new Set(joined.heads.keys())).toEqual(
+        new Set([validOwner.requestDeliveryId, terminalParent.requestDeliveryId]),
+      );
+      expect(
+        new Set(resultValue(journal.loadRecoveryHeads()).heads.map((head) => head.handle.runId)),
+      ).toEqual(new Set([validOwner.requestDeliveryId, terminalParent.requestDeliveryId]));
+      expect(notices.map((context) => context.reason)).toEqual(
+        invalidOwnerIds.map(() => "invalid-retained-delivery"),
+      );
+      expect(resultValue(store.load(unrelatedControl.requestDeliveryId)).state).toBe("accepted");
+      expect(joined.heads.has(unrelatedOwner.requestDeliveryId)).toBe(false);
+      expect(selectAgentRunAcceptedRecovery(joined, validControl.requestDeliveryId)).toEqual({
+        kind: "retained-active",
+        ownerRunId: validOwner.requestDeliveryId,
+      });
+      expect(
+        selectAgentRunAcceptedRecovery(joined, terminalParentControl.requestDeliveryId),
+      ).toEqual({
+        kind: "terminal",
+        outcome: { kind: "completed" },
+        finalReplayDeadline: 99,
+      });
+      expect(selectAgentRunAcceptedRecovery(joined, unrelatedControl.requestDeliveryId)).toEqual({
+        kind: "resume",
+      });
+      expect(selectAgentRunAcceptedRecovery(joined, unrelatedOwner.requestDeliveryId)).toEqual({
+        kind: "resume",
+      });
+    } finally {
+      journal.close();
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reconciles an active WAL head whose request owner is already terminal", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-recovery-join-"));
+    const dbPath = path.join(dir, "request-delivery.db");
+    const store = createRecoveryJoinStore(dbPath);
+    const journal = new SqliteAgentRunJournal({ dbPath, now: () => 10 });
+    const notices: Array<Readonly<Record<string, string | number | boolean>>> = [];
+
+    try {
+      const owner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-terminal",
+        sessionId: "session-terminal",
+      };
+      acceptRecoveryJoinOwner(store, owner);
+      resultValue(journal.openRun(owner));
+      resultValue(
+        store.terminalize({
+          requestDeliveryId: owner.requestDeliveryId,
+          outcome: { kind: "completed" },
+          terminalAt: 3,
+          transportCommitRequired: false,
+        }),
+      );
+
+      const joined = joinAgentRunRecoveryHeads({
+        heads: resultValue(journal.loadRecoveryHeads()).heads,
+        requestDeliveryStore: store,
+        journal,
+        workflowAuthority: noWorkflowRecoveryAuthority,
+        logger: { warn: (_message, context) => notices.push(context) },
+      });
+
+      expect(joined.heads.size).toBe(0);
+      expect(resultValue(journal.loadRecoveryHeads()).heads).toEqual([]);
+      expect(notices).toEqual([
+        {
+          requestDeliveryId: owner.requestDeliveryId,
+          operation: "reconcile",
+          reason: "owner-terminal",
+        },
+      ]);
+    } finally {
+      journal.close();
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a terminal WAL head until its partially terminalized retained controls converge", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-recovery-join-"));
+    const dbPath = path.join(dir, "request-delivery.db");
+    const store = createRecoveryJoinStore(dbPath);
+    const journal = new SqliteAgentRunJournal({ dbPath, now: () => 10 });
+
+    try {
+      const owner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-partial-terminal",
+        sessionId: "session-partial-terminal",
+      };
+      const controls = [crypto.randomUUID(), crypto.randomUUID()].map((requestDeliveryId) => ({
+        requestDeliveryId,
+        requestId: owner.requestId,
+        sessionId: owner.sessionId,
+        queue: "steer" as const,
+        raw: { requiresActive: true },
+      }));
+      acceptRecoveryJoinOwner(store, owner);
+      for (const control of controls) acceptRecoveryJoinOwner(store, control);
+      const checkpoint = resultValue(
+        journal.writeCheckpoint(resultValue(journal.openRun(owner)), {
+          version: 1,
+          messages: [{ role: "user", content: "terminal checkpoint" }],
+          retainedRequestDeliveries: controls.map((control) => ({
+            requestDeliveryId: control.requestDeliveryId,
+            outcome: { kind: "completed", code: "control-applied" },
+          })),
+        }),
+      );
+      resultValue(
+        journal.markTerminal(checkpoint, {
+          outcome: { kind: "completed", code: "owner-completed" },
+          finalReplayDeadline: 99,
+        }),
+      );
+      resultValue(
+        store.terminalize({
+          requestDeliveryId: owner.requestDeliveryId,
+          outcome: { kind: "completed", code: "owner-completed" },
+          terminalAt: 3,
+          transportCommitRequired: false,
+          finalReplayDeadline: 99,
+        }),
+      );
+      resultValue(
+        store.terminalize({
+          requestDeliveryId: controls[0]!.requestDeliveryId,
+          outcome: { kind: "completed", code: "control-applied" },
+          terminalAt: 4,
+          transportCommitRequired: false,
+        }),
+      );
+
+      const joined = joinAgentRunRecoveryHeads({
+        heads: resultValue(journal.loadRecoveryHeads()).heads,
+        requestDeliveryStore: store,
+        journal,
+        workflowAuthority: noWorkflowRecoveryAuthority,
+        logger: { warn: () => undefined },
+      });
+      expect([...joined.heads.keys()]).toEqual([owner.requestDeliveryId]);
+      expect(selectAgentRunAcceptedRecovery(joined, controls[1]!.requestDeliveryId)).toEqual({
+        kind: "terminal",
+        outcome: { kind: "completed", code: "control-applied" },
+        finalReplayDeadline: 99,
+      });
+
+      removeFullyReconciledAgentRunTerminalHeads({
+        heads: joined.heads,
+        requestDeliveryStore: store,
+        journal,
+      });
+      expect(resultValue(journal.loadRecoveryHeads()).heads).toHaveLength(1);
+
+      resultValue(
+        store.terminalize({
+          requestDeliveryId: controls[1]!.requestDeliveryId,
+          outcome: { kind: "completed", code: "control-applied" },
+          terminalAt: 5,
+          transportCommitRequired: false,
+        }),
+      );
+      removeFullyReconciledAgentRunTerminalHeads({
+        heads: joined.heads,
+        requestDeliveryStore: store,
+        journal,
+      });
+      expect(resultValue(journal.loadRecoveryHeads()).heads).toEqual([]);
+    } finally {
+      journal.close();
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resets only a terminal head that claims an unrelated terminal control", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-recovery-join-"));
+    const dbPath = path.join(dir, "request-delivery.db");
+    const store = createRecoveryJoinStore(dbPath);
+    const journal = new SqliteAgentRunJournal({ dbPath, now: () => 10 });
+    const notices: Array<Readonly<Record<string, string | number | boolean>>> = [];
+
+    try {
+      const validOwner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-valid-neighbor",
+        sessionId: "session-valid-neighbor",
+      };
+      acceptRecoveryJoinOwner(store, validOwner);
+      resultValue(journal.openRun(validOwner));
+
+      const badOwner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-bad-terminal-owner",
+        sessionId: "session-bad-terminal-owner",
+      };
+      const unrelatedControl = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-unrelated-terminal-control",
+        sessionId: badOwner.sessionId,
+        queue: "steer" as const,
+        raw: { requiresActive: true },
+      };
+      acceptRecoveryJoinOwner(store, badOwner);
+      acceptRecoveryJoinOwner(store, unrelatedControl);
+      const checkpoint = resultValue(
+        journal.writeCheckpoint(resultValue(journal.openRun(badOwner)), {
+          version: 1,
+          messages: [],
+          retainedRequestDeliveries: [
+            {
+              requestDeliveryId: unrelatedControl.requestDeliveryId,
+              outcome: { kind: "completed", code: "control-applied" },
+            },
+          ],
+        }),
+      );
+      resultValue(
+        journal.markTerminal(checkpoint, {
+          outcome: { kind: "completed", code: "owner-completed" },
+        }),
+      );
+      resultValue(
+        store.terminalize({
+          requestDeliveryId: badOwner.requestDeliveryId,
+          outcome: { kind: "completed", code: "owner-completed" },
+          terminalAt: 3,
+          transportCommitRequired: false,
+        }),
+      );
+      resultValue(
+        store.terminalize({
+          requestDeliveryId: unrelatedControl.requestDeliveryId,
+          outcome: { kind: "completed", code: "control-applied" },
+          terminalAt: 4,
+          transportCommitRequired: false,
+        }),
+      );
+
+      const joined = joinAgentRunRecoveryHeads({
+        heads: resultValue(journal.loadRecoveryHeads()).heads,
+        requestDeliveryStore: store,
+        journal,
+        workflowAuthority: noWorkflowRecoveryAuthority,
+        logger: { warn: (_message, context) => notices.push(context) },
+      });
+
+      expect([...joined.heads.keys()]).toEqual([validOwner.requestDeliveryId]);
+      expect(
+        resultValue(journal.loadRecoveryHeads()).heads.map((head) => head.handle.runId),
+      ).toEqual([validOwner.requestDeliveryId]);
+      expect(notices).toEqual([
+        {
+          requestDeliveryId: badOwner.requestDeliveryId,
+          operation: "reset",
+          reason: "invalid-retained-delivery",
+        },
+      ]);
+      expect(resultValue(store.load(unrelatedControl.requestDeliveryId)).state).toBe("terminal");
+    } finally {
+      journal.close();
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps one deterministic active WAL head per session", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-recovery-join-"));
+    const dbPath = path.join(dir, "request-delivery.db");
+    const store = createRecoveryJoinStore(dbPath);
+    const journal = new SqliteAgentRunJournal({ dbPath, now: () => 10 });
+    const notices: Array<Readonly<Record<string, string | number | boolean>>> = [];
+
+    try {
+      const first = {
+        requestDeliveryId: "11111111-1111-4111-8111-111111111111",
+        requestId: "request-first",
+        sessionId: "shared-session",
+      };
+      const second = {
+        requestDeliveryId: "22222222-2222-4222-8222-222222222222",
+        requestId: "request-second",
+        sessionId: "shared-session",
+      };
+      acceptRecoveryJoinOwner(store, first);
+      acceptRecoveryJoinOwner(store, second);
+      resultValue(journal.openRun(first));
+      resultValue(journal.openRun(second));
+      const loaded = resultValue(journal.loadRecoveryHeads()).heads;
+
+      const joined = joinAgentRunRecoveryHeads({
+        heads: [...loaded].reverse(),
+        requestDeliveryStore: store,
+        journal,
+        workflowAuthority: noWorkflowRecoveryAuthority,
+        logger: { warn: (_message, context) => notices.push(context) },
+      });
+
+      expect([...joined.heads.keys()]).toEqual([first.requestDeliveryId]);
+      expect(joined.recoverableRootParentRequestIds).toEqual([first.requestId]);
+      expect(
+        resultValue(journal.loadRecoveryHeads()).heads.map((head) => head.handle.runId),
+      ).toEqual([first.requestDeliveryId]);
+      expect(notices).toEqual([
+        {
+          requestDeliveryId: second.requestDeliveryId,
+          operation: "reset",
+          reason: "duplicate-active-session",
+        },
+      ]);
+      expect(resultValue(store.load(second.requestDeliveryId)).state).toBe("accepted");
+    } finally {
+      journal.close();
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not protect workflow-owned recovered runs as live root parents", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-recovery-join-"));
+    const dbPath = path.join(dir, "request-delivery.db");
+    const store = createRecoveryJoinStore(dbPath);
+    const journal = new SqliteAgentRunJournal({ dbPath, now: () => 10 });
+
+    try {
+      const workflowOwner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-workflow-child",
+        sessionId: "workflow-child-session",
+        requestClient: "unknown" as const,
+        raw: {
+          workflow: {
+            runId: "workflow-run",
+            operationId: "workflow-operation",
+            dispatchEpoch: "dispatch-epoch-0001",
+          },
+        },
+      };
+      const staleHintOwner = {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: "request-stale-workflow-hint",
+        sessionId: "stale-workflow-hint-session",
+        requestClient: "unknown" as const,
+        raw: workflowOwner.raw,
+      };
+      acceptRecoveryJoinOwner(store, workflowOwner);
+      acceptRecoveryJoinOwner(store, staleHintOwner);
+      resultValue(journal.openRun(workflowOwner));
+      resultValue(journal.openRun(staleHintOwner));
+
+      const joined = joinAgentRunRecoveryHeads({
+        heads: resultValue(journal.loadRecoveryHeads()).heads,
+        requestDeliveryStore: store,
+        journal,
+        workflowAuthority: {
+          authorizeWorkflowRequest: ({ requestId }) =>
+            requestId === workflowOwner.requestId
+              ? {
+                  policy: {
+                    runId: workflowOwner.raw.workflow.runId,
+                    operationId: workflowOwner.raw.workflow.operationId,
+                    dispatchEpoch: workflowOwner.raw.workflow.dispatchEpoch,
+                  },
+                }
+              : null,
+        },
+        logger: { warn: () => undefined },
+      });
+
+      expect(new Set(joined.heads.keys())).toEqual(
+        new Set([workflowOwner.requestDeliveryId, staleHintOwner.requestDeliveryId]),
+      );
+      expect(joined.recoverableRootParentRequestIds).toEqual([staleHintOwner.requestId]);
+    } finally {
+      journal.close();
+      store.close();
       await rm(dir, { recursive: true, force: true });
     }
   });
@@ -254,7 +973,6 @@ describe("Core runtime startup", () => {
     try {
       expect(() =>
         openCoreDurableStoresInStartupOrder({
-          openGracefulRestart: () => undefined,
           openTranscript: () => {
             deferredTranscript.store = new SqliteTranscriptStore(
               transcriptPath,

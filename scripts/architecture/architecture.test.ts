@@ -2558,7 +2558,7 @@ describe("permanent architecture governance", () => {
 
     for (const required of [
       "apps/acp-controller:run-store.ts#decodeRunRecord->run-store.ts#runRecordCodecCases",
-      "apps/core:src/runtime/graceful-restart-store.ts#decodeGracefulRestartSnapshot->src/runtime/graceful-restart-store.ts#gracefulRestartSnapshotCodecCases",
+      "apps/core:src/migration/frozen-graceful-restart-store.ts#decodeGracefulRestartSnapshot->src/migration/frozen-graceful-restart-store.ts#gracefulRestartSnapshotCodecCases",
       "apps/core:src/workflow/workflow-persistence-codec.ts#decodeWorkflowPersistenceRow->src/workflow/workflow-persistence-codec.ts#workflowPersistenceRowCodecCases",
       "apps/mini-lilac-tui:src/preferences.ts#decodeBindingPreferences->src/preferences.ts#bindingPreferencesCodecCases",
       "packages/mini-lilac-runtime:src/workspace-history-persistence-codec.ts#decodeWorkspaceHistorySnapshotManifest->src/workspace-history-persistence-codec.ts#workspaceHistorySnapshotManifestCodecCases",

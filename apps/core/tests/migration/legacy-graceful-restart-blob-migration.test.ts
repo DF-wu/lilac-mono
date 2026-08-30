@@ -11,7 +11,7 @@ import {
   LegacyGracefulRestartMigrationFailed,
   preflightLegacyGracefulRestartMigration,
 } from "../../scripts/legacy-graceful-restart-blob-migration";
-import { gracefulRestartSnapshotCodecCases } from "../../src/runtime/graceful-restart-store";
+import { gracefulRestartSnapshotCodecCases } from "../../src/migration/frozen-graceful-restart-store";
 
 const tempDirs: string[] = [];
 

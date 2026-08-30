@@ -25,7 +25,6 @@ function createComposition(input: {
   }> = [];
   let adapterEventHandler: AdapterEventHandler | undefined;
   let transcriptStoreLookups = 0;
-  const restored: unknown[] = [];
   const discordAdapter = {} as SurfaceAdapter;
   const githubAdapter = {} as SurfaceAdapter;
   const eventSource: SurfaceAdapterEventSource = {
@@ -51,9 +50,6 @@ function createComposition(input: {
       transcriptStoreLookups += 1;
       return undefined;
     },
-    activateRestoredDiscordOutputChains: (generation, chains) => {
-      restored.push(generation, chains);
-    },
     logger: {
       debug: (message, context) => logs.push({ level: "debug", message, context }),
       info: (message, context) => logs.push({ level: "info", message, context }),
@@ -67,7 +63,6 @@ function createComposition(input: {
     discordAdapter,
     githubAdapter,
     logs,
-    restored,
     getAdapterEventHandler: () => adapterEventHandler,
     getTranscriptStoreLookups: () => transcriptStoreLookups,
   };
@@ -144,7 +139,7 @@ describe("built-in surface runtime composition", () => {
     },
   );
 
-  it("preserves Discord ingress, relay recovery, transcript lookup, IDs, and logging", async () => {
+  it("preserves Discord ingress, transcript lookup, relay IDs, and logging", async () => {
     const composition = createComposition({
       webhookSecret: "webhook-secret",
       githubAppCredentialsAvailable: true,
@@ -174,12 +169,9 @@ describe("built-in surface runtime composition", () => {
       }),
     ).toThrow(Panic);
 
-    const generation = { generation: Symbol("restore") };
-    discord.relay.recovery?.activateRestoredOutputChains(generation, []);
     const discordRelay = await discord.relay.lifecycle.start();
     const githubRelay = await github.relay.lifecycle.start();
 
-    expect(composition.restored).toEqual([generation, []]);
     expect(composition.getTranscriptStoreLookups()).toBe(3);
     expect(composition.logs).toEqual([
       {

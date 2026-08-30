@@ -83,11 +83,6 @@ export type RequestMessageCacheOptions = {
   readonly now?: () => number;
 };
 
-export type RequestMessageCacheRestoreAttempt = {
-  apply(): ResultType<void, AuthenticatedRequestIdentityConflict>;
-  rollback(): void;
-};
-
 export type RequestMessageCache = {
   get(requestId: string): readonly unknown[] | undefined;
   getOrigin(requestId: string): AuthenticatedRequestOrigin | undefined;
@@ -95,12 +90,6 @@ export type RequestMessageCache = {
     msg: LilacMessageForTopic<"cmd.request">,
     projection?: AuthenticatedRequestProjection,
   ): ResultType<AuthenticatedRequestOrigin | undefined, RequestMessageCacheAdmissionError>;
-  prepareRestore(
-    input: readonly {
-      readonly projection: AuthenticatedRequestProjection;
-      readonly parkedEventIds: readonly string[];
-    }[],
-  ): ResultType<RequestMessageCacheRestoreAttempt, AuthenticatedRequestIdentityConflict>;
   acquireOwner(
     requestId: string,
   ): ResultType<RequestMessageCacheOwner, RequestIdentitySourceMissing>;
@@ -292,174 +281,6 @@ export function createRequestMessageCache(
     return continueProjected();
   }
 
-  function cloneCacheEntry(entry: CacheEntry): CacheEntry {
-    return {
-      messages: entry.messages,
-      projection: entry.projection,
-      intakeEventIds: new Set(entry.intakeEventIds),
-      parkedEventIds: new Set(entry.parkedEventIds),
-      owners: new Set(entry.owners),
-      expiresAt: entry.expiresAt,
-      updatedAt: entry.updatedAt,
-    };
-  }
-
-  function cloneEntries(source: ReadonlyMap<string, CacheEntry>): Map<string, CacheEntry> {
-    return new Map([...source].map(([requestId, entry]) => [requestId, cloneCacheEntry(entry)]));
-  }
-
-  function replaceEntries(source: ReadonlyMap<string, CacheEntry>): void {
-    entries.clear();
-    for (const [requestId, entry] of source) entries.set(requestId, cloneCacheEntry(entry));
-  }
-
-  function prepareRestore(
-    input: readonly {
-      readonly projection: AuthenticatedRequestProjection;
-      readonly parkedEventIds: readonly string[];
-    }[],
-  ): ResultType<RequestMessageCacheRestoreAttempt, AuthenticatedRequestIdentityConflict> {
-    const proposed = new Map<
-      string,
-      { projection: AuthenticatedRequestProjection; parkedEventIds: Set<string> }
-    >();
-    const mergeInputAt = (
-      index: number,
-    ): ResultType<void, AuthenticatedRequestIdentityConflict> => {
-      const record = input[index];
-      if (!record) return Result.ok(undefined);
-      const current = proposed.get(record.projection.requestId);
-      if (current) {
-        const latched = latchAuthenticatedRequest(
-          current.projection,
-          record.projection,
-          "graceful-restart",
-        );
-        const continueLatched = latched.match<
-          () => ResultType<void, AuthenticatedRequestIdentityConflict>
-        >({
-          err: (error) => () => Result.err(error),
-          ok: (projection) => () => {
-            current.projection = projection;
-            for (const eventId of record.parkedEventIds) current.parkedEventIds.add(eventId);
-            return mergeInputAt(index + 1);
-          },
-        });
-        return continueLatched();
-      }
-      proposed.set(record.projection.requestId, {
-        projection: record.projection,
-        parkedEventIds: new Set(record.parkedEventIds),
-      });
-      return mergeInputAt(index + 1);
-    };
-    const proposedEntries = () => [...proposed];
-    const mergeExistingAt = (
-      records: ReturnType<typeof proposedEntries>,
-      index: number,
-    ): ResultType<void, AuthenticatedRequestIdentityConflict> => {
-      const pair = records[index];
-      if (!pair) return Result.ok(undefined);
-      const [requestId, record] = pair;
-      const existing = entries.get(requestId);
-      if (!existing) return mergeExistingAt(records, index + 1);
-      const latched = latchAuthenticatedRequest(
-        existing.projection,
-        record.projection,
-        "graceful-restart",
-      );
-      const continueLatched = latched.match<
-        () => ResultType<void, AuthenticatedRequestIdentityConflict>
-      >({
-        err: (error) => () => Result.err(error),
-        ok: (projection) => () => {
-          record.projection = projection;
-          return mergeExistingAt(records, index + 1);
-        },
-      });
-      return continueLatched();
-    };
-
-    let before = new Map<string, CacheEntry>();
-    let applied = false;
-    const merged = mergeInputAt(0).andThen(() => mergeExistingAt(proposedEntries(), 0));
-    const continueMerged = merged.match<
-      () => ResultType<RequestMessageCacheRestoreAttempt, AuthenticatedRequestIdentityConflict>
-    >({
-      err: (error) => () => Result.err(error),
-      ok: () => () =>
-        Result.ok({
-          apply: () => {
-            if (applied) return Result.ok(undefined);
-            const at = now();
-            const staged = cloneEntries(entries);
-            const stagedRecords = proposedEntries();
-            const stageAt = (
-              index: number,
-            ): ResultType<void, AuthenticatedRequestIdentityConflict> => {
-              const pair = stagedRecords[index];
-              if (!pair) return Result.ok(undefined);
-              const [requestId, record] = pair;
-              const existing = staged.get(requestId);
-              if (existing) {
-                const latched = latchAuthenticatedRequest(
-                  existing.projection,
-                  record.projection,
-                  "graceful-restart",
-                );
-                const continueLatched = latched.match<
-                  () => ResultType<void, AuthenticatedRequestIdentityConflict>
-                >({
-                  err: (error) => () => Result.err(error),
-                  ok: (projection) => () => {
-                    const next = cloneCacheEntry(existing);
-                    next.projection = projection;
-                    for (const eventId of record.parkedEventIds) next.parkedEventIds.add(eventId);
-                    next.expiresAt = at + ttlMs;
-                    next.updatedAt = at;
-                    staged.set(requestId, next);
-                    return stageAt(index + 1);
-                  },
-                });
-                return continueLatched();
-              }
-              staged.set(requestId, {
-                messages: [],
-                projection: record.projection,
-                intakeEventIds: new Set(),
-                parkedEventIds: new Set(record.parkedEventIds),
-                owners: new Set(),
-                expiresAt: at + ttlMs,
-                updatedAt: at,
-              });
-              return stageAt(index + 1);
-            };
-            const stagedResult = stageAt(0);
-            const continueStaged = stagedResult.match<
-              () => ResultType<void, AuthenticatedRequestIdentityConflict>
-            >({
-              err: (error) => () => Result.err(error),
-              ok: () => () => {
-                const evicted = pruneMapToCapacity(staged);
-                before = cloneEntries(entries);
-                replaceEntries(staged);
-                applied = true;
-                logCapacityEvictions(evicted, entries.size);
-                return Result.ok(undefined);
-              },
-            });
-            return continueStaged();
-          },
-          rollback: () => {
-            if (!applied) return;
-            replaceEntries(before);
-            applied = false;
-          },
-        }),
-    });
-    return continueMerged();
-  }
-
   return {
     get: (requestId) => {
       pruneExpired();
@@ -470,7 +291,6 @@ export function createRequestMessageCache(
       return entries.get(requestId)?.projection;
     },
     cacheMessage,
-    prepareRestore,
     acquireOwner: (requestId) => {
       const entry = entries.get(requestId);
       if (!entry) {

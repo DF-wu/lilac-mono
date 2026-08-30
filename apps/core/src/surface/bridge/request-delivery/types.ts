@@ -274,21 +274,6 @@ export type RequestDeliveryMaintenanceSummary = {
   readonly failures: readonly RequestDeliveryDeleteFailed[];
 };
 
-export type RequestOutputReplayRecoveryOutcome =
-  | {
-      readonly disposition: "resume";
-      readonly reason: "absent" | "no-terminal-output";
-    }
-  | { readonly disposition: "retain-terminal"; readonly uncertainty: Error }
-  | { readonly disposition: "terminalize"; readonly replayDeadline: number };
-
-export interface RequestOutputReplayRecovery {
-  inspect(input: {
-    readonly requestId: string;
-    readonly requestDeliveryId: string;
-  }): Promise<Result<RequestOutputReplayRecoveryOutcome, Error>>;
-}
-
 export type RequestDeliveryAdmissionError = RequestDeliveryAdmissionRejected;
 
 export interface RequestOutputLifecycleRegistrar<TMetadata> {

@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import { Result } from "better-result";
+import { Result, type Result as ResultType } from "better-result";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import type { ToolSet } from "ai";
 import { AiSdkPiAgent, type AiSdkPiAgentOptions } from "@stanley2058/lilac-agent";
@@ -47,7 +47,10 @@ import { WorkflowEngine } from "../../src/workflow/workflow-engine";
 import { WorkflowProgressProjector } from "../../src/workflow/workflow-progress-projector";
 import { SurfaceAdapterTestBase } from "../helpers/surface-adapter-test-base";
 import { createRequestMessageCache } from "../../src/tool-server/request-message-cache";
-import { resolveRequestCapabilityIdentity } from "../../src/runtime/create-core-runtime";
+import {
+  joinAgentRunRecoveryHeads,
+  resolveRequestCapabilityIdentity,
+} from "../../src/runtime/create-core-runtime";
 import {
   resolveAgentRunModel,
   startBusAgentRunner,
@@ -56,6 +59,8 @@ import { createCoreToolPluginManager, type CoreToolPluginManager } from "../../s
 import { createToolServer } from "../../src/tool-server/create-tool-server";
 import { RequestControlAuthority } from "../../src/tool-server/request-control-authority";
 import type { RequestContext, ServerTool } from "../../src/tool-server/types";
+import { SqliteAgentRunJournal } from "../../src/surface/bridge/agent-run-journal";
+import { createCoreRequestDelivery } from "../../src/surface/bridge/request-delivery";
 
 function serverToolValue<T>(result: ServerToolResult<T>): T {
   return result.match({
@@ -64,6 +69,11 @@ function serverToolValue<T>(result: ServerToolResult<T>): T {
       throw new Error(error.message);
     },
   })();
+}
+
+function resultValue<T, E>(result: ResultType<T, E>): T {
+  if (result.status === "error") throw result.error;
+  return result.value;
 }
 
 const TEST_SURFACE_PROTOCOL_RESOLVER: SurfaceProtocolResolver = {
@@ -97,12 +107,14 @@ function workflowProgressPorts(adapter: WorkflowCardAdapter) {
 
 class LiveRawBus implements RawBus {
   subscribe = subscribeForTest;
+  readonly messages: Array<Omit<Message<unknown>, "id" | "ts">> = [];
   private sequence = 0;
   private readonly subscriptions = new Set<{
     topic: string;
     handler: TestRawMessageHandler;
   }>();
   async publish<TData>(message: Omit<Message<TData>, "id" | "ts">, options: PublishOptions) {
+    this.messages.push(message);
     const id = `${++this.sequence}-0`;
     const stored: Message<TData> = { ...message, id, ts: Date.now(), topic: options.topic };
     for (const subscription of this.subscriptions) {
@@ -126,6 +138,30 @@ class LiveRawBus implements RawBus {
   }
   async close() {
     this.subscriptions.clear();
+  }
+}
+class WorkflowReceiptTrackingStore extends DurableWorkflowStore {
+  readonly requestClaims: Array<{
+    requestId: string;
+    claimed: boolean;
+  }> = [];
+  readonly terminalRequests: Array<{
+    requestId: string;
+    recorded: boolean;
+  }> = [];
+  override claimWorkflowRequest(
+    input: Parameters<DurableWorkflowStore["claimWorkflowRequest"]>[0],
+  ): boolean {
+    const claimed = super.claimWorkflowRequest(input);
+    this.requestClaims.push({ requestId: input.requestId, claimed });
+    return claimed;
+  }
+  override recordWorkflowRequestTerminal(
+    input: Parameters<DurableWorkflowStore["recordWorkflowRequestTerminal"]>[0],
+  ): boolean {
+    const recorded = super.recordWorkflowRequestTerminal(input);
+    this.terminalRequests.push({ requestId: input.requestId, recorded });
+    return recorded;
   }
 }
 class WorkflowCardAdapter extends SurfaceAdapterTestBase {
@@ -731,4 +767,330 @@ describe("unified workflow integration", () => {
       store.close();
     }
   }, 15000);
+  it("converges workflow ownership with one recovered child from an active agent WAL head", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-agent-wal-restart-"));
+    roots.push(root);
+    const workspaceRoot = path.join(root, "workspace");
+    const dataDir = path.join(root, "data");
+    const workflowDbPath = path.join(root, "workflow.sqlite");
+    const requestDbPath = path.join(root, "request-delivery.db");
+    await fs.mkdir(workspaceRoot);
+
+    let workflowStore = new DurableWorkflowStore(workflowDbPath);
+    let requestDelivery = createCoreRequestDelivery({
+      dbPath: requestDbPath,
+      blobStore,
+      now: () => 100,
+    });
+    let journal = new SqliteAgentRunJournal({ dbPath: requestDbPath, now: () => 100 });
+    const raw = new LiveRawBus();
+    const bus = createLilacBus(raw);
+    const tool = new ProgrammaticWorkflow({ blobStore, dataDir, store: workflowStore, bus });
+    const config = parseCoreConfigV1ToUniversal({});
+    config.models.main = { model: "openai/workflow-wal-recovery" };
+    const context: RequestContext = {
+      requestId: "discord:channel-1:wal-origin",
+      sessionId: "channel-1",
+      requestClient: "discord",
+      cwd: workspaceRoot,
+      safetyMode: "trusted",
+      serverOwnedRequest: true,
+      requestInitiator: { platform: "discord", userId: "user-1" },
+      requestInitiatorSessionId: "channel-1",
+      toolCallId: "workflow-wal-tool",
+    };
+    const persisted = Promise.withResolvers<{
+      requestDeliveryId: string;
+      requestId: string;
+      sessionId: string;
+      dispatchEpoch: string;
+    }>();
+    const firstRequestCapture = await startResultForTest(
+      bus.subscribeTopic(
+        "cmd.request",
+        { mode: "fanout", subscriptionId: "workflow-wal-crashing-runner" },
+        async (message) => {
+          if (
+            message.type !== lilacEventTypes.CmdRequestMessage ||
+            message.data.queue !== "prompt"
+          ) {
+            return okResultForTest();
+          }
+          const requestId = message.headers?.request_id;
+          const sessionId = message.headers?.session_id;
+          if (!requestId || !sessionId) throw new Error("workflow request missing identity");
+          const workflow = z
+            .object({
+              workflow: z.strictObject({
+                runId: z.string(),
+                operationId: z.string(),
+                dispatchEpoch: z.string(),
+              }),
+            })
+            .parse(message.data.raw).workflow;
+          const requestDeliveryId = message.data.requestDeliveryId;
+          const prompt = z
+            .object({ role: z.literal("user"), content: z.string() })
+            .parse(message.data.messages[0]).content;
+          const data = {
+            requestDeliveryId,
+            queue: "prompt" as const,
+            messages: [{ role: "user" as const, content: prompt }],
+            raw: message.data.raw,
+          };
+          const headers = {
+            ...message.headers,
+            request_id: requestId,
+            session_id: sessionId,
+            request_client: "unknown" as const,
+          };
+          resultValue(
+            requestDelivery.store.prepare({
+              requestDeliveryId,
+              requestId,
+              envelope: { headers, data },
+              inputHandles: [],
+              createdAt: 100,
+            }),
+          );
+          const accepted = resultValue(
+            requestDelivery.store.accept({
+              requestDeliveryId,
+              work: {
+                requestDeliveryId,
+                requestId,
+                sessionId,
+                requestClient: "unknown",
+                headers,
+                data,
+              },
+              inputReferences: [],
+              acceptedAt: 100,
+            }),
+          ).record;
+          expect(
+            workflowStore.claimWorkflowRequest({
+              requestId,
+              dispatchEpoch: workflow.dispatchEpoch,
+              ownerId: "crashed-agent-runner",
+              now: 70_000,
+            }),
+          ).toBe(true);
+          const handle = resultValue(
+            journal.openRun({
+              requestDeliveryId: accepted.requestDeliveryId,
+              requestId: accepted.requestId,
+              sessionId: accepted.work.sessionId,
+            }),
+          );
+          resultValue(
+            journal.writeCheckpoint(handle, {
+              version: 1,
+              messages: [{ role: "user", content: "durable workflow child checkpoint" }],
+              retainedRequestDeliveries: [],
+            }),
+          );
+          persisted.resolve({ requestDeliveryId, requestId, sessionId, ...workflow });
+          return okResultForTest();
+        },
+        () => "commit",
+      ),
+    );
+    const firstEngine = new WorkflowEngine({
+      bus,
+      store: workflowStore,
+      blobStore,
+      dataDir,
+      subscriptionId: "workflow-wal-first",
+      pollMs: 5,
+      now: () => 100,
+      validateAgentSelection: ({ profile, model, reasoning }) => {
+        const resolved = resolveAgentRunModel({
+          cfg: config,
+          runProfile: profile,
+          ...(model ? { requestModelOverride: model } : {}),
+          ...(reasoning ? { reasoningOverride: reasoning } : {}),
+        });
+        return {
+          model: resolved.head.spec,
+          reasoning: resolved.head.reasoning ?? null,
+          request: toDurableResolvedModelPlan(resolved, config.agent.reasoningDisplay),
+        };
+      },
+    });
+
+    let restartedEngine: WorkflowEngine | null = null;
+    let runner: Awaited<ReturnType<typeof startBusAgentRunner>> | null = null;
+    let pluginManager: CoreToolPluginManager | null = null;
+    try {
+      await tool.init();
+      serverToolValue(
+        await tool.call(
+          "workflow.definition.save",
+          { scope: "project", name: "integration-audit", source: source() },
+          { context },
+        ),
+      );
+      const triggered = serverToolValue(
+        await tool.call(
+          "workflow.run.trigger",
+          {
+            scope: "project",
+            name: "integration-audit",
+            args: { target: "agent WAL restart", token: "workflow-wal-secret" },
+          },
+          { context },
+        ),
+      );
+      const { runId } = z.object({ runId: z.string() }).parse(triggered);
+      await firstEngine.start();
+      const child = await persisted.promise;
+      expect(workflowStoreValue(workflowStore.getRun(runId))?.state).toBe("running");
+      expect(
+        workflowStoreValue(workflowStore.listOperations(runId, { state: "dispatched" })),
+      ).toHaveLength(1);
+
+      await firstEngine.stop();
+      await tool.destroy();
+      journal.close();
+      requestDelivery.store.close();
+      workflowStore.close();
+
+      const recoveredWorkflowStore = new WorkflowReceiptTrackingStore(workflowDbPath);
+      workflowStore = recoveredWorkflowStore;
+      requestDelivery = createCoreRequestDelivery({ dbPath: requestDbPath, blobStore });
+      journal = new SqliteAgentRunJournal({ dbPath: requestDbPath });
+      const loaded = resultValue(journal.loadRecoveryHeads());
+      expect(loaded.heads).toHaveLength(1);
+      expect(loaded.heads[0]).toMatchObject({
+        state: "active",
+        handle: { runId: child.requestDeliveryId, requestId: child.requestId },
+        checkpoint: {
+          messages: [{ role: "user", content: "durable workflow child checkpoint" }],
+        },
+      });
+      const joined = joinAgentRunRecoveryHeads({
+        heads: loaded.heads,
+        requestDeliveryStore: requestDelivery.store,
+        journal,
+        logger: { warn: () => undefined },
+      });
+      expect([...joined.heads.keys()]).toEqual([child.requestDeliveryId]);
+
+      pluginManager = createCoreToolPluginManager({ runtime: { config }, dataDir });
+      resultValue(await pluginManager.init());
+      let modelCalls = 0;
+      const recoveredPrompts: string[] = [];
+      let runnerPanic: Error | null = null;
+      runner = await startBusAgentRunner({
+        bus,
+        blobStore,
+        subscriptionId: "workflow-wal-recovered-runner",
+        config,
+        pluginManager,
+        durableWorkflowStore: workflowStore,
+        requestDelivery: requestDelivery.coordinator,
+        agentRunJournal: journal,
+        startPaused: true,
+        surfaceProtocolResolver: TEST_SURFACE_PROTOCOL_RESOLVER,
+        reportFatalPanic: (panic) => (runnerPanic = panic),
+        issueControlCapability: () => ({ capability: "workflow-wal", principal: null }),
+        createAgent: (options: AiSdkPiAgentOptions<ToolSet>) =>
+          new AiSdkPiAgent({
+            ...options,
+            model: new MockLanguageModelV4({
+              modelId: "workflow-wal-recovery",
+              doStream: async (call) => {
+                modelCalls += 1;
+                recoveredPrompts.push(JSON.stringify(call.prompt));
+                return workflowAgentTextStep("recovered workflow child");
+              },
+            }),
+          }),
+      });
+      let resumedDeliveries = 0;
+      const recovery = resultValue(
+        await requestDelivery.coordinator.recoverAccepted((record) => {
+          resumedDeliveries += 1;
+          return runner!.resumeAcceptedDelivery(record, joined.heads.get(record.requestDeliveryId));
+        }),
+      );
+      expect(recovery).toMatchObject({ resumed: 1, terminalized: 0, failures: [] });
+      expect(resumedDeliveries).toBe(1);
+
+      runner.activate();
+      await runner.getActiveDrainOperation();
+      expect(runnerPanic).toBeNull();
+      expect(modelCalls).toBe(1);
+      expect(recoveredWorkflowStore.requestClaims).toEqual([
+        { requestId: child.requestId, claimed: true },
+      ]);
+      expect(recoveredWorkflowStore.terminalRequests).toEqual([
+        { requestId: child.requestId, recorded: true },
+      ]);
+      expect(
+        resultValue(workflowStore.getWorkflowRequestTerminalReceipt(child.requestId)),
+      ).toMatchObject({
+        requestId: child.requestId,
+        dispatchEpoch: child.dispatchEpoch,
+        state: "resolved",
+        output: "recovered workflow child",
+      });
+      restartedEngine = new WorkflowEngine({
+        bus,
+        store: workflowStore,
+        blobStore,
+        dataDir,
+        subscriptionId: "workflow-wal-second",
+        pollMs: 5,
+        now: () => 60_101,
+      });
+      await restartedEngine.start();
+      await waitFor(() => {
+        const state = workflowStoreValue(workflowStore.getRun(runId))?.state;
+        return state === "succeeded" || state === "failed" || state === "cancelled";
+      });
+      expect(workflowStoreValue(workflowStore.getRun(runId))).toMatchObject({
+        state: "succeeded",
+      });
+      await runner.getActiveDrainOperation();
+
+      expect(recoveredPrompts).toHaveLength(1);
+      expect(recoveredPrompts[0]).toContain("durable workflow child checkpoint");
+      expect(recoveredPrompts[0]).not.toContain("Inspect agent WAL restart");
+      expect(workflowStoreValue(workflowStore.getRun(runId))?.result).toBe(
+        "recovered workflow child",
+      );
+      const operations = workflowStoreValue(workflowStore.listOperations(runId));
+      expect(operations.filter((operation) => operation.kind === "agent")).toMatchObject([
+        { state: "succeeded", requestId: child.requestId, output: "recovered workflow child" },
+      ]);
+      expect(resultValue(requestDelivery.store.load(child.requestDeliveryId)).state).toBe(
+        "terminal",
+      );
+      expect(resultValue(journal.loadRecoveryHeads()).heads).toEqual([]);
+      expect(
+        raw.messages.filter(
+          (message) =>
+            message.type === lilacEventTypes.CmdRequestMessage &&
+            message.headers?.request_id === child.requestId &&
+            typeof message.data === "object" &&
+            message.data !== null &&
+            "queue" in message.data &&
+            message.data.queue === "prompt",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      await restartedEngine?.stop();
+      await runner?.stop();
+      await pluginManager?.destroy();
+      await firstEngine.stop();
+      await stopResultForTest(firstRequestCapture.stop());
+      await tool.destroy();
+      await bus.close();
+      journal.close();
+      requestDelivery.store.close();
+      workflowStore.close();
+    }
+  }, 20000);
 });

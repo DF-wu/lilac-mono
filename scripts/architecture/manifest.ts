@@ -1486,6 +1486,7 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       })),
       ...[
         ["src/transcript/transcript-persistence-codec.ts", "normalizeStoredMessagesV1"],
+        ["src/surface/bridge/agent-run-journal/index.ts", "deserialize.andThen.<callback@1>"],
         ["src/transcript/transcript-persistence-codec.ts", "decodeStoredBlobRefV1"],
         [
           "src/transcript/stored-message-materialization.ts",
@@ -3621,43 +3622,104 @@ const BLOB_TOOL_RESULT_ARTIFACT_METADATA_CONSUMER = {
   codecs: [BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
 
+const CORE_AGENT_RUN_OPENED_PERSISTED_CODEC = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "decodeAgentRunOpenedPayload",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "agentRunOpenedPayloadCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "decodeAgentRunCheckpointPayload",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "agentRunCheckpointPayloadCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "decodeAgentRunTerminalPayload",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "agentRunTerminalPayloadCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "SqliteAgentRunJournal.#decodeHead",
+  },
+  codecs: [
+    CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity,
+    CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity,
+  ],
+} as const satisfies PersistedStoreConsumerRegistration;
+
+const CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "SqliteAgentRunJournal.#validateHeadEvents",
+  },
+  codecs: [CORE_AGENT_RUN_OPENED_PERSISTED_CODEC.identity],
+} as const satisfies PersistedStoreConsumerRegistration;
+
+const CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS = [
+  {
+    identity: {
+      module: "src/surface/bridge/agent-run-journal/index.ts",
+      exportName: "validatedOpenedPayload",
+    },
+    codecs: [CORE_AGENT_RUN_OPENED_PERSISTED_CODEC.identity],
+  },
+  {
+    identity: {
+      module: "src/surface/bridge/agent-run-journal/index.ts",
+      exportName: "validatedCheckpointPayload",
+    },
+    codecs: [CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity],
+  },
+  {
+    identity: {
+      module: "src/surface/bridge/agent-run-journal/index.ts",
+      exportName: "validatedTerminalPayload",
+    },
+    codecs: [CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity],
+  },
+] as const satisfies readonly PersistedStoreConsumerRegistration[];
+
 const CORE_GRACEFUL_RESTART_PERSISTED_CODEC = {
   identity: {
-    module: "src/runtime/graceful-restart-store.ts",
+    module: "src/migration/frozen-graceful-restart-store.ts",
     exportName: "decodeGracefulRestartSnapshot",
   },
   inputParameter: 0,
   fixtureCatalog: {
-    module: "src/runtime/graceful-restart-store.ts",
+    module: "src/migration/frozen-graceful-restart-store.ts",
     exportName: "gracefulRestartSnapshotCodecCases",
   },
   provenance: ["current", "missing-defaulted"],
   legacyOutcome: "rejected",
 } as const satisfies PersistedCodecRegistration;
-
-const CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER = {
-  identity: {
-    module: "src/runtime/graceful-restart-store.ts",
-    exportName: "SqliteGracefulRestartStore.readCompletedSnapshot",
-  },
-  codecs: [CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity],
-} as const satisfies PersistedStoreConsumerRegistration;
-
-const CORE_GRACEFUL_RESTART_STARTUP_CONSUMER = {
-  identity: {
-    module: "src/runtime/graceful-restart-store.ts",
-    exportName: "SqliteGracefulRestartStore.acceptsCurrentSnapshot",
-  },
-  codecs: [CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity],
-} as const satisfies PersistedStoreConsumerRegistration;
-
-const CORE_GRACEFUL_RESTART_ENCODER_CONSUMER = {
-  identity: {
-    module: "src/runtime/graceful-restart-store.ts",
-    exportName: "encodeGracefulRestartSnapshot",
-  },
-  codecs: [CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity],
-} as const satisfies PersistedStoreConsumerRegistration;
 
 const CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER = {
   identity: {
@@ -4002,6 +4064,10 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
     exportName: "transaction",
   },
   {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "transaction",
+  },
+  {
     module: "src/transcript/transcript-store.ts",
     exportName: "SqliteTranscriptStore.saveRequestTranscript",
   },
@@ -4049,15 +4115,6 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
     module: "scripts/legacy-graceful-restart-blob-migration.ts",
     exportName: "commitLegacyGracefulRestartMigration",
   },
-  ...[
-    "SqliteGracefulRestartStore.clear",
-    "SqliteGracefulRestartStore.consumeCompletedSnapshot",
-    "SqliteGracefulRestartStore.readCompletedSnapshot",
-    "SqliteGracefulRestartStore.saveCompletedSnapshot",
-  ].map((exportName) => ({
-    module: "src/runtime/graceful-restart-store.ts",
-    exportName,
-  })),
 ].map(
   (identity): SqliteTransactionConsumerRegistration => ({
     identity,
@@ -4083,14 +4140,6 @@ const MINI_SQLITE_TRANSACTION_CONSUMERS = [
 ] as const satisfies readonly SqliteTransactionConsumerRegistration[];
 
 const CORE_EVENT_DELIVERY_CONSUMERS = [
-  {
-    identity: {
-      module: "src/surface/bridge/request-delivery/core-integration.ts",
-      exportName: "createCoreRequestOutputReplayRecovery.inspect",
-    },
-    apiPackage: "@stanley2058/lilac-event-bus",
-    operations: ["fetchTopic"],
-  },
   {
     identity: {
       module: "src/surface/bridge/request-delivery/durable-request-bus.ts",
@@ -4251,7 +4300,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                   { include: "src/conversation/thread-store.ts" },
                   { include: "src/transcript/transcript-persistence-codec.ts" },
                   { include: "src/transcript/transcript-store.ts" },
-                  { include: "src/runtime/graceful-restart-store.ts" },
+                  { include: "src/surface/bridge/agent-run-journal/index.ts" },
+                  { include: "src/migration/frozen-graceful-restart-store.ts" },
                   {
                     include: "src/workflow/workflow-artifact-persistence-codec.ts",
                   },
@@ -4308,7 +4358,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                     include: "src/conversation/thread-summary-persistence-codec.ts",
                   },
                   { include: "src/transcript/transcript-persistence-codec.ts" },
-                  { include: "src/runtime/graceful-restart-store.ts" },
+                  { include: "src/surface/bridge/agent-run-journal/index.ts" },
+                  { include: "src/migration/frozen-graceful-restart-store.ts" },
                   {
                     include: "src/workflow/workflow-artifact-persistence-codec.ts",
                   },
@@ -4347,8 +4398,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "apps/core"
         ? [
             { include: "src/conversation/thread-store.ts" },
-            { include: "src/runtime/graceful-restart-store.ts" },
             { include: "scripts/legacy-graceful-restart-blob-migration.ts" },
+            { include: "src/surface/bridge/agent-run-journal/index.ts" },
             { include: "src/surface/bridge/request-delivery/sqlite-store.ts" },
             { include: "src/transcript/transcript-store.ts" },
             { include: "src/workflow/durable-workflow-store.ts" },
@@ -4398,6 +4449,9 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                     ...CORE_THREAD_PERSISTED_CODECS,
                     ...CORE_TRANSCRIPT_PERSISTED_CODECS,
                     CORE_RESOURCE_PERSISTED_CODEC,
+                    CORE_AGENT_RUN_OPENED_PERSISTED_CODEC,
+                    CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC,
+                    CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC,
                     CORE_GRACEFUL_RESTART_PERSISTED_CODEC,
                     CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC,
                     CORE_WORKFLOW_ROW_PERSISTED_CODEC,
@@ -4425,9 +4479,9 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                     ...CORE_THREAD_PERSISTED_CONSUMERS,
                     ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS,
                     CORE_RESOURCE_PERSISTED_CONSUMER,
-                    CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER,
-                    CORE_GRACEFUL_RESTART_STARTUP_CONSUMER,
-                    CORE_GRACEFUL_RESTART_ENCODER_CONSUMER,
+                    CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER,
+                    CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER,
+                    ...CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS,
                     CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER,
                     CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER,
                     CORE_LEGACY_WORKFLOW_BLOB_MIGRATION_PERSISTED_CONSUMER,
@@ -4758,13 +4812,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               category: "persistence",
             },
             {
-              identity: {
-                module: "src/runtime/graceful-restart-store.ts",
-                exportName: "decodeOpaqueSuperJsonValue",
-              },
-              category: "persistence",
-            },
-            {
               identity: CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC.identity,
               category: "persistence",
             },
@@ -4974,15 +5021,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             {
               identity: {
-                module: "src/runtime/graceful-restart-store.ts",
-                exportName: "decodeOpaqueSuperJsonValue",
-              },
-              reason:
-                "Carries an opaque historical restart value through exact SuperJSON capability validation without inspecting domain content.",
-            },
-            {
-              identity: {
-                module: "src/runtime/graceful-restart-store.ts",
+                module: "src/migration/frozen-graceful-restart-store.ts",
                 exportName: "isOpaqueSuperJsonValue",
               },
               reason:
@@ -5251,15 +5290,14 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS.map(({ identity }) => identity),
             CORE_RESOURCE_PERSISTED_CODEC.identity,
             CORE_RESOURCE_PERSISTED_CONSUMER.identity,
+            CORE_AGENT_RUN_OPENED_PERSISTED_CODEC.identity,
+            CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity,
+            CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity,
+            CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER.identity,
+            CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER.identity,
+            ...CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS.map(({ identity }) => identity),
             CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity,
-            CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER.identity,
-            CORE_GRACEFUL_RESTART_STARTUP_CONSUMER.identity,
-            CORE_GRACEFUL_RESTART_ENCODER_CONSUMER.identity,
             CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER.identity,
-            {
-              module: "src/runtime/graceful-restart-store.ts",
-              exportName: "decodeOpaqueSuperJsonValue",
-            },
             CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC.identity,
             CORE_WORKFLOW_ROW_PERSISTED_CODEC.identity,
             CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER.identity,
@@ -5699,7 +5737,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "09f4ec27e90d0781242d6473da253049c812b4da53ba788504ac31257705de5b";
+  "86111dd4fef2ceca7e96e68f116218dcffbfe644feccc7317bea0659bcd0eb4b";
 
 export const architectureManifest = {
   version: 1,

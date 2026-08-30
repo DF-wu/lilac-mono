@@ -360,66 +360,6 @@ describe("request message cache", () => {
     expect(cache.getOrigin(requestId)?.authenticatedOrigin?.userId).toBe("user-1");
   });
 
-  it("validates a restore batch fully at apply time before mutating any entry", () => {
-    const cache = createRequestMessageCache();
-    const first = requestMessage({ eventId: "1-0", requestId: "first" });
-    expect(cache.cacheMessage(first).status).toBe("ok");
-    const firstProjection = cache.getOrigin(first.key);
-    if (!firstProjection) throw new Error("Expected first projection");
-
-    const projectionSource = createRequestMessageCache();
-    const second = requestMessage({ eventId: "2-0", requestId: "second" });
-    expect(projectionSource.cacheMessage(second).status).toBe("ok");
-    const secondProjection = projectionSource.getOrigin(second.key);
-    if (!secondProjection) throw new Error("Expected second projection");
-
-    const prepared = cache.prepareRestore([
-      { projection: firstProjection, parkedEventIds: ["parked-first"] },
-      { projection: secondProjection, parkedEventIds: ["parked-second"] },
-    ]);
-    if (prepared.status === "error") throw prepared.error;
-    expect(
-      cache.cacheMessage(
-        requestMessage({ eventId: "3-0", requestId: "second", sessionId: "other-channel" }),
-      ).status,
-    ).toBe("ok");
-
-    expect(prepared.value.apply().status).toBe("error");
-    expect(cache.snapshot("first")?.parkedEventIds).toEqual([]);
-    expect(cache.getOrigin("second")?.sessionId).toBe("other-channel");
-  });
-
-  it("restores unrelated capacity evictions on rollback", () => {
-    let now = 1;
-    const cache = createRequestMessageCache({ maxEntries: 2, now: () => now++ });
-    const projections = ["first", "second", "third"].map((requestId, index) => {
-      const source = createRequestMessageCache();
-      const message = requestMessage({ eventId: `${index + 1}-0`, requestId });
-      expect(source.cacheMessage(message).status).toBe("ok");
-      const projection = source.getOrigin(requestId);
-      if (!projection) throw new Error(`Expected ${requestId} projection`);
-      return projection;
-    });
-    const initial = cache.prepareRestore(
-      projections.slice(0, 2).map((projection) => ({ projection, parkedEventIds: [] })),
-    );
-    if (initial.status === "error") throw initial.error;
-    expect(initial.value.apply().status).toBe("ok");
-
-    const overCapacity = cache.prepareRestore([
-      { projection: projections[2]!, parkedEventIds: [] },
-    ]);
-    if (overCapacity.status === "error") throw overCapacity.error;
-    expect(overCapacity.value.apply().status).toBe("ok");
-    expect(cache.getOrigin("first")).toBeUndefined();
-    expect(cache.getOrigin("third")).toBeDefined();
-
-    overCapacity.value.rollback();
-    expect(cache.getOrigin("first")).toBeDefined();
-    expect(cache.getOrigin("second")).toBeDefined();
-    expect(cache.getOrigin("third")).toBeUndefined();
-  });
-
   it("creates a restricted actor-based Discord alias without message proof", () => {
     const cache = createRequestMessageCache();
     const source = requestMessage({
