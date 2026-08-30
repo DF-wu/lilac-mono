@@ -636,6 +636,15 @@ export type BeforeStepHandler = (context: {
   abortSignal?: AbortSignal;
 }) => void | Promise<void>;
 
+/** Stable identifier for one queued steering or follow-up input. */
+export type AgentInputQueueId = string;
+
+/** Awaited hook for persisting the current replay-safe transcript. */
+export type RecoveryCheckpointHandler = (
+  messages: readonly ModelMessage[],
+  canonicalInputIds: readonly AgentInputQueueId[],
+) => void | Promise<void>;
+
 export type ExecutedExpansionChild = {
   toolCallId: string;
   toolName: string;
@@ -679,6 +688,8 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   beforeSteeringDelivery?: BeforeSteeringDeliveryHandler;
   /** Refresh active tools and other per-step state before tool authority is frozen. */
   beforeStep?: BeforeStepHandler;
+  /** Persist replay-safe messages before later model or tool work starts. */
+  recoveryCheckpointHandler?: RecoveryCheckpointHandler;
   /** Normalize model-facing tool output before it enters the canonical transcript. */
   normalizeToolResultOutput?: NormalizeToolResultOutputFn;
   /** Normalize one fully settled expansion cohort in declared child order. */
@@ -971,6 +982,7 @@ function peekQueued<T>(mode: "one-at-a-time" | "all", queue: T[]): T[] {
 }
 
 type FollowUpQueueEntry = {
+  readonly id: AgentInputQueueId;
   readonly message: ModelMessage;
 };
 
@@ -1346,11 +1358,14 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private nextSteeringId = 1;
   private steeringQueue: SteeringDeliveryEntry[] = [];
   private steeringDeliveryPreparation: SteeringDeliveryPreparation | undefined;
-  private deliveredSteeringMessages: ModelMessage[] = [];
+  private deliveredSteeringMessages: SteeringDeliveryEntry[] = [];
   private followUpQueue: FollowUpQueueEntry[] = [];
+  private nextFollowUpId = 1;
+  private canonicalInputIdsSinceCheckpoint: AgentInputQueueId[] = [];
   private recoveryCheckpoint: RecoveryCheckpoint | null = null;
 
   private pendingInterrupt: ModelMessage[] | null = null;
+  private pendingInterruptInputIds: AgentInputQueueId[] = [];
   private awaitedSteeringInterrupt: AwaitedSteeringInterruptRequest | null = null;
   private cancelResetPending = false;
   private abortRequestedReason: TurnAbortReason | null = null;
@@ -1366,6 +1381,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private turnBoundaryHandler: TurnBoundaryHandler | undefined;
   private beforeSteeringDelivery: BeforeSteeringDeliveryHandler | undefined;
   private beforeStep: BeforeStepHandler | undefined;
+  private recoveryCheckpointHandler: RecoveryCheckpointHandler | undefined;
   private experimentalDownload: DownloadFunction | undefined;
   private normalizeToolResultOutput: NormalizeToolResultOutputFn | undefined;
   private normalizeSettledToolResultOutputs: NormalizeSettledToolResultOutputsFn | undefined;
@@ -1393,6 +1409,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.turnBoundaryHandler = options.turnBoundaryHandler;
     this.beforeSteeringDelivery = options.beforeSteeringDelivery;
     this.beforeStep = options.beforeStep;
+    this.recoveryCheckpointHandler = options.recoveryCheckpointHandler;
     this.experimentalDownload = options.experimentalDownload;
     this.normalizeToolResultOutput = options.normalizeToolResultOutput;
     this.normalizeSettledToolResultOutputs = options.normalizeSettledToolResultOutputs;
@@ -1513,6 +1530,20 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     return checkpoint
       ? [...cloneMessages(checkpoint.baseMessages), ...cloneMessages(checkpoint.suffixMessages)]
       : cloneMessages(this.state.messages);
+  }
+
+  private async persistRecoveryCheckpoint(): Promise<void> {
+    const canonicalInputCount = this.canonicalInputIdsSinceCheckpoint.length;
+    const canonicalInputIds = this.canonicalInputIdsSinceCheckpoint.slice(0, canonicalInputCount);
+    await this.recoveryCheckpointHandler?.(
+      this.getRecoverableMessages().map(cloneMessage),
+      canonicalInputIds,
+    );
+    this.canonicalInputIdsSinceCheckpoint.splice(0, canonicalInputCount);
+  }
+
+  private recordCanonicalInputs(entries: readonly { readonly id: AgentInputQueueId }[]): void {
+    for (const entry of entries) this.canonicalInputIdsSinceCheckpoint.push(entry.id);
   }
 
   private markExternalToolCallNormalized(toolCallId: string): void {
@@ -1804,7 +1835,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     if (index < 0) return Result.ok(false);
     const [entry] = this.steeringQueue.splice(index, 1);
     if (!entry) return Result.ok(false);
-    this.deliveredSteeringMessages.push(entry.message);
+    this.deliveredSteeringMessages.push(entry);
     return Result.ok(true);
   }
 
@@ -1819,10 +1850,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    *
    * Follow-ups are only injected when a turn finishes without tool calls.
    */
-  followUp(message: string | ModelMessage) {
+  followUp(message: string | ModelMessage): AgentInputQueueId {
+    const id = `follow-up-${this.nextFollowUpId++}`;
     this.followUpQueue.push({
+      id,
       message: cloneQueuedMessage(makeUserMessage(message), "queue"),
     });
+    return id;
   }
 
   /**
@@ -1852,6 +1886,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       ...followUps.map((entry) => entry.message),
       ...steering.map((entry) => entry.message),
     ]);
+    this.pendingInterruptInputIds.push(
+      ...followUps.map((entry) => entry.id),
+      ...steering.map((entry) => entry.id),
+    );
     if (!pendingInterrupt) this.requestAbort("interrupt");
 
     return {
@@ -1904,10 +1942,16 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.abortController?.abort();
   }
 
-  private takePendingInterrupt(): ModelMessage[] | null {
+  private takePendingInterrupt(): {
+    readonly messages: ModelMessage[];
+    readonly inputIds: readonly AgentInputQueueId[];
+  } | null {
     const messages = this.pendingInterrupt;
     this.pendingInterrupt = null;
-    return messages;
+    if (!messages) return null;
+    const inputIds = this.pendingInterruptInputIds;
+    this.pendingInterruptInputIds = [];
+    return { messages, inputIds };
   }
 
   /**
@@ -1941,6 +1985,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       this.followUpQueue.length = 0;
     }
     this.pendingInterrupt = null;
+    this.pendingInterruptInputIds = [];
 
     if (!this.state.isStreaming) {
       this.finishCancellation();
@@ -2289,6 +2334,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       return;
     }
     for (const message of consumedOutcome.value) this.appendMessage(message);
+    this.recordCanonicalInputs([...preparation.followUpEntries, ...preparation.steeringEntries]);
     this.settleAwaitedSteeringInterrupt(request, {
       status: "interrupted",
       steeringIds: preparation.steeringEntries.map((entry) => entry.id),
@@ -2501,11 +2547,17 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     // the run was cancelled. Provider-executed work it caused is preserved by
     // recovery, so dropping the message would leave an answer to a question no
     // user turn ever asked. Undelivered steering is still discarded.
-    this.resetMessagesAfterAbort("cancel", takeAll(this.deliveredSteeringMessages));
+    const deliveredSteering = takeAll(this.deliveredSteeringMessages);
+    this.resetMessagesAfterAbort(
+      "cancel",
+      deliveredSteering.map((entry) => entry.message),
+    );
+    this.recordCanonicalInputs(deliveredSteering);
     this.steeringQueue.length = 0;
     this.steeringDeliveryPreparation = undefined;
     this.followUpQueue.length = 0;
     this.pendingInterrupt = null;
+    this.pendingInterruptInputIds = [];
     this.cancelResetPending = false;
   }
 
@@ -2580,8 +2632,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
 
             // Handle a legacy interrupt that arrived between awaited operations.
             if (this.pendingInterrupt) {
-              const interruptMessages = this.takePendingInterrupt();
-              if (!interruptMessages) continue;
+              const pendingInterrupt = this.takePendingInterrupt();
+              if (!pendingInterrupt) continue;
 
               this.emit({
                 type: "turn_abort",
@@ -2594,7 +2646,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                 this.finishCancellation();
                 break;
               }
-              for (const message of interruptMessages) this.appendMessage(message);
+              for (const message of pendingInterrupt.messages) this.appendMessage(message);
+              this.canonicalInputIdsSinceCheckpoint.push(...pendingInterrupt.inputIds);
 
               this.beginFreshPostInterruptPhase();
             } else if (this.abortController?.signal.aborted) {
@@ -2630,9 +2683,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                   );
                 }
 
-                for (const delivered of takeAll(this.deliveredSteeringMessages)) {
-                  this.appendMessage(delivered);
+                const deliveredSteering = takeAll(this.deliveredSteeringMessages);
+                for (const delivered of deliveredSteering) {
+                  this.appendMessage(delivered.message);
                 }
+                this.recordCanonicalInputs(deliveredSteering);
                 const truncatedToolResult =
                   turn.finishReason === "length"
                     ? truncatedToolCallResultMessage(turn.toolCalls)
@@ -2671,6 +2726,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                   usage: turn.usage,
                   totalUsage: turn.totalUsage,
                 });
+                await this.persistRecoveryCheckpoint();
 
                 if (this.cancelResetPending) {
                   return signalAgentStateHost(
@@ -2729,6 +2785,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                   for (const msg of consumedOutcome.value) {
                     this.appendMessage(msg);
                   }
+                  this.recordCanonicalInputs([
+                    ...steeringPreparation.preparation.followUpEntries,
+                    ...steeringPreparation.preparation.steeringEntries,
+                  ]);
                   return "continue" as const;
                 }
 
@@ -2762,6 +2822,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                     for (const msg of merged) {
                       this.appendMessage(msg);
                     }
+                    this.recordCanonicalInputs(followUps);
                     return "continue" as const;
                   }
                 }
@@ -2836,7 +2897,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                   this.finishCancellation();
                   break;
                 }
-                for (const message of interruptMessages) this.appendMessage(message);
+                for (const message of interruptMessages.messages) this.appendMessage(message);
+                this.canonicalInputIdsSinceCheckpoint.push(...interruptMessages.inputIds);
 
                 this.beginFreshPostInterruptPhase();
 
@@ -2863,9 +2925,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               break;
             }
 
-            for (const delivered of takeAll(this.deliveredSteeringMessages)) {
-              this.appendMessage(delivered);
+            const deliveredSteering = takeAll(this.deliveredSteeringMessages);
+            for (const delivered of deliveredSteering) {
+              this.appendMessage(delivered.message);
             }
+            this.recordCanonicalInputs(deliveredSteering);
 
             if (this.turnErrorHandler) {
               const lastMessage = this.state.messages.at(-1);
@@ -2938,6 +3002,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
             );
           }
 
+          await this.persistRecoveryCheckpoint();
           this.emit({
             type: "agent_end",
             messages: this.getRecoverableMessages().map(cloneMessage),
@@ -2980,6 +3045,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           this.abortController = undefined;
           this.abortRequestedReason = null;
           this.pendingInterrupt = null;
+          this.pendingInterruptInputIds = [];
+          this.canonicalInputIdsSinceCheckpoint.length = 0;
           this.alreadyNormalizedExternalToolCallIds.clear();
           if (this.cancelResetPending) {
             this.steeringQueue.length = 0;
@@ -3022,6 +3089,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       this.providerExecutedToolAttemptLatched = false;
     }
     params.onErrorPhase("before-step");
+    await this.persistRecoveryCheckpoint();
     this.emit({ type: "turn_start" });
 
     const turnIndex = ++this.turnCounter;

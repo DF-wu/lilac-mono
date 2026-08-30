@@ -638,6 +638,236 @@ describe("AiSdkPiAgent model spec tracking", () => {
   });
 });
 
+describe("AiSdkPiAgent recovery checkpoints", () => {
+  it("awaits the replay-safe checkpoint before starting the model call", async () => {
+    const gate = deferred();
+    let checkpointCalls = 0;
+    const model = new MockLanguageModelV4({
+      doStream: async () => textStream("answer", "done"),
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      recoveryCheckpointHandler: async () => {
+        checkpointCalls += 1;
+        if (checkpointCalls === 1) await gate.promise;
+      },
+    });
+
+    const run = agent.prompt("persist first");
+    await Promise.resolve();
+    expect(model.doStreamCalls).toHaveLength(0);
+    gate.resolve();
+    await run;
+
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(checkpointCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  it("checkpoints a completed local tool result before the continuation model call", async () => {
+    const checkpointEntered = deferred();
+    const releaseCheckpoint = deferred();
+    let resultCheckpoint: readonly ModelMessage[] | undefined;
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "tool-call", toolCallId: "lookup-1", toolName: "lookup", input: "{}" },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textStream("answer", "used lookup result"),
+      ],
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        lookup: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "local lookup result",
+        }),
+      },
+      recoveryCheckpointHandler: async (messages) => {
+        if (!JSON.stringify(messages).includes("local lookup result")) return;
+        resultCheckpoint = messages;
+        checkpointEntered.resolve();
+        await releaseCheckpoint.promise;
+      },
+    });
+
+    const run = agent.prompt("look it up");
+    await checkpointEntered.promise;
+
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(JSON.stringify(resultCheckpoint)).toContain("lookup-1");
+    expect(JSON.stringify(resultCheckpoint)).toContain("local lookup result");
+
+    releaseCheckpoint.resolve();
+    await run;
+
+    expect(model.doStreamCalls).toHaveLength(2);
+  });
+
+  it("checkpoints delivered steering and its follow-up before the next model call", async () => {
+    const checkpointEntered = deferred();
+    const releaseCheckpoint = deferred();
+    let deliveredCheckpoint: readonly ModelMessage[] | undefined;
+    let deliveredInputIds: readonly string[] | undefined;
+    const prematureInputIds: string[] = [];
+    const model = new MockLanguageModelV4({
+      doStream: [textStream("first", "initial answer"), textStream("second", "redirected")],
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      recoveryCheckpointHandler: async (messages, canonicalInputIds) => {
+        const includesDeliveredMessage = messages.some(
+          (message) =>
+            message.role === "user" && message.content === "queued follow-up\n\nchange direction",
+        );
+        if (!includesDeliveredMessage) prematureInputIds.push(...canonicalInputIds);
+        if (!includesDeliveredMessage) return;
+        deliveredCheckpoint = messages;
+        deliveredInputIds = canonicalInputIds;
+        checkpointEntered.resolve();
+        await releaseCheckpoint.promise;
+      },
+    });
+    const followUpId = agent.followUp("queued follow-up");
+    const steeringId = agent.steer("change direction");
+
+    const run = agent.prompt("start");
+    await checkpointEntered.promise;
+
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(deliveredCheckpoint).toContainEqual({
+      role: "user",
+      content: "queued follow-up\n\nchange direction",
+    });
+    expect(prematureInputIds).toEqual([]);
+    expect(deliveredInputIds).toEqual([followUpId, steeringId]);
+
+    releaseCheckpoint.resolve();
+    await run;
+
+    expect(model.doStreamCalls).toHaveLength(2);
+  });
+
+  it("checkpoints only the replay-safe tool prefix after idle recovery normalization", async () => {
+    const checkpointEntered = deferred();
+    const releaseCheckpoint = deferred();
+    let normalizedCheckpoint: readonly ModelMessage[] | undefined;
+    let recovery: Promise<IdleRecoveryResult> | undefined;
+    const model = new MockLanguageModelV4({
+      doStream: [
+        {
+          stream: simulateReadableStream({
+            chunks: [
+              { type: "tool-call", toolCallId: "completed", toolName: "fast", input: "{}" },
+              { type: "tool-call", toolCallId: "incomplete", toolName: "slow", input: "{}" },
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool-calls" },
+                usage: zeroUsage(),
+              },
+            ],
+          }),
+        },
+        textStream("recovered", "continued safely"),
+      ],
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      tools: {
+        fast: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: () => "fast result",
+        }),
+        slow: tool({
+          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+          execute: (_input, { abortSignal }) =>
+            new Promise<string>((_resolve, reject) => {
+              const abort = () => reject(new DOMException("recovery", "AbortError"));
+              if (abortSignal?.aborted) abort();
+              else abortSignal?.addEventListener("abort", abort, { once: true });
+            }),
+        }),
+      },
+      recoveryCheckpointHandler: async (messages) => {
+        if (!JSON.stringify(messages).includes("fast result")) return;
+        normalizedCheckpoint = messages;
+        checkpointEntered.resolve();
+        await releaseCheckpoint.promise;
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type !== "tool_execution_end" || event.toolCallId !== "completed") return;
+      recovery = agent.requestIdleRecovery(new Error("idle"), () => "retry");
+    });
+
+    const run = agent.prompt("run tools");
+    await checkpointEntered.promise;
+
+    expect(model.doStreamCalls).toHaveLength(1);
+    expect(JSON.stringify(normalizedCheckpoint)).toContain("completed");
+    expect(JSON.stringify(normalizedCheckpoint)).toContain("fast result");
+    expect(JSON.stringify(normalizedCheckpoint)).not.toContain("incomplete");
+
+    releaseCheckpoint.resolve();
+    await run;
+    await expect(recovery).resolves.toEqual({ status: "retried" });
+
+    expect(model.doStreamCalls).toHaveLength(2);
+  });
+
+  it("does not write checkpoints for streaming deltas alone", async () => {
+    let checkpointCalls = 0;
+    const checkpointCountsAtDeltas: number[] = [];
+    const model = new MockLanguageModelV4({
+      doStream: {
+        stream: simulateReadableStream({
+          chunks: [
+            { type: "text-start", id: "answer" },
+            { type: "text-delta", id: "answer", delta: "first" },
+            { type: "text-delta", id: "answer", delta: " second" },
+            { type: "text-end", id: "answer" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: "stop" },
+              usage: zeroUsage(),
+            },
+          ],
+        }),
+      },
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      recoveryCheckpointHandler: () => {
+        checkpointCalls += 1;
+      },
+    });
+    agent.subscribe((event) => {
+      if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+        checkpointCountsAtDeltas.push(checkpointCalls);
+      }
+    });
+
+    await agent.prompt("stream answer");
+
+    expect(checkpointCountsAtDeltas).toEqual([1, 1]);
+    expect(checkpointCalls).toBe(3);
+  });
+});
+
 describe("AiSdkPiAgent streamText retries", () => {
   it("preserves AI SDK retries when no stream retry limit is supplied", async () => {
     let calls = 0;
