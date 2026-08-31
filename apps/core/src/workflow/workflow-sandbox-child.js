@@ -1,3 +1,5 @@
+import { captureError } from "../shared/error-capture.ts";
+import { Result } from "better-result";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 const MAX_PROTOCOL_BYTES = 16 * 1024 * 1024;
@@ -227,19 +229,31 @@ function lockDownPrimordials() {
     Object.getPrototypeOf(async function* () {}).constructor,
   ];
   for (const constructor of constructors) {
-    try {
-      objectDefineProperty(constructor.prototype, "constructor", { value: undefined });
-    } catch {}
+    Result.try({
+      try: () => {
+        objectDefineProperty(constructor.prototype, "constructor", { value: undefined });
+      },
+      catch: captureError,
+    }).match({
+      ok: () => undefined,
+      err: () => undefined,
+    });
     objectFreeze(constructor.prototype);
     objectFreeze(constructor);
   }
-  try {
-    objectDefineProperty(globalThis, "eval", {
-      value: undefined,
-      writable: false,
-      configurable: false,
-    });
-  } catch {}
+  Result.try({
+    try: () => {
+      objectDefineProperty(globalThis, "eval", {
+        value: undefined,
+        writable: false,
+        configurable: false,
+      });
+    },
+    catch: captureError,
+  }).match({
+    ok: () => undefined,
+    err: () => undefined,
+  });
   objectDefineProperty(Math, "random", {
     value: () => {
       throw new Error("Math.random is unavailable in deterministic workflows");
@@ -369,10 +383,7 @@ async function start(message) {
 
 function handle(message) {
   if (message.type === "start") {
-    void start(message).catch((error) => {
-      send({ type: "error", error: error instanceof Error ? error.message : String(error) });
-      setExitCode(1);
-    });
+    void observeStart(message);
     return;
   }
   if (message.type !== "resolve" && message.type !== "reject") return;
@@ -381,6 +392,23 @@ function handle(message) {
   mapDelete(pending, message.id);
   if (message.type === "resolve") waiter.resolve(message.value);
   else waiter.reject(new Error(message.error));
+}
+
+async function observeStart(message) {
+  const started = await Result.tryPromise({
+    try: () => start(message),
+    catch: captureError,
+  });
+  const failure = started.match({ ok: () => null, err: ({ cause }) => ({ cause }) });
+  if (!failure) return;
+  const error = failure.cause;
+  const projected = Result.try({
+    try: () => (error instanceof Error ? error.message : "Workflow execution failed"),
+    catch: () => "Workflow execution failed",
+  });
+  const errorMessage = projected.match({ ok: (value) => value, err: (value) => value });
+  send({ type: "error", error: errorMessage });
+  setExitCode(1);
 }
 
 for await (const chunk of bunRuntime.stdin.stream()) {

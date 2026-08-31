@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import { Panic, Result, type Result as ResultType } from "better-result";
 
 import {
@@ -185,17 +186,26 @@ function parseGithubThreadResult(
   operation: SurfaceOperation,
   sessionRef: GithubSessionRef,
 ): SurfaceOperationResult<ReturnType<typeof parseGithubSessionId>> {
-  try {
-    return Result.ok(parseGithubSessionId(sessionRef.channelId));
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      invalidInput(
-        operation,
-        "sessionRef.channelId",
-        `Invalid GitHub session id '${sessionRef.channelId}'`,
-      ),
-    );
+  {
+    const attempt = Result.try({
+      try: () => {
+        return Result.ok(parseGithubSessionId(sessionRef.channelId));
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (Panic.is(cause)) throw cause;
+      return Result.err(
+        invalidInput(
+          operation,
+          "sessionRef.channelId",
+          `Invalid GitHub session id '${sessionRef.channelId}'`,
+        ),
+      );
+    }
+    return attempt.value;
   }
 }
 
@@ -304,13 +314,22 @@ async function captureGithubOperation<T>(
   operation: SurfaceOperation,
   effect: () => Promise<T>,
 ): Promise<SurfaceOperationResult<T>> {
-  try {
-    return Result.ok(await effect());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    const classified = classifyGithubSurfaceError(operation, cause);
-    if (classified) return Result.err(classified);
-    throw cause;
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await effect());
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (Panic.is(cause)) throw cause;
+      const classified = classifyGithubSurfaceError(operation, cause);
+      if (classified) return Result.err(classified);
+      throw cause;
+    }
+    return attempt.value;
   }
 }
 
@@ -467,26 +486,16 @@ export class GithubAdapter implements SurfaceAdapter {
     return continueResult(refResult, {
       err: (error) => Result.err(error),
       ok: (ref) => {
-        const nestedRefs = [
-          ...(opts?.replyTo
-            ? [
-                githubNestedMsgRefResult({
-                  operation: "start-output",
-                  sessionRef: ref,
-                  msgRef: opts.replyTo,
-                  refRole: "replyTo",
-                }),
-              ]
-            : []),
-          ...(opts?.resume?.created ?? []).map((created, index) =>
-            githubNestedMsgRefResult({
-              operation: "start-output",
-              sessionRef: ref,
-              msgRef: created,
-              refRole: `resume.created[${index}]`,
-            }),
-          ),
-        ];
+        const nestedRefs = opts?.replyTo
+          ? [
+              githubNestedMsgRefResult({
+                operation: "start-output",
+                sessionRef: ref,
+                msgRef: opts.replyTo,
+                refRole: "replyTo",
+              }),
+            ]
+          : [];
         return continueResult(Result.all(nestedRefs), {
           err: (error) => Result.err(error),
           ok: () => {

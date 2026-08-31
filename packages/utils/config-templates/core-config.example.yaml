@@ -1,5 +1,24 @@
 configVersion: 2
 
+# Managed opaque bytes use local storage below the runtime data directory by default.
+# Set an absolute local root when the blob store lives elsewhere:
+# blobStorage:
+#   kind: local
+#   root: /var/lib/lilac/blobs
+#
+# Or select an existing private S3-compatible bucket. Credential fields name
+# environment variables; never put literal credentials in this file.
+# blobStorage:
+#   kind: s3
+#   bucket: lilac
+#   prefix: production/blobs
+#   endpoint: https://s3.example.com
+#   region: us-east-1
+#   accessKeyIdEnv: LILAC_S3_ACCESS_KEY_ID
+#   secretAccessKeyEnv: LILAC_S3_SECRET_ACCESS_KEY
+#   sessionTokenEnv: LILAC_S3_SESSION_TOKEN
+#   forcePathStyle: true
+
 basePrompt: "You are Lilac."
 
 tools:
@@ -119,10 +138,10 @@ surface:
     # - active: treat the channel like a DM (respond to everything)
     defaultMode: mention
 
-    # Per-session overrides. Key is the session/channel id.
-    # A Discord server/guild id can provide additionalPrompts as a fallback for
-    # its channels. Prompt precedence is thread/channel, parent channel, then guild.
-    # An explicit additionalPrompts: [] disables broader prompt inheritance.
+    # Per-session overrides. Key is a session/channel id or Discord server/guild id.
+    # Every option inherits independently. Precedence is thread/channel, parent
+    # channel, guild, then the option's global default. An explicit value such as
+    # additionalPrompts: [] disables broader inheritance for that option.
     # Reserved internal keys: "__heartbeat__" (canonical) and "heartbeat" (alias)
     # target the autonomous heartbeat lane.
     sessionModes: {}
@@ -145,7 +164,11 @@ surface:
     #     additionalPrompts:
     #       - "Keep replies concise for this session."
     #       - "file:///abs/path/to/session-memo.md"
-    #   "234567890123456789": # Discord server/guild id
+    #   "234567890123456789": # Discord server/guild defaults
+    #     mode: active
+    #     gate: false
+    #     model: "haiku"
+    #     safetyMode: restricted
     #     additionalPrompts:
     #       - "Default memo for channels in this server."
     #   "__heartbeat__":
@@ -164,6 +187,11 @@ surface:
 
   discord:
     tokenEnv: "DISCORD_TOKEN"
+
+    # Reuse downloaded Discord ingress attachments for this long. Set ttl to
+    # "unlimited" to keep new cache objects without an expiry.
+    attachmentCache:
+      ttl: 30d
 
     # If both lists are empty, the bot will ignore all Discord traffic.
     allowedChannelIds: []
@@ -192,6 +220,12 @@ surface:
     # - plain: repost the final answer as normal Discord text message(s)
     # Only applies when outputMode is preview.
     outputPreviewModeFinalStyle: plain
+
+    # Final plain-text grouping used after preview mode finishes:
+    # - flat: reply with the first final-answer chunk, then send later chunks directly
+    # - reply-chain: repost commentary + final answer as a reply chain
+    # Only applies when outputMode is preview and outputPreviewModeFinalStyle is plain.
+    outputPreviewModeFinalText: flat
 
     # Global override for Discord notifications on output messages.
     # - true: allow reply ping + @user mentions to notify
@@ -321,6 +355,12 @@ surface:
     #   timezone: "Asia/Taipei"
 
 agent:
+  # Retain completed request transcripts by age and count. Each limit can be
+  # set independently to "unlimited".
+  transcriptRetention:
+    maxAge: 180d
+    maxRequests: 10000
+
   # Optional: include token/model timing stats in final response metadata.
   # - false: disable stats metadata on response events
   # - true: enable concise stats line ([M], [T], [TTFT], [TPS])

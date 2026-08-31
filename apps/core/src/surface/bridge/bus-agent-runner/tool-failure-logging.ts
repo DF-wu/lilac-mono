@@ -6,6 +6,7 @@ import {
   type Level1ToolSpec,
 } from "@stanley2058/lilac-plugin-runtime";
 import { isRecord } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 
 import { redactSecrets } from "../../../tools/bash-safety/format";
 
@@ -53,33 +54,33 @@ function getBooleanField(value: unknown, key: string): boolean | undefined {
 function toSerializablePreview(value: unknown, maxChars?: number): string {
   const seen = new WeakSet<object>();
 
-  let raw = "";
-  try {
-    raw = JSON.stringify(value, (key, nested) => {
-      if (SENSITIVE_KEYS.has(key)) return "<redacted>";
+  const serialized = Result.try({
+    try: () =>
+      JSON.stringify(value, (key, nested) => {
+        if (SENSITIVE_KEYS.has(key)) return "<redacted>";
 
-      if (nested instanceof Error) {
-        return {
-          name: nested.name,
-          message: nested.message,
-          stack: nested.stack,
-        };
-      }
+        if (nested instanceof Error) {
+          return {
+            name: nested.name,
+            message: nested.message,
+            stack: nested.stack,
+          };
+        }
 
-      if (typeof nested === "bigint") {
-        return nested.toString();
-      }
+        if (typeof nested === "bigint") {
+          return nested.toString();
+        }
 
-      if (isRecord(nested)) {
-        if (seen.has(nested)) return "<circular>";
-        seen.add(nested);
-      }
+        if (isRecord(nested)) {
+          if (seen.has(nested)) return "<circular>";
+          seen.add(nested);
+        }
 
-      return nested;
-    });
-  } catch {
-    raw = String(value);
-  }
+        return nested;
+      }),
+    catch: () => undefined,
+  });
+  const raw = serialized.match({ ok: (text) => text, err: () => String(value) });
 
   const redacted = redactSecrets(raw);
   if (maxChars === undefined || maxChars <= 0) return redacted;
@@ -196,11 +197,13 @@ export function summarizeSubagentFailure(result: unknown): ToolFailureSummary {
 export function summarizeToolFailure(params: {
   toolName: string;
   isError: boolean;
-  result: unknown;
+  result?: unknown;
+  event?: { readonly result: unknown };
   toolSpecs?: ReadonlyMap<string, Level1ToolSpec<unknown>>;
   contributionInfo?: ReadonlyMap<Level1ToolSpec<unknown>, Level1ContributionInfo>;
 }): ToolFailureSummary {
-  const { toolName, isError, result, toolSpecs, contributionInfo } = params;
+  const { toolName, isError, toolSpecs, contributionInfo } = params;
+  const result = params.event ? params.event.result : params.result;
 
   if (isError) {
     return {
@@ -234,10 +237,13 @@ export function summarizeToolFailure(params: {
 
 export function formatToolLogPreview(params: {
   toolName: string;
-  value: unknown;
+  value?: unknown;
+  event?: { readonly args: unknown; readonly result: unknown };
+  field?: "args" | "result";
   untruncated?: boolean;
 }): string {
-  const { value, untruncated } = params;
+  const { untruncated } = params;
+  const value = params.event && params.field ? params.event[params.field] : params.value;
   const maxChars = untruncated ? undefined : DEFAULT_PREVIEW_MAX_CHARS;
   return toSerializablePreview(value, maxChars);
 }

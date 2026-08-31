@@ -1,3 +1,5 @@
+import { captureError } from "../shared/error-capture.js";
+import { Result } from "better-result";
 import { errorMessage } from "@stanley2058/lilac-utils";
 
 import { MCP_OAUTH_CALLBACK_URL, type McpOAuthProviderService } from "./oauth-provider";
@@ -60,25 +62,33 @@ export class McpOAuthCallbackService {
   start(): McpOAuthCallbackListenerStatus {
     if (this.server) return this.listenerStatus;
 
-    try {
-      this.server = this.serverFactory({
-        hostname: this.hostname,
-        port: this.port,
-        fetch: (request) => this.handleRequest(request),
+    {
+      const captured = Result.try({
+        try: () => {
+          this.server = this.serverFactory({
+            hostname: this.hostname,
+            port: this.port,
+            fetch: (request) => this.handleRequest(request),
+          });
+          this.listenerStatus = {
+            status: "listening",
+            hostname: this.hostname,
+            port: this.server.port ?? this.port,
+          };
+        },
+        catch: captureError,
       });
-      this.listenerStatus = {
-        status: "listening",
-        hostname: this.hostname,
-        port: this.server.port ?? this.port,
-      };
-    } catch (error) {
-      this.server = undefined;
-      this.listenerStatus = {
-        status: "unavailable",
-        hostname: this.hostname,
-        port: this.port,
-        error: errorMessage(error),
-      };
+
+      if (captured.isErr()) {
+        const error = captured.error.cause;
+        this.server = undefined;
+        this.listenerStatus = {
+          status: "unavailable",
+          hostname: this.hostname,
+          port: this.port,
+          error: errorMessage(error),
+        };
+      }
     }
 
     return this.listenerStatus;
@@ -91,16 +101,16 @@ export class McpOAuthCallbackService {
   async stop(): Promise<void> {
     const server = this.server;
     this.server = undefined;
-    try {
-      if (server) await server.stop(true);
-    } finally {
-      this.listenerStatus = {
-        status: "unavailable",
-        hostname: this.hostname,
-        port: this.port,
-        error: "OAuth callback listener is stopped",
-      };
-    }
+    await Promise.resolve()
+      .then(() => server?.stop(true))
+      .finally(() => {
+        this.listenerStatus = {
+          status: "unavailable",
+          hostname: this.hostname,
+          port: this.port,
+          error: "OAuth callback listener is stopped",
+        };
+      });
   }
 
   async handleRequest(request: Request): Promise<Response> {
@@ -116,10 +126,12 @@ export class McpOAuthCallbackService {
 
     const codes = url.searchParams.getAll("code");
     const states = url.searchParams.getAll("state");
+    const issuers = url.searchParams.getAll("iss");
     if (
       url.searchParams.has("error") ||
       codes.length !== 1 ||
       states.length !== 1 ||
+      issuers.length > 1 ||
       !codes[0] ||
       !states[0]
     ) {
@@ -129,7 +141,7 @@ export class McpOAuthCallbackService {
     const provider = this.providers.getProviderForState(states[0]);
     if (!provider) return invalidCallbackResponse();
 
-    const completed = await provider.completeAuthorizationResult(codes[0], states[0]);
+    const completed = await provider.completeAuthorizationResult(codes[0], states[0], issuers[0]);
     return completed.match({
       ok: () =>
         new Response("OAuth authorization completed.\n", {

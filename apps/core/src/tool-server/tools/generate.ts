@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import { env, errorMessage, getModelProviders, type CoreConfig } from "@stanley2058/lilac-utils";
 import {
   defineServerTool,
@@ -12,6 +13,26 @@ import {
 } from "@stanley2058/lilac-plugin-runtime";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
+
+function settleCapturedError<T, E>(
+  result: ResultType<T, { readonly cause: Error | Panic }>,
+  resolve: (cause: Error | Panic) => E,
+): ResultType<T, E> {
+  return result.mapError(({ cause }) => resolve(cause));
+}
+
+async function settleCapturedPromise<T, E>(
+  result: Promise<ResultType<T, { readonly cause: Error | Panic }>>,
+  resolve: (cause: Error | Panic) => E,
+): Promise<ResultType<T, E>> {
+  return settleCapturedError(await result, resolve);
+}
+
+function captureGenerateFailure(cause: unknown): { readonly cause: Error | Panic } {
+  if (Panic.is(cause)) return { cause };
+  if (cause instanceof Error) return { cause };
+  return { cause: new Error("Unknown image generation failure", { cause }) };
+}
 import {
   experimental_generateVideo as generateVideo,
   generateImage,
@@ -778,9 +799,12 @@ async function readImageDataFromPath(
   path: string,
   displayPath = path,
 ): Promise<ResultType<Buffer, ServerToolFailure>> {
-  const read = await Result.tryPromise({
-    try: () => fs.readFile(path),
-    catch: (cause) => {
+  const read = await settleCapturedPromise(
+    Result.tryPromise({
+      try: () => fs.readFile(path),
+      catch: captureGenerateFailure,
+    }),
+    (cause) => {
       if (Panic.is(cause)) return preserveToolPanic(cause);
       return generateFailure(
         typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT"
@@ -789,17 +813,20 @@ async function readImageDataFromPath(
         errorMessage(cause),
       );
     },
-  });
+  );
   return Result.gen(async function* () {
     const bytes = yield* read;
     const typeFromBytes = yield* Result.await(
-      Result.tryPromise({
-        try: () => fileTypeFromBuffer(bytes),
-        catch: (cause) => {
+      settleCapturedPromise(
+        Result.tryPromise({
+          try: () => fileTypeFromBuffer(bytes),
+          catch: captureGenerateFailure,
+        }),
+        (cause) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
           return generateFailure("unavailable", errorMessage(cause));
         },
-      }),
+      ),
     );
 
     if (typeFromBytes?.mime?.startsWith("image/")) {
@@ -841,13 +868,16 @@ export async function resolveImageEditInputs(
   return Result.gen(async function* () {
     const images: DataContent[] = [];
     for (const imagePath of input.inputImages ?? []) {
-      const resolved = yield* Result.try({
-        try: () => resolveToolPathForRequestContext({ cwd, inputPath: imagePath, context }),
-        catch: (cause) => {
+      const resolved = yield* settleCapturedError(
+        Result.try({
+          try: () => resolveToolPathForRequestContext({ cwd, inputPath: imagePath, context }),
+          catch: captureGenerateFailure,
+        }),
+        (cause) => {
           if (Panic.is(cause)) return preserveToolPanic(cause);
           return generateFailure("denied", errorMessage(cause));
         },
-      });
+      );
       images.push(
         yield* Result.await(
           readImageDataFromPath(
@@ -860,18 +890,21 @@ export async function resolveImageEditInputs(
 
     if (!input.maskImage) return Result.ok({ images });
 
-    const resolvedMask = yield* Result.try({
-      try: () =>
-        resolveToolPathForRequestContext({
-          cwd,
-          inputPath: input.maskImage!,
-          context,
-        }),
-      catch: (cause) => {
+    const resolvedMask = yield* settleCapturedError(
+      Result.try({
+        try: () =>
+          resolveToolPathForRequestContext({
+            cwd,
+            inputPath: input.maskImage!,
+            context,
+          }),
+        catch: captureGenerateFailure,
+      }),
+      (cause) => {
         if (Panic.is(cause)) return preserveToolPanic(cause);
         return generateFailure("denied", errorMessage(cause));
       },
-    });
+    );
     const mask = yield* Result.await(
       readImageDataFromPath(
         resolvedMask,
@@ -911,18 +944,21 @@ export async function buildVideoGenerationPrompt(
   }
 
   return Result.gen(async function* () {
-    const resolvedImage = yield* Result.try({
-      try: () =>
-        resolveToolPathForRequestContext({
-          cwd,
-          inputPath: input.inputImage!,
-          context,
-        }),
-      catch: (cause) => {
+    const resolvedImage = yield* settleCapturedError(
+      Result.try({
+        try: () =>
+          resolveToolPathForRequestContext({
+            cwd,
+            inputPath: input.inputImage!,
+            context,
+          }),
+        catch: captureGenerateFailure,
+      }),
+      (cause) => {
         if (Panic.is(cause)) return preserveToolPanic(cause);
         return generateFailure("denied", errorMessage(cause));
       },
-    });
+    );
     const image = yield* Result.await(
       readImageDataFromPath(
         resolvedImage,
@@ -942,19 +978,28 @@ async function writeFileWithUniqueName(
 
   for (let i = 0; i < 10_000; i++) {
     const candidate = i === 0 ? targetPath : `${base} (${i})${ext}`;
-    try {
-      await fs.writeFile(candidate, bytes, { flag: "wx" });
-      return Result.ok(candidate);
-    } catch (error) {
-      if (Panic.is(error)) return preserveToolPanic(error);
-      const code =
-        typeof error === "object" && error !== null && "code" in error
-          ? (error.code as string | undefined)
-          : undefined;
-      if (code === "EEXIST") {
-        continue;
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          await fs.writeFile(candidate, bytes, { flag: "wx" });
+          return Result.ok(candidate);
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const error = attempt.error.cause;
+        if (Panic.is(error)) return preserveToolPanic(error);
+        const code =
+          typeof error === "object" && error !== null && "code" in error
+            ? (error.code as string | undefined)
+            : undefined;
+        if (code === "EEXIST") {
+          continue;
+        }
+        return Result.err(generateFailure("unavailable", errorMessage(error)));
       }
-      return Result.err(generateFailure("unavailable", errorMessage(error)));
+      return attempt.value;
     }
   }
 
@@ -1120,19 +1165,22 @@ export class Generate implements ServerTool {
         yield* descriptor.validateInput(payload);
 
         const cwd = opts?.context?.cwd ?? process.cwd();
-        const resolvedOutputDir = yield* Result.try({
-          try: () =>
-            resolveToolPathForRequestContext({
-              cwd,
-              inputPath:
-                payload.outputDir ?? (opts?.context?.safetyMode === "restricted" ? "/tmp" : "."),
-              context: opts?.context,
-            }),
-          catch: (cause) => {
+        const resolvedOutputDir = yield* settleCapturedError(
+          Result.try({
+            try: () =>
+              resolveToolPathForRequestContext({
+                cwd,
+                inputPath:
+                  payload.outputDir ?? (opts?.context?.safetyMode === "restricted" ? "/tmp" : "."),
+                context: opts?.context,
+              }),
+            catch: captureGenerateFailure,
+          }),
+          (cause) => {
             if (Panic.is(cause)) return preserveToolPanic(cause);
             return generateFailure("denied", errorMessage(cause));
           },
-        });
+        );
 
         const dimensions = resolveImageDimensions(picked.id, payload);
         // The OpenAI-compatible image API has no aspect-ratio parameter, so the
@@ -1152,23 +1200,26 @@ export class Generate implements ServerTool {
         const prompt = yield* Result.await(buildImageGenerationPrompt(cwd, payload, opts?.context));
 
         const res = yield* Result.await(
-          Result.tryPromise({
-            try: () =>
-              generateImageWithModel(picked.model, prompt, {
-                abortSignal: opts?.signal,
-                size,
-                aspectRatio,
-                maxRetries: imageProvider === "openai-compatible" ? 0 : undefined,
-                providerOptions,
-              }),
-            catch: (cause) => {
+          settleCapturedPromise(
+            Result.tryPromise({
+              try: () =>
+                generateImageWithModel(picked.model, prompt, {
+                  abortSignal: opts?.signal,
+                  size,
+                  aspectRatio,
+                  maxRetries: imageProvider === "openai-compatible" ? 0 : undefined,
+                  providerOptions,
+                }),
+              catch: captureGenerateFailure,
+            }),
+            (cause) => {
               if (Panic.is(cause)) return preserveToolPanic(cause);
               return generateFailure(
                 opts?.signal?.aborted ? "cancelled" : "unavailable",
                 errorMessage(cause),
               );
             },
-          }),
+          ),
         );
 
         const image = res.image;
@@ -1179,13 +1230,16 @@ export class Generate implements ServerTool {
         );
 
         yield* Result.await(
-          Result.tryPromise({
-            try: () => fs.mkdir(dirname(targetWithExt), { recursive: true }),
-            catch: (cause) => {
+          settleCapturedPromise(
+            Result.tryPromise({
+              try: () => fs.mkdir(dirname(targetWithExt), { recursive: true }),
+              catch: captureGenerateFailure,
+            }),
+            (cause) => {
               if (Panic.is(cause)) return preserveToolPanic(cause);
               return generateFailure("unavailable", errorMessage(cause));
             },
-          }),
+          ),
         );
         const outPath = yield* Result.await(
           writeFileWithUniqueName(targetWithExt, image.uint8Array),
@@ -1226,18 +1280,21 @@ export class Generate implements ServerTool {
         yield* descriptor.validateInput(payload);
 
         const cwd = opts?.context?.cwd ?? process.cwd();
-        const resolvedTarget = yield* Result.try({
-          try: () =>
-            resolveToolPathForRequestContext({
-              cwd,
-              inputPath: payload.path,
-              context: opts?.context,
-            }),
-          catch: (cause) => {
+        const resolvedTarget = yield* settleCapturedError(
+          Result.try({
+            try: () =>
+              resolveToolPathForRequestContext({
+                cwd,
+                inputPath: payload.path,
+                context: opts?.context,
+              }),
+            catch: captureGenerateFailure,
+          }),
+          (cause) => {
             if (Panic.is(cause)) return preserveToolPanic(cause);
             return generateFailure("denied", errorMessage(cause));
           },
-        });
+        );
 
         const prompt = yield* Result.await(
           buildVideoGenerationPrompt(
@@ -1251,22 +1308,25 @@ export class Generate implements ServerTool {
         );
 
         const res = yield* Result.await(
-          Result.tryPromise({
-            try: () =>
-              generateVideoWithModel(picked.model, prompt, {
-                abortSignal: opts?.signal,
-                aspectRatio: payload.aspectRatio as `${number}:${number}` | undefined,
-                resolution: payload.resolution as `${number}x${number}` | undefined,
-                duration: payload.duration,
-              }),
-            catch: (cause) => {
+          settleCapturedPromise(
+            Result.tryPromise({
+              try: () =>
+                generateVideoWithModel(picked.model, prompt, {
+                  abortSignal: opts?.signal,
+                  aspectRatio: payload.aspectRatio as `${number}:${number}` | undefined,
+                  resolution: payload.resolution as `${number}x${number}` | undefined,
+                  duration: payload.duration,
+                }),
+              catch: captureGenerateFailure,
+            }),
+            (cause) => {
               if (Panic.is(cause)) return preserveToolPanic(cause);
               return generateFailure(
                 opts?.signal?.aborted ? "cancelled" : "unavailable",
                 errorMessage(cause),
               );
             },
-          }),
+          ),
         );
 
         const video = res.video;
@@ -1275,13 +1335,16 @@ export class Generate implements ServerTool {
         const targetWithExt =
           originalExt.length > 0 ? resolvedTarget : `${resolvedTarget}${inferredExt}`;
         yield* Result.await(
-          Result.tryPromise({
-            try: () => fs.mkdir(dirname(targetWithExt), { recursive: true }),
-            catch: (cause) => {
+          settleCapturedPromise(
+            Result.tryPromise({
+              try: () => fs.mkdir(dirname(targetWithExt), { recursive: true }),
+              catch: captureGenerateFailure,
+            }),
+            (cause) => {
               if (Panic.is(cause)) return preserveToolPanic(cause);
               return generateFailure("unavailable", errorMessage(cause));
             },
-          }),
+          ),
         );
         const outPath = yield* Result.await(
           writeFileWithUniqueName(targetWithExt, video.uint8Array),

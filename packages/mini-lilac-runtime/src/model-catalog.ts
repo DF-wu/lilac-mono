@@ -15,8 +15,10 @@ import type {
   ProviderType,
 } from "./providers";
 
-function throwModelCatalogPanic(panic: Panic): never {
-  throw panic;
+type OpaqueModelCatalogValue = {} | null | undefined;
+
+function throwModelCatalogPanic(cause: OpaqueModelCatalogValue): never {
+  throw cause;
 }
 
 type ModelCatalogCapture<T, E> =
@@ -27,28 +29,38 @@ type ModelCatalogCapture<T, E> =
 type ModelCatalogFailureKind = "missing" | "other";
 
 function captureModelCatalogSync<T, E>(
-  operation: () => T,
-  mapError: (cause: unknown) => E,
+  operation: () => Awaited<T>,
+  mapError: (cause: OpaqueModelCatalogValue) => E,
 ): ModelCatalogCapture<T, E> {
-  try {
-    return { status: "ok", value: operation() };
-  } catch (cause) {
-    if (isPanic(cause)) return { status: "panic", panic: cause };
-    return { status: "error", error: mapError(cause) };
-  }
+  const captured = Result.try<T, OpaqueModelCatalogValue>({
+    try: operation,
+    catch: (cause) => cause,
+  });
+  const outcome = captured.match<
+    | { readonly ok: true; readonly value: T }
+    | { readonly ok: false; readonly error: OpaqueModelCatalogValue }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+  if (outcome.ok) return { status: "ok", value: outcome.value };
+  if (isPanic(outcome.error)) return { status: "panic", panic: outcome.error };
+  return { status: "error", error: mapError(outcome.error) };
 }
 
 async function captureModelCatalogPromise<T, E>(
   operation: () => Promise<T>,
   mapError: (kind: ModelCatalogFailureKind) => E,
 ): Promise<ModelCatalogCapture<T, E>> {
-  try {
-    return { status: "ok", value: await operation() };
-  } catch (cause) {
-    if (isPanic(cause)) return { status: "panic", panic: cause };
-    const kind = errorCode(cause) === "ENOENT" ? "missing" : "other";
-    return { status: "error", error: mapError(kind) };
-  }
+  const captured = await Result.tryPromise<T, OpaqueModelCatalogValue>({
+    try: operation,
+    catch: (cause) => cause,
+  });
+  const outcome = captured.match<
+    | { readonly ok: true; readonly value: T }
+    | { readonly ok: false; readonly error: OpaqueModelCatalogValue }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+  if (outcome.ok) return { status: "ok", value: outcome.value };
+  if (isPanic(outcome.error)) return { status: "panic", panic: outcome.error };
+  const kind = errorCode(outcome.error) === "ENOENT" ? "missing" : "other";
+  return { status: "error", error: mapError(kind) };
 }
 
 const modalitySchema = z.enum(["text", "image", "audio", "video", "pdf"]);
@@ -1097,121 +1109,132 @@ export class ModelCatalog {
       controller.abort();
     }, this.requestTimeoutMs);
 
-    try {
-      const responseResult = await Promise.race([
-        this.captureFetch(input, { ...init, signal: controller.signal }),
-        interruption,
-      ]);
-      if (responseResult.status === "panic") {
-        throwModelCatalogPanic(responseResult.panic);
-      }
-      if (responseResult.status === "error") return Result.err(responseResult.error);
-      const response = responseResult.value;
-      if (!response.ok) {
-        return this.responseFailureAfterCancel(
-          response,
-          new ModelCatalogRequestFailed({
-            message: `Model catalog request returned HTTP ${response.status}`,
-          }),
-          "HTTP response rejected",
-        );
-      }
-      const contentLength = Number(response.headers.get("content-length"));
-      if (Number.isFinite(contentLength) && contentLength > this.maxResponseBytes) {
-        controller.abort();
-        return this.responseFailureAfterCancel(
-          response,
-          new ModelCatalogRequestFailed({
-            message: `Model catalog response exceeded ${this.maxResponseBytes} bytes`,
-          }),
-          "response too large",
-        );
-      }
-      if (!response.body) return Result.ok("");
-
-      const responseBody = response.body;
-      const acquired = this.acquireResponseReader(responseBody);
-      if (acquired.status === "panic") {
-        await this.cancelResponseBody(responseBody, "reader acquisition failed");
-        throwModelCatalogPanic(acquired.panic);
-      }
-      if (acquired.status === "error") {
-        return this.responseFailureAfterBodyCancel(
-          responseBody,
-          acquired.error,
-          "reader acquisition failed",
-        );
-      }
-      const reader = acquired.value;
-      const chunks: Uint8Array[] = [];
-      let totalBytes = 0;
-      let primary: ModelCatalogCancelled | ModelCatalogRequestFailed | undefined;
-      let primaryPanic: Panic | undefined;
-      let shouldCancel = false;
-
-      while (primary === undefined && primaryPanic === undefined) {
-        const result = await Promise.race([this.captureReaderRead(reader), interruption]);
-        if (result.status === "panic") {
-          primaryPanic = result.panic;
-          shouldCancel = true;
-          break;
+    const attempted = await Result.tryPromise<
+      ResultType<string, ModelCatalogFetchError>,
+      OpaqueModelCatalogValue
+    >({
+      try: async () => {
+        const responseResult = await Promise.race([
+          this.captureFetch(input, { ...init, signal: controller.signal }),
+          interruption,
+        ]);
+        if (responseResult.status === "panic") {
+          throwModelCatalogPanic(responseResult.panic);
         }
-        if (result.status === "error") {
-          primary = result.error;
-          shouldCancel = true;
-          break;
+        if (responseResult.status === "error") return Result.err(responseResult.error);
+        const response = responseResult.value;
+        if (!response.ok) {
+          return this.responseFailureAfterCancel(
+            response,
+            new ModelCatalogRequestFailed({
+              message: `Model catalog request returned HTTP ${response.status}`,
+            }),
+            "HTTP response rejected",
+          );
         }
-        if (result.value.done) break;
-        totalBytes += result.value.value.byteLength;
-        if (totalBytes > this.maxResponseBytes) {
+        const contentLength = Number(response.headers.get("content-length"));
+        if (Number.isFinite(contentLength) && contentLength > this.maxResponseBytes) {
           controller.abort();
-          primary = new ModelCatalogRequestFailed({
-            message: `Model catalog response exceeded ${this.maxResponseBytes} bytes`,
-          });
-          shouldCancel = true;
-          break;
+          return this.responseFailureAfterCancel(
+            response,
+            new ModelCatalogRequestFailed({
+              message: `Model catalog response exceeded ${this.maxResponseBytes} bytes`,
+            }),
+            "response too large",
+          );
         }
-        chunks.push(result.value.value);
-      }
+        if (!response.body) return Result.ok("");
 
-      const cleanupOperations: ModelCatalogResponseCleanupFailed["operations"][number][] = [];
-      let cleanupPanic: Panic | undefined;
-      if (shouldCancel) {
-        const cancelled = await this.cancelResponseReader(reader);
-        if (cancelled.status === "panic") cleanupPanic = cancelled.panic;
-        else if (cancelled.status === "error") {
-          cleanupOperations.push(...cancelled.error.operations);
+        const responseBody = response.body;
+        const acquired = this.acquireResponseReader(responseBody);
+        if (acquired.status === "panic") {
+          await this.cancelResponseBody(responseBody, "reader acquisition failed");
+          throwModelCatalogPanic(acquired.panic);
         }
-      }
-      const released = this.releaseReader(reader);
-      if (released.status === "panic") cleanupPanic ??= released.panic;
-      else if (released.status === "error") cleanupOperations.push(...released.error.operations);
+        if (acquired.status === "error") {
+          return this.responseFailureAfterBodyCancel(
+            responseBody,
+            acquired.error,
+            "reader acquisition failed",
+          );
+        }
+        const reader = acquired.value;
+        const chunks: Uint8Array[] = [];
+        let totalBytes = 0;
+        let primary: ModelCatalogCancelled | ModelCatalogRequestFailed | undefined;
+        let primaryPanic: Panic | undefined;
+        let shouldCancel = false;
 
-      if (primaryPanic !== undefined) throwModelCatalogPanic(primaryPanic);
-      if (cleanupPanic !== undefined) throwModelCatalogPanic(cleanupPanic);
-      const cleanup =
-        cleanupOperations.length === 0
-          ? undefined
-          : new ModelCatalogResponseCleanupFailed({
-              operations: cleanupOperations,
-              message: "Model catalog response cleanup failed",
+        while (primary === undefined && primaryPanic === undefined) {
+          const result = await Promise.race([this.captureReaderRead(reader), interruption]);
+          if (result.status === "panic") {
+            primaryPanic = result.panic;
+            shouldCancel = true;
+            break;
+          }
+          if (result.status === "error") {
+            primary = result.error;
+            shouldCancel = true;
+            break;
+          }
+          if (result.value.done) break;
+          totalBytes += result.value.value.byteLength;
+          if (totalBytes > this.maxResponseBytes) {
+            controller.abort();
+            primary = new ModelCatalogRequestFailed({
+              message: `Model catalog response exceeded ${this.maxResponseBytes} bytes`,
             });
-      if (primary !== undefined) {
-        return Result.err(combineCatalogRequestAndCleanup(primary, cleanup));
-      }
-      if (cleanup !== undefined) return Result.err(cleanup);
+            shouldCancel = true;
+            break;
+          }
+          chunks.push(result.value.value);
+        }
 
-      const bytes = new Uint8Array(totalBytes);
-      let offset = 0;
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-      return Result.ok(new TextDecoder().decode(bytes));
-    } finally {
-      clearTimeout(timer);
-      externalSignal?.removeEventListener("abort", cancelForSignal);
-    }
+        const cleanupOperations: ModelCatalogResponseCleanupFailed["operations"][number][] = [];
+        let cleanupPanic: Panic | undefined;
+        if (shouldCancel) {
+          const cancelled = await this.cancelResponseReader(reader);
+          if (cancelled.status === "panic") cleanupPanic = cancelled.panic;
+          else if (cancelled.status === "error") {
+            cleanupOperations.push(...cancelled.error.operations);
+          }
+        }
+        const released = this.releaseReader(reader);
+        if (released.status === "panic") cleanupPanic ??= released.panic;
+        else if (released.status === "error") cleanupOperations.push(...released.error.operations);
+
+        if (primaryPanic !== undefined) throwModelCatalogPanic(primaryPanic);
+        if (cleanupPanic !== undefined) throwModelCatalogPanic(cleanupPanic);
+        const cleanup =
+          cleanupOperations.length === 0
+            ? undefined
+            : new ModelCatalogResponseCleanupFailed({
+                operations: cleanupOperations,
+                message: "Model catalog response cleanup failed",
+              });
+        if (primary !== undefined) {
+          return Result.err(combineCatalogRequestAndCleanup(primary, cleanup));
+        }
+        if (cleanup !== undefined) return Result.err(cleanup);
+
+        const bytes = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return Result.ok(new TextDecoder().decode(bytes));
+      },
+      catch: (cause) => cause,
+    });
+    clearTimeout(timer);
+    externalSignal?.removeEventListener("abort", cancelForSignal);
+    const outcome = attempted.match<
+      | { readonly ok: true; readonly value: ResultType<string, ModelCatalogFetchError> }
+      | { readonly ok: false; readonly error: OpaqueModelCatalogValue }
+    >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+    if (!outcome.ok) return throwModelCatalogPanic(outcome.error);
+    return outcome.value;
   }
 
   private async captureFetch(

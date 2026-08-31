@@ -18,6 +18,8 @@
       "files": ["apps/**/*.{js,jsx,cjs,mjs,ts,tsx}", "packages/**/*.{js,jsx,cjs,mjs,ts,tsx}"],
       "rules": {
         "@typescript-eslint/no-explicit-any": "error",
+        "lilac/no-else-after-terminal": "error",
+        "lilac/prefer-switch-true-chain": "error",
         "no-nested-ternary": "error",
         "lilac/no-local-is-record": "error"
       }

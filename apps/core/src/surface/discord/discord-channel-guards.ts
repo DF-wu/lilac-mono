@@ -8,9 +8,9 @@ import {
   type RepliableInteraction,
 } from "discord.js";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
-import { Result } from "better-result";
+import { Panic, Result } from "better-result";
 
-import { surfaceExternalFallback } from "../adapter";
+import { settleSurfaceFallback } from "../adapter";
 
 export function shouldAllowMessage(params: {
   cfg: CoreConfig;
@@ -42,10 +42,15 @@ export async function resolveTextSendableChannel(
   client: Client,
   channelId: string,
 ): Promise<SendableDiscordChannel | null> {
-  const fetched = await Result.tryPromise({
-    try: () => client.channels.fetch(channelId),
-    catch: surfaceExternalFallback(null),
-  });
+  const fetched = settleSurfaceFallback(
+    await Result.tryPromise({
+      try: () => client.channels.fetch(channelId),
+      catch: (cause) =>
+        Panic.is(cause)
+          ? { kind: "panic", panic: cause, fallback: null }
+          : { kind: "fallback", fallback: null },
+    }),
+  );
   const channel = fetched.unwrapOr(null);
   return isTextSendableChannel(channel) ? channel : null;
 }
@@ -87,20 +92,30 @@ export async function tryReplyEphemeral(
   interaction: RepliableInteraction<CacheType>,
   content: string,
 ): Promise<void> {
-  await Result.tryPromise({
-    try: () => replyEphemeral(interaction, content),
-    catch: surfaceExternalFallback(undefined),
-  });
+  settleSurfaceFallback(
+    await Result.tryPromise({
+      try: () => replyEphemeral(interaction, content),
+      catch: (cause) =>
+        Panic.is(cause)
+          ? { kind: "panic", panic: cause, fallback: undefined }
+          : { kind: "fallback", fallback: undefined },
+    }),
+  );
 }
 
 export async function tryEditOrReplyEphemeral(
   interaction: RepliableInteraction<CacheType>,
   content: string,
 ): Promise<void> {
-  await Result.tryPromise({
-    try: () => editOrReplyEphemeral(interaction, content),
-    catch: surfaceExternalFallback(undefined),
-  });
+  settleSurfaceFallback(
+    await Result.tryPromise({
+      try: () => editOrReplyEphemeral(interaction, content),
+      catch: (cause) =>
+        Panic.is(cause)
+          ? { kind: "panic", panic: cause, fallback: undefined }
+          : { kind: "fallback", fallback: undefined },
+    }),
+  );
 }
 
 export function isRoutableDiscordUserMessage(msg: Message): boolean {

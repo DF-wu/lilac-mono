@@ -288,11 +288,24 @@ function classifyHttpOperationFailure(
 async function captureHttpOperation(
   operation: () => HttpResult<Response> | Promise<HttpResult<Response>>,
 ): Promise<HttpResult<Response>> {
-  try {
-    return await operation();
-  } catch (cause) {
-    return Result.err(classifyHttpOperationFailure(cause));
+  type CapturedHttpFailure = {
+    readonly kind: "failure";
+    readonly classify: () => MiniLilacHttpFailure;
+  };
+  function captureHttpFailure<Cause>(cause: Cause): CapturedHttpFailure {
+    return { kind: "failure", classify: () => classifyHttpOperationFailure(cause) };
   }
+  const attempted = await Result.tryPromise({
+    try: async () => operation(),
+    catch: captureHttpFailure,
+  });
+  const settlement = attempted.match<
+    { readonly kind: "success"; readonly result: HttpResult<Response> } | CapturedHttpFailure
+  >({
+    ok: (result) => ({ kind: "success", result }),
+    err: (failure) => failure,
+  });
+  return settlement.kind === "success" ? settlement.result : Result.err(settlement.classify());
 }
 
 async function handleHttpOperation(
@@ -344,14 +357,27 @@ async function canonicalDirectory(
   supplied: string,
   subject: "Session" | "Skill",
 ): Promise<HttpResult<string>> {
-  try {
-    return Result.ok(await realpath(supplied));
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      httpFailure(400, "invalid_cwd", `${subject} cwd '${supplied}' does not exist`),
-    );
+  type CapturedCanonicalDirectoryFailure =
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "missing" };
+  function captureCanonicalDirectoryFailure<Cause>(
+    cause: Cause,
+  ): CapturedCanonicalDirectoryFailure {
+    return Panic.is(cause) ? { kind: "panic", panic: cause } : { kind: "missing" };
   }
+  const attempted = await Result.tryPromise({
+    try: () => realpath(supplied),
+    catch: captureCanonicalDirectoryFailure,
+  });
+  const settlement = attempted.match<
+    { readonly kind: "success"; readonly directory: string } | CapturedCanonicalDirectoryFailure
+  >({
+    ok: (directory) => ({ kind: "success", directory }),
+    err: (failure) => failure,
+  });
+  if (settlement.kind === "success") return Result.ok(settlement.directory);
+  if (settlement.kind === "panic") throw settlement.panic;
+  return Result.err(httpFailure(400, "invalid_cwd", `${subject} cwd '${supplied}' does not exist`));
 }
 
 function requireClientCommandId<T extends { clientCommandId?: string }>(
@@ -381,19 +407,34 @@ function pumpSseBody(
   close: () => void,
 ): void {
   void (async () => {
-    try {
-      for (;;) {
-        const result = await reader.read();
-        if (result.done) {
-          close();
-          controller.close();
-          return;
+    type CapturedPumpFailure = {
+      readonly kind: "failure";
+      readonly restoreCause: () => unknown;
+    };
+    function capturePumpFailure<Cause>(cause: Cause): CapturedPumpFailure {
+      return { kind: "failure", restoreCause: () => cause };
+    }
+    const attempted = await Result.tryPromise({
+      try: async () => {
+        for (;;) {
+          const result = await reader.read();
+          if (result.done) {
+            close();
+            controller.close();
+            return;
+          }
+          controller.enqueue(result.value);
         }
-        controller.enqueue(result.value);
-      }
-    } catch (cause) {
+      },
+      catch: capturePumpFailure,
+    });
+    const settlement = attempted.match<{ readonly kind: "success" } | CapturedPumpFailure>({
+      ok: () => ({ kind: "success" }),
+      err: (failure) => failure,
+    });
+    if (settlement.kind === "failure") {
       close();
-      controller.error(cause);
+      controller.error(settlement.restoreCause());
     }
   })();
 }
@@ -403,12 +444,23 @@ function enqueueSseKeepAlive(
   value: Uint8Array,
   close: () => void,
 ): void {
-  try {
-    controller.enqueue(value);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    close();
+  type CapturedEnqueueFailure =
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "failure" };
+  function captureEnqueueFailure<Cause>(cause: Cause): CapturedEnqueueFailure {
+    return Panic.is(cause) ? { kind: "panic", panic: cause } : { kind: "failure" };
   }
+  const attempted = Result.try({
+    try: () => controller.enqueue(value),
+    catch: captureEnqueueFailure,
+  });
+  const settlement = attempted.match<{ readonly kind: "success" } | CapturedEnqueueFailure>({
+    ok: () => ({ kind: "success" }),
+    err: (failure) => failure,
+  });
+  if (settlement.kind === "success") return;
+  if (settlement.kind === "panic") throw settlement.panic;
+  close();
 }
 
 export function withSseKeepAlive(
@@ -555,12 +607,13 @@ export function createMiniLilacServer(options: CreateMiniLilacServerOptions) {
     const current = new Promise<void>((resolve) => void (release = resolve));
     sessionLocks.set(sessionId, current);
     await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-      if (sessionLocks.get(sessionId) === current) sessionLocks.delete(sessionId);
-    }
+    using _releaseSessionLock = {
+      [Symbol.dispose]() {
+        release();
+        if (sessionLocks.get(sessionId) === current) sessionLocks.delete(sessionId);
+      },
+    };
+    return await operation();
   }
 
   const app = new Elysia();

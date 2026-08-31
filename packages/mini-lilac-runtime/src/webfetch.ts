@@ -239,10 +239,18 @@ type ExternalCapture<T, E> =
   | { readonly status: "ok"; readonly value: T }
   | { readonly status: "error"; readonly error: E }
   | { readonly status: "panic"; readonly panic: Panic };
+type OpaqueWebfetchValue = {} | null | undefined;
+type WebfetchSettlement<T> =
+  | { readonly kind: "value"; readonly value: T }
+  | { readonly kind: "failure"; readonly cause: OpaqueWebfetchValue };
 type Destination = { readonly addresses: readonly string[]; readonly hostname: string };
 type ParsedContentType = { readonly raw: string; readonly mime: string };
 type ConvertedHtml = { readonly title: string; readonly content: string };
 const legacyWebfetchErrors = new WeakMap<object, Error>();
+
+function captureWebfetchFailure(cause: unknown): OpaqueWebfetchValue {
+  return cause;
+}
 
 function destinationRejected(message: string): WebfetchDestinationRejected {
   return new WebfetchDestinationRejected({ message });
@@ -276,27 +284,36 @@ async function captureWebfetchPromise<T, E>(
   effect: () => Promise<T>,
   error: E,
 ): Promise<ExternalCapture<T, E>> {
-  try {
-    return { status: "ok", value: await effect() };
-  } catch (cause) {
-    if (Panic.is(cause)) return { status: "panic", panic: cause };
-    if (cause instanceof Error && typeof error === "object" && error !== null) {
-      legacyWebfetchErrors.set(error, cause);
-    }
-    return { status: "error", error };
+  const captured = await Result.tryPromise<T, OpaqueWebfetchValue>({
+    try: effect,
+    catch: captureWebfetchFailure,
+  });
+  const settlement = captured.match<WebfetchSettlement<T>>({
+    ok: (value) => ({ kind: "value", value }),
+    err: (cause) => ({ kind: "failure", cause }),
+  });
+  if (settlement.kind === "value") return { status: "ok", value: settlement.value };
+  if (Panic.is(settlement.cause)) return { status: "panic", panic: settlement.cause };
+  if (settlement.cause instanceof Error && typeof error === "object" && error !== null) {
+    legacyWebfetchErrors.set(error, settlement.cause);
   }
+  return { status: "error", error };
 }
 
-function captureWebfetchSync<T, E>(effect: () => T, error: E): ExternalCapture<T, E> {
-  try {
-    return { status: "ok", value: effect() };
-  } catch (cause) {
-    if (Panic.is(cause)) return { status: "panic", panic: cause };
-    if (cause instanceof Error && typeof error === "object" && error !== null) {
-      legacyWebfetchErrors.set(error, cause);
-    }
-    return { status: "error", error };
+function captureWebfetchSync<T, E>(effect: () => Awaited<T>, error: E): ExternalCapture<T, E> {
+  const settlement = Result.try<T, OpaqueWebfetchValue>({
+    try: effect,
+    catch: captureWebfetchFailure,
+  }).match<WebfetchSettlement<T>>({
+    ok: (value) => ({ kind: "value", value }),
+    err: (cause) => ({ kind: "failure", cause }),
+  });
+  if (settlement.kind === "value") return { status: "ok", value: settlement.value };
+  if (Panic.is(settlement.cause)) return { status: "panic", panic: settlement.cause };
+  if (settlement.cause instanceof Error && typeof error === "object" && error !== null) {
+    legacyWebfetchErrors.set(error, settlement.cause);
   }
+  return { status: "error", error };
 }
 
 async function awaitWebfetchCapture<T, E>(

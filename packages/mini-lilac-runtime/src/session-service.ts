@@ -136,7 +136,16 @@ import {
   UnsupportedVersion,
   withoutOpenAIItemIds,
 } from "@stanley2058/lilac-utils";
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import {
+  Panic,
+  Result,
+  TaggedError,
+  type Err,
+  type InferErr,
+  type InferOk,
+  type Ok,
+  type Result as ResultType,
+} from "better-result";
 import { z } from "zod";
 
 import {
@@ -271,28 +280,57 @@ function rejectSessionOperation(
 }
 
 function sessionResultToCompatibility<T, E>(result: ResultType<T, E>): T {
-  let $resultResultValue8531!: import("better-result").InferOk<NonNullable<typeof result>>;
-  let $resultResultError8531!: import("better-result").InferErr<NonNullable<typeof result>>;
-  const $resultResultOk8531 = Result.match<
-    import("better-result").InferOk<NonNullable<typeof result>>,
-    import("better-result").InferErr<NonNullable<typeof result>>,
-    boolean
-  >(result, {
-    ok: (value) => {
-      $resultResultValue8531 = value;
-      return true;
-    },
-    err: (error) => {
-      $resultResultError8531 = error;
-      return false;
-    },
-  });
-  if (($resultResultOk8531 ? "ok" : "error") === "error") throw $resultResultError8531;
-  return $resultResultValue8531;
+  const resultOutcome = sessionCaptureOutcome(result);
+  if (!resultOutcome.ok) throw resultOutcome.error;
+  return resultOutcome.value;
 }
 
-function rethrowSessionPanic(cause: unknown): void {
-  if (Panic.is(cause)) throw cause;
+function rethrowSessionPanic(cause: unknown): void;
+function rethrowSessionPanic(cause: unknown, inspectCause: true): OpaqueSessionValue;
+function rethrowSessionPanic(cause: unknown, inspectCause?: true): OpaqueSessionValue {
+  if (!Panic.is(cause)) return undefined;
+  if (inspectCause) return cause.cause;
+  throw cause;
+}
+
+type OpaqueSessionValue = {} | null | undefined;
+
+type AnyMiniResult = Ok<unknown, unknown> | Err<unknown, unknown>;
+type MiniResultOutcome<R extends AnyMiniResult> =
+  | { readonly ok: true; readonly value: InferOk<R> }
+  | { readonly ok: false; readonly error: InferErr<R> };
+
+function sessionCaptureOutcome<R extends AnyMiniResult>(result: R): MiniResultOutcome<R>;
+function sessionCaptureOutcome<T, E>(
+  result: ResultType<T, E>,
+): { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E } {
+  return result.match<
+    { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: E }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+}
+
+function captureSessionOperation<T>(
+  operation: () => Awaited<T>,
+): ResultType<T, OpaqueSessionValue> {
+  return Result.try<T, OpaqueSessionValue>({ try: operation, catch: (cause) => cause });
+}
+
+function captureSessionPromise<T>(
+  operation: () => Promise<T>,
+): Promise<ResultType<T, OpaqueSessionValue>> {
+  return Result.tryPromise<T, OpaqueSessionValue>({ try: operation, catch: (cause) => cause });
+}
+
+function signalSessionFailure(cause: OpaqueSessionValue): never {
+  return sessionResultToCompatibility(Result.err(cause));
+}
+
+async function observeSessionPromise(
+  operation: Promise<unknown>,
+  onRejected: (error: OpaqueSessionValue) => void = () => {},
+): Promise<void> {
+  const observed = sessionCaptureOutcome(await captureSessionPromise(async () => await operation));
+  if (!observed.ok) onRejected(observed.error);
 }
 
 type ManualCompactionFailure = {
@@ -341,27 +379,12 @@ export function resolveMiniClaudeCompactionSummaryModel(input: {
   if (input.run === null) return input.fallback();
 
   const created = input.run.createUtilityModelResult();
-  let $createdResultValue10416!: import("better-result").InferOk<NonNullable<typeof created>>;
-  let $createdResultError10416!: import("better-result").InferErr<NonNullable<typeof created>>;
-  const $createdResultOk10416 = Result.match<
-    import("better-result").InferOk<NonNullable<typeof created>>,
-    import("better-result").InferErr<NonNullable<typeof created>>,
-    boolean
-  >(created, {
-    ok: (value) => {
-      $createdResultValue10416 = value;
-      return true;
-    },
-    err: (error) => {
-      $createdResultError10416 = error;
-      return false;
-    },
-  });
-  if (($createdResultOk10416 ? "ok" : "error") === "ok") return $createdResultValue10416;
+  const createdOutcome = sessionCaptureOutcome(created);
+  if (createdOutcome.ok) return createdOutcome.value;
 
-  switch ($createdResultError10416._tag) {
+  switch (createdOutcome.error._tag) {
     case "ClaudeCodeRunExternalFailure":
-      input.onFailure($createdResultError10416);
+      input.onFailure(createdOutcome.error);
       return input.fallback();
   }
 }
@@ -792,12 +815,12 @@ function artifactScopeId(sessionId: string): string {
 function toolOutputErrorText(output: ToolResultOutput, fallback: string): string {
   if (output.type === "error-text") return output.value;
   if (output.type === "error-json") {
-    try {
-      return JSON.stringify(output.value);
-    } catch (cause) {
-      rethrowSessionPanic(cause);
-      return fallback;
-    }
+    const serialized = sessionCaptureOutcome(
+      captureSessionOperation(() => JSON.stringify(output.value)),
+    );
+    if (serialized.ok) return serialized.value;
+    rethrowSessionPanic(serialized.error);
+    return fallback;
   }
   if (output.type === "execution-denied") return output.reason ?? fallback;
   return fallback;
@@ -824,12 +847,12 @@ function toolOutputDisplayValue(output: ToolResultOutput, rawResult?: unknown): 
 }
 
 function serializedUtf8Bytes(value: unknown): number {
-  try {
-    return Buffer.byteLength(JSON.stringify(value) ?? "null", "utf8");
-  } catch (cause) {
-    rethrowSessionPanic(cause);
-    return Buffer.byteLength(String(value), "utf8");
-  }
+  const serialized = sessionCaptureOutcome(
+    captureSessionOperation(() => Buffer.byteLength(JSON.stringify(value) ?? "null", "utf8")),
+  );
+  if (serialized.ok) return serialized.value;
+  rethrowSessionPanic(serialized.error);
+  return Buffer.byteLength(String(value), "utf8");
 }
 
 const TODO_WRITE_DESCRIPTION = [
@@ -1284,11 +1307,12 @@ class SessionActor {
     this.serial = settled.promise;
     return (async () => {
       await previous;
-      try {
-        return await operation();
-      } finally {
-        settled.resolve();
-      }
+      const attempted = sessionCaptureOutcome(
+        await captureSessionPromise(async () => await operation()),
+      );
+      settled.resolve();
+      if (!attempted.ok) return signalSessionFailure(attempted.error);
+      return attempted.value;
     })();
   }
 
@@ -1643,150 +1667,164 @@ class SessionActor {
       let pendingClaudeRuntime: MiniMainClaudeRuntime | null = null;
       let pendingClaudeCodeRun: MaterializedClaudeCodeRun | null = null;
       let started = false;
-      try {
-        let created: CreatedAgent | undefined;
-        if (context.depth > 0 && !context.namedContinuation) {
-          created = await this.createAgent(
+      const prepared = sessionCaptureOutcome(
+        await captureSessionPromise(async () => {
+          let created: CreatedAgent | undefined;
+          if (context.depth > 0 && !context.namedContinuation) {
+            created = await this.createAgent(
+              profileId,
+              context,
+              priorModelMessages,
+              this.store.getCurrentHistoryState(this.snapshot.id),
+              userModelMessage,
+            );
+            pendingClaudeRuntime = created.claudeRuntime;
+            pendingClaudeCodeRun = created.claudeCodeRun;
+          }
+          admittedHistory = await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
+            const current = this.store.getCurrentHistoryState(this.snapshot.id);
+            const outcome = await this.captureWorkspaceOutcome(lockedStore);
+            const admittedPrompt = sessionCaptureOutcome(
+              captureSessionOperation(() =>
+                this.store.admitRootPromptHistory({
+                  run: {
+                    id: runId,
+                    sessionId: this.snapshot.id,
+                    profile: profileId,
+                    depth: context.depth,
+                  },
+                  commandId: clientCommandId,
+                  commandPayload: command.payload,
+                  transitionId: crypto.randomUUID(),
+                  expectedCurrentStateId: current.id,
+                  modelMessages: [...priorModelMessages, userModelMessage],
+                  uiMessages: [...priorUiMessages, userMessage],
+                  observation: this.workspaceObservation(current, outcome),
+                  title: initialTitle,
+                }),
+              ),
+            );
+            if (!admittedPrompt.ok) {
+              this.deleteUnreferencedWorkspaceOutcome(outcome);
+              return signalSessionFailure(admittedPrompt.error);
+            }
+            return admittedPrompt.value;
+          });
+          this.snapshot = admittedHistory.snapshot;
+          this.terminalReplay = undefined;
+          admitted = true;
+          created ??= await this.createAgent(
             profileId,
             context,
             priorModelMessages,
-            this.store.getCurrentHistoryState(this.snapshot.id),
+            admittedHistory.fromState,
             userModelMessage,
           );
-          pendingClaudeRuntime = created.claudeRuntime;
-          pendingClaudeCodeRun = created.claudeCodeRun;
-        }
-        admittedHistory = await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
-          const current = this.store.getCurrentHistoryState(this.snapshot.id);
-          const outcome = await this.captureWorkspaceOutcome(lockedStore);
-          try {
-            return this.store.admitRootPromptHistory({
-              run: {
-                id: runId,
-                sessionId: this.snapshot.id,
-                profile: profileId,
-                depth: context.depth,
-              },
-              commandId: clientCommandId,
-              commandPayload: command.payload,
-              transitionId: crypto.randomUUID(),
-              expectedCurrentStateId: current.id,
-              modelMessages: [...priorModelMessages, userModelMessage],
-              uiMessages: [...priorUiMessages, userMessage],
-              observation: this.workspaceObservation(current, outcome),
-              title: initialTitle,
-            });
-          } catch (error) {
-            this.deleteUnreferencedWorkspaceOutcome(outcome);
-            throw error;
-          }
-        });
-        this.snapshot = admittedHistory.snapshot;
-        this.terminalReplay = undefined;
-        admitted = true;
-        created ??= await this.createAgent(
-          profileId,
-          context,
-          priorModelMessages,
-          admittedHistory.fromState,
-          userModelMessage,
-        );
-        const { agent, claudeRuntime, claudeCodeRun } = created;
-        pendingClaudeRuntime = claudeRuntime;
-        pendingClaudeCodeRun = claudeCodeRun;
-        this.active = {
-          runId,
-          agent,
-          isClaudeCode: created.isClaudeCode,
-          claudeRuntime,
-          claudeCodeRun,
-          context,
-          eventQueue: Promise.resolve(),
-          cancelRequested: false,
-          initialUserSeen: false,
-          stepOpen: false,
-          phase: "accepting-controls",
-          streamFinished: false,
-          uiChunkCursor: 0,
-          chronologicalUiPrefix: [...priorUiMessages, userMessage],
-          liveLog: [],
-          nextSeq: 1,
-          inputTokens: this.snapshot.inputTokens ?? null,
-          openTransitionId: admittedHistory.transition.id,
-          providerState: created.providerState,
-          toolInputsAvailable: new Map(),
-          streamedToolInputIds: new Set(),
-          suppressedClaudeMcpToolInputIds: new Set(),
-          toolOutputsAvailable: new Set(),
-          openReasoningIds: new Set(),
-          openTextIds: new Set(),
-          turnReasoningIds: new Set(),
-          turnTextIds: new Set(),
-          turnToolCallIds: new Set(),
-          visibleToolCallIds: new Set(),
-          preliminaryToolOutputBytes: new Map(),
-          truncatedPreliminaryToolOutputs: new Set(),
-        };
-        agent.subscribe((event) => {
-          this.enqueueEvent(runId, event);
-        });
-
-        if (isFirstPrompt && this.config.agent.titleModel !== undefined) {
-          const controller = new AbortController();
-          this.titleControllers.set(runId, controller);
-          const titleTask = this.generateSessionTitle(
+          const { agent, claudeRuntime, claudeCodeRun } = created;
+          pendingClaudeRuntime = claudeRuntime;
+          pendingClaudeCodeRun = claudeCodeRun;
+          this.active = {
             runId,
-            initialTitle ?? "Mini Lilac",
-            userMessage,
-            controller.signal,
-          ).finally(() => {
-            if (this.titleControllers.get(runId) === controller) {
-              this.titleControllers.delete(runId);
-            }
+            agent,
+            isClaudeCode: created.isClaudeCode,
+            claudeRuntime,
+            claudeCodeRun,
+            context,
+            eventQueue: Promise.resolve(),
+            cancelRequested: false,
+            initialUserSeen: false,
+            stepOpen: false,
+            phase: "accepting-controls",
+            streamFinished: false,
+            uiChunkCursor: 0,
+            chronologicalUiPrefix: [...priorUiMessages, userMessage],
+            liveLog: [],
+            nextSeq: 1,
+            inputTokens: this.snapshot.inputTokens ?? null,
+            openTransitionId: admittedHistory.transition.id,
+            providerState: created.providerState,
+            toolInputsAvailable: new Map(),
+            streamedToolInputIds: new Set(),
+            suppressedClaudeMcpToolInputIds: new Set(),
+            toolOutputsAvailable: new Set(),
+            openReasoningIds: new Set(),
+            openTextIds: new Set(),
+            turnReasoningIds: new Set(),
+            turnTextIds: new Set(),
+            turnToolCallIds: new Set(),
+            visibleToolCallIds: new Set(),
+            preliminaryToolOutputBytes: new Map(),
+            truncatedPreliminaryToolOutputs: new Set(),
+          };
+          agent.subscribe((event) => {
+            this.enqueueEvent(runId, event);
           });
-          void this.trackExecution(titleTask);
-        }
 
-        const execution = Promise.resolve().then(() =>
-          this.executeTopLevelRun(agent, context, userModelMessage),
-        );
-        const trackedExecution = this.trackExecution(execution);
-        void trackedExecution.finally(() => this.closeSubscribers(runId));
-        started = true;
-        return { runId, stream: this.streamRun(runId) };
-      } catch (error) {
+          if (isFirstPrompt && this.config.agent.titleModel !== undefined) {
+            const controller = new AbortController();
+            this.titleControllers.set(runId, controller);
+            const titleTask = this.generateSessionTitle(
+              runId,
+              initialTitle ?? "Mini Lilac",
+              userMessage,
+              controller.signal,
+            ).finally(() => {
+              if (this.titleControllers.get(runId) === controller) {
+                this.titleControllers.delete(runId);
+              }
+            });
+            void this.trackExecution(titleTask);
+          }
+
+          const execution = Promise.resolve().then(() =>
+            this.executeTopLevelRun(agent, context, userModelMessage),
+          );
+          const trackedExecution = this.trackExecution(execution);
+          void trackedExecution.finally(() => this.closeSubscribers(runId));
+          started = true;
+          return { runId, stream: this.streamRun(runId) };
+        }),
+      );
+      if (!prepared.ok) {
+        const error = prepared.error;
         if (!admitted) {
           this.active = undefined;
           this.closeSubscribers(runId);
           this.store.releaseCommand(this.snapshot.id, clientCommandId, command);
         } else if (!started && admittedHistory !== undefined) {
+          const history = admittedHistory;
           const message = opaqueErrorMessage(error, "Runtime preparation failed");
-          try {
-            this.snapshot = await this.commitRunFinalization(admittedHistory.transition.id, {
-              runId,
-              sessionId: this.snapshot.id,
-              runStatus: "error",
-              sessionStatus: "error",
-              error: `Failed to prepare model runtime: ${message}`,
-              terminalResult: { text: "" },
-              modelMessages: [...priorModelMessages, userModelMessage],
-              uiMessages: [...priorUiMessages, userMessage],
-              inputTokens: this.snapshot.inputTokens ?? null,
-              ...(admittedHistory.fromState.providerState === null
-                ? {}
-                : { providerState: admittedHistory.fromState.providerState }),
-            });
-          } catch (finalizationError) {
-            rethrowSessionPanic(finalizationError);
+          const finalized = sessionCaptureOutcome(
+            await captureSessionPromise(() =>
+              this.commitRunFinalization(history.transition.id, {
+                runId,
+                sessionId: this.snapshot.id,
+                runStatus: "error",
+                sessionStatus: "error",
+                error: `Failed to prepare model runtime: ${message}`,
+                terminalResult: { text: "" },
+                modelMessages: [...priorModelMessages, userModelMessage],
+                uiMessages: [...priorUiMessages, userMessage],
+                inputTokens: this.snapshot.inputTokens ?? null,
+                ...(history.fromState.providerState === null
+                  ? {}
+                  : { providerState: history.fromState.providerState }),
+              }),
+            ),
+          );
+          if (finalized.ok) {
+            this.snapshot = finalized.value;
+          } else {
+            rethrowSessionPanic(finalized.error);
             logger.error(
               "failed to terminalize admitted prompt after runtime preparation failure",
               {
                 requestId: runId,
                 sessionId: this.snapshot.id,
                 error:
-                  finalizationError instanceof Error
-                    ? finalizationError.message
-                    : String(finalizationError),
+                  finalized.error instanceof Error
+                    ? finalized.error.message
+                    : String(finalized.error),
               },
             );
           }
@@ -1796,6 +1834,7 @@ class SessionActor {
         }
         throw error;
       }
+      return prepared.value;
     });
   }
 
@@ -1903,12 +1942,13 @@ class SessionActor {
       denyPaths: [...DEFAULT_DENY_PATHS, ...this.protectedToolPaths],
     });
     let readFileMediaSupported = false;
-    try {
-      readFileMediaSupported = supportsReadFileMedia(
-        await this.modelCapability.resolve(modelSpecifier),
-      );
-    } catch (cause) {
-      rethrowSessionPanic(cause);
+    const capability = sessionCaptureOutcome(
+      await captureSessionPromise(() => this.modelCapability.resolve(modelSpecifier)),
+    );
+    if (capability.ok) {
+      readFileMediaSupported = supportsReadFileMedia(capability.value);
+    } else {
+      rethrowSessionPanic(capability.error);
       // Unknown capability stays text-only rather than risking a provider-invalid request.
     }
     const tools = this.createTools(
@@ -2188,41 +2228,46 @@ class SessionActor {
           sourceSessionId: input.binding?.claudeSessionId ?? null,
           candidateSessionId,
         });
-        try {
-          const run = await this.materializeClaudeCode({
-            modelId: parseModelRef(modelSpecifier).modelId,
-            cwd: this.snapshot.cwd,
-            tools,
-            builtInTools: claudeBuiltInTools,
-            reasoning,
-            nativeSession:
-              input.binding === null
-                ? { mode: "fresh", sessionId: candidateSessionId }
-                : {
-                    mode: "fork",
-                    baseSessionId: input.binding.claudeSessionId,
-                    sessionId: candidateSessionId,
-                    expectedSourceLastModified: input.binding.nativeLastModified,
-                  },
-            execute: async (request) => {
-              if (!materializedAgent) {
-                throw new Error("Claude Code tool execution started before the agent was ready");
-              }
-              return await materializedAgent.executeExternalToolCall(request);
-            },
-          });
+        const materialized = sessionCaptureOutcome(
+          await captureSessionPromise(() =>
+            this.materializeClaudeCode({
+              modelId: parseModelRef(modelSpecifier).modelId,
+              cwd: this.snapshot.cwd,
+              tools,
+              builtInTools: claudeBuiltInTools,
+              reasoning,
+              nativeSession:
+                input.binding === null
+                  ? { mode: "fresh", sessionId: candidateSessionId }
+                  : {
+                      mode: "fork",
+                      baseSessionId: input.binding.claudeSessionId,
+                      sessionId: candidateSessionId,
+                      expectedSourceLastModified: input.binding.nativeLastModified,
+                    },
+              execute: async (request) => {
+                if (!materializedAgent) {
+                  return signalSessionFailure(
+                    new Error("Claude Code tool execution started before the agent was ready"),
+                  );
+                }
+                return await materializedAgent.executeExternalToolCall(request);
+              },
+            }),
+          ),
+        );
+        if (materialized.ok) {
           return {
-            run,
+            run: materialized.value,
             modelSpecifier,
             initialPayload:
               input.binding === null
                 ? ({ mode: "full" } as const)
                 : ({ mode: "suffix", startIndex: input.binding.canonicalMessageCount } as const),
           };
-        } catch (error) {
-          recordAttemptOutcome("failed");
-          throw error;
         }
+        recordAttemptOutcome("failed");
+        throw materialized.error;
       };
       const owner = new ClaudeAttemptRuntimeOwner<null>({
         factoryInputs: null,
@@ -2259,20 +2304,22 @@ class SessionActor {
             reason,
           });
           if (binding !== null) {
-            try {
-              return await materializeAttempt({
-                attemptIndex: persistedAttemptIndex,
-                binding,
-              });
-            } catch (error) {
-              if (!(error instanceof ClaudeNativeSessionPreflightError)) throw error;
-              logger.warn("Claude native source validation failed; starting fresh", {
-                ...lifecycleOperationalFields,
-                mode: "fresh",
-                reason: "native-source-invalid",
-                issues: error.issues.map((issue) => issue.code),
-              });
-            }
+            const forked = sessionCaptureOutcome(
+              await captureSessionPromise(() =>
+                materializeAttempt({
+                  attemptIndex: persistedAttemptIndex,
+                  binding,
+                }),
+              ),
+            );
+            if (forked.ok) return forked.value;
+            if (!(forked.error instanceof ClaudeNativeSessionPreflightError)) throw forked.error;
+            logger.warn("Claude native source validation failed; starting fresh", {
+              ...lifecycleOperationalFields,
+              mode: "fresh",
+              reason: "native-source-invalid",
+              issues: forked.error.issues.map((issue) => issue.code),
+            });
           }
           return await materializeAttempt({
             attemptIndex: persistedAttemptIndex + (binding === null ? 0 : 1),
@@ -2394,36 +2441,17 @@ class SessionActor {
             return null;
           }
           const finalizedResult = await candidate.run.nativeSession.finalizeResult();
-          let $finalizedResultResultValue86044!: import("better-result").InferOk<
-            NonNullable<typeof finalizedResult>
-          >;
-          let $finalizedResultResultError86044!: import("better-result").InferErr<
-            NonNullable<typeof finalizedResult>
-          >;
-          const $finalizedResultResultOk86044 = Result.match<
-            import("better-result").InferOk<NonNullable<typeof finalizedResult>>,
-            import("better-result").InferErr<NonNullable<typeof finalizedResult>>,
-            boolean
-          >(finalizedResult, {
-            ok: (value) => {
-              $finalizedResultResultValue86044 = value;
-              return true;
-            },
-            err: (error) => {
-              $finalizedResultResultError86044 = error;
-              return false;
-            },
-          });
-          if (($finalizedResultResultOk86044 ? "ok" : "error") === "error") {
+          const finalizedResultOutcome = sessionCaptureOutcome(finalizedResult);
+          if (!finalizedResultOutcome.ok) {
             recordAttemptOutcome("failed");
             logger.warn("Claude native candidate finalization failed", {
               ...lifecycleOperationalFields,
               reason: "native-finalization-failed",
-              error: $finalizedResultResultError86044.message,
+              error: finalizedResultOutcome.error.message,
             });
             return null;
           }
-          const finalized = $finalizedResultResultValue86044;
+          const finalized = finalizedResultOutcome.value;
           if (
             finalized.status !== "promotable" ||
             finalized.candidate === null ||
@@ -2463,33 +2491,35 @@ class SessionActor {
         },
       };
     }
-    try {
-      return await this.buildAgent({
-        context,
-        messages,
-        modelSpecifier,
-        reasoning,
-        tools,
-        providerOptions,
-        transientRetryController,
-        normalizeOverflow,
-        readFileMediaSupported,
-        usesCodexOAuth,
-        openaiServerCompactionEnabled,
-        isClaudeCode,
-        claudeRuntime,
-        directClaudeCodeRun,
-        agentSystem,
-        prepareHistoryView,
-        providerState,
-        onAgentReady: (ready) => {
-          materializedAgent = ready;
-        },
-      });
-    } catch (error) {
-      await this.disposeClaudeRuntime(claudeRuntime, directClaudeCodeRun, context.runId);
-      throw error;
-    }
+    const built = sessionCaptureOutcome(
+      await captureSessionPromise(() =>
+        this.buildAgent({
+          context,
+          messages,
+          modelSpecifier,
+          reasoning,
+          tools,
+          providerOptions,
+          transientRetryController,
+          normalizeOverflow,
+          readFileMediaSupported,
+          usesCodexOAuth,
+          openaiServerCompactionEnabled,
+          isClaudeCode,
+          claudeRuntime,
+          directClaudeCodeRun,
+          agentSystem,
+          prepareHistoryView,
+          providerState,
+          onAgentReady: (ready) => {
+            materializedAgent = ready;
+          },
+        }),
+      ),
+    );
+    if (built.ok) return built.value;
+    await this.disposeClaudeRuntime(claudeRuntime, directClaudeCodeRun, context.runId);
+    throw built.error;
   }
 
   /**
@@ -2884,8 +2914,8 @@ class SessionActor {
       const mergedModelMessages = [...active.agent.state.messages, ...delivery.canonicalMessages];
       delivery.abortSignal?.throwIfAborted();
       const workspace = await this.captureWorkspaceOutcome(lockedStore, delivery.abortSignal);
-      const committed = (() => {
-        try {
+      const committedAttempt = sessionCaptureOutcome(
+        captureSessionOperation(() => {
           delivery.abortSignal?.throwIfAborted();
           return this.store.commitSteeringHistoryBoundary({
             sessionId: this.snapshot.id,
@@ -2898,11 +2928,13 @@ class SessionActor {
             entries,
             providerState: active.providerState,
           });
-        } catch (error) {
-          this.deleteUnreferencedWorkspaceOutcome(workspace);
-          throw error;
-        }
-      })();
+        }),
+      );
+      if (!committedAttempt.ok) {
+        this.deleteUnreferencedWorkspaceOutcome(workspace);
+        throw committedAttempt.error;
+      }
+      const committed = committedAttempt.value;
 
       active.openTransitionId = committed.openTransition.id;
       active.chronologicalUiPrefix = uiMessages;
@@ -2911,23 +2943,26 @@ class SessionActor {
       const remaining = this.steeringEntries.filter((entry) => !consumedIds.has(entry.id));
       this.steeringEntries.splice(0, this.steeringEntries.length, ...remaining);
       this.snapshot = this.store.getSession(this.snapshot.id);
-      try {
-        for (const entry of entries) {
+      const projected = sessionCaptureOutcome(
+        await captureSessionPromise(async () => {
+          for (const entry of entries) {
+            await this.appendChunk(active.runId, {
+              type: "data-steeringCommitted",
+              id: entry.message.id,
+              data: entry.message,
+            });
+          }
           await this.appendChunk(active.runId, {
-            type: "data-steeringCommitted",
-            id: entry.message.id,
-            data: entry.message,
+            type: "data-session",
+            data: this.describe(this.snapshot),
           });
-        }
-        await this.appendChunk(active.runId, {
-          type: "data-session",
-          data: this.describe(this.snapshot),
-        });
-      } catch (error) {
+        }),
+      );
+      if (!projected.ok) {
         logger.warn("failed to project committed steering boundary", {
           requestId: active.runId,
           sessionId: this.snapshot.id,
-          error: opaqueErrorMessage(error, "Session title generation failed"),
+          error: opaqueErrorMessage(projected.error, "Session title generation failed"),
         });
       }
     });
@@ -2941,61 +2976,69 @@ class SessionActor {
   ): Promise<void> {
     const titleModel = this.config.agent.titleModel;
     if (titleModel === undefined) return;
-    try {
-      const titleMessages = await convertToModelMessages([
-        {
-          ...message,
-          parts: message.parts.map((part) => {
-            if (part.type !== "file" || part.providerReference === undefined) return part;
-            const file = { ...part };
-            delete file.providerReference;
-            return file;
-          }),
-        },
-      ]);
-      const titleMessage = titleMessages[0];
-      if (titleMessages.length !== 1 || titleMessage?.role !== "user") {
-        throw new Error("Title UI message did not convert to one model user message");
-      }
-      const modelRef = parseModelRef(titleModel);
-      const usesCodexOAuth = this.supersededProviderIds.has(modelRef.providerId);
-      const result = streamText({
-        model: this.resolveModel(titleModel),
-        instructions: TITLE_GENERATION_INSTRUCTIONS,
-        messages: [{ role: "user", content: TITLE_GENERATION_REQUEST }, titleMessage],
-        maxOutputTokens: usesCodexOAuth ? undefined : 64,
-        providerOptions: usesCodexOAuth ? { openai: { store: false } } : undefined,
-        abortSignal,
-      });
-      let rejectAbort: (reason: DOMException) => void = () => {};
-      const aborted = new Promise<never>((_resolve, reject) => {
-        rejectAbort = reject;
-      });
-      const onAbort = () => rejectAbort(new DOMException("Title generation aborted", "AbortError"));
-      if (abortSignal.aborted) onAbort();
-      else abortSignal.addEventListener("abort", onAbort, { once: true });
-      let titleText: string;
-      try {
-        titleText = await Promise.race([result.text, aborted]);
-      } finally {
-        abortSignal.removeEventListener("abort", onAbort);
-      }
-      const title = parseGeneratedSessionTitle(titleText);
-      if (title === undefined) return;
-      await this.withLock(async () => {
-        this.snapshot = this.store.updateSessionTitle(this.snapshot.id, fallbackTitle, title);
-        const active = this.active;
-        if (!active || active.runId !== runId || active.streamFinished) return;
-        const operation = active.eventQueue.then(() =>
-          this.appendChunk(runId, { type: "data-session", data: this.describe(this.snapshot) }),
+    const generated = sessionCaptureOutcome(
+      await captureSessionPromise(async () => {
+        const titleMessages = await convertToModelMessages([
+          {
+            ...message,
+            parts: message.parts.map((part) => {
+              if (part.type !== "file" || part.providerReference === undefined) return part;
+              const file = { ...part };
+              delete file.providerReference;
+              return file;
+            }),
+          },
+        ]);
+        const titleMessage = titleMessages[0];
+        if (titleMessages.length !== 1 || titleMessage?.role !== "user") {
+          return signalSessionFailure(
+            new Error("Title UI message did not convert to one model user message"),
+          );
+        }
+        const modelRef = parseModelRef(titleModel);
+        const usesCodexOAuth = this.supersededProviderIds.has(modelRef.providerId);
+        const result = streamText({
+          model: this.resolveModel(titleModel),
+          instructions: TITLE_GENERATION_INSTRUCTIONS,
+          messages: [{ role: "user", content: TITLE_GENERATION_REQUEST }, titleMessage],
+          maxOutputTokens: usesCodexOAuth ? undefined : 64,
+          providerOptions: usesCodexOAuth ? { openai: { store: false } } : undefined,
+          abortSignal,
+        });
+        let rejectAbort: (reason: DOMException) => void = () => {};
+        const aborted = new Promise<never>((_resolve, reject) => {
+          rejectAbort = reject;
+        });
+        const onAbort = () =>
+          rejectAbort(new DOMException("Title generation aborted", "AbortError"));
+        if (abortSignal.aborted) onAbort();
+        else abortSignal.addEventListener("abort", onAbort, { once: true });
+        const titleAttempt = sessionCaptureOutcome(
+          await captureSessionPromise(() => Promise.race([result.text, aborted])),
         );
-        active.eventQueue = operation.catch((error) => this.reportEventFailure(runId, error));
-        await operation;
-      });
-    } catch (error) {
-      if (Panic.is(error)) throw error;
+        abortSignal.removeEventListener("abort", onAbort);
+        if (!titleAttempt.ok) return signalSessionFailure(titleAttempt.error);
+        const titleText = titleAttempt.value;
+        const title = parseGeneratedSessionTitle(titleText);
+        if (title === undefined) return;
+        await this.withLock(async () => {
+          this.snapshot = this.store.updateSessionTitle(this.snapshot.id, fallbackTitle, title);
+          const active = this.active;
+          if (!active || active.runId !== runId || active.streamFinished) return;
+          const operation = active.eventQueue.then(() =>
+            this.appendChunk(runId, { type: "data-session", data: this.describe(this.snapshot) }),
+          );
+          active.eventQueue = observeSessionPromise(operation, (error) =>
+            this.reportEventFailure(runId, error),
+          );
+          await operation;
+        });
+      }),
+    );
+    if (!generated.ok) {
+      if (Panic.is(generated.error)) throw generated.error;
       if (abortSignal.aborted) return;
-      const messageValue = opaqueErrorMessage(error, "Title generation failed");
+      const messageValue = opaqueErrorMessage(generated.error, "Title generation failed");
       console.warn(`Mini Lilac title generation failed: ${messageValue}`);
     }
   }
@@ -3186,10 +3229,9 @@ class SessionActor {
         }
         return result.state;
       });
-      active.eventQueue = operation.then(
-        () => undefined,
-        (error) => this.reportEventFailure(context.runId, error),
-      );
+      active.eventQueue = observeSessionPromise(operation, (error) =>
+        this.reportEventFailure(context.runId, error),
+      ).then(() => undefined);
       return operation;
     });
   }
@@ -3215,8 +3257,11 @@ class SessionActor {
     }
     const sessionName = requestedSessionName ?? generateSubagentSessionName(profileId);
     const childSessionId = delegatedSessionId(this.snapshot.id, sessionName);
-    try {
-      const child = this.store.getSession(childSessionId);
+    const existingChild = sessionCaptureOutcome(
+      captureSessionOperation(() => this.store.getSession(childSessionId)),
+    );
+    if (existingChild.ok) {
+      const child = existingChild.value;
       if (child.activeRunId !== null) {
         return {
           status: "rejected",
@@ -3225,8 +3270,8 @@ class SessionActor {
           reason: `subagent session '${sessionName}' already has an active run`,
         };
       }
-    } catch (cause) {
-      rethrowSessionPanic(cause);
+    } else {
+      rethrowSessionPanic(existingChild.error);
       // The session will be created during delegated admission.
     }
     let toolCount = 0;
@@ -3247,27 +3292,32 @@ class SessionActor {
         ...(activity ? { activity } : {}),
       });
     };
-    try {
-      handle = await this.promptDelegatedSession({
-        parentSessionId: this.snapshot.id,
-        parentRunId: parent.runId,
-        parentToolCallId: toolCallId,
-        sessionName,
-        namedContinuation: true,
-        profileId,
-        prompt,
-        depth: parent.depth + 1,
-        overrides,
-        reportActivity: () => parent.reportActivity?.(),
-        onActivity: (nextToolCount, nextActivity) => {
-          toolCount = nextToolCount;
-          activity = nextActivity;
-          parent.reportActivity?.();
-          queueRunningStatus();
-        },
-      });
-    } catch (error) {
-      const message = opaqueErrorMessage(error, "Subagent admission failed");
+    const admitted = sessionCaptureOutcome(
+      await captureSessionPromise(() =>
+        this.promptDelegatedSession({
+          parentSessionId: this.snapshot.id,
+          parentRunId: parent.runId,
+          parentToolCallId: toolCallId,
+          sessionName,
+          namedContinuation: true,
+          profileId,
+          prompt,
+          depth: parent.depth + 1,
+          overrides,
+          reportActivity: () => parent.reportActivity?.(),
+          onActivity: (nextToolCount, nextActivity) => {
+            toolCount = nextToolCount;
+            activity = nextActivity;
+            parent.reportActivity?.();
+            queueRunningStatus();
+          },
+        }),
+      ),
+    );
+    if (admitted.ok) {
+      handle = admitted.value;
+    } else {
+      const message = opaqueErrorMessage(admitted.error, "Subagent admission failed");
       return {
         status: "error",
         childRunId: "unavailable",
@@ -3278,44 +3328,43 @@ class SessionActor {
         error: message,
       } satisfies SubagentTerminalResult;
     }
-    if (handle === undefined) throw new Error("Subagent session admission returned no handle");
+    if (handle === undefined)
+      return signalSessionFailure(new Error("Subagent session admission returned no handle"));
     const childRunId = handle.runId;
     this.delegatedCancels.set(childRunId, handle.cancel);
     queueRunningStatus();
-    const promise = handle.completion
-      .catch((error): SubagentTerminalResult => {
-        const message = opaqueErrorMessage(error, "Subagent run failed");
-        const result: SubagentTerminalResult = {
-          status: "error",
-          childRunId,
-          childSessionId,
-          sessionName,
-          profile: profileId,
-          text: "",
-          error: message,
-        };
-        return result;
-      })
-      .then((result) => {
-        this.queueSubagentStatus(parent.runId, {
-          toolCallId,
-          runId: childRunId,
-          sessionId: childSessionId,
-          sessionName,
-          profile: profileId,
-          prompt,
-          mode,
-          state: result.status,
-          toolCount,
-          ...(activity ? { activity } : {}),
-          text: result.text,
-          ...(result.error ? { error: result.error } : {}),
-        });
-        return result;
-      })
-      .finally(() => {
-        this.delegatedCancels.delete(childRunId);
+    const promise = (async (): Promise<SubagentTerminalResult> => {
+      const completed = sessionCaptureOutcome(
+        await captureSessionPromise(async () => await handle.completion),
+      );
+      const result = completed.ok
+        ? completed.value
+        : ({
+            status: "error",
+            childRunId,
+            childSessionId,
+            sessionName,
+            profile: profileId,
+            text: "",
+            error: opaqueErrorMessage(completed.error, "Subagent run failed"),
+          } satisfies SubagentTerminalResult);
+      this.queueSubagentStatus(parent.runId, {
+        toolCallId,
+        runId: childRunId,
+        sessionId: childSessionId,
+        sessionName,
+        profile: profileId,
+        prompt,
+        mode,
+        state: result.status,
+        toolCount,
+        ...(activity ? { activity } : {}),
+        text: result.text,
+        ...(result.error ? { error: result.error } : {}),
       });
+      this.delegatedCancels.delete(childRunId);
+      return result;
+    })();
     const abortChild = () => handle.cancel();
     abortSignal?.addEventListener("abort", abortChild, { once: true });
     if (abortSignal?.aborted) abortChild();
@@ -3336,11 +3385,10 @@ class SessionActor {
         mode,
       };
     }
-    try {
-      return await promise;
-    } finally {
-      abortSignal?.removeEventListener("abort", abortChild);
-    }
+    const completed = sessionCaptureOutcome(await captureSessionPromise(() => promise));
+    abortSignal?.removeEventListener("abort", abortChild);
+    if (!completed.ok) throw completed.error;
+    return completed.value;
   }
 
   private async finishDeferredChildren(context: RunContext): Promise<TurnBoundaryDecision> {
@@ -3448,14 +3496,20 @@ class SessionActor {
     idleWatchdog.start();
     const operation = agent.prompt(userModelMessage);
     let thrown: string | undefined;
-    try {
-      while (true) {
-        try {
-          await idleWatchdog.waitFor(operation);
-          break;
-        } catch (error) {
+    let runDefect: Panic | undefined;
+    const run = sessionCaptureOutcome(
+      await captureSessionPromise(async () => {
+        while (true) {
+          const waited = sessionCaptureOutcome(
+            await captureSessionPromise(() => idleWatchdog.waitFor(operation)),
+          );
+          if (waited.ok) {
+            break;
+          }
+          const error = waited.error;
           const recovery = idleRecovery.promise;
-          if (!(error instanceof AgentIdleTimeoutError) || !recovery) throw error;
+          if (!(error instanceof AgentIdleTimeoutError) || !recovery)
+            return signalSessionFailure(error);
           const result = await recovery;
           if (idleRecovery.promise === recovery) idleRecovery.promise = null;
           if (
@@ -3465,19 +3519,22 @@ class SessionActor {
               (result.reason === "cancel" || result.reason === "interrupt")
             )
           ) {
-            throw error;
+            return signalSessionFailure(error);
           }
           idleWatchdog.restart();
         }
-      }
-    } catch (error) {
+      }),
+    );
+    if (!run.ok) {
+      const error = run.error;
+      if (Panic.is(error)) runDefect = error;
       thrown = opaqueErrorMessage(error, "Agent run failed");
       if (error instanceof AgentIdleTimeoutError) {
         const settled = await Promise.race([
-          operation.then(
-            () => true,
-            () => true,
-          ),
+          Result.tryPromise<void, "settled">({
+            try: async () => await operation,
+            catch: () => "settled",
+          }).then(() => true),
           Bun.sleep(5_000).then(() => false),
         ]);
         if (!settled) {
@@ -3489,16 +3546,16 @@ class SessionActor {
           });
         }
       }
-    } finally {
-      idleWatchdog.stop();
-      unsubscribeActivity();
-      context.reportActivity = undefined;
     }
+    idleWatchdog.stop();
+    unsubscribeActivity();
+    context.reportActivity = undefined;
 
     const active = this.active;
     if (!active || active.runId !== context.runId) return;
     await active.eventQueue;
     await this.withLock(() => this.finalizeTopLevelRun(agent, context, active, thrown));
+    if (runDefect !== undefined) throw runDefect;
   }
 
   private async finalizeTopLevelRun(
@@ -3515,105 +3572,122 @@ class SessionActor {
       for (const cancel of this.delegatedCancels.values()) cancel();
     }
     this.steeringEntries.length = 0;
-    try {
-      if (error && !agent.state.error) {
-        await this.appendChunk(context.runId, { type: "error", errorText: error });
-        await this.appendChunk(context.runId, { type: "finish", finishReason: "error" });
-      }
-      let runStatus: "completed" | "cancelled" | "error";
-      if (cancelled) {
-        runStatus = "cancelled";
-      } else if (error) {
-        runStatus = "error";
-      } else {
-        runStatus = "completed";
-      }
-      const runChunks = active.liveLog;
-      const { message: assistantMessage } = await assistantMessageFromChunks(
-        runChunks,
-        active.uiChunkCursor,
-      );
-      const uiMessages = [...active.chronologicalUiPrefix];
-      if (assistantMessage && assistantMessage.parts.length > 0) {
-        uiMessages.push(
-          ...(runStatus === "completed"
-            ? splitFinalAnswerUIMessage(assistantMessage)
-            : [assistantMessage]),
+    const finalized = sessionCaptureOutcome(
+      await captureSessionPromise(async () => {
+        if (error && !agent.state.error) {
+          await this.appendChunk(context.runId, { type: "error", errorText: error });
+          await this.appendChunk(context.runId, { type: "finish", finishReason: "error" });
+        }
+        let runStatus: "completed" | "cancelled" | "error";
+        if (cancelled) {
+          runStatus = "cancelled";
+        } else if (error) {
+          runStatus = "error";
+        } else {
+          runStatus = "completed";
+        }
+        const runChunks = active.liveLog;
+        const { message: assistantMessage } = await assistantMessageFromChunks(
+          runChunks,
+          active.uiChunkCursor,
         );
-      }
-      // A run interrupted between a provider-executed tool call and its inline
-      // result would otherwise persist an unpaired call that poisons the next
-      // prompt. The delegated result must read the same messages that were
-      // persisted, or a subagent reports an answer its transcript contradicts.
-      const finalMessages = buildSafeRecoveryCheckpoint(
-        agent.getRecoverableMessages(),
-        "run ended",
-      );
-      const claudePromotion =
-        active.claudeRuntime === null
-          ? null
-          : await active.claudeRuntime.finalize(runStatus, finalMessages);
-      this.snapshot = await this.commitRunFinalization(active.openTransitionId, {
-        runId: context.runId,
-        sessionId: this.snapshot.id,
-        runStatus,
-        sessionStatus: error && !cancelled ? "error" : "idle",
-        error,
-        terminalResult: { text: terminalText(finalMessages) },
-        modelMessages: finalMessages,
-        uiMessages,
-        inputTokens: active.inputTokens,
-        providerState: active.providerState,
-        ...(claudePromotion?.owner === "main"
-          ? { claudeBindingPromotion: claudePromotion.value }
-          : {}),
-        ...(claudePromotion?.owner === "named"
-          ? { namedClaudeBindingPromotion: claudePromotion.value }
-          : {}),
-      });
-      this.terminalReplay = undefined;
-    } catch (finalizationError) {
-      rethrowSessionPanic(finalizationError);
-      const message = opaqueErrorMessage(finalizationError, "Run finalization failed");
-      error ??= `Failed to persist final transcript: ${message}`;
-      try {
+        const uiMessages = [...active.chronologicalUiPrefix];
+        if (assistantMessage && assistantMessage.parts.length > 0) {
+          uiMessages.push(
+            ...(runStatus === "completed"
+              ? splitFinalAnswerUIMessage(assistantMessage)
+              : [assistantMessage]),
+          );
+        }
+        // A run interrupted between a provider-executed tool call and its inline
+        // result would otherwise persist an unpaired call that poisons the next
+        // prompt. The delegated result must read the same messages that were
+        // persisted, or a subagent reports an answer its transcript contradicts.
+        const finalMessages = buildSafeRecoveryCheckpoint(
+          agent.getRecoverableMessages(),
+          "run ended",
+        );
+        const claudePromotion =
+          active.claudeRuntime === null
+            ? null
+            : await active.claudeRuntime.finalize(runStatus, finalMessages);
         this.snapshot = await this.commitRunFinalization(active.openTransitionId, {
           runId: context.runId,
           sessionId: this.snapshot.id,
-          runStatus: "error",
-          sessionStatus: "error",
+          runStatus,
+          sessionStatus: error && !cancelled ? "error" : "idle",
           error,
-          terminalResult: { text: terminalText(agent.state.messages) },
-          modelMessages: this.store.getModelMessages(this.snapshot.id),
-          uiMessages: this.store.getUiMessages(this.snapshot.id),
+          terminalResult: { text: terminalText(finalMessages) },
+          modelMessages: finalMessages,
+          uiMessages,
           inputTokens: active.inputTokens,
           providerState: active.providerState,
+          ...(claudePromotion?.owner === "main"
+            ? { claudeBindingPromotion: claudePromotion.value }
+            : {}),
+          ...(claudePromotion?.owner === "named"
+            ? { namedClaudeBindingPromotion: claudePromotion.value }
+            : {}),
         });
         this.terminalReplay = undefined;
-      } catch (fallbackCause) {
-        rethrowSessionPanic(fallbackCause);
-        // Keep the only replayable response alive even though durable state
-        // remains active for startup recovery to terminalize.
-        this.terminalReplay = {
-          runId: active.runId,
-          snapshot: {
-            ...this.snapshot,
-            activeRunId: null,
-            status: "error",
-            queuedSteeringCount: 0,
-            inputTokens: active.inputTokens,
-            updatedAt: new Date().toISOString(),
-          },
-          uiChunkCursor: active.uiChunkCursor,
-          chronologicalUiPrefix: [...active.chronologicalUiPrefix],
-          liveLog: active.liveLog,
-        };
+      }),
+    );
+    let finalizationDefect: OpaqueSessionValue;
+    if (!finalized.ok) {
+      const finalizationError = finalized.error;
+      if (Panic.is(finalizationError)) {
+        finalizationDefect = finalizationError;
+      } else {
+        rethrowSessionPanic(finalizationError);
+        const message = opaqueErrorMessage(finalizationError, "Run finalization failed");
+        error ??= `Failed to persist final transcript: ${message}`;
+        const fallback = sessionCaptureOutcome(
+          await captureSessionPromise(() =>
+            this.commitRunFinalization(active.openTransitionId, {
+              runId: context.runId,
+              sessionId: this.snapshot.id,
+              runStatus: "error",
+              sessionStatus: "error",
+              error,
+              terminalResult: { text: terminalText(agent.state.messages) },
+              modelMessages: this.store.getModelMessages(this.snapshot.id),
+              uiMessages: this.store.getUiMessages(this.snapshot.id),
+              inputTokens: active.inputTokens,
+              providerState: active.providerState,
+            }),
+          ),
+        );
+        if (fallback.ok) {
+          this.snapshot = fallback.value;
+          this.terminalReplay = undefined;
+        } else {
+          if (Panic.is(fallback.error)) {
+            finalizationDefect = fallback.error;
+          } else {
+            // Keep the only replayable response alive even though durable state
+            // remains active for startup recovery to terminalize.
+            this.terminalReplay = {
+              runId: active.runId,
+              snapshot: {
+                ...this.snapshot,
+                activeRunId: null,
+                status: "error",
+                queuedSteeringCount: 0,
+                inputTokens: active.inputTokens,
+                updatedAt: new Date().toISOString(),
+              },
+              uiChunkCursor: active.uiChunkCursor,
+              chronologicalUiPrefix: [...active.chronologicalUiPrefix],
+              liveLog: active.liveLog,
+            };
+          }
+        }
       }
-    } finally {
-      await this.disposeClaudeRuntime(active.claudeRuntime, active.claudeCodeRun, context.runId);
-      this.active = undefined;
-      this.interruptedSteerCommandIds.clear();
     }
+    await this.disposeClaudeRuntime(active.claudeRuntime, active.claudeCodeRun, context.runId);
+    this.active = undefined;
+    this.interruptedSteerCommandIds.clear();
+    if (finalizationDefect !== undefined) return signalSessionFailure(finalizationDefect);
   }
 
   private async commitRunFinalization(
@@ -3624,7 +3698,7 @@ class SessionActor {
       readonly runStatus: "completed" | "cancelled" | "error";
       readonly sessionStatus: "idle" | "error";
       readonly error?: string;
-      readonly terminalResult?: unknown;
+      readonly terminalResult?: { readonly text: string };
       readonly modelMessages: readonly ModelMessage[];
       readonly uiMessages: readonly MiniLilacUIMessage[];
       readonly inputTokens: number | null;
@@ -3668,30 +3742,40 @@ class SessionActor {
         workspaceUnavailableReason: "capture-failed",
       };
       let capture: WorkspaceHistoryCaptureResult | undefined;
-      try {
-        capture = await this.captureWorkspaceWithCacheInvalidationPolicy(lockedStore);
-      } catch (error) {
-        rethrowSessionPanic(error);
+      const capturedWorkspace = sessionCaptureOutcome(
+        await captureSessionPromise(() =>
+          this.captureWorkspaceWithCacheInvalidationPolicy(lockedStore),
+        ),
+      );
+      if (capturedWorkspace.ok) {
+        capture = capturedWorkspace.value;
+      } else {
+        rethrowSessionPanic(capturedWorkspace.error);
         logger.warn("terminal workspace capture failed", {
           requestId: input.runId,
           sessionId: input.sessionId,
-          error: opaqueErrorMessage(error, "Run finalization fallback failed"),
+          error: opaqueErrorMessage(capturedWorkspace.error, "Run finalization fallback failed"),
         });
       }
       if (capture !== undefined) workspace = this.recordWorkspaceCapture(capture);
-      try {
-        const committed = this.store.commitPendingRunFinalization({
-          runId: input.runId,
-          destinationStateId: crypto.randomUUID(),
-          ...(input.providerState === undefined ? {} : { providerState: input.providerState }),
-          ...(input.claudeBindingPromotion === undefined
-            ? {}
-            : { claudeBindingPromotion: input.claudeBindingPromotion }),
-          ...(input.namedClaudeBindingPromotion === undefined
-            ? {}
-            : { namedClaudeBindingPromotion: input.namedClaudeBindingPromotion }),
-          ...workspace,
-        });
+      const committedAttempt = sessionCaptureOutcome(
+        captureSessionOperation(() =>
+          this.store.commitPendingRunFinalization({
+            runId: input.runId,
+            destinationStateId: crypto.randomUUID(),
+            ...(input.providerState === undefined ? {} : { providerState: input.providerState }),
+            ...(input.claudeBindingPromotion === undefined
+              ? {}
+              : { claudeBindingPromotion: input.claudeBindingPromotion }),
+            ...(input.namedClaudeBindingPromotion === undefined
+              ? {}
+              : { namedClaudeBindingPromotion: input.namedClaudeBindingPromotion }),
+            ...workspace,
+          }),
+        ),
+      );
+      if (committedAttempt.ok) {
+        const committed = committedAttempt.value;
         const promotion = input.claudeBindingPromotion ?? input.namedClaudeBindingPromotion;
         const owner = input.claudeBindingPromotion ? "main" : "named";
         if (promotion !== undefined) {
@@ -3734,10 +3818,9 @@ class SessionActor {
           });
         }
         return committed.snapshot;
-      } catch (error) {
-        this.deleteUnreferencedWorkspaceOutcome(workspace);
-        throw error;
       }
+      this.deleteUnreferencedWorkspaceOutcome(workspace);
+      return signalSessionFailure(committedAttempt.error);
     });
   }
 
@@ -3752,7 +3835,7 @@ class SessionActor {
       }
     }
     const operation = projection.eventQueue.then(() => this.handleAgentEvent(projection, event));
-    projection.eventQueue = operation.catch((error) => {
+    projection.eventQueue = observeSessionPromise(operation, (error) => {
       this.reportEventFailure(runId, error);
     });
   }
@@ -3878,7 +3961,8 @@ class SessionActor {
       case "message_start":
         if (event.message.role === "user") {
           return;
-        } else if (event.message.role === "tool") {
+        }
+        if (event.message.role === "tool") {
           for (const part of event.message.content) {
             if (part.type !== "tool-result") continue;
             await this.appendToolResultChunk(runId, projection, part);
@@ -4282,10 +4366,11 @@ class SessionActor {
     const runSubscribers = this.subscribers.get(runId);
     if (!runSubscribers) return;
     for (const subscriber of runSubscribers) {
-      try {
-        enqueueStoredChunk(subscriber, runId, entry);
-      } catch (cause) {
-        rethrowSessionPanic(cause);
+      const published = sessionCaptureOutcome(
+        captureSessionOperation(() => enqueueStoredChunk(subscriber, runId, entry)),
+      );
+      if (!published.ok) {
+        rethrowSessionPanic(published.error);
         runSubscribers.delete(subscriber);
       }
     }
@@ -4296,10 +4381,9 @@ class SessionActor {
     if (!runSubscribers) return;
     this.subscribers.delete(runId);
     for (const subscriber of runSubscribers) {
-      try {
-        subscriber.close();
-      } catch (cause) {
-        rethrowSessionPanic(cause);
+      const closed = sessionCaptureOutcome(captureSessionOperation(() => subscriber.close()));
+      if (!closed.ok) {
+        rethrowSessionPanic(closed.error);
         // A disconnected stream is already closed and does not affect the run.
       }
     }
@@ -4317,7 +4401,7 @@ class SessionActor {
       await this.appendChunk(runId, { type: "data-control", id, data: result });
       await this.appendChunk(runId, { type: "data-session", data: this.describe(this.snapshot) });
     });
-    active.eventQueue = operation.catch((error) => {
+    active.eventQueue = observeSessionPromise(operation, (error) => {
       this.reportEventFailure(runId, error);
     });
     return operation;
@@ -4329,7 +4413,7 @@ class SessionActor {
     const operation = active.eventQueue.then(() =>
       this.appendChunk(runId, { type: "data-steering", id: message.id, data: message }),
     );
-    active.eventQueue = operation.catch((error) => {
+    active.eventQueue = observeSessionPromise(operation, (error) => {
       this.reportEventFailure(runId, error);
     });
     return operation;
@@ -4345,7 +4429,7 @@ class SessionActor {
         data: status,
       }),
     );
-    projection.eventQueue = operation.catch((error) => {
+    projection.eventQueue = observeSessionPromise(operation, (error) => {
       this.reportEventFailure(parentRunId, error);
     });
   }
@@ -4425,7 +4509,7 @@ class SessionActor {
     const operation = active.eventQueue.then(() =>
       this.appendChunk(active.runId, { type: "data-compaction", id: live.chunkId, data }),
     );
-    active.eventQueue = operation.catch((error) => {
+    active.eventQueue = observeSessionPromise(operation, (error) => {
       this.reportEventFailure(active.runId, error);
     });
   }
@@ -4596,28 +4680,11 @@ class SessionActor {
       for (const cancel of this.delegatedCancels.values()) cancel();
       return Result.ok({ kind: "pending" as const, id, command, active, operation });
     });
-    let $preparedResultValue168449!: import("better-result").InferOk<NonNullable<typeof prepared>>;
-    let $preparedResultError168449!: import("better-result").InferErr<NonNullable<typeof prepared>>;
-    const $preparedResultOk168449 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof prepared>>,
-      import("better-result").InferErr<NonNullable<typeof prepared>>,
-      boolean
-    >(prepared, {
-      ok: (value) => {
-        $preparedResultValue168449 = value;
-        return true;
-      },
-      err: (error) => {
-        $preparedResultError168449 = error;
-        return false;
-      },
-    });
-    if (($preparedResultOk168449 ? "ok" : "error") === "error")
-      return Result.err($preparedResultError168449);
-    if ($preparedResultValue168449.kind === "replay")
-      return Result.ok($preparedResultValue168449.result);
+    const preparedOutcome = sessionCaptureOutcome(prepared);
+    if (!preparedOutcome.ok) return Result.err(preparedOutcome.error);
+    if (preparedOutcome.value.kind === "replay") return Result.ok(preparedOutcome.value.result);
 
-    const pending = $preparedResultValue168449;
+    const pending = preparedOutcome.value;
     const interrupted = await pending.operation;
     return this.withLock(async () => {
       const decoded = miniLilacInterruptQueuedSteeringResultSchema.safeParse({
@@ -4847,158 +4914,185 @@ class SessionActor {
     this.store.reserveCommand(this.snapshot.id, commandIdValue, command);
     let operationReserved = false;
     let completed = false;
-    try {
-      if (initialTarget === null) {
-        const committed = this.store.commitEmptyHistoryNavigation({
-          sessionId: this.snapshot.id,
-          commandId: commandIdValue,
-          requestedAction: action,
-          request: command,
-          result: { status: "empty", clientCommandId: commandIdValue },
-        });
-        this.snapshot = this.store.getSession(this.snapshot.id);
-        completed = true;
-        return committed.result;
-      }
-
-      const result = await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
-        let capturedSource: StoredHistoryWorkspaceOutcome | undefined;
-        try {
-          sessionResultToCompatibility(this.workspaceHistoryAvailable(`prepare-${action}`));
-          const source = this.store.getCurrentHistoryState(this.snapshot.id);
-          const sourceCapture = await this.captureWorkspaceWithCacheInvalidationPolicy(lockedStore);
-          capturedSource = this.recordWorkspaceCapture(sourceCapture);
-          const target = sessionResultToCompatibility(this.historyNavigationTargetResult(action));
-          if (
-            target === null ||
-            target.target.id !== initialTarget.target.id ||
-            target.transitionId !== initialTarget.transitionId
-          ) {
-            throw new Error(`History ${action} target changed during preparation`);
-          }
-
-          let filesystemMode: "restore" | "skip" = "skip";
-          let skipReason:
-            | "git-unavailable"
-            | "non-git-workspace"
-            | "snapshot-unavailable"
-            | "platform-unsupported" = "snapshot-unavailable";
-          let preparedRestore: PreparedWorkspaceRestore | undefined;
-          if (target.target.workspaceStatus === "captured") {
-            const snapshot =
-              target.target.workspaceSnapshotId === null
-                ? null
-                : this.store.getWorkspaceSnapshot(target.target.workspaceSnapshotId);
-            if (snapshot !== null && snapshot.availability === "available") {
-              try {
-                const prepared = await lockedStore.prepareRestore(
-                  snapshot.rootTreeOid,
-                  expectedWorkspaceCurrent(sourceCapture),
-                  operationId,
-                );
-                if (prepared.status === "prepared") {
-                  filesystemMode = "restore";
-                  preparedRestore = prepared.plan;
-                } else {
-                  skipReason = prepared.reason;
-                }
-              } catch (error) {
-                if (
-                  !(error instanceof WorkspaceHistoryStoreError) ||
-                  error.code !== "snapshot-invalid"
-                ) {
-                  throw error;
-                }
-                skipReason = "snapshot-unavailable";
-              }
-            }
-          } else if (sourceCapture.status === "skipped") {
-            skipReason = sourceCapture.reason;
-          }
-          if (filesystemMode === "skip") {
-            const deletion = await this.workspaceHistory.deleteRestorePlanResult(operationId);
-            const deletionError = deletion.match({ ok: () => null, err: (error) => error });
-            if (deletionError !== null) throw deletionError;
-          }
-
-          const reserved = this.store.reserveHistoryOperation({
-            id: operationId,
+    const navigated = sessionCaptureOutcome(
+      await captureSessionPromise(async () => {
+        if (initialTarget === null) {
+          const committed = this.store.commitEmptyHistoryNavigation({
             sessionId: this.snapshot.id,
             commandId: commandIdValue,
             requestedAction: action,
-            expectedSourceStateId: source.id,
-            targetStateId: target.target.id,
-            userTransitionId: target.transitionId,
-            filesystemMode,
-            skipReason: filesystemMode === "skip" ? skipReason : null,
-            observation: this.workspaceObservation(source, capturedSource),
+            request: command,
+            result: { status: "empty", clientCommandId: commandIdValue },
           });
-          operationReserved = true;
-
-          if (preparedRestore !== undefined) {
-            this.store.updateHistoryOperationPhase(reserved.operation.id, "restoring");
-            await preparedRestore.apply();
-            this.store.updateHistoryOperationPhase(reserved.operation.id, "verified");
-          }
-
-          const result = {
-            status: action === "undo" ? ("undone" as const) : ("redone" as const),
-            clientCommandId: commandIdValue,
-            message: target.message,
-            historyStateId: target.target.id,
-            filesystem:
-              filesystemMode === "restore"
-                ? ({ status: "restored" } as const)
-                : ({ status: "skipped", reason: skipReason } as const),
-          };
-          this.store.commitHistoryNavigation({ operationId: reserved.operation.id, result });
           this.snapshot = this.store.getSession(this.snapshot.id);
-          if (filesystemMode === "restore") {
-            try {
-              const deletion = await this.workspaceHistory.deleteRestorePlanResult(operationId);
-              const deletionError = deletion.match({ ok: () => null, err: (error) => error });
-              if (deletionError !== null) throw deletionError;
-            } catch (error) {
-              rethrowSessionPanic(error);
-              logger.warn("committed history navigation retained its restore plan", {
-                requestId: commandIdValue,
+          completed = true;
+          return committed.result;
+        }
+
+        const result = await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
+          let capturedSource: StoredHistoryWorkspaceOutcome | undefined;
+          const preparedNavigation = sessionCaptureOutcome(
+            await captureSessionPromise(async () => {
+              sessionResultToCompatibility(this.workspaceHistoryAvailable(`prepare-${action}`));
+              const source = this.store.getCurrentHistoryState(this.snapshot.id);
+              const sourceCapture =
+                await this.captureWorkspaceWithCacheInvalidationPolicy(lockedStore);
+              capturedSource = this.recordWorkspaceCapture(sourceCapture);
+              const target = sessionResultToCompatibility(
+                this.historyNavigationTargetResult(action),
+              );
+              if (
+                target === null ||
+                target.target.id !== initialTarget.target.id ||
+                target.transitionId !== initialTarget.transitionId
+              ) {
+                return signalSessionFailure(
+                  new Error(`History ${action} target changed during preparation`),
+                );
+              }
+
+              let filesystemMode: "restore" | "skip" = "skip";
+              let skipReason:
+                | "git-unavailable"
+                | "non-git-workspace"
+                | "snapshot-unavailable"
+                | "platform-unsupported" = "snapshot-unavailable";
+              let preparedRestore: PreparedWorkspaceRestore | undefined;
+              if (target.target.workspaceStatus === "captured") {
+                const snapshot =
+                  target.target.workspaceSnapshotId === null
+                    ? null
+                    : this.store.getWorkspaceSnapshot(target.target.workspaceSnapshotId);
+                if (snapshot !== null && snapshot.availability === "available") {
+                  const preparedAttempt = sessionCaptureOutcome(
+                    await captureSessionPromise(() =>
+                      lockedStore.prepareRestore(
+                        snapshot.rootTreeOid,
+                        expectedWorkspaceCurrent(sourceCapture),
+                        operationId,
+                      ),
+                    ),
+                  );
+                  if (preparedAttempt.ok) {
+                    const prepared = preparedAttempt.value;
+                    if (prepared.status === "prepared") {
+                      filesystemMode = "restore";
+                      preparedRestore = prepared.plan;
+                    } else {
+                      skipReason = prepared.reason;
+                    }
+                  } else {
+                    const error = preparedAttempt.error;
+                    if (
+                      !(error instanceof WorkspaceHistoryStoreError) ||
+                      error.code !== "snapshot-invalid"
+                    ) {
+                      return signalSessionFailure(error);
+                    }
+                    skipReason = "snapshot-unavailable";
+                  }
+                }
+              } else if (sourceCapture.status === "skipped") {
+                skipReason = sourceCapture.reason;
+              }
+              if (filesystemMode === "skip") {
+                const deletion = await this.workspaceHistory.deleteRestorePlanResult(operationId);
+                const deletionError = deletion.match({ ok: () => null, err: (error) => error });
+                if (deletionError !== null) return signalSessionFailure(deletionError);
+              }
+
+              const reserved = this.store.reserveHistoryOperation({
+                id: operationId,
                 sessionId: this.snapshot.id,
-                operationId,
-                error: opaqueErrorMessage(error, "Restore plan cleanup failed"),
+                commandId: commandIdValue,
+                requestedAction: action,
+                expectedSourceStateId: source.id,
+                targetStateId: target.target.id,
+                userTransitionId: target.transitionId,
+                filesystemMode,
+                skipReason: filesystemMode === "skip" ? skipReason : null,
+                observation: this.workspaceObservation(source, capturedSource),
               });
-            }
-          }
-          return result;
-        } catch (error) {
+              operationReserved = true;
+
+              if (preparedRestore !== undefined) {
+                this.store.updateHistoryOperationPhase(reserved.operation.id, "restoring");
+                await preparedRestore.apply();
+                this.store.updateHistoryOperationPhase(reserved.operation.id, "verified");
+              }
+
+              const result = {
+                status: action === "undo" ? ("undone" as const) : ("redone" as const),
+                clientCommandId: commandIdValue,
+                message: target.message,
+                historyStateId: target.target.id,
+                filesystem:
+                  filesystemMode === "restore"
+                    ? ({ status: "restored" } as const)
+                    : ({ status: "skipped", reason: skipReason } as const),
+              };
+              this.store.commitHistoryNavigation({ operationId: reserved.operation.id, result });
+              this.snapshot = this.store.getSession(this.snapshot.id);
+              if (filesystemMode === "restore") {
+                const deleted = sessionCaptureOutcome(
+                  await captureSessionPromise(async () => {
+                    const deletion =
+                      await this.workspaceHistory.deleteRestorePlanResult(operationId);
+                    const deletionError = deletion.match({ ok: () => null, err: (error) => error });
+                    if (deletionError !== null) return signalSessionFailure(deletionError);
+                  }),
+                );
+                if (!deleted.ok) {
+                  rethrowSessionPanic(deleted.error);
+                  logger.warn("committed history navigation retained its restore plan", {
+                    requestId: commandIdValue,
+                    sessionId: this.snapshot.id,
+                    operationId,
+                    error: opaqueErrorMessage(deleted.error, "Restore plan cleanup failed"),
+                  });
+                }
+              }
+              return result;
+            }),
+          );
+          if (preparedNavigation.ok) return preparedNavigation.value;
+          const error = preparedNavigation.error;
           if (!operationReserved) {
             if (capturedSource !== undefined) {
               this.deleteUnreferencedWorkspaceOutcome(capturedSource);
             }
-            try {
-              const deletion = await this.workspaceHistory.deleteRestorePlanResult(operationId);
-              const deletionError = deletion.match({ ok: () => null, err: (error) => error });
-              if (deletionError !== null) throw deletionError;
-            } catch (cleanupError) {
-              if (Panic.is(error)) throw error;
-              if (Panic.is(cleanupError)) throw cleanupError;
-              throw new MiniLilacSessionOperationAndCleanupFailed({
-                operation: `history-${action}-preparation`,
-                operationError: error,
-                cleanupError,
-                message: `History ${action} preparation and restore-plan cleanup both failed`,
-              });
+            const cleanup = sessionCaptureOutcome(
+              await captureSessionPromise(async () => {
+                const deletion = await this.workspaceHistory.deleteRestorePlanResult(operationId);
+                const deletionError = deletion.match({ ok: () => null, err: (error) => error });
+                if (deletionError !== null) return signalSessionFailure(deletionError);
+              }),
+            );
+            if (!cleanup.ok) {
+              const cleanupError = cleanup.error;
+              if (Panic.is(error)) return signalSessionFailure(error);
+              if (Panic.is(cleanupError)) return signalSessionFailure(cleanupError);
+              return signalSessionFailure(
+                new MiniLilacSessionOperationAndCleanupFailed({
+                  operation: `history-${action}-preparation`,
+                  operationError: error,
+                  cleanupError,
+                  message: `History ${action} preparation and restore-plan cleanup both failed`,
+                }),
+              );
             }
           }
-          throw error;
-        }
-      });
-      completed = true;
-      return result;
-    } finally {
-      if (!operationReserved && !completed) {
-        this.store.releaseCommand(this.snapshot.id, commandIdValue, command);
-      }
+          return signalSessionFailure(error);
+        });
+        completed = true;
+        return result;
+      }),
+    );
+    if (!operationReserved && !completed) {
+      this.store.releaseCommand(this.snapshot.id, commandIdValue, command);
     }
+    if (!navigated.ok) return signalSessionFailure(navigated.error);
+    return navigated.value;
   }
 
   /**
@@ -5085,37 +5179,19 @@ class SessionActor {
       this.manualCompaction = live;
       return Result.ok({ kind: "admitted", id, command, messages, live } as const);
     });
-    let $admittedResultValue186491!: import("better-result").InferOk<NonNullable<typeof admitted>>;
-    let $admittedResultError186491!: import("better-result").InferErr<NonNullable<typeof admitted>>;
-    const $admittedResultOk186491 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof admitted>>,
-      import("better-result").InferErr<NonNullable<typeof admitted>>,
-      boolean
-    >(admitted, {
-      ok: (value) => {
-        $admittedResultValue186491 = value;
-        return true;
-      },
-      err: (error) => {
-        $admittedResultError186491 = error;
-        return false;
-      },
-    });
+    const admittedOutcome = sessionCaptureOutcome(admitted);
 
-    if (($admittedResultOk186491 ? "ok" : "error") === "error")
-      return Result.err($admittedResultError186491);
-    if ($admittedResultValue186491.kind === "replay") {
+    if (!admittedOutcome.ok) return Result.err(admittedOutcome.error);
+    if (admittedOutcome.value.kind === "replay") {
       return Result.ok({
-        stream: singleCompactionEventStream(compactionEventFor($admittedResultValue186491.result)),
+        stream: singleCompactionEventStream(compactionEventFor(admittedOutcome.value.result)),
       });
     }
 
     // Tracked as runtime work rather than as part of the caller's promise: the
     // store must stay open, and shutdown must wait, even with no client attached.
-    void this.trackExecution(
-      this.runCompaction($admittedResultValue186491, $admittedResultValue186491.live),
-    );
-    return Result.ok({ stream: this.subscribeCompaction($admittedResultValue186491.live) });
+    void this.trackExecution(this.runCompaction(admittedOutcome.value, admittedOutcome.value.live));
+    return Result.ok({ stream: this.subscribeCompaction(admittedOutcome.value.live) });
   }
 
   /**
@@ -5175,10 +5251,11 @@ class SessionActor {
 
   private broadcastCompaction(live: ManualCompaction, chunk: MiniLilacRuntimeChunk): void {
     for (const subscriber of live.subscribers) {
-      try {
-        subscriber.enqueue(chunk);
-      } catch (cause) {
-        rethrowSessionPanic(cause);
+      const published = sessionCaptureOutcome(
+        captureSessionOperation(() => subscriber.enqueue(chunk)),
+      );
+      if (!published.ok) {
+        rethrowSessionPanic(published.error);
         // The client went away mid-write; the next detach cleans it up.
       }
     }
@@ -5237,129 +5314,130 @@ class SessionActor {
 
     publishSession();
 
-    try {
-      const summarized = await this.summarizeForCompaction({
-        messages,
-        clientCommandId: id,
-        abortSignal: live.controller.signal,
-        onProgress: (progress) => {
-          modelCalls += 1;
-          // Each refinement step rewrites the whole anchored summary.
-          summary = "";
-          publish(event("progress", { progress }));
-        },
-        onSummaryDelta: (delta, progress) => {
-          summary += delta;
-          const now = Date.now();
-          if (now - lastPublishedAt < COMPACTION_SUMMARY_PUBLISH_INTERVAL_MS) return;
-          lastPublishedAt = now;
-          publish(event("progress", { progress }));
-        },
-      });
-      let $summarizedResultValue193700!: import("better-result").InferOk<
-        NonNullable<typeof summarized>
-      >;
-      let $summarizedResultError193700!: import("better-result").InferErr<
-        NonNullable<typeof summarized>
-      >;
-      const $summarizedResultOk193700 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof summarized>>,
-        import("better-result").InferErr<NonNullable<typeof summarized>>,
-        boolean
-      >(summarized, {
-        ok: (value) => {
-          $summarizedResultValue193700 = value;
-          return true;
-        },
-        err: (error) => {
-          $summarizedResultError193700 = error;
-          return false;
-        },
-      });
-      if (($summarizedResultOk193700 ? "ok" : "error") === "error") {
-        await fail({
-          cancelled: false,
-          error: $summarizedResultError193700.message,
+    const compacted = sessionCaptureOutcome(
+      await captureSessionPromise(async () => {
+        const summarized = await this.summarizeForCompaction({
+          messages,
+          clientCommandId: id,
+          abortSignal: live.controller.signal,
+          onProgress: (progress) => {
+            modelCalls += 1;
+            // Each refinement step rewrites the whole anchored summary.
+            summary = "";
+            publish(event("progress", { progress }));
+          },
+          onSummaryDelta: (delta, progress) => {
+            summary += delta;
+            const now = Date.now();
+            if (now - lastPublishedAt < COMPACTION_SUMMARY_PUBLISH_INTERVAL_MS) return;
+            lastPublishedAt = now;
+            publish(event("progress", { progress }));
+          },
         });
-        return;
-      }
-      const summaryResult = $summarizedResultValue193700;
-
-      // Validate the terminal payload before committing. Once the transaction
-      // below returns, no failure may be reported as if the transcript were
-      // unchanged.
-      const completedEvent = event("completed", {
-        outcome: summaryResult.result.status,
-        messageCountAfter: summaryResult.result.messageCountAfter,
-        estimatedInputTokensBefore: summaryResult.result.estimatedInputTokensBefore,
-        estimatedInputTokensAfter: summaryResult.result.estimatedInputTokensAfter,
-        durationMs: Math.max(0, Date.now() - live.startedAt),
-        ...(summaryResult.summary === undefined ? {} : { summary: summaryResult.summary }),
-      });
-
-      await this.withLock(async () => {
-        // A cancel that lands while summarization is finishing must still stop
-        // the commit; the transcript is only rewritten here.
-        live.controller.signal.throwIfAborted();
-        const saved = await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
-          live.controller.signal.throwIfAborted();
-          const current = this.store.getCurrentHistoryState(sessionId);
-          live.controller.signal.throwIfAborted();
-          const workspace = await this.captureWorkspaceOutcome(lockedStore, live.controller.signal);
-          let committed = false;
-          try {
-            live.controller.signal.throwIfAborted();
-            const committedResult = this.store.commitHistoryCompaction({
-              sessionId,
-              commandId: id,
-              request: command,
-              expectedCurrentStateId: current.id,
-              stateId: crypto.randomUUID(),
-              transitionId: crypto.randomUUID(),
-              modelMessages: summaryResult.messages,
-              compactionEvent: completedEvent,
-              result: summaryResult.result,
-              ...(current.providerState === null ? {} : { providerState: current.providerState }),
-              observation: this.workspaceObservation(current, workspace),
-              ...workspace,
-            });
-            committed = true;
-            return committedResult;
-          } finally {
-            if (!committed) this.deleteUnreferencedWorkspaceOutcome(workspace);
-          }
-        });
-        live.finished = true;
-        this.snapshot = saved.snapshot;
-      });
-
-      // The session snapshot precedes the terminal event: the terminal event is
-      // where clients stop reading, so anything after it would never arrive.
-      publishSession();
-      publish(completedEvent);
-    } catch (error) {
-      const wrappedAbort = Panic.is(error) && isAbortError(error.cause);
-      const cancelled = Panic.is(error)
-        ? wrappedAbort
-        : live.controller.signal.aborted || isAbortError(error);
-      if (!cancelled) rethrowSessionPanic(error);
-      await fail({
-        cancelled,
-        ...(cancelled ? {} : { error: opaqueErrorMessage(error, "Compaction failed") }),
-      });
-    } finally {
-      live.finished = true;
-      if (this.manualCompaction === live) this.manualCompaction = undefined;
-      for (const subscriber of live.subscribers) {
-        try {
-          subscriber.close();
-        } catch (cause) {
-          rethrowSessionPanic(cause);
-          // Already closed by the client.
+        const summarizedOutcome = sessionCaptureOutcome(summarized);
+        if (!summarizedOutcome.ok) {
+          await fail({
+            cancelled: false,
+            error: summarizedOutcome.error.message,
+          });
+          return;
         }
+        const summaryResult = summarizedOutcome.value;
+
+        // Validate the terminal payload before committing. Once the transaction
+        // below returns, no failure may be reported as if the transcript were
+        // unchanged.
+        const completedEvent = event("completed", {
+          outcome: summaryResult.result.status,
+          messageCountAfter: summaryResult.result.messageCountAfter,
+          estimatedInputTokensBefore: summaryResult.result.estimatedInputTokensBefore,
+          estimatedInputTokensAfter: summaryResult.result.estimatedInputTokensAfter,
+          durationMs: Math.max(0, Date.now() - live.startedAt),
+          ...(summaryResult.summary === undefined ? {} : { summary: summaryResult.summary }),
+        });
+
+        await this.withLock(async () => {
+          // A cancel that lands while summarization is finishing must still stop
+          // the commit; the transcript is only rewritten here.
+          live.controller.signal.throwIfAborted();
+          const saved = await this.workspaceHistory.withWorkspaceLock(async (lockedStore) => {
+            live.controller.signal.throwIfAborted();
+            const current = this.store.getCurrentHistoryState(sessionId);
+            live.controller.signal.throwIfAborted();
+            const workspace = await this.captureWorkspaceOutcome(
+              lockedStore,
+              live.controller.signal,
+            );
+            const committed = sessionCaptureOutcome(
+              captureSessionOperation(() => {
+                live.controller.signal.throwIfAborted();
+                return this.store.commitHistoryCompaction({
+                  sessionId,
+                  commandId: id,
+                  request: command,
+                  expectedCurrentStateId: current.id,
+                  stateId: crypto.randomUUID(),
+                  transitionId: crypto.randomUUID(),
+                  modelMessages: summaryResult.messages,
+                  compactionEvent: completedEvent,
+                  result: summaryResult.result,
+                  ...(current.providerState === null
+                    ? {}
+                    : { providerState: current.providerState }),
+                  observation: this.workspaceObservation(current, workspace),
+                  ...workspace,
+                });
+              }),
+            );
+            if (!committed.ok) {
+              this.deleteUnreferencedWorkspaceOutcome(workspace);
+              return signalSessionFailure(committed.error);
+            }
+            return committed.value;
+          });
+          live.finished = true;
+          this.snapshot = saved.snapshot;
+        });
+
+        // The session snapshot precedes the terminal event: the terminal event is
+        // where clients stop reading, so anything after it would never arrive.
+        publishSession();
+        publish(completedEvent);
+      }),
+    );
+    let handlingError: OpaqueSessionValue;
+    let hasHandlingError = false;
+    if (!compacted.ok) {
+      const handled = sessionCaptureOutcome(
+        await captureSessionPromise(async () => {
+          const error = compacted.error;
+          const wrappedAbort = Panic.is(error) && isAbortError(rethrowSessionPanic(error, true));
+          const cancelled = Panic.is(error)
+            ? wrappedAbort
+            : live.controller.signal.aborted || isAbortError(error);
+          if (!cancelled) rethrowSessionPanic(error);
+          await fail({
+            cancelled,
+            ...(cancelled ? {} : { error: opaqueErrorMessage(error, "Compaction failed") }),
+          });
+        }),
+      );
+      if (!handled.ok) {
+        handlingError = handled.error;
+        hasHandlingError = true;
       }
-      live.subscribers.clear();
     }
+    live.finished = true;
+    if (this.manualCompaction === live) this.manualCompaction = undefined;
+    for (const subscriber of live.subscribers) {
+      const closed = sessionCaptureOutcome(captureSessionOperation(() => subscriber.close()));
+      if (!closed.ok) {
+        rethrowSessionPanic(closed.error);
+        // Already closed by the client.
+      }
+    }
+    live.subscribers.clear();
+    if (hasHandlingError) return signalSessionFailure(handlingError);
   }
 
   private async summarizeForCompaction(params: {
@@ -5450,12 +5528,13 @@ class SessionActor {
         denyPaths: [...DEFAULT_DENY_PATHS, ...this.protectedToolPaths],
       });
       let readFileMediaSupported = false;
-      try {
-        readFileMediaSupported = supportsReadFileMedia(
-          await this.modelCapability.resolve(modelSpecifier),
-        );
-      } catch (cause) {
-        rethrowSessionPanic(cause);
+      const capability = sessionCaptureOutcome(
+        await captureSessionPromise(() => this.modelCapability.resolve(modelSpecifier)),
+      );
+      if (capability.ok) {
+        readFileMediaSupported = supportsReadFileMedia(capability.value);
+      } else {
+        rethrowSessionPanic(capability.error);
         // Keep the manual compaction tool declaration conservative when capability is unknown.
       }
       const tools = this.createTools(
@@ -5747,15 +5826,17 @@ export class SessionService {
     this.resolveModelLimits =
       this.options.modelLimitsResolver ??
       (async (specifier) => {
-        try {
-          const capability = await this.modelCapability.resolve(specifier);
+        const resolved = sessionCaptureOutcome(
+          await captureSessionPromise(() => this.modelCapability.resolve(specifier)),
+        );
+        if (resolved.ok) {
+          const capability = resolved.value;
           return capability.limit.context > 0
             ? { context: capability.limit.context, output: capability.limit.output }
             : undefined;
-        } catch (cause) {
-          rethrowSessionPanic(cause);
-          return undefined;
         }
+        rethrowSessionPanic(resolved.error);
+        return undefined;
       });
     this.attachCompaction = this.options.attachCompaction ?? attachAutoCompaction;
     this.supersededProviderIds = new Set(providers?.supersededProviderIds);
@@ -5778,7 +5859,7 @@ export class SessionService {
     this.initialization = this.recoverHistory().finally(() => {
       this.initializationBlocksClose = false;
     });
-    void this.initialization.catch((error) => {
+    void observeSessionPromise(this.initialization, (error) => {
       logger.error("session history recovery failed", {
         error: opaqueErrorMessage(error, "Recovery workspace capture failed"),
       });
@@ -5866,36 +5947,20 @@ export class SessionService {
     lockedStore: LockedWorkspaceHistoryStore,
   ): Promise<ResultType<WorkspaceHistoryCaptureResult, MiniLilacSessionServiceError>> {
     const captured = await lockedStore.captureResult();
-    let $capturedResultValue217391!: import("better-result").InferOk<NonNullable<typeof captured>>;
-    let $capturedResultError217391!: import("better-result").InferErr<NonNullable<typeof captured>>;
-    const $capturedResultOk217391 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof captured>>,
-      import("better-result").InferErr<NonNullable<typeof captured>>,
-      boolean
-    >(captured, {
-      ok: (value) => {
-        $capturedResultValue217391 = value;
-        return true;
-      },
-      err: (error) => {
-        $capturedResultError217391 = error;
-        return false;
-      },
-    });
-    if (($capturedResultOk217391 ? "ok" : "error") === "ok")
-      return Result.ok($capturedResultValue217391);
-    if ($capturedResultError217391 instanceof WorkspaceHistoryStoreError) {
+    const capturedOutcome = sessionCaptureOutcome(captured);
+    if (capturedOutcome.ok) return Result.ok(capturedOutcome.value);
+    if (capturedOutcome.error instanceof WorkspaceHistoryStoreError) {
       return Result.err(
-        mapMiniLilacPersistenceFailure("captureWorkspaceHistory", $capturedResultError217391),
+        mapMiniLilacPersistenceFailure("captureWorkspaceHistory", capturedOutcome.error),
       );
     }
 
     const diagnostic: WorkspaceHistoryPersistenceDiagnostic = {
       operation: "invalidate-capture-cache",
-      recordKind: $capturedResultError217391.recordKind,
-      issueCode: $capturedResultError217391.issueCode,
-      ...($capturedResultError217391._tag === "WorkspaceHistoryPersistenceUnsupportedVersion"
-        ? { versionCategory: $capturedResultError217391.versionCategory }
+      recordKind: capturedOutcome.error.recordKind,
+      issueCode: capturedOutcome.error.issueCode,
+      ...(capturedOutcome.error._tag === "WorkspaceHistoryPersistenceUnsupportedVersion"
+        ? { versionCategory: capturedOutcome.error.versionCategory }
         : {}),
     };
     logger.warn("workspace history capture cache invalidated", diagnostic);
@@ -5909,32 +5974,13 @@ export class SessionService {
       );
     }
     const recomputed = await lockedStore.captureResult();
-    let $recomputedResultValue218448!: import("better-result").InferOk<
-      NonNullable<typeof recomputed>
-    >;
-    let $recomputedResultError218448!: import("better-result").InferErr<
-      NonNullable<typeof recomputed>
-    >;
-    const $recomputedResultOk218448 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof recomputed>>,
-      import("better-result").InferErr<NonNullable<typeof recomputed>>,
-      boolean
-    >(recomputed, {
-      ok: (value) => {
-        $recomputedResultValue218448 = value;
-        return true;
-      },
-      err: (error) => {
-        $recomputedResultError218448 = error;
-        return false;
-      },
-    });
-    if (($recomputedResultOk218448 ? "ok" : "error") === "error") {
+    const recomputedOutcome = sessionCaptureOutcome(recomputed);
+    if (!recomputedOutcome.ok) {
       return Result.err(
-        mapMiniLilacPersistenceFailure("recomputeWorkspaceCapture", $recomputedResultError218448),
+        mapMiniLilacPersistenceFailure("recomputeWorkspaceCapture", recomputedOutcome.error),
       );
     }
-    return Result.ok($recomputedResultValue218448);
+    return Result.ok(recomputedOutcome.value);
   }
 
   private logWorkspaceHistoryMetric(workspaceId: string, metric: WorkspaceHistoryMetric): void {
@@ -6073,30 +6119,15 @@ export class SessionService {
     };
     let capture: WorkspaceHistoryCaptureResult | undefined;
     const captured = await this.captureWorkspaceWithCacheInvalidationPolicyResult(lockedStore);
-    let $capturedResultValue223662!: import("better-result").InferOk<NonNullable<typeof captured>>;
-    let $capturedResultError223662!: import("better-result").InferErr<NonNullable<typeof captured>>;
-    const $capturedResultOk223662 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof captured>>,
-      import("better-result").InferErr<NonNullable<typeof captured>>,
-      boolean
-    >(captured, {
-      ok: (value) => {
-        $capturedResultValue223662 = value;
-        return true;
-      },
-      err: (error) => {
-        $capturedResultError223662 = error;
-        return false;
-      },
-    });
-    if (($capturedResultOk223662 ? "ok" : "error") === "error") {
+    const capturedOutcome = sessionCaptureOutcome(captured);
+    if (!capturedOutcome.ok) {
       logger.warn("recovery workspace capture failed", {
         requestId: pending.runId,
         sessionId: pending.sessionId,
-        error: opaqueErrorMessage($capturedResultError223662, "Recovery workspace capture failed"),
+        error: opaqueErrorMessage(capturedOutcome.error, "Recovery workspace capture failed"),
       });
     } else {
-      capture = $capturedResultValue223662;
+      capture = capturedOutcome.value;
     }
     if (capture !== undefined) {
       workspace = this.recordWorkspaceCaptureForSession(pending.sessionId, capture);
@@ -6223,27 +6254,8 @@ export class SessionService {
           },
         },
       });
-      let $maintenanceResultValue228648!: import("better-result").InferOk<
-        NonNullable<typeof maintenance>
-      >;
-      let $maintenanceResultError228648!: import("better-result").InferErr<
-        NonNullable<typeof maintenance>
-      >;
-      const $maintenanceResultOk228648 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof maintenance>>,
-        import("better-result").InferErr<NonNullable<typeof maintenance>>,
-        boolean
-      >(maintenance, {
-        ok: (value) => {
-          $maintenanceResultValue228648 = value;
-          return true;
-        },
-        err: (error) => {
-          $maintenanceResultError228648 = error;
-          return false;
-        },
-      });
-      if (($maintenanceResultOk228648 ? "ok" : "error") === "error") {
+      const maintenanceOutcome = sessionCaptureOutcome(maintenance);
+      if (!maintenanceOutcome.ok) {
         const accounting = this.store.getHistoryAccountingResult(workspace.id);
         const accountingValue = accounting.match({ ok: (value) => value, err: () => null });
         if (accountingValue === null) {
@@ -6253,8 +6265,8 @@ export class SessionService {
             maintenanceFailureCount: 1,
             accountingUnavailableCount: 1,
             errorType:
-              $maintenanceResultError228648 instanceof WorkspaceHistoryStoreError
-                ? $maintenanceResultError228648.code
+              maintenanceOutcome.error instanceof WorkspaceHistoryStoreError
+                ? maintenanceOutcome.error.code
                 : "unexpected",
           });
         } else {
@@ -6270,14 +6282,14 @@ export class SessionService {
             activeOperationCount: accountingValue.activeOperationCount,
             pendingFinalizationCount: accountingValue.pendingFinalizationCount,
             errorType:
-              $maintenanceResultError228648 instanceof WorkspaceHistoryStoreError
-                ? $maintenanceResultError228648.code
+              maintenanceOutcome.error instanceof WorkspaceHistoryStoreError
+                ? maintenanceOutcome.error.code
                 : "unexpected",
           });
         }
         continue;
       }
-      const result = $maintenanceResultValue228648;
+      const result = maintenanceOutcome.value;
       const accounting = this.store.getHistoryAccounting(workspace.id);
       if (result.status === "unavailable") {
         logger.info("workspace history maintenance completed", {
@@ -6344,76 +6356,39 @@ export class SessionService {
           this.store.listWorkspaceSnapshots(workspace.id).map((snapshot) => snapshot.rootTreeOid),
         );
       });
-      let $lockedResultValue233716!: import("better-result").InferOk<NonNullable<typeof locked>>;
-      let $lockedResultError233716!: import("better-result").InferErr<NonNullable<typeof locked>>;
-      const $lockedResultOk233716 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof locked>>,
-        import("better-result").InferErr<NonNullable<typeof locked>>,
-        boolean
-      >(locked, {
-        ok: (value) => {
-          $lockedResultValue233716 = value;
-          return true;
-        },
-        err: (error) => {
-          $lockedResultError233716 = error;
-          return false;
-        },
-      });
-      if (($lockedResultOk233716 ? "ok" : "error") === "error") {
+      const lockedOutcome = sessionCaptureOutcome(locked);
+      if (!lockedOutcome.ok) {
         return Result.err(
           mapMiniLilacPersistenceFailure(
             "reconcileWorkspaceSnapshotRefs.lock",
-            $lockedResultError233716,
+            lockedOutcome.error,
           ),
         );
       }
-      const reconciliation = $lockedResultValue233716;
-      let $reconciliationResultValue234253!: import("better-result").InferOk<
-        NonNullable<typeof reconciliation>
-      >;
-      let $reconciliationResultError234253!: import("better-result").InferErr<
-        NonNullable<typeof reconciliation>
-      >;
-      const $reconciliationResultOk234253 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof reconciliation>>,
-        import("better-result").InferErr<NonNullable<typeof reconciliation>>,
-        boolean
-      >(reconciliation, {
-        ok: (value) => {
-          $reconciliationResultValue234253 = value;
-          return true;
-        },
-        err: (error) => {
-          $reconciliationResultError234253 = error;
-          return false;
-        },
-      });
-      if (($reconciliationResultOk234253 ? "ok" : "error") === "error") {
+      const reconciliation = lockedOutcome.value;
+      const reconciliationOutcome = sessionCaptureOutcome(reconciliation);
+      if (!reconciliationOutcome.ok) {
         return Result.err(
           mapMiniLilacPersistenceFailure(
             "reconcileWorkspaceSnapshotRefs",
-            $reconciliationResultError234253,
+            reconciliationOutcome.error,
           ),
         );
       }
       const snapshots = this.store.listWorkspaceSnapshots(workspace.id);
-      if ($reconciliationResultValue234253.status === "unavailable") {
+      if (reconciliationOutcome.value.status === "unavailable") {
         statuses.push({
           workspaceId: workspace.id,
           canonicalCwd: workspace.canonicalCwd,
           status: "unavailable",
-          reason: $reconciliationResultValue234253.reason,
+          reason: reconciliationOutcome.value.reason,
           orphanRefs: [],
         });
         continue;
       }
 
       const expectedByRoot = new Map(
-        $reconciliationResultValue234253.expected.map((expected) => [
-          expected.rootTreeOid,
-          expected,
-        ]),
+        reconciliationOutcome.value.expected.map((expected) => [expected.rootTreeOid, expected]),
       );
       const updates = [];
       for (const snapshot of snapshots) {
@@ -6454,12 +6429,12 @@ export class SessionService {
         workspaceId: workspace.id,
         canonicalCwd: workspace.canonicalCwd,
         status: "reconciled",
-        orphanRefs: $reconciliationResultValue234253.orphanRefs,
+        orphanRefs: reconciliationOutcome.value.orphanRefs,
       });
-      if ($reconciliationResultValue234253.orphanRefs.length > 0) {
+      if (reconciliationOutcome.value.orphanRefs.length > 0) {
         logger.warn("workspace history reconciliation retained orphan snapshot refs", {
           workspaceId: workspace.id,
-          orphanRefCount: $reconciliationResultValue234253.orphanRefs.length,
+          orphanRefCount: reconciliationOutcome.value.orphanRefs.length,
         });
       }
     }
@@ -6551,35 +6526,16 @@ export class SessionService {
         const verification = await this.workspaceHistoryForSession(
           operation.sessionId,
         ).verifySnapshotResult(snapshot.rootTreeOid);
-        let $verificationResultValue239725!: import("better-result").InferOk<
-          NonNullable<typeof verification>
-        >;
-        let $verificationResultError239725!: import("better-result").InferErr<
-          NonNullable<typeof verification>
-        >;
-        const $verificationResultOk239725 = Result.match<
-          import("better-result").InferOk<NonNullable<typeof verification>>,
-          import("better-result").InferErr<NonNullable<typeof verification>>,
-          boolean
-        >(verification, {
-          ok: (value) => {
-            $verificationResultValue239725 = value;
-            return true;
-          },
-          err: (error) => {
-            $verificationResultError239725 = error;
-            return false;
-          },
-        });
-        if (($verificationResultOk239725 ? "ok" : "error") === "error") {
+        const verificationOutcome = sessionCaptureOutcome(verification);
+        if (!verificationOutcome.ok) {
           return Result.err(
             mapMiniLilacPersistenceFailure(
               "recoverHistoryNavigation.verifySnapshot",
-              $verificationResultError239725,
+              verificationOutcome.error,
             ),
           );
         }
-        const verified = $verificationResultValue239725;
+        const verified = verificationOutcome.value;
         if (verified.status === "skipped" && verified.reason !== "non-git-workspace") {
           return Result.err(
             rejectSessionOperation(
@@ -6707,26 +6663,20 @@ export class SessionService {
 
   private capturePersistenceResult<T>(
     operationName: string,
-    operation: () => T,
+    operation: () => Awaited<T>,
   ): ResultType<T, MiniLilacSessionServiceError> {
-    try {
-      return Result.ok(operation());
-    } catch (cause) {
-      const failure = mapMiniLilacPersistenceFailure(operationName, cause);
-      return Result.err(failure);
-    }
+    const captured = sessionCaptureOutcome(captureSessionOperation(operation));
+    if (captured.ok) return Result.ok(captured.value);
+    return Result.err(mapMiniLilacPersistenceFailure(operationName, captured.error));
   }
 
   private async capturePersistencePromise<T>(
     operationName: string,
     operation: () => Promise<T>,
   ): Promise<ResultType<T, MiniLilacSessionServiceError>> {
-    try {
-      return Result.ok(await operation());
-    } catch (cause) {
-      const failure = mapMiniLilacPersistenceFailure(operationName, cause);
-      return Result.err(failure);
-    }
+    const captured = sessionCaptureOutcome(await captureSessionPromise(operation));
+    if (captured.ok) return Result.ok(captured.value);
+    return Result.err(mapMiniLilacPersistenceFailure(operationName, captured.error));
   }
 
   createSession(input: CreateSessionInput): Promise<MiniLilacSessionSnapshot> {
@@ -6759,21 +6709,26 @@ export class SessionService {
         ),
       );
     }
-    let cwd: string;
-    let cwdStat: Awaited<ReturnType<typeof stat>>;
-    try {
-      cwd = await realpath(input.cwd);
-      cwdStat = await stat(cwd);
-    } catch (cause) {
-      rethrowSessionPanic(cause);
+    const inspectedCwd = sessionCaptureOutcome(
+      await captureSessionPromise(async () => {
+        const cwd = await realpath(input.cwd);
+        return { cwd, cwdStat: await stat(cwd) };
+      }),
+    );
+    if (!inspectedCwd.ok) {
+      rethrowSessionPanic(inspectedCwd.error);
       return Result.err(
         new MiniLilacSessionExternalFailure({
           operation: "createSession",
-          cause,
-          message: opaqueErrorMessage(cause, `Unable to access session cwd '${input.cwd}'`),
+          cause: inspectedCwd.error,
+          message: opaqueErrorMessage(
+            inspectedCwd.error,
+            `Unable to access session cwd '${input.cwd}'`,
+          ),
         }),
       );
     }
+    const { cwd, cwdStat } = inspectedCwd.value;
     if (!cwdStat.isDirectory()) {
       return Result.err(
         rejectSessionOperation("createSession", `Session cwd '${cwd}' is not a directory`),
@@ -6784,15 +6739,19 @@ export class SessionService {
     if (!modelRefValid) {
       return Result.err(rejectSessionOperation("createSession", `Invalid model '${input.model}'`));
     }
-    try {
-      this.resolveModel(input.model);
-    } catch (cause) {
-      rethrowSessionPanic(cause);
+    const resolvedModel = sessionCaptureOutcome(
+      captureSessionOperation(() => this.resolveModel(input.model)),
+    );
+    if (!resolvedModel.ok) {
+      rethrowSessionPanic(resolvedModel.error);
       return Result.err(
         new MiniLilacSessionExternalFailure({
           operation: "createSession.resolveModel",
-          cause,
-          message: opaqueErrorMessage(cause, `Unable to resolve model '${input.model}'`),
+          cause: resolvedModel.error,
+          message: opaqueErrorMessage(
+            resolvedModel.error,
+            `Unable to resolve model '${input.model}'`,
+          ),
         }),
       );
     }
@@ -6819,25 +6778,9 @@ export class SessionService {
         contextWindow: limits?.context,
       }),
     );
-    let $createdResultValue248238!: import("better-result").InferOk<NonNullable<typeof created>>;
-    let $createdResultError248238!: import("better-result").InferErr<NonNullable<typeof created>>;
-    const $createdResultOk248238 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof created>>,
-      import("better-result").InferErr<NonNullable<typeof created>>,
-      boolean
-    >(created, {
-      ok: (value) => {
-        $createdResultValue248238 = value;
-        return true;
-      },
-      err: (error) => {
-        $createdResultError248238 = error;
-        return false;
-      },
-    });
-    if (($createdResultOk248238 ? "ok" : "error") === "error")
-      return Result.err($createdResultError248238);
-    const snapshot = $createdResultValue248238;
+    const createdOutcome = sessionCaptureOutcome(created);
+    if (!createdOutcome.ok) return Result.err(createdOutcome.error);
+    const snapshot = createdOutcome.value;
     this.actors.set(snapshot.id, this.createActor(snapshot));
     return Result.ok(snapshot);
   }
@@ -6923,21 +6866,26 @@ export class SessionService {
     const initializationError = initialized.match({ ok: () => null, err: (error) => error });
     if (initializationError !== null) return Result.err(initializationError);
     if (this.options.skillCatalog === undefined) return Result.ok([]);
-    let cwd: string;
-    let cwdStat: Awaited<ReturnType<typeof stat>>;
-    try {
-      cwd = await realpath(cwdValue);
-      cwdStat = await stat(cwd);
-    } catch (cause) {
-      rethrowSessionPanic(cause);
+    const inspectedCwd = sessionCaptureOutcome(
+      await captureSessionPromise(async () => {
+        const cwd = await realpath(cwdValue);
+        return { cwd, cwdStat: await stat(cwd) };
+      }),
+    );
+    if (!inspectedCwd.ok) {
+      rethrowSessionPanic(inspectedCwd.error);
       return Result.err(
         new MiniLilacSessionExternalFailure({
           operation: "listSkills",
-          cause,
-          message: opaqueErrorMessage(cause, `Unable to access skill cwd '${cwdValue}'`),
+          cause: inspectedCwd.error,
+          message: opaqueErrorMessage(
+            inspectedCwd.error,
+            `Unable to access skill cwd '${cwdValue}'`,
+          ),
         }),
       );
     }
+    const { cwd, cwdStat } = inspectedCwd.value;
     if (!cwdStat.isDirectory()) {
       return Result.err(
         rejectSessionOperation("listSkills", `Skill cwd '${cwd}' is not a directory`),
@@ -6952,36 +6900,17 @@ export class SessionService {
     }
     if (!profileRequestsTool(profile, "skill")) return Result.ok([]);
     const discovered = await this.options.skillCatalog.discoverResult(cwd);
-    let $discoveredResultValue252569!: import("better-result").InferOk<
-      NonNullable<typeof discovered>
-    >;
-    let $discoveredResultError252569!: import("better-result").InferErr<
-      NonNullable<typeof discovered>
-    >;
-    const $discoveredResultOk252569 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof discovered>>,
-      import("better-result").InferErr<NonNullable<typeof discovered>>,
-      boolean
-    >(discovered, {
-      ok: (value) => {
-        $discoveredResultValue252569 = value;
-        return true;
-      },
-      err: (error) => {
-        $discoveredResultError252569 = error;
-        return false;
-      },
-    });
-    if (($discoveredResultOk252569 ? "ok" : "error") === "error") {
+    const discoveredOutcome = sessionCaptureOutcome(discovered);
+    if (!discoveredOutcome.ok) {
       return Result.err(
         new MiniLilacSessionExternalFailure({
           operation: "listSkills.discover",
-          cause: $discoveredResultError252569,
-          message: $discoveredResultError252569.message,
+          cause: discoveredOutcome.error,
+          message: discoveredOutcome.error.message,
         }),
       );
     }
-    return Result.ok([...$discoveredResultValue252569.summaries]);
+    return Result.ok([...discoveredOutcome.value.summaries]);
   }
 
   startPrompt(
@@ -7014,10 +6943,13 @@ export class SessionService {
     return this.withDelegatedSessionLock(childSessionId, async () => {
       let snapshot: MiniLilacSessionSnapshot;
       let created = false;
-      try {
-        snapshot = this.store.getSession(childSessionId);
-      } catch (cause) {
-        rethrowSessionPanic(cause);
+      const existing = sessionCaptureOutcome(
+        captureSessionOperation(() => this.store.getSession(childSessionId)),
+      );
+      if (existing.ok) {
+        snapshot = existing.value;
+      } else {
+        rethrowSessionPanic(existing.error);
         const parent = this.store.getSession(request.parentSessionId);
         const model = request.overrides.model ?? parent.model;
         const reasoning = request.overrides.effort ?? parent.reasoning;
@@ -7129,14 +7061,13 @@ export class SessionService {
     this.delegatedSessionLocks.set(sessionId, settled.promise);
     return (async () => {
       await previous;
-      try {
-        return await operation();
-      } finally {
-        settled.resolve();
-        if (this.delegatedSessionLocks.get(sessionId) === settled.promise) {
-          this.delegatedSessionLocks.delete(sessionId);
-        }
+      const attempted = sessionCaptureOutcome(await captureSessionPromise(operation));
+      settled.resolve();
+      if (this.delegatedSessionLocks.get(sessionId) === settled.promise) {
+        this.delegatedSessionLocks.delete(sessionId);
       }
+      if (!attempted.ok) return signalSessionFailure(attempted.error);
+      return attempted.value;
     })();
   }
 
@@ -7307,28 +7238,13 @@ export class SessionService {
       }
       return Result.ok(abandoned);
     });
-    let $lockedResultValue264121!: import("better-result").InferOk<NonNullable<typeof locked>>;
-    let $lockedResultError264121!: import("better-result").InferErr<NonNullable<typeof locked>>;
-    const $lockedResultOk264121 = Result.match<
-      import("better-result").InferOk<NonNullable<typeof locked>>,
-      import("better-result").InferErr<NonNullable<typeof locked>>,
-      boolean
-    >(locked, {
-      ok: (value) => {
-        $lockedResultValue264121 = value;
-        return true;
-      },
-      err: (error) => {
-        $lockedResultError264121 = error;
-        return false;
-      },
-    });
-    if (($lockedResultOk264121 ? "ok" : "error") === "error") {
+    const lockedOutcome = sessionCaptureOutcome(locked);
+    if (!lockedOutcome.ok) {
       return Result.err(
-        mapMiniLilacPersistenceFailure("abandonHistoryNavigation.lock", $lockedResultError264121),
+        mapMiniLilacPersistenceFailure("abandonHistoryNavigation.lock", lockedOutcome.error),
       );
     }
-    return $lockedResultValue264121;
+    return lockedOutcome.value;
   }
 
   compact(request: MiniLilacCompactRequest): Promise<StartedCompaction> {
@@ -7435,29 +7351,8 @@ export class SessionService {
       const performed = await this.capturePersistencePromise("shutdown", () =>
         this.performShutdownResult(graceMs),
       );
-      let $performedResultValue268969!: import("better-result").InferOk<
-        NonNullable<typeof performed>
-      >;
-      let $performedResultError268969!: import("better-result").InferErr<
-        NonNullable<typeof performed>
-      >;
-      const $performedResultOk268969 = Result.match<
-        import("better-result").InferOk<NonNullable<typeof performed>>,
-        import("better-result").InferErr<NonNullable<typeof performed>>,
-        boolean
-      >(performed, {
-        ok: (value) => {
-          $performedResultValue268969 = value;
-          return true;
-        },
-        err: (error) => {
-          $performedResultError268969 = error;
-          return false;
-        },
-      });
-      return ($performedResultOk268969 ? "ok" : "error") === "error"
-        ? Result.err($performedResultError268969)
-        : $performedResultValue268969;
+      const performedOutcome = sessionCaptureOutcome(performed);
+      return !performedOutcome.ok ? Result.err(performedOutcome.error) : performedOutcome.value;
     })().finally(() => {
       if (this.shutdownAttempt === attempt) this.shutdownAttempt = undefined;
     });
@@ -7544,10 +7439,7 @@ export class SessionService {
       releaseStore();
       this.activeTasks.delete(completion);
     });
-    completion = tracked.then(
-      () => undefined,
-      () => undefined,
-    );
+    completion = observeSessionPromise(tracked);
     this.activeTasks.add(completion);
     return tracked;
   }
@@ -7559,17 +7451,14 @@ export class SessionService {
       releaseStore();
       this.activeTasks.delete(completion);
     });
-    completion = tracked.then(
-      () => undefined,
-      (error) => {
-        if (Panic.is(error)) {
-          (this.options.reportFatalPanic ?? signalMiniLilacRuntimePanicToProcess)(error);
-          return;
-        }
-        const message = opaqueErrorMessage(error, "Tracked runtime task failed");
-        logger.error("tracked runtime task failed", { error: message });
-      },
-    );
+    completion = observeSessionPromise(tracked, (error) => {
+      if (Panic.is(error)) {
+        (this.options.reportFatalPanic ?? signalMiniLilacRuntimePanicToProcess)(error);
+        return;
+      }
+      const message = opaqueErrorMessage(error, "Tracked runtime task failed");
+      logger.error("tracked runtime task failed", { error: message });
+    });
     this.activeTasks.add(completion);
     return completion;
   }

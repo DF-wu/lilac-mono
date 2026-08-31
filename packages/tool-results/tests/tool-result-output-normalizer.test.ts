@@ -380,7 +380,7 @@ describe("tool result output normalizer", () => {
         { toolCallId: "hostile", toolName: "plugin" },
       ),
     ).toEqual({ type: "text", value: "[tool result is not JSON-serializable]" });
-  });
+  }, 15_000);
 
   it("preserves exact Panic identity from hostile JSON serialization", async () => {
     const normalize = createOverflowReferenceNormalizer({

@@ -156,6 +156,7 @@ export async function startTelegramRequestRouter(
       await input.bus.publish(
         lilacEventTypes.CmdRequestMessage,
         {
+          requestDeliveryId: crypto.randomUUID(),
           queue: "prompt",
           messages: composed.messages,
           ...(modelOverride ? { modelOverride } : {}),

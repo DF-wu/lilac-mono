@@ -18,12 +18,16 @@ declare module "better-result" {
   export class Ok<A, E = never> {
     readonly status: "ok";
     readonly value: A;
+    mapError<F>(mapper: (error: E) => F): Result<A, F>;
+    match<B>(handlers: { ok: (value: A) => B; err: (error: E) => B }): B;
     unwrap(): A;
   }
 
   export class Err<A, E> {
     readonly status: "err";
     readonly error: E;
+    mapError<F>(mapper: (error: E) => F): Result<A, F>;
+    match<B>(handlers: { ok: (value: A) => B; err: (error: E) => B }): B;
     unwrap(): never;
   }
 
@@ -50,6 +54,10 @@ declare module "better-result" {
     readonly _tag: "UnhandledException";
   }
 
+  export class Panic extends Error {
+    static is(value: unknown): value is Panic;
+  }
+
   export class TaggedErrorBase extends Error {
     readonly _tag: string;
     match(): void;
@@ -60,6 +68,10 @@ declare module "better-result" {
 
 declare module "wire-api" {
   export function send(value: unknown): void;
+}
+
+declare module "unresolved-result-helper" {
+  export function unresolvedMapper(cause: unknown): Error;
 }
 
 declare module "third-party-closed" {

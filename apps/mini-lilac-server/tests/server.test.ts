@@ -854,7 +854,7 @@ describe("createMiniLilacServer", () => {
       },
     });
 
-    service.store.database.exec("DROP TABLE session_todos");
+    service.store.database.run("DROP TABLE session_todos");
     const driver = service.getTodosResult(session.id);
     expect(driver.status).toBe("error");
     if (driver.status === "error") {
@@ -994,8 +994,10 @@ describe("createMiniLilacServer", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
+    const modelStarted = Promise.withResolvers<void>();
     const model = new MockLanguageModelV4({
       doStream: async () => {
+        modelStarted.resolve();
         await gate;
         return textResult("answer", "complete");
       },
@@ -1004,8 +1006,7 @@ describe("createMiniLilacServer", () => {
     const chat = await app.handle(
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/chat`, chatBody(directory)),
     );
-    // test-wait-justification: lets chat enter its gated active run before attempting the conflicting binding update
-    await Bun.sleep(0);
+    await modelStarted.promise;
     const bindings = await app.handle(
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/sessions/session-1/bindings`, {
         sessionId: "session-1",
@@ -1839,10 +1840,12 @@ describe("createMiniLilacServer", () => {
       releaseSecond = resolve;
     });
     let modelCall = 0;
+    const secondModelStarted = Promise.withResolvers<void>();
     const model = new MockLanguageModelV4({
       doStream: async () => {
         modelCall += 1;
         if (modelCall === 1) return textResult("first-answer", "first run");
+        secondModelStarted.resolve();
         await secondGate;
         return textResult("second-answer", "second run");
       },
@@ -1872,8 +1875,7 @@ describe("createMiniLilacServer", () => {
         }),
       ),
     );
-    // test-wait-justification: lets the second chat register its active run before capturing its run identifier
-    await Bun.sleep(0);
+    await secondModelStarted.promise;
     const secondRunId = service.getSnapshot("session-1").activeRunId;
     if (!secondRunId) throw new Error("Expected a second active run");
     expect(secondRunId).not.toBe(firstRunId);
@@ -1924,8 +1926,10 @@ describe("createMiniLilacServer", () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
+    const modelStarted = Promise.withResolvers<void>();
     const model = new MockLanguageModelV4({
       doStream: async () => {
+        modelStarted.resolve();
         await gate;
         return textResult("delayed", "finished after reconnect");
       },
@@ -1936,8 +1940,7 @@ describe("createMiniLilacServer", () => {
       jsonRequest("POST", `${MINI_LILAC_API_PREFIX}/chat`, chatBody(directory)),
     );
     expect(initial.status).toBe(200);
-    // test-wait-justification: lets the chat stream enter its active run before simulating client disconnect
-    await Bun.sleep(0);
+    await modelStarted.promise;
     await initial.body?.cancel("client disconnected");
     expect(service.getSnapshot("session-1").status).toBe("streaming");
 

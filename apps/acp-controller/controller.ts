@@ -57,6 +57,18 @@ import {
   type SessionSummary,
 } from "./types.ts";
 
+function settleAcpCapture<T>(
+  captured: ResultType<T, ReturnType<typeof captureAcpFailure>>,
+): ResultType<T, CapturedAcpFailure> {
+  return captured.mapError(({ settle }) => settle());
+}
+
+async function settleAcpCapturePromise<T>(
+  captured: Promise<ResultType<T, ReturnType<typeof captureAcpFailure>>>,
+): Promise<ResultType<T, CapturedAcpFailure>> {
+  return settleAcpCapture(await captured);
+}
+
 declare const PACKAGE_VERSION: string;
 
 type OutputMode = "json" | "human";
@@ -881,10 +893,12 @@ export async function persistSpawnedWorkerAdmission(
     workerPid: worker.pid,
     updatedAt: Date.now(),
   };
-  const persistence = await Result.tryPromise({
-    try: () => persist(admitted),
-    catch: captureAcpFailure,
-  });
+  const persistence = await settleAcpCapturePromise(
+    Result.tryPromise({
+      try: () => persist(admitted),
+      catch: captureAcpFailure,
+    }),
+  );
   const persistedSuccessfully = persistence.match({
     ok: (result) => result.match({ ok: () => true, err: () => false }),
     err: () => false,
@@ -894,10 +908,12 @@ export async function persistSpawnedWorkerAdmission(
     return Result.ok(admitted);
   }
 
-  const termination = await Result.tryPromise({
-    try: worker.terminate,
-    catch: captureAcpFailure,
-  });
+  const termination = await settleAcpCapturePromise(
+    Result.tryPromise({
+      try: worker.terminate,
+      catch: captureAcpFailure,
+    }),
+  );
   const persistenceCaptureFailure = persistence.match({
     ok: () => undefined,
     err: (failure) => failure,
@@ -1595,9 +1611,15 @@ export async function runAcpWorkerLifecycle<T, WorkError extends { readonly mess
   cleanup: () => Promise<ResultType<void, ExternalOperationFailed>>,
   removeSignals: () => void,
 ): Promise<ResultType<T, AcpWorkerLifecycleError<WorkError>>> {
-  const attempted = await Result.tryPromise({ try: work, catch: captureAcpFailure });
-  const removalAttempted = Result.try({ try: removeSignals, catch: captureAcpFailure });
-  const cleanupAttempted = await Result.tryPromise({ try: cleanup, catch: captureAcpFailure });
+  const attempted = await settleAcpCapturePromise(
+    Result.tryPromise({ try: work, catch: captureAcpFailure }),
+  );
+  const removalAttempted = settleAcpCapture(
+    Result.try({ try: removeSignals, catch: captureAcpFailure }),
+  );
+  const cleanupAttempted = await settleAcpCapturePromise(
+    Result.tryPromise({ try: cleanup, catch: captureAcpFailure }),
+  );
 
   const workCaptureFailure = attempted.match({ ok: () => undefined, err: (failure) => failure });
   const removalCaptureFailure = removalAttempted.match({
@@ -1744,26 +1766,30 @@ export async function runPromptWithCancellationMonitor(params: {
     return params.cancel();
   })();
 
-  const promptedAttemptedPromise = Result.tryPromise({
-    try: () =>
-      runAcpWorkerLifecycle(
-        async () => {
-          promptActive = true;
-          signalPromptStarted();
-          const prompt = params.prompt();
-          const result = await prompt;
-          promptActive = false;
-          return result;
-        },
-        observation.close,
-        () => undefined,
-      ),
-    catch: captureAcpFailure,
-  });
-  const monitorAttemptedPromise = Result.tryPromise({
-    try: () => monitored,
-    catch: captureAcpFailure,
-  });
+  const promptedAttemptedPromise = settleAcpCapturePromise(
+    Result.tryPromise({
+      try: () =>
+        runAcpWorkerLifecycle(
+          async () => {
+            promptActive = true;
+            signalPromptStarted();
+            const prompt = params.prompt();
+            const result = await prompt;
+            promptActive = false;
+            return result;
+          },
+          observation.close,
+          () => undefined,
+        ),
+      catch: captureAcpFailure,
+    }),
+  );
+  const monitorAttemptedPromise = settleAcpCapturePromise(
+    Result.tryPromise({
+      try: () => monitored,
+      catch: captureAcpFailure,
+    }),
+  );
   const first = await Promise.race([
     promptedAttemptedPromise.then((attempted) => ({ kind: "prompt" as const, attempted })),
     monitorAttemptedPromise.then((attempted) => ({ kind: "monitor" as const, attempted })),
@@ -1777,14 +1803,18 @@ export async function runPromptWithCancellationMonitor(params: {
     });
   if (firstMonitorFailed && first.kind === "monitor") {
     promptActive = false;
-    const watcherCleanupPromise = Result.tryPromise({
-      try: observation.close,
-      catch: captureAcpFailure,
-    });
-    const terminationPromise = Result.tryPromise({
-      try: params.terminate,
-      catch: captureAcpFailure,
-    });
+    const watcherCleanupPromise = settleAcpCapturePromise(
+      Result.tryPromise({
+        try: observation.close,
+        catch: captureAcpFailure,
+      }),
+    );
+    const terminationPromise = settleAcpCapturePromise(
+      Result.tryPromise({
+        try: params.terminate,
+        catch: captureAcpFailure,
+      }),
+    );
     const [watcherCleanup, termination] = await Promise.all([
       watcherCleanupPromise,
       terminationPromise,

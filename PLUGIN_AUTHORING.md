@@ -190,7 +190,7 @@ plugins:
 ## Level 1 Output
 
 - Text and JSON returned to the model are bounded by `tools.output.maxPreviewBytes` after `toModelOutput` conversion.
-- Oversized text and JSON are preserved as transient, session-owned `tool-result://` artifacts when storage succeeds. The preview tells the model how to inspect the artifact with `read`; built-in `grep` can search the URI directly and always returns a bounded inline result.
+- Oversized text and JSON are preserved as transient, session-owned `resource://t1_` artifacts when storage succeeds. The preview tells the model how to inspect the artifact with `read`; built-in `grep` can search the URI directly and always returns a bounded inline result. Core accepts legacy `tool-result://` references as read-only compatibility input.
 - Core's trusted built-in `read` is the exception: it bounds only its textual payload by actual UTF-8 bytes, returns an exact continuation, and is excluded from settled batch aggregate budgeting. External tools named `read` do not receive this trust.
 - Media and provider-reference content parts are not converted into text artifacts.
 - Truncation does not change whether the tool execution succeeded or failed.

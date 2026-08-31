@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   buildUnifiedToolCatalogResult,
   createPortableToolSearchResult,
+  formatCatalogNamespaceSummary,
   type CatalogToolCandidate,
 } from "../../src/mcp/catalog";
 import {
@@ -39,6 +40,7 @@ function candidate(params: {
   rawName: string;
   title?: string;
   description?: string;
+  namespaceSummary?: string;
 }): CatalogToolCandidate {
   return {
     identity: {
@@ -48,6 +50,7 @@ function candidate(params: {
     },
     ...(params.title === undefined ? {} : { title: params.title }),
     ...(params.description === undefined ? {} : { description: params.description }),
+    ...(params.namespaceSummary === undefined ? {} : { namespaceSummary: params.namespaceSummary }),
     tool: executable(params.description),
   };
 }
@@ -59,12 +62,38 @@ function executableSearch(searchTool: unknown) {
     !("execute" in searchTool) ||
     typeof searchTool.execute !== "function"
   ) {
-    throw new Error("portable tool_search is not executable");
+    throw new Error("portable find_tools is not executable");
   }
   return searchTool.execute;
 }
 
 describe("unified deferred tool catalog", () => {
+  it("formats deterministic one-line MCP namespace summaries in find_tools", () => {
+    expect(formatCatalogNamespaceSummary({ source: "mcp", sourceId: "solo", toolCount: 1 })).toBe(
+      "mcp_solo.* — 1 tool",
+    );
+
+    const search = createPortableToolSearch({
+      catalog: [],
+      namespaceSummaries: [
+        { source: "mcp", sourceId: "zeta", toolCount: 2 },
+        {
+          source: "mcp",
+          sourceId: "excalidraw",
+          toolCount: 37,
+          description:
+            "  diagrams, presentations, scene editing,\nimages, collections, workspace administration  ",
+        },
+      ],
+    });
+    expect((search as { description?: string }).description).toBe(
+      [
+        "Search deferred plugin and MCP tools. Use keywords for ranked search, select:name,... for exact model-facing names, or +term to require a term in tool names. Returned tools become available on the next model step.",
+        "Available MCP namespaces:\nmcp_excalidraw.* — 37 tools: diagrams, presentations, scene editing, images, collections, workspace administration\nmcp_zeta.* — 2 tools",
+      ].join("\n\n"),
+    );
+  });
+
   it("assigns deterministic qualified names without raw plugin aliases", () => {
     const candidates = [
       candidate({ source: "plugin", sourceId: "fixture", rawName: "shared tool" }),
@@ -130,6 +159,7 @@ describe("unified deferred tool catalog", () => {
           rawName: "lookup-page",
           title: "Knowledge lookup",
           description: "Search internal documentation",
+          namespaceSummary: "mcp_company_wiki.* — 1 tool: Internal documentation",
         }),
       ],
     });
@@ -140,6 +170,9 @@ describe("unified deferred tool catalog", () => {
     );
     expect(catalog.catalogMetadata.plugin_calendar_plugin_create_event?.description).toBe(
       longDescription,
+    );
+    expect(catalog.catalogMetadata.mcp_company_wiki_lookup_page?.namespaceSummary).toBe(
+      "mcp_company_wiki.* — 1 tool: Internal documentation",
     );
     expect(
       await execute({ query: "COMPANY-WIKI" }, { toolCallId: "source", messages: [] }),

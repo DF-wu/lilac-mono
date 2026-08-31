@@ -15,10 +15,26 @@ import {
   type LilacTopic,
   type LilacTopicForType,
 } from "./lilac-spec";
+import { panic as signalEventBusPanic } from "./redis-managed-delivery";
 import type { DecodedMessage, Message } from "./types";
 
 const nonemptyStringSchema = z.string().min(1);
 const finiteNumberSchema = z.number().finite();
+
+type CapturedCodecFailure =
+  | { readonly kind: "panic"; readonly panic: Panic }
+  | { readonly kind: "ordinary"; readonly cause: unknown };
+
+function captureCodecFailure(cause: unknown): () => CapturedCodecFailure {
+  return () => {
+    const inspected = Result.try({
+      try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),
+      catch: () => undefined,
+    });
+    const panic = inspected.match({ ok: (value) => value, err: () => undefined });
+    return panic ? { kind: "panic", panic } : { kind: "ordinary", cause };
+  };
+}
 
 type CatalogDefinitionForType<TType extends LilacEventType> = LilacEventDefinitionForType<
   typeof LILAC_EVENTS,
@@ -119,20 +135,33 @@ function decodeSchema<T>(options: {
   readonly stage: LilacEventDecodeStage;
   readonly eventType?: string;
 }): ResultType<T, LilacEventDecodeError> {
-  let parsed: z.ZodSafeParseResult<T>;
-  try {
-    parsed = options.schema.safeParse(options.value);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
+  const captured = Result.try({
+    try: () => options.schema.safeParse(options.value),
+    catch: captureCodecFailure,
+  });
+  const outcome = captured
+    .mapError((settle) => settle())
+    .match<
+      | { readonly kind: "parsed"; readonly value: z.ZodSafeParseResult<T> }
+      | { readonly kind: "failed"; readonly failure: CapturedCodecFailure }
+    >({
+      ok: (value) => ({ kind: "parsed", value }),
+      err: (failure) => ({ kind: "failed", failure }),
+    });
+  if (outcome.kind === "failed") {
+    if (outcome.failure.kind === "panic") return signalEventBusPanic(outcome.failure.panic);
     return Result.err(
       new LilacEventDecodeError({
         stage: options.stage,
         eventType: options.eventType,
-        issues: [cause instanceof Error ? cause.message : "Decoder failed"],
+        issues: [
+          outcome.failure.cause instanceof Error ? outcome.failure.cause.message : "Decoder failed",
+        ],
         message: `Invalid Lilac event ${options.stage}`,
       }),
     );
   }
+  const parsed = outcome.value;
   if (parsed.success) return Result.ok(parsed.data);
   return Result.err(
     new LilacEventDecodeError({

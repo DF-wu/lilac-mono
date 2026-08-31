@@ -62,6 +62,21 @@ function clampInt(n: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.trunc(n)));
 }
 
+type CapturedRedisPoolFailure =
+  | { readonly kind: "panic"; readonly panic: Panic }
+  | { readonly kind: "ordinary"; readonly cause: unknown };
+
+function captureRedisPoolFailure(cause: unknown): () => CapturedRedisPoolFailure {
+  return () => {
+    const inspected = Result.try({
+      try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),
+      catch: () => undefined,
+    });
+    const panic = inspected.match({ ok: (value) => value, err: () => undefined });
+    return panic ? { kind: "panic", panic } : { kind: "ordinary", cause };
+  };
+}
+
 export class RedisConnectionPool {
   private readonly base: Redis;
   private max: number;
@@ -213,45 +228,56 @@ export class RedisConnectionPool {
   }
 
   private async createConnection(): Promise<ResultType<Redis, RedisConnectionCreateFailed>> {
-    try {
-      return Result.ok(this.base.duplicate());
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      return Result.err(
-        new RedisConnectionCreateFailed({
-          cause,
-          label: this.label,
-          message: `RedisConnectionPool(${this.label}) could not create a connection`,
-        }),
-      );
-    }
+    const duplicated = Result.try({
+      try: () => this.base.duplicate(),
+      catch: captureRedisPoolFailure,
+    });
+    const outcome = duplicated
+      .mapError((settle) => settle())
+      .match<
+        | { readonly kind: "created"; readonly redis: Redis }
+        | { readonly kind: "failed"; readonly failure: CapturedRedisPoolFailure }
+      >({
+        ok: (redis) => ({ kind: "created", redis }),
+        err: (failure) => ({ kind: "failed", failure }),
+      });
+    if (outcome.kind === "created") return Result.ok(outcome.redis);
+    if (outcome.failure.kind === "panic") throw outcome.failure.panic;
+    return Result.err(
+      new RedisConnectionCreateFailed({
+        cause: outcome.failure.cause,
+        label: this.label,
+        message: `RedisConnectionPool(${this.label}) could not create a connection`,
+      }),
+    );
   }
 
   private async createReservedConnection(): Promise<
     ResultType<Redis, RedisConnectionPoolClosed | RedisConnectionCreateFailed>
   > {
     this.creating += 1;
-    try {
-      const createdResult = await this.createConnection();
-      const created = createdResult.match<Redis | RedisConnectionCreateFailed>({
-        ok: (value) => value,
-        err: (error) => error,
-      });
-      if (RedisConnectionCreateFailed.is(created)) return Result.err(created);
-      if (this.closed) {
-        created.disconnect();
-        return Result.err(
-          new RedisConnectionPoolClosed({
-            label: this.label,
-            message: `RedisConnectionPool(${this.label}) is closed`,
-          }),
-        );
-      }
-      this.created += 1;
-      return Result.ok(created);
-    } finally {
-      this.creating -= 1;
+    using _reservation = {
+      [Symbol.dispose]: () => {
+        this.creating -= 1;
+      },
+    };
+    const createdResult = await this.createConnection();
+    const created = createdResult.match<Redis | RedisConnectionCreateFailed>({
+      ok: (value) => value,
+      err: (error) => error,
+    });
+    if (RedisConnectionCreateFailed.is(created)) return Result.err(created);
+    if (this.closed) {
+      created.disconnect();
+      return Result.err(
+        new RedisConnectionPoolClosed({
+          label: this.label,
+          message: `RedisConnectionPool(${this.label}) is closed`,
+        }),
+      );
     }
+    this.created += 1;
+    return Result.ok(created);
   }
 
   private async warmUp(): Promise<

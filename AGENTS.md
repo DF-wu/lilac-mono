@@ -24,6 +24,17 @@ These rules apply to all tasks. Use the linked documents for detailed rules and 
 - Use `ref/` only as a read-only upstream reference.
 - Do not put credentials, tokens, private transcripts, or sensitive command data in outputs or files.
 
+## Control Flow
+
+- Keep workflows flat. Keep the happy path at the function's base indentation.
+- Handle terminal branches immediately with `return`. Handle loop-only branches immediately with
+  `continue` or `break`. A branch, callback, or handler must not contain the remainder of the workflow.
+- Extract a named function when a branch needs multiple steps.
+- Keep a single guard or two-way branch as an `if`. When an `if`/`else if` chain has at least three
+  conditional arms and multiple arms group alternatives with `||`, use `switch (true)` with one decision
+  per case. Name compound predicates when that keeps each case to one idea, and make each case terminal or
+  delegate it.
+
 ## Repository Information
 
 - Use `bun` in this Bun workspace. The workspace packages are in `apps/*` and `packages/*`.
@@ -39,6 +50,8 @@ These rules apply to all tasks. Use the linked documents for detailed rules and 
 
 - Use focused tests and the typecheck for each changed workspace.
 - Run architecture checks when the change is in code that these checks control.
-- Run full repository checks only for broad changes, the final plan check, or a user request.
+- Run `bun run check` at least once against the final changes before every commit. Also run full
+  repository checks for broad changes, the final plan check, or a user request.
 - Do not use fixed waits to synchronize tests. Follow the `lilac/no-fixed-test-wait` rule.
 - Commit or create a pull request only when the user requests it.
+  - Read recent git history and follow the pattern when creating a commit.

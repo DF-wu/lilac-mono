@@ -11,7 +11,10 @@ import { canonicalizePathAsFarAsExists } from "@stanley2058/lilac-fs";
 import { opaqueErrorMessage } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { opaqueErrorCause } from "../../ssh/remote-js/remote-runner-utils";
+import {
+  captureOpaqueErrorCause,
+  projectOpaqueErrorCapture,
+} from "../../ssh/remote-js/remote-runner-utils";
 import { adaptToolResultToHost, preserveToolPanic } from "../tool-result-adapters";
 
 export type { PatchHunk };
@@ -101,10 +104,11 @@ async function captureApplyPatchOperation<T>(params: {
   readonly signal?: AbortSignal;
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, ApplyPatchOperationError | ApplyPatchCancelled>> {
-  const captured = await Result.tryPromise({
-    try: params.run,
-    catch: opaqueErrorCause(`Opaque apply_patch ${params.operation} failure`),
-  });
+  const captured = (
+    await Result.tryPromise({ try: params.run, catch: captureOpaqueErrorCause })
+  ).mapError((error) =>
+    projectOpaqueErrorCapture(error, `Opaque apply_patch ${params.operation} failure`),
+  );
   return captured.match<() => ResultType<T, ApplyPatchOperationError | ApplyPatchCancelled>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {

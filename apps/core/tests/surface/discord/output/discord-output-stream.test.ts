@@ -705,39 +705,68 @@ describe("Discord initial output", () => {
     expect(createdMessageId).toBe("m_1");
     await out.finish();
   });
-});
 
-describe("Discord recovery hydration", () => {
-  it("applies restored state without provider calls before the first live part", async () => {
+  it("edits a recovered output message instead of posting another reply", async () => {
     const { client, createdMessageIds, operations } = createFakeDiscordClient();
-    const out = new DiscordOutputStream({
+    const original = new DiscordOutputStream({
       client,
       sessionRef: { platform: "discord", channelId: "chan" },
       useSmartSplitting: false,
       outputMode: "inline",
-      reasoningDisplayMode: "simple",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+    await original.push({ type: "text.delta", delta: "before crash" });
+    const originalResult = resultValue(await original.finish());
+    const operationsBeforeRecovery = operations.length;
+    let recoveredMessageId: string | undefined;
+    const recovered = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      opts: {
+        requestId: "discord:chan:request",
+        resumeAt: originalResult.last,
+        onMessageCreated: (ref) => {
+          recoveredMessageId = ref.messageId;
+        },
+      },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
       workingIndicators: ["Working"],
     });
 
-    expect(
-      out.hydrateRecovery([
-        { type: "text.set", text: "restored" },
-        {
-          type: "reasoning.status",
-          update: { startedAtMs: 1, frozenAtMs: 2, detailText: "reasoning" },
-        },
-      ]),
-    ).toBe("visible");
-    expect(createdMessageIds).toEqual([]);
-    expect(operations).toEqual([]);
+    await recovered.push({ type: "text.delta", delta: "after recovery" });
 
-    await expect(out.push({ type: "text.delta", delta: " live" })).resolves.toEqual(
-      Result.ok("visible"),
-    );
     expect(createdMessageIds).toEqual(["m_1"]);
-    expect(operations.map((operation) => operation.kind)).toEqual(["send"]);
-    expect(hasEmbeds(operations[0]?.options)).toBe(true);
-    expect(contentFromOptions(operations[0]?.options)).not.toBe("*Replying...*");
+    expect(operations.slice(operationsBeforeRecovery)).toEqual([
+      expect.objectContaining({ kind: "edit", messageId: "m_1" }),
+    ]);
+    expect(recoveredMessageId).toBe("m_1");
+    expect(resultValue(await recovered.finish()).last).toEqual(originalResult.last);
+  });
+
+  it("posts a fresh message when the recovered output message is unavailable", async () => {
+    const { client, createdMessageIds, operations } = createFakeDiscordClient({
+      failResumeFetch: true,
+    });
+    const recovered = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      opts: {
+        resumeAt: { platform: "discord", channelId: "chan", messageId: "missing" },
+      },
+      useSmartSplitting: false,
+      outputMode: "inline",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await recovered.push({ type: "text.delta", delta: "after recovery" });
+
+    expect(createdMessageIds).toEqual(["m_1"]);
+    expect(operations[0]).toEqual(expect.objectContaining({ kind: "send", messageId: "m_1" }));
+    await recovered.finish();
   });
 });
 
@@ -944,6 +973,31 @@ describe("preview reanchor behavior", () => {
     expect(deletedMessageIds).toEqual([]);
   });
 
+  it.each([
+    ["reanchor", "*Steering...*"],
+    ["reanchor_interrupt", "*Interrupted...*"],
+  ] as const)("replaces the flat-mode placeholder on %s", async (reason, placeholder) => {
+    const { client, operations } = createFakeDiscordClient();
+
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      useSmartSplitting: false,
+      outputMode: "preview",
+      outputPreviewModeFinalStyle: "plain",
+      outputPreviewModeFinalText: "flat",
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await out.push({ type: "text.delta", delta: "hidden final", phase: "final_answer" });
+    await out.abort(reason);
+
+    const finalEdit = operations.filter((operation) => operation.kind === "edit").at(-1);
+    expect(contentFromOptions(finalEdit?.options)).toBe(placeholder);
+    expect(contentFromOptions(finalEdit?.options)).not.toBe("*Replying...*");
+  });
+
   it("reports continuation final text mode for inline streams", () => {
     const { client } = createFakeDiscordClient();
 
@@ -994,6 +1048,7 @@ describe("output operation failures", () => {
       useSmartSplitting: false,
       outputMode: "preview",
       outputPreviewModeFinalStyle: "plain",
+      outputPreviewModeFinalText: "reply-chain",
       reasoningDisplayMode: "none",
       workingIndicators: ["Working"],
     });
@@ -1027,35 +1082,6 @@ describe("output operation failures", () => {
     });
   });
 
-  it("classifies resume fetch failures instead of creating a duplicate chain", async () => {
-    const { client, createdMessageIds } = createFakeDiscordClient({
-      resumeFetchFailure: { status: 403 },
-    });
-    const out = new DiscordOutputStream({
-      client,
-      sessionRef: { platform: "discord", channelId: "chan" },
-      opts: {
-        resume: {
-          created: [{ platform: "discord", channelId: "chan", messageId: "existing" }],
-        },
-      },
-      useSmartSplitting: false,
-      outputMode: "inline",
-      reasoningDisplayMode: "none",
-      workingIndicators: ["Working"],
-    });
-
-    const result = await out.push({ type: "text.delta", delta: "hello" });
-
-    expect(result.status).toBe("error");
-    if (result.status === "ok") throw new Error("expected push failure");
-    expect(result.error).toMatchObject({
-      _tag: "SurfacePermissionDenied",
-      operation: "push-output",
-    });
-    expect(createdMessageIds).toEqual([]);
-  });
-
   it("returns partial completion when a later final chunk fails", async () => {
     const replyFailure = Object.assign(new Error("reply unavailable"), { status: 503 });
     const { client } = createFakeDiscordClient({
@@ -1068,6 +1094,7 @@ describe("output operation failures", () => {
       useSmartSplitting: false,
       outputMode: "preview",
       outputPreviewModeFinalStyle: "plain",
+      outputPreviewModeFinalText: "reply-chain",
       reasoningDisplayMode: "none",
       workingIndicators: ["Working"],
     });
@@ -1210,6 +1237,7 @@ describe("preview final output style", () => {
       useSmartSplitting: false,
       outputMode: "preview",
       outputPreviewModeFinalStyle: "plain",
+      outputPreviewModeFinalText: "reply-chain",
       reasoningDisplayMode: "none",
       workingIndicators: ["Working"],
     });
@@ -1250,6 +1278,7 @@ describe("preview final output style", () => {
       useSmartSplitting: false,
       outputMode: "preview",
       outputPreviewModeFinalStyle: "plain",
+      outputPreviewModeFinalText: "reply-chain",
       reasoningDisplayMode: "none",
       workingIndicators: ["Working"],
       markdownMathRender: { fallbackMode: "passthrough" },
@@ -1279,6 +1308,7 @@ describe("preview final output style", () => {
       useSmartSplitting: false,
       outputMode: "preview",
       outputPreviewModeFinalStyle: "plain",
+      outputPreviewModeFinalText: "reply-chain",
       reasoningDisplayMode: "none",
       workingIndicators: ["Working"],
     });
@@ -1313,6 +1343,7 @@ describe("preview final output style", () => {
       useSmartSplitting: false,
       outputMode: "preview",
       outputPreviewModeFinalStyle: "plain",
+      outputPreviewModeFinalText: "reply-chain",
       reasoningDisplayMode: "none",
       workingIndicators: ["Working"],
     });
@@ -1351,6 +1382,7 @@ describe("preview final output style", () => {
       useSmartSplitting: false,
       outputMode: "preview",
       outputPreviewModeFinalStyle: "plain",
+      outputPreviewModeFinalText: "reply-chain",
       reasoningDisplayMode: "none",
       workingIndicators: ["Working"],
     });
@@ -1376,6 +1408,79 @@ describe("preview final output style", () => {
     expect(plainFinalOps[1]?.parentId).toBe(plainFinalOps[0]?.messageId);
     expect(plainFinalOps[2]?.parentId).toBe(plainFinalOps[1]?.messageId);
     expect(res.last.messageId).toBe(lastPlainFinal.messageId);
+  });
+
+  it("posts only the final answer as visually grouped plain messages", async () => {
+    const { client, operations, deletedMessageIds } = createFakeDiscordClient();
+    const commentary = "Commentary stays in the preview.";
+    const finalAnswer = "F".repeat(4500);
+    const out = new DiscordOutputStream({
+      client,
+      sessionRef: { platform: "discord", channelId: "chan" },
+      opts: {
+        replyTo: { platform: "discord", channelId: "chan", messageId: "source" },
+      },
+      useSmartSplitting: false,
+      outputMode: "preview",
+      outputPreviewModeFinalStyle: "plain",
+      outputPreviewModeFinalText: "flat",
+      outputNotification: true,
+      reasoningDisplayMode: "none",
+      workingIndicators: ["Working"],
+    });
+
+    await out.push({ type: "text.delta", delta: commentary, phase: "commentary" });
+    await out.push({ type: "text.delta", delta: finalAnswer, phase: "final_answer" });
+    await out.push({ type: "attachment.add", attachment: makeAttachment(9) });
+    await out.push({
+      type: "text.set",
+      text: commentary + finalAnswer,
+      phase: "final_answer",
+      finalSegments: [commentary, finalAnswer],
+    });
+    const res = resultValue(await out.finish());
+
+    const previewDescriptions = operations.flatMap((operation) =>
+      embedDescriptionsFromOptions(operation.options),
+    );
+    expect(previewDescriptions.some((description) => description.includes(commentary))).toBe(true);
+    expect(previewDescriptions.some((description) => description.includes("F".repeat(100)))).toBe(
+      false,
+    );
+
+    const finalOps = operations.filter(
+      (operation) => contentFromOptions(operation.options)?.startsWith("F") ?? false,
+    );
+    expect(finalOps.map((operation) => operation.kind)).toEqual(["send", "send", "send"]);
+    expect(finalOps.map((operation) => contentFromOptions(operation.options)?.length)).toEqual([
+      2000, 2000, 500,
+    ]);
+    expect(
+      (finalOps[0]?.options as { reply?: { messageReference?: string } } | undefined)?.reply,
+    ).toEqual({ messageReference: "source" });
+    expect((finalOps[1]?.options as { reply?: unknown } | undefined)?.reply).toBeUndefined();
+    expect((finalOps[2]?.options as { reply?: unknown } | undefined)?.reply).toBeUndefined();
+    expect(
+      (finalOps[0]?.options as { allowedMentions?: unknown } | undefined)?.allowedMentions,
+    ).toEqual({ parse: ["users"], repliedUser: true });
+    expect(
+      (finalOps[1]?.options as { allowedMentions?: unknown } | undefined)?.allowedMentions,
+    ).toEqual({ parse: ["users"], repliedUser: false });
+    expect(
+      (finalOps[2]?.options as { allowedMentions?: unknown } | undefined)?.allowedMentions,
+    ).toEqual({ parse: ["users"], repliedUser: false });
+    expect(filesCount(finalOps[0]?.options)).toBe(0);
+    expect(filesCount(finalOps[1]?.options)).toBe(0);
+    expect(filesCount(finalOps[2]?.options)).toBe(1);
+    expect(
+      operations.some(
+        (operation) => contentFromOptions(operation.options)?.includes(commentary) ?? false,
+      ),
+    ).toBe(false);
+    expect(deletedMessageIds.length).toBeGreaterThan(0);
+    const lastFinalOp = finalOps[2];
+    if (!lastFinalOp) throw new Error("expected third final plain message");
+    expect(res.last.messageId).toBe(lastFinalOp.messageId);
   });
 });
 
@@ -1782,6 +1887,12 @@ describe("preview tail helper", () => {
     const out = toPreviewTail("0123456789", 6);
     expect(out).toBe("...789");
     expect(out.length).toBe(6);
+  });
+
+  it("prefers a complete trailing block over a partial text tail", () => {
+    expect(toPreviewTail("discarded text that is long\n\ncomplete block", 20, true)).toBe(
+      "...complete block",
+    );
   });
 });
 

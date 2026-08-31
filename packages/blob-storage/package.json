@@ -1,0 +1,29 @@
+{
+  "name": "@stanley2058/lilac-blob-storage",
+  "version": "0.0.0",
+  "type": "module",
+  "module": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    }
+  },
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "bunx tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "better-result": "catalog:",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0"
+  },
+  "peerDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

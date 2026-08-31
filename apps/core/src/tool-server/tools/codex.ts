@@ -15,6 +15,19 @@ import { z } from "zod";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
 
+function captureCodexFailure(cause: unknown): { readonly cause: Error | Panic } {
+  if (Panic.is(cause)) return { cause };
+  if (cause instanceof Error) return { cause };
+  return { cause: new Error("Codex operation failed", { cause }) };
+}
+
+async function settleCapturedPromise<T, E>(
+  result: Promise<ResultType<T, { readonly cause: Error | Panic }>>,
+  resolve: (cause: Error | Panic) => E,
+): Promise<ResultType<T, E>> {
+  return (await result).mapError(({ cause }) => resolve(cause));
+}
+
 function codexFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
   return serverToolFailure({
     kind,
@@ -28,16 +41,16 @@ async function observeCodexLogin(
   login: CodexOAuthLogin,
 ): Promise<ResultType<void, ServerToolFailure>> {
   return (
-    await Result.tryPromise({
-      try: () => login.result,
-      catch: (cause) => {
+    await settleCapturedPromise(
+      Result.tryPromise({
+        try: () => login.result,
+        catch: captureCodexFailure,
+      }),
+      (cause) => {
         if (Panic.is(cause)) return preserveToolPanic(cause);
-        return codexFailure(
-          "unavailable",
-          cause instanceof Error ? cause.message : "Codex OAuth login failed",
-        );
+        return codexFailure("unavailable", cause.message);
       },
-    })
+    )
   ).map(() => undefined);
 }
 
@@ -96,11 +109,7 @@ async function runPendingTransition<T>(operation: () => Promise<T>): Promise<T> 
     release = resolve;
   });
   await previous;
-  try {
-    return await operation();
-  } finally {
-    release();
-  }
+  return await operation().finally(release);
 }
 
 export type CodexDependencies = {
@@ -199,51 +208,51 @@ export class Codex implements ServerTool {
       if (payload.mode === "start") {
         const generation = ++pendingGeneration;
         return (
-          await Result.tryPromise({
-            try: () =>
-              runPendingTransition(async () => {
-                if (generation !== pendingGeneration) {
-                  return Result.err(codexFailure("conflict", "Codex OAuth login was superseded"));
-                }
-                const previous = pending;
-                pending = null;
-                await previous?.close();
-                if (generation !== pendingGeneration) {
-                  return Result.err(codexFailure("conflict", "Codex OAuth login was superseded"));
-                }
+          await settleCapturedPromise(
+            Result.tryPromise({
+              try: () =>
+                runPendingTransition(async () => {
+                  if (generation !== pendingGeneration) {
+                    return Result.err(codexFailure("conflict", "Codex OAuth login was superseded"));
+                  }
+                  const previous = pending;
+                  pending = null;
+                  await previous?.close();
+                  if (generation !== pendingGeneration) {
+                    return Result.err(codexFailure("conflict", "Codex OAuth login was superseded"));
+                  }
 
-                const login = await this.dependencies.startLogin({ callbackServer: "optional" });
-                if (generation !== pendingGeneration) {
-                  await login.close();
-                  return Result.err(codexFailure("conflict", "Codex OAuth login was superseded"));
-                }
-                pending = login;
-                void observeCodexLogin(login).then(() => {
-                  if (pending === login) pending = null;
-                });
-                return Result.ok({
-                  step: "start" as const,
-                  authorizeUrl: login.authorizeUrl,
-                  redirectUri: login.redirectUri,
-                  port: login.port,
-                  state: login.state,
-                  pkceVerifier: login.pkce.verifier,
-                  storagePath: login.storagePath,
-                  instructions: [
-                    "1) Open authorizeUrl in your browser.",
-                    "2) Sign in and approve.",
-                    "3) The localhost callback exchanges and stores tokens automatically. If it cannot connect, run codex.login mode=exchange with callbackUrl and pkceVerifier. A manually extracted code also requires state.",
-                  ].join("\n"),
-                });
-              }),
-            catch: (cause) => {
+                  const login = await this.dependencies.startLogin({ callbackServer: "optional" });
+                  if (generation !== pendingGeneration) {
+                    await login.close();
+                    return Result.err(codexFailure("conflict", "Codex OAuth login was superseded"));
+                  }
+                  pending = login;
+                  void observeCodexLogin(login).then(() => {
+                    if (pending === login) pending = null;
+                  });
+                  return Result.ok({
+                    step: "start" as const,
+                    authorizeUrl: login.authorizeUrl,
+                    redirectUri: login.redirectUri,
+                    port: login.port,
+                    state: login.state,
+                    pkceVerifier: login.pkce.verifier,
+                    storagePath: login.storagePath,
+                    instructions: [
+                      "1) Open authorizeUrl in your browser.",
+                      "2) Sign in and approve.",
+                      "3) The localhost callback exchanges and stores tokens automatically. If it cannot connect, run codex.login mode=exchange with callbackUrl and pkceVerifier. A manually extracted code also requires state.",
+                    ].join("\n"),
+                  });
+                }),
+              catch: captureCodexFailure,
+            }),
+            (cause) => {
               if (Panic.is(cause)) return preserveToolPanic(cause);
-              return codexFailure(
-                "unavailable",
-                cause instanceof Error ? cause.message : "Codex OAuth login is unavailable",
-              );
+              return codexFailure("unavailable", cause.message);
             },
-          })
+          )
         ).andThen((result) => result);
       }
 
@@ -257,16 +266,16 @@ export class Codex implements ServerTool {
       }
       const login = pending;
       return (
-        await Result.tryPromise({
-          try: () => login.exchange(payload),
-          catch: (cause) => {
+        await settleCapturedPromise(
+          Result.tryPromise({
+            try: () => login.exchange(payload),
+            catch: captureCodexFailure,
+          }),
+          (cause) => {
             if (Panic.is(cause)) return preserveToolPanic(cause);
-            return codexFailure(
-              "denied",
-              cause instanceof Error ? cause.message : "Codex OAuth exchange failed",
-            );
+            return codexFailure("denied", cause.message);
           },
-        })
+        )
       ).map((result) => {
         if (pending === login) pending = null;
         return { step: "exchange" as const, ...result };
@@ -275,15 +284,17 @@ export class Codex implements ServerTool {
 
     if (callableId === "codex.status") {
       const loaded = await this.dependencies.readTokens();
-      return loaded.match<ServerToolResult>({
-        ok: ({ value: tokens }) =>
-          Result.ok({
-            configured: tokens !== null,
-            storagePath: this.dependencies.storagePath(),
-            expires: tokens?.expires,
-            accountId: tokens?.accountId,
-          }),
-        err: (error) => {
+      return loaded.match<() => ServerToolResult>({
+        ok:
+          ({ value: tokens }) =>
+          () =>
+            Result.ok({
+              configured: tokens !== null,
+              storagePath: this.dependencies.storagePath(),
+              expires: tokens?.expires,
+              accountId: tokens?.accountId,
+            }),
+        err: (error) => () => {
           if (Panic.is(error)) return preserveToolPanic(error);
           switch (error._tag) {
             case "CodexTokensReadFailed":
@@ -303,33 +314,36 @@ export class Codex implements ServerTool {
               });
           }
         },
-      });
+      })();
     }
 
     if (callableId === "codex.logout") {
       pendingGeneration += 1;
       return (
-        await Result.tryPromise({
-          try: () =>
-            runPendingTransition(async () => {
-              const login = pending;
-              pending = null;
-              await login?.close();
-              return (await this.dependencies.clearTokens())
-                .mapError((error) => {
-                  if (Panic.is(error)) return preserveToolPanic(error);
-                  return codexFailure("unavailable", error.message);
-                })
-                .map(() => ({ ok: true as const, storagePath: this.dependencies.storagePath() }));
-            }),
-          catch: (cause) => {
+        await settleCapturedPromise(
+          Result.tryPromise({
+            try: () =>
+              runPendingTransition(async () => {
+                const login = pending;
+                pending = null;
+                await login?.close();
+                const cleared = await this.dependencies.clearTokens();
+                return cleared.match<() => ServerToolResult>({
+                  ok: () => () =>
+                    Result.ok({ ok: true as const, storagePath: this.dependencies.storagePath() }),
+                  err: (error) => () => {
+                    if (Panic.is(error)) return preserveToolPanic(error);
+                    return Result.err(codexFailure("unavailable", error.message));
+                  },
+                })();
+              }),
+            catch: captureCodexFailure,
+          }),
+          (cause) => {
             if (Panic.is(cause)) return preserveToolPanic(cause);
-            return codexFailure(
-              "unavailable",
-              cause instanceof Error ? cause.message : "Codex logout failed",
-            );
+            return codexFailure("unavailable", cause.message);
           },
-        })
+        )
       ).andThen((result) => result);
     }
     return Result.err(codexFailure("internal", `Unhandled callable ID '${callableId}'`));

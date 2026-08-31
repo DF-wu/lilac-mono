@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { z } from "zod";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
@@ -54,6 +55,7 @@ export const mcpAuthConfigSchema = authorizationCodeAuthSchema;
 
 const stdioServerInputSchemaV1 = z.strictObject({
   transport: z.literal("stdio"),
+  description: z.string().trim().min(1).optional(),
   command: z.string().min(1),
   args: z.array(z.string()).optional(),
   cwd: z.string().min(1).optional(),
@@ -62,6 +64,7 @@ const stdioServerInputSchemaV1 = z.strictObject({
 
 const httpServerInputObjectSchemaV1 = z.strictObject({
   transport: z.literal("http"),
+  description: z.string().trim().min(1).optional(),
   url: z.string().min(1),
   headers: z.record(z.string().min(1), mcpValueSourceSchema).optional(),
   auth: mcpAuthConfigSchema.optional(),
@@ -143,6 +146,7 @@ function toUniversalConfig(input: McpConfigInputV1): UniversalMcpConfig {
 
     servers[id] = {
       id,
+      ...(server.description === undefined ? {} : { description: server.description }),
       transportConfig:
         server.transport === "stdio"
           ? {
@@ -194,6 +198,7 @@ function toConfigInputV1(
       transport.transport === "stdio"
         ? {
             transport: "stdio",
+            ...(server.description === undefined ? {} : { description: server.description }),
             command: transport.command,
             ...(transport.args.length === 0 ? {} : { args: [...transport.args] }),
             ...(transport.cwd === undefined ? {} : { cwd: transport.cwd }),
@@ -201,6 +206,7 @@ function toConfigInputV1(
           }
         : {
             transport: "http",
+            ...(server.description === undefined ? {} : { description: server.description }),
             url: transport.url,
             ...(Object.keys(transport.headers).length === 0
               ? {}
@@ -251,14 +257,17 @@ export function parseMcpConfigDocument(raw: unknown): McpConfigParseResult {
 }
 
 export function parseMcpConfigYaml(source: string): McpConfigParseResult {
-  let document: unknown;
-  try {
-    document = Bun.YAML.parse(source);
-  } catch (error) {
-    const message = opaqueErrorMessage(error);
-    return { ok: false, issues: [`<root>: failed to parse YAML: ${message}`] };
-  }
-  return parseMcpConfigDocument(document);
+  const parsed = Result.try({
+    try: () => Bun.YAML.parse(source) as unknown,
+    catch: captureError,
+  });
+  return parsed.match<() => McpConfigParseResult>({
+    ok: (document) => () => parseMcpConfigDocument(document),
+    err: (error) => () => ({
+      ok: false as const,
+      issues: [`<root>: failed to parse YAML: ${opaqueErrorMessage(error)}`],
+    }),
+  })();
 }
 
 export function serializeMcpConfigYamlResult(

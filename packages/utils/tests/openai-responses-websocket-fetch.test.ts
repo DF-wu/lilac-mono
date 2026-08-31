@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, jest } from "bun:test";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { streamText } from "ai";
+import { Panic } from "better-result";
 
 import { createOpenAIResponsesWebSocketFetch } from "../openai-responses-websocket-fetch";
 
@@ -18,6 +19,7 @@ class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
   static openOnConstruct = true;
   static onConstruct: (() => void) | undefined;
+  static onSend: (() => void) | undefined;
 
   readonly url: string;
   readonly init?: WebSocketInit;
@@ -43,6 +45,7 @@ class FakeWebSocket {
     FakeWebSocket.instances.length = 0;
     FakeWebSocket.openOnConstruct = true;
     FakeWebSocket.onConstruct = undefined;
+    FakeWebSocket.onSend = undefined;
   }
 
   addEventListener(type: string, listener: (event: Event) => void): void {
@@ -59,6 +62,7 @@ class FakeWebSocket {
 
   send(data: string): void {
     this.sent.push(data);
+    FakeWebSocket.onSend?.();
   }
 
   close(): void {
@@ -417,6 +421,8 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
 
     const wsFetch = createOpenAIResponsesWebSocketFetch({ mode: "websocket" });
     const openai = createOpenAI({ apiKey: "test-token", fetch: wsFetch });
+    const requestSent = Promise.withResolvers<void>();
+    FakeWebSocket.onSend = requestSent.resolve;
 
     const result = streamText({
       model: openai.responses("gpt-5-mini"),
@@ -437,8 +443,7 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
       })(),
     );
 
-    // test-wait-justification: lets stream consumption create the fake websocket before injecting its error event
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await requestSent.promise;
 
     const socket = FakeWebSocket.instances[0];
     expect(socket).toBeDefined();
@@ -700,6 +705,60 @@ describe("createOpenAIResponsesWebSocketFetch", () => {
     await expect(response.text()).rejects.toThrow(
       "Response stream ended before a terminal response event",
     );
+    wsFetch.close();
+  });
+
+  it("releases the SSE source reader after an exact Panic", async () => {
+    const panic = new Panic({ message: "SSE read invariant" });
+    let sourceController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const source = new ReadableStream<Uint8Array>({
+      start(controller) {
+        sourceController = controller;
+      },
+    });
+    globals.fetch = (async () =>
+      new Response(source, {
+        headers: { "content-type": "text/event-stream" },
+      })) as unknown as typeof globalThis.fetch;
+
+    const wsFetch = createOpenAIResponsesWebSocketFetch({ mode: "sse" });
+    const response = await wsFetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ stream: true, input: "hi" }),
+    });
+    const text = response.text();
+    sourceController?.error(panic);
+
+    await expect(text).rejects.toBe(panic);
+    expect(source.locked).toBe(false);
+    wsFetch.close();
+  });
+
+  it("cancels and releases the SSE source reader while preserving the cancel error", async () => {
+    const cancelError = new Error("SSE cancellation failed");
+    const cancelReason = new Error("consumer stopped");
+    let receivedReason: unknown;
+    const source = new ReadableStream<Uint8Array>({
+      cancel(reason) {
+        receivedReason = reason;
+        throw cancelError;
+      },
+    });
+    globals.fetch = (async () =>
+      new Response(source, {
+        headers: { "content-type": "text/event-stream" },
+      })) as unknown as typeof globalThis.fetch;
+
+    const wsFetch = createOpenAIResponsesWebSocketFetch({ mode: "sse" });
+    const response = await wsFetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      body: JSON.stringify({ stream: true, input: "hi" }),
+    });
+    const reader = response.body?.getReader();
+
+    await expect(reader?.cancel(cancelReason)).rejects.toBe(cancelError);
+    expect(receivedReason).toBe(cancelReason);
+    expect(source.locked).toBe(false);
     wsFetch.close();
   });
 

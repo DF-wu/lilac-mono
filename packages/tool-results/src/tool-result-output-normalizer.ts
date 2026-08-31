@@ -132,16 +132,23 @@ function ownerScopeId(owner: ToolResultOutputNormalizerOwner): string {
 function serializeOutput(
   value: JsonToolResultOutput["value"],
 ): ResultType<string | undefined, ToolResultOutputSerializationFailed> {
-  try {
-    return Result.ok(JSON.stringify(value, null, 2));
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new ToolResultOutputSerializationFailed({
-        message: "Tool result output is not JSON-serializable",
-      }),
-    );
-  }
+  const captured = Result.try({
+    try: () => JSON.stringify(value, null, 2),
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = captured.match<
+    { readonly value: string | undefined } | { readonly cause: unknown }
+  >({
+    ok: (value) => ({ value }),
+    err: ({ cause }) => ({ cause }),
+  });
+  if ("value" in outcome) return Result.ok(outcome.value);
+  if (Panic.is(outcome.cause)) throw outcome.cause;
+  return Result.err(
+    new ToolResultOutputSerializationFailed({
+      message: "Tool result output is not JSON-serializable",
+    }),
+  );
 }
 
 export function createOverflowReferenceNormalizer(
@@ -306,17 +313,18 @@ export function createOverflowReferenceNormalizer(
         output.type === "error-json"
           ? { ...output, type: "error-text", value: UNSERIALIZABLE_JSON_OUTPUT }
           : { ...output, type: "text", value: UNSERIALIZABLE_JSON_OUTPUT };
-      return serialized.match({
-        err: async () => unserializable(),
-        ok: async (serializedValue) => {
-          if (serializedValue === undefined) return unserializable();
-          if (!spillOutput) return output;
-          const value = await normalizeCapturedText(serializedValue, context, true, config);
-          return output.type === "error-json"
-            ? { ...output, type: "error-text", value }
-            : { ...output, type: "text", value };
-        },
+      const serializedOutcome = serialized.match<
+        { readonly ok: true; readonly value: string | undefined } | { readonly ok: false }
+      >({
+        err: () => ({ ok: false }),
+        ok: (value) => ({ ok: true, value }),
       });
+      if (!serializedOutcome.ok || serializedOutcome.value === undefined) return unserializable();
+      if (!spillOutput) return output;
+      const value = await normalizeCapturedText(serializedOutcome.value, context, true, config);
+      return output.type === "error-json"
+        ? { ...output, type: "error-text", value }
+        : { ...output, type: "text", value };
     }
 
     if (output.type === "content") {

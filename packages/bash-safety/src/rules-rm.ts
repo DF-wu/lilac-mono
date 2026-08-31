@@ -51,18 +51,26 @@ function resolveRmPaths(
   cwd: string,
   target: string,
 ): ResultType<ResolvedRmPaths, RmPathResolutionFailed> {
-  return Result.try({
+  const captured = Result.try({
     try: () => ({ cwd: realpathSync(cwd), target: realpathSync(resolve(cwd, target)) }),
-    catch: (cause) => {
-      if (Panic.is(cause)) throw cause;
-      return new RmPathResolutionFailed({
-        cwd,
-        target,
-        cause,
-        message: "rm target paths could not be resolved",
-      });
-    },
+    catch: (cause) => ({ cause }),
   });
+  const outcome = captured.match<{ readonly value: ResolvedRmPaths } | { readonly cause: unknown }>(
+    {
+      ok: (value) => ({ value }),
+      err: ({ cause }) => ({ cause }),
+    },
+  );
+  if ("value" in outcome) return Result.ok(outcome.value);
+  if (Panic.is(outcome.cause)) throw outcome.cause;
+  return Result.err(
+    new RmPathResolutionFailed({
+      cwd,
+      target,
+      cause: outcome.cause,
+      message: "rm target paths could not be resolved",
+    }),
+  );
 }
 
 export function analyzeRm(tokens: string[], options: AnalyzeRmOptions = {}): string | null {
@@ -258,15 +266,16 @@ function isCwdSelfTarget(target: string, cwd: string): boolean {
   }
 
   const resolvedPaths = resolveRmPaths(cwd, target);
-  return resolvedPaths.match({
-    ok: (paths) => paths.target === paths.cwd,
-    err: () => {
+  const compare = resolvedPaths.match<() => boolean>({
+    ok: (paths) => () => paths.target === paths.cwd,
+    err: () => () => {
       // Missing paths cannot be canonicalized, so preserve the lexical fallback.
       const resolved = resolve(cwd, target);
       const normalizedCwd = normalize(cwd);
       return resolved === normalizedCwd;
     },
   });
+  return compare();
 }
 
 function isTargetWithinCwd(target: string, originalCwd: string, effectiveCwd?: string): boolean {

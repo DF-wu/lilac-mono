@@ -24,7 +24,7 @@ import {
   type ToolModelMessage,
   type ToolSet,
 } from "ai";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 import {
   createLogger,
@@ -50,7 +50,12 @@ import {
   type SettledToolResultOutputEntry,
   type ToolResultOutput,
 } from "./atomic-tool-execution";
-import { rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
+import {
+  captureAgentOperation,
+  captureAgentPromise,
+  rethrowAgentPanic,
+  type OpaqueAgentValue,
+} from "./failure-adapters";
 import { normalizeModelMessagesToolCallIds } from "./tool-call-id-normalization";
 import type { ExpandedToolCall } from "./tool-call-expansion";
 
@@ -631,6 +636,15 @@ export type BeforeStepHandler = (context: {
   abortSignal?: AbortSignal;
 }) => void | Promise<void>;
 
+/** Stable identifier for one queued steering or follow-up input. */
+export type AgentInputQueueId = string;
+
+/** Awaited hook for persisting the current replay-safe transcript. */
+export type RecoveryCheckpointHandler = (
+  messages: readonly ModelMessage[],
+  canonicalInputIds: readonly AgentInputQueueId[],
+) => void | Promise<void>;
+
 export type ExecutedExpansionChild = {
   toolCallId: string;
   toolName: string;
@@ -674,6 +688,8 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   beforeSteeringDelivery?: BeforeSteeringDeliveryHandler;
   /** Refresh active tools and other per-step state before tool authority is frozen. */
   beforeStep?: BeforeStepHandler;
+  /** Persist replay-safe messages before later model or tool work starts. */
+  recoveryCheckpointHandler?: RecoveryCheckpointHandler;
   /** Normalize model-facing tool output before it enters the canonical transcript. */
   normalizeToolResultOutput?: NormalizeToolResultOutputFn;
   /** Normalize one fully settled expansion cohort in declared child order. */
@@ -811,22 +827,23 @@ function cloneSteeringValue(
     }
     return Result.ok(cloned);
   }
-  let prototype: object | null;
-  let symbols: symbol[];
-  let descriptors: Record<string, PropertyDescriptor>;
-  try {
-    prototype = Object.getPrototypeOf(value);
-    symbols = Object.getOwnPropertySymbols(value);
-    descriptors = Object.getOwnPropertyDescriptors(value);
-  } catch (cause) {
-    rethrowAgentPanic(cause);
+  const inspected = resultOutcome(
+    captureAgentOperation(() => ({
+      prototype: Object.getPrototypeOf(value),
+      symbols: Object.getOwnPropertySymbols(value),
+      descriptors: Object.getOwnPropertyDescriptors(value),
+    })),
+  );
+  if (!inspected.ok) {
+    rethrowAgentPanic(inspected.error);
     return Result.err(
       new SteeringMessageCloneFailed({
-        cause,
-        message: `reflective message inspection failed: ${errorMessage(cause)}`,
+        cause: inspected.error,
+        message: `reflective message inspection failed: ${errorMessage(inspected.error)}`,
       }),
     );
   }
+  const { prototype, symbols, descriptors } = inspected.value;
   if (prototype !== Object.prototype && prototype !== null) {
     return Result.err(
       new SteeringMessageCloneFailed({
@@ -965,6 +982,7 @@ function peekQueued<T>(mode: "one-at-a-time" | "all", queue: T[]): T[] {
 }
 
 type FollowUpQueueEntry = {
+  readonly id: AgentInputQueueId;
   readonly message: ModelMessage;
 };
 
@@ -1257,12 +1275,12 @@ function recoveryToolOutput(value: unknown): ToolResultOutput {
       };
     }
   }
-  try {
-    return { type: "text", value: JSON.stringify(value) ?? String(value) };
-  } catch (cause) {
-    rethrowAgentPanic(cause);
-    return { type: "text", value: String(value) };
-  }
+  const serialized = resultOutcome(
+    captureAgentOperation(() => JSON.stringify(value) ?? String(value)),
+  );
+  if (serialized.ok) return { type: "text", value: serialized.value };
+  rethrowAgentPanic(serialized.error);
+  return { type: "text", value: String(value) };
 }
 
 function truncateToLastValidBoundary(messages: ModelMessage[]): {
@@ -1340,11 +1358,14 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private nextSteeringId = 1;
   private steeringQueue: SteeringDeliveryEntry[] = [];
   private steeringDeliveryPreparation: SteeringDeliveryPreparation | undefined;
-  private deliveredSteeringMessages: ModelMessage[] = [];
+  private deliveredSteeringMessages: SteeringDeliveryEntry[] = [];
   private followUpQueue: FollowUpQueueEntry[] = [];
+  private nextFollowUpId = 1;
+  private canonicalInputIdsSinceCheckpoint: AgentInputQueueId[] = [];
   private recoveryCheckpoint: RecoveryCheckpoint | null = null;
 
   private pendingInterrupt: ModelMessage[] | null = null;
+  private pendingInterruptInputIds: AgentInputQueueId[] = [];
   private awaitedSteeringInterrupt: AwaitedSteeringInterruptRequest | null = null;
   private cancelResetPending = false;
   private abortRequestedReason: TurnAbortReason | null = null;
@@ -1360,6 +1381,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private turnBoundaryHandler: TurnBoundaryHandler | undefined;
   private beforeSteeringDelivery: BeforeSteeringDeliveryHandler | undefined;
   private beforeStep: BeforeStepHandler | undefined;
+  private recoveryCheckpointHandler: RecoveryCheckpointHandler | undefined;
   private experimentalDownload: DownloadFunction | undefined;
   private normalizeToolResultOutput: NormalizeToolResultOutputFn | undefined;
   private normalizeSettledToolResultOutputs: NormalizeSettledToolResultOutputsFn | undefined;
@@ -1387,6 +1409,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.turnBoundaryHandler = options.turnBoundaryHandler;
     this.beforeSteeringDelivery = options.beforeSteeringDelivery;
     this.beforeStep = options.beforeStep;
+    this.recoveryCheckpointHandler = options.recoveryCheckpointHandler;
     this.experimentalDownload = options.experimentalDownload;
     this.normalizeToolResultOutput = options.normalizeToolResultOutput;
     this.normalizeSettledToolResultOutputs = options.normalizeSettledToolResultOutputs;
@@ -1507,6 +1530,20 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     return checkpoint
       ? [...cloneMessages(checkpoint.baseMessages), ...cloneMessages(checkpoint.suffixMessages)]
       : cloneMessages(this.state.messages);
+  }
+
+  private async persistRecoveryCheckpoint(): Promise<void> {
+    const canonicalInputCount = this.canonicalInputIdsSinceCheckpoint.length;
+    const canonicalInputIds = this.canonicalInputIdsSinceCheckpoint.slice(0, canonicalInputCount);
+    await this.recoveryCheckpointHandler?.(
+      this.getRecoverableMessages().map(cloneMessage),
+      canonicalInputIds,
+    );
+    this.canonicalInputIdsSinceCheckpoint.splice(0, canonicalInputCount);
+  }
+
+  private recordCanonicalInputs(entries: readonly { readonly id: AgentInputQueueId }[]): void {
+    for (const entry of entries) this.canonicalInputIdsSinceCheckpoint.push(entry.id);
   }
 
   private markExternalToolCallNormalized(toolCallId: string): void {
@@ -1798,7 +1835,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     if (index < 0) return Result.ok(false);
     const [entry] = this.steeringQueue.splice(index, 1);
     if (!entry) return Result.ok(false);
-    this.deliveredSteeringMessages.push(entry.message);
+    this.deliveredSteeringMessages.push(entry);
     return Result.ok(true);
   }
 
@@ -1813,10 +1850,13 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
    *
    * Follow-ups are only injected when a turn finishes without tool calls.
    */
-  followUp(message: string | ModelMessage) {
+  followUp(message: string | ModelMessage): AgentInputQueueId {
+    const id = `follow-up-${this.nextFollowUpId++}`;
     this.followUpQueue.push({
+      id,
       message: cloneQueuedMessage(makeUserMessage(message), "queue"),
     });
+    return id;
   }
 
   /**
@@ -1846,6 +1886,10 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       ...followUps.map((entry) => entry.message),
       ...steering.map((entry) => entry.message),
     ]);
+    this.pendingInterruptInputIds.push(
+      ...followUps.map((entry) => entry.id),
+      ...steering.map((entry) => entry.id),
+    );
     if (!pendingInterrupt) this.requestAbort("interrupt");
 
     return {
@@ -1898,10 +1942,16 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     this.abortController?.abort();
   }
 
-  private takePendingInterrupt(): ModelMessage[] | null {
+  private takePendingInterrupt(): {
+    readonly messages: ModelMessage[];
+    readonly inputIds: readonly AgentInputQueueId[];
+  } | null {
     const messages = this.pendingInterrupt;
     this.pendingInterrupt = null;
-    return messages;
+    if (!messages) return null;
+    const inputIds = this.pendingInterruptInputIds;
+    this.pendingInterruptInputIds = [];
+    return { messages, inputIds };
   }
 
   /**
@@ -1935,6 +1985,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       this.followUpQueue.length = 0;
     }
     this.pendingInterrupt = null;
+    this.pendingInterruptInputIds = [];
 
     if (!this.state.isStreaming) {
       this.finishCancellation();
@@ -2159,34 +2210,37 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
   private async invokeSteeringDeliveryHook(
     preparation: SteeringDeliveryPreparation,
   ): Promise<SteeringDeliveryHookResult> {
-    try {
-      if (this.beforeSteeringDelivery) {
-        const batch = Object.freeze(
-          preparation.steeringEntries.map((entry) =>
+    const attempted = resultOutcome(
+      await captureAgentPromise(async (): Promise<SteeringDeliveryHookResult> => {
+        if (this.beforeSteeringDelivery) {
+          const batch = Object.freeze(
+            preparation.steeringEntries.map((entry) =>
+              Object.freeze({
+                id: entry.id,
+                message: cloneQueuedMessage(entry.message, "deliver"),
+              }),
+            ),
+          );
+          const canonicalMessages = Object.freeze(
+            preparation.canonicalMessages.map((message) => cloneQueuedMessage(message, "deliver")),
+          );
+          const abortSignal = this.abortController?.signal;
+          await this.beforeSteeringDelivery(
             Object.freeze({
-              id: entry.id,
-              message: cloneQueuedMessage(entry.message, "deliver"),
+              deliveryKind: preparation.deliveryKind,
+              batch,
+              canonicalMessages,
+              ...(abortSignal ? { abortSignal } : {}),
             }),
-          ),
-        );
-        const canonicalMessages = Object.freeze(
-          preparation.canonicalMessages.map((message) => cloneQueuedMessage(message, "deliver")),
-        );
-        const abortSignal = this.abortController?.signal;
-        await this.beforeSteeringDelivery(
-          Object.freeze({
-            deliveryKind: preparation.deliveryKind,
-            batch,
-            canonicalMessages,
-            ...(abortSignal ? { abortSignal } : {}),
-          }),
-        );
-      }
-      preparation.hookStatus = "prepared";
-      return { status: "prepared" };
-    } catch (error) {
-      rethrowAgentPanic(error);
-      const message = errorMessage(error);
+          );
+        }
+        preparation.hookStatus = "prepared";
+        return { status: "prepared" };
+      }),
+    );
+    if (!attempted.ok) {
+      rethrowAgentPanic(attempted.error);
+      const message = errorMessage(attempted.error);
       this.emit({
         type: "steering_delivery_failed",
         deliveryKind: preparation.deliveryKind,
@@ -2195,6 +2249,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       });
       return { status: "failed", error: message };
     }
+    return attempted.value;
   }
 
   private clearSteeringDeliveryPreparation(preparation: SteeringDeliveryPreparation): void {
@@ -2279,6 +2334,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       return;
     }
     for (const message of consumedOutcome.value) this.appendMessage(message);
+    this.recordCanonicalInputs([...preparation.followUpEntries, ...preparation.steeringEntries]);
     this.settleAwaitedSteeringInterrupt(request, {
       status: "interrupted",
       steeringIds: preparation.steeringEntries.map((entry) => entry.id),
@@ -2437,12 +2493,17 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     const abortSignal = this.beginFreshPostInterruptPhase();
 
     let decision: TurnErrorHandlerDecision = "fail";
-    try {
-      decision = await request.decideRetry(request.error, {
-        abortSignal,
-      });
-    } catch (cause) {
-      rethrowAgentPanic(cause);
+    const decided = resultOutcome(
+      await captureAgentPromise(
+        async () =>
+          await request.decideRetry(request.error, {
+            abortSignal,
+          }),
+      ),
+    );
+    if (decided.ok) decision = decided.value;
+    else {
+      rethrowAgentPanic(decided.error);
       // A failed retry decision refuses recovery; the original idle error remains authoritative.
     }
 
@@ -2486,11 +2547,17 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
     // the run was cancelled. Provider-executed work it caused is preserved by
     // recovery, so dropping the message would leave an answer to a question no
     // user turn ever asked. Undelivered steering is still discarded.
-    this.resetMessagesAfterAbort("cancel", takeAll(this.deliveredSteeringMessages));
+    const deliveredSteering = takeAll(this.deliveredSteeringMessages);
+    this.resetMessagesAfterAbort(
+      "cancel",
+      deliveredSteering.map((entry) => entry.message),
+    );
+    this.recordCanonicalInputs(deliveredSteering);
     this.steeringQueue.length = 0;
     this.steeringDeliveryPreparation = undefined;
     this.followUpQueue.length = 0;
     this.pendingInterrupt = null;
+    this.pendingInterruptInputIds = [];
     this.cancelResetPending = false;
   }
 
@@ -2510,244 +2577,274 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       let runTotalUsage: LanguageModelUsage | undefined = undefined;
       let lengthRecoveryAttempted = false;
 
-      try {
-        if (options.newMessages) {
-          for (const msg of options.newMessages) {
-            this.appendMessage(msg);
-          }
-        }
-
-        while (true) {
-          if (this.cancelResetPending) {
-            this.emit({ type: "turn_abort", reason: "cancel", phase: "tools" });
-            this.finishCancellation();
-            break;
-          }
-
-          const idleRecoveryRequest = this.idleRecoveryRequest;
-          if (idleRecoveryRequest) {
-            const supersedingReason = this.idleRecoverySupersedingReason();
-            if (supersedingReason) {
-              this.settleIdleRecovery(idleRecoveryRequest, {
-                status: "superseded",
-                reason: supersedingReason,
-              });
-            } else {
-              this.emit({ type: "turn_abort", reason: "recovery", phase: "tools" });
-              await this.finishIdleRecovery(idleRecoveryRequest);
-              continue;
+      const runAttempt = resultOutcome(
+        await captureAgentPromise(async () => {
+          if (options.newMessages) {
+            for (const msg of options.newMessages) {
+              this.appendMessage(msg);
             }
           }
 
-          // Awaited steering interrupts prepare only after the active phase has settled.
-          const awaitedInterrupt = this.awaitedSteeringInterrupt;
-          if (awaitedInterrupt) {
-            this.emit({
-              type: "turn_abort",
-              reason: "interrupt",
-              phase: "tools",
-            });
-            this.resetMessagesAfterAbort("interrupt");
-            this.beginFreshPostInterruptPhase();
-            await this.deliverAwaitedSteeringInterrupt(awaitedInterrupt);
+          while (true) {
             if (this.cancelResetPending) {
+              this.emit({ type: "turn_abort", reason: "cancel", phase: "tools" });
               this.finishCancellation();
               break;
             }
-            if (this.abortController?.signal.aborted) {
-              const reason = this.abortRequestedReason ?? "manual";
-              this.emit({ type: "turn_abort", reason, phase: "tools" });
-              break;
-            }
-            continue;
-          }
 
-          // Handle a legacy interrupt that arrived between awaited operations.
-          if (this.pendingInterrupt) {
-            const interruptMessages = this.takePendingInterrupt();
-            if (!interruptMessages) continue;
-
-            this.emit({
-              type: "turn_abort",
-              reason: "interrupt",
-              phase: "tools",
-            });
-
-            this.resetMessagesAfterAbort("interrupt");
-            if (this.cancelResetPending) {
-              this.finishCancellation();
-              break;
-            }
-            for (const message of interruptMessages) this.appendMessage(message);
-
-            this.beginFreshPostInterruptPhase();
-          } else if (this.abortController?.signal.aborted) {
-            // Manual abort between turns.
-            const reason: TurnAbortReason = this.abortRequestedReason ?? "manual";
-            this.emit({ type: "turn_abort", reason, phase: "tools" });
-            break;
-          }
-
-          let modelTurnCompleted = false;
-          let turnErrorPhase: TurnErrorPhase = "before-step";
-          const localToolDraftIds = new Set<string>();
-
-          try {
-            const turn = await this.runTurn({
-              onErrorPhase: (phase) => {
-                turnErrorPhase = phase;
-                if (phase === "post-model") modelTurnCompleted = true;
-              },
-              onProviderExecutedTool: () => {
-                this.providerExecutedToolAttemptLatched = true;
-              },
-              onLocalToolDraft: (toolCallId) => {
-                localToolDraftIds.add(toolCallId);
-              },
-            });
-            modelTurnCompleted = true;
-            turnErrorPhase = "post-model";
-            if (this.cancelResetPending) {
-              throw new TurnAbortedError({ reason: "cancel", phase: "model" });
-            }
-
-            for (const delivered of takeAll(this.deliveredSteeringMessages)) {
-              this.appendMessage(delivered);
-            }
-            const truncatedToolResult =
-              turn.finishReason === "length"
-                ? truncatedToolCallResultMessage(turn.toolCalls)
-                : null;
-            const normalizedTruncatedToolResult = truncatedToolResult
-              ? await this.normalizeNewToolMessage(truncatedToolResult)
-              : null;
-            for (const added of turn.newMessages) {
-              this.state.messages.push(added);
-            }
-            if (normalizedTruncatedToolResult) {
-              this.appendMessage(normalizedTruncatedToolResult);
-            }
-            const newMessages = normalizedTruncatedToolResult
-              ? [...turn.newMessages, normalizedTruncatedToolResult]
-              : turn.newMessages;
-            this.recoveryCheckpoint = null;
-            for (const added of newMessages) {
-              if (
-                added.role === "assistant" &&
-                getUnresolvedAssistantToolCallIds(added).length > 0
-              ) {
-                this.checkpointCurrentToolExchange();
-              }
-            }
-            if (truncateToLastValidBoundary(this.state.messages).droppedMessageCount === 0) {
-              this.recoveryCheckpoint = null;
-            }
-
-            runTotalUsage = sumLanguageModelUsage(runTotalUsage, turn.totalUsage);
-
-            this.emit({
-              type: "turn_end",
-              finishReason: turn.finishReason,
-              newMessages: newMessages.map(cloneMessage),
-              usage: turn.usage,
-              totalUsage: turn.totalUsage,
-            });
-
-            if (this.cancelResetPending) {
-              throw new TurnAbortedError({ reason: "cancel", phase: "tools" });
-            }
-
-            // Parsed local calls are authoritative even when compatible providers
-            // return a non-standard finish reason such as "other".
-            const hasLocalToolCalls = turn.toolCalls.length > 0;
-            // AI SDK materializes rejected tool inputs as completed tool results.
-            // Continue so the model can inspect the validation error and retry.
-            const hasCompletedToolExchange =
-              turn.finishReason === "tool-calls" &&
-              newMessages.some(
-                (message) => message.role === "tool" || hasInlineToolResult(message),
-              );
-            const shouldExecuteLocalToolCalls = hasLocalToolCalls && turn.finishReason !== "length";
-            const toolExecution = shouldExecuteLocalToolCalls
-              ? await this.executeToolCalls(turn.toolCalls, turn.toolSnapshot)
-              : Result.ok<number, ToolBatchExecutionFailed>(0);
-            const toolExecutionOutcome = resultOutcome(toolExecution);
-            if (!toolExecutionOutcome.ok) throw toolExecutionOutcome.error.cause;
-            const executedToolCallCount = toolExecutionOutcome.value;
-            if (hasLocalToolCalls) this.recoveryCheckpoint = null;
-
-            const boundaryDecision = await this.applyTurnBoundary({
-              finishReason: turn.finishReason,
-              modelInputMessages: turn.modelInputMessages,
-              executedToolCallCount,
-            });
-            const recoverFromLength = turn.finishReason === "length" && !lengthRecoveryAttempted;
-            if (recoverFromLength) {
-              lengthRecoveryAttempted = true;
-              this.appendMessage(lengthRecoveryContinueMessage());
-            }
-
-            if (this.cancelResetPending) {
-              throw new TurnAbortedError({ reason: "cancel", phase: "tools" });
-            }
-            if (this.awaitedSteeringInterrupt) continue;
-            if (this.pendingInterrupt) continue;
-
-            // Steering should pick up any buffered follow-ups and remains ahead of
-            // the normal tool-result continuation decision.
-            const steeringPreparation = await this.prepareQueuedSteeringDelivery();
-            if (steeringPreparation.status === "prepared") {
-              const consumed = this.consumeSteeringDelivery(steeringPreparation.preparation);
-              const consumedOutcome = resultOutcome(consumed);
-              if (!consumedOutcome.ok) {
-                this.clearSteeringDeliveryPreparation(steeringPreparation.preparation);
-                break;
-              }
-              for (const msg of consumedOutcome.value) {
-                this.appendMessage(msg);
-              }
-              continue;
-            }
-
-            if (this.cancelResetPending) {
-              throw new TurnAbortedError({ reason: "cancel", phase: "tools" });
-            }
-            if (this.pendingInterrupt || this.abortController?.signal.aborted) continue;
-
-            const naturallyRequiresNextTurn =
-              hasLocalToolCalls ||
-              hasCompletedToolExchange ||
-              boundaryDecision.requiresNextTurn ||
-              recoverFromLength;
-            if (
-              steeringPreparation.status === "failed" ||
-              steeringPreparation.status === "external-settled"
-            ) {
-              if (naturallyRequiresNextTurn) continue;
-              this.recoveryCheckpoint = null;
-              break;
-            }
-
-            if (turn.finishReason !== "tool-calls") {
-              const followUps = takeQueued(this.followUpMode, this.followUpQueue);
-              if (followUps.length > 0) {
-                const merged = mergeUserMessages(followUps.map((entry) => entry.message));
-                for (const msg of merged) {
-                  this.appendMessage(msg);
-                }
+            const idleRecoveryRequest = this.idleRecoveryRequest;
+            if (idleRecoveryRequest) {
+              const supersedingReason = this.idleRecoverySupersedingReason();
+              if (supersedingReason) {
+                this.settleIdleRecovery(idleRecoveryRequest, {
+                  status: "superseded",
+                  reason: supersedingReason,
+                });
+              } else {
+                this.emit({ type: "turn_abort", reason: "recovery", phase: "tools" });
+                await this.finishIdleRecovery(idleRecoveryRequest);
                 continue;
               }
             }
 
-            if (naturallyRequiresNextTurn) {
+            // Awaited steering interrupts prepare only after the active phase has settled.
+            const awaitedInterrupt = this.awaitedSteeringInterrupt;
+            if (awaitedInterrupt) {
+              this.emit({
+                type: "turn_abort",
+                reason: "interrupt",
+                phase: "tools",
+              });
+              this.resetMessagesAfterAbort("interrupt");
+              this.beginFreshPostInterruptPhase();
+              await this.deliverAwaitedSteeringInterrupt(awaitedInterrupt);
+              if (this.cancelResetPending) {
+                this.finishCancellation();
+                break;
+              }
+              if (this.abortController?.signal.aborted) {
+                const reason = this.abortRequestedReason ?? "manual";
+                this.emit({ type: "turn_abort", reason, phase: "tools" });
+                break;
+              }
               continue;
             }
 
-            // A normally completed run persists its finalized messages. The
-            // checkpoint is only authoritative when the active block aborts.
-            this.recoveryCheckpoint = null;
-            break;
-          } catch (err) {
+            // Handle a legacy interrupt that arrived between awaited operations.
+            if (this.pendingInterrupt) {
+              const pendingInterrupt = this.takePendingInterrupt();
+              if (!pendingInterrupt) continue;
+
+              this.emit({
+                type: "turn_abort",
+                reason: "interrupt",
+                phase: "tools",
+              });
+
+              this.resetMessagesAfterAbort("interrupt");
+              if (this.cancelResetPending) {
+                this.finishCancellation();
+                break;
+              }
+              for (const message of pendingInterrupt.messages) this.appendMessage(message);
+              this.canonicalInputIdsSinceCheckpoint.push(...pendingInterrupt.inputIds);
+
+              this.beginFreshPostInterruptPhase();
+            } else if (this.abortController?.signal.aborted) {
+              // Manual abort between turns.
+              const reason: TurnAbortReason = this.abortRequestedReason ?? "manual";
+              this.emit({ type: "turn_abort", reason, phase: "tools" });
+              break;
+            }
+
+            let modelTurnCompleted = false;
+            let turnErrorPhase: TurnErrorPhase = "before-step";
+            const localToolDraftIds = new Set<string>();
+
+            const turnAttempt = resultOutcome(
+              await captureAgentPromise(async () => {
+                const turn = await this.runTurn({
+                  onErrorPhase: (phase) => {
+                    turnErrorPhase = phase;
+                    if (phase === "post-model") modelTurnCompleted = true;
+                  },
+                  onProviderExecutedTool: () => {
+                    this.providerExecutedToolAttemptLatched = true;
+                  },
+                  onLocalToolDraft: (toolCallId) => {
+                    localToolDraftIds.add(toolCallId);
+                  },
+                });
+                modelTurnCompleted = true;
+                turnErrorPhase = "post-model";
+                if (this.cancelResetPending) {
+                  return signalAgentStateHost(
+                    new TurnAbortedError({ reason: "cancel", phase: "model" }),
+                  );
+                }
+
+                const deliveredSteering = takeAll(this.deliveredSteeringMessages);
+                for (const delivered of deliveredSteering) {
+                  this.appendMessage(delivered.message);
+                }
+                this.recordCanonicalInputs(deliveredSteering);
+                const truncatedToolResult =
+                  turn.finishReason === "length"
+                    ? truncatedToolCallResultMessage(turn.toolCalls)
+                    : null;
+                const normalizedTruncatedToolResult = truncatedToolResult
+                  ? await this.normalizeNewToolMessage(truncatedToolResult)
+                  : null;
+                for (const added of turn.newMessages) {
+                  this.state.messages.push(added);
+                }
+                if (normalizedTruncatedToolResult) {
+                  this.appendMessage(normalizedTruncatedToolResult);
+                }
+                const newMessages = normalizedTruncatedToolResult
+                  ? [...turn.newMessages, normalizedTruncatedToolResult]
+                  : turn.newMessages;
+                this.recoveryCheckpoint = null;
+                for (const added of newMessages) {
+                  if (
+                    added.role === "assistant" &&
+                    getUnresolvedAssistantToolCallIds(added).length > 0
+                  ) {
+                    this.checkpointCurrentToolExchange();
+                  }
+                }
+                if (truncateToLastValidBoundary(this.state.messages).droppedMessageCount === 0) {
+                  this.recoveryCheckpoint = null;
+                }
+
+                runTotalUsage = sumLanguageModelUsage(runTotalUsage, turn.totalUsage);
+
+                this.emit({
+                  type: "turn_end",
+                  finishReason: turn.finishReason,
+                  newMessages: newMessages.map(cloneMessage),
+                  usage: turn.usage,
+                  totalUsage: turn.totalUsage,
+                });
+                await this.persistRecoveryCheckpoint();
+
+                if (this.cancelResetPending) {
+                  return signalAgentStateHost(
+                    new TurnAbortedError({ reason: "cancel", phase: "tools" }),
+                  );
+                }
+
+                // Parsed local calls are authoritative even when compatible providers
+                // return a non-standard finish reason such as "other". Length-truncated
+                // turns are excluded because their tool arguments may be incomplete.
+                const hasLocalToolCalls =
+                  turn.finishReason !== "length" && turn.toolCalls.length > 0;
+                // AI SDK materializes rejected tool inputs as completed tool results.
+                // Continue so the model can inspect the validation error and retry.
+                const hasCompletedToolExchange =
+                  turn.finishReason === "tool-calls" &&
+                  newMessages.some(
+                    (message) => message.role === "tool" || hasInlineToolResult(message),
+                  );
+                const toolExecution = hasLocalToolCalls
+                  ? await this.executeToolCalls(turn.toolCalls, turn.toolSnapshot)
+                  : Result.ok<number, ToolBatchExecutionFailed>(0);
+                const toolExecutionOutcome = resultOutcome(toolExecution);
+                if (!toolExecutionOutcome.ok)
+                  return signalExternalToolCallHost(toolExecutionOutcome.error);
+                const executedToolCallCount = toolExecutionOutcome.value;
+                if (hasLocalToolCalls) this.recoveryCheckpoint = null;
+
+                const boundaryDecision = await this.applyTurnBoundary({
+                  finishReason: turn.finishReason,
+                  modelInputMessages: turn.modelInputMessages,
+                  executedToolCallCount,
+                });
+                const recoverFromLength =
+                  turn.finishReason === "length" && !lengthRecoveryAttempted;
+                if (recoverFromLength) {
+                  lengthRecoveryAttempted = true;
+                  this.appendMessage(lengthRecoveryContinueMessage());
+                }
+
+                if (this.cancelResetPending) {
+                  return signalAgentStateHost(
+                    new TurnAbortedError({ reason: "cancel", phase: "tools" }),
+                  );
+                }
+                if (this.awaitedSteeringInterrupt) return "continue" as const;
+                if (this.pendingInterrupt) return "continue" as const;
+
+                // Steering should pick up any buffered follow-ups and remains ahead of
+                // the normal tool-result continuation decision.
+                const steeringPreparation = await this.prepareQueuedSteeringDelivery();
+                if (steeringPreparation.status === "prepared") {
+                  const consumed = this.consumeSteeringDelivery(steeringPreparation.preparation);
+                  const consumedOutcome = resultOutcome(consumed);
+                  if (!consumedOutcome.ok) {
+                    this.clearSteeringDeliveryPreparation(steeringPreparation.preparation);
+                    return "break" as const;
+                  }
+                  for (const msg of consumedOutcome.value) {
+                    this.appendMessage(msg);
+                  }
+                  this.recordCanonicalInputs([
+                    ...steeringPreparation.preparation.followUpEntries,
+                    ...steeringPreparation.preparation.steeringEntries,
+                  ]);
+                  return "continue" as const;
+                }
+
+                if (this.cancelResetPending) {
+                  return signalAgentStateHost(
+                    new TurnAbortedError({ reason: "cancel", phase: "tools" }),
+                  );
+                }
+                if (this.pendingInterrupt || this.abortController?.signal.aborted) {
+                  return "continue" as const;
+                }
+
+                const naturallyRequiresNextTurn =
+                  hasLocalToolCalls ||
+                  hasCompletedToolExchange ||
+                  boundaryDecision.requiresNextTurn ||
+                  recoverFromLength;
+                if (
+                  steeringPreparation.status === "failed" ||
+                  steeringPreparation.status === "external-settled"
+                ) {
+                  if (naturallyRequiresNextTurn) return "continue" as const;
+                  this.recoveryCheckpoint = null;
+                  return "break" as const;
+                }
+
+                if (turn.finishReason !== "tool-calls") {
+                  const followUps = takeQueued(this.followUpMode, this.followUpQueue);
+                  if (followUps.length > 0) {
+                    const merged = mergeUserMessages(followUps.map((entry) => entry.message));
+                    for (const msg of merged) {
+                      this.appendMessage(msg);
+                    }
+                    this.recordCanonicalInputs(followUps);
+                    return "continue" as const;
+                  }
+                }
+
+                if (naturallyRequiresNextTurn) {
+                  return "continue" as const;
+                }
+
+                // A normally completed run persists its finalized messages. The
+                // checkpoint is only authoritative when the active block aborts.
+                this.recoveryCheckpoint = null;
+                return "break" as const;
+              }),
+            );
+            if (turnAttempt.ok) {
+              if (turnAttempt.value === "break") break;
+              continue;
+            }
+            const err = turnAttempt.error;
             rethrowAgentPanic(err);
             if (err instanceof TurnAbortedError) {
               const idleRecoveryRequest = this.idleRecoveryRequest;
@@ -2803,7 +2900,8 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
                   this.finishCancellation();
                   break;
                 }
-                for (const message of interruptMessages) this.appendMessage(message);
+                for (const message of interruptMessages.messages) this.appendMessage(message);
+                this.canonicalInputIdsSinceCheckpoint.push(...interruptMessages.inputIds);
 
                 this.beginFreshPostInterruptPhase();
 
@@ -2830,9 +2928,11 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               break;
             }
 
-            for (const delivered of takeAll(this.deliveredSteeringMessages)) {
-              this.appendMessage(delivered);
+            const deliveredSteering = takeAll(this.deliveredSteeringMessages);
+            for (const delivered of deliveredSteering) {
+              this.appendMessage(delivered.message);
             }
+            this.recordCanonicalInputs(deliveredSteering);
 
             if (this.turnErrorHandler) {
               const lastMessage = this.state.messages.at(-1);
@@ -2849,21 +2949,31 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               } else {
                 retrySafety = { canRetry: true };
               }
+              const handled = resultOutcome(
+                await captureAgentPromise(
+                  async () =>
+                    await this.turnErrorHandler!(err, {
+                      abortSignal: this.abortController?.signal,
+                      retrySafety,
+                      phase: turnErrorPhase,
+                    }),
+                ),
+              );
               let decision: TurnErrorHandlerDecision | undefined;
-              try {
-                decision = await this.turnErrorHandler(err, {
-                  abortSignal: this.abortController?.signal,
-                  retrySafety,
-                  phase: turnErrorPhase,
-                });
-              } catch (handlerError) {
-                rethrowAgentPanic(handlerError);
+              if (handled.ok) decision = handled.value;
+              else {
+                rethrowAgentPanic(handled.error);
                 if (
                   !this.cancelResetPending &&
                   !this.pendingInterrupt &&
                   !this.abortController?.signal.aborted
                 ) {
-                  throw handlerError;
+                  return signalExternalToolCallHost(
+                    new AgentExternalHostFailed({
+                      cause: handled.error,
+                      message: "Turn error handler failed",
+                    }),
+                  );
                 }
               }
               if (this.cancelResetPending) {
@@ -2890,48 +3000,68 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
               }
             }
 
-            throw err;
+            return signalExternalToolCallHost(
+              new AgentExternalHostFailed({ cause: err, message: "Agent turn failed" }),
+            );
           }
-        }
 
-        this.emit({
-          type: "agent_end",
-          messages: this.getRecoverableMessages().map(cloneMessage),
-          totalUsage: runTotalUsage,
-        });
-      } catch (err) {
-        rethrowAgentPanic(err);
-        this.state.error = err instanceof Error ? err.message : String(err);
-        this.emit({
-          type: "agent_end",
-          messages: this.getRecoverableMessages().map(cloneMessage),
-          totalUsage: runTotalUsage,
-        });
-        throw err;
-      } finally {
-        const awaitedInterrupt = this.awaitedSteeringInterrupt;
-        if (awaitedInterrupt) {
-          this.settleAwaitedSteeringInterrupt(awaitedInterrupt, { status: "inactive" });
+          await this.persistRecoveryCheckpoint();
+          this.emit({
+            type: "agent_end",
+            messages: this.getRecoverableMessages().map(cloneMessage),
+            totalUsage: runTotalUsage,
+          });
+        }),
+      );
+      let runError: OpaqueAgentValue;
+      if (!runAttempt.ok) {
+        const err = runAttempt.error;
+        if (err instanceof Panic) {
+          runError = err;
+        } else {
+          const handled = resultOutcome(
+            captureAgentOperation(() => {
+              this.state.error = err instanceof Error ? err.message : String(err);
+              this.emit({
+                type: "agent_end",
+                messages: this.getRecoverableMessages().map(cloneMessage),
+                totalUsage: runTotalUsage,
+              });
+            }),
+          );
+          runError = handled.ok ? err : handled.error;
         }
-        const idleRecoveryRequest = this.idleRecoveryRequest;
-        if (idleRecoveryRequest) {
-          this.settleIdleRecovery(idleRecoveryRequest, { status: "inactive" });
-        }
-        this.state.isStreaming = false;
-        this.state.streamMessage = null;
-        this.state.pendingToolCalls = new Set();
-        this.abortController = undefined;
-        this.abortRequestedReason = null;
-        this.pendingInterrupt = null;
-        this.alreadyNormalizedExternalToolCallIds.clear();
-        if (this.cancelResetPending) {
-          this.steeringQueue.length = 0;
-          this.steeringDeliveryPreparation = undefined;
-          this.deliveredSteeringMessages.length = 0;
-          this.followUpQueue.length = 0;
-        }
-        this.cancelResetPending = false;
       }
+      const cleanupAttempt = resultOutcome(
+        captureAgentOperation(() => {
+          const awaitedInterrupt = this.awaitedSteeringInterrupt;
+          if (awaitedInterrupt) {
+            this.settleAwaitedSteeringInterrupt(awaitedInterrupt, { status: "inactive" });
+          }
+          const idleRecoveryRequest = this.idleRecoveryRequest;
+          if (idleRecoveryRequest) {
+            this.settleIdleRecovery(idleRecoveryRequest, { status: "inactive" });
+          }
+          this.state.isStreaming = false;
+          this.state.streamMessage = null;
+          this.state.pendingToolCalls = new Set();
+          this.abortController = undefined;
+          this.abortRequestedReason = null;
+          this.pendingInterrupt = null;
+          this.pendingInterruptInputIds = [];
+          this.canonicalInputIdsSinceCheckpoint.length = 0;
+          this.alreadyNormalizedExternalToolCallIds.clear();
+          if (this.cancelResetPending) {
+            this.steeringQueue.length = 0;
+            this.steeringDeliveryPreparation = undefined;
+            this.deliveredSteeringMessages.length = 0;
+            this.followUpQueue.length = 0;
+          }
+          this.cancelResetPending = false;
+        }),
+      );
+      if (!cleanupAttempt.ok) throw cleanupAttempt.error;
+      if (!runAttempt.ok) throw runError;
     })();
 
     await this.running;
@@ -2962,6 +3092,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       this.providerExecutedToolAttemptLatched = false;
     }
     params.onErrorPhase("before-step");
+    await this.persistRecoveryCheckpoint();
     this.emit({ type: "turn_start" });
 
     const turnIndex = ++this.turnCounter;
@@ -3496,18 +3627,17 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
       signalAgentStateHost(new TurnAbortedError({ reason, phase: "model" }));
     }
 
-    let response: Awaited<typeof result.response>;
-    let finishReason: FinishReason;
-    let usage: LanguageModelUsage;
-    let totalUsage: LanguageModelUsage;
-    let warnings: CallWarning[] | undefined;
-    try {
-      response = await result.response;
-      finishReason = await result.finishReason;
-      usage = await result.usage;
-      totalUsage = await result.totalUsage;
-      warnings = await result.warnings;
-    } catch (e) {
+    const responseAttempt = resultOutcome(
+      await captureAgentPromise(async () => ({
+        response: await result.response,
+        finishReason: await result.finishReason,
+        usage: await result.usage,
+        totalUsage: await result.totalUsage,
+        warnings: await result.warnings,
+      })),
+    );
+    if (!responseAttempt.ok) {
+      const e = responseAttempt.error;
       rethrowAgentPanic(e);
       if (this.abortController?.signal.aborted) {
         if (assistantStarted) {
@@ -3527,6 +3657,7 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
         new AgentExternalHostFailed({ cause: e, message: "AI SDK model response failed" }),
       );
     }
+    const { response, finishReason, usage, totalUsage, warnings } = responseAttempt.value;
     params.onErrorPhase("post-model");
 
     if (warnings && warnings.length > 0) {
@@ -3727,10 +3858,15 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           entries.map((entry) => this.normalizeToolOutput(entry.output, entry.context)),
         );
       }
-      try {
-        const outputs = await this.normalizeSettledToolResultOutputs(entries, (output, context) =>
-          this.normalizeToolOutput(output, context),
-        );
+      const normalized = resultOutcome(
+        await captureAgentPromise(() =>
+          this.normalizeSettledToolResultOutputs!(entries, (output, context) =>
+            this.normalizeToolOutput(output, context),
+          ),
+        ),
+      );
+      if (normalized.ok) {
+        const outputs = normalized.value;
         if (outputs.length !== entries.length) {
           logger.warn("settled expansion output normalization returned wrong output count", {
             expected: entries.length,
@@ -3742,16 +3878,16 @@ export class AiSdkPiAgent<TOOLS extends ToolSet = ToolSet> {
           }));
         }
         return outputs;
-      } catch (error) {
-        rethrowAgentPanic(error);
-        logger.warn("settled expansion output normalization failed", {
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return entries.map(() => ({
-          type: "error-text" as const,
-          value: SETTLED_NORMALIZATION_FAILED,
-        }));
       }
+      rethrowAgentPanic(normalized.error);
+      logger.warn("settled expansion output normalization failed", {
+        error:
+          normalized.error instanceof Error ? normalized.error.message : String(normalized.error),
+      });
+      return entries.map(() => ({
+        type: "error-text" as const,
+        value: SETTLED_NORMALIZATION_FAILED,
+      }));
     };
 
     const checkpointCompleted = (

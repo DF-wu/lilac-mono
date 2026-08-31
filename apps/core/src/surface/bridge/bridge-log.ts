@@ -1,4 +1,4 @@
-import { TaggedError } from "better-result";
+import { Result, TaggedError } from "better-result";
 import {
   formatTaggedErrorForLog,
   redactErrorTextForLog,
@@ -26,13 +26,13 @@ export function formatBridgeTaggedErrorForLog(
   },
 ): BridgeLogContext & TaggedErrorLogProjection {
   const formattedContext = formatBridgeLogContext(context);
-  try {
-    if (TaggedError.is(error)) {
-      return { ...formattedContext, ...formatTaggedErrorForLog(error) };
-    }
-  } catch {
-    // Logging must not replace the bridge failure being reported.
-  }
+  const formatted = Result.try({
+    try: () =>
+      TaggedError.is(error) ? { ...formattedContext, ...formatTaggedErrorForLog(error) } : null,
+    catch: () => null,
+  });
+  const projection = formatted.match({ ok: (value) => value, err: () => null });
+  if (projection) return projection;
   return {
     ...formattedContext,
     errorTag: redactErrorTextForLog(fallback.errorTag),

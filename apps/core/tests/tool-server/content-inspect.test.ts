@@ -189,4 +189,46 @@ describe("content.inspect", () => {
       error: { kind: "usage", message: expect.stringContaining("exceeds") },
     });
   });
+
+  it("propagates oversized response cancellation failures", async () => {
+    const failure = new Error("response cancellation failed");
+    installMockFetch(
+      async () =>
+        new Response(
+          new ReadableStream({
+            cancel: () => Promise.reject(failure),
+          }),
+          { headers: { "content-length": String(CONTENT_INSPECT_MAX_SOURCE_BYTES + 1) } },
+        ),
+    );
+    const input = contentInspectInputSchema.parse({ url: "https://example.com/large.bin" });
+    if (input.type !== "binary") throw new Error("expected binary input");
+
+    const [settled] = await Promise.allSettled([loadInspectSource(input)]);
+
+    expect(settled).toEqual({ status: "rejected", reason: failure });
+  });
+
+  it("preserves Panic from oversized response cancellation", async () => {
+    const panic = new Panic({ message: "response cancellation invariant" });
+    installMockFetch(
+      async () =>
+        new Response(
+          new ReadableStream({
+            cancel: () => Promise.reject(panic),
+          }),
+          { headers: { "content-length": String(CONTENT_INSPECT_MAX_SOURCE_BYTES + 1) } },
+        ),
+    );
+    const input = contentInspectInputSchema.parse({ url: "https://example.com/large.bin" });
+    if (input.type !== "binary") throw new Error("expected binary input");
+
+    const [settled] = await Promise.allSettled([loadInspectSource(input)]);
+
+    expect(settled?.status).toBe("rejected");
+    if (settled?.status === "rejected") {
+      expect(settled.reason).toBe(panic);
+      expect(Panic.is(settled.reason)).toBe(true);
+    }
+  });
 });

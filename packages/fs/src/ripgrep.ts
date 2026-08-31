@@ -111,13 +111,19 @@ const ripgrepNonMatchEventSchema = z.object({
 export function decodeRipgrepMatchLine(
   line: string,
 ): ResultType<GrepMatch | null, RipgrepLineMalformed> {
-  let event: unknown;
-  try {
-    event = JSON.parse(line);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
+  const decoded = Result.try({
+    try: () => JSON.parse(line) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = decoded.match<{ readonly value: unknown } | { readonly cause: unknown }>({
+    ok: (value) => ({ value }),
+    err: ({ cause }) => ({ cause }),
+  });
+  if ("cause" in outcome && Panic.is(outcome.cause)) throw outcome.cause;
+  if ("cause" in outcome) {
     return Result.err(new RipgrepLineMalformed({ message: "ripgrep emitted malformed JSON" }));
   }
+  const event = outcome.value;
   const parsed = ripgrepMatchEventSchema.safeParse(event);
   if (!parsed.success) {
     const nonMatch = ripgrepNonMatchEventSchema.safeParse(event);
@@ -159,23 +165,40 @@ export async function ripgrep(
   } = options;
   const limit = Math.max(1, maxMatches);
 
-  let child: ChildProcessByStdio<null, Readable, Readable> | ChildProcessWithoutNullStreams;
-  try {
-    const args = [...argsForRipgrep({ extraArgs, globs, limit, pattern, regex }), searchPath];
-    child =
-      input === undefined
+  const spawned = Result.try({
+    try: () => {
+      const args = [...argsForRipgrep({ extraArgs, globs, limit, pattern, regex }), searchPath];
+      return input === undefined
         ? spawn("rg", args, { cwd, stdio: ["ignore", "pipe", "pipe"] })
         : spawn("rg", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
+    },
+    catch: (cause) => ({ cause }),
+  });
+  const spawnOutcome = spawned.match<
+    | {
+        readonly child:
+          | ChildProcessByStdio<null, Readable, Readable>
+          | ChildProcessWithoutNullStreams;
+      }
+    | { readonly cause: unknown }
+  >({
+    ok: (child) => ({ child }),
+    err: ({ cause }) => ({ cause }),
+  });
+  if ("cause" in spawnOutcome && Panic.is(spawnOutcome.cause)) throw spawnOutcome.cause;
+  if ("cause" in spawnOutcome) {
     return Result.err(
       new RipgrepExecutionFailed({
         code: null,
         signal: null,
-        message: cause instanceof Error ? cause.message : "Failed to start ripgrep",
+        message:
+          spawnOutcome.cause instanceof Error
+            ? spawnOutcome.cause.message
+            : "Failed to start ripgrep",
       }),
     );
   }
+  const child = spawnOutcome.child;
 
   return await new Promise<ResultType<RipgrepResult, RipgrepError>>((resolve) => {
     const matches: GrepMatch[] = [];
@@ -336,10 +359,19 @@ export async function grepText(
     cwd: process.cwd(),
     input: content,
   });
-  return result.map((value) => ({
-    ...value,
-    matches: value.matches.map((match) => ({ ...match, file: reportedPath })),
-  }));
+  const outcome = result.match<
+    | { readonly ok: true; readonly value: RipgrepResult }
+    | { readonly ok: false; readonly error: RipgrepError }
+  >({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+  return outcome.ok
+    ? Result.ok({
+        ...outcome.value,
+        matches: outcome.value.matches.map((match) => ({ ...match, file: reportedPath })),
+      })
+    : Result.err(outcome.error);
 }
 
 function argsForRipgrep(options: {

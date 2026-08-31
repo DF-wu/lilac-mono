@@ -3,7 +3,11 @@ import { createLogger } from "@stanley2058/lilac-utils";
 import { Panic } from "better-result";
 
 import { createProcessHandlers } from "../../src/runtime/process-handlers";
-import { projectRuntimeError, safeRuntimeErrorText } from "../../src/runtime/error-format";
+import {
+  captureRuntimeError,
+  projectRuntimeError,
+  safeRuntimeErrorText,
+} from "../../src/runtime/error-format";
 
 function createLoggerStub() {
   return createLogger({
@@ -22,6 +26,28 @@ function createExitCodeHooks() {
 }
 
 describe("createProcessHandlers", () => {
+  it("passes one absolute hard deadline to runtime shutdown", async () => {
+    const exitCodeHooks = createExitCodeHooks();
+    const deadlines: number[] = [];
+    const before = Date.now();
+    const handlers = createProcessHandlers({
+      logger: createLoggerStub(),
+      stop: async (_fatalError, hardDeadlineAtMs) => {
+        if (hardDeadlineAtMs !== undefined) deadlines.push(hardDeadlineAtMs);
+      },
+      getExitCode: exitCodeHooks.getExitCode,
+      setExitCode: exitCodeHooks.setExitCode,
+      exitTimeoutMs: 2_000,
+      exit: (() => undefined as never) as (code: number) => never,
+    });
+
+    await handlers.handleSignal("SIGTERM");
+
+    expect(deadlines).toHaveLength(1);
+    expect(deadlines[0]).toBeGreaterThanOrEqual(before + 2_000);
+    expect(deadlines[0]).toBeLessThanOrEqual(Date.now() + 2_000);
+  });
+
   it("redacts standalone provider and AWS credential formats", () => {
     const credentials = [
       "ghp_abcdefghijklmnopqrstuvwxyz123456",
@@ -43,6 +69,7 @@ describe("createProcessHandlers", () => {
   it("safely projects revoked failures", () => {
     const { proxy, revoke } = Proxy.revocable({}, {});
     revoke();
+    expect(captureRuntimeError(proxy)).toEqual({ kind: "opaque" });
     const projected = projectRuntimeError(proxy, "Opaque revoked process failure");
     expect(projected).toBeInstanceOf(Error);
     expect(projected.message).toBe("Opaque revoked process failure");
@@ -74,6 +101,7 @@ describe("createProcessHandlers", () => {
 
   it("treats uncaught exceptions as fatal and exits after stop", async () => {
     const exitCalls: number[] = [];
+    const exited = Promise.withResolvers<void>();
     let stopCalls = 0;
     const exitCodeHooks = createExitCodeHooks();
     const handlers = createProcessHandlers({
@@ -85,13 +113,13 @@ describe("createProcessHandlers", () => {
       setExitCode: exitCodeHooks.setExitCode,
       exit: ((code: number) => {
         exitCalls.push(code);
+        exited.resolve();
         return undefined as never;
       }) as (code: number) => never,
     });
 
     handlers.handleUncaughtException(new Error("fatal"));
-    // test-wait-justification: yields until the fatal handler's asynchronous stop and exit sequence completes
-    await Bun.sleep(0);
+    await exited.promise;
 
     expect(stopCalls).toBe(1);
     expect(exitCalls).toEqual([1]);
@@ -131,9 +159,11 @@ describe("createProcessHandlers", () => {
     const stopPromise = new Promise<void>((resolve) => {
       resolveStop = () => resolve();
     });
+    const stopEntered = Promise.withResolvers<void>();
     const handlers = createProcessHandlers({
       logger: createLoggerStub(),
       stop: async () => {
+        stopEntered.resolve();
         await stopPromise;
       },
       getExitCode: exitCodeHooks.getExitCode,
@@ -144,15 +174,13 @@ describe("createProcessHandlers", () => {
       }) as (code: number) => never,
     });
 
-    void handlers.handleSignal("SIGTERM");
+    const shutdown = handlers.handleSignal("SIGTERM");
+    await stopEntered.promise;
     handlers.handleUncaughtException(new Error("fatal during shutdown"));
-    // test-wait-justification: yields until the concurrently started signal shutdown enters its pending stop
-    await Bun.sleep(0);
 
     expect(exitCalls).toEqual([1]);
 
     resolveStop();
-    // test-wait-justification: drains the released asynchronous shutdown before the test returns
-    await Bun.sleep(0);
+    await shutdown;
   });
 });

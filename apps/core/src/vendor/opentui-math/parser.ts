@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture.js";
 import {
   LatexParseError,
   type AccentKind,
@@ -13,6 +14,7 @@ import {
   DEFAULT_MAX_SOURCE_LENGTH,
   resolvePositiveInteger,
 } from "./limits.js"
+import { Result } from "better-result"
 import { delimiterTable, largeOperators, namedOperators, spacingCommands, symbolTable } from "./symbols.js"
 
 const matrixEnvironments = new Set<MatrixEnvironment>([
@@ -186,11 +188,14 @@ class Parser {
       this.depth--
       this.fail(`LaTeX nesting exceeds the ${this.maxDepth}-level limit`)
     }
-    try {
-      return this.parseAtomInner()
-    } finally {
-      this.depth--
-    }
+    const parsed = Result.try({ try: () => this.parseAtomInner(), catch: captureError })
+    this.depth--
+    return parsed.match({
+      ok: (node) => () => node,
+      err: ({ cause }) => () => {
+        throw cause
+      },
+    })()
   }
 
   private parseAtomInner(): MathNode {

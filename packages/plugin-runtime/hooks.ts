@@ -109,19 +109,29 @@ function captureSyncHook<TInput, TOutput = TInput, E = never>(
   run: () => TInput,
   decode?: (value: TInput) => ResultType<TOutput, E>,
 ): ResultType<TInput | TOutput, ToolPluginInvocationError | E> {
-  try {
-    const value = run();
-    return decode ? decode(value) : Result.ok(value);
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    let skipReason: string | undefined;
-    try {
-      if (cause instanceof ToolPluginSkipError) skipReason = opaquePluginExceptionMessage(cause);
-    } catch {
-      skipReason = undefined;
-    }
-    return Result.err(mapPluginHookException(context, safePluginExceptionCause(cause), skipReason));
-  }
+  const captured = Result.try({
+    try: () => {
+      const value = run();
+      return decode ? decode(value) : Result.ok(value);
+    },
+    catch: (cause) => ({ restoreCause: () => cause }),
+  });
+  const outcome = captured.match<
+    | { readonly kind: "result"; readonly result: ResultType<TInput | TOutput, E> }
+    | { readonly kind: "failure"; readonly restoreCause: () => unknown }
+  >({
+    ok: (result) => ({ kind: "result", result }),
+    err: ({ restoreCause }) => ({ kind: "failure", restoreCause }),
+  });
+  if (outcome.kind === "result") return outcome.result;
+  const cause = outcome.restoreCause();
+  if (isPluginPanic(cause)) throw cause;
+  const skipped = Result.try({
+    try: () => cause instanceof ToolPluginSkipError,
+    catch: () => undefined,
+  }).match({ ok: (value) => value, err: () => false });
+  const skipReason = skipped ? opaquePluginExceptionMessage(cause) : undefined;
+  return Result.err(mapPluginHookException(context, safePluginExceptionCause(cause), skipReason));
 }
 
 async function captureAsyncHook<T>(
@@ -138,19 +148,29 @@ async function captureAsyncHook<TInput, TOutput = Awaited<TInput>, E = never>(
   run: () => Promise<TInput> | TInput,
   decode?: (value: Awaited<TInput>) => ResultType<TOutput, E>,
 ): Promise<ResultType<Awaited<TInput> | TOutput, ToolPluginInvocationError | E>> {
-  try {
-    const value = await run();
-    return decode ? decode(value) : Result.ok(value);
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    let skipReason: string | undefined;
-    try {
-      if (cause instanceof ToolPluginSkipError) skipReason = opaquePluginExceptionMessage(cause);
-    } catch {
-      skipReason = undefined;
-    }
-    return Result.err(mapPluginHookException(context, safePluginExceptionCause(cause), skipReason));
-  }
+  const captured = await Result.tryPromise({
+    try: async () => {
+      const value = await run();
+      return decode ? decode(value) : Result.ok(value);
+    },
+    catch: (cause) => ({ restoreCause: () => cause }),
+  });
+  const outcome = captured.match<
+    | { readonly kind: "result"; readonly result: ResultType<Awaited<TInput> | TOutput, E> }
+    | { readonly kind: "failure"; readonly restoreCause: () => unknown }
+  >({
+    ok: (result) => ({ kind: "result", result }),
+    err: ({ restoreCause }) => ({ kind: "failure", restoreCause }),
+  });
+  if (outcome.kind === "result") return outcome.result;
+  const cause = outcome.restoreCause();
+  if (isPluginPanic(cause)) throw cause;
+  const skipped = Result.try({
+    try: () => cause instanceof ToolPluginSkipError,
+    catch: () => undefined,
+  }).match({ ok: (value) => value, err: () => false });
+  const skipReason = skipped ? opaquePluginExceptionMessage(cause) : undefined;
+  return Result.err(mapPluginHookException(context, safePluginExceptionCause(cause), skipReason));
 }
 
 export async function invokeToolPluginCreate<TRuntimeContext>(params: {

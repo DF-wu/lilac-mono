@@ -5,6 +5,7 @@ export type PluginSource = "builtin" | "external";
 
 export type RequestContext<P extends string = string> = {
   requestId?: string;
+  requestDeliveryId?: string;
   sessionId?: string;
   /** Server-issued surface origin when sessionId is a synthetic workflow session. */
   originSessionId?: string;
@@ -125,6 +126,7 @@ export type Level1SubagentConfig = {
 
 export type Level1ExecutionRequestContext<P extends string = string> = {
   requestId: string;
+  requestDeliveryId?: string;
   sessionId: string;
   requestClient: string;
   subagentDepth: number;

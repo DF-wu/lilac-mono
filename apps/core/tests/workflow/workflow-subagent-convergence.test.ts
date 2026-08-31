@@ -1,8 +1,12 @@
 import { workflowStoreValue } from "./workflow-store-test-helpers";
+import {
+  createWorkflowTestBlobStore,
+  workflowValueArtifactReferenceForTest,
+} from "./workflow-test-blob-store";
 import { afterEach, describe, expect, it, jest, spyOn } from "bun:test";
 import { Logger } from "@stanley2058/simple-module-logger";
 import path from "node:path";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { z } from "zod";
 import {
@@ -31,7 +35,9 @@ import {
 } from "../../src/workflow/workflow-live-parent-bridge";
 import { WorkflowSubagentDispatcher } from "../../src/workflow/workflow-subagent-dispatcher";
 import { WorkflowEngine } from "../../src/workflow/workflow-engine";
+import { readWorkflowSourceArtifact } from "../../src/workflow/workflow-artifact-store";
 import { createToolResultArtifactStore } from "../../src/artifacts/tool-result-artifact-store";
+const blobStore = await createWorkflowTestBlobStore();
 const roots: string[] = [];
 const AUTHENTICATED_PARENT = { platform: "discord", userId: "user-1" } as const;
 function createInMemoryRawBus(control?: {
@@ -119,6 +125,7 @@ async function setup(maxActiveRuns?: number, now?: () => number) {
   const store = new DurableWorkflowStore(dbPath);
   const dispatcher = await WorkflowSubagentDispatcher.create({
     store,
+    blobStore,
     dataDir,
     pollMs: 1,
     now,
@@ -349,7 +356,7 @@ describe("workflow subagent convergence", () => {
     store.close();
   });
   it("preserves a self profile in the generated workflow", async () => {
-    const { dataDir, projectRoot, store, dispatcher } = await setup();
+    const { projectRoot, store, dispatcher } = await setup();
     const handle = await dispatcher.delegate({
       ...registration(projectRoot),
       profile: "self",
@@ -365,20 +372,26 @@ describe("workflow subagent convergence", () => {
       maxConcurrent: 1,
     });
     if (!revision) throw new Error("generated self revision missing");
-    const generated = await readFile(
-      path.join(dataDir, "workflow-snapshots", `${revision.sourceSha256}.js`),
-      "utf8",
-    );
+    const generatedArtifact = await readWorkflowSourceArtifact({
+      blobStore,
+      reference: revision.snapshotArtifact,
+      maxBytes: revision.limits.maxSourceBytes,
+    });
+    const generated = generatedArtifact.unwrap();
     expect(generated).toContain('profile: { type: "string", const: "self" }');
     expect(generated).not.toContain("delegation:");
     store.close();
   });
   it("transfers child tool-result wrappers before parent delivery", async () => {
     const setupResult = await setup();
-    const artifacts = createToolResultArtifactStore(path.join(setupResult.dataDir, "tool-results"));
+    const artifacts = createToolResultArtifactStore(
+      path.join(setupResult.dataDir, "tool-results"),
+      blobStore,
+    );
     await artifacts.init();
     const dispatcher = await WorkflowSubagentDispatcher.create({
       store: setupResult.store,
+      blobStore,
       dataDir: setupResult.dataDir,
       toolResultArtifacts: artifacts,
       pollMs: 1,
@@ -476,6 +489,7 @@ describe("workflow subagent convergence", () => {
     );
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
       subscriptionId: "test-live-parent-tool-tree",
     });
@@ -581,6 +595,7 @@ describe("workflow subagent convergence", () => {
     );
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
       subscriptionId: "test-live-parent-activity-coalescing",
     });
@@ -624,6 +639,7 @@ describe("workflow subagent convergence", () => {
     const warning = spyOn(Logger.prototype, "warn").mockImplementation(() => {});
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
       subscriptionId: "test-live-parent-publication-warning",
     });
@@ -710,6 +726,7 @@ describe("workflow subagent convergence", () => {
     );
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
       subscriptionId: "test-live-parent-terminal-tree",
     });
@@ -749,6 +766,7 @@ describe("workflow subagent convergence", () => {
     );
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
       subscriptionId: "generated-subagent-parent-bridge",
     });
@@ -833,6 +851,7 @@ describe("workflow subagent convergence", () => {
     );
     const engine = new WorkflowEngine({
       bus,
+      blobStore,
       store,
       dataDir,
       subscriptionId: "generated-subagent-engine",
@@ -880,6 +899,7 @@ describe("workflow subagent convergence", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
       subscriptionId: "test-live-parent",
     });
@@ -912,20 +932,20 @@ describe("workflow subagent convergence", () => {
     store.close();
   });
   it("keeps artifact-backed completion pending when artifact loading fails", async () => {
-    const { store, run, dataDir } = await createRun();
+    const { store, run } = await createRun();
     store.transitionRun({ runId: run.runId, from: "queued", to: "running", now: 10 });
     store.transitionRun({
       runId: run.runId,
       from: "running",
       to: "succeeded",
       now: 20,
-      resultArtifactId: `workflow-value:${"f".repeat(64)}`,
+      resultArtifact: workflowValueArtifactReferenceForTest("missing-artifact"),
     });
     const bus = createLilacBus(createInMemoryRawBus());
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
-      dataDir,
       subscriptionId: "missing-artifact-delivery",
     });
     const parent = bridge.registerParent({ parentRequestId: "parent:1" });
@@ -966,7 +986,7 @@ describe("workflow subagent convergence", () => {
       from: "running",
       to: "succeeded",
       now: 20,
-      resultArtifactId: `workflow-value:${"f".repeat(64)}`,
+      resultArtifact: workflowValueArtifactReferenceForTest("missing-partial-artifact"),
     });
     setupResult.store.transitionRun({
       runId: second.runId,
@@ -984,8 +1004,8 @@ describe("workflow subagent convergence", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store: setupResult.store,
-      dataDir: setupResult.dataDir,
       subscriptionId: "partial-materialization",
     });
     const parent = bridge.registerParent({ parentRequestId: "parent:partial-materialization" });
@@ -1046,6 +1066,7 @@ describe("workflow subagent convergence", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store: setupResult.store,
       subscriptionId: "test-live-parent-order",
     });
@@ -1065,6 +1086,7 @@ describe("workflow subagent convergence", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
       subscriptionId: "test-live-parent-cancel",
     });
@@ -1087,6 +1109,7 @@ describe("workflow subagent convergence", () => {
     const bus = createLilacBus(raw);
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
       subscriptionId: "test-live-parent-active-orphan",
     });
@@ -1102,6 +1125,7 @@ describe("workflow subagent convergence", () => {
     ]).toEqual([]);
     const engine = new WorkflowEngine({
       bus,
+      blobStore,
       store,
       dataDir,
       subscriptionId: "test-live-parent-active-orphan-engine",
@@ -1129,6 +1153,7 @@ describe("workflow subagent convergence", () => {
     const bus = createLilacBus(raw);
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store: setupResult.store,
       subscriptionId: "test-live-parent-sequential",
     });
@@ -1169,7 +1194,7 @@ describe("workflow subagent convergence", () => {
             attempt: 0,
             requestId: childRequestId,
             output: null,
-            resultArtifactId: null,
+            resultArtifact: null,
             error: null,
             usage: null,
             claimedBy: null,
@@ -1221,7 +1246,7 @@ describe("workflow subagent convergence", () => {
           now: 200 + index,
           detail: "complete",
           result: `result-${index}`,
-          resultArtifactId: null,
+          resultArtifact: null,
         }),
       ).toBe(true);
       await bus.publish(lilacEventTypes.EvtWorkflowRunChanged, {
@@ -1267,6 +1292,7 @@ describe("workflow subagent convergence", () => {
     );
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
       subscriptionId: "test-live-parent-orphan",
     });
@@ -1293,6 +1319,7 @@ describe("workflow subagent convergence", () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const bridge = new WorkflowLiveParentBridge({
       bus,
+      blobStore,
       store,
       subscriptionId: "test-live-parent-protected",
     });

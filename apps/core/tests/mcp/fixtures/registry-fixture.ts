@@ -53,6 +53,7 @@ export function configSnapshot(
 }
 
 export class FakeMcpClient implements McpRegistryClient {
+  readonly serverInfo: McpRegistryClient["serverInfo"];
   readonly cursors: Array<string | undefined> = [];
   readonly convertedDefinitions: ListToolsResult[] = [];
   closeCount = 0;
@@ -64,7 +65,13 @@ export class FakeMcpClient implements McpRegistryClient {
     private pages: Readonly<Record<string, ListToolsResult>> = {
       first: { tools: [] },
     },
-  ) {}
+    serverInfo: McpRegistryClient["serverInfo"] = {
+      name: "fixture-mcp-server",
+      version: "1.0.0",
+    },
+  ) {
+    this.serverInfo = serverInfo;
+  }
 
   setPages(pages: Readonly<Record<string, ListToolsResult>>): void {
     this.pages = pages;

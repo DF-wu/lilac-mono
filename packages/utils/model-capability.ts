@@ -2,7 +2,7 @@ import type { LanguageModelUsage } from "ai";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-import { isPanic } from "./runtime-utils";
+import { capturePromiseResult, captureResultOutcome, isPanic } from "./runtime-utils";
 
 export type ModelSpecifier = string;
 
@@ -382,19 +382,19 @@ export class ModelCapability {
   ): Promise<ResultType<ModelsDevRegistry, ModelCapabilityResolutionFailed>> {
     if (!this.registryPromise) {
       this.registryPromise = (async () => {
-        let response: Response;
-        try {
-          response = await this.fetchFn(this.apiUrl, { signal });
-        } catch (cause) {
-          if (isPanic(cause)) throw cause;
+        const fetched = await capturePromiseResult(() => this.fetchFn(this.apiUrl, { signal }));
+        const fetchOutcome = captureResultOutcome(fetched);
+        if (!fetchOutcome.ok && isPanic(fetchOutcome.error)) throw fetchOutcome.error;
+        if (!fetchOutcome.ok) {
           return Result.err(
             new ModelCapabilityResolutionFailed({
               spec: this.apiUrl,
-              cause,
+              cause: fetchOutcome.error,
               message: "Failed to fetch models.dev registry",
             }),
           );
         }
+        const response = fetchOutcome.value;
         if (!response.ok) {
           return Result.err(
             new ModelCapabilityResolutionFailed({
@@ -404,19 +404,19 @@ export class ModelCapability {
           );
         }
 
-        let payload: unknown;
-        try {
-          payload = await response.json();
-        } catch (cause) {
-          if (isPanic(cause)) throw cause;
+        const decoded = await capturePromiseResult(() => response.json() as Promise<unknown>);
+        const decodeOutcome = captureResultOutcome(decoded);
+        if (!decodeOutcome.ok && isPanic(decodeOutcome.error)) throw decodeOutcome.error;
+        if (!decodeOutcome.ok) {
           return Result.err(
             new ModelCapabilityResolutionFailed({
               spec: this.apiUrl,
-              cause,
+              cause: decodeOutcome.error,
               message: "models.dev registry response was not valid JSON",
             }),
           );
         }
+        const payload = decodeOutcome.value;
         const registry = decodeModelsDevRegistry(payload);
         return registry
           ? Result.ok(registry)

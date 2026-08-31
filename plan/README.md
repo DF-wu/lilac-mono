@@ -7,8 +7,7 @@ facts are incorporated into those documents and remain available in Git history.
 
 ## Active
 
-- [`redis-event-delivery-reliability.md`](redis-event-delivery-reliability.md): pending-entry reclamation,
-  fenced retries, idempotent dead-letter finalization, and transactional inbox/outbox processing.
+No repository-wide implementation plans are active.
 
 Only plans listed under **Active** are repository-wide implementation plans. A task-specific plan is
 authoritative only when the user explicitly approves it for that task.

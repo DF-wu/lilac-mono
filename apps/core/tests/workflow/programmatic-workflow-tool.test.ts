@@ -20,6 +20,9 @@ import { ProgrammaticWorkflow } from "../../src/tool-server/tools/programmatic-w
 import { writeWorkflowValueArtifact } from "../../src/workflow/workflow-artifact-store";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import { workflowStoreValue } from "./workflow-store-test-helpers";
+import { createWorkflowTestBlobStore } from "./workflow-test-blob-store";
+
+const blobStore = await createWorkflowTestBlobStore();
 
 async function callValue(
   tool: ProgrammaticWorkflow,
@@ -104,6 +107,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     await fs.mkdir(workspaceRoot);
     const store = new DurableWorkflowStore(dbPath);
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir,
       store,
       progressCards: {
@@ -204,6 +208,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     const store = new DurableWorkflowStore(path.join(root, "workflow.sqlite"));
     await fs.mkdir(workspaceRoot);
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir: path.join(root, "data"),
       store,
       progressCards: {
@@ -262,6 +267,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       const store = new DurableWorkflowStore(path.join(root, `workflow-${index}.sqlite`));
       await fs.mkdir(workspaceRoot);
       const tool = new ProgrammaticWorkflow({
+        blobStore,
         dataDir: path.join(root, `data-${index}`),
         store,
         bus: createLilacBus(
@@ -322,6 +328,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       idempotencyKey: "stable-invocation",
     };
     const firstTool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir: path.join(root, "data"),
       store,
       progressCards: {
@@ -352,7 +359,11 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
       expect(workflowStoreValue(store.listRuns())).toHaveLength(1);
       await firstTool.destroy();
 
-      const replayTool = new ProgrammaticWorkflow({ dataDir: path.join(root, "data"), store });
+      const replayTool = new ProgrammaticWorkflow({
+        blobStore,
+        dataDir: path.join(root, "data"),
+        store,
+      });
       await replayTool.init();
       try {
         const failed = createdProjectionFailureSchema.parse(
@@ -380,6 +391,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     const panic = new Panic({ message: "progress projection invariant failed" });
     await fs.mkdir(workspaceRoot);
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir: path.join(root, "data"),
       store,
       progressCards: {
@@ -427,6 +439,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     await fs.mkdir(workspaceRoot);
     const cards: string[] = [];
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir,
       dbPath: path.join(root, "workflow.sqlite"),
       now: () => 100,
@@ -538,6 +551,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     const workspaceRoot = path.join(root, "workspace");
     await fs.mkdir(workspaceRoot);
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir: path.join(root, "data"),
       dbPath: path.join(root, "workflow.sqlite"),
     });
@@ -578,6 +592,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     const dbPath = path.join(root, "workflow.sqlite");
     await fs.mkdir(workspaceRoot);
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir,
       dbPath,
       now: () => 100,
@@ -632,7 +647,8 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
         store.tryClaimRun({ runId: invocation.runId, claimerId: "worker-1", now: 101 }),
       ).not.toBeNull();
       const artifact = await writeWorkflowValueArtifact({
-        dataDir,
+        blobStore,
+        workflowStore: store,
         value: "unrestricted result",
         maxBytes: 1_048_576,
       });
@@ -646,7 +662,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           now: 102,
           detail: "unrestricted detail",
           result: null,
-          resultArtifactId: artifact.value,
+          resultArtifact: artifact.value,
         }),
       ).toBe(true);
 
@@ -689,7 +705,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
           now: 104,
           detail: "inline detail",
           result: "inline unrestricted result",
-          resultArtifactId: null,
+          resultArtifact: null,
         }),
       ).toBe(true);
       const inlineFetched = await callValue(
@@ -717,6 +733,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     const workspaceRoot = path.join(root, "workspace");
     await fs.mkdir(workspaceRoot);
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir: path.join(root, "data"),
       dbPath: path.join(root, "workflow.sqlite"),
       now: () => 100,
@@ -787,6 +804,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     const workspaceRoot = path.join(root, "workspace");
     await fs.mkdir(workspaceRoot);
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir: path.join(root, "data"),
       dbPath: path.join(root, "workflow.sqlite"),
       getMaxActiveRuns: () => 1,
@@ -852,6 +870,7 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     await fs.mkdir(workspaceRoot);
     const panic = new Panic({ message: "workflow capacity invariant failed" });
     const tool = new ProgrammaticWorkflow({
+      blobStore,
       dataDir: path.join(root, "data"),
       dbPath: path.join(root, "workflow.sqlite"),
       getMaxActiveRuns: () => {

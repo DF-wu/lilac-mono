@@ -27,6 +27,10 @@ import {
 } from "../helpers/result-raw-bus";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import {
+  createWorkflowTestBlobStore,
+  workflowArtifactReferenceForTest,
+} from "./workflow-test-blob-store";
+import {
   applyWorkflowEventDeliveryPolicy,
   captureWorkflowIdleCancellationPublication,
   captureWorkflowTerminalReceiptAdoption,
@@ -63,6 +67,7 @@ function parseWorkflowCallSiteManifest(source: string) {
   return result.value;
 }
 const HASH_A = "a".repeat(64);
+const blobStore = await createWorkflowTestBlobStore();
 class HandoffInterceptStore extends DurableWorkflowStore {
   beforeHandoff: (() => void) | null = null;
   override getWorkflowRequestDispatchHandoff(
@@ -279,7 +284,7 @@ function createTrustedRun(
     scope: "project" as const,
     normalizedPath: "audit.js",
     name: "audit",
-    snapshotArtifactId: `workflow-source:${HASH_A}`,
+    snapshotArtifact: workflowArtifactReferenceForTest(`workflow-source:${HASH_A}`),
     sourceSha256: HASH_A,
     inputSchemaSha256: canonicalJsonSha256(inputSchema),
     resourcePolicySha256: canonicalJsonSha256({ resources, limits }),
@@ -310,7 +315,7 @@ function createTrustedRun(
       progressTarget: null,
       terminalDetail: null,
       result: null,
-      resultArtifactId: null,
+      resultArtifact: null,
       claimedBy: null,
       claimedAt: null,
       createdAt: 1,
@@ -396,6 +401,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "start-failure",
     });
@@ -418,6 +424,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "compiler-panic",
       loadSnapshot: async () => agentWorkflowSource(),
@@ -481,7 +488,7 @@ describe("WorkflowEngine", () => {
   });
   it("returns idle cancellation publication failures as values and preserves Panic", async () => {
     class CancellationFailingRawBus extends CapturingRawBus {
-      constructor(private readonly cause: Error) {
+      constructor(private readonly cause: unknown) {
         super();
       }
       override async publish<TData>(
@@ -525,6 +532,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "heartbeat-pacing",
       now: () => now,
@@ -584,6 +592,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "wake-tick-failure",
       pollMs: 1000000,
@@ -621,6 +630,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "timer-tick-failure",
       pollMs: 1,
@@ -645,6 +655,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "initial-publish-failure",
       pollMs: 1000000,
@@ -690,6 +701,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "mixed-operation-authority",
       pollMs: 5,
@@ -766,6 +778,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir,
       subscriptionId: "actual-data-dir-cwd",
       pollMs: 5,
@@ -835,6 +848,7 @@ describe("WorkflowEngine", () => {
       const first = new WorkflowEngine({
         bus,
         store,
+        blobStore,
         dataDir: dirname(dbPath),
         subscriptionId: `stale-policy-first-${scenario.model}`,
         pollMs: 5,
@@ -878,6 +892,7 @@ describe("WorkflowEngine", () => {
       const replacement = new WorkflowEngine({
         bus,
         store,
+        blobStore,
         dataDir: dirname(dbPath),
         subscriptionId: `stale-policy-replacement-${scenario.model}`,
         pollMs: 5,
@@ -992,6 +1007,7 @@ describe("WorkflowEngine", () => {
       const engine = new WorkflowEngine({
         bus,
         store,
+        blobStore,
         dataDir: dirname(dbPath),
         subscriptionId: `terminal-${terminalState}`,
         pollMs: 5,
@@ -1077,6 +1093,7 @@ describe("WorkflowEngine", () => {
       const engine = new WorkflowEngine({
         bus,
         store,
+        blobStore,
         dataDir: dirname(dbPath),
         subscriptionId: `invalid-${invalidTopic}-fetch`,
         pollMs: 5,
@@ -1192,6 +1209,7 @@ describe("WorkflowEngine", () => {
       const engine = new WorkflowEngine({
         bus,
         store,
+        blobStore,
         dataDir: dirname(dbPath),
         subscriptionId: `mismatched-${lifecycleState}`,
         pollMs: 5,
@@ -1244,6 +1262,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "manual-block",
       pollMs: 5,
@@ -1273,6 +1292,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "terminal-race",
       pollMs: 5,
@@ -1352,6 +1372,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "missing-terminal-receipt",
       pollMs: 5,
@@ -1423,6 +1444,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "live-terminal-receipt",
       pollMs: 5,
@@ -1538,6 +1560,7 @@ describe("WorkflowEngine", () => {
     const first = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "replacement-receipt-first",
       pollMs: 5,
@@ -1590,6 +1613,7 @@ describe("WorkflowEngine", () => {
     const replacement = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "replacement-receipt-second",
       pollMs: 5,
@@ -1655,6 +1679,7 @@ describe("WorkflowEngine", () => {
       const first = new WorkflowEngine({
         bus,
         store,
+        blobStore,
         dataDir: dirname(dbPath),
         subscriptionId: `${raceWindow}-receipt-first`,
         pollMs: 5,
@@ -1712,6 +1737,7 @@ describe("WorkflowEngine", () => {
       const replacement = new WorkflowEngine({
         bus,
         store,
+        blobStore,
         dataDir: dirname(dbPath),
         subscriptionId: `${raceWindow}-receipt-second`,
         pollMs: 5,
@@ -1780,6 +1806,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "pause-receipt",
       pollMs: 5,
@@ -1921,6 +1948,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "lease-loss-local-only",
       pollMs: 5,
@@ -1982,6 +2010,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "test-workflow-engine",
       pollMs: 5,
@@ -2063,7 +2092,7 @@ describe("WorkflowEngine", () => {
         attempt: 0,
         requestId: "wfr:completed",
         output: "cached",
-        resultArtifactId: null,
+        resultArtifact: null,
         error: null,
         usage: null,
         claimedBy: null,
@@ -2079,6 +2108,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "test-workflow-restart",
       pollMs: 5,
@@ -2110,6 +2140,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "test-workflow-limits",
       pollMs: 5,
@@ -2163,6 +2194,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: root,
       subscriptionId: "test-workflow-artifacts",
       pollMs: 5,
@@ -2180,23 +2212,29 @@ describe("WorkflowEngine", () => {
       await waitFor(() => workflowStoreValue(store.getRun("run-artifact"))?.state === "succeeded");
       const operation = workflowStoreValue(store.listOperations("run-artifact"))[0];
       const run = workflowStoreValue(store.getRun("run-artifact"));
-      expect(operation).toMatchObject({ output: null, resultArtifactId: expect.any(String) });
-      expect(run).toMatchObject({ result: null, resultArtifactId: expect.any(String) });
+      expect(operation).toMatchObject({
+        output: null,
+        resultArtifact: { artifactId: expect.any(String), blobRef: expect.any(Object) },
+      });
+      expect(run).toMatchObject({
+        result: null,
+        resultArtifact: { artifactId: expect.any(String), blobRef: expect.any(Object) },
+      });
       await engine.stop();
       store.close();
       const reopened = new DurableWorkflowStore(dbPath);
       const persistedOperation = workflowStoreValue(reopened.listOperations("run-artifact"))[0]!;
       const persistedRun = workflowStoreValue(reopened.getRun("run-artifact"))!;
       const operationArtifact = await readWorkflowValueArtifact({
-        dataDir: root,
-        artifactId: persistedOperation.resultArtifactId!,
+        blobStore,
+        reference: persistedOperation.resultArtifact!,
         maxBytes: 100000,
       });
       expect(operationArtifact.status).toBe("ok");
       if (operationArtifact.status === "ok") expect(operationArtifact.value).toBe(largeOutput);
       const runArtifact = await readWorkflowValueArtifact({
-        dataDir: root,
-        artifactId: persistedRun.resultArtifactId!,
+        blobStore,
+        reference: persistedRun.resultArtifact!,
         maxBytes: 100000,
       });
       expect(runArtifact.status).toBe("ok");
@@ -2219,6 +2257,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "test-workflow-controls",
       pollMs: 5,
@@ -2324,6 +2363,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "test-workflow-abort-publication",
       pollMs: 5,
@@ -2497,6 +2537,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "idle-receipt",
       pollMs: 5,
@@ -2553,6 +2594,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "test-engine-waits",
       now: () => now,
@@ -2616,6 +2658,7 @@ describe("WorkflowEngine", () => {
       new WorkflowEngine({
         bus,
         store,
+        blobStore,
         dataDir: dirname(dbPath),
         subscriptionId: `test-reply-restart-${crypto.randomUUID()}`,
         pollMs: 5,
@@ -2700,6 +2743,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore,
       dataDir: dirname(dbPath),
       subscriptionId: "test-unauthenticated-reply",
       pollMs: 5,
@@ -2743,6 +2787,7 @@ describe("WorkflowEngine", () => {
     const engine = new WorkflowEngine({
       bus,
       store,
+      blobStore: await createWorkflowTestBlobStore(),
       dataDir: dirname(dbPath),
       subscriptionId: "test-telegram-reply",
       pollMs: 5,

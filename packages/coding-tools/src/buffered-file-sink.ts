@@ -1,5 +1,5 @@
 import fs, { type FileHandle } from "node:fs/promises";
-import { Panic, Result } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
 import { adaptCodingToolResultToHost } from "./host-compatibility";
 
@@ -10,11 +10,60 @@ function signalBufferedFileSinkHost(error: Error): never {
 }
 
 async function continueBufferedSinkQueue(operation: Promise<unknown>): Promise<void> {
-  try {
-    await operation;
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-  }
+  const captured = settleBufferedSinkCapture(
+    await Result.tryPromise({
+      try: () => operation,
+      catch: captureBufferedSinkFailure,
+    }),
+  );
+  const failure = captured.match({ ok: () => undefined, err: (error) => error });
+  if (failure?.kind === "panic") throw failure.panic;
+}
+
+type CapturedBufferedSinkFailure =
+  | { readonly kind: "panic"; readonly panic: Panic }
+  | { readonly kind: "ordinary"; readonly error: Error };
+
+type BufferedSinkFailureSettlement = () => CapturedBufferedSinkFailure;
+
+function captureBufferedSinkFailure(cause: unknown): BufferedSinkFailureSettlement {
+  return () => {
+    const inspected = Result.try({
+      try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),
+      catch: () => undefined,
+    });
+    const panic = inspected.match({ ok: (value) => value, err: () => undefined });
+    if (panic) return { kind: "panic", panic };
+    const error = Result.try({
+      try: () => (cause instanceof Error ? cause : new Error("Opaque buffered file sink failure")),
+      catch: () => new Error("Opaque buffered file sink failure"),
+    }).match({ ok: (value) => value, err: (value) => value });
+    return { kind: "ordinary", error };
+  };
+}
+
+function settleBufferedSinkCapture<T>(
+  result: ResultType<T, BufferedSinkFailureSettlement>,
+): ResultType<T, CapturedBufferedSinkFailure> {
+  return result.mapError((settle) => settle());
+}
+
+function bufferedSinkOutcome<T>(
+  result: ReturnType<typeof Result.try<T, CapturedBufferedSinkFailure>>,
+):
+  | { readonly kind: "ok"; readonly value: T }
+  | { readonly kind: "error"; readonly error: CapturedBufferedSinkFailure } {
+  return result.match<
+    | { readonly kind: "ok"; readonly value: T }
+    | { readonly kind: "error"; readonly error: CapturedBufferedSinkFailure }
+  >({
+    ok: (value) => ({ kind: "ok", value }),
+    err: (error) => ({ kind: "error", error }),
+  });
+}
+
+function bufferedSinkError(failure: CapturedBufferedSinkFailure): Error {
+  return failure.kind === "panic" ? failure.panic : failure.error;
 }
 
 /**
@@ -44,13 +93,21 @@ export class BufferedFileSink {
       throw new RangeError("Buffered file sink blockBytes must be a positive finite number");
     }
     const handle = await fs.open(filePath, options?.flags ?? "w", mode);
-    try {
-      await handle.chmod(mode);
-      return new BufferedFileSink(handle, Math.floor(blockBytes));
-    } catch (error) {
+    const opened = settleBufferedSinkCapture(
+      await Result.tryPromise({
+        try: async () => {
+          await handle.chmod(mode);
+          return new BufferedFileSink(handle, Math.floor(blockBytes));
+        },
+        catch: captureBufferedSinkFailure,
+      }),
+    );
+    const outcome = bufferedSinkOutcome(opened);
+    if (outcome.kind === "error") {
       await continueBufferedSinkQueue(handle.close());
-      throw error;
+      throw outcome.error.kind === "panic" ? outcome.error.panic : outcome.error.error;
     }
+    return outcome.value;
   }
 
   async write(chunk: Uint8Array | string): Promise<void> {
@@ -76,10 +133,27 @@ export class BufferedFileSink {
     if (this.terminalPromise) return this.terminalPromise;
     this.acceptingWrites = false;
     const operation = this.operationTail.then(async () => {
-      try {
-        if (this.pendingBytes > 0) await this.writeBytes(this.take(this.pendingBytes));
-      } finally {
-        await this.closeHandle();
+      const flushed = settleBufferedSinkCapture(
+        await Result.tryPromise({
+          try: async () => {
+            if (this.pendingBytes > 0) await this.writeBytes(this.take(this.pendingBytes));
+          },
+          catch: captureBufferedSinkFailure,
+        }),
+      );
+      const closed = settleBufferedSinkCapture(
+        await Result.tryPromise({
+          try: () => this.closeHandle(),
+          catch: captureBufferedSinkFailure,
+        }),
+      );
+      const closeFailure = closed.match({ ok: () => undefined, err: (failure) => failure });
+      if (closeFailure) {
+        return signalBufferedFileSinkHost(bufferedSinkError(closeFailure));
+      }
+      const flushFailure = flushed.match({ ok: () => undefined, err: (failure) => failure });
+      if (flushFailure) {
+        return signalBufferedFileSinkHost(bufferedSinkError(flushFailure));
       }
     });
     this.terminalPromise = operation;

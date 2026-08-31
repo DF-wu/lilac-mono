@@ -3,15 +3,18 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import type { ToolContent } from "ai";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 import {
+  capturePromiseResult,
+  captureResultOutcome,
   errorCode,
   isPanic,
   isRecord,
   opaqueErrorCause,
   opaqueErrorMessage,
+  settlePromiseResult,
 } from "./runtime-utils";
 import { formatTaggedErrorForLog } from "./tagged-error-log";
 
@@ -211,25 +214,25 @@ async function pathExists(
   filePath: string,
   dependencies: CustomCommandDiscoveryDependencies,
 ): Promise<boolean> {
-  try {
-    await dependencies.access(filePath);
-    return true;
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return false;
-  }
+  const settlement = await settlePromiseResult(() => dependencies.access(filePath));
+  if (settlement.kind === "panic") throw settlement.panic;
+  return settlement.kind === "value";
 }
 
 export async function readCustomCommandDefinition(params: {
   defPath: string;
   readText?: CustomCommandDiscoveryDependencies["readText"];
 }): Promise<ResultType<CustomCommandDef, CustomCommandDefinitionError>> {
-  let text: string;
-  try {
-    text = await (params.readText ?? DEFAULT_DISCOVERY_DEPENDENCIES.readText)(params.defPath);
-  } catch (caught) {
-    if (isPanic(caught)) throw caught;
-    const cause = opaqueErrorCause(caught, "Opaque custom-command definition read failure");
+  const read = await capturePromiseResult(() =>
+    (params.readText ?? DEFAULT_DISCOVERY_DEPENDENCIES.readText)(params.defPath),
+  );
+  const readOutcome = captureResultOutcome(read);
+  if (!readOutcome.ok && isPanic(readOutcome.error)) throw readOutcome.error;
+  if (!readOutcome.ok) {
+    const cause = opaqueErrorCause(
+      readOutcome.error,
+      "Opaque custom-command definition read failure",
+    );
     return Result.err(
       new CustomCommandDefinitionReadError({
         defPath: params.defPath,
@@ -238,13 +241,19 @@ export async function readCustomCommandDefinition(params: {
       }),
     );
   }
+  const text = readOutcome.value;
 
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(text);
-  } catch (caught) {
-    if (isPanic(caught)) throw caught;
-    const cause = opaqueErrorCause(caught, "Opaque custom-command definition JSON failure");
+  const parsedJson = Result.try({
+    try: () => JSON.parse(text) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const jsonOutcome = captureResultOutcome(parsedJson);
+  if (!jsonOutcome.ok && isPanic(jsonOutcome.error.cause)) throw jsonOutcome.error.cause;
+  if (!jsonOutcome.ok) {
+    const cause = opaqueErrorCause(
+      jsonOutcome.error.cause,
+      "Opaque custom-command definition JSON failure",
+    );
     return Result.err(
       new CustomCommandDefinitionJsonError({
         defPath: params.defPath,
@@ -253,30 +262,35 @@ export async function readCustomCommandDefinition(params: {
       }),
     );
   }
+  const decoded = jsonOutcome.value;
 
-  try {
-    const parsed = customCommandDefSchema.safeParse(decoded);
-    if (parsed.success) return Result.ok(parsed.data);
-    return Result.err(
-      new CustomCommandDefinitionSchemaError({
-        defPath: params.defPath,
-        issues: parsed.error.issues.map((issue) => issue.message),
-        message: parsed.error.message,
-      }),
-    );
-  } catch (caught) {
-    if (isPanic(caught)) throw caught;
-    const cause = opaqueErrorCause(caught, "Opaque custom-command schema failure");
-    const message = opaqueErrorMessage(cause, "Opaque custom-command schema failure");
-    return Result.err(
-      new CustomCommandDefinitionSchemaError({
-        defPath: params.defPath,
-        issues: [message],
-        cause,
-        message,
-      }),
-    );
-  }
+  const schema = Result.try({
+    try: () => {
+      const parsed = customCommandDefSchema.safeParse(decoded);
+      if (parsed.success) return Result.ok(parsed.data);
+      return Result.err(
+        new CustomCommandDefinitionSchemaError({
+          defPath: params.defPath,
+          issues: parsed.error.issues.map((issue) => issue.message),
+          message: parsed.error.message,
+        }),
+      );
+    },
+    catch: (cause) => ({ cause }),
+  });
+  const schemaOutcome = captureResultOutcome(schema);
+  if (schemaOutcome.ok) return schemaOutcome.value;
+  if (isPanic(schemaOutcome.error.cause)) throw schemaOutcome.error.cause;
+  const cause = opaqueErrorCause(schemaOutcome.error.cause, "Opaque custom-command schema failure");
+  const message = opaqueErrorMessage(cause, "Opaque custom-command schema failure");
+  return Result.err(
+    new CustomCommandDefinitionSchemaError({
+      defPath: params.defPath,
+      issues: [message],
+      cause,
+      message,
+    }),
+  );
 }
 
 async function resolveEntrypoint(
@@ -372,182 +386,205 @@ export function parseCustomCommandToken(
 }
 
 export function decodeCustomCommandResult(value: unknown): CustomCommandResult | null {
-  try {
-    const hasPlainPrototype = (candidate: Record<string, unknown>): boolean => {
-      const prototype = Object.getPrototypeOf(candidate);
-      return prototype === Object.prototype || prototype === null;
-    };
-    const isStringMap = (candidate: unknown): boolean => {
-      if (!isRecord(candidate) || !hasPlainPrototype(candidate)) return false;
-      return Object.keys(candidate).every((key) => typeof candidate[key] === "string");
-    };
-    const isProviderReference = (candidate: unknown): boolean =>
-      isRecord(candidate) &&
-      hasPlainPrototype(candidate) &&
-      !Object.hasOwn(candidate, "type") &&
-      Object.keys(candidate).every((key) => typeof candidate[key] === "string");
-    const isJsonValue = (candidate: unknown, ancestors: WeakSet<object>): boolean => {
-      if (candidate === null || typeof candidate === "string" || typeof candidate === "boolean") {
-        return true;
-      }
-      if (typeof candidate === "number") return Number.isFinite(candidate);
-      if (typeof candidate !== "object") return false;
-      if (ancestors.has(candidate)) return false;
-
-      ancestors.add(candidate);
-      try {
-        if (Array.isArray(candidate)) {
-          for (let index = 0; index < candidate.length; index += 1) {
-            if (!Object.hasOwn(candidate, index) || !isJsonValue(candidate[index], ancestors)) {
-              return false;
-            }
-          }
-          return true;
-        }
+  let deferredPanic: Panic | undefined;
+  const captured = Result.try({
+    try: () => {
+      const hasPlainPrototype = (candidate: Record<string, unknown>): boolean => {
+        const prototype = Object.getPrototypeOf(candidate);
+        return prototype === Object.prototype || prototype === null;
+      };
+      const isStringMap = (candidate: unknown): boolean => {
         if (!isRecord(candidate) || !hasPlainPrototype(candidate)) return false;
-        return Object.keys(candidate).every((key) => {
-          const nested = candidate[key];
-          return nested === undefined || isJsonValue(nested, ancestors);
-        });
-      } finally {
-        ancestors.delete(candidate);
-      }
-    };
-    const isProviderOptions = (candidate: unknown): boolean => {
-      if (!isRecord(candidate) || !hasPlainPrototype(candidate)) return false;
-      return Object.keys(candidate).every((provider) => {
-        const options = candidate[provider];
-        return (
-          isRecord(options) && hasPlainPrototype(options) && isJsonValue(options, new WeakSet())
-        );
-      });
-    };
-    const hasOptionalString = (candidate: Record<string, unknown>, key: string): boolean =>
-      Object.hasOwn(candidate, key)
-        ? candidate[key] === undefined || typeof candidate[key] === "string"
-        : !(key in candidate);
-    const hasOptionalProviderOptions = (candidate: Record<string, unknown>): boolean =>
-      Object.hasOwn(candidate, "providerOptions")
-        ? candidate["providerOptions"] === undefined ||
-          isProviderOptions(candidate["providerOptions"])
-        : !("providerOptions" in candidate);
-    const isFileData = (candidate: unknown): boolean => {
-      if (!isRecord(candidate) || !Object.hasOwn(candidate, "type")) return false;
-      switch (candidate["type"]) {
-        case "data": {
-          if (!Object.hasOwn(candidate, "data")) return false;
-          const data = candidate["data"];
-          return (
-            typeof data === "string" || data instanceof Uint8Array || data instanceof ArrayBuffer
-          );
-        }
-        case "url":
-          return Object.hasOwn(candidate, "url") && candidate["url"] instanceof URL;
-        case "reference":
-          return (
-            Object.hasOwn(candidate, "reference") && isProviderReference(candidate["reference"])
-          );
-        case "text":
-          return Object.hasOwn(candidate, "text") && typeof candidate["text"] === "string";
-        default:
-          return false;
-      }
-    };
-    const isFileId = (candidate: unknown): boolean =>
-      typeof candidate === "string" || isStringMap(candidate);
-    const isContentPart = (candidate: unknown): boolean => {
-      if (!isRecord(candidate) || !Object.hasOwn(candidate, "type")) return false;
-      if (!hasOptionalProviderOptions(candidate)) return false;
-      switch (candidate["type"]) {
-        case "text":
-          return Object.hasOwn(candidate, "text") && typeof candidate["text"] === "string";
-        case "file":
-          return (
-            Object.hasOwn(candidate, "data") &&
-            isFileData(candidate["data"]) &&
-            Object.hasOwn(candidate, "mediaType") &&
-            typeof candidate["mediaType"] === "string" &&
-            hasOptionalString(candidate, "filename")
-          );
-        case "file-data":
-          return (
-            Object.hasOwn(candidate, "data") &&
-            typeof candidate["data"] === "string" &&
-            Object.hasOwn(candidate, "mediaType") &&
-            typeof candidate["mediaType"] === "string" &&
-            hasOptionalString(candidate, "filename")
-          );
-        case "file-url":
-          return (
-            Object.hasOwn(candidate, "url") &&
-            typeof candidate["url"] === "string" &&
-            hasOptionalString(candidate, "mediaType")
-          );
-        case "file-id":
-        case "image-file-id":
-          return Object.hasOwn(candidate, "fileId") && isFileId(candidate["fileId"]);
-        case "file-reference":
-        case "image-file-reference":
-          return (
-            Object.hasOwn(candidate, "providerReference") &&
-            isProviderReference(candidate["providerReference"])
-          );
-        case "image-data":
-          return (
-            Object.hasOwn(candidate, "data") &&
-            typeof candidate["data"] === "string" &&
-            Object.hasOwn(candidate, "mediaType") &&
-            typeof candidate["mediaType"] === "string"
-          );
-        case "image-url":
-          return Object.hasOwn(candidate, "url") && typeof candidate["url"] === "string";
-        case "custom":
+        return Object.keys(candidate).every((key) => typeof candidate[key] === "string");
+      };
+      const isProviderReference = (candidate: unknown): boolean =>
+        isRecord(candidate) &&
+        hasPlainPrototype(candidate) &&
+        !Object.hasOwn(candidate, "type") &&
+        Object.keys(candidate).every((key) => typeof candidate[key] === "string");
+      const isJsonValue = (candidate: unknown, ancestors: WeakSet<object>): boolean => {
+        if (candidate === null || typeof candidate === "string" || typeof candidate === "boolean") {
           return true;
-        default:
-          return false;
-      }
-    };
-    const isContentParts = (candidate: unknown[]): boolean => {
-      for (let index = 0; index < candidate.length; index += 1) {
-        if (!Object.hasOwn(candidate, index) || !isContentPart(candidate[index])) return false;
-      }
-      return true;
-    };
-    const identitySchema = z.custom<CustomCommandResult>((candidate) => {
-      if (!isRecord(candidate) || !Object.hasOwn(candidate, "type")) return false;
-      switch (candidate["type"]) {
-        case "text":
-        case "error-text":
+        }
+        if (typeof candidate === "number") return Number.isFinite(candidate);
+        if (typeof candidate !== "object") return false;
+        if (ancestors.has(candidate)) return false;
+
+        ancestors.add(candidate);
+        const inspected = Result.try({
+          try: () => {
+            if (Array.isArray(candidate)) {
+              for (let index = 0; index < candidate.length; index += 1) {
+                if (!Object.hasOwn(candidate, index) || !isJsonValue(candidate[index], ancestors)) {
+                  return false;
+                }
+              }
+              return true;
+            }
+            if (!isRecord(candidate) || !hasPlainPrototype(candidate)) return false;
+            return Object.keys(candidate).every((key) => {
+              const nested = candidate[key];
+              return nested === undefined || isJsonValue(nested, ancestors);
+            });
+          },
+          catch: (cause) => ({ cause }),
+        });
+        ancestors.delete(candidate);
+        return inspected.match({
+          ok: (result) => result,
+          err: ({ cause }) => {
+            if (isPanic(cause)) deferredPanic = cause;
+            return false;
+          },
+        });
+      };
+      const isProviderOptions = (candidate: unknown): boolean => {
+        if (!isRecord(candidate) || !hasPlainPrototype(candidate)) return false;
+        return Object.keys(candidate).every((provider) => {
+          const options = candidate[provider];
           return (
-            Object.hasOwn(candidate, "value") &&
-            typeof candidate["value"] === "string" &&
-            hasOptionalProviderOptions(candidate)
+            isRecord(options) && hasPlainPrototype(options) && isJsonValue(options, new WeakSet())
           );
-        case "json":
-        case "error-json":
-          return (
-            Object.hasOwn(candidate, "value") &&
-            isJsonValue(candidate["value"], new WeakSet()) &&
-            hasOptionalProviderOptions(candidate)
-          );
-        case "execution-denied":
-          return hasOptionalString(candidate, "reason") && hasOptionalProviderOptions(candidate);
-        case "content":
-          return (
-            Object.hasOwn(candidate, "value") &&
-            Array.isArray(candidate["value"]) &&
-            isContentParts(candidate["value"])
-          );
-        default:
-          return false;
-      }
-    });
-    const decoded = identitySchema.safeParse(value);
-    return decoded.success ? decoded.data : null;
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return null;
-  }
+        });
+      };
+      const hasOptionalString = (candidate: Record<string, unknown>, key: string): boolean =>
+        Object.hasOwn(candidate, key)
+          ? candidate[key] === undefined || typeof candidate[key] === "string"
+          : !(key in candidate);
+      const hasOptionalProviderOptions = (candidate: Record<string, unknown>): boolean =>
+        Object.hasOwn(candidate, "providerOptions")
+          ? candidate["providerOptions"] === undefined ||
+            isProviderOptions(candidate["providerOptions"])
+          : !("providerOptions" in candidate);
+      const isFileData = (candidate: unknown): boolean => {
+        if (!isRecord(candidate) || !Object.hasOwn(candidate, "type")) return false;
+        switch (candidate["type"]) {
+          case "data": {
+            if (!Object.hasOwn(candidate, "data")) return false;
+            const data = candidate["data"];
+            return (
+              typeof data === "string" || data instanceof Uint8Array || data instanceof ArrayBuffer
+            );
+          }
+          case "url":
+            return Object.hasOwn(candidate, "url") && candidate["url"] instanceof URL;
+          case "reference":
+            return (
+              Object.hasOwn(candidate, "reference") && isProviderReference(candidate["reference"])
+            );
+          case "text":
+            return Object.hasOwn(candidate, "text") && typeof candidate["text"] === "string";
+          default:
+            return false;
+        }
+      };
+      const isFileId = (candidate: unknown): boolean =>
+        typeof candidate === "string" || isStringMap(candidate);
+      const isContentPart = (candidate: unknown): boolean => {
+        if (!isRecord(candidate) || !Object.hasOwn(candidate, "type")) return false;
+        if (!hasOptionalProviderOptions(candidate)) return false;
+        switch (candidate["type"]) {
+          case "text":
+            return Object.hasOwn(candidate, "text") && typeof candidate["text"] === "string";
+          case "file":
+            return (
+              Object.hasOwn(candidate, "data") &&
+              isFileData(candidate["data"]) &&
+              Object.hasOwn(candidate, "mediaType") &&
+              typeof candidate["mediaType"] === "string" &&
+              hasOptionalString(candidate, "filename")
+            );
+          case "file-data":
+            return (
+              Object.hasOwn(candidate, "data") &&
+              typeof candidate["data"] === "string" &&
+              Object.hasOwn(candidate, "mediaType") &&
+              typeof candidate["mediaType"] === "string" &&
+              hasOptionalString(candidate, "filename")
+            );
+          case "file-url":
+            return (
+              Object.hasOwn(candidate, "url") &&
+              typeof candidate["url"] === "string" &&
+              hasOptionalString(candidate, "mediaType")
+            );
+          case "file-id":
+          case "image-file-id":
+            return Object.hasOwn(candidate, "fileId") && isFileId(candidate["fileId"]);
+          case "file-reference":
+          case "image-file-reference":
+            return (
+              Object.hasOwn(candidate, "providerReference") &&
+              isProviderReference(candidate["providerReference"])
+            );
+          case "image-data":
+            return (
+              Object.hasOwn(candidate, "data") &&
+              typeof candidate["data"] === "string" &&
+              Object.hasOwn(candidate, "mediaType") &&
+              typeof candidate["mediaType"] === "string"
+            );
+          case "image-url":
+            return Object.hasOwn(candidate, "url") && typeof candidate["url"] === "string";
+          case "custom":
+            return true;
+          default:
+            return false;
+        }
+      };
+      const isContentParts = (candidate: unknown[]): boolean => {
+        for (let index = 0; index < candidate.length; index += 1) {
+          if (!Object.hasOwn(candidate, index) || !isContentPart(candidate[index])) return false;
+        }
+        return true;
+      };
+      const identitySchema = z.custom<CustomCommandResult>((candidate) => {
+        if (!isRecord(candidate) || !Object.hasOwn(candidate, "type")) return false;
+        switch (candidate["type"]) {
+          case "text":
+          case "error-text":
+            return (
+              Object.hasOwn(candidate, "value") &&
+              typeof candidate["value"] === "string" &&
+              hasOptionalProviderOptions(candidate)
+            );
+          case "json":
+          case "error-json":
+            return (
+              Object.hasOwn(candidate, "value") &&
+              isJsonValue(candidate["value"], new WeakSet()) &&
+              hasOptionalProviderOptions(candidate)
+            );
+          case "execution-denied":
+            return hasOptionalString(candidate, "reason") && hasOptionalProviderOptions(candidate);
+          case "content":
+            return (
+              Object.hasOwn(candidate, "value") &&
+              Array.isArray(candidate["value"]) &&
+              isContentParts(candidate["value"])
+            );
+          default:
+            return false;
+        }
+      });
+      const decoded = identitySchema.safeParse(value);
+      return decoded.success ? decoded.data : null;
+    },
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = captured.match<
+    | { readonly kind: "value"; readonly value: CustomCommandResult | null }
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "invalid" }
+  >({
+    ok: (decoded) =>
+      isPanic(deferredPanic)
+        ? { kind: "panic", panic: deferredPanic }
+        : { kind: "value", value: decoded },
+    err: ({ cause }) => (isPanic(cause) ? { kind: "panic", panic: cause } : { kind: "invalid" }),
+  });
+  if (outcome.kind === "panic") throw outcome.panic;
+  return outcome.kind === "value" ? outcome.value : null;
 }
 
 export async function discoverCustomCommands(params: {
@@ -562,12 +599,13 @@ export async function discoverCustomCommands(params: {
       params.dependencies?.readDirectory ?? DEFAULT_DISCOVERY_DEPENDENCIES.readDirectory,
   };
 
-  let dirents: Dirent[];
-  try {
-    dirents = await dependencies.readDirectory(root);
-  } catch (caught) {
-    if (isPanic(caught)) throw caught;
-    const cause = opaqueErrorCause(caught, "Opaque custom-command discovery failure");
+  const directoryOutcome = await settlePromiseResult(() => dependencies.readDirectory(root));
+  if (directoryOutcome.kind === "panic") throw directoryOutcome.panic;
+  if (directoryOutcome.kind === "failure") {
+    const cause = opaqueErrorCause(
+      directoryOutcome.restoreCause(),
+      "Opaque custom-command discovery failure",
+    );
     if (errorCode(cause) === "ENOENT") return Result.ok([]);
     return Result.err(
       new CustomCommandDirectoryReadError({
@@ -577,6 +615,7 @@ export async function discoverCustomCommands(params: {
       }),
     );
   }
+  const dirents = directoryOutcome.value;
 
   const out: CustomCommandDiscovery[] = [];
   for (const dirent of [...dirents].sort((a, b) => a.name.localeCompare(b.name))) {
@@ -613,22 +652,22 @@ export async function discoverCustomCommands(params: {
       defPath,
       readText: dependencies.readText,
     });
-    definition.match({
-      ok: (value) =>
-        out.push({
-          type: "command",
-          command: { def: value, dir, defPath, entrypointPath },
-        }),
-      err: (error) =>
-        out.push({
-          type: "invalid",
-          invalid: {
-            dir,
-            defPath,
-            reason: `invalid def.json: ${formatTaggedErrorForLog(error).errorMessage}`,
-          },
-        }),
-    });
+    const definitionOutcome = captureResultOutcome(definition);
+    if (definitionOutcome.ok) {
+      out.push({
+        type: "command",
+        command: { def: definitionOutcome.value, dir, defPath, entrypointPath },
+      });
+    } else {
+      out.push({
+        type: "invalid",
+        invalid: {
+          dir,
+          defPath,
+          reason: `invalid def.json: ${formatTaggedErrorForLog(definitionOutcome.error).errorMessage}`,
+        },
+      });
+    }
   }
 
   return Result.ok(out);

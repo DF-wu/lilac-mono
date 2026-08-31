@@ -15,6 +15,17 @@ export function createAgentOutputActivityPublisher(params: {
     if (lastPublishedAt !== null && now - lastPublishedAt < intervalMs) return;
     lastPublishedAt = now;
 
-    void params.publish(source).catch((error: unknown) => params.onError?.(error));
+    void publish();
+
+    async function publish(): Promise<void> {
+      const published = await Result.tryPromise({
+        try: () => params.publish(source),
+        catch: captureError,
+      });
+      const failure = published.match({ ok: () => null, err: ({ cause }) => ({ cause }) });
+      if (failure) params.onError?.(failure.cause);
+    }
   };
 }
+import { captureError } from "./error-capture.js";
+import { Result } from "better-result";

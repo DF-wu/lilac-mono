@@ -21,11 +21,26 @@ export function preserveSurfacePanic(cause: unknown): void {
   if (Panic.is(cause)) throw cause;
 }
 
+export type SurfaceFallbackCapture<T> =
+  | { readonly kind: "fallback"; readonly fallback: T }
+  | { readonly kind: "panic"; readonly panic: Panic; readonly fallback: T };
+
 export function surfaceExternalFallback<T>(fallback: T): (cause: unknown) => T {
   return (cause) => {
     preserveSurfacePanic(cause);
     return fallback;
   };
+}
+
+export function settleSurfaceFallback<T, E>(
+  result: ResultType<T, SurfaceFallbackCapture<E>>,
+): ResultType<T, E> {
+  return result.mapError((captured) => {
+    if (captured.kind === "panic" && Panic.is(captured.panic)) {
+      preserveSurfacePanic(captured.panic);
+    }
+    return captured.fallback;
+  });
 }
 
 export type SurfaceOperation =
@@ -150,9 +165,16 @@ export type SurfaceReasoningStatusUpdate = {
   detailText?: string;
 };
 
+export type SurfaceTextPhase = "commentary" | "final_answer";
+
 export type SurfaceOutputPart =
-  | { type: "text.delta"; delta: string }
-  | { type: "text.set"; text: string; finalSegments?: readonly string[] }
+  | { type: "text.delta"; delta: string; phase?: SurfaceTextPhase }
+  | {
+      type: "text.set";
+      text: string;
+      phase?: SurfaceTextPhase;
+      finalSegments?: readonly string[];
+    }
   | { type: "reasoning.status"; update: SurfaceReasoningStatusUpdate }
   | { type: "meta.stats"; line: string }
   | { type: "tool.status"; update: SurfaceToolStatusUpdate }
@@ -175,7 +197,6 @@ export type SurfaceMergeBlockPlanOptions = {
 };
 
 export interface SurfaceOutputStream {
-  hydrateRecovery?(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition;
   push(part: SurfaceOutputPart): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>>;
   finish(): Promise<SurfaceOperationResult<SurfaceOutputResult>>;
   abort(reason?: string): Promise<SurfaceOperationResult<void>>;
@@ -188,9 +209,9 @@ export interface SurfaceOutputStream {
 }
 
 export type StartOutputOpts = {
-  /** Internal preparation mode for recovery admission before snapshot disposition. */
-  preparationMode?: "paused-recovery";
   replyTo?: MsgRef;
+  /** Existing output message to edit when reconnecting a recovered stream. */
+  resumeAt?: MsgRef;
   /** Disable all Discord notifications for this output stream (mentions + reply ping). */
   silent?: boolean;
   /** Router-derived session mode. Used for surface-specific behaviors (e.g. mention pings). */
@@ -201,11 +222,6 @@ export type StartOutputOpts = {
   requestStartedAtMs?: number;
   /** Optional hook invoked when the surface creates a message for this stream. */
   onMessageCreated?: (msgRef: MsgRef) => void;
-  /** Optional resume metadata used to continue editing an existing output chain. */
-  resume?: {
-    /** Previously created output messages for this request (oldest to newest). */
-    created: MsgRef[];
-  };
 };
 
 export type AdapterSubscription = {
@@ -222,6 +238,11 @@ export interface SurfaceAdapterEventSource {
   subscribe(handler: AdapterEventHandler): Promise<AdapterSubscription>;
 }
 
+export type StartTypingOpts = {
+  /** Called after the surface confirms the first typing indicator request. */
+  onStarted?: () => void;
+};
+
 export interface SurfaceAdapter {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
@@ -237,7 +258,10 @@ export interface SurfaceAdapter {
     sessionRef: SessionRef,
     opts?: StartOutputOpts,
   ): Promise<SurfaceOperationResult<SurfaceOutputStream>>;
-  startTyping(sessionRef: SessionRef): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
+  startTyping(
+    sessionRef: SessionRef,
+    opts?: StartTypingOpts,
+  ): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
 
   prepareSendMsg(
     sessionRef: SessionRef,

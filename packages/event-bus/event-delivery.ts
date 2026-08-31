@@ -86,9 +86,21 @@ export type EventDeliveryContext =
     };
 
 export type RawDeliveryAction =
-  | { readonly disposition: "commit" | "park-pending" | "stop" }
-  | { readonly disposition: "retry"; readonly failure: EventDeadLetterHandlerFailure }
-  | { readonly disposition: "dead-letter"; readonly reason: EventDeadLetterReason };
+  | {
+      readonly disposition: "commit";
+      readonly observePostCommit?: () => Promise<
+        import("better-result").Result<void, EventPostCommitObservationFailed>
+      >;
+    }
+  | { readonly disposition: "park-pending" | "stop" }
+  | {
+      readonly disposition: "retry";
+      readonly failure: EventDeadLetterHandlerFailure;
+    }
+  | {
+      readonly disposition: "dead-letter";
+      readonly reason: EventDeadLetterReason;
+    };
 
 export type RawDeliveryHandler = (
   message: RawMessageDecodeOutcome,
@@ -135,6 +147,15 @@ export class EventDeliveryTransportFailed extends TaggedError("EventDeliveryTran
   readonly message: string;
 }> {}
 
+export class EventPostCommitObservationFailed extends TaggedError(
+  "EventPostCommitObservationFailed",
+)<{
+  readonly cause: unknown;
+  readonly topic: string;
+  readonly cursor: Cursor;
+  readonly message: string;
+}> {}
+
 export class EventDeliveryStopped extends TaggedError("EventDeliveryStopped")<{
   readonly reason: "requested" | "tail-cannot-park" | "dead-letter-failed";
   readonly topic: string;
@@ -148,7 +169,57 @@ export class EventDeliveryStopFailed extends TaggedError("EventDeliveryStopFaile
   readonly message: string;
 }> {}
 
-export type EventDeliveryDoneError = EventDeliveryTransportFailed | EventDeliveryStopped;
+export type EventDeliveryDoneError =
+  | EventDeliveryTransportFailed
+  | EventPostCommitObservationFailed
+  | EventDeliveryStopped;
+
+export class EventRequestPublicationConfirmationFailed extends TaggedError(
+  "EventRequestPublicationConfirmationFailed",
+)<{
+  readonly cause: unknown;
+  readonly requestDeliveryId: string;
+  readonly expectedStreamId: string;
+  readonly message: string;
+}> {}
+
+export class EventRequestPublicationConfirmationUnsupported extends TaggedError(
+  "EventRequestPublicationConfirmationUnsupported",
+)<{
+  readonly message: string;
+}> {}
+
+export class EventRequestPublicationClaimFailed extends TaggedError(
+  "EventRequestPublicationClaimFailed",
+)<{
+  readonly cause: unknown;
+  readonly operation: "abandon" | "acquire";
+  readonly requestDeliveryId: string;
+  readonly message: string;
+}> {}
+
+export class EventRequestPublicationClaimUnsupported extends TaggedError(
+  "EventRequestPublicationClaimUnsupported",
+)<{
+  readonly operation: "abandon" | "acquire" | "publish";
+  readonly message: string;
+}> {}
+
+export class EventRequestPublicationClaimFenced extends TaggedError(
+  "EventRequestPublicationClaimFenced",
+)<{
+  readonly requestDeliveryId: string;
+  readonly message: string;
+}> {}
+
+export class EventOutputStreamExpiryUnavailable extends TaggedError(
+  "EventOutputStreamExpiryUnavailable",
+)<{
+  readonly reason: "unsupported" | "transport-unavailable" | "expiry-uncertain";
+  readonly requestId: string;
+  readonly topic: string;
+  readonly message: string;
+}> {}
 
 export class EventFetchTransportFailed extends TaggedError("EventFetchTransportFailed")<{
   readonly cause: unknown;

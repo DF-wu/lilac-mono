@@ -39,7 +39,7 @@ function rejectDriverFailures(): undefined {
 
 function createTestDatabase(): Database {
   const database = new Database(":memory:", { strict: true });
-  database.exec("CREATE TABLE entries (value TEXT NOT NULL UNIQUE)");
+  database.run("CREATE TABLE entries (value TEXT NOT NULL UNIQUE)");
   return database;
 }
 
@@ -246,10 +246,10 @@ describe("runBunSqliteTransaction", () => {
     let operationCalls = 0;
 
     try {
-      writer.exec("CREATE TABLE entries (value TEXT NOT NULL UNIQUE)");
-      writer.exec("PRAGMA busy_timeout = 0");
-      contender.exec("PRAGMA busy_timeout = 0");
-      writer.exec("BEGIN IMMEDIATE");
+      writer.run("CREATE TABLE entries (value TEXT NOT NULL UNIQUE)");
+      writer.run("PRAGMA busy_timeout = 0");
+      contender.run("PRAGMA busy_timeout = 0");
+      writer.run("BEGIN IMMEDIATE");
       writer.run("INSERT INTO entries (value) VALUES (?)", ["uncommitted"]);
 
       const result = runBunSqliteTransaction(
@@ -268,7 +268,7 @@ describe("runBunSqliteTransaction", () => {
       }
       expect(operationCalls).toBe(0);
 
-      writer.exec("ROLLBACK");
+      writer.run("ROLLBACK");
       expect(values(contender)).toEqual([]);
     } finally {
       writer.close();

@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import {
   createLogger,
   formatTaggedErrorForLog,
@@ -220,20 +221,28 @@ export function startConversationThreadSummarizationWorker(params: {
   const postRequest = (
     request: ThreadSummarizationParentMessage,
   ): ResultType<void, ConversationThreadSummarizationTransportError> => {
-    try {
-      worker.postMessage(request);
-      return Result.ok(undefined);
-    } catch (cause) {
-      pending.delete(request.id);
-      jobs.delete(request.id);
-      if (Panic.is(cause)) rethrowConversationThreadWorkerPanic(cause);
-      return Result.err(
-        new ConversationThreadSummarizationTransportError({
-          operation: "post-message",
-          cause,
-          message: "Could not post conversation thread summarization worker request",
-        }),
-      );
+    {
+      const captured = Result.try({
+        try: () => {
+          worker.postMessage(request);
+          return Result.ok(undefined);
+        },
+        catch: captureError,
+      });
+      if (captured.isErr()) {
+        const cause = captured.error.cause;
+        pending.delete(request.id);
+        jobs.delete(request.id);
+        if (Panic.is(cause)) rethrowConversationThreadWorkerPanic(cause);
+        return Result.err(
+          new ConversationThreadSummarizationTransportError({
+            operation: "post-message",
+            cause,
+            message: "Could not post conversation thread summarization worker request",
+          }),
+        );
+      }
+      return captured.value;
     }
   };
 
@@ -488,53 +497,69 @@ export function startConversationThreadWorker(params: {
     }
 
     running = true;
-    try {
-      const cfg = await params.getConfig();
-      if (cfg.conversation.thread.summarization.enabled !== true) {
-        logger.debug("conversation thread summarization disabled");
-        return;
-      }
+    await (async () => {
+      const operation = await Result.tryPromise({
+        try: async () => {
+          const cfg = await params.getConfig();
+          if (cfg.conversation.thread.summarization.enabled !== true) {
+            logger.debug("conversation thread summarization disabled");
+            return;
+          }
 
-      logger.debug("conversation thread summarization tick started");
-      const run = await params.runner.runSummarization({
-        wait: true,
-        limit: cfg.conversation.thread.summarization.batchSize,
-        trigger: "periodic",
-      });
-      run.match({
-        err: (error) => {
-          logger.error(
-            "conversation thread summarization tick failed",
-            formatTaggedErrorForLog(error),
-          );
-        },
-        ok: (result) => {
-          logger.debug("conversation thread summarization tick completed", {
-            eligible: result.eligible,
-            eligibleTotal: result.eligibleTotal,
-            summarized: result.summarized,
-            failed: result.failed,
-            refreshed: result.refreshed,
+          logger.debug("conversation thread summarization tick started");
+          const run = await params.runner.runSummarization({
+            wait: true,
+            limit: cfg.conversation.thread.summarization.batchSize,
+            trigger: "periodic",
+          });
+          run.match({
+            err: (error) => {
+              logger.error(
+                "conversation thread summarization tick failed",
+                formatTaggedErrorForLog(error),
+              );
+            },
+            ok: (result) => {
+              logger.debug("conversation thread summarization tick completed", {
+                eligible: result.eligible,
+                eligibleTotal: result.eligibleTotal,
+                summarized: result.summarized,
+                failed: result.failed,
+                refreshed: result.refreshed,
+              });
+            },
           });
         },
+        catch: captureError,
       });
-    } catch (error) {
-      if (isPanic(error)) {
-        terminalPanic = error;
-        reportConversationThreadWorkerPanicOnce(error, reportFatalPanic);
-        logger.error(
-          "conversation thread summarization tick panicked",
-          formatTaggedErrorForLog(error),
-        );
-      } else {
-        logger.error("conversation thread summarization tick failed", {
-          error: opaqueErrorMessage(error, "Opaque conversation thread worker failure"),
-        });
-      }
-    } finally {
+      operation.match({
+        ok: () => undefined,
+        err: ({ cause: error }) => {
+          if (isPanic(error)) {
+            terminalPanic = error;
+            reportConversationThreadWorkerPanicOnce(error, reportFatalPanic);
+            logger.error(
+              "conversation thread summarization tick panicked",
+              formatTaggedErrorForLog(error),
+            );
+          } else {
+            logger.error(
+              "conversation thread summarization tick failed",
+              formatTaggedErrorForLog(
+                new ConversationThreadSummarizationRuntimeError({
+                  operation: "in-process",
+                  cause: error,
+                  message: opaqueErrorMessage(error, "Opaque conversation thread worker failure"),
+                }),
+              ),
+            );
+          }
+        },
+      });
+    })().finally(() => {
       running = false;
       if (!terminalPanic) schedule(checkIntervalMs);
-    }
+    });
   };
 
   schedule(params.initialCheckDelayMs ?? INITIAL_CHECK_DELAY_MS);

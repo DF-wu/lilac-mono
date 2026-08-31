@@ -13,17 +13,23 @@ class BashCommandParseFailed extends TaggedError("BashCommandParseFailed")<{
 }> {}
 
 function parseBashCommand(command: string): ResultType<ScriptNode, BashCommandParseFailed> {
-  return Result.try({
+  const captured = Result.try({
     try: () => parse(command),
-    catch: (cause) => {
-      if (Panic.is(cause)) throw cause;
-      return new BashCommandParseFailed({
-        command,
-        cause,
-        message: "Bash command could not be parsed",
-      });
-    },
+    catch: (cause) => ({ cause }),
   });
+  const outcome = captured.match<{ readonly value: ScriptNode } | { readonly cause: unknown }>({
+    ok: (value) => ({ value }),
+    err: ({ cause }) => ({ cause }),
+  });
+  if ("value" in outcome) return Result.ok(outcome.value);
+  if (Panic.is(outcome.cause)) throw outcome.cause;
+  return Result.err(
+    new BashCommandParseFailed({
+      command,
+      cause: outcome.cause,
+      message: "Bash command could not be parsed",
+    }),
+  );
 }
 
 export function analyzeCommandInternal(
@@ -45,8 +51,8 @@ function analyzeCommandAtCwd(
   }
 
   const parsed = parseBashCommand(command);
-  return parsed.match({
-    ok: (script) =>
+  const continueAnalysis = parsed.match<() => AnalyzeResult | null>({
+    ok: (script) => () =>
       analyzeScript(
         script,
         {
@@ -58,9 +64,10 @@ function analyzeCommandAtCwd(
         },
         { cwd: effectiveCwd },
       ),
-    err: () => {
+    err: () => () => {
       const reason = dangerousReasonInText(command, options);
       return reason ? { reason, segment: command } : null;
     },
   });
+  return continueAnalysis();
 }

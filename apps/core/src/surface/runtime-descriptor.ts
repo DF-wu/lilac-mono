@@ -4,7 +4,6 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import type { SurfaceAdapter } from "./adapter";
 import type { SurfaceOperationError } from "./adapter";
 import type { ContentOpts, MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from "./types";
-import type { BusToAdapterRelaySnapshot } from "./bridge/subscribe-from-bus";
 import {
   createDescriptorBoundSurfaceAdapter,
   createDescriptorBoundWorkflowProgressPort,
@@ -41,42 +40,11 @@ export type SurfaceRequestIngressHandle = SurfaceLifecycleHandle;
 
 export interface SurfaceRequestIngress extends SurfaceLifecyclePort<SurfaceRequestIngressHandle> {}
 
-export type SurfaceRelaySnapshotFor<P extends RegisteredSurfacePlatform> = Omit<
-  BusToAdapterRelaySnapshot,
-  "platform"
-> & {
-  readonly platform: P;
-};
-
-export class SurfaceRelayRestoreApplyFailed extends TaggedError("SurfaceRelayRestoreApplyFailed")<{
-  readonly platform: AdapterPlatform;
-  readonly requestId: string;
-  readonly message: string;
-}> {}
-
-export class SurfaceRelayRestoreRollbackFailed extends TaggedError(
-  "SurfaceRelayRestoreRollbackFailed",
-)<{
-  readonly platform: RegisteredSurfacePlatform;
-  readonly message: string;
-}> {}
-
-export type SurfaceRelayRestoreAttempt<P extends RegisteredSurfacePlatform> = {
-  readonly platform: P;
-  apply(): Promise<ResultType<void, SurfaceRelayRestoreApplyFailed>>;
-  rollback(): Promise<ResultType<void, SurfaceRelayRestoreRollbackFailed>>;
-  activate(): void;
-};
-
 export interface SurfaceRelayHandle<
   P extends RegisteredSurfacePlatform,
 > extends SurfaceLifecycleHandle {
   readonly platform: P;
   beginDrain(options: { readonly deadlineMs: number }): Promise<void>;
-  snapshotRelays(): SurfaceRelaySnapshotFor<P>[];
-  prepareRestoreRelays(
-    snapshots: readonly SurfaceRelaySnapshotFor<P>[],
-  ): ResultType<SurfaceRelayRestoreAttempt<P>, SurfaceRelayRestoreApplyFailed>;
 }
 
 export interface SurfaceRelayLifecyclePort<
@@ -119,28 +87,9 @@ export type SurfaceRelayFinalization<P extends RegisteredSurfacePlatform> = {
   cleanupSkippedOutput?(input: { readonly ref: MsgRefFor<P> }): Promise<void>;
 };
 
-export type SurfaceRestoredOutputChain<P extends RegisteredSurfacePlatform> = {
-  readonly requestId: string;
-  readonly sessionId: string;
-  readonly createdOutputRefs: readonly MsgRefFor<P>[];
-  readonly activeOutputRefs?: readonly MsgRefFor<P>[];
-};
-
-export type SurfaceRecoveryGeneration = {
-  readonly generation: symbol;
-};
-
-export type SurfaceRelayRecovery<P extends RegisteredSurfacePlatform> = {
-  activateRestoredOutputChains(
-    generation: SurfaceRecoveryGeneration,
-    chains: readonly SurfaceRestoredOutputChain<P>[],
-  ): void;
-};
-
 export type SurfaceRelayPolicy<P extends RegisteredSurfacePlatform> = {
   readonly refs: SurfaceRelayRefs<P>;
   readonly finalization?: SurfaceRelayFinalization<P>;
-  readonly recovery?: SurfaceRelayRecovery<P>;
 };
 
 export type SurfaceRelayDescriptor<P extends RegisteredSurfacePlatform> = {

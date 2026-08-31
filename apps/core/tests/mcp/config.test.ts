@@ -70,6 +70,7 @@ configVersion: 1
 servers:
   local-docs:
     transport: stdio
+    description: "  Search local product documentation.  "
     command: bun
     args: [run, server.ts]
     cwd: /workspace
@@ -104,6 +105,9 @@ servers:
       cwd: "/workspace",
       env: { DOCS_TOKEN: { env: "DOCS_TOKEN" } },
     });
+    expect(parsed.config.servers["local-docs"]?.description).toBe(
+      "Search local product documentation.",
+    );
     expect(parsed.config.servers["dynamic-auth"]?.id).toBe("dynamic-auth");
 
     const reparsed = parseMcpConfigYaml(serializeMcpConfigYaml(parsed.config));

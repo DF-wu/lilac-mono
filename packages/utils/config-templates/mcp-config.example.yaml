@@ -5,6 +5,7 @@ servers: {}
 # Replace `servers: {}` with entries such as:
 # servers:
 #   docs:
+#     description: Search and retrieve the documentation library.
 #     transport: http
 #     url: https://mcp.example.com/mcp
 #     headers:

@@ -13,6 +13,7 @@ import {
 class FakeMaterializerWorker implements ThreadMaterializerWorkerHost {
   readonly requests: ThreadMaterializerWorkerRequest[] = [];
   terminated = false;
+  postFailure: unknown;
   private messageHandler: ((event: MessageEvent<unknown>) => void) | null = null;
   private readonly requestWaiters = new Map<
     number,
@@ -28,6 +29,7 @@ class FakeMaterializerWorker implements ThreadMaterializerWorkerHost {
   }
 
   postMessage(request: Parameters<ThreadMaterializerWorkerHost["postMessage"]>[0]): void {
+    if (this.postFailure !== undefined) throw this.postFailure;
     this.requests.push(request);
     this.requestWaiters.get(this.requests.length - 1)?.(request);
     this.requestWaiters.delete(this.requests.length - 1);
@@ -271,5 +273,29 @@ describe("thread materializer worker protocol", () => {
 
     await flushed;
     await materializer.stop();
+  });
+
+  it("handles an Error thrown by postMessage as the original operation failure", async () => {
+    const worker = new FakeMaterializerWorker();
+    const materializer = startConversationThreadMaterializer({
+      searchDbPath: "/tmp/search.db",
+      workerFactory: () => worker,
+    });
+    const initialList = await worker.waitForRequest(0);
+    worker.emitMessage({
+      id: initialList.id,
+      ok: true,
+      type: "list-channels",
+      channelIds: [],
+    });
+    await materializer.flush();
+
+    const failure = new Error("post failed");
+    worker.postFailure = failure;
+    materializer.markDirty({ channelId: "channel-a", kind: "topology" });
+
+    await expect(materializer.flush()).rejects.toBe(failure);
+    worker.postFailure = undefined;
+    await expect(materializer.stop()).rejects.toBe(failure);
   });
 });

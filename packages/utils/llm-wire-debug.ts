@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { Panic, Result } from "better-result";
 
 import { env } from "./env";
-import { isPanic, isRecord, opaqueErrorMessage } from "./runtime-utils";
+import { isPanic, isRecord, opaqueErrorMessage, settlePromiseResult } from "./runtime-utils";
 import { redactErrorTextForLog } from "./tagged-error-log";
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
@@ -29,7 +30,7 @@ class JsonlWriter {
 
   constructor(
     private readonly filePath: string,
-    private readonly onError: (details: { filePath: string; error: unknown }) => void,
+    private readonly onError: (details: { filePath: string; restoreError: () => unknown }) => void,
   ) {}
 
   write(entry: WireDebugEvent): void {
@@ -44,18 +45,15 @@ class JsonlWriter {
   }
 
   private async append(line: string): Promise<boolean> {
-    try {
-      await fs.appendFile(this.filePath, line, "utf8");
-      return true;
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-      this.failed = true;
-      if (!this.failureLogged) {
-        this.failureLogged = true;
-        this.onError({ filePath: this.filePath, error: cause });
-      }
-      return false;
+    const outcome = await settlePromiseResult(() => fs.appendFile(this.filePath, line, "utf8"));
+    if (outcome.kind === "value") return true;
+    if (outcome.kind === "panic") throw outcome.panic;
+    this.failed = true;
+    if (!this.failureLogged) {
+      this.failureLogged = true;
+      this.onError({ filePath: this.filePath, restoreError: outcome.restoreCause });
     }
+    return false;
   }
 }
 
@@ -91,10 +89,10 @@ export function withLlmWireDebugFetch(params: {
       data: requestSnapshot,
     });
 
-    let response: FetchResponse;
-    try {
-      response = await params.fetchFn(input, init);
-    } catch (error) {
+    const fetchOutcome = await settlePromiseResult(() => params.fetchFn(input, init));
+    if (fetchOutcome.kind !== "value") {
+      const error =
+        fetchOutcome.kind === "panic" ? fetchOutcome.panic : fetchOutcome.restoreCause();
       writer?.write({
         ts: new Date().toISOString(),
         provider: params.provider,
@@ -108,6 +106,7 @@ export function withLlmWireDebugFetch(params: {
       await writer?.flush();
       throw error;
     }
+    const response = fetchOutcome.value;
 
     const responseInfo = {
       status: response.status,
@@ -181,28 +180,30 @@ async function createWriter(
   provider: string,
   traceId: string,
 ): Promise<JsonlWriter | null> {
-  try {
+  const outcome = await settlePromiseResult(async () => {
     await fs.mkdir(path.dirname(filePath), { recursive: true });
-    return new JsonlWriter(filePath, ({ filePath: failedPath, error }) => {
+    return new JsonlWriter(filePath, ({ filePath: failedPath, restoreError }) => {
       warn?.("llm wire debug append failed", {
         provider,
         traceId,
         filePath: failedPath,
         error: redactErrorTextForLog(
-          opaqueErrorMessage(error, "Unknown trace-file creation failure"),
+          opaqueErrorMessage(restoreError(), "Unknown trace-file creation failure"),
         ),
       });
     });
-  } catch (error) {
-    if (isPanic(error)) throw error;
-    warn?.("llm wire debug disabled for request (failed to create trace file)", {
-      provider,
-      traceId,
-      filePath,
-      error: redactErrorTextForLog(opaqueErrorMessage(error, "Unknown response body read failure")),
-    });
-    return null;
-  }
+  });
+  if (outcome.kind === "value") return outcome.value;
+  if (outcome.kind === "panic") throw outcome.panic;
+  warn?.("llm wire debug disabled for request (failed to create trace file)", {
+    provider,
+    traceId,
+    filePath,
+    error: redactErrorTextForLog(
+      opaqueErrorMessage(outcome.restoreCause(), "Unknown response body read failure"),
+    ),
+  });
+  return null;
 }
 
 function buildTraceFilePath(provider: string, traceId: string): string {
@@ -246,16 +247,19 @@ async function captureNonStreamingResponse(input: {
 }): Promise<void> {
   const { response, writer, provider, traceId, maxBodyBytes, startedAt } = input;
 
-  let body: unknown;
-  try {
-    const text = await response.text();
-    body = toRedactedBodyPreview(text, maxBodyBytes);
-  } catch (error) {
-    if (isPanic(error)) throw error;
-    body = {
-      error: redactErrorTextForLog(opaqueErrorMessage(error, "Unknown response body read failure")),
-    };
-  }
+  const readOutcome = await settlePromiseResult(async () => {
+    const body = toRedactedBodyPreview(await response.text(), maxBodyBytes);
+    return () => body;
+  });
+  if (readOutcome.kind === "panic") throw readOutcome.panic;
+  const body =
+    readOutcome.kind === "value"
+      ? readOutcome.value()
+      : {
+          error: redactErrorTextForLog(
+            opaqueErrorMessage(readOutcome.restoreCause(), "Unknown response body read failure"),
+          ),
+        };
 
   writer?.write({
     ts: new Date().toISOString(),
@@ -295,9 +299,9 @@ async function consumeSseDebugStream(input: {
   let buffered = "";
   let eventCount = 0;
   let truncated = false;
-  let deferredPanic: unknown;
+  let deferredPanic: Panic | undefined;
 
-  try {
+  const consumed = await settlePromiseResult(async () => {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -361,10 +365,10 @@ async function consumeSseDebugStream(input: {
         });
       }
     }
-  } catch (error) {
-    if (isPanic(error)) {
-      deferredPanic = error;
-    } else {
+  });
+  if (consumed.kind !== "value") {
+    if (consumed.kind === "panic") deferredPanic = consumed.panic;
+    else {
       writer?.write({
         ts: new Date().toISOString(),
         provider,
@@ -372,34 +376,39 @@ async function consumeSseDebugStream(input: {
         event: "response.sse.error",
         data: {
           error: redactErrorTextForLog(
-            opaqueErrorMessage(error, "Unknown SSE debug stream failure"),
+            opaqueErrorMessage(consumed.restoreCause(), "Unknown SSE debug stream failure"),
           ),
         },
       });
     }
-  } finally {
-    writer?.write({
-      ts: new Date().toISOString(),
-      provider,
-      traceId,
-      event: "response.complete",
-      data: {
-        elapsedMs: Date.now() - startedAt,
-        transport: "sse",
-        eventCount,
-      },
-    });
-    try {
-      await writer?.flush();
-    } catch (cause) {
-      if (deferredPanic === undefined && isPanic(cause)) deferredPanic = cause;
-    }
-    try {
-      reader.releaseLock();
-    } catch (cause) {
-      if (deferredPanic === undefined && isPanic(cause)) deferredPanic = cause;
-    }
   }
+  writer?.write({
+    ts: new Date().toISOString(),
+    provider,
+    traceId,
+    event: "response.complete",
+    data: {
+      elapsedMs: Date.now() - startedAt,
+      transport: "sse",
+      eventCount,
+    },
+  });
+  const flushed = await settlePromiseResult(async () => writer?.flush());
+  if (flushed.kind === "panic" && deferredPanic === undefined) deferredPanic = flushed.panic;
+  const released = Result.try({
+    try: () => reader.releaseLock(),
+    catch: (cause) => ({ cause }),
+  });
+  const releaseOutcome = released.match<
+    | { readonly kind: "released" }
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "failure" }
+  >({
+    ok: () => ({ kind: "released" }),
+    err: ({ cause }) => (isPanic(cause) ? { kind: "panic", panic: cause } : { kind: "failure" }),
+  });
+  if (releaseOutcome.kind === "panic" && deferredPanic === undefined)
+    deferredPanic = releaseOutcome.panic;
   if (deferredPanic !== undefined) throw deferredPanic;
 }
 
@@ -414,12 +423,20 @@ function extractSseData(frame: string): string {
 }
 
 function safeParseJson(text: string): unknown | null {
-  try {
-    return JSON.parse(text) as unknown;
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return null;
-  }
+  const captured = Result.try({
+    try: () => JSON.parse(text) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = captured.match<
+    | { readonly kind: "value"; readonly restoreValue: () => unknown }
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "invalid" }
+  >({
+    ok: (value) => ({ kind: "value", restoreValue: () => value }),
+    err: ({ cause }) => (isPanic(cause) ? { kind: "panic", panic: cause } : { kind: "invalid" }),
+  });
+  if (outcome.kind === "panic") throw outcome.panic;
+  return outcome.kind === "value" ? outcome.restoreValue() : null;
 }
 
 function projectWireDebugEventType(value: Record<string, unknown> | null): string | null {
@@ -571,12 +588,9 @@ async function decodeRequestBody(input: FetchInput, init?: FetchInit): Promise<s
   if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
 
   if (input instanceof Request) {
-    try {
-      return await input.clone().text();
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-      return undefined;
-    }
+    const outcome = await settlePromiseResult(() => input.clone().text());
+    if (outcome.kind === "panic") throw outcome.panic;
+    return outcome.kind === "value" ? outcome.value : undefined;
   }
 
   return undefined;

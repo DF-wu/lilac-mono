@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import {
   AISDKError,
   generateText,
@@ -60,7 +61,6 @@ import {
 import { stripLeadingContinueDirective } from "../surface/discord/discord-request-router/common";
 import { isSqliteBusyError } from "../shared/sqlite";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
-import { projectRuntimeError } from "../runtime/error-format";
 
 const SUMMARY_QUIET_MS = 60 * 60 * 1000;
 const SUMMARY_HEAD_MESSAGES = 40;
@@ -632,16 +632,18 @@ function captureConversationThreadSqliteOperation(
 ): ResultType<void, ConversationThreadOperationFailed> {
   const captured = Result.try({
     try: run,
-    catch: (cause) => projectRuntimeError(cause, "Conversation thread SQLite operation defect"),
+    catch: (cause) => captureError(cause, "Conversation thread SQLite operation defect"),
   });
   return captured.match<() => ResultType<void, ConversationThreadOperationFailed>>({
     ok: (value) => () => Result.ok(value),
-    err: (error) => () => {
-      if (error instanceof Error && classifyBunSqliteError(error) !== undefined) {
-        return Result.err(conversationThreadOperationFailed(operation, message));
-      }
-      return signalConversationThreadDefect(error);
-    },
+    err:
+      ({ cause: error }) =>
+      () => {
+        if (error instanceof Error && classifyBunSqliteError(error) !== undefined) {
+          return Result.err(conversationThreadOperationFailed(operation, message));
+        }
+        return signalConversationThreadDefect(error);
+      },
   })();
 }
 

@@ -9,7 +9,7 @@ import {
 import { GithubOutputStream } from "../../../src/surface/github/output/github-output-stream";
 
 describe("GithubOutputStream", () => {
-  it("hydrates restored state without provider calls and publishes only on finish", async () => {
+  it("buffers text without provider calls and publishes only on finish", async () => {
     const comments: string[] = [];
     const stream = new GithubOutputStream(
       { platform: "github", channelId: "octo/repo#1" },
@@ -22,7 +22,9 @@ describe("GithubOutputStream", () => {
       },
     );
 
-    expect(stream.hydrateRecovery([{ type: "text.set", text: "restored" }])).toBe("visible");
+    await expect(stream.push({ type: "text.set", text: "buffered" })).resolves.toEqual(
+      Result.ok("visible"),
+    );
     expect(comments).toEqual([]);
     await expect(stream.push({ type: "text.delta", delta: " live" })).resolves.toEqual(
       Result.ok("visible"),
@@ -32,7 +34,7 @@ describe("GithubOutputStream", () => {
     const finished = await stream.finish();
     expect(finished.status).toBe("ok");
     expect(comments).toHaveLength(1);
-    expect(comments[0]).toContain("restored live");
+    expect(comments[0]).toContain("buffered live");
   });
 
   it("distinguishes visible, terminal-only, and ignored presentation parts", async () => {

@@ -143,6 +143,22 @@ function resultOutcome<T, E>(
   });
 }
 
+type OpaqueClaudeValue = {} | null | undefined;
+
+function capturedClaudeError(cause: OpaqueClaudeValue, message: string): Error {
+  return cause instanceof Error ? cause : new Error(message, { cause });
+}
+
+function captureClaudeOperation<T>(operation: () => Awaited<T>): ResultType<T, OpaqueClaudeValue> {
+  return Result.try<T, OpaqueClaudeValue>({ try: operation, catch: (cause) => cause });
+}
+
+function captureClaudePromise<T>(
+  operation: () => Promise<T>,
+): Promise<ResultType<T, OpaqueClaudeValue>> {
+  return Result.tryPromise<T, OpaqueClaudeValue>({ try: operation, catch: (cause) => cause });
+}
+
 export type ClaudeCodeRunMaterializationError =
   | ClaudeCodeRunInvalidConfiguration
   | ClaudeNativeSessionPreflightError
@@ -321,36 +337,47 @@ async function captureExternalOperation<T>(
   operation: string,
   effect: () => T | PromiseLike<T>,
 ): Promise<ResultType<T, ClaudeCodeRunExternalFailure>> {
-  try {
-    return Result.ok(await effect());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new ClaudeCodeRunExternalFailure({
-        operation,
-        cause,
-        message: `${operation} failed`,
-      }),
-    );
-  }
+  const captured = resultOutcome(await captureClaudePromise(async () => await effect()));
+  if (captured.ok) return Result.ok(captured.value);
+  if (Panic.is(captured.error)) throw captured.error;
+  return Result.err(
+    new ClaudeCodeRunExternalFailure({
+      operation,
+      cause: capturedClaudeError(captured.error, `${operation} failed`),
+      message: `${operation} failed`,
+    }),
+  );
 }
 
+function captureExternalOperationSync(error: ClaudeCodeRunExternalFailure): never;
 function captureExternalOperationSync<T>(
   operation: string,
-  effect: () => T,
+  effect: () => Awaited<T>,
+): ResultType<T, ClaudeCodeRunExternalFailure>;
+function captureExternalOperationSync<T>(
+  operation: string | ClaudeCodeRunExternalFailure,
+  effect?: () => Awaited<T>,
 ): ResultType<T, ClaudeCodeRunExternalFailure> {
-  try {
-    return Result.ok(effect());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
+  if (operation instanceof ClaudeCodeRunExternalFailure) throw operation;
+  if (effect === undefined) {
+    return captureExternalOperationSync(
       new ClaudeCodeRunExternalFailure({
         operation,
-        cause,
+        cause: new Error(`${operation} failed`),
         message: `${operation} failed`,
       }),
     );
   }
+  const captured = resultOutcome(captureClaudeOperation(effect));
+  if (captured.ok) return Result.ok(captured.value);
+  if (Panic.is(captured.error)) throw captured.error;
+  return Result.err(
+    new ClaudeCodeRunExternalFailure({
+      operation,
+      cause: capturedClaudeError(captured.error, `${operation} failed`),
+      message: `${operation} failed`,
+    }),
+  );
 }
 
 type CapturedCleanupOperation<T> =
@@ -359,14 +386,14 @@ type CapturedCleanupOperation<T> =
 
 function captureCleanupOperationSync<T>(
   operation: string,
-  effect: () => T,
+  effect: () => Awaited<T>,
 ): CapturedCleanupOperation<T> {
-  try {
-    return { status: "result", result: captureExternalOperationSync(operation, effect) };
-  } catch (cause) {
-    if (!Panic.is(cause)) throw cause;
-    return { status: "panic", panic: cause };
-  }
+  const captured = resultOutcome(
+    captureClaudeOperation(() => captureExternalOperationSync(operation, effect)),
+  );
+  if (captured.ok) return { status: "result", result: captured.value };
+  if (!Panic.is(captured.error)) throw captured.error;
+  return { status: "panic", panic: captured.error };
 }
 
 function deferredCleanupPanic<T>(outcome: PromiseSettledResult<T>): Panic | undefined {
@@ -440,18 +467,11 @@ async function captureClaudeContextUsage(
     ClaudeCodeRunExternalFailure | ClaudeCodeRunInvalidConfiguration
   >
 > {
-  try {
-    return decodeClaudeContextUsage(await controller.getContextUsage());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new ClaudeCodeRunExternalFailure({
-        operation: "Claude context usage capture",
-        cause,
-        message: "Claude context usage capture failed",
-      }),
-    );
-  }
+  return (
+    await captureExternalOperation("Claude context usage capture", () =>
+      controller.getContextUsage(),
+    )
+  ).andThen(decodeClaudeContextUsage);
 }
 
 export function decodeClaudeStopHookInput(
@@ -1296,156 +1316,160 @@ export async function materializeClaudeCodeRunResult(options: {
     return finalizationPromise;
   };
 
-  try {
-    const sharedAgentSettings = {
-      ...executable,
-      cwd: options.cwd,
-      env: { ENABLE_TOOL_SEARCH: "true" },
-      tools: builtInTools,
-      settingSources: [],
-      mcpServers: bridge.mcpServers,
-      canUseTool: bridge.canUseTool,
-      spawnClaudeCodeProcess: spawnTrackedProcess,
-      streamingInput: "always",
-      hooks: { Stop: [{ hooks: [stopHook] }] },
-      onSdkMessage: observeSdkMessage,
-      onStreamStart: (nextInjector) => {
-        invoked = true;
-        if (disposed) {
-          const closed = captureExternalOperationSync("Late Claude message injector close", () =>
-            nextInjector.close(),
-          );
-          closed.match({
-            ok: () => undefined,
-            err: (error) =>
-              recordCallbackError(boundedExternalFailure(error, MAX_CALLBACK_ERROR_CHARS)),
-          });
-          return;
-        }
-        injectors.add(nextInjector);
-        injector = nextInjector;
-      },
-      onQueryControllerCreated: (nextController) => {
-        invoked = true;
-        const process = unclaimedProcesses.shift();
-        let settlement: Promise<ResultType<void, ClaudeCodeRunCleanupFailed>> | null = null;
-        const trackedController: TrackedQueryController = {
-          settleResult: () => {
-            settlement ??= settleQueryAndProcess({
-              settleQuery: async () => {
-                await nextController.rawQuery.return(undefined);
-              },
-              process,
-            });
-            return settlement;
-          },
-        };
-        const queryController: ClaudeNativeQueryController = {
-          getContextUsage: () => nextController.getContextUsage(),
-          interrupt: () => nextController.interrupt(),
-          settle: async () => undefined,
-        };
-        queryControllers.add(trackedController);
-        if (!disposed) controller = queryController;
-      },
-    } satisfies ClaudeCodeRunModelSettings;
-    const agentModel = createModel(options.modelId, {
-      ...sharedAgentSettings,
-      ...nativeSettings(start),
-    });
-    const continuationModel =
-      start.mode === "ephemeral"
-        ? undefined
-        : createModel(options.modelId, {
-            ...sharedAgentSettings,
-            persistSession: true,
-            resume: start.sessionId,
-          });
-    const createUtilityModelResult = () =>
-      captureExternalOperationSync("Claude utility model construction", () =>
-        createModel(options.modelId, {
-          ...executable,
-          cwd: options.cwd,
-          tools: [],
-          settingSources: [],
-          persistSession: false,
-        }),
-      );
-    const createUtilityModel = () => {
-      const created = resultOutcome(createUtilityModelResult());
-      if (!created.ok) throw created.error;
-      return created.value;
-    };
-    return Result.ok({
-      agentModel,
-      ...(continuationModel ? { continuationModel } : {}),
-      createUtilityModelResult,
-      createUtilityModel,
-      control,
-      nativeSession: {
-        getObservation,
-        waitForObservation,
-        recordWarning,
-        finalizeResult,
-        finalize,
-      },
-      disposeResult,
-      dispose,
-    });
-  } catch (cause) {
-    disposed = true;
-    acceptingProcesses = false;
-    const operationPanic = Panic.is(cause) ? cause : undefined;
-    const cleanupFailures: ClaudeCodeRunExternalFailure[] = [];
-    let cleanupPanic: Panic | undefined;
-    const controlsCleared = captureCleanupOperationSync("Claude run control cleanup", clearResult);
-    if (controlsCleared.status === "panic") cleanupPanic = controlsCleared.panic;
-    else {
-      const controlsOutcome = resultOutcome(controlsCleared.result);
-      if (!controlsOutcome.ok) cleanupFailures.push(controlsOutcome.error);
-      else {
-        controlsOutcome.value.match({
-          ok: () => undefined,
-          err: (error) => cleanupFailures.push(...error.failures),
-        });
-      }
-    }
-    const [bridgeCleanup] = await Promise.allSettled([bridge.closeResult()]);
-    const bridgePanic = deferredCleanupPanic(bridgeCleanup);
-    if (bridgeCleanup.status === "fulfilled") {
-      const bridgeClosed = bridgeCleanup.value;
-      bridgeClosed.match({
-        ok: () => undefined,
-        err: (error) =>
-          cleanupFailures.push(
-            new ClaudeCodeRunExternalFailure({
-              operation: "Claude MCP bridge cleanup",
-              cause: error,
-              message: error.message,
-            }),
-          ),
-      });
-    }
-    if (bridgePanic) cleanupPanic ??= bridgePanic;
-    if (operationPanic) throw operationPanic;
-    if (cleanupPanic) throw cleanupPanic;
-    const operationError = new ClaudeCodeRunExternalFailure({
-      operation: "Claude model construction",
-      cause,
-      message: "Claude model construction failed",
-    });
-    if (cleanupFailures.length === 0) return Result.err(operationError);
-    return Result.err(
-      new ClaudeCodeRunOperationAndCleanupFailed({
-        operationError,
-        cleanupError: new ClaudeCodeRunCleanupFailed({
-          failures: cleanupFailures,
-          message: "Claude run cleanup after model construction failure failed",
-        }),
-        message: "Claude model construction and cleanup failed",
+  const createUtilityModelResult = () =>
+    captureExternalOperationSync("Claude utility model construction", () =>
+      createModel(options.modelId, {
+        ...executable,
+        cwd: options.cwd,
+        tools: [],
+        settingSources: [],
+        persistSession: false,
       }),
     );
+  const createUtilityModel = () => {
+    const created = resultOutcome(createUtilityModelResult());
+    if (!created.ok) return captureExternalOperationSync(created.error);
+    return created.value;
+  };
+
+  const construction = resultOutcome(
+    await captureClaudePromise(async () => {
+      const sharedAgentSettings = {
+        ...executable,
+        cwd: options.cwd,
+        env: { ENABLE_TOOL_SEARCH: "true" },
+        tools: builtInTools,
+        settingSources: [],
+        mcpServers: bridge.mcpServers,
+        canUseTool: bridge.canUseTool,
+        spawnClaudeCodeProcess: spawnTrackedProcess,
+        streamingInput: "always",
+        hooks: { Stop: [{ hooks: [stopHook] }] },
+        onSdkMessage: observeSdkMessage,
+        onStreamStart: (nextInjector) => {
+          invoked = true;
+          if (disposed) {
+            const closed = captureExternalOperationSync("Late Claude message injector close", () =>
+              nextInjector.close(),
+            );
+            closed.match({
+              ok: () => undefined,
+              err: (error) =>
+                recordCallbackError(boundedExternalFailure(error, MAX_CALLBACK_ERROR_CHARS)),
+            });
+            return;
+          }
+          injectors.add(nextInjector);
+          injector = nextInjector;
+        },
+        onQueryControllerCreated: (nextController) => {
+          invoked = true;
+          const process = unclaimedProcesses.shift();
+          let settlement: Promise<ResultType<void, ClaudeCodeRunCleanupFailed>> | null = null;
+          const trackedController: TrackedQueryController = {
+            settleResult: () => {
+              settlement ??= settleQueryAndProcess({
+                settleQuery: async () => {
+                  await nextController.rawQuery.return(undefined);
+                },
+                process,
+              });
+              return settlement;
+            },
+          };
+          const queryController: ClaudeNativeQueryController = {
+            getContextUsage: () => nextController.getContextUsage(),
+            interrupt: () => nextController.interrupt(),
+            settle: async () => undefined,
+          };
+          queryControllers.add(trackedController);
+          if (!disposed) controller = queryController;
+        },
+      } satisfies ClaudeCodeRunModelSettings;
+      const agentModel = createModel(options.modelId, {
+        ...sharedAgentSettings,
+        ...nativeSettings(start),
+      });
+      const continuationModel =
+        start.mode === "ephemeral"
+          ? undefined
+          : createModel(options.modelId, {
+              ...sharedAgentSettings,
+              persistSession: true,
+              resume: start.sessionId,
+            });
+      return Result.ok({
+        agentModel,
+        ...(continuationModel ? { continuationModel } : {}),
+        createUtilityModelResult,
+        createUtilityModel,
+        control,
+        nativeSession: {
+          getObservation,
+          waitForObservation,
+          recordWarning,
+          finalizeResult,
+          finalize,
+        },
+        disposeResult,
+        dispose,
+      });
+    }),
+  );
+  if (construction.ok) return construction.value;
+  const cause = construction.error;
+  disposed = true;
+  acceptingProcesses = false;
+  const operationPanic = Panic.is(cause) ? cause : undefined;
+  const cleanupFailures: ClaudeCodeRunExternalFailure[] = [];
+  let cleanupPanic: Panic | undefined;
+  const controlsCleared = captureCleanupOperationSync("Claude run control cleanup", clearResult);
+  if (controlsCleared.status === "panic") cleanupPanic = controlsCleared.panic;
+  else {
+    const controlsOutcome = resultOutcome(controlsCleared.result);
+    if (!controlsOutcome.ok) cleanupFailures.push(controlsOutcome.error);
+    else {
+      controlsOutcome.value.match({
+        ok: () => undefined,
+        err: (error) => cleanupFailures.push(...error.failures),
+      });
+    }
   }
+  const [bridgeCleanup] = await Promise.allSettled([bridge.closeResult()]);
+  const bridgePanic = deferredCleanupPanic(bridgeCleanup);
+  if (bridgeCleanup.status === "fulfilled") {
+    const bridgeClosed = bridgeCleanup.value;
+    bridgeClosed.match({
+      ok: () => undefined,
+      err: (error) =>
+        cleanupFailures.push(
+          new ClaudeCodeRunExternalFailure({
+            operation: "Claude MCP bridge cleanup",
+            cause: error,
+            message: error.message,
+          }),
+        ),
+    });
+  }
+  if (bridgePanic) cleanupPanic ??= bridgePanic;
+  if (operationPanic) throw operationPanic;
+  if (cleanupPanic) throw cleanupPanic;
+  const operationError = new ClaudeCodeRunExternalFailure({
+    operation: "Claude model construction",
+    cause: capturedClaudeError(cause, "Claude model construction failed"),
+    message: "Claude model construction failed",
+  });
+  if (cleanupFailures.length === 0) return Result.err(operationError);
+  return Result.err(
+    new ClaudeCodeRunOperationAndCleanupFailed({
+      operationError,
+      cleanupError: new ClaudeCodeRunCleanupFailed({
+        failures: cleanupFailures,
+        message: "Claude run cleanup after model construction failure failed",
+      }),
+      message: "Claude model construction and cleanup failed",
+    }),
+  );
 }
 
 /** Compatibility adapter for callers that consume materialization failures as rejections. */

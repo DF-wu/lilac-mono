@@ -24,6 +24,7 @@ import { canonicalJsonSha256, sha256 } from "../../src/workflow/workflow-definit
 import { type WorkflowWait } from "../../src/workflow/workflow-domain";
 import { shouldSuppressRouterForWorkflowReply } from "../../src/workflow/workflow-router-suppression";
 import { WorkflowWaitResolver } from "../../src/workflow/workflow-wait-resolver";
+import { workflowArtifactReferenceForTest } from "./workflow-test-blob-store";
 class IdleRawBus implements RawBus {
   readonly subscribe = subscribeForTest;
   readonly retiredGroups: Array<{
@@ -264,7 +265,7 @@ function createRunAndWait(
       scope: "project",
       normalizedPath: `${input.runId}.js`,
       name: input.runId,
-      snapshotArtifactId: `workflow-source:${sha256(input.runId)}`,
+      snapshotArtifact: workflowArtifactReferenceForTest(`workflow-source:${sha256(input.runId)}`),
       sourceSha256: sha256(input.runId),
       inputSchemaSha256: "a".repeat(64),
       resourcePolicySha256: "b".repeat(64),
@@ -306,7 +307,7 @@ function createRunAndWait(
       progressTarget: null,
       terminalDetail: null,
       result: null,
-      resultArtifactId: null,
+      resultArtifact: null,
       claimedBy: null,
       claimedAt: null,
       createdAt: 1,
@@ -331,7 +332,7 @@ function createRunAndWait(
       attempt: 0,
       requestId: null,
       output: null,
-      resultArtifactId: null,
+      resultArtifact: null,
       error: null,
       usage: null,
       claimedBy: null,

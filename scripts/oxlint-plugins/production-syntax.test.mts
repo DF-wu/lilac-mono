@@ -2,17 +2,28 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "bun:test";
 
-import { type ArchitectureManifest, type ExceptionAdapter } from "../architecture/manifest.ts";
 import {
+  BLOB_STORAGE_ARCHITECTURE_POLICY,
+  architectureManifest,
+  type ArchitectureManifest,
+  type BlobStorageArchitecturePolicy,
+  type ExceptionAdapter,
+} from "../architecture/manifest.ts";
+import {
+  findBlobStorageSeamViolations,
   findExceptionFlowViolations,
   findExceptionFlowViolationsInSourceFile,
   findDirectSqliteTransactionViolations,
   findDirectSqliteTransactionViolationsInSourceFile,
+  findElseAfterTerminalViolations,
+  findElseAfterTerminalViolationsInSourceFile,
   findInlineAsyncResultCallbackViolations,
   findInlineAsyncResultCallbackViolationsInSourceFile,
   findLocalRecordGuardViolations,
   findPresentationDecoderImportViolations,
   findPresentationDecoderImportViolationsInSourceFile,
+  findPreferSwitchTrueChainViolations,
+  findPreferSwitchTrueChainViolationsInSourceFile,
   findStoreInlineDecodingViolations,
   findStoreInlineDecodingViolationsInSourceFile,
   parseProductionSyntaxSource,
@@ -180,7 +191,7 @@ function manifestWithStage6(): FixtureArchitectureManifest {
 function adapter(exportName: string, direction: ExceptionAdapter["direction"]): ExceptionAdapter {
   return {
     identity: { module: "src/adapter.ts", exportName },
-    category: direction === "signal-host" ? "result-to-framework" : "external-to-result",
+    category: direction === "signal-host" ? "result-to-framework" : "defect-supervisor",
     externalApi: { package: "example-host", exportName: "operation" },
     direction,
     reason: "Test exact adapter registration",
@@ -209,6 +220,22 @@ describe("parsed production syntax finders", () => {
         resultPath,
       ),
     ).toEqual(findInlineAsyncResultCallbackViolations(resultSource, resultPath));
+
+    const controlFlowSource = `
+      function classify() {
+        if (a || b) return 1;
+        else if (c || d) return 2;
+        else if (e) return 3;
+      }
+    `;
+    const controlFlowPath = "apps/example/src/control-flow.ts";
+    const controlFlowSourceFile = parseProductionSyntaxSource(controlFlowSource, controlFlowPath);
+    expect(
+      findPreferSwitchTrueChainViolationsInSourceFile(controlFlowSourceFile, controlFlowPath),
+    ).toEqual(findPreferSwitchTrueChainViolations(controlFlowSource, controlFlowPath));
+    expect(
+      findElseAfterTerminalViolationsInSourceFile(controlFlowSourceFile, controlFlowPath),
+    ).toEqual(findElseAfterTerminalViolations(controlFlowSource, controlFlowPath));
 
     const presentationSource = `import { z } from "zod"; z.string().parse("value");`;
     const presentationPath = "apps/example/src/render.ts";
@@ -251,6 +278,190 @@ describe("parsed production syntax finders", () => {
     ).toEqual(
       findDirectSqliteTransactionViolations(sqliteSource, storePath, policyWith(), storeManifest),
     );
+  });
+});
+
+describe("flat control flow syntax", () => {
+  const filePath = "apps/example/src/control-flow.ts";
+
+  it("prefers switch true for ordered chains with multiple disjunctive arms", () => {
+    const violations = findPreferSwitchTrueChainViolations(
+      `
+        if (a || b || c) first();
+        else if (d || e) second();
+        else if (f) third();
+        else fallback();
+
+        if (a || b) first();
+        else fallback();
+
+        if (a || b) first();
+        else if (c) second();
+        else if (d) fallback();
+
+        if (a || b) first();
+        else if (c || d) second();
+        else if (e) third();
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind }) => kind)).toEqual([
+      "prefer-switch-true-chain",
+      "prefer-switch-true-chain",
+    ]);
+  });
+
+  it("removes else branches after direct terminal statements", () => {
+    const violations = findElseAfterTerminalViolations(
+      `
+        function returned() {
+          if (ready) return value;
+          else return fallback;
+        }
+        function thrown() {
+          if (failed) { throw error; }
+          else recover();
+        }
+        function loop() {
+          while (active) {
+            if (skip) { continue; }
+            else visit();
+            if (done) break;
+            else advance();
+          }
+        }
+        function retainedElse() {
+          if (ready) prepare();
+          else fallback();
+        }
+      `,
+      filePath,
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind }) => kind)).toEqual([
+      "else-after-terminal",
+      "else-after-terminal",
+      "else-after-terminal",
+      "else-after-terminal",
+    ]);
+  });
+
+  it("excludes test modules from production control-flow rules", () => {
+    const source = `
+      if (a || b) first();
+      else if (c || d) second();
+      else if (e) fallback();
+      if (ready) returnValue();
+      else fallback();
+    `;
+    expect(
+      findPreferSwitchTrueChainViolations(source, "apps/example/tests/control-flow.test.ts"),
+    ).toEqual([]);
+    expect(
+      findElseAfterTerminalViolations(source, "apps/example/tests/control-flow.test.ts"),
+    ).toEqual([]);
+  });
+});
+
+describe("unified blob-storage seam syntax", () => {
+  const findings = (
+    source: string,
+    filePath: string,
+    policy: BlobStorageArchitecturePolicy = BLOB_STORAGE_ARCHITECTURE_POLICY,
+  ) => findBlobStorageSeamViolations(source, filePath, policyWith(), architectureManifest, policy);
+
+  it("keeps Bun S3 operations and Lilac domain dependencies inside the storage package", () => {
+    expect(
+      findings('import { S3Client } from "bun"; new S3Client({});', "apps/core/src/s3.ts").map(
+        ({ kind }) => kind,
+      ),
+    ).toEqual(["s3-storage-import", "s3-storage-import"]);
+    expect(
+      findings(
+        'import { RedisStreamsBus } from "@stanley2058/lilac-event-bus";',
+        "packages/blob-storage/src/adapter.ts",
+      ).map(({ kind }) => kind),
+    ).toEqual(["blob-domain-import"]);
+    expect(
+      findings(
+        'import { secret } from "../../../apps/core/src/runtime/private";',
+        "packages/blob-storage/src/adapter.ts",
+      ).map(({ kind }) => kind),
+    ).toEqual(["blob-domain-import"]);
+    expect(
+      findings(
+        'import { S3Client } from "bun"; new S3Client({});',
+        "packages/blob-storage/src/s3.ts",
+      ),
+    ).toEqual([]);
+  });
+
+  it("allows adapter construction only at composition and rejects current inline wire bytes", () => {
+    const factoryImport = 'import { createLocalBlobStore } from "@stanley2058/lilac-blob-storage";';
+    expect(
+      findings(factoryImport, "apps/core/src/surface/leaf.ts").map(({ kind }) => kind),
+    ).toEqual(["adapter-construction-import"]);
+    expect(findings(factoryImport, "apps/core/src/runtime/create-core-blob-store.ts")).toEqual([]);
+    expect(
+      findings(
+        'import * as blobs from "@stanley2058/lilac-blob-storage"; blobs.createLocalBlobStore({});',
+        "apps/core/src/surface/leaf.ts",
+      ).map(({ kind }) => kind),
+    ).toEqual(["adapter-construction-import"]);
+    expect(
+      findings(
+        "const binarySchema = z.strictObject({ dataBase64: z.string() });",
+        "packages/event-bus/lilac-spec.ts",
+      ).map(({ kind }) => kind),
+    ).toEqual(["current-inline-blob-value"]);
+  });
+
+  it("rejects managed SQLite BLOB columns but keeps structured embeddings", () => {
+    expect(
+      findings(
+        "db.exec(`CREATE TABLE artifacts (payload BLOB NOT NULL, embedding BLOB NOT NULL)`);",
+        "apps/core/src/workflow/store.ts",
+      ).map(({ kind, message }) => ({ kind, message })),
+    ).toEqual([
+      {
+        kind: "core-inline-blob-column",
+        message: expect.stringContaining("payload"),
+      },
+    ]);
+  });
+
+  it("localizes BlobStore open and close ownership and legacy decoder imports", () => {
+    const blobCalls = `
+      import type { BlobStore } from "@stanley2058/lilac-blob-storage";
+      export async function leaf(blobStore: BlobStore) {
+        await blobStore.open(ref);
+        await blobStore.close({ deadlineAtMs: Date.now() });
+      }
+    `;
+    expect(findings(blobCalls, "apps/core/src/surface/leaf.ts").map(({ kind }) => kind)).toEqual([
+      "blob-materialization-locality",
+      "blob-store-close-ownership",
+    ]);
+    const materializationPolicy = {
+      ...BLOB_STORAGE_ARCHITECTURE_POLICY,
+      materializationModules: [{ workspace: "apps/core", module: "src/surface/blob-materializer" }],
+    } satisfies BlobStorageArchitecturePolicy;
+    expect(
+      findings(
+        blobCalls.replace("await blobStore.close({ deadlineAtMs: Date.now() });", ""),
+        "apps/core/src/surface/blob-materializer.ts",
+        materializationPolicy,
+      ),
+    ).toEqual([]);
+
+    const legacyImport = 'import { decodeLegacyBlobRow } from "./legacy-blob-codec";';
+    expect(findings(legacyImport, "apps/core/src/runtime/main.ts").map(({ kind }) => kind)).toEqual(
+      ["legacy-blob-decoder-import"],
+    );
+    expect(findings(legacyImport, "apps/core/scripts/migrate-blob-storage.ts")).toEqual([]);
   });
 });
 
@@ -410,12 +621,76 @@ describe("production exception syntax", () => {
     );
 
     expect(violations.map((violation) => violation.kind)).toEqual([
+      "try-statement",
       "throw",
-      "catch-clause",
       "stream-error-signal",
       "stream-error-signal",
       "stream-error-signal",
     ]);
+  });
+
+  it("exempts only throws inside object captures proven from better-result imports", () => {
+    const violations = findExceptionFlowViolations(
+      `
+        import { Result as R } from "better-result";
+        import * as Better from "better-result";
+        const Alias = R;
+        const capture = Alias.try;
+        const FakeResult = { try: (options) => options.try() };
+        export function run() {
+          const captured = capture({ try: () => { throw new Error("captured"); }, catch: String });
+          Better.Result.try({ try: () => { throw new Error("namespace captured"); }, catch: String });
+          FakeResult.try({ try: () => { throw new Error("fake"); }, catch: String });
+          if (captured) throw new Error("same callable");
+        }
+      `,
+      "apps/example/src/service.ts",
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind, symbol }) => [kind, symbol])).toEqual([
+      ["throw", "run.try@3"],
+      ["throw", "run"],
+    ]);
+  });
+
+  it("does not trust mutated better-result bindings or aliases", () => {
+    const violations = findExceptionFlowViolations(
+      `
+        import { Result } from "better-result";
+        const Alias = Result;
+        Alias.try = fakeCapture;
+        Alias.try({ try: () => { throw new Error("mutated alias"); }, catch: String });
+        Result.try = fakeCapture;
+        Result.try({ try: () => { throw new Error("mutated root"); }, catch: String });
+      `,
+      "apps/example/src/service.ts",
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind }) => kind)).toEqual(["throw", "throw"]);
+  });
+
+  it("does not trust better-result aliases mutated through reflective object operations", () => {
+    const violations = findExceptionFlowViolations(
+      `
+        import { Result } from "better-result";
+        const Assigned = Result;
+        Object.assign(Assigned, { try: fakeCapture });
+        Assigned.try({ try: () => { throw new Error("assigned"); }, catch: String });
+        const Reflected = Result;
+        Reflect.set(Reflected, "try", fakeCapture);
+        Reflected.try({ try: () => { throw new Error("reflected"); }, catch: String });
+        const Defined = Result;
+        Object.defineProperty(Defined, "try", { value: fakeCapture });
+        const capture = Defined.try;
+        capture({ try: () => { throw new Error("defined"); }, catch: String });
+      `,
+      "apps/example/src/service.ts",
+      policyWith(),
+    );
+
+    expect(violations.map(({ kind }) => kind)).toEqual(["throw", "throw", "throw"]);
   });
 
   it("owns Stage 1 TaggedError throws, broad catches, and rejected Result promises", () => {
@@ -439,12 +714,12 @@ describe("production exception syntax", () => {
 
     expect(violations.map((violation) => violation.kind)).toEqual([
       "throw",
-      "catch-clause",
+      "try-statement",
       "promise-reject",
     ]);
     expect(violations.map((violation) => violation.message)).toEqual([
       "Return a typed Result error; throw only in an exactly registered adapter",
-      "Capture the external exception in an exactly registered adapter; try/finally remains allowed",
+      "Use object-form Result.try or Result.tryPromise; production try statements are forbidden",
       "Return Result.err instead of Promise.reject",
     ]);
   });
@@ -456,7 +731,7 @@ describe("production exception syntax", () => {
       export function domainFlow() { throw new Error("domain"); }
     `;
     const manifest = manifestWithAdapters([
-      adapter("captureExternal", "capture-external"),
+      adapter("captureExternal", "signal-host"),
       adapter("signalHost", "signal-host"),
     ]);
 
@@ -465,12 +740,12 @@ describe("production exception syntax", () => {
         (violation) => [violation.symbol, violation.kind],
       ),
     ).toEqual([
-      ["captureExternal", "throw"],
+      ["captureExternal", "try-statement"],
       ["domainFlow", "throw"],
     ]);
   });
 
-  it("allows observe-panic flow only in the exact registered callable", () => {
+  it("allows exact observe-panic throws but never exempts a try statement", () => {
     const code = `
       export function observePanic() {
         try { return operation(); } catch (cause) {
@@ -491,8 +766,10 @@ describe("production exception syntax", () => {
     ]);
 
     expect(
-      findExceptionFlowViolations(code, "apps/example/src/adapter.ts", policyWith(), manifest),
-    ).toEqual([]);
+      findExceptionFlowViolations(code, "apps/example/src/adapter.ts", policyWith(), manifest).map(
+        ({ symbol, kind }) => [symbol, kind],
+      ),
+    ).toEqual([["observePanic", "try-statement"]]);
   });
 
   it("does not let observe-panic authorize signaling forms or sibling callables", () => {
@@ -516,7 +793,7 @@ describe("production exception syntax", () => {
       ),
     ).toEqual([
       ["observePanic", "promise-reject"],
-      ["sibling", "catch-clause"],
+      ["sibling", "try-statement"],
       ["sibling", "throw"],
       ["signalStream.start", "stream-error-signal"],
     ]);
@@ -542,8 +819,8 @@ describe("production exception syntax", () => {
         "apps/example/src/adapter.ts",
         policyWith(),
         manifestWithAdapters([
-          adapter("namedRejection", "capture-external"),
-          adapter("outer.catch.<callback@1>", "capture-external"),
+          adapter("namedRejection", "signal-host"),
+          adapter("outer.catch.<callback@1>", "signal-host"),
         ]),
       ),
     ).toEqual([]);
@@ -552,7 +829,7 @@ describe("production exception syntax", () => {
         code,
         "apps/example/src/adapter.ts",
         policyWith(),
-        manifestWithAdapters([adapter("outer", "capture-external")]),
+        manifestWithAdapters([adapter("outer", "signal-host")]),
       ).map((violation) => violation.symbol),
     ).toEqual(["namedRejection", "outer.catch.<callback@1>"]);
   });
@@ -576,7 +853,7 @@ describe("production exception syntax", () => {
         code,
         "apps/example/src/adapter.ts",
         policyWith(),
-        manifestWithAdapters([adapter("repeated.catch.<callback@1>@1", "capture-external")]),
+        manifestWithAdapters([adapter("repeated.catch.<callback@1>@1", "signal-host")]),
       ).map((violation) => violation.symbol),
     ).toEqual(["repeated.catch.<callback@1>@2"]);
   });
@@ -972,6 +1249,8 @@ describe("Oxlint production syntax activation", () => {
       files: expect.arrayContaining(["packages/**/*.{js,jsx,cjs,mjs,ts,tsx}"]),
       rules: {
         "@typescript-eslint/no-explicit-any": "error",
+        "lilac/no-else-after-terminal": "error",
+        "lilac/prefer-switch-true-chain": "error",
         "no-nested-ternary": "error",
         "lilac/no-local-is-record": "error",
       },

@@ -1,5 +1,5 @@
 import { redactErrorTextForLog } from "@stanley2058/lilac-utils";
-import { Panic } from "better-result";
+import { Panic, Result } from "better-result";
 
 const MAX_SAFE_ERROR_LENGTH = 1_000;
 
@@ -8,13 +8,14 @@ export function rethrowPanic(error: unknown): void {
 }
 
 export function opaqueErrorMessage(error: unknown): string {
-  try {
-    if (typeof error === "string") return error;
-    if (error instanceof Error) return error.message;
-    return "Unknown error";
-  } catch {
-    return "Unknown error";
-  }
+  return Result.try({
+    try: () => {
+      if (typeof error === "string") return error;
+      if (error instanceof Error) return error.message;
+      return "Unknown error";
+    },
+    catch: () => "Unknown error",
+  }).match({ ok: (message) => message, err: () => "Unknown error" });
 }
 
 export function safeMcpErrorText(error: unknown, sensitiveValues: readonly string[] = []): string {

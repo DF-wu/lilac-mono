@@ -13,7 +13,10 @@ export type SubagentProfile = (typeof SUBAGENT_PROFILES)[number];
 export type AgentRunProfile = "primary" | SubagentProfile;
 export type AgentRunnerRaw = {} | null;
 
-export function preserveAgentRunnerRaw(raw: unknown): AgentRunnerRaw | undefined {
+export function preserveAgentRunnerRaw(message: {
+  readonly data: { readonly raw?: unknown };
+}): AgentRunnerRaw | undefined {
+  const { raw } = message.data;
   if (raw === undefined || raw === null) return raw;
   return raw;
 }
@@ -84,6 +87,7 @@ const routerRawSchema = z
     sessionMode: sessionModeSchema,
     sessionConfigId: optionalNonEmptyStringSchema,
     parentChannelId: optionalNonEmptyStringSchema,
+    guildId: optionalNonEmptyStringSchema,
     modelOverride: optionalNonEmptyStringSchema,
     bufferedForActiveRequestId: optionalNonEmptyStringSchema,
     chainMessageIds: stringArraySchema,
@@ -159,6 +163,10 @@ export function parseSessionConfigIdFromRaw(raw: unknown): string | null {
 
 export function parseParentChannelIdFromRaw(raw: unknown): string | null {
   return parseRouterRaw(raw)?.parentChannelId ?? null;
+}
+
+export function parseGuildIdFromRaw(raw: unknown): string | null {
+  return parseRouterRaw(raw)?.guildId ?? null;
 }
 
 export function parseRequestModelOverrideFromRaw(raw: unknown): string | null {

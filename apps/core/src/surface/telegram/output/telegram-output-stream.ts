@@ -36,6 +36,7 @@ import {
   type MarkdownTableRenderOptions,
   renderMarkdownTablesAsCodeBlocks,
 } from "../../../shared/markdown-table-renderer";
+import { captureError } from "../../../shared/error-capture";
 import { chatIdOf, parseTelegramMessageId, telegramMsgRef, threadIdOf } from "../telegram-ids";
 import { captureTelegramOperation } from "../telegram-operation-result";
 import { projectTelegramError, type TelegramErrorProjection } from "../telegram-error-projection";
@@ -325,18 +326,17 @@ export class TelegramOutputStream implements SurfaceOutputStream {
     const requestId = deps.opts?.requestId;
     this.cancelCallbackData = requestId ? buildTelegramCancelCallbackData(requestId) : null;
 
-    for (const ref of deps.opts?.resume?.created ?? []) {
-      if (ref.platform !== "telegram") continue;
-      if (chatIdOf(ref) !== this.chatId) continue;
+    const resumeAt = deps.opts?.resumeAt;
+    if (resumeAt?.platform === "telegram" && chatIdOf(resumeAt) === this.chatId) {
       // `sentText` is intentionally left empty: the remote content is unknown,
       // so the first edit must always be issued.
       this.messages.push({
-        messageId: parseTelegramMessageId(ref.messageId),
+        messageId: parseTelegramMessageId(resumeAt.messageId),
         sentText: "",
         sentMarkup: "",
         deliveredTextKnown: false,
       });
-      this.created.push(ref);
+      this.created.push(resumeAt);
     }
   }
 
@@ -672,22 +672,24 @@ export class TelegramOutputStream implements SurfaceOutputStream {
   private async deleteSurplusMessage(messageId: number): Promise<boolean> {
     const attempted = await Result.tryPromise({
       try: () => this.deps.api.deleteMessage({ chat_id: this.chatId, message_id: messageId }),
-      catch: projectTelegramError("Telegram surplus message deletion failed"),
+      catch: (cause) => captureError(cause, "Telegram surplus message deletion failed"),
     });
-    return attempted.match({
-      ok: () => true,
-      err: (error) => {
-        const outcome = classifySurplusDeletionFailure(error);
-        if (outcome === "absent") return true;
+    if (attempted.isErr()) {
+      const error = projectTelegramError(
+        attempted.error.cause,
+        "Telegram surplus message deletion failed",
+      );
+      const outcome = classifySurplusDeletionFailure(error);
+      if (outcome === "absent") return true;
 
-        this.surplusDeletionFailures.push({
-          messageId,
-          outcome,
-          reason: errorText(error),
-        });
-        return false;
-      },
-    });
+      this.surplusDeletionFailures.push({
+        messageId,
+        outcome,
+        reason: errorText(error),
+      });
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -705,15 +707,18 @@ export class TelegramOutputStream implements SurfaceOutputStream {
   private async ensureTyping(): Promise<void> {
     if (this.typingSent) return;
     this.typingSent = true;
-    await Result.tryPromise({
+    const attempted = await Result.tryPromise({
       try: () =>
         this.deps.api.sendChatAction({
           chat_id: this.chatId,
           ...(this.threadId === undefined ? {} : { message_thread_id: this.threadId }),
           action: "typing",
         }),
-      catch: projectTelegramError("Telegram typing indicator failed"),
+      catch: (cause) => captureError(cause, "Telegram typing indicator failed"),
     });
+    if (attempted.isErr()) {
+      projectTelegramError(attempted.error.cause, "Telegram typing indicator failed");
+    }
   }
 
   private async sendNewMessage(
@@ -751,10 +756,13 @@ export class TelegramOutputStream implements SurfaceOutputStream {
       messageId: sent.message_id,
     });
     this.created.push(ref);
-    Result.try({
+    const reported = Result.try({
       try: () => this.deps.opts?.onMessageCreated?.(ref),
-      catch: projectTelegramError("Telegram message-created callback failed"),
+      catch: (cause) => captureError(cause, "Telegram message-created callback failed"),
     });
+    if (reported.isErr()) {
+      projectTelegramError(reported.error.cause, "Telegram message-created callback failed");
+    }
   }
 
   private async editMessage(
@@ -833,14 +841,17 @@ export class TelegramOutputStream implements SurfaceOutputStream {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (!message) continue;
-      await Result.tryPromise({
+      const attempted = await Result.tryPromise({
         try: () =>
           this.deps.api.deleteMessage({
             chat_id: this.chatId,
             message_id: message.messageId,
           }),
-        catch: projectTelegramError("Telegram preview cleanup failed"),
+        catch: (cause) => captureError(cause, "Telegram preview cleanup failed"),
       });
+      if (attempted.isErr()) {
+        projectTelegramError(attempted.error.cause, "Telegram preview cleanup failed");
+      }
     }
     this.created.length = 0;
   }

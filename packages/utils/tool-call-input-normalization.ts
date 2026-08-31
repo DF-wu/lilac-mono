@@ -1,4 +1,5 @@
 import type { ModelMessage } from "ai";
+import { Result } from "better-result";
 
 import { isRecord } from "./runtime-utils";
 
@@ -91,12 +92,10 @@ function repairTruncatedJson(text: string): string | null {
 }
 
 function parsePlainObjectJson(text: string): Record<string, unknown> | null {
-  try {
-    const parsed = globalThis.JSON.parse(text) as unknown;
-    return isRecord(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
+  return Result.try({
+    try: () => globalThis.JSON.parse(text) as unknown,
+    catch: () => undefined,
+  }).match({ ok: (parsed) => (isRecord(parsed) ? parsed : null), err: () => null });
 }
 
 export function normalizeToolCallInputValue(input: unknown): unknown {

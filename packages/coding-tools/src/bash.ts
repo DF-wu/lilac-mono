@@ -8,7 +8,7 @@ import { Readable } from "node:stream";
 import { analyzeBashCommand } from "@stanley2058/lilac-bash-safety";
 import { expandTilde } from "@stanley2058/lilac-fs";
 import { tool, type ToolSet } from "ai";
-import { Panic, Result } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
 import {
   DEFAULT_ARTIFACT_MAX_BYTES_PER_SCOPE,
@@ -95,31 +95,70 @@ const MIDDLE_OMISSION_MARKER = "\n...[middle output omitted]...\n";
 const SENSITIVE_ENV_NAME_PATTERN = /(?:TOKEN|SECRET|PASSWORD|PASS|KEY|CREDENTIALS)/iu;
 
 async function ignoreBashFailure(effect: () => Promise<unknown>): Promise<void> {
-  try {
-    await effect();
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-  }
+  const captured = settleBashCapture(
+    await Result.tryPromise({ try: effect, catch: captureBashFailure }),
+  );
+  const failure = captured.match({ ok: () => undefined, err: (error) => error });
+  if (failure?.kind === "panic") return signalCodingToolHost(failure.panic);
 }
 
-function captureBashPromise<T>(promise: Promise<T>): Promise<CapturedBashPromise<T>> {
-  return promise.then(
-    (value) => ({ kind: "ok", value }),
-    (cause) => {
-      try {
-        if (Panic.is(cause)) return { kind: "panic", panic: cause };
-      } catch {
-        return {
-          kind: "error",
-          error: new Error("Opaque Bash operation failure"),
-        };
-      }
-      return {
-        kind: "error",
-        error: new Error(bashFailureMessage(cause)),
-      };
-    },
+type CapturedBashFailure =
+  | { readonly kind: "panic"; readonly panic: Panic }
+  | { readonly kind: "ordinary"; readonly error: Error };
+
+type BashFailureSettlement = () => CapturedBashFailure;
+
+function captureBashFailure(cause: unknown): BashFailureSettlement {
+  return () => {
+    const inspected = Result.try({
+      try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),
+      catch: () => undefined,
+    });
+    const panic = inspected.match({ ok: (value) => value, err: () => undefined });
+    if (panic) return { kind: "panic", panic };
+    const error = Result.try({
+      try: () => new Error(bashFailureMessage(cause)),
+      catch: () => new Error("Opaque Bash operation failure"),
+    }).match({ ok: (value) => value, err: (value) => value });
+    return { kind: "ordinary", error };
+  };
+}
+
+function settleBashCapture<T>(
+  result: ResultType<T, BashFailureSettlement>,
+): ResultType<T, CapturedBashFailure> {
+  return result.mapError((settle) => settle());
+}
+
+function bashOutcome<T>(
+  result: ResultType<T, CapturedBashFailure>,
+):
+  | { readonly kind: "ok"; readonly value: T }
+  | { readonly kind: "error"; readonly error: CapturedBashFailure } {
+  return result.match<
+    | { readonly kind: "ok"; readonly value: T }
+    | { readonly kind: "error"; readonly error: CapturedBashFailure }
+  >({
+    ok: (value) => ({ kind: "ok", value }),
+    err: (error) => ({ kind: "error", error }),
+  });
+}
+
+function bashCapturedError(failure: CapturedBashFailure): Error {
+  return failure.kind === "panic" ? failure.panic : failure.error;
+}
+
+async function captureBashPromise<T>(promise: Promise<T>): Promise<CapturedBashPromise<T>> {
+  const captured = settleBashCapture(
+    await Result.tryPromise({ try: () => promise, catch: captureBashFailure }),
   );
+  return captured.match<CapturedBashPromise<T>>({
+    ok: (value) => ({ kind: "ok", value }),
+    err: (failure) =>
+      failure.kind === "panic"
+        ? { kind: "panic", panic: failure.panic }
+        : { kind: "error", error: failure.error },
+  });
 }
 
 function bashExceptionOutput(error: Error): BashOutput {
@@ -145,12 +184,16 @@ function bashFailureMessage(cause: unknown): string {
       return String(cause);
     case "function":
     case "object":
-      try {
-        if (cause instanceof Error && typeof cause.message === "string") return cause.message;
-      } catch {
-        return "Opaque Bash operation failure";
-      }
-      return "Opaque Bash operation failure";
+      return Result.try({
+        try: () =>
+          cause instanceof Error && typeof cause.message === "string"
+            ? cause.message
+            : "Opaque Bash operation failure",
+        catch: () => "Opaque Bash operation failure",
+      }).match({
+        ok: (message) => message,
+        err: () => "Opaque Bash operation failure",
+      });
   }
 }
 
@@ -198,7 +241,7 @@ function createBashSpool(maxBytes: number, outputCapBytes: number): BashSpool {
     if (sinks || !spool.complete) return;
     let stdoutSink: BufferedFileSink | undefined;
     let stderrSink: BufferedFileSink | undefined;
-    try {
+    const activateStorage = async () => {
       directory = await fs.mkdtemp(path.join(tmpdir(), BASH_SPOOL_DIRECTORY_PREFIX));
       await fs.chmod(directory, 0o700);
       const stdoutPath = path.join(directory, `${randomUUID()}.stdout.raw`);
@@ -212,8 +255,16 @@ function createBashSpool(maxBytes: number, outputCapBytes: number): BashSpool {
         for (const chunk of buffered[kind]) await sinks[kind].write(chunk);
         buffered[kind].length = 0;
       }
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
+    };
+    const activated = settleBashCapture(
+      await Result.tryPromise({
+        try: activateStorage,
+        catch: captureBashFailure,
+      }),
+    );
+    const failure = activated.match({ ok: () => undefined, err: (error) => error });
+    if (failure) {
+      if (failure.kind === "panic") return signalCodingToolHost(failure.panic);
       await ignoreBashFailure(() => Promise.all([stdoutSink?.abort(), stderrSink?.abort()]));
       spool.complete = false;
       await removeStorage();
@@ -241,12 +292,20 @@ function createBashSpool(maxBytes: number, outputCapBytes: number): BashSpool {
           return;
         }
 
-        try {
+        const retainChunk = async () => {
           if (sinks) await sinks[kind].write(retained);
           else buffered[kind].push(retained);
           if (totalBytes > outputCapBytes) await activate();
-        } catch (cause) {
-          if (Panic.is(cause)) throw cause;
+        };
+        const retainedChunk = settleBashCapture(
+          await Result.tryPromise({
+            try: retainChunk,
+            catch: captureBashFailure,
+          }),
+        );
+        const failure = retainedChunk.match({ ok: () => undefined, err: (error) => error });
+        if (failure) {
+          if (failure.kind === "panic") return signalCodingToolHost(failure.panic);
           spool.complete = false;
           await removeStorage();
         }
@@ -289,7 +348,7 @@ async function readBoundedStream(
   let tail = Buffer.alloc(0);
   let totalBytes = 0;
 
-  try {
+  const readStream = async () => {
     while (true) {
       const next = await reader.read();
       if (next.done) break;
@@ -309,8 +368,20 @@ async function readBoundedStream(
       }
       await onChunk?.(next.value);
     }
-  } finally {
-    reader.releaseLock();
+  };
+  const read = settleBashCapture(
+    await Result.tryPromise({ try: readStream, catch: captureBashFailure }),
+  );
+  const released = settleBashCapture(
+    Result.try({ try: () => reader.releaseLock(), catch: captureBashFailure }),
+  );
+  const releaseFailure = released.match({ ok: () => undefined, err: (failure) => failure });
+  if (releaseFailure) {
+    return signalCodingToolHost(bashCapturedError(releaseFailure));
+  }
+  const readFailure = read.match({ ok: () => undefined, err: (failure) => failure });
+  if (readFailure) {
+    return signalCodingToolHost(bashCapturedError(readFailure));
   }
   const finalDelta = decoder?.decode();
   if (finalDelta) onDelta?.(finalDelta);
@@ -420,17 +491,23 @@ function createBashArtifactSource(
 }
 
 function killProcessGroup(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
-  try {
-    process.kill(-pid, signal);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    try {
-      process.kill(pid, signal);
-    } catch (fallbackCause) {
-      if (Panic.is(fallbackCause)) throw fallbackCause;
-      // The process may already have exited.
-    }
-  }
+  const groupKill = settleBashCapture(
+    Result.try({
+      try: () => process.kill(-pid, signal),
+      catch: captureBashFailure,
+    }),
+  );
+  const groupFailure = groupKill.match({ ok: () => undefined, err: (failure) => failure });
+  if (!groupFailure) return;
+  if (groupFailure.kind === "panic") return signalCodingToolHost(groupFailure.panic);
+  const processKill = settleBashCapture(
+    Result.try({
+      try: () => process.kill(pid, signal),
+      catch: captureBashFailure,
+    }),
+  );
+  const processFailure = processKill.match({ ok: () => undefined, err: (failure) => failure });
+  if (processFailure?.kind === "panic") return signalCodingToolHost(processFailure.panic);
 }
 
 function protectedPathInCommand(command: string, denyPaths: readonly string[]): string | undefined {
@@ -586,20 +663,27 @@ export async function executeLocalBash(
     );
   }
 
-  let child: ReturnType<typeof Bun.spawn>;
-  try {
-    const stdinCommand = input.stdinMode === "eof" ? input.command : `exec 0>&-; ${input.command}`;
-    const command = options.mergeOutput ? `exec 2>&1; ${stdinCommand}` : stdinCommand;
-    child = Bun.spawn(["bash", "-c", command], {
-      cwd,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-      detached: true,
-      env: { ...environment, NO_COLOR: "1", FORCE_COLOR: undefined },
-    });
-  } catch (error: unknown) {
-    if (Panic.is(error)) return signalCodingToolHost(error);
+  const spawned = settleBashCapture(
+    Result.try({
+      try: () => {
+        const stdinCommand =
+          input.stdinMode === "eof" ? input.command : `exec 0>&-; ${input.command}`;
+        const command = options.mergeOutput ? `exec 2>&1; ${stdinCommand}` : stdinCommand;
+        return Bun.spawn(["bash", "-c", command], {
+          cwd,
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+          detached: true,
+          env: { ...environment, NO_COLOR: "1", FORCE_COLOR: undefined },
+        });
+      },
+      catch: captureBashFailure,
+    }),
+  );
+  const spawnOutcome = bashOutcome(spawned);
+  if (spawnOutcome.kind === "error") {
+    if (spawnOutcome.error.kind === "panic") return signalCodingToolHost(spawnOutcome.error.panic);
     await spool?.cleanup();
     return {
       stdout: "",
@@ -609,10 +693,11 @@ export async function executeLocalBash(
       stderrTruncated: false,
       executionError: {
         type: "exception",
-        message: bashFailureMessage(error),
+        message: spawnOutcome.error.error.message,
       },
     };
   }
+  const child = spawnOutcome.value;
 
   let termination:
     | { type: "aborted" }
@@ -621,7 +706,6 @@ export async function executeLocalBash(
   let hardKillTimer: ReturnType<typeof setTimeout> | undefined;
   let noOutputTimer: ReturnType<typeof setTimeout> | undefined;
   let wallClockTimer: ReturnType<typeof setTimeout> | undefined;
-  let operationPanic: Panic | undefined;
   const terminate = (
     reason:
       | { type: "aborted" }
@@ -669,7 +753,7 @@ export async function executeLocalBash(
     options.abortSignal?.removeEventListener("abort", onAbort);
   };
 
-  try {
+  const runExecution = async (): Promise<BashOutput> => {
     const stdoutStream = child.stdout;
     const stderrStream = child.stderr;
     if (
@@ -805,32 +889,57 @@ export async function executeLocalBash(
       ...(executionError ? { executionError } : {}),
       ...(truncation ? { truncation } : {}),
     };
-  } catch (error: unknown) {
-    if (Panic.is(error)) {
-      operationPanic = error;
-      signalCodingToolHost(error);
-    }
-    killProcessGroup(child.pid, "SIGTERM");
-    const forceKill = setTimeout(() => killProcessGroup(child.pid, "SIGKILL"), HARD_KILL_DELAY_MS);
-    await ignoreBashFailure(() => child.exited);
-    clearTimeout(forceKill);
-    return {
-      stdout: "",
-      stderr: "",
-      exitCode: -1,
-      stdoutTruncated: false,
-      stderrTruncated: false,
-      executionError: {
-        type: "exception",
-        message: bashFailureMessage(error),
-      },
+  };
+  const executed = settleBashCapture(
+    await Result.tryPromise({ try: runExecution, catch: captureBashFailure }),
+  );
+  const executionFailure = executed.match({ ok: () => undefined, err: (failure) => failure });
+  let executionResult: BashOutput | undefined;
+  let recoveryFailure: CapturedBashFailure | undefined;
+  if (executionFailure?.kind === "ordinary") {
+    const recoverExecution = async (): Promise<BashOutput> => {
+      killProcessGroup(child.pid, "SIGTERM");
+      const forceKill = setTimeout(
+        () => killProcessGroup(child.pid, "SIGKILL"),
+        HARD_KILL_DELAY_MS,
+      );
+      await ignoreBashFailure(() => child.exited);
+      clearTimeout(forceKill);
+      return {
+        stdout: "",
+        stderr: "",
+        exitCode: -1,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        executionError: {
+          type: "exception",
+          message: executionFailure.error.message,
+        },
+      };
     };
-  } finally {
-    stopWatchingExecution();
-    const cleanupFailure = await cleanupBashSpoolAfterExecution(spool, operationPanic);
-    // Cleanup failure must override successful work; an operation Panic remains primary.
-    if (cleanupFailure) signalCodingToolHost(cleanupFailure);
+    const recovered = settleBashCapture(
+      await Result.tryPromise({
+        try: recoverExecution,
+        catch: captureBashFailure,
+      }),
+    );
+    executionResult = recovered.match({ ok: (output) => output, err: () => undefined });
+    recoveryFailure = recovered.match({ ok: () => undefined, err: (failure) => failure });
+  } else if (!executionFailure) {
+    executionResult = executed.match({ ok: (output) => output, err: () => undefined });
   }
+
+  stopWatchingExecution();
+  const operationPanic = executionFailure?.kind === "panic" ? executionFailure.panic : undefined;
+  const cleanupFailure = await cleanupBashSpoolAfterExecution(spool, operationPanic);
+  if (cleanupFailure) return signalCodingToolHost(cleanupFailure);
+  if (recoveryFailure) {
+    return signalCodingToolHost(bashCapturedError(recoveryFailure));
+  }
+  if (!executionResult) {
+    return signalCodingToolHost(new Panic({ message: "Bash execution settled without output" }));
+  }
+  return executionResult;
 }
 
 async function* streamLocalBash(
@@ -909,22 +1018,23 @@ function captureStreamingBash(
   | { readonly kind: "error"; readonly error: Error }
   | { readonly kind: "panic"; readonly panic: Panic }
 > {
-  return execution.then(
-    (output) => ({ kind: "output", output }),
-    (cause) => {
-      try {
-        if (Panic.is(cause)) return { kind: "panic", panic: cause };
-      } catch {
-        return {
-          kind: "error",
-          error: new Error("Opaque Bash streaming failure"),
-        };
-      }
-      return {
-        kind: "error",
-        error: new Error(bashFailureMessage(cause)),
-      };
-    },
+  return Result.tryPromise({
+    try: () => execution,
+    catch: captureBashFailure,
+  }).then((captured) =>
+    captured
+      .mapError((settle) => settle())
+      .match<
+        | { readonly kind: "output"; readonly output: BashOutput }
+        | { readonly kind: "error"; readonly error: Error }
+        | { readonly kind: "panic"; readonly panic: Panic }
+      >({
+        ok: (output) => ({ kind: "output" as const, output }),
+        err: (failure) =>
+          failure.kind === "panic"
+            ? { kind: "panic" as const, panic: failure.panic }
+            : { kind: "error" as const, error: failure.error },
+      }),
   );
 }
 

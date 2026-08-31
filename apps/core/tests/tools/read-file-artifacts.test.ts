@@ -3,8 +3,10 @@ import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { getTestBlobStore } from "../helpers/blob-store";
 import {
   createToolResultArtifactStore,
+  legacyToolResultUri,
   TOOL_RESULT_UNAVAILABLE_MESSAGE,
 } from "../../src/artifacts/tool-result-artifact-store";
 import { fsTool } from "../../src/tools/fs/fs";
@@ -30,7 +32,10 @@ describe("read tool-result resources", () => {
   });
 
   it("pages artifacts by Unicode character offset independent of cwd", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const created = resultValue(
       await store.create({
@@ -43,6 +48,7 @@ describe("read tool-result resources", () => {
         maxBytesPerSession: 1024,
       }),
     );
+    expect(created.uri).toMatch(/^resource:\/\/t1_[0-9a-f]{32}$/u);
     const readFile = fsTool(baseDir, {
       toolResultArtifacts: store,
       requestContext: { requestId: "request-a", sessionId: "session-a" },
@@ -74,10 +80,19 @@ describe("read tool-result resources", () => {
       { toolCallId: "read-next", messages: [], context: {} },
     );
     expect(next).toMatchObject({ content: "d", startOffset: 4, endOffset: 5, hasMore: false });
+
+    const legacy = await readFile.execute!(
+      { path: legacyToolResultUri(created.uri) },
+      { toolCallId: "read-legacy", messages: [], context: {} },
+    );
+    expect(legacy).toMatchObject({ success: true, content: "ab😀cd" });
   });
 
   it("supports line starts for artifacts and offset starts for ordinary files", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const created = resultValue(
       await store.create({
@@ -127,7 +142,10 @@ describe("read tool-result resources", () => {
   });
 
   it("allows artifact reads but rejects filesystem paths in artifact-only mode", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const created = resultValue(
       await store.create({
@@ -160,13 +178,16 @@ describe("read tool-result resources", () => {
       success: false,
       error: {
         code: "PERMISSION",
-        message: "Restricted sessions can use read only with tool-result:// artifacts.",
+        message: "Restricted sessions can use read only with resource:// references.",
       },
     });
   });
 
   it("does not reveal foreign or missing artifact existence", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const created = resultValue(
       await store.create({
@@ -201,7 +222,10 @@ describe("read tool-result resources", () => {
   });
 
   it("reports evicted artifacts as unavailable", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const first = resultValue(
       await store.create({
@@ -238,7 +262,10 @@ describe("read tool-result resources", () => {
   });
 
   it("greps artifacts inline without creating another artifact", async () => {
-    const store = createToolResultArtifactStore(path.join(baseDir, "tool-results"));
+    const store = createToolResultArtifactStore(
+      path.join(baseDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await store.init();
     const created = resultValue(
       await store.create({
@@ -271,13 +298,23 @@ describe("read tool-result resources", () => {
     expect(Buffer.byteLength(JSON.stringify(output, null, 2), "utf8")).toBeLessThanOrEqual(512);
     expect(await readdir(store.rootDir)).toEqual(filesBefore);
 
+    const legacyUri = legacyToolResultUri(created.uri);
+    const legacy = await tools.grep.execute!(
+      { pattern: "needle", path: legacyUri },
+      { toolCallId: "grep-artifact-legacy", messages: [], context: {} },
+    );
+    expect(legacy).toMatchObject({
+      mode: "default",
+      results: [{ file: legacyUri, line: 2 }],
+    });
+
     const hashline = await tools.grep.execute!(
       { pattern: "needle", path: created.uri, mode: "hashline" },
       { toolCallId: "grep-artifact-hashline", messages: [], context: {} },
     );
     expect(hashline).toMatchObject({
       mode: "hashline",
-      error: expect.stringContaining("unavailable for tool-result://"),
+      error: expect.stringContaining("unavailable for transient resources"),
     });
 
     const foreignTools = fsTool(baseDir, {

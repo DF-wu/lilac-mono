@@ -9,7 +9,7 @@ import {
 import { isRecord } from "@stanley2058/lilac-utils";
 import { Result } from "better-result";
 
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { formatRemoteDisplayPath, parseSshCwdTarget } from "../ssh/ssh-cwd";
 import { bashInputSchema } from "./bash";
 import { preserveToolPanic } from "./tool-result-adapters";
@@ -31,8 +31,10 @@ function safeValidateSync(
       if ("then" in result) return undefined;
       return result.success ? result.value : undefined;
     },
-    catch: projectRuntimeError("Opaque tool argument validation failure"),
-  });
+    catch: captureRuntimeError,
+  }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque tool argument validation failure"),
+  );
   return validated.match({
     ok: (value) => () => value,
     err: (error) => () => {
@@ -209,7 +211,7 @@ export const formatGrepToolArgs: ToolArgsFormatter = (args) => {
   if (!pattern) return "";
 
   const target = (
-    parsed.path?.startsWith("tool-result://")
+    parsed.path?.startsWith("tool-result://") || parsed.path?.startsWith("resource://")
       ? parsed.path
       : normalizeRemoteCwdDisplay(parsed.path ?? "")
   )
@@ -295,7 +297,9 @@ export function formatToolArgsForDisplayWithSpecs(
   args: unknown,
   toolSpecs?: ReadonlyMap<string, Level1ToolSpec<unknown>>,
   contributionInfo?: ReadonlyMap<Level1ToolSpec<unknown>, Level1ContributionInfo>,
+  event?: { readonly args: unknown },
 ): string {
+  const value = event ? event.args : args;
   const spec = toolSpecs?.get(toolName);
   if (spec) {
     const contribution = contributionInfo?.get(spec) ??
@@ -307,7 +311,7 @@ export function formatToolArgsForDisplayWithSpecs(
       pluginId: contribution.pluginId,
       source: contribution.source,
       spec,
-      args,
+      args: value,
     });
     return formatted.match({
       ok: (value) => value ?? "",
@@ -315,5 +319,5 @@ export function formatToolArgsForDisplayWithSpecs(
     });
   }
 
-  return formatToolArgsForDisplay(toolName, args);
+  return formatToolArgsForDisplay(toolName, value);
 }

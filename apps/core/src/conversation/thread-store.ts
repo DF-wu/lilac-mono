@@ -4,6 +4,7 @@ import * as sqliteVec from "sqlite-vec";
 import {
   classifyBunSqliteError,
   createLogger,
+  resolveRouterSessionConfig,
   runBunSqliteTransaction,
   type CoreConfig,
   type PersistedDataError,
@@ -615,16 +616,13 @@ function resolveThreadGroupingMode(input: {
   if (message.session_type === null) return "active";
   if (!cfg) return "active";
 
-  const directMode = cfg.surface.router.sessionModes[message.channel_id]?.mode;
-  if (directMode) return directMode;
-
-  const parentChannelId = message.parent_channel_id?.trim();
-  if (parentChannelId) {
-    const parentMode = cfg.surface.router.sessionModes[parentChannelId]?.mode;
-    if (parentMode) return parentMode;
-  }
-
-  return cfg.surface.router.defaultMode;
+  return (
+    resolveRouterSessionConfig(cfg, {
+      sessionId: message.channel_id,
+      parentChannelId: message.parent_channel_id,
+      guildId: message.guild_id,
+    }).mode ?? cfg.surface.router.defaultMode
+  );
 }
 
 export type ConversationThreadSummaryWriteResult = {

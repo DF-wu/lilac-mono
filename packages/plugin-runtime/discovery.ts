@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -43,21 +44,45 @@ export type PluginPackageJson = z.output<typeof packageJsonSchema>;
 
 const errorCodeSchema = z.object({ code: z.string() });
 
+type PluginDiscoveryOutcome<T> =
+  | { readonly kind: "value"; readonly value: T }
+  | { readonly kind: "error"; readonly error: ToolPluginDiscoveryError };
+
+function discoveryOutcome<T>(
+  result: ResultType<T, ToolPluginDiscoveryError>,
+): PluginDiscoveryOutcome<T> {
+  return result.match<PluginDiscoveryOutcome<T>>({
+    ok: (value) => ({ kind: "value" as const, value }),
+    err: (error) => ({ kind: "error" as const, error }),
+  });
+}
+
 export function opaquePluginDiscoveryExceptionMessage(cause: unknown): string {
   return opaquePluginExceptionMessage(cause);
 }
 
 export function decodePluginFilesystemErrorCode(value: unknown): string | undefined {
-  try {
-    const parsed = errorCodeSchema.safeParse(value);
-    return parsed.success ? parsed.data.code : undefined;
-  } catch {
-    return undefined;
-  }
+  return Result.try({
+    try: () => errorCodeSchema.safeParse(value),
+    catch: () => undefined,
+  }).match({
+    ok: (parsed) => (parsed.success ? parsed.data.code : undefined),
+    err: () => undefined,
+  });
 }
 
 function isMissingPluginPathCode(code: string | undefined): boolean {
   return code === "ENOENT" || code === "ENOTDIR";
+}
+
+function updateFreshnessHash(
+  hash: ReturnType<typeof createHash>,
+  value: string | number | null,
+): void {
+  const text = value === null ? "" : String(value);
+  hash.update(String(Buffer.byteLength(text, "utf8")));
+  hash.update(":");
+  hash.update(text);
 }
 
 async function captureFileOperation<T>(params: {
@@ -65,20 +90,29 @@ async function captureFileOperation<T>(params: {
   filePath: string;
   run: () => Promise<T>;
 }): Promise<ResultType<T, ToolPluginDiscoveryError>> {
-  try {
-    return Result.ok(await params.run());
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(
-      new ToolPluginDiscoveryError({
-        operation: params.operation,
-        path: params.filePath,
-        code: decodePluginFilesystemErrorCode(cause),
-        cause: safePluginExceptionCause(cause),
-        message: `Failed to ${params.operation.replaceAll("_", " ")} at ${params.filePath}: ${opaquePluginDiscoveryExceptionMessage(cause)}`,
-      }),
-    );
-  }
+  const captured = await Result.tryPromise({
+    try: params.run,
+    catch: (cause) => ({ restoreCause: () => cause }),
+  });
+  const outcome = captured.match<
+    | { readonly kind: "value"; readonly value: T }
+    | { readonly kind: "failure"; readonly restoreCause: () => unknown }
+  >({
+    ok: (value) => ({ kind: "value", value }),
+    err: ({ restoreCause }) => ({ kind: "failure", restoreCause }),
+  });
+  if (outcome.kind === "value") return Result.ok(outcome.value);
+  const cause = outcome.restoreCause();
+  if (isPluginPanic(cause)) throw cause;
+  return Result.err(
+    new ToolPluginDiscoveryError({
+      operation: params.operation,
+      path: params.filePath,
+      code: decodePluginFilesystemErrorCode(cause),
+      cause: safePluginExceptionCause(cause),
+      message: `Failed to ${params.operation.replaceAll("_", " ")} at ${params.filePath}: ${opaquePluginDiscoveryExceptionMessage(cause)}`,
+    }),
+  );
 }
 
 async function statMtimeMs(filePath: string): Promise<number> {
@@ -104,6 +138,21 @@ type DirectoryFingerprintEntry =
       readonly hash: string;
     }
   | { readonly type: "symlink"; readonly path: string; readonly target: string };
+
+function updateDirectoryFreshnessHash(
+  hash: ReturnType<typeof createHash>,
+  entries: readonly DirectoryFingerprintEntry[],
+): void {
+  for (const entry of entries) {
+    updateFreshnessHash(hash, entry.type);
+    updateFreshnessHash(hash, entry.path);
+    if (entry.type === "dir") updateDirectoryFreshnessHash(hash, entry.entries);
+    else if (entry.type === "file") {
+      updateFreshnessHash(hash, entry.mtimeMs);
+      updateFreshnessHash(hash, entry.hash);
+    } else updateFreshnessHash(hash, entry.target);
+  }
+}
 
 async function buildDirectoryFingerprint(
   rootDir: string,
@@ -150,16 +199,21 @@ async function buildDirectoryFingerprint(
 }
 
 export function decodePluginPackageJsonText(raw: string): ResultType<PluginPackageJson, string> {
-  let json: unknown;
-  try {
-    json = JSON.parse(raw);
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
+  const decoded = Result.try({
+    try: () => JSON.parse(raw) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const json = decoded.match<{ readonly parsed: unknown } | { readonly cause: unknown }>({
+    ok: (value) => ({ parsed: value }),
+    err: ({ cause }) => ({ cause }),
+  });
+  if ("cause" in json && isPluginPanic(json.cause)) throw json.cause;
+  if ("cause" in json) {
     return Result.err(
-      `Failed to parse package.json: ${opaquePluginDiscoveryExceptionMessage(cause)}`,
+      `Failed to parse package.json: ${opaquePluginDiscoveryExceptionMessage(json.cause)}`,
     );
   }
-  const parsed = packageJsonSchema.safeParse(json);
+  const parsed = packageJsonSchema.safeParse(json.parsed);
   if (parsed.success) return Result.ok(parsed.data);
   return Result.err(`Invalid package.json: ${parsed.error.message}`);
 }
@@ -177,16 +231,14 @@ export async function discoverExternalToolPlugins(params: {
     filePath: pluginsDir,
     run: () => fs.readdir(pluginsDir, { withFileTypes: true }),
   });
-  const pluginDirents = readPlugins.match<Dirent[] | ToolPluginDiscoveryError>({
-    ok: (value) => value,
-    err: (error) => error,
-  });
-  if (ToolPluginDiscoveryError.is(pluginDirents)) {
-    if (isMissingPluginPathCode(pluginDirents.code)) {
+  const readPluginsOutcome = discoveryOutcome(readPlugins);
+  if (readPluginsOutcome.kind === "error") {
+    if (isMissingPluginPathCode(readPluginsOutcome.error.code)) {
       return Result.ok([]);
     }
-    return Result.err(pluginDirents);
+    return Result.err(readPluginsOutcome.error);
   }
+  const pluginDirents = readPluginsOutcome.value;
 
   const entries: ExternalToolPluginDiscovery[] = [];
   for (const dirent of [...pluginDirents].sort((a, b) => a.name.localeCompare(b.name))) {
@@ -200,43 +252,39 @@ export async function discoverExternalToolPlugins(params: {
       filePath: packageJsonPath,
       run: () => statMtimeMs(packageJsonPath),
     });
-    const packageMtime = packageStat.match<number | ToolPluginDiscoveryError>({
-      ok: (value) => value,
-      err: (error) => error,
-    });
-    if (ToolPluginDiscoveryError.is(packageMtime)) {
+    const packageStatOutcome = discoveryOutcome(packageStat);
+    if (packageStatOutcome.kind === "error") {
       entries.push({
         type: "invalid",
         pluginId,
         pluginDir,
         packageJsonPath,
-        reason: isMissingPluginPathCode(packageMtime.code)
+        reason: isMissingPluginPathCode(packageStatOutcome.error.code)
           ? "missing package.json"
-          : packageMtime.message,
+          : packageStatOutcome.error.message,
       });
       continue;
     }
+    const packageMtime = packageStatOutcome.value;
 
     const packageText = await captureFileOperation({
       operation: "fingerprint_plugins",
       filePath: packageJsonPath,
       run: () => fs.readFile(packageJsonPath, "utf8"),
     });
-    const packageRaw = packageText.match<string | ToolPluginDiscoveryError>({
-      ok: (value) => value,
-      err: (error) => error,
-    });
-    if (ToolPluginDiscoveryError.is(packageRaw)) {
+    const packageTextOutcome = discoveryOutcome(packageText);
+    if (packageTextOutcome.kind === "error") {
       entries.push({
         type: "invalid",
         pluginId,
         pluginDir,
         packageJsonPath,
         packageJsonMtimeMs: packageMtime,
-        reason: packageRaw.message,
+        reason: packageTextOutcome.error.message,
       });
       continue;
     }
+    const packageRaw = packageTextOutcome.value;
 
     const packageJson = decodePluginPackageJsonText(packageRaw).match<PluginPackageJson | string>({
       ok: (value) => value,
@@ -260,21 +308,19 @@ export async function discoverExternalToolPlugins(params: {
       filePath: entrypointPath,
       run: () => statMtimeMs(entrypointPath),
     });
-    const entrypointMtime = entrypointStat.match<number | ToolPluginDiscoveryError>({
-      ok: (value) => value,
-      err: (error) => error,
-    });
-    if (ToolPluginDiscoveryError.is(entrypointMtime)) {
+    const entrypointStatOutcome = discoveryOutcome(entrypointStat);
+    if (entrypointStatOutcome.kind === "error") {
       entries.push({
         type: "invalid",
         pluginId,
         pluginDir,
         packageJsonPath,
         packageJsonMtimeMs: packageMtime,
-        reason: `plugin entrypoint missing or unreadable: ${entrypointMtime.message}`,
+        reason: `plugin entrypoint missing or unreadable: ${entrypointStatOutcome.error.message}`,
       });
       continue;
     }
+    const entrypointMtime = entrypointStatOutcome.value;
 
     entries.push({
       type: "plugin",
@@ -295,13 +341,9 @@ export async function buildExternalToolPluginFreshnessKey(params: {
   configPath?: string;
 }): Promise<ResultType<string, ToolPluginDiscoveryError>> {
   const discovered = await discoverExternalToolPlugins({ dataDir: params.dataDir });
-  const discoveredEntries = discovered.match<
-    readonly ExternalToolPluginDiscovery[] | ToolPluginDiscoveryError
-  >({
-    ok: (value) => value,
-    err: (error) => error,
-  });
-  if (ToolPluginDiscoveryError.is(discoveredEntries)) return Result.err(discoveredEntries);
+  const discoveredOutcome = discoveryOutcome(discovered);
+  if (discoveredOutcome.kind === "error") return Result.err(discoveredOutcome.error);
+  const discoveredEntries = discoveredOutcome.value;
 
   let configMtimeMs: number | null = null;
   if (params.configPath) {
@@ -310,14 +352,13 @@ export async function buildExternalToolPluginFreshnessKey(params: {
       filePath: params.configPath,
       run: () => statMtimeMs(params.configPath!),
     });
-    const configMtime = configStat.match<number | ToolPluginDiscoveryError>({
-      ok: (value) => value,
-      err: (error) => error,
-    });
-    if (ToolPluginDiscoveryError.is(configMtime)) {
-      if (!isMissingPluginPathCode(configMtime.code)) return Result.err(configMtime);
+    const configStatOutcome = discoveryOutcome(configStat);
+    if (configStatOutcome.kind === "error") {
+      if (!isMissingPluginPathCode(configStatOutcome.error.code)) {
+        return Result.err(configStatOutcome.error);
+      }
     } else {
-      configMtimeMs = configMtime;
+      configMtimeMs = configStatOutcome.value;
     }
   }
 
@@ -339,7 +380,6 @@ export async function buildExternalToolPluginFreshnessKey(params: {
         discoveredFingerprints.push({
           type: entry.type,
           pluginId: entry.pluginId,
-          reason: entry.reason,
           packageJsonMtimeMs: entry.packageJsonMtimeMs ?? null,
           packageJsonHash: entry.packageJsonPath ? await hashFile(entry.packageJsonPath) : null,
         });
@@ -348,5 +388,20 @@ export async function buildExternalToolPluginFreshnessKey(params: {
       return { configMtimeMs, discovered: discoveredFingerprints };
     },
   });
-  return fingerprint.map((value) => Bun.hash(JSON.stringify(value)).toString(16));
+  const fingerprintOutcome = discoveryOutcome(fingerprint);
+  if (fingerprintOutcome.kind === "error") return Result.err(fingerprintOutcome.error);
+  const hash = createHash("sha256");
+  updateFreshnessHash(hash, fingerprintOutcome.value.configMtimeMs);
+  for (const entry of fingerprintOutcome.value.discovered) {
+    updateFreshnessHash(hash, entry.type);
+    updateFreshnessHash(hash, entry.pluginId);
+    if (entry.type === "plugin") {
+      updateFreshnessHash(hash, entry.pluginDir);
+      updateDirectoryFreshnessHash(hash, entry.fingerprint);
+    } else {
+      updateFreshnessHash(hash, entry.packageJsonMtimeMs);
+      updateFreshnessHash(hash, entry.packageJsonHash);
+    }
+  }
+  return Result.ok(hash.digest("hex"));
 }

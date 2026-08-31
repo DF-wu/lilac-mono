@@ -17,6 +17,8 @@ export type CapturedAcpFailure =
       readonly projection: ExternalFailureProjection;
     };
 
+type CapturedAcpCause = { readonly settle: () => CapturedAcpFailure };
+
 export function signalAcpDefect(defect: Panic): never {
   throw defect;
 }
@@ -34,18 +36,22 @@ export function acpCleanupFailuresForPanic(
   return cleanupFailuresByPanic.get(panic) ?? [];
 }
 
-export function captureAcpFailure(cause: unknown): CapturedAcpFailure {
-  const panic = Result.try({
-    try: () => (Panic.is(cause) ? cause : null),
-    catch: () => null,
-  });
-  const capturedPanic = panic.match({ ok: (value) => value, err: () => null });
-  if (capturedPanic) return { kind: "panic", panic: capturedPanic };
-  const projection = projectExternalFailure(cause);
+export function captureAcpFailure(cause: unknown): CapturedAcpCause {
   return {
-    kind: "ordinary",
-    cause: new Error(projection.message, { cause }),
-    projection,
+    settle: () => {
+      const panic = Result.try({
+        try: () => (Panic.is(cause) ? cause : null),
+        catch: () => null,
+      });
+      const capturedPanic = panic.match({ ok: (value) => value, err: () => null });
+      if (capturedPanic) return { kind: "panic", panic: capturedPanic };
+      const projection = projectExternalFailure(cause);
+      return {
+        kind: "ordinary",
+        cause: new Error(projection.message, { cause }),
+        projection,
+      };
+    },
   };
 }
 
@@ -96,10 +102,12 @@ export async function captureExternal<T>(
   run: () => Promise<T>,
   message?: string,
 ): Promise<ResultType<T, ExternalOperationFailed>> {
-  const captured = await Result.tryPromise({
-    try: run,
-    catch: captureAcpFailure,
-  });
+  const captured = (
+    await Result.tryPromise({
+      try: run,
+      catch: captureAcpFailure,
+    })
+  ).mapError(({ settle }) => settle());
   const outcome = captured.match<ResultType<T, ExternalOperationFailed> | (() => never)>({
     ok: (value) => Result.ok(value),
     err: (failure) =>
