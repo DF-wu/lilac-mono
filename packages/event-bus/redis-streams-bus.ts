@@ -61,6 +61,7 @@ import type {
   RequestPublicationClaimAcquisition,
   RequestPublicationConfirmation,
 } from "./types";
+import { lilacEventTypes } from "./lilac-spec";
 
 const DEFAULT_MAX_MESSAGES = 50;
 const DEFAULT_BLOCK_MS = 1000;
@@ -70,6 +71,10 @@ const TRIM_DEBOUNCE_MS = 100;
 const TAIL_REPLAY_TOPICS = new Set<Topic>(["evt.request", "evt.adapter"]);
 const MAX_EVIDENCE_VALUES = 32;
 const MAX_INLINE_SOURCE_VALUE_CHARS = 1024;
+const QUIET_PUBLISH_TYPES = new Set<string>([
+  lilacEventTypes.EvtAgentOutputDeltaReasoning,
+  lilacEventTypes.EvtAgentOutputDeltaText,
+]);
 const STRING_HEADERS_SCHEMA = z.record(z.string(), z.string());
 const REDIS_STREAM_ID_PATTERN = /^\d+-\d+$/;
 const HANDLER_FAILURE_SCHEMA = z.object({
@@ -1340,14 +1345,16 @@ export class RedisStreamsBus implements RawBus {
       throw new Panic({ message: "Redis XADD returned invalid id" });
     }
 
-    this.logger.debug("event_bus.publish", {
-      topic: opts.topic,
-      type: opts.type,
-      key: opts.key,
-      messageId: id,
-      hasHeaders: Boolean(opts.headers),
-      durationMs: Date.now() - startedAt,
-    });
+    if (!QUIET_PUBLISH_TYPES.has(opts.type)) {
+      this.logger.debug("event_bus.publish", {
+        topic: opts.topic,
+        type: opts.type,
+        key: opts.key,
+        messageId: id,
+        hasHeaders: Boolean(opts.headers),
+        durationMs: Date.now() - startedAt,
+      });
+    }
 
     return {
       id,
