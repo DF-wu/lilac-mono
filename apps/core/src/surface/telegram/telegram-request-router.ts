@@ -9,6 +9,7 @@ import { getCoreConfig, parseCoreConfigResult, type CoreConfig } from "@stanley2
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type { CustomCommandManager } from "../../custom-commands/manager";
+import { captureError } from "../../shared/error-capture";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import type { SurfaceAdapter } from "../adapter";
 import { formatTelegramMessageRequestId } from "../bridge/request-ids";
@@ -205,27 +206,32 @@ export async function startTelegramRequestRouter(
       ) {
         return Result.ok(undefined);
       }
-      try {
-        const suppressed = await input.shouldSuppressAdapterEvent?.({ evt: message.data });
-        if (suppressed?.suppress) return Result.ok(undefined);
-        const flags = telegramFlags(message.data);
-        const mode = flags.isDMBased
-          ? "active"
-          : getSessionMode(cfg, message.data.channelId, flags.parentChannelId);
-        if (mode === "active" && !flags.isDMBased && !flags.mentionsBot && !flags.replyToBot) {
-          const previous = buffers.get(message.data.channelId);
-          if (previous?.timer) clearTimeout(previous.timer);
-          const buffer: DebounceBuffer = { event: message.data, timer: null };
-          buffer.timer = setTimeout(
-            () => void flush(message.data.channelId),
-            cfg.surface.router.activeDebounceMs,
-          );
-          buffers.set(message.data.channelId, buffer);
+      const routed = await Result.tryPromise({
+        try: async () => {
+          const suppressed = await input.shouldSuppressAdapterEvent?.({ evt: message.data });
+          if (suppressed?.suppress) return Result.ok(undefined);
+          const flags = telegramFlags(message.data);
+          const mode = flags.isDMBased
+            ? "active"
+            : getSessionMode(cfg, message.data.channelId, flags.parentChannelId);
+          if (mode === "active" && !flags.isDMBased && !flags.mentionsBot && !flags.replyToBot) {
+            const previous = buffers.get(message.data.channelId);
+            if (previous?.timer) clearTimeout(previous.timer);
+            const buffer: DebounceBuffer = { event: message.data, timer: null };
+            buffer.timer = setTimeout(
+              () => void flush(message.data.channelId),
+              cfg.surface.router.activeDebounceMs,
+            );
+            buffers.set(message.data.channelId, buffer);
+            return Result.ok(undefined);
+          }
+          await publishEvent(message.data);
           return Result.ok(undefined);
-        }
-        await publishEvent(message.data);
-        return Result.ok(undefined);
-      } catch (cause) {
+        },
+        catch: (cause) => captureError(cause, "Telegram request routing failed"),
+      });
+      if (routed.isErr()) {
+        const cause = routed.error.cause;
         if (Panic.is(cause)) throw cause;
         return Result.err(
           new TelegramRequestRoutingFailed({
@@ -234,6 +240,7 @@ export async function startTelegramRequestRouter(
           }),
         );
       }
+      return routed.value;
     },
     deliveryPolicy,
   );

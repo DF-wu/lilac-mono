@@ -803,27 +803,30 @@ export class TelegramAdapter implements SurfaceAdapter {
           const bot = this.mustBot();
           const replyMarkup = buildTelegramActionKeyboard(content.actions);
           const renderedText = content.format === "markdown" ? markdownToTelegramHtml(text) : text;
-          try {
-            const message = await bot.api.editMessageText(
-              chatIdOf(telegramRef),
-              parseTelegramMessageId(telegramRef.messageId),
-              renderedText,
-              {
-                ...(content.format === "markdown" ? { parse_mode: "HTML" as const } : {}),
-                ...(content.actions === undefined ? {} : { reply_markup: replyMarkup }),
-              },
-            );
-            if (message !== true) this.recordMessage(message, { fromBot: true });
-          } catch (cause) {
+          const attempted = await Result.tryPromise({
+            try: () =>
+              bot.api.editMessageText(
+                chatIdOf(telegramRef),
+                parseTelegramMessageId(telegramRef.messageId),
+                renderedText,
+                {
+                  ...(content.format === "markdown" ? { parse_mode: "HTML" as const } : {}),
+                  ...(content.actions === undefined ? {} : { reply_markup: replyMarkup }),
+                },
+              ),
+            catch: (cause) => captureError(cause, "Telegram message edit failed"),
+          });
+          if (attempted.isErr()) {
             if (
               isTelegramMessageNotModified(
-                projectTelegramError(cause, "Telegram message edit failed"),
+                projectTelegramError(attempted.error.cause, "Telegram message edit failed"),
               )
             ) {
               return;
             }
-            throw cause;
+            throw attempted.error.cause;
           }
+          if (attempted.value !== true) this.recordMessage(attempted.value, { fromBot: true });
         });
         edited.match({
           ok: () => undefined,
