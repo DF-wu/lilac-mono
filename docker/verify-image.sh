@@ -95,6 +95,16 @@ for path in /app /usr/local/bin/bun /usr/local/libexec/lilac-tool-bridge; do
     fail "$path is writable by lilac"
   fi
 done
+for path in \
+  /app/build/build-info.json \
+  /app/packages/utils/builtin-skills/customize-lilac/SKILL.md \
+  /app/packages/utils/builtin-skills/customize-lilac/references/self-debugging.md \
+  /app/packages/utils/builtin-skills/customize-lilac/references/core-config.md \
+  /app/packages/utils/config-templates/core-config.example.yaml \
+  /app/packages/utils/core-config.ts; do
+  docker exec --user lilac "$container_name" /usr/bin/test -r "$path" ||
+    fail "$path is not readable by lilac"
+done
 docker exec --user lilac "$container_name" /usr/bin/test -w /data ||
   fail "/data is not writable by lilac"
 
