@@ -8,6 +8,7 @@ import type { TranscriptStore } from "../transcript/transcript-store";
 import {
   assignCatalogToolNames,
   catalogToolStableId,
+  catalogToolNamespaceName,
   type CatalogToolIdentity,
 } from "./catalog-identity";
 
@@ -15,6 +16,7 @@ export type CatalogToolCandidate = {
   readonly identity: CatalogToolIdentity;
   readonly title?: string;
   readonly description?: string;
+  readonly namespaceSummary?: string;
   readonly tool: unknown;
 };
 
@@ -26,6 +28,7 @@ export type CatalogToolEntry = {
   readonly title?: string;
   /** The complete source-provided description, without catalog truncation. */
   readonly description?: string;
+  readonly namespaceSummary?: string;
   readonly identity: CatalogToolIdentity;
   readonly stableId: string;
   readonly tool: unknown;
@@ -36,6 +39,13 @@ export type UnifiedToolCatalog = {
   readonly byStableId: ReadonlyMap<string, CatalogToolEntry>;
   readonly byModelName: ReadonlyMap<string, CatalogToolEntry>;
   readonly catalogMetadata: ClaudeCodeToolCatalogMetadataMap;
+};
+
+export type CatalogNamespaceSummary = {
+  readonly source: CatalogToolIdentity["source"];
+  readonly sourceId: string;
+  readonly toolCount: number;
+  readonly description?: string;
 };
 
 export class UnifiedToolCatalogInvalid extends TaggedError("UnifiedToolCatalogInvalid")<{
@@ -51,6 +61,19 @@ function compareText(left: string, right: string): number {
   if (left < right) return -1;
   if (left > right) return 1;
   return 0;
+}
+
+function oneLineDescription(description: string | undefined): string | undefined {
+  const normalized = description?.replace(/\s+/g, " ").trim();
+  return normalized ? normalized : undefined;
+}
+
+export function formatCatalogNamespaceSummary(summary: CatalogNamespaceSummary): string {
+  const namespace = catalogToolNamespaceName(summary);
+  const description = oneLineDescription(summary.description);
+  return `${namespace}.* — ${summary.toolCount} ${summary.toolCount === 1 ? "tool" : "tools"}${
+    description === undefined ? "" : `: ${description}`
+  }`;
 }
 
 export function catalogCandidateExecutable(candidate: CatalogToolCandidate): unknown {
@@ -121,6 +144,9 @@ export function buildUnifiedToolCatalogResult(params: {
       modelName,
       ...(candidate.title === undefined ? {} : { title: candidate.title }),
       ...(candidate.description === undefined ? {} : { description: candidate.description }),
+      ...(candidate.namespaceSummary === undefined
+        ? {}
+        : { namespaceSummary: candidate.namespaceSummary }),
       identity,
       stableId,
       tool: catalogCandidateExecutable(candidate),
@@ -133,6 +159,7 @@ export function buildUnifiedToolCatalogResult(params: {
       rawName: entry.rawName,
       ...(entry.title === undefined ? {} : { title: entry.title }),
       ...(entry.description === undefined ? {} : { description: entry.description }),
+      ...(entry.namespaceSummary === undefined ? {} : { namespaceSummary: entry.namespaceSummary }),
     });
   }
 
@@ -354,6 +381,7 @@ function portableRequestClient(value: string): AdapterPlatform | null {
 
 export function createPortableToolSearchResult(params: {
   catalog: readonly CatalogToolEntry[];
+  namespaceSummaries?: readonly CatalogNamespaceSummary[];
   transcriptStore?: Pick<TranscriptStore, "selectSessionToolIds">;
   requestContext?: {
     readonly requestClient: string;
@@ -377,11 +405,23 @@ export function createPortableToolSearchResult(params: {
           sessionId: params.requestContext.sessionId,
         }
       : undefined;
+  const namespaceCatalog = [...(params.namespaceSummaries ?? [])]
+    .sort(
+      (left, right) =>
+        compareText(catalogToolNamespaceName(left), catalogToolNamespaceName(right)) ||
+        left.toolCount - right.toolCount,
+    )
+    .map(formatCatalogNamespaceSummary);
+  const searchDescription = [
+    "Search deferred plugin and MCP tools. Use keywords for ranked search, select:name,... for exact model-facing names, or +term to require a term in tool names. Returned tools become available on the next model step.",
+    ...(namespaceCatalog.length === 0
+      ? []
+      : [`Available MCP namespaces:\n${namespaceCatalog.join("\n")}`]),
+  ].join("\n\n");
 
   return Result.ok(
     tool({
-      description:
-        "Search deferred plugin and MCP tools. Use keywords for ranked search, select:name,... for exact model-facing names, or +term to require a term in tool names. Returned tools become available on the next model step.",
+      description: searchDescription,
       inputSchema: toolSearchInputSchema,
       execute: ({ query, max_results }) => {
         const parsedQuery = parseToolSearchQuery(query);

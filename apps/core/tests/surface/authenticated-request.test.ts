@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { lilacEventTypes, type LilacMessageForTopic } from "@stanley2058/lilac-event-bus";
+import {
+  lilacEventTypes,
+  type BusMessageV2,
+  type LilacMessageForTopic,
+} from "@stanley2058/lilac-event-bus";
 
 import {
   isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid,
@@ -17,6 +21,7 @@ function requestMessage(input: {
   readonly requestClient?: "discord" | "github" | "telegram" | "slack" | "unknown";
   readonly raw?: unknown;
 }): RequestMessage {
+  const messages: BusMessageV2[] = [{ role: "user", content: "hello" }];
   return {
     id: "1-0",
     topic: "cmd.request",
@@ -29,8 +34,9 @@ function requestMessage(input: {
       ...(input.requestClient ? { request_client: input.requestClient } : {}),
     },
     data: {
+      requestDeliveryId: crypto.randomUUID(),
       queue: "prompt",
-      messages: [{ role: "user", content: "hello" }],
+      messages,
       ...(input.raw !== undefined ? { raw: input.raw } : {}),
     },
   };

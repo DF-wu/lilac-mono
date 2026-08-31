@@ -1,9 +1,10 @@
 import path from "node:path";
 
 import { isRecord } from "@stanley2058/lilac-utils";
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
+import { captureError } from "../shared/error-capture.js";
 import type { McpValueSource } from "./config-types";
 import { opaqueErrorMessage, rethrowPanic } from "./error-format";
 
@@ -186,21 +187,46 @@ async function captureTextFileRead(
   source: string,
   context: McpValueResolutionContext,
 ): Promise<ResultType<string, McpValueFileReadError>> {
-  try {
-    const text = context.readTextFile
-      ? await context.readTextFile(filePath)
-      : await Bun.file(filePath).text();
-    return Result.ok(text);
-  } catch (cause) {
-    rethrowPanic(cause);
-    return Result.err(
-      new McpValueFileReadError({
-        source,
-        cause,
-        message: `failed to read ${source}: ${opaqueErrorMessage(cause)}`,
-      }),
-    );
-  }
+  const captured = await Result.tryPromise({
+    try: () => (context.readTextFile ? context.readTextFile(filePath) : Bun.file(filePath).text()),
+    catch: (cause) => {
+      if (Panic.is(cause)) return { kind: "panic", panic: cause } as const;
+      if (cause instanceof Error) return { kind: "error", cause } as const;
+      return {
+        kind: "failure",
+        error: new McpValueFileReadError({
+          source,
+          cause,
+          message: `failed to read ${source}: Unknown error`,
+        }),
+      } as const;
+    },
+  });
+  return captured.match<() => ResultType<string, McpValueFileReadError>>({
+    ok: (text) => () => Result.ok(text),
+    err: (failure) => () => {
+      if (failure.kind === "panic") {
+        rethrowPanic(failure.panic);
+        return Result.err(
+          new McpValueFileReadError({
+            source,
+            cause: failure.panic,
+            message: `failed to read ${source}`,
+          }),
+        );
+      }
+      if (failure.kind === "failure") return Result.err(failure.error);
+      const cause = failure.cause;
+      rethrowPanic(cause);
+      return Result.err(
+        new McpValueFileReadError({
+          source,
+          cause,
+          message: `failed to read ${source}: ${opaqueErrorMessage(cause)}`,
+        }),
+      );
+    },
+  })();
 }
 
 function decodeJsonValue(
@@ -209,28 +235,51 @@ function decodeJsonValue(
 ): ResultType<JsonValue, McpValueJsonParseError> {
   const json = Result.try({
     try: () => JSON.parse(text),
-    catch: (cause) => {
-      rethrowPanic(cause);
-      return new McpValueJsonParseError({
+    catch: (cause) =>
+      Panic.is(cause)
+        ? ({ kind: "panic", panic: cause } as const)
+        : ({
+            kind: "failure",
+            ...captureError(cause, `failed to parse ${source}`),
+          } as const),
+  }).match<
+    | { readonly kind: "success"; readonly value: unknown }
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "failure"; readonly cause: Error; readonly captured: unknown }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: (failure) => failure,
+  });
+  if (json.kind === "panic") {
+    rethrowPanic(json.panic);
+    return Result.err(
+      new McpValueJsonParseError({
         source,
-        cause,
-        message: `failed to parse ${source} as JSON: ${opaqueErrorMessage(cause)}`,
-      });
-    },
-  });
-  return json.andThen((value) => {
-    const parsed = jsonValueSchema.safeParse(value);
-    if (!parsed.success) {
-      return Result.err(
-        new McpValueJsonParseError({
-          source,
-          cause: parsed.error,
-          message: `failed to parse ${source} as JSON: ${parsed.error.message}`,
-        }),
-      );
-    }
-    return Result.ok(parsed.data);
-  });
+        cause: json.panic,
+        message: `failed to parse ${source}`,
+      }),
+    );
+  }
+  if (json.kind === "failure") {
+    return Result.err(
+      new McpValueJsonParseError({
+        source,
+        cause: json.cause,
+        message: `failed to parse ${source} as JSON: ${opaqueErrorMessage(json.cause)}`,
+      }),
+    );
+  }
+  const parsed = jsonValueSchema.safeParse(json.value);
+  if (!parsed.success) {
+    return Result.err(
+      new McpValueJsonParseError({
+        source,
+        cause: parsed.error,
+        message: `failed to parse ${source} as JSON: ${parsed.error.message}`,
+      }),
+    );
+  }
+  return Result.ok(parsed.data);
 }
 
 export async function resolveMcpValueSource(

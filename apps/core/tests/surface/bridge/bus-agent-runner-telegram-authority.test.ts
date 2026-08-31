@@ -22,6 +22,7 @@ import type { TrustedSubagentDelegationRegistration } from "../../../src/tools/s
 import type { WorkflowLiveParentBridge } from "../../../src/workflow/workflow-live-parent-bridge";
 import type { WorkflowSubagentDispatcher } from "../../../src/workflow/workflow-subagent-dispatcher";
 import { createInMemoryDeliveryBus } from "../../helpers/in-memory-delivery-bus";
+import { getTestBlobStore } from "../../helpers/blob-store";
 
 /**
  * Capability issuance used to be gated on `discord | github`, so a Telegram
@@ -189,6 +190,7 @@ async function runRequest(input: {
 
   const runner = await startBusAgentRunner({
     bus,
+    blobStore: await getTestBlobStore(),
     subscriptionId: `telegram-authority-${input.requestClient}`,
     config,
     pluginManager: recordingPluginManager((params) => builds.push(params)),
@@ -238,6 +240,7 @@ async function runRequest(input: {
     await bus.publish(
       lilacEventTypes.CmdRequestMessage,
       {
+        requestDeliveryId: crypto.randomUUID(),
         queue: "prompt",
         messages: [{ role: "user", content: "who am I talking to?" }],
         raw: input.authenticatedOrigin ? { authenticatedOrigin: input.authenticatedOrigin } : {},

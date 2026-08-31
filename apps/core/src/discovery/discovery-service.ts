@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { Database } from "bun:sqlite";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -17,6 +18,7 @@ import {
 import type { DiscordSearchStore } from "../surface/store/discord-search-store";
 import type { TranscriptStore } from "../transcript/transcript-store";
 import { bestEffortAliasForDiscordChannelId } from "../surface/discord/discord-tool-targets";
+import { rethrowPanic } from "../mcp/error-format";
 
 export const DISCOVERY_LIMIT_MAX = 100;
 export const DISCOVERY_SURROUNDING_MAX = 20;
@@ -1104,16 +1106,24 @@ export class DiscoveryService {
   }
 
   closeResult(): ResultType<void, DiscoveryCloseError> {
-    return Result.try({
+    const closed = Result.try({
       try: () => this.store.close(),
-      catch: (caught) => {
-        if (isPanic(caught)) throw caught;
-        return new DiscoveryCloseError({
-          cause: opaqueErrorCause(caught, "Opaque discovery close failure"),
-          message: "Failed to close discovery storage",
-        });
-      },
+      catch: (cause) => captureError(cause, "Discovery search failed"),
     });
+    const outcome = closed.match<
+      { readonly kind: "success" } | { readonly kind: "failure"; readonly cause: unknown }
+    >({
+      ok: () => ({ kind: "success" }),
+      err: ({ cause }) => ({ kind: "failure", cause }),
+    });
+    if (outcome.kind === "success") return Result.ok();
+    rethrowPanic(outcome.cause);
+    return Result.err(
+      new DiscoveryCloseError({
+        cause: opaqueErrorCause(outcome.cause, "Opaque discovery close failure"),
+        message: "Failed to close discovery storage",
+      }),
+    );
   }
 
   close(): void {
@@ -1277,14 +1287,9 @@ export class DiscoveryService {
       await this.syncFileSources();
     })();
     this.sourceSyncPromise = syncPromise;
-
-    try {
-      await syncPromise;
-    } finally {
-      if (this.sourceSyncPromise === syncPromise) {
-        this.sourceSyncPromise = undefined;
-      }
-    }
+    await syncPromise.finally(() => {
+      if (this.sourceSyncPromise === syncPromise) this.sourceSyncPromise = undefined;
+    });
   }
 
   private async buildOriginGroups(params: {
@@ -1476,17 +1481,35 @@ export class DiscoveryService {
   async searchResult(
     input: DiscoverySearchInput,
   ): Promise<ResultType<DiscoverySearchResult, DiscoverySearchError>> {
-    return Result.tryPromise({
-      try: () => this.searchOperation(input),
-      catch: (caught) => {
-        if (isPanic(caught)) throw caught;
-        if (DiscoverySearchInputError.is(caught)) return caught;
-        return new DiscoverySearchOperationError({
-          cause: opaqueErrorCause(caught, "Opaque discovery search failure"),
-          message: "Discovery search failed",
-        });
-      },
+    const pending = this.searchOperation(input);
+    const searched = await Result.tryPromise({
+      try: () => pending,
+      catch: (cause) => captureError(cause, "Discovery search failed"),
     });
+    const outcome = searched.match<
+      | { readonly kind: "success"; readonly value: DiscoverySearchResult }
+      | { readonly kind: "failure"; readonly cause: Error }
+    >({
+      ok: (value) => ({ kind: "success", value }),
+      err: ({ cause }) => ({ kind: "failure", cause }),
+    });
+    if (outcome.kind === "success") return Result.ok(outcome.value);
+    if (isPanic(outcome.cause)) {
+      await pending;
+      return Result.err(
+        new DiscoverySearchOperationError({
+          cause: opaqueErrorCause(outcome.cause, "Opaque discovery search failure"),
+          message: "Discovery search failed",
+        }),
+      );
+    }
+    if (DiscoverySearchInputError.is(outcome.cause)) return Result.err(outcome.cause);
+    return Result.err(
+      new DiscoverySearchOperationError({
+        cause: opaqueErrorCause(outcome.cause, "Opaque discovery search failure"),
+        message: "Discovery search failed",
+      }),
+    );
   }
 
   async search(input: DiscoverySearchInput): Promise<DiscoverySearchResult> {

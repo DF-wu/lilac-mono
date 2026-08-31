@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture";
 import Elysia, { NotFoundError } from "elysia";
 import {
   createLogger,
@@ -54,8 +55,10 @@ import {
   type ToolServerLagIncident,
 } from "./health-state";
 import type { RequestContext, ServerTool } from "./types";
+import { bindRequestInvocationCwd } from "./request-invocation-cwd";
 import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../surface/types";
 import { resolveAuthenticatedRequestSafetyMode } from "../surface/builtin-surface-protocols";
+import { resolveSessionSafetyMode } from "../surface/session-policy";
 import type { AuthenticatedRequestOrigin } from "./request-message-cache";
 
 type ToolPluginManagerLike = {
@@ -81,6 +84,7 @@ type FatalToolCallDefect = Panic | Error;
 type ToolRequestHeaders = {
   readonly operatorToken?: string;
   readonly requestId?: string;
+  readonly requestDeliveryId?: string;
   readonly sessionId?: string;
   readonly originSessionId?: string;
   readonly requestClient?: string;
@@ -111,6 +115,7 @@ const toolPayloadSchema: z.ZodType<ToolJsonObject> = z.record(z.string(), toolJs
 const toolRequestHeadersSchema = z.object({
   "x-lilac-operator-token": z.string().optional(),
   "x-lilac-request-id": z.string().optional(),
+  "x-lilac-request-delivery-id": z.string().optional(),
   "x-lilac-session-id": z.string().optional(),
   "x-lilac-origin-session-id": z.string().optional(),
   "x-lilac-request-client": z.string().optional(),
@@ -193,11 +198,19 @@ function safeToolInputPreview(callableId: string, input: ToolJsonObject): string
 }
 
 function frameworkErrorLogProjection<TError>(error: TError): Readonly<Record<string, string>> {
-  try {
-    if (TaggedError.is(error)) return formatTaggedErrorForLog(error);
-    return { errorMessage: opaquePluginExceptionMessage(error) };
-  } catch {
-    return { errorMessage: "Unknown framework error" };
+  {
+    const attempt = Result.try({
+      try: () => {
+        if (TaggedError.is(error)) return formatTaggedErrorForLog(error);
+        return { errorMessage: opaquePluginExceptionMessage(error) };
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      return { errorMessage: "Unknown framework error" };
+    }
+    return attempt.value;
   }
 }
 
@@ -224,6 +237,7 @@ function decodeToolRequestHeaders(
   return Result.ok({
     operatorToken: headerStr(decoded.data["x-lilac-operator-token"]),
     requestId: headerStr(decoded.data["x-lilac-request-id"]),
+    requestDeliveryId: headerStr(decoded.data["x-lilac-request-delivery-id"]),
     sessionId: headerStr(decoded.data["x-lilac-session-id"]),
     originSessionId: headerStr(decoded.data["x-lilac-origin-session-id"]),
     requestClient: headerStr(decoded.data["x-lilac-request-client"]),
@@ -247,6 +261,7 @@ function decodeToolPayload(
 function parseRequestContext(headers: ToolRequestHeaders): RequestContext {
   return {
     requestId: headers.requestId,
+    requestDeliveryId: headers.requestDeliveryId,
     sessionId: headers.sessionId,
     originSessionId: headers.originSessionId,
     requestClient: headers.requestClient,
@@ -294,6 +309,7 @@ const RESTRICTED_LEVEL2_ALLOWED = new Set([
   "generate.video",
   "attachment.add_files",
   "attachment.download",
+  "resource.materialize",
   "skills.list",
   "skills.brief",
   "skills.full",
@@ -506,7 +522,7 @@ function projectFatalToolCallDefect(reason: unknown, opaque = false): FatalToolC
 
 export function normalizeSuccessfulToolValue(
   value: unknown,
-): ResultType<ToolJsonValue, FatalToolCallDefect> {
+): ResultType<ToolJsonValue, ToolPayloadInvalid> {
   let containsNonFiniteNumber = false;
   const normalized = Result.try({
     try: () => {
@@ -525,13 +541,44 @@ export function normalizeSuccessfulToolValue(
         ? { kind: "valid" as const, value: decoded.data }
         : { kind: "invalid" as const };
     },
-    catch: (cause) => projectFatalToolCallDefect(cause, true),
+    catch: (cause) => ({ restoreCause: () => cause }),
   });
-  return normalized.andThen((outcome) =>
-    outcome.kind === "valid"
-      ? Result.ok(outcome.value)
-      : Result.err(projectFatalToolCallDefect(undefined, true)),
-  );
+  const settlement = normalized.match<
+    | {
+        readonly kind: "normalized";
+        readonly outcome:
+          | { readonly kind: "valid"; readonly value: ToolJsonValue }
+          | { readonly kind: "invalid" };
+      }
+    | { readonly kind: "serialization-failed"; readonly restoreCause: () => unknown }
+  >({
+    ok: (outcome) => ({ kind: "normalized", outcome }),
+    err: ({ restoreCause }) => ({ kind: "serialization-failed", restoreCause }),
+  });
+  if (settlement.kind === "serialization-failed") {
+    const classified = Result.try({
+      try: () => {
+        const cause = settlement.restoreCause();
+        return isPluginPanic(cause)
+          ? ({ kind: "panic", panic: cause } as const)
+          : ({ kind: "ordinary" } as const);
+      },
+      catch: () => ({ kind: "ordinary" }) as const,
+    }).match<{ readonly kind: "panic"; readonly panic: Panic } | { readonly kind: "ordinary" }>({
+      ok: (outcome) => outcome,
+      err: () => ({ kind: "ordinary" }) as const,
+    });
+    if (classified.kind === "panic") {
+      return adaptPanicToToolServerHost(classified.panic);
+    }
+    return Result.err(
+      new ToolPayloadInvalid({ message: TOOL_CALL_OUTPUT_CONTRACT_DEFECT_MESSAGE }),
+    );
+  }
+  const outcome = settlement.outcome;
+  return outcome.kind === "valid"
+    ? Result.ok(outcome.value)
+    : Result.err(new ToolPayloadInvalid({ message: TOOL_CALL_OUTPUT_CONTRACT_DEFECT_MESSAGE }));
 }
 
 function signalFatalToolCallDefectToProcess(defect: FatalToolCallDefect): void {
@@ -556,17 +603,23 @@ function superviseToolCallRejections(context: {
   readonly promise: Promise<unknown>;
   readonly report: (defect: FatalToolCallDefect) => void;
 }): void {
-  const defect = context.promise.then(() => null, projectFatalToolCallDefect);
-  void defect.then((reason) => {
-    if (reason === null) return;
+  void supervise();
+
+  async function supervise(): Promise<void> {
+    const captured = await Result.tryPromise({
+      try: () => context.promise,
+      catch: captureError,
+    });
+    const failure = captured.match({ ok: () => null, err: ({ cause }) => ({ cause }) });
+    if (!failure) return;
     observeToolCallRejection(
       {
         didTimeout: context.didTimeout,
         report: context.report,
       },
-      reason,
+      projectFatalToolCallDefect(failure.cause),
     );
-  });
+  }
 }
 
 export function createToolServer(options: ToolServerOptions) {
@@ -725,33 +778,53 @@ export function createToolServer(options: ToolServerOptions) {
     source: "server-provider" | "config",
     provider: () => Promise<TValue>,
   ): Promise<ResultType<TValue, ToolSafetyModeResolutionError>> {
-    return Result.tryPromise({
+    const captured = await Result.tryPromise({
       try: provider,
-      catch: <TCause>(cause: TCause) => {
-        if (isPanic(cause)) return adaptPanicToToolServerHost(cause);
-        return new ToolSafetyModeResolutionError({
-          source,
-          sessionId: ctx.sessionId,
-          cause: safePluginExceptionCause(cause),
-          message: opaquePluginExceptionMessage(cause),
-        });
-      },
+      catch: captureError,
     });
+    return captured.match<() => ResultType<TValue, ToolSafetyModeResolutionError>>({
+      ok: (value) => () => Result.ok(value),
+      err:
+        ({ cause }) =>
+        () => {
+          if (isPanic(cause)) return adaptPanicToToolServerHost(cause);
+          return Result.err(
+            new ToolSafetyModeResolutionError({
+              source,
+              sessionId: ctx.sessionId,
+              cause: safePluginExceptionCause(cause),
+              message: opaquePluginExceptionMessage(cause),
+            }),
+          );
+        },
+    })();
   }
 
   function captureAuthenticationOperation<TValue>(
     run: () => TValue,
   ): Promise<ResultType<Awaited<TValue>, ToolRequestAuthenticationError>> {
-    return Result.tryPromise({
-      try: () => Promise.resolve(run()),
-      catch: <TCause>(cause: TCause) => {
-        if (isPanic(cause)) return adaptPanicToToolServerHost(cause);
-        return new ToolRequestAuthenticationError({
-          cause: safePluginExceptionCause(cause),
-          message: opaquePluginExceptionMessage(cause),
-        });
-      },
-    });
+    return capture();
+
+    async function capture(): Promise<ResultType<Awaited<TValue>, ToolRequestAuthenticationError>> {
+      const captured = await Result.tryPromise({
+        try: () => Promise.resolve(run()),
+        catch: captureError,
+      });
+      return captured.match<() => ResultType<Awaited<TValue>, ToolRequestAuthenticationError>>({
+        ok: (value) => () => Result.ok(value),
+        err:
+          ({ cause }) =>
+          () => {
+            if (isPanic(cause)) return adaptPanicToToolServerHost(cause);
+            return Result.err(
+              new ToolRequestAuthenticationError({
+                cause: safePluginExceptionCause(cause),
+                message: opaquePluginExceptionMessage(cause),
+              }),
+            );
+          },
+      })();
+    }
   }
 
   async function resolveSafetyMode(
@@ -777,8 +850,7 @@ export function createToolServer(options: ToolServerOptions) {
         const loaded = await captureSafetyModeProvider(ctx, "config", options.getConfig);
         const loadedValue = loaded.match({ ok: (value) => value, err: () => null });
         if (!loadedValue) return loaded.map(() => "restricted");
-        assertedSafetyMode =
-          loadedValue.surface.router.sessionModes[sessionId]?.safetyMode ?? "trusted";
+        assertedSafetyMode = resolveSessionSafetyMode(loadedValue, sessionId);
       }
     }
     return Result.ok(
@@ -896,19 +968,19 @@ export function createToolServer(options: ToolServerOptions) {
           }),
         );
       }
-      return Result.ok({
-        context: {
-          requestId: headers.requestId,
-          toolCallId: headers.toolCallId,
-          cwd: options.canonicalWorkspaceRoot,
-          safetyMode: "trusted",
-          serverOwnedRequest: true,
-          operator: true,
-        },
-        messages: undefined,
-      });
+      const operatorContext: RequestContext = {
+        requestId: headers.requestId,
+        toolCallId: headers.toolCallId,
+        cwd: options.canonicalWorkspaceRoot,
+        safetyMode: "trusted",
+        serverOwnedRequest: true,
+        operator: true,
+      };
+      bindRequestInvocationCwd(operatorContext, headers.cwd);
+      return Result.ok({ context: operatorContext, messages: undefined });
     }
     const context = parseRequestContext(headers);
+    bindRequestInvocationCwd(context, context.cwd);
     const cachedMessages = await captureAuthenticationOperation(() =>
       authenticateRequestContext(context, options.requestMessageCache),
     );
@@ -1606,7 +1678,7 @@ export function createToolServer(options: ToolServerOptions) {
       healthState.markListening(false);
       healthState.markInitialized(false);
       healthState.stopMonitoring();
-      try {
+      const destroy = async () => {
         if (options.pluginManager) {
           const destroyed = await options.pluginManager.destroy();
           destroyed.match<() => void>({
@@ -1616,10 +1688,11 @@ export function createToolServer(options: ToolServerOptions) {
         } else {
           await runStaticToolLifecycle("level2.destroy");
         }
-      } finally {
+      };
+      await destroy().finally(() => {
         if (started) app.stop();
         started = false;
-      }
+      });
     },
     getHealthSnapshot: async () => await healthState.getSnapshot(),
     recordUnhandledRejection: recordUnhandledRejectionAtBoundary,

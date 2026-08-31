@@ -6,7 +6,15 @@ import { z } from "zod";
 
 import { env } from "./env";
 import type { DecodedPersistedValue } from "./persistence";
-import { isPanic, opaqueErrorMessage } from "./runtime-utils";
+import {
+  capturePromiseResult,
+  captureResultOutcome,
+  isPanic,
+  opaqueErrorMessage,
+  settlePromiseResult,
+  settleSyncResult,
+  type CapturedSettlement,
+} from "./runtime-utils";
 
 export const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export const CODEX_OAUTH_ISSUER = "https://auth.openai.com";
@@ -140,12 +148,15 @@ export function decodeCodexTokens(input: {
   if (input.serialized === null) {
     return Result.ok({ value: null, provenance: "missing-defaulted" });
   }
+  const serialized = input.serialized;
 
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(input.serialized);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+  const parsedJson = Result.try({
+    try: () => JSON.parse(serialized) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const jsonOutcome = captureResultOutcome(parsedJson);
+  if (!jsonOutcome.ok && isPanic(jsonOutcome.error.cause)) throw jsonOutcome.error.cause;
+  if (!jsonOutcome.ok) {
     return Result.err(
       new CodexTokensMalformed({
         storagePath: input.storagePath,
@@ -153,6 +164,7 @@ export function decodeCodexTokens(input: {
       }),
     );
   }
+  const decoded = jsonOutcome.value;
 
   const current = codexOAuthTokensSchema.safeParse(decoded);
   if (current.success) {
@@ -240,13 +252,13 @@ export const codexTokensCodecCases = {
 function parseJwtClaims(token: string): Record<string, unknown> | undefined {
   const parts = token.split(".");
   if (parts.length !== 3) return undefined;
-  try {
-    const parsed = JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8")) as unknown;
-    return jwtClaimsSchema.safeParse(parsed).data;
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return undefined;
-  }
+  const captured = Result.try({
+    try: () => JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8")) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = captureResultOutcome(captured);
+  if (!outcome.ok && isPanic(outcome.error.cause)) throw outcome.error.cause;
+  return outcome.ok ? jwtClaimsSchema.safeParse(outcome.value).data : undefined;
 }
 
 function extractAccountIdFromClaims(claims: Record<string, unknown>): string | undefined {
@@ -340,52 +352,48 @@ export async function writeSecretFileResult(
   let writeCause: unknown;
   const cleanupCauses: unknown[] = [];
 
-  try {
+  const written = await settlePromiseResult(async () => {
     await operations.ensureDirectory(storagePath);
     handle = await operations.openTemporaryFile(temporaryPath);
     needsCleanup = true;
     await handle.writeFile(contents, "utf8");
     await handle.sync();
-  } catch (cause) {
+  });
+  if (written.kind !== "value") {
     writeFailed = true;
-    writeCause = cause;
+    writeCause = written.kind === "panic" ? written.panic : written.restoreCause();
   }
 
   if (handle) {
-    try {
-      await handle.close();
-    } catch (cause) {
-      cleanupCauses.push(cause);
-    }
+    const closed = await settlePromiseResult(() => handle!.close());
+    if (closed.kind !== "value")
+      cleanupCauses.push(closed.kind === "panic" ? closed.panic : closed.restoreCause());
     handle = undefined;
   }
 
   if (!writeFailed && cleanupCauses.length === 0) {
-    try {
+    const committed = await settlePromiseResult(async () => {
       if (operations.syncDirectory) directoryHandle = await operations.openDirectory(directory);
       await operations.rename(temporaryPath, storagePath);
       needsCleanup = false;
       if (process.platform !== "win32") await operations.chmod(storagePath, 0o600);
       await directoryHandle?.sync();
-    } catch (cause) {
+    });
+    if (committed.kind !== "value") {
       writeFailed = true;
-      writeCause = cause;
+      writeCause = committed.kind === "panic" ? committed.panic : committed.restoreCause();
     }
   }
 
   if (directoryHandle) {
-    try {
-      await directoryHandle.close();
-    } catch (cause) {
-      cleanupCauses.push(cause);
-    }
+    const closed = await settlePromiseResult(() => directoryHandle!.close());
+    if (closed.kind !== "value")
+      cleanupCauses.push(closed.kind === "panic" ? closed.panic : closed.restoreCause());
   }
   if (needsCleanup) {
-    try {
-      await operations.unlink(temporaryPath);
-    } catch (cause) {
-      cleanupCauses.push(cause);
-    }
+    const unlinked = await settlePromiseResult(() => operations.unlink(temporaryPath));
+    if (unlinked.kind !== "value")
+      cleanupCauses.push(unlinked.kind === "panic" ? unlinked.panic : unlinked.restoreCause());
   }
 
   if (isPanic(writeCause)) throw writeCause;
@@ -432,36 +440,34 @@ export async function readCodexTokensResult(
   >
 > {
   const file = Bun.file(storagePath);
-  let exists: boolean;
-  try {
-    exists = await file.exists();
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+  const inspectOutcome = await settlePromiseResult(() => file.exists());
+  if (inspectOutcome.kind === "panic") throw inspectOutcome.panic;
+  if (inspectOutcome.kind === "failure") {
     return Result.err(
       new CodexTokensReadFailed({
         operation: "inspect",
         storagePath,
-        cause,
+        cause: inspectOutcome.restoreCause(),
         message: `Failed to inspect Codex OAuth tokens at '${storagePath}'`,
       }),
     );
   }
+  const exists = inspectOutcome.value;
   if (!exists) return decodeCodexTokens({ serialized: null, storagePath });
 
-  let text: string;
-  try {
-    text = await file.text();
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+  const readOutcome = await settlePromiseResult(() => file.text());
+  if (readOutcome.kind === "panic") throw readOutcome.panic;
+  if (readOutcome.kind === "failure") {
     return Result.err(
       new CodexTokensReadFailed({
         operation: "read",
         storagePath,
-        cause,
+        cause: readOutcome.restoreCause(),
         message: `Failed to read Codex OAuth tokens at '${storagePath}'`,
       }),
     );
   }
+  const text = readOutcome.value;
 
   return decodeCodexTokens({ serialized: text, storagePath });
 }
@@ -556,20 +562,19 @@ export async function clearCodexTokensResult(
   >
 > {
   const file = Bun.file(storagePath);
-  let exists: boolean;
-  try {
-    exists = await file.exists();
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+  const inspectOutcome = await settlePromiseResult(() => file.exists());
+  if (inspectOutcome.kind === "panic") throw inspectOutcome.panic;
+  if (inspectOutcome.kind === "failure") {
     return Result.err(
       new CodexTokensReadFailed({
         operation: "inspect",
         storagePath,
-        cause,
+        cause: inspectOutcome.restoreCause(),
         message: `Failed to inspect Codex OAuth tokens at '${storagePath}'`,
       }),
     );
   }
+  const exists = inspectOutcome.value;
   if (!exists) return Result.ok(undefined);
   return writeSecretFileResult(storagePath, "{}\n");
 }
@@ -689,9 +694,8 @@ export async function exchangeCodeForTokensResult(options: {
 }): Promise<
   ResultType<AuthorizationCodeTokenResponse, CodexOAuthRequestFailed | CodexOAuthResponseInvalid>
 > {
-  let response: Response;
-  try {
-    response = await (options.fetch ?? fetch)(`${CODEX_OAUTH_ISSUER}/oauth/token`, {
+  const requested = await capturePromiseResult(() =>
+    (options.fetch ?? fetch)(`${CODEX_OAUTH_ISSUER}/oauth/token`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -702,17 +706,20 @@ export async function exchangeCodeForTokensResult(options: {
         code_verifier: options.pkce.verifier,
       }).toString(),
       signal: options.signal,
-    });
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+    }),
+  );
+  const requestOutcome = captureResultOutcome(requested);
+  if (!requestOutcome.ok && isPanic(requestOutcome.error)) throw requestOutcome.error;
+  if (!requestOutcome.ok) {
     return Result.err(
       new CodexOAuthRequestFailed({
         operation: "exchange",
-        cause,
+        cause: requestOutcome.error,
         message: "Token exchange request failed",
       }),
     );
   }
+  const response = requestOutcome.value;
   if (!response.ok) {
     return Result.err(
       new CodexOAuthRequestFailed({
@@ -723,19 +730,19 @@ export async function exchangeCodeForTokensResult(options: {
     );
   }
 
-  let payload: unknown;
-  try {
-    payload = await response.json();
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+  const decoded = await capturePromiseResult(() => response.json() as Promise<unknown>);
+  const decodedOutcome = captureResultOutcome(decoded);
+  if (!decodedOutcome.ok && isPanic(decodedOutcome.error)) throw decodedOutcome.error;
+  if (!decodedOutcome.ok) {
     return Result.err(
       new CodexOAuthResponseInvalid({
         operation: "exchange",
-        cause,
+        cause: decodedOutcome.error,
         message: "Token exchange response was not valid JSON",
       }),
     );
   }
+  const payload = decodedOutcome.value;
   const parsed = authorizationCodeTokenResponseSchema.safeParse(payload);
   return parsed.success
     ? Result.ok(parsed.data)
@@ -782,7 +789,20 @@ export async function refreshAccessTokenResult(
     ? AbortSignal.any([signal, timeoutController.signal])
     : timeoutController.signal;
   const abortedRefresh = Symbol("aborted-refresh");
-  const waitForRefresh = async <T>(request: Promise<T>): Promise<T | typeof abortedRefresh> => {
+  const settleRefreshSync = <T>(effect: () => T): CapturedSettlement<T> =>
+    Result.try({
+      try: () => ({ value: effect() }),
+      catch: (cause: unknown) => ({ restoreCause: () => cause }),
+    }).match<CapturedSettlement<T>>({
+      ok: ({ value }) => ({ kind: "value", value }),
+      err: ({ restoreCause }) => {
+        const cause = restoreCause();
+        return isPanic(cause) ? { kind: "panic", panic: cause } : { kind: "failure", restoreCause };
+      },
+    });
+  const waitForRefresh = async <T>(
+    request: Promise<T>,
+  ): Promise<CapturedSettlement<T | typeof abortedRefresh>> => {
     let removeAbortListener = () => {};
     const aborted = new Promise<typeof abortedRefresh>((resolve) => {
       const onAbort = () => resolve(abortedRefresh);
@@ -790,48 +810,57 @@ export async function refreshAccessTokenResult(
       if (requestSignal.aborted) onAbort();
       else requestSignal.addEventListener("abort", onAbort, { once: true });
     });
-    try {
-      return await Promise.race([request, aborted]);
-    } finally {
-      removeAbortListener();
-    }
+    const raced = await settlePromiseResult(() => Promise.race([request, aborted]));
+    const removed = settleRefreshSync(removeAbortListener);
+    return removed.kind === "value" ? raced : removed;
   };
-  let response: Response;
-  try {
-    const fetched = await waitForRefresh(
-      fetchFn(`${CODEX_OAUTH_ISSUER}/oauth/token`, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({
-          grant_type: "refresh_token",
-          refresh_token: refreshToken,
-          client_id: CODEX_OAUTH_CLIENT_ID,
-        }).toString(),
-        signal: requestSignal,
-      }),
-    );
-    if (fetched === abortedRefresh) {
-      clearTimeout(timeout);
-      return Result.err(
-        new CodexOAuthRequestFailed({
-          operation: "refresh",
-          cause: requestSignal.reason,
-          message: "Token refresh request failed",
-        }),
-      );
-    }
-    response = fetched;
-  } catch (cause) {
+  const requestStarted = settleRefreshSync(() =>
+    fetchFn(`${CODEX_OAUTH_ISSUER}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: CODEX_OAUTH_CLIENT_ID,
+      }).toString(),
+      signal: requestSignal,
+    }),
+  );
+  if (requestStarted.kind !== "value") {
     clearTimeout(timeout);
-    if (isPanic(cause)) throw cause;
+    if (requestStarted.kind === "panic") throw requestStarted.panic;
     return Result.err(
       new CodexOAuthRequestFailed({
         operation: "refresh",
-        cause,
+        cause: requestStarted.restoreCause(),
         message: "Token refresh request failed",
       }),
     );
   }
+  const requestOutcome = await waitForRefresh(requestStarted.value);
+  if (requestOutcome.kind !== "value") {
+    clearTimeout(timeout);
+    if (requestOutcome.kind === "panic") throw requestOutcome.panic;
+    return Result.err(
+      new CodexOAuthRequestFailed({
+        operation: "refresh",
+        cause: requestOutcome.restoreCause(),
+        message: "Token refresh request failed",
+      }),
+    );
+  }
+  const fetched = requestOutcome.value;
+  if (fetched === abortedRefresh) {
+    clearTimeout(timeout);
+    return Result.err(
+      new CodexOAuthRequestFailed({
+        operation: "refresh",
+        cause: requestSignal.reason,
+        message: "Token refresh request failed",
+      }),
+    );
+  }
+  const response = fetched;
   if (!response.ok) {
     clearTimeout(timeout);
     return Result.err(
@@ -843,28 +872,38 @@ export async function refreshAccessTokenResult(
     );
   }
 
-  let payload: unknown;
-  try {
-    const decoded = await waitForRefresh(response.json());
-    if (decoded === abortedRefresh) {
-      clearTimeout(timeout);
-      return Result.err(
-        new CodexOAuthRequestFailed({
-          operation: "refresh",
-          cause: requestSignal.reason,
-          message: "Token refresh request failed",
-        }),
-      );
-    }
-    payload = decoded;
-  } catch (cause) {
+  const responseStarted = settleRefreshSync(() => response.json());
+  if (responseStarted.kind !== "value") {
     clearTimeout(timeout);
-    if (isPanic(cause)) throw cause;
+    if (responseStarted.kind === "panic") throw responseStarted.panic;
     return Result.err(
       new CodexOAuthResponseInvalid({
         operation: "refresh",
-        cause,
+        cause: responseStarted.restoreCause(),
         message: "Token refresh response was not valid JSON",
+      }),
+    );
+  }
+  const responseOutcome = await waitForRefresh(responseStarted.value);
+  if (responseOutcome.kind !== "value") {
+    clearTimeout(timeout);
+    if (responseOutcome.kind === "panic") throw responseOutcome.panic;
+    return Result.err(
+      new CodexOAuthResponseInvalid({
+        operation: "refresh",
+        cause: responseOutcome.restoreCause(),
+        message: "Token refresh response was not valid JSON",
+      }),
+    );
+  }
+  const payload = responseOutcome.value;
+  if (payload === abortedRefresh) {
+    clearTimeout(timeout);
+    return Result.err(
+      new CodexOAuthRequestFailed({
+        operation: "refresh",
+        cause: requestSignal.reason,
+        message: "Token refresh request failed",
       }),
     );
   }
@@ -923,18 +962,18 @@ export function parseCodexOAuthCallback(input: CodexOAuthCallbackPayload): {
   errorDescription?: string;
 } {
   if (input.callbackUrl) {
-    try {
-      const url = new URL(input.callbackUrl);
+    const callbackUrl = input.callbackUrl;
+    const outcome = settleSyncResult(() => {
+      const url = new URL(callbackUrl);
       return {
         code: url.searchParams.get("code") ?? undefined,
         state: url.searchParams.get("state") ?? undefined,
         error: url.searchParams.get("error") ?? undefined,
         errorDescription: url.searchParams.get("error_description") ?? undefined,
       };
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-      // Fall back to explicit fields for manual exchange.
-    }
+    });
+    if (outcome.kind === "panic") throw outcome.panic;
+    if (outcome.kind === "value") return outcome.value;
   }
   return { code: input.code, state: input.state };
 }
@@ -1007,9 +1046,21 @@ export async function startCodexOAuthLogin(
   const resultDeferred = Promise.withResolvers<CodexOAuthLoginResult>();
   const result = resultDeferred.promise;
   // Manual exchange callers are not required to await the automatic callback result.
-  void result.catch((cause) => {
-    if (isPanic(cause)) throw cause;
-  });
+  void (async () => {
+    const observed = await Result.tryPromise({
+      try: () => result,
+      catch: (cause) => ({ restoreCause: () => cause }),
+    });
+    const outcome = observed.match<
+      { readonly kind: "completed" } | { readonly kind: "failed"; restoreCause: () => unknown }
+    >({
+      ok: () => ({ kind: "completed" }),
+      err: ({ restoreCause }) => ({ kind: "failed", restoreCause }),
+    });
+    if (outcome.kind === "failed" && isPanic(outcome.restoreCause())) {
+      return result;
+    }
+  })();
 
   const stopServer = () => {
     server?.stop();
@@ -1082,22 +1133,25 @@ export async function startCodexOAuthLogin(
     }
     const accountId = extractAccountId(exchangedTokens);
     const expires = now() + (exchangedTokens.expires_in ?? 3600) * 1000;
-    try {
-      await (options.writeTokens ?? ((tokens) => writeCodexTokens(tokens, storagePath)))({
+    const writeOutcome = await settlePromiseResult(() =>
+      (options.writeTokens ?? ((tokens) => writeCodexTokens(tokens, storagePath)))({
         type: "oauth",
         access: exchangedTokens.access_token,
         refresh: exchangedTokens.refresh_token,
         expires,
         accountId,
         idToken: exchangedTokens.id_token,
-      });
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
+      }),
+    );
+    if (writeOutcome.kind === "panic") throw writeOutcome.panic;
+    if (writeOutcome.kind === "failure") {
+      const writeCause = writeOutcome.restoreCause();
       return Result.err(
         new CodexOAuthLoginFailed({
           issue: "token-write",
-          cause,
-          message: cause instanceof Error ? cause.message : "Failed to write Codex OAuth tokens",
+          cause: writeCause,
+          message:
+            writeCause instanceof Error ? writeCause.message : "Failed to write Codex OAuth tokens",
         }),
       );
     }
@@ -1115,43 +1169,36 @@ export async function startCodexOAuthLogin(
     return Result.ok(completed);
   };
 
-  const exchangeResult = (
+  const exchangeResult = async (
     input: CodexOAuthCallbackPayload,
   ): Promise<ResultType<CodexOAuthLoginResult, CodexOAuthLoginFailed>> => {
     if (closed) {
-      return Promise.resolve(
-        Result.err(
-          new CodexOAuthLoginFailed({ issue: "closed", message: "Codex OAuth login closed" }),
-        ),
+      return Result.err(
+        new CodexOAuthLoginFailed({ issue: "closed", message: "Codex OAuth login closed" }),
       );
     }
     if (settled) {
-      return Promise.resolve(
-        Result.err(
-          new CodexOAuthLoginFailed({
-            issue: "already-completed",
-            message: "Codex OAuth login already completed",
-          }),
-        ),
+      return Result.err(
+        new CodexOAuthLoginFailed({
+          issue: "already-completed",
+          message: "Codex OAuth login already completed",
+        }),
       );
     }
     if (activeExchange) {
-      return Promise.resolve(
-        Result.err(
-          new CodexOAuthLoginFailed({
-            issue: "exchange-in-progress",
-            message: "Codex OAuth token exchange already in progress",
-          }),
-        ),
+      return Result.err(
+        new CodexOAuthLoginFailed({
+          issue: "exchange-in-progress",
+          message: "Codex OAuth token exchange already in progress",
+        }),
       );
     }
 
     const currentExchange = runExchangeResult(input);
-    const trackedExchange = currentExchange.finally(() => {
-      if (activeExchange === trackedExchange) activeExchange = null;
-    });
-    activeExchange = trackedExchange;
-    return trackedExchange;
+    activeExchange = currentExchange;
+    const settlement = await settlePromiseResult(() => currentExchange);
+    if (activeExchange === currentExchange) activeExchange = null;
+    return settlement.kind === "value" ? settlement.value : currentExchange;
   };
 
   const exchange = async (input: CodexOAuthCallbackPayload): Promise<CodexOAuthLoginResult> => {
@@ -1167,50 +1214,63 @@ export async function startCodexOAuthLogin(
   };
 
   if (callbackServer !== "disabled") {
-    try {
-      server = Bun.serve({
-        hostname: "localhost",
-        port: options.port ?? CODEX_OAUTH_PORT,
-        async fetch(request) {
-          const url = new URL(request.url);
-          if (url.pathname !== "/auth/callback") return new Response("Not found", { status: 404 });
+    const served = Result.try({
+      try: () =>
+        Bun.serve({
+          hostname: "localhost",
+          port: options.port ?? CODEX_OAUTH_PORT,
+          async fetch(request) {
+            const url = new URL(request.url);
+            if (url.pathname !== "/auth/callback")
+              return new Response("Not found", { status: 404 });
 
-          const callbackState = url.searchParams.get("state");
-          if (callbackState !== state) {
-            const error = new Error("Invalid state - potential CSRF or mismatched start step");
-            return new Response(htmlError(error.message), {
-              status: 400,
-              headers: { "Content-Type": "text/html" },
+            const callbackState = url.searchParams.get("state");
+            if (callbackState !== state) {
+              const error = new Error("Invalid state - potential CSRF or mismatched start step");
+              return new Response(htmlError(error.message), {
+                status: 400,
+                headers: { "Content-Type": "text/html" },
+              });
+            }
+
+            const exchanged = await exchangeResult({ callbackUrl: request.url });
+            const respond = exchanged.match<() => Response>({
+              ok: () => () =>
+                new Response(HTML_SUCCESS, { headers: { "Content-Type": "text/html" } }),
+              err: (error) => () => {
+                const cause = projectLegacyCodexOAuthLoginFailure(error);
+                if (!activeExchange && !settled) {
+                  settled = true;
+                  stopServer();
+                  resultDeferred.reject(cause);
+                }
+                return new Response(
+                  htmlError(opaqueErrorMessage(cause, "Unknown Codex OAuth callback failure")),
+                  {
+                    status: 400,
+                    headers: { "Content-Type": "text/html" },
+                  },
+                );
+              },
             });
-          }
-
-          const exchanged = await exchangeResult({ callbackUrl: request.url });
-          const respond = exchanged.match<() => Response>({
-            ok: () => () =>
-              new Response(HTML_SUCCESS, { headers: { "Content-Type": "text/html" } }),
-            err: (error) => () => {
-              const cause = projectLegacyCodexOAuthLoginFailure(error);
-              if (!activeExchange && !settled) {
-                settled = true;
-                stopServer();
-                resultDeferred.reject(cause);
-              }
-              return new Response(
-                htmlError(opaqueErrorMessage(cause, "Unknown Codex OAuth callback failure")),
-                {
-                  status: 400,
-                  headers: { "Content-Type": "text/html" },
-                },
-              );
-            },
-          });
-          return respond();
-        },
-      });
+            return respond();
+          },
+        }),
+      catch: (cause) => ({ cause }),
+    });
+    const serveOutcome = served.match<CapturedSettlement<ReturnType<typeof Bun.serve>>>({
+      ok: (value) => ({ kind: "value", value }),
+      err: ({ cause }) =>
+        isPanic(cause)
+          ? { kind: "panic", panic: cause }
+          : { kind: "failure", restoreCause: () => cause },
+    });
+    if (serveOutcome.kind === "panic") throw serveOutcome.panic;
+    if (serveOutcome.kind === "failure" && callbackServer === "required")
+      throw serveOutcome.restoreCause();
+    if (serveOutcome.kind === "value") {
+      server = serveOutcome.value;
       redirectUri = `http://localhost:${server.port}/auth/callback`;
-    } catch (error) {
-      if (isPanic(error)) throw error;
-      if (callbackServer === "required") throw error;
     }
   }
 

@@ -14,6 +14,11 @@ import type {
   JSONValue,
   UniversalCoreConfig,
 } from "./types";
+import {
+  DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
+} from "./types";
 
 export const jsonValueSchema: z.ZodType<JSONValue> = z.lazy(() =>
   z.union([
@@ -115,7 +120,7 @@ export const routerSchema = z
   .object({
     /** Default behavior for channels unless overridden by sessionModes. */
     defaultMode: z.enum(["mention", "active"]).default("mention"),
-    /** Per-session overrides. Discord guild keys provide additionalPrompts fallback only. */
+    /** Per-session overrides. Discord guild keys provide fallback values for every option. */
     sessionModes: z
       .record(
         z.string().min(1),
@@ -694,6 +699,7 @@ function coreConfigV1ToUniversal(
 
   return {
     ...parsed,
+    blobStorage: { kind: "local" },
     plugins: parsed.plugins,
     tools: {
       ...toolsRest,
@@ -759,7 +765,11 @@ function coreConfigV1ToUniversal(
       ...parsed.surface,
       discord: {
         ...discordRest,
+        attachmentCache: {
+          ttlMs: { kind: "bounded", value: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
+        },
         outputPreviewModeFinalStyle: previewFinalOutputStyle,
+        outputPreviewModeFinalText: "reply-chain",
         markdownTableRender: experimental.markdownTableRender,
         markdownMathRender: {
           enabled: false,
@@ -776,6 +786,13 @@ function coreConfigV1ToUniversal(
       ...agentRest,
       systemPrompt: "",
       idleTimeoutMs: 15 * 60 * 1000,
+      transcriptRetention: {
+        maxAgeMs: { kind: "bounded", value: DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS },
+        maxRequests: {
+          kind: "bounded",
+          value: DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
+        },
+      },
       retry: { ...DEFAULT_AGENT_RETRY },
       subagents: {
         enabled: subagents.enabled,

@@ -14,15 +14,16 @@ export function createSerialJobQueue<T>(params: {
   const drain = async () => {
     if (running) return;
     running = true;
-    try {
+    const work = async () => {
       while (queue.length > 0) {
         const job = queue.shift()!;
         await params.run(job);
       }
-      params.onIdle?.();
-    } finally {
+    };
+    await work().finally(() => {
       running = false;
-    }
+    });
+    params.onIdle?.();
   };
 
   return {

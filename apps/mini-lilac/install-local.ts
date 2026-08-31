@@ -42,18 +42,31 @@ async function captureInstallOperation<T>(
   operation: string,
   run: () => Promise<T>,
 ): Promise<ResultType<T, LocalInstallOperationFailed>> {
-  try {
-    return Result.ok(await run());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new LocalInstallOperationFailed({
-        operation,
-        cause,
-        message: `Local installation failed while attempting to ${operation}`,
-      }),
-    );
+  type CapturedInstallFailure =
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "failure"; readonly error: LocalInstallOperationFailed };
+  function captureInstallFailure<Cause>(cause: Cause): CapturedInstallFailure {
+    return Panic.is(cause)
+      ? { kind: "panic", panic: cause }
+      : {
+          kind: "failure",
+          error: new LocalInstallOperationFailed({
+            operation,
+            cause,
+            message: `Local installation failed while attempting to ${operation}`,
+          }),
+        };
   }
+  const attempted = await Result.tryPromise({ try: run, catch: captureInstallFailure });
+  const settlement = attempted.match<
+    { readonly kind: "success"; readonly value: T } | CapturedInstallFailure
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: (failure) => failure,
+  });
+  if (settlement.kind === "success") return Result.ok(settlement.value);
+  if (settlement.kind === "panic") throw settlement.panic;
+  return Result.err(settlement.error);
 }
 
 export async function decodeNpmPackOutput(

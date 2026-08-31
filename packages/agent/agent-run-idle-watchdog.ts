@@ -1,3 +1,5 @@
+import { captureAgentPromise } from "./failure-adapters";
+
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export type IdleTimer = {
@@ -80,7 +82,7 @@ export function createAgentRunIdleWatchdog(params: {
     timeoutPromise = new Promise<never>((_, reject) => {
       rejectTimeout = reject;
     });
-    void timeoutPromise.then(undefined, () => undefined);
+    void captureAgentPromise(() => timeoutPromise);
   };
   renewTimeoutPromise();
 

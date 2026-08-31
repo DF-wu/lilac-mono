@@ -1,6 +1,7 @@
 import { asSchema, type CallWarning, type FinishReason, type LanguageModelUsage } from "ai";
 import type { ModelMessage } from "ai";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 
 import { formatInt, formatSeconds, safeStringify } from "./formatting";
 
@@ -12,12 +13,11 @@ function getToolDefsText(tools: ToolsLike | null): string {
   if (entries.length === 0) return "";
 
   const toolDesc = entries.map(([name, tool]) => {
-    let jsonSchema: unknown = {};
-    try {
-      jsonSchema = asSchema(tool?.inputSchema as never).jsonSchema;
-    } catch {
-      jsonSchema = {};
-    }
+    const schema = Result.try({
+      try: () => asSchema(tool?.inputSchema as never).jsonSchema,
+      catch: () => null,
+    });
+    const jsonSchema: unknown = schema.match({ ok: (value) => value, err: () => ({}) });
     return {
       name,
       description: tool?.description ?? "",

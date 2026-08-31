@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { Result } from "better-result";
 import { z } from "zod";
 
 export const CATALOG_TOOL_ID_VERSION = 1 as const;
@@ -37,14 +38,13 @@ export function catalogToolStableId(identity: CatalogToolIdentity): string {
 }
 
 export function parseCatalogToolStableId(stableId: string): CatalogStableIdParseResult {
-  let decoded: unknown;
-  try {
-    decoded = JSON.parse(stableId);
-  } catch {
-    return { ok: false, error: "invalid catalog tool ID JSON" };
-  }
+  const decoded = Result.try({ try: () => JSON.parse(stableId) as unknown, catch: () => null });
 
-  const parsed = stableIdSchema.safeParse(decoded);
+  const parsed = decoded.match<() => ReturnType<typeof stableIdSchema.safeParse> | null>({
+    ok: (value) => () => stableIdSchema.safeParse(value),
+    err: () => () => null,
+  })();
+  if (!parsed) return { ok: false, error: "invalid catalog tool ID JSON" };
   if (!parsed.success) return { ok: false, error: z.prettifyError(parsed.error) };
   return {
     ok: true,
@@ -63,6 +63,13 @@ function normalizeNameSegment(value: string): string {
   return normalized.replace(/^_+|_+$/g, "");
 }
 
+export function catalogToolNamespaceName(
+  identity: Pick<CatalogToolIdentity, "source" | "sourceId">,
+): string {
+  const sourceId = normalizeNameSegment(identity.sourceId) || "source";
+  return `${identity.source}_${sourceId}`;
+}
+
 function identityHash(identity: CatalogToolIdentity): string {
   return createHash("sha256").update(catalogToolStableId(identity)).digest("hex").slice(0, 10);
 }
@@ -76,9 +83,9 @@ function appendHash(base: string, identity: CatalogToolIdentity): string {
 
 /** Deterministic candidate before catalog-wide collision resolution. */
 export function baseCatalogToolName(identity: CatalogToolIdentity): string {
-  const sourceId = normalizeNameSegment(identity.sourceId) || "source";
+  const namespace = catalogToolNamespaceName(identity);
   const rawToolName = normalizeNameSegment(identity.rawToolName) || "tool";
-  const base = `${identity.source}_${sourceId}_${rawToolName}`;
+  const base = `${namespace}_${rawToolName}`;
   return base.length <= MAX_MODEL_TOOL_NAME_LENGTH ? base : appendHash(base, identity);
 }
 

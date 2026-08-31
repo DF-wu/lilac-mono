@@ -1,5 +1,4 @@
-import type { ModelMessage } from "ai";
-import type { EvtAdapterMessageCreatedData } from "@stanley2058/lilac-event-bus";
+import type { EvtAdapterMessageCreatedData, StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 import { z } from "zod";
 
 import {
@@ -137,7 +136,7 @@ export async function composeTelegramMessages(input: {
   readonly botUserId: string;
   readonly botNames: readonly string[];
   readonly modelOverride?: string;
-}): Promise<{ readonly messages: ModelMessage[]; readonly chainMessageIds: string[] }> {
+}): Promise<{ readonly messages: StoredMessageV1[]; readonly chainMessageIds: string[] }> {
   const chain: SurfaceMessage[] = [];
   const seen = new Set<string>();
   const triggerFlags = telegramFlags(input.event);

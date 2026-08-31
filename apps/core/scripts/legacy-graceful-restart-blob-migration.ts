@@ -1,15 +1,15 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
+
 import {
   adapterPlatformSchema,
-  decodeCorePrimaryLineageV1,
   requestOriginSchema,
   requestQueueModeSchema,
   requestRunPolicySchema,
 } from "@stanley2058/lilac-event-bus";
 import {
-  classifyBunSqliteError,
   CorruptPersistedFields,
   isRecord,
   MalformedSerialization,
@@ -17,109 +17,43 @@ import {
   UnsupportedVersion,
   type DecodedPersistedValue,
   type PersistedDataError,
-  type PersistenceProvenance,
 } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import SuperJSON from "superjson";
 import { z } from "zod";
 
-import type {
-  AgentRunnerQueueAttempt,
-  AgentRunnerRecoveryEntry,
-  AgentRunnerRecoveryIdentity,
-} from "../surface/bridge/bus-agent-runner";
-import { parseBufferedForActiveRequestIdFromRaw } from "../surface/bridge/bus-agent-runner/raw";
+import { captureError } from "../src/shared/error-capture";
+import {
+  type AgentRunnerQueueAttempt,
+  type AgentRunnerRecoveryIdentity,
+  decodeGracefulRestartSnapshot as decodeCurrentGracefulRestartSnapshot,
+  GRACEFUL_RESTART_SNAPSHOT_VERSION,
+  type BusToAdapterRelaySnapshot,
+} from "../src/migration/frozen-graceful-restart-store";
+import { parseBufferedForActiveRequestIdFromRaw } from "../src/surface/bridge/bus-agent-runner/raw";
 import {
   isAuthenticatedRequestProjectionSemanticallyValid,
   isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid,
   type AuthenticatedRequestProjection,
-} from "../surface/authenticated-request";
-import type { BusToAdapterRelaySnapshot } from "../surface/bridge/subscribe-from-bus";
+} from "../src/surface/authenticated-request";
+import { preserveToolPanic } from "../src/tools/tool-result-adapters";
 
-export const GRACEFUL_RESTART_SNAPSHOT_VERSION = 4 as const;
+const TABLE = "graceful_restart_state";
+const FORMER_GRACEFUL_RESTART_SNAPSHOT_VERSION = 4 as const;
+const FORMER_GRACEFUL_RESTART_RECORD_ID = "singleton";
 
-const GRACEFUL_RESTART_TABLE = "graceful_restart_state";
-const GRACEFUL_RESTART_RECORD_ID = "singleton";
-
-export type OpaqueSuperJsonValue = null | undefined | boolean | number | string | bigint | object;
-
-export type GracefulRestartRawValue = OpaqueSuperJsonValue;
-
-export type PersistedGracefulRestartRow = {
+type FormerOpaqueSuperJsonValue = null | undefined | boolean | number | string | bigint | object;
+type FormerGracefulRestartRawValue = FormerOpaqueSuperJsonValue;
+type FormerPersistedGracefulRestartRow = {
   readonly status: string;
-  readonly updated_ts?: number;
   readonly payload_json: string;
 };
-
-export type GracefulRestartRowToken = {
-  readonly updatedAt: number;
-  readonly payloadSha256: string;
-};
-
-export type GracefulRestartLoadOutcome =
-  | {
-      readonly state: "loaded";
-      readonly snapshot: GracefulRestartSnapshot;
-      readonly rowToken: GracefulRestartRowToken;
-      readonly provenance: "current" | "migrated";
-    }
-  | {
-      readonly state: "empty";
-      readonly rowToken: GracefulRestartRowToken;
-      readonly provenance: "current" | "migrated";
-    }
-  | {
-      readonly state: "absent";
-      readonly provenance: "missing-defaulted";
-    }
-  | {
-      readonly state: "stale";
-      readonly rowToken: GracefulRestartRowToken;
-      readonly createdAt: number;
-      readonly deadlineMs: number;
-      readonly ageMs: number;
-      readonly provenance: "current" | "migrated";
-    };
-
-export class GracefulRestartSqliteFailure extends TaggedError("GracefulRestartSqliteFailure")<{
-  readonly operation: "clear" | "consume" | "read" | "save";
-  readonly code: string;
-  readonly message: string;
-}> {}
-
-export class GracefulRestartSerializationFailure extends TaggedError(
-  "GracefulRestartSerializationFailure",
-)<{
-  readonly message: string;
-}> {}
-
-export class GracefulRestartDispositionConflict extends TaggedError(
-  "GracefulRestartDispositionConflict",
-)<{
-  readonly message: string;
-}> {}
-
-export class OpaqueSuperJsonValueUnsupported extends TaggedError(
-  "OpaqueSuperJsonValueUnsupported",
-)<{
-  readonly message: string;
-}> {}
-
-export type GracefulRestartSaveError =
-  | CorruptPersistedFields
-  | GracefulRestartSerializationFailure
-  | GracefulRestartSqliteFailure;
-
-export type GracefulRestartLoadError = PersistedDataError | GracefulRestartSqliteFailure;
-export type GracefulRestartConsumeError =
-  | GracefulRestartDispositionConflict
-  | GracefulRestartSqliteFailure;
 
 const finiteNonNegativeSchema = z.number().finite().nonnegative();
 const finitePositiveSchema = z.number().finite().positive();
 const nonemptyStringSchema = z.string().min(1);
 
-function isOpaqueSuperJsonValue(value: unknown): value is OpaqueSuperJsonValue {
+function isFormerOpaqueSuperJsonValue(value: unknown): value is FormerOpaqueSuperJsonValue {
   if (value === null) return true;
   switch (typeof value) {
     case "undefined":
@@ -136,38 +70,9 @@ function isOpaqueSuperJsonValue(value: unknown): value is OpaqueSuperJsonValue {
   return false;
 }
 
-export function decodeOpaqueSuperJsonValue(
-  value: unknown,
-): ResultType<OpaqueSuperJsonValue, OpaqueSuperJsonValueUnsupported> {
-  if (!isOpaqueSuperJsonValue(value)) {
-    return Result.err(
-      new OpaqueSuperJsonValueUnsupported({
-        message: "Opaque graceful restart value is not supported by SuperJSON",
-      }),
-    );
-  }
-  try {
-    const serialized = SuperJSON.stringify(value);
-    const roundTripped: unknown = SuperJSON.parse(serialized);
-    if (!isOpaqueSuperJsonValue(roundTripped) || !isDeepStrictEqual(roundTripped, value)) {
-      return Result.err(
-        new OpaqueSuperJsonValueUnsupported({
-          message: "Opaque graceful restart value cannot be preserved exactly by SuperJSON",
-        }),
-      );
-    }
-    return Result.ok(value);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new OpaqueSuperJsonValueUnsupported({
-        message: "Opaque graceful restart value cannot be serialized safely by SuperJSON",
-      }),
-    );
-  }
-}
-
-const opaqueSuperJsonValueSchema = z.custom<OpaqueSuperJsonValue>(isOpaqueSuperJsonValue);
+const opaqueSuperJsonValueSchema = z.custom<FormerOpaqueSuperJsonValue>(
+  isFormerOpaqueSuperJsonValue,
+);
 
 type GracefulRestartJsonValue =
   | null
@@ -594,7 +499,127 @@ type GracefulRestartCorePrimaryLineage =
       }>;
     };
 
-export type GracefulRestartAgentRecoveryEntry = {
+const FORMER_CORE_PRIMARY_LINEAGE_DOMAIN = "lilac:core-primary-lineage:v1";
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
+
+type FormerCanonicalJson =
+  | null
+  | boolean
+  | number
+  | string
+  | FormerCanonicalJson[]
+  | { [key: string]: FormerCanonicalJson };
+
+function canonicalizeFormerLineageJson(value: FormerCanonicalJson): FormerCanonicalJson {
+  if (value === null || typeof value !== "object") {
+    return typeof value === "number" && Object.is(value, -0) ? 0 : value;
+  }
+  if (Array.isArray(value)) return value.map(canonicalizeFormerLineageJson);
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, canonicalizeFormerLineageJson(value[key]!)]),
+  );
+}
+
+function extendFormerLineageDigest(
+  previousDigest: string,
+  atomIndex: number,
+  atom: z.output<typeof lineageAtomSchema>,
+): string {
+  const index = Buffer.alloc(8);
+  index.writeBigUInt64BE(BigInt(atomIndex));
+  return createHash("sha256")
+    .update(FORMER_CORE_PRIMARY_LINEAGE_DOMAIN, "utf8")
+    .update(index)
+    .update(Buffer.from(previousDigest, "hex"))
+    .update(JSON.stringify(canonicalizeFormerLineageJson(atom as FormerCanonicalJson)), "utf8")
+    .digest("hex");
+}
+
+function formerLineageAtomSourceKey(atom: z.output<typeof lineageAtomSchema>): string {
+  if (atom.kind === "surface") {
+    return `surface\u0000${atom.requestClient}\u0000${atom.surfaceId}\u0000${atom.sessionId}\u0000${atom.messageId}`;
+  }
+  if (atom.kind === "request" || atom.kind === "checkpoint") {
+    return `request\u0000${atom.requestId}`;
+  }
+  return `synthetic\u0000${atom.source}\u0000${atom.messageDigest}`;
+}
+
+function validateFormerCorePrimaryLineageV1(
+  lineage: GracefulRestartCorePrimaryLineage,
+  canonicalMessages: readonly GracefulRestartModelMessage[],
+): boolean {
+  if (lineage.currentCanonicalStart > canonicalMessages.length) return false;
+  if (lineage.state === "fresh-only") return true;
+  if (lineage.segments.length === 0) return false;
+
+  let canonicalEnd = 0;
+  let atomCount = 0;
+  let digest = createHash("sha256").update(FORMER_CORE_PRIMARY_LINEAGE_DOMAIN).digest("hex");
+  const claimedSources = new Set<string>();
+  let currentStartIsSegmentBoundary = false;
+
+  const claimSource = (key: string): boolean => {
+    if (claimedSources.has(key)) return false;
+    claimedSources.add(key);
+    return true;
+  };
+
+  for (const segment of lineage.segments) {
+    if (segment.atoms.length === 0 || segment.canonicalMessages.length === 0) return false;
+    if (segment.canonicalStart === lineage.currentCanonicalStart) {
+      currentStartIsSegmentBoundary = true;
+    }
+    if (segment.canonicalStart !== canonicalEnd) return false;
+    canonicalEnd += segment.canonicalMessages.length;
+    if (segment.canonicalEnd !== canonicalEnd) return false;
+
+    const kinds = new Set(segment.atoms.map((atom) => atom.kind));
+    const isSurface = kinds.size === 1 && kinds.has("surface");
+    const isRequest = segment.atoms.length === 1 && segment.atoms[0]?.kind === "request";
+    const isCheckpoint = segment.atoms.length === 1 && segment.atoms[0]?.kind === "checkpoint";
+    const isSynthetic = segment.atoms.length === 1 && segment.atoms[0]?.kind === "synthetic";
+    if (!isSurface && !isRequest && !isCheckpoint && !isSynthetic) return false;
+    if (isRequest !== (segment.requestSource !== undefined)) return false;
+    if (segment.requestSource && segment.requestSource.aliases.length === 0) return false;
+
+    for (const atom of segment.atoms) {
+      if (
+        ((atom.kind === "request" || atom.kind === "checkpoint") &&
+          !SHA256_HEX_PATTERN.test(atom.transcriptDigest)) ||
+        (atom.kind === "synthetic" && !SHA256_HEX_PATTERN.test(atom.messageDigest))
+      ) {
+        return false;
+      }
+      if (!claimSource(formerLineageAtomSourceKey(atom))) return false;
+      atomCount += 1;
+      digest = extendFormerLineageDigest(digest, atomCount, atom);
+    }
+    for (const alias of segment.requestSource?.aliases ?? []) {
+      if (
+        !claimSource(
+          `surface\u0000${alias.requestClient}\u0000${alias.surfaceId}\u0000${alias.sessionId}\u0000${alias.messageId}`,
+        )
+      ) {
+        return false;
+      }
+    }
+    if (segment.cumulativeAtomCount !== atomCount || segment.cumulativePrefixDigest !== digest) {
+      return false;
+    }
+  }
+  return (
+    currentStartIsSegmentBoundary &&
+    isDeepStrictEqual(
+      lineage.segments.flatMap((segment) => segment.canonicalMessages),
+      canonicalMessages,
+    )
+  );
+}
+
+type GracefulRestartAgentRecoveryEntry = {
   readonly queueEntryId: string;
   readonly kind: "active" | "queued";
   readonly requestId: string;
@@ -607,7 +632,7 @@ export type GracefulRestartAgentRecoveryEntry = {
   readonly corePrimaryLineage?: GracefulRestartCorePrimaryLineage;
   readonly modelOverride?: string;
   readonly currentTurnUserId?: string;
-  readonly raw?: GracefulRestartRawValue;
+  readonly raw?: FormerGracefulRestartRawValue;
   readonly recovery?: {
     readonly checkpointMessages: GracefulRestartModelMessage[];
     readonly partialText: string;
@@ -615,18 +640,14 @@ export type GracefulRestartAgentRecoveryEntry = {
   readonly identity: AgentRunnerRecoveryIdentity;
 };
 
-export type GracefulRestartSnapshot = {
-  version: typeof GRACEFUL_RESTART_SNAPSHOT_VERSION;
+type GracefulRestartSnapshot = {
+  version: typeof FORMER_GRACEFUL_RESTART_SNAPSHOT_VERSION;
   createdAt: number;
   deadlineMs: number;
   queueAttemptProof: "complete" | "legacy-ambiguous";
   agent: GracefulRestartAgentRecoveryEntry[];
   queueAttempts: AgentRunnerQueueAttempt[];
   relays: BusToAdapterRelaySnapshot[];
-};
-
-export type GracefulRestartSnapshotInput = Omit<GracefulRestartSnapshot, "agent"> & {
-  readonly agent: AgentRunnerRecoveryEntry[];
 };
 
 const relayMsgRefSchema = z.strictObject({
@@ -690,7 +711,7 @@ const legacySnapshotPayloadShape = {
 };
 
 const currentSnapshotSchema = z.strictObject({
-  version: z.literal(GRACEFUL_RESTART_SNAPSHOT_VERSION),
+  version: z.literal(FORMER_GRACEFUL_RESTART_SNAPSHOT_VERSION),
   createdAt: finiteNonNegativeSchema,
   deadlineMs: finitePositiveSchema,
   queueAttemptProof: z.literal("complete"),
@@ -725,11 +746,11 @@ function persistenceContext(input: {
   readonly issueCode: "invalid-row-field" | "malformed-json" | "unsupported-version";
 }) {
   return {
-    table: GRACEFUL_RESTART_TABLE,
+    table: TABLE,
     field: input.field,
     version: input.version,
     issueCode: input.issueCode,
-    recordId: GRACEFUL_RESTART_RECORD_ID,
+    recordId: FORMER_GRACEFUL_RESTART_RECORD_ID,
     message: `Persisted graceful restart snapshot ${input.issueCode}`,
   };
 }
@@ -741,16 +762,25 @@ function corruptSnapshot(version: number, field: "payload_json" | "status") {
 }
 
 function parsePersistedPayload(payloadJson: string): ResultType<unknown, MalformedSerialization> {
-  try {
-    const parsed: unknown = SuperJSON.parse(payloadJson);
-    return Result.ok(parsed);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new MalformedSerialization(
-        persistenceContext({ field: "payload_json", version: -1, issueCode: "malformed-json" }),
-      ),
-    );
+  {
+    const captured = Result.try({
+      try: () => {
+        const parsed: unknown = SuperJSON.parse(payloadJson);
+        return Result.ok(parsed);
+      },
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const cause = captured.error.cause;
+      preserveToolPanic(cause);
+      return Result.err(
+        new MalformedSerialization(
+          persistenceContext({ field: "payload_json", version: -1, issueCode: "malformed-json" }),
+        ),
+      );
+    }
+    return captured.value;
   }
 }
 
@@ -873,8 +903,8 @@ function validateSnapshotCorrelation(
     }
     if (!validateRecoveryIdentity(entry, entry.identity, requireDurableProof)) return false;
     if (entry.corePrimaryLineage) {
-      const lineage = decodeCorePrimaryLineageV1(entry.corePrimaryLineage, entry.messages);
-      if (!lineage.match({ ok: () => true, err: () => false })) return false;
+      if (!validateFormerCorePrimaryLineageV1(entry.corePrimaryLineage, entry.messages))
+        return false;
     }
   }
 
@@ -942,7 +972,7 @@ function normalizeLegacySnapshot(
     relays.push({ ...relay, requestClient: relay.platform });
   }
   const snapshot: GracefulRestartSnapshot = {
-    version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
+    version: FORMER_GRACEFUL_RESTART_SNAPSHOT_VERSION,
     createdAt: decoded.createdAt,
     deadlineMs: decoded.deadlineMs,
     queueAttemptProof: decoded.agent.some((entry) => entry.kind === "queued")
@@ -968,7 +998,7 @@ function normalizeSnapshotV3(
 ): ResultType<GracefulRestartSnapshot, CorruptPersistedFields> {
   const snapshot: GracefulRestartSnapshot = {
     ...decoded,
-    version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
+    version: FORMER_GRACEFUL_RESTART_SNAPSHOT_VERSION,
     agent: decoded.agent.map((entry) => ({ ...entry, currentTurnUserId: undefined })),
   };
   if (!validateSnapshotCorrelation(snapshot, true)) {
@@ -977,8 +1007,8 @@ function normalizeSnapshotV3(
   return Result.ok(snapshot);
 }
 
-export function decodeGracefulRestartSnapshot(
-  row: PersistedGracefulRestartRow | null,
+function decodeFormerGracefulRestartSnapshot(
+  row: FormerPersistedGracefulRestartRow | null,
 ): ResultType<DecodedPersistedValue<GracefulRestartSnapshot | null>, PersistedDataError> {
   if (row === null) {
     return Result.ok<DecodedPersistedValue<GracefulRestartSnapshot | null>>({
@@ -1004,7 +1034,7 @@ export function decodeGracefulRestartSnapshot(
         version !== 1 &&
         version !== 2 &&
         version !== 3 &&
-        version !== GRACEFUL_RESTART_SNAPSHOT_VERSION
+        version !== FORMER_GRACEFUL_RESTART_SNAPSHOT_VERSION
       ) {
         return Result.err(
           new UnsupportedVersion(
@@ -1066,297 +1096,385 @@ export function decodeGracefulRestartSnapshot(
   return continueParsed();
 }
 
-function encodeGracefulRestartSnapshot(
-  snapshot: GracefulRestartSnapshotInput,
-): ResultType<string, CorruptPersistedFields | GracefulRestartSerializationFailure> {
-  try {
-    for (const entry of snapshot.agent) {
-      if (entry.raw === undefined) continue;
-      const opaque = decodeOpaqueSuperJsonValue(entry.raw);
-      if (!opaque.match({ ok: () => true, err: () => false })) {
-        return Result.err(corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json"));
-      }
-    }
-    const payloadJson = SuperJSON.stringify(snapshot);
-    const validated = decodeGracefulRestartSnapshot({
-      status: "completed",
-      payload_json: payloadJson,
-    });
-    return validated.match({
-      err: (error) => () => {
-        if (error instanceof CorruptPersistedFields) return Result.err(error);
-        throw new Panic({
-          message: "Graceful restart current snapshot encoding produced an invalid envelope",
-          cause: error,
-        });
-      },
-      ok: (value) => () =>
-        isDeepStrictEqual(value.value, snapshot)
-          ? Result.ok(payloadJson)
-          : Result.err(corruptSnapshot(GRACEFUL_RESTART_SNAPSHOT_VERSION, "payload_json")),
-    })();
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    if (!(cause instanceof Error)) throw cause;
-    return Result.err(
-      new GracefulRestartSerializationFailure({
-        message: "Graceful restart snapshot serialization failed",
-      }),
-    );
-  }
+const expectedColumns = [
+  { name: "singleton_id", type: "INTEGER", notnull: 0, pk: 1 },
+  { name: "status", type: "TEXT", notnull: 1, pk: 0 },
+  { name: "updated_ts", type: "INTEGER", notnull: 1, pk: 0 },
+  { name: "payload_json", type: "TEXT", notnull: 1, pk: 0 },
+] as const;
+
+const columnSchema = z.strictObject({
+  cid: z.number().int().nonnegative(),
+  name: z.string(),
+  type: z.string(),
+  notnull: z.number().int(),
+  dflt_value: z.null(),
+  pk: z.number().int(),
+});
+
+const rowSchema = z.strictObject({
+  singleton_id: z.literal(1),
+  status: z.string(),
+  updated_ts: z.number().int(),
+  payload_json: z.string(),
+});
+
+export type LegacyGracefulRestartClassification = "absent" | "current" | "legacy-discard";
+
+export type LegacyGracefulRestartMigrationReport = {
+  readonly classification: LegacyGracefulRestartClassification;
+  readonly rowCount: 0 | 1;
+  readonly snapshotCount: 0 | 1;
+  readonly sourceVersion: number | null;
+  readonly discardedSnapshotCount: 0 | 1;
+};
+
+export type LegacyGracefulRestartMigrationPlan = {
+  readonly classification: LegacyGracefulRestartClassification;
+  readonly sourceRowSha256: string | null;
+  readonly sourceVersion: number | null;
+};
+
+export type LegacyGracefulRestartPreflight = {
+  readonly report: LegacyGracefulRestartMigrationReport;
+  readonly plan: LegacyGracefulRestartMigrationPlan;
+};
+
+export class LegacyGracefulRestartMigrationFailed extends TaggedError(
+  "LegacyGracefulRestartMigrationFailed",
+)<{
+  readonly stage: "preflight" | "rewrite";
+  readonly code:
+    | "database-unreadable"
+    | "invalid-snapshot"
+    | "invalid-table-layout"
+    | "row-changed";
+  readonly message: string;
+}> {}
+
+function failure(
+  stage: LegacyGracefulRestartMigrationFailed["stage"],
+  code: LegacyGracefulRestartMigrationFailed["code"],
+  message: string,
+): LegacyGracefulRestartMigrationFailed {
+  return new LegacyGracefulRestartMigrationFailed({ stage, code, message });
 }
 
-function classifySqliteFailure(
-  operation: GracefulRestartSqliteFailure["operation"],
-  cause: Error,
-): GracefulRestartSqliteFailure | undefined {
-  const sqliteError = classifyBunSqliteError(cause);
-  if (sqliteError === undefined) return undefined;
-  return new GracefulRestartSqliteFailure({
-    operation,
-    code: sqliteError.code,
-    message: `Graceful restart SQLite ${operation} failed`,
-  });
+function decodeGracefulRestartMigrationRow(
+  input: unknown,
+): ResultType<z.output<typeof rowSchema>, LegacyGracefulRestartMigrationFailed> {
+  const decoded = rowSchema.safeParse(input);
+  return decoded.success
+    ? Result.ok(decoded.data)
+    : Result.err(rewriteFailure("row-changed", "Graceful restart row changed after preflight"));
 }
 
-function loadOutcome(
-  decoded: DecodedPersistedValue<GracefulRestartSnapshot | null>,
-  nowMs: number,
-  rowToken?: GracefulRestartRowToken,
-): GracefulRestartLoadOutcome {
-  if (decoded.value === null) {
-    return { state: "absent", provenance: "missing-defaulted" };
-  }
-
-  const { value: snapshot } = decoded;
-  if (!rowToken) {
-    signalMissingGracefulRestartDispositionToken();
-  }
-  const provenance: Exclude<PersistenceProvenance, "missing-defaulted"> =
-    decoded.provenance === "migrated" ? "migrated" : "current";
-  const ageMs = Math.max(0, nowMs - snapshot.createdAt);
-  if (nowMs - snapshot.createdAt > snapshot.deadlineMs) {
-    return {
-      state: "stale",
-      rowToken,
-      createdAt: snapshot.createdAt,
-      deadlineMs: snapshot.deadlineMs,
-      ageMs,
-      provenance,
-    };
-  }
-  if (snapshot.agent.length === 0 && snapshot.relays.length === 0) {
-    return { state: "empty", rowToken, provenance };
-  }
-  return { state: "loaded", snapshot, rowToken, provenance };
-}
-
-function signalMissingGracefulRestartDispositionToken(): never {
-  throw new Panic({ message: "Decoded graceful restart row is missing its disposition token" });
-}
-
-function rowToken(row: PersistedGracefulRestartRow): GracefulRestartRowToken | null {
-  if (row.updated_ts === undefined || !Number.isSafeInteger(row.updated_ts)) return null;
+function emptyReport(
+  classification: LegacyGracefulRestartClassification,
+): LegacyGracefulRestartMigrationReport {
   return {
-    updatedAt: row.updated_ts,
-    payloadSha256: createHash("sha256")
-      .update(row.status)
-      .update("\u0000")
-      .update(row.payload_json)
-      .digest("hex"),
+    classification,
+    rowCount: 0,
+    snapshotCount: 0,
+    sourceVersion: null,
+    discardedSnapshotCount: 0,
   };
 }
 
-export class SqliteGracefulRestartStore {
-  private readonly db: Database;
+function rowSha256(row: z.output<typeof rowSchema>): string {
+  return createHash("sha256")
+    .update(String(row.singleton_id))
+    .update("\u0000")
+    .update(row.status)
+    .update("\u0000")
+    .update(String(row.updated_ts))
+    .update("\u0000")
+    .update(row.payload_json)
+    .digest("hex");
+}
 
-  constructor(dbPath: string) {
-    this.db = new Database(dbPath);
-    this.migrate();
+function parseVersion(payloadJson: string): number | null {
+  const parsed = Result.try({
+    try: () => SuperJSON.parse<unknown>(payloadJson),
+    catch: captureError,
+  });
+  if (parsed.isErr()) {
+    if (Panic.is(parsed.error.cause)) preserveToolPanic(parsed.error.cause);
+    return null;
+  }
+  const value = parsed.value;
+  if (value === null || typeof value !== "object" || !("version" in value)) return null;
+  const version = Reflect.get(value, "version");
+  return typeof version === "number" && Number.isInteger(version) ? version : null;
+}
+
+function classifyPersistedSnapshot(
+  row: z.output<typeof rowSchema>,
+  sourceVersion: number | null,
+): ResultType<LegacyGracefulRestartClassification, LegacyGracefulRestartMigrationFailed> {
+  if (
+    sourceVersion === 1 ||
+    sourceVersion === 2 ||
+    sourceVersion === 3 ||
+    sourceVersion === FORMER_GRACEFUL_RESTART_SNAPSHOT_VERSION
+  ) {
+    return decodeFormerGracefulRestartSnapshot({
+      status: row.status,
+      payload_json: row.payload_json,
+    })
+      .map((): LegacyGracefulRestartClassification => "legacy-discard")
+      .mapError(() =>
+        failure(
+          "preflight",
+          "invalid-snapshot",
+          `Graceful restart snapshot v${sourceVersion} does not match its exact persisted contract`,
+        ),
+      );
+  }
+  if (sourceVersion === GRACEFUL_RESTART_SNAPSHOT_VERSION) {
+    return decodeCurrentGracefulRestartSnapshot({
+      status: row.status,
+      payload_json: row.payload_json,
+    })
+      .map((): LegacyGracefulRestartClassification => "current")
+      .mapError(() =>
+        failure(
+          "preflight",
+          "invalid-snapshot",
+          `Graceful restart snapshot v${sourceVersion} does not match its exact persisted contract`,
+        ),
+      );
+  }
+  return Result.err(
+    failure(
+      "preflight",
+      "invalid-snapshot",
+      sourceVersion === null
+        ? "Graceful restart snapshot payload is malformed or has no integer version"
+        : `Graceful restart snapshot version ${sourceVersion} is unsupported`,
+    ),
+  );
+}
+
+function preflightUnsafe(
+  dbPath: string,
+): ResultType<LegacyGracefulRestartPreflight, LegacyGracefulRestartMigrationFailed> {
+  if (!existsSync(dbPath)) {
+    return Result.ok({
+      report: emptyReport("absent"),
+      plan: { classification: "absent", sourceRowSha256: null, sourceVersion: null },
+    });
   }
 
-  close(): void {
-    this.db.close();
-  }
-
-  clear(): ResultType<void, GracefulRestartSqliteFailure> {
-    return runBunSqliteTransaction(
-      this.db,
-      () => {
-        this.db.run("DELETE FROM graceful_restart_state");
-        return Result.ok(undefined);
-      },
-      (cause) => classifySqliteFailure("clear", cause),
+  using database = new Database(dbPath, { readonly: true, strict: true });
+  const schemaObjects = database
+    .query<{ type: string; name: string; tbl_name: string; sql: string | null }, []>(
+      `SELECT type, name, tbl_name, sql
+       FROM sqlite_schema
+       WHERE name NOT LIKE 'sqlite_%'
+         AND type IN ('index', 'table', 'trigger', 'view')
+       ORDER BY type, name`,
+    )
+    .all();
+  const table = schemaObjects[0];
+  if (
+    schemaObjects.length !== 1 ||
+    table?.type !== "table" ||
+    table.name !== TABLE ||
+    table.tbl_name !== TABLE ||
+    table.sql === null ||
+    createHash("sha256").update(table.sql.replace(/\s+/g, " ").trim()).digest("hex") !==
+      "459439a28b0233cb0aa4263885ad13aae0ed893c010ef0f67c2629d96dde9345"
+  ) {
+    return Result.err(
+      failure(
+        "preflight",
+        "invalid-table-layout",
+        "Expected the exact graceful_restart_state SQLite object catalog and DDL",
+      ),
     );
   }
-
-  saveCompletedSnapshot(
-    snapshot: GracefulRestartSnapshotInput,
-  ): ResultType<void, GracefulRestartSaveError> {
-    return encodeGracefulRestartSnapshot(snapshot).andThen((encoded) =>
-      runBunSqliteTransaction(
-        this.db,
-        () => {
-          this.db.run(
-            `
-          INSERT INTO graceful_restart_state (
-            singleton_id,
-            status,
-            updated_ts,
-            payload_json
-          ) VALUES (?, ?, ?, ?)
-          ON CONFLICT(singleton_id) DO UPDATE SET
-            status=excluded.status,
-            updated_ts=excluded.updated_ts,
-            payload_json=excluded.payload_json
-          `,
-            [1, "completed", Date.now(), encoded],
-          );
-          return Result.ok(undefined);
-        },
-        (cause) => classifySqliteFailure("save", cause),
+  const columns = z
+    .array(columnSchema)
+    .safeParse(database.query<unknown, []>(`PRAGMA table_info(${TABLE})`).all());
+  if (
+    !columns.success ||
+    columns.data.length !== expectedColumns.length ||
+    columns.data.some((column, index) => {
+      const expected = expectedColumns[index];
+      return (
+        !expected ||
+        column.cid !== index ||
+        column.name !== expected.name ||
+        column.type.toUpperCase() !== expected.type ||
+        column.notnull !== expected.notnull ||
+        column.pk !== expected.pk ||
+        column.dflt_value !== null
+      );
+    })
+  ) {
+    return Result.err(
+      failure(
+        "preflight",
+        "invalid-table-layout",
+        "Expected the exact graceful_restart_state table layout",
       ),
     );
   }
 
-  readCompletedSnapshot(
-    nowMs: number = Date.now(),
-  ): ResultType<GracefulRestartLoadOutcome, GracefulRestartLoadError> {
-    const read = runBunSqliteTransaction(
-      this.db,
-      () => {
-        const row = this.db
-          .query<PersistedGracefulRestartRow, [number]>(
-            "SELECT status, updated_ts, payload_json FROM graceful_restart_state WHERE singleton_id = ?",
-          )
-          .get(1);
-        return Result.ok(row);
-      },
-      (cause) => classifySqliteFailure("read", cause),
-    );
-    const continueRead = read.match<
-      () => ResultType<GracefulRestartLoadOutcome, GracefulRestartLoadError>
-    >({
-      err: (error) => () => Result.err(error),
-      ok: (row) => () => {
-        const token = row ? rowToken(row) : undefined;
-        if (row && !token) return Result.err(corruptSnapshot(-1, "payload_json"));
-        const decoded = decodeGracefulRestartSnapshot(row);
-        const continueDecoded = decoded.match<
-          () => ResultType<GracefulRestartLoadOutcome, GracefulRestartLoadError>
-        >({
-          err: (error) => () => Result.err(error),
-          ok: (value) => () => Result.ok(loadOutcome(value, nowMs, token ?? undefined)),
-        });
-        return continueDecoded();
-      },
+  const rows = database.query<unknown, []>(`SELECT * FROM ${TABLE} ORDER BY singleton_id`).all();
+  if (rows.length === 0) {
+    return Result.ok({
+      report: emptyReport("current"),
+      plan: { classification: "current", sourceRowSha256: null, sourceVersion: null },
     });
-    return continueRead();
   }
-
-  consumeCompletedSnapshot(
-    token: GracefulRestartRowToken,
-  ): ResultType<void, GracefulRestartConsumeError> {
-    return runBunSqliteTransaction(
-      this.db,
-      () => {
-        const current = this.db
-          .query<PersistedGracefulRestartRow, [number]>(
-            "SELECT status, updated_ts, payload_json FROM graceful_restart_state WHERE singleton_id = ?",
-          )
-          .get(1);
-        const currentToken = current ? rowToken(current) : null;
-        if (
-          !currentToken ||
-          currentToken.updatedAt !== token.updatedAt ||
-          currentToken.payloadSha256 !== token.payloadSha256
-        ) {
-          return Result.err(
-            new GracefulRestartDispositionConflict({
-              message: "Graceful restart row changed before disposition",
-            }),
-          );
-        }
-        const deleted = this.db.run(
-          "DELETE FROM graceful_restart_state WHERE singleton_id = ? AND updated_ts = ?",
-          [1, token.updatedAt],
-        );
-        if (deleted.changes !== 1) {
-          return Result.err(
-            new GracefulRestartDispositionConflict({
-              message: "Graceful restart row changed during disposition",
-            }),
-          );
-        }
-        return Result.ok(undefined);
-      },
-      (cause) => classifySqliteFailure("consume", cause),
+  if (rows.length !== 1) {
+    return Result.err(
+      failure(
+        "preflight",
+        "invalid-table-layout",
+        "Expected at most one graceful restart singleton row",
+      ),
     );
   }
-
-  private migrate(): void {
-    this.db.run(`
-      CREATE TABLE IF NOT EXISTS graceful_restart_state (
-        singleton_id INTEGER PRIMARY KEY,
-        status TEXT NOT NULL,
-        updated_ts INTEGER NOT NULL,
-        payload_json TEXT NOT NULL
-      )
-    `);
+  const decodedRow = rowSchema.safeParse(rows[0]);
+  if (!decodedRow.success) {
+    return Result.err(
+      failure(
+        "preflight",
+        "invalid-table-layout",
+        "Expected the exact graceful restart singleton row fields",
+      ),
+    );
   }
+  const row = decodedRow.data;
+  if (row.status !== "completed") {
+    return Result.err(
+      failure(
+        "preflight",
+        "invalid-snapshot",
+        "Graceful restart snapshot status must be completed",
+      ),
+    );
+  }
+  const sourceVersion = parseVersion(row.payload_json);
+  return classifyPersistedSnapshot(row, sourceVersion).map((classification) => ({
+    report: {
+      classification,
+      rowCount: 1,
+      snapshotCount: 1,
+      sourceVersion,
+      discardedSnapshotCount: 0,
+    },
+    plan: {
+      classification,
+      sourceRowSha256: rowSha256(row),
+      sourceVersion,
+    },
+  }));
 }
 
-const fixtureSnapshot = {
-  version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
-  createdAt: 1,
-  deadlineMs: 1_000,
-  queueAttemptProof: "complete",
-  agent: [],
-  queueAttempts: [],
-  relays: [],
-} as const satisfies GracefulRestartSnapshot;
+export function preflightLegacyGracefulRestartMigration(
+  dbPath: string,
+): ResultType<LegacyGracefulRestartPreflight, LegacyGracefulRestartMigrationFailed> {
+  const captured = Result.try({
+    try: () => preflightUnsafe(dbPath),
+    catch: captureError,
+  });
+  if (captured.isErr()) {
+    if (Panic.is(captured.error.cause)) preserveToolPanic(captured.error.cause);
+    return Result.err(
+      failure(
+        "preflight",
+        "database-unreadable",
+        "Could not inspect the graceful restart database",
+      ),
+    );
+  }
+  return captured.value;
+}
 
-export const gracefulRestartSnapshotCodecCases = {
-  current: {
-    input: { status: "completed", payload_json: SuperJSON.stringify(fixtureSnapshot) },
-    outcome: "ok",
-    provenance: "current",
-  },
-  legacy: {
-    input: {
-      status: "completed",
-      payload_json: SuperJSON.stringify({
-        version: 2,
-        createdAt: fixtureSnapshot.createdAt,
-        deadlineMs: fixtureSnapshot.deadlineMs,
-        agent: [],
-        relays: [],
+function rewriteFailure(
+  code: "database-unreadable" | "row-changed",
+  message: string,
+): LegacyGracefulRestartMigrationFailed {
+  return failure("rewrite", code, message);
+}
+
+export function commitLegacyGracefulRestartMigration(input: {
+  readonly dbPath: string;
+  readonly plan: LegacyGracefulRestartMigrationPlan;
+}): ResultType<LegacyGracefulRestartMigrationReport, LegacyGracefulRestartMigrationFailed> {
+  if (input.plan.classification !== "legacy-discard") {
+    return Result.ok(
+      input.plan.sourceRowSha256
+        ? {
+            classification: "current",
+            rowCount: 1,
+            snapshotCount: 1,
+            sourceVersion: GRACEFUL_RESTART_SNAPSHOT_VERSION,
+            discardedSnapshotCount: 0,
+          }
+        : emptyReport(input.plan.classification),
+    );
+  }
+  const expectedSha256 = input.plan.sourceRowSha256;
+  if (!expectedSha256) {
+    return Result.err(
+      rewriteFailure("row-changed", "Graceful restart migration plan is incomplete"),
+    );
+  }
+
+  const opened = Result.try({
+    try: () => new Database(input.dbPath, { strict: true }),
+    catch: captureError,
+  });
+  if (opened.isErr()) {
+    if (Panic.is(opened.error.cause)) preserveToolPanic(opened.error.cause);
+    return Result.err(
+      rewriteFailure("database-unreadable", "Could not open the graceful restart database"),
+    );
+  }
+  const database = opened.value;
+  const discarded = runBunSqliteTransaction(
+    database,
+    () =>
+      decodeGracefulRestartMigrationRow(
+        database.query<unknown, []>(`SELECT * FROM ${TABLE} ORDER BY singleton_id`).get(),
+      ).andThen((current) => {
+        if (rowSha256(current) !== expectedSha256) {
+          return Result.err(
+            rewriteFailure("row-changed", "Graceful restart row changed after preflight"),
+          );
+        }
+        const deleted = database.run(`DELETE FROM ${TABLE} WHERE singleton_id = ?`, [
+          current.singleton_id,
+        ]);
+        return deleted.changes === 1
+          ? Result.ok(undefined)
+          : Result.err(
+              rewriteFailure("row-changed", "Graceful restart row changed during discard"),
+            );
       }),
-    },
-    outcome: "ok",
-    provenance: "migrated",
-  },
-  "missing-defaulted": {
-    input: null,
-    outcome: "ok",
-    provenance: "missing-defaulted",
-  },
-  "unsupported-version": {
-    input: {
-      status: "completed",
-      payload_json: SuperJSON.stringify({ ...fixtureSnapshot, version: 5 }),
-    },
-    outcome: "error",
-  },
-  "malformed-serialization": {
-    input: { status: "completed", payload_json: "{" },
-    outcome: "error",
-  },
-  "corrupt-fields": {
-    input: {
-      status: "completed",
-      payload_json: SuperJSON.stringify({ ...fixtureSnapshot, agent: [{}] }),
-    },
-    outcome: "error",
-  },
-} as const;
+    () =>
+      rewriteFailure(
+        "database-unreadable",
+        "Could not transactionally discard the legacy graceful restart snapshot",
+      ),
+  );
+  const closed = Result.try({ try: () => database.close(), catch: captureError });
+  if (closed.isErr()) {
+    if (Panic.is(closed.error.cause)) preserveToolPanic(closed.error.cause);
+    return Result.err(
+      rewriteFailure("database-unreadable", "Could not close the graceful restart database"),
+    );
+  }
+  return discarded.map(() => ({
+    classification: "current",
+    rowCount: 0,
+    snapshotCount: 0,
+    sourceVersion: null,
+    discardedSnapshotCount: 1,
+  }));
+}

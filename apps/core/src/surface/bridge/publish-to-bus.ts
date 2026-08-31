@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import type {
   EventPublishContractInvalid,
   EventPublishTransportFailed,
@@ -5,7 +6,7 @@ import type {
 } from "@stanley2058/lilac-event-bus";
 import { lilacEventTypes } from "@stanley2058/lilac-event-bus";
 import { createLogger } from "@stanley2058/lilac-utils";
-import { Panic, type Result as ResultType } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 
 import type { SurfaceAdapterEventSource } from "../adapter";
 import type { AdapterEvent } from "../events";
@@ -115,48 +116,56 @@ export async function bridgeAdapterToBus(params: {
       }
 
       case "adapter.message.deleted": {
-        try {
-          const unlinkResult = params.transcriptStore?.unlinkSurfaceMessage?.({
-            platform: evt.messageRef.platform,
-            channelId: evt.messageRef.channelId,
-            messageId: evt.messageRef.messageId,
-          });
-          unlinkResult?.match({
-            err: (error) => () =>
-              logger.warn(
-                "failed to unlink deleted surface message",
-                formatBridgeTaggedErrorForLog(error, {
-                  platform: evt.messageRef.platform,
-                  channelId: evt.messageRef.channelId,
-                  messageId: evt.messageRef.messageId,
-                }),
-              ),
-            ok: (value) => () => {
-              if (value.checkpointDeleted) {
-                logger.info(
-                  "compaction checkpoint deleted",
-                  formatBridgeLogContext({
-                    requestId: value.requestId,
-                    platform: evt.messageRef.platform,
-                    channelId: evt.messageRef.channelId,
-                    messageId: evt.messageRef.messageId,
-                    reason: "last_surface_link_deleted",
-                  }),
-                );
-              }
+        {
+          const attempt = Result.try({
+            try: () => {
+              const unlinkResult = params.transcriptStore?.unlinkSurfaceMessage?.({
+                platform: evt.messageRef.platform,
+                channelId: evt.messageRef.channelId,
+                messageId: evt.messageRef.messageId,
+              });
+              unlinkResult?.match({
+                err: (error) => () =>
+                  logger.warn(
+                    "failed to unlink deleted surface message",
+                    formatBridgeTaggedErrorForLog(error, {
+                      platform: evt.messageRef.platform,
+                      channelId: evt.messageRef.channelId,
+                      messageId: evt.messageRef.messageId,
+                    }),
+                  ),
+                ok: (value) => () => {
+                  if (value.checkpointDeleted) {
+                    logger.info(
+                      "compaction checkpoint deleted",
+                      formatBridgeLogContext({
+                        requestId: value.requestId,
+                        platform: evt.messageRef.platform,
+                        channelId: evt.messageRef.channelId,
+                        messageId: evt.messageRef.messageId,
+                        reason: "last_surface_link_deleted",
+                      }),
+                    );
+                  }
+                },
+              })();
             },
-          })();
-        } catch (cause) {
-          if (Panic.is(cause)) throw cause;
-          logger.warn(
-            "failed to unlink deleted surface message",
-            formatBridgeLogContext({
-              platform: evt.messageRef.platform,
-              channelId: evt.messageRef.channelId,
-              messageId: evt.messageRef.messageId,
-              errorMessage: cause instanceof Error ? cause.message : "Unknown unlink failure",
-            }),
-          );
+            catch: captureError,
+          });
+
+          if (attempt.isErr()) {
+            const cause = attempt.error.cause;
+            if (Panic.is(cause)) throw cause;
+            logger.warn(
+              "failed to unlink deleted surface message",
+              formatBridgeLogContext({
+                platform: evt.messageRef.platform,
+                channelId: evt.messageRef.channelId,
+                messageId: evt.messageRef.messageId,
+                errorMessage: cause instanceof Error ? cause.message : "Unknown unlink failure",
+              }),
+            );
+          }
         }
 
         const published = await bus.publish(
@@ -211,10 +220,12 @@ export async function bridgeAdapterToBus(params: {
       case "adapter.request.cancel": {
         const cancelScope = evt.cancelScope ?? "active_only";
         const cancelQueued = cancelScope === "active_or_queued";
+        const requestDeliveryId = crypto.randomUUID();
 
         const published = await bus.publish(
           lilacEventTypes.CmdRequestMessage,
           {
+            requestDeliveryId,
             queue: "interrupt",
             messages: [],
             raw: {
@@ -248,9 +259,10 @@ export async function bridgeAdapterToBus(params: {
       }
 
       case "adapter.command.invoked": {
+        const requestDeliveryId = crypto.randomUUID();
         const published = await bus.publish(
           lilacEventTypes.CmdRequestMessage,
-          toBusDiscordCommandInvokedData(evt),
+          { ...toBusDiscordCommandInvokedData(evt), requestDeliveryId },
           {
             headers: {
               request_id: evt.requestId,

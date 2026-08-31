@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { Panic } from "better-result";
+import { Panic, Result } from "better-result";
 import { GrammyError } from "grammy";
 
+import { captureError } from "../../../src/shared/error-capture";
 import { projectTelegramError } from "../../../src/surface/telegram/telegram-error-projection";
 
 describe("Telegram error projection", () => {
@@ -65,5 +66,29 @@ describe("Telegram error projection", () => {
 
     // When / Then
     expect(() => projectTelegramError(panic, "Telegram operation failed")).toThrow(panic);
+  });
+
+  it("preserves Panic identity after Result capture", () => {
+    // Given
+    const panic = new Panic({ message: "telegram invariant failed" });
+    const captured = Result.try({
+      try: () => {
+        throw panic;
+      },
+      catch: (cause) => captureError(cause, "Telegram operation failed"),
+    });
+
+    // When
+    let thrown: unknown;
+    try {
+      if (captured.isErr()) {
+        projectTelegramError(captured.error.cause, "Telegram operation failed");
+      }
+    } catch (cause) {
+      thrown = cause;
+    }
+
+    // Then
+    expect(thrown).toBe(panic);
   });
 });

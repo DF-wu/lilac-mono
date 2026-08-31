@@ -255,7 +255,7 @@ describe("MiniLilacSqliteStore todos", () => {
     });
     const beforeState = store.getTodos("session-1");
     const beforeUpdatedAt = store.getSession("session-1").updatedAt;
-    store.database.exec(`
+    store.database.run(`
       CREATE TRIGGER reject_todo_session_update BEFORE UPDATE ON sessions
       BEGIN
         SELECT RAISE(ABORT, 'rejected session update');

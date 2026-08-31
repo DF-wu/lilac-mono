@@ -493,7 +493,7 @@ describe("Mini Lilac SQLite persistence codecs", () => {
       profile: "reader",
       reasoning: "high",
     });
-    store.database.exec(`
+    store.database.run(`
       CREATE TRIGGER fail_root_history BEFORE INSERT ON session_history
       BEGIN SELECT RAISE(ABORT, 'sensitive trigger detail'); END;
     `);
@@ -529,7 +529,7 @@ describe("Mini Lilac SQLite persistence codecs", () => {
     const first = new MiniLilacSqliteStore(databasePath);
     const second = new MiniLilacSqliteStore(databasePath);
     try {
-      first.database.exec("BEGIN IMMEDIATE");
+      first.database.run("BEGIN IMMEDIATE");
       let failure: unknown;
       try {
         second.createSession({
@@ -543,7 +543,7 @@ describe("Mini Lilac SQLite persistence codecs", () => {
         failure = cause;
       }
       expect(failure).toBeInstanceOf(MiniLilacSqliteDriverFailure);
-      first.database.exec("ROLLBACK");
+      first.database.run("ROLLBACK");
       expect(first.database.query("SELECT 1 FROM sessions WHERE id = 'blocked'").get()).toBeNull();
     } finally {
       first.close();

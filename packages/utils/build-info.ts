@@ -5,7 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 
 import { findWorkspaceRootResult } from "./find-root";
-import { isPanic } from "./runtime-utils";
+import { settleSyncResult } from "./runtime-utils";
 
 const DEFAULT_BUILD_VERSION = "dev";
 const DEFAULT_BUILD_COMMIT = "dev";
@@ -60,7 +60,7 @@ function findWorkspaceRootSafe(startDir: string): string | undefined {
 }
 
 function readBuildInfoFile(cwd: string): BuildInfo | null {
-  try {
+  const outcome = settleSyncResult(() => {
     const workspaceRoot = findWorkspaceRootSafe(cwd);
     if (!workspaceRoot) return null;
 
@@ -84,28 +84,26 @@ function readBuildInfoFile(cwd: string): BuildInfo | null {
       dirty,
       builtAt,
     };
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return null;
-  }
+  });
+  if (outcome.kind === "panic") throw outcome.panic;
+  return outcome.kind === "value" ? outcome.value : null;
 }
 
 function getBuildInfoFileCacheKey(cwd: string): string {
-  try {
+  const outcome = settleSyncResult(() => {
     const workspaceRoot = findWorkspaceRootSafe(cwd);
     if (!workspaceRoot) return "missing-workspace";
 
     const buildInfoPath = path.join(workspaceRoot, BUILD_INFO_PATH);
     const stats = fs.statSync(buildInfoPath);
     return `${buildInfoPath}:${stats.size}:${stats.mtimeMs}`;
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return "missing-build-info";
-  }
+  });
+  if (outcome.kind === "panic") throw outcome.panic;
+  return outcome.kind === "value" ? outcome.value : "missing-build-info";
 }
 
 function readGitBuildInfo(cwd: string): Pick<BuildInfo, "commit" | "dirty"> | null {
-  try {
+  const outcome = settleSyncResult(() => {
     const workspaceRoot = findWorkspaceRootSafe(cwd);
     if (!workspaceRoot) return null;
 
@@ -130,10 +128,9 @@ function readGitBuildInfo(cwd: string): Pick<BuildInfo, "commit" | "dirty"> | nu
       commit,
       dirty: dirtyOutput.length > 0,
     };
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return null;
-  }
+  });
+  if (outcome.kind === "panic") throw outcome.panic;
+  return outcome.kind === "value" ? outcome.value : null;
 }
 
 function resolveBuildInfo(params: ResolveBuildInfoParams): BuildInfo {

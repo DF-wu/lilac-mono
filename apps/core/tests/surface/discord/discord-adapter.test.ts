@@ -57,9 +57,15 @@ describe("Discord command actor projection", () => {
       ts: 1,
       sessionMode: "mention",
       sessionConfigId: "channel",
+      parentChannelId: "parent",
+      guildId: "guild",
     });
 
     expect(Object.hasOwn(projected.raw ?? {}, "authenticatedActor")).toBe(false);
+    expect(projected.raw).toMatchObject({
+      parentChannelId: "parent",
+      guildId: "guild",
+    });
   });
 });
 
@@ -186,37 +192,31 @@ describe("classifyDiscordSurfaceError", () => {
     ).toBeInstanceOf(SurfaceUnavailable);
     expect(classifyDiscordSurfaceError("send-message", new Error("unknown"))).toBeNull();
   });
-});
 
-describe("DiscordAdapter nested refs", () => {
-  it("starts a resumable output stream without invoking Discord", async () => {
-    let providerCalls = 0;
-    const config = testConfigWithStatusMessage();
-    const adapter = createTestDiscordAdapter({ config });
-    const internals = adapter as unknown as { client: unknown; cfg: CoreConfig };
-    internals.client = {
+  it("classifies a plain Discord rejection before defect propagation", async () => {
+    const adapter = createTestDiscordAdapter();
+    const state = adapter as unknown as {
+      cfg: CoreConfig | null;
+      client: { channels: { fetch(channelId: string): Promise<unknown> } } | null;
+    };
+    state.cfg = testConfigWithStatusMessage();
+    state.client = {
       channels: {
         fetch: async () => {
-          providerCalls += 1;
-          return null;
+          throw { code: 10_003 };
         },
       },
     };
-    internals.cfg = config;
 
-    const result = await adapter.startOutput(
-      { platform: "discord", channelId: "c1" },
-      {
-        resume: {
-          created: [{ platform: "discord", channelId: "c1", messageId: "existing" }],
-        },
-      },
-    );
+    const listed = await adapter.listMsg({ platform: "discord", channelId: "missing" });
 
-    expect(result.status).toBe("ok");
-    expect(providerCalls).toBe(0);
+    expect(listed.status).toBe("error");
+    if (listed.status === "ok") throw new Error("expected missing channel failure");
+    expect(listed.error).toBeInstanceOf(SurfaceMessageNotFound);
   });
+});
 
+describe("DiscordAdapter nested refs", () => {
   it("threads enabled math options into output streams and omits disabled options", async () => {
     const base = testConfigWithStatusMessage();
     const enabledConfig: CoreConfig = {
@@ -279,22 +279,6 @@ describe("DiscordAdapter nested refs", () => {
       expect(result.error).toMatchObject({ operation: "start-output", refRole });
     },
   );
-
-  it("identifies the mismatched resumed ref", async () => {
-    const result = await createTestDiscordAdapter().startOutput(
-      { platform: "discord", channelId: "c1" },
-      {
-        resume: {
-          created: [{ platform: "discord", channelId: "c2", messageId: "m1" }],
-        },
-      },
-    );
-
-    expect(result.status).toBe("error");
-    if (result.status === "ok") throw new Error("expected nested-ref failure");
-    expect(result.error).toBeInstanceOf(SurfaceSessionMismatch);
-    expect(result.error).toMatchObject({ refRole: "resume.created[0]" });
-  });
 });
 
 describe("DiscordAdapter typing", () => {
@@ -302,6 +286,8 @@ describe("DiscordAdapter typing", () => {
     const config = testConfigWithStatusMessage();
     const typingStarted = Promise.withResolvers<void>();
     const typingRelease = Promise.withResolvers<void>();
+    const typingConfirmed = Promise.withResolvers<void>();
+    let confirmed = false;
     const adapter = createTestDiscordAdapter({ config });
     Object.assign(adapter, {
       client: {
@@ -317,14 +303,24 @@ describe("DiscordAdapter typing", () => {
       cfg: config,
     });
 
-    const started = await adapter.startTyping({ platform: "discord", channelId: "c1" });
+    const started = await adapter.startTyping(
+      { platform: "discord", channelId: "c1" },
+      {
+        onStarted: () => {
+          confirmed = true;
+          typingConfirmed.resolve();
+        },
+      },
+    );
     expect(started.status).toBe("ok");
     if (started.status === "error") throw started.error;
     await typingStarted.promise;
+    expect(confirmed).toBe(false);
 
     expect(await started.value.stop()).toEqual(Result.ok(undefined));
     typingRelease.resolve();
-    await typingRelease.promise;
+    await typingConfirmed.promise;
+    expect(confirmed).toBe(true);
   });
 
   it("reports a detached typing Panic to the fatal supervisor", async () => {
@@ -1324,27 +1320,6 @@ describe("DiscordAdapter.refreshCoreConfig", () => {
     internals.cfg = previousConfig;
     internals.appliedStatusMessage = "previous presence";
     cfg = changedConfig;
-
-    const prepared = await adapter.startOutput(
-      { platform: "discord", channelId: "c1" },
-      {
-        preparationMode: "paused-recovery",
-        resume: {
-          created: [{ platform: "discord", channelId: "c1", messageId: "restored-output" }],
-        },
-      },
-    );
-    expect(prepared.status).toBe("ok");
-    if (prepared.status === "error") throw prepared.error;
-    expect(
-      prepared.value.hydrateRecovery?.([{ type: "text.set", text: "restored response" }]),
-    ).toBe("visible");
-    await expect(prepared.value.abort("restore_rollback")).resolves.toEqual(Result.ok(undefined));
-    expect({ configReads, channelFetches, providerMutations }).toEqual({
-      configReads: 0,
-      channelFetches: 0,
-      providerMutations: [],
-    });
 
     const normal = await adapter.startOutput({ platform: "discord", channelId: "c1" });
     expect(normal.status).toBe("ok");

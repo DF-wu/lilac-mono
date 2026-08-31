@@ -1,10 +1,12 @@
 import type { MsgRefFor } from "../../runtime-descriptor";
+import type { SurfaceMessage } from "../../types";
 
 import type { SessionMode } from "./common";
 import { stripLeadingContinueDirective, stripLeadingModelOverrideDirective } from "./common";
 
 export type PendingMentionReplyBatchItem = {
   msgRef: MsgRefFor<"discord">;
+  ingressMessage?: SurfaceMessage;
   requestModelOverride?: string;
   continueCount?: number;
   botMentionNames: readonly string[];
@@ -43,6 +45,7 @@ export function enqueuePendingMentionReplyBatch(params: {
       items: [
         {
           msgRef: params.input.item.msgRef,
+          ingressMessage: params.input.item.ingressMessage,
           requestModelOverride: params.input.item.requestModelOverride,
           continueCount: params.input.item.continueCount,
           botMentionNames: [...params.input.item.botMentionNames],
@@ -58,6 +61,7 @@ export function enqueuePendingMentionReplyBatch(params: {
   if (!alreadyTracked) {
     existing.items.push({
       msgRef: params.input.item.msgRef,
+      ingressMessage: params.input.item.ingressMessage,
       requestModelOverride: params.input.item.requestModelOverride,
       continueCount: params.input.item.continueCount,
       botMentionNames: [...params.input.item.botMentionNames],

@@ -1,4 +1,4 @@
-import { Result, TaggedError, type UnhandledException } from "better-result";
+import { Panic, Result, TaggedError, type UnhandledException } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 
@@ -42,6 +42,14 @@ export function mappedCaptureContract(): Result<string, SecretFailure> {
     try: () => "value",
     catch: (cause) => new SecretFailure({ cause, secret: "redacted" }),
   });
+}
+
+export function unknownExpectedErrorContract(): Result<string, unknown> {
+  return Result.err("unknown");
+}
+
+export function panicExpectedErrorContract(): Result<string, Panic> {
+  return Result.err(new Panic({ message: "not expected" }));
 }
 
 export async function rejectingFallibleApi(): Promise<string> {

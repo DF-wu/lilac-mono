@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import { z } from "zod";
 import fs from "node:fs/promises";
 import { basename } from "node:path";
@@ -89,18 +90,53 @@ const surfaceFailureSchema: z.ZodType<ServerToolFailure> = z
   })
   .strict();
 
-function surfaceExternalFailure(cause: unknown, signal?: AbortSignal): ServerToolFailure {
+type SurfaceCapturedFailure = {
+  readonly cause: Error | Panic;
+  readonly code?: string;
+};
+
+function captureSurfaceFailure(cause: unknown): SurfaceCapturedFailure {
+  const code =
+    typeof cause === "object" && cause !== null && "code" in cause && typeof cause.code === "string"
+      ? cause.code
+      : undefined;
+  if (Panic.is(cause)) return { cause, code };
+  if (cause instanceof Error) return { cause, code };
+  const message =
+    typeof cause === "object" &&
+    cause !== null &&
+    "message" in cause &&
+    typeof cause.message === "string"
+      ? cause.message
+      : "Surface operation failed";
+  return { cause: new Error(message, { cause }), code };
+}
+
+function surfaceExternalFailure(
+  failure: SurfaceCapturedFailure,
+  signal?: AbortSignal,
+): ServerToolFailure {
+  const { cause, code } = failure;
   if (Panic.is(cause)) preserveToolPanic(cause);
   const decodedFailure = surfaceFailureSchema.safeParse(cause);
   if (decodedFailure.success) return decodedFailure.data;
   const message = errorMessage(cause);
   const normalized = message.toLowerCase();
-  const code = cause && typeof cause === "object" && "code" in cause ? cause.code : undefined;
   let category: ServerToolFailure["kind"] = "unavailable";
-  if (signal?.aborted || /\babort(?:ed)?\b/.test(normalized)) category = "cancelled";
-  else if (/\b(?:timeout|timed out)\b/.test(normalized)) category = "timeout";
-  else if (code === "ENOENT") category = "not_found";
-  else if (code === "EACCES" || code === "EPERM") category = "denied";
+  switch (true) {
+    case signal?.aborted || /\babort(?:ed)?\b/.test(normalized):
+      category = "cancelled";
+      break;
+    case /\b(?:timeout|timed out)\b/.test(normalized):
+      category = "timeout";
+      break;
+    case code === "ENOENT":
+      category = "not_found";
+      break;
+    case code === "EACCES" || code === "EPERM":
+      category = "denied";
+      break;
+  }
   return surfaceFailure(category, message);
 }
 
@@ -279,8 +315,8 @@ export async function loadLocalAttachments(params: {
       const st = yield* Result.await(
         Result.tryPromise({
           try: () => fs.stat(resolvedPath),
-          catch: (cause) => surfaceExternalFailure(cause),
-        }),
+          catch: captureSurfaceFailure,
+        }).then((result) => result.mapError((failure) => surfaceExternalFailure(failure))),
       );
       if (!st.isFile()) {
         return Result.err(
@@ -315,15 +351,15 @@ export async function loadLocalAttachments(params: {
       const bytes = yield* Result.await(
         Result.tryPromise({
           try: () => fs.readFile(resolvedPath),
-          catch: (cause) => surfaceExternalFailure(cause),
-        }),
+          catch: captureSurfaceFailure,
+        }).then((result) => result.mapError((failure) => surfaceExternalFailure(failure))),
       );
       const filename = (params.filenames && params.filenames[i]) ?? basename(resolvedPath);
       const typeFromBytes = yield* Result.await(
         Result.tryPromise({
           try: () => fileTypeFromBuffer(bytes),
-          catch: (cause) => surfaceExternalFailure(cause),
-        }),
+          catch: captureSurfaceFailure,
+        }).then((result) => result.mapError((failure) => surfaceExternalFailure(failure))),
       );
       const mimeType =
         (params.mimeTypes && params.mimeTypes[i]) ??
@@ -1449,8 +1485,8 @@ export class Surface implements ServerTool {
     if (this.params.getConfig) {
       return Result.tryPromise({
         try: this.params.getConfig,
-        catch: (cause) => surfaceExternalFailure(cause),
-      });
+        catch: captureSurfaceFailure,
+      }).then((result) => result.mapError((failure) => surfaceExternalFailure(failure)));
     }
     return Result.err(
       surfaceFailure(
@@ -1542,9 +1578,11 @@ export class Surface implements ServerTool {
               sessionRef: target.sessionRef,
               reason: "surface_tool",
             }),
-          catch: (cause) => surfaceExternalFailure(cause),
+          catch: captureSurfaceFailure,
         });
-        return burst.map(() => ({ ...target, msgRef }));
+        return burst
+          .mapError((failure) => surfaceExternalFailure(failure))
+          .map(() => ({ ...target, msgRef }));
       }
       return Result.ok({ ...target, msgRef });
     });
@@ -1571,15 +1609,23 @@ export class Surface implements ServerTool {
     if (!requestId || !this.params.transcriptStore) return;
     if (!ctx?.sessionId || !isHeartbeatSessionId(ctx.sessionId)) return;
 
-    try {
-      this.params.transcriptStore.linkSurfaceMessagesToRequest({
-        requestId,
-        created: [ref],
-        last: ref,
+    {
+      const attempt = Result.try({
+        try: () => {
+          this.params.transcriptStore!.linkSurfaceMessagesToRequest({
+            requestId,
+            created: [ref],
+            last: ref,
+          });
+        },
+        catch: captureError,
       });
-    } catch (cause) {
-      if (Panic.is(cause)) preserveToolPanic(cause);
-      // Best-effort only. Do not fail the send on transcript linkage issues.
+
+      if (attempt.isErr()) {
+        const cause = attempt.error.cause;
+        if (Panic.is(cause)) preserveToolPanic(cause);
+        // Best-effort only. Do not fail the send on transcript linkage issues.
+      }
     }
   }
 
@@ -1649,12 +1695,14 @@ export class Surface implements ServerTool {
           const text = (
             await Result.tryPromise({
               try: () => this.readRecentAgentWriteText(row),
-              catch: (cause) => surfaceExternalFailure(cause),
+              catch: captureSurfaceFailure,
             })
-          ).match({
-            ok: (value) => value,
-            err: () => row.finalText ?? "",
-          });
+          )
+            .mapError((failure) => surfaceExternalFailure(failure))
+            .match({
+              ok: (value) => value,
+              err: () => row.finalText ?? "",
+            });
 
           const preview = toPreviewText(text);
 
@@ -1806,8 +1854,8 @@ export class Surface implements ServerTool {
                 sessionRef: target.sessionRef,
                 reason: "surface_tool",
               }),
-            catch: (cause) => surfaceExternalFailure(cause),
-          }),
+            catch: captureSurfaceFailure,
+          }).then((result) => result.mapError((failure) => surfaceExternalFailure(failure))),
         );
       }
       const messages = yield* surfaceOperationResult(
@@ -1884,8 +1932,8 @@ export class Surface implements ServerTool {
                 sessionRef: target.sessionRef,
                 reason: "surface_tool",
               }),
-            catch: (cause) => surfaceExternalFailure(cause),
-          }),
+            catch: captureSurfaceFailure,
+          }).then((result) => result.mapError((failure) => surfaceExternalFailure(failure))),
         );
       }
       const msg = yield* surfaceOperationResult(await target.resolved.adapter.readMsg(msgRef));
@@ -2004,12 +2052,14 @@ export class Surface implements ServerTool {
                 hits.map(async (hit) => {
                   const read = await Result.tryPromise({
                     try: () => target.resolved.adapter.readMsg(hit.ref),
-                    catch: (cause) => surfaceExternalFailure(cause),
+                    catch: captureSurfaceFailure,
                   });
-                  const msg = read.match({
-                    ok: (result) => result.match({ ok: (value) => value, err: () => null }),
-                    err: () => null,
-                  });
+                  const msg = read
+                    .mapError((failure) => surfaceExternalFailure(failure))
+                    .match({
+                      ok: (result) => result.match({ ok: (value) => value, err: () => null }),
+                      err: () => null,
+                    });
                   const attachments = msg ? getMessageAttachmentMeta(msg) : [];
                   attachmentHintsByMessageId.set(
                     hit.ref.messageId,

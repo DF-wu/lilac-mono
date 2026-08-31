@@ -19,12 +19,18 @@ describe("agent run idle watchdog", () => {
       onTimeout: (error) => timedOut.push(error),
     });
 
-    watchdog.start();
-    await expect(watchdog.waitFor(new Promise<void>(() => {}))).rejects.toThrow(
-      "agent idle timed out after 20ms",
-    );
-    expect(timedOut).toHaveLength(1);
-    watchdog.stop();
+    jest.useFakeTimers({ now: 0 });
+    try {
+      watchdog.start();
+      const waited = watchdog.waitFor(new Promise<void>(() => {}));
+      jest.advanceTimersByTime(20);
+
+      await expect(waited).rejects.toThrow("agent idle timed out after 20ms");
+      expect(timedOut).toHaveLength(1);
+    } finally {
+      watchdog.stop();
+      jest.useRealTimers();
+    }
   });
 
   it("pauses monitoring between separately raced operations", () => {
@@ -58,15 +64,20 @@ describe("agent run idle watchdog", () => {
       },
     });
 
-    watchdog.start();
-    await expect(watchdog.waitFor(new Promise<void>(() => {}))).rejects.toThrow(
-      "agent idle timed out after 15ms",
-    );
+    jest.useFakeTimers({ now: 0 });
+    try {
+      watchdog.start();
+      const timedOut = watchdog.waitFor(new Promise<void>(() => {}));
+      jest.advanceTimersByTime(15);
+      await expect(timedOut).rejects.toThrow("agent idle timed out after 15ms");
 
-    watchdog.restart();
-    await expect(watchdog.waitFor(Promise.resolve("recovered"))).resolves.toBe("recovered");
-    expect(timeoutCount).toBe(1);
-    watchdog.stop();
+      watchdog.restart();
+      await expect(watchdog.waitFor(Promise.resolve("recovered"))).resolves.toBe("recovered");
+      expect(timeoutCount).toBe(1);
+    } finally {
+      watchdog.stop();
+      jest.useRealTimers();
+    }
   });
 
   it("does not clamp large idle deadlines to an immediate timer", () => {

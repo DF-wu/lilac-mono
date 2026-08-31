@@ -34,7 +34,7 @@ import {
 } from "just-bash";
 
 import type { ToolResultArtifactStore } from "../artifacts/tool-result-artifact-store";
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { resolveRestrictedSessionTmpDir } from "../shared/attachment-utils";
 import { parseSshCwdTarget } from "../ssh/ssh-cwd";
 import {
@@ -68,10 +68,33 @@ async function captureRestrictedBashOperation<T>(params: {
   readonly operation: string;
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, RestrictedBashOperationError>> {
-  const captured = await Result.tryPromise({
-    try: params.run,
-    catch: projectRuntimeError(`Opaque restricted Bash ${params.operation} failure`),
-  });
+  const captured = (
+    await Result.tryPromise({ try: params.run, catch: captureRuntimeError })
+  ).mapError((error) =>
+    projectCapturedRuntimeError(error, `Opaque restricted Bash ${params.operation} failure`),
+  );
+  return captured.match<() => ResultType<T, RestrictedBashOperationError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (error) => () => {
+      const cause = preserveToolPanic(error);
+      return Result.err(
+        new RestrictedBashOperationError({
+          operation: params.operation,
+          cause,
+          message: opaqueErrorMessage(cause, `Restricted Bash failed while ${params.operation}`),
+        }),
+      );
+    },
+  })();
+}
+
+function captureRestrictedBashSync<T>(params: {
+  readonly operation: string;
+  readonly run: () => Awaited<T>;
+}): ResultType<T, RestrictedBashOperationError> {
+  const captured = Result.try({ try: params.run, catch: captureRuntimeError }).mapError((error) =>
+    projectCapturedRuntimeError(error, `Opaque restricted Bash ${params.operation} failure`),
+  );
   return captured.match<() => ResultType<T, RestrictedBashOperationError>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {
@@ -99,13 +122,12 @@ function signalRestrictedBashFailure(operation: string, message: string): never 
   );
 }
 
-function captureRestrictedHostPromise<T>(
+async function captureRestrictedHostPromise<T>(
   run: () => Promise<T>,
 ): Promise<ResultType<T, Error | Panic>> {
-  return Result.tryPromise({
-    try: run,
-    catch: projectRuntimeError("Opaque restricted host operation failure"),
-  });
+  return (await Result.tryPromise({ try: run, catch: captureRuntimeError })).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque restricted host operation failure"),
+  );
 }
 
 function restrictedHostErrorCode(cause: Error): string | undefined {
@@ -139,8 +161,8 @@ function toRestrictedTerminationError(
 
 type RestrictedBashContext = {
   requestId?: string;
+  requestDeliveryId?: string;
   sessionId?: string;
-  originSessionId?: string;
   requestClient?: string;
   controlCapability?: string;
   currentTurnUserId?: string;
@@ -515,8 +537,10 @@ async function readJsonSource(source: string, ctx: CommandContext): Promise<unkn
 function decodeRestrictedJson(source: string): ResultType<unknown, NestedToolsCommandFailure> {
   const decoded = Result.try({
     try: () => JSON.parse(source),
-    catch: projectRuntimeError("Opaque restricted Bash JSON parse failure"),
-  });
+    catch: captureRuntimeError,
+  }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque restricted Bash JSON parse failure"),
+  );
   return decoded.match<() => ResultType<unknown, NestedToolsCommandFailure>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {
@@ -597,10 +621,10 @@ function buildToolServerHeaders(
     "x-lilac-safety-mode": "restricted",
   };
   if (context.requestId) headers["x-lilac-request-id"] = context.requestId;
-  if (context.sessionId) headers["x-lilac-session-id"] = context.sessionId;
-  if (context.originSessionId) {
-    headers["x-lilac-origin-session-id"] = context.originSessionId;
+  if (context.requestDeliveryId) {
+    headers["x-lilac-request-delivery-id"] = context.requestDeliveryId;
   }
+  if (context.sessionId) headers["x-lilac-session-id"] = context.sessionId;
   if (context.requestClient) headers["x-lilac-request-client"] = context.requestClient;
   if (context.controlCapability) {
     headers["x-lilac-control-capability"] = context.controlCapability;
@@ -679,15 +703,25 @@ async function fetchNestedToolsJson(params: {
       kind: "internal",
       retryable: false,
     };
-    if (status === 400 || status === 422) projection = { kind: "usage", retryable: false };
-    else if (status === 401 || status === 403) {
-      projection = { kind: "denied", retryable: false };
-    } else if (status === 404) projection = { kind: "not_found", retryable: false };
-    else if (status === 408 || status === 504) {
-      projection = { kind: "timeout", retryable: true };
-    } else if (status === 409) projection = { kind: "conflict", retryable: false };
-    else if (status === 429 || status >= 500) {
-      projection = { kind: "unavailable", retryable: true };
+    switch (true) {
+      case status === 400 || status === 422:
+        projection = { kind: "usage", retryable: false };
+        break;
+      case status === 401 || status === 403:
+        projection = { kind: "denied", retryable: false };
+        break;
+      case status === 404:
+        projection = { kind: "not_found", retryable: false };
+        break;
+      case status === 408 || status === 504:
+        projection = { kind: "timeout", retryable: true };
+        break;
+      case status === 409:
+        projection = { kind: "conflict", retryable: false };
+        break;
+      case status === 429 || status >= 500:
+        projection = { kind: "unavailable", retryable: true };
+        break;
     }
     return signalNestedToolsFailure(
       createNestedToolsFailure({
@@ -709,8 +743,10 @@ async function fetchNestedToolsJson(params: {
         }
         return value;
       }),
-    catch: projectRuntimeError("Tool server returned invalid JSON"),
-  });
+    catch: captureRuntimeError,
+  }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Tool server returned invalid JSON"),
+  );
   const parseError = parsed.match({ ok: () => null, err: (error) => error });
   if (parseError) {
     return signalNestedToolsFailure(
@@ -1004,50 +1040,38 @@ function resolveRestrictedCwd(input: {
   cwd?: string;
   workspaceRoot: string;
   sessionTmpDir: string;
-}): ResultType<string, RestrictedBashOperationError> {
-  if (!input.cwd) return Result.ok(WORKSPACE_MOUNT);
+}): string {
+  if (!input.cwd) return WORKSPACE_MOUNT;
   const parsed = parseSshCwdTarget(input.cwd);
   if (parsed.kind === "ssh") {
-    const message = "Restricted bash does not allow SSH cwd targets";
-    return Result.err(
-      new RestrictedBashOperationError({
-        operation: "resolve_cwd",
-        cause: new Error(message),
-        message,
-      }),
-    );
+    signalRestrictedBashFailure("resolve_cwd", "Restricted bash does not allow SSH cwd targets");
   }
 
   const expanded = path.resolve(expandTilde(parsed.cwd ?? input.cwd));
   const workspaceRoot = path.resolve(input.workspaceRoot);
   const sessionTmpDir = path.resolve(input.sessionTmpDir);
 
-  if (expanded === workspaceRoot) return Result.ok(WORKSPACE_MOUNT);
+  if (expanded === workspaceRoot) return WORKSPACE_MOUNT;
   if (expanded.startsWith(`${workspaceRoot}${path.sep}`)) {
-    return Result.ok(
-      posixPath.join(
-        WORKSPACE_MOUNT,
-        path.relative(workspaceRoot, expanded).split(path.sep).join("/"),
-      ),
+    return posixPath.join(
+      WORKSPACE_MOUNT,
+      path.relative(workspaceRoot, expanded).split(path.sep).join("/"),
     );
   }
-  if (expanded === sessionTmpDir) return Result.ok(TMP_MOUNT);
+  if (expanded === sessionTmpDir) return TMP_MOUNT;
   if (expanded.startsWith(`${sessionTmpDir}${path.sep}`)) {
-    return Result.ok(
-      posixPath.join(TMP_MOUNT, path.relative(sessionTmpDir, expanded).split(path.sep).join("/")),
+    return posixPath.join(
+      TMP_MOUNT,
+      path.relative(sessionTmpDir, expanded).split(path.sep).join("/"),
     );
   }
-  if (input.cwd === TMP_MOUNT) return Result.ok(input.cwd);
+  if (input.cwd === TMP_MOUNT || input.cwd.startsWith(`${TMP_MOUNT}/`)) return input.cwd;
   if (input.cwd === WORKSPACE_MOUNT || input.cwd.startsWith(`${WORKSPACE_MOUNT}/`))
-    return Result.ok(input.cwd);
+    return input.cwd;
 
-  const message = "Restricted bash cwd is outside the approved workspace and session temp roots";
-  return Result.err(
-    new RestrictedBashOperationError({
-      operation: "resolve_cwd",
-      cause: new Error(message),
-      message,
-    }),
+  signalRestrictedBashFailure(
+    "resolve_cwd",
+    "Restricted bash cwd is outside the approved workspace and session temp roots",
   );
 }
 
@@ -1113,9 +1137,6 @@ async function createRestrictedBash(params: {
       LILAC_RESTRICTED_TMP: TMP_MOUNT,
       ...(params.context.requestId ? { LILAC_REQUEST_ID: params.context.requestId } : {}),
       ...(params.context.sessionId ? { LILAC_SESSION_ID: params.context.sessionId } : {}),
-      ...(params.context.originSessionId
-        ? { LILAC_ORIGIN_SESSION_ID: params.context.originSessionId }
-        : {}),
       ...(params.context.requestClient
         ? { LILAC_REQUEST_CLIENT: params.context.requestClient }
         : {}),
@@ -1157,6 +1178,7 @@ async function getRestrictedBash(params: {
   const cacheKey = JSON.stringify([
     params.context.sessionId ?? "",
     params.requestId,
+    params.context.requestDeliveryId ?? "",
     params.workspaceRoot,
     params.context.toolCallId ?? "",
     params.context.currentTurnUserId ?? "",
@@ -1193,7 +1215,10 @@ export async function executeRestrictedBash(
   const workspaceRoot = path.resolve(expandTilde(options.workspaceRoot ?? process.cwd()));
   const sessionTmpDir = resolveRestrictedSessionTmpDir(context.sessionId);
 
-  const resolvedCwd = resolveRestrictedCwd({ cwd, workspaceRoot, sessionTmpDir });
+  const resolvedCwd = captureRestrictedBashSync({
+    operation: "resolve_cwd",
+    run: () => resolveRestrictedCwd({ cwd, workspaceRoot, sessionTmpDir }),
+  });
   const blockedCwd = resolvedCwd.match<BashToolOutput | null>({
     ok: () => null,
     err: (error) => ({
@@ -1326,16 +1351,13 @@ export async function executeRestrictedBash(
       originalStderrBytes: Buffer.byteLength(output.stderr, "utf8"),
     });
   };
-  let executed: ResultType<BashToolOutput, RestrictedBashOperationError>;
-  try {
-    executed = await captureRestrictedBashOperation({
-      operation: "execute",
-      run: runRestrictedExecution,
-    });
-  } finally {
+  const executed = await captureRestrictedBashOperation({
+    operation: "execute",
+    run: runRestrictedExecution,
+  }).finally(() => {
     clearTimeout(timeout);
     options.abortSignal?.removeEventListener("abort", abortListener);
-  }
+  });
   return executed.match<() => BashToolOutput>({
     err: (error) => () => {
       const executionError = toRestrictedTerminationError(termination, wallClockTimeoutMs) ?? {

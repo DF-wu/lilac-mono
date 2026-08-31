@@ -192,7 +192,7 @@ describe("tool-server discovery", () => {
 
   function openDiscoveryWriteAudit(dbPath: string): Database {
     const db = new Database(dbPath);
-    db.exec(`
+    db.run(`
       CREATE TABLE discovery_write_audit (operation TEXT NOT NULL);
       CREATE TRIGGER discovery_documents_audit_insert
       AFTER INSERT ON discovery_documents

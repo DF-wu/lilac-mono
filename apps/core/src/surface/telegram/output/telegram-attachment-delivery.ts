@@ -3,6 +3,7 @@ import { InputFile } from "grammy";
 import type { Bot } from "grammy";
 
 import type { MsgRef, SurfaceAttachment } from "../../types";
+import { captureError } from "../../../shared/error-capture";
 import {
   SurfaceOperationPartiallyCompleted,
   type SurfaceFinalTextMode,
@@ -144,21 +145,21 @@ export async function deliverTelegramAttachments(input: {
         shouldSendAsPhoto(attachment)
           ? input.api.sendPhoto(chatId, file, opts)
           : input.api.sendDocument(chatId, file, opts),
-      catch: projectTelegramError("Telegram attachment delivery failed"),
+      catch: (cause) => captureError(cause, "Telegram attachment delivery failed"),
     });
-    const outcome = attempted.match<
-      | { readonly kind: "sent"; readonly messageId: number }
-      | { readonly kind: "failed"; readonly error: TelegramErrorProjection }
-    >({
-      ok: (sent) => ({ kind: "sent", messageId: sent.message_id }),
-      err: (error) => ({ kind: "failed", error }),
-    });
-    if (outcome.kind === "failed") {
-      return { uploaded, failure: { error: outcome.error, attachment } };
+    if (attempted.isErr()) {
+      return {
+        uploaded,
+        failure: {
+          error: projectTelegramError(attempted.error.cause, "Telegram attachment delivery failed"),
+          attachment,
+        },
+      };
     }
+    const messageId = attempted.value.message_id;
     uploaded.push({
-      ref: telegramMsgRef({ chatId, threadId, messageId: outcome.messageId }),
-      messageId: outcome.messageId,
+      ref: telegramMsgRef({ chatId, threadId, messageId }),
+      messageId,
       attachment,
     });
   }
@@ -230,12 +231,22 @@ export class TelegramOutputStreamWithAttachments implements SurfaceOutputStream 
               attachments,
               silent: this.deps.silent,
             }),
-          catch: projectTelegramError("Telegram attachment delivery failed"),
+          catch: (cause) => captureError(cause, "Telegram attachment delivery failed"),
         });
-        const delivery = deliveryAttempt.match<TelegramAttachmentDeliveryResult>({
-          ok: (value) => value,
-          err: (error) => ({ uploaded: [], failure: { error } }),
-        });
+        let delivery: TelegramAttachmentDeliveryResult;
+        if (deliveryAttempt.isErr()) {
+          delivery = {
+            uploaded: [],
+            failure: {
+              error: projectTelegramError(
+                deliveryAttempt.error.cause,
+                "Telegram attachment delivery failed",
+              ),
+            },
+          };
+        } else {
+          delivery = deliveryAttempt.value;
+        }
 
         // Index before reporting the failure: every upload here is visible in the
         // chat, so a reply to one has to resolve even when a later upload failed.
@@ -282,13 +293,15 @@ export class TelegramOutputStreamWithAttachments implements SurfaceOutputStream 
 
   /** Reporting is best-effort; it must never fail a reply that was delivered. */
   private report(fn: () => void): void {
-    Result.try({
+    const reported = Result.try({
       try: fn,
-      catch: projectTelegramError("Telegram output reporting failed"),
-    }).match({
-      ok: () => undefined,
-      err: (error) => this.deps.onError(error.error),
+      catch: (cause) => captureError(cause, "Telegram output reporting failed"),
     });
+    if (reported.isErr()) {
+      this.deps.onError(
+        projectTelegramError(reported.error.cause, "Telegram output reporting failed").error,
+      );
+    }
   }
 
   abort(reason?: string): Promise<SurfaceOperationResult<void>> {

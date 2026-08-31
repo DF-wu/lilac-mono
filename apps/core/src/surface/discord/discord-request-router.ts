@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import {
   createLogger,
   extractAiErrorLogDetails,
@@ -8,8 +9,8 @@ import {
   type CoreConfig,
 } from "@stanley2058/lilac-utils";
 import {
-  buildCoreLineageManifestV1,
-  createCorePrimaryLineageFreshOnlyV1,
+  buildCoreLineageManifestV2,
+  createCorePrimaryLineageFreshOnlyV2,
   lilacEventTypes,
   type DeliveryDisposition,
   type EventDeliveryDoneError,
@@ -17,17 +18,15 @@ import {
   type EventDeliveryStopFailed,
   type EvtAdapterMessageCreatedData,
   type LilacBus,
-  type CorePrimaryLineageV1,
+  type CorePrimaryLineageV2,
 } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { SurfaceAdapter, SurfaceOperationError } from "../adapter";
-import type {
-  MsgRefFor,
-  SurfaceRecoveryGeneration,
-  SurfaceRestoredOutputChain,
-} from "../runtime-descriptor";
-import type { MsgRef, SurfaceSelf } from "../types";
+import type { MsgRefFor } from "../runtime-descriptor";
+import type { MsgRef, SurfaceMessage, SurfaceSelf } from "../types";
+import { normalizeDiscordRaw, type NormalizedDiscordRaw } from "./discord-raw-normalizer";
 import {
   CoreOwnedBlobIntegrityError,
   type TranscriptStore,
@@ -35,14 +34,16 @@ import {
 import {
   composeRequestMessages,
   composeSingleMessageWithLineage,
+  DiscordRequestCompositionAndCleanupFailed,
   type RequestCompositionError,
   type RequestCompositionResult,
 } from "../bridge/request-composition";
+import { deleteDiscordRequestBlobHandles } from "../bridge/request-composition/attachments";
 import { formatDiscordMessageRequestId } from "../bridge/request-ids";
+import { recordRequestLatencyStage } from "../bridge/request-latency-trace";
 
 import {
   type SessionMode,
-  type RouterConfigOverride,
   previewText,
   resolveBotMentionNames,
   normalizeGateText,
@@ -63,7 +64,6 @@ import {
   resolveSessionModelOverride,
   buildDiscordUserAliasById,
   getDiscordFlags,
-  withDefaultToolsConfig,
 } from "./discord-request-router/common";
 
 import {
@@ -81,6 +81,9 @@ import {
 } from "./discord-request-router/pending-batch";
 import {
   type PublishBusRequestInput,
+  DiscordRequestDeliveryFailed,
+  type DiscordRequestDeliveryPort,
+  type DiscordRequestPublishError,
   publishActiveChannelPrompt as publishActiveChannelPromptImpl,
   publishBusRequest as publishBusRequestImpl,
   publishComposedRequest as publishComposedRequestImpl,
@@ -88,6 +91,13 @@ import {
   publishSingleMessageToActiveRequest as publishSingleMessageToActiveRequestImpl,
   publishSurfaceOutputReanchor as publishSurfaceOutputReanchorImpl,
 } from "./discord-request-router/publish";
+import type { DiscordAttachmentCacheAccess } from "./discord-attachment";
+import type { DiscordMessageCacheAccess } from "../store/discord-search-store";
+import {
+  ResourceIdCollisionExhausted,
+  ResourceStoreFailure,
+  type ResourceRegistry,
+} from "../../resource";
 import {
   resolvePreviousBatchMessageText as resolvePreviousBatchMessageTextImpl,
   resolvePreviousMessageText as resolvePreviousMessageTextImpl,
@@ -114,13 +124,13 @@ function continueResult<T, E, ROk, RErr>(
 function createFreshOnlyLineage(
   reason: string,
   currentCanonicalStart: number,
-): CorePrimaryLineageV1 {
-  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
+): CorePrimaryLineageV2 {
+  const created = createCorePrimaryLineageFreshOnlyV2(reason, currentCanonicalStart);
   return created.match({
     ok: (value) => value,
     err: () => ({
       state: "fresh-only",
-      lineageVersion: 1,
+      lineageVersion: 2,
       currentCanonicalStart: 0,
       reason: "lineage-fallback-construction-failed",
     }),
@@ -141,6 +151,28 @@ export function discordRequestCompositionFailurePolicy(
 ): DiscordRequestCompositionFailurePolicy {
   if (error instanceof CoreOwnedBlobIntegrityError) {
     return { disposition: "drop-integrity-failure", level: "error", retryable: false };
+  }
+  if (error instanceof ResourceStoreFailure || error instanceof ResourceIdCollisionExhausted) {
+    return {
+      disposition: "drop-transient-gateway-event",
+      level: "warn",
+      retryable: true,
+    };
+  }
+  if (
+    error._tag === "DiscordRequestCompositionAndCleanupFailed" ||
+    error._tag === "DiscordStoredBlobPreparationAndCleanupFailed" ||
+    error._tag === "DiscordStoredBlobPreparationFailed" ||
+    error._tag === "StoredMessageValidationError"
+  ) {
+    return { disposition: "drop-integrity-failure", level: "error", retryable: false };
+  }
+  if (error._tag === "DiscordAttachmentPreparationFailed") {
+    return {
+      disposition: "drop-transient-gateway-event",
+      level: "warn",
+      retryable: true,
+    };
   }
   return discordSurfaceCompositionFailurePolicy(error);
 }
@@ -188,6 +220,31 @@ function logDiscordRequestCompositionFailure(
     });
     return;
   }
+  if (
+    error._tag === "DiscordRequestCompositionAndCleanupFailed" ||
+    error._tag === "DiscordStoredBlobPreparationAndCleanupFailed" ||
+    error._tag === "DiscordStoredBlobPreparationFailed" ||
+    error._tag === "StoredMessageValidationError"
+  ) {
+    logger.error("request composition failed", {
+      requestId,
+      sessionId,
+      disposition: "drop-integrity-failure",
+      retryable: false,
+      ...formatTaggedErrorForLog(error),
+    });
+    return;
+  }
+  if (error._tag === "DiscordAttachmentPreparationFailed") {
+    logger.warn("request composition failed", {
+      requestId,
+      sessionId,
+      disposition: "drop-transient-gateway-event",
+      retryable: true,
+      ...formatTaggedErrorForLog(error),
+    });
+    return;
+  }
   switch (error._tag) {
     case "SurfaceRateLimited":
     case "SurfaceUnavailable":
@@ -217,13 +274,38 @@ function logDiscordRequestCompositionFailure(
   }
 }
 
+function logDiscordRequestPublishFailure(
+  logger: Logger,
+  requestId: string,
+  sessionId: string,
+  error: DiscordRequestPublishError,
+): void {
+  if (error instanceof DiscordRequestDeliveryFailed) {
+    logger.error("request delivery failed", {
+      requestId,
+      sessionId,
+      ...formatTaggedErrorForLog(error),
+    });
+    return;
+  }
+  logDiscordRequestCompositionFailure(logger, requestId, sessionId, error);
+}
+
+function requestPublishRoutingError(
+  error: DiscordRequestPublishError,
+): BusRequestRouterRoutingError {
+  return new BusRequestRouterRoutingError({
+    topic: "evt.adapter",
+    cause: error,
+    message: "Bus request router failed while handling evt.adapter",
+  });
+}
+
 type ActiveSessionState = {
   requestId: string;
   /** IDs of bot output messages in the current active output chain. */
   activeOutputMessageIds: Set<string>;
 };
-
-const MAX_TERMINAL_LIFECYCLE_TOMBSTONES = 2_048;
 
 export class BusRequestRouterMissingHeadersError extends TaggedError(
   "BusRequestRouterMissingHeadersError",
@@ -279,10 +361,6 @@ type RouterDeliverySubscription = {
 
 export type DiscordRequestRouter = {
   readonly done: Promise<ResultType<void, EventDeliveryDoneError>>;
-  restoreActiveOutputChains(
-    generation: SurfaceRecoveryGeneration,
-    chains: readonly SurfaceRestoredOutputChain<"discord">[],
-  ): void;
   stop(): Promise<void>;
 };
 
@@ -402,17 +480,26 @@ async function captureRouterRouting(
   topic: "evt.request" | "evt.adapter",
   operation: () => Promise<void | ResultType<void, BusRequestRouterRoutingError>>,
 ): Promise<ResultType<void, BusRequestRouterRoutingError>> {
-  try {
-    return (await operation()) ?? Result.ok(undefined);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return Result.err(
-      new BusRequestRouterRoutingError({
-        topic,
-        cause,
-        message: `Bus request router failed while handling ${topic}`,
-      }),
-    );
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return (await operation()) ?? Result.ok(undefined);
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (isPanic(cause)) throw cause;
+      return Result.err(
+        new BusRequestRouterRoutingError({
+          topic,
+          cause,
+          message: `Bus request router failed while handling ${topic}`,
+        }),
+      );
+    }
+    return attempt.value;
   }
 }
 
@@ -420,17 +507,26 @@ async function captureRouterActiveBatchGate(
   sessionId: string,
   operation: () => Promise<RouterGateDecision>,
 ): Promise<ResultType<RouterGateDecision, BusRequestRouterActiveBatchGateFailed>> {
-  try {
-    return Result.ok(await operation());
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return Result.err(
-      new BusRequestRouterActiveBatchGateFailed({
-        sessionId,
-        cause,
-        message: "Active-batch router gate failed",
-      }),
-    );
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await operation());
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (isPanic(cause)) throw cause;
+      return Result.err(
+        new BusRequestRouterActiveBatchGateFailed({
+          sessionId,
+          cause,
+          message: "Active-batch router gate failed",
+        }),
+      );
+    }
+    return attempt.value;
   }
 }
 
@@ -439,21 +535,30 @@ async function captureRouterDebounceFlush(input: {
   readonly operation: () => Promise<void>;
   readonly reportFatalPanic: (panic: Panic) => void;
 }): Promise<ResultType<void, BusRequestRouterDebounceFlushFailed>> {
-  try {
-    await input.operation();
-    return Result.ok(undefined);
-  } catch (cause) {
-    if (isPanic(cause)) {
-      input.reportFatalPanic(cause);
-      return Result.ok(undefined);
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        await input.operation();
+        return Result.ok(undefined);
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      if (isPanic(cause)) {
+        input.reportFatalPanic(cause);
+        return Result.ok(undefined);
+      }
+      return Result.err(
+        new BusRequestRouterDebounceFlushFailed({
+          sessionId: input.sessionId,
+          cause,
+          message: "Bus request router debounce flush failed",
+        }),
+      );
     }
-    return Result.err(
-      new BusRequestRouterDebounceFlushFailed({
-        sessionId: input.sessionId,
-        cause,
-        message: "Bus request router debounce flush failed",
-      }),
-    );
+    return attempt.value;
   }
 }
 
@@ -505,7 +610,7 @@ async function adaptRouterSelfLookup(
   return Result.tryPromise({
     try: operation,
     catch: <T>(cause: T) =>
-      isPanic(cause)
+      Panic.is(cause)
         ? cause
         : new DiscordRequestRouterAdapterSelfLookupRejected({
             cause,
@@ -526,7 +631,7 @@ async function adaptRouterSubscriptionStart(
   const captured = await Result.tryPromise({
     try: () => started,
     catch: <T>(cause: T) =>
-      isPanic(cause)
+      Panic.is(cause)
         ? cause
         : new DiscordRequestRouterSubscriptionStartRejected({
             cause,
@@ -534,23 +639,6 @@ async function adaptRouterSubscriptionStart(
           }),
   });
   return Result.flatten(captured);
-}
-
-function adaptRouterConfigResult(result: ReturnType<typeof withDefaultToolsConfig>): CoreConfig {
-  return result.match<() => CoreConfig>({
-    ok: (value) => () => value,
-    err: (error) => () => {
-      switch (error._tag) {
-        case "CoreConfigV1Invalid":
-        case "CoreConfigV2Invalid":
-          throw error.cause;
-        case "CoreConfigVersionInvalid":
-        case "CoreConfigMustBeObject":
-        case "CoreConfigDeprecatedField":
-          throw new Error(error.message);
-      }
-    },
-  })();
 }
 
 function superviseRouterSubscriptionsDone(
@@ -703,6 +791,41 @@ function resolveTriggerType(input: {
   return undefined;
 }
 
+function surfaceMessageFromIngress(input: {
+  event: EvtAdapterMessageCreatedData;
+  raw: NormalizedDiscordRaw | null;
+  parentChannelId?: string;
+  guildId?: string;
+}): SurfaceMessage {
+  const normalizedRaw = input.raw;
+  const reference = normalizedRaw?.reference ?? normalizedRaw?.replyReference;
+  return {
+    ref: parseDiscordMsgRefFromAdapterEvent(input.event),
+    session: {
+      platform: "discord",
+      channelId: input.event.channelId,
+      ...(input.guildId ? { guildId: input.guildId } : {}),
+      ...(input.parentChannelId ? { parentChannelId: input.parentChannelId } : {}),
+    },
+    userId: input.event.userId,
+    ...(input.event.userName ? { userName: input.event.userName } : {}),
+    text: input.event.text,
+    ts: input.event.ts,
+    raw: normalizedRaw
+      ? {
+          ...(normalizedRaw.content ? { content: normalizedRaw.content } : {}),
+          embeds: normalizedRaw.embeds,
+          attachments: normalizedRaw.attachments,
+          ...(reference ? { reference } : {}),
+          ...(normalizedRaw.forwardSnapshot
+            ? { messageSnapshots: [{ message: normalizedRaw.forwardSnapshot.raw }] }
+            : {}),
+          discord: normalizedRaw.isChat === undefined ? {} : { isChat: normalizedRaw.isChat },
+        }
+      : {},
+  };
+}
+
 function uniqueParticipantUserIds(input: {
   values: readonly (string | undefined)[];
   exclude: string;
@@ -721,6 +844,7 @@ type DebounceBuffer = {
   sessionId: string;
   sessionConfigId: string;
   parentChannelId?: string;
+  guildId?: string;
   messages: BufferedMessage[];
   timer: ReturnType<typeof setTimeout> | null;
 };
@@ -728,10 +852,15 @@ type DebounceBuffer = {
 export type StartDiscordRequestRouterInput = {
   adapter: SurfaceAdapter;
   bus: LilacBus;
+  blobStore: BlobStore;
+  resourceRegistry: ResourceRegistry;
+  attachmentCache?: DiscordAttachmentCacheAccess;
+  messageCache?: DiscordMessageCacheAccess;
+  requestDelivery: DiscordRequestDeliveryPort;
   subscriptionId: string;
   customCommands?: CustomCommandManager;
   /** Optionally inject config; defaults to getCoreConfig(). */
-  config?: RouterConfigOverride;
+  config?: CoreConfig;
   transcriptStore?: TranscriptStore;
   /**
    * Optionally suppress routing for specific adapter events.
@@ -742,7 +871,6 @@ export type StartDiscordRequestRouterInput = {
   }) => Promise<{ suppress: boolean; reason?: string }>;
   /** Optional injection for unit tests (bypasses real model call). */
   routerGate?: (input: RouterGateInput) => Promise<RouterGateDecision>;
-  recoveryTombstoneCapacity?: number;
   /** Optional structured logger injection for embedding and tests. */
   logger?: Logger;
 };
@@ -774,120 +902,57 @@ export async function startDiscordRequestRouter(
       module: "discord-request-router",
     });
 
-  let cfg = params.config
-    ? adaptRouterConfigResult(withDefaultToolsConfig(params.config))
-    : await getCoreConfig();
+  let cfg = params.config ?? (await getCoreConfig());
   let coreConfigReloadHadError = false;
   let lastCoreConfigReloadError: string | null = null;
 
   async function reloadCoreConfigIfNeeded(): Promise<void> {
     if (params.config) return;
 
-    try {
-      cfg = await getCoreConfig();
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          cfg = await getCoreConfig();
 
-      if (coreConfigReloadHadError) {
-        logger.info("core-config reload recovered", {
+          if (coreConfigReloadHadError) {
+            logger.info("core-config reload recovered", {
+              path: "core-config.yaml",
+            });
+          }
+
+          coreConfigReloadHadError = false;
+          lastCoreConfigReloadError = null;
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const e = attempt.error.cause;
+        if (isPanic(e)) throw e;
+        const failure = new BusRequestRouterConfigReloadFailed({
+          cause: e,
+          message: "Core config reload failed",
+        });
+        const logContext = formatBridgeTaggedErrorForLog(failure, {
           path: "core-config.yaml",
         });
-      }
+        const msg = logContext.errorMessage;
+        if (!coreConfigReloadHadError || lastCoreConfigReloadError !== msg) {
+          logger.warn("core-config reload failed; using last known config", logContext);
+        }
 
-      coreConfigReloadHadError = false;
-      lastCoreConfigReloadError = null;
-    } catch (e) {
-      if (isPanic(e)) throw e;
-      const failure = new BusRequestRouterConfigReloadFailed({
-        cause: e,
-        message: "Core config reload failed",
-      });
-      const logContext = formatBridgeTaggedErrorForLog(failure, {
-        path: "core-config.yaml",
-      });
-      const msg = logContext.errorMessage;
-      if (!coreConfigReloadHadError || lastCoreConfigReloadError !== msg) {
-        logger.warn("core-config reload failed; using last known config", logContext);
+        coreConfigReloadHadError = true;
+        lastCoreConfigReloadError = msg;
       }
-
-      coreConfigReloadHadError = true;
-      lastCoreConfigReloadError = msg;
     }
   }
 
   const activeBySession = new Map<string, ActiveSessionState>();
-  const finalizedRecoveryGenerations = new WeakSet<SurfaceRecoveryGeneration>();
-  const terminalLifecycleTombstones = new Map<
-    string,
-    {
-      readonly requestId: string;
-      readonly platform: "discord";
-      readonly sessionId: string;
-    }
-  >();
-  const terminalLifecycleTombstoneCapacity = Math.max(
-    1,
-    Math.floor(params.recoveryTombstoneCapacity ?? MAX_TERMINAL_LIFECYCLE_TOMBSTONES),
-  );
-  let terminalLifecycleTombstoneOverflow = false;
-  const terminalLifecycleTombstoneKey = (requestId: string, sessionId: string): string =>
-    `${requestId}\u0000discord\u0000${sessionId}`;
-  const recordTerminalLifecycleTombstone = (requestId: string, sessionId: string): void => {
-    const key = terminalLifecycleTombstoneKey(requestId, sessionId);
-    if (terminalLifecycleTombstones.has(key) || terminalLifecycleTombstoneOverflow) return;
-    if (terminalLifecycleTombstones.size >= terminalLifecycleTombstoneCapacity) {
-      terminalLifecycleTombstoneOverflow = true;
-      return;
-    }
-    terminalLifecycleTombstones.set(key, {
-      requestId,
-      platform: "discord",
-      sessionId,
-    });
-  };
   const activeSessionForRequest = (requestId: string): string | undefined => {
     for (const [sessionId, active] of activeBySession) {
       if (active.requestId === requestId) return sessionId;
     }
     return undefined;
-  };
-  const terminalSessionForRequest = (requestId: string): string | undefined => {
-    for (const tombstone of terminalLifecycleTombstones.values()) {
-      if (tombstone.requestId === requestId) return tombstone.sessionId;
-    }
-    return undefined;
-  };
-  const restoreActiveOutputChains = (
-    generation: SurfaceRecoveryGeneration,
-    chains: readonly SurfaceRestoredOutputChain<"discord">[],
-  ): void => {
-    if (finalizedRecoveryGenerations.has(generation)) return;
-    finalizedRecoveryGenerations.add(generation);
-    for (const chain of chains) {
-      if (terminalLifecycleTombstoneOverflow) {
-        const current = activeBySession.get(chain.sessionId);
-        if (current?.requestId === chain.requestId) activeBySession.delete(chain.sessionId);
-        continue;
-      }
-      const terminalKey = terminalLifecycleTombstoneKey(chain.requestId, chain.sessionId);
-      if (terminalLifecycleTombstones.has(terminalKey)) {
-        const current = activeBySession.get(chain.sessionId);
-        if (current?.requestId === chain.requestId) activeBySession.delete(chain.sessionId);
-        continue;
-      }
-      const current = activeBySession.get(chain.sessionId);
-      if (current && current.requestId !== chain.requestId) continue;
-      for (const [key, tombstone] of terminalLifecycleTombstones) {
-        if (tombstone.requestId === chain.requestId) terminalLifecycleTombstones.delete(key);
-      }
-      const active = current ?? {
-        requestId: chain.requestId,
-        activeOutputMessageIds: new Set<string>(),
-      };
-      const refs = chain.activeOutputRefs ?? chain.createdOutputRefs;
-      for (const ref of refs) active.activeOutputMessageIds.add(ref.messageId);
-      activeBySession.set(chain.sessionId, active);
-    }
-    terminalLifecycleTombstones.clear();
-    terminalLifecycleTombstoneOverflow = false;
   };
   const buffers = new Map<string, DebounceBuffer>();
   const pendingMentionReplyBatchBySession = new Map<string, PendingMentionReplyBatch>();
@@ -902,20 +967,29 @@ export async function startDiscordRequestRouter(
     msgRef: MsgRef;
     triggerTs: number;
   }): Promise<string | undefined> {
-    return resolvePreviousMessageTextImpl({ adapter, input });
+    return resolvePreviousMessageTextImpl({ adapter, messageCache: params.messageCache, input });
   }
 
   async function resolveRepliedToMessageText(input: {
     sessionId: string;
     replyToMessageId?: string;
   }): Promise<string | undefined> {
-    return resolveRepliedToMessageTextImpl({ adapter, input });
+    return resolveRepliedToMessageTextImpl({
+      adapter,
+      messageCache: params.messageCache,
+      transcriptStore: params.transcriptStore,
+      input,
+    });
   }
 
   async function resolvePreviousBatchMessageText(
     messages: readonly BufferedMessage[],
   ): Promise<string | undefined> {
-    return resolvePreviousBatchMessageTextImpl({ adapter, messages });
+    return resolvePreviousBatchMessageTextImpl({
+      adapter,
+      messageCache: params.messageCache,
+      messages,
+    });
   }
 
   function combineTextTransforms(
@@ -944,45 +1018,70 @@ export async function startDiscordRequestRouter(
   async function evaluateAdapterSuppression(
     evt: EvtAdapterMessageCreatedData,
   ): Promise<{ suppress: boolean; reason?: string }> {
-    if (!params.shouldSuppressAdapterEvent) return { suppress: false };
-    try {
-      return await params.shouldSuppressAdapterEvent({ evt });
-    } catch (cause) {
+    const shouldSuppressAdapterEvent = params.shouldSuppressAdapterEvent;
+    if (!shouldSuppressAdapterEvent) return { suppress: false };
+    const captured = await Result.tryPromise({
+      try: () => shouldSuppressAdapterEvent({ evt }),
+      catch: (cause) => ({ restoreCause: () => cause }),
+    });
+    const outcome = captured.match<
+      | {
+          readonly kind: "success";
+          readonly decision: Awaited<
+            ReturnType<NonNullable<typeof params.shouldSuppressAdapterEvent>>
+          >;
+        }
+      | { readonly kind: "failure"; readonly restoreCause: () => unknown }
+    >({
+      ok: (decision) => ({ kind: "success", decision }),
+      err: ({ restoreCause }) => ({ kind: "failure", restoreCause }),
+    });
+    if (outcome.kind === "failure") {
+      const cause = outcome.restoreCause();
       if (isPanic(cause)) throw cause;
+      const error = new BusRequestRouterSuppressionFailed({
+        cause,
+        message: "Router suppression hook failed",
+      });
       logger.error(
         "router suppression hook failed; proceeding",
-        formatBridgeTaggedErrorForLog(
-          new BusRequestRouterSuppressionFailed({
-            cause,
-            message: "Router suppression hook failed",
-          }),
-        ),
+        formatBridgeTaggedErrorForLog(error),
       );
       return { suppress: false };
     }
+    return outcome.decision;
   }
 
   async function evaluateDirectReplyRouterGate(input: {
     readonly sessionId: string;
     readonly gateInput: RouterGateInput;
   }): Promise<RouterGateDecision> {
-    try {
-      return await evaluateRouterGate(input.gateInput);
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-      const failure = new BusRequestRouterActiveBatchGateFailed({
-        sessionId: input.sessionId,
-        cause,
-        message: "Direct-reply router gate failed",
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          return await evaluateRouterGate(input.gateInput);
+        },
+        catch: captureError,
       });
-      logger.error(
-        "router direct-reply gate failed; forwarding",
-        formatBridgeTaggedErrorForLog(failure, {
+
+      if (attempt.isErr()) {
+        const cause = attempt.error.cause;
+        if (isPanic(cause)) throw cause;
+        const failure = new BusRequestRouterActiveBatchGateFailed({
           sessionId: input.sessionId,
-          ...extractAiErrorLogDetails(cause),
-        }),
-      );
-      return { forward: true, reason: "error-fail-open" };
+          cause,
+          message: "Direct-reply router gate failed",
+        });
+        logger.error(
+          "router direct-reply gate failed; forwarding",
+          formatBridgeTaggedErrorForLog(failure, {
+            sessionId: input.sessionId,
+            ...extractAiErrorLogDetails(cause),
+          }),
+        );
+        return { forward: true, reason: "error-fail-open" };
+      }
+      return attempt.value;
     }
   }
 
@@ -1025,9 +1124,8 @@ export async function startDiscordRequestRouter(
         }
 
         const activeSessionId = activeSessionForRequest(requestId);
-        const terminalSessionId = terminalSessionForRequest(requestId);
         if (requestClient !== "discord") {
-          if (activeSessionId !== undefined || terminalSessionId !== undefined) {
+          if (activeSessionId !== undefined) {
             return Result.err(
               new BusRequestRouterLifecycleCorrelationInvalid({
                 requestId,
@@ -1037,10 +1135,7 @@ export async function startDiscordRequestRouter(
           }
           return Result.ok(undefined);
         }
-        if (
-          (activeSessionId !== undefined && activeSessionId !== sessionId) ||
-          (terminalSessionId !== undefined && terminalSessionId !== sessionId)
-        ) {
+        if (activeSessionId !== undefined && activeSessionId !== sessionId) {
           return Result.err(
             new BusRequestRouterLifecycleCorrelationInvalid({
               requestId,
@@ -1051,7 +1146,6 @@ export async function startDiscordRequestRouter(
 
         return captureRouterRouting("evt.request", async () => {
           if (msg.data.state === "running") {
-            terminalLifecycleTombstones.delete(terminalLifecycleTombstoneKey(requestId, sessionId));
             const current = activeBySession.get(sessionId);
             if (current?.requestId !== requestId) {
               activeBySession.set(sessionId, {
@@ -1066,13 +1160,14 @@ export async function startDiscordRequestRouter(
             msg.data.state === "failed" ||
             msg.data.state === "cancelled"
           ) {
-            recordTerminalLifecycleTombstone(requestId, sessionId);
             const cur = activeBySession.get(sessionId);
             if (cur?.requestId === requestId) {
-              await flushPendingMentionReplyBatchAsPrompt({
+              const flushed = await flushPendingMentionReplyBatchAsPrompt({
                 sessionId,
                 sourceRequestId: requestId,
               });
+              const flushError = flushed.match({ ok: () => null, err: (error) => error });
+              if (flushError) return Result.err(flushError);
               activeBySession.delete(sessionId);
             }
           }
@@ -1171,6 +1266,13 @@ export async function startDiscordRequestRouter(
           return Result.ok(undefined);
         }
 
+        const latencyRequestId = formatDiscordMessageRequestId({
+          channelId: msg.data.channelId,
+          messageId: msg.data.messageId,
+        });
+        recordRequestLatencyStage(latencyRequestId, "adapterEventPublishedAt", msg.ts);
+        recordRequestLatencyStage(latencyRequestId, "routerReceivedAt");
+
         return captureRouterRouting("evt.adapter", async () => {
           if (env.perf.log) {
             const lagMs = Date.now() - msg.ts;
@@ -1218,6 +1320,12 @@ export async function startDiscordRequestRouter(
           const flags = getDiscordFlags(msg.data.raw);
           const isDm = flags.isDMBased === true;
           const parentChannelId = flags.parentChannelId;
+          const ingressMessage = surfaceMessageFromIngress({
+            event: msg.data,
+            raw: normalizeDiscordRaw(msg.data.raw),
+            parentChannelId,
+            guildId: flags.guildId,
+          });
           const botMentionNames = resolveBotMentionNames({
             cfg,
             botUserId: flags.botUserId ?? (await adapter.getSelf()).userId,
@@ -1234,6 +1342,7 @@ export async function startDiscordRequestRouter(
             cfg,
             sessionId,
             parentChannelId,
+            flags.guildId,
           );
           const modelOverride =
             requestModelOverride ?? flags.sessionModelOverride ?? configuredSessionModelOverride;
@@ -1248,8 +1357,13 @@ export async function startDiscordRequestRouter(
 
           const mode: SessionMode = isDm
             ? "active"
-            : getSessionMode(cfg, sessionId, parentChannelId);
-          const gateEnabled = resolveSessionGateEnabled(cfg, sessionId, parentChannelId);
+            : getSessionMode(cfg, sessionId, parentChannelId, flags.guildId);
+          const gateEnabled = resolveSessionGateEnabled(
+            cfg,
+            sessionId,
+            parentChannelId,
+            flags.guildId,
+          );
 
           const active = activeBySession.get(sessionId);
 
@@ -1372,6 +1486,7 @@ export async function startDiscordRequestRouter(
               sessionConfigId,
               parentChannelId,
               msgRef,
+              ingressMessage,
               sessionMode: mode,
               modelOverride,
               raw,
@@ -1442,41 +1557,18 @@ export async function startDiscordRequestRouter(
 
           if (mode === "active") {
             if (isDm) {
-              await handleActiveDmMode({
+              return handleActiveDmMode({
                 adapter,
                 bus,
                 cfg,
                 sessionId,
                 msgRef,
+                ingressMessage,
                 userId: msg.data.userId,
                 userText: msg.data.text,
                 mentionsBot: flags.mentionsBot === true,
                 replyToBot: flags.replyToBot === true,
                 replyToMessageId: flags.replyToMessageId,
-                active,
-                sessionMode: mode,
-                sessionConfigId,
-                modelOverride,
-                requestModelOverride,
-                continueCount,
-                botMentionNames,
-              });
-            } else {
-              await handleActiveChannelMode({
-                adapter,
-                bus,
-                cfg,
-                buffers,
-                sessionId,
-                msgRef,
-                userId: msg.data.userId,
-                userText: msg.data.text,
-                messageTs: msg.data.ts,
-                mentionsBot: flags.mentionsBot === true,
-                replyToBot: flags.replyToBot === true,
-                replyToMessageId: flags.replyToMessageId,
-                botUserId: flags.botUserId,
-                parentChannelId,
                 active,
                 sessionMode: mode,
                 sessionConfigId,
@@ -1486,8 +1578,31 @@ export async function startDiscordRequestRouter(
                 botMentionNames,
               });
             }
-
-            return;
+            return handleActiveChannelMode({
+              adapter,
+              bus,
+              cfg,
+              buffers,
+              sessionId,
+              msgRef,
+              ingressMessage,
+              userId: msg.data.userId,
+              userText: msg.data.text,
+              messageTs: msg.data.ts,
+              mentionsBot: flags.mentionsBot === true,
+              replyToBot: flags.replyToBot === true,
+              replyToMessageId: flags.replyToMessageId,
+              botUserId: flags.botUserId,
+              parentChannelId,
+              guildId: flags.guildId,
+              active,
+              sessionMode: mode,
+              sessionConfigId,
+              modelOverride,
+              requestModelOverride,
+              continueCount,
+              botMentionNames,
+            });
           }
 
           return handleMentionMode({
@@ -1497,7 +1612,7 @@ export async function startDiscordRequestRouter(
             activeBySession,
             sessionId,
             msgRef,
-            userId: msg.data.userId,
+            ingressMessage,
             userText: msg.data.text,
             mentionsBot: flags.mentionsBot,
             replyToBot: flags.replyToBot,
@@ -1595,6 +1710,7 @@ export async function startDiscordRequestRouter(
         parentChannelId: batch.parentChannelId,
         queue: "followUp",
         msgRef: item.msgRef,
+        ingressMessage: item.ingressMessage,
         sessionMode: batch.sessionMode,
         modelOverride: batch.modelOverride,
         transformUserText: transformPendingUserText(item),
@@ -1621,15 +1737,21 @@ export async function startDiscordRequestRouter(
   async function flushPendingMentionReplyBatchAsPrompt(input: {
     sessionId: string;
     sourceRequestId: string;
-  }) {
+  }): Promise<ResultType<void, BusRequestRouterRoutingError>> {
     const batch = takePendingMentionReplyBatch(input);
-    if (!batch || batch.items.length === 0) return;
+    if (!batch || batch.items.length === 0) return Result.ok(undefined);
+    const restoreBatch = (): void => {
+      if (!pendingMentionReplyBatchBySession.has(input.sessionId)) {
+        pendingMentionReplyBatchBySession.set(input.sessionId, batch);
+      }
+    };
 
     const last = batch.items[batch.items.length - 1]!;
     const requestId = formatDiscordMessageRequestId({
       channelId: input.sessionId,
       messageId: last.msgRef.messageId,
     });
+    const requestDeliveryId = crypto.randomUUID();
 
     const self = await adapter.getSelf();
     const discordUserAliasById = buildDiscordUserAliasById(cfg);
@@ -1639,6 +1761,14 @@ export async function startDiscordRequestRouter(
       botUserId: self.userId,
       botName: cfg.surface.discord.botName,
       transcriptStore: params.transcriptStore,
+      blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
+      attachmentCache: params.attachmentCache,
+      attachmentCacheTtl: cfg.surface.discord.attachmentCache.ttlMs,
+      messageCache: params.messageCache,
+      ingressMessages: batch.items.flatMap((item) =>
+        item.ingressMessage ? [item.ingressMessage] : [],
+      ),
       currentRequestId: requestId,
       currentMessageIds: batch.items.map((item) => item.msgRef.messageId),
       discordUserAliasById,
@@ -1652,17 +1782,29 @@ export async function startDiscordRequestRouter(
     const compositionError = composed.match({ ok: () => null, err: (error) => error });
     if (compositionError) {
       logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, compositionError);
-      return;
+      restoreBatch();
+      return Result.err(requestPublishRoutingError(compositionError));
     }
     const composition = composed.match({ ok: (value) => value, err: () => null });
-    if (!composition) return;
+    if (!composition) {
+      restoreBatch();
+      return Result.err(
+        new BusRequestRouterRoutingError({
+          topic: "evt.request",
+          cause: null,
+          message: "Deferred Discord request composition returned no result",
+        }),
+      );
+    }
 
     const chainMessageIds = new Set(composition.chainMessageIds);
     const extraCompositions: RequestCompositionResult[] = [];
     const batchParticipantUserIds: string[] = [];
 
     for (const item of batch.items) {
-      const surfaceMessage = await adapter.readMsg(item.msgRef);
+      const surfaceMessage = item.ingressMessage
+        ? Result.ok(item.ingressMessage)
+        : await adapter.readMsg(item.msgRef);
       const userId = surfaceMessage.match({ ok: (value) => value?.userId, err: () => undefined });
       if (userId) batchParticipantUserIds.push(userId);
       if (chainMessageIds.has(item.msgRef.messageId)) continue;
@@ -1673,12 +1815,32 @@ export async function startDiscordRequestRouter(
         msgRef: item.msgRef,
         discordUserAliasById,
         transcriptStore: params.transcriptStore,
+        blobStore: params.blobStore,
+        resourceRegistry: params.resourceRegistry,
+        attachmentCache: params.attachmentCache,
+        attachmentCacheTtl: cfg.surface.discord.attachmentCache.ttlMs,
+        messageCache: params.messageCache,
+        ingressMessages: item.ingressMessage ? [item.ingressMessage] : undefined,
         transformUserText: transformPendingUserText(item),
       });
       const extraError = extra.match({ ok: () => null, err: (error) => error });
       if (extraError) {
-        logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, extraError);
-        return;
+        const cleanup = await deleteDiscordRequestBlobHandles(params.blobStore, [
+          ...composition.inputHandles,
+          ...extraCompositions.flatMap((value) => value.inputHandles),
+        ]);
+        const finalError = cleanup.match<RequestCompositionError>({
+          ok: () => extraError,
+          err: (cleanupError) =>
+            new DiscordRequestCompositionAndCleanupFailed({
+              primary: extraError,
+              cleanup: cleanupError,
+              message: "Deferred Discord request composition and input handle cleanup failed",
+            }),
+        });
+        logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, finalError);
+        restoreBatch();
+        return Result.err(requestPublishRoutingError(finalError));
       }
       const extraValue = extra.match({ ok: (value) => value, err: () => null });
       if (!extraValue) continue;
@@ -1749,7 +1911,7 @@ export async function startDiscordRequestRouter(
           : baseCurrentSegment +
               (insertSegmentIndex <= baseCurrentSegment ? extraSegments.length : 0),
       );
-      const built = buildCoreLineageManifestV1(
+      const built = buildCoreLineageManifestV2(
         combinedSegments.map((segment) => ({
           atoms: segment.atoms,
           canonicalMessages: segment.canonicalMessages,
@@ -1767,7 +1929,8 @@ export async function startDiscordRequestRouter(
       });
     })();
 
-    await publishBusRequest({
+    const published = await publishBusRequest({
+      requestDeliveryId,
       requestId,
       sessionId: input.sessionId,
       sessionConfigId: batch.sessionConfigId,
@@ -1777,6 +1940,10 @@ export async function startDiscordRequestRouter(
       sessionMode: batch.sessionMode,
       modelOverride: batch.modelOverride,
       messages: finalMessages,
+      inputHandles: [
+        ...composition.inputHandles,
+        ...extraCompositions.flatMap((value) => value.inputHandles),
+      ],
       corePrimaryLineage: finalLineage,
       raw: {
         triggerType: "reply",
@@ -1795,6 +1962,9 @@ export async function startDiscordRequestRouter(
         },
       },
     });
+    const publishError = published.match({ ok: () => null, err: (error) => error });
+    if (publishError) restoreBatch();
+    return published;
   }
 
   async function handleActiveDmMode(input: {
@@ -1803,6 +1973,7 @@ export async function startDiscordRequestRouter(
     cfg: CoreConfig;
     sessionId: string;
     msgRef: MsgRef;
+    ingressMessage: SurfaceMessage;
     userId: string;
     userText: string;
     mentionsBot: boolean;
@@ -1822,6 +1993,7 @@ export async function startDiscordRequestRouter(
       cfg,
       sessionId,
       msgRef,
+      ingressMessage,
       userText,
       userId: _userId,
       mentionsBot,
@@ -1849,7 +2021,7 @@ export async function startDiscordRequestRouter(
     });
 
     if (active && requestModelOverride) {
-      await publishActiveChannelPrompt({
+      return publishActiveChannelPrompt({
         adapter,
         bus,
         cfg,
@@ -1859,6 +2031,7 @@ export async function startDiscordRequestRouter(
         }),
         sessionId,
         triggerMsgRef: msgRef,
+        ingressMessages: [ingressMessage],
         triggerType: resolveTriggerType({ replyToBot, mentionsBot }),
         sessionMode,
         sessionConfigId,
@@ -1871,7 +2044,6 @@ export async function startDiscordRequestRouter(
         transformUserTextForMessageId: msgRef.messageId,
         markActive: false,
       });
-      return;
     }
 
     if (active) {
@@ -1903,7 +2075,7 @@ export async function startDiscordRequestRouter(
           });
           active.activeOutputMessageIds.clear();
 
-          await publishSingleMessageToActiveRequest({
+          return publishSingleMessageToActiveRequest({
             adapter,
             bus,
             cfg,
@@ -1911,6 +2083,7 @@ export async function startDiscordRequestRouter(
             sessionId,
             queue: steerMode,
             msgRef,
+            ingressMessage,
             sessionMode,
             sessionConfigId,
             modelOverride,
@@ -1926,10 +2099,9 @@ export async function startDiscordRequestRouter(
                 : undefined,
             ),
           });
-          return;
         }
 
-        await publishSingleMessageToActiveRequest({
+        return publishSingleMessageToActiveRequest({
           adapter,
           bus,
           cfg,
@@ -1937,6 +2109,7 @@ export async function startDiscordRequestRouter(
           sessionId,
           queue: "followUp",
           msgRef,
+          ingressMessage,
           sessionMode,
           sessionConfigId,
           modelOverride,
@@ -1945,7 +2118,6 @@ export async function startDiscordRequestRouter(
             continueDirectiveTransform,
           ),
         });
-        return;
       }
 
       if (replyToBot) {
@@ -1954,13 +2126,14 @@ export async function startDiscordRequestRouter(
           messageId: msgRef.messageId,
         });
 
-        await publishActiveChannelPrompt({
+        return publishActiveChannelPrompt({
           adapter,
           bus,
           cfg,
           requestId,
           sessionId,
           triggerMsgRef: msgRef,
+          ingressMessages: [ingressMessage],
           triggerType: "reply",
           sessionMode,
           sessionConfigId,
@@ -1973,10 +2146,9 @@ export async function startDiscordRequestRouter(
           transformUserTextForMessageId: msgRef.messageId,
           markActive: false,
         });
-        return;
       }
 
-      await publishSingleMessageToActiveRequest({
+      return publishSingleMessageToActiveRequest({
         adapter,
         bus,
         cfg,
@@ -1984,12 +2156,12 @@ export async function startDiscordRequestRouter(
         sessionId,
         queue: "followUp",
         msgRef,
+        ingressMessage,
         sessionMode,
         sessionConfigId,
         modelOverride,
         transformUserText: continueDirectiveTransform,
       });
-      return;
     }
 
     const requestId = formatDiscordMessageRequestId({
@@ -2000,13 +2172,14 @@ export async function startDiscordRequestRouter(
     const triggerType = resolveTriggerType({ replyToBot, mentionsBot });
 
     // DMs are ungated: start a new request immediately.
-    await publishActiveChannelPrompt({
+    return publishActiveChannelPrompt({
       adapter,
       bus,
       cfg,
       requestId,
       sessionId,
       triggerMsgRef: msgRef,
+      ingressMessages: [ingressMessage],
       triggerType,
       sessionMode,
       sessionConfigId,
@@ -2028,6 +2201,7 @@ export async function startDiscordRequestRouter(
     buffers: Map<string, DebounceBuffer>;
     sessionId: string;
     msgRef: MsgRef;
+    ingressMessage: SurfaceMessage;
     userId: string;
     userText: string;
     messageTs: number;
@@ -2036,6 +2210,7 @@ export async function startDiscordRequestRouter(
     replyToMessageId?: string;
     botUserId?: string;
     parentChannelId?: string;
+    guildId?: string;
     active: ActiveSessionState | undefined;
     sessionMode: SessionMode;
     sessionConfigId: string;
@@ -2051,6 +2226,7 @@ export async function startDiscordRequestRouter(
       buffers,
       sessionId,
       msgRef,
+      ingressMessage,
       userId,
       userText,
       messageTs,
@@ -2058,6 +2234,7 @@ export async function startDiscordRequestRouter(
       replyToBot,
       botUserId,
       parentChannelId,
+      guildId,
       active,
       sessionMode,
       sessionConfigId,
@@ -2083,7 +2260,7 @@ export async function startDiscordRequestRouter(
     });
 
     if (active && requestModelOverride) {
-      await publishActiveChannelPrompt({
+      return publishActiveChannelPrompt({
         adapter,
         bus,
         cfg,
@@ -2093,6 +2270,7 @@ export async function startDiscordRequestRouter(
         }),
         sessionId,
         triggerMsgRef: msgRef,
+        ingressMessages: [ingressMessage],
         triggerType: resolveTriggerType({ replyToBot, mentionsBot }),
         sessionMode,
         sessionConfigId,
@@ -2106,7 +2284,6 @@ export async function startDiscordRequestRouter(
         transformUserTextForMessageId: msgRef.messageId,
         markActive: false,
       });
-      return;
     }
 
     if (active) {
@@ -2141,7 +2318,7 @@ export async function startDiscordRequestRouter(
           });
           active.activeOutputMessageIds.clear();
 
-          await publishSingleMessageToActiveRequest({
+          return publishSingleMessageToActiveRequest({
             adapter,
             bus,
             cfg,
@@ -2149,6 +2326,7 @@ export async function startDiscordRequestRouter(
             sessionId,
             queue: routeDecision.queue,
             msgRef,
+            ingressMessage,
             sessionMode,
             sessionConfigId,
             parentChannelId,
@@ -2165,11 +2343,10 @@ export async function startDiscordRequestRouter(
                 : undefined,
             ),
           });
-          return;
         }
         case "active_output_follow_up":
         case "plain_follow_up": {
-          await publishSingleMessageToActiveRequest({
+          return publishSingleMessageToActiveRequest({
             adapter,
             bus,
             cfg,
@@ -2177,6 +2354,7 @@ export async function startDiscordRequestRouter(
             sessionId,
             queue: "followUp",
             msgRef,
+            ingressMessage,
             sessionMode,
             sessionConfigId,
             parentChannelId,
@@ -2186,7 +2364,6 @@ export async function startDiscordRequestRouter(
               continueDirectiveTransform,
             ),
           });
-          return;
         }
         case "fork_reply_prompt": {
           const requestId = formatDiscordMessageRequestId({
@@ -2194,13 +2371,14 @@ export async function startDiscordRequestRouter(
             messageId: msgRef.messageId,
           });
 
-          await publishActiveChannelPrompt({
+          return publishActiveChannelPrompt({
             adapter,
             bus,
             cfg,
             requestId,
             sessionId,
             triggerMsgRef: msgRef,
+            ingressMessages: [ingressMessage],
             triggerType: "reply",
             sessionMode,
             sessionConfigId,
@@ -2214,10 +2392,9 @@ export async function startDiscordRequestRouter(
             modelOverride,
             markActive: false,
           });
-          return;
         }
         case "buffered_prompt": {
-          await publishSingleMessagePrompt({
+          return publishSingleMessagePrompt({
             adapter,
             bus,
             cfg,
@@ -2226,6 +2403,7 @@ export async function startDiscordRequestRouter(
             sessionConfigId,
             parentChannelId,
             msgRef,
+            ingressMessage,
             sessionMode,
             modelOverride,
             transformUserText: combineTextTransforms(
@@ -2236,7 +2414,6 @@ export async function startDiscordRequestRouter(
               bufferedForActiveRequestId: active.requestId,
             },
           });
-          return;
         }
       }
     }
@@ -2245,13 +2422,14 @@ export async function startDiscordRequestRouter(
     if (continueCount !== undefined && !mentionsBot && !replyToBot && !hasReplyTarget) {
       clearDebounceBuffer(sessionId);
 
-      await publishActiveChannelPrompt({
+      return publishActiveChannelPrompt({
         adapter,
         bus,
         cfg,
         requestId: randomRequestId(),
         sessionId,
         triggerMsgRef: msgRef,
+        ingressMessages: [ingressMessage],
         triggerType: undefined,
         sessionMode,
         sessionConfigId,
@@ -2265,7 +2443,6 @@ export async function startDiscordRequestRouter(
         transformUserTextForMessageId: msgRef.messageId,
         markActive: true,
       });
-      return;
     }
 
     if (mentionsBot || replyToBot) {
@@ -2279,13 +2456,14 @@ export async function startDiscordRequestRouter(
         messageId: msgRef.messageId,
       });
 
-      await publishActiveChannelPrompt({
+      return publishActiveChannelPrompt({
         adapter,
         bus,
         cfg,
         requestId,
         sessionId,
         triggerMsgRef: msgRef,
+        ingressMessages: [ingressMessage],
         triggerType,
         sessionMode,
         sessionConfigId,
@@ -2299,7 +2477,6 @@ export async function startDiscordRequestRouter(
         transformUserTextForMessageId: msgRef.messageId,
         markActive: true,
       });
-      return;
     }
 
     bufferActiveChannelMessage({
@@ -2308,8 +2485,10 @@ export async function startDiscordRequestRouter(
       sessionId,
       sessionConfigId,
       parentChannelId,
+      guildId,
       message: {
         msgRef,
+        ingressMessage,
         userId,
         text: userText,
         ts: messageTs,
@@ -2328,9 +2507,10 @@ export async function startDiscordRequestRouter(
     sessionId: string;
     sessionConfigId: string;
     parentChannelId?: string;
+    guildId?: string;
     message: BufferedMessage;
   }) {
-    const { buffers, cfg, sessionId, sessionConfigId, parentChannelId, message } = input;
+    const { buffers, cfg, sessionId, sessionConfigId, parentChannelId, guildId, message } = input;
 
     const existing = buffers.get(sessionId);
     if (!existing) {
@@ -2343,6 +2523,7 @@ export async function startDiscordRequestRouter(
         sessionId,
         sessionConfigId,
         parentChannelId,
+        guildId,
         messages: [message],
         timer: null,
       };
@@ -2380,7 +2561,7 @@ export async function startDiscordRequestRouter(
     clearDebounceBuffer(sessionId);
 
     // Gate is only for active channels with no running request.
-    const gateEnabled = resolveSessionGateEnabled(cfg, b.sessionId, b.parentChannelId);
+    const gateEnabled = resolveSessionGateEnabled(cfg, b.sessionId, b.parentChannelId, b.guildId);
     const previousMessageText = gateEnabled
       ? await resolvePreviousBatchMessageText(b.messages)
       : undefined;
@@ -2464,6 +2645,7 @@ export async function startDiscordRequestRouter(
     const modelOverride =
       overrideCarrier?.model ?? b.messages[b.messages.length - 1]?.sessionModelOverride;
     const self = await adapter.getSelf();
+    const newestBufferedMessage = b.messages[b.messages.length - 1];
 
     // Gate-forwarded prompt: do NOT reply-to a message.
     // Use newest message as the context anchor.
@@ -2476,7 +2658,10 @@ export async function startDiscordRequestRouter(
       sessionConfigId: b.sessionConfigId,
       parentChannelId: b.parentChannelId,
       // Use newest message as the context anchor (not a reply trigger).
-      triggerMsgRef: b.messages[b.messages.length - 1]?.msgRef,
+      triggerMsgRef: newestBufferedMessage?.msgRef,
+      ingressMessages: b.messages.flatMap((message) =>
+        message.ingressMessage ? [message.ingressMessage] : [],
+      ),
       currentMessageIds: b.messages.map((message) => message.msgRef.messageId),
       triggerType: undefined,
       sessionMode: "active",
@@ -2505,7 +2690,7 @@ export async function startDiscordRequestRouter(
     activeBySession: Map<string, ActiveSessionState>;
     sessionId: string;
     msgRef: MsgRefFor<"discord">;
-    userId: string;
+    ingressMessage: SurfaceMessage;
     userText: string;
     mentionsBot?: boolean;
     replyToBot?: boolean;
@@ -2526,7 +2711,7 @@ export async function startDiscordRequestRouter(
       activeBySession,
       sessionId,
       msgRef,
-      userId,
+      ingressMessage,
       userText,
       mentionsBot,
       replyToBot,
@@ -2571,7 +2756,7 @@ export async function startDiscordRequestRouter(
     });
 
     if (active && requestModelOverride) {
-      await publishComposedRequest({
+      return publishComposedRequest({
         adapter,
         bus,
         cfg,
@@ -2580,7 +2765,7 @@ export async function startDiscordRequestRouter(
         queue: "prompt",
         triggerType,
         msgRef,
-        userId,
+        ingressMessages: [ingressMessage],
         sessionMode: input.sessionMode,
         sessionConfigId: input.sessionConfigId,
         parentChannelId,
@@ -2591,7 +2776,6 @@ export async function startDiscordRequestRouter(
         ),
         transformUserTextForMessageId: msgRef.messageId,
       });
-      return Result.ok(undefined);
     }
 
     // Special case: if the user is replying to the currently active output message chain,
@@ -2619,7 +2803,7 @@ export async function startDiscordRequestRouter(
         });
         active.activeOutputMessageIds.clear();
 
-        await publishSingleMessageToActiveRequest({
+        const published = await publishSingleMessageToActiveRequest({
           adapter,
           bus,
           cfg,
@@ -2627,6 +2811,7 @@ export async function startDiscordRequestRouter(
           sessionId,
           queue: steerMode,
           msgRef,
+          ingressMessage,
           sessionMode: input.sessionMode,
           sessionConfigId: input.sessionConfigId,
           parentChannelId,
@@ -2643,28 +2828,29 @@ export async function startDiscordRequestRouter(
               : undefined,
           ),
         });
+        const publishError = published.match({ ok: () => null, err: (error) => error });
+        if (publishError) return Result.err(publishError);
 
-        await flushPendingMentionReplyBatchAsFollowUp({
+        return flushPendingMentionReplyBatchAsFollowUp({
           sessionId,
           sourceRequestId: active.requestId,
-        });
-        return Result.ok(undefined);
-      } else {
-        return enqueuePendingMentionReplyBatch({
-          sessionId,
-          sourceRequestId: active.requestId,
-          sessionConfigId: input.sessionConfigId,
-          parentChannelId,
-          sessionMode: input.sessionMode,
-          modelOverride: input.modelOverride,
-          item: {
-            msgRef,
-            requestModelOverride,
-            continueCount,
-            botMentionNames,
-          },
         });
       }
+      return enqueuePendingMentionReplyBatch({
+        sessionId,
+        sourceRequestId: active.requestId,
+        sessionConfigId: input.sessionConfigId,
+        parentChannelId,
+        sessionMode: input.sessionMode,
+        modelOverride: input.modelOverride,
+        item: {
+          msgRef,
+          ingressMessage,
+          requestModelOverride,
+          continueCount,
+          botMentionNames,
+        },
+      });
     }
 
     if (!active) {
@@ -2676,7 +2862,7 @@ export async function startDiscordRequestRouter(
     }
 
     // Triggers always start a new request. If a request is running, the runner will queue it.
-    await publishComposedRequest({
+    return publishComposedRequest({
       adapter,
       bus,
       cfg,
@@ -2685,7 +2871,7 @@ export async function startDiscordRequestRouter(
       queue: "prompt",
       triggerType,
       msgRef,
-      userId,
+      ingressMessages: [ingressMessage],
       sessionMode: input.sessionMode,
       sessionConfigId: input.sessionConfigId,
       parentChannelId,
@@ -2696,11 +2882,21 @@ export async function startDiscordRequestRouter(
       ),
       transformUserTextForMessageId: msgRef.messageId,
     });
-    return Result.ok(undefined);
   }
 
   async function publishBusRequest(input: PublishBusRequestInput) {
-    await publishBusRequestImpl({ logger, bus, input });
+    const published = await publishBusRequestImpl({
+      logger,
+      blobStore: params.blobStore,
+      requestDelivery: params.requestDelivery,
+      input,
+    });
+    published.match<() => void>({
+      ok: () => () => undefined,
+      err: (error) => () =>
+        logDiscordRequestPublishFailure(logger, input.requestId, input.sessionId, error),
+    })();
+    return published.mapError(requestPublishRoutingError);
   }
 
   type PublishComposedLocalInput = Parameters<typeof publishComposedRequestImpl>[0]["input"] & {
@@ -2710,11 +2906,15 @@ export async function startDiscordRequestRouter(
   };
 
   async function publishComposedRequest(input: PublishComposedLocalInput) {
-    const { adapter, bus, cfg, ...requestInput } = input;
+    const { adapter, bus: _bus, cfg, ...requestInput } = input;
     const published = await publishComposedRequestImpl({
       adapter,
-      bus,
       cfg,
+      blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
+      attachmentCache: params.attachmentCache,
+      messageCache: params.messageCache,
+      requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
       input: requestInput,
@@ -2722,8 +2922,9 @@ export async function startDiscordRequestRouter(
     published.match<() => void>({
       ok: () => () => undefined,
       err: (error) => () =>
-        logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, error),
+        logDiscordRequestPublishFailure(logger, input.requestId, input.sessionId, error),
     })();
+    return published.mapError(requestPublishRoutingError);
   }
 
   type PublishActiveChannelPromptLocalInput = Parameters<
@@ -2736,27 +2937,31 @@ export async function startDiscordRequestRouter(
   };
 
   async function publishActiveChannelPrompt(input: PublishActiveChannelPromptLocalInput) {
-    const { adapter, bus, cfg, markActive, ...requestInput } = input;
+    const { adapter, bus: _bus, cfg, markActive, ...requestInput } = input;
     const published = await publishActiveChannelPromptImpl({
       adapter,
-      bus,
       cfg,
+      blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
+      attachmentCache: params.attachmentCache,
+      messageCache: params.messageCache,
+      requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
       input: requestInput,
     });
     const publishError = published.match({ ok: () => null, err: (error) => error });
     if (publishError) {
-      logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, publishError);
-      return;
+      logDiscordRequestPublishFailure(logger, input.requestId, input.sessionId, publishError);
+      return Result.err(requestPublishRoutingError(publishError));
     }
-
     if (markActive) {
       activeBySession.set(input.sessionId, {
         requestId: input.requestId,
         activeOutputMessageIds: new Set(),
       });
     }
+    return Result.ok(undefined);
   }
 
   type PublishSingleMessageToActiveRequestLocalInput = Parameters<
@@ -2770,11 +2975,15 @@ export async function startDiscordRequestRouter(
   async function publishSingleMessageToActiveRequest(
     input: PublishSingleMessageToActiveRequestLocalInput,
   ) {
-    const { adapter, bus, cfg, ...requestInput } = input;
+    const { adapter, bus: _bus, cfg, ...requestInput } = input;
     const published = await publishSingleMessageToActiveRequestImpl({
       adapter,
-      bus,
       cfg,
+      blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
+      attachmentCache: params.attachmentCache,
+      messageCache: params.messageCache,
+      requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
       input: requestInput,
@@ -2782,9 +2991,9 @@ export async function startDiscordRequestRouter(
     published.match<() => void>({
       ok: () => () => undefined,
       err: (error) => () =>
-        logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, error),
+        logDiscordRequestPublishFailure(logger, input.requestId, input.sessionId, error),
     })();
-    return published;
+    return published.mapError(requestPublishRoutingError);
   }
 
   type PublishSingleMessagePromptLocalInput = Parameters<
@@ -2796,11 +3005,15 @@ export async function startDiscordRequestRouter(
   };
 
   async function publishSingleMessagePrompt(input: PublishSingleMessagePromptLocalInput) {
-    const { adapter, bus, cfg, ...requestInput } = input;
+    const { adapter, bus: _bus, cfg, ...requestInput } = input;
     const published = await publishSingleMessagePromptImpl({
       adapter,
-      bus,
       cfg,
+      blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
+      attachmentCache: params.attachmentCache,
+      messageCache: params.messageCache,
+      requestDelivery: params.requestDelivery,
       transcriptStore: params.transcriptStore,
       logger,
       input: requestInput,
@@ -2808,8 +3021,9 @@ export async function startDiscordRequestRouter(
     published.match<() => void>({
       ok: () => () => undefined,
       err: (error) => () =>
-        logDiscordRequestCompositionFailure(logger, input.requestId, input.sessionId, error),
+        logDiscordRequestPublishFailure(logger, input.requestId, input.sessionId, error),
     })();
+    return published.mapError(requestPublishRoutingError);
   }
 
   async function publishSurfaceOutputReanchor(
@@ -2829,19 +3043,14 @@ export async function startDiscordRequestRouter(
     residualRouter: null,
     result: Result.ok({
       done,
-      restoreActiveOutputChains,
       stop: async () => {
-        try {
-          await adaptRouterSubscriptionsStop(subscriptions);
-        } finally {
+        await adaptRouterSubscriptionsStop(subscriptions).finally(() => {
           for (const b of buffers.values()) {
             if (b.timer) clearTimeout(b.timer);
           }
           buffers.clear();
           pendingMentionReplyBatchBySession.clear();
-          terminalLifecycleTombstones.clear();
-          terminalLifecycleTombstoneOverflow = false;
-        }
+        });
       },
     }),
   };

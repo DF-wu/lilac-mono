@@ -18,7 +18,7 @@ import {
 } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { getBuiltinSurfaceProtocol } from "../surface/builtin-surface-protocols";
 import type { SurfaceProtocolRouting } from "../surface/protocol";
 import type {
@@ -145,10 +145,11 @@ async function captureSubagentOperation<T>(params: {
   readonly operation: string;
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, SubagentDelegationError>> {
-  const captured = await Result.tryPromise({
-    try: params.run,
-    catch: projectRuntimeError(`Opaque subagent ${params.operation} failure`),
-  });
+  const captured = (
+    await Result.tryPromise({ try: params.run, catch: captureRuntimeError })
+  ).mapError((error) =>
+    projectCapturedRuntimeError(error, `Opaque subagent ${params.operation} failure`),
+  );
   return captured.match<() => ResultType<T, SubagentDelegationError>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {
@@ -567,15 +568,12 @@ export function subagentTools(params: {
           }
         }
 
-        let completed: ResultType<SubagentDelegationOutcome, SubagentDelegationError>;
-        try {
-          completed = await captureSubagentOperation({
-            operation: "await_completion",
-            run: () => handle.completion,
-          });
-        } finally {
+        const completed = await captureSubagentOperation({
+          operation: "await_completion",
+          run: () => handle.completion,
+        }).finally(() => {
           abortListener?.();
-        }
+        });
         const complete = completed.match<() => SubagentDelegateOutput>({
           err: (error) => () => {
             logger.error("subagent delegate failed", {

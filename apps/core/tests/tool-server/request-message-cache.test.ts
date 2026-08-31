@@ -1,5 +1,9 @@
 import { describe, expect, it } from "bun:test";
-import { lilacEventTypes, type LilacMessageForTopic } from "@stanley2058/lilac-event-bus";
+import {
+  lilacEventTypes,
+  type BusMessageV2,
+  type LilacMessageForTopic,
+} from "@stanley2058/lilac-event-bus";
 
 import {
   createRequestMessageCache,
@@ -20,8 +24,12 @@ function requestMessage(input: {
   readonly sessionId?: string;
   readonly requestClient?: "discord" | "github" | "unknown";
   readonly text?: string;
+  readonly messages?: BusMessageV2[];
   readonly raw?: Record<string, unknown>;
 }): LilacMessageForTopic<"cmd.request"> {
+  const messages: BusMessageV2[] = input.messages ?? [
+    { role: "user", content: input.text ?? input.eventId },
+  ];
   return {
     id: input.eventId,
     topic: "cmd.request",
@@ -34,8 +42,9 @@ function requestMessage(input: {
       request_client: input.requestClient ?? "discord",
     },
     data: {
+      requestDeliveryId: crypto.randomUUID(),
       queue: "prompt",
-      messages: [{ role: "user", content: input.text ?? input.eventId }],
+      messages,
       ...(input.raw ? { raw: input.raw } : {}),
     },
   };
@@ -66,6 +75,40 @@ describe("request message cache", () => {
     const message = requestMessage({ eventId: "1-0", requestId: "request-1" });
     expect(cache.cacheMessage(message).status).toBe("ok");
     expect(cache.get("request-1")).toHaveLength(1);
+  });
+
+  it("preserves structured resources in current-request and alias message caches", () => {
+    const cache = createRequestMessageCache();
+    const resource = {
+      type: "resource" as const,
+      uri: `resource://r1_${"ab".repeat(16)}`,
+      filename: "diagram.png",
+      mediaType: "image/png",
+      size: 321,
+    };
+    const message = requestMessage({
+      eventId: "1-0",
+      requestId: "resource-source",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "inspect" }, resource],
+        },
+      ],
+    });
+
+    expect(cache.cacheMessage(message).status).toBe("ok");
+    const alias = cache.createAliasOwner({
+      sourceRequestId: "resource-source",
+      aliasRequestId: "resource-alias",
+      requestClient: "discord",
+      sessionId: "channel-1",
+    });
+    if (alias.status === "error") throw alias.error;
+
+    expect(cache.get("resource-source")).toEqual(message.data.messages);
+    expect(cache.get("resource-alias")).toEqual(message.data.messages);
+    expect(cache.releaseOwner(alias.value)).toBe(true);
   });
 
   it("keeps slow intake alive beyond TTL and releases it after committed handling", () => {
@@ -315,66 +358,6 @@ describe("request message cache", () => {
       "message-1",
     );
     expect(cache.getOrigin(requestId)?.authenticatedOrigin?.userId).toBe("user-1");
-  });
-
-  it("validates a restore batch fully at apply time before mutating any entry", () => {
-    const cache = createRequestMessageCache();
-    const first = requestMessage({ eventId: "1-0", requestId: "first" });
-    expect(cache.cacheMessage(first).status).toBe("ok");
-    const firstProjection = cache.getOrigin(first.key);
-    if (!firstProjection) throw new Error("Expected first projection");
-
-    const projectionSource = createRequestMessageCache();
-    const second = requestMessage({ eventId: "2-0", requestId: "second" });
-    expect(projectionSource.cacheMessage(second).status).toBe("ok");
-    const secondProjection = projectionSource.getOrigin(second.key);
-    if (!secondProjection) throw new Error("Expected second projection");
-
-    const prepared = cache.prepareRestore([
-      { projection: firstProjection, parkedEventIds: ["parked-first"] },
-      { projection: secondProjection, parkedEventIds: ["parked-second"] },
-    ]);
-    if (prepared.status === "error") throw prepared.error;
-    expect(
-      cache.cacheMessage(
-        requestMessage({ eventId: "3-0", requestId: "second", sessionId: "other-channel" }),
-      ).status,
-    ).toBe("ok");
-
-    expect(prepared.value.apply().status).toBe("error");
-    expect(cache.snapshot("first")?.parkedEventIds).toEqual([]);
-    expect(cache.getOrigin("second")?.sessionId).toBe("other-channel");
-  });
-
-  it("restores unrelated capacity evictions on rollback", () => {
-    let now = 1;
-    const cache = createRequestMessageCache({ maxEntries: 2, now: () => now++ });
-    const projections = ["first", "second", "third"].map((requestId, index) => {
-      const source = createRequestMessageCache();
-      const message = requestMessage({ eventId: `${index + 1}-0`, requestId });
-      expect(source.cacheMessage(message).status).toBe("ok");
-      const projection = source.getOrigin(requestId);
-      if (!projection) throw new Error(`Expected ${requestId} projection`);
-      return projection;
-    });
-    const initial = cache.prepareRestore(
-      projections.slice(0, 2).map((projection) => ({ projection, parkedEventIds: [] })),
-    );
-    if (initial.status === "error") throw initial.error;
-    expect(initial.value.apply().status).toBe("ok");
-
-    const overCapacity = cache.prepareRestore([
-      { projection: projections[2]!, parkedEventIds: [] },
-    ]);
-    if (overCapacity.status === "error") throw overCapacity.error;
-    expect(overCapacity.value.apply().status).toBe("ok");
-    expect(cache.getOrigin("first")).toBeUndefined();
-    expect(cache.getOrigin("third")).toBeDefined();
-
-    overCapacity.value.rollback();
-    expect(cache.getOrigin("first")).toBeDefined();
-    expect(cache.getOrigin("second")).toBeDefined();
-    expect(cache.getOrigin("third")).toBeUndefined();
   });
 
   it("creates a restricted actor-based Discord alias without message proof", () => {

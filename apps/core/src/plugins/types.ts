@@ -1,5 +1,6 @@
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import type {
   Level1ToolSpec,
   LilacToolPlugin,
@@ -18,10 +19,15 @@ import type { McpRegistryApi } from "../mcp/registry-types";
 import type { McpOAuthProviderService } from "../mcp/oauth-provider";
 import type { McpOAuthCallbackControl } from "../mcp/oauth-callback";
 import type { RegisteredSurfacePlatform } from "../surface/types";
+import type { AttachmentOutputLifecycle } from "../tools/attachment-output-lifecycle";
+import type { ResourceAccess } from "../resource";
 
 export type CoreToolPluginRuntime = {
   dataDir?: string;
   bus?: LilacBus;
+  blobStore?: BlobStore;
+  attachmentOutputLifecycle?: AttachmentOutputLifecycle;
+  resourceAccess?: ResourceAccess;
   surfaceAdapterResolver?: SurfaceAdapterResolver;
   config?: CoreConfig;
   getConfig?: () => Promise<CoreConfig>;

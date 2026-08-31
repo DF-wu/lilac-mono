@@ -2,9 +2,16 @@ import type { Database } from "bun:sqlite";
 import { classifyBunSqliteError, runBunSqliteTransaction } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { WORKFLOW_MANUAL_RECONCILIATION_DETAIL } from "./workflow-domain";
+import {
+  WORKFLOW_MANUAL_RECONCILIATION_DETAIL,
+  workflowArtifactReferenceSchema,
+  type WorkflowArtifactReference,
+} from "./workflow-domain";
+import { canonicalJson } from "./workflow-definition";
 
-export const WORKFLOW_SCHEMA_VERSION = 25;
+export const WORKFLOW_SCHEMA_VERSION = 26;
+export const WORKFLOW_BLOB_MIGRATION_COMMAND =
+  "bun run migrate:blob-storage -- --config /path/to/core-config.yaml --data-dir /path/to/data";
 
 type WorkflowMigration = {
   version: number;
@@ -1439,6 +1446,81 @@ const WORKFLOW_MIGRATIONS: readonly WorkflowMigration[] = [
     name: "durable workflow progress permanent failure gate",
     statements: [`ALTER TABLE workflow_surface_bindings ADD COLUMN permanent_failure_json TEXT`],
   },
+  {
+    version: 26,
+    name: "unified durable workflow artifact references",
+    statements: [
+      `CREATE TABLE workflow_artifacts (
+        artifact_id TEXT PRIMARY KEY,
+        blob_ref_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )`,
+      `CREATE TRIGGER workflow_revision_artifact_reference_insert
+       BEFORE INSERT ON workflow_revisions
+       WHEN NOT EXISTS (
+         SELECT 1 FROM workflow_artifacts artifact
+         WHERE artifact.artifact_id = json_extract(NEW.snapshot_artifact_id, '$.artifactId')
+           AND json(artifact.blob_ref_json) = json_extract(NEW.snapshot_artifact_id, '$.blobRef')
+       )
+       BEGIN SELECT RAISE(ABORT, 'invalid workflow snapshot artifact reference'); END`,
+      `CREATE TRIGGER workflow_revision_artifact_reference_update
+       BEFORE UPDATE OF snapshot_artifact_id ON workflow_revisions
+       WHEN NOT EXISTS (
+         SELECT 1 FROM workflow_artifacts artifact
+         WHERE artifact.artifact_id = json_extract(NEW.snapshot_artifact_id, '$.artifactId')
+           AND json(artifact.blob_ref_json) = json_extract(NEW.snapshot_artifact_id, '$.blobRef')
+       )
+       BEGIN SELECT RAISE(ABORT, 'invalid workflow snapshot artifact reference'); END`,
+      `CREATE TRIGGER workflow_run_artifact_reference_insert
+       BEFORE INSERT ON workflow_runs
+       WHEN NEW.result_artifact_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM workflow_artifacts artifact
+         WHERE artifact.artifact_id = json_extract(NEW.result_artifact_id, '$.artifactId')
+           AND json(artifact.blob_ref_json) = json_extract(NEW.result_artifact_id, '$.blobRef')
+       )
+       BEGIN SELECT RAISE(ABORT, 'invalid workflow run artifact reference'); END`,
+      `CREATE TRIGGER workflow_run_artifact_reference_update
+       BEFORE UPDATE OF result_artifact_id ON workflow_runs
+       WHEN NEW.result_artifact_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM workflow_artifacts artifact
+         WHERE artifact.artifact_id = json_extract(NEW.result_artifact_id, '$.artifactId')
+           AND json(artifact.blob_ref_json) = json_extract(NEW.result_artifact_id, '$.blobRef')
+       )
+       BEGIN SELECT RAISE(ABORT, 'invalid workflow run artifact reference'); END`,
+      `CREATE TRIGGER workflow_operation_artifact_reference_insert
+       BEFORE INSERT ON workflow_operations
+       WHEN NEW.result_artifact_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM workflow_artifacts artifact
+         WHERE artifact.artifact_id = json_extract(NEW.result_artifact_id, '$.artifactId')
+           AND json(artifact.blob_ref_json) = json_extract(NEW.result_artifact_id, '$.blobRef')
+       )
+       BEGIN SELECT RAISE(ABORT, 'invalid workflow operation artifact reference'); END`,
+      `CREATE TRIGGER workflow_operation_artifact_reference_update
+       BEFORE UPDATE OF result_artifact_id ON workflow_operations
+       WHEN NEW.result_artifact_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM workflow_artifacts artifact
+         WHERE artifact.artifact_id = json_extract(NEW.result_artifact_id, '$.artifactId')
+           AND json(artifact.blob_ref_json) = json_extract(NEW.result_artifact_id, '$.blobRef')
+       )
+       BEGIN SELECT RAISE(ABORT, 'invalid workflow operation artifact reference'); END`,
+      `CREATE TRIGGER workflow_receipt_artifact_reference_insert
+       BEFORE INSERT ON workflow_request_terminal_receipts
+       WHEN NEW.result_artifact_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM workflow_artifacts artifact
+         WHERE artifact.artifact_id = json_extract(NEW.result_artifact_id, '$.artifactId')
+           AND json(artifact.blob_ref_json) = json_extract(NEW.result_artifact_id, '$.blobRef')
+       )
+       BEGIN SELECT RAISE(ABORT, 'invalid workflow receipt artifact reference'); END`,
+      `CREATE TRIGGER workflow_receipt_artifact_reference_update
+       BEFORE UPDATE OF result_artifact_id ON workflow_request_terminal_receipts
+       WHEN NEW.result_artifact_id IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM workflow_artifacts artifact
+         WHERE artifact.artifact_id = json_extract(NEW.result_artifact_id, '$.artifactId')
+           AND json(artifact.blob_ref_json) = json_extract(NEW.result_artifact_id, '$.blobRef')
+       )
+       BEGIN SELECT RAISE(ABORT, 'invalid workflow receipt artifact reference'); END`,
+    ],
+  },
 ];
 
 export const WORKFLOW_MIGRATION_VERSIONS: readonly number[] = WORKFLOW_MIGRATIONS.map(
@@ -1473,10 +1555,27 @@ export class WorkflowMigrationInvalidTimestamp extends TaggedError(
   readonly message: string;
 }> {}
 
+export class WorkflowBlobStorageMigrationRequired extends TaggedError(
+  "WorkflowBlobStorageMigrationRequired",
+)<{
+  readonly version: number;
+  readonly command: string;
+  readonly message: string;
+}> {}
+
+export class WorkflowMigrationArtifactSetInvalid extends TaggedError(
+  "WorkflowMigrationArtifactSetInvalid",
+)<{
+  readonly artifactId: string;
+  readonly message: string;
+}> {}
+
 export type WorkflowMigrationError =
   | WorkflowMigrationUnsupportedVersion
   | WorkflowMigrationNameMismatch
   | WorkflowMigrationInvalidTimestamp
+  | WorkflowBlobStorageMigrationRequired
+  | WorkflowMigrationArtifactSetInvalid
   | WorkflowMigrationSqliteDriverFailure;
 
 function captureWorkflowMigrationTimestamp(
@@ -1506,6 +1605,167 @@ function classifyMigrationDriverFailure(
   });
 }
 
+export type StagedWorkflowArtifact = {
+  readonly reference: WorkflowArtifactReference;
+  readonly createdAt: number;
+};
+
+export function decodeStagedWorkflowArtifactReference(
+  input: unknown,
+): ResultType<WorkflowArtifactReference, WorkflowMigrationArtifactSetInvalid> {
+  const decoded = workflowArtifactReferenceSchema.safeParse(input);
+  return decoded.success
+    ? Result.ok(decoded.data)
+    : Result.err(
+        new WorkflowMigrationArtifactSetInvalid({
+          artifactId: "invalid-artifact",
+          message: "Workflow blob migration artifact reference is invalid",
+        }),
+      );
+}
+
+export function applyWorkflowBlobStorageSchema26Migration(
+  db: Database,
+  artifacts: readonly StagedWorkflowArtifact[],
+  now: () => number = Date.now,
+): ResultType<void, WorkflowMigrationError> {
+  const timestamp = captureWorkflowMigrationTimestamp(now);
+  function* applyWorkflowBlobMigration() {
+    const appliedAt = yield* timestamp;
+    const encodedById = new Map<
+      string,
+      { readonly referenceJson: string; readonly blobRefJson: string; readonly createdAt: number }
+    >();
+    for (const artifact of artifacts) {
+      const reference = yield* decodeStagedWorkflowArtifactReference(artifact.reference);
+      if (
+        !Number.isInteger(artifact.createdAt) ||
+        artifact.createdAt < 0 ||
+        encodedById.has(reference.artifactId)
+      ) {
+        return Result.err(
+          new WorkflowMigrationArtifactSetInvalid({
+            artifactId: artifact.reference.artifactId.slice(0, 256),
+            message: "Workflow blob migration artifact set is invalid",
+          }),
+        );
+      }
+      encodedById.set(reference.artifactId, {
+        referenceJson: canonicalJson(reference),
+        blobRefJson: canonicalJson(reference.blobRef),
+        createdAt: artifact.createdAt,
+      });
+    }
+
+    yield* runBunSqliteTransaction(
+      db,
+      (): ResultType<void, WorkflowMigrationError> => {
+        const rows = db
+          .query<{ version: number; name: string }, []>(
+            "SELECT version, name FROM workflow_schema_migrations ORDER BY version",
+          )
+          .all();
+        if (rows.length !== 25 || rows.at(-1)?.version !== 25) {
+          return Result.err(
+            new WorkflowMigrationUnsupportedVersion({
+              version: rows.at(-1)?.version ?? 0,
+              message: "Workflow blob migration requires exact schema 25",
+            }),
+          );
+        }
+        for (const [index, row] of rows.entries()) {
+          const expected = WORKFLOW_MIGRATIONS[index];
+          if (!expected || row.version !== expected.version || row.name !== expected.name) {
+            return Result.err(
+              new WorkflowMigrationNameMismatch({
+                version: row.version,
+                expectedName: expected?.name ?? "missing migration",
+                storedName: row.name,
+                message: `Workflow migration ${row.version} name mismatch`,
+              }),
+            );
+          }
+        }
+
+        const referencedIds = db
+          .query<{ artifact_id: string }, []>(
+            `SELECT snapshot_artifact_id AS artifact_id FROM workflow_revisions
+             UNION SELECT result_artifact_id FROM workflow_runs WHERE result_artifact_id IS NOT NULL
+             UNION SELECT result_artifact_id FROM workflow_operations WHERE result_artifact_id IS NOT NULL
+             UNION SELECT result_artifact_id FROM workflow_request_terminal_receipts
+               WHERE result_artifact_id IS NOT NULL`,
+          )
+          .all()
+          .map((row) => row.artifact_id);
+        for (const artifactId of referencedIds) {
+          if (encodedById.has(artifactId)) continue;
+          return Result.err(
+            new WorkflowMigrationArtifactSetInvalid({
+              artifactId: artifactId.slice(0, 256),
+              message: "Workflow blob migration is missing a referenced artifact",
+            }),
+          );
+        }
+        if (referencedIds.length !== encodedById.size) {
+          const referenced = new Set(referencedIds);
+          const extra = [...encodedById.keys()].find((artifactId) => !referenced.has(artifactId));
+          return Result.err(
+            new WorkflowMigrationArtifactSetInvalid({
+              artifactId: (extra ?? "unknown-artifact").slice(0, 256),
+              message: "Workflow blob migration contains an unreferenced artifact",
+            }),
+          );
+        }
+
+        const migration = WORKFLOW_MIGRATIONS.find(({ version }) => version === 26);
+        if (!migration) {
+          return Result.err(
+            new WorkflowMigrationUnsupportedVersion({
+              version: 26,
+              message: "Workflow schema 26 is unavailable",
+            }),
+          );
+        }
+        db.run(migration.statements[0]!);
+        for (const [artifactId, encoded] of encodedById) {
+          db.run(
+            `INSERT INTO workflow_artifacts (artifact_id, blob_ref_json, created_at)
+             VALUES (?, ?, ?)`,
+            [artifactId, encoded.blobRefJson, encoded.createdAt],
+          );
+          db.run(
+            "UPDATE workflow_revisions SET snapshot_artifact_id = ? WHERE snapshot_artifact_id = ?",
+            [encoded.referenceJson, artifactId],
+          );
+          db.run("UPDATE workflow_runs SET result_artifact_id = ? WHERE result_artifact_id = ?", [
+            encoded.referenceJson,
+            artifactId,
+          ]);
+          db.run(
+            "UPDATE workflow_operations SET result_artifact_id = ? WHERE result_artifact_id = ?",
+            [encoded.referenceJson, artifactId],
+          );
+          db.run(
+            `UPDATE workflow_request_terminal_receipts
+             SET result_artifact_id = ? WHERE result_artifact_id = ?`,
+            [encoded.referenceJson, artifactId],
+          );
+        }
+        for (const statement of migration.statements.slice(1)) db.run(statement);
+        db.run(
+          `INSERT INTO workflow_schema_migrations (version, name, applied_at)
+           VALUES (?, ?, ?)`,
+          [migration.version, migration.name, appliedAt],
+        );
+        return Result.ok(undefined);
+      },
+      (cause) => classifyMigrationDriverFailure("apply-v26-offline", cause),
+    );
+    return Result.ok(undefined);
+  }
+  return Result.gen(applyWorkflowBlobMigration);
+}
+
 export function applyWorkflowSchemaMigrations(
   db: Database,
   now: () => number = Date.now,
@@ -1526,19 +1786,27 @@ export function applyWorkflowSchemaMigrations(
       const inspected = runBunSqliteTransaction(
         db,
         () => {
+          const migrationTableExists =
+            db
+              .query<{ count: number }, []>(
+                `SELECT COUNT(*) AS count FROM sqlite_master
+                 WHERE type = 'table' AND name = 'workflow_schema_migrations'`,
+              )
+              .get()?.count === 1;
           db.run(`CREATE TABLE IF NOT EXISTS workflow_schema_migrations (
         version INTEGER PRIMARY KEY,
         name TEXT NOT NULL,
         applied_at INTEGER NOT NULL
       )`);
 
-          return Result.ok(
-            db
+          return Result.ok({
+            migrationTableExists,
+            rows: db
               .query<{ version: number; name: string }, []>(
                 "SELECT version, name FROM workflow_schema_migrations ORDER BY version",
               )
               .all(),
-          );
+          });
         },
         (cause) => classifyMigrationDriverFailure("inspect", cause),
       );
@@ -1546,60 +1814,78 @@ export function applyWorkflowSchemaMigrations(
         () => ResultType<void, WorkflowMigrationError>
       >({
         err: (error) => () => Result.err(error),
-        ok: (rows) => () => {
-          const applied = new Map(rows.map((row) => [row.version, row.name]));
-          const knownVersions = new Set(WORKFLOW_MIGRATION_VERSIONS);
-          for (const version of applied.keys()) {
-            if (!knownVersions.has(version)) {
-              return Result.err(
-                new WorkflowMigrationUnsupportedVersion({
-                  version,
-                  message: `Workflow database migration ${version} is newer than this runtime`,
-                }),
-              );
-            }
-          }
-
-          const applyMigration = (index: number): ResultType<void, WorkflowMigrationError> => {
-            const migration = WORKFLOW_MIGRATIONS[index];
-            if (!migration || migration.version > throughVersion) return Result.ok(undefined);
-            const appliedName = applied.get(migration.version);
-            if (appliedName !== undefined) {
-              if (appliedName !== migration.name) {
+        ok:
+          ({ migrationTableExists, rows }) =>
+          () => {
+            const applied = new Map(rows.map((row) => [row.version, row.name]));
+            const knownVersions = new Set(WORKFLOW_MIGRATION_VERSIONS);
+            for (const version of applied.keys()) {
+              if (!knownVersions.has(version)) {
                 return Result.err(
-                  new WorkflowMigrationNameMismatch({
-                    version: migration.version,
-                    expectedName: migration.name,
-                    storedName: appliedName,
-                    message: `Workflow migration ${migration.version} name mismatch`,
+                  new WorkflowMigrationUnsupportedVersion({
+                    version,
+                    message: `Workflow database migration ${version} is newer than this runtime`,
                   }),
                 );
               }
-              return applyMigration(index + 1);
+            }
+            if (
+              throughVersion === WORKFLOW_SCHEMA_VERSION &&
+              migrationTableExists &&
+              !applied.has(WORKFLOW_SCHEMA_VERSION)
+            ) {
+              const legacyVersion = Math.max(0, ...applied.keys());
+              return Result.err(
+                new WorkflowBlobStorageMigrationRequired({
+                  version: legacyVersion,
+                  command: WORKFLOW_BLOB_MIGRATION_COMMAND,
+                  message:
+                    `Workflow database schema ${legacyVersion} requires offline blob migration. ` +
+                    `Run: ${WORKFLOW_BLOB_MIGRATION_COMMAND}`,
+                }),
+              );
             }
 
-            const migrated = runBunSqliteTransaction(
-              db,
-              () => {
-                for (const statement of migration.statements) db.run(statement);
-                db.run(
-                  "INSERT INTO workflow_schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-                  [migration.version, migration.name, timestamp],
-                );
-                return Result.ok(undefined);
-              },
-              (cause) => classifyMigrationDriverFailure(`apply-v${migration.version}`, cause),
-            );
-            const continueAfterMigration = migrated.match<
-              () => ResultType<void, WorkflowMigrationError>
-            >({
-              err: (error) => () => Result.err(error),
-              ok: () => () => applyMigration(index + 1),
-            });
-            return continueAfterMigration();
-          };
-          return applyMigration(0);
-        },
+            const applyMigration = (index: number): ResultType<void, WorkflowMigrationError> => {
+              const migration = WORKFLOW_MIGRATIONS[index];
+              if (!migration || migration.version > throughVersion) return Result.ok(undefined);
+              const appliedName = applied.get(migration.version);
+              if (appliedName !== undefined) {
+                if (appliedName !== migration.name) {
+                  return Result.err(
+                    new WorkflowMigrationNameMismatch({
+                      version: migration.version,
+                      expectedName: migration.name,
+                      storedName: appliedName,
+                      message: `Workflow migration ${migration.version} name mismatch`,
+                    }),
+                  );
+                }
+                return applyMigration(index + 1);
+              }
+
+              const migrated = runBunSqliteTransaction(
+                db,
+                () => {
+                  for (const statement of migration.statements) db.run(statement);
+                  db.run(
+                    "INSERT INTO workflow_schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+                    [migration.version, migration.name, timestamp],
+                  );
+                  return Result.ok(undefined);
+                },
+                (cause) => classifyMigrationDriverFailure(`apply-v${migration.version}`, cause),
+              );
+              const continueAfterMigration = migrated.match<
+                () => ResultType<void, WorkflowMigrationError>
+              >({
+                err: (error) => () => Result.err(error),
+                ok: () => () => applyMigration(index + 1),
+              });
+              return continueAfterMigration();
+            };
+            return applyMigration(0);
+          },
       });
       return continueAfterInspection();
     },

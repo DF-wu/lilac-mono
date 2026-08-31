@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { randomBytes } from "node:crypto";
 
 import {
@@ -38,6 +39,27 @@ type PendingAuthorization = {
   codeVerifier?: string;
   authorizationUrl?: string;
 };
+
+function bindClientInformationToAuthorizationServer(
+  credential: McpOAuthCredential,
+  authorizationServerInformation: OAuthAuthorizationServerInformation,
+): McpOAuthCredential {
+  const clientInformation = credential.clientInformation;
+  if (!clientInformation) {
+    return { ...credential, authorizationServerInformation };
+  }
+
+  return {
+    ...credential,
+    authorizationServerInformation,
+    clientInformation: {
+      ...clientInformation,
+      issuer: authorizationServerInformation.issuer,
+      authorization_server: authorizationServerInformation.authorizationServerUrl,
+      token_endpoint: authorizationServerInformation.tokenEndpoint,
+    },
+  };
+}
 
 export type McpOAuthStartResult =
   | { readonly status: "authorized" }
@@ -90,12 +112,19 @@ async function captureOAuthAttempt<T>(options: {
   readonly operation: "start" | "complete";
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, McpOAuthProviderError>> {
-  try {
-    return Result.ok(await options.run());
-  } catch (cause) {
-    rethrowPanic(cause);
-    return Result.err(oauthProviderError(options.serverId, options.operation, cause));
-  }
+  const captured = await Result.tryPromise({
+    try: options.run,
+    catch: captureError,
+  });
+  return captured.match<() => ResultType<T, McpOAuthProviderError>>({
+    ok: (value) => () => Result.ok(value),
+    err:
+      ({ cause }) =>
+      () => {
+        rethrowPanic(cause);
+        return Result.err(oauthProviderError(options.serverId, options.operation, cause));
+      },
+  })();
 }
 
 export class McpOAuthCredentialResolutionError extends TaggedError(
@@ -103,7 +132,7 @@ export class McpOAuthCredentialResolutionError extends TaggedError(
 )<{
   readonly serverId: string;
   readonly field: "client_id" | "client_secret";
-  readonly cause: Error;
+  readonly cause: unknown;
   readonly message: string;
 }> {}
 
@@ -257,10 +286,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
   async saveAuthorizationServerInformation(
     authorizationServerInformation: OAuthAuthorizationServerInformation,
   ): Promise<void> {
-    await this.updateCredential((credential) => ({
-      ...credential,
-      authorizationServerInformation,
-    }));
+    await this.updateCredential((credential) =>
+      bindClientInformationToAuthorizationServer(credential, authorizationServerInformation),
+    );
   }
 
   state(): string {
@@ -345,6 +373,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
   async completeAuthorizationResult(
     authorizationCode: string,
     callbackState: string,
+    callbackIssuer?: string,
   ): Promise<ResultType<void, McpOAuthProviderError>> {
     this.pruneExpiredPending();
     const pending = this.pending.get(callbackState);
@@ -361,6 +390,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
           serverUrl: this.serverUrl,
           authorizationCode,
           callbackState,
+          ...(callbackIssuer === undefined ? {} : { callbackIssuer }),
           ...(this.authConfig.scopes?.length ? { scope: this.authConfig.scopes.join(" ") } : {}),
           ...(this.fetchFn ? { fetchFn: this.fetchFn } : {}),
         }),
@@ -381,8 +411,16 @@ export class McpOAuthProvider implements OAuthClientProvider {
     })();
   }
 
-  async completeAuthorization(authorizationCode: string, callbackState: string): Promise<void> {
-    const completed = await this.completeAuthorizationResult(authorizationCode, callbackState);
+  async completeAuthorization(
+    authorizationCode: string,
+    callbackState: string,
+    callbackIssuer?: string,
+  ): Promise<void> {
+    const completed = await this.completeAuthorizationResult(
+      authorizationCode,
+      callbackState,
+      callbackIssuer,
+    );
     completed.match({
       ok: () => () => undefined,
       err: (error) => () => {
@@ -466,10 +504,9 @@ export class McpOAuthProvider implements OAuthClientProvider {
         authorizationServerInformation: OAuthAuthorizationServerInformation,
       ) => {
         this.assertActive(pending, "start");
-        await this.updateCredentialForAttempt(pending, "start", (credential) => ({
-          ...credential,
-          authorizationServerInformation,
-        }));
+        await this.updateCredentialForAttempt(pending, "start", (credential) =>
+          bindClientInformationToAuthorizationServer(credential, authorizationServerInformation),
+        );
       },
       state: () => pending.state,
       saveState: (state: string) => {

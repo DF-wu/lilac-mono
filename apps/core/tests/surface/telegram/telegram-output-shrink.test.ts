@@ -269,20 +269,21 @@ describe("an unremovable surplus message is reported, not silently kept", () => 
     expect(result.created.length).toBeGreaterThan(1);
   });
 
-  it("does not report untouched resumed surplus text as an empty delivered message", async () => {
-    const resumed: MsgRef[] = [
-      { platform: "telegram", channelId: "1001", messageId: "10" },
-      { platform: "telegram", channelId: "1001", messageId: "11" },
-    ];
+  it("replaces a resumed message without reporting a surplus deletion", async () => {
+    const resumed: MsgRef = {
+      platform: "telegram",
+      channelId: "1001",
+      messageId: "10",
+    };
     const { api } = harness({
       failDelete: () => new Error("Bad Request: message can't be deleted"),
     });
-    const stream = makeStream(api, "inline", { resume: { created: resumed } });
+    const stream = makeStream(api, "inline", { resumeAt: resumed });
 
     resultValue(await stream.push({ type: "text.set", text: "replacement" }));
     resultValue(await stream.finish());
 
-    expect(stream.getSurplusDeletionFailures().length).toBeGreaterThan(0);
+    expect(stream.getSurplusDeletionFailures()).toEqual([]);
     expect(stream.getDeliveredMessages()).toEqual([{ messageId: 10, text: "replacement" }]);
   });
 

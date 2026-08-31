@@ -3,30 +3,42 @@ import { Database } from "bun:sqlite";
 import SuperJSON from "superjson";
 
 import fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
-import type { ModelMessage } from "ai";
-import { Panic, type Result as ResultType } from "better-result";
-import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import {
-  buildCoreLineageManifestV1 as buildCoreLineageManifestResultV1,
-  computeCoreLineagePrefixDigestV1,
-  type CoreLineageAtomV1,
-  type CoreLineageManifestV1,
-  type CoreRequestAliasV1,
+  buildCoreLineageManifestV2 as buildCoreLineageManifestResultV2,
+  computeCoreLineagePrefixDigestV2,
+  type BusMessageV2,
+  type CoreLineageAtomV2,
+  type CoreLineageManifestV2,
+  type CoreRequestAliasV2,
+  type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
+import {
+  BlobAdapterFailure,
+  BlobDeleteFailed,
+  createMemoryBlobStore,
+} from "@stanley2058/lilac-blob-storage";
+import type { RetentionLimit } from "@stanley2058/lilac-utils";
 
+import type { ResourceId } from "../../src/resource/contracts";
 import {
   CORE_SURFACE_PROJECTION_FORMAT_VERSION,
   computeCorePrimaryClaudeTerminalHead as computeCorePrimaryClaudeTerminalHeadResult,
   CoreOwnedBlobIntegrityError,
+  type CoreStoredLineageManifestV2,
   type CoreClaudeAttemptMutationError,
   type CoreClaudeBindingReadError,
   SqliteTranscriptStore,
   TranscriptStoreSqliteDriverFailure,
 } from "../../src/transcript/transcript-store";
-import { selectCorePrimaryClaudePrefix } from "../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
+import {
+  hashCanonicalStoredMessagesV2 as hashCanonicalStoredMessagesResultV2,
+  normalizeStoredMessagesV1,
+} from "../../src/transcript/transcript-persistence-codec";
 
 function resultValue<T, E>(result: ResultType<T, E>): T {
   if (result.status === "error") throw result.error;
@@ -36,6 +48,10 @@ function resultValue<T, E>(result: ResultType<T, E>): T {
 function resultError<T, E>(result: ResultType<T, E>): E {
   if (result.status === "ok") throw new Error("expected Result error");
   return result.error;
+}
+
+function hashCanonicalStoredMessagesV2(messages: readonly StoredMessageV1[]) {
+  return resultValue(hashCanonicalStoredMessagesResultV2(messages));
 }
 
 function computeCorePrimaryClaudeTerminalHead(
@@ -119,8 +135,8 @@ function recordPrimaryAttemptOutcome(
   return attemptMutationValue(store.recordCorePrimaryClaudeSessionAttemptOutcome(input));
 }
 
-function buildCoreLineageManifestV1(...args: Parameters<typeof buildCoreLineageManifestResultV1>) {
-  return resultValue(buildCoreLineageManifestResultV1(...args));
+function buildCoreLineageManifestV2(...args: Parameters<typeof buildCoreLineageManifestResultV2>) {
+  return resultValue(buildCoreLineageManifestResultV2(...args));
 }
 
 function getRequestTranscript(
@@ -179,6 +195,16 @@ function putCoreOwnedBlob(
   return resultValue(store.putCoreOwnedBlob(input));
 }
 
+function durableBlob(value: string, objectId: string) {
+  const bytes = new TextEncoder().encode(value);
+  return {
+    version: 1 as const,
+    objectId: `b1_${createHash("sha256").update(objectId).digest("hex").slice(0, 32)}`,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    byteLength: bytes.byteLength,
+  };
+}
+
 function getCoreOwnedBlob(
   store: SqliteTranscriptStore,
   input: Parameters<SqliteTranscriptStore["getCoreOwnedBlob"]>[0],
@@ -219,13 +245,13 @@ function validateCorePrimaryLineageReferences(
 }
 
 function manifestFor(
-  atoms: readonly CoreLineageAtomV1[],
-  canonicalMessages: readonly ModelMessage[],
-  requestAliases?: readonly CoreRequestAliasV1[],
-): CoreLineageManifestV1 {
+  atoms: readonly CoreLineageAtomV2[],
+  canonicalMessages: readonly StoredMessageV1[],
+  requestAliases?: readonly CoreRequestAliasV2[],
+): CoreStoredLineageManifestV2 {
   return {
     state: "complete",
-    lineageVersion: 1,
+    lineageVersion: 2,
     currentCanonicalStart: 0,
     segments: [
       {
@@ -235,19 +261,19 @@ function manifestFor(
         canonicalStart: 0,
         canonicalEnd: canonicalMessages.length,
         cumulativeAtomCount: atoms.length,
-        cumulativePrefixDigest: computeCoreLineagePrefixDigestV1(atoms),
+        cumulativePrefixDigest: computeCoreLineagePrefixDigestV2(atoms),
       },
     ],
   };
 }
 
-function syntheticManifestSegment(messages: readonly ModelMessage[]) {
+function syntheticManifestSegment(messages: readonly StoredMessageV1[]) {
   return {
     atoms: [
       {
         kind: "synthetic" as const,
         source: "transcript-store-test",
-        messageDigest: hashCanonicalMessagesV1(messages).hash,
+        messageDigest: hashCanonicalStoredMessagesV2(messages).hash,
       },
     ],
     canonicalMessages: messages,
@@ -255,11 +281,13 @@ function syntheticManifestSegment(messages: readonly ModelMessage[]) {
 }
 
 function seedPrimaryBinding(store: SqliteTranscriptStore, requestId: string, sessionId: string) {
-  const inputMessages = [{ role: "user", content: `input:${requestId}` }] satisfies ModelMessage[];
-  const manifest = buildCoreLineageManifestV1([syntheticManifestSegment(inputMessages)]);
+  const inputMessages = [
+    { role: "user", content: `input:${requestId}` },
+  ] satisfies StoredMessageV1[];
+  const manifest = buildCoreLineageManifestV2([syntheticManifestSegment(inputMessages)]);
   const responseMessages = [
     { role: "assistant", content: `response:${requestId}` },
-  ] satisfies ModelMessage[];
+  ] satisfies StoredMessageV1[];
   const providerState = {
     lastFamily: "claude-code",
     containsCrossFamilyTurns: false,
@@ -299,7 +327,7 @@ function seedPrimaryBinding(store: SqliteTranscriptStore, requestId: string, ses
     requestId,
     attemptIndex: 0,
     terminalRequestId: requestId,
-    terminalLineageVersion: 1,
+    terminalLineageVersion: 2,
     terminalAtomCount: head.atomCount,
     terminalPrefixDigest: head.prefixDigest,
     terminalCanonicalMessageCount: head.canonicalMessageCount,
@@ -337,7 +365,7 @@ function prepareNamedBindingPromotion(
   const messages = [
     { role: "user", content: `input:${requestId}` },
     { role: "assistant", content: `response:${requestId}` },
-  ] satisfies ModelMessage[];
+  ] satisfies StoredMessageV1[];
   const candidateSessionId = crypto.randomUUID();
   reserveNamedAttempt(store, {
     providerId: "claude-code",
@@ -367,7 +395,7 @@ function prepareNamedBindingPromotion(
       requestId,
       attemptIndex: 0,
       terminalRequestId: requestId,
-      terminalCanonicalHeadHash: hashCanonicalMessagesV1(messages).hash,
+      terminalCanonicalHeadHash: hashCanonicalStoredMessagesV2(messages).hash,
       terminalCanonicalMessageCount: messages.length,
       providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
       nativeCwd: "/workspace",
@@ -409,57 +437,6 @@ function expectCorruptBinding<T>(
   }
 }
 
-function downgradePrimaryBindingSchemaToV4(dbPath: string, corruptHead = false): void {
-  const db = new Database(dbPath);
-  db.run("PRAGMA foreign_keys = OFF");
-  db.exec(`
-    CREATE TABLE core_primary_claude_bindings_v4 (
-      request_client TEXT NOT NULL CHECK (request_client = 'discord'),
-      session_id TEXT NOT NULL,
-      provider_id TEXT NOT NULL,
-      binding_protocol_version INTEGER NOT NULL CHECK (binding_protocol_version = 1),
-      provider_family TEXT NOT NULL CHECK (provider_family = 'claude-code'),
-      lineage_version INTEGER NOT NULL CHECK (lineage_version = 1),
-      atom_count INTEGER NOT NULL CHECK (atom_count > 0),
-      prefix_digest TEXT NOT NULL,
-      canonical_message_count INTEGER NOT NULL CHECK (canonical_message_count > 0),
-      execution_scope_hash_version INTEGER NOT NULL CHECK (execution_scope_hash_version = 1),
-      execution_scope_hash TEXT NOT NULL,
-      claude_session_id TEXT NOT NULL,
-      native_cwd TEXT NOT NULL,
-      native_last_modified REAL NOT NULL CHECK (native_last_modified >= 0),
-      native_context_tokens INTEGER NOT NULL CHECK (native_context_tokens >= 0),
-      native_context_max_tokens INTEGER NOT NULL CHECK (native_context_max_tokens > 0),
-      last_model_specifier TEXT NOT NULL,
-      last_reasoning TEXT NOT NULL,
-      revision INTEGER NOT NULL CHECK (revision > 0),
-      updated_ts INTEGER NOT NULL,
-      PRIMARY KEY (request_client, session_id, provider_id)
-    );
-    INSERT INTO core_primary_claude_bindings_v4 (
-      request_client, session_id, provider_id, binding_protocol_version, provider_family,
-      lineage_version, atom_count, prefix_digest, canonical_message_count,
-      execution_scope_hash_version, execution_scope_hash, claude_session_id, native_cwd,
-      native_last_modified, native_context_tokens, native_context_max_tokens,
-      last_model_specifier, last_reasoning, revision, updated_ts
-    ) SELECT
-      request_client, session_id, provider_id, binding_protocol_version, provider_family,
-      lineage_version, atom_count, prefix_digest, canonical_message_count,
-      execution_scope_hash_version, execution_scope_hash, claude_session_id, native_cwd,
-      native_last_modified, native_context_tokens, native_context_max_tokens,
-      last_model_specifier, last_reasoning, revision, updated_ts
-    FROM core_primary_claude_bindings;
-    DROP TABLE core_primary_claude_bindings;
-    ALTER TABLE core_primary_claude_bindings_v4 RENAME TO core_primary_claude_bindings;
-    DELETE FROM core_primary_claude_attempts;
-    DELETE FROM transcript_schema_migrations WHERE version = 5;
-  `);
-  if (corruptHead) {
-    db.run("UPDATE core_primary_claude_bindings SET prefix_digest = ?", ["00".repeat(32)]);
-  }
-  db.close();
-}
-
 describe("SqliteTranscriptStore", () => {
   it("roundtrips transcripts without mutating tool outputs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
@@ -493,7 +470,7 @@ describe("SqliteTranscriptStore", () => {
         ],
       },
       { role: "assistant", content: "a1" },
-    ] satisfies ModelMessage[];
+    ] satisfies StoredMessageV1[];
 
     store.saveRequestTranscript({
       requestId: "r1",
@@ -537,14 +514,59 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("roundtrips large base64 tool attachments without scrubbing", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
-    const dbPath = path.join(dir, "transcripts.db");
+  it("omits explicit undefined tool fields before transcript persistence", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-undefined-"));
+    const store = new SqliteTranscriptStore(path.join(dir, "transcripts.db"));
+    const messages = [
+      {
+        role: "assistant",
+        providerOptions: undefined,
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-undefined",
+            toolName: "inspect",
+            input: { path: "note.txt" },
+            providerOptions: undefined,
+            providerExecuted: undefined,
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-undefined",
+            toolName: "inspect",
+            providerOptions: undefined,
+            output: { type: "text", value: "done", providerOptions: undefined },
+          },
+        ],
+      },
+    ] satisfies StoredMessageV1[];
 
-    const store = new SqliteTranscriptStore(dbPath);
+    resultValue(
+      store.saveRequestTranscript({
+        requestId: "undefined-tool-fields",
+        sessionId: "chan",
+        requestClient: "discord",
+        messages,
+      }),
+    );
 
+    const normalized = normalizeStoredMessagesV1(messages);
+    if (!normalized) throw new Error("expected valid normalized stored messages");
+    expect(getRequestTranscript(store, { requestId: "undefined-tool-fields" })?.messages).toEqual(
+      normalized,
+    );
+
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("rejects inline base64 tool attachments from durable messages", () => {
     const hugeBase64 = "A".repeat(400_000);
-
     const messages = [
       {
         role: "assistant",
@@ -580,56 +602,9 @@ describe("SqliteTranscriptStore", () => {
         ],
       },
       { role: "assistant", content: "a1" },
-    ] satisfies ModelMessage[];
+    ];
 
-    store.saveRequestTranscript({
-      requestId: "r1",
-      sessionId: "chan",
-      requestClient: "discord",
-      messages,
-      finalText: "done",
-      modelLabel: "test-model",
-    });
-
-    store.linkSurfaceMessagesToRequest({
-      requestId: "r1",
-      created: [{ platform: "discord", channelId: "chan", messageId: "bot-1" }],
-      last: { platform: "discord", channelId: "chan", messageId: "bot-1" },
-    });
-
-    const snap = getTranscriptBySurfaceMessage(store, {
-      platform: "discord",
-      channelId: "chan",
-      messageId: "bot-1",
-    });
-
-    expect(snap).not.toBeNull();
-
-    const toolMsg = snap!.messages.find((m) => m.role === "tool");
-    expect(toolMsg).not.toBeUndefined();
-
-    const parts = Array.isArray(toolMsg!.content) ? (toolMsg!.content as unknown[]) : [];
-    const toolResult = parts.find((p) => {
-      if (!p || typeof p !== "object") return false;
-      return (p as Record<string, unknown>)["type"] === "tool-result";
-    }) as Record<string, unknown> | undefined;
-
-    const output = toolResult?.["output"] as Record<string, unknown> | undefined;
-    expect(output?.["type"]).toBe("content");
-
-    const value = Array.isArray(output?.["value"]) ? (output?.["value"] as unknown[]) : [];
-
-    // The binary data should be preserved in the persisted transcript.
-    const filePart = value.find(
-      (v) => !!v && typeof v === "object" && (v as Record<string, unknown>)["type"] === "file",
-    ) as Record<string, unknown> | undefined;
-
-    expect(filePart).toBeDefined();
-    expect(filePart?.["filename"]).toBe("doc.pdf");
-    expect(filePart?.["data"]).toEqual({ type: "data", data: hugeBase64 });
-
-    store.close();
-    await fs.rm(dir, { recursive: true, force: true });
+    expect(normalizeStoredMessagesV1(messages)).toBeNull();
   });
 
   it("keeps the first surface-to-request writer and treats same-request relinks as idempotent", async () => {
@@ -689,7 +664,7 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("heals stringified assistant tool-call inputs when loading old transcripts", async () => {
+  it("preserves stringified assistant tool-call inputs in current transcripts", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
     const dbPath = path.join(dir, "transcripts.db");
 
@@ -723,7 +698,7 @@ describe("SqliteTranscriptStore", () => {
               },
             ],
           },
-        ] satisfies ModelMessage[]),
+        ] satisfies StoredMessageV1[]),
       ],
     );
     rawDb.close();
@@ -743,21 +718,15 @@ describe("SqliteTranscriptStore", () => {
       throw new Error("expected tool-call part");
     }
 
-    expect(part.input).toEqual({
-      path: "note.txt",
-      edits: [
-        {
-          op: "replace",
-          lines: ["after install."],
-        },
-      ],
-    });
+    expect(part.input).toBe(
+      '{"path":"note.txt","edits":[{"op":"replace","lines":["after install."]}}',
+    );
 
     store.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("drops duplicate tool results when loading old transcripts", async () => {
+  it("preserves duplicate tool results in current transcripts", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
     const dbPath = path.join(dir, "transcripts.db");
 
@@ -812,14 +781,14 @@ describe("SqliteTranscriptStore", () => {
               },
             ],
           },
-        ] satisfies ModelMessage[]),
+        ] satisfies StoredMessageV1[]),
       ],
     );
     rawDb.close();
 
     const latest = getLatestTranscriptBySession(store, { sessionId: "chan" });
     expect(latest).not.toBeNull();
-    expect(latest?.messages).toHaveLength(2);
+    expect(latest?.messages).toHaveLength(3);
 
     const tool = latest?.messages[1];
     expect(tool?.role).toBe("tool");
@@ -1277,7 +1246,7 @@ describe("SqliteTranscriptStore", () => {
       last: { platform: "discord", channelId: "chan", messageId: "output" },
     });
     const raw = new Database(dbPath);
-    raw.exec("CREATE TABLE diagnostic_observations (record_id TEXT NOT NULL)");
+    raw.run("CREATE TABLE diagnostic_observations (record_id TEXT NOT NULL)");
     raw.run("UPDATE request_transcripts SET context_meta_json = ?", ["{"]);
 
     const unlink = store.unlinkSurfaceMessage({
@@ -1387,8 +1356,10 @@ describe("SqliteTranscriptStore", () => {
       }
       throw new Error("save diagnostic observer failed");
     });
-    const manifestMessages = [{ role: "user", content: "lineage input" }] satisfies ModelMessage[];
-    const manifest = buildCoreLineageManifestV1([syntheticManifestSegment(manifestMessages)]);
+    const manifestMessages = [
+      { role: "user", content: "lineage input" },
+    ] satisfies StoredMessageV1[];
+    const manifest = buildCoreLineageManifestV2([syntheticManifestSegment(manifestMessages)]);
     store.saveRequestTranscript({
       requestId: "lineage-owner",
       sessionId: "chan",
@@ -1413,7 +1384,7 @@ describe("SqliteTranscriptStore", () => {
       finalText: "before corruption",
     });
     const raw = new Database(dbPath);
-    raw.exec(`
+    raw.run(`
       CREATE TABLE save_diagnostic_observations (
         record_id TEXT NOT NULL,
         field TEXT NOT NULL
@@ -1507,6 +1478,125 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("classifies lineage SQLite failures and rolls back the transcript write", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-lineage-save-rollback-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath);
+    const raw = new Database(dbPath);
+    raw.run(`
+      CREATE TABLE lineage_save_probe (marker TEXT NOT NULL);
+      CREATE TRIGGER reject_lineage_save
+      BEFORE INSERT ON core_primary_lineage_manifests
+      BEGIN
+        INSERT INTO lineage_save_probe (marker) VALUES ('touched');
+        SELECT RAISE(ABORT, 'reject lineage save');
+      END;
+    `);
+    const messages = [{ role: "user", content: "lineage input" }] satisfies StoredMessageV1[];
+    const manifest = buildCoreLineageManifestV2([syntheticManifestSegment(messages)]);
+
+    const saved = store.saveRequestTranscript({
+      requestId: "lineage-driver-failure",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages,
+      corePrimaryLineage: manifest,
+    });
+
+    expect(saved.status).toBe("error");
+    if (saved.status === "error") {
+      expect(saved.error).toBeInstanceOf(TranscriptStoreSqliteDriverFailure);
+      if (TranscriptStoreSqliteDriverFailure.is(saved.error)) {
+        expect(saved.error.operation).toBe("save-request-transcript");
+      }
+    }
+    expect(raw.query("SELECT * FROM lineage_save_probe").all()).toEqual([]);
+    expect(raw.query("SELECT * FROM request_transcripts").all()).toEqual([]);
+    expect(raw.query("SELECT * FROM core_primary_lineage_manifests").all()).toEqual([]);
+
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("classifies retention SQLite failures and rolls back the saved transcript", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-retention-save-rollback-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      retention: {
+        maxAgeMs: { kind: "unlimited" },
+        maxRequests: { kind: "bounded", value: 1 },
+      },
+    });
+    resultValue(
+      store.saveRequestTranscript({
+        requestId: "retained-before-failure",
+        sessionId: "chan",
+        requestClient: "discord",
+        messages: [{ role: "user", content: "first" }],
+      }),
+    );
+    const raw = new Database(dbPath);
+    raw.run(`
+      CREATE TABLE retention_save_probe (marker TEXT NOT NULL);
+      CREATE TRIGGER reject_retention_delete
+      BEFORE DELETE ON request_transcripts
+      BEGIN
+        INSERT INTO retention_save_probe (marker) VALUES ('touched');
+        SELECT RAISE(ABORT, 'reject retention delete');
+      END;
+    `);
+
+    const saved = store.saveRequestTranscript({
+      requestId: "rolled-back-after-failure",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "second" }],
+    });
+
+    expect(saved.status).toBe("error");
+    if (saved.status === "error") {
+      expect(saved.error).toBeInstanceOf(TranscriptStoreSqliteDriverFailure);
+      if (TranscriptStoreSqliteDriverFailure.is(saved.error)) {
+        expect(saved.error.operation).toBe("save-request-transcript");
+      }
+    }
+    expect(raw.query("SELECT * FROM retention_save_probe").all()).toEqual([]);
+    expect(
+      raw.query<{ request_id: string }, []>("SELECT request_id FROM request_transcripts").all(),
+    ).toEqual([{ request_id: "retained-before-failure" }]);
+
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("preserves retention Panic identity and rolls back the saved transcript", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-retention-save-panic-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const retentionPanic = new Panic({ message: "retention policy invariant failed" });
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      getRetention: () => {
+        throw retentionPanic;
+      },
+    });
+
+    expect(() =>
+      store.saveRequestTranscript({
+        requestId: "rolled-back-after-panic",
+        sessionId: "chan",
+        requestClient: "discord",
+        messages: [{ role: "user", content: "panic" }],
+      }),
+    ).toThrow(retentionPanic);
+    const raw = new Database(dbPath);
+    expect(raw.query("SELECT * FROM request_transcripts").all()).toEqual([]);
+
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("emits prune diagnostics after the save commits and releases its SQLite lock", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-prune-diagnostics-"));
     const dbPath = path.join(dir, "transcripts.db");
@@ -1529,7 +1619,7 @@ describe("SqliteTranscriptStore", () => {
       contextMeta: { type: "compaction", formatVersion: 1 },
     });
     const raw = new Database(dbPath);
-    raw.exec("CREATE TABLE prune_diagnostic_observations (record_id TEXT NOT NULL)");
+    raw.run("CREATE TABLE prune_diagnostic_observations (record_id TEXT NOT NULL)");
     raw.run(
       `UPDATE request_transcripts
        SET context_meta_json = ?, updated_ts = ?
@@ -1561,6 +1651,154 @@ describe("SqliteTranscriptStore", () => {
         .all(),
     ).toEqual([{ record_id: "malformed-prune-candidate" }]);
 
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("applies configured transcript age retention", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-age-retention-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      retention: {
+        maxAgeMs: { kind: "bounded", value: 1_000 },
+        maxRequests: { kind: "unlimited" },
+      },
+    });
+    store.saveRequestTranscript({
+      requestId: "expired",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "expired" }],
+    });
+    const raw = new Database(dbPath);
+    raw.run("UPDATE request_transcripts SET updated_ts = 0 WHERE request_id = ?", ["expired"]);
+
+    store.saveRequestTranscript({
+      requestId: "current",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "current" }],
+    });
+
+    expect(
+      raw
+        .query<{ request_id: string }, []>(
+          "SELECT request_id FROM request_transcripts ORDER BY request_id",
+        )
+        .all(),
+    ).toEqual([{ request_id: "current" }]);
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("disables transcript age and count pruning when configured as unlimited", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-unlimited-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      retention: {
+        maxAgeMs: { kind: "unlimited" },
+        maxRequests: { kind: "unlimited" },
+      },
+    });
+    store.saveRequestTranscript({
+      requestId: "old",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "old" }],
+    });
+    const raw = new Database(dbPath);
+    raw.run("UPDATE request_transcripts SET updated_ts = 0 WHERE request_id = ?", ["old"]);
+    store.saveRequestTranscript({
+      requestId: "new",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "new" }],
+    });
+
+    expect(
+      raw.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM request_transcripts").get(),
+    ).toEqual({ count: 2 });
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("applies configured transcript count retention independently", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-count-retention-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      retention: {
+        maxAgeMs: { kind: "unlimited" },
+        maxRequests: { kind: "bounded", value: 1 },
+      },
+    });
+    store.saveRequestTranscript({
+      requestId: "first",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "first" }],
+    });
+    const ordering = new Database(dbPath);
+    ordering.run("UPDATE request_transcripts SET updated_ts = 0 WHERE request_id = ?", ["first"]);
+    ordering.close();
+    store.saveRequestTranscript({
+      requestId: "second",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "second" }],
+    });
+
+    const raw = new Database(dbPath);
+    expect(
+      raw.query<{ request_id: string }, []>("SELECT request_id FROM request_transcripts").all(),
+    ).toEqual([{ request_id: "second" }]);
+    raw.close();
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("reads transcript retention again before each prune", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-live-retention-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    let retention: {
+      readonly maxAgeMs: RetentionLimit;
+      readonly maxRequests: RetentionLimit;
+    } = {
+      maxAgeMs: { kind: "unlimited" },
+      maxRequests: { kind: "unlimited" },
+    };
+    const store = new SqliteTranscriptStore(dbPath, undefined, undefined, {
+      getRetention: () => retention,
+    });
+    store.saveRequestTranscript({
+      requestId: "old",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "old" }],
+    });
+    const raw = new Database(dbPath);
+    raw.run("UPDATE request_transcripts SET updated_ts = 0 WHERE request_id = ?", ["old"]);
+
+    retention = {
+      maxAgeMs: { kind: "bounded", value: 1_000 },
+      maxRequests: { kind: "unlimited" },
+    };
+    store.saveRequestTranscript({
+      requestId: "current",
+      sessionId: "chan",
+      requestClient: "discord",
+      messages: [{ role: "user", content: "current" }],
+    });
+
+    expect(
+      raw
+        .query<{ request_id: string }, []>(
+          "SELECT request_id FROM request_transcripts ORDER BY request_id",
+        )
+        .all(),
+    ).toEqual([{ request_id: "current" }]);
     raw.close();
     store.close();
     await fs.rm(dir, { recursive: true, force: true });
@@ -1887,7 +2125,7 @@ describe("SqliteTranscriptStore", () => {
     const version = migrated
       .query("SELECT MAX(version) AS version FROM transcript_schema_migrations")
       .get();
-    expect(version).toEqual({ version: 5 });
+    expect(version).toEqual({ version: 8 });
     expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
     const columns = migrated.query("PRAGMA table_info(request_transcripts)").all() as Array<{
       name: string;
@@ -1906,95 +2144,12 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("migrates a valid v4 primary binding from its durable head after its attempt was pruned", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-v4-primary-"));
-    const dbPath = path.join(dir, "transcripts.db");
-    const initial = new SqliteTranscriptStore(dbPath);
-    const seeded = seedPrimaryBinding(initial, "v4-terminal", "v4-session");
-    initial.close();
-    downgradePrimaryBindingSchemaToV4(dbPath);
-
-    const migrated = new SqliteTranscriptStore(dbPath);
-    const binding = getPrimaryBinding(migrated, {
-      providerId: "claude-code",
-      requestClient: "discord",
-      lilacSessionId: "v4-session",
-    });
-    expect(binding).toMatchObject({
-      terminalRequestId: "v4-terminal",
-      atomCount: seeded.binding.atomCount,
-      prefixDigest: seeded.binding.prefixDigest,
-      canonicalMessageCount: seeded.binding.canonicalMessageCount,
-      claudeSessionId: seeded.binding.claudeSessionId,
-      revision: seeded.binding.revision,
-    });
-    expect(
-      selectCorePrimaryClaudePrefix({
-        lineage: {
-          state: "complete",
-          lineageVersion: 1,
-          currentCanonicalStart: seeded.canonicalMessages.length,
-          segments: [
-            {
-              atoms: seeded.manifest.segments[0]!.atoms,
-              canonicalMessages: seeded.canonicalMessages,
-              canonicalStart: 0,
-              canonicalEnd: seeded.canonicalMessages.length,
-              cumulativeAtomCount: seeded.binding.atomCount,
-              cumulativePrefixDigest: seeded.binding.prefixDigest,
-            },
-          ],
-        },
-        canonicalMessages: seeded.canonicalMessages,
-        binding,
-        executionScopeHash: "scope",
-        executionCwd: "/workspace",
-      }),
-    ).toEqual({ mode: "fork", canonicalEnd: seeded.canonicalMessages.length });
-    expect(
-      migrated.getCorePrimaryClaudeSessionAttempt({
-        providerId: "claude-code",
-        requestClient: "discord",
-        lilacSessionId: "v4-session",
-        requestId: "v4-terminal",
-        attemptIndex: 0,
-      }),
-    ).toBeNull();
-    migrated.close();
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-
-  it("retires a v4 primary binding with no matching durable terminal head", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-v4-stale-"));
-    const dbPath = path.join(dir, "transcripts.db");
-    const initial = new SqliteTranscriptStore(dbPath);
-    seedPrimaryBinding(initial, "v4-stale-terminal", "v4-stale-session");
-    initial.close();
-    downgradePrimaryBindingSchemaToV4(dbPath, true);
-
-    const migrated = new SqliteTranscriptStore(dbPath);
-    expect(
-      getPrimaryBinding(migrated, {
-        providerId: "claude-code",
-        requestClient: "discord",
-        lilacSessionId: "v4-stale-session",
-      }),
-    ).toBeNull();
-    const raw = new Database(dbPath);
-    expect(raw.query("SELECT COUNT(*) AS count FROM core_primary_claude_bindings").get()).toEqual({
-      count: 0,
-    });
-    raw.close();
-    migrated.close();
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-
   it("promotes a canonically verified named candidate and rejects a stale revision race", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-stage5-"));
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
     const sessionId = "sub:parent:named:audit";
-    const sourceMessages = [{ role: "user", content: "first" }] satisfies ModelMessage[];
+    const sourceMessages = [{ role: "user", content: "first" }] satisfies StoredMessageV1[];
     store.saveRequestTranscript({
       requestId: "source",
       sessionId,
@@ -2019,8 +2174,8 @@ describe("SqliteTranscriptStore", () => {
     const firstTerminal = [
       ...sourceMessages,
       { role: "assistant", content: "first answer" },
-    ] satisfies ModelMessage[];
-    const firstHash = hashCanonicalMessagesV1(firstTerminal).hash;
+    ] satisfies StoredMessageV1[];
+    const firstHash = hashCanonicalStoredMessagesV2(firstTerminal).hash;
     store.saveRequestTranscript({
       requestId: "candidate-1",
       sessionId,
@@ -2081,8 +2236,8 @@ describe("SqliteTranscriptStore", () => {
         ...firstTerminal,
         { role: "user", content: requestId },
         { role: "assistant", content: `answer:${requestId}` },
-      ] satisfies ModelMessage[];
-      const hash = hashCanonicalMessagesV1(terminal).hash;
+      ] satisfies StoredMessageV1[];
+      const hash = hashCanonicalStoredMessagesV2(terminal).hash;
       store.saveRequestTranscript({
         requestId,
         sessionId,
@@ -2145,7 +2300,7 @@ describe("SqliteTranscriptStore", () => {
     const store = new SqliteTranscriptStore(dbPath);
     const promotion = prepareNamedBindingPromotion(store, "promotion-failure", "named-session");
     const raw = new Database(dbPath);
-    raw.exec(`
+    raw.run(`
       CREATE TABLE named_promotion_probe (marker TEXT NOT NULL);
       CREATE TRIGGER reject_named_promotion
       BEFORE INSERT ON core_named_claude_bindings
@@ -2186,7 +2341,7 @@ describe("SqliteTranscriptStore", () => {
     prepareNamedBindingPromotion(first, "named-recovery-panic", "named-recovery-session");
     first.close();
     const raw = new Database(dbPath);
-    raw.exec(`
+    raw.run(`
       CREATE TRIGGER reject_named_recovery_promotion
       BEFORE INSERT ON core_named_claude_bindings
       BEGIN
@@ -2218,7 +2373,7 @@ describe("SqliteTranscriptStore", () => {
     const terminal = [
       { role: "user", content: "restart" },
       { role: "assistant", content: "ready" },
-    ] satisfies ModelMessage[];
+    ] satisfies StoredMessageV1[];
     first.saveRequestTranscript({
       requestId: "succeeded-pending",
       sessionId,
@@ -2244,7 +2399,7 @@ describe("SqliteTranscriptStore", () => {
       requestId: "succeeded-pending",
       attemptIndex: 0,
       terminalRequestId: "succeeded-pending",
-      terminalCanonicalHeadHash: hashCanonicalMessagesV1(terminal).hash,
+      terminalCanonicalHeadHash: hashCanonicalStoredMessagesV2(terminal).hash,
       terminalCanonicalMessageCount: terminal.length,
       providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
       nativeCwd: "/workspace",
@@ -2282,6 +2437,29 @@ describe("SqliteTranscriptStore", () => {
         lilacSessionId: sessionId,
       })?.terminalRequestId,
     ).toBe("succeeded-pending");
+    expect(
+      recovered.getCoreNamedClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: "sub:parent:named:crashed",
+        requestId: "crash-left",
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("uncertain");
+    const recoveredAttempt = reserveNamedAttempt(recovered, {
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: "sub:parent:named:crashed",
+      executionScopeHashVersion: 1,
+      executionScopeHash: "scope",
+      requestId: "crash-left",
+      attemptIndex: 0,
+      candidateSessionId: crypto.randomUUID(),
+      sourceSessionId: null,
+      expectedBindingRevision: null,
+    });
+    expect(recoveredAttempt.attemptIndex).toBe(2);
+    expect(recoveredAttempt.state).toBe("active");
     expect(
       recovered.getCoreNamedClaudeSessionAttempt({
         providerId: "claude-code",
@@ -2444,7 +2622,7 @@ describe("SqliteTranscriptStore", () => {
     const terminal = [
       { role: "user", content: "publish" },
       { role: "assistant", content: "candidate" },
-    ] satisfies ModelMessage[];
+    ] satisfies StoredMessageV1[];
     reserveNamedAttempt(store, {
       providerId: "claude-code",
       requestClient: "discord",
@@ -2470,7 +2648,7 @@ describe("SqliteTranscriptStore", () => {
       requestId,
       attemptIndex: 0,
       terminalRequestId: requestId,
-      terminalCanonicalHeadHash: hashCanonicalMessagesV1(terminal).hash,
+      terminalCanonicalHeadHash: hashCanonicalStoredMessagesV2(terminal).hash,
       terminalCanonicalMessageCount: terminal.length,
       providerState: { lastFamily: "claude-code", containsCrossFamilyTurns: false },
       nativeCwd: "/workspace",
@@ -2509,7 +2687,7 @@ describe("SqliteTranscriptStore", () => {
     ).toBe("active");
 
     const fence = new Database(dbPath);
-    fence.exec(`
+    fence.run(`
       DROP TRIGGER reject_core_named_success;
       CREATE TRIGGER steal_core_named_success_fence
       AFTER UPDATE OF provider_state_json ON request_transcripts
@@ -2588,7 +2766,7 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("transactionally migrates a schema-v1 database to the Stage 6 layout", async () => {
+  it("rejects a schema-v1 database pending the offline blob migration", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-stage6-"));
     const dbPath = path.join(dir, "transcripts.db");
     const db = new Database(dbPath);
@@ -2609,7 +2787,7 @@ describe("SqliteTranscriptStore", () => {
       provider_state_json TEXT,
       stable_named_request_client TEXT
     )`);
-    const messages = [{ role: "assistant", content: "legacy" }] satisfies ModelMessage[];
+    const messages = [{ role: "assistant", content: "legacy" }] satisfies StoredMessageV1[];
     db.run("INSERT INTO request_transcripts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
       "legacy-v1",
       "session",
@@ -2625,23 +2803,19 @@ describe("SqliteTranscriptStore", () => {
     ]);
     db.close();
 
-    const store = new SqliteTranscriptStore(dbPath);
-    expect(getRequestTranscript(store, { requestId: "legacy-v1" })).toMatchObject({
-      canonicalHashVersion: 1,
-      transcriptDigest: hashCanonicalMessagesV1(messages).hash,
-    });
-    store.close();
+    expect(() => new SqliteTranscriptStore(dbPath)).toThrow(
+      "Core transcript schema 1 requires offline blob migration. Run: bun run migrate:blob-storage -- --config /path/to/core-config.yaml --data-dir /path/to/data",
+    );
 
     const migrated = new Database(dbPath);
     expect(
       migrated.query("SELECT version FROM transcript_schema_migrations ORDER BY version").all(),
-    ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
-    expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    ).toEqual([{ version: 1 }]);
     expect(
       migrated
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'core_%'")
         .all(),
-    ).toContainEqual({ name: "core_primary_lineage_manifests" });
+    ).not.toContainEqual({ name: "core_primary_lineage_manifests" });
     migrated.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
@@ -2683,7 +2857,7 @@ describe("SqliteTranscriptStore", () => {
     db.close();
 
     expect(() => new SqliteTranscriptStore(dbPath)).toThrow(
-      "Cannot migrate corrupt transcript messages to schema v2",
+      "Core transcript schema 1 requires offline blob migration. Run: bun run migrate:blob-storage -- --config /path/to/core-config.yaml --data-dir /path/to/data",
     );
 
     const rolledBack = new Database(dbPath);
@@ -2709,7 +2883,7 @@ describe("SqliteTranscriptStore", () => {
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
     const blob = putCoreOwnedBlob(store, {
-      bytes: new TextEncoder().encode("owned attachment"),
+      blob: durableBlob("owned attachment", "owned-attachment"),
       mediaType: "text/plain",
       filename: "attachment.txt",
     });
@@ -2745,10 +2919,10 @@ describe("SqliteTranscriptStore", () => {
     expect(readmitted.canonicalMessages).toEqual([{ role: "user", content: "first text" }]);
     expect(readmitted.ownedBlobs).toEqual([
       {
-        sha256: blob.sha256,
+        ownerId: blob.ownerId,
+        blob: blob.blob,
         mediaType: "text/plain",
         filename: "attachment.txt",
-        byteLength: blob.byteLength,
       },
     ]);
     store.close();
@@ -2764,7 +2938,7 @@ describe("SqliteTranscriptStore", () => {
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
     const raw = new Database(dbPath);
-    raw.exec(`
+    raw.run(`
       CREATE TABLE projection_admission_audit (message_id TEXT NOT NULL);
       CREATE TRIGGER discard_admitted_projection
       AFTER INSERT ON core_surface_projections
@@ -2814,12 +2988,12 @@ describe("SqliteTranscriptStore", () => {
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
     const retainedBlob = putCoreOwnedBlob(store, {
-      bytes: new TextEncoder().encode("retained"),
+      blob: durableBlob("retained", "retained"),
       mediaType: "text/plain",
       filename: "retained.txt",
     });
     const orphanBlob = putCoreOwnedBlob(store, {
-      bytes: new TextEncoder().encode("orphan"),
+      blob: durableBlob("orphan", "orphan"),
       mediaType: "text/plain",
       filename: "orphan.txt",
     });
@@ -2838,9 +3012,9 @@ describe("SqliteTranscriptStore", () => {
     });
     expect(getCoreRetentionDiagnostics(store)).toMatchObject({
       unreferencedProjectionCount: 1,
-      ownedBlobBytes: retainedBlob.byteLength + orphanBlob.byteLength,
+      ownedBlobBytes: retainedBlob.blob.byteLength + orphanBlob.blob.byteLength,
       unreferencedOwnedBlobCount: 1,
-      unreferencedOwnedBlobBytes: orphanBlob.byteLength,
+      unreferencedOwnedBlobBytes: orphanBlob.blob.byteLength,
       orphanManifestCount: 0,
     });
     store.close();
@@ -2848,21 +3022,23 @@ describe("SqliteTranscriptStore", () => {
     const reopened = new SqliteTranscriptStore(dbPath);
     expect(getCoreSurfaceProjection(reopened, projectionKey)?.ownedBlobs).toEqual([
       {
-        sha256: retainedBlob.sha256,
+        ownerId: retainedBlob.ownerId,
+        blob: retainedBlob.blob,
         mediaType: retainedBlob.mediaType,
         filename: retainedBlob.filename,
-        byteLength: retainedBlob.byteLength,
       },
     ]);
-    expect(getCoreOwnedBlob(reopened, { sha256: orphanBlob.sha256 }).sha256).toBe(
-      orphanBlob.sha256,
+    expect(getCoreOwnedBlob(reopened, { ownerId: orphanBlob.ownerId }).ownerId).toBe(
+      orphanBlob.ownerId,
     );
-    expect(reopened.deleteCoreOwnedBlobIfUnreferenced({ sha256: orphanBlob.sha256 })).toBe(true);
-    const missingBlob = reopened.getCoreOwnedBlob({ sha256: orphanBlob.sha256 });
+    expect(reopened.deleteCoreOwnedBlobIfUnreferenced({ ownerId: orphanBlob.ownerId })).toEqual(
+      orphanBlob.blob,
+    );
+    const missingBlob = reopened.getCoreOwnedBlob({ ownerId: orphanBlob.ownerId });
     expect(missingBlob.status).toBe("error");
     expect(getCoreRetentionDiagnostics(reopened)).toMatchObject({
       unreferencedProjectionCount: 1,
-      ownedBlobBytes: retainedBlob.byteLength,
+      ownedBlobBytes: retainedBlob.blob.byteLength,
       unreferencedOwnedBlobCount: 0,
       unreferencedOwnedBlobBytes: 0,
     });
@@ -2885,10 +3061,231 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("owns transcript blob references until transcript retention releases them", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-blobs-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const bytes = new TextEncoder().encode("local read output");
+    const upload = resultValue(
+      await blobStore.startUpload({ source: bytes, retention: { kind: "durable" } }),
+    );
+    const blob = resultValue(await upload.completion);
+    let store = new SqliteTranscriptStore(dbPath);
+
+    resultValue(
+      store.saveRequestTranscript({
+        requestId: "local-read",
+        sessionId: "session",
+        requestClient: "discord",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "blob",
+                blob,
+                mediaType: "text/plain",
+                filename: "local.txt",
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    store.close();
+    const schema7 = new Database(dbPath);
+    schema7.run("DROP TABLE core_transcript_blob_refs");
+    schema7.run("ALTER TABLE core_owned_blobs DROP COLUMN deletion_claim_ts");
+    schema7.run("DELETE FROM transcript_schema_migrations WHERE version = 8");
+    schema7.close();
+    store = new SqliteTranscriptStore(dbPath);
+    expect(store.deleteCoreOwnedBlobIfUnreferenced({ ownerId: blob.objectId })).toBeNull();
+
+    const inspection = new Database(dbPath);
+    expect(
+      inspection
+        .query("SELECT request_id, position, blob_owner_id FROM core_transcript_blob_refs")
+        .all(),
+    ).toEqual([{ request_id: "local-read", position: 0, blob_owner_id: blob.objectId }]);
+    inspection.run("PRAGMA foreign_keys = ON");
+    inspection.run("DELETE FROM request_transcripts WHERE request_id = ?", ["local-read"]);
+    inspection.close();
+
+    expect(
+      resultValue(
+        await store.maintainCoreOwnedBlobs({
+          blobStore,
+          limit: 8,
+          now: Date.now() + 10 * 60 * 1_000,
+        }),
+      ),
+    ).toEqual({ inspected: 1, deleted: 1, retained: 0, failed: 0 });
+    expect((await blobStore.open(blob)).status).toBe("error");
+
+    store.close();
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("blocks new references while an unreferenced blob deletion is in progress", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-blob-claim-"));
+    const store = new SqliteTranscriptStore(path.join(dir, "transcripts.db"));
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const upload = resultValue(
+      await blobStore.startUpload({
+        source: new TextEncoder().encode("claimed local read"),
+        retention: { kind: "durable" },
+      }),
+    );
+    const blob = resultValue(await upload.completion);
+    const owned = putCoreOwnedBlob(store, {
+      blob,
+      mediaType: "text/plain",
+      filename: "claimed.txt",
+    });
+    let releaseDeletion: (() => void) | undefined;
+    const deletionReleased = new Promise<void>((resolve) => {
+      releaseDeletion = resolve;
+    });
+    let signalDeletionStarted: (() => void) | undefined;
+    const deletionStarted = new Promise<void>((resolve) => {
+      signalDeletionStarted = resolve;
+    });
+
+    const maintenance = store.maintainCoreOwnedBlobs({
+      blobStore: {
+        delete: async (target) => {
+          signalDeletionStarted?.();
+          await deletionReleased;
+          return blobStore.delete(target);
+        },
+      },
+      limit: 8,
+      now: Date.now() + 10 * 60 * 1_000,
+    });
+    await deletionStarted;
+
+    const transcriptFailure = resultError(
+      store.saveRequestTranscript({
+        requestId: "claimed-transcript",
+        sessionId: "session",
+        requestClient: "discord",
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "blob", blob, mediaType: "text/plain", filename: "claimed.txt" }],
+          },
+        ],
+      }),
+    );
+    expect(transcriptFailure).toBeInstanceOf(CoreOwnedBlobIntegrityError);
+    expect(transcriptFailure.message).toContain("pending deletion");
+
+    const projectionFailure = resultError(
+      store.admitCoreSurfaceProjection({
+        requestClient: "discord",
+        surfaceId: "surface",
+        sessionId: "session",
+        messageId: "claimed-message",
+        projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+        canonicalMessages: [{ role: "user", content: "claimed" }],
+        sourceFacts: {},
+        ownedBlobs: [owned],
+      }),
+    );
+    expect(projectionFailure).toBeInstanceOf(CoreOwnedBlobIntegrityError);
+    expect(projectionFailure.message).toContain("pending deletion");
+
+    releaseDeletion?.();
+    expect(resultValue(await maintenance)).toEqual({
+      inspected: 1,
+      deleted: 1,
+      retained: 0,
+      failed: 0,
+    });
+    expect((await blobStore.open(blob)).status).toBe("error");
+
+    store.close();
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("keeps a failed deletion claimed until maintenance can retry it", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcript-blob-retry-"));
+    const store = new SqliteTranscriptStore(path.join(dir, "transcripts.db"));
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const upload = resultValue(
+      await blobStore.startUpload({
+        source: new TextEncoder().encode("fenced local read"),
+        retention: { kind: "durable" },
+      }),
+    );
+    const blob = resultValue(await upload.completion);
+    putCoreOwnedBlob(store, {
+      blob,
+      mediaType: "text/plain",
+      filename: "fenced.txt",
+    });
+    const firstMaintenanceNow = Date.now() + 10 * 60 * 1_000;
+
+    expect(
+      resultValue(
+        await store.maintainCoreOwnedBlobs({
+          blobStore: {
+            delete: async () =>
+              Result.err(
+                new BlobDeleteFailed({
+                  objectId: blob.objectId,
+                  failure: new BlobAdapterFailure({
+                    adapter: "memory",
+                    kind: "io",
+                    operation: "delete",
+                    message: "physical deletion failed after fencing",
+                  }),
+                  message: "physical deletion failed after fencing",
+                }),
+              ),
+          },
+          limit: 8,
+          now: firstMaintenanceNow,
+        }),
+      ),
+    ).toEqual({ inspected: 1, deleted: 0, retained: 0, failed: 1 });
+
+    const referenceFailure = resultError(
+      store.saveRequestTranscript({
+        requestId: "fenced-transcript",
+        sessionId: "session",
+        requestClient: "discord",
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "blob", blob, mediaType: "text/plain", filename: "fenced.txt" }],
+          },
+        ],
+      }),
+    );
+    expect(referenceFailure).toBeInstanceOf(CoreOwnedBlobIntegrityError);
+    expect(referenceFailure.message).toContain("pending deletion");
+
+    expect(
+      resultValue(
+        await store.maintainCoreOwnedBlobs({
+          blobStore,
+          limit: 8,
+          now: firstMaintenanceNow + 31 * 60 * 1_000,
+        }),
+      ),
+    ).toEqual({ inspected: 1, deleted: 1, retained: 0, failed: 0 });
+
+    store.close();
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("fails explicitly for corrupt or missing owned projection blobs", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-stage6-"));
     const dbPath = path.join(dir, "transcripts.db");
-    const originalBytes = new TextEncoder().encode("blob bytes");
     const key = {
       requestClient: "discord",
       surfaceId: "surface",
@@ -2898,7 +3295,7 @@ describe("SqliteTranscriptStore", () => {
     } as const;
     const first = new SqliteTranscriptStore(dbPath);
     const blob = putCoreOwnedBlob(first, {
-      bytes: originalBytes,
+      blob: durableBlob("blob bytes", "corrupt-blob"),
       mediaType: "text/plain",
       filename: "blob.txt",
     });
@@ -2911,24 +3308,24 @@ describe("SqliteTranscriptStore", () => {
     first.close();
 
     const raw = new Database(dbPath);
-    raw.run("UPDATE core_owned_blobs SET bytes = ? WHERE sha256 = ?", [
-      new TextEncoder().encode("corrupt!!!"),
-      blob.sha256,
+    raw.run("UPDATE core_owned_blobs SET blob_ref_json = ? WHERE owner_id = ?", [
+      "{}",
+      blob.ownerId,
     ]);
     raw.close();
     const corrupt = new SqliteTranscriptStore(dbPath);
     expect(() => getCoreSurfaceProjection(corrupt, key)).toThrow(CoreOwnedBlobIntegrityError);
-    expect(() => getCoreSurfaceProjection(corrupt, key)).toThrow("failed SHA-256 validation");
+    expect(() => getCoreSurfaceProjection(corrupt, key)).toThrow("failed validation");
     corrupt.close();
 
     const missing = new SqliteTranscriptStore(dbPath);
     const remove = new Database(dbPath);
-    remove.run("UPDATE core_owned_blobs SET bytes = ? WHERE sha256 = ?", [
-      originalBytes,
-      blob.sha256,
+    remove.run("UPDATE core_owned_blobs SET blob_ref_json = ? WHERE owner_id = ?", [
+      JSON.stringify(blob.blob),
+      blob.ownerId,
     ]);
     remove.run("PRAGMA foreign_keys = OFF");
-    remove.run("DELETE FROM core_owned_blobs WHERE sha256 = ?", [blob.sha256]);
+    remove.run("DELETE FROM core_owned_blobs WHERE owner_id = ?", [blob.ownerId]);
     remove.close();
     expect(() => getCoreSurfaceProjection(missing, key)).toThrow(CoreOwnedBlobIntegrityError);
     expect(() => getCoreSurfaceProjection(missing, key)).toThrow("references a missing blob");
@@ -2936,13 +3333,101 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
+  it("rejects unresolved lineage messages at the persistence boundary", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-stored-lineage-"));
+    const store = new SqliteTranscriptStore(path.join(dir, "transcripts.db"));
+    store.saveRequestTranscript({
+      requestId: "stored-lineage-owner",
+      sessionId: "session",
+      requestClient: "discord",
+      messages: [{ role: "assistant", content: "owner" }],
+    });
+    const pendingMessages = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "blob",
+            blob: { version: 1, objectId: `b1_${"01".repeat(16)}` },
+            mediaType: "image/png",
+          },
+        ],
+      },
+    ] satisfies BusMessageV2[];
+    const pendingAtom = {
+      kind: "surface",
+      requestClient: "discord",
+      surfaceId: "discord:session",
+      sessionId: "session",
+      messageId: "pending-upload",
+    } as const;
+    const pendingManifest: CoreLineageManifestV2 = {
+      state: "complete",
+      lineageVersion: 2,
+      currentCanonicalStart: 0,
+      segments: [
+        {
+          atoms: [pendingAtom],
+          canonicalMessages: pendingMessages,
+          canonicalStart: 0,
+          canonicalEnd: 1,
+          cumulativeAtomCount: 1,
+          cumulativePrefixDigest: computeCoreLineagePrefixDigestV2([pendingAtom]),
+        },
+      ],
+    };
+
+    const rejected = store.saveCorePrimaryLineageManifest({
+      requestId: "stored-lineage-owner",
+      manifest: pendingManifest,
+    });
+    expect(resultError(rejected)).toMatchObject({
+      _tag: "TranscriptTransactionConflict",
+      reason: "lineage-invalid",
+    });
+    expect(getCorePrimaryLineageManifest(store, { requestId: "stored-lineage-owner" })).toBeNull();
+
+    store.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
   it("roundtrips aligned manifests and exposes exact request atom metadata", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-stage6-"));
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
+    const sourceResourceId = `r1_${"61".repeat(16)}` as ResourceId;
+    const sourceResourceUri = `resource://${sourceResourceId}`;
+    resultValue(
+      store.registerOrGet({
+        candidateResourceId: sourceResourceId,
+        origin: {
+          version: 1,
+          kind: "discord-attachment",
+          channelId: "session",
+          messageId: "source-resource",
+          ordinal: 0,
+          attachmentId: "source-resource",
+        },
+        filename: "source.webp",
+        declaredMediaType: "image/webp",
+        reportedByteLength: 321,
+        createdAt: 1,
+      }),
+    );
     const sourceMessages = [
-      { role: "assistant", content: "source output" },
-    ] satisfies ModelMessage[];
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "resource",
+            uri: sourceResourceUri,
+            filename: "source.webp",
+            mediaType: "image/webp",
+            size: 321,
+          },
+        ],
+      },
+    ] satisfies StoredMessageV1[];
     store.saveRequestTranscript({
       requestId: "source",
       sessionId: "session",
@@ -2953,7 +3438,7 @@ describe("SqliteTranscriptStore", () => {
     const metadata = getCoreRequestAtomMetadata(store, { requestId: "source" });
     expect(metadata).toEqual({
       requestId: "source",
-      transcriptDigest: hashCanonicalMessagesV1(sourceMessages).hash,
+      transcriptDigest: hashCanonicalStoredMessagesV2(sourceMessages).hash,
       providerFamily: "claude-code",
       containsCrossFamilyTurns: true,
     });
@@ -2990,7 +3475,43 @@ describe("SqliteTranscriptStore", () => {
       messages: sourceMessages,
       corePrimaryLineage: manifest,
     });
-    expect(getCorePrimaryLineageManifest(store, { requestId: "destination" })).toEqual(manifest);
+    const storedManifest = getCorePrimaryLineageManifest(store, { requestId: "destination" });
+    expect(storedManifest).toEqual(manifest);
+    const storedCanonicalMessages: StoredMessageV1[] =
+      storedManifest?.segments.flatMap((segment) => segment.canonicalMessages) ?? [];
+    expect(storedCanonicalMessages).toEqual(sourceMessages);
+    const transformedMetadataMessages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "resource",
+            uri: sourceResourceUri,
+            filename: "downloaded.png",
+            mediaType: "image/png",
+            size: 999,
+          },
+        ],
+      },
+    ] satisfies StoredMessageV1[];
+    expect(
+      validateCorePrimaryLineageReferences(store, {
+        manifest: manifestFor([atom], transformedMetadataMessages, [requestAlias]),
+        requestClient: "discord",
+        sessionId: "session",
+        surfaceId: "discord:session",
+      }),
+    ).toBeNull();
+    const differentResourceMessages = structuredClone(transformedMetadataMessages);
+    differentResourceMessages[0]!.content[0]!.uri = `resource://r1_${"62".repeat(16)}`;
+    expect(
+      validateCorePrimaryLineageReferences(store, {
+        manifest: manifestFor([atom], differentResourceMessages, [requestAlias]),
+        requestClient: "discord",
+        sessionId: "session",
+        surfaceId: "discord:session",
+      }),
+    ).toBe("transformed-request-lineage");
     const constrained = new Database(dbPath);
     constrained.run("PRAGMA foreign_keys = ON");
     expect(() =>
@@ -3000,7 +3521,7 @@ describe("SqliteTranscriptStore", () => {
 
     const replacementMessages = [
       { role: "assistant", content: "different projection" },
-    ] satisfies ModelMessage[];
+    ] satisfies StoredMessageV1[];
     expect(
       resultError(
         store.saveCorePrimaryLineageManifest({
@@ -3050,7 +3571,7 @@ describe("SqliteTranscriptStore", () => {
 
     const ordinaryMessages = [
       { role: "assistant", content: "not a checkpoint" },
-    ] satisfies ModelMessage[];
+    ] satisfies StoredMessageV1[];
     store.saveRequestTranscript({
       requestId: "ordinary",
       sessionId: "session",
@@ -3064,13 +3585,13 @@ describe("SqliteTranscriptStore", () => {
           sessionId: "session",
           requestClient: "discord",
           messages: ordinaryMessages,
-          corePrimaryLineage: buildCoreLineageManifestV1([
+          corePrimaryLineage: buildCoreLineageManifestV2([
             {
               atoms: [
                 {
                   kind: "checkpoint",
                   requestId: "ordinary",
-                  transcriptDigest: hashCanonicalMessagesV1(ordinaryMessages).hash,
+                  transcriptDigest: hashCanonicalStoredMessagesV2(ordinaryMessages).hash,
                 },
               ],
               canonicalMessages: ordinaryMessages,
@@ -3087,13 +3608,13 @@ describe("SqliteTranscriptStore", () => {
       messages: ordinaryMessages,
       contextMeta: { type: "compaction", formatVersion: 1 },
     });
-    const checkpointManifest = buildCoreLineageManifestV1([
+    const checkpointManifest = buildCoreLineageManifestV2([
       {
         atoms: [
           {
             kind: "checkpoint",
             requestId: "unlinked-checkpoint",
-            transcriptDigest: hashCanonicalMessagesV1(ordinaryMessages).hash,
+            transcriptDigest: hashCanonicalStoredMessagesV2(ordinaryMessages).hash,
           },
         ],
         canonicalMessages: ordinaryMessages,
@@ -3137,7 +3658,7 @@ describe("SqliteTranscriptStore", () => {
     const store = new SqliteTranscriptStore(dbPath);
     const checkpointMessages = [
       { role: "assistant", content: "checkpoint" },
-    ] satisfies ModelMessage[];
+    ] satisfies StoredMessageV1[];
     store.saveRequestTranscript({
       requestId: "checkpoint",
       sessionId: "session",
@@ -3156,7 +3677,7 @@ describe("SqliteTranscriptStore", () => {
       last: checkpointOutputRef,
     });
     const blob = putCoreOwnedBlob(store, {
-      bytes: new TextEncoder().encode("retained"),
+      blob: durableBlob("retained", "lineage-retained"),
       mediaType: "text/plain",
       filename: "retained.txt",
     });
@@ -3172,21 +3693,21 @@ describe("SqliteTranscriptStore", () => {
       canonicalMessages: [{ role: "user", content: "surface" }],
       sourceFacts: {
         segmentMessageIds: ["surface-message"],
-        segmentDigest: hashCanonicalMessagesV1([{ role: "user", content: "surface" }]).hash,
+        segmentDigest: hashCanonicalStoredMessagesV2([{ role: "user", content: "surface" }]).hash,
       },
       ownedBlobs: [blob],
     });
     const destinationMessages = [
       ...checkpointMessages,
       { role: "user", content: "surface" },
-    ] satisfies ModelMessage[];
-    const manifest = buildCoreLineageManifestV1([
+    ] satisfies StoredMessageV1[];
+    const manifest = buildCoreLineageManifestV2([
       {
         atoms: [
           {
             kind: "checkpoint",
             requestId: "checkpoint",
-            transcriptDigest: hashCanonicalMessagesV1(checkpointMessages).hash,
+            transcriptDigest: hashCanonicalStoredMessagesV2(checkpointMessages).hash,
           },
         ],
         canonicalMessages: checkpointMessages,
@@ -3234,13 +3755,13 @@ describe("SqliteTranscriptStore", () => {
       constrained.run("DELETE FROM core_surface_projections WHERE message_id = 'surface-message'"),
     ).toThrow();
     expect(() =>
-      constrained.run("DELETE FROM core_owned_blobs WHERE sha256 = ?", [blob.sha256]),
+      constrained.run("DELETE FROM core_owned_blobs WHERE owner_id = ?", [blob.ownerId]),
     ).toThrow();
 
     constrained.run("DELETE FROM request_transcripts WHERE request_id = 'destination'");
     expect(deleteUnlinkedCheckpointCandidate(store, { requestId: "checkpoint" })).toBe(true);
     constrained.run("DELETE FROM core_surface_projections WHERE message_id = 'surface-message'");
-    constrained.run("DELETE FROM core_owned_blobs WHERE sha256 = ?", [blob.sha256]);
+    constrained.run("DELETE FROM core_owned_blobs WHERE owner_id = ?", [blob.ownerId]);
     expect(constrained.query("PRAGMA foreign_key_check").all()).toEqual([]);
     constrained.close();
 
@@ -3253,20 +3774,20 @@ describe("SqliteTranscriptStore", () => {
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
     const sessionId = "primary-channel";
-    const inputMessages = [{ role: "user", content: "first" }] satisfies ModelMessage[];
-    const manifest = buildCoreLineageManifestV1([
+    const inputMessages = [{ role: "user", content: "first" }] satisfies StoredMessageV1[];
+    const manifest = buildCoreLineageManifestV2([
       {
         atoms: [
           {
             kind: "synthetic",
             source: "stage7-test",
-            messageDigest: hashCanonicalMessagesV1(inputMessages).hash,
+            messageDigest: hashCanonicalStoredMessagesV2(inputMessages).hash,
           },
         ],
         canonicalMessages: inputMessages,
       },
     ]);
-    const response = [{ role: "assistant", content: "answer" }] satisfies ModelMessage[];
+    const response = [{ role: "assistant", content: "answer" }] satisfies StoredMessageV1[];
     const providerState = {
       lastFamily: "claude-code",
       containsCrossFamilyTurns: false,
@@ -3307,7 +3828,7 @@ describe("SqliteTranscriptStore", () => {
       requestId: "primary-1",
       attemptIndex: 0,
       terminalRequestId: "primary-1",
-      terminalLineageVersion: 1,
+      terminalLineageVersion: 2,
       terminalAtomCount: head.atomCount,
       terminalPrefixDigest: head.prefixDigest,
       terminalCanonicalMessageCount: head.canonicalMessageCount,
@@ -3337,7 +3858,7 @@ describe("SqliteTranscriptStore", () => {
       }),
     ).toMatchObject({
       claudeSessionId: candidateSessionId,
-      lineageVersion: 1,
+      lineageVersion: 2,
       atomCount: head.atomCount,
       prefixDigest: head.prefixDigest,
       canonicalMessageCount: 2,
@@ -3389,7 +3910,7 @@ describe("SqliteTranscriptStore", () => {
         requestId,
         attemptIndex: 0,
         terminalRequestId: requestId,
-        terminalLineageVersion: 1,
+        terminalLineageVersion: 2,
         terminalAtomCount: candidateHead.atomCount,
         terminalPrefixDigest: candidateHead.prefixDigest,
         terminalCanonicalMessageCount: candidateHead.canonicalMessageCount,
@@ -3483,14 +4004,14 @@ describe("SqliteTranscriptStore", () => {
       lastFamily: "claude-code",
       containsCrossFamilyTurns: false,
     } as const;
-    const inputMessages = [{ role: "user", content: "recover" }] satisfies ModelMessage[];
-    const manifest = buildCoreLineageManifestV1([
+    const inputMessages = [{ role: "user", content: "recover" }] satisfies StoredMessageV1[];
+    const manifest = buildCoreLineageManifestV2([
       {
         atoms: [
           {
             kind: "synthetic",
             source: "recovery",
-            messageDigest: hashCanonicalMessagesV1(inputMessages).hash,
+            messageDigest: hashCanonicalStoredMessagesV2(inputMessages).hash,
           },
         ],
         canonicalMessages: inputMessages,
@@ -3516,7 +4037,7 @@ describe("SqliteTranscriptStore", () => {
         sourceSessionId: binding?.claudeSessionId ?? null,
         expectedBindingRevision,
       });
-      const response = [{ role: "assistant", content: requestId }] satisfies ModelMessage[];
+      const response = [{ role: "assistant", content: requestId }] satisfies StoredMessageV1[];
       first.saveRequestTranscript({
         requestId,
         sessionId,
@@ -3540,7 +4061,7 @@ describe("SqliteTranscriptStore", () => {
         requestId,
         attemptIndex: 0,
         terminalRequestId: requestId,
-        terminalLineageVersion: 1,
+        terminalLineageVersion: 2,
         terminalAtomCount: head.atomCount,
         terminalPrefixDigest: head.prefixDigest,
         terminalCanonicalMessageCount: head.canonicalMessageCount,
@@ -3593,6 +4114,107 @@ describe("SqliteTranscriptStore", () => {
         attemptIndex: 0,
       })?.state,
     ).toBe("uncertain");
+    const recoveredAttempt = reservePrimaryAttempt(recovered, {
+      providerId: "claude-code",
+      requestClient: "discord",
+      lilacSessionId: "crashed-owner",
+      executionScopeHashVersion: 1,
+      executionScopeHash: "scope",
+      requestId: "crashed",
+      attemptIndex: 0,
+      candidateSessionId: crypto.randomUUID(),
+      sourceSessionId: null,
+      expectedBindingRevision: null,
+    });
+    expect(recoveredAttempt.attemptIndex).toBe(2);
+    expect(recoveredAttempt.state).toBe("active");
+    expect(
+      recovered.getCorePrimaryClaudeSessionAttempt({
+        providerId: "claude-code",
+        requestClient: "discord",
+        lilacSessionId: "crashed-owner",
+        requestId: "crashed",
+        attemptIndex: 0,
+      })?.state,
+    ).toBe("uncertain");
+    recovered.close();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  it("preserves primary fork and fresh-fallback parity across recovery collisions", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-primary-recovery-parity-"));
+    const dbPath = path.join(dir, "transcripts.db");
+    const owner = {
+      providerId: "claude-code",
+      requestClient: "discord" as const,
+      lilacSessionId: "primary-recovery-parity",
+      executionScopeHashVersion: 1 as const,
+      executionScopeHash: "scope",
+      requestId: "recovered-request",
+      sourceSessionId: null,
+      expectedBindingRevision: null,
+    };
+    const first = new SqliteTranscriptStore(dbPath);
+    reservePrimaryAttempt(first, {
+      ...owner,
+      attemptIndex: 0,
+      candidateSessionId: crypto.randomUUID(),
+    });
+    recordPrimaryAttemptOutcome(first, {
+      providerId: owner.providerId,
+      requestClient: owner.requestClient,
+      lilacSessionId: owner.lilacSessionId,
+      requestId: owner.requestId,
+      attemptIndex: 0,
+      state: "failed",
+    });
+    reservePrimaryAttempt(first, {
+      ...owner,
+      attemptIndex: 1,
+      candidateSessionId: crypto.randomUUID(),
+    });
+    first.close();
+
+    const recovered = new SqliteTranscriptStore(dbPath);
+    expect(
+      recovered.getCorePrimaryClaudeSessionAttempt({
+        providerId: owner.providerId,
+        requestClient: owner.requestClient,
+        lilacSessionId: owner.lilacSessionId,
+        requestId: owner.requestId,
+        attemptIndex: 1,
+      })?.state,
+    ).toBe("uncertain");
+    const fork = reservePrimaryAttempt(recovered, {
+      ...owner,
+      attemptIndex: 0,
+      candidateSessionId: crypto.randomUUID(),
+    });
+    expect(fork.attemptIndex).toBe(2);
+    recordPrimaryAttemptOutcome(recovered, {
+      providerId: owner.providerId,
+      requestClient: owner.requestClient,
+      lilacSessionId: owner.lilacSessionId,
+      requestId: owner.requestId,
+      attemptIndex: fork.attemptIndex,
+      state: "failed",
+    });
+    const freshFallback = reservePrimaryAttempt(recovered, {
+      ...owner,
+      attemptIndex: 1,
+      candidateSessionId: crypto.randomUUID(),
+    });
+    expect(freshFallback.attemptIndex).toBe(3);
+    expect(
+      recovered.getCorePrimaryClaudeSessionAttempt({
+        providerId: owner.providerId,
+        requestClient: owner.requestClient,
+        lilacSessionId: owner.lilacSessionId,
+        requestId: owner.requestId,
+        attemptIndex: 1,
+      })?.state,
+    ).toBe("uncertain");
+
     recovered.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
@@ -3602,9 +4224,9 @@ describe("SqliteTranscriptStore", () => {
     const dbPath = path.join(dir, "transcripts.db");
     const requestId = "primary-recovery-panic";
     const sessionId = "primary-recovery-session";
-    const inputMessages = [{ role: "user", content: "recover" }] satisfies ModelMessage[];
-    const responseMessages = [{ role: "assistant", content: "ready" }] satisfies ModelMessage[];
-    const manifest = buildCoreLineageManifestV1([syntheticManifestSegment(inputMessages)]);
+    const inputMessages = [{ role: "user", content: "recover" }] satisfies StoredMessageV1[];
+    const responseMessages = [{ role: "assistant", content: "ready" }] satisfies StoredMessageV1[];
+    const manifest = buildCoreLineageManifestV2([syntheticManifestSegment(inputMessages)]);
     const providerState = {
       lastFamily: "claude-code",
       containsCrossFamilyTurns: false,
@@ -3645,7 +4267,7 @@ describe("SqliteTranscriptStore", () => {
       requestId,
       attemptIndex: 0,
       terminalRequestId: requestId,
-      terminalLineageVersion: 1,
+      terminalLineageVersion: 2,
       terminalAtomCount: head.atomCount,
       terminalPrefixDigest: head.prefixDigest,
       terminalCanonicalMessageCount: head.canonicalMessageCount,
@@ -3659,7 +4281,7 @@ describe("SqliteTranscriptStore", () => {
     });
     first.close();
     const raw = new Database(dbPath);
-    raw.exec(`
+    raw.run(`
       CREATE TRIGGER reject_primary_recovery_promotion
       BEFORE INSERT ON core_primary_claude_bindings
       BEGIN
@@ -3690,11 +4312,11 @@ describe("SqliteTranscriptStore", () => {
     const first = new SqliteTranscriptStore(dbPath);
     const seeded = seedPrimaryBinding(first, "recovery-base", sessionId);
     const requestId = "recovery-pending";
-    const inputMessages = [{ role: "user", content: "pending" }] satisfies ModelMessage[];
-    const manifest = buildCoreLineageManifestV1([syntheticManifestSegment(inputMessages)]);
+    const inputMessages = [{ role: "user", content: "pending" }] satisfies StoredMessageV1[];
+    const manifest = buildCoreLineageManifestV2([syntheticManifestSegment(inputMessages)]);
     const responseMessages = [
       { role: "assistant", content: "pending response" },
-    ] satisfies ModelMessage[];
+    ] satisfies StoredMessageV1[];
     const providerState = {
       lastFamily: "claude-code",
       containsCrossFamilyTurns: false,
@@ -3734,7 +4356,7 @@ describe("SqliteTranscriptStore", () => {
       requestId,
       attemptIndex: 0,
       terminalRequestId: requestId,
-      terminalLineageVersion: 1,
+      terminalLineageVersion: 2,
       terminalAtomCount: head.atomCount,
       terminalPrefixDigest: head.prefixDigest,
       terminalCanonicalMessageCount: head.canonicalMessageCount,
@@ -3787,9 +4409,9 @@ describe("SqliteTranscriptStore", () => {
     const dbPath = path.join(dir, "transcripts.db");
     const store = new SqliteTranscriptStore(dbPath);
     const sessionId = "primary-atomic";
-    const inputMessages = [{ role: "user", content: "atomic" }] satisfies ModelMessage[];
-    const manifest = buildCoreLineageManifestV1([syntheticManifestSegment(inputMessages)]);
-    const response = [{ role: "assistant", content: "candidate" }] satisfies ModelMessage[];
+    const inputMessages = [{ role: "user", content: "atomic" }] satisfies StoredMessageV1[];
+    const manifest = buildCoreLineageManifestV2([syntheticManifestSegment(inputMessages)]);
+    const response = [{ role: "assistant", content: "candidate" }] satisfies StoredMessageV1[];
     const candidateSessionId = crypto.randomUUID();
     reservePrimaryAttempt(store, {
       providerId: "claude-code",
@@ -3830,7 +4452,7 @@ describe("SqliteTranscriptStore", () => {
       requestId: "atomic-primary",
       attemptIndex: 0,
       terminalRequestId: "atomic-primary",
-      terminalLineageVersion: 1,
+      terminalLineageVersion: 2,
       terminalAtomCount: head.atomCount,
       terminalPrefixDigest: head.prefixDigest,
       terminalCanonicalMessageCount: head.canonicalMessageCount,
@@ -3866,7 +4488,7 @@ describe("SqliteTranscriptStore", () => {
     ).toBeNull();
 
     const fence = new Database(dbPath);
-    fence.exec(`
+    fence.run(`
       DROP TRIGGER reject_core_primary_success;
       CREATE TRIGGER steal_core_primary_success_fence
       AFTER UPDATE OF provider_state_json ON request_transcripts

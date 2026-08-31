@@ -10,11 +10,12 @@ import {
 import { Panic, Result, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-import { projectRuntimeError } from "../runtime/error-format";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import {
   jsonValueSchema,
   workflowOperationSchema,
+  workflowArtifactIdSchema,
+  workflowArtifactReferenceSchema,
   workflowProgressPermanentFailureSchema,
   workflowRevisionSchema,
   workflowRunSchema,
@@ -25,6 +26,7 @@ import {
   workflowWaitSchema,
   type JsonValue,
   type WorkflowOperation,
+  type WorkflowArtifactReference,
   type WorkflowRevision,
   type WorkflowRun,
   type WorkflowSurfaceAction,
@@ -235,6 +237,12 @@ const legacyAuditRowSchema = z.strictObject({
   archived_at: z.number(),
 });
 
+const workflowArtifactRowSchema = z.strictObject({
+  artifact_id: workflowArtifactIdSchema,
+  blob_ref_json: z.string(),
+  created_at: z.number(),
+});
+
 export type WorkflowPersistenceDiagnostic = {
   readonly table: string;
   readonly field: string;
@@ -270,7 +278,7 @@ export type DecodedWorkflowRequestTerminalReceipt = {
   readonly state: "resolved" | "failed" | "cancelled";
   readonly detail: string | null;
   readonly output: WorkflowOperation["output"];
-  readonly resultArtifactId: string | null;
+  readonly resultArtifact: WorkflowArtifactReference | null;
   readonly usage: WorkflowOperation["usage"];
   readonly createdAt: number;
 };
@@ -372,12 +380,13 @@ function decodeJson(input: {
 }): ResultType<unknown, MalformedSerialization | Panic> {
   const parsed = Result.try({
     try: () => JSON.parse(input.raw),
-    catch: projectRuntimeError("Opaque workflow persistence JSON failure"),
+    catch: (cause): { kind: "panic"; panic: Panic } | { kind: "error" } =>
+      Panic.is(cause) ? { kind: "panic", panic: cause } : { kind: "error" },
   });
   const finish = parsed.match<() => ResultType<unknown, MalformedSerialization | Panic>>({
     ok: (value) => () => Result.ok(value),
-    err: (error) => () => {
-      if (Panic.is(error)) return Result.err(error);
+    err: (captured) => () => {
+      if (captured.kind === "panic") return Result.err(captured.panic);
       return Result.err(
         new MalformedSerialization(
           diagnostic({
@@ -486,6 +495,14 @@ function decodeWorkflowRevisionRow(input: {
       });
       decoded.push(value);
     }
+    const snapshotArtifact = yield* decodeJsonField({
+      raw: row.data.snapshot_artifact_id,
+      schema: workflowArtifactReferenceSchema,
+      table,
+      field: "snapshot_artifact_id",
+      version: version.version,
+      recordId,
+    });
     const value = workflowRevisionSchema.safeParse({
       revisionId: row.data.revision_id,
       canonicalProjectId: row.data.canonical_project_id,
@@ -493,7 +510,7 @@ function decodeWorkflowRevisionRow(input: {
       scope: row.data.scope,
       normalizedPath: row.data.normalized_path,
       name: row.data.name,
-      snapshotArtifactId: row.data.snapshot_artifact_id,
+      snapshotArtifact,
       sourceSha256: row.data.source_sha256,
       inputSchemaSha256: row.data.input_schema_sha256,
       resourcePolicySha256: row.data.capability_sha256,
@@ -552,6 +569,14 @@ function decodeWorkflowRunRow(input: {
       version: version.version,
       recordId,
     });
+    const resultArtifact = yield* decodeNullableJsonField({
+      raw: row.data.result_artifact_id,
+      schema: workflowArtifactReferenceSchema,
+      table,
+      field: "result_artifact_id",
+      version: version.version,
+      recordId,
+    });
     const value = workflowRunSchema.safeParse({
       runId: row.data.run_id,
       revisionId: row.data.revision_id,
@@ -570,7 +595,7 @@ function decodeWorkflowRunRow(input: {
       progressTarget,
       terminalDetail: row.data.terminal_detail,
       result,
-      resultArtifactId: row.data.result_artifact_id,
+      resultArtifact,
       claimedBy: row.data.claimed_by,
       claimedAt: row.data.claimed_at,
       createdAt: row.data.created_at,
@@ -619,6 +644,14 @@ function decodeWorkflowOperationRow(input: {
       version: version.version,
       recordId,
     });
+    const resultArtifact = yield* decodeNullableJsonField({
+      raw: row.data.result_artifact_id,
+      schema: workflowArtifactReferenceSchema,
+      table,
+      field: "result_artifact_id",
+      version: version.version,
+      recordId,
+    });
     const value = workflowOperationSchema.safeParse({
       runId: row.data.run_id,
       operationId: row.data.operation_id,
@@ -633,7 +666,7 @@ function decodeWorkflowOperationRow(input: {
       attempt: row.data.attempt,
       requestId: row.data.request_id,
       output,
-      resultArtifactId: row.data.result_artifact_id,
+      resultArtifact,
       error: row.data.error,
       usage,
       claimedBy: row.data.claimed_by,
@@ -793,10 +826,7 @@ function decodeWorkflowSurfaceBindingRow(input: {
       version: version.version,
       recordId,
     });
-    if (
-      version.version === WORKFLOW_SCHEMA_VERSION &&
-      row.data.permanent_failure_json === undefined
-    ) {
+    if (version.version >= 25 && row.data.permanent_failure_json === undefined) {
       return Result.err(invalidRow(table, version.version, recordId));
     }
     const permanentFailure = yield* decodeNullableJsonField({
@@ -940,7 +970,15 @@ function decodeWorkflowRequestTerminalReceiptRow(input: {
       version: version.version,
       recordId,
     });
-    if (row.data.state === "resolved" && output === null && row.data.result_artifact_id === null) {
+    const resultArtifact = yield* decodeNullableJsonField({
+      raw: row.data.result_artifact_id,
+      schema: workflowArtifactReferenceSchema,
+      table,
+      field: "result_artifact_id",
+      version: version.version,
+      recordId,
+    });
+    if (row.data.state === "resolved" && output === null && resultArtifact === null) {
       return Result.err(invalidRow(table, version.version, recordId));
     }
     return Result.ok(
@@ -953,7 +991,7 @@ function decodeWorkflowRequestTerminalReceiptRow(input: {
           state: row.data.state,
           detail: row.data.detail,
           output,
-          resultArtifactId: row.data.result_artifact_id,
+          resultArtifact,
           usage,
           createdAt: row.data.created_at,
         },
@@ -1042,6 +1080,32 @@ function decodeWorkflowLegacyAuditRow(input: {
   });
 }
 
+function decodeWorkflowArtifactRow(input: {
+  readonly row: WorkflowPersistedRow;
+  readonly schemaVersion: number;
+}): ResultType<DecodedPersistedValue<WorkflowArtifactReference>, WorkflowPersistenceDecodeError> {
+  return Result.gen(function* () {
+    const table = "workflow_artifacts";
+    const recordId = recordIdFromRow(input.row, "artifact_id");
+    const version = yield* decodeSchemaVersion(input.schemaVersion, table, recordId);
+    const row = workflowArtifactRowSchema.safeParse(input.row);
+    if (!row.success) return Result.err(invalidRow(table, version.version, recordId));
+    const blobRef = yield* decodeJsonField({
+      raw: row.data.blob_ref_json,
+      schema: workflowArtifactReferenceSchema.shape.blobRef,
+      table,
+      field: "blob_ref_json",
+      version: version.version,
+      recordId,
+    });
+    const reference: WorkflowArtifactReference = {
+      artifactId: row.data.artifact_id,
+      blobRef,
+    };
+    return Result.ok(provenance(reference, version));
+  });
+}
+
 type WorkflowPersistenceRowInput<TKind extends string> = {
   readonly kind: TKind;
   readonly row: WorkflowPersistedRow;
@@ -1082,6 +1146,9 @@ export function decodeWorkflowPersistenceRow(
   input: WorkflowPersistenceRowInput<"legacy-audit">,
 ): ResultType<DecodedPersistedValue<DecodedWorkflowLegacyAuditRecord>, PersistedDataError>;
 export function decodeWorkflowPersistenceRow(
+  input: WorkflowPersistenceRowInput<"artifact">,
+): ResultType<DecodedPersistedValue<WorkflowArtifactReference>, PersistedDataError>;
+export function decodeWorkflowPersistenceRow(
   input: WorkflowPersistenceRowInput<
     | "revision"
     | "run"
@@ -1094,6 +1161,7 @@ export function decodeWorkflowPersistenceRow(
     | "receipt"
     | "outbox"
     | "legacy-audit"
+    | "artifact"
   >,
 ): ResultType<
   DecodedPersistedValue<
@@ -1108,6 +1176,7 @@ export function decodeWorkflowPersistenceRow(
     | DecodedWorkflowRequestTerminalReceipt
     | DecodedWorkflowActionOutboxEntry
     | DecodedWorkflowLegacyAuditRecord
+    | WorkflowArtifactReference
   >,
   PersistedDataError
 > {
@@ -1134,8 +1203,21 @@ export function decodeWorkflowPersistenceRow(
       return adaptWorkflowPersistenceDecodeResult(decodeWorkflowActionOutboxRow(input));
     case "legacy-audit":
       return adaptWorkflowPersistenceDecodeResult(decodeWorkflowLegacyAuditRow(input));
+    case "artifact":
+      return adaptWorkflowPersistenceDecodeResult(decodeWorkflowArtifactRow(input));
   }
 }
+
+const fixtureArtifactRow = {
+  artifact_id: `workflow-value:${"a".repeat(64)}`,
+  blob_ref_json: JSON.stringify({
+    version: 1,
+    objectId: `b1_${"b".repeat(32)}`,
+    sha256: "c".repeat(64),
+    byteLength: 1,
+  }),
+  created_at: 1,
+};
 
 const fixtureRunRow = {
   run_id: "fixture-run",
@@ -1184,7 +1266,15 @@ const fixtureRevisionRow = {
   scope: "project",
   normalized_path: "fixture.ts",
   name: "fixture",
-  snapshot_artifact_id: "fixture-artifact",
+  snapshot_artifact_id: JSON.stringify({
+    artifactId: `workflow-source:${"a".repeat(64)}`,
+    blobRef: {
+      version: 1,
+      objectId: `b1_${"b".repeat(32)}`,
+      byteLength: 1,
+      sha256: "a".repeat(64),
+    },
+  }),
   source_sha256: "a".repeat(64),
   input_schema_sha256: "b".repeat(64),
   capability_sha256: "c".repeat(64),
@@ -1352,6 +1442,7 @@ const fixtureLegacyAuditRow = {
 };
 
 type WorkflowFixtureKind =
+  | "artifact"
   | "revision"
   | "run"
   | "operation"
@@ -1395,6 +1486,7 @@ function familyFixtureInputs<TKind extends WorkflowFixtureKind>(
 }
 
 export const workflowPersistenceRowFamilyFixtures = {
+  artifact: familyFixtureInputs("artifact", fixtureArtifactRow, "blob_ref_json", "artifact_id"),
   revision: familyFixtureInputs("revision", fixtureRevisionRow, "metadata_json", "revision_id"),
   run: familyFixtureInputs("run", fixtureRunRow, "args_json", "run_id"),
   operation: familyFixtureInputs("operation", fixtureOperationRow, "input_json", "operation_id"),

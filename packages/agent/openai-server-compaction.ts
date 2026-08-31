@@ -17,7 +17,7 @@ import {
 } from "@stanley2058/lilac-utils";
 
 import { stripToolExecuteForModel, type SystemPrompt } from "./ai-sdk-pi-agent";
-import { rethrowAgentPanic } from "./failure-adapters";
+import { captureAgentPromise, rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
 
 const SERVER_COMPACTION_FORMAT_VERSION = 1 as const;
 const SERVER_COMPACTION_PROTOCOL = "openai-responses-v2" as const;
@@ -264,9 +264,7 @@ export function hasOpenAIServerCompaction(messages: readonly ModelMessage[]): bo
 export async function compactWithOpenAIResponsesResult(
   request: OpenAIServerCompactionRequest,
 ): Promise<ResultType<OpenAIServerCompactionArtifact, OpenAIServerCompactionError>> {
-  let response: Awaited<ReturnType<typeof streamText>["response"]>;
-  let usage: Awaited<ReturnType<typeof streamText>["usage"]>;
-  try {
+  const attempted = await captureAgentPromise(async () => {
     request.abortSignal?.throwIfAborted();
     const result = streamText({
       model: request.model,
@@ -285,24 +283,43 @@ export async function compactWithOpenAIResponsesResult(
       request.abortSignal?.throwIfAborted();
     }
 
-    [response, usage] = await Promise.all([result.response, result.usage]);
-  } catch (cause) {
+    const [response, usage] = await Promise.all([result.response, result.usage]);
+    return { response, usage };
+  });
+  const attempt = attempted.match<
+    | {
+        readonly ok: true;
+        readonly value: {
+          response: Awaited<ReturnType<typeof streamText>["response"]>;
+          usage: Awaited<ReturnType<typeof streamText>["usage"]>;
+        };
+      }
+    | { readonly ok: false; readonly error: OpaqueAgentValue }
+  >({
+    ok: (value) => ({ ok: true, value }),
+    err: (error) => ({ ok: false, error }),
+  });
+  if (!attempt.ok) {
+    const cause = attempt.error;
     rethrowAgentPanic(cause);
+    const error =
+      cause instanceof Error ? cause : new Error("OpenAI server compaction failed", { cause });
     if (request.abortSignal?.aborted) {
       return Result.err(
         new OpenAIServerCompactionAborted({
-          cause,
+          cause: error,
           message: "OpenAI server compaction was aborted",
         }),
       );
     }
     return Result.err(
       new OpenAIServerCompactionRequestFailed({
-        cause,
+        cause: error,
         message: "OpenAI server compaction request failed",
       }),
     );
   }
+  const { response, usage } = attempt.value;
 
   const compactionParts = response.messages.flatMap((message) =>
     message.role === "assistant" && Array.isArray(message.content)

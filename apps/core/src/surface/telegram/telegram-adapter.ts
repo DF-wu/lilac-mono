@@ -91,6 +91,7 @@ import {
   telegramSessionRefResult,
   telegramUnsupported,
 } from "./telegram-operation-result";
+import { captureError } from "../../shared/error-capture";
 import {
   projectTelegramBotFailure,
   projectTelegramError,
@@ -295,24 +296,25 @@ export class TelegramAdapter implements SurfaceAdapter {
     // are registered before connect(), so they are in place by now.
     const replayed = await Result.tryPromise({
       try: () => this.replayPendingIngress(),
-      catch: projectTelegramError("Telegram ingress replay failed"),
+      catch: (cause) => captureError(cause, "Telegram ingress replay failed"),
     });
-    replayed.match({
-      ok: () => undefined,
-      err: (error) =>
-        this.logger.error("telegram ingress replay failed; entries are retained", {}, error.error),
-    });
+    if (replayed.isErr()) {
+      const error = projectTelegramError(replayed.error.cause, "Telegram ingress replay failed");
+      this.logger.error("telegram ingress replay failed; entries are retained", {}, error.error);
+    }
 
     if (cfg.surface.telegram.commandMenu) {
       const registered = await Result.tryPromise({
         try: () => this.registerCommandMenu(bot),
-        catch: projectTelegramError("Telegram command menu registration failed"),
+        catch: (cause) => captureError(cause, "Telegram command menu registration failed"),
       });
-      registered.match({
-        ok: () => undefined,
-        err: (error) =>
-          this.logger.warn("failed to register telegram command menu", {}, error.error),
-      });
+      if (registered.isErr()) {
+        const error = projectTelegramError(
+          registered.error.cause,
+          "Telegram command menu registration failed",
+        );
+        this.logger.warn("failed to register telegram command menu", {}, error.error);
+      }
     }
 
     this.stopping = false;
@@ -340,15 +342,21 @@ export class TelegramAdapter implements SurfaceAdapter {
       },
     });
 
-    this.pollingStopped = Result.tryPromise({
+    this.pollingStopped = this.supervisePolling(polling);
+  }
+
+  private async supervisePolling(polling: Promise<void>): Promise<void> {
+    const settled = await Result.tryPromise({
       try: () => polling,
-      catch: projectTelegramError("Telegram long polling failed"),
-    }).then((settled) =>
-      settled.match({
-        ok: () => this.onPollingSettled(null),
-        err: (error) => this.onPollingSettled(error),
-      }),
-    );
+      catch: (cause) => captureError(cause, "Telegram long polling failed"),
+    });
+    if (settled.isErr()) {
+      this.onPollingSettled(
+        projectTelegramError(settled.error.cause, "Telegram long polling failed"),
+      );
+      return;
+    }
+    this.onPollingSettled(null);
   }
 
   /**
@@ -411,15 +419,19 @@ export class TelegramAdapter implements SurfaceAdapter {
     this.ingressStopped = true;
     // Tell the supervisor this settlement is deliberate.
     this.stopping = true;
-    await Result.tryPromise({
+    const stopped = await Result.tryPromise({
       try: () => bot.stop(),
-      catch: projectTelegramError("Telegram bot stop failed"),
+      catch: (cause) => captureError(cause, "Telegram bot stop failed"),
     });
+    if (stopped.isErr()) projectTelegramError(stopped.error.cause, "Telegram bot stop failed");
     if (this.pollingStopped) {
-      await Result.tryPromise({
+      const settled = await Result.tryPromise({
         try: () => this.pollingStopped ?? Promise.resolve(),
-        catch: projectTelegramError("Telegram polling settlement failed"),
+        catch: (cause) => captureError(cause, "Telegram polling settlement failed"),
       });
+      if (settled.isErr()) {
+        projectTelegramError(settled.error.cause, "Telegram polling settlement failed");
+      }
     }
     this.pollingStopped = null;
 
@@ -440,16 +452,20 @@ export class TelegramAdapter implements SurfaceAdapter {
     if (!this.ingressStopped) {
       // Stopping aborts the in-flight getUpdates, which surfaces as a transport
       // error. That is the expected shape of a clean shutdown, not a failure.
-      await Result.tryPromise({
+      const stopped = await Result.tryPromise({
         try: () => bot.stop(),
-        catch: projectTelegramError("Telegram bot stop failed"),
+        catch: (cause) => captureError(cause, "Telegram bot stop failed"),
       });
+      if (stopped.isErr()) projectTelegramError(stopped.error.cause, "Telegram bot stop failed");
       // Let the polling loop unwind before tearing down the store it may touch.
       if (this.pollingStopped) {
-        await Result.tryPromise({
+        const settled = await Result.tryPromise({
           try: () => this.pollingStopped ?? Promise.resolve(),
-          catch: projectTelegramError("Telegram polling settlement failed"),
+          catch: (cause) => captureError(cause, "Telegram polling settlement failed"),
         });
+        if (settled.isErr()) {
+          projectTelegramError(settled.error.cause, "Telegram polling settlement failed");
+        }
       }
     }
     this.pollingStopped = null;
@@ -572,18 +588,16 @@ export class TelegramAdapter implements SurfaceAdapter {
           }).map(() => session),
         )
       : ref;
-    const validated = (opts?.resume?.created ?? []).reduce(
-      (current, created, index) =>
-        current.andThen((session) =>
+    const validated = opts?.resumeAt
+      ? replyValidated.andThen((session) =>
           telegramNestedMsgRefResult({
             operation: "start-output",
             sessionRef: session,
-            msgRef: created,
-            refRole: `resume.created[${index}]`,
+            msgRef: opts.resumeAt!,
+            refRole: "resumeAt",
           }).map(() => session),
-        ),
-      replyValidated,
-    );
+        )
+      : replyValidated;
     const continueStart = validated.match<
       () => Promise<SurfaceOperationResult<SurfaceOutputStream>>
     >({
@@ -960,19 +974,22 @@ export class TelegramAdapter implements SurfaceAdapter {
           const bot = this.mustBot();
           const { chatId, threadId } = parseTelegramSessionId(telegramRef.channelId);
           let stopped = false;
-          const send = () => {
+          const send = async () => {
             if (stopped) return;
-            void Result.tryPromise({
+            const attempted = await Result.tryPromise({
               try: () =>
                 bot.api.sendChatAction(
                   chatId,
                   "typing",
                   threadId === undefined ? {} : { message_thread_id: threadId },
                 ),
-              catch: projectTelegramError("Telegram typing heartbeat failed"),
+              catch: (cause) => captureError(cause, "Telegram typing heartbeat failed"),
             });
+            if (attempted.isErr()) {
+              projectTelegramError(attempted.error.cause, "Telegram typing heartbeat failed");
+            }
           };
-          send();
+          void send();
           const timer = setInterval(send, 4_500);
           return {
             stop: async () => {
@@ -1154,14 +1171,20 @@ export class TelegramAdapter implements SurfaceAdapter {
           userId: String(query.from.id),
           messageId: String(message.message_id),
         });
-        await Result.tryPromise({
+        const acknowledged = await Result.tryPromise({
           try: () =>
             ctx.answerCallbackQuery({
               text: delivered.ok ? "Cancelling…" : "Cancel could not be delivered. Try again.",
               show_alert: !delivered.ok,
             }),
-          catch: projectTelegramError("Telegram callback acknowledgement failed"),
+          catch: (cause) => captureError(cause, "Telegram callback acknowledgement failed"),
         });
+        if (acknowledged.isErr()) {
+          projectTelegramError(
+            acknowledged.error.cause,
+            "Telegram callback acknowledgement failed",
+          );
+        }
         return;
       }
 
@@ -1177,15 +1200,18 @@ export class TelegramAdapter implements SurfaceAdapter {
           messageId: message.message_id,
         }),
       });
-      await Result.tryPromise({
+      const acknowledged = await Result.tryPromise({
         try: () =>
           ctx.answerCallbackQuery(
             delivered.ok
               ? {}
               : { text: "Action could not be delivered. Try again.", show_alert: true },
           ),
-        catch: projectTelegramError("Telegram callback acknowledgement failed"),
+        catch: (cause) => captureError(cause, "Telegram callback acknowledgement failed"),
       });
+      if (acknowledged.isErr()) {
+        projectTelegramError(acknowledged.error.cause, "Telegram callback acknowledgement failed");
+      }
     });
   }
 
@@ -1388,17 +1414,13 @@ export class TelegramAdapter implements SurfaceAdapter {
     for (const handler of this.handlers) {
       const delivered = await Result.tryPromise({
         try: async () => await handler(evt),
-        catch: projectTelegramError("Telegram adapter handler failed"),
+        catch: (cause) => captureError(cause, "Telegram adapter handler failed"),
       });
-      const outcome = delivered.match<
-        | { readonly kind: "delivered" }
-        | { readonly kind: "failed"; readonly error: TelegramErrorProjection }
-      >({
-        ok: () => ({ kind: "delivered" }),
-        err: (error) => ({ kind: "failed", error }),
-      });
-      if (outcome.kind === "failed") {
-        const error = outcome.error;
+      if (delivered.isErr()) {
+        const error = projectTelegramError(
+          delivered.error.cause,
+          "Telegram adapter handler failed",
+        );
         this.logger.error("telegram adapter handler failed", { type: evt.type }, error.error);
         // Keep the first failure: later handlers may succeed, but the event
         // is only safe to forget once every subscriber has taken it.
@@ -1487,19 +1509,21 @@ export class TelegramAdapter implements SurfaceAdapter {
     this.ingressReplayActive = true;
     const replayed = await Result.tryPromise({
       try: () => this.replayPendingIngress(),
-      catch: projectTelegramError("Telegram ingress replay attempt failed"),
+      catch: (cause) => captureError(cause, "Telegram ingress replay attempt failed"),
     });
-    replayed.match({
-      ok: (result) => {
-        if (result.failed > 0 && (this.store?.countPendingIngress() ?? 0) > 0) {
-          this.scheduleIngressReplay(Math.min(30_000, 1_000 * (result.failed + 1)));
-        }
-      },
-      err: (error) => {
-        this.logger.error("telegram ingress replay attempt failed", {}, error.error);
-        if ((this.store?.countPendingIngress() ?? 0) > 0) this.scheduleIngressReplay(5_000);
-      },
-    });
+    if (replayed.isErr()) {
+      const error = projectTelegramError(
+        replayed.error.cause,
+        "Telegram ingress replay attempt failed",
+      );
+      this.logger.error("telegram ingress replay attempt failed", {}, error.error);
+      if ((this.store?.countPendingIngress() ?? 0) > 0) this.scheduleIngressReplay(5_000);
+      this.ingressReplayActive = false;
+      return;
+    }
+    if (replayed.value.failed > 0 && (this.store?.countPendingIngress() ?? 0) > 0) {
+      this.scheduleIngressReplay(Math.min(30_000, 1_000 * (replayed.value.failed + 1)));
+    }
     this.ingressReplayActive = false;
   }
 

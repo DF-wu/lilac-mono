@@ -7,7 +7,7 @@ import {
   getCoreConfig,
   isRecord,
 } from "@stanley2058/lilac-utils";
-import { Panic, Result } from "better-result";
+import { Panic, Result, TaggedError } from "better-result";
 import { z } from "zod";
 import {
   serverToolFailure,
@@ -96,6 +96,11 @@ const getPageSchema = z.object({
 type GetPageMode = z.infer<typeof getPageModeSchema>;
 type GetPageInput = z.infer<typeof getPageSchema>;
 type WebProviderFailure = { providerId: WebSearchProviderId; failure: ServerToolFailure };
+
+class WebProviderOperationFailed extends TaggedError("WebProviderOperationFailed")<{
+  readonly cause: ServerToolFailure;
+  readonly message: string;
+}> {}
 type WebPageContentError = PageContentError & { failure?: ServerToolFailure };
 type WebPageContentResult = Exclude<PageContentResult, PageContentError> | WebPageContentError;
 type WebFetchResult = ReturnType<typeof slicePageContent> | WebPageContentError;
@@ -185,8 +190,17 @@ const defaultWebDependencies: WebDependencies = {
   firecrawlSearchPermits: sharedFirecrawlSearchPermits,
 };
 
-function captureWebConfigFailure(error: unknown): string {
-  return webFailure(error).message;
+function captureWebFailure(error: unknown): { readonly cause: Error | Panic } {
+  if (Panic.is(error)) return { cause: error };
+  if (error instanceof Error) return { cause: error };
+  const message =
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof error.message === "string"
+      ? error.message
+      : "Web operation failed";
+  return { cause: new Error(message, { cause: error }) };
 }
 
 function getNumericField(record: Record<string, unknown>, key: string): number | null {
@@ -208,7 +222,15 @@ function getErrorStatus(error: unknown): number | null {
 
   const cause = error.cause;
   if (isRecord(cause)) {
-    return getNumericField(cause, "status") ?? getNumericField(cause, "statusCode");
+    const causeStatus = getNumericField(cause, "status") ?? getNumericField(cause, "statusCode");
+    if (causeStatus !== null) return causeStatus;
+
+    const causeResponse = cause.response;
+    if (isRecord(causeResponse)) {
+      return (
+        getNumericField(causeResponse, "status") ?? getNumericField(causeResponse, "statusCode")
+      );
+    }
   }
   return null;
 }
@@ -235,20 +257,24 @@ function webFailure(error: unknown, signal?: AbortSignal): ServerToolFailure {
   const status = getErrorStatus(error);
   const normalized = message.toLowerCase();
   let category: ServerToolFailure["kind"] = "unavailable";
-  if (signal?.aborted || /\babort(?:ed)?\b/.test(normalized)) {
-    category = "cancelled";
-  } else if (status === 408 || /\b(?:timeout|timed out)\b/.test(normalized)) {
-    category = "timeout";
-  } else if (
-    status === 401 ||
-    status === 403 ||
-    /\b(?:401|403|unauthori[sz]ed|forbidden)\b/.test(normalized)
-  ) {
-    category = "denied";
-  } else if (status === 404 || /\b(?:404|not found)\b/.test(normalized)) {
-    category = "not_found";
-  } else if (/unsupported|invalid (?:url|format|content)|response too large/.test(normalized)) {
-    category = "usage";
+  switch (true) {
+    case signal?.aborted || /\babort(?:ed)?\b/.test(normalized):
+      category = "cancelled";
+      break;
+    case status === 408 || /\b(?:timeout|timed out)\b/.test(normalized):
+      category = "timeout";
+      break;
+    case status === 401 ||
+      status === 403 ||
+      /\b(?:401|403|unauthori[sz]ed|forbidden)\b/.test(normalized):
+      category = "denied";
+      break;
+    case status === 404 || /\b(?:404|not found)\b/.test(normalized):
+      category = "not_found";
+      break;
+    case /unsupported|invalid (?:url|format|content)|response too large/.test(normalized):
+      category = "usage";
+      break;
   }
   return serverToolFailure({
     kind: category,
@@ -382,33 +408,36 @@ export class Web implements ServerTool {
   private async refreshWebConfig(): Promise<void> {
     const loaded = await Result.tryPromise({
       try: this.dependencies.loadWebToolConfig,
-      catch: captureWebConfigFailure,
+      catch: captureWebFailure,
     });
-    const configState = loaded.match<
-      | { succeeded: true; config: WebToolConfig }
-      | { succeeded: false; config: WebToolConfig; error: string }
-    >({
-      ok: (config) => ({ succeeded: true, config }),
-      err: (error) => ({
-        succeeded: false,
-        config: { extractProviders: [], fetchMode: "auto", firecrawlPolicy: undefined },
-        error,
-      }),
+    const config = loaded.match<WebToolConfig>({
+      ok: (value) => value,
+      err: () => ({ extractProviders: [], fetchMode: "auto", firecrawlPolicy: undefined }),
     });
-    if (!configState.succeeded) {
+    const loadFailure = loaded.match<Error | Panic | null>({
+      ok: () => null,
+      err: ({ cause }) => cause,
+    });
+    if (loadFailure) {
+      if (Panic.is(loadFailure)) preserveToolPanic(loadFailure);
+      const failure = new WebProviderOperationFailed({
+        cause: webFailure(loadFailure),
+        message: "Failed to read core-config.yaml for web tool config",
+      });
       this.logger.logError(
-        `Failed to read core-config.yaml for web tool config: ${configState.error}`,
+        "Failed to read core-config.yaml for web tool config",
+        formatTaggedErrorForLog(failure),
       );
     }
 
-    const normalizedRequested = configState.config.extractProviders.map((providerId) =>
+    const normalizedRequested = config.extractProviders.map((providerId) =>
       providerId.trim().toLowerCase(),
     );
     const environment = this.dependencies.getProviderEnvironment();
     const nextKey = JSON.stringify({
       requested: normalizedRequested,
-      fetchMode: configState.config.fetchMode,
-      firecrawlPolicy: configState.config.firecrawlPolicy ?? null,
+      fetchMode: config.fetchMode,
+      firecrawlPolicy: config.firecrawlPolicy ?? null,
       firecrawlApiBaseUrl: environment.firecrawl.apiBaseUrl ?? null,
       hasFirecrawlApiKey: Boolean(environment.firecrawl.apiKey),
       exaBaseUrl: environment.exa.baseUrl ?? null,
@@ -418,9 +447,9 @@ export class Web implements ServerTool {
     });
     if (nextKey === this.webSearchProviderKey) return;
     this.webSearchProviderKey = nextKey;
-    if (configState.succeeded) {
-      this.dependencies.firecrawlFetchPermits.configure(configState.config.firecrawlPolicy);
-      this.dependencies.firecrawlSearchPermits.configure(configState.config.firecrawlPolicy);
+    if (!loadFailure) {
+      this.dependencies.firecrawlFetchPermits.configure(config.firecrawlPolicy);
+      this.dependencies.firecrawlSearchPermits.configure(config.firecrawlPolicy);
     }
 
     const previousIds = this.webSearchProviders.map((provider) => provider.id).join(" -> ") || null;
@@ -435,12 +464,12 @@ export class Web implements ServerTool {
       tavilyApiBaseUrl: environment.tavily.apiBaseUrl,
     });
     const resolved = resolveWebSearchProvider({
-      requested: configState.config.extractProviders,
+      requested: config.extractProviders,
       providers,
     });
     this.webSearchProviders = resolved.providers;
     this.webSearchProviderError = resolved.error;
-    this.webFetchDefaultMode = configState.config.fetchMode;
+    this.webFetchDefaultMode = config.fetchMode;
 
     const nextIds = this.webSearchProviders.map((provider) => provider.id).join(" -> ") || null;
     if (resolved.warning) this.logger.logInfo(resolved.warning);
@@ -534,23 +563,56 @@ export class Web implements ServerTool {
         permit = acquired.permit;
       }
 
-      try {
-        return Result.ok(await provider.search(input, { signal: opts?.signal }));
-      } catch (error) {
-        const failure = webFailure(error, opts?.signal);
-        const message = failure.message;
-        failures.push({ providerId: provider.id, failure });
-        if (isRetriableWebProviderError(error) && index < this.webSearchProviders.length - 1) {
-          this.logger.logInfo(
-            `web.search retryable failure (${provider.id}): ${message}. Falling back to next provider.`,
-          );
-          continue;
-        }
-        this.logger.logError(`web.search failed (${provider.id}): ${message}`);
-        break;
-      } finally {
-        permit?.release();
+      const outcome = await (async () => {
+        const searched = await Result.tryPromise({
+          try: () => provider.search(input, { signal: opts?.signal }),
+          catch: captureWebFailure,
+        });
+        return searched.match<
+          | { readonly kind: "return"; readonly value: ServerToolResult }
+          | { readonly kind: "panic"; readonly panic: Panic }
+          | {
+              readonly kind: "failure";
+              readonly failure: ServerToolFailure;
+              readonly retryable: boolean;
+            }
+        >({
+          ok: (value) => ({ kind: "return", value: Result.ok(value) }),
+          err: ({ cause }) =>
+            Panic.is(cause)
+              ? ({ kind: "panic", panic: cause } as const)
+              : ({
+                  kind: "failure",
+                  failure: webFailure(cause, opts?.signal),
+                  retryable: isRetriableWebProviderError(cause),
+                } as const),
+        });
+      })().finally(() => permit?.release());
+      if (outcome.kind === "return") return outcome.value;
+      if (outcome.kind === "panic") preserveToolPanic(outcome.panic);
+      failures.push({ providerId: provider.id, failure: outcome.failure });
+      if (outcome.retryable && index < this.webSearchProviders.length - 1) {
+        this.logger.logInfo(
+          `web.search retryable failure (${provider.id}); falling back to next provider.`,
+          formatTaggedErrorForLog(
+            new WebProviderOperationFailed({
+              cause: outcome.failure,
+              message: outcome.failure.message,
+            }),
+          ),
+        );
+        continue;
       }
+      this.logger.logError(
+        `web.search failed (${provider.id}).`,
+        formatTaggedErrorForLog(
+          new WebProviderOperationFailed({
+            cause: outcome.failure,
+            message: outcome.failure.message,
+          }),
+        ),
+      );
+      break;
     }
     return Result.err(aggregateWebProviderFailure("search", failures));
   }
@@ -572,47 +634,89 @@ export class Web implements ServerTool {
       if (index > 0) {
         this.logger.logInfo(`web.extract retrying with fallback provider '${provider.id}'.`);
       }
-      try {
-        const result = await this.providerPageExtractor.extract(provider.id, input, opts);
-        if (!result.isError) return result;
-        if (result.aborted) return result;
-        failures.push({
-          providerId: provider.id,
-          failure: webFailure(
-            {
-              message: result.error,
-              ...(result.status === undefined ? {} : { status: result.status }),
-            },
-            opts?.signal,
+      const extracted = await Result.tryPromise({
+        try: () => this.providerPageExtractor.extract(provider.id, input, opts),
+        catch: captureWebFailure,
+      });
+      const outcome = extracted.match<
+        | { readonly kind: "result"; readonly result: WebPageContentResult }
+        | { readonly kind: "panic"; readonly panic: Panic }
+        | {
+            readonly kind: "failure";
+            readonly failure: ServerToolFailure;
+            readonly retryable: boolean;
+          }
+      >({
+        ok: (result) => ({ kind: "result", result }),
+        err: ({ cause }) =>
+          Panic.is(cause)
+            ? ({ kind: "panic", panic: cause } as const)
+            : ({
+                kind: "failure",
+                failure: webFailure(cause, opts?.signal),
+                retryable: isRetriableWebProviderError(cause),
+              } as const),
+      });
+      if (outcome.kind === "panic") preserveToolPanic(outcome.panic);
+      if (outcome.kind === "failure") {
+        failures.push({ providerId: provider.id, failure: outcome.failure });
+        if (outcome.retryable && index < this.webSearchProviders.length - 1) {
+          this.logger.logInfo(
+            `web.extract retryable failure (${provider.id}); falling back to next provider.`,
+            formatTaggedErrorForLog(
+              new WebProviderOperationFailed({
+                cause: outcome.failure,
+                message: outcome.failure.message,
+              }),
+            ),
+          );
+          continue;
+        }
+        this.logger.logError(
+          `web.extract failed (${provider.id}).`,
+          formatTaggedErrorForLog(
+            new WebProviderOperationFailed({
+              cause: outcome.failure,
+              message: outcome.failure.message,
+            }),
           ),
-        });
-
-        const canTryNextProviderForFormat =
-          format === "html" && !supportsHtmlExtractFormat(provider.id);
-        if (
-          (isRetriableWebProviderError(result.error) || canTryNextProviderForFormat) &&
-          index < this.webSearchProviders.length - 1
-        ) {
-          this.logger.logInfo(
-            `web.extract fallback failure (${provider.id}): ${result.error}. Falling back to next provider.`,
-          );
-          continue;
-        }
-        this.logger.logError(`web.extract failed (${provider.id}): ${result.error}`);
-        break;
-      } catch (error) {
-        const failure = webFailure(error, opts?.signal);
-        const message = failure.message;
-        failures.push({ providerId: provider.id, failure });
-        if (isRetriableWebProviderError(error) && index < this.webSearchProviders.length - 1) {
-          this.logger.logInfo(
-            `web.extract retryable failure (${provider.id}): ${message}. Falling back to next provider.`,
-          );
-          continue;
-        }
-        this.logger.logError(`web.extract failed (${provider.id}): ${message}`);
+        );
         break;
       }
+      const { result } = outcome;
+      if (!result.isError || result.aborted) return result;
+      const failure = webFailure(
+        {
+          message: result.error,
+          ...(result.status === undefined ? {} : { status: result.status }),
+        },
+        opts?.signal,
+      );
+      failures.push({
+        providerId: provider.id,
+        failure,
+      });
+      const canTryNextProviderForFormat =
+        format === "html" && !supportsHtmlExtractFormat(provider.id);
+      if (
+        (isRetriableWebProviderError(result.error) || canTryNextProviderForFormat) &&
+        index < this.webSearchProviders.length - 1
+      ) {
+        this.logger.logInfo(
+          `web.extract fallback failure (${provider.id}); falling back to next provider.`,
+          formatTaggedErrorForLog(
+            new WebProviderOperationFailed({ cause: failure, message: failure.message }),
+          ),
+        );
+        continue;
+      }
+      this.logger.logError(
+        `web.extract failed (${provider.id}).`,
+        formatTaggedErrorForLog(
+          new WebProviderOperationFailed({ cause: failure, message: failure.message }),
+        ),
+      );
+      break;
     }
     const failure = aggregateWebProviderFailure("extract", failures);
     return { isError: true, error: failure.message, failure };

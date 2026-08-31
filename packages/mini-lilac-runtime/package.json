@@ -8,7 +8,8 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "bun test --parallel=4",
+    "test": "bun test --parallel=${MINI_LILAC_RUNTIME_TEST_PARALLEL:-4} --timings=test-timings.json",
+    "test:update-timings": "bun test --parallel=${MINI_LILAC_RUNTIME_TEST_PARALLEL:-4} --timings=test-timings.json --update-timings",
     "typecheck": "bunx tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -33,7 +34,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/bun": "^1.3.14",
+    "@types/bun": "^1.4.0",
     "@types/turndown": "^5.0.6"
   },
   "peerDependencies": {

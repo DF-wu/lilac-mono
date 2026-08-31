@@ -27,6 +27,7 @@ function message(platform: AdapterPlatform): CacheMessage {
       request_client: platform,
     },
     data: {
+      requestDeliveryId: crypto.randomUUID(),
       queue: "prompt",
       messages: [],
       raw: {

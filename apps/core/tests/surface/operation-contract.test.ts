@@ -3,6 +3,7 @@ import { Result, type Result as ResultType } from "better-result";
 
 import {
   type StartOutputOpts,
+  type StartTypingOpts,
   type SurfaceAdapter,
   SurfaceInvalidInput,
   SurfaceMessageNotFound,
@@ -182,7 +183,10 @@ interface SurfaceAdapterSignatureFixture {
     sessionRef: SessionRef,
     opts?: StartOutputOpts,
   ): Promise<SurfaceOperationResult<SurfaceOutputStream>>;
-  startTyping(sessionRef: SessionRef): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
+  startTyping(
+    sessionRef: SessionRef,
+    opts?: StartTypingOpts,
+  ): Promise<SurfaceOperationResult<TypingIndicatorSubscription>>;
   prepareSendMsg(
     sessionRef: SessionRef,
     input: SurfaceSendPreparationInput,

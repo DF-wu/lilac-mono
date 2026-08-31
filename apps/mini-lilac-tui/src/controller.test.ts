@@ -67,8 +67,7 @@ function idleSnapshot(
 }
 
 function flush(): Promise<void> {
-  // test-wait-justification: drains controller work queued onto the next timer turn by fake transport actions
-  return new Promise((resolve) => setTimeout(resolve, 0));
+  return new Promise(setImmediate);
 }
 
 function deferred<T>(): {

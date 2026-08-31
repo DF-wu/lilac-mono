@@ -470,20 +470,23 @@ function decodeJson<T, E, Context>(
   decode: (value: unknown, context: Context) => ResultType<T, E>,
   context: Context,
 ): ResultType<T, E | RemoteRunnerMalformedJsonError> {
-  let value: unknown;
-  try {
-    value = JSON.parse(text);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new RemoteRunnerMalformedJsonError({
-        boundary,
-        cause,
-        message: `${boundary} contained malformed JSON`,
-      }),
-    );
-  }
-  return decode(value, context);
+  const captured = Result.try({
+    try: () => JSON.parse(text) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = captured.match<{ readonly value: unknown } | { readonly cause: unknown }>({
+    ok: (value) => ({ value }),
+    err: ({ cause }) => ({ cause }),
+  });
+  if ("value" in outcome) return decode(outcome.value, context);
+  if (Panic.is(outcome.cause)) throw outcome.cause;
+  return Result.err(
+    new RemoteRunnerMalformedJsonError({
+      boundary,
+      cause: outcome.cause,
+      message: `${boundary} contained malformed JSON`,
+    }),
+  );
 }
 
 function knownBundledOperation(operation: string): boolean {

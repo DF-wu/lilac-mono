@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { createHash } from "node:crypto";
 import path from "node:path";
 
@@ -16,8 +17,10 @@ import { catalogToolStableId, type CatalogToolIdentity } from "./catalog-identit
 import type { McpServerDefinition } from "./config-types";
 import { McpConfigError, readMcpConfigFile } from "./config-file";
 import { rethrowPanic, safeMcpErrorText } from "./error-format";
+import { enforceModernMcpResultContract, retainTransportPanic } from "./modern-result-validation";
 import type {
   McpCatalogTool,
+  McpCatalogServer,
   McpConvertedTool,
   McpRegistryApi,
   McpRegistryClient,
@@ -28,19 +31,35 @@ import type {
   McpReloadOutcome,
   McpReloadReconciliation,
   McpServerStatus,
+  McpServerInfo,
 } from "./registry-types";
 import { resolveMcpValueSourceMap, validateHttpHeaders } from "./value-source";
 
 const DEFAULT_INIT_DEADLINE_MS = 30_000;
-const mcpApplicationErrorSchema = z.object({
-  name: z.literal("MCPClientError"),
-  code: z.number(),
-});
+const mcpNonTerminalExecutionErrorSchema = z.union([
+  z.object({
+    name: z.literal("MCPClientError"),
+    code: z.number(),
+  }),
+  // @ai-sdk/mcp 2.0.39 does not export a runtime error type for this limitation.
+  z.object({
+    name: z.literal("MCPClientError"),
+    message: z.literal(
+      "Server requested additional input, but multi round-trip requests are not supported yet",
+    ),
+  }),
+]);
 const optionalHttpInboundSseErrorSchema = z.object({
   name: z.literal("MCPClientError"),
   message: z.string().startsWith("MCP HTTP Transport Error: GET SSE failed:"),
   statusCode: z.number().int(),
   url: z.string(),
+});
+const mcpServerInfoSchema = z.object({
+  name: z.string(),
+  version: z.string(),
+  title: z.string().optional(),
+  description: z.string().optional(),
 });
 
 type RegistryEntry = {
@@ -48,6 +67,7 @@ type RegistryEntry = {
   readonly fingerprint: string;
   readonly transportFingerprint?: string;
   readonly client?: McpRegistryClient;
+  readonly serverInfo?: McpServerInfo;
   readonly sensitiveValues: readonly string[];
   readonly status: McpServerStatus;
   readonly tools: readonly McpCatalogTool[];
@@ -55,6 +75,7 @@ type RegistryEntry = {
 
 type InitializedCandidate = {
   readonly client: McpRegistryClient;
+  readonly serverInfo: McpServerInfo;
   readonly sensitiveValues: readonly string[];
   readonly transportFingerprint: string;
   readonly tools: readonly McpCatalogTool[];
@@ -119,7 +140,7 @@ class McpRegistryTransportConfigurationError extends TaggedError(
   "McpRegistryTransportConfigurationError",
 )<{
   readonly serverId: string;
-  readonly cause: Error;
+  readonly cause: unknown;
   readonly message: string;
 }> {}
 
@@ -156,9 +177,28 @@ class McpRegistryCloseDeadlineError extends Error {
 }
 
 class McpRegistryDiscoveryInvalid extends TaggedError("McpRegistryDiscoveryInvalid")<{
-  readonly reason: "duplicate-tool" | "missing-conversion" | "repeated-cursor";
+  readonly reason:
+    | "duplicate-tool"
+    | "invalid-server-info"
+    | "missing-conversion"
+    | "repeated-cursor";
   readonly message: string;
 }> {}
+
+function decodeMcpServerInfo(
+  value: unknown,
+): ResultType<McpServerInfo, McpRegistryDiscoveryInvalid> {
+  const parsed = mcpServerInfoSchema.safeParse(value);
+  if (!parsed.success) {
+    return Result.err(
+      new McpRegistryDiscoveryInvalid({
+        reason: "invalid-server-info",
+        message: `Invalid MCP serverInfo: ${z.prettifyError(parsed.error)}`,
+      }),
+    );
+  }
+  return Result.ok(Object.freeze(parsed.data));
+}
 
 class McpRegistryTerminalFailure extends TaggedError("McpRegistryTerminalFailure")<{
   readonly status: "unavailable" | "authentication_required";
@@ -296,6 +336,7 @@ export class McpRegistry implements McpRegistryApi {
   private entries = new Map<string, RegistryEntry>();
   private configStatus: McpRegistryConfigStatus = Object.freeze({ status: "valid" });
   private statusSnapshot: readonly McpServerStatus[] = Object.freeze([]);
+  private catalogServerSnapshot: readonly McpCatalogServer[] = Object.freeze([]);
   private toolSnapshot: readonly McpCatalogTool[] = Object.freeze([]);
   private lifecycleQueue: Promise<void> = Promise.resolve();
   private initialized = false;
@@ -403,6 +444,10 @@ export class McpRegistry implements McpRegistryApi {
 
   getConfigStatus(): McpRegistryConfigStatus {
     return this.configStatus;
+  }
+
+  getCatalogServers(): readonly McpCatalogServer[] {
+    return this.catalogServerSnapshot;
   }
 
   getTools(): readonly McpCatalogTool[] {
@@ -515,67 +560,78 @@ export class McpRegistry implements McpRegistryApi {
         });
       }
       const retainedClient = current.client;
-      try {
-        const discovered = await this.withDeadline(definition.id, (signal) =>
-          this.discoverTools(definition, retainedClient, signal),
-        );
-        const discoveryFailure = discovered.match<() => McpReloadOutcome | null>({
-          err: (error) => () =>
-            freezeOutcome({
+      {
+        const captured = await Result.tryPromise({
+          try: async () => {
+            const discovered = await this.withDeadline(definition.id, (signal) =>
+              this.discoverTools(definition, retainedClient, signal),
+            );
+            const discoveryFailure = discovered.match<() => McpReloadOutcome | null>({
+              err: (error) => () =>
+                freezeOutcome({
+                  serverId,
+                  reconciliation,
+                  result: "retained",
+                  error: error.message,
+                }),
+              ok: () => () => null,
+            });
+            const failed = discoveryFailure();
+            if (failed) return failed;
+            const tools = discovered.match({ ok: (value) => value, err: () => [] });
+            if (this.entries.get(serverId) !== current || current.status.status !== "available") {
+              return freezeOutcome({
+                serverId,
+                reconciliation,
+                result: "unavailable",
+                error: "MCP server became unavailable while refreshing its tool manifest",
+              });
+            }
+            this.entries.set(serverId, {
+              ...current,
+              definition,
+              fingerprint: definitionFingerprint(definition),
+              tools,
+              status: Object.freeze({
+                serverId,
+                transport: definition.transportConfig.transport,
+                status: "available",
+                toolCount: tools.length,
+              }),
+            });
+            this.publishSnapshots();
+            return freezeOutcome({ serverId, reconciliation, result: "available" });
+          },
+          catch: captureError,
+        });
+
+        if (captured.isErr()) {
+          const error = captured.error.cause;
+          rethrowPanic(error);
+          const latest = this.entries.get(serverId);
+          if (!latest || latest.client !== retainedClient || latest.status.status !== "available") {
+            return freezeOutcome({
               serverId,
               reconciliation,
-              result: "retained",
-              error: error.message,
-            }),
-          ok: () => () => null,
-        });
-        const failed = discoveryFailure();
-        if (failed) return failed;
-        const tools = discovered.match({ ok: (value) => value, err: () => [] });
-        if (this.entries.get(serverId) !== current || current.status.status !== "available") {
+              result:
+                latest?.status.status === "authentication_required"
+                  ? "authentication_required"
+                  : "unavailable",
+              error:
+                latest?.status.status === "unavailable" ||
+                latest?.status.status === "authentication_required"
+                  ? latest.status.error
+                  : "MCP server became unavailable while refreshing its tool manifest",
+            });
+          }
           return freezeOutcome({
             serverId,
             reconciliation,
-            result: "unavailable",
-            error: "MCP server became unavailable while refreshing its tool manifest",
+            result: "retained",
+            error: safeErrorText(error, current.sensitiveValues),
           });
         }
-        this.entries.set(serverId, {
-          ...current,
-          tools,
-          status: Object.freeze({
-            serverId,
-            transport: definition.transportConfig.transport,
-            status: "available",
-            toolCount: tools.length,
-          }),
-        });
-        this.publishSnapshots();
-        return freezeOutcome({ serverId, reconciliation, result: "available" });
-      } catch (error) {
-        rethrowPanic(error);
-        const latest = this.entries.get(serverId);
-        if (!latest || latest.client !== retainedClient || latest.status.status !== "available") {
-          return freezeOutcome({
-            serverId,
-            reconciliation,
-            result:
-              latest?.status.status === "authentication_required"
-                ? "authentication_required"
-                : "unavailable",
-            error:
-              latest?.status.status === "unavailable" ||
-              latest?.status.status === "authentication_required"
-                ? latest.status.error
-                : "MCP server became unavailable while refreshing its tool manifest",
-          });
-        }
-        return freezeOutcome({
-          serverId,
-          reconciliation,
-          result: "retained",
-          error: safeErrorText(error, current.sensitiveValues),
-        });
+        return captured.value;
       }
     }
 
@@ -643,103 +699,133 @@ export class McpRegistry implements McpRegistryApi {
     let client: McpRegistryClient | undefined;
     const holder: {
       client?: McpRegistryClient;
+      panic?: Panic;
       terminalFailure?: McpRegistryTerminalFailure;
       sessionExpired?: boolean;
     } = {};
 
-    try {
-      const resolution: ResultType<ResolvedTransport, McpRegistryTransportError> =
-        prefetchedTransport
-          ? Result.ok(prefetchedTransport)
-          : await this.resolveTransport(definition);
-      return await resolution.match<() => Promise<CandidateResult>>({
-        err: (error) => async () => ({
+    {
+      const captured = await Result.tryPromise({
+        try: async () => {
+          const resolution: ResultType<ResolvedTransport, McpRegistryTransportError> =
+            prefetchedTransport
+              ? Result.ok(prefetchedTransport)
+              : await this.resolveTransport(definition);
+          return await resolution.match<() => Promise<CandidateResult>>({
+            err: (error) => async () => ({
+              ok: false,
+              status: this.failureStatus(definition, error),
+              phase,
+              error: safeErrorText(error),
+            }),
+            ok: (resolved) => async () => {
+              sensitiveValues = resolved.sensitiveValues;
+              const transport = enforceModernMcpResultContract(
+                observeHttpSessionExpiration(this.createTransport(resolved.input), () => {
+                  holder.sessionExpired = true;
+                }),
+              );
+              phase = "connection";
+
+              const candidate = await this.withDeadline(
+                definition.id,
+                async (signal) => {
+                  const createdClient: McpRegistryClient = await this.createClient({
+                    transport,
+                    clientName: `lilac-mcp-${definition.id}`,
+                    maxRetries: 0,
+                    protocolVersionDiscovery: true,
+                    onUncaughtError: <TError>(error: TError) => {
+                      if (
+                        isOptionalHttpInboundSseError(
+                          definition,
+                          holder.sessionExpired === true,
+                          error,
+                        )
+                      ) {
+                        return;
+                      }
+                      retainTransportPanic(error, holder);
+                      rethrowPanic(error);
+                      const failure = new McpRegistryTerminalFailure({
+                        status: this.failureStatus(definition, error),
+                        message: safeErrorText(error, sensitiveValues),
+                      });
+                      holder.terminalFailure = failure;
+                      if (holder.client)
+                        this.handleTerminalFailure(definition.id, holder.client, failure);
+                    },
+                  });
+                  rethrowPanic(holder.panic);
+                  client = createdClient;
+                  holder.client = createdClient;
+                  this.observeTransportClose(definition.id, createdClient, transport);
+                  if (signal.aborted) this.closeClientInBackground(createdClient);
+                  signal.throwIfAborted();
+                  if (holder.terminalFailure) return Result.err(holder.terminalFailure);
+
+                  phase = "discovery";
+                  return await decodeMcpServerInfo(createdClient.serverInfo).match<
+                    () => Promise<ResultType<InitializedCandidate, McpRegistryDiscoveryError>>
+                  >({
+                    err: (error) => async () => Result.err(error),
+                    ok: (serverInfo) => async () => {
+                      const tools = await this.discoverTools(
+                        definition,
+                        createdClient,
+                        signal,
+                        holder,
+                      );
+                      return tools.map(
+                        (value) =>
+                          ({
+                            client: createdClient,
+                            serverInfo,
+                            sensitiveValues: Object.freeze([...sensitiveValues]),
+                            transportFingerprint: transportFingerprint(resolved.input),
+                            tools: value,
+                          }) satisfies InitializedCandidate,
+                      );
+                    },
+                  })();
+                },
+                () => {
+                  if (isCustomTransport(transport)) this.closeTransportInBackground(transport);
+                },
+              );
+              return candidate.match<CandidateResult>({
+                err: (error) => {
+                  if (client) this.closeClientInBackground(client);
+                  return {
+                    ok: false,
+                    status:
+                      error._tag === "McpRegistryTerminalFailure" ? error.status : "unavailable",
+                    phase,
+                    error: error.message,
+                  };
+                },
+                ok: (value) => ({ ok: true, candidate: value }),
+              });
+            },
+          })();
+        },
+        catch: captureError,
+      });
+
+      if (captured.isErr()) {
+        const error = holder.panic ?? captured.error.cause;
+        if (client) {
+          this.closeClientInBackground(client);
+        }
+        rethrowPanic(error);
+        return {
           ok: false,
           status: this.failureStatus(definition, error),
           phase,
-          error: safeErrorText(error),
-        }),
-        ok: (resolved) => async () => {
-          sensitiveValues = resolved.sensitiveValues;
-          const transport = observeHttpSessionExpiration(
-            this.createTransport(resolved.input),
-            () => {
-              holder.sessionExpired = true;
-            },
-          );
-          phase = "connection";
-
-          const candidate = await this.withDeadline(
-            definition.id,
-            async (signal) => {
-              const createdClient = await this.createClient({
-                transport,
-                clientName: `lilac-mcp-${definition.id}`,
-                maxRetries: 0,
-                onUncaughtError: <TError>(error: TError) => {
-                  if (
-                    isOptionalHttpInboundSseError(definition, holder.sessionExpired === true, error)
-                  ) {
-                    return;
-                  }
-                  rethrowPanic(error);
-                  const failure = new McpRegistryTerminalFailure({
-                    status: this.failureStatus(definition, error),
-                    message: safeErrorText(error, sensitiveValues),
-                  });
-                  holder.terminalFailure = failure;
-                  if (holder.client)
-                    this.handleTerminalFailure(definition.id, holder.client, failure);
-                },
-              });
-              client = createdClient;
-              holder.client = createdClient;
-              this.observeTransportClose(definition.id, createdClient, transport);
-              if (signal.aborted) this.closeClientInBackground(createdClient);
-              signal.throwIfAborted();
-              if (holder.terminalFailure) return Result.err(holder.terminalFailure);
-
-              phase = "discovery";
-              const tools = await this.discoverTools(definition, createdClient, signal, holder);
-              return tools.map(
-                (value) =>
-                  ({
-                    client: createdClient,
-                    sensitiveValues: Object.freeze([...sensitiveValues]),
-                    transportFingerprint: transportFingerprint(resolved.input),
-                    tools: value,
-                  }) satisfies InitializedCandidate,
-              );
-            },
-            () => {
-              if (isCustomTransport(transport)) this.closeTransportInBackground(transport);
-            },
-          );
-          return candidate.match<CandidateResult>({
-            err: (error) => {
-              if (client) this.closeClientInBackground(client);
-              return {
-                ok: false,
-                status: error._tag === "McpRegistryTerminalFailure" ? error.status : "unavailable",
-                phase,
-                error: error.message,
-              };
-            },
-            ok: (value) => ({ ok: true, candidate: value }),
-          });
-        },
-      })();
-    } catch (error) {
-      if (client) {
-        this.closeClientInBackground(client);
+          error: safeErrorText(error, sensitiveValues),
+        };
       }
-      rethrowPanic(error);
-      return {
-        ok: false,
-        status: this.failureStatus(definition, error),
-        phase,
-        error: safeErrorText(error, sensitiveValues),
-      };
+      return captured.value;
     }
   }
 
@@ -782,6 +868,7 @@ export class McpRegistry implements McpRegistryApi {
     return headersResult.match({
       err: (error) => async () => Result.err(error),
       ok: (headers) => async () => {
+        const quotedServerId = JSON.stringify(definition.id);
         const validHeaders = validateHttpHeaders(headers).mapError(
           (error) =>
             new McpRegistryTransportConfigurationError({
@@ -805,42 +892,82 @@ export class McpRegistry implements McpRegistryApi {
                 configPath: this.configPath,
                 valueContext: this.valueContext,
               }),
-            catch: <TCause>(cause: TCause) => {
-              rethrowPanic(cause);
-              return new McpRegistryAuthProviderCreateError({
+            catch: (cause) =>
+              Panic.is(cause)
+                ? ({ kind: "panic", panic: cause } as const)
+                : ({
+                    kind: "failure",
+                    error: new McpRegistryAuthProviderCreateError({
+                      serverId: definition.id,
+                      cause,
+                      message: `Failed to create OAuth provider for MCP server ${quotedServerId}`,
+                    }),
+                  } as const),
+          });
+          const providerOutcome = providerResult.match<
+            | {
+                readonly kind: "success";
+                readonly provider: import("better-result").InferOk<typeof providerResult>;
+              }
+            | { readonly kind: "panic"; readonly panic: Panic }
+            | { readonly kind: "failure"; readonly error: McpRegistryAuthProviderCreateError }
+          >({
+            ok: (provider) => ({ kind: "success", provider }),
+            err: (failure) => failure,
+          });
+          if (providerOutcome.kind === "panic") {
+            rethrowPanic(providerOutcome.panic);
+            return Result.err(
+              new McpRegistryAuthProviderCreateError({
                 serverId: definition.id,
-                cause,
-                message: `Failed to create OAuth provider for MCP server ${JSON.stringify(definition.id)}`,
-              });
-            },
-          });
-          const providerFailure = providerResult.match({
-            ok: () => null,
-            err: (error) => Result.err(error),
-          });
-          if (providerFailure) return providerFailure;
-          authProvider = providerResult.match({ ok: (value) => value, err: () => undefined });
+                cause: providerOutcome.panic,
+                message: `Failed to create OAuth provider for MCP server ${quotedServerId}`,
+              }),
+            );
+          }
+          if (providerOutcome.kind === "failure") return Result.err(providerOutcome.error);
+          authProvider = providerOutcome.provider;
           if (!authProvider) {
             return Result.err(new McpAuthenticationRequiredError(definition.id));
           }
           const provider = authProvider;
           const tokensResult = await Result.tryPromise({
             try: async () => await provider.tokens(),
-            catch: <TCause>(cause: TCause) => {
-              rethrowPanic(cause);
-              return new McpRegistryAuthTokensReadError({
+            catch: (cause) =>
+              Panic.is(cause)
+                ? ({ kind: "panic", panic: cause } as const)
+                : ({
+                    kind: "failure",
+                    error: new McpRegistryAuthTokensReadError({
+                      serverId: definition.id,
+                      cause,
+                      message: `Failed to read OAuth tokens for MCP server ${quotedServerId}`,
+                    }),
+                  } as const),
+          });
+          const tokensOutcome = tokensResult.match<
+            | {
+                readonly kind: "success";
+                readonly tokens: import("better-result").InferOk<typeof tokensResult>;
+              }
+            | { readonly kind: "panic"; readonly panic: Panic }
+            | { readonly kind: "failure"; readonly error: McpRegistryAuthTokensReadError }
+          >({
+            ok: (tokens) => ({ kind: "success", tokens }),
+            err: (failure) => failure,
+          });
+          if (tokensOutcome.kind === "panic") {
+            rethrowPanic(tokensOutcome.panic);
+            return Result.err(
+              new McpRegistryAuthTokensReadError({
                 serverId: definition.id,
-                cause,
-                message: `Failed to read OAuth tokens for MCP server ${JSON.stringify(definition.id)}`,
-              });
-            },
-          });
-          const tokenFailure = tokensResult.match({
-            ok: () => null,
-            err: (error) => Result.err(error),
-          });
-          if (tokenFailure) return tokenFailure;
-          const tokens = tokensResult.match({ ok: (value) => value, err: () => undefined });
+                cause: tokensOutcome.panic,
+                message: `Failed to read OAuth tokens for MCP server ${quotedServerId}`,
+              }),
+            );
+          }
+          if (tokensOutcome.kind === "failure") return Result.err(tokensOutcome.error);
+          const { tokens } = tokensOutcome;
           if (!tokens) {
             return Result.err(new McpAuthenticationRequiredError(definition.id));
           }
@@ -962,44 +1089,67 @@ export class McpRegistry implements McpRegistryApi {
     return {
       ...sdkTool,
       execute: (...args: Parameters<typeof execute>) => {
-        try {
-          const result = execute(...args);
-          if (result instanceof Promise) {
-            return result.catch((error: unknown) => {
-              rethrowPanic(error);
-              if (!mcpApplicationErrorSchema.safeParse(error).success) {
-                const current = this.entries.get(serverId);
-                if (current?.client === client) {
-                  this.handleTerminalFailure(
-                    serverId,
-                    client,
-                    new McpRegistryTerminalFailure({
-                      status: this.failureStatus(current.definition, error),
-                      message: safeErrorText(error, current.sensitiveValues),
-                    }),
-                  );
-                }
-              }
-              throw error;
-            });
-          }
-          return result;
-        } catch (error) {
-          rethrowPanic(error);
-          if (!mcpApplicationErrorSchema.safeParse(error).success) {
+        const observeExecution = async <T>(result: Promise<T>): Promise<T> => {
+          const captured = await Result.tryPromise({
+            try: () => result,
+            catch: captureError,
+          });
+          const outcome = captured.match<
+            | { readonly kind: "success"; readonly value: T }
+            | { readonly kind: "failure"; readonly failure: { readonly cause: unknown } }
+          >({
+            ok: (value) => ({ kind: "success", value }),
+            err: (failure) => ({ kind: "failure", failure }),
+          });
+          if (outcome.kind === "success") return outcome.value;
+          const cause = outcome.failure.cause;
+          rethrowPanic(cause);
+          if (!mcpNonTerminalExecutionErrorSchema.safeParse(cause).success) {
             const current = this.entries.get(serverId);
             if (current?.client === client) {
               this.handleTerminalFailure(
                 serverId,
                 client,
                 new McpRegistryTerminalFailure({
-                  status: this.failureStatus(current.definition, error),
-                  message: safeErrorText(error, current.sensitiveValues),
+                  status: this.failureStatus(current.definition, cause),
+                  message: safeErrorText(cause, current.sensitiveValues),
                 }),
               );
             }
           }
-          throw error;
+          return await result;
+        };
+        {
+          const captured = Result.try({
+            try: () => {
+              const result = execute(...args);
+              if (result instanceof Promise) {
+                return observeExecution(result);
+              }
+              return result;
+            },
+            catch: captureError,
+          });
+
+          if (captured.isErr()) {
+            const error = captured.error.cause;
+            rethrowPanic(error);
+            if (!mcpNonTerminalExecutionErrorSchema.safeParse(error).success) {
+              const current = this.entries.get(serverId);
+              if (current?.client === client) {
+                this.handleTerminalFailure(
+                  serverId,
+                  client,
+                  new McpRegistryTerminalFailure({
+                    status: this.failureStatus(current.definition, error),
+                    message: safeErrorText(error, current.sensitiveValues),
+                  }),
+                );
+              }
+            }
+            throw error;
+          }
+          return captured.value;
         }
       },
     };
@@ -1059,6 +1209,7 @@ export class McpRegistry implements McpRegistryApi {
       fingerprint: definitionFingerprint(definition),
       transportFingerprint: result.candidate.transportFingerprint,
       client: result.candidate.client,
+      serverInfo: result.candidate.serverInfo,
       sensitiveValues: result.candidate.sensitiveValues,
       status: Object.freeze({
         serverId: definition.id,
@@ -1078,18 +1229,15 @@ export class McpRegistry implements McpRegistryApi {
     if (!isCustomTransport(transport)) return;
     const sdkOnClose = transport.onclose;
     transport.onclose = () => {
-      try {
-        sdkOnClose?.();
-      } finally {
-        this.handleTerminalFailure(
-          serverId,
-          client,
-          new McpRegistryTerminalFailure({
-            status: "unavailable",
-            message: "MCP transport closed",
-          }),
-        );
-      }
+      this.handleTerminalFailure(
+        serverId,
+        client,
+        new McpRegistryTerminalFailure({
+          status: "unavailable",
+          message: "MCP transport closed",
+        }),
+      );
+      sdkOnClose?.();
     };
   }
 
@@ -1113,9 +1261,15 @@ export class McpRegistry implements McpRegistryApi {
       tools: Object.freeze([]),
     });
     this.publishSnapshots();
-    void this.closeClientOnce(client).catch((closeError) => {
-      if (Panic.is(closeError)) {
-        this.reportCleanupPanic(closeError);
+    const observeClose = async (): Promise<void> => {
+      const closed = await Result.tryPromise({
+        try: () => this.closeClientOnce(client),
+        catch: captureError,
+      });
+      const failure = closed.match({ ok: () => null, err: ({ cause }) => cause });
+      if (!failure) return;
+      if (Panic.is(failure)) {
+        this.reportCleanupPanic(failure);
         return;
       }
       const latest = this.entries.get(serverId);
@@ -1124,24 +1278,34 @@ export class McpRegistry implements McpRegistryApi {
         ...latest,
         status: Object.freeze({
           ...latest.status,
-          error: `${latest.status.error}; cleanup failed: ${safeErrorText(closeError, latest.sensitiveValues)}`,
+          error: `${latest.status.error}; cleanup failed: ${safeErrorText(failure, latest.sensitiveValues)}`,
         }),
       });
       this.publishSnapshots();
-    });
+    };
+    void observeClose();
   }
 
   private async closeEntry(entry: RegistryEntry): Promise<string | Panic | undefined> {
     if (!entry.client) return undefined;
-    try {
-      await this.closeClientWithinDeadline(entry.definition.id, entry.client);
-      return undefined;
-    } catch (error) {
-      if (Panic.is(error)) {
-        this.reportCleanupPanic(error);
-        return error;
+    {
+      const captured = await Result.tryPromise({
+        try: async () => {
+          await this.closeClientWithinDeadline(entry.definition.id, entry.client!);
+          return undefined;
+        },
+        catch: captureError,
+      });
+
+      if (captured.isErr()) {
+        const error = captured.error.cause;
+        if (Panic.is(error)) {
+          this.reportCleanupPanic(error);
+          return error;
+        }
+        return safeErrorText(error, entry.sensitiveValues);
       }
-      return safeErrorText(error, entry.sensitiveValues);
+      return captured.value;
     }
   }
 
@@ -1169,9 +1333,7 @@ export class McpRegistry implements McpRegistryApi {
   }
 
   private closeClientInBackground(client: McpRegistryClient): void {
-    void this.closeClientOnce(client).catch((error: unknown) => {
-      if (Panic.is(error)) this.reportCleanupPanic(error);
-    });
+    void this.observeBackgroundClose(() => this.closeClientOnce(client));
   }
 
   private closeClientWithinDeadline(serverId: string, client: McpRegistryClient): Promise<void> {
@@ -1195,9 +1357,16 @@ export class McpRegistry implements McpRegistryApi {
   }
 
   private closeTransportInBackground(transport: MCPTransport): void {
-    void this.closeTransportOnce(transport).catch((error: unknown) => {
-      if (Panic.is(error)) this.reportCleanupPanic(error);
+    void this.observeBackgroundClose(() => this.closeTransportOnce(transport));
+  }
+
+  private async observeBackgroundClose(close: () => Promise<void>): Promise<void> {
+    const closed = await Result.tryPromise({
+      try: close,
+      catch: captureError,
     });
+    const failure = closed.match({ ok: () => null, err: ({ cause }) => cause });
+    if (failure && Panic.is(failure)) this.reportCleanupPanic(failure);
   }
 
   private publishSnapshots(): void {
@@ -1205,6 +1374,19 @@ export class McpRegistry implements McpRegistryApi {
       left.definition.id.localeCompare(right.definition.id),
     );
     this.statusSnapshot = Object.freeze(entries.map((entry) => entry.status));
+    this.catalogServerSnapshot = Object.freeze(
+      entries.flatMap((entry) => {
+        if (entry.status.status !== "available" || !entry.serverInfo) return [];
+        const description = entry.definition.description ?? entry.serverInfo.description;
+        return [
+          Object.freeze({
+            serverId: entry.definition.id,
+            serverInfo: entry.serverInfo,
+            ...(description === undefined ? {} : { description }),
+          } satisfies McpCatalogServer),
+        ];
+      }),
+    );
     this.toolSnapshot = Object.freeze(
       entries.flatMap((entry) => (entry.status.status === "available" ? entry.tools : [])),
     );

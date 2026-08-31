@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
+
+import { settleSyncResult } from "./runtime-utils";
 
 export class WorkspaceRootAccessFailed extends TaggedError("WorkspaceRootAccessFailed")<{
   readonly path: string;
@@ -17,20 +19,21 @@ export class WorkspaceRootNotFound extends TaggedError("WorkspaceRootNotFound")<
 export function hasWorkspacesFieldResult(
   pkgJsonPath: string,
 ): ResultType<boolean, WorkspaceRootAccessFailed> {
-  try {
+  const outcome = settleSyncResult(() => {
     const raw: unknown = JSON.parse(fs.readFileSync(pkgJsonPath, "utf8"));
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return Result.ok(false);
-    return Result.ok(Reflect.get(raw, "workspaces") != null);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new WorkspaceRootAccessFailed({
-        path: pkgJsonPath,
-        cause,
-        message: `Failed to inspect workspace manifest at ${pkgJsonPath}`,
-      }),
-    );
-  }
+    return typeof raw !== "object" || raw === null || Array.isArray(raw)
+      ? false
+      : Reflect.get(raw, "workspaces") != null;
+  });
+  if (outcome.kind === "value") return Result.ok(outcome.value);
+  if (outcome.kind === "panic") throw outcome.panic;
+  return Result.err(
+    new WorkspaceRootAccessFailed({
+      path: pkgJsonPath,
+      cause: outcome.restoreCause(),
+      message: `Failed to inspect workspace manifest at ${pkgJsonPath}`,
+    }),
+  );
 }
 
 export function hasWorkspacesField(pkgJsonPath: string): boolean {

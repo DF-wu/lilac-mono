@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="Lilac" width="160">
+</p>
+
 # Lilac Mono
 
 <p align="center">
@@ -7,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/stanley2058/lilac-mono"><img alt="Upstream" src="https://img.shields.io/badge/upstream-stanley2058%2Flilac--mono-6f42c1"></a>
-  <a href="./package.json"><img alt="Bun 1.3.14" src="https://img.shields.io/badge/Bun-1.3.14-14151a?logo=bun&logoColor=white"></a>
+  <a href="./package.json"><img alt="Bun 1.4.0" src="https://img.shields.io/badge/Bun-1.4.0-14151a?logo=bun&logoColor=white"></a>
   <a href="./LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
 </p>
 
@@ -23,7 +27,6 @@
   <a href="./docs/README.md">Full documentation</a> ·
   <a href="./PROJECT.md">Architecture details</a>
 </p>
-
 Lilac contains three related agent products built on shared Bun workspaces:
 
 - **Core** is the Redis-backed, event-driven runtime for Discord, Telegram, and optional GitHub ingress. It owns surface routing, agent execution, output relays, durable workflows, and the internal HTTP tool server.

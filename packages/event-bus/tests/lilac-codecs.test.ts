@@ -124,6 +124,7 @@ const compatibilityFixtures = [
     key: "request-1",
     headers: requestHeaders,
     data: {
+      requestDeliveryId: crypto.randomUUID(),
       queue: "prompt",
       messages: [{ role: "user", content: "hello" }],
       corePrimaryLineage: undefined,
@@ -391,7 +392,11 @@ const compatibilityFixtures = [
     overrideTopic: "out.req.override-request-1",
     key: "request-1",
     headers: requestHeaders,
-    data: { mimeType: "text/plain", dataBase64: "aGVsbG8=", filename: "hello.txt" },
+    data: {
+      blob: { version: 1, objectId: `b1_${"ab".repeat(16)}` },
+      mimeType: "text/plain",
+      filename: "hello.txt",
+    },
   }),
   compatibilityFixture({
     family: "agent-output",
@@ -663,6 +668,65 @@ describe("canonical Lilac event codecs", () => {
       },
       "payload",
     );
+  });
+
+  it("accepts only handle-bearing request and binary-output content", async () => {
+    const request = compatibilityFixtureFor(lilacEventTypes.CmdRequestMessage).message;
+    for (const content of [
+      [{ type: "file", data: "aGVsbG8=", mediaType: "text/plain" }],
+      [{ type: "image", image: new Uint8Array([1, 2, 3]), mediaType: "image/png" }],
+      [{ type: "file", data: "data:text/plain;base64,aGVsbG8=", mediaType: "text/plain" }],
+    ]) {
+      expectDecodeError(
+        {
+          ...request,
+          data: {
+            requestDeliveryId: crypto.randomUUID(),
+            queue: "prompt",
+            messages: [{ role: "user", content }],
+          },
+        },
+        "payload",
+      );
+    }
+    for (const raw of [
+      { dataBase64: "aGVsbG8=" },
+      { bytes: new Uint8Array([1, 2, 3]) },
+      { source: "data:text/plain;base64,aGVsbG8=" },
+    ]) {
+      expectDecodeError(
+        {
+          ...request,
+          data: {
+            requestDeliveryId: crypto.randomUUID(),
+            queue: "prompt",
+            messages: [{ role: "user", content: "hello" }],
+            raw,
+          },
+        },
+        "payload",
+      );
+    }
+
+    const binary = compatibilityFixtureFor(lilacEventTypes.EvtAgentOutputResponseBinary).message;
+    expectDecodeError(
+      { ...binary, data: { mimeType: "text/plain", dataBase64: "aGVsbG8=" } },
+      "payload",
+    );
+
+    const raw = new CapturingRawBus();
+    const rejectedPublish = await createLilacBus(raw).publish(
+      lilacEventTypes.CmdRequestMessage,
+      {
+        requestDeliveryId: crypto.randomUUID(),
+        queue: "prompt",
+        messages: [{ role: "user", content: "hello" }],
+        raw: { bytes: new Uint8Array([1]) },
+      },
+      { headers: { request_id: "request-1" } },
+    );
+    expect(rejectedPublish.status).toBe("error");
+    expect(raw.messages).toEqual([]);
   });
 
   it("enforces static and request-output topic coherence", () => {

@@ -2,3 +2,4 @@
 # Keep `ref/` (vendored upstreams) out of the default test run.
 # Workspace tests run through their package scripts.
 root = "./__tests__"
+preload = ["./__tests__/test-data-dir-preload.ts"]

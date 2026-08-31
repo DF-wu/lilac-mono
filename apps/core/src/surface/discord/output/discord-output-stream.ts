@@ -28,7 +28,7 @@ import {
   SurfacePlatformMismatch,
   SurfaceOperationPartiallyCompleted,
   SurfaceUnavailable,
-  surfaceExternalFallback,
+  settleSurfaceFallback,
   type SurfaceOperation,
   type SurfaceOperationResult,
 } from "../../adapter";
@@ -55,7 +55,7 @@ import {
 import { renderMarkdownTablesAsCodeBlocks } from "../../../shared/markdown-table-renderer";
 import { buildCancelCustomId } from "../discord-cancel";
 import { isTextSendableChannel, type SendableDiscordChannel } from "../discord-channel-guards";
-import { classifyDiscordSurfaceError, classifyDiscordSurfaceNotFound } from "../discord-adapter";
+import { captureDiscordSurfaceError, classifyDiscordSurfaceError } from "../discord-adapter";
 
 function asDiscordMsgRef(channelId: string, messageId: string): MsgRef {
   return { platform: "discord", channelId, messageId };
@@ -116,33 +116,54 @@ async function captureDiscordOutputOperation<T>(
   operation: SurfaceOperation,
   effect: () => Promise<T>,
 ): Promise<SurfaceOperationResult<T>> {
-  try {
-    return Result.ok(await effect());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    if (cause instanceof DiscordOutputPlatformUnsupported) {
-      return Result.err(
-        new SurfacePlatformMismatch({
-          operation,
-          refRole: "sessionRef",
-          expectedPlatform: "discord",
-          receivedPlatform: cause.platform,
-          message: cause.message,
-        }),
-      );
-    }
-    if (cause instanceof DiscordOutputChannelUnavailable) {
-      return Result.err(
-        new SurfaceUnavailable({ platform: "discord", operation, message: cause.message }),
-      );
-    }
-    if (cause instanceof DiscordOutputInvariantViolation) {
-      throw new Panic({ message: "Discord output invariant violated", cause });
-    }
-    const classified = classifyDiscordSurfaceError(operation, cause);
-    if (classified) return Result.err(classified);
-    throw cause;
-  }
+  const captured = await Result.tryPromise({
+    try: effect,
+    catch: captureDiscordSurfaceError,
+  });
+  const outcome = captured.match<
+    | { readonly kind: "result"; readonly result: SurfaceOperationResult<T> }
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "failure"; readonly cause: Error }
+  >({
+    ok: (value) => ({ kind: "result", result: Result.ok(value) }),
+    err: (cause) => {
+      if (Panic.is(cause)) return { kind: "panic", panic: cause };
+      if (cause instanceof DiscordOutputPlatformUnsupported) {
+        return {
+          kind: "result",
+          result: Result.err(
+            new SurfacePlatformMismatch({
+              operation,
+              refRole: "sessionRef",
+              expectedPlatform: "discord",
+              receivedPlatform: cause.platform,
+              message: cause.message,
+            }),
+          ),
+        };
+      }
+      if (cause instanceof DiscordOutputChannelUnavailable) {
+        return {
+          kind: "result",
+          result: Result.err(
+            new SurfaceUnavailable({ platform: "discord", operation, message: cause.message }),
+          ),
+        };
+      }
+      if (cause instanceof DiscordOutputInvariantViolation) {
+        return {
+          kind: "panic",
+          panic: new Panic({ message: "Discord output invariant violated", cause }),
+        };
+      }
+      const classified = classifyDiscordSurfaceError(operation, cause);
+      if (classified) return { kind: "result", result: Result.err(classified) };
+      return { kind: "failure", cause };
+    },
+  });
+  if (outcome.kind === "panic") return adaptDiscordOutputResultToHost(Result.err(outcome.panic));
+  if (outcome.kind === "failure") return adaptDiscordOutputResultToHost(Result.err(outcome.cause));
+  return outcome.result;
 }
 
 function discordOutputSessionResult(
@@ -170,6 +191,7 @@ function finalDiscordMessageResult(
 
 type DiscordOutputMode = "inline" | "preview";
 type DiscordPreviewFinalOutputStyle = "embed" | "plain";
+type DiscordPreviewFinalText = "flat" | "reply-chain";
 const NOTIFY_PARSE_USERS = ["users"] as const;
 
 function clampWithEllipsis(text: string, maxChars: number): string {
@@ -508,11 +530,28 @@ export function buildDiscordProgressLines(input: {
     .map((line) => clampWithEllipsis(line, PROGRESS_LINE_MAX_CHARS));
 }
 
-export function toPreviewTail(text: string, maxChars = PREVIEW_TEXT_TAIL_CHARS): string {
+export function toPreviewTail(
+  text: string,
+  maxChars = PREVIEW_TEXT_TAIL_CHARS,
+  preferCompleteBlock = false,
+): string {
   if (maxChars <= 0) return "";
   if (text.length <= maxChars) return text;
   if (maxChars <= 3) return "...".slice(0, maxChars);
-  return `...${text.slice(text.length - (maxChars - 3))}`;
+
+  const tailLength = maxChars - 3;
+  const rawStart = text.length - tailLength;
+  if (!preferCompleteBlock) return `...${text.slice(rawStart)}`;
+
+  const completeBlockStart = text.indexOf("\n\n", rawStart);
+  if (completeBlockStart >= 0) {
+    const completeBlocks = text.slice(completeBlockStart + 2);
+    if (completeBlocks.length > 0 && completeBlocks.length <= tailLength) {
+      return `...${completeBlocks}`;
+    }
+  }
+
+  return `...${text.slice(rawStart)}`;
 }
 
 export function buildOutputAllowedMentions(input: {
@@ -564,43 +603,6 @@ async function fetchTextChannelResult(
   return Result.ok(ch);
 }
 
-async function fetchExistingMessagesForResume(params: {
-  channel: Channel & SendableDiscordChannel;
-  channelId: string;
-  refs: readonly MsgRef[];
-}): Promise<Message[]> {
-  const { channel, channelId, refs } = params;
-  if (refs.length === 0) return [];
-
-  if (!("messages" in channel) || typeof channel.messages?.fetch !== "function") {
-    return [];
-  }
-  const messagesApi = channel.messages;
-
-  const out: Message[] = [];
-  const seen = new Set<string>();
-
-  for (const ref of refs) {
-    if (ref.platform !== "discord") continue;
-    if (ref.channelId !== channelId) continue;
-    if (seen.has(ref.messageId)) continue;
-
-    let msg: Message;
-    try {
-      msg = await messagesApi.fetch(ref.messageId);
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      if (classifyDiscordSurfaceNotFound(cause)) continue;
-      throw cause;
-    }
-
-    seen.add(ref.messageId);
-    out.push(msg);
-  }
-
-  return out;
-}
-
 function toDiscordFiles(attachments: readonly SurfaceAttachment[]): MessageCreateOptions["files"] {
   if (attachments.length === 0) return undefined;
 
@@ -613,10 +615,15 @@ function toDiscordFiles(attachments: readonly SurfaceAttachment[]): MessageCreat
 }
 
 async function safeEdit(msg: Message, options: Parameters<Message["edit"]>[0]): Promise<boolean> {
-  const edited = await Result.tryPromise({
-    try: () => msg.edit(options),
-    catch: surfaceExternalFallback(false),
-  });
+  const edited = settleSurfaceFallback(
+    await Result.tryPromise({
+      try: () => msg.edit(options),
+      catch: (cause) =>
+        Panic.is(cause)
+          ? { kind: "panic", panic: cause, fallback: false }
+          : { kind: "fallback", fallback: false },
+    }),
+  );
   return edited.match({ ok: () => true, err: () => false });
 }
 
@@ -649,6 +656,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   private pendingTaskDrivenIndicatorChange = false;
 
   private textAcc = "";
+  private previewTextAcc = "";
   private pendingAttachments: SurfaceAttachment[] = [];
 
   private firstMsg: Message | null = null;
@@ -675,6 +683,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       markdownMathRender?: DiscordMarkdownMathRenderOptions;
       outputMode: DiscordOutputMode;
       outputPreviewModeFinalStyle?: DiscordPreviewFinalOutputStyle;
+      outputPreviewModeFinalText?: DiscordPreviewFinalText;
       outputNotification?: boolean;
       reasoningDisplayMode: "none" | "simple" | "detailed";
       workingIndicators: readonly string[];
@@ -704,14 +713,27 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   }
 
   private notifyCreated(msgRef: MsgRef) {
-    Result.try({
-      try: () => this.deps.opts?.onMessageCreated?.(msgRef),
-      catch: surfaceExternalFallback(undefined),
-    });
+    settleSurfaceFallback(
+      Result.try({
+        try: () => this.deps.opts?.onMessageCreated?.(msgRef),
+        catch: (cause) =>
+          Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback: undefined }
+            : { kind: "fallback", fallback: undefined },
+      }),
+    );
   }
 
   private isPreviewMode(): boolean {
     return this.deps.outputMode === "preview";
+  }
+
+  private usesFlatPreviewFinalText(): boolean {
+    return (
+      this.isPreviewMode() &&
+      this.deps.outputPreviewModeFinalStyle === "plain" &&
+      this.deps.outputPreviewModeFinalText === "flat"
+    );
   }
 
   private trackTransientPreviewRef(ref: MsgRef): void {
@@ -755,9 +777,12 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   }
 
   private getStreamingDisplayText(isStreaming: boolean): string {
-    const rendered = this.getRenderedText(isStreaming ? "streaming" : "terminal");
+    const phase = isStreaming ? "streaming" : "terminal";
+    const rendered = this.usesFlatPreviewFinalText()
+      ? this.renderText(this.previewTextAcc, phase)
+      : this.getRenderedText(phase);
     if (!this.isPreviewMode()) return rendered;
-    return toPreviewTail(rendered);
+    return toPreviewTail(rendered, PREVIEW_TEXT_TAIL_CHARS, this.usesFlatPreviewFinalText());
   }
 
   private getAllowedMentions(input: {
@@ -791,25 +816,40 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const { client } = this.deps;
     if (ref.platform !== "discord") return;
 
-    const fetchedChannel = await Result.tryPromise({
-      try: () => client.channels.fetch(ref.channelId),
-      catch: surfaceExternalFallback(null),
-    });
+    const fetchedChannel = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => client.channels.fetch(ref.channelId),
+        catch: (cause) =>
+          Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback: null }
+            : { kind: "fallback", fallback: null },
+      }),
+    );
     const channel = fetchedChannel.match({ ok: (value) => value, err: () => null });
     if (!channel || !("messages" in channel) || !channel.messages?.fetch) {
       return;
     }
 
-    const fetchedMessage = await Result.tryPromise({
-      try: () => channel.messages.fetch(ref.messageId),
-      catch: surfaceExternalFallback(null),
-    });
+    const fetchedMessage = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => channel.messages.fetch(ref.messageId),
+        catch: (cause) =>
+          Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback: null }
+            : { kind: "fallback", fallback: null },
+      }),
+    );
     const msg = fetchedMessage.match({ ok: (value) => value, err: () => null });
     if (!msg) return;
-    await Result.tryPromise({
-      try: () => msg.delete(),
-      catch: surfaceExternalFallback(undefined),
-    });
+    settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => msg.delete(),
+        catch: (cause) =>
+          Panic.is(cause)
+            ? { kind: "panic", panic: cause, fallback: undefined }
+            : { kind: "fallback", fallback: undefined },
+      }),
+    );
   }
 
   private shouldShowProgressTitle(): boolean {
@@ -925,6 +965,25 @@ export class DiscordOutputStream implements SurfaceOutputStream {
 
     const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
     const channel = adaptDiscordOutputResultToHost(channelResult);
+    let recoveredMessage: Message | null = null;
+    const resumeAt = this.deps.opts?.resumeAt;
+    if (
+      resumeAt?.platform === "discord" &&
+      resumeAt.channelId === discordSessionRef.channelId &&
+      "messages" in channel &&
+      channel.messages?.fetch
+    ) {
+      const fetched = settleSurfaceFallback(
+        await Result.tryPromise({
+          try: () => channel.messages.fetch(resumeAt.messageId),
+          catch: (cause) =>
+            Panic.is(cause)
+              ? { kind: "panic", panic: cause, fallback: null }
+              : { kind: "fallback", fallback: null },
+        }),
+      );
+      recoveredMessage = fetched.match({ ok: (message) => message, err: () => null });
+    }
 
     // Delay creating the first message until either:
     // - we have something to display (text/action), or
@@ -952,37 +1011,45 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       return [row];
     };
 
-    const resumedMessages = await fetchExistingMessagesForResume({
-      channel,
-      channelId: discordSessionRef.channelId,
-      refs: this.deps.opts?.resume?.created ?? [],
-    });
-    const resumed = resumedMessages.length > 0;
-    const resumedFirst = resumedMessages[0];
-    if (resumed) {
-      const seen = new Set<string>();
-      for (const m of resumedMessages) {
-        if (seen.has(m.id)) continue;
-        seen.add(m.id);
-        const ref = asDiscordMsgRef(discordSessionRef.channelId, m.id);
-        this.created.push(ref);
-        this.trackTransientPreviewRef(ref);
-      }
-      this.firstMsg = resumedFirst ?? null;
-      this.lastMsg = resumedMessages[resumedMessages.length - 1] ?? null;
-    }
+    const registerFirstMessage = (message: Message): void => {
+      const ref = asDiscordMsgRef(discordSessionRef.channelId, message.id);
+      this.created.push(ref);
+      this.trackTransientPreviewRef(ref);
+      this.notifyCreated(ref);
+      this.firstMsg = message;
+      this.lastMsg = message;
+    };
 
-    // Special case: attachments-only output (no text and no tool lines).
-    // In this case we don't start the embed pusher at all.
+    const claimRecoveredMessage = async (
+      options: Parameters<Message["edit"]>[0],
+    ): Promise<Message | null> => {
+      const message = recoveredMessage;
+      recoveredMessage = null;
+      if (!message) return null;
+      const edited = await safeEdit(message, options);
+      if (!edited) return null;
+      registerFirstMessage(message);
+      return message;
+    };
+
+    // When the preview has no displayable text or progress, use one placeholder instead of
+    // starting an embed pusher that has nothing to create yet.
+    const hasInitialDisplayText = this.usesFlatPreviewFinalText()
+      ? this.getStreamingDisplayText(true).length > 0
+      : this.textAcc.length > 0;
     if (
-      this.textAcc.length === 0 &&
+      !hasInitialDisplayText &&
       this.toolLines.length === 0 &&
       this.subagentLines.length === 0 &&
       !this.hasReasoningStatus &&
       this.statsForNerdsLine === null
     ) {
       const first =
-        resumedFirst ??
+        (await claimRecoveredMessage({
+          content: "*Replying...*",
+          embeds: [],
+          components: buildCancelComponents(true),
+        })) ??
         (await channel.send({
           content: "*Replying...*",
           reply:
@@ -992,14 +1059,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           components: buildCancelComponents(true),
           allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: false }),
         }));
-      if (!resumed) {
-        const ref = asDiscordMsgRef(discordSessionRef.channelId, first.id);
-        this.created.push(ref);
-        this.trackTransientPreviewRef(ref);
-        this.notifyCreated(ref);
-      }
-      this.firstMsg = first;
-      this.lastMsg = first;
+      if (!this.firstMsg) registerFirstMessage(first);
       this.running = Promise.resolve();
       return;
     }
@@ -1021,16 +1081,15 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     this.running = (async () => {
       const pushed = await startEmbedPusher({
         createFirst: async (emb) => {
-          if (resumedFirst) {
-            await safeEdit(resumedFirst, {
-              content: "",
-              embeds: [emb],
-              components: buildCancelComponents(true),
-            });
+          const recovered = await claimRecoveredMessage({
+            content: null,
+            embeds: [emb],
+            components: buildCancelComponents(true),
+          });
+          if (recovered) {
             firstMessageReady.resolve();
-            return resumedFirst;
+            return recovered;
           }
-
           const first = await channel.send({
             embeds: [emb],
             reply:
@@ -1040,11 +1099,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
             components: buildCancelComponents(true),
             allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: false }),
           });
-          const ref = asDiscordMsgRef(discordSessionRef.channelId, first.id);
-          this.firstMsg = first;
-          this.created.push(ref);
-          this.trackTransientPreviewRef(ref);
-          this.notifyCreated(ref);
+          registerFirstMessage(first);
           firstMessageReady.resolve();
           return first;
         },
@@ -1104,17 +1159,6 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     return await captureDiscordOutputOperation("push-output", () => this.pushOutput(part));
   }
 
-  hydrateRecovery(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition {
-    let disposition: SurfaceOutputPartDisposition = "ignored";
-    for (const part of parts) {
-      const applied = this.applyOutputPartLocally(part);
-      if (applied === "visible" || (applied === "terminal" && disposition === "ignored")) {
-        disposition = applied;
-      }
-    }
-    return disposition;
-  }
-
   private async pushOutput(part: SurfaceOutputPart): Promise<SurfaceOutputPartDisposition> {
     // Ensure started on first push so attachments can be part of the first send.
     // If the first push is a delta, we start immediately.
@@ -1135,10 +1179,23 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       case "text.delta":
         this.finalTextSegments = null;
         this.textAcc += part.delta;
+        if (!this.usesFlatPreviewFinalText() || part.phase !== "final_answer") {
+          this.previewTextAcc += part.delta;
+        }
         return "visible";
       case "text.set":
         this.textAcc = part.text;
         this.finalTextSegments = part.finalSegments?.slice() ?? null;
+        if (
+          this.usesFlatPreviewFinalText() &&
+          part.phase === "final_answer" &&
+          part.finalSegments &&
+          part.finalSegments.length > 1
+        ) {
+          this.previewTextAcc = part.finalSegments[0] ?? this.previewTextAcc;
+        } else if (!this.usesFlatPreviewFinalText() || part.phase !== "final_answer") {
+          this.previewTextAcc = part.text;
+        }
         return "visible";
       case "meta.stats":
         this.statsForNerdsLine = part.line.trim().length > 0 ? part.line : null;
@@ -1343,9 +1400,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const { CLOSING_TAG_BUFFER } = getEmbedPusherConstants();
     const maxChunkLength =
       DISCORD_CONTENT_MAX_CHARS - (this.deps.useSmartSplitting ? CLOSING_TAG_BUFFER : 0);
+    const selectedFinalTexts =
+      this.usesFlatPreviewFinalText() && this.finalTextSegments
+        ? this.finalTextSegments.slice(-1)
+        : this.finalTextSegments;
     const finalTexts =
-      this.finalTextSegments && this.finalTextSegments.length > 0
-        ? this.finalTextSegments.map((segment) => this.renderText(segment, "terminal"))
+      selectedFinalTexts && selectedFinalTexts.length > 0
+        ? selectedFinalTexts.map((segment) => this.renderText(segment, "terminal"))
         : [this.getRenderedText("terminal")];
     const chunks = finalTexts.flatMap((text) =>
       chunkMarkdownForEmbeds(text.length > 0 ? text : "*<empty_string>*", {
@@ -1365,6 +1426,29 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const createdMsgs: Message[] = [];
     let parent: Message | null = null;
 
+    const sendChunk = async (options: MessageCreateOptions): Promise<Message> => {
+      if (parent === null) {
+        return await channel.send({
+          ...options,
+          reply:
+            this.deps.opts?.replyTo && this.deps.opts.replyTo.platform === "discord"
+              ? { messageReference: this.deps.opts.replyTo.messageId }
+              : undefined,
+          allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: true }),
+        });
+      }
+      if (this.usesFlatPreviewFinalText()) {
+        return await channel.send({
+          ...options,
+          allowedMentions: this.getAllowedMentions({ isReply: false, isFinalLane: true }),
+        });
+      }
+      return await parent.reply({
+        ...options,
+        allowedMentions: this.getAllowedMentions({ isReply: false, isFinalLane: true }),
+      });
+    };
+
     for (let i = 0; i < displayChunks.length; i++) {
       const chunk = displayChunks[i] ?? "";
       const isLast = i === displayChunks.length - 1;
@@ -1380,24 +1464,11 @@ export class DiscordOutputStream implements SurfaceOutputStream {
             ]
           : undefined;
 
-      const msg: Message =
-        parent === null
-          ? await channel.send({
-              content: contentChunk,
-              embeds,
-              files: isLast ? toDiscordFiles(filesForLastMessage) : undefined,
-              reply:
-                this.deps.opts?.replyTo && this.deps.opts.replyTo.platform === "discord"
-                  ? { messageReference: this.deps.opts.replyTo.messageId }
-                  : undefined,
-              allowedMentions: this.getAllowedMentions({ isReply: true, isFinalLane: true }),
-            })
-          : await parent.reply({
-              content: contentChunk,
-              embeds,
-              files: isLast ? toDiscordFiles(filesForLastMessage) : undefined,
-              allowedMentions: this.getAllowedMentions({ isReply: false, isFinalLane: true }),
-            });
+      const msg = await sendChunk({
+        content: contentChunk,
+        embeds,
+        files: isLast ? toDiscordFiles(filesForLastMessage) : undefined,
+      });
 
       createdMsgs.push(msg);
       const ref = asDiscordMsgRef(discordSessionRef.channelId, msg.id);
@@ -1531,6 +1602,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const isReanchor = reason === "reanchor" || reason === "reanchor_interrupt";
     const isInterruptReanchor = reason === "reanchor_interrupt";
     const isCancel = reason === "cancel";
+    const reanchorPlaceholder = isInterruptReanchor ? "*Interrupted...*" : "*Steering...*";
 
     if (isCancel && this.textAcc.trim().length === 0) {
       this.textAcc = "Cancelled.";
@@ -1545,7 +1617,10 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       // Freeze the current message chain in a coherent state.
       // If we have not produced any text yet, replace emptiness with a placeholder.
       if (this.textAcc.trim().length === 0) {
-        this.textAcc = isInterruptReanchor ? "*Interrupted...*" : "*Steering...*";
+        this.textAcc = reanchorPlaceholder;
+      }
+      if (this.usesFlatPreviewFinalText() && this.previewTextAcc.trim().length === 0) {
+        this.previewTextAcc = reanchorPlaceholder;
       }
 
       // Ensure the placeholder message exists so we can "freeze" it.
@@ -1555,12 +1630,13 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     this.done.resolve();
     await this.running;
 
-    // Best-effort: if we never started the embed pusher, the first message is still
-    // the placeholder "Replying...". For cancels, rewrite it so the thread isn't left
-    // in a confusing state.
-    if (isCancel && this.firstMsg && !this.usedEmbedPusher) {
+    // Best-effort: if we never started the embed pusher, rewrite the initial
+    // "Replying..." placeholder to the terminal abort state.
+    if ((isReanchor || isCancel) && this.firstMsg && !this.usedEmbedPusher) {
       await safeEdit(this.firstMsg, {
-        content: this.textAcc || "Cancelled.",
+        content: isReanchor
+          ? this.getStreamingDisplayText(false) || reanchorPlaceholder
+          : this.textAcc || "Cancelled.",
       });
     }
 

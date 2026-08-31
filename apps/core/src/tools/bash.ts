@@ -64,6 +64,7 @@ export function bashTool() {
         } as {
           context?: {
             requestId: string;
+            requestDeliveryId?: string;
             sessionId: string;
             requestClient: string;
             currentTurnUserId?: string;
@@ -95,6 +96,7 @@ export function bashToolWithCwd(
         const typedContext = context as
           | {
               requestId?: string;
+              requestDeliveryId?: string;
               sessionId?: string;
               requestClient?: string;
               safetyMode?: "trusted" | "restricted";
@@ -133,6 +135,7 @@ export function bashToolWithCwd(
         } as {
           context?: {
             requestId: string;
+            requestDeliveryId?: string;
             sessionId: string;
             requestClient: string;
             currentTurnUserId?: string;

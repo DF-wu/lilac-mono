@@ -51,7 +51,7 @@ async function createV2Database(): Promise<{ databasePath: string; directory: st
   temporaryDirectories.push(directory);
   const databasePath = path.join(directory, "runtime.sqlite");
   const database = new Database(databasePath, { create: true, strict: true });
-  database.exec(`
+  database.run(`
     PRAGMA foreign_keys = ON;
     CREATE TABLE sessions (
       id TEXT PRIMARY KEY, active_run_id TEXT, cwd TEXT NOT NULL, model TEXT NOT NULL,
@@ -430,7 +430,7 @@ describe("MiniLilacSqliteStore transcript schema", () => {
     expect(store.database.query("SELECT COUNT(*) AS count FROM transcript_nodes").get()).toEqual({
       count: 2,
     });
-    store.database.exec(`
+    store.database.run(`
       CREATE TRIGGER immutable_transcript_update BEFORE UPDATE ON transcript_nodes
       BEGIN SELECT RAISE(ABORT, 'transcript node updated'); END;
       CREATE TRIGGER immutable_transcript_delete BEFORE DELETE ON transcript_nodes

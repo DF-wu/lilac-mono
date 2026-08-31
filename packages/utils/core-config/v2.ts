@@ -1,4 +1,5 @@
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import path from "node:path";
 import { z } from "zod";
 
 import { cloneDefaultWorkingIndicators } from "../working-indicators";
@@ -33,6 +34,12 @@ import type {
   SubagentProfileConfig,
   UniversalCoreConfig,
 } from "./types";
+import {
+  DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
+  DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
+  type RetentionLimit,
+} from "./types";
 
 export const V2_CORE_CONFIG_VERSION = 2 satisfies CoreConfigVersion;
 export const CURRENT_CORE_CONFIG_VERSION = V2_CORE_CONFIG_VERSION;
@@ -42,6 +49,44 @@ export const SUPPORTED_CORE_CONFIG_VERSIONS = [
 ] as const satisfies readonly CoreConfigVersion[];
 
 const configVersionSchema = z.literal(V2_CORE_CONFIG_VERSION).default(V2_CORE_CONFIG_VERSION);
+
+const environmentVariableNameSchema = z
+  .string()
+  .regex(/^[A-Za-z_][A-Za-z0-9_]*$/u, "expected an environment variable name");
+
+const blobStorageSchemaV2 = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("local"),
+      root: z
+        .string()
+        .trim()
+        .min(1)
+        .refine((value) => path.isAbsolute(value), "root must be an absolute path"),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("s3"),
+      bucket: z.string().trim().min(1),
+      prefix: z.string().trim().min(1),
+      endpoint: z.url().superRefine((value, ctx) => {
+        const endpoint = new URL(value);
+        if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
+          ctx.addIssue({ code: "custom", message: "endpoint must use http or https" });
+        }
+        if (endpoint.username || endpoint.password) {
+          ctx.addIssue({ code: "custom", message: "endpoint must not contain credentials" });
+        }
+      }),
+      region: z.string().trim().min(1),
+      accessKeyIdEnv: environmentVariableNameSchema,
+      secretAccessKeyEnv: environmentVariableNameSchema,
+      sessionTokenEnv: environmentVariableNameSchema.optional(),
+      forcePathStyle: z.boolean().default(false),
+    })
+    .strict(),
+]);
 
 const pluginsSchemaV2 = z
   .object({
@@ -288,6 +333,27 @@ const discordMarkdownMathRenderSchema = z
     fallbackMode: "source",
   });
 
+const positiveDurationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
+const retentionDurationSchema = z.union([z.literal("unlimited"), positiveDurationMsSchema]);
+
+const retentionCountSchema = z.union([z.number().int().positive(), z.literal("unlimited")]);
+
+const discordAttachmentCacheSchema = z
+  .object({
+    ttl: retentionDurationSchema.default(DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS),
+  })
+  .default({ ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS });
+
+const transcriptRetentionSchema = z
+  .object({
+    maxAge: retentionDurationSchema.default(DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS),
+    maxRequests: retentionCountSchema.default(DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS),
+  })
+  .default({
+    maxAge: DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
+    maxRequests: DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
+  });
+
 const discordSurfaceSchema = z
   .object({
     tokenEnv: z.string().min(1).default("DISCORD_TOKEN"),
@@ -303,7 +369,9 @@ const discordSurfaceSchema = z
     memberPresence: z.boolean().optional(),
     outputMode: z.enum(["inline", "preview"]).default("preview"),
     outputPreviewModeFinalStyle: z.enum(["embed", "plain"]).default("plain"),
+    outputPreviewModeFinalText: z.enum(["flat", "reply-chain"]).default("flat"),
     outputNotification: z.boolean().default(true),
+    attachmentCache: discordAttachmentCacheSchema,
     workingIndicators: z
       .array(z.string().trim().min(1))
       .min(1)
@@ -318,7 +386,9 @@ const discordSurfaceSchema = z
     botName: "lilac",
     outputMode: "preview",
     outputPreviewModeFinalStyle: "plain",
+    outputPreviewModeFinalText: "flat",
     outputNotification: true,
+    attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
     workingIndicators: cloneDefaultWorkingIndicators(),
     markdownTableRender: {
       enabled: true,
@@ -713,6 +783,8 @@ const modelsSchemaV2 = z
 export const coreConfigInputSchemaV2 = z.object({
   configVersion: configVersionSchema,
 
+  blobStorage: blobStorageSchemaV2.optional(),
+
   tools: toolsSchema,
   plugins: pluginsSchemaV2,
   conversation: conversationSchemaV2,
@@ -741,7 +813,9 @@ export const coreConfigInputSchemaV2 = z.object({
         botName: "lilac",
         outputMode: "preview" as const,
         outputPreviewModeFinalStyle: "plain" as const,
+        outputPreviewModeFinalText: "flat" as const,
         outputNotification: true,
+        attachmentCache: { ttl: DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS },
         workingIndicators: cloneDefaultWorkingIndicators(),
         markdownTableRender: {
           enabled: true,
@@ -776,6 +850,7 @@ export const coreConfigInputSchemaV2 = z.object({
         .min(1_500)
         .default(15 * 60 * 1000),
       retry: agentRetrySchema,
+      transcriptRetention: transcriptRetentionSchema,
       subagents: subagentsSchemaV2.default({
         enabled: true,
         maxDepth: 2,
@@ -795,6 +870,10 @@ export const coreConfigInputSchemaV2 = z.object({
         maxRetries: 3,
         baseDelayMs: 2_000,
         maxDelayMs: 30_000,
+      },
+      transcriptRetention: {
+        maxAge: DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
+        maxRequests: DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
       },
       subagents: {
         enabled: true,
@@ -847,13 +926,22 @@ function coreConfigV2ToUniversal(
       options.onUnknownKey(path);
     }
   }
-  const { artifactTtl, ...output } = parsed.tools.output;
-  const { firecrawl, ...web } = parsed.tools.web;
+  // Zod default objects may be reused between parses. Isolate the decoded
+  // config so runtime/test mutations cannot change a later parse's defaults.
+  const isolated = structuredClone(parsed);
+  const { artifactTtl, ...output } = isolated.tools.output;
+  const { firecrawl, ...web } = isolated.tools.web;
+  const { attachmentCache, ...discord } = isolated.surface.discord;
+  const { transcriptRetention, ...agent } = isolated.agent;
+
+  const retentionLimit = (value: number | "unlimited"): RetentionLimit =>
+    value === "unlimited" ? { kind: "unlimited" } : { kind: "bounded", value };
 
   return {
-    ...parsed,
+    ...isolated,
+    blobStorage: isolated.blobStorage ?? { kind: "local" },
     tools: {
-      ...parsed.tools,
+      ...isolated.tools,
       web: firecrawl
         ? {
             ...web,
@@ -868,14 +956,27 @@ function coreConfigV2ToUniversal(
         artifactTtlMs: artifactTtl,
       },
     },
+    surface: {
+      ...isolated.surface,
+      discord: {
+        ...discord,
+        attachmentCache: {
+          ttlMs: retentionLimit(attachmentCache.ttl),
+        },
+      },
+    },
     agent: {
-      ...parsed.agent,
+      ...agent,
+      transcriptRetention: {
+        maxAgeMs: retentionLimit(transcriptRetention.maxAge),
+        maxRequests: retentionLimit(transcriptRetention.maxRequests),
+      },
       subagents: {
-        ...parsed.agent.subagents,
+        ...isolated.agent.subagents,
         profiles: {
-          explore: normalizeProfileToolNames(parsed.agent.subagents.profiles.explore),
-          general: normalizeProfileToolNames(parsed.agent.subagents.profiles.general),
-          self: normalizeProfileToolNames(parsed.agent.subagents.profiles.self),
+          explore: normalizeProfileToolNames(isolated.agent.subagents.profiles.explore),
+          general: normalizeProfileToolNames(isolated.agent.subagents.profiles.general),
+          self: normalizeProfileToolNames(isolated.agent.subagents.profiles.self),
         },
       },
       systemPrompt: "",

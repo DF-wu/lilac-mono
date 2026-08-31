@@ -1,4 +1,5 @@
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 
 import type { TranscriptStore } from "../transcript/transcript-store";
 import type { SurfaceAdapter, SurfaceAdapterEventSource } from "../surface/adapter";
@@ -14,7 +15,6 @@ import {
 } from "../surface/github/github-runtime-descriptor";
 import {
   SurfaceRuntimeRegistry,
-  type SurfaceRelayRecovery,
   type SurfaceRuntimeHealthPort,
 } from "../surface/runtime-descriptor";
 import {
@@ -42,11 +42,11 @@ export type ComposeBuiltinSurfaceRuntimesInput = {
     readonly healthProvider: TelegramRuntimeHealthProvider;
   };
   readonly bus: LilacBus;
+  readonly blobStore: BlobStore;
   readonly subscriptionPrefix: string;
   readonly webhookSecret: string | undefined;
   readonly githubAppCredentialsAvailable: boolean;
   readonly getTranscriptStore: () => TranscriptStore | undefined;
-  readonly activateRestoredDiscordOutputChains: SurfaceRelayRecovery<"discord">["activateRestoredOutputChains"];
   readonly logger: BuiltinSurfaceRuntimeLogger;
   readonly reportFatalError: (error: Error) => void;
 };
@@ -69,14 +69,14 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
             subscriptionId: id,
             transcriptStore: input.getTranscriptStore(),
           });
-          input.logger.debug("bridgeAdapterToBus started", { subscriptionId: id });
+          input.logger.debug("bridgeAdapterToBus started", {
+            subscriptionId: id,
+          });
           return { platform: "discord", stop: () => handle.stop() };
         },
       },
       createRelay: (guardedAdapter) => {
-        const policy = createDiscordRelayPolicy(guardedAdapter, {
-          activateRestoredOutputChains: input.activateRestoredDiscordOutputChains,
-        });
+        const policy = createDiscordRelayPolicy(guardedAdapter);
         return {
           ...policy,
           lifecycle: {
@@ -85,13 +85,16 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
               const id = subscriptionId("bus-to-adapter");
               const relay = await bridgeBusToAdapter({
                 adapter: guardedAdapter,
+                blobStore: input.blobStore,
                 bus: input.bus,
                 platform: "discord",
                 policy,
                 subscriptionId: id,
                 transcriptStore: input.getTranscriptStore(),
               });
-              input.logger.debug("bridgeBusToAdapter started", { subscriptionId: id });
+              input.logger.debug("bridgeBusToAdapter started", {
+                subscriptionId: id,
+              });
               return relay;
             },
           },
@@ -121,13 +124,16 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
               const id = subscriptionId("bus-to-github");
               const relay = await bridgeBusToAdapter({
                 adapter: guardedAdapter,
+                blobStore: input.blobStore,
                 bus: input.bus,
                 platform: "github",
                 policy,
                 subscriptionId: id,
                 transcriptStore: input.getTranscriptStore(),
               });
-              input.logger.debug("GitHub output relay started", { subscriptionId: id });
+              input.logger.debug("GitHub output relay started", {
+                subscriptionId: id,
+              });
               return relay;
             },
           },
@@ -170,6 +176,7 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
                     const id = subscriptionId("bus-to-telegram");
                     const relay = await bridgeBusToAdapter({
                       adapter: guardedAdapter,
+                      blobStore: input.blobStore,
                       bus: input.bus,
                       platform: "telegram",
                       policy,

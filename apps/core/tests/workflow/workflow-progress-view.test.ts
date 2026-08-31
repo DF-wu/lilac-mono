@@ -16,6 +16,10 @@ import {
   renderWorkflowProgressView,
   type WorkflowProgressView,
 } from "../../src/workflow/workflow-progress-view";
+import {
+  workflowArtifactReferenceForTest,
+  workflowValueArtifactReferenceForTest,
+} from "./workflow-test-blob-store";
 
 const SOURCE_HASH = "a".repeat(64);
 const SCHEMA_HASH = "b".repeat(64);
@@ -33,7 +37,7 @@ function revision(): WorkflowRevision {
     resourcePolicySha256: RESOURCE_HASH,
     runtimeVersion: "lilac-workflow-js-v4",
     name: "audit-routes",
-    snapshotArtifactId: `workflow-source:${SOURCE_HASH}`,
+    snapshotArtifact: workflowArtifactReferenceForTest(`workflow-source:${SOURCE_HASH}`),
     metadata: {
       name: "audit-routes",
       description: "Audit routes for missing authentication coverage.",
@@ -74,7 +78,7 @@ function run(): WorkflowRun {
     progressTarget: { platform: "discord", channelId: "channel-internal", replyToMessageId: null },
     terminalDetail: null,
     result: null,
-    resultArtifactId: null,
+    resultArtifact: null,
     claimedBy: "engine",
     claimedAt: 2_000,
     createdAt: 1_000,
@@ -161,7 +165,7 @@ function operation(input: {
     attempt: 0,
     requestId: null,
     output: null,
-    resultArtifactId: null,
+    resultArtifact: null,
     error: null,
     usage: null,
     claimedBy: null,
@@ -277,7 +281,7 @@ describe("workflow progress view", () => {
     const terminalRun = {
       ...run(),
       state: "succeeded" as const,
-      resultArtifactId: "workflow-result:internal-artifact-id",
+      resultArtifact: workflowValueArtifactReferenceForTest("internal-artifact"),
       claimedBy: null,
       claimedAt: null,
       terminalAt: 86_000,

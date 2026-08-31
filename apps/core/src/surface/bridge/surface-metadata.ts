@@ -1,4 +1,5 @@
 import type { ModelMessage } from "ai";
+import { Result } from "better-result";
 
 export const SURFACE_METADATA_VERSION = 1;
 export const SURFACE_METADATA_OPEN_TAG = `<LILAC_META:v${SURFACE_METADATA_VERSION}>`;
@@ -81,16 +82,20 @@ export function parseSurfaceMetadataLine(text: string): {
   const match = SURFACE_METADATA_LINE_PARSE_RE.exec(getFirstLine(text));
   if (!match) return null;
 
-  try {
-    const parsed: unknown = JSON.parse(String(match[1]));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    return {
-      version: SURFACE_METADATA_VERSION,
-      meta: parsed as Record<string, SurfaceMetadataValue>,
-    };
-  } catch {
-    return null;
-  }
+  const parsed = Result.try({
+    try: () => JSON.parse(String(match[1])) as unknown,
+    catch: () => null,
+  });
+  return parsed.match({
+    ok: (value) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      return {
+        version: SURFACE_METADATA_VERSION,
+        meta: value as Record<string, SurfaceMetadataValue>,
+      };
+    },
+    err: () => null,
+  });
 }
 
 export function hasLeadingSurfaceMetadataLine(text: string): boolean {

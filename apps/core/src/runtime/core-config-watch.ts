@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import fs from "node:fs/promises";
 
 import { errorCode, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
@@ -40,18 +41,27 @@ async function captureCoreConfigWatchRead(
   configPath: string,
   read: () => Promise<string>,
 ): Promise<ResultType<string, CoreConfigWatchReadFailed>> {
-  try {
-    return Result.ok(await read());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new CoreConfigWatchReadFailed({
-        configPath,
-        code: errorCode(cause),
-        cause,
-        message: "Core config watcher read failed",
-      }),
-    );
+  {
+    const captured = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await read());
+      },
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const cause = captured.error.cause;
+      if (Panic.is(cause)) throw cause;
+      return Result.err(
+        new CoreConfigWatchReadFailed({
+          configPath,
+          code: errorCode(cause),
+          cause,
+          message: "Core config watcher read failed",
+        }),
+      );
+    }
+    return captured.value;
   }
 }
 

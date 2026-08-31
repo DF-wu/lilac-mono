@@ -1,5 +1,5 @@
 export type ExceptionFlowKind =
-  | "catch-clause"
+  | "try-statement"
   | "promise-catch"
   | "promise-reject"
   | "rejection-callback"
@@ -19,11 +19,14 @@ export interface SyntacticPolicy {
 }
 
 export const ACTIVE_SYNTAX_RULES = [
+  "lilac/blob-storage-seam",
+  "lilac/no-else-after-terminal",
   "lilac/no-exception-flow",
   "lilac/no-inline-async-result-callback",
   "lilac/no-presentation-decoder-import",
   "lilac/no-store-inline-decoding",
   "lilac/no-direct-sqlite-transaction",
+  "lilac/prefer-switch-true-chain",
 ] as const;
 
 export type ActiveSyntaxRule = (typeof ACTIVE_SYNTAX_RULES)[number];

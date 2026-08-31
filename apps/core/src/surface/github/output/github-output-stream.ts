@@ -33,17 +33,6 @@ export class GithubOutputStream implements SurfaceOutputStream {
     private readonly opts?: { replyTo?: MsgRef },
   ) {}
 
-  hydrateRecovery(parts: readonly SurfaceOutputPart[]): SurfaceOutputPartDisposition {
-    let disposition: SurfaceOutputPartDisposition = "ignored";
-    for (const part of parts) {
-      const applied = this.applyPart(part);
-      if (applied === "visible" || (applied === "terminal" && disposition === "ignored")) {
-        disposition = applied;
-      }
-    }
-    return disposition;
-  }
-
   async push(
     part: SurfaceOutputPart,
   ): Promise<SurfaceOperationResult<SurfaceOutputPartDisposition>> {

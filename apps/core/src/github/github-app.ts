@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
@@ -25,14 +26,24 @@ export class GithubAppSecretReadError extends TaggedError("GithubAppSecretReadEr
 
 async function captureGithubAppFs<T, E>(
   run: () => Promise<T>,
-  mapError: (cause: unknown) => E,
+  mapError: <Cause>(cause: Cause) => E,
 ): Promise<ResultType<T, E>> {
-  try {
-    return Result.ok(await run());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(mapError(cause));
-  }
+  const captured = (
+    await Result.tryPromise({
+      try: run,
+      catch: captureError,
+    })
+  ).match<
+    | { readonly kind: "success"; readonly value: T }
+    | { readonly kind: "failure"; readonly failure: Error }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (captured.kind === "success") return Result.ok(captured.value);
+  const cause = captured.failure;
+  if (Panic.is(cause)) throw cause;
+  return Result.err(mapError(cause));
 }
 
 export function decodeGithubAppSecret(

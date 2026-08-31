@@ -5,6 +5,7 @@ import path from "node:path";
 
 import { Panic, Result } from "better-result";
 import Redis from "ioredis";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 
 import {
   CoreDeadLetterKeyAccessFailed,
@@ -25,6 +26,11 @@ async function setupCoreEventBusResources(
 }
 
 const temporaryRoots: string[] = [];
+const unusedEvidenceBlobStore: Pick<BlobStore, "startUpload"> = {
+  startUpload: async () => {
+    throw new Error("unexpected dead-letter evidence upload");
+  },
+};
 
 async function temporaryRoot(): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-dead-letter-key-"));
@@ -89,6 +95,7 @@ describe("Core dead-letter encryption key", () => {
       redisUrl: "redis://unused",
       cwd: path.join(root, "workspace"),
       dataDir: root,
+      evidenceBlobStore: unusedEvidenceBlobStore,
       logger: { warn: () => {}, error: () => {} },
       reportFatalError: () => {},
       dependencies: {
@@ -112,7 +119,9 @@ describe("Core dead-letter encryption key", () => {
     const root = await temporaryRoot();
     const redis = new Redis({ lazyConnect: true });
     const setupPanic = new Panic({ message: "key setup invariant failed" });
-    const cleanupPanic = new Panic({ message: "Redis cleanup invariant failed" });
+    const cleanupPanic = new Panic({
+      message: "Redis cleanup invariant failed",
+    });
     Reflect.set(redis, "quit", async () => {
       redis.disconnect();
       throw cleanupPanic;
@@ -123,6 +132,7 @@ describe("Core dead-letter encryption key", () => {
         redisUrl: "redis://unused",
         cwd: path.join(root, "workspace"),
         dataDir: root,
+        evidenceBlobStore: unusedEvidenceBlobStore,
         logger: { warn: () => {}, error: () => {} },
         reportFatalError: () => {},
         dependencies: {

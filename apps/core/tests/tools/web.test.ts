@@ -137,6 +137,10 @@ function configuredProvider(
   return { id, isConfigured: () => true, search };
 }
 
+function mockFetch(run: () => Promise<Response>): typeof fetch {
+  return Object.assign(run, { preconnect: fetch.preconnect });
+}
+
 describe("web tool direct fetch", () => {
   it("propagates abort signals through fetch mode", async () => {
     const server = startServer(async () => {
@@ -188,6 +192,85 @@ describe("web tool direct fetch", () => {
       tool.call("fetch", { url: `http://127.0.0.1:${server.port}/oversized`, mode: "auto" }),
     ).rejects.toThrow("response too large");
     expect(browser).not.toHaveBeenCalled();
+  });
+
+  it("cancels Content-Length oversized response bodies before signaling the size limit", async () => {
+    const cancel = jest.fn(() => undefined);
+    const body = new ReadableStream<Uint8Array>({ cancel });
+    const direct = createDirectHttpPageAcquisition({
+      pageContent: new PageContent(),
+      fetch: mockFetch(
+        async () =>
+          new Response(body, {
+            headers: {
+              "content-length": String(5 * 1024 * 1024 + 1),
+              "content-type": "text/plain",
+            },
+          }),
+      ),
+    });
+
+    await expect(direct.acquire({ url: "https://example.com/oversized" })).rejects.toThrow(
+      "response too large",
+    );
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives Content-Length cancellation failure precedence and preserves its identity", async () => {
+    const failure = new Error("header response cancellation failed");
+    const body = new ReadableStream<Uint8Array>({
+      cancel: () => Promise.reject(failure),
+    });
+    const direct = createDirectHttpPageAcquisition({
+      pageContent: new PageContent(),
+      fetch: mockFetch(
+        async () =>
+          new Response(body, {
+            headers: {
+              "content-length": String(5 * 1024 * 1024 + 1),
+              "content-type": "text/plain",
+            },
+          }),
+      ),
+    });
+
+    await expect(direct.acquire({ url: "https://example.com/oversized" })).rejects.toBe(failure);
+  });
+
+  it("preserves streamed overflow cancellation failure identity", async () => {
+    const failure = new Error("stream cancellation failed");
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(5 * 1024 * 1024 + 1));
+      },
+      cancel: () => Promise.reject(failure),
+    });
+    const direct = createDirectHttpPageAcquisition({
+      pageContent: new PageContent(),
+      fetch: mockFetch(
+        async () => new Response(body, { headers: { "content-type": "text/plain" } }),
+      ),
+    });
+
+    await expect(direct.acquire({ url: "https://example.com/streamed" })).rejects.toBe(failure);
+  });
+
+  it("preserves Panic from streamed overflow cancellation", async () => {
+    const panic = new Panic({ message: "stream cancellation invariant" });
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(5 * 1024 * 1024 + 1));
+      },
+      cancel: () => Promise.reject(panic),
+    });
+    const direct = createDirectHttpPageAcquisition({
+      pageContent: new PageContent(),
+      fetch: mockFetch(
+        async () => new Response(body, { headers: { "content-type": "text/plain" } }),
+      ),
+    });
+
+    await expect(direct.acquire({ url: "https://example.com/streamed" })).rejects.toBe(panic);
   });
 
   it("falls back to simple extraction for large html pages", async () => {
@@ -433,7 +516,7 @@ describe("web provider extraction", () => {
       providers: [configuredProvider("tavily"), configuredProvider("exa")],
       extract: async (providerId) => {
         if (providerId === "tavily") {
-          throw Object.assign(new Error("primary provider failed"), { status: 503 });
+          throw { message: "primary provider failed", response: { status: 503 } };
         }
         throw Object.assign(new Error("access blocked"), { status: 403 });
       },
@@ -696,7 +779,7 @@ describe("web search and permits", () => {
     const tool = createTool({
       providers: [
         configuredProvider("tavily", async () => {
-          throw Object.assign(new Error("primary provider failed"), { status: 503 });
+          throw { message: "primary provider failed", response: { status: 503 } };
         }),
         configuredProvider("exa", async () => {
           throw Object.assign(new Error("resource absent"), { status: 404 });

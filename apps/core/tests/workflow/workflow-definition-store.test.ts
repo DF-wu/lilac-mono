@@ -4,6 +4,9 @@ import os from "node:os";
 import path from "node:path";
 
 import { WorkflowDefinitionStore } from "../../src/workflow/workflow-definition-store";
+import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
+import { createWorkflowTestBlobStore } from "./workflow-test-blob-store";
+import type { WorkflowArtifactReference } from "../../src/workflow/workflow-domain";
 
 async function storeResultValue<T>(
   resultPromise: Promise<import("better-result").Result<T, Error>>,
@@ -13,8 +16,12 @@ async function storeResultValue<T>(
   return result.value;
 }
 
-async function createStore(input: Parameters<typeof WorkflowDefinitionStore.createResult>[0]) {
-  const store = await storeResultValue(WorkflowDefinitionStore.createResult(input));
+async function createStore(input: { workspaceRoot: string; dataDir: string }) {
+  const blobStore = await createWorkflowTestBlobStore();
+  const workflowStore = new DurableWorkflowStore(":memory:");
+  const store = await storeResultValue(
+    WorkflowDefinitionStore.createResult({ ...input, blobStore, workflowStore }),
+  );
   return {
     save: (params: Parameters<typeof store.saveResult>[0]) =>
       storeResultValue(store.saveResult(params)),
@@ -25,8 +32,8 @@ async function createStore(input: Parameters<typeof WorkflowDefinitionStore.crea
       storeResultValue(store.listResult(params)),
     createSnapshot: (source: string, sourceSha256: string) =>
       storeResultValue(store.createSnapshotResult(source, sourceSha256)),
-    readSnapshot: (sourceSha256: string) =>
-      storeResultValue(store.readSnapshotResult(sourceSha256)),
+    readSnapshot: (artifact: WorkflowArtifactReference) =>
+      storeResultValue(store.readSnapshotResult(artifact)),
   };
 }
 
@@ -138,9 +145,9 @@ describe("WorkflowDefinitionStore", () => {
     const first = await store.createSnapshot(saved.source, saved.validation.sourceSha256);
     const second = await store.createSnapshot(saved.source, saved.validation.sourceSha256);
     expect(first).toEqual(second);
-    expect(await store.readSnapshot(saved.validation.sourceSha256)).toBe(saved.source);
-    expect(path.basename(first.path)).toBe(`${saved.validation.sourceSha256}.js`);
-    expect((await fs.stat(first.path)).mode & 0o777).toBe(0o600);
+    expect(await store.readSnapshot(first.artifact)).toBe(saved.source);
+    expect(first.artifact.artifactId).toBe(`workflow-source:${saved.validation.sourceSha256}`);
+    expect(first.artifact.blobRef.expiresAt).toBeUndefined();
     await expect(
       store.createSnapshot(`${saved.source}\n`, saved.validation.sourceSha256),
     ).rejects.toThrow("hash mismatch");
@@ -168,6 +175,8 @@ describe("WorkflowDefinitionStore", () => {
     const created = await WorkflowDefinitionStore.createResult({
       workspaceRoot,
       dataDir: path.join(root, "data"),
+      blobStore: await createWorkflowTestBlobStore(),
+      workflowStore: new DurableWorkflowStore(":memory:"),
     });
     expect(created.status).toBe("error");
     if (created.status === "error") {

@@ -21,6 +21,8 @@ export type DeliveryObservation = {
   readonly contextHasCommit: boolean;
 };
 
+const OUTPUT_STREAM_REPLAY_TTL_MS = 24 * 60 * 60 * 1000;
+
 type InMemoryDeliverySubscription = {
   readonly topic: string;
   readonly opts: SubscriptionOptions;
@@ -72,6 +74,7 @@ export function createInMemoryDeliveryBus(
     string,
     { readonly session_id: string; readonly request_client: string }
   >();
+  const outputExpiryByTopic = new Map<string, number>();
   let sequence = 0;
   const deliverySubs = new Set<InMemoryDeliverySubscription>();
 
@@ -175,12 +178,31 @@ export function createInMemoryDeliveryBus(
       list.push(stored);
       topics.set(opts.topic, list);
 
+      const replayDeadline = opts.topic.startsWith("out.req.")
+        ? Date.now() + OUTPUT_STREAM_REPLAY_TTL_MS
+        : undefined;
+      if (replayDeadline !== undefined) outputExpiryByTopic.set(opts.topic, replayDeadline);
+
       for (const subscription of deliverySubs) {
         if (subscription.topic !== opts.topic) continue;
         await deliver(subscription, stored);
       }
 
-      return { id, cursor: id };
+      return {
+        id,
+        cursor: id,
+        ...(replayDeadline === undefined ? {} : { replayDeadline }),
+      };
+    },
+    readOutputStreamExpiry: async (topic) => {
+      const expiresAt = outputExpiryByTopic.get(topic);
+      if (expiresAt === undefined) return { kind: "absent" };
+      if (expiresAt <= Date.now()) {
+        outputExpiryByTopic.delete(topic);
+        topics.delete(topic);
+        return { kind: "absent" };
+      }
+      return { kind: "present", expiresAt };
     },
     subscribe: async (topic, opts, handler) => {
       if (failStartForTopic?.(topic)) {

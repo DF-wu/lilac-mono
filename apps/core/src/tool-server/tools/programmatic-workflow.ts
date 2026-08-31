@@ -1,9 +1,10 @@
 import { z } from "zod";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { env, type CoreConfig } from "@stanley2058/lilac-utils";
+import { env } from "@stanley2058/lilac-utils";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
 import { Panic, Result, type Result as ResultType } from "better-result";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { preserveToolPanic } from "../../tools/tool-result-adapters";
 import {
   serverToolFailure,
@@ -50,8 +51,6 @@ import {
 import { redactWorkflowValue } from "../../workflow/workflow-progress-view";
 import { getBuiltinSurfaceProtocol } from "../../surface/builtin-surface-protocols";
 import type { RegisteredSurfacePlatform } from "../../surface/types";
-import { isTelegramChatAllowed } from "../../surface/telegram/telegram-guards";
-import { parseTelegramSessionId } from "../../surface/telegram/telegram-ids";
 
 function workflowFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
   return serverToolFailure({
@@ -60,6 +59,12 @@ function workflowFailure(kind: ServerToolFailure["kind"], message: string): Serv
     message,
     retryable: kind === "unavailable" || kind === "timeout",
   });
+}
+
+function captureWorkflowFailure(error: unknown): { readonly cause: Error | Panic } {
+  if (Panic.is(error)) return { cause: error };
+  if (error instanceof Error) return { cause: error };
+  return { cause: new Error("Workflow operation failed", { cause: error }) };
 }
 
 function workflowRunCreatedProjectionFailure(runId: string): ServerToolFailure {
@@ -298,66 +303,6 @@ function validateWorkflowRequestIdentity(
   return Result.ok(undefined);
 }
 
-function resolveRequestedWorkflowProgressTarget(
-  progress: z.output<typeof progressInputSchema> | undefined,
-  requestTarget: ReturnType<typeof requestProgressTarget>,
-): { readonly platform: string; readonly channelId: string } | null {
-  if (progress?.client && progress.sessionId) {
-    return { platform: progress.client, channelId: progress.sessionId };
-  }
-  if (!requestTarget) return null;
-  return {
-    platform: requestTarget.platform,
-    channelId: requestTarget.sessionRef.channelId,
-  };
-}
-
-async function validateProgressTargetAllowed(input: {
-  readonly requestTarget: ReturnType<typeof requestProgressTarget>;
-  readonly progressTarget: { readonly platform: string; readonly channelId: string } | null;
-  readonly getConfig?: () => CoreConfig | Promise<CoreConfig>;
-}): Promise<ResultType<void, ServerToolFailure>> {
-  const requestIsTelegram = input.requestTarget?.platform === "telegram";
-  const targetIsTelegram = input.progressTarget?.platform === "telegram";
-  if (!requestIsTelegram && !targetIsTelegram) return Result.ok(undefined);
-  if (
-    !input.requestTarget ||
-    input.requestTarget.platform !== "telegram" ||
-    !input.progressTarget ||
-    input.progressTarget.platform !== "telegram" ||
-    input.progressTarget.channelId !== input.requestTarget.sessionRef.channelId
-  ) {
-    return Result.err(
-      workflowFailure(
-        "denied",
-        "Telegram workflow progress targets must use the current Telegram session",
-      ),
-    );
-  }
-  if (!input.getConfig) {
-    return Result.err(
-      workflowFailure(
-        "unavailable",
-        "Telegram workflow progress targets require current config access",
-      ),
-    );
-  }
-  const configResult = await Result.tryPromise({
-    try: async () => input.getConfig!(),
-    catch: () => workflowFailure("unavailable", "Workflow configuration unavailable"),
-  });
-  return configResult.andThen((cfg) => {
-    const { chatId } = parseTelegramSessionId(input.progressTarget!.channelId);
-    if (isTelegramChatAllowed({ cfg, chatId })) return Result.ok(undefined);
-    return Result.err(
-      workflowFailure(
-        "denied",
-        `Not allowed: Telegram workflow progress session '${input.progressTarget!.channelId}' is not in allowedChatIds`,
-      ),
-    );
-  });
-}
-
 function resolveWorkflowProgressTarget(
   progress: z.output<typeof progressInputSchema> | undefined,
   requestTarget: ReturnType<typeof requestProgressTarget>,
@@ -531,14 +476,14 @@ export class ProgrammaticWorkflow implements ServerTool {
   constructor(
     private readonly params: {
       dataDir?: string;
+      blobStore: BlobStore;
       dbPath?: string;
       now?: () => number;
       store?: DurableWorkflowStore;
       bus?: LilacBus;
       progressCards?: WorkflowProgressCardService;
       getMaxActiveRuns?: () => number | Promise<number>;
-      getConfig?: () => CoreConfig | Promise<CoreConfig>;
-    } = {},
+    },
   ) {
     this.serverTool = defineServerTool({
       id: this.id,
@@ -719,29 +664,40 @@ export class ProgrammaticWorkflow implements ServerTool {
           canonicalProjectId: `project:${sha256(canonicalRoot)}`,
         });
       },
-      catch: (error) => {
-        if (Panic.is(error)) return preserveToolPanic(error);
-        const message =
-          error instanceof Error ? error.message : "Workflow project root unavailable";
-        let category: ServerToolFailure["kind"] = "unavailable";
-        if (/ENOENT|not found|no such file/i.test(message)) {
-          category = "not_found";
-        } else if (/EACCES|EPERM|permission/i.test(message)) {
-          category = "denied";
-        }
-        return workflowFailure(category, message);
-      },
-    }).then((captured) => captured.andThen((result) => result));
+      catch: captureWorkflowFailure,
+    }).then((captured) =>
+      captured
+        .mapError(({ cause }) => {
+          if (Panic.is(cause)) return preserveToolPanic(cause);
+          const message = cause.message;
+          let category: ServerToolFailure["kind"] = "unavailable";
+          if (/ENOENT|not found|no such file/i.test(message)) {
+            category = "not_found";
+          } else if (/EACCES|EPERM|permission/i.test(message)) {
+            category = "denied";
+          }
+          return workflowFailure(category, message);
+        })
+        .andThen((result) => result),
+    );
   }
 
   private async definitions(
     canonicalRoot: string,
   ): Promise<ResultType<WorkflowDefinitionStore, ServerToolFailure>> {
+    const workflowStore = this.durableStore;
+    if (!workflowStore) {
+      return Result.err(
+        workflowFailure("internal", "Programmatic workflow tool is not initialized"),
+      );
+    }
     let definitions = this.definitionsStores.get(canonicalRoot);
     if (!definitions) {
       definitions = WorkflowDefinitionStore.createResult({
         workspaceRoot: canonicalRoot,
         dataDir: this.params.dataDir ?? env.dataDir,
+        blobStore: this.params.blobStore,
+        workflowStore,
       }).then(workflowDefinitionResult);
       this.definitionsStores.set(canonicalRoot, definitions);
       definitions.then((result) =>
@@ -858,13 +814,6 @@ export class ProgrammaticWorkflow implements ServerTool {
       const context = yield* decodeTriggerContext(opts?.context);
       yield* validateWorkflowRequestIdentity(context);
       const requestTarget = requestProgressTarget(context);
-      yield* Result.await(
-        validateProgressTargetAllowed({
-          requestTarget,
-          progressTarget: resolveRequestedWorkflowProgressTarget(input.progress, requestTarget),
-          getConfig: this.params.getConfig,
-        }),
-      );
       const explicitProgressPlatform = yield* resolveExplicitWorkflowProgressPlatform(
         input.progress,
         this.params.progressCards,
@@ -905,7 +854,7 @@ export class ProgrammaticWorkflow implements ServerTool {
         ...revisionIdentity,
         revisionId,
         name: definition.name,
-        snapshotArtifactId: snapshot.artifactId,
+        snapshotArtifact: snapshot.artifact,
         metadata: definition.validation.metadata,
         inputSchema: definition.validation.inputSchema,
         resources: definition.validation.resources,
@@ -914,13 +863,10 @@ export class ProgrammaticWorkflow implements ServerTool {
       };
       yield* Result.try({
         try: () => store.createRevision(revision),
-        catch: (error) => {
-          if (Panic.is(error)) return preserveToolPanic(error);
-          return workflowFailure(
-            "unavailable",
-            error instanceof Error ? error.message : "Workflow revision persistence failed",
-          );
-        },
+        catch: captureWorkflowFailure,
+      }).mapError(({ cause }) => {
+        if (Panic.is(cause)) return preserveToolPanic(cause);
+        return workflowFailure("unavailable", cause.message);
       });
       const storedRevisionResult = store.findRevisionByIdentity(revisionIdentity);
       const storedRevision = yield* durableWorkflowReadResult(storedRevisionResult);
@@ -946,13 +892,10 @@ export class ProgrammaticWorkflow implements ServerTool {
       const schedule = input.schedule;
       const { timestampAt, nextFireAt } = yield* Result.try({
         try: () => resolveScheduleTiming(schedule, now),
-        catch: (error) => {
-          if (Panic.is(error)) return preserveToolPanic(error);
-          return workflowFailure(
-            "usage",
-            error instanceof Error ? error.message : "Invalid workflow trigger schedule",
-          );
-        },
+        catch: captureWorkflowFailure,
+      }).mapError(({ cause }) => {
+        if (Panic.is(cause)) return preserveToolPanic(cause);
+        return workflowFailure("usage", cause.message);
       });
       if (schedule.kind === "timestamp" && !Number.isFinite(timestampAt)) {
         return Result.err(
@@ -1009,15 +952,13 @@ export class ProgrammaticWorkflow implements ServerTool {
             trigger,
             idempotency: { key: idempotencyKey, fingerprintSha256: triggerFingerprint },
           }),
-        catch: (error) => {
-          if (Panic.is(error)) return preserveToolPanic(error);
-          return workflowFailure(
-            /idempotency|conflict|already/i.test(error instanceof Error ? error.message : "")
-              ? "conflict"
-              : "unavailable",
-            error instanceof Error ? error.message : "Workflow trigger persistence failed",
-          );
-        },
+        catch: captureWorkflowFailure,
+      }).mapError(({ cause }) => {
+        if (Panic.is(cause)) return preserveToolPanic(cause);
+        return workflowFailure(
+          /idempotency|conflict|already/i.test(cause.message) ? "conflict" : "unavailable",
+          cause.message,
+        );
       });
       return Result.ok({
         ok: true as const,
@@ -1156,13 +1097,6 @@ export class ProgrammaticWorkflow implements ServerTool {
       const context = yield* decodeTriggerContext(opts?.context);
       yield* validateWorkflowRequestIdentity(context);
       const requestTarget = requestProgressTarget(context);
-      yield* Result.await(
-        validateProgressTargetAllowed({
-          requestTarget,
-          progressTarget: resolveRequestedWorkflowProgressTarget(input.progress, requestTarget),
-          getConfig: this.params.getConfig,
-        }),
-      );
       const explicitProgressPlatform = yield* resolveExplicitWorkflowProgressPlatform(
         input.progress,
         this.params.progressCards,
@@ -1203,7 +1137,7 @@ export class ProgrammaticWorkflow implements ServerTool {
         ...revisionIdentity,
         revisionId,
         name: definition.name,
-        snapshotArtifactId: snapshot.artifactId,
+        snapshotArtifact: snapshot.artifact,
         metadata: definition.validation.metadata,
         inputSchema: definition.validation.inputSchema,
         resources: definition.validation.resources,
@@ -1250,7 +1184,7 @@ export class ProgrammaticWorkflow implements ServerTool {
         progressTarget,
         terminalDetail: null,
         result: null,
-        resultArtifactId: null,
+        resultArtifact: null,
         claimedBy: null,
         claimedAt: null,
         createdAt: now,
@@ -1262,16 +1196,13 @@ export class ProgrammaticWorkflow implements ServerTool {
         Result.tryPromise({
           try: async () =>
             (await this.params.getMaxActiveRuns?.()) ?? DEFAULT_MAX_ACTIVE_WORKFLOW_RUNS,
-          catch: (error) => {
-            if (Panic.is(error)) return preserveToolPanic(error);
-            return workflowFailure(
-              "unavailable",
-              error instanceof Error
-                ? error.message
-                : "Workflow capacity configuration unavailable",
-            );
-          },
-        }),
+          catch: captureWorkflowFailure,
+        }).then((result) =>
+          result.mapError(({ cause }) => {
+            if (Panic.is(cause)) return preserveToolPanic(cause);
+            return workflowFailure("unavailable", cause.message);
+          }),
+        ),
       );
       const invocation = yield* store
         .createInvocation({
@@ -1300,11 +1231,13 @@ export class ProgrammaticWorkflow implements ServerTool {
         card = yield* Result.await(
           Result.tryPromise({
             try: () => this.params.progressCards!.ensureInitialCard(invocation.run.runId),
-            catch: (error) => {
-              if (Panic.is(error)) return preserveToolPanic(error);
+            catch: captureWorkflowFailure,
+          }).then((result) =>
+            result.mapError(({ cause }) => {
+              if (Panic.is(cause)) return preserveToolPanic(cause);
               return workflowRunCreatedProjectionFailure(invocation.run.runId);
-            },
-          }),
+            }),
+          ),
         );
       }
       if (this.params.bus) {
@@ -1377,10 +1310,10 @@ export class ProgrammaticWorkflow implements ServerTool {
         revision,
       });
       let resultArtifact;
-      if (input.includeResultArtifact && run.resultArtifactId) {
+      if (input.includeResultArtifact && run.resultArtifact) {
         const loaded = await readWorkflowValueArtifact({
-          dataDir: this.params.dataDir ?? env.dataDir,
-          artifactId: run.resultArtifactId,
+          blobStore: this.params.blobStore,
+          reference: run.resultArtifact,
           maxBytes: revision.limits.maxResultBytes,
         });
         resultArtifact = yield* loaded.mapError(workflowArtifactFailure);
@@ -1388,7 +1321,7 @@ export class ProgrammaticWorkflow implements ServerTool {
       const source = input.includeSource
         ? yield* Result.await(
             (yield* Result.await(this.definitions(projectScope.canonicalRoot)))
-              .readSnapshotResult(revision.sourceSha256)
+              .readSnapshotResult(revision.snapshotArtifact)
               .then(workflowDefinitionResult),
           )
         : undefined;
@@ -1463,7 +1396,12 @@ export class ProgrammaticWorkflow implements ServerTool {
             this.params.bus
               .publish(
                 lilacEventTypes.CmdRequestMessage,
-                { queue: "interrupt", messages: [], raw: { cancel: true, cancelQueued: true } },
+                {
+                  requestDeliveryId: crypto.randomUUID(),
+                  queue: "interrupt",
+                  messages: [],
+                  raw: { cancel: true, cancelQueued: true },
+                },
                 {
                   headers: {
                     request_id: requestId,

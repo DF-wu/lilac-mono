@@ -261,7 +261,7 @@ export async function startWorkflowActionResolver(input: {
   const drainOutbox = async (): Promise<void> => {
     if (draining) return;
     draining = true;
-    try {
+    const drain = async () => {
       const now = input.now?.() ?? Date.now();
       const entries = input.store.listPendingActionOutboxEvents(now);
       const pendingEntries = entries.match({
@@ -311,9 +311,10 @@ export async function startWorkflowActionResolver(input: {
           },
         });
       }
-    } finally {
+    };
+    await drain().finally(() => {
       draining = false;
-    }
+    });
   };
   async function startWorkflowActionSubscriptionResult(): Promise<
     ResultType<WorkflowActionResolverSubscription, EventDeliveryStartFailed>
@@ -370,20 +371,27 @@ export async function startWorkflowActionResolver(input: {
             });
           return Result.ok({ action, event });
         });
-        return handled.match<Promise<ResultType<void, WorkflowActionResolverDeliveryError>>>({
-          err: (error) => Promise.resolve(Result.err(error)),
-          ok: async ({ action, event }) => {
-            if (action.status !== "applied") {
-              logger.info("Workflow surface action rejected", {
-                status: action.status,
-                platform: event.platform,
-                messageId: event.messageRef.messageId,
-              });
-            }
-            await drainOutbox();
-            return Result.ok(undefined);
-          },
-        });
+        return handled.match<() => Promise<ResultType<void, WorkflowActionResolverDeliveryError>>>({
+          err: (error) => () => Promise.resolve(Result.err(error)),
+          ok: (value) => () => finishAction(value),
+        })();
+
+        async function finishAction({
+          action,
+          event,
+        }: import("better-result").InferOk<typeof handled>): Promise<
+          ResultType<void, WorkflowActionResolverDeliveryError>
+        > {
+          if (action.status !== "applied") {
+            logger.info("Workflow surface action rejected", {
+              status: action.status,
+              platform: event.platform,
+              messageId: event.messageRef.messageId,
+            });
+          }
+          await drainOutbox();
+          return Result.ok(undefined);
+        }
       },
       workflowActionResolverDeliveryPolicy,
     );

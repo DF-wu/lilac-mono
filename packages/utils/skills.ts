@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-import { errorMessage, isPanic } from "./runtime-utils";
+import { captureResultOutcome, errorMessage, isPanic, settlePromiseResult } from "./runtime-utils";
 
 export type SkillSource =
   | "lilac-builtin"
@@ -66,13 +66,9 @@ export class SkillReadAndCleanupFailed extends TaggedError("SkillReadAndCleanupF
 }> {}
 
 async function pathExists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return false;
-  }
+  const settlement = await settlePromiseResult(() => fs.access(p));
+  if (settlement.kind === "panic") throw settlement.panic;
+  return settlement.kind === "value";
 }
 
 async function scanSkillPathsBounded(
@@ -93,13 +89,10 @@ async function scanSkillPathsBounded(
   while (pending.length > 0) {
     const currentDirectory = pending.shift();
     if (currentDirectory === undefined) break;
-    let directory: Awaited<ReturnType<typeof fs.opendir>>;
-    try {
-      directory = await fs.opendir(currentDirectory);
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-      continue;
-    }
+    const opened = await settlePromiseResult(() => fs.opendir(currentDirectory));
+    if (opened.kind === "panic") throw opened.panic;
+    if (opened.kind === "failure") continue;
+    const directory = opened.value;
     for await (const entry of directory) {
       scannedEntries += 1;
       if (scannedEntries > maxEntries) {
@@ -124,61 +117,48 @@ export async function readTextPrefixResult(
   filePath: string,
   maxBytes: number,
 ): Promise<ResultType<string, SkillFilesystemError | SkillReadAndCleanupFailed>> {
-  let handle: Awaited<ReturnType<typeof fs.open>>;
-  try {
-    handle = await fs.open(filePath, "r");
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+  const opened = await settlePromiseResult(() => fs.open(filePath, "r"));
+  if (opened.kind === "panic") throw opened.panic;
+  if (opened.kind === "failure") {
     return Result.err(
       new SkillFilesystemError({
         operation: "open-file",
         path: filePath,
-        cause,
+        cause: opened.restoreCause(),
         message: `Failed to open skill file '${filePath}'`,
       }),
     );
   }
+  const handle = opened.value;
 
-  let readValue = "";
-  let readCause: unknown;
-  let readFailed = false;
-  try {
+  const read = await settlePromiseResult(async () => {
     const buffer = Buffer.allocUnsafe(maxBytes);
     const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
-    readValue = buffer.subarray(0, bytesRead).toString("utf8");
-  } catch (cause) {
-    readFailed = true;
-    readCause = cause;
-  }
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  });
+  const cleanup = await settlePromiseResult(() => handle.close());
 
-  let cleanupCause: unknown;
-  let cleanupFailed = false;
-  try {
-    await handle.close();
-  } catch (cause) {
-    cleanupFailed = true;
-    cleanupCause = cause;
-  }
+  if (read.kind === "panic") throw read.panic;
+  if (cleanup.kind === "panic") throw cleanup.panic;
 
-  if (isPanic(readCause)) throw readCause;
-  if (isPanic(cleanupCause)) throw cleanupCause;
-
-  const readError = readFailed
-    ? new SkillFilesystemError({
-        operation: "read-file",
-        path: filePath,
-        cause: readCause,
-        message: `Failed to read skill file '${filePath}'`,
-      })
-    : undefined;
-  const cleanupError = cleanupFailed
-    ? new SkillFilesystemError({
-        operation: "close-file",
-        path: filePath,
-        cause: cleanupCause,
-        message: `Failed to close skill file '${filePath}'`,
-      })
-    : undefined;
+  const readError =
+    read.kind === "failure"
+      ? new SkillFilesystemError({
+          operation: "read-file",
+          path: filePath,
+          cause: read.restoreCause(),
+          message: `Failed to read skill file '${filePath}'`,
+        })
+      : undefined;
+  const cleanupError =
+    cleanup.kind === "failure"
+      ? new SkillFilesystemError({
+          operation: "close-file",
+          path: filePath,
+          cause: cleanup.restoreCause(),
+          message: `Failed to close skill file '${filePath}'`,
+        })
+      : undefined;
 
   if (readError && cleanupError) {
     return Result.err(
@@ -190,9 +170,9 @@ export async function readTextPrefixResult(
       }),
     );
   }
-  if (readError) return Result.err(readError);
+  if (read.kind === "failure") return Result.err(readError!);
   if (cleanupError) return Result.err(cleanupError);
-  return Result.ok(readValue);
+  return Result.ok(read.value);
 }
 
 function globBaseDir(pattern: string): string {
@@ -257,19 +237,22 @@ export function parseSkillMarkdownResult(
     );
   }
 
-  let yaml: unknown;
-  try {
-    yaml = Bun.YAML.parse(parts.frontmatterText);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
+  const decoded = Result.try({
+    try: () => Bun.YAML.parse(parts.frontmatterText),
+    catch: (cause) => ({ cause }),
+  });
+  const decodeOutcome = captureResultOutcome(decoded);
+  if (!decodeOutcome.ok && isPanic(decodeOutcome.error.cause)) throw decodeOutcome.error.cause;
+  if (!decodeOutcome.ok) {
     return Result.err(
       new SkillMarkdownInvalid({
         issue: "malformed-yaml",
-        cause,
-        message: `Failed to parse YAML frontmatter: ${errorMessage(cause)}`,
+        cause: decodeOutcome.error.cause,
+        message: `Failed to parse YAML frontmatter: ${errorMessage(decodeOutcome.error.cause)}`,
       }),
     );
   }
+  const yaml = decodeOutcome.value;
 
   const parsed = skillFrontmatterSchema.safeParse(yaml);
   if (!parsed.success) {

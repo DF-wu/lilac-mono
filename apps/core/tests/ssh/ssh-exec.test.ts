@@ -1157,7 +1157,8 @@ printf '%s' '{"ok":true,"value":{"results":[],"totalMatched":0,"totalFiles":0,"t
     const tools = fsTool(tempDir, {
       includeEditFile: true,
       fsBackend: "fff",
-      readFileDirectAttachmentSupported: true,
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: true,
     });
     if (!("edit" in tools)) throw new Error("expected edit tool");
     const editFile = tools.edit;

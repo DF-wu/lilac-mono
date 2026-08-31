@@ -41,17 +41,23 @@ class GitMetadataReadFailed extends TaggedError("GitMetadataReadFailed")<{
 }> {}
 
 function readGitMetadataFile(markerPath: string): ResultType<string, GitMetadataReadFailed> {
-  return Result.try({
+  const captured = Result.try({
     try: () => readFileSync(markerPath, "utf8"),
-    catch: (cause) => {
-      if (Panic.is(cause)) throw cause;
-      return new GitMetadataReadFailed({
-        markerPath,
-        cause,
-        message: "Git metadata marker could not be read",
-      });
-    },
+    catch: (cause) => ({ cause }),
   });
+  const outcome = captured.match<{ readonly value: string } | { readonly cause: unknown }>({
+    ok: (value) => ({ value }),
+    err: ({ cause }) => ({ cause }),
+  });
+  if ("value" in outcome) return Result.ok(outcome.value);
+  if (Panic.is(outcome.cause)) throw outcome.cause;
+  return Result.err(
+    new GitMetadataReadFailed({
+      markerPath,
+      cause: outcome.cause,
+      message: "Git metadata marker could not be read",
+    }),
+  );
 }
 
 export function analyzeDestructiveFilesystemCommand(
@@ -343,16 +349,24 @@ function activeGitMetadataPaths(cwd: string): string[] {
     const candidate = join(current, ".git");
     if (existsSync(candidate)) {
       paths.push(candidate);
-      const gitDir = readGitMetadataFile(candidate).match({
-        ok: (content) => parseGitDirMarker(content, candidate),
-        err: () => null,
+      const gitMetadata = readGitMetadataFile(candidate).match<
+        { readonly value: string } | { readonly value: null }
+      >({
+        ok: (value) => ({ value }),
+        err: () => ({ value: null }),
       });
+      const gitDir =
+        gitMetadata.value === null ? null : parseGitDirMarker(gitMetadata.value, candidate);
       if (gitDir) {
         paths.push(gitDir);
-        const commonDir = readGitMetadataFile(join(gitDir, "commondir")).match({
-          ok: (content) => parseCommonDir(content, gitDir),
-          err: () => null,
+        const commonMetadata = readGitMetadataFile(join(gitDir, "commondir")).match<
+          { readonly value: string } | { readonly value: null }
+        >({
+          ok: (value) => ({ value }),
+          err: () => ({ value: null }),
         });
+        const commonDir =
+          commonMetadata.value === null ? null : parseCommonDir(commonMetadata.value, gitDir);
         if (commonDir) paths.push(commonDir);
       }
     }

@@ -1,3 +1,5 @@
+import { captureError } from "../shared/error-capture";
+import { Result } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import type { ToolPluginStatus } from "@stanley2058/lilac-plugin-runtime";
 import { formatTaggedErrorForLog, redactErrorTextForLog } from "@stanley2058/lilac-utils";
@@ -181,10 +183,18 @@ const MEMORY_HISTORY_SIZE = 60;
 function previewReason(reason: unknown): string {
   if (reason instanceof Error) return reason.message;
   if (typeof reason === "string") return reason;
-  try {
-    return JSON.stringify(reason);
-  } catch {
-    return String(reason);
+  {
+    const attempt = Result.try({
+      try: () => {
+        return JSON.stringify(reason);
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      return String(reason);
+    }
+    return attempt.value;
   }
 }
 
@@ -235,31 +245,49 @@ export function createToolServerHealthState(options: ToolServerHealthStateOption
     options.runtimeDiagnosticSampler ?? ownedRuntimeDiagnosticSampler.sample;
 
   function captureRuntimeDiagnostics(includeLinux: boolean): RuntimeDiagnosticSample | undefined {
-    try {
-      return sampleRuntimeDiagnostics({ includeLinux });
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      return undefined;
+    {
+      const attempt = Result.try({
+        try: () => {
+          return sampleRuntimeDiagnostics({ includeLinux });
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const cause = attempt.error.cause;
+        if (Panic.is(cause)) throw cause;
+        return undefined;
+      }
+      return attempt.value;
     }
   }
 
   function captureActiveLevel1Work(): readonly ToolServerActiveLevel1Work[] {
-    try {
-      return (options.activeLevel1WorkProvider?.() ?? []).map((work) => ({
-        requestId: work.requestId,
-        requestClient: work.requestClient,
-        runProfile: work.runProfile,
-        phase: work.phase,
-        runAgeMs: work.runAgeMs,
-        tools: work.tools.map((tool) => ({
-          toolCallId: tool.toolCallId,
-          toolName: tool.toolName,
-          ageMs: tool.ageMs,
-        })),
-      }));
-    } catch (cause) {
-      if (Panic.is(cause)) throw cause;
-      return [];
+    {
+      const attempt = Result.try({
+        try: () => {
+          return (options.activeLevel1WorkProvider?.() ?? []).map((work) => ({
+            requestId: work.requestId,
+            requestClient: work.requestClient,
+            runProfile: work.runProfile,
+            phase: work.phase,
+            runAgeMs: work.runAgeMs,
+            tools: work.tools.map((tool) => ({
+              toolCallId: tool.toolCallId,
+              toolName: tool.toolName,
+              ageMs: tool.ageMs,
+            })),
+          }));
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const cause = attempt.error.cause;
+        if (Panic.is(cause)) throw cause;
+        return [];
+      }
+      return attempt.value;
     }
   }
 
@@ -548,28 +576,39 @@ export function createToolServerHealthState(options: ToolServerHealthStateOption
     let externalInfo: Record<string, unknown> | undefined;
     let memoryDiagnostics: Record<string, unknown> | undefined;
     if (options.externalHealthProvider) {
-      try {
-        const external = await options.externalHealthProvider({
-          includeMemoryDiagnostics: memory.rss >= maxRssBytes,
+      {
+        const attempt = await Result.tryPromise({
+          try: async () => {
+            const external = await options.externalHealthProvider!({
+              includeMemoryDiagnostics: memory.rss >= maxRssBytes,
+            });
+            if (external.checks) checks.push(...external.checks);
+            externalInfo = external.info;
+            memoryDiagnostics = external.memoryDiagnostics;
+          },
+          catch: captureError,
         });
-        if (external.checks) checks.push(...external.checks);
-        externalInfo = external.info;
-        memoryDiagnostics = external.memoryDiagnostics;
-      } catch (e) {
-        if (Panic.is(e)) throw e;
-        checks.push({
-          name: "health.external",
-          ok: false,
-          impact: "live",
-          reason: previewReason(e),
-        });
+
+        if (attempt.isErr()) {
+          const e = attempt.error.cause;
+          if (Panic.is(e)) throw e;
+          checks.push({
+            name: "health.external",
+            ok: false,
+            impact: "live",
+            reason: previewReason(e),
+          });
+        }
       }
     }
     if (memoryDiagnostics) {
-      memoryCheck.details = {
-        ...memoryUsage,
-        maxRssBytes,
-        diagnostics: memoryDiagnostics,
+      checks[3] = {
+        name: "process.memory",
+        ok: memory.rss < maxRssBytes,
+        impact: "live",
+        reason:
+          memory.rss >= maxRssBytes ? `rss ${memory.rss} exceeded limit ${maxRssBytes}` : undefined,
+        details: { ...memoryUsage, maxRssBytes, diagnostics: memoryDiagnostics },
       };
     }
 
@@ -701,24 +740,14 @@ export function createToolServerHealthState(options: ToolServerHealthStateOption
     return tracked;
   }
 
-  function reportWatchdogDefect(reason: unknown): void {
+  function reportWatchdogDefect(reason: Error): void {
     if (Panic.is(reason)) {
       options.logger.error("tool-server watchdog failed", formatTaggedErrorForLog(reason));
       signalWatchdogDefect(reason);
       return;
     }
-    if (reason instanceof Error) {
-      options.logger.error(`tool-server watchdog failed: ${redactErrorTextForLog(reason.message)}`);
-      signalWatchdogDefect(reason);
-      return;
-    }
-
-    const panic = new Panic({
-      cause: reason,
-      message: "Tool-server watchdog rejected with an opaque defect",
-    });
-    options.logger.error("tool-server watchdog failed", formatTaggedErrorForLog(panic));
-    signalWatchdogDefect(panic);
+    options.logger.error(`tool-server watchdog failed: ${redactErrorTextForLog(reason.message)}`);
+    signalWatchdogDefect(reason);
   }
 
   function signalWatchdogDefect(defect: Panic | Error): void {
@@ -746,9 +775,18 @@ export function createToolServerHealthState(options: ToolServerHealthStateOption
 
     if (!watchdogTimer && options.onUnhealthy) {
       watchdogTimer = setInterval(() => {
-        void runWatchdog().catch(reportWatchdogDefect);
+        void observeWatchdog();
       }, watchdogIntervalMs);
       watchdogTimer.unref?.();
+    }
+
+    async function observeWatchdog(): Promise<void> {
+      const watched = await Result.tryPromise({
+        try: runWatchdog,
+        catch: captureError,
+      });
+      const failure = watched.match({ ok: () => null, err: ({ cause }) => cause });
+      if (failure) reportWatchdogDefect(failure);
     }
   }
 

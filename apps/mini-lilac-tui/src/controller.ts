@@ -1382,75 +1382,74 @@ export class Controller {
   private async watchDetachedCompaction(): Promise<void> {
     if (this.watchingDetachedCompaction) return;
     this.watchingDetachedCompaction = true;
-    try {
-      this.dispatch({ type: "compaction-observed" });
-      const wait =
-        this.options.compactionWatchDelay ?? (() => Bun.sleep(COMPACTION_WATCH_INTERVAL_MS));
+    using _detachedCompactionWatch = {
+      [Symbol.dispose]: () => void (this.watchingDetachedCompaction = false),
+    };
+    this.dispatch({ type: "compaction-observed" });
+    const wait =
+      this.options.compactionWatchDelay ?? (() => Bun.sleep(COMPACTION_WATCH_INTERVAL_MS));
+    for (;;) {
+      let terminal: MiniLilacSessionSnapshot | undefined;
+      // Follow one compaction generation to a non-compacting snapshot.
       for (;;) {
-        let terminal: MiniLilacSessionSnapshot | undefined;
-        // Follow one compaction generation to a non-compacting snapshot.
-        for (;;) {
-          if (this.disposed) return;
-          const loaded = await this.options.transport.getSessionResult(this.sessionId, {
-            signal: this.abortController.signal,
-          });
-          const snapshot = loaded.match({ ok: (value) => value, err: () => undefined });
-          if (snapshot === undefined) {
-            // Transient: the outcome is still unknown, so keep watching.
-            if (this.disposed) return;
-          } else {
-            if (this.disposed) return;
-            this.acceptSnapshot(snapshot);
-            if (snapshot.status !== "compacting") {
-              this.compactionCommandId = undefined;
-              terminal = snapshot;
-              break;
-            }
-          }
-          await wait();
-        }
-
-        const loadedMessages = await this.options.transport.getMessagesResult(this.sessionId, {
+        if (this.disposed) return;
+        const loaded = await this.options.transport.getSessionResult(this.sessionId, {
           signal: this.abortController.signal,
         });
-        const messagesError = loadedMessages.match({
-          ok: () => undefined,
-          err: (error) => error,
-        });
-        if (messagesError !== undefined) {
+        const snapshot = loaded.match({ ok: (value) => value, err: () => undefined });
+        if (snapshot === undefined) {
+          // Transient: the outcome is still unknown, so keep watching.
           if (this.disposed) return;
-          this.appendOutput({
-            kind: "status",
-            tone: "warning",
-            text: `compaction ended, but refreshing the transcript failed: ${errorMessage(messagesError)}`,
-          });
         } else {
           if (this.disposed) return;
-          const messages = loadedMessages.match({ ok: (value) => value, err: () => undefined });
-          if (messages !== undefined) this.replaceMessages(messages);
-        }
-
-        if (terminal !== undefined) {
-          const refreshed = await this.options.transport.getSessionResult(this.sessionId, {
-            signal: this.abortController.signal,
-          });
-          const snapshot = refreshed.match({ ok: (value) => value, err: () => undefined });
-          if (snapshot !== undefined) {
+          this.acceptSnapshot(snapshot);
+          if (snapshot.status !== "compacting") {
+            this.compactionCommandId = undefined;
             terminal = snapshot;
-            if (this.disposed) return;
-            this.acceptSnapshot(terminal);
+            break;
           }
         }
-        // A successor compaction may begin while its predecessor's transcript is
-        // being refreshed. Continue in this watcher instead of recursively
-        // calling a watcher that the reentrancy guard would discard.
-        if (terminal?.status === "compacting") continue;
-        if (terminal !== undefined && this.followSnapshotActivity(terminal)) return;
-        this.dispatch({ type: "operation-completed" });
-        return;
+        await wait();
       }
-    } finally {
-      this.watchingDetachedCompaction = false;
+
+      const loadedMessages = await this.options.transport.getMessagesResult(this.sessionId, {
+        signal: this.abortController.signal,
+      });
+      const messagesError = loadedMessages.match({
+        ok: () => undefined,
+        err: (error) => error,
+      });
+      if (messagesError !== undefined) {
+        if (this.disposed) return;
+        this.appendOutput({
+          kind: "status",
+          tone: "warning",
+          text: `compaction ended, but refreshing the transcript failed: ${errorMessage(messagesError)}`,
+        });
+      } else {
+        if (this.disposed) return;
+        const messages = loadedMessages.match({ ok: (value) => value, err: () => undefined });
+        if (messages !== undefined) this.replaceMessages(messages);
+      }
+
+      if (terminal !== undefined) {
+        const refreshed = await this.options.transport.getSessionResult(this.sessionId, {
+          signal: this.abortController.signal,
+        });
+        const snapshot = refreshed.match({ ok: (value) => value, err: () => undefined });
+        if (snapshot !== undefined) {
+          terminal = snapshot;
+          if (this.disposed) return;
+          this.acceptSnapshot(terminal);
+        }
+      }
+      // A successor compaction may begin while its predecessor's transcript is
+      // being refreshed. Continue in this watcher instead of recursively
+      // calling a watcher that the reentrancy guard would discard.
+      if (terminal?.status === "compacting") continue;
+      if (terminal !== undefined && this.followSnapshotActivity(terminal)) return;
+      this.dispatch({ type: "operation-completed" });
+      return;
     }
   }
 

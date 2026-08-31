@@ -23,12 +23,22 @@ describe("partition 8 shared boundaries", () => {
   it("decodes complete request contexts and rejects malformed external values", () => {
     expect(
       decodeRequiredRequestContext(
-        { requestId: "req-1", sessionId: "session-1", requestClient: "discord" },
+        {
+          requestId: "req-1",
+          requestDeliveryId: "delivery-1",
+          sessionId: "session-1",
+          requestClient: "discord",
+        },
         "test",
       ),
     ).toMatchObject({
       status: "ok",
-      value: { requestId: "req-1", sessionId: "session-1", requestClient: "discord" },
+      value: {
+        requestId: "req-1",
+        requestDeliveryId: "delivery-1",
+        sessionId: "session-1",
+        requestClient: "discord",
+      },
     });
 
     const invalid = decodeRequiredRequestContext(

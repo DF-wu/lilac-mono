@@ -10,7 +10,7 @@ import {
 } from "@stanley2058/simple-module-logger";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { isPanic, isRecord } from "./runtime-utils";
+import { captureResultOutcome, isPanic, isRecord, settleSyncResult } from "./runtime-utils";
 
 function hasTestGlobals(): boolean {
   return "describe" in globalThis && "it" in globalThis;
@@ -156,12 +156,38 @@ type OpenObserveDeliveryFailure =
   | OpenObserveRequestFailed
   | OpenObserveHttpFailed;
 
-function projectOpenObserveRequestFailure(cause: unknown): OpenObserveRequestFailed {
-  if (isPanic(cause)) throw cause;
-  return new OpenObserveRequestFailed({
-    cause,
-    message: "OpenObserve request failed",
-  });
+type CapturedOpenObservePanic = { readonly kind: "panic"; readonly panic: Panic };
+type CapturedOpenObserveRequestFailure =
+  | CapturedOpenObservePanic
+  | { readonly kind: "request"; readonly error: OpenObserveRequestFailed };
+
+function captureOpenObservePanic(restoreCause: () => unknown): CapturedOpenObservePanic {
+  const cause = restoreCause();
+  const panic = Result.try({
+    try: () => (Panic.is(cause) ? cause : undefined),
+    catch: () => undefined,
+  }).match({ ok: (value) => value, err: () => undefined });
+  return {
+    kind: "panic",
+    panic:
+      panic ?? new Panic({ cause, message: "OpenObserve operation failed with an opaque defect" }),
+  };
+}
+
+function captureOpenObserveRequestFailure(
+  restoreCause: () => unknown,
+): CapturedOpenObserveRequestFailure {
+  const cause = restoreCause();
+  const panic = Result.try({
+    try: () => (Panic.is(cause) ? cause : undefined),
+    catch: () => undefined,
+  }).match({ ok: (value) => value, err: () => undefined });
+  return panic
+    ? { kind: "panic", panic }
+    : {
+        kind: "request",
+        error: new OpenObserveRequestFailed({ cause, message: "OpenObserve request failed" }),
+      };
 }
 
 function signalOpenObservePanic(cause: unknown): void {
@@ -246,12 +272,13 @@ function sanitizeFieldSegment(value: string): string {
 }
 
 function safeJsonStringify(value: unknown): string {
-  try {
-    return JSON.stringify(value) ?? "[unsupported]";
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return "[unserializable]";
-  }
+  const captured = Result.try({
+    try: () => JSON.stringify(value) ?? "[unsupported]",
+    catch: (cause) => ({ cause }),
+  });
+  const outcome = captureResultOutcome(captured);
+  if (!outcome.ok && isPanic(outcome.error.cause)) throw outcome.error.cause;
+  return outcome.ok ? outcome.value : "[unserializable]";
 }
 
 function addNormalizedArgFields(target: OpenObserveRecord, index: number, value: unknown): void {
@@ -347,7 +374,7 @@ class OpenObserveJsonlStream implements WriteStream {
     for (const rawLine of lines) {
       const line = rawLine.trim();
       if (!line) continue;
-      try {
+      const outcome = settleSyncResult(() => {
         const parsed = JSON.parse(line) as unknown;
         const normalized = normalizeRecordForOpenObserve(parsed);
         if (normalized) {
@@ -355,10 +382,8 @@ class OpenObserveJsonlStream implements WriteStream {
           const bytes = Buffer.byteLength(json, "utf8");
           this.enqueue({ json, bytes });
         }
-      } catch (cause) {
-        if (isPanic(cause)) throw cause;
-        // Ignore malformed lines; logger output should be valid JSONL.
-      }
+      });
+      if (outcome.kind === "panic") throw outcome.panic;
     }
 
     this.scheduleFlush();
@@ -429,7 +454,7 @@ class OpenObserveJsonlStream implements WriteStream {
     this.flushScheduled = true;
     queueMicrotask(() => {
       this.flushScheduled = false;
-      void this.flush().catch(signalOpenObservePanic);
+      void this.flush();
     });
   }
 
@@ -437,35 +462,36 @@ class OpenObserveJsonlStream implements WriteStream {
     if (this.flushing) return;
     this.flushing = true;
 
-    try {
-      while (this.queue.length > 0) {
-        const batch = this.takeBatch();
-        try {
-          const result = await this.postBatch(batch.body);
-
-          const record = result.match<() => void>({
-            ok: () => () => {
-              this.succeededBatches += 1;
-              this.lastSuccessAtMs = Date.now();
-              this.lastSuccessSequence = ++openObserveOutcomeSequence;
-            },
-            err: (error) => () => {
-              this.recordFailure(error);
-              reportOpenObserveDiagnostics();
-            },
-          });
-          record();
-        } finally {
+    const flushed = await Result.tryPromise({
+      try: async () => {
+        while (this.queue.length > 0) {
+          const batch = this.takeBatch();
+          const result = captureResultOutcome(await this.postBatch(batch.body));
+          if (result.ok) {
+            this.succeededBatches += 1;
+            this.lastSuccessAtMs = Date.now();
+            this.lastSuccessSequence = ++openObserveOutcomeSequence;
+          } else {
+            this.recordFailure(result.error);
+            reportOpenObserveDiagnostics();
+          }
           this.activeBatch = [];
           this.activeBytes = 0;
         }
-      }
-    } finally {
-      this.flushing = false;
-      if (this.activeBatch.length === 0 && this.queue.length > 0) {
-        this.scheduleFlush();
-      }
+      },
+      catch: (cause) => ({ restoreCause: () => cause }),
+    });
+    this.activeBatch = [];
+    this.activeBytes = 0;
+    this.flushing = false;
+    if (this.activeBatch.length === 0 && this.queue.length > 0) {
+      this.scheduleFlush();
     }
+    const flushOutcome = flushed.match<{ readonly kind: "completed" } | CapturedOpenObservePanic>({
+      ok: () => ({ kind: "completed" }),
+      err: ({ restoreCause }) => captureOpenObservePanic(restoreCause),
+    });
+    if (flushOutcome.kind === "panic") signalOpenObservePanic(flushOutcome.panic);
   }
 
   private takeBatch(): { readonly body: string } {
@@ -509,7 +535,7 @@ class OpenObserveJsonlStream implements WriteStream {
           body,
           signal: controller.signal,
         }),
-      catch: projectOpenObserveRequestFailure,
+      catch: (cause) => ({ restoreCause: () => cause }),
     });
 
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -527,34 +553,58 @@ class OpenObserveJsonlStream implements WriteStream {
       },
     );
 
-    try {
-      const outcome = await Promise.race([
-        request.then((result) => ({ kind: "response" as const, result })),
-        timeout,
-      ]);
-      if (outcome.kind === "timeout") {
-        controller.abort();
-        await request;
-        return Result.err(outcome.error);
-      }
-
-      const response = outcome.result;
-      const finish = response.match<() => ResultType<void, OpenObserveDeliveryFailure>>({
-        err: (error) => () => Result.err(error),
-        ok: (value) => () =>
-          value.ok
-            ? Result.ok(undefined)
-            : Result.err(
-                new OpenObserveHttpFailed({
-                  status: value.status,
-                  message: "OpenObserve rejected a log batch",
-                }),
-              ),
+    const outcome = await Promise.race([
+      request.then((result) => ({ kind: "response" as const, result })),
+      timeout,
+    ]);
+    let result: ResultType<void, OpenObserveDeliveryFailure>;
+    if (outcome.kind === "timeout") {
+      controller.abort();
+      await request;
+      result = Result.err(outcome.error);
+    } else {
+      const response = outcome.result.match<
+        | { readonly kind: "response"; readonly response: Response }
+        | CapturedOpenObserveRequestFailure
+      >({
+        ok: (value) => ({ kind: "response", response: value }),
+        err: ({ restoreCause }) => captureOpenObserveRequestFailure(restoreCause),
       });
-      return finish();
-    } finally {
-      if (timeoutId) clearTimeout(timeoutId);
+      if (response.kind !== "response") {
+        if (response.kind === "panic") {
+          signalOpenObservePanic(response.panic);
+          result = Result.err(
+            new OpenObserveRequestFailed({
+              cause: response.panic,
+              message: "OpenObserve request failed",
+            }),
+          );
+        } else {
+          result = Result.err(response.error);
+        }
+      } else {
+        result = response.response.ok
+          ? Result.ok(undefined)
+          : Result.err(
+              new OpenObserveHttpFailed({
+                status: response.response.status,
+                message: "OpenObserve rejected a log batch",
+              }),
+            );
+      }
     }
+    const cleared = Result.try({
+      try: () => {
+        if (timeoutId) clearTimeout(timeoutId);
+      },
+      catch: (cause) => ({ restoreCause: () => cause }),
+    });
+    const clearOutcome = cleared.match<{ readonly kind: "completed" } | CapturedOpenObservePanic>({
+      ok: () => ({ kind: "completed" }),
+      err: ({ restoreCause }) => captureOpenObservePanic(restoreCause),
+    });
+    if (clearOutcome.kind === "panic") signalOpenObservePanic(clearOutcome.panic);
+    return result;
   }
 
   private recordFailure(error: OpenObserveDeliveryFailure): void {
@@ -640,11 +690,8 @@ function reportOpenObserveDiagnostics(): void {
     ` dropped_bytes=${diagnostics.droppedBytes} retained_records=${diagnostics.retainedRecords}` +
     ` retained_bytes=${diagnostics.retainedBytes} in_flight=${diagnostics.inFlightRequests}\n`;
 
-  try {
-    process.stderr.write(message);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-  }
+  const outcome = settleSyncResult(() => process.stderr.write(message));
+  if (outcome.kind === "panic") throw outcome.panic;
 }
 
 function getOpenObserveStream(config: OpenObserveConfig): OpenObserveJsonlStream {

@@ -71,7 +71,7 @@ describe("AiSdkPiAgent step tool authority", () => {
         offered.push(offeredToolNames(options));
         return offered.length === 1
           ? toolCallStep([
-              { toolCallId: "search", toolName: "tool_search" },
+              { toolCallId: "search", toolName: "find_tools" },
               { toolCallId: "hidden", toolName: "catalog_tool" },
             ])
           : textStep("done");
@@ -84,7 +84,7 @@ describe("AiSdkPiAgent step tool authority", () => {
       model,
       tools: {
         builtin: emptyTool(() => "builtin"),
-        tool_search: emptyTool(() => {
+        find_tools: emptyTool(() => {
           selected.add("catalog_tool");
           return "selected";
         }),
@@ -94,7 +94,7 @@ describe("AiSdkPiAgent step tool authority", () => {
         }),
       },
       beforeStep: () => {
-        agent.setActiveTools(new Set(["builtin", "tool_search", ...selected]));
+        agent.setActiveTools(new Set(["builtin", "find_tools", ...selected]));
       },
     });
 
@@ -102,12 +102,12 @@ describe("AiSdkPiAgent step tool authority", () => {
 
     expect(catalogExecutions).toBe(0);
     expect(offered).toEqual([
-      ["builtin", "tool_search"],
-      ["builtin", "tool_search", "catalog_tool"],
+      ["builtin", "find_tools"],
+      ["builtin", "find_tools", "catalog_tool"],
     ]);
     expect(agent.getLastStepToolSnapshot()?.names).toEqual([
       "builtin",
-      "tool_search",
+      "find_tools",
       "catalog_tool",
     ]);
     expect(Object.isFrozen(agent.getLastStepToolSnapshot())).toBe(true);

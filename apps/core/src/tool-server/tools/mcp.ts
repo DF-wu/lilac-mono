@@ -34,6 +34,12 @@ const optionalServerIdInputSchema = z.strictObject({
     .describe("Configured MCP server ID; omit for all servers."),
 });
 
+function captureMcpFailure(cause: unknown): { readonly cause: Error | Panic } {
+  if (Panic.is(cause)) return { cause };
+  if (cause instanceof Error) return { cause };
+  return { cause: new Error(String(cause), { cause }) };
+}
+
 const [stdioServerInputSchema, httpServerInputSchema] = mcpServerInputSchemaV1.options;
 const mcpAddInputSchema = z.discriminatedUnion("transport", [
   stdioServerInputSchema.extend({
@@ -313,20 +319,22 @@ export class McpManagement implements ServerTool {
     return (
       await Result.tryPromise({
         try: () => this.params.providers.startAuthorization(serverId),
-        catch: (cause) => {
-          if (Panic.is(cause)) return preserveToolPanic(cause);
-          return mcpFailure("unavailable", cause instanceof Error ? cause.message : String(cause));
-        },
+        catch: captureMcpFailure,
       })
-    ).map((result) =>
-      result.status === "authorized"
-        ? { status: result.status }
-        : {
-            status: result.status,
-            authorizationUrl: result.authorizationUrl,
-            callbackUrl: result.callbackUrl,
-          },
-    );
+    )
+      .mapError(({ cause }) => {
+        if (Panic.is(cause)) return preserveToolPanic(cause);
+        return mcpFailure("unavailable", cause.message);
+      })
+      .map((result) =>
+        result.status === "authorized"
+          ? { status: result.status }
+          : {
+              status: result.status,
+              authorizationUrl: result.authorizationUrl,
+              callbackUrl: result.callbackUrl,
+            },
+      );
   }
 
   private async callReload({
@@ -363,13 +371,10 @@ export class McpManagement implements ServerTool {
   ): ResultType<void, ServerToolFailure> {
     return Result.try({
       try: () => this.params.providers.reconcile(config),
-      catch: (cause) => {
-        if (Panic.is(cause)) return preserveToolPanic(cause);
-        return mcpFailure(
-          "unavailable",
-          cause instanceof Error ? cause.message : "MCP provider reconciliation failed",
-        );
-      },
+      catch: captureMcpFailure,
+    }).mapError(({ cause }) => {
+      if (Panic.is(cause)) return preserveToolPanic(cause);
+      return mcpFailure("unavailable", cause.message);
     });
   }
 

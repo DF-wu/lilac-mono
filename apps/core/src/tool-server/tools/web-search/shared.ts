@@ -77,24 +77,15 @@ export function withAbortSignal<T>(
     return pending;
   }
 
-  return new Promise<T>((resolve, reject) => {
+  let removeAbortListener: () => void = () => undefined;
+  const aborted = new Promise<never>((_, reject) => {
     const onAbort = () => {
       const error = new Error("Aborted");
       error.name = "AbortError";
       reject(error);
     };
-
     signal.addEventListener("abort", onAbort, { once: true });
-
-    pending.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
+    removeAbortListener = () => signal.removeEventListener("abort", onAbort);
   });
+  return Promise.race([pending, aborted]).finally(removeAbortListener);
 }

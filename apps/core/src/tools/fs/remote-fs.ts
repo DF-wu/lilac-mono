@@ -27,7 +27,7 @@ import path from "node:path";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-import { projectRuntimeError } from "../../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../../runtime/error-format";
 import {
   SshExecutionAdapterError,
   SshExecutionCancelledError,
@@ -159,8 +159,10 @@ function toBundledRemoteEditRequest(
 function decodeRemoteFsRunnerPackageSpec(): ResultType<string, RemoteFsRunnerSetupError> {
   const loaded = Result.try({
     try: (): unknown => requirePackageJson("@stanley2058/lilac-remote-fs-runner/package.json"),
-    catch: projectRuntimeError("Opaque remote fs runner setup failure"),
-  });
+    catch: captureRuntimeError,
+  }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque remote fs runner setup failure"),
+  );
   return loaded.match<() => ResultType<string, RemoteFsRunnerSetupError>>({
     err: (error) => () => {
       const cause = preserveToolPanic(error);
@@ -306,17 +308,21 @@ ${inputJson}
 __LILAC_INPUT__
 `;
 
-  const executed = await Result.tryPromise({
-    try: () =>
-      sshExecBash({
-        host: params.host,
-        cmd: script,
-        timeoutMs: params.timeoutMs,
-        signal: params.signal,
-        maxOutputChars: params.maxOutputChars,
-      }),
-    catch: projectRuntimeError("Opaque remote fs SSH adapter failure"),
-  });
+  const executed = (
+    await Result.tryPromise({
+      try: () =>
+        sshExecBash({
+          host: params.host,
+          cmd: script,
+          timeoutMs: params.timeoutMs,
+          signal: params.signal,
+          maxOutputChars: params.maxOutputChars,
+        }),
+      catch: captureRuntimeError,
+    })
+  ).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque remote fs SSH adapter failure"),
+  );
   const executionError = executed.match({ ok: () => null, err: (error) => error });
   if (executionError) {
     const cause = preserveToolPanic(executionError);

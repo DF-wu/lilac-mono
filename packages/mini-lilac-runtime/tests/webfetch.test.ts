@@ -297,6 +297,7 @@ describe("Mini Lilac webfetch", () => {
     const started = new Promise<void>((resolve) => {
       responseStarted = resolve;
     });
+    const bodyReadStarted = Promise.withResolvers<void>();
     const pending = executeWebfetchResult(
       decodedInput({ url: "https://public.example.com/stalled" }),
       { abortSignal: abortController.signal },
@@ -305,19 +306,24 @@ describe("Mini Lilac webfetch", () => {
         fetch: async () => {
           responseStarted?.();
           return new Response(
-            new ReadableStream({
-              cancel() {
-                bodyCancelled = true;
+            new ReadableStream(
+              {
+                pull() {
+                  bodyReadStarted.resolve();
+                },
+                cancel() {
+                  bodyCancelled = true;
+                },
               },
-            }),
+              { highWaterMark: 0 },
+            ),
             { headers: { "content-type": "text/plain" } },
           );
         },
       },
     );
     await started;
-    // test-wait-justification: lets response-body consumption attach before aborting the in-flight fetch
-    await Bun.sleep(0);
+    await bodyReadStarted.promise;
     abortController.abort(new Error("cancelled by test"));
     const result = await pending;
     expect(result).toMatchObject({
@@ -333,6 +339,7 @@ describe("Mini Lilac webfetch", () => {
     const legacyStarted = new Promise<void>((resolve) => {
       legacyResponseStarted = resolve;
     });
+    const legacyBodyReadStarted = Promise.withResolvers<void>();
     const legacyPending = executeWebfetch(
       { url: "https://public.example.com/legacy-stalled" },
       { abortSignal: legacyAbortController.signal },
@@ -341,19 +348,24 @@ describe("Mini Lilac webfetch", () => {
         fetch: async () => {
           legacyResponseStarted?.();
           return new Response(
-            new ReadableStream({
-              cancel() {
-                legacyBodyCancelled = true;
+            new ReadableStream(
+              {
+                pull() {
+                  legacyBodyReadStarted.resolve();
+                },
+                cancel() {
+                  legacyBodyCancelled = true;
+                },
               },
-            }),
+              { highWaterMark: 0 },
+            ),
             { headers: { "content-type": "text/plain" } },
           );
         },
       },
     );
     await legacyStarted;
-    // test-wait-justification: lets legacy response-body consumption attach before aborting it
-    await Bun.sleep(0);
+    await legacyBodyReadStarted.promise;
     legacyAbortController.abort(legacyReason);
     await expect(legacyPending).rejects.toBe(legacyReason);
     expect(legacyBodyCancelled).toBe(true);

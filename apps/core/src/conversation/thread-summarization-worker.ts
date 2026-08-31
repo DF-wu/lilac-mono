@@ -47,8 +47,8 @@ export class ThreadSummarizationWorkerOperationFailed extends TaggedError(
   "ThreadSummarizationWorkerOperationFailed",
 )<{ readonly message: string }> {}
 
-export function captureThreadSummarizationWorkerOperationFailure(
-  cause: unknown,
+export function captureThreadSummarizationWorkerOperationFailure<Cause>(
+  cause: Cause,
 ): ThreadSummarizationWorkerOperationFailed | Panic {
   if (isPanic(cause)) return cause;
   if (ThreadSummarizationWorkerOperationFailed.is(cause)) return cause;
@@ -58,8 +58,8 @@ export function captureThreadSummarizationWorkerOperationFailure(
   });
 }
 
-export function captureThreadSummarizationWorkerCleanupFailure(
-  cause: unknown,
+export function captureThreadSummarizationWorkerCleanupFailure<Cause>(
+  cause: Cause,
 ): ThreadSummarizationWorkerOperationFailed | Panic {
   if (isPanic(cause)) return cause;
   return new ThreadSummarizationWorkerOperationFailed({
@@ -71,35 +71,37 @@ export async function runThreadSummarizationWorkerOperation(params: {
   readonly run: () => Promise<void>;
   readonly cleanups: readonly ThreadSummarizationWorkerCleanup[];
   readonly onCleanupFailure: (failure: ThreadSummarizationWorkerCleanupFailure) => void;
-}): Promise<ResultType<void, ThreadSummarizationWorkerOperationFailed | Panic>> {
-  const operation = await Result.tryPromise({
-    try: params.run,
-    catch: captureThreadSummarizationWorkerOperationFailure,
-  });
-  const operationError = operation.match({ ok: () => null, err: (error) => error });
+}): Promise<ResultType<void, ThreadSummarizationWorkerOperationFailed>> {
+  const [operationSettled] = await Promise.allSettled([params.run()]);
+  const operationFailure =
+    operationSettled.status === "rejected"
+      ? captureThreadSummarizationWorkerOperationFailure(operationSettled.reason)
+      : null;
+  const operationPanic = operationFailure && Panic.is(operationFailure) ? operationFailure : null;
+  const operationError = operationFailure && !Panic.is(operationFailure) ? operationFailure : null;
   let cleanupPanic: Panic | null = null;
 
   for (const cleanup of params.cleanups) {
-    const closed = Result.try({
-      try: cleanup.close,
-      catch: captureThreadSummarizationWorkerCleanupFailure,
-    });
-    const reportCleanup = closed.match<() => void>({
-      ok: () => () => undefined,
-      err: (error) => () => {
-        if (Panic.is(error)) {
-          cleanupPanic ??= error;
-          params.onCleanupFailure({ cleanup, kind: "panic", panic: error });
-        } else {
-          params.onCleanupFailure({ cleanup, kind: "ordinary", message: error.message });
-        }
-      },
-    });
-    reportCleanup();
+    const [cleanupSettled] = await Promise.allSettled([Promise.resolve().then(cleanup.close)]);
+    if (cleanupSettled.status === "fulfilled") continue;
+    const failure = Result.try({
+      try: () => captureThreadSummarizationWorkerCleanupFailure(cleanupSettled.reason),
+      catch: () =>
+        new ThreadSummarizationWorkerOperationFailed({
+          message: "Conversation thread summarization worker cleanup failed",
+        }),
+    }).match({ ok: (value) => value, err: (value) => value });
+    if (Panic.is(failure)) {
+      cleanupPanic ??= failure;
+      params.onCleanupFailure({ cleanup, kind: "panic", panic: failure });
+    } else {
+      params.onCleanupFailure({ cleanup, kind: "ordinary", message: failure.message });
+    }
   }
 
+  if (operationPanic) throw operationPanic;
+  if (cleanupPanic) throw cleanupPanic;
   if (operationError) return Result.err(operationError);
-  if (cleanupPanic) return Result.err(cleanupPanic);
   return Result.ok(undefined);
 }
 
@@ -235,7 +237,6 @@ async function runJob(request: ThreadSummarizationWorkerRequest): Promise<void> 
   operation.match({
     ok: () => () => undefined,
     err: (error) => () => {
-      if (Panic.is(error)) throw error;
       logger.error("conversation thread summarization worker job failed", {
         jobId: request.id,
         durationMs: Date.now() - startedAt,

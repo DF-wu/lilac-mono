@@ -9,7 +9,7 @@ import {
 } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { configureSqliteConnection } from "../shared/sqlite";
 import { adaptToolResultToHost, preserveToolPanic } from "../tools/tool-result-adapters";
 import {
@@ -23,6 +23,7 @@ import {
   workflowSchemaMigrationSchema,
   WORKFLOW_MANUAL_RECONCILIATION_DETAIL,
   type JsonValue,
+  type WorkflowArtifactReference,
   type WorkflowOperation,
   type WorkflowOperationState,
   type WorkflowRevision,
@@ -56,6 +57,7 @@ import {
   type WorkflowRequestPolicy,
 } from "./workflow-request-authority";
 import { canonicalJson } from "./workflow-definition";
+import { encodeWorkflowArtifactReference } from "./workflow-artifact-persistence-codec";
 import { resolvedWorkflowAgentInputSchema } from "./workflow-operation-policy";
 
 function resolveWorkflowDbPath(): string {
@@ -126,6 +128,12 @@ function decodeWorkflowActionOutboxRow(
   return decodeWorkflowPersistenceRow({ ...input, kind: "outbox" });
 }
 
+function decodeWorkflowArtifactRow(
+  input: Parameters<WorkflowRowDecoder<WorkflowArtifactReference>>[0],
+) {
+  return decodeWorkflowPersistenceRow({ ...input, kind: "artifact" });
+}
+
 export class DurableWorkflowSqliteDriverFailure extends TaggedError(
   "DurableWorkflowSqliteDriverFailure",
 )<{
@@ -134,7 +142,9 @@ export class DurableWorkflowSqliteDriverFailure extends TaggedError(
   readonly message: string;
 }> {}
 
-class DurableWorkflowInvariantViolation extends TaggedError("DurableWorkflowInvariantViolation")<{
+export class DurableWorkflowInvariantViolation extends TaggedError(
+  "DurableWorkflowInvariantViolation",
+)<{
   readonly message: string;
 }> {}
 
@@ -163,12 +173,14 @@ function captureWorkflowRead<T>(
 ): ResultType<T, DurableWorkflowReadError> {
   const captured = Result.try({
     try: read,
-    catch: projectRuntimeError("Opaque durable workflow read failure"),
+    catch: captureRuntimeError,
   });
   const finishRead = captured.match<() => ResultType<T, DurableWorkflowReadError>>({
     ok: (value) => () => value,
-    err: (error) => () => {
-      const cause = preserveToolPanic(error);
+    err: (captured) => () => {
+      const cause = preserveToolPanic(
+        projectCapturedRuntimeError(captured, "Opaque durable workflow read failure"),
+      );
       const failure = classifyWorkflowSqliteDriverFailure(operation, cause);
       if (failure === undefined) return adaptToolResultToHost(Result.err(cause));
       return Result.err(failure);
@@ -246,6 +258,12 @@ function revisionIdentityValues(identity: WorkflowRevisionIdentity): readonly st
   ];
 }
 
+function encodeNullableWorkflowArtifactReference(
+  reference: WorkflowArtifactReference | null,
+): string | null {
+  return reference === null ? null : encodeWorkflowArtifactReference(reference);
+}
+
 export type CreateWorkflowInvocationResult =
   | {
       status: "accepted";
@@ -315,6 +333,7 @@ export type OrphanedLiveParentRun = {
 
 export type DurableWorkflowStoreOptions = {
   readonly onPersistenceDiagnostic?: (diagnostic: WorkflowPersistenceDiagnostic) => void;
+  readonly deferStartupRecovery?: boolean;
   readonly testHooks?: {
     readonly afterSurfaceActionStateChange?: () => void;
   };
@@ -325,6 +344,7 @@ export class DurableWorkflowStore {
   private readonly options: DurableWorkflowStoreOptions;
   private readonly pendingPersistenceDiagnostics: WorkflowPersistenceDiagnostic[] = [];
   private persistenceDiagnosticFlushQueued = false;
+  private startupRecoveryInitialized = false;
 
   constructor(dbPath?: string, options: DurableWorkflowStoreOptions = {}) {
     this.options = options;
@@ -332,7 +352,13 @@ export class DurableWorkflowStore {
     configureSqliteConnection(this.db);
     this.db.run("PRAGMA foreign_keys = ON");
     adaptWorkflowMigrationResultToStartupHost(applyWorkflowSchemaMigrations(this.db));
+    if (options.deferStartupRecovery !== true) this.initializeStartupRecovery();
+  }
+
+  initializeStartupRecovery(): void {
+    if (this.startupRecoveryInitialized) return;
     this.quarantineAndPauseLegacyResolvedReceipts(Date.now());
+    this.startupRecoveryInitialized = true;
   }
 
   close(): void {
@@ -383,6 +409,97 @@ export class DurableWorkflowStore {
       for (const row of rows) values.push(yield* this.decodeRow(row, decoder));
       return Result.ok(values);
     }, this);
+  }
+
+  getWorkflowArtifact(
+    artifactId: string,
+  ): ResultType<WorkflowArtifactReference | null, DurableWorkflowReadError> {
+    return captureWorkflowRead("get-workflow-artifact", () => {
+      const row = this.persistedRows(
+        "SELECT artifact_id, blob_ref_json, created_at FROM workflow_artifacts WHERE artifact_id = ?",
+      ).get(artifactId);
+      return row === null ? Result.ok(null) : this.decodeRow(row, decodeWorkflowArtifactRow);
+    });
+  }
+
+  private ensureWorkflowArtifactReference(
+    reference: WorkflowArtifactReference,
+    createdAt: number,
+  ): void {
+    this.db
+      .query(
+        `INSERT INTO workflow_artifacts (artifact_id, blob_ref_json, created_at)
+         VALUES (?, ?, ?) ON CONFLICT(artifact_id) DO NOTHING`,
+      )
+      .run(reference.artifactId, canonicalJson(reference.blobRef), createdAt);
+    const stored = adaptToolResultToHost(this.getWorkflowArtifact(reference.artifactId));
+    if (
+      stored === null ||
+      encodeWorkflowArtifactReference(stored) !== encodeWorkflowArtifactReference(reference)
+    ) {
+      adaptToolResultToHost(
+        Result.err(
+          new DurableWorkflowInvariantViolation({
+            message: `Workflow artifact identity conflict: ${reference.artifactId}`,
+          }),
+        ),
+      );
+    }
+  }
+
+  registerWorkflowArtifact(
+    reference: WorkflowArtifactReference,
+    createdAt: number,
+  ): ResultType<
+    WorkflowArtifactReference,
+    DurableWorkflowReadError | DurableWorkflowInvariantViolation
+  > {
+    return runWorkflowTransaction(this.db, "register-workflow-artifact", () => {
+      this.db
+        .query(
+          `INSERT INTO workflow_artifacts (artifact_id, blob_ref_json, created_at)
+           VALUES (?, ?, ?) ON CONFLICT(artifact_id) DO NOTHING`,
+        )
+        .run(reference.artifactId, canonicalJson(reference.blobRef), createdAt);
+      return this.getWorkflowArtifact(reference.artifactId).andThen((stored) => {
+        if (stored === null) {
+          return Result.err(
+            new DurableWorkflowInvariantViolation({
+              message: `Workflow artifact registration disappeared: ${reference.artifactId}`,
+            }),
+          );
+        }
+        return Result.ok(stored);
+      });
+    });
+  }
+
+  releaseWorkflowArtifactIfUnreferenced(
+    artifactId: string,
+  ): ResultType<WorkflowArtifactReference | null, DurableWorkflowReadError> {
+    return runWorkflowTransaction(this.db, "release-workflow-artifact", () => {
+      const loaded = this.getWorkflowArtifact(artifactId);
+      return loaded.andThen((reference) => {
+        if (reference === null) return Result.ok(null);
+        const referenced = this.db
+          .query<{ count: number }, [string, string, string, string]>(
+            `SELECT (
+               (SELECT COUNT(*) FROM workflow_revisions
+                WHERE json_extract(snapshot_artifact_id, '$.artifactId') = ?) +
+               (SELECT COUNT(*) FROM workflow_runs
+                WHERE json_extract(result_artifact_id, '$.artifactId') = ?) +
+               (SELECT COUNT(*) FROM workflow_operations
+                WHERE json_extract(result_artifact_id, '$.artifactId') = ?) +
+               (SELECT COUNT(*) FROM workflow_request_terminal_receipts
+                WHERE json_extract(result_artifact_id, '$.artifactId') = ?)
+             ) AS count`,
+          )
+          .get(artifactId, artifactId, artifactId, artifactId)?.count;
+        if (referenced !== 0) return Result.ok(null);
+        this.db.run("DELETE FROM workflow_artifacts WHERE artifact_id = ?", [artifactId]);
+        return Result.ok(reference);
+      });
+    });
   }
 
   private quarantineAndPauseLegacyResolvedReceipts(now: number): void {
@@ -457,6 +574,7 @@ export class DurableWorkflowStore {
 
   createRevision(revisionInput: WorkflowRevision): boolean {
     const revision = revisionInput;
+    this.ensureWorkflowArtifactReference(revision.snapshotArtifact, revision.createdAt);
     const result = this.db
       .query(
         `INSERT INTO workflow_revisions (
@@ -474,7 +592,7 @@ export class DurableWorkflowStore {
         revision.scope,
         revision.normalizedPath,
         revision.name,
-        revision.snapshotArtifactId,
+        encodeWorkflowArtifactReference(revision.snapshotArtifact),
         revision.sourceSha256,
         revision.inputSchemaSha256,
         revision.resourcePolicySha256,
@@ -537,6 +655,9 @@ export class DurableWorkflowStore {
 
   createRun(runInput: WorkflowRun): boolean {
     const run = runInput;
+    if (run.resultArtifact) {
+      this.ensureWorkflowArtifactReference(run.resultArtifact, run.createdAt);
+    }
     const result = this.db
       .query(
         `INSERT INTO workflow_runs (
@@ -565,7 +686,7 @@ export class DurableWorkflowStore {
         run.progressTarget === null ? null : JSON.stringify(run.progressTarget),
         run.terminalDetail,
         run.result === null ? null : JSON.stringify(run.result),
-        run.resultArtifactId,
+        run.resultArtifact === null ? null : encodeWorkflowArtifactReference(run.resultArtifact),
         run.claimedBy,
         run.claimedAt,
         run.createdAt,
@@ -1138,7 +1259,7 @@ export class DurableWorkflowStore {
     now: number;
     detail?: string | null;
     result?: WorkflowRun["result"];
-    resultArtifactId?: string | null;
+    resultArtifact?: WorkflowArtifactReference | null;
   }): boolean {
     if (!canTransitionWorkflowRun(input.from, input.to)) {
       return false;
@@ -1147,6 +1268,9 @@ export class DurableWorkflowStore {
     if (!current) return false;
     if (current.state === input.to) return true;
     if (current.state !== input.from) return false;
+    if (input.resultArtifact) {
+      this.ensureWorkflowArtifactReference(input.resultArtifact, input.now);
+    }
     if (input.from === "paused" && input.to === "queued") {
       return runWorkflowTransactionForStoreHost(this.db, "resume-run", () => {
         const readPaused = this.getRun(input.runId).match({
@@ -1186,7 +1310,9 @@ export class DurableWorkflowStore {
         input.to,
         input.detail ?? current.terminalDetail,
         resultJson,
-        input.resultArtifactId === undefined ? current.resultArtifactId : input.resultArtifactId,
+        input.resultArtifact === undefined
+          ? encodeNullableWorkflowArtifactReference(current.resultArtifact)
+          : encodeNullableWorkflowArtifactReference(input.resultArtifact),
         input.to,
         input.now,
         terminal,
@@ -1206,9 +1332,12 @@ export class DurableWorkflowStore {
     now: number;
     detail: string;
     result: WorkflowRun["result"];
-    resultArtifactId: string | null;
+    resultArtifact: WorkflowArtifactReference | null;
   }): boolean {
     return runWorkflowTransactionForStoreHost(this.db, "terminalize-run", () => {
+      if (input.resultArtifact) {
+        this.ensureWorkflowArtifactReference(input.resultArtifact, input.now);
+      }
       const readRun = this.getRun(input.runId).match({
         ok: (value) => () => value,
         err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
@@ -1250,7 +1379,9 @@ export class DurableWorkflowStore {
           input.to,
           input.detail,
           input.result === null ? null : JSON.stringify(input.result),
-          input.resultArtifactId,
+          input.resultArtifact === null
+            ? null
+            : encodeWorkflowArtifactReference(input.resultArtifact),
           input.now,
           input.now,
           input.runId,
@@ -1657,7 +1788,9 @@ export class DurableWorkflowStore {
         operation.attempt,
         operation.requestId,
         operation.output === null ? null : JSON.stringify(operation.output),
-        operation.resultArtifactId,
+        operation.resultArtifact === null
+          ? null
+          : encodeWorkflowArtifactReference(operation.resultArtifact),
         operation.error,
         operation.usage === null ? null : JSON.stringify(operation.usage),
         operation.claimedBy,
@@ -1937,17 +2070,20 @@ export class DurableWorkflowStore {
     state: "resolved" | "failed" | "cancelled";
     detail?: string;
     output?: WorkflowOperation["output"];
-    resultArtifactId?: string | null;
+    resultArtifact?: WorkflowArtifactReference | null;
     usage?: WorkflowOperation["usage"];
     now: number;
   }): boolean {
     const output = input.output ?? null;
     const usage = input.usage ?? null;
-    if (input.state === "resolved" && output === null && !input.resultArtifactId) return false;
+    if (input.state === "resolved" && output === null && !input.resultArtifact) return false;
     return runWorkflowResultTransactionForStoreHost<boolean, DurableWorkflowInvariantViolation>(
       this.db,
       "record-workflow-request-terminal",
       () => {
+        if (input.resultArtifact) {
+          this.ensureWorkflowArtifactReference(input.resultArtifact, input.now);
+        }
         const inserted = this.db
           .query(
             `INSERT INTO workflow_request_terminal_receipts (
@@ -1971,7 +2107,9 @@ export class DurableWorkflowStore {
             input.state,
             input.detail ?? null,
             output === null ? null : JSON.stringify(output),
-            input.resultArtifactId ?? null,
+            input.resultArtifact === undefined || input.resultArtifact === null
+              ? null
+              : encodeWorkflowArtifactReference(input.resultArtifact),
             usage === null ? null : JSON.stringify(usage),
             input.now,
             input.requestId,
@@ -2349,7 +2487,7 @@ export class DurableWorkflowStore {
     now: number;
     requestId?: string | null;
     output?: WorkflowOperation["output"];
-    resultArtifactId?: string | null;
+    resultArtifact?: WorkflowArtifactReference | null;
     error?: string | null;
     usage?: WorkflowOperation["usage"];
     runOwnerId: string;
@@ -2361,6 +2499,9 @@ export class DurableWorkflowStore {
     if (!current) return false;
     if (current.state === input.to) return true;
     if (current.state !== input.from) return false;
+    if (input.resultArtifact) {
+      this.ensureWorkflowArtifactReference(input.resultArtifact, input.now);
+    }
     const terminal = ["succeeded", "failed", "cancelled", "timed_out"].includes(input.to);
     let outputJson: string | null;
     if (input.output === undefined) {
@@ -2395,7 +2536,9 @@ export class DurableWorkflowStore {
         input.to,
         input.requestId === undefined ? current.requestId : input.requestId,
         outputJson,
-        input.resultArtifactId === undefined ? current.resultArtifactId : input.resultArtifactId,
+        input.resultArtifact === undefined
+          ? encodeNullableWorkflowArtifactReference(current.resultArtifact)
+          : encodeNullableWorkflowArtifactReference(input.resultArtifact),
         input.error === undefined ? current.error : input.error,
         usageJson,
         input.to,
@@ -2419,7 +2562,7 @@ export class DurableWorkflowStore {
     to: "succeeded" | "failed" | "cancelled" | "timed_out";
     now: number;
     output?: WorkflowOperation["output"];
-    resultArtifactId?: string | null;
+    resultArtifact?: WorkflowArtifactReference | null;
     error?: string | null;
     usage?: WorkflowOperation["usage"];
     runOwnerId: string;

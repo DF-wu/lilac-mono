@@ -122,11 +122,17 @@ export function decodeMiniLilacTodos(
       }),
     );
   }
-  let value: unknown;
-  try {
-    value = JSON.parse(input.row.todos_json);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
+  const todosJson = input.row.todos_json;
+  const revision = input.row.revision;
+  const parsed = Result.try<unknown, unknown>({
+    try: () => JSON.parse(todosJson),
+    catch: (cause) => cause,
+  });
+  const parsedOutcome = parsed.match<
+    { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly error: unknown }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+  if (!parsedOutcome.ok) {
+    if (Panic.is(parsedOutcome.error)) throw parsedOutcome.error;
     return Result.err(
       new MalformedSerialization(
         context({
@@ -137,9 +143,10 @@ export function decodeMiniLilacTodos(
       ),
     );
   }
+  const value = parsedOutcome.value;
   const todos = miniLilacTodosSchema.safeParse(value);
   const state = todos.success
-    ? miniLilacTodoStateSchema.safeParse({ revision: input.row.revision, todos: todos.data })
+    ? miniLilacTodoStateSchema.safeParse({ revision, todos: todos.data })
     : todos;
   if (!state.success) {
     return Result.err(
@@ -160,33 +167,49 @@ export function readMiniLilacTodos(
   MiniLilacTodoState,
   PersistedDataError | MiniLilacSqliteDriverFailure | MiniLilacHistoryRecordMissing
 > {
-  try {
-    const session = database.query("SELECT 1 FROM sessions WHERE id = ?").get(sessionId);
-    if (!session) {
-      return Result.err(
-        new MiniLilacHistoryRecordMissing({
-          recordKind: "session",
-          recordId: sessionId,
-          message: `Session '${sessionId}' was not found`,
-        }),
-      );
-    }
-    const row = database
-      .query("SELECT revision, todos_json FROM session_todos WHERE session_id = ?")
-      .get(sessionId);
-    const decoded = decodeMiniLilacTodos({
-      row,
-      schemaVersion: CURRENT_VERSION,
-      recordId: sessionId,
-    });
-    return decoded.map((value) => value.value);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    if (!(cause instanceof Error)) throw cause;
-    const driverFailure = classifyMiniLilacSqliteDriverFailure("getTodos", cause);
-    if (driverFailure !== undefined) return Result.err(driverFailure);
-    throw cause;
-  }
+  const read = Result.try<
+    ResultType<MiniLilacTodoState, PersistedDataError | MiniLilacHistoryRecordMissing>,
+    unknown
+  >({
+    try: () => {
+      const session = database.query("SELECT 1 FROM sessions WHERE id = ?").get(sessionId);
+      if (!session) {
+        return Result.err(
+          new MiniLilacHistoryRecordMissing({
+            recordKind: "session",
+            recordId: sessionId,
+            message: `Session '${sessionId}' was not found`,
+          }),
+        );
+      }
+      const row = database
+        .query("SELECT revision, todos_json FROM session_todos WHERE session_id = ?")
+        .get(sessionId);
+      const decoded = decodeMiniLilacTodos({
+        row,
+        schemaVersion: CURRENT_VERSION,
+        recordId: sessionId,
+      });
+      return decoded.map((value) => value.value);
+    },
+    catch: (cause) => cause,
+  });
+  const readOutcome = read.match<
+    | {
+        readonly ok: true;
+        readonly value: ResultType<
+          MiniLilacTodoState,
+          PersistedDataError | MiniLilacHistoryRecordMissing
+        >;
+      }
+    | { readonly ok: false; readonly error: unknown }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+  if (readOutcome.ok) return readOutcome.value;
+  if (Panic.is(readOutcome.error)) throw readOutcome.error;
+  if (!(readOutcome.error instanceof Error)) throw readOutcome.error;
+  const driverFailure = classifyMiniLilacSqliteDriverFailure("getTodos", readOutcome.error);
+  if (driverFailure !== undefined) return Result.err(driverFailure);
+  throw readOutcome.error;
 }
 
 export const miniLilacTodosCodecCases = {

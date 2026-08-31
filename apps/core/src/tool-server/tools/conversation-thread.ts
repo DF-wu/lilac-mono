@@ -1,5 +1,4 @@
 import { z } from "zod";
-import { isRecord } from "@stanley2058/lilac-utils";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import {
   serverToolFailure,
@@ -108,13 +107,36 @@ const CONVERSATION_THREAD_CALLABLE_IDS = {
   runSummarization: "conversation.thread.runSummarization",
 } as const;
 
-function conversationThreadFailure(error: unknown): ServerToolFailure {
+type ConversationThreadCapturedFailure = {
+  readonly cause: Error | Panic;
+  readonly _tag?: string;
+  readonly message: string;
+};
+
+function captureConversationThreadFailure(error: unknown): ConversationThreadCapturedFailure {
+  const tag =
+    typeof error === "object" && error !== null && "_tag" in error && typeof error._tag === "string"
+      ? error._tag
+      : undefined;
+  const message =
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof error.message === "string"
+      ? error.message
+      : "Conversation thread operation failed";
+  if (Panic.is(error)) return { cause: error, _tag: tag, message };
+  if (error instanceof Error) return { cause: error, _tag: tag, message };
+  return { cause: new Error(message, { cause: error }), _tag: tag, message };
+}
+
+function conversationThreadFailure(
+  error: Error | Panic | { readonly _tag?: string; readonly message: string },
+): ServerToolFailure {
   if (Panic.is(error)) preserveToolPanic(error);
 
-  const tagged = isRecord(error) ? error : {};
-  const tag = typeof tagged._tag === "string" ? tagged._tag : undefined;
-  const message =
-    typeof tagged.message === "string" ? tagged.message : "Conversation thread operation failed";
+  const tag = "_tag" in error && typeof error._tag === "string" ? error._tag : undefined;
+  const message = error.message;
   const normalized = message.toLowerCase();
   switch (tag) {
     case "ConversationThreadInvalidInput":
@@ -168,9 +190,14 @@ function conversationThreadServerFailure(
 async function captureConversationThreadOperation<TValue>(
   operation: () => Promise<TValue>,
 ): Promise<ResultType<TValue, ServerToolFailure>> {
-  return Result.tryPromise({
-    try: operation,
-    catch: conversationThreadFailure,
+  return (
+    await Result.tryPromise({
+      try: operation,
+      catch: captureConversationThreadFailure,
+    })
+  ).mapError((failure) => {
+    if (Panic.is(failure.cause)) return preserveToolPanic(failure.cause);
+    return conversationThreadFailure(failure);
   });
 }
 

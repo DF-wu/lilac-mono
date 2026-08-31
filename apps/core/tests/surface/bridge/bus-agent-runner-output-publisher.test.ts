@@ -29,6 +29,7 @@ function deferred<T>() {
 function createRecordingRawBus(options?: {
   beforePublish?: (type: string) => Promise<void>;
   failTypes?: ReadonlySet<string>;
+  replayDeadline?: number;
 }): RawBus & { messages: Array<Message<unknown>> } {
   const messages: Array<Message<unknown>> = [];
   return {
@@ -46,7 +47,13 @@ function createRecordingRawBus(options?: {
         key: opts.key,
         headers: opts.headers,
       });
-      return { id, cursor: id };
+      return {
+        id,
+        cursor: id,
+        ...(options?.replayDeadline === undefined
+          ? {}
+          : { replayDeadline: options.replayDeadline }),
+      };
     },
     subscribe: async (
       _topic: string,
@@ -104,6 +111,15 @@ function createPublisher(
 }
 
 describe("request-local agent output publisher", () => {
+  it("records the final response replay deadline for request terminalization", async () => {
+    const raw = createRecordingRawBus({ replayDeadline: 12_345 });
+    const publisher = createPublisher(raw);
+
+    await publisher.publishResponseText({ finalText: "done" });
+
+    expect(publisher.getFinalReplayDeadline()).toBe(12_345);
+  });
+
   it("flushes adjacent text after 40ms and reconstructs it exactly", async () => {
     const raw = createRecordingRawBus();
     const scheduler = createManualScheduler();

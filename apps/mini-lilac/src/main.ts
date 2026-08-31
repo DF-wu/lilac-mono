@@ -56,13 +56,27 @@ async function captureCommand<T>(
   command: "cli" | "server" | "tui",
   operation: () => Promise<T>,
 ): Promise<ResultType<T, MiniLilacCommandFailed>> {
-  try {
-    return Result.ok(await operation());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
+  type CapturedCommandFailure =
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "failure"; readonly error: MiniLilacCommandFailed };
+  function captureCommandFailure<Cause>(cause: Cause): CapturedCommandFailure {
+    if (Panic.is(cause)) return { kind: "panic", panic: cause };
     const message = cause instanceof Error ? cause.message : "Mini Lilac command failed";
-    return Result.err(new MiniLilacCommandFailed({ command, cause, message }));
+    return {
+      kind: "failure",
+      error: new MiniLilacCommandFailed({ command, cause, message }),
+    };
   }
+  const attempted = await Result.tryPromise({ try: operation, catch: captureCommandFailure });
+  const settlement = attempted.match<
+    { readonly kind: "success"; readonly value: T } | CapturedCommandFailure
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: (failure) => failure,
+  });
+  if (settlement.kind === "success") return Result.ok(settlement.value);
+  if (settlement.kind === "panic") throw settlement.panic;
+  return Result.err(settlement.error);
 }
 
 export async function runMiniLilac(

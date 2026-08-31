@@ -46,6 +46,7 @@ describe("LilacBus Result APIs", () => {
     const raw = rawBusWithFetch(async () => ({ messages: [] }));
     const bus = createLilacBus(raw);
     const missingRequestId = await bus.publish(lilacEventTypes.CmdRequestMessage, {
+      requestDeliveryId: crypto.randomUUID(),
       queue: "prompt",
       messages: [{ role: "user", content: "hello" }],
     });
@@ -85,11 +86,98 @@ describe("LilacBus Result APIs", () => {
     ).rejects.toBe(panic);
   });
 
+  it("returns owned failures for unsupported and failed request publication claim operations", async () => {
+    const raw = rawBusWithFetch(async () => ({ messages: [] }));
+    const bus = createLilacBus(raw);
+    const requestDeliveryId = crypto.randomUUID();
+    const claim = { requestDeliveryId, token: crypto.randomUUID() };
+    const data = {
+      requestDeliveryId,
+      queue: "prompt" as const,
+      messages: [{ role: "user" as const, content: "hello" }],
+    };
+    const options = { headers: { request_id: "request-claim-result" } };
+
+    const unsupportedAcquire = await bus.acquireRequestPublicationClaim(requestDeliveryId);
+    expect(unsupportedAcquire.status).toBe("error");
+    if (unsupportedAcquire.status === "error") {
+      expect(unsupportedAcquire.error._tag).toBe("EventRequestPublicationClaimUnsupported");
+      expect(unsupportedAcquire.error.operation).toBe("acquire");
+    }
+    const unsupportedPublish = await bus.publishClaimedRequest(data, claim, options);
+    expect(unsupportedPublish.status).toBe("error");
+    if (unsupportedPublish.status === "error") {
+      expect(unsupportedPublish.error._tag).toBe("EventRequestPublicationClaimUnsupported");
+    }
+    expect(await bus.confirmRequestPublication(claim, "1-0")).toMatchObject({
+      status: "error",
+      error: { _tag: "EventRequestPublicationConfirmationUnsupported" },
+    });
+    expect(await bus.abandonRequestPublicationClaim(claim)).toMatchObject({
+      status: "error",
+      error: {
+        _tag: "EventRequestPublicationClaimUnsupported",
+        operation: "abandon",
+      },
+    });
+
+    raw.acquireRequestPublicationClaim = async () => {
+      throw new Error("redis unavailable");
+    };
+    const failedAcquire = await bus.acquireRequestPublicationClaim(requestDeliveryId);
+    expect(failedAcquire.status).toBe("error");
+    if (failedAcquire.status === "error") {
+      expect(failedAcquire.error._tag).toBe("EventRequestPublicationClaimFailed");
+    }
+  });
+
   it("returns unsupported topic operations as owned Results", async () => {
     const bus = createLilacBus(rawBusWithFetch(async () => ({ messages: [] })));
     expect((await bus.getTopicWatermark("evt.adapter")).status).toBe("error");
     expect((await bus.trimTopicBeforeCheckpoint("evt.adapter", "1-0", 10)).status).toBe("error");
     expect((await bus.retireTopicConsumerGroup("evt.adapter", "old-group")).status).toBe("error");
+  });
+
+  it("reports present, absent, uncertain, and unavailable output stream expiry outcomes", async () => {
+    const raw = rawBusWithFetch(async () => ({ messages: [] }));
+    const bus = createLilacBus(raw);
+
+    const unsupported = await bus.getOutputStreamExpiry("request-unsupported");
+    expect(unsupported.status).toBe("error");
+    if (unsupported.status === "error") {
+      expect(unsupported.error._tag).toBe("EventOutputStreamExpiryUnavailable");
+      expect(unsupported.error.reason).toBe("unsupported");
+    }
+
+    raw.readOutputStreamExpiry = async (topic) => ({
+      kind: "present",
+      expiresAt: topic === "out.req.request-present" ? 123_456 : 654_321,
+    });
+    expect(await bus.getOutputStreamExpiry("request-present")).toEqual(
+      Result.ok({ kind: "present", expiresAt: 123_456 }),
+    );
+
+    raw.readOutputStreamExpiry = async () => ({ kind: "absent" });
+    expect(await bus.getOutputStreamExpiry("request-absent")).toEqual(
+      Result.ok({ kind: "absent" }),
+    );
+
+    raw.readOutputStreamExpiry = async () => ({
+      kind: "uncertain",
+      reason: "stream-has-no-expiry",
+    });
+    const uncertain = await bus.getOutputStreamExpiry("request-uncertain");
+    expect(uncertain.status).toBe("error");
+    if (uncertain.status === "error") expect(uncertain.error.reason).toBe("expiry-uncertain");
+
+    raw.readOutputStreamExpiry = async () => {
+      throw new Error("redis unavailable");
+    };
+    const unavailable = await bus.getOutputStreamExpiry("request-unavailable");
+    expect(unavailable.status).toBe("error");
+    if (unavailable.status === "error") {
+      expect(unavailable.error.reason).toBe("transport-unavailable");
+    }
   });
 
   it("returns raw close rejection as an owned Result", async () => {
@@ -136,7 +224,11 @@ describe("LilacBus Result APIs", () => {
         ts: 1,
         key: "request-1",
         headers: { request_id: "request-1" },
-        data: { queue: "prompt", messages: [{ role: "user", content: "hello" }] },
+        data: {
+          requestDeliveryId: crypto.randomUUID(),
+          queue: "prompt",
+          messages: [{ role: "user", content: "hello" }],
+        },
       },
       {
         cursor: "1-0",
@@ -188,7 +280,11 @@ describe("LilacBus Result APIs", () => {
           ts: 1,
           key: "request-1",
           headers: { request_id: "request-1" },
-          data: { queue: "prompt", messages: [{ role: "user", content: "hello" }] },
+          data: {
+            requestDeliveryId: crypto.randomUUID(),
+            queue: "prompt",
+            messages: [{ role: "user", content: "hello" }],
+          },
         },
         {
           cursor: "1-0",
@@ -232,7 +328,9 @@ describe("LilacBus Result APIs", () => {
       },
     });
 
-    const fetched = await bus.fetchTopic("cmd.request", { offset: { type: "begin" } });
+    const fetched = await bus.fetchTopic("cmd.request", {
+      offset: { type: "begin" },
+    });
     expect(fetched.status).toBe("error");
     if (fetched.status === "error") expect(fetched.error._tag).toBe("EventFetchContractInvalid");
     expect(diagnostics).toEqual([

@@ -36,7 +36,7 @@ describe("conversation thread summarization worker cleanup", () => {
         const closed: ThreadSummarizationWorkerCleanup["label"][] = [];
         const cleanupFailures: ThreadSummarizationWorkerCleanupFailure[] = [];
 
-        const operation = await runThreadSummarizationWorkerOperation({
+        const operation = runThreadSummarizationWorkerOperation({
           run: async () => {
             throw operationPanic;
           },
@@ -44,8 +44,7 @@ describe("conversation thread summarization worker cleanup", () => {
           onCleanupFailure: (failure) => cleanupFailures.push(failure),
         });
 
-        expect(operation.status).toBe("error");
-        if (operation.status === "error") expect(operation.error).toBe(operationPanic);
+        await expect(operation).rejects.toBe(operationPanic);
         expect(closed).toEqual([...CLEANUP_LABELS]);
         expect(cleanupFailures).toHaveLength(1);
         expect(cleanupFailures[0]?.cleanup.label).toBe(failingLabel);
@@ -80,14 +79,13 @@ describe("conversation thread summarization worker cleanup", () => {
       const cleanupPanic = new Panic({ message: `${failingLabel} close invariant failed` });
       const closed: ThreadSummarizationWorkerCleanup["label"][] = [];
 
-      const operation = await runThreadSummarizationWorkerOperation({
+      const operation = runThreadSummarizationWorkerOperation({
         run: async () => {},
         cleanups: cleanupsThatFail(failingLabel, cleanupPanic, closed),
         onCleanupFailure: () => {},
       });
 
-      expect(operation.status).toBe("error");
-      if (operation.status === "error") expect(operation.error).toBe(cleanupPanic);
+      await expect(operation).rejects.toBe(cleanupPanic);
       expect(closed).toEqual([...CLEANUP_LABELS]);
     });
   }
@@ -99,7 +97,7 @@ describe("conversation thread summarization worker cleanup", () => {
     const closed: ThreadSummarizationWorkerCleanup["label"][] = [];
     const cleanupFailures: ThreadSummarizationWorkerCleanupFailure[] = [];
 
-    const operation = await runThreadSummarizationWorkerOperation({
+    const operation = runThreadSummarizationWorkerOperation({
       run: async () => {
         throw operationPanic;
       },
@@ -107,8 +105,7 @@ describe("conversation thread summarization worker cleanup", () => {
       onCleanupFailure: (failure) => cleanupFailures.push(failure),
     });
 
-    expect(operation.status).toBe("error");
-    if (operation.status === "error") expect(operation.error).toBe(operationPanic);
+    await expect(operation).rejects.toBe(operationPanic);
     expect(closed).toEqual([...CLEANUP_LABELS]);
     expect(cleanupFailures).toEqual([
       {
@@ -121,7 +118,7 @@ describe("conversation thread summarization worker cleanup", () => {
 
   it("promotes an unexpected operation defect to Panic supervision", async () => {
     const defect = new Error("unexpected SDK defect");
-    const operation = await runThreadSummarizationWorkerOperation({
+    const operation = runThreadSummarizationWorkerOperation({
       run: async () => {
         throw defect;
       },
@@ -129,11 +126,8 @@ describe("conversation thread summarization worker cleanup", () => {
       onCleanupFailure: () => {},
     });
 
-    expect(operation.status).toBe("error");
-    if (operation.status === "error") {
-      expect(Panic.is(operation.error)).toBe(true);
-      expect(operation.error).toHaveProperty("cause", defect);
-    }
+    await expect(operation).rejects.toBeInstanceOf(Panic);
+    await expect(operation).rejects.toHaveProperty("cause", defect);
   });
 
   it("preserves onCleanupFailure Panic identity", async () => {

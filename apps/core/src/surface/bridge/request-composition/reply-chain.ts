@@ -13,6 +13,10 @@ import type { MergedChunk, ReplyChainMessage } from "./types";
 
 const DEFAULT_MENTION_BLOCK_LIMIT = 50;
 
+export type ResolveDiscordMessagesByRefs = (
+  refs: readonly MsgRef[],
+) => Promise<SurfaceOperationResult<SurfaceMessage[]>>;
+
 function continueResult<T, E, ROk, RErr>(
   result: ResultType<T, E>,
   branches: { ok: (value: T) => ROk; err: (error: E) => RErr },
@@ -25,15 +29,16 @@ function continueResult<T, E, ROk, RErr>(
 }
 
 function compareDiscordSnowflakeLike(a: string, b: string): number {
-  try {
-    const ai = BigInt(a);
-    const bi = BigInt(b);
-    if (ai < bi) return -1;
-    if (ai > bi) return 1;
-    return 0;
-  } catch {
-    return a.localeCompare(b);
-  }
+  return Result.try({
+    try: () => {
+      const ai = BigInt(a);
+      const bi = BigInt(b);
+      if (ai < bi) return -1;
+      if (ai > bi) return 1;
+      return 0;
+    },
+    catch: () => null,
+  }).match({ ok: (order) => order, err: () => a.localeCompare(b) });
 }
 
 export function getForwardSnapshotTextFromRaw(raw: unknown): string | undefined {
@@ -123,9 +128,11 @@ async function readMessagesByRefs(input: {
   adapter: SurfaceAdapter;
   refs: readonly MsgRef[];
   concurrency?: number;
+  resolveMessagesByRefs?: ResolveDiscordMessagesByRefs;
 }): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
   const { adapter, refs } = input;
   if (refs.length === 0) return Result.ok([]);
+  if (input.resolveMessagesByRefs) return input.resolveMessagesByRefs(refs);
 
   const pairs = await mapWithConcurrency({
     items: refs,
@@ -156,7 +163,10 @@ async function readMessagesByRefs(input: {
 export async function resolveMergeBlockEndingAt(
   adapter: SurfaceAdapter,
   triggerMsg: SurfaceMessage,
-  opts?: { limit?: number },
+  opts?: {
+    limit?: number;
+    resolveMessagesByRefs?: ResolveDiscordMessagesByRefs;
+  },
 ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
   const limit = opts?.limit ?? DEFAULT_MENTION_BLOCK_LIMIT;
 
@@ -169,6 +179,7 @@ export async function resolveMergeBlockEndingAt(
         adapter,
         refs,
         concurrency: 8,
+        resolveMessagesByRefs: opts?.resolveMessagesByRefs,
       });
       const list = continueResult(listed, { ok: (value) => value, err: () => null });
       if (list === null) return listed;
@@ -238,6 +249,24 @@ export function findEarliestReplyAnchor(block: readonly SurfaceMessage[]): Surfa
   return null;
 }
 
+export async function findEarliestEffectiveReplyAnchor(
+  adapter: SurfaceAdapter,
+  block: readonly SurfaceMessage[],
+): Promise<SurfaceMessage | null> {
+  const directAnchor = findEarliestReplyAnchor(block);
+  if (directAnchor) return directAnchor;
+
+  const planned = await mapWithConcurrency({
+    items: block,
+    concurrency: 8,
+    run: async (message) => {
+      const result = await adapter.planReplyChain(message.ref);
+      return continueResult(result, { ok: (refs) => refs.length > 1, err: () => false });
+    },
+  });
+  return block.find((_, index) => planned[index]) ?? null;
+}
+
 export async function fetchReplyChainFrom(
   adapter: SurfaceAdapter,
   opts: {
@@ -248,6 +277,7 @@ export async function fetchReplyChainFrom(
     startMsgRef: MsgRef;
     /** Maximum number of merged Discord UI groups to traverse. */
     maxDepth?: number;
+    resolveMessagesByRefs?: ResolveDiscordMessagesByRefs;
   },
 ): Promise<SurfaceOperationResult<ReplyChainMessage[]>> {
   const maxGroupCount = opts.maxDepth ?? 20;
@@ -284,6 +314,7 @@ export async function fetchReplyChainFrom(
             adapter,
             refs: refsToRead,
             concurrency: 8,
+            resolveMessagesByRefs: opts.resolveMessagesByRefs,
           });
           return continueResult(messages, {
             err: (error) => Promise.resolve(Result.err(error)),
@@ -299,14 +330,20 @@ export async function fetchReplyChainFrom(
                 [...plannedRefKeys].every((key) => resolvedRefKeys.has(key));
 
               if (allResolved && messageValues.length > 0) return Result.ok(messageValues);
-              const cursorResult = await adapter.readMsg(cursorRef);
+              const cursorResult = opts.resolveMessagesByRefs
+                ? await opts
+                    .resolveMessagesByRefs([cursorRef])
+                    .then((resolved) => resolved.map((messages) => messages[0] ?? null))
+                : await adapter.readMsg(cursorRef);
               const continueCursor = cursorResult.match<
                 () => Promise<SurfaceOperationResult<SurfaceMessage[]>>
               >({
                 err: (error) => async () => Result.err(error),
                 ok: (cursor) => () =>
                   cursor
-                    ? resolveMergeBlockEndingAt(adapter, cursor)
+                    ? resolveMergeBlockEndingAt(adapter, cursor, {
+                        resolveMessagesByRefs: opts.resolveMessagesByRefs,
+                      })
                     : Promise.resolve(Result.ok([])),
               });
               return continueCursor();
@@ -320,10 +357,6 @@ export async function fetchReplyChainFrom(
         ok: (resolvedGroups) => {
           const flattened = resolvedGroups.flat();
           if (flattened.length === 0) return null;
-          flattened.sort((a, b) => {
-            if (a.ts !== b.ts) return a.ts - b.ts;
-            return compareDiscordSnowflakeLike(a.ref.messageId, b.ref.messageId);
-          });
           return Result.ok(dedupeByMessageId(flattened.map((m) => toReplyChainMessage(m))));
         },
       });
@@ -340,7 +373,9 @@ export async function fetchReplyChainFrom(
     depth: number,
   ): Promise<SurfaceOperationResult<ReplyChainMessage[]>> => {
     if (depth >= maxGroupCount || seenMessageIds.has(cursor.ref.messageId)) return finish();
-    const groupResult = await resolveMergeBlockEndingAt(adapter, cursor);
+    const groupResult = await resolveMergeBlockEndingAt(adapter, cursor, {
+      resolveMessagesByRefs: opts.resolveMessagesByRefs,
+    });
     const continueGroup = groupResult.match<
       () => Promise<SurfaceOperationResult<ReplyChainMessage[]>>
     >({
@@ -355,11 +390,16 @@ export async function fetchReplyChainFrom(
         if (!ref.messageId) return finish();
         if (ref.channelId && ref.channelId !== opts.trigger.msgRef.channelId) return finish();
 
-        const next = await adapter.readMsg({
+        const nextRef = {
           platform: opts.platform,
           channelId: opts.trigger.msgRef.channelId,
           messageId: ref.messageId,
-        });
+        } as const;
+        const next = opts.resolveMessagesByRefs
+          ? await opts
+              .resolveMessagesByRefs([nextRef])
+              .then((resolved) => resolved.map((messages) => messages[0] ?? null))
+          : await adapter.readMsg(nextRef);
         const continueNext = next.match<() => Promise<SurfaceOperationResult<ReplyChainMessage[]>>>(
           {
             err: (error) => async () => Result.err(error),
@@ -372,7 +412,11 @@ export async function fetchReplyChainFrom(
     return continueGroup();
   };
 
-  const start = await adapter.readMsg(opts.startMsgRef);
+  const start = opts.resolveMessagesByRefs
+    ? await opts
+        .resolveMessagesByRefs([opts.startMsgRef])
+        .then((resolved) => resolved.map((messages) => messages[0] ?? null))
+    : await adapter.readMsg(opts.startMsgRef);
   const continueStart = start.match<() => Promise<SurfaceOperationResult<ReplyChainMessage[]>>>({
     err: (error) => async () => Result.err(error),
     ok: (value) => () => (value ? walk(value, 0) : Promise.resolve(Result.ok([]))),
@@ -388,15 +432,18 @@ export async function fetchMentionThreadContext(
     botName: string;
     triggerMsg: SurfaceMessage;
     maxDepth?: number;
+    resolveMessagesByRefs?: ResolveDiscordMessagesByRefs;
   },
 ): Promise<SurfaceOperationResult<ReplyChainMessage[]>> {
-  const blockResult = await resolveMergeBlockEndingAt(adapter, params.triggerMsg);
+  const blockResult = await resolveMergeBlockEndingAt(adapter, params.triggerMsg, {
+    resolveMessagesByRefs: params.resolveMessagesByRefs,
+  });
   const continueBlock = blockResult.match<
     () => Promise<SurfaceOperationResult<ReplyChainMessage[]>>
   >({
     err: (error) => async () => Result.err(error),
     ok: (block) => async () => {
-      const anchor = findEarliestReplyAnchor(block);
+      const anchor = await findEarliestEffectiveReplyAnchor(adapter, block);
       const startMsgRef = anchor?.ref ?? params.triggerMsg.ref;
       const chainResult = await fetchReplyChainFrom(adapter, {
         platform: params.platform,
@@ -405,6 +452,7 @@ export async function fetchMentionThreadContext(
         trigger: { type: "mention", msgRef: params.triggerMsg.ref },
         startMsgRef,
         maxDepth: params.maxDepth,
+        resolveMessagesByRefs: params.resolveMessagesByRefs,
       });
       return continueResult(chainResult, {
         err: (error) => Result.err(error),
