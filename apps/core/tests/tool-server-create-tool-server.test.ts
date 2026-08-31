@@ -3560,6 +3560,7 @@ describe("createToolServer", () => {
 
   it("invokes the unhealthy watchdog after repeated live failures", async () => {
     const unhealthySnapshots: ToolServerHealthSnapshot[] = [];
+    const unhealthy = Promise.withResolvers<ToolServerHealthSnapshot>();
     const server = createToolServer({
       tools: [],
       healthProvider: () => ({
@@ -3574,6 +3575,7 @@ describe("createToolServer", () => {
       }),
       onUnhealthy: async (snapshot) => {
         unhealthySnapshots.push(snapshot);
+        unhealthy.resolve(snapshot);
       },
       healthConfig: {
         watchdogIntervalMs: 10,
@@ -3584,16 +3586,20 @@ describe("createToolServer", () => {
     await server.init();
     await server.start(0);
 
-    // test-wait-justification: allows two real watchdog intervals to trigger the configured unhealthy callback
-    await Bun.sleep(40);
+    const snapshot = await Promise.race([
+      unhealthy.promise,
+      Bun.sleep(1_000).then(() => {
+        throw new Error("Watchdog did not report the unhealthy runtime");
+      }),
+    ]).finally(async () => {
+      await server.stop();
+    });
 
     expect(unhealthySnapshots).toHaveLength(1);
     expect(
-      unhealthySnapshots[0]?.checks.find(
+      snapshot.checks.find(
         (check: ToolServerHealthSnapshot["checks"][number]) => check.name === "runtime.redis",
       )?.ok,
     ).toBe(false);
-
-    await server.stop();
   });
 });
