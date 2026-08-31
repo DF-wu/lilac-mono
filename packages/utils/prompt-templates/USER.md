@@ -1,13 +1,24 @@
-# USER.md - About Your Human
+# USER.md - Primary user
 
-_Learn about the person you're helping. Update this as you go._
+Keep facts in editable lists. Remove stale context instead of accumulating a biography.
 
-- **Name:**
-- **What to call them:**
-- **Pronouns:** _(optional)_
-- **Timezone:**
-- **Notes:**
+## Profile
 
-## Context
+- Name and form of address:
+- Pronouns: _(optional)_
+- Timezone:
+- Work or background:
+- Relationship to the agent:
 
-_(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)_
+## Interaction
+
+- Autonomy and decision-making:
+- Communication:
+- Languages:
+- Preferences:
+- Dislikes:
+- Trust: _(relationship context only; `AGENTS.md` owns operational authorization)_
+
+## Standing context
+
+_(Keep only current facts or preferences that should affect future sessions.)_

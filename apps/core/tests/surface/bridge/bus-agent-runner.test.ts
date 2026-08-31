@@ -11180,6 +11180,13 @@ describe("shouldCancelRunPolicyRequest", () => {
 });
 
 describe("maybeAppendResponseCommentaryPrompt", () => {
+  it("describes commentary and final_answer as response phases", () => {
+    expect(RESPONSE_COMMENTARY_INSTRUCTIONS).toContain("response phases");
+    expect(RESPONSE_COMMENTARY_INSTRUCTIONS).toContain("`commentary` phase");
+    expect(RESPONSE_COMMENTARY_INSTRUCTIONS).toContain("`final_answer` phase");
+    expect(RESPONSE_COMMENTARY_INSTRUCTIONS).not.toContain("Use two channels");
+  });
+
   it("appends commentary guidance for openai provider when enabled", () => {
     const out = maybeAppendResponseCommentaryPrompt({
       baseSystemPrompt: "Base prompt",

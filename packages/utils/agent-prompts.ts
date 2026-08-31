@@ -588,14 +588,10 @@ export async function loadPromptFiles(options?: { dataDir?: string }): Promise<P
   return files;
 }
 
-export function compileSystemPromptFromFiles(
-  files: readonly PromptFile[],
-  basePrompt?: string,
-): string {
-  const lines: string[] = basePrompt ? [basePrompt] : [];
-
+export function compileSystemPromptFromFiles(files: readonly PromptFile[]): string {
+  const lines: string[] = [];
   lines.push("Your system behavior is defined by a set of workspace prompt files.");
-  lines.push("These files are loaded from the local data directory and are authoritative.");
+  lines.push("These local files provide workspace instructions and context for this agent.");
   lines.push("");
 
   for (const f of files) {
@@ -606,20 +602,32 @@ export function compileSystemPromptFromFiles(
   return lines.join("\n").trim();
 }
 
-export async function buildAgentSystemPrompt(options?: {
-  dataDir?: string;
-  basePrompt?: string;
-}): Promise<{
+export async function buildAgentSystemPrompt(options?: { dataDir?: string }): Promise<{
   systemPrompt: string;
   promptDir: string;
   filePaths: string[];
 }> {
   const files = await loadPromptFiles({ dataDir: options?.dataDir });
   return {
-    systemPrompt: compileSystemPromptFromFiles(files, options?.basePrompt),
+    systemPrompt: compileSystemPromptFromFiles(files),
     promptDir: resolvePromptDir({ dataDir: options?.dataDir }),
     filePaths: files.map((f) => f.path),
   };
+}
+
+export function applyBasePromptForProvider(params: {
+  systemPrompt: string;
+  basePrompt?: string;
+  provider: string;
+}): string {
+  const systemPrompt = params.systemPrompt.trim();
+  if (params.provider === "codex") return systemPrompt;
+
+  const basePrompt = params.basePrompt?.trim();
+  if (!basePrompt) return systemPrompt;
+  if (!systemPrompt) return basePrompt;
+
+  return `${basePrompt}\n\n${systemPrompt}`;
 }
 
 export async function promptWorkspaceSignature(options?: { dataDir?: string }): Promise<{

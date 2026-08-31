@@ -33,6 +33,7 @@ import type {
 } from "@stanley2058/lilac-utils";
 import {
   CUSTOM_COMMAND_TOOL_NAME,
+  applyBasePromptForProvider,
   discoverSkills,
   deriveSubagentIdleTimeoutMs,
   env,
@@ -5394,8 +5395,13 @@ export async function startBusAgentRunner(params: {
             resolved: ResolvedModelRef,
             editingToolMode: ReturnType<typeof resolveEditingToolMode>,
           ): string => {
+            const providerSystemPrompt = applyBasePromptForProvider({
+              systemPrompt: cfg.agent.systemPrompt,
+              basePrompt: cfg.basePrompt,
+              provider: resolved.provider,
+            });
             const profilePrompt = {
-              baseSystemPrompt: cfg.agent.systemPrompt,
+              baseSystemPrompt: providerSystemPrompt,
               activeEditingTool: runProfile === "explore" ? null : editingToolMode,
               exploreOverlay: subagents.profiles.explore.promptOverlay,
               generalOverlay: subagents.profiles.general.promptOverlay,
@@ -5966,7 +5972,11 @@ export async function startBusAgentRunner(params: {
                     }
                   : null,
                 systemPolicy: {
-                  base: cfg.agent.systemPrompt,
+                  base: applyBasePromptForProvider({
+                    systemPrompt: cfg.agent.systemPrompt,
+                    basePrompt: cfg.basePrompt,
+                    provider: activeBinding.resolved.provider,
+                  }),
                   profileOverlay: profileConfig?.promptOverlay ?? null,
                   additionalSessionPrompts,
                   skillsSection,

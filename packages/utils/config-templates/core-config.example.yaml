@@ -19,6 +19,8 @@ configVersion: 2
 #   sessionTokenEnv: LILAC_S3_SESSION_TOKEN
 #   forcePathStyle: true
 
+# Codex uses this for Responses instructions when codex_instructions is absent.
+# Other providers prepend it to data/prompts/*.
 basePrompt: "You are Lilac."
 
 tools:
@@ -387,7 +389,8 @@ agent:
         # promptOverlay: |
         #   Assume no prior conversation context; restate assumptions briefly.
 
-# Optional: extra system prompt text prepended to data/prompts/*.
+# Optional base instructions. Codex uses this for Responses instructions when
+# codex_instructions is absent; other providers prepend it to data/prompts/*.
 # basePrompt: |
 #   You are lilac.
 
