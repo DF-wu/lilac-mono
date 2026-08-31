@@ -13,6 +13,7 @@ import {
   HEARTBEAT_PROMPT_FILENAME,
   PROMPT_TEMPLATE_BASELINE_DIRNAME,
   PROMPT_TEMPLATE_STATE_FILENAME,
+  WORKER_PROMPT_FILES,
   ensurePromptWorkspace,
 } from "../agent-prompts";
 
@@ -141,6 +142,13 @@ describe("agent prompts", () => {
 
       for (const name of CORE_PROMPT_FILES) {
         expect(built.systemPrompt).toContain(`# ${name}`);
+      }
+      for (const name of WORKER_PROMPT_FILES) {
+        expect(built.workerSystemPrompt).toContain(`# ${name}`);
+      }
+      for (const name of CORE_PROMPT_FILES) {
+        if ((WORKER_PROMPT_FILES as readonly string[]).includes(name)) continue;
+        expect(built.workerSystemPrompt).not.toContain(`# ${name}`);
       }
       expect(built.systemPrompt).toContain(
         "These local files provide workspace instructions and context for this agent.",

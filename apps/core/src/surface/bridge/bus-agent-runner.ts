@@ -187,7 +187,10 @@ import {
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
 import { recordRequestLatencyStage } from "./request-latency-trace";
-import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
+import {
+  buildSystemPromptForProfile,
+  selectWorkspaceSystemPrompt,
+} from "./bus-agent-runner/subagent-prompt";
 import {
   formatToolLogPreview,
   summarizeToolFailure,
@@ -5403,12 +5406,18 @@ export async function startBusAgentRunner(params: {
               ? buildRestrictedSessionOverlay({ sessionId: next.sessionId })
               : null;
 
+          const workspaceSystemPrompt = selectWorkspaceSystemPrompt({
+            profile: runProfile,
+            primarySystemPrompt: cfg.agent.systemPrompt,
+            workerSystemPrompt: cfg.agent.workerSystemPrompt,
+          });
+
           const buildSystemPrompt = (
             resolved: ResolvedModelRef,
             editingToolMode: ReturnType<typeof resolveEditingToolMode>,
           ): string => {
             const providerSystemPrompt = applyBasePromptForProvider({
-              systemPrompt: cfg.agent.systemPrompt,
+              systemPrompt: workspaceSystemPrompt,
               basePrompt: cfg.basePrompt,
               provider: resolved.provider,
             });
@@ -5985,7 +5994,7 @@ export async function startBusAgentRunner(params: {
                   : null,
                 systemPolicy: {
                   base: applyBasePromptForProvider({
-                    systemPrompt: cfg.agent.systemPrompt,
+                    systemPrompt: workspaceSystemPrompt,
                     basePrompt: cfg.basePrompt,
                     provider: activeBinding.resolved.provider,
                   }),

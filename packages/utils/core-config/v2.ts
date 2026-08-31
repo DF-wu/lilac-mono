@@ -891,6 +891,7 @@ function coreConfigV2ToUniversal(
         },
       },
       systemPrompt: "",
+      workerSystemPrompt: "",
     },
   };
 }

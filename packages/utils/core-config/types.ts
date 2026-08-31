@@ -276,6 +276,7 @@ export type UniversalCoreConfig = {
 
   agent: {
     systemPrompt: string;
+    workerSystemPrompt: string;
     statsForNerds: boolean | { verbose: boolean };
     reasoningDisplay: "none" | "simple" | "detailed";
     idleTimeoutMs: number;

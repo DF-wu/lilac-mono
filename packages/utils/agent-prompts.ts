@@ -42,6 +42,11 @@ const PROMPT_TEMPLATE_STATE_SCHEMA_VERSION = 1 as const;
 
 export type CorePromptFileName = (typeof CORE_PROMPT_FILES)[number];
 
+export const WORKER_PROMPT_FILES = [
+  "AGENTS.md",
+  "TOOLS.md",
+] as const satisfies readonly CorePromptFileName[];
+
 type EnsureResult = {
   promptDir: string;
   ensured: {
@@ -602,14 +607,24 @@ export function compileSystemPromptFromFiles(files: readonly PromptFile[]): stri
   return lines.join("\n").trim();
 }
 
+function selectPromptFiles(
+  files: readonly PromptFile[],
+  names: readonly CorePromptFileName[],
+): PromptFile[] {
+  const included = new Set<CorePromptFileName>(names);
+  return files.filter((file) => included.has(file.name as CorePromptFileName));
+}
+
 export async function buildAgentSystemPrompt(options?: { dataDir?: string }): Promise<{
   systemPrompt: string;
+  workerSystemPrompt: string;
   promptDir: string;
   filePaths: string[];
 }> {
   const files = await loadPromptFiles({ dataDir: options?.dataDir });
   return {
     systemPrompt: compileSystemPromptFromFiles(files),
+    workerSystemPrompt: compileSystemPromptFromFiles(selectPromptFiles(files, WORKER_PROMPT_FILES)),
     promptDir: resolvePromptDir({ dataDir: options?.dataDir }),
     filePaths: files.map((f) => f.path),
   };

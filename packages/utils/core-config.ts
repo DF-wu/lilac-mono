@@ -483,6 +483,7 @@ export async function getCoreConfig(options?: {
     agent: {
       ...cfg.agent,
       systemPrompt: built.systemPrompt,
+      workerSystemPrompt: built.workerSystemPrompt,
     },
   };
 

@@ -774,6 +774,7 @@ function coreConfigV1ToUniversal(
     agent: {
       ...agentRest,
       systemPrompt: "",
+      workerSystemPrompt: "",
       idleTimeoutMs: 15 * 60 * 1000,
       transcriptRetention: {
         maxAgeMs: { kind: "bounded", value: DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS },
