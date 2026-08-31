@@ -1887,6 +1887,15 @@ export function degradeCorePrimaryLineageForMutation(
   return createFreshOnlyLineage(reason, currentCanonicalStart);
 }
 
+export function corePrimaryLineageHasCompactionCheckpoint(
+  lineage: CorePrimaryLineageV2 | undefined,
+): boolean {
+  return (
+    lineage?.state === "complete" &&
+    lineage.segments.some((segment) => segment.atoms.some((atom) => atom.kind === "checkpoint"))
+  );
+}
+
 const AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE = "conversation-thread-auto-inject";
 
 export function appendAutoInjectedThreadSearchLineage(input: {
@@ -4862,6 +4871,9 @@ export async function startBusAgentRunner(params: {
     let customCommandMessages: ModelMessage[] = [];
     let initialMessagesEndWithInjectedTool = false;
     let responseStartIndex = 0;
+    let transcriptHasCompactionCheckpoint = corePrimaryLineageHasCompactionCheckpoint(
+      next.corePrimaryLineage,
+    );
     const runStats: {
       totalUsage?: LanguageModelUsage;
       finalMessages?: ModelMessage[];
@@ -7891,6 +7903,7 @@ export async function startBusAgentRunner(params: {
                   corePrimaryClaudeRuntime.markTerminalFailure(false);
                 }
                 if (isCompactionCheckpoint) {
+                  transcriptHasCompactionCheckpoint = true;
                   logger.info(
                     "compaction checkpoint persisted",
                     formatBridgeLogContext({
@@ -8035,6 +8048,8 @@ export async function startBusAgentRunner(params: {
               model: activeBinding.resolved.spec,
               durationMs: Date.now() - runStartedAt,
               turns: turnEndCount,
+              transcriptMessageCount: (runStats.finalMessages ?? agent.state.messages).length,
+              transcriptHasCompactionCheckpoint,
               finalTextChars: finalText.length,
               ttftMs,
               tokensPerSecond: tps,

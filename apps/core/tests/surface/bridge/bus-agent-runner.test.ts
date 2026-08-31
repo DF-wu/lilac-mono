@@ -85,6 +85,7 @@ import {
   maybeBuildAutoInjectedThreadSearchMessages,
   buildPersistedHeartbeatMessages,
   buildSurfaceMetadataOverlay,
+  corePrimaryLineageHasCompactionCheckpoint,
   isActiveRuntimeModelCompatible,
   markAssistantTextPartEnded,
   markAssistantTextPartStarted,
@@ -2089,6 +2090,30 @@ describe("selectPersistedTranscriptMessages", () => {
       resolveCompactionCheckpointMeta({ ...base, completedCompactionCount: 0 }),
     ).toBeUndefined();
     expect(resolveCompactionCheckpointMeta({ ...base, isPrimary: false })).toBeUndefined();
+  });
+
+  it("detects compaction checkpoint ancestry in complete primary lineage", () => {
+    const messages = [{ role: "assistant", content: "compacted history" }] satisfies ModelMessage[];
+    const lineage = buildCoreLineageManifestV2([
+      {
+        atoms: [
+          {
+            kind: "checkpoint",
+            requestId: "discord:channel:checkpoint",
+            transcriptDigest: "0".repeat(64),
+          },
+        ],
+        canonicalMessages: messages,
+      },
+    ]);
+
+    expect(corePrimaryLineageHasCompactionCheckpoint(lineage)).toBe(true);
+    expect(
+      corePrimaryLineageHasCompactionCheckpoint(
+        degradeCorePrimaryLineageForMutation("test", messages.length),
+      ),
+    ).toBe(false);
+    expect(corePrimaryLineageHasCompactionCheckpoint(undefined)).toBe(false);
   });
 });
 
