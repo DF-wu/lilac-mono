@@ -30,6 +30,7 @@ import {
   createCoreRuntimeFatalReporter,
   joinAgentRunRecoveryHeads,
   openCoreDurableStoresInStartupOrder,
+  recoverAgentRunCheckpointBlobReferences,
   removeFullyReconciledAgentRunTerminalHeads,
   resolveRequestCapabilityIdentity,
   resolveCoreGracefulDrainDeadlineMs,
@@ -254,6 +255,79 @@ describe("delegated request capability identity", () => {
 });
 
 describe("Core runtime startup", () => {
+  it("resets unsafe checkpoint recovery and clears stale blob ownership", () => {
+    const reconcileCalls: Array<
+      readonly { readonly requestDeliveryId: string; readonly messages: readonly object[] }[]
+    > = [];
+    let reconciliationAttempt = 0;
+    const decision = recoverAgentRunCheckpointBlobReferences({
+      heads: new Map([
+        [
+          "delivery-1",
+          {
+            handle: {
+              runId: "delivery-1",
+              requestId: "request-1",
+              sessionId: "session-1",
+              sequence: 3,
+            },
+            state: "active" as const,
+            checkpoint: {
+              version: 1 as const,
+              messages: [{ role: "user" as const, content: "latest" }],
+              retainedRequestDeliveries: [],
+            },
+            previousCheckpoint: {
+              version: 1 as const,
+              messages: [{ role: "user" as const, content: "previous" }],
+              retainedRequestDeliveries: [],
+            },
+            createdAt: 1,
+            updatedAt: 2,
+          },
+        ],
+      ]),
+      reconcile: ({ checkpoints }) => {
+        reconcileCalls.push(checkpoints);
+        reconciliationAttempt += 1;
+        return reconciliationAttempt === 1
+          ? Result.err(new Error("checkpoint blob missing"))
+          : Result.ok(undefined);
+      },
+      resetAll: () => Result.ok(undefined),
+    });
+
+    expect(decision.kind).toBe("reset");
+    expect(reconcileCalls).toEqual([
+      [
+        {
+          requestDeliveryId: "delivery-1",
+          messages: [
+            { role: "user", content: "latest" },
+            { role: "user", content: "previous" },
+          ],
+        },
+      ],
+      [],
+    ]);
+  });
+
+  it("disables checkpoint recovery when its journal cannot reset", () => {
+    const reconciliationError = new Error("checkpoint blob missing");
+    const resetError = new Error("journal reset failed");
+    const decision = recoverAgentRunCheckpointBlobReferences({
+      heads: new Map(),
+      reconcile: () => Result.err(reconciliationError),
+      resetAll: () => Result.err(resetError),
+    });
+
+    expect(decision).toEqual({
+      kind: "disabled",
+      reconciliationError,
+      resetError,
+    });
+  });
+
   it("stops WAL recovery after a run reset fails and falls every accepted owner back to original work", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "lilac-core-recovery-join-"));
     const dbPath = path.join(dir, "request-delivery.db");
@@ -709,11 +783,13 @@ describe("Core runtime startup", () => {
         finalReplayDeadline: 99,
       });
 
-      removeFullyReconciledAgentRunTerminalHeads({
-        heads: joined.heads,
-        requestDeliveryStore: store,
-        journal,
-      });
+      expect(
+        removeFullyReconciledAgentRunTerminalHeads({
+          heads: joined.heads,
+          requestDeliveryStore: store,
+          journal,
+        }),
+      ).toEqual([]);
       expect(resultValue(journal.loadRecoveryHeads()).heads).toHaveLength(1);
 
       resultValue(
@@ -724,11 +800,13 @@ describe("Core runtime startup", () => {
           transportCommitRequired: false,
         }),
       );
-      removeFullyReconciledAgentRunTerminalHeads({
-        heads: joined.heads,
-        requestDeliveryStore: store,
-        journal,
-      });
+      expect(
+        removeFullyReconciledAgentRunTerminalHeads({
+          heads: joined.heads,
+          requestDeliveryStore: store,
+          journal,
+        }),
+      ).toEqual([owner.requestDeliveryId]);
       expect(resultValue(journal.loadRecoveryHeads()).heads).toEqual([]);
     } finally {
       journal.close();

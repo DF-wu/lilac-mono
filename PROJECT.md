@@ -210,10 +210,12 @@ deletes any resource-owned cached blob, then removes the unretained resource row
 leaves the row for a later retry.
 
 `request-delivery.db` owns both accepted request work and the agent-run WAL. Accepted work is the recovery
-floor. The WAL stores only the latest replay-safe `StoredMessageV1` checkpoint, recovery-safe lineage,
-retained control outcomes, and active or terminal state. Startup joins both sources while the runner is
-paused, terminalizes terminal heads, restores active heads, and starts accepted work without a head from
-its original messages. Journal corruption resets only journal progress and never rewrites accepted work.
+floor. The WAL stores the latest replay-safe `StoredMessageV1` checkpoint and one predecessor,
+recovery-safe lineage, retained control outcomes, and active or terminal state. The runner writes
+checkpoints through a serialized, coalescing background worker, so model and tool work can advance before
+the latest checkpoint becomes durable. Startup joins both sources while the runner is paused,
+terminalizes terminal heads, restores active heads, and starts accepted work without a head from its
+original messages. Journal corruption resets only journal progress and never rewrites accepted work.
 
 Agent recovery is at-least-once. A crash can repeat model calls, tools, controls, external effects, or a
 terminal surface write. A run becomes terminal when Core initiates its terminal output write. Core does

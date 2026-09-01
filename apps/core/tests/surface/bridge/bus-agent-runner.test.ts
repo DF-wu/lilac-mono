@@ -3289,6 +3289,7 @@ describe("durable accepted runner recovery", () => {
     const checkpoints: AgentRunCheckpointV1[] = [];
     let crashBoundaryCheckpoint: AgentRunCheckpointV1 | undefined;
     let controlQueued = false;
+    let failedControlCheckpoint = false;
     let journalSequence = 0;
     const journal = {
       openRun: (owner: {
@@ -3313,12 +3314,13 @@ describe("durable accepted runner recovery", () => {
         },
         checkpoint: AgentRunCheckpointV1,
       ) => {
+        const includesControl = JSON.stringify(checkpoint.messages).includes("apply queued steer");
+        if (includesControl && !failedControlCheckpoint) {
+          failedControlCheckpoint = true;
+          throw new Error("injected unexpected checkpoint writer failure");
+        }
         checkpoints.push(checkpoint);
-        if (
-          controlQueued &&
-          !JSON.stringify(checkpoint.messages).includes("apply queued steer") &&
-          !crashBoundaryCheckpoint
-        ) {
+        if (controlQueued && !includesControl && !crashBoundaryCheckpoint) {
           crashBoundaryCheckpoint = checkpoint;
         }
         journalSequence = handle.sequence + 1;
@@ -3357,9 +3359,23 @@ describe("durable accepted runner recovery", () => {
                 firstStarted.resolve(undefined);
                 await releaseFirst.promise;
               }
+              if (modelCalls === 2) {
+                return level1ToolCallStep([
+                  { toolCallId: "retry-checkpoint", toolName: "retry_checkpoint" },
+                ]);
+              }
               return level1TextStep("done");
             },
           }),
+          beforeStep: undefined,
+          normalizeToolResultOutput: undefined,
+          normalizeSettledToolResultOutputs: undefined,
+          tools: {
+            retry_checkpoint: tool({
+              inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+              execute: () => "checkpoint retry boundary",
+            }),
+          },
         });
         const steer = agent.steer.bind(agent);
         agent.steer = (message) => {
@@ -3416,7 +3432,8 @@ describe("durable accepted runner recovery", () => {
             ).length === 1,
         ),
       ).toBe(true);
-      expect(modelCalls).toBe(2);
+      expect(failedControlCheckpoint).toBe(true);
+      expect(modelCalls).toBe(3);
       expect(transcriptResultValue(store.load(controlDeliveryId)).state).toBe("terminal");
     } finally {
       releaseFirst.resolve(undefined);
@@ -3428,8 +3445,37 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
-  it("checkpoints before provider work and marks terminal after the surface write starts", async () => {
+  it("continues provider work while a checkpoint blob upload is pending", async () => {
     const order: string[] = [];
+    const uploadStarted = deferred<void>();
+    const secondModelStarted = deferred<void>();
+    const releaseUpload = deferred<void>();
+    let uploadReleased = false;
+    let modelAdvancedBeforeUpload = false;
+    const directory = await mkdtemp(path.join(tmpdir(), "lilac-runner-journal-background-"));
+    const transcriptStore = new SqliteTranscriptStore(path.join(directory, "transcripts.db"));
+    const baseBlobStore = transcriptResultValue(await createMemoryBlobStore());
+    let uploadCount = 0;
+    const blobStore: BlobStore = {
+      startUpload: async (input) => {
+        const started = await baseBlobStore.startUpload(input);
+        uploadCount += 1;
+        if (uploadCount !== 1) return started;
+        return started.map((upload) => ({
+          ...upload,
+          completion: (async () => {
+            uploadStarted.resolve(undefined);
+            await releaseUpload.promise;
+            return await upload.completion;
+          })(),
+        }));
+      },
+      resolve: (handle, options) => baseBlobStore.resolve(handle, options),
+      open: (ref) => baseBlobStore.open(ref),
+      delete: (target) => baseBlobStore.delete(target),
+      maintain: (input) => baseBlobStore.maintain(input),
+      close: (input) => baseBlobStore.close(input),
+    };
     const rawBus = createInMemoryRawBus({
       onPublish: (eventType) => {
         if (eventType === lilacEventTypes.EvtAgentOutputResponseText) order.push("surface-write");
@@ -3442,8 +3488,8 @@ describe("durable accepted runner recovery", () => {
     });
     const requestDelivery = new RequestDeliveryCoordinator({
       store,
-      blobStore: TEST_BLOB_STORE,
-      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+      blobStore,
+      admission: createCoreRequestDeliveryAdmission(blobStore),
     });
     const pluginManager = corePrimaryTestPluginManager();
     const requestDeliveryId = crypto.randomUUID();
@@ -3515,21 +3561,52 @@ describe("durable accepted runner recovery", () => {
       pluginManager,
       requestDelivery,
       agentRunJournal: journal,
+      blobStore,
+      transcriptStore,
       issueControlCapability: () => ({
         capability: "journal-order",
         principal: null,
       }),
-      createAgent: (options) =>
-        new AiSdkPiAgent({
+      createAgent: (options) => {
+        let modelCalls = 0;
+        return new AiSdkPiAgent({
           ...options,
           model: new MockLanguageModelV4({
             modelId: "journal-order",
             doStream: async () => {
-              order.push("model");
+              modelCalls += 1;
+              order.push(`model-${modelCalls}`);
+              if (modelCalls === 1) {
+                return level1ToolCallStep([{ toolCallId: "read-image", toolName: "read" }]);
+              }
+              modelAdvancedBeforeUpload = !uploadReleased;
+              secondModelStarted.resolve(undefined);
               return level1TextStep("journalled");
             },
           }),
-        }),
+          beforeStep: undefined,
+          normalizeToolResultOutput: undefined,
+          normalizeSettledToolResultOutputs: undefined,
+          tools: {
+            read: tool({
+              inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+              execute: () => ({ filename: "image.png" }),
+              toModelOutput: () => ({
+                type: "content",
+                value: [
+                  { type: "text", text: "Attached image.png" },
+                  {
+                    type: "file",
+                    data: { type: "data", data: "iVBORwE=" },
+                    mediaType: "image/png",
+                    filename: "image.png",
+                  },
+                ],
+              }),
+            }),
+          },
+        });
+      },
     });
     const lifecycle = await observeRequestLifecycle(bus, requestId);
     try {
@@ -3540,26 +3617,63 @@ describe("durable accepted runner recovery", () => {
         sessionId,
         text: "persist before work",
       });
+      await uploadStarted.promise;
+      await secondModelStarted.promise;
+      expect(modelAdvancedBeforeUpload).toBe(true);
+      uploadReleased = true;
+      releaseUpload.resolve(undefined);
       await expect(lifecycle.terminal).resolves.toBe("resolved");
       await runner.getActiveDrainOperation();
-      expect(order.indexOf("open")).toBeLessThan(order.indexOf("checkpoint"));
-      expect(order.indexOf("checkpoint")).toBeLessThan(order.indexOf("model"));
       expect(order.indexOf("surface-write")).toBeLessThan(order.indexOf("terminal"));
     } finally {
+      uploadReleased = true;
+      releaseUpload.resolve(undefined);
       await lifecycle.stop();
       await runner.stop();
       await pluginManager.destroy();
+      transcriptStore.close();
+      await baseBlobStore.close({ deadlineAtMs: Date.now() + 1_000 });
       store.close();
       await bus.close();
+      await rm(directory, { recursive: true });
     }
   });
 
   it("keeps recovery ownership when both terminal surface publications fail", async () => {
     let terminalSurfaceAttempts = 0;
+    const terminalSurfaceFailed = deferred<void>();
+    const uploadStarted = deferred<void>();
+    const releaseUpload = deferred<void>();
+    const liveParentClosed = deferred<void>();
+    const directory = await mkdtemp(path.join(tmpdir(), "lilac-runner-journal-failed-output-"));
+    const transcriptStore = new SqliteTranscriptStore(path.join(directory, "transcripts.db"));
+    const baseBlobStore = transcriptResultValue(await createMemoryBlobStore());
+    let uploadCount = 0;
+    const blobStore: BlobStore = {
+      startUpload: async (input) => {
+        const started = await baseBlobStore.startUpload(input);
+        uploadCount += 1;
+        if (uploadCount !== 1) return started;
+        return started.map((upload) => ({
+          ...upload,
+          completion: (async () => {
+            uploadStarted.resolve(undefined);
+            await releaseUpload.promise;
+            return await upload.completion;
+          })(),
+        }));
+      },
+      resolve: (handle, options) => baseBlobStore.resolve(handle, options),
+      open: (ref) => baseBlobStore.open(ref),
+      delete: (target) => baseBlobStore.delete(target),
+      maintain: (input) => baseBlobStore.maintain(input),
+      close: (input) => baseBlobStore.close(input),
+    };
     const rawBus = createInMemoryRawBus({
       onPublish: (eventType) => {
         if (eventType !== lilacEventTypes.EvtAgentOutputResponseText) return;
         terminalSurfaceAttempts += 1;
+        if (terminalSurfaceAttempts === 2) terminalSurfaceFailed.resolve(undefined);
         throw new Error("injected terminal surface publication failure");
       },
     });
@@ -3570,8 +3684,8 @@ describe("durable accepted runner recovery", () => {
     });
     const requestDelivery = new RequestDeliveryCoordinator({
       store,
-      blobStore: TEST_BLOB_STORE,
-      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+      blobStore,
+      admission: createCoreRequestDeliveryAdmission(blobStore),
     });
     const pluginManager = corePrimaryTestPluginManager();
     const requestDeliveryId = crypto.randomUUID();
@@ -3599,6 +3713,29 @@ describe("durable accepted runner recovery", () => {
     );
     let terminalMarks = 0;
     let reconciliations = 0;
+    const workflowLiveParentBridge = {
+      registerParent: () => ({
+        ready: Promise.resolve(),
+        snapshot: () => ({
+          signalVersion: 0,
+          hasPendingCompletions: false,
+          hasOutstandingRuns: false,
+        }),
+        waitForSignalSince: async () => undefined,
+        listPendingIdentities: () => [],
+        listPendingSettledAsync: async () => [],
+        acknowledge: async () => undefined,
+        isPending: () => false,
+        clearMaterializationFailure: () => undefined,
+        recordMaterializationFailure: () => 0,
+        cancelAll: async () => undefined,
+        close: async () => {
+          liveParentClosed.resolve(undefined);
+        },
+      }),
+    } as unknown as NonNullable<
+      Parameters<typeof startBusAgentRunner>[0]["workflowLiveParentBridge"]
+    >;
     const journal = {
       openRun: (owner: {
         readonly requestDeliveryId: string;
@@ -3640,18 +3777,49 @@ describe("durable accepted runner recovery", () => {
       pluginManager,
       requestDelivery,
       agentRunJournal: journal,
+      blobStore,
+      transcriptStore,
+      workflowLiveParentBridge,
       issueControlCapability: () => ({
         capability: "terminal-publication",
         principal: null,
       }),
-      createAgent: (options) =>
-        new AiSdkPiAgent({
+      createAgent: (options) => {
+        let modelCalls = 0;
+        return new AiSdkPiAgent({
           ...options,
           model: new MockLanguageModelV4({
             modelId: "journal-terminal-publication-failure",
-            doStream: async () => level1TextStep("surface must accept this"),
+            doStream: async () => {
+              modelCalls += 1;
+              return modelCalls === 1
+                ? level1ToolCallStep([{ toolCallId: "failed-output-read", toolName: "read" }])
+                : level1TextStep("surface must accept this");
+            },
           }),
-        }),
+          beforeStep: undefined,
+          normalizeToolResultOutput: undefined,
+          normalizeSettledToolResultOutputs: undefined,
+          tools: {
+            read: tool({
+              inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+              execute: () => ({ filename: "failed-output.png" }),
+              toModelOutput: () => ({
+                type: "content",
+                value: [
+                  { type: "text", text: "Attached failed-output.png" },
+                  {
+                    type: "file",
+                    data: { type: "data", data: "iVBORwE=" },
+                    mediaType: "image/png",
+                    filename: "failed-output.png",
+                  },
+                ],
+              }),
+            }),
+          },
+        });
+      },
     });
     const lifecycle = await observeRequestLifecycle(bus, requestId);
     try {
@@ -3662,6 +3830,12 @@ describe("durable accepted runner recovery", () => {
         sessionId,
         text: "retain recovery ownership",
       });
+      await uploadStarted.promise;
+      await terminalSurfaceFailed.promise;
+      await liveParentClosed.promise;
+      await Promise.resolve();
+      expect(runner.getActiveLevel1Work()).toHaveLength(1);
+      releaseUpload.resolve(undefined);
       await expect(lifecycle.terminal).resolves.toBe("resolved");
       await runner.getActiveDrainOperation();
 
@@ -3670,11 +3844,15 @@ describe("durable accepted runner recovery", () => {
       expect(reconciliations).toBe(0);
       expect(transcriptResultValue(store.load(requestDeliveryId)).state).toBe("accepted");
     } finally {
+      releaseUpload.resolve(undefined);
       await lifecycle.stop();
       await runner.stop();
       await pluginManager.destroy();
+      transcriptStore.close();
+      await baseBlobStore.close({ deadlineAtMs: Date.now() + 1_000 });
       store.close();
       await bus.close();
+      await rm(directory, { recursive: true });
     }
   });
 
@@ -3824,7 +4002,7 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
-  it("resets one failed checkpoint, continues that run, and admits a later request", async () => {
+  it("keeps the previous checkpoint after one conflict and admits a later request", async () => {
     const rawBus = createInMemoryRawBus();
     const bus = createLilacBus(rawBus);
     const store = new SqliteRequestDeliveryStore({
@@ -3953,7 +4131,7 @@ describe("durable accepted runner recovery", () => {
         text: "second",
       });
       await expect(secondLifecycle.terminal).resolves.toBe("resolved");
-      expect(resets).toBe(1);
+      expect(resets).toBe(0);
       expect(modelCalls).toBe(2);
     } finally {
       await firstLifecycle.stop();
@@ -3965,7 +4143,7 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
-  it("disables the journal for the runner boot when reset fails", async () => {
+  it("stops checkpoint writes for each run after a conflict and still marks it terminal", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const store = new SqliteRequestDeliveryStore({
       dbPath: ":memory:",
@@ -4110,13 +4288,11 @@ describe("durable accepted runner recovery", () => {
         await expect(lifecycles[index]!.terminal).resolves.toBe("resolved");
       }
       expect(modelCalls).toBe(2);
-      expect(journalCalls).toEqual({
-        open: 1,
-        checkpoint: 1,
-        reset: 1,
-        terminal: 0,
-        remove: 0,
-      });
+      expect(journalCalls.open).toBe(4);
+      expect(journalCalls.checkpoint).toBe(2);
+      expect(journalCalls.reset).toBe(0);
+      expect(journalCalls.terminal).toBe(2);
+      expect(journalCalls.remove).toBe(2);
     } finally {
       await Promise.all(lifecycles.map((lifecycle) => lifecycle.stop()));
       await runner.stop();
@@ -4126,160 +4302,157 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
-  it.each(["reopen", "checkpoint-retry"] as const)(
-    "disables the journal for later runs when the bounded %s attempt fails",
-    async (failureStage) => {
-      const bus = createLilacBus(createInMemoryRawBus());
-      const store = new SqliteRequestDeliveryStore({
-        dbPath: ":memory:",
-        codecs: coreRequestDeliveryCodecs,
-      });
-      const requestDelivery = new RequestDeliveryCoordinator({
-        store,
-        blobStore: TEST_BLOB_STORE,
-        admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
-      });
-      const pluginManager = corePrimaryTestPluginManager();
-      const journalCalls = { open: 0, checkpoint: 0, reset: 0, terminal: 0 };
-      let modelCalls = 0;
-      const journal = {
-        openRun: (owner: {
-          readonly requestDeliveryId: string;
-          readonly requestId: string;
-          readonly sessionId: string;
-        }) => {
-          journalCalls.open += 1;
-          if (failureStage === "reopen" && journalCalls.open === 2) {
-            return Result.err(
-              new AgentRunJournalConflict({
-                runId: owner.requestDeliveryId,
-                message: "injected journal reopen failure",
-              }),
-            );
-          }
-          return Result.ok({
-            runId: owner.requestDeliveryId,
-            requestId: owner.requestId,
-            sessionId: owner.sessionId,
-            sequence: 1,
-          });
-        },
-        writeCheckpoint: (handle: {
-          readonly runId: string;
-          readonly requestId: string;
-          readonly sessionId: string;
-          readonly sequence: number;
-        }) => {
-          journalCalls.checkpoint += 1;
+  it("resets a conflicted run only when its current handle cannot be reopened", async () => {
+    const failureStage = "reopen" as const;
+    const bus = createLilacBus(createInMemoryRawBus());
+    const store = new SqliteRequestDeliveryStore({
+      dbPath: ":memory:",
+      codecs: coreRequestDeliveryCodecs,
+    });
+    const requestDelivery = new RequestDeliveryCoordinator({
+      store,
+      blobStore: TEST_BLOB_STORE,
+      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+    });
+    const pluginManager = corePrimaryTestPluginManager();
+    const journalCalls = { open: 0, checkpoint: 0, reset: 0, terminal: 0 };
+    let modelCalls = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) => {
+        journalCalls.open += 1;
+        if (journalCalls.open === 2) {
           return Result.err(
             new AgentRunJournalConflict({
-              runId: handle.runId,
-              message: "injected journal checkpoint failure",
+              runId: owner.requestDeliveryId,
+              message: "injected journal reopen failure",
             }),
           );
-        },
-        markTerminal: (handle: {
-          readonly runId: string;
-          readonly requestId: string;
-          readonly sessionId: string;
-          readonly sequence: number;
-        }) => {
-          journalCalls.terminal += 1;
-          return Result.ok({ ...handle, sequence: handle.sequence + 1 });
-        },
-        resetRun: () => {
-          journalCalls.reset += 1;
-          return Result.ok(undefined);
-        },
-        removeReconciled: () => Result.ok(undefined),
-      };
-      const runner = await startBusAgentRunner({
-        bus,
-        subscriptionId: `journal-bounded-${failureStage}`,
-        reportFatalPanic: () => undefined,
-        config: parseCoreConfigV2ToUniversal({}),
-        pluginManager,
-        requestDelivery,
-        agentRunJournal: journal,
-        issueControlCapability: () => ({
-          capability: `journal-bounded-${failureStage}`,
-          principal: null,
-        }),
-        createAgent: (options) =>
-          new AiSdkPiAgent({
-            ...options,
-            model: new MockLanguageModelV4({
-              modelId: `journal-bounded-${failureStage}`,
-              doStream: async () => {
-                modelCalls += 1;
-                return level1TextStep("continued without journal");
-              },
-            }),
-          }),
-      });
-      const requests = [
-        {
-          requestDeliveryId: crypto.randomUUID(),
-          requestId: `github:journal-bounded-${failureStage}:first`,
-          sessionId: `journal-bounded-${failureStage}-first`,
-        },
-        {
-          requestDeliveryId: crypto.randomUUID(),
-          requestId: `github:journal-bounded-${failureStage}:second`,
-          sessionId: `journal-bounded-${failureStage}-second`,
-        },
-      ] as const;
-      for (const [index, request] of requests.entries()) {
-        transcriptResultValue(
-          store.prepare({
-            requestDeliveryId: request.requestDeliveryId,
-            requestId: request.requestId,
-            envelope: {
-              headers: {
-                request_id: request.requestId,
-                session_id: request.sessionId,
-                request_client: "github",
-              },
-              data: {
-                requestDeliveryId: request.requestDeliveryId,
-                queue: "prompt",
-                messages: [{ role: "user", content: `request ${index + 1}` }],
-              },
-            },
-            inputHandles: [],
-            createdAt: index + 1,
-          }),
-        );
-      }
-      const lifecycles = await Promise.all(
-        requests.map((request) => observeRequestLifecycle(bus, request.requestId)),
-      );
-      try {
-        for (const [index, request] of requests.entries()) {
-          await publishRunnerRequest({
-            bus,
-            requestDeliveryId: request.requestDeliveryId,
-            requestId: request.requestId,
-            sessionId: request.sessionId,
-            text: `request ${index + 1}`,
-          });
-          await expect(lifecycles[index]!.terminal).resolves.toBe("resolved");
         }
-        expect(modelCalls).toBe(2);
-        expect(journalCalls).toEqual(
-          failureStage === "reopen"
-            ? { open: 2, checkpoint: 1, reset: 1, terminal: 0 }
-            : { open: 2, checkpoint: 2, reset: 2, terminal: 0 },
+        return Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        });
+      },
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        journalCalls.checkpoint += 1;
+        return Result.err(
+          new AgentRunJournalConflict({
+            runId: handle.runId,
+            message: "injected journal checkpoint failure",
+          }),
         );
-      } finally {
-        await Promise.all(lifecycles.map((lifecycle) => lifecycle.stop()));
-        await runner.stop();
-        await pluginManager.destroy();
-        store.close();
-        await bus.close();
+      },
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        journalCalls.terminal += 1;
+        return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+      },
+      resetRun: () => {
+        journalCalls.reset += 1;
+        return Result.ok(undefined);
+      },
+      removeReconciled: () => Result.ok(undefined),
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: `journal-bounded-${failureStage}`,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      requestDelivery,
+      agentRunJournal: journal,
+      issueControlCapability: () => ({
+        capability: `journal-bounded-${failureStage}`,
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: `journal-bounded-${failureStage}`,
+            doStream: async () => {
+              modelCalls += 1;
+              return level1TextStep("continued without journal");
+            },
+          }),
+        }),
+    });
+    const requests = [
+      {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: `github:journal-bounded-${failureStage}:first`,
+        sessionId: `journal-bounded-${failureStage}-first`,
+      },
+      {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: `github:journal-bounded-${failureStage}:second`,
+        sessionId: `journal-bounded-${failureStage}-second`,
+      },
+    ] as const;
+    for (const [index, request] of requests.entries()) {
+      transcriptResultValue(
+        store.prepare({
+          requestDeliveryId: request.requestDeliveryId,
+          requestId: request.requestId,
+          envelope: {
+            headers: {
+              request_id: request.requestId,
+              session_id: request.sessionId,
+              request_client: "github",
+            },
+            data: {
+              requestDeliveryId: request.requestDeliveryId,
+              queue: "prompt",
+              messages: [{ role: "user", content: `request ${index + 1}` }],
+            },
+          },
+          inputHandles: [],
+          createdAt: index + 1,
+        }),
+      );
+    }
+    const lifecycles = await Promise.all(
+      requests.map((request) => observeRequestLifecycle(bus, request.requestId)),
+    );
+    try {
+      for (const [index, request] of requests.entries()) {
+        await publishRunnerRequest({
+          bus,
+          requestDeliveryId: request.requestDeliveryId,
+          requestId: request.requestId,
+          sessionId: request.sessionId,
+          text: `request ${index + 1}`,
+        });
+        await expect(lifecycles[index]!.terminal).resolves.toBe("resolved");
       }
-    },
-  );
+      expect(modelCalls).toBe(2);
+      expect(journalCalls.open).toBe(5);
+      expect(journalCalls.checkpoint).toBe(2);
+      expect(journalCalls.reset).toBe(1);
+      expect(journalCalls.terminal).toBe(2);
+    } finally {
+      await Promise.all(lifecycles.map((lifecycle) => lifecycle.stop()));
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+    }
+  });
 
   it("reconstructs original and checkpointed work across sessions and skips terminal heads", async () => {
     const rawBus = createInMemoryRawBus();
@@ -4381,6 +4554,140 @@ describe("durable accepted runner recovery", () => {
       expect(observedModelPrompts.some((messages) => messages.includes("must not rerun"))).toBe(
         false,
       );
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("reseeds recovery from the previous checkpoint when the latest blob is unavailable", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    const modelCalled = deferred<void>();
+    let observedPrompt = "";
+    let resets = 0;
+    let promotions = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) =>
+        Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        }),
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      promotePreviousCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        promotions += 1;
+        return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+      },
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      loadRecoveryHeads: () => Result.ok({ heads: [], resets: [] }),
+      resetRun: () => {
+        resets += 1;
+        return Result.ok(undefined);
+      },
+      resetAll: () => Result.ok(undefined),
+      removeReconciled: () => Result.ok(undefined),
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "journal-previous-checkpoint",
+      startPaused: true,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      agentRunJournal: journal,
+      issueControlCapability: () => ({
+        capability: "journal-previous-checkpoint",
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "journal-previous-checkpoint",
+            doStream: async (call) => {
+              observedPrompt = JSON.stringify(call.prompt);
+              modelCalled.resolve(undefined);
+              return level1TextStep("recovered previous checkpoint");
+            },
+          }),
+        }),
+    });
+    const accepted = acceptedRunnerDelivery({
+      requestDeliveryId: crypto.randomUUID(),
+      requestId: "github:journal-previous-checkpoint",
+      sessionId: "journal-previous-checkpoint",
+      queue: "prompt",
+      messages: [{ role: "user", content: "accepted floor" }],
+    });
+    const head: AgentRunRecoveryHead = {
+      handle: {
+        runId: accepted.requestDeliveryId,
+        requestId: accepted.requestId,
+        sessionId: accepted.work.sessionId,
+        sequence: 3,
+      },
+      state: "active",
+      checkpoint: {
+        version: 1,
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "blob",
+                blob: {
+                  version: 1,
+                  objectId: `b1_${"11".repeat(16)}`,
+                  sha256: "22".repeat(32),
+                  byteLength: 1,
+                },
+                mediaType: "image/png",
+                filename: "missing.png",
+              },
+            ],
+          },
+        ],
+        retainedRequestDeliveries: [],
+      },
+      previousCheckpoint: {
+        version: 1,
+        messages: [{ role: "user", content: "previous safe checkpoint" }],
+        retainedRequestDeliveries: [],
+      },
+      createdAt: 1,
+      updatedAt: 3,
+    };
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, head));
+      runner.activate();
+      await modelCalled.promise;
+      expect(promotions).toBe(1);
+      expect(resets).toBe(0);
+      expect(observedPrompt).toContain("previous safe checkpoint");
+      expect(observedPrompt).not.toContain("accepted floor");
+      expect(observedPrompt).not.toContain("missing.png");
     } finally {
       await runner.stop();
       await pluginManager.destroy();

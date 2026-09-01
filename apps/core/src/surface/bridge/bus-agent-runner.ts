@@ -179,11 +179,17 @@ import type {
 } from "./request-delivery";
 import type { AcceptedRequestDelivery } from "./request-delivery/types";
 import {
-  createAgentRunCheckpoint,
+  AgentRunJournalConflict,
+  type AgentRunCheckpointV1,
   type AgentRunJournal,
   type AgentRunJournalHandle,
   type AgentRunRecoveryHead,
 } from "./agent-run-journal";
+import {
+  AgentRunCheckpointOwnershipRollbackFailed,
+  AgentRunCheckpointPreparationFailed,
+  persistBlobBackedAgentRunCheckpoint,
+} from "./agent-run-checkpoint-persistence";
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
 import { recordRequestLatencyStage } from "./request-latency-trace";
@@ -1786,6 +1792,9 @@ type Enqueued = {
     partialText: string;
   };
   storedRecoveryCheckpoint?: StoredMessageV1[];
+  previousRecoveryCheckpoint?: AgentRunCheckpointV1;
+  acceptedCorePrimaryLineage?: CorePrimaryLineageV2;
+  acceptedCurrentTurnUserId?: string;
   retainedRequestDeliveries?: readonly AgentRunnerRetainedRequestDelivery[];
   journalHandle?: AgentRunJournalHandle;
 };
@@ -2614,6 +2623,22 @@ type SessionQueue = {
     checkpointedRetainedRequestDeliveryIds: Set<string>;
     retainedRequestDeliveryByInputId: Map<AgentInputQueueId, string>;
     journalHandle: AgentRunJournalHandle | null;
+    checkpointWriter: {
+      disabled: boolean;
+      pending: {
+        readonly messages: readonly ModelMessage[];
+        readonly canonicalInputIds: ReadonlySet<AgentInputQueueId>;
+        readonly identityProjection: StoredMessageIdentityProjectionV1;
+      } | null;
+      operation: Promise<void> | null;
+      closed: boolean;
+      abandoned: boolean;
+      retryInputIds: Set<AgentInputQueueId>;
+      inFlightInputIds: ReadonlySet<AgentInputQueueId> | null;
+      lastCommittedProviderMessages: readonly ModelMessage[];
+      lastCommittedStoredMessages: readonly StoredMessageV1[];
+      retainedPredecessorStoredMessages: readonly StoredMessageV1[];
+    };
   } | null;
   /** Track toolCallIds whose outputs are compacted in the model-facing view. */
   compactedToolCallIds: Set<string>;
@@ -2739,7 +2764,8 @@ export async function startBusAgentRunner(params: {
   agentRunJournal?: Pick<
     AgentRunJournal,
     "openRun" | "writeCheckpoint" | "markTerminal" | "resetRun" | "removeReconciled"
-  >;
+  > &
+    Partial<Pick<AgentRunJournal, "promotePreviousCheckpoint">>;
   subscriptionId: string;
   config?: CoreConfig;
   pluginManager: CoreToolPluginManager;
@@ -2910,6 +2936,21 @@ export async function startBusAgentRunner(params: {
     });
   };
 
+  const releaseRunCheckpointBlobs = (input: {
+    readonly requestDeliveryId: string;
+    readonly requestId: string;
+    readonly sessionId: string;
+  }): void => {
+    const releaseError = params.transcriptStore
+      ?.releaseAgentRunCheckpointBlobs?.({ requestDeliveryId: input.requestDeliveryId })
+      .match({ ok: () => null, err: (error) => error });
+    if (!releaseError) return;
+    logger.warn(
+      "agent run checkpoint blob reference cleanup deferred",
+      formatBridgeTaggedErrorForLog(releaseError, input),
+    );
+  };
+
   const resetRunJournal = (input: {
     readonly requestDeliveryId: string;
     readonly requestId: string;
@@ -2919,7 +2960,10 @@ export async function startBusAgentRunner(params: {
     if (!journal) return false;
     const reset = journal.resetRun(input.requestDeliveryId);
     const resetError = reset.match({ ok: () => null, err: (error) => error });
-    if (!resetError) return true;
+    if (!resetError) {
+      releaseRunCheckpointBlobs(input);
+      return true;
+    }
     logJournalReset({ ...input, error: resetError });
     activeAgentRunJournal = null;
     return false;
@@ -2953,104 +2997,404 @@ export async function startBusAgentRunner(params: {
     });
   };
 
-  const persistRunCheckpoint = (
+  const persistRunCheckpoint = async (
     run: NonNullable<SessionQueue["activeRun"]>,
     messages: readonly ModelMessage[],
     canonicalInputIds: readonly AgentInputQueueId[],
-  ): void => {
+    identityProjection: StoredMessageIdentityProjectionV1,
+  ): Promise<"written" | "kept-previous"> => {
     const journal = activeAgentRunJournal;
     const requestDeliveryId = run.requestDeliveryId;
-    if (!journal || !requestDeliveryId) return;
-    const projected = projectStoredMessagesV1(messages);
-    const projection = projected.match<
-      | {
-          readonly kind: "messages";
-          readonly messages: readonly StoredMessageV1[];
-        }
-      | { readonly kind: "reset"; readonly error: Error }
-    >({
-      ok: (storedMessages) => ({ kind: "messages", messages: storedMessages }),
-      err: (error) => ({ kind: "reset", error }),
-    });
-    if (projection.kind === "reset") {
-      logJournalReset({
-        requestDeliveryId,
-        requestId: run.requestId,
-        sessionId: run.sessionId,
-        error: projection.error,
-      });
-      resetRunJournal({
-        requestDeliveryId,
-        requestId: run.requestId,
-        sessionId: run.sessionId,
-      });
-      run.journalHandle = null;
-      return;
-    }
+    if (!journal || !requestDeliveryId || run.checkpointWriter.disabled) return "written";
+    const nextCheckpointedRetainedRequestDeliveryIds = new Set(
+      run.checkpointedRetainedRequestDeliveryIds,
+    );
     for (const inputId of canonicalInputIds) {
       const retainedRequestDeliveryId = run.retainedRequestDeliveryByInputId.get(inputId);
       if (!retainedRequestDeliveryId) continue;
-      run.retainedRequestDeliveryByInputId.delete(inputId);
-      run.checkpointedRetainedRequestDeliveryIds.add(retainedRequestDeliveryId);
+      nextCheckpointedRetainedRequestDeliveryIds.add(retainedRequestDeliveryId);
     }
-    const checkpoint = createAgentRunCheckpoint({
-      messages: projection.messages,
-      ...(run.corePrimaryLineage ? { corePrimaryLineage: run.corePrimaryLineage } : {}),
-      ...(run.currentTurnUserId ? { currentTurnUserId: run.currentTurnUserId } : {}),
-      retainedRequestDeliveries: [...run.retainedRequestDeliveries]
-        .filter(([retainedRequestDeliveryId]) =>
-          run.checkpointedRetainedRequestDeliveryIds.has(retainedRequestDeliveryId),
-        )
-        .map(([retainedRequestDeliveryId, outcome]) => ({
-          requestDeliveryId: retainedRequestDeliveryId,
-          outcome,
-        })),
-    });
     const owner = {
       requestDeliveryId,
       requestId: run.requestId,
       sessionId: run.sessionId,
     };
     const handle = run.journalHandle ?? openRunJournal(owner);
-    if (!handle) return;
-    const written = journal.writeCheckpoint(handle, checkpoint);
-    const writeDecision = written.match<
-      | { readonly kind: "written"; readonly handle: AgentRunJournalHandle }
-      | { readonly kind: "reset"; readonly error: Error }
+    if (!handle) return activeAgentRunJournal ? "kept-previous" : "written";
+    const persisted = await persistBlobBackedAgentRunCheckpoint({
+      handle,
+      journal,
+      messages,
+      previousCheckpoint: {
+        providerMessages: run.checkpointWriter.lastCommittedProviderMessages,
+        storedMessages: run.checkpointWriter.lastCommittedStoredMessages,
+      },
+      retainedPredecessorMessages: run.checkpointWriter.retainedPredecessorStoredMessages,
+      identityProjection,
+      blobStore: params.blobStore,
+      transcriptStore: params.transcriptStore,
+      shouldAbandon: () => run.checkpointWriter.abandoned,
+      ...(run.corePrimaryLineage ? { corePrimaryLineage: run.corePrimaryLineage } : {}),
+      ...(run.currentTurnUserId ? { currentTurnUserId: run.currentTurnUserId } : {}),
+      retainedRequestDeliveries: [...run.retainedRequestDeliveries]
+        .filter(([retainedRequestDeliveryId]) =>
+          nextCheckpointedRetainedRequestDeliveryIds.has(retainedRequestDeliveryId),
+        )
+        .map(([retainedRequestDeliveryId, outcome]) => ({
+          requestDeliveryId: retainedRequestDeliveryId,
+          outcome,
+        })),
+    });
+    const decision = persisted.match<
+      | {
+          readonly kind: "written";
+          readonly handle: AgentRunJournalHandle;
+          readonly messages: readonly StoredMessageV1[];
+          readonly advanced: boolean;
+          readonly cleanupError?: Error;
+        }
+      | { readonly kind: "kept-previous"; readonly error: Error }
     >({
-      ok: (nextHandle) => ({ kind: "written", handle: nextHandle }),
-      err: (error) => ({ kind: "reset", error }),
+      ok: ({ handle: nextHandle, messages: storedMessages, advanced, cleanupError }) => ({
+        kind: "written",
+        handle: nextHandle,
+        messages: storedMessages,
+        advanced,
+        ...(cleanupError ? { cleanupError } : {}),
+      }),
+      err: (error) => ({ kind: "kept-previous", error }),
     });
-    if (writeDecision.kind === "written") {
-      run.journalHandle = writeDecision.handle;
+    if (decision.kind === "kept-previous") {
+      logger.warn(
+        "agent run checkpoint kept previous",
+        formatBridgeTaggedErrorForLog(decision.error, {
+          requestDeliveryId,
+          requestId: run.requestId,
+          sessionId: run.sessionId,
+          ...(AgentRunCheckpointPreparationFailed.is(decision.error)
+            ? { stage: decision.error.stage }
+            : {}),
+        }),
+      );
+      const journalError = AgentRunCheckpointOwnershipRollbackFailed.is(decision.error)
+        ? decision.error.journalError
+        : decision.error;
+      if (AgentRunCheckpointOwnershipRollbackFailed.is(decision.error)) {
+        logger.warn(
+          "agent run checkpoint blob reference cleanup deferred",
+          formatBridgeTaggedErrorForLog(decision.error.cleanupError, {
+            requestDeliveryId,
+            requestId: run.requestId,
+            sessionId: run.sessionId,
+          }),
+        );
+      }
+      if (AgentRunJournalConflict.is(journalError)) {
+        run.journalHandle = openRunJournal(owner);
+        run.checkpointWriter.disabled = true;
+      }
+      return "kept-previous";
+    }
+    const priorCommittedCheckpointMessages = run.checkpointWriter.lastCommittedStoredMessages;
+    run.journalHandle = decision.handle;
+    if (decision.advanced) {
+      run.checkpointWriter.retainedPredecessorStoredMessages = priorCommittedCheckpointMessages;
+    }
+    run.checkpointWriter.lastCommittedProviderMessages = messages;
+    run.checkpointWriter.lastCommittedStoredMessages = decision.messages;
+    for (const inputId of canonicalInputIds) {
+      run.retainedRequestDeliveryByInputId.delete(inputId);
+    }
+    run.checkpointedRetainedRequestDeliveryIds = nextCheckpointedRetainedRequestDeliveryIds;
+    if (decision.cleanupError) {
+      logger.warn(
+        "agent run checkpoint blob reference cleanup deferred",
+        formatBridgeTaggedErrorForLog(decision.cleanupError, {
+          requestDeliveryId,
+          requestId: run.requestId,
+          sessionId: run.sessionId,
+        }),
+      );
+    }
+    return "written";
+  };
+
+  const enqueueRunCheckpoint = (
+    run: NonNullable<SessionQueue["activeRun"]>,
+    messages: readonly ModelMessage[],
+    canonicalInputIds: readonly AgentInputQueueId[],
+    identityProjection: StoredMessageIdentityProjectionV1,
+  ): void => {
+    if (
+      run.checkpointWriter.closed ||
+      run.checkpointWriter.disabled ||
+      !activeAgentRunJournal ||
+      !run.requestDeliveryId
+    ) {
       return;
     }
-    logJournalReset({ ...owner, error: writeDecision.error });
-    if (!resetRunJournal(owner)) {
-      run.journalHandle = null;
-      return;
+    const pendingInputIds = new Set(run.checkpointWriter.pending?.canonicalInputIds ?? []);
+    for (const inputId of canonicalInputIds) pendingInputIds.add(inputId);
+    run.checkpointWriter.pending = {
+      messages,
+      canonicalInputIds: pendingInputIds,
+      identityProjection,
+    };
+    startRunCheckpointWriter(run);
+  };
+
+  function startRunCheckpointWriter(run: NonNullable<SessionQueue["activeRun"]>): void {
+    if (run.checkpointWriter.operation || !run.checkpointWriter.pending) return;
+    const operation = deferRunCheckpointWriter(run);
+    run.checkpointWriter.operation = operation;
+  }
+
+  async function deferRunCheckpointWriter(
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await superviseRunCheckpointWriter(run);
+  }
+
+  async function superviseRunCheckpointWriter(
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> {
+    const completed = await Result.tryPromise({
+      try: () => drainRunCheckpointWriter(run),
+      catch: captureError,
+    });
+    const failure = completed.match({
+      ok: () => null,
+      err: ({ cause }) => ({ cause }),
+    });
+    const inFlightInputIds = run.checkpointWriter.inFlightInputIds;
+    run.checkpointWriter.inFlightInputIds = null;
+    run.checkpointWriter.operation = null;
+    if (failure) {
+      for (const inputId of inFlightInputIds ?? []) {
+        run.checkpointWriter.retryInputIds.add(inputId);
+      }
+      if (Panic.is(failure.cause)) {
+        reportFatalPanic(failure.cause);
+      } else {
+        const error = projectBusAgentRunnerError(
+          failure.cause,
+          "Agent run checkpoint background write failed",
+        );
+        logger.error("agent run checkpoint background write failed", {
+          requestDeliveryId: run.requestDeliveryId,
+          requestId: run.requestId,
+          sessionId: run.sessionId,
+          errorMessage: error.message,
+        });
+      }
     }
-    run.journalHandle = journal.openRun(owner).match({
-      ok: (reopenedHandle) => reopenedHandle,
-      err: (error) => {
-        logJournalReset({ ...owner, error });
-        activeAgentRunJournal = null;
-        return null;
-      },
+    if (run.checkpointWriter.pending) startRunCheckpointWriter(run);
+  }
+
+  async function drainRunCheckpointWriter(
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> {
+    while (run.checkpointWriter.pending) {
+      const pending = run.checkpointWriter.pending;
+      run.checkpointWriter.pending = null;
+      const canonicalInputIds = new Set(run.checkpointWriter.retryInputIds);
+      for (const inputId of pending.canonicalInputIds) canonicalInputIds.add(inputId);
+      run.checkpointWriter.inFlightInputIds = canonicalInputIds;
+      const outcome = await persistRunCheckpoint(
+        run,
+        pending.messages,
+        [...canonicalInputIds],
+        pending.identityProjection,
+      );
+      run.checkpointWriter.inFlightInputIds = null;
+      if (outcome === "kept-previous") {
+        for (const inputId of canonicalInputIds) run.checkpointWriter.retryInputIds.add(inputId);
+        continue;
+      }
+      for (const inputId of canonicalInputIds) run.checkpointWriter.retryInputIds.delete(inputId);
+    }
+  }
+
+  const flushRunCheckpointWriter = async (
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> => {
+    run.checkpointWriter.closed = true;
+    while (run.checkpointWriter.operation) {
+      await run.checkpointWriter.operation;
+    }
+  };
+
+  const stopRunCheckpointWriters = async (): Promise<void> => {
+    const operations = [...bySession.values()].flatMap((state) => {
+      const run = state.activeRun;
+      if (!run) return [];
+      run.checkpointWriter.closed = true;
+      run.checkpointWriter.abandoned = true;
+      run.checkpointWriter.pending = null;
+      return run.checkpointWriter.operation ? [run.checkpointWriter.operation] : [];
     });
-    if (!run.journalHandle) return;
-    const retried = journal.writeCheckpoint(run.journalHandle, checkpoint);
-    retried.match({
-      ok: (nextHandle) => {
-        run.journalHandle = nextHandle;
-      },
-      err: (error) => {
-        logJournalReset({ ...owner, error });
-        resetRunJournal(owner);
-        activeAgentRunJournal = null;
-        run.journalHandle = null;
-      },
+    if (operations.length === 0) return;
+
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    const completed = await Promise.race([
+      Promise.all(operations).then(() => true),
+      new Promise<false>((resolve) => {
+        deadlineTimer = setTimeout(() => resolve(false), TERMINAL_CLEANUP_SHUTDOWN_WAIT_MS);
+        deadlineTimer.unref?.();
+      }),
+    ]).finally(() => {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
     });
+    if (completed) return;
+    logger.warn("agent run checkpoint writes exceeded shutdown wait", {
+      timeoutMs: TERMINAL_CLEANUP_SHUTDOWN_WAIT_MS,
+      pendingCount: operations.length,
+    });
+  };
+
+  const restorePreviousRunCheckpoint = async (input: {
+    readonly entry: Enqueued;
+    readonly checkpoint: AgentRunCheckpointV1;
+  }): Promise<AgentRunJournalHandle | null> => {
+    const journal = activeAgentRunJournal;
+    const requestDeliveryId = input.entry.requestDeliveryId;
+    if (!journal || !requestDeliveryId || !journal.promotePreviousCheckpoint) return null;
+    const owner = {
+      requestDeliveryId,
+      requestId: input.entry.requestId,
+      sessionId: input.entry.sessionId,
+    };
+    const currentHandle = input.entry.journalHandle;
+    if (!currentHandle) return null;
+    const promoted = journal.promotePreviousCheckpoint(currentHandle, input.checkpoint);
+    const decision = promoted.match<
+      | {
+          readonly kind: "restored";
+          readonly handle: AgentRunJournalHandle;
+        }
+      | { readonly kind: "failed"; readonly error: Error }
+    >({
+      ok: (handle) => ({ kind: "restored", handle }),
+      err: (error) => ({ kind: "failed", error }),
+    });
+    if (decision.kind === "failed") {
+      logger.warn(
+        "agent run previous checkpoint restore failed",
+        formatBridgeTaggedErrorForLog(decision.error, owner),
+      );
+      return null;
+    }
+    const cleanupError = params.transcriptStore?.replaceAgentRunCheckpointBlobs
+      ?.call(params.transcriptStore, {
+        requestDeliveryId,
+        messages: input.checkpoint.messages,
+      })
+      .match({ ok: () => undefined, err: (error) => error });
+    if (cleanupError) {
+      logger.warn(
+        "agent run checkpoint blob reference cleanup deferred",
+        formatBridgeTaggedErrorForLog(cleanupError, owner),
+      );
+    }
+    return decision.handle;
+  };
+
+  const materializePreviousRunCheckpoint = async (input: {
+    readonly entry: Enqueued;
+    readonly identityProjection: StoredMessageIdentityProjectionV1;
+  }): Promise<
+    | {
+        readonly kind: "restored";
+        readonly checkpoint: AgentRunCheckpointV1;
+        readonly messages: ModelMessage[];
+        readonly handle: AgentRunJournalHandle;
+      }
+    | { readonly kind: "unavailable" }
+  > => {
+    const checkpoint = input.entry.previousRecoveryCheckpoint;
+    if (!checkpoint) return { kind: "unavailable" };
+    const materialized = await materializeStoredMessagesV1({
+      messages: checkpoint.messages,
+      blobStore: params.blobStore,
+      identityProjection: input.identityProjection,
+    });
+    const decision = materialized.match<
+      | { readonly kind: "messages"; readonly messages: ModelMessage[] }
+      | { readonly kind: "unavailable"; readonly error: Error }
+    >({
+      ok: (messages) => ({ kind: "messages", messages }),
+      err: (error) => ({ kind: "unavailable", error }),
+    });
+    if (decision.kind === "unavailable") {
+      logger.warn(
+        "agent run previous checkpoint blob unavailable",
+        formatBridgeTaggedErrorForLog(decision.error, {
+          requestDeliveryId: input.entry.requestDeliveryId,
+          requestId: input.entry.requestId,
+          sessionId: input.entry.sessionId,
+        }),
+      );
+      return { kind: "unavailable" };
+    }
+    const handle = await restorePreviousRunCheckpoint({
+      entry: input.entry,
+      checkpoint,
+    });
+    return handle
+      ? { kind: "restored", checkpoint, messages: decision.messages, handle }
+      : { kind: "unavailable" };
+  };
+
+  const installPreviousRunCheckpoint = (input: {
+    readonly entry: Enqueued;
+    readonly recovery: NonNullable<Enqueued["recovery"]>;
+    readonly checkpoint: AgentRunCheckpointV1;
+    readonly messages: ModelMessage[];
+    readonly handle: AgentRunJournalHandle;
+  }): void => {
+    logger.warn("agent run checkpoint restore used previous checkpoint", {
+      requestDeliveryId: input.entry.requestDeliveryId,
+      requestId: input.entry.requestId,
+      sessionId: input.entry.sessionId,
+    });
+    input.recovery.checkpointMessages = input.messages;
+    input.entry.storedRecoveryCheckpoint = [...input.checkpoint.messages];
+    input.entry.retainedRequestDeliveries = input.checkpoint.retainedRequestDeliveries;
+    input.entry.journalHandle = input.handle;
+    input.entry.corePrimaryLineage =
+      input.checkpoint.corePrimaryLineage ?? input.entry.acceptedCorePrimaryLineage;
+    input.entry.currentTurnUserId =
+      input.checkpoint.currentTurnUserId ?? input.entry.acceptedCurrentTurnUserId;
+    delete input.entry.previousRecoveryCheckpoint;
+  };
+
+  const fallBackRunCheckpointToAcceptedWork = (input: {
+    readonly entry: Enqueued;
+    readonly error: Error;
+  }): void => {
+    logger.warn(
+      "agent run checkpoint restore fell back to accepted work",
+      formatBridgeTaggedErrorForLog(input.error, {
+        requestDeliveryId: input.entry.requestDeliveryId,
+        requestId: input.entry.requestId,
+        sessionId: input.entry.sessionId,
+      }),
+    );
+    if (input.entry.requestDeliveryId) {
+      resetRunJournal({
+        requestDeliveryId: input.entry.requestDeliveryId,
+        requestId: input.entry.requestId,
+        sessionId: input.entry.sessionId,
+      });
+    }
+    delete input.entry.recovery;
+    delete input.entry.storedRecoveryCheckpoint;
+    delete input.entry.previousRecoveryCheckpoint;
+    delete input.entry.retainedRequestDeliveries;
+    delete input.entry.journalHandle;
+    input.entry.corePrimaryLineage = input.entry.acceptedCorePrimaryLineage;
+    input.entry.currentTurnUserId = input.entry.acceptedCurrentTurnUserId;
   };
 
   const markRunTerminal = (
@@ -4438,13 +4782,27 @@ export async function startBusAgentRunner(params: {
         err: (error) => error,
       });
       if (materializationError) {
-        state.queue.unshift(next);
-        return signalBusAgentRunnerHostFailure(materializationError);
+        const previous = await materializePreviousRunCheckpoint({
+          entry: next,
+          identityProjection: storedMessageIdentity,
+        });
+        if (previous.kind === "restored") {
+          installPreviousRunCheckpoint({
+            entry: next,
+            recovery: next.recovery,
+            checkpoint: previous.checkpoint,
+            messages: previous.messages,
+            handle: previous.handle,
+          });
+        } else {
+          fallBackRunCheckpointToAcceptedWork({ entry: next, error: materializationError });
+        }
+      } else {
+        next.recovery.checkpointMessages = materialized.match({
+          ok: (value) => value,
+          err: () => [],
+        });
       }
-      next.recovery.checkpointMessages = materialized.match({
-        ok: (value) => value,
-        err: () => [],
-      });
     }
     if (next.recovery) {
       const mergedControls = mergeQueuedControlsForRecovery(
@@ -4867,6 +5225,18 @@ export async function startBusAgentRunner(params: {
       ),
       retainedRequestDeliveryByInputId: new Map(),
       journalHandle: runJournalHandle,
+      checkpointWriter: {
+        disabled: false,
+        pending: null,
+        operation: null,
+        closed: false,
+        abandoned: false,
+        retryInputIds: new Set(),
+        inFlightInputIds: null,
+        lastCommittedProviderMessages: next.recovery?.checkpointMessages ?? [],
+        lastCommittedStoredMessages: next.storedRecoveryCheckpoint ?? [],
+        retainedPredecessorStoredMessages: next.previousRecoveryCheckpoint?.messages ?? [],
+      },
     };
 
     let initialMessages: ModelMessage[] = [];
@@ -4902,14 +5272,21 @@ export async function startBusAgentRunner(params: {
     let requestTerminalKind: "completed" | "failed" | "cancelled" = "failed";
     let shouldTerminalizeRequest = true;
     let terminalMarkerAttempted = false;
+    let terminalMarkerOperation: Promise<void> | null = null;
     let terminalSurfaceWriteAttempted = false;
     let terminalSurfaceWriteInitiated = false;
     const markActiveRunTerminal = (): void => {
       if (terminalMarkerAttempted || terminalPanic || !shouldTerminalizeRequest) return;
       const run = state.activeRun;
-      if (!run) return;
+      if (!run || run.checkpointWriter.abandoned) return;
       terminalMarkerAttempted = true;
-      markRunTerminal(run, { kind: requestTerminalKind }, outputPublisher.getFinalReplayDeadline());
+      const outcome = { kind: requestTerminalKind } as const;
+      const finalReplayDeadline = outputPublisher.getFinalReplayDeadline();
+      terminalMarkerOperation = (async () => {
+        await flushRunCheckpointWriter(run);
+        if (terminalPanic || run.checkpointWriter.abandoned) return;
+        markRunTerminal(run, outcome, finalReplayDeadline);
+      })();
     };
     const publishTerminalResponseText = async (
       input: Parameters<typeof outputPublisher.publishResponseText>[0],
@@ -4920,6 +5297,7 @@ export async function startBusAgentRunner(params: {
       terminalSurfaceWriteInitiated = true;
       requestTerminalKind = terminalKind;
       markActiveRunTerminal();
+      await terminalMarkerOperation;
     };
     const outcome = await (async () => {
       const runResult = await captureBusAgentRunnerOperation(
@@ -6124,7 +6502,7 @@ export async function startBusAgentRunner(params: {
             recoveryCheckpointHandler: (messages, canonicalInputIds) => {
               const activeRun = state.activeRun;
               if (!activeRun || activeRun.requestId !== next.requestId) return;
-              persistRunCheckpoint(activeRun, messages, canonicalInputIds);
+              enqueueRunCheckpoint(activeRun, messages, canonicalInputIds, storedMessageIdentity);
             },
             beforeStep:
               activeBinding.resolved.provider !== "claude-code"
@@ -8524,9 +8902,16 @@ export async function startBusAgentRunner(params: {
       const terminalSurfaceWriteSatisfied =
         !terminalSurfaceWriteAttempted || terminalSurfaceWriteInitiated;
       if (terminalSurfaceWriteSatisfied) markActiveRunTerminal();
+      if (terminalMarkerOperation) {
+        await terminalMarkerOperation;
+      } else if (state.activeRun) {
+        await flushRunCheckpointWriter(state.activeRun);
+      }
+      const checkpointWriterAbandoned = state.activeRun?.checkpointWriter.abandoned === true;
       let owningDeliveryTerminalized = false;
       if (
         !terminalPanic &&
+        !checkpointWriterAbandoned &&
         shouldTerminalizeRequest &&
         terminalSurfaceWriteSatisfied &&
         next.requestDeliveryId &&
@@ -8562,6 +8947,7 @@ export async function startBusAgentRunner(params: {
       let retainedDeliveriesTerminalized = true;
       if (
         !terminalPanic &&
+        !checkpointWriterAbandoned &&
         shouldTerminalizeRequest &&
         terminalSurfaceWriteSatisfied &&
         params.requestDelivery
@@ -8590,8 +8976,21 @@ export async function startBusAgentRunner(params: {
           });
         }
       }
-      if (owningDeliveryTerminalized && retainedDeliveriesTerminalized && next.requestDeliveryId) {
-        activeAgentRunJournal?.removeReconciled(next.requestDeliveryId);
+      if (
+        !checkpointWriterAbandoned &&
+        owningDeliveryTerminalized &&
+        retainedDeliveriesTerminalized &&
+        next.requestDeliveryId
+      ) {
+        const removed = activeAgentRunJournal?.removeReconciled(next.requestDeliveryId);
+        const removeError = removed?.match({ ok: () => null, err: (error) => error });
+        if (removed && !removeError) {
+          releaseRunCheckpointBlobs({
+            requestDeliveryId: next.requestDeliveryId,
+            requestId: next.requestId,
+            sessionId: next.sessionId,
+          });
+        }
       }
       state.agent = null;
       state.activeRequestId = null;
@@ -8599,7 +8998,7 @@ export async function startBusAgentRunner(params: {
       state.running = false;
       cancelledByRequestId.delete(headers.request_id);
       shutdownAbortRequestIds.delete(headers.request_id);
-      if (!terminalPanic) {
+      if (!terminalPanic && !checkpointWriterAbandoned) {
         startSessionQueueDrain(sessionId, state);
       }
     });
@@ -8851,6 +9250,7 @@ export async function startBusAgentRunner(params: {
       storedMessages: [...work.data.messages],
       corePrimaryLineage:
         recoveryHead?.checkpoint?.corePrimaryLineage ?? work.data.corePrimaryLineage,
+      acceptedCorePrimaryLineage: work.data.corePrimaryLineage,
       modelOverride: work.data.modelOverride,
       raw: preserveAgentRunnerRaw({ data: work.data }),
       ...(restoredIdentity
@@ -8860,6 +9260,11 @@ export async function startBusAgentRunner(params: {
               ? { authenticatedOrigin: restoredIdentity.projection.authenticatedOrigin }
               : {}),
             ...(restoredCurrentTurnUserId ? { currentTurnUserId: restoredCurrentTurnUserId } : {}),
+            ...(restoredIdentity.projection.authenticatedOrigin?.userId
+              ? {
+                  acceptedCurrentTurnUserId: restoredIdentity.projection.authenticatedOrigin.userId,
+                }
+              : {}),
             verifiedIngress: restoredIdentity.projection.verifiedIngress,
           }
         : { restoredSafetyMode: "restricted" as const }),
@@ -8867,6 +9272,9 @@ export async function startBusAgentRunner(params: {
         ? {
             recovery: { checkpointMessages: [], partialText: "" },
             storedRecoveryCheckpoint: [...recoveryHead.checkpoint.messages],
+            ...(recoveryHead.previousCheckpoint
+              ? { previousRecoveryCheckpoint: recoveryHead.previousCheckpoint }
+              : {}),
             retainedRequestDeliveries: recoveryHead.checkpoint.retainedRequestDeliveries,
           }
         : {}),
@@ -8911,6 +9319,7 @@ export async function startBusAgentRunner(params: {
     stop: async () => {
       stopRunnerAdmission();
       await stopSubscription();
+      await stopRunCheckpointWriters();
       if (terminalCleanupCompletion) {
         let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
         const completed = await Promise.race([

@@ -36,6 +36,7 @@ import {
   type EventDeliveryLogContext,
   type EventDeliveryLogger,
   type LilacBus,
+  type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
 
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
@@ -677,7 +678,8 @@ export function removeFullyReconciledAgentRunTerminalHeads(input: {
   readonly heads: ReadonlyMap<string, AgentRunRecoveryHead>;
   readonly requestDeliveryStore: Pick<CoreRequestDeliveryStore, "load">;
   readonly journal: Pick<AgentRunJournal, "removeReconciled">;
-}): void {
+}): readonly string[] {
+  const removedRunIds: string[] = [];
   for (const [runId, head] of input.heads) {
     if (head.state !== "terminal" || !head.terminalOutcome) continue;
     const terminalOutcome = head.terminalOutcome;
@@ -701,8 +703,66 @@ export function removeFullyReconciledAgentRunTerminalHeads(input: {
         }),
     );
     if (!retainedAreTerminal) continue;
-    input.journal.removeReconciled(runId);
+    input.journal.removeReconciled(runId).match({
+      ok: () => removedRunIds.push(runId),
+      err: () => undefined,
+    });
   }
+  return removedRunIds;
+}
+
+export type AgentRunCheckpointBlobRecoveryDecision =
+  | { readonly kind: "retained" }
+  | {
+      readonly kind: "reset";
+      readonly reconciliationError: Error;
+      readonly cleanupError?: Error;
+    }
+  | {
+      readonly kind: "disabled";
+      readonly reconciliationError: Error;
+      readonly resetError: Error;
+    };
+
+export function recoverAgentRunCheckpointBlobReferences<
+  TReconciliationError extends Error,
+  TResetError extends Error,
+>(input: {
+  readonly heads: ReadonlyMap<string, AgentRunRecoveryHead>;
+  readonly reconcile: (checkpoints: {
+    readonly checkpoints: readonly {
+      readonly requestDeliveryId: string;
+      readonly messages: readonly StoredMessageV1[];
+    }[];
+  }) => ResultType<void, TReconciliationError>;
+  readonly resetAll: () => ResultType<void, TResetError>;
+}): AgentRunCheckpointBlobRecoveryDecision {
+  const checkpoints = [...input.heads.values()].flatMap((head) =>
+    head.checkpoint
+      ? [
+          {
+            requestDeliveryId: head.handle.runId,
+            messages: [...head.checkpoint.messages, ...(head.previousCheckpoint?.messages ?? [])],
+          },
+        ]
+      : [],
+  );
+  const reconciliationError = input
+    .reconcile({ checkpoints })
+    .match({ ok: () => null, err: (error) => error });
+  if (!reconciliationError) return { kind: "retained" };
+
+  const resetError = input.resetAll().match({ ok: () => null, err: (error) => error });
+  if (resetError) return { kind: "disabled", reconciliationError, resetError };
+
+  const cleanupError = input
+    .reconcile({ checkpoints: [] })
+    .match({ ok: () => undefined, err: (error) => error });
+  return {
+    kind: "reset",
+    reconciliationError,
+    ...(cleanupError ? { cleanupError } : {}),
+  };
 }
 
 export type AgentRunAcceptedRecoveryDecision =
@@ -3514,7 +3574,79 @@ export async function createCoreRuntime(
               journalRecoveryJoin = joined;
             }
           }
-          const journalRecoveryHeads = journalRecoveryJoin.heads;
+          let journalRecoveryHeads = journalRecoveryJoin.heads;
+          const reconcileCheckpointBlobs = transcriptStore?.reconcileAgentRunCheckpointBlobs;
+          if (agentRunJournal && transcriptStore && reconcileCheckpointBlobs) {
+            const recoveryJournal = agentRunJournal;
+            const recoveryDecision = recoverAgentRunCheckpointBlobReferences({
+              heads: journalRecoveryHeads,
+              reconcile: (checkpoints) =>
+                reconcileCheckpointBlobs.call(transcriptStore, checkpoints),
+              resetAll: () => recoveryJournal.resetAll(),
+            });
+            const applyBlobReferenceRecoveryFailure = (
+              decision: Exclude<
+                AgentRunCheckpointBlobRecoveryDecision,
+                { readonly kind: "retained" }
+              >,
+            ): void => {
+              if (TaggedError.is(decision.reconciliationError)) {
+                logger.warn(
+                  "Agent run journal recovery reset after blob reference failure",
+                  formatTaggedErrorForLog(decision.reconciliationError),
+                );
+              } else {
+                logger.warn("Agent run journal recovery reset after blob reference failure", {
+                  errorTag: "CoreOwnedBlobIntegrityError",
+                  errorMessage: "Agent run checkpoint blob reference reconciliation failed",
+                });
+              }
+              journalRecoveryJoin = emptyAgentRunRecoveryJoin();
+              journalRecoveryHeads = new Map();
+              if (decision.kind === "reset") {
+                if (decision.cleanupError) {
+                  if (TaggedError.is(decision.cleanupError)) {
+                    logger.warn(
+                      "Agent run checkpoint blob reference cleanup deferred",
+                      formatTaggedErrorForLog(decision.cleanupError),
+                    );
+                  } else {
+                    logger.warn("Agent run checkpoint blob reference cleanup deferred", {
+                      errorTag: "CoreOwnedBlobIntegrityError",
+                      errorMessage: "Agent run checkpoint blob reference cleanup failed",
+                    });
+                  }
+                }
+                return;
+              }
+              if (TaggedError.is(decision.resetError)) {
+                logger.warn(
+                  "Agent run journal disabled after blob reference reset failure",
+                  formatTaggedErrorForLog(decision.resetError),
+                );
+              } else {
+                logger.warn("Agent run journal disabled after blob reference reset failure", {
+                  errorTag: "AgentRunJournalSqliteFailure",
+                  errorMessage: "Agent run journal reset failed",
+                });
+              }
+              const disabledJournal = recoveryJournal;
+              Result.try({
+                try: () => disabledJournal.close(),
+                catch: captureRuntimeError,
+              });
+              agentRunJournal = null;
+            };
+            switch (recoveryDecision.kind) {
+              case "retained":
+                break;
+              case "reset":
+              case "disabled": {
+                applyBlobReferenceRecoveryFailure(recoveryDecision);
+                break;
+              }
+            }
+          }
 
           // Start agent runner last so it can't publish replies before relay is online.
           const startedAgentRunner = await startBusAgentRunner({
@@ -3647,11 +3779,22 @@ export async function createCoreRuntime(
             };
           }
           if (agentRunJournal && requestDeliveryStore) {
-            removeFullyReconciledAgentRunTerminalHeads({
+            const removedRunIds = removeFullyReconciledAgentRunTerminalHeads({
               heads: journalRecoveryHeads,
               requestDeliveryStore,
               journal: agentRunJournal,
             });
+            for (const requestDeliveryId of removedRunIds) {
+              const releaseError = transcriptStore
+                ?.releaseAgentRunCheckpointBlobs?.({ requestDeliveryId })
+                .match({ ok: () => null, err: (error) => error });
+              if (releaseError) {
+                logger.warn(
+                  "Agent run checkpoint blob reference cleanup deferred",
+                  formatTaggedErrorForLog(releaseError),
+                );
+              }
+            }
           }
 
           const recoverableRootParentRequestIds =
