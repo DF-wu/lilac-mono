@@ -13,13 +13,13 @@ type EmbeddingUsage = Parameters<
 >[0];
 
 describe("conversation thread auto-inject usage", () => {
-  it("combines planner and concurrent search embedding usage into one compact log", () => {
-    const messages: string[] = [];
+  it("combines planner and concurrent search embedding usage into one structured log", () => {
+    const entries: Array<{ message: string; record: unknown }> = [];
     const times = [100, 156];
     const usage = createConversationThreadAutoInjectUsageAccumulator({
       requestId: "request-1",
       now: () => times.shift() ?? 156,
-      log: (message) => messages.push(message),
+      log: (message, record) => entries.push({ message, record }),
     });
 
     usage.recordPlannerUsage({
@@ -35,8 +35,32 @@ describe("conversation thread auto-inject usage", () => {
     usage.finish({ status: "completed", searchCount: 2, queryCount: 6 });
     usage.finish({ status: "failed" });
 
-    expect(messages).toEqual([
-      'conversation.thread.auto_inject.usage {"status":"completed","requestId":"request-1","elapsedMs":56,"searches":2,"queries":6,"planner":{"model":"codex/gpt-5.3-codex-spark","calls":1,"inputTokens":424,"outputTokens":730,"cacheReadTokens":0,"reasoningTokens":402},"embedding":{"model":"openai/text-embedding-3-small","calls":6,"inputChars":288,"tokens":59,"warnings":0}}',
+    expect(entries).toEqual([
+      {
+        message: "conversation.thread.auto_inject.usage",
+        record: {
+          status: "completed",
+          requestId: "request-1",
+          elapsedMs: 56,
+          searches: 2,
+          queries: 6,
+          planner: {
+            model: "codex/gpt-5.3-codex-spark",
+            calls: 1,
+            inputTokens: 424,
+            outputTokens: 730,
+            cacheReadTokens: 0,
+            reasoningTokens: 402,
+          },
+          embedding: {
+            model: "openai/text-embedding-3-small",
+            calls: 6,
+            inputChars: 288,
+            tokens: 59,
+            warnings: 0,
+          },
+        },
+      },
     ]);
   });
 });

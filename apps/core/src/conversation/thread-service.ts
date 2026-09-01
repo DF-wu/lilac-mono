@@ -658,11 +658,13 @@ function createThreadEmbeddingUsageAccumulator(
 export function createConversationThreadAutoInjectUsageAccumulator(input: {
   requestId?: string;
   now?: () => number;
-  log?: (message: string) => void;
+  log?: (message: string, record: AutoInjectUsageLogRecord) => void;
 }): ConversationThreadAutoInjectUsageAccumulator {
   const now = input.now ?? performance.now.bind(performance);
   const startedAt = now();
-  const log = input.log ?? ((message: string) => threadLogger.info(message));
+  const log =
+    input.log ??
+    ((message: string, record: AutoInjectUsageLogRecord) => threadLogger.info(message, record));
   let finished = false;
   let plannerModel: string | undefined;
   let plannerCalls = 0;
@@ -725,7 +727,7 @@ export function createConversationThreadAutoInjectUsageAccumulator(input: {
             }
           : {}),
       };
-      log(`conversation.thread.auto_inject.usage ${JSON.stringify(record)}`);
+      log("conversation.thread.auto_inject.usage", record);
     },
   };
 }
