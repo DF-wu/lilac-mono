@@ -115,6 +115,19 @@ async function projectCheckpointMessages(input: {
   }
   for (const message of messagesToProject) {
     if (typeof message.content === "string") continue;
+    const hasInlineFile = message.content.some(
+      (part) =>
+        part.type === "file" ||
+        (part.type === "tool-result" &&
+          part.output.type === "content" &&
+          part.output.value.some((output) => output.type === "file")),
+    );
+    if (!hasInlineFile) continue;
+    const requiresUpload = input.identityProjection.project([message]).match({
+      ok: () => false,
+      err: () => true,
+    });
+    if (!requiresUpload) continue;
     for (const part of message.content) {
       if (part.type === "file") {
         return Result.err(
@@ -125,8 +138,12 @@ async function projectCheckpointMessages(input: {
         );
       }
       if (part.type !== "tool-result" || part.output.type !== "content") continue;
-      const hasInlineFile = part.output.value.some((output) => output.type === "file");
-      if (hasInlineFile && part.toolName !== "read" && !readToolCallIds.has(part.toolCallId)) {
+      const hasInlineOutputFile = part.output.value.some((output) => output.type === "file");
+      if (
+        hasInlineOutputFile &&
+        part.toolName !== "read" &&
+        !readToolCallIds.has(part.toolCallId)
+      ) {
         return Result.err(
           new AgentRunCheckpointPreparationFailed({
             stage: "projection",

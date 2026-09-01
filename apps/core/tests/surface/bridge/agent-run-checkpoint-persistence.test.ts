@@ -178,6 +178,63 @@ describe("blob-backed agent run checkpoints", () => {
     resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
   });
 
+  it("uploads local reads alongside remembered ingress images", async () => {
+    const { blobStore, transcriptStore, owner, journal, identityProjection } =
+      await checkpointFixture();
+    const handle = resultValue(journal.openRun(owner));
+    const uri = "resource://r1_00000000000000000000000000000001" as const;
+    const ingressBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const providerMessages = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `[discord_attachment uri="${uri}" filename="image.png" mime="image/png"]`,
+          },
+          { type: "file", data: ingressBytes, mediaType: "image/png", filename: "image.png" },
+        ],
+      },
+    ] satisfies ModelMessage[];
+    const storedMessages = [
+      {
+        role: "user",
+        content: [{ type: "resource", uri, filename: "image.png", mediaType: "image/png" }],
+      },
+    ] satisfies StoredMessageV1[];
+    resultValue(identityProjection.remember(providerMessages, storedMessages));
+    const agentClone = providerMessages.map(
+      (message): ModelMessage => ({
+        ...message,
+        content: message.content.map((part) => ({ ...part })),
+      }),
+    );
+    const cropRead = localImageRead({
+      toolCallId: "read-crop",
+      path: "/tmp/crop.png",
+      filename: "crop.png",
+      bytes: Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 1]),
+    });
+
+    const persisted = resultValue(
+      await persistBlobBackedAgentRunCheckpoint({
+        handle,
+        journal,
+        messages: [...agentClone, ...cropRead],
+        identityProjection,
+        blobStore,
+        transcriptStore,
+        retainedRequestDeliveries: [],
+      }),
+    );
+
+    expect(persisted.messages[0]).toEqual(storedMessages[0]);
+    expect(storedBlobs(persisted.messages)).toHaveLength(1);
+    journal.close();
+    transcriptStore.close();
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
   it("uploads local reads and keeps every blob reachable from the cumulative checkpoint", async () => {
     const { transcriptDbPath, blobStore, transcriptStore, owner, journal, identityProjection } =
       await checkpointFixture();
