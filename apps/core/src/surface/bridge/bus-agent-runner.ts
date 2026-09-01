@@ -153,9 +153,11 @@ import {
   type TranscriptSnapshot,
   type TranscriptStore,
 } from "../../transcript/transcript-store";
-import type {
-  ConversationThreadSearchResult,
-  ConversationThreadToolService,
+import {
+  createConversationThreadAutoInjectUsageAccumulator,
+  type ConversationThreadAutoInjectUsageAccumulator,
+  type ConversationThreadSearchResult,
+  type ConversationThreadToolService,
 } from "../../conversation/thread-service";
 import {
   rankAutoInjectedThreadSearchResults,
@@ -1286,6 +1288,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   }) => Promise<void>;
   onInjected?: (event: AutoInjectedThreadSearchAppendedEvent) => void;
   onError: (message: string, error: BusAgentRunnerErrorProjection) => void;
+  autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
 }): Promise<ModelMessage[]> {
   const autoInject = params.cfg.conversation.thread.autoInject;
   if (!autoInject.enabled) return [];
@@ -1313,6 +1316,13 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
     ? getParticipantUserIdsFromRaw(params.raw)
     : [];
   if (autoInject.filterCurrentParticipants && participantIds.length === 0) return [];
+
+  const autoInjectUsage =
+    params.autoInjectUsage ??
+    createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
+  let usageStatus: "completed" | "abstained" | "partial" | "failed" = "failed";
+  let usageSearchCount = 0;
+  let usageQueryCount = 0;
 
   const toolCallId = buildAutoInjectedThreadSearchToolCallId(params.requestId);
   const display = `${AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME} auto-injected metadata`;
@@ -1349,8 +1359,15 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
         const plan = await conversationThreads.planAutoInjectSearch({
           text,
           content: latestInput.content,
+          autoInjectUsage,
         });
+        usageSearchCount = plan.searches.length;
+        usageQueryCount = plan.searches.reduce(
+          (sum, searchPlan) => sum + searchPlan.queries.length,
+          0,
+        );
         if (plan.searches.length === 0) {
+          usageStatus = "abstained";
           await publishToolStatusBestEffort({
             toolCallId,
             status: "end",
@@ -1369,6 +1386,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
               minScore: autoInject.minScore,
               mode: autoInject.mode,
               verbose: true,
+              autoInjectUsage,
               ...(participantIds.length > 0 ? { participantIdsAny: participantIds } : {}),
             }),
           ),
@@ -1407,6 +1425,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
           );
           return [];
         }
+        usageStatus = fulfilledSearches === plan.searches.length ? "completed" : "partial";
         const corpusDocuments = conversationThreads.getAutoInjectRankingCorpusDocuments?.() ?? [];
         const rankingResult = rankAutoInjectedThreadSearchResults({
           plan,
@@ -1488,8 +1507,18 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
         error: projected.message,
       });
       params.onError("auto-injected thread search failed; continuing without metadata", projected);
+      autoInjectUsage.finish({
+        status: "failed",
+        searchCount: usageSearchCount,
+        queryCount: usageQueryCount,
+      });
       return [];
     }
+    autoInjectUsage.finish({
+      status: usageStatus,
+      searchCount: usageSearchCount,
+      queryCount: usageQueryCount,
+    });
     return attempt.value;
   }
 }

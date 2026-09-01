@@ -49,7 +49,10 @@ import {
   type ClaudeNativeSessionStart,
   type MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
-import type { ConversationThreadToolService } from "../../../src/conversation/thread-service";
+import type {
+  ConversationThreadAutoInjectUsageAccumulator,
+  ConversationThreadToolService,
+} from "../../../src/conversation/thread-service";
 
 import {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
@@ -9216,6 +9219,14 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     const statuses: Array<{ status: "start" | "end"; ok?: boolean }> = [];
     let searchCalls = 0;
     const errors: string[] = [];
+    let plannerUsage: ConversationThreadAutoInjectUsageAccumulator | undefined;
+    const finishedUsage: Parameters<ConversationThreadAutoInjectUsageAccumulator["finish"]>[0][] =
+      [];
+    const autoInjectUsage: ConversationThreadAutoInjectUsageAccumulator = {
+      recordPlannerUsage: () => {},
+      recordEmbeddingUsage: () => {},
+      finish: (usage) => finishedUsage.push(usage),
+    };
 
     const messages = await maybeBuildAutoInjectedThreadSearchMessages({
       cfg: autoInjectCfg,
@@ -9223,7 +9234,10 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       raw: {},
       userMessages: [{ role: "user", content: "A long incidental article excerpt" }],
       conversationThreads: {
-        planAutoInjectSearch: async () => ({ searches: [] }),
+        planAutoInjectSearch: async (input) => {
+          plannerUsage = input.autoInjectUsage;
+          return { searches: [] };
+        },
         search: async () => {
           searchCalls += 1;
           throw new Error("not used");
@@ -9245,12 +9259,15 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       onError: (message) => {
         errors.push(message);
       },
+      autoInjectUsage,
     });
 
     expect(messages).toEqual([]);
     expect(searchCalls).toBe(0);
     expect(statuses).toEqual([{ status: "start" }, { status: "end", ok: true }]);
     expect(errors).toEqual([]);
+    expect(plannerUsage).toBe(autoInjectUsage);
+    expect(finishedUsage).toEqual([{ status: "abstained", searchCount: 0, queryCount: 0 }]);
   });
 
   it("includes dynamically capped brief metadata", async () => {

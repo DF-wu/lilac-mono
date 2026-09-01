@@ -477,6 +477,51 @@ type ThreadLanguageModelUsageOperation = "summary" | "query_aboutness" | "auto_i
 type ThreadEmbeddingUsageOperation = "thread_facets" | "search_query";
 type ThreadEmbeddingUsageStatus = "completed" | "failed";
 
+export type ConversationThreadAutoInjectUsageAccumulator = {
+  recordPlannerUsage(usage: {
+    model: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    reasoningTokens?: number;
+  }): void;
+  recordEmbeddingUsage(usage: {
+    model: string;
+    calls: number;
+    inputChars: number;
+    tokens: number;
+    warnings: number;
+  }): void;
+  finish(input: {
+    status: "completed" | "abstained" | "partial" | "failed";
+    searchCount?: number;
+    queryCount?: number;
+  }): void;
+};
+
+type AutoInjectUsageLogRecord = {
+  status: "completed" | "abstained" | "partial" | "failed";
+  requestId?: string;
+  elapsedMs: number;
+  searches: number;
+  queries: number;
+  planner?: {
+    model: string;
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    reasoningTokens: number;
+  };
+  embedding?: {
+    model: string;
+    calls: number;
+    inputChars: number;
+    tokens: number;
+    warnings: number;
+  };
+};
+
 type ThreadLanguageModelCallEndEvent = {
   provider: string;
   modelId: string;
@@ -499,8 +544,19 @@ function createThreadLanguageModelUsageLogger(input: {
   omittedMessages?: number;
   queryCount?: number;
   inputChars?: number;
+  autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
 }) {
   return (event: ThreadLanguageModelCallEndEvent) => {
+    if (input.autoInjectUsage) {
+      input.autoInjectUsage.recordPlannerUsage({
+        model: input.modelSpec,
+        inputTokens: event.usage.inputTokens,
+        outputTokens: event.usage.outputTokens,
+        cacheReadTokens: event.usage.inputTokenDetails.cacheReadTokens,
+        reasoningTokens: event.usage.outputTokenDetails.reasoningTokens,
+      });
+      return;
+    }
     threadLogger.info("conversation.thread.llm.usage", {
       operation: input.operation,
       jobId: input.jobId,
@@ -529,7 +585,10 @@ function createThreadLanguageModelUsageLogger(input: {
   };
 }
 
-function createThreadEmbeddingUsageAccumulator(operation: ThreadEmbeddingUsageOperation) {
+function createThreadEmbeddingUsageAccumulator(
+  operation: ThreadEmbeddingUsageOperation,
+  autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator,
+) {
   let calls = 0;
   let inputChars = 0;
   let tokens = 0;
@@ -561,7 +620,7 @@ function createThreadEmbeddingUsageAccumulator(operation: ThreadEmbeddingUsageOp
       error?: string;
     }) {
       if (calls === 0) return;
-      threadLogger.info("conversation.thread.embedding.usage", {
+      const usage = {
         operation,
         status: input.status,
         jobId: input.jobId,
@@ -580,7 +639,93 @@ function createThreadEmbeddingUsageAccumulator(operation: ThreadEmbeddingUsageOp
         dimensions: input.dimensions,
         persistedEmbeddings: input.persistedEmbeddings,
         error: input.error,
-      });
+      };
+      if (autoInjectUsage) {
+        autoInjectUsage.recordEmbeddingUsage({
+          model: modelSpec ?? modelId ?? "unknown",
+          calls,
+          inputChars,
+          tokens,
+          warnings,
+        });
+        return;
+      }
+      threadLogger.info("conversation.thread.embedding.usage", usage);
+    },
+  };
+}
+
+export function createConversationThreadAutoInjectUsageAccumulator(input: {
+  requestId?: string;
+  now?: () => number;
+  log?: (message: string) => void;
+}): ConversationThreadAutoInjectUsageAccumulator {
+  const now = input.now ?? performance.now.bind(performance);
+  const startedAt = now();
+  const log = input.log ?? ((message: string) => threadLogger.info(message));
+  let finished = false;
+  let plannerModel: string | undefined;
+  let plannerCalls = 0;
+  let plannerInputTokens = 0;
+  let plannerOutputTokens = 0;
+  let plannerCacheReadTokens = 0;
+  let plannerReasoningTokens = 0;
+  let embeddingModel: string | undefined;
+  let embeddingCalls = 0;
+  let embeddingInputChars = 0;
+  let embeddingTokens = 0;
+  let embeddingWarnings = 0;
+
+  return {
+    recordPlannerUsage(usage) {
+      plannerModel ??= usage.model;
+      plannerCalls += 1;
+      plannerInputTokens += usage.inputTokens ?? 0;
+      plannerOutputTokens += usage.outputTokens ?? 0;
+      plannerCacheReadTokens += usage.cacheReadTokens ?? 0;
+      plannerReasoningTokens += usage.reasoningTokens ?? 0;
+    },
+    recordEmbeddingUsage(usage) {
+      embeddingModel ??= usage.model;
+      embeddingCalls += usage.calls;
+      embeddingInputChars += usage.inputChars;
+      embeddingTokens += usage.tokens;
+      embeddingWarnings += usage.warnings;
+    },
+    finish(finishInput) {
+      if (finished) return;
+      finished = true;
+      const record: AutoInjectUsageLogRecord = {
+        status: finishInput.status,
+        ...(input.requestId ? { requestId: input.requestId } : {}),
+        elapsedMs: Math.round(now() - startedAt),
+        searches: finishInput.searchCount ?? 0,
+        queries: finishInput.queryCount ?? 0,
+        ...(plannerCalls > 0 && plannerModel
+          ? {
+              planner: {
+                model: plannerModel,
+                calls: plannerCalls,
+                inputTokens: plannerInputTokens,
+                outputTokens: plannerOutputTokens,
+                cacheReadTokens: plannerCacheReadTokens,
+                reasoningTokens: plannerReasoningTokens,
+              },
+            }
+          : {}),
+        ...(embeddingCalls > 0 && embeddingModel
+          ? {
+              embedding: {
+                model: embeddingModel,
+                calls: embeddingCalls,
+                inputChars: embeddingInputChars,
+                tokens: embeddingTokens,
+                warnings: embeddingWarnings,
+              },
+            }
+          : {}),
+      };
+      log(`conversation.thread.auto_inject.usage ${JSON.stringify(record)}`);
     },
   };
 }
@@ -1513,6 +1658,7 @@ async function defaultAutoInjectQueryPlanner(input: {
   cfg: CoreConfig;
   text: string;
   content?: UserContent;
+  autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
 }): Promise<ResultType<ConversationThreadAutoInjectQueryPlan, ConversationThreadGenerationError>> {
   const resolvedResult = resolveAutoInjectPlannerModel(input.cfg, input.content);
   const resolvedError = resultErrorOrNull(resolvedResult);
@@ -1544,6 +1690,7 @@ async function defaultAutoInjectQueryPlanner(input: {
     operation: "auto_inject_query_plan",
     modelSpec: resolved.spec,
     inputChars: input.text.length,
+    autoInjectUsage: input.autoInjectUsage,
   });
 
   if (resolved.provider === "codex") {
@@ -1711,6 +1858,7 @@ export class ConversationThreadService {
     minScore?: number;
     verbose?: boolean;
     queryAboutness?: ConversationThreadQueryAboutness;
+    autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
   }): Promise<ResultType<ConversationThreadSearchResult, ConversationThreadSearchError>> {
     const cfg = await this.params.getConfig();
     const limit = Math.min(50, Math.max(1, Math.floor(input.limit ?? 5)));
@@ -1731,7 +1879,7 @@ export class ConversationThreadService {
     const filters = buildSearchFilters(input);
     const recallLimit =
       mode === "lexical" ? limit : Math.min(50, Math.max(limit * COVERAGE_RECALL_MULTIPLIER, 10));
-    const usage = createThreadEmbeddingUsageAccumulator("search_query");
+    const usage = createThreadEmbeddingUsageAccumulator("search_query", input.autoInjectUsage);
     const recallHits = await this.searchHitsForQueries({
       queries,
       limit: recallLimit,
@@ -1782,6 +1930,7 @@ export class ConversationThreadService {
   async planAutoInjectSearch(input: {
     text: string;
     content?: UserContent;
+    autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
   }): Promise<
     ResultType<
       ConversationThreadAutoInjectQueryPlan,
@@ -1806,7 +1955,12 @@ export class ConversationThreadService {
           "summarize-thread",
           "Query planning failed",
         )
-      : await defaultAutoInjectQueryPlanner({ cfg, text, content: input.content });
+      : await defaultAutoInjectQueryPlanner({
+          cfg,
+          text,
+          content: input.content,
+          autoInjectUsage: input.autoInjectUsage,
+        });
     return planned.map(normalizeAutoInjectQueryPlan);
   }
 
