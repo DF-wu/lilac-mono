@@ -97,6 +97,10 @@ type ModelFilePart = Extract<
 type RememberedProviderMessage =
   | { readonly kind: "remembered"; readonly message: StoredMessageV1 }
   | { readonly kind: "ambiguous" };
+type ProviderFileIdentityPart = {
+  readonly type: string;
+  readonly data?: ModelFilePart["data"];
+};
 
 const resourceReadInputSchema = z.object({ path: storedResourcePartV1Schema.shape.uri });
 type PendingResourcesByToolCallId = Map<string, Array<StoredResourcePartV1 | undefined>>;
@@ -477,10 +481,10 @@ export function createStoredMessageIdentityProjectionV1(): StoredMessageIdentity
   const storedByProviderMessage = new WeakMap<object, StoredMessageV1>();
   const storedByProviderFileData = new WeakMap<object, RememberedProviderMessage>();
 
-  const providerFileData = (message: ModelMessage): object[] => {
+  const providerFileData = (message: ModelMessage | StoredMessageV1): object[] => {
     if (typeof message.content === "string") return [];
     const identities: object[] = [];
-    const rememberFile = (part: ModelPart | ModelToolResultContentPart): void => {
+    const rememberFile = (part: ProviderFileIdentityPart): void => {
       if (part.type !== "file" || typeof part.data !== "object" || part.data === null) return;
       identities.push(part.data);
     };
@@ -511,13 +515,8 @@ export function createStoredMessageIdentityProjectionV1(): StoredMessageIdentity
   const findRememberedProviderMessage = (
     providerMessage: ModelMessage | StoredMessageV1,
   ): StoredMessageV1 | undefined => {
-    const provider = decodeProviderMessageForPersistence(providerMessage).match({
-      ok: (message) => message,
-      err: () => null,
-    });
-    if (!provider) return undefined;
     let candidate: StoredMessageV1 | undefined;
-    for (const identity of providerFileData(provider)) {
+    for (const identity of providerFileData(providerMessage)) {
       const remembered = storedByProviderFileData.get(identity);
       if (remembered?.kind !== "remembered") continue;
       if (!candidate) {

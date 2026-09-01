@@ -824,6 +824,7 @@ describe("stored message materialization", () => {
   it("wraps resource bytes embedded in tool results for the provider contract", async () => {
     const blobStore = resultValue(await createMemoryBlobStore());
     const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const identityProjection = createStoredMessageIdentityProjectionV1();
     const uri = "resource://r1_00000000000000000000000000000001" as const;
     const messages = [
       {
@@ -860,6 +861,7 @@ describe("stored message materialization", () => {
       await materializeStoredMessagesV1({
         messages,
         blobStore,
+        identityProjection,
         resourceAccess: resourceAccess({
           bytes,
           mediaType: "image/png",
@@ -893,6 +895,16 @@ describe("stored message materialization", () => {
         },
       ],
     });
+    const agentClone = materialized.map((message): ModelMessage => {
+      if (message.role === "tool") {
+        return { ...message, content: message.content.map((part) => ({ ...part })) };
+      }
+      if (message.role === "assistant" && Array.isArray(message.content)) {
+        return { ...message, content: message.content.map((part) => ({ ...part })) };
+      }
+      return { ...message };
+    });
+    expect(resultValue(identityProjection.project(agentClone))).toEqual(messages);
 
     resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
   });
