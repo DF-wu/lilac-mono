@@ -16,4 +16,12 @@ export LILAC_GID="$gid"
 export HOME="$home"
 export USER="$runtime_user"
 export LOGNAME="$runtime_user"
+
+if [ "$#" -eq 2 ] && [ "$1" = "/usr/local/bin/bun" ] && [ "$2" = "apps/core/src/runtime/main.ts" ]; then
+  if [ "${LILAC_AUTO_MIGRATE_BLOB_STORAGE:-1}" != "0" ]; then
+    /usr/bin/setpriv --reuid="$uid" --regid="$gid" --init-groups -- \
+      /usr/local/bin/bun apps/core/scripts/startup-blob-storage-migration.ts
+  fi
+fi
+
 exec /usr/bin/setpriv --reuid="$uid" --regid="$gid" --init-groups -- "$@"
