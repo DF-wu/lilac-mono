@@ -762,12 +762,14 @@ describe("stored message materialization", () => {
   it("adds verified byte-backed images for a capable AI SDK provider", async () => {
     const blobStore = resultValue(await createMemoryBlobStore());
     const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const identityProjection = createStoredMessageIdentityProjectionV1();
     let openedWith = 0;
 
     const materialized = resultValue(
       await materializeStoredMessagesV1({
         messages: storedImageResource,
         blobStore,
+        identityProjection,
         resourceAccess: resourceAccess({
           bytes,
           mediaType: "image/png",
@@ -797,6 +799,100 @@ describe("stored message materialization", () => {
         filename: "image.png",
       },
     ]);
+    const agentClone = materialized.map((message): ModelMessage => {
+      if (message.role === "assistant") {
+        return {
+          ...message,
+          content: Array.isArray(message.content)
+            ? message.content.map((part) => ({ ...part }))
+            : message.content,
+        };
+      }
+      if (message.role === "tool") {
+        return { ...message, content: message.content.map((part) => ({ ...part })) };
+      }
+      if (message.role === "user" && Array.isArray(message.content)) {
+        return { ...message, content: message.content.map((part) => ({ ...part })) };
+      }
+      return { ...message };
+    });
+    expect(resultValue(identityProjection.project(agentClone))).toEqual(storedImageResource);
+
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
+  it("wraps resource bytes embedded in tool results for the provider contract", async () => {
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const uri = "resource://r1_00000000000000000000000000000001" as const;
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "read-resource-image",
+            toolName: "read",
+            input: { path: uri },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "read-resource-image",
+            toolName: "read",
+            output: {
+              type: "content",
+              value: [
+                { type: "text", text: "Attached file from read: image.png" },
+                { type: "resource", uri, filename: "image.png", mediaType: "image/png" },
+              ],
+            },
+          },
+        ],
+      },
+    ] satisfies StoredMessageV1[];
+
+    const materialized = resultValue(
+      await materializeStoredMessagesV1({
+        messages,
+        blobStore,
+        resourceAccess: resourceAccess({
+          bytes,
+          mediaType: "image/png",
+          classification: { kind: "image", mediaType: "image/png" },
+        }),
+        resourceTarget: {
+          family: "ai-sdk",
+          supportsImage: true,
+          supportsPdf: true,
+        },
+      }),
+    );
+
+    expect(materialized[1]).toMatchObject({
+      role: "tool",
+      content: [
+        {
+          output: {
+            type: "content",
+            value: [
+              { type: "text", text: "Attached file from read: image.png" },
+              { type: "text" },
+              {
+                type: "file",
+                data: { type: "data", data: Buffer.from(bytes).toString("base64") },
+                mediaType: "image/png",
+                filename: "image.png",
+              },
+            ],
+          },
+        },
+      ],
+    });
 
     resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
   });
