@@ -235,6 +235,46 @@ describe("blob-backed agent run checkpoints", () => {
     resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
   });
 
+  it("stores URL read bytes as a blob and restores them without refetching", async () => {
+    const { blobStore, transcriptStore, owner, journal, identityProjection } =
+      await checkpointFixture();
+    const handle = resultValue(journal.openRun(owner));
+    const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+    const messages = localImageRead({
+      toolCallId: "read-url-image",
+      path: "https://cdn.example.test/image.png?signature=secret",
+      filename: "image.png",
+      bytes,
+    });
+
+    const persisted = resultValue(
+      await persistBlobBackedAgentRunCheckpoint({
+        handle,
+        journal,
+        messages: structuredClone(messages),
+        identityProjection,
+        blobStore,
+        transcriptStore,
+        retainedRequestDeliveries: [],
+      }),
+    );
+
+    expect(storedBlobs(persisted.messages)).toHaveLength(1);
+    expect(JSON.stringify(persisted.messages)).not.toContain(Buffer.from(bytes).toString("base64"));
+    expect(
+      resultValue(
+        await materializeStoredMessagesV1({
+          messages: persisted.messages,
+          blobStore,
+        }),
+      ),
+    ).toEqual(messages);
+
+    journal.close();
+    transcriptStore.close();
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
   it("uploads local reads and keeps every blob reachable from the cumulative checkpoint", async () => {
     const { transcriptDbPath, blobStore, transcriptStore, owner, journal, identityProjection } =
       await checkpointFixture();
