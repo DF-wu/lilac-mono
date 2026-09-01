@@ -495,6 +495,15 @@ export type CoreOwnedBlobMaintenanceSummary = {
   readonly failed: number;
 };
 
+export type AgentRunCheckpointBlobOwner = {
+  readonly requestDeliveryId: string;
+  readonly messages: readonly StoredMessageV1[];
+};
+
+export type AgentRunCheckpointBlobReferenceError =
+  | CoreOwnedBlobIntegrityError
+  | TranscriptStoreSqliteDriverFailure;
+
 export type CoreSurfaceProjectionKey = {
   readonly requestClient: AdapterPlatform;
   readonly surfaceId: string;
@@ -1039,6 +1048,22 @@ export type TranscriptStore = {
     limit: number;
     now?: number;
   }): Promise<ResultType<CoreOwnedBlobMaintenanceSummary, CoreOwnedBlobIntegrityError>>;
+
+  retainAgentRunCheckpointBlobs?(
+    input: AgentRunCheckpointBlobOwner,
+  ): ResultType<void, AgentRunCheckpointBlobReferenceError>;
+
+  replaceAgentRunCheckpointBlobs?(
+    input: AgentRunCheckpointBlobOwner,
+  ): ResultType<void, AgentRunCheckpointBlobReferenceError>;
+
+  releaseAgentRunCheckpointBlobs?(input: {
+    readonly requestDeliveryId: string;
+  }): ResultType<void, TranscriptStoreSqliteDriverFailure>;
+
+  reconcileAgentRunCheckpointBlobs?(input: {
+    readonly checkpoints: readonly AgentRunCheckpointBlobOwner[];
+  }): ResultType<void, AgentRunCheckpointBlobReferenceError>;
 
   admitCoreSurfaceProjection?(
     input: AdmitCoreSurfaceProjection,
@@ -1888,6 +1913,24 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           [8, Date.now()],
         );
       }
+      if (version < 9) {
+        this.db.run(`
+          CREATE TABLE core_agent_run_checkpoint_blobs (
+            request_delivery_id TEXT NOT NULL CHECK (length(request_delivery_id) > 0),
+            blob_owner_id TEXT NOT NULL
+              REFERENCES core_owned_blobs(owner_id) ON DELETE RESTRICT,
+            PRIMARY KEY (request_delivery_id, blob_owner_id)
+          )
+        `);
+        this.db.run(`
+          CREATE INDEX idx_core_agent_run_checkpoint_blobs_blob
+          ON core_agent_run_checkpoint_blobs(blob_owner_id)
+        `);
+        this.db.run(
+          "INSERT INTO transcript_schema_migrations (version, applied_ts) VALUES (?, ?)",
+          [9, Date.now()],
+        );
+      }
       const foreignKeyFailures = this.db
         .query<DecodedTranscriptForeignKeyFailureRow, []>("PRAGMA foreign_key_check")
         .all()
@@ -2667,8 +2710,11 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
          )
          AND NOT EXISTS (
            SELECT 1 FROM core_transcript_blob_refs WHERE blob_owner_id = ?
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM core_agent_run_checkpoint_blobs WHERE blob_owner_id = ?
          )`,
-      [ownerId, ownerId, ownerId],
+      [ownerId, ownerId, ownerId, ownerId],
     );
     const deleted = result.changes > 0;
     if (deleted) {
@@ -2701,6 +2747,10 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
              SELECT 1 FROM core_transcript_blob_refs AS transcript_ref
              WHERE transcript_ref.blob_owner_id = blob.owner_id
            )
+           AND NOT EXISTS (
+             SELECT 1 FROM core_agent_run_checkpoint_blobs AS checkpoint_ref
+             WHERE checkpoint_ref.blob_owner_id = blob.owner_id
+           )
          ORDER BY blob.created_ts ASC, blob.owner_id ASC
          LIMIT ?`,
       )
@@ -2728,8 +2778,12 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
            AND NOT EXISTS (
              SELECT 1 FROM core_transcript_blob_refs
              WHERE blob_owner_id = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM core_agent_run_checkpoint_blobs
+             WHERE blob_owner_id = ?
            )`,
-        [now, row.owner_id, staleClaimCutoff, row.owner_id, row.owner_id],
+        [now, row.owner_id, staleClaimCutoff, row.owner_id, row.owner_id, row.owner_id],
       );
       if (claim.changes === 0) {
         retained += 1;
@@ -2749,8 +2803,11 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
            )
            AND NOT EXISTS (
              SELECT 1 FROM core_transcript_blob_refs WHERE blob_owner_id = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM core_agent_run_checkpoint_blobs WHERE blob_owner_id = ?
            )`,
-        [row.owner_id, now, row.owner_id, row.owner_id],
+        [row.owner_id, now, row.owner_id, row.owner_id, row.owner_id],
       );
       if (finalized.changes === 0) {
         return Result.err(
@@ -2766,6 +2823,100 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       });
     }
     return Result.ok({ inspected: rows.length, deleted, retained, failed });
+  }
+
+  retainAgentRunCheckpointBlobs(
+    input: AgentRunCheckpointBlobOwner,
+  ): ResultType<void, AgentRunCheckpointBlobReferenceError> {
+    return runBunSqliteTransaction<
+      void,
+      CoreOwnedBlobIntegrityError,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () =>
+        Result.gen(function* (this: SqliteTranscriptStore) {
+          const references = yield* collectStoredBlobReferences(input.messages);
+          for (const reference of references) {
+            yield* this.ensureTranscriptOwnedBlob(reference);
+            this.db.run(
+              `INSERT OR IGNORE INTO core_agent_run_checkpoint_blobs (
+                 request_delivery_id, blob_owner_id
+               ) VALUES (?, ?)`,
+              [input.requestDeliveryId, reference.ownerId],
+            );
+          }
+          return Result.ok(undefined);
+        }, this),
+      (cause) => classifyTranscriptSqliteDriverFailure("retain-agent-run-checkpoint-blobs", cause),
+    );
+  }
+
+  replaceAgentRunCheckpointBlobs(
+    input: AgentRunCheckpointBlobOwner,
+  ): ResultType<void, AgentRunCheckpointBlobReferenceError> {
+    return runBunSqliteTransaction<
+      void,
+      CoreOwnedBlobIntegrityError,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () =>
+        Result.gen(function* (this: SqliteTranscriptStore) {
+          const references = yield* collectStoredBlobReferences(input.messages);
+          for (const reference of references) yield* this.ensureTranscriptOwnedBlob(reference);
+          this.replaceAgentRunCheckpointBlobReferences(input.requestDeliveryId, references);
+          return Result.ok(undefined);
+        }, this),
+      (cause) => classifyTranscriptSqliteDriverFailure("replace-agent-run-checkpoint-blobs", cause),
+    );
+  }
+
+  releaseAgentRunCheckpointBlobs(input: {
+    readonly requestDeliveryId: string;
+  }): ResultType<void, TranscriptStoreSqliteDriverFailure> {
+    return this.readFromSqlite("release-agent-run-checkpoint-blobs", () => {
+      this.db.run("DELETE FROM core_agent_run_checkpoint_blobs WHERE request_delivery_id = ?", [
+        input.requestDeliveryId,
+      ]);
+    });
+  }
+
+  reconcileAgentRunCheckpointBlobs(input: {
+    readonly checkpoints: readonly AgentRunCheckpointBlobOwner[];
+  }): ResultType<void, AgentRunCheckpointBlobReferenceError> {
+    return runBunSqliteTransaction<
+      void,
+      CoreOwnedBlobIntegrityError,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () =>
+        Result.gen(function* (this: SqliteTranscriptStore) {
+          const prepared: Array<{
+            readonly requestDeliveryId: string;
+            readonly references: readonly CoreOwnedBlobReference[];
+          }> = [];
+          for (const checkpoint of input.checkpoints) {
+            const references = yield* collectStoredBlobReferences(checkpoint.messages);
+            for (const reference of references) yield* this.ensureTranscriptOwnedBlob(reference);
+            prepared.push({
+              requestDeliveryId: checkpoint.requestDeliveryId,
+              references,
+            });
+          }
+          this.db.run("DELETE FROM core_agent_run_checkpoint_blobs");
+          for (const checkpoint of prepared) {
+            this.replaceAgentRunCheckpointBlobReferences(
+              checkpoint.requestDeliveryId,
+              checkpoint.references,
+            );
+          }
+          return Result.ok(undefined);
+        }, this),
+      (cause) =>
+        classifyTranscriptSqliteDriverFailure("reconcile-agent-run-checkpoint-blobs", cause),
+    );
   }
 
   admitCoreSurfaceProjection(
@@ -3665,6 +3816,22 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         `INSERT INTO core_transcript_blob_refs (request_id, position, blob_owner_id)
          VALUES (?, ?, ?)`,
         [requestId, position, reference.ownerId],
+      );
+    }
+  }
+
+  private replaceAgentRunCheckpointBlobReferences(
+    requestDeliveryId: string,
+    references: readonly CoreOwnedBlobReference[],
+  ): void {
+    this.db.run("DELETE FROM core_agent_run_checkpoint_blobs WHERE request_delivery_id = ?", [
+      requestDeliveryId,
+    ]);
+    for (const reference of references) {
+      this.db.run(
+        `INSERT INTO core_agent_run_checkpoint_blobs (request_delivery_id, blob_owner_id)
+         VALUES (?, ?)`,
+        [requestDeliveryId, reference.ownerId],
       );
     }
   }
@@ -4649,12 +4816,18 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
                ) AND NOT EXISTS (
                  SELECT 1 FROM core_transcript_blob_refs AS reference
                  WHERE reference.blob_owner_id = blob.owner_id
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM core_agent_run_checkpoint_blobs AS reference
+                 WHERE reference.blob_owner_id = blob.owner_id
                ) THEN 1 ELSE 0 END), 0) AS unreferenced_count,
                COALESCE(SUM(CASE WHEN NOT EXISTS (
                  SELECT 1 FROM core_surface_projection_blobs AS reference
                  WHERE reference.blob_owner_id = blob.owner_id
                ) AND NOT EXISTS (
                  SELECT 1 FROM core_transcript_blob_refs AS reference
+                 WHERE reference.blob_owner_id = blob.owner_id
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM core_agent_run_checkpoint_blobs AS reference
                  WHERE reference.blob_owner_id = blob.owner_id
                ) THEN blob.byte_length ELSE 0 END), 0) AS unreferenced_bytes
              FROM core_owned_blobs AS blob`,

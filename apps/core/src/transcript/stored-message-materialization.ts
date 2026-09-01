@@ -59,6 +59,7 @@ export type StoredMessageIdentityProjectionV1 = {
   projectForPersistence(input: {
     readonly providerMessages: readonly (ModelMessage | StoredMessageV1)[];
     readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+    readonly shouldAbandon?: () => boolean;
     readonly retainUploadedFile: (
       file: StoredFilePartV1,
     ) => ResultType<void, StoredMessageProjectionError>;
@@ -209,13 +210,34 @@ function byteBackedProviderFile(part: ModelFilePart): Uint8Array | null {
   return null;
 }
 
+async function abandonProviderFileUpload(input: {
+  readonly blobStore: Pick<BlobStore, "delete">;
+  readonly target: Parameters<BlobStore["delete"]>[0];
+}): Promise<StoredMessageProjectionError> {
+  const deletionError = (await input.blobStore.delete(input.target)).match({
+    ok: () => null,
+    err: (error) => error,
+  });
+  return new StoredMessageProjectionError({
+    message: deletionError
+      ? `Provider file persistence was abandoned; upload cleanup failed: ${deletionError.message}`
+      : "Provider file persistence was abandoned",
+  });
+}
+
 async function persistProviderFile(input: {
   readonly part: ModelFilePart;
   readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly shouldAbandon?: () => boolean;
   readonly retainUploadedFile: (
     file: StoredFilePartV1,
   ) => ResultType<void, StoredMessageProjectionError>;
 }): Promise<ResultType<StoredFilePartV1, StoredMessageProjectionError>> {
+  if (input.shouldAbandon?.()) {
+    return Result.err(
+      new StoredMessageProjectionError({ message: "Provider file persistence was abandoned" }),
+    );
+  }
   const bytes = byteBackedProviderFile(input.part);
   if (bytes === null) {
     return Result.err(
@@ -237,6 +259,14 @@ async function persistProviderFile(input: {
           ),
         ),
     );
+    if (input.shouldAbandon?.()) {
+      return Result.err(
+        await abandonProviderFileUpload({
+          blobStore: input.blobStore,
+          target: upload.handle,
+        }),
+      );
+    }
     const blob = yield* Result.await(
       upload.completion.then((completed) =>
         completed.mapError(
@@ -247,6 +277,11 @@ async function persistProviderFile(input: {
         ),
       ),
     );
+    if (input.shouldAbandon?.()) {
+      return Result.err(
+        await abandonProviderFileUpload({ blobStore: input.blobStore, target: blob }),
+      );
+    }
     const file = {
       type: "blob" as const,
       blob,
@@ -288,6 +323,7 @@ async function settleUnretainedProviderFile(input: {
 async function persistProviderToolResult(input: {
   readonly part: ModelToolResultPart;
   readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly shouldAbandon?: () => boolean;
   readonly retainUploadedFile: (
     file: StoredFilePartV1,
   ) => ResultType<void, StoredMessageProjectionError>;
@@ -317,6 +353,7 @@ async function persistProviderToolResult(input: {
 async function persistProviderPart(input: {
   readonly part: ModelPart;
   readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly shouldAbandon?: () => boolean;
   readonly retainUploadedFile: (
     file: StoredFilePartV1,
   ) => ResultType<void, StoredMessageProjectionError>;
@@ -342,6 +379,7 @@ async function persistProviderMessage(input: {
   readonly reconstructResourceReads: boolean;
   readonly pendingResourcesByToolCallId: PendingResourcesByToolCallId;
   readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly shouldAbandon?: () => boolean;
   readonly retainUploadedFile: (
     file: StoredFilePartV1,
   ) => ResultType<void, StoredMessageProjectionError>;
@@ -405,6 +443,7 @@ async function projectMessagesWithDurableProviderFiles(input: {
     readonly reconstructResourceReads: boolean;
   }[];
   readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly shouldAbandon?: () => boolean;
   readonly retainUploadedFile: (
     file: StoredFilePartV1,
   ) => ResultType<void, StoredMessageProjectionError>;
@@ -416,6 +455,7 @@ async function projectMessagesWithDurableProviderFiles(input: {
     const persisted = await persistProviderMessage({
       ...candidate,
       blobStore: input.blobStore,
+      ...(input.shouldAbandon ? { shouldAbandon: input.shouldAbandon } : {}),
       retainUploadedFile: input.retainUploadedFile,
       pendingResourcesByToolCallId,
       uploadedFiles,
@@ -469,6 +509,7 @@ export function createStoredMessageIdentityProjectionV1(): StoredMessageIdentity
       return projectMessagesWithDurableProviderFiles({
         messages: candidates,
         blobStore: input.blobStore,
+        ...(input.shouldAbandon ? { shouldAbandon: input.shouldAbandon } : {}),
         retainUploadedFile: input.retainUploadedFile,
       });
     },

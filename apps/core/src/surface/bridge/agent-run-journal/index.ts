@@ -94,6 +94,7 @@ export type AgentRunRecoveryHead = {
   readonly handle: AgentRunJournalHandle;
   readonly state: "active" | "terminal";
   readonly checkpoint?: AgentRunCheckpointV1;
+  readonly previousCheckpoint?: AgentRunCheckpointV1;
   readonly terminalOutcome?: RequestDeliveryTerminalOutcome;
   readonly finalReplayDeadline?: number;
   readonly createdAt: number;
@@ -115,6 +116,10 @@ export type AgentRunJournalLoad = {
 export interface AgentRunJournal {
   openRun(work: AgentRunJournalOwner): ResultType<AgentRunJournalHandle, AgentRunJournalError>;
   writeCheckpoint(
+    handle: AgentRunJournalHandle,
+    checkpoint: AgentRunCheckpointV1,
+  ): ResultType<AgentRunJournalHandle, AgentRunJournalError>;
+  promotePreviousCheckpoint(
     handle: AgentRunJournalHandle,
     checkpoint: AgentRunCheckpointV1,
   ): ResultType<AgentRunJournalHandle, AgentRunJournalError>;
@@ -517,8 +522,92 @@ export class SqliteAgentRunJournal implements AgentRunJournal {
           );
           this.#database.run(
             `DELETE FROM agent_run_wal_events
-             WHERE request_delivery_id = ? AND event_kind = 'checkpoint' AND sequence < ?`,
-            [handle.runId, sequence],
+             WHERE request_delivery_id = ? AND event_kind = 'checkpoint' AND sequence NOT IN (
+               SELECT sequence
+               FROM agent_run_wal_events
+               WHERE request_delivery_id = ? AND event_kind = 'checkpoint'
+               ORDER BY sequence DESC
+               LIMIT 2
+             )`,
+            [handle.runId, handle.runId],
+          );
+          return Result.ok({ ...handle, sequence });
+        },
+      ),
+    );
+  }
+
+  promotePreviousCheckpoint(
+    handle: AgentRunJournalHandle,
+    checkpoint: AgentRunCheckpointV1,
+  ): ResultType<AgentRunJournalHandle, AgentRunJournalError> {
+    return validatedCheckpointPayload(handle.runId, checkpoint).andThen((payload) =>
+      transaction(
+        this.#database,
+        "promote-previous-checkpoint",
+        (): ResultType<AgentRunJournalHandle, AgentRunJournalError> => {
+          const current = this.#selectHead(handle.runId);
+          if (
+            !current ||
+            current.state !== "active" ||
+            current.request_id !== handle.requestId ||
+            current.session_id !== handle.sessionId ||
+            current.latest_sequence !== handle.sequence ||
+            !positiveSafeInteger(handle.sequence) ||
+            handle.sequence === Number.MAX_SAFE_INTEGER
+          ) {
+            return Result.err(
+              new AgentRunJournalConflict({
+                runId: handle.runId,
+                message: "Agent run fallback used a stale or incompatible journal handle",
+              }),
+            );
+          }
+          const previous = this.#database
+            .query<Pick<JournalEventRow, "payload_json">, [string]>(
+              `SELECT payload_json
+               FROM agent_run_wal_events
+               WHERE request_delivery_id = ? AND event_kind = 'checkpoint'
+               ORDER BY sequence DESC
+               LIMIT 1 OFFSET 1`,
+            )
+            .get(handle.runId);
+          if (!previous || previous.payload_json !== payload) {
+            return Result.err(
+              new AgentRunJournalConflict({
+                runId: handle.runId,
+                message: "Agent run fallback checkpoint is no longer the retained predecessor",
+              }),
+            );
+          }
+          const sequence = handle.sequence + 1;
+          const observedNow = this.#now();
+          if (!nonnegativeSafeInteger(observedNow)) {
+            return Result.err(
+              new AgentRunJournalCodecFailure({
+                runId: handle.runId,
+                field: "timestamp",
+                message: "Agent run journal clock returned an invalid timestamp",
+              }),
+            );
+          }
+          const now = Math.max(observedNow, current.updated_at);
+          this.#database.run(
+            `DELETE FROM agent_run_wal_events
+             WHERE request_delivery_id = ? AND event_kind = 'checkpoint'`,
+            [handle.runId],
+          );
+          this.#database.run(
+            `INSERT INTO agent_run_wal_events (
+               request_delivery_id, sequence, event_kind, payload_json, created_at
+             ) VALUES (?, ?, 'checkpoint', ?, ?)`,
+            [handle.runId, sequence, payload, now],
+          );
+          this.#database.run(
+            `UPDATE agent_run_wal_heads
+             SET latest_sequence = ?, checkpoint_sequence = ?, checkpoint_json = ?, updated_at = ?
+             WHERE request_delivery_id = ?`,
+            [sequence, sequence, payload, now, handle.runId],
           );
           return Result.ok({ ...handle, sequence });
         },
@@ -634,13 +723,16 @@ export class SqliteAgentRunJournal implements AgentRunJournal {
       }
       return decodeAgentRunCheckpointPayload(row.checkpoint_json, row.request_delivery_id).andThen(
         ({ value: checkpoint }) =>
-          this.#validateHeadEvents(row).map(() => ({
-            handle,
-            state: "active" as const,
-            checkpoint,
-            createdAt: row.created_at,
-            updatedAt: row.updated_at,
-          })),
+          this.#decodePreviousCheckpoint(row).andThen((previousCheckpoint) =>
+            this.#validateHeadEvents(row).map(() => ({
+              handle,
+              state: "active" as const,
+              checkpoint,
+              ...(previousCheckpoint ? { previousCheckpoint } : {}),
+              createdAt: row.created_at,
+              updatedAt: row.updated_at,
+            })),
+          ),
       );
     }
     if (row.state !== "terminal" || row.terminal_outcome_json === null) {
@@ -663,19 +755,41 @@ export class SqliteAgentRunJournal implements AgentRunJournal {
             )
           : Result.ok(undefined);
       return checkpoint.andThen((decodedCheckpoint) =>
-        this.#validateHeadEvents(row).map(() => ({
-          handle,
-          state: "terminal" as const,
-          ...(decodedCheckpoint ? { checkpoint: decodedCheckpoint } : {}),
-          terminalOutcome: terminal.outcome,
-          ...(terminal.finalReplayDeadline === undefined
-            ? {}
-            : { finalReplayDeadline: terminal.finalReplayDeadline }),
-          createdAt: row.created_at,
-          updatedAt: row.updated_at,
-        })),
+        this.#decodePreviousCheckpoint(row).andThen((previousCheckpoint) =>
+          this.#validateHeadEvents(row).map(() => ({
+            handle,
+            state: "terminal" as const,
+            ...(decodedCheckpoint ? { checkpoint: decodedCheckpoint } : {}),
+            ...(previousCheckpoint ? { previousCheckpoint } : {}),
+            terminalOutcome: terminal.outcome,
+            ...(terminal.finalReplayDeadline === undefined
+              ? {}
+              : { finalReplayDeadline: terminal.finalReplayDeadline }),
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+          })),
+        ),
       );
     });
+  }
+
+  #decodePreviousCheckpoint(
+    row: JournalHeadRow,
+  ): ResultType<AgentRunCheckpointV1 | undefined, AgentRunJournalCodecFailure> {
+    if (row.checkpoint_sequence === null) return Result.ok(undefined);
+    const previous = this.#database
+      .query<{ payload_json: string }, [string, number]>(
+        `SELECT payload_json
+         FROM agent_run_wal_events
+         WHERE request_delivery_id = ? AND event_kind = 'checkpoint' AND sequence < ?
+         ORDER BY sequence DESC
+         LIMIT 1`,
+      )
+      .get(row.request_delivery_id, row.checkpoint_sequence);
+    if (!previous) return Result.ok(undefined);
+    return decodeAgentRunCheckpointPayload(previous.payload_json, row.request_delivery_id).map(
+      ({ value }) => value,
+    );
   }
 
   #validateHeadEvents(row: JournalHeadRow): ResultType<void, AgentRunJournalCodecFailure> {
@@ -687,10 +801,14 @@ export class SqliteAgentRunJournal implements AgentRunJournal {
          ORDER BY sequence`,
       )
       .all(row.request_delivery_id);
-    const checkpointEvent = events.find((event) => event.event_kind === "checkpoint");
+    const checkpointEvents = events.filter((event) => event.event_kind === "checkpoint");
+    const checkpointEvent = checkpointEvents.at(-1);
     const terminalEvent = events.find((event) => event.event_kind === "terminal");
-    const expectedEventCount =
-      1 + (row.checkpoint_sequence === null ? 0 : 1) + (row.state === "terminal" ? 1 : 0);
+    const checkpointEventCountIsCoherent =
+      row.checkpoint_sequence === null
+        ? checkpointEvents.length === 0
+        : checkpointEvents.length === 1 || checkpointEvents.length === 2;
+    const expectedEventCount = 1 + checkpointEvents.length + (row.state === "terminal" ? 1 : 0);
     const everyEventTimestampIsCoherent = events.every(
       (event) =>
         positiveSafeInteger(event.sequence) &&
@@ -725,6 +843,7 @@ export class SqliteAgentRunJournal implements AgentRunJournal {
         : terminalEvent === undefined;
     if (
       events.length !== expectedEventCount ||
+      !checkpointEventCountIsCoherent ||
       !everyEventTimestampIsCoherent ||
       !openedEventIsCoherent ||
       !checkpointEventIsCoherent ||

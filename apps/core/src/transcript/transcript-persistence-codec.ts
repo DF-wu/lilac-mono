@@ -41,7 +41,7 @@ import {
 } from "../resource/contracts";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
-export const TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION = 8 as const;
+export const TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION = 9 as const;
 export const COMPACTION_CHECKPOINT_FORMAT_VERSION = 1 as const;
 export const CORE_SURFACE_PROJECTION_FORMAT_VERSION = 1 as const;
 export const CORE_TRANSCRIPT_DIGEST_VERSION = 2 as const;
@@ -414,7 +414,7 @@ export type CoreStoredLineageManifestV2 = {
 };
 
 type DecodedSchemaVersion = {
-  readonly version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+  readonly version: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
   readonly provenance: "current" | "migrated";
 };
 
@@ -657,6 +657,7 @@ function decodeSchemaVersion(
     case 6:
     case 7:
     case 8:
+    case 9:
       return Result.ok({
         version,
         provenance: version === TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION ? "current" : "migrated",
@@ -1942,7 +1943,7 @@ const fixtureResourceRow = {
 
 export const resourceRecordRowCodecCases = {
   current: {
-    input: { row: fixtureResourceRow, schemaVersion: 8, recordId: "current-resource" },
+    input: { row: fixtureResourceRow, schemaVersion: 9, recordId: "current-resource" },
     outcome: "ok",
     provenance: "current",
   },
@@ -1951,17 +1952,17 @@ export const resourceRecordRowCodecCases = {
     outcome: "error",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 8, recordId: "missing-resource" },
+    input: { row: null, schemaVersion: 9, recordId: "missing-resource" },
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureResourceRow, schemaVersion: 9, recordId: "future-resource" },
+    input: { row: fixtureResourceRow, schemaVersion: 10, recordId: "future-resource" },
     outcome: "error",
   },
   "malformed-serialization": {
     input: {
       row: { ...fixtureResourceRow, origin_json: "{" },
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "malformed-resource",
     },
     outcome: "error",
@@ -1969,7 +1970,7 @@ export const resourceRecordRowCodecCases = {
   "corrupt-fields": {
     input: {
       row: { ...fixtureResourceRow, declared_media_type: "TEXT/PLAIN" },
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "corrupt-resource",
     },
     outcome: "error",
@@ -2009,7 +2010,7 @@ const fixtureSurfaceMessageLinkRow = {
 
 export const surfaceMessageLinkRowCodecCases = {
   current: {
-    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 8, recordId: "current" },
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 9, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -2019,17 +2020,17 @@ export const surfaceMessageLinkRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 8, recordId: "missing" },
+    input: { row: null, schemaVersion: 9, recordId: "missing" },
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 9, recordId: "unsupported" },
+    input: { row: fixtureSurfaceMessageLinkRow, schemaVersion: 10, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
     input: {
       row: { ...fixtureSurfaceMessageLinkRow, request_id: 1 },
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "malformed",
     },
     outcome: "error",
@@ -2037,7 +2038,7 @@ export const surfaceMessageLinkRowCodecCases = {
   "corrupt-fields": {
     input: {
       row: { ...fixtureSurfaceMessageLinkRow, platform: "future" },
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -2046,7 +2047,7 @@ export const surfaceMessageLinkRowCodecCases = {
 
 export const recentAgentWriteRowCodecCases = {
   current: {
-    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 8, recordId: "current" },
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 9, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -2056,17 +2057,17 @@ export const recentAgentWriteRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 8, recordId: "missing" },
+    input: { row: null, schemaVersion: 9, recordId: "missing" },
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 9, recordId: "unsupported" },
+    input: { row: fixtureRecentAgentWriteRow, schemaVersion: 10, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
     input: {
       row: { ...fixtureRecentAgentWriteRow, updated_ts: "{" },
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "malformed",
     },
     outcome: "error",
@@ -2074,7 +2075,7 @@ export const recentAgentWriteRowCodecCases = {
   "corrupt-fields": {
     input: {
       row: { ...fixtureRecentAgentWriteRow, platform: "future" },
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -2095,7 +2096,7 @@ const fixtureDiscoveryRecordRow = {
 
 export const discoveryRecordRowCodecCases = {
   current: {
-    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 8, recordId: "current" },
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 9, recordId: "current" },
     outcome: "ok",
     provenance: "current",
   },
@@ -2105,17 +2106,17 @@ export const discoveryRecordRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 8, recordId: "missing" },
+    input: { row: null, schemaVersion: 9, recordId: "missing" },
     outcome: "error",
   },
   "unsupported-version": {
-    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 9, recordId: "unsupported" },
+    input: { row: fixtureDiscoveryRecordRow, schemaVersion: 10, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
     input: {
       row: { ...fixtureDiscoveryRecordRow, updated_ts: "{" },
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "malformed",
     },
     outcome: "error",
@@ -2123,7 +2124,7 @@ export const discoveryRecordRowCodecCases = {
   "corrupt-fields": {
     input: {
       row: { ...fixtureDiscoveryRecordRow, surface_message_id: null },
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -2134,7 +2135,7 @@ export const transcriptCompactionContextCodecCases = {
   current: {
     input: {
       raw: '{"type":"compaction","formatVersion":1}',
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "current",
     },
     outcome: "ok",
@@ -2146,22 +2147,22 @@ export const transcriptCompactionContextCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { raw: null, schemaVersion: 8, recordId: "missing" },
+    input: { raw: null, schemaVersion: 9, recordId: "missing" },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { raw: null, schemaVersion: 9, recordId: "unsupported" },
+    input: { raw: null, schemaVersion: 10, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { raw: "{", schemaVersion: 8, recordId: "malformed" },
+    input: { raw: "{", schemaVersion: 9, recordId: "malformed" },
     outcome: "error",
   },
   "corrupt-fields": {
     input: {
       raw: '{"type":"compaction","formatVersion":2}',
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "corrupt",
     },
     outcome: "error",
@@ -2172,7 +2173,7 @@ export const transcriptProviderStateCodecCases = {
   current: {
     input: {
       raw: '{"lastFamily":"ai-sdk","containsCrossFamilyTurns":false}',
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "current",
     },
     outcome: "ok",
@@ -2188,20 +2189,20 @@ export const transcriptProviderStateCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { raw: null, schemaVersion: 8, recordId: "missing" },
+    input: { raw: null, schemaVersion: 9, recordId: "missing" },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { raw: null, schemaVersion: 9, recordId: "unsupported" },
+    input: { raw: null, schemaVersion: 10, recordId: "unsupported" },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { raw: "{", schemaVersion: 8, recordId: "malformed" },
+    input: { raw: "{", schemaVersion: 9, recordId: "malformed" },
     outcome: "error",
   },
   "corrupt-fields": {
-    input: { raw: '{"lastFamily":"future"}', schemaVersion: 8, recordId: "corrupt" },
+    input: { raw: '{"lastFamily":"future"}', schemaVersion: 9, recordId: "corrupt" },
     outcome: "error",
   },
 } as const;
@@ -2214,7 +2215,7 @@ export const transcriptRowCodecCases = {
         context_meta_json: '{"type":"compaction","formatVersion":1}',
         provider_state_json: '{"lastFamily":"ai-sdk","containsCrossFamilyTurns":false}',
       },
-      schemaVersion: 8,
+      schemaVersion: 9,
     },
     outcome: "ok",
     provenance: "current",
@@ -2225,22 +2226,22 @@ export const transcriptRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: fixtureTranscriptRow, schemaVersion: 8 },
+    input: { row: fixtureTranscriptRow, schemaVersion: 9 },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { row: fixtureTranscriptRow, schemaVersion: 9 },
+    input: { row: fixtureTranscriptRow, schemaVersion: 10 },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { row: { ...fixtureTranscriptRow, messages_json: "{" }, schemaVersion: 8 },
+    input: { row: { ...fixtureTranscriptRow, messages_json: "{" }, schemaVersion: 9 },
     outcome: "error",
   },
   "corrupt-fields": {
     input: {
       row: { ...fixtureTranscriptRow, transcript_digest: "00".repeat(32) },
-      schemaVersion: 8,
+      schemaVersion: 9,
     },
     outcome: "error",
   },
@@ -2274,7 +2275,7 @@ export const transcriptStoreRowFixtures = {
     input: {
       storeKind: "named-binding",
       row: fixtureNamedBindingRow,
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "current-binding",
     },
     outcome: "ok",
@@ -2294,7 +2295,7 @@ export const transcriptStoreRowFixtures = {
     input: {
       storeKind: "named-binding",
       row: { ...fixtureNamedBindingRow, provider_family: "future-provider" },
-      schemaVersion: 8,
+      schemaVersion: 9,
       recordId: "corrupt-binding",
     },
     outcome: "error",
@@ -2314,7 +2315,7 @@ const fixtureProjectionRow = {
 
 export const coreSurfaceProjectionRowCodecCases = {
   current: {
-    input: { row: fixtureProjectionRow, schemaVersion: 8 },
+    input: { row: fixtureProjectionRow, schemaVersion: 9 },
     outcome: "ok",
     provenance: "current",
   },
@@ -2324,16 +2325,16 @@ export const coreSurfaceProjectionRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 8 },
+    input: { row: null, schemaVersion: 9 },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
   "unsupported-version": {
-    input: { row: fixtureProjectionRow, schemaVersion: 9 },
+    input: { row: fixtureProjectionRow, schemaVersion: 10 },
     outcome: "error",
   },
   "malformed-serialization": {
-    input: { row: { ...fixtureProjectionRow, source_facts_json: "{" }, schemaVersion: 8 },
+    input: { row: { ...fixtureProjectionRow, source_facts_json: "{" }, schemaVersion: 9 },
     outcome: "error",
   },
   "corrupt-fields": {
@@ -2343,7 +2344,7 @@ export const coreSurfaceProjectionRowCodecCases = {
         source_facts_json: '{"bad":null,"nested":{"bad":null}}',
         projection_format_version: 2,
       },
-      schemaVersion: 8,
+      schemaVersion: 9,
     },
     outcome: "error",
   },
@@ -2377,7 +2378,7 @@ const fixtureLineageRow = {
 
 export const coreLineageManifestRowCodecCases = {
   current: {
-    input: { row: fixtureLineageRow, schemaVersion: 8 },
+    input: { row: fixtureLineageRow, schemaVersion: 9 },
     outcome: "ok",
     provenance: "current",
   },
@@ -2387,17 +2388,17 @@ export const coreLineageManifestRowCodecCases = {
     provenance: "migrated",
   },
   "missing-defaulted": {
-    input: { row: null, schemaVersion: 8 },
+    input: { row: null, schemaVersion: 9 },
     outcome: "ok",
     provenance: "missing-defaulted",
   },
-  "unsupported-version": { input: { row: fixtureLineageRow, schemaVersion: 9 }, outcome: "error" },
+  "unsupported-version": { input: { row: fixtureLineageRow, schemaVersion: 10 }, outcome: "error" },
   "malformed-serialization": {
-    input: { row: { ...fixtureLineageRow, manifest_json: "{" }, schemaVersion: 8 },
+    input: { row: { ...fixtureLineageRow, manifest_json: "{" }, schemaVersion: 9 },
     outcome: "error",
   },
   "corrupt-fields": {
-    input: { row: { ...fixtureLineageRow, manifest_json: "{}" }, schemaVersion: 8 },
+    input: { row: { ...fixtureLineageRow, manifest_json: "{}" }, schemaVersion: 9 },
     outcome: "error",
   },
 } as const;

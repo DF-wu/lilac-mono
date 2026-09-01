@@ -1970,7 +1970,7 @@ describe("SqliteTranscriptStore", () => {
     const version = migrated
       .query("SELECT MAX(version) AS version FROM transcript_schema_migrations")
       .get();
-    expect(version).toEqual({ version: 8 });
+    expect(version).toEqual({ version: 9 });
     expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
     const columns = migrated.query("PRAGMA table_info(request_transcripts)").all() as Array<{
       name: string;
@@ -2939,9 +2939,10 @@ describe("SqliteTranscriptStore", () => {
     );
     store.close();
     const schema7 = new Database(dbPath);
+    schema7.run("DROP TABLE core_agent_run_checkpoint_blobs");
     schema7.run("DROP TABLE core_transcript_blob_refs");
     schema7.run("ALTER TABLE core_owned_blobs DROP COLUMN deletion_claim_ts");
-    schema7.run("DELETE FROM transcript_schema_migrations WHERE version = 8");
+    schema7.run("DELETE FROM transcript_schema_migrations WHERE version >= 8");
     schema7.close();
     store = new SqliteTranscriptStore(dbPath);
     expect(store.deleteCoreOwnedBlobIfUnreferenced({ ownerId: blob.objectId })).toBeNull();

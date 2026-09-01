@@ -73,7 +73,7 @@ function insertAccepted(dbPath: string, accepted: CoreAcceptedRequestWork): void
 }
 
 describe("SqliteAgentRunJournal", () => {
-  it("restores the latest compacted checkpoint after reopen", async () => {
+  it("restores the latest checkpoint and one predecessor after reopen", async () => {
     const { dbPath } = await fixture();
     const accepted = work();
     insertAccepted(dbPath, accepted);
@@ -103,6 +103,17 @@ describe("SqliteAgentRunJournal", () => {
       },
     });
     expect(second.sequence).toBe(3);
+    const latestCheckpoint = createAgentRunCheckpoint({
+      messages: [{ role: "user", content: "latest" }],
+      currentTurnUserId: "user-2",
+    });
+    const third = journal.writeCheckpoint(second, latestCheckpoint).match({
+      ok: (value) => value,
+      err: (error) => {
+        throw error;
+      },
+    });
+    expect(third.sequence).toBe(4);
     journal.close();
 
     const reopened = new SqliteAgentRunJournal({ dbPath });
@@ -114,7 +125,8 @@ describe("SqliteAgentRunJournal", () => {
     });
     expect(recovery.resets).toEqual([]);
     expect(recovery.heads).toHaveLength(1);
-    expect(recovery.heads[0]?.checkpoint).toEqual(checkpoint);
+    expect(recovery.heads[0]?.checkpoint).toEqual(latestCheckpoint);
+    expect(recovery.heads[0]?.previousCheckpoint).toEqual(checkpoint);
 
     const database = new Database(dbPath, { strict: true });
     const checkpointEvents = database
@@ -122,9 +134,104 @@ describe("SqliteAgentRunJournal", () => {
         "SELECT COUNT(*) AS count FROM agent_run_wal_events WHERE event_kind = 'checkpoint'",
       )
       .get();
-    expect(checkpointEvents?.count).toBe(1);
+    expect(checkpointEvents?.count).toBe(2);
     database.close();
     reopened.close();
+  });
+
+  it("promotes the predecessor atomically and preserves both checkpoints on mutation failure", async () => {
+    const { dbPath } = await fixture();
+    const accepted = work();
+    insertAccepted(dbPath, accepted);
+    const journal = new SqliteAgentRunJournal({ dbPath, now: () => 20 });
+    const opened = journal.openRun(accepted).match({
+      ok: (value) => value,
+      err: (error) => {
+        throw error;
+      },
+    });
+    const predecessor = createAgentRunCheckpoint({
+      messages: [{ role: "user", content: "safe" }],
+    });
+    const predecessorHandle = journal.writeCheckpoint(opened, predecessor).match({
+      ok: (value) => value,
+      err: (error) => {
+        throw error;
+      },
+    });
+    const latest = createAgentRunCheckpoint({
+      messages: [{ role: "user", content: "missing blob" }],
+    });
+    const latestHandle = journal.writeCheckpoint(predecessorHandle, latest).match({
+      ok: (value) => value,
+      err: (error) => {
+        throw error;
+      },
+    });
+    const database = new Database(dbPath, { strict: true });
+    const failureTriggers = [
+      `CREATE TRIGGER reject_agent_run_checkpoint_delete
+       BEFORE DELETE ON agent_run_wal_events
+       WHEN OLD.event_kind = 'checkpoint'
+       BEGIN SELECT RAISE(ABORT, 'checkpoint delete rejected'); END`,
+      `CREATE TRIGGER reject_agent_run_checkpoint_insert
+       BEFORE INSERT ON agent_run_wal_events
+       WHEN NEW.event_kind = 'checkpoint'
+       BEGIN SELECT RAISE(ABORT, 'checkpoint insert rejected'); END`,
+      `CREATE TRIGGER reject_agent_run_checkpoint_promote_update
+       BEFORE UPDATE OF checkpoint_json ON agent_run_wal_heads
+       BEGIN SELECT RAISE(ABORT, 'checkpoint update rejected'); END`,
+    ] as const;
+
+    for (const [index, trigger] of failureTriggers.entries()) {
+      database.run(trigger);
+      expect(
+        journal
+          .promotePreviousCheckpoint(latestHandle, predecessor)
+          .match({ ok: () => false, err: () => true }),
+      ).toBe(true);
+      database.run(
+        `DROP TRIGGER ${[
+          "reject_agent_run_checkpoint_delete",
+          "reject_agent_run_checkpoint_insert",
+          "reject_agent_run_checkpoint_promote_update",
+        ][index]!}`,
+      );
+      const recovery = journal.loadRecoveryHeads().match({
+        ok: (value) => value,
+        err: (error) => {
+          throw error;
+        },
+      });
+      expect(recovery.heads[0]?.handle).toEqual(latestHandle);
+      expect(recovery.heads[0]?.checkpoint).toEqual(latest);
+      expect(recovery.heads[0]?.previousCheckpoint).toEqual(predecessor);
+    }
+
+    const promoted = journal.promotePreviousCheckpoint(latestHandle, predecessor).match({
+      ok: (value) => value,
+      err: (error) => {
+        throw error;
+      },
+    });
+    expect(promoted.sequence).toBe(latestHandle.sequence + 1);
+    const recovery = journal.loadRecoveryHeads().match({
+      ok: (value) => value,
+      err: (error) => {
+        throw error;
+      },
+    });
+    expect(recovery.heads[0]?.checkpoint).toEqual(predecessor);
+    expect(recovery.heads[0]?.previousCheckpoint).toBeUndefined();
+    expect(
+      database
+        .query<{ count: number }, []>(
+          "SELECT COUNT(*) AS count FROM agent_run_wal_events WHERE event_kind = 'checkpoint'",
+        )
+        .get()?.count,
+    ).toBe(1);
+    database.close();
+    journal.close();
   });
 
   it("retains terminal state until reconciliation", async () => {

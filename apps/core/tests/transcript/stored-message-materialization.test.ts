@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import type { ModelMessage } from "ai";
-import { createMemoryBlobStore } from "@stanley2058/lilac-blob-storage";
+import { createMemoryBlobStore, type BlobStore } from "@stanley2058/lilac-blob-storage";
 import type { StoredFilePartV1, StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 import { Result, type Result as ResultType } from "better-result";
 
@@ -589,6 +589,111 @@ describe("stored message materialization", () => {
     expect((await blobStore.open(uploadedFile.blob)).status).toBe("error");
 
     resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
+  it("does not retain an uploaded provider file after persistence is abandoned", async () => {
+    const baseBlobStore = resultValue(await createMemoryBlobStore());
+    const uploadStarted = Promise.withResolvers<void>();
+    const releaseUpload = Promise.withResolvers<void>();
+    let abandoned = false;
+    let retainCalls = 0;
+    const blobStore: Pick<BlobStore, "startUpload" | "delete"> = {
+      startUpload: async (input) => {
+        const started = await baseBlobStore.startUpload(input);
+        return started.map((upload) => ({
+          ...upload,
+          completion: (async () => {
+            uploadStarted.resolve();
+            await releaseUpload.promise;
+            return await upload.completion;
+          })(),
+        }));
+      },
+      delete: (target) => baseBlobStore.delete(target),
+    };
+    const projection = createStoredMessageIdentityProjectionV1().projectForPersistence({
+      providerMessages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "file",
+              data: Buffer.from("abandoned provider file").toString("base64"),
+              mediaType: "text/plain",
+              filename: "abandoned.txt",
+            },
+          ],
+        },
+      ],
+      blobStore,
+      shouldAbandon: () => abandoned,
+      retainUploadedFile: () => {
+        retainCalls += 1;
+        return Result.ok(undefined);
+      },
+    });
+
+    await uploadStarted.promise;
+    abandoned = true;
+    releaseUpload.resolve();
+
+    expect((await projection).status).toBe("error");
+    expect(retainCalls).toBe(0);
+    resultValue(await baseBlobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
+  it("deletes an upload handle when persistence is abandoned as the upload starts", async () => {
+    const baseBlobStore = resultValue(await createMemoryBlobStore());
+    const uploadStarted = Promise.withResolvers<void>();
+    const releaseUploadStart = Promise.withResolvers<void>();
+    let abandoned = false;
+    let startedHandle: Parameters<BlobStore["delete"]>[0] | undefined;
+    let deletedTarget: Parameters<BlobStore["delete"]>[0] | undefined;
+    const blobStore: Pick<BlobStore, "startUpload" | "delete"> = {
+      startUpload: async (input) => {
+        const started = await baseBlobStore.startUpload(input);
+        started.match({
+          ok: (upload) => {
+            startedHandle = upload.handle;
+          },
+          err: () => undefined,
+        });
+        uploadStarted.resolve();
+        await releaseUploadStart.promise;
+        return started;
+      },
+      delete: (target) => {
+        deletedTarget = target;
+        return baseBlobStore.delete(target);
+      },
+    };
+    const projection = createStoredMessageIdentityProjectionV1().projectForPersistence({
+      providerMessages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "file",
+              data: Buffer.from("abandoned provider upload").toString("base64"),
+              mediaType: "text/plain",
+              filename: "abandoned-start.txt",
+            },
+          ],
+        },
+      ],
+      blobStore,
+      shouldAbandon: () => abandoned,
+      retainUploadedFile: () => Result.ok(undefined),
+    });
+
+    await uploadStarted.promise;
+    abandoned = true;
+    releaseUploadStart.resolve();
+
+    expect((await projection).status).toBe("error");
+    expect(startedHandle).toBeDefined();
+    expect(deletedTarget).toEqual(startedHandle);
+    resultValue(await baseBlobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
   });
 
   it("correlates reused read call IDs with their results in transcript order", () => {

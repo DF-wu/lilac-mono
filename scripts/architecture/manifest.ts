@@ -3683,6 +3683,14 @@ const CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER = {
   codecs: [CORE_AGENT_RUN_OPENED_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
 
+const CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "SqliteAgentRunJournal.#decodePreviousCheckpoint",
+  },
+  codecs: [CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity],
+} as const satisfies PersistedStoreConsumerRegistration;
+
 const CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS = [
   {
     identity: {
@@ -4087,6 +4095,9 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
     "SqliteTranscriptStore.registerOrGet",
     "SqliteTranscriptStore.compareAndSwapCache",
     "SqliteTranscriptStore.finalizeUnretained",
+    "SqliteTranscriptStore.retainAgentRunCheckpointBlobs",
+    "SqliteTranscriptStore.replaceAgentRunCheckpointBlobs",
+    "SqliteTranscriptStore.reconcileAgentRunCheckpointBlobs",
   ].map((exportName) => ({
     module: "src/transcript/transcript-store.ts",
     exportName,
@@ -4481,6 +4492,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                     CORE_RESOURCE_PERSISTED_CONSUMER,
                     CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER,
                     CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER,
+                    CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER,
                     ...CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS,
                     CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER,
                     CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER,
@@ -5295,6 +5307,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity,
             CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER.identity,
             CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER.identity,
+            CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER.identity,
             ...CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS.map(({ identity }) => identity),
             CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity,
             CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER.identity,
