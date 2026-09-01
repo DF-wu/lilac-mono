@@ -57,6 +57,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
     ["src/github/github-user-token.ts", "writeGithubUserTokenSecret.err.<callback>", "signal"],
     ["src/github/webhook/github-webhook-server.ts", "captureGithubWebhookOperation", "signal"],
     ["src/plugins/builtin/local-tools.ts", "captureLocalApplyPatchFs", "signal"],
+    ["src/tools/fs/remote-media-download.ts", "readRemoteMedia", "signal"],
     ["src/plugins/builtin/local-tools.ts", "signalBuiltinToolHostError", "signal"],
     ["src/plugins/builtin/server-tools.ts", "signalBuiltinPluginSkip", "signal"],
     [

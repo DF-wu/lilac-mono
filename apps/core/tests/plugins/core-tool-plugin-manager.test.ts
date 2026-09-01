@@ -508,6 +508,92 @@ describe("core tool plugin manager", () => {
     expect(getToolDescription(toolset.tools, "read")).toContain(
       "Analyze supported images and PDFs already attached to context directly",
     );
+    expect(getToolDescription(toolset.tools, "read")).toContain("direct HTTP(S) URL");
+  });
+
+  it("gates URL reads with the web.fetch native-profile authority", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfigV2({
+      configVersion: 2,
+      agent: {
+        subagents: {
+          profiles: {
+            explore: {
+              network: true,
+              level2: { plugins: ["web"], callables: ["search"] },
+            },
+            general: { network: false },
+          },
+        },
+      },
+    });
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
+        discovery: {} as DiscoveryService,
+        config: cfg,
+      },
+      dataDir,
+    });
+    await manager.init();
+
+    const build = (runProfile: "primary" | "explore" | "general") =>
+      manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile,
+        editingToolMode: "none",
+        subagentDepth: runProfile === "primary" ? 0 : 1,
+        subagentConfig: cfg.agent.subagents,
+        requestContext: {
+          requestId: `req:url-read-${runProfile}`,
+          sessionId: "test-session",
+          requestClient: "test",
+          subagentDepth: runProfile === "primary" ? 0 : 1,
+          subagentProfile: runProfile,
+          metadata: { readFileDirectImageSupported: true },
+        },
+      });
+
+    const primary = await build("primary");
+    const missingFetch = await build("explore");
+    const networkDisabled = await build("general");
+
+    expect(getToolDescription(primary.tools, "read")).toContain("direct HTTP(S) URL");
+    expect(getToolDescription(missingFetch.tools, "read")).not.toContain("HTTP(S)");
+    expect(getToolDescription(networkDisabled.tools, "read")).not.toContain("HTTP(S)");
+
+    const webDisabledCfg: CoreConfig = {
+      ...cfg,
+      plugins: { ...cfg.plugins, disabled: [...cfg.plugins.disabled, "web"] },
+    };
+    const webDisabledManager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
+        discovery: {} as DiscoveryService,
+        config: webDisabledCfg,
+      },
+      dataDir: path.join(dataDir, "web-disabled"),
+    });
+    await webDisabledManager.init();
+    const webDisabled = await webDisabledManager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: webDisabledCfg.agent.subagents,
+      requestContext: {
+        requestId: "req:url-read-web-disabled",
+        sessionId: "test-session",
+        requestClient: "test",
+        subagentDepth: 0,
+        subagentProfile: "primary",
+        metadata: { readFileDirectImageSupported: true },
+      },
+    });
+    expect(getToolDescription(webDisabled.tools, "read")).not.toContain("HTTP(S)");
   });
 
   it("retains delegation and Level 2 metadata when direct attachment support is false", async () => {

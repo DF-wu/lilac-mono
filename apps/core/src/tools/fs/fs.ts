@@ -33,6 +33,7 @@ import {
   readFileInputSchema as sharedReadFileInputSchema,
 } from "@stanley2058/lilac-coding-tools/schemas";
 import { fileTypeFromBuffer } from "file-type";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -81,6 +82,35 @@ const REMOTE_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.gnupg"] as const;
 const FFF_CACHE_DIR = path.join(env.dataDir, ".cache", "fff");
 const RESOURCE_URI_PREFIX = "resource://";
 const REDACTED_RESOURCE_LOG_PATH = "resource://[redacted]";
+
+export type ReadRemoteMedia = (input: {
+  readonly url: URL;
+  readonly abortSignal?: AbortSignal;
+  readonly maxBytes: number;
+}) => Promise<
+  ResultType<
+    {
+      readonly data: Uint8Array;
+    },
+    Error
+  >
+>;
+
+function parseRemoteMediaUrl(value: string): URL | null {
+  if (!URL.canParse(value)) return null;
+  const url = new URL(value);
+  return url.protocol === "http:" || url.protocol === "https:" ? url : null;
+}
+
+function remoteMediaFilename(url: URL, extension?: string): string {
+  const filename = path.posix.basename(url.pathname);
+  if (filename) return filename;
+  return extension ? `remote-media.${extension}` : "remote-media";
+}
+
+function remoteMediaLogPath(url: URL): string {
+  return `${url.origin}${url.pathname}`;
+}
 
 function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
   const select = result.match<() => T>({
@@ -704,6 +734,9 @@ type ReadFileOutput =
       error: { code: (typeof READ_ERROR_CODES)[number]; message: string };
     };
 
+type ReadFileAttachmentOutput = Extract<ReadFileOutput, { success: true; kind: "attachment" }>;
+type ReadFileFailureOutput = Extract<ReadFileOutput, { success: false }>;
+
 type CapturedResourceFsOperation<T> =
   | { readonly kind: "completed"; readonly value: T }
   | { readonly kind: "panic"; readonly panic: Panic }
@@ -1129,6 +1162,7 @@ export function fsTool(
     fsBackend?: FsBackend;
     readFileDirectImageSupported?: boolean;
     readFileDirectPdfSupported?: boolean;
+    readRemoteMedia?: ReadRemoteMedia;
     maxOutputBytes?: number;
     maxInlineMediaBytesPerPart?: number;
     artifactOnly?: boolean;
@@ -1167,7 +1201,13 @@ export function fsTool(
   const readFileSchema = createReadFileInputSchema({
     hashlineEnabled,
   }).extend({
-    path: z.string().describe("Filesystem path or resource:// URI."),
+    path: z
+      .string()
+      .describe(
+        opts?.readRemoteMedia && readFileDirectMediaSupported
+          ? "Filesystem path, resource:// URI, or HTTP(S) URL for a supported image or PDF."
+          : "Filesystem path or resource:// URI.",
+      ),
   });
   const readFileOutputSchema = buildReadFileOutputZod(hashlineEnabled);
   const grepInputSchema = createGrepInputSchema(hashlineEnabled).extend({
@@ -1224,6 +1264,57 @@ export function fsTool(
     }
   >();
   const instructionClaims = createReadFileInstructionClaims();
+
+  async function finalizeAttachmentRead(params: {
+    readonly source: "file" | "url";
+    readonly resolvedPath: string;
+    readonly filename: string;
+    readonly bytes: Buffer;
+    readonly fileHash: string;
+    readonly reportedBytes?: number;
+    readonly toolCallId: string;
+  }): Promise<ReadFileAttachmentOutput | ReadFileFailureOutput> {
+    const detected = await fileTypeFromBuffer(params.bytes);
+    if (!detected || !attachmentMimeTypes.has(detected.mime)) {
+      return {
+        success: false,
+        resolvedPath: params.resolvedPath,
+        error: {
+          code: "UNKNOWN",
+          message: `Cannot attach '${params.filename}': its content is not a supported image or PDF.${params.source === "url" ? " Use fetch for web pages and text URLs." : ""}`,
+        },
+      };
+    }
+
+    const mimeType = detected.mime;
+    if (!directMediaTypeSupported(mimeType)) {
+      return {
+        success: false,
+        resolvedPath: params.resolvedPath,
+        error: {
+          code: "UNKNOWN",
+          message: `Cannot attach '${params.filename}' (${mimeType}) because this model does not accept this file type as direct input.`,
+        },
+      };
+    }
+
+    binaryCacheByToolCallId.set(params.toolCallId, {
+      resolvedPath: params.resolvedPath,
+      filename: params.filename,
+      mimeType,
+      bytes: params.bytes,
+      fileHash: params.fileHash,
+    });
+    return {
+      success: true,
+      kind: "attachment",
+      resolvedPath: params.resolvedPath,
+      fileHash: params.fileHash,
+      filename: params.filename,
+      mimeType,
+      bytes: params.reportedBytes ?? params.bytes.byteLength,
+    };
+  }
 
   async function executeResourceRead(
     input: Omit<ReadFileInput, "cwd" | "dangerouslyAllow">,
@@ -1391,6 +1482,95 @@ export function fsTool(
     };
   }
 
+  async function executeRemoteMediaRead(
+    url: URL,
+    options: { readonly toolCallId: string; readonly abortSignal?: AbortSignal },
+  ): Promise<ReadFileOutput> {
+    const resolvedPath = remoteMediaLogPath(url);
+    const filenameHint = remoteMediaFilename(url);
+    const download = opts?.readRemoteMedia;
+    if (!download) {
+      return {
+        success: false,
+        resolvedPath,
+        error: {
+          code: "PERMISSION",
+          message: "Reading remote media is unavailable because this run cannot use web.fetch.",
+        },
+      };
+    }
+    if (!readFileDirectMediaSupported) {
+      return {
+        success: false,
+        resolvedPath,
+        error: {
+          code: "UNKNOWN",
+          message: "This model does not accept images or PDFs as direct input.",
+        },
+      };
+    }
+
+    const downloaded = (
+      await download({
+        url,
+        abortSignal: options.abortSignal,
+        maxBytes: maxInlineMediaBytesPerPart,
+      })
+    ).match<
+      | { readonly ok: true; readonly data: Uint8Array }
+      | { readonly ok: false; readonly error: Error }
+    >({
+      ok: (value) => ({ ok: true, ...value }),
+      err: (error) => ({ ok: false, error }),
+    });
+    if (!downloaded.ok) {
+      return remoteMediaDownloadFailure(resolvedPath, filenameHint, downloaded.error);
+    }
+
+    const bytes = Buffer.from(downloaded.data);
+    return await finalizeAttachmentRead({
+      source: "url",
+      resolvedPath,
+      filename: filenameHint,
+      bytes,
+      fileHash: createHash("sha256").update(bytes).digest("hex"),
+      toolCallId: options.toolCallId,
+    });
+  }
+
+  function remoteMediaDownloadFailure(
+    resolvedPath: string,
+    filename: string,
+    error: Error,
+  ): ReadFileFailureOutput {
+    const message = /too large|media limit|maximum \d+ bytes|exceeded.*bytes/i.test(error.message)
+      ? buildInlineMediaLimitMessage({
+          filename,
+          mimeType: inferMimeTypeFromFilename(filename),
+          maxBytes: maxInlineMediaBytesPerPart,
+          detail: error.message,
+        })
+      : error.message;
+    return {
+      success: false,
+      resolvedPath,
+      error: { code: "UNKNOWN", message },
+    };
+  }
+
+  async function executeLoggedRemoteMediaRead(
+    url: URL,
+    input: Omit<ReadFileInput, "cwd" | "dangerouslyAllow">,
+    options: { readonly toolCallId: string; readonly abortSignal?: AbortSignal },
+  ): Promise<ReadFileOutput> {
+    logger.info("fs.readFile", {
+      path: remoteMediaLogPath(url),
+      target: "url",
+      format: input.format ?? "raw",
+    });
+    return await executeRemoteMediaRead(url, options);
+  }
+
   async function executeResourceGrep(
     input: GrepInput & { readonly path: string },
     options: { readonly abortSignal?: AbortSignal },
@@ -1514,7 +1694,9 @@ export function fsTool(
     const parts = ["Reads text from a filesystem path or resource:// URI."];
     if (readFileDirectMediaSupported) {
       parts.push(
-        `Analyze ${mediaDescription} already attached to context directly. Use read to attach ${mediaDescription} available only through a filesystem path or resource:// URI, directly or as an independent batch child. If read reports unsupported or oversized media, use shell tools to create a supported file, then read that file.`,
+        opts?.readRemoteMedia
+          ? `Analyze ${mediaDescription} already attached to context directly. Use read to attach ${mediaDescription} from a filesystem path, resource:// URI, or direct HTTP(S) URL, directly or as an independent batch child. Use fetch for web pages and text URLs. If read reports unsupported or oversized media, use shell tools to create a supported file, then read that file.`
+          : `Analyze ${mediaDescription} already attached to context directly. Use read to attach ${mediaDescription} available only through a filesystem path or resource:// URI, directly or as an independent batch child. If read reports unsupported or oversized media, use shell tools to create a supported file, then read that file.`,
       );
     }
     parts.push("Continue a paged text read by passing a returned nextStart back unchanged.");
@@ -1640,6 +1822,11 @@ export function fsTool(
           };
         }
 
+        const remoteMediaUrl = parseRemoteMediaUrl(input.path);
+        if (remoteMediaUrl) {
+          return await executeLoggedRemoteMediaRead(remoteMediaUrl, input, options);
+        }
+
         if (opts?.artifactOnly) {
           return {
             success: false as const,
@@ -1736,47 +1923,15 @@ export function fsTool(
                 fileHash: bytesOutput.fileHash,
               });
               const filename = path.basename(bytesOutput.resolvedPath);
-
-              const detected = await fileTypeFromBuffer(bytes);
-              if (!detected || !attachmentMimeTypes.has(detected.mime)) {
-                return {
-                  success: false as const,
-                  resolvedPath: remoteResolvedPath,
-                  error: {
-                    code: "UNKNOWN" as const,
-                    message: `Cannot attach '${filename}': its content is not a supported image or PDF.`,
-                  },
-                };
-              }
-              const mimeType = detected.mime;
-              if (!directMediaTypeSupported(mimeType)) {
-                return {
-                  success: false as const,
-                  resolvedPath: remoteResolvedPath,
-                  error: {
-                    code: "UNKNOWN" as const,
-                    message: `Cannot attach '${filename}' (${mimeType}) because this model does not accept this file type as direct input.`,
-                  },
-                };
-              }
-
-              binaryCacheByToolCallId.set(options.toolCallId, {
+              return await finalizeAttachmentRead({
+                source: "file",
                 resolvedPath: remoteResolvedPath,
                 filename,
-                mimeType,
                 bytes,
                 fileHash: bytesOutput.fileHash,
+                reportedBytes: bytesOutput.bytesLength,
+                toolCallId: options.toolCallId,
               });
-
-              return {
-                success: true as const,
-                kind: "attachment" as const,
-                resolvedPath: remoteResolvedPath,
-                fileHash: bytesOutput.fileHash,
-                filename,
-                mimeType,
-                bytes: bytesOutput.bytesLength,
-              };
             }
 
             const bytesRes = await fileSystem.readFileBytes(
@@ -1809,37 +1964,16 @@ export function fsTool(
 
             const resolvedPath = bytesRes.resolvedPath;
             const filename = path.basename(resolvedPath);
-
-            const detected = await fileTypeFromBuffer(bytesRes.bytes);
-            if (!detected || !attachmentMimeTypes.has(detected.mime)) {
-              return {
-                success: false as const,
-                resolvedPath,
-                error: {
-                  code: "UNKNOWN" as const,
-                  message: `Cannot attach '${filename}': its content is not a supported image or PDF.`,
-                },
-              };
-            }
-            const mimeType = detected.mime;
-            if (!directMediaTypeSupported(mimeType)) {
-              return {
-                success: false as const,
-                resolvedPath,
-                error: {
-                  code: "UNKNOWN" as const,
-                  message: `Cannot attach '${filename}' (${mimeType}) because this model does not accept this file type as direct input.`,
-                },
-              };
-            }
-
-            binaryCacheByToolCallId.set(options.toolCallId, {
+            const attachment = await finalizeAttachmentRead({
+              source: "file",
               resolvedPath,
               filename,
-              mimeType,
               bytes: bytesRes.bytes,
               fileHash: bytesRes.fileHash,
+              reportedBytes: bytesRes.bytesLength,
+              toolCallId: options.toolCallId,
             });
+            if (!attachment.success) return attachment;
 
             const instructions = await loadReadFileInstructions({
               resolvedPath,
@@ -1851,13 +1985,7 @@ export function fsTool(
             });
 
             return {
-              success: true as const,
-              kind: "attachment" as const,
-              resolvedPath,
-              fileHash: bytesRes.fileHash,
-              filename,
-              mimeType,
-              bytes: bytesRes.bytesLength,
+              ...attachment,
               ...(instructions
                 ? {
                     loadedInstructions: instructions.loaded,
@@ -1975,10 +2103,14 @@ export function fsTool(
         const filename = cached?.filename ?? output.filename;
         const mimeType = cached?.mimeType ?? output.mimeType;
 
-        if (output.resolvedPath.startsWith(RESOURCE_URI_PREFIX) && bytes === undefined) {
+        if (
+          (output.resolvedPath.startsWith(RESOURCE_URI_PREFIX) ||
+            parseRemoteMediaUrl(output.resolvedPath)) &&
+          bytes === undefined
+        ) {
           return {
             type: "error-text",
-            value: `Failed to retain verified resource bytes for '${filename}'.`,
+            value: `Failed to retain verified attachment bytes for '${filename}'.`,
           };
         }
 

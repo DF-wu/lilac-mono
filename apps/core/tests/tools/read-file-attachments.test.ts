@@ -6,6 +6,7 @@ import path from "node:path";
 import { asSchema, type ToolModelMessage, type ToolSet } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { AiSdkPiAgent } from "@stanley2058/lilac-agent";
+import { Result } from "better-result";
 
 import { createToolResultOutputNormalizer } from "../../src/artifacts/tool-result-output-normalizer";
 import { batchTool } from "../../src/tools/batch";
@@ -121,6 +122,16 @@ describe("read attachments", () => {
     );
     expect(supportedDescription).not.toContain("OCR");
     expect(supportedDescription).not.toContain("upstream provider");
+
+    const urlDescription = getToolDescription(
+      fsTool(baseDir, {
+        readFileDirectImageSupported: true,
+        readFileDirectPdfSupported: true,
+        readRemoteMedia: async () => Result.err(new Error("unused")),
+      }).read,
+    );
+    expect(urlDescription).toContain("direct HTTP(S) URL");
+    expect(urlDescription).toContain("Use fetch for web pages and text URLs");
   });
 
   it("keeps path syntax separate from media behavior", () => {
@@ -148,6 +159,14 @@ describe("read attachments", () => {
     );
     expect(imageOnlyDescription).toContain("Analyze supported images already attached");
     expect(imageOnlyDescription).not.toContain("PDFs");
+
+    const urlSupported = getInputPropertyDescriptions(
+      fsTool(baseDir, {
+        readFileDirectImageSupported: true,
+        readRemoteMedia: async () => Result.err(new Error("unused")),
+      }).read,
+    );
+    expect(urlSupported.path).toContain("HTTP(S) URL");
   });
 
   it("does not emit attachment output when the model lacks direct media support", async () => {
@@ -271,6 +290,95 @@ describe("read attachments", () => {
     expect(parts[1]!.mediaType).toBe("application/pdf");
     expect(parts[1]!.filename).toBe("doc.pdf");
     expect(parts[1]!.data).toEqual({ type: "data", data: pdf.toString("base64") });
+  });
+
+  it("returns URL images through the existing attachment output", async () => {
+    const pngBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=";
+    const pngBytes = Buffer.from(pngBase64, "base64");
+    const downloads: Array<{ url: string; maxBytes: number }> = [];
+    const read = fsTool(baseDir, {
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: true,
+      maxInlineMediaBytesPerPart: 123_456,
+      readRemoteMedia: async ({ url, maxBytes }) => {
+        downloads.push({ url: url.toString(), maxBytes });
+        return Result.ok({ data: pngBytes });
+      },
+    }).read;
+
+    const inputUrl = "https://cdn.example.test/assets/photo?signature=secret";
+    const output = await resolveExecuteResult(
+      read.execute!({ path: inputUrl }, { toolCallId: "url-image", messages: [], context: {} }),
+    );
+
+    expect(downloads).toEqual([{ url: inputUrl, maxBytes: 123_456 }]);
+    expect(output).toMatchObject({
+      success: true,
+      kind: "attachment",
+      resolvedPath: "https://cdn.example.test/assets/photo",
+      filename: "photo",
+      mimeType: "image/png",
+      bytes: pngBytes.byteLength,
+    });
+    if (!isAttachmentResult(output)) return;
+
+    const modelOutput = await read.toModelOutput!({
+      toolCallId: "url-image",
+      input: { path: inputUrl },
+      output,
+    });
+    expect(modelOutput).toMatchObject({
+      type: "content",
+      value: [
+        { type: "text" },
+        {
+          type: "file",
+          mediaType: "image/png",
+          filename: "photo",
+          data: { type: "data", data: pngBase64 },
+        },
+      ],
+    });
+  });
+
+  it("does not let dangerouslyAllow bypass URL-read authority", async () => {
+    const read = fsTool(baseDir, {
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: true,
+    }).read;
+
+    const output = await resolveExecuteResult(
+      read.execute!(
+        { path: "https://example.test/image.png", dangerouslyAllow: true },
+        { toolCallId: "url-denied", messages: [], context: {} },
+      ),
+    );
+
+    expect(output).toMatchObject({
+      success: false,
+      error: { code: "PERMISSION", message: expect.stringContaining("web.fetch") },
+    });
+  });
+
+  it("directs remote text and web pages back to fetch", async () => {
+    const read = fsTool(baseDir, {
+      readFileDirectImageSupported: true,
+      readRemoteMedia: async () =>
+        Result.ok({ data: Buffer.from("<html><body>hello</body></html>") }),
+    }).read;
+
+    const output = await resolveExecuteResult(
+      read.execute!(
+        { path: "https://example.test/page" },
+        { toolCallId: "url-html", messages: [], context: {} },
+      ),
+    );
+
+    expect(output).toMatchObject({
+      success: false,
+      error: { code: "UNKNOWN", message: expect.stringContaining("Use fetch") },
+    });
   });
 
   it("keeps image-only models from attaching local PDFs", async () => {
