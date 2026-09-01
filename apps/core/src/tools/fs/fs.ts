@@ -790,33 +790,10 @@ function resourceExpectedClassification(
   return hint === "other" ? "any" : hint;
 }
 
-function directMediaDescription(
-  image: boolean,
-  pdf: boolean,
-): {
-  readonly schemaSubject: string;
-  readonly supportedMedia: string;
-  readonly mediaPaths: string;
-} {
-  if (image && pdf) {
-    return {
-      schemaSubject: "Supported images and PDFs are",
-      supportedMedia: "supported images and PDFs",
-      mediaPaths: "an image or PDF path",
-    };
-  }
-  if (image) {
-    return {
-      schemaSubject: "Supported images are",
-      supportedMedia: "supported images",
-      mediaPaths: "an image path",
-    };
-  }
-  return {
-    schemaSubject: "PDFs are",
-    supportedMedia: "PDFs",
-    mediaPaths: "a PDF path",
-  };
+function directMediaDescription(image: boolean, pdf: boolean): string {
+  if (image && pdf) return "supported images and PDFs";
+  if (image) return "supported images";
+  return "PDFs";
 }
 
 function resourceFilename(descriptor: ResourceDescriptor): string {
@@ -1189,15 +1166,8 @@ export function fsTool(
       : undefined;
   const readFileSchema = createReadFileInputSchema({
     hashlineEnabled,
-    directAttachmentSupported: readFileDirectMediaSupported,
   }).extend({
-    path: z
-      .string()
-      .describe(
-        readFileDirectMediaSupported
-          ? `Filesystem path or resource:// URI to read. ${mediaDescription.schemaSubject} attached to your context for native visual or document analysis.`
-          : "Filesystem path or resource:// URI to read.",
-      ),
+    path: z.string().describe("Filesystem path or resource:// URI."),
   });
   const readFileOutputSchema = buildReadFileOutputZod(hashlineEnabled);
   const grepInputSchema = createGrepInputSchema(hashlineEnabled).extend({
@@ -1541,33 +1511,14 @@ export function fsTool(
   }
 
   function buildReadFileDescription(): string {
-    let introduction: string;
+    const parts = ["Reads text from a filesystem path or resource:// URI."];
     if (readFileDirectMediaSupported) {
-      introduction = `Reads files from the filesystem or a resource:// URI. For ${mediaDescription.supportedMedia} in retained resources, calling read attaches the original file to your context for native visual or document analysis. Call read first for ${mediaDescription.mediaPaths}, either directly or as an independent batch child; use shell media processing only if read reports that the input is unsupported or oversized.`;
-    } else if (hashlineEnabled) {
-      introduction =
-        "Reads a file from the filesystem or a resource:// URI. Default format is raw to preserve indentation. Use format='hashline' before edit when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead.";
-    } else {
-      introduction =
-        "Reads a file from the filesystem or a resource:// URI. Default format is raw (no line numbers) to preserve indentation.";
-    }
-    const parts = [introduction];
-
-    if (readFileDirectMediaSupported && hashlineEnabled) {
       parts.push(
-        "For text files, default format is raw to preserve indentation. Use format='hashline' before edit when you need stable edit anchors. Very long lines may downgrade the response back to raw with a warning that tells you to use bash instead.",
-      );
-    } else if (readFileDirectMediaSupported) {
-      parts.push(
-        "For text files, default format is raw (no line numbers) to preserve indentation.",
+        `Analyze ${mediaDescription} already attached to context directly. Use read to attach ${mediaDescription} available only through a filesystem path or resource:// URI, directly or as an independent batch child. If read reports unsupported or oversized media, use shell tools to create a supported file, then read that file.`,
       );
     }
-
-    parts.push(
-      "Use maxCharacters with either absolute offset or line/column start positions to page through text resources. Absolute offsets count Unicode characters including newlines. Reuse nextStart unchanged to continue.",
-    );
+    parts.push("Continue a paged text read by passing a returned nextStart back unchanged.");
     parts.push(READ_FILE_INSTRUCTION_HINT);
-    parts.push("Denylisted paths require dangerouslyAllow=true.");
     return parts.join(" ");
   }
 

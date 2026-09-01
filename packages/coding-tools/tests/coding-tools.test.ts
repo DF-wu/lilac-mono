@@ -958,7 +958,15 @@ describe("coding tools", () => {
         ],
       });
     }
-    expect(tools.read?.description).toContain("native visual or document analysis");
+    expect(tools.read?.description).toContain(
+      "Analyze supported images and PDFs already attached to context directly",
+    );
+    expect(tools.read?.description).toContain(
+      "Use read to attach supported images and PDFs available only through a local filesystem path",
+    );
+    expect(JSON.stringify(await asSchema(tools.read?.inputSchema).jsonSchema)).toContain(
+      "Local filesystem path or tool-result:// URI.",
+    );
   });
 
   it("read preserves attachment instructions and reports consumed attachment bytes", async () => {
@@ -1123,7 +1131,7 @@ describe("coding tools", () => {
   it("read enables media explicitly and enforces the decoded per-part byte limit", async () => {
     await writeFile(path.join(cwd, "large.webp"), Buffer.alloc(17));
     const textOnly = createCodingToolset({ cwd });
-    expect(textOnly.read?.description).not.toContain("native visual or document analysis");
+    expect(textOnly.read?.description).not.toContain("supported images and PDFs");
 
     const read = executable(
       createCodingToolset({

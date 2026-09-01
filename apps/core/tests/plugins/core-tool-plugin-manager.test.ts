@@ -506,7 +506,7 @@ describe("core tool plugin manager", () => {
     });
 
     expect(getToolDescription(toolset.tools, "read")).toContain(
-      "calling read attaches the original file to your context for native visual or document analysis",
+      "Analyze supported images and PDFs already attached to context directly",
     );
   });
 
@@ -586,7 +586,7 @@ describe("core tool plugin manager", () => {
     });
     expect(delegationCount).toBe(1);
     expect(getToolDescription(toolset.tools, "read")).not.toContain(
-      "calling read attaches the original file to your context for native visual or document analysis",
+      "Analyze supported images and PDFs already attached to context directly",
     );
   });
 

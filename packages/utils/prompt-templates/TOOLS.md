@@ -5,7 +5,7 @@ Keep a compact existence map for tools hidden behind the `tools` CLI. Add detail
 ## `tools` CLI catalog
 
 - `fetch` extracts ordinary webpages; `search` discovers pages. Use raw HTTP or browser tooling for headers, status, raw content, or interaction.
-- `generate.{image,video}` creates media; native `read` inspects existing images and PDFs.
+- `generate.{image,video}` creates media.
 - `skills.{list,brief,full}` finds and loads installed skills.
 - `ssh.{hosts,probe,run}` discovers hosts and runs remote shell work.
 - `attachment.add_files` attaches local files to a reply; `resource.materialize` writes `resource://` references locally.

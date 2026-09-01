@@ -98,7 +98,7 @@ describe("read attachments", () => {
     await rm(baseDir, { recursive: true, force: true });
   });
 
-  it("advertises direct image and PDF reads only when enabled", () => {
+  it("advertises the direct-media branches only when enabled", () => {
     const unsupportedDescription = getToolDescription(fsTool(baseDir).read);
     expect(unsupportedDescription).not.toContain("image");
     expect(unsupportedDescription).not.toContain("PDF");
@@ -111,16 +111,19 @@ describe("read attachments", () => {
       }).read,
     );
     expect(supportedDescription).toContain(
-      "calling read attaches the original file to your context for native visual or document analysis",
+      "Analyze supported images and PDFs already attached to context directly",
     );
     expect(supportedDescription).toContain(
-      "Call read first for an image or PDF path, either directly or as an independent batch child",
+      "Use read to attach supported images and PDFs available only through a filesystem path or resource:// URI",
+    );
+    expect(supportedDescription).toContain(
+      "If read reports unsupported or oversized media, use shell tools to create a supported file, then read that file",
     );
     expect(supportedDescription).not.toContain("OCR");
     expect(supportedDescription).not.toContain("upstream provider");
   });
 
-  it("describes native media paths and text-only options when enabled", () => {
+  it("keeps path syntax separate from media behavior", () => {
     const unsupported = getInputPropertyDescriptions(fsTool(baseDir).read);
     expect(unsupported.path).not.toContain("images");
     expect(unsupported.path).not.toContain("PDFs");
@@ -131,22 +134,20 @@ describe("read attachments", () => {
         readFileDirectPdfSupported: true,
       }).read,
     );
-    expect(supported.path).toContain(
-      "Supported images and PDFs are attached to your context for native visual or document analysis.",
-    );
+    expect(supported.path).toBe("Filesystem path or resource:// URI.");
     expect(supported.start).toStartWith("Text files only.");
     expect(supported.maxLines).toStartWith("Text files only.");
     expect(supported.maxCharacters).toStartWith("Text files only.");
     expect(supported.format).toStartWith("Text files only.");
 
-    const imageOnly = getInputPropertyDescriptions(
+    const imageOnlyDescription = getToolDescription(
       fsTool(baseDir, {
         readFileDirectImageSupported: true,
         readFileDirectPdfSupported: false,
       }).read,
     );
-    expect(imageOnly.path).toContain("Supported images are attached");
-    expect(imageOnly.path).not.toContain("PDFs are attached");
+    expect(imageOnlyDescription).toContain("Analyze supported images already attached");
+    expect(imageOnlyDescription).not.toContain("PDFs");
   });
 
   it("does not emit attachment output when the model lacks direct media support", async () => {

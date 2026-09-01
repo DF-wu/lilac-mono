@@ -1524,7 +1524,7 @@ describe("SessionService", () => {
     expect(JSON.stringify(chunks)).not.toContain(pdf.toString("base64"));
     expect(JSON.stringify(chunks)).toContain('"kind":"attachment"');
     expect(JSON.stringify(model.doStreamCalls[0]?.tools)).toContain(
-      "native visual or document analysis",
+      "Analyze supported images and PDFs already attached to context directly",
     );
     service.close();
   });

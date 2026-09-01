@@ -46,7 +46,7 @@ export type BashInput = z.infer<typeof bashInputSchema>;
 const pathSchema = z
   .string()
   .describe(
-    "Path to the file, or a tool-result:// URI returned by a truncated tool result. Relative paths are resolved against the tool root; absolute paths are also supported.",
+    "Path to the file. Relative paths are resolved against the tool root; absolute paths are also supported.",
   );
 
 const readStartSchema = z.discriminatedUnion("type", [
@@ -58,17 +58,10 @@ const readStartSchema = z.discriminatedUnion("type", [
   }),
 ]);
 
-export function createReadFileInputSchema(options?: {
-  hashlineEnabled?: boolean;
-  directAttachmentSupported?: boolean;
-}) {
+export function createReadFileInputSchema(options?: { hashlineEnabled?: boolean }) {
   const hashlineEnabled = options?.hashlineEnabled === true;
   return z.object({
-    path: pathSchema.describe(
-      options?.directAttachmentSupported
-        ? "Path to a file. Supported images and PDFs are attached to your context for native visual or document analysis. Relative paths are resolved against the tool root; absolute paths are also supported."
-        : "Path to the file, or a tool-result:// URI returned by a truncated tool result. Artifact URIs are paged independently of cwd. Relative paths are resolved against the tool root; absolute paths are also supported.",
-    ),
+    path: pathSchema.describe("Local filesystem path or tool-result:// URI."),
     cwd: z
       .string()
       .optional()
