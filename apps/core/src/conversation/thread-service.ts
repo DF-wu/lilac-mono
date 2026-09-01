@@ -242,6 +242,7 @@ export type ConversationThreadToolService = {
   planAutoInjectSearch(
     input: Parameters<ConversationThreadService["planAutoInjectSearch"]>[0],
   ): Promise<ConversationThreadAutoInjectQueryPlan>;
+  getAutoInjectRankingCorpusDocuments?(): readonly string[];
 };
 
 export type ConversationThreadSearchResult = {
@@ -835,10 +836,13 @@ function normalizeAutoInjectQueryPlan(
   plan: ConversationThreadAutoInjectQueryPlan,
 ): ConversationThreadAutoInjectQueryPlan {
   return {
-    searches: plan.searches.slice(0, AUTO_INJECT_SEARCH_MAX).map((search) => ({
-      queries: normalizeSearchQueries(search.queries, AUTO_INJECT_QUERIES_PER_SEARCH_MAX),
-      aboutness: normalizeQueryAboutness(search.aboutness),
-    })),
+    searches: plan.searches
+      .slice(0, AUTO_INJECT_SEARCH_MAX)
+      .map((search) => ({
+        queries: normalizeSearchQueries(search.queries, AUTO_INJECT_QUERIES_PER_SEARCH_MAX),
+        aboutness: normalizeQueryAboutness(search.aboutness),
+      }))
+      .filter((search) => search.queries.length > 0),
   };
 }
 
@@ -1603,8 +1607,11 @@ export function buildAutoInjectQueryPlanInstructions(): string {
     'Shape: {"searches":[{"queries":["..."],"aboutness":{"domains":["..."],"situations":["..."],"targets":["..."],"entities":["..."],"userWouldAskForThisAs":["..."],"intentSummary":"..."}}]}',
     "",
     "The input is a newly received user message, possibly a long article or essay.",
-    "Do not summarize the article for the final answer. Instead, generate semantic search queries that would find prior conversation threads useful for responding to it.",
-    "You must produce 1-3 searches, ordered by expected usefulness. Each search is one distinct retrieval category or intent.",
+    "Do not summarize the article for the final answer. Generate semantic search queries only when a prior conversation thread would materially help answer the user's current request.",
+    'Return {"searches":[]} when retrieval would not help. Abstain for casual reactions, transient coordination, reply-only context, attachment-only messages without a clear durable subject, and incidental mentions of a person, product, or topic.',
+    "Use one search for one substantive user intent. Use 2-3 searches only when the user explicitly asks about distinct durable intents and each could retrieve independently useful history.",
+    "Do not create separate searches from examples, links, quoted text, article sections, or background clauses unless the user asks about them.",
+    "Order multiple searches by expected usefulness.",
     "Each search must contain 1-3 non-empty query variants/facets for the same intent. Prefer 1 query unless aliases, exact entities, or meaningfully different wording improve recall.",
     "Do not split near-duplicate phrasings into separate searches; keep them as query variants inside one search.",
     "Queries should name the durable subject, task, decision, complaint target, project, technology, entities, or situation.",
@@ -1801,6 +1808,10 @@ export class ConversationThreadService {
         )
       : await defaultAutoInjectQueryPlanner({ cfg, text, content: input.content });
     return planned.map(normalizeAutoInjectQueryPlan);
+  }
+
+  getAutoInjectRankingCorpusDocuments(): readonly string[] {
+    return this.params.store.listAutoInjectRankingDocuments();
   }
 
   async read(input: {
@@ -2967,6 +2978,7 @@ export function createConversationThreadToolService(
     runSummarization: (input) => service.runSummarization(input),
     planAutoInjectSearch: (input) =>
       resolvePersistenceOperation(service.planAutoInjectSearch(input)),
+    getAutoInjectRankingCorpusDocuments: () => service.getAutoInjectRankingCorpusDocuments(),
   };
 }
 

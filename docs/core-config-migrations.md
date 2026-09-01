@@ -105,6 +105,9 @@ New v2 fields:
 - `conversation.thread.autoInject.limit`: maximum injected search results; defaults to `3`.
 - `conversation.thread.autoInject.minScore`: minimum final `conversation.thread.search` score for
   auto-injected metadata; defaults to `0.1`.
+- `conversation.thread.autoInject.expansionMinConfidence`: minimum ranking confidence for optional
+  auto-injected results after the single recall-floor result; accepts `0` through `1` and defaults to
+  `0.57`. Frozen v1 configs receive the same universal default but cannot override it.
 - `conversation.thread.autoInject.mode`: search mode (`hybrid`, `semantic`, or `lexical`); defaults to
   `hybrid`.
 - `conversation.thread.autoInject.filterCurrentParticipants`: optionally restricts search to threads

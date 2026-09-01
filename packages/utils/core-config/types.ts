@@ -201,6 +201,7 @@ export type UniversalCoreConfig = {
         followUpMinTextUnits: number;
         limit: number;
         minScore: number;
+        expansionMinConfidence: number;
         mode: "hybrid" | "semantic" | "lexical";
         filterCurrentParticipants: boolean;
       };

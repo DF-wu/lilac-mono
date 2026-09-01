@@ -7499,6 +7499,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       followUpMinTextUnits: 20,
       limit: 1,
       minScore: 0.1,
+      expansionMinConfidence: 0.57,
       mode: "hybrid",
       filterCurrentParticipants: false,
     };
@@ -9120,6 +9121,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9188,6 +9190,69 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     );
   });
 
+  it("treats an empty planner result as a successful retrieval abstention", async () => {
+    const cfg = parseCoreConfigV2ToUniversal({
+      surface: { discord: { botName: "lilac", allowedChannelIds: ["c1"] } },
+    });
+    const autoInjectCfg: CoreConfig = {
+      ...cfg,
+      conversation: {
+        ...cfg.conversation,
+        thread: {
+          ...cfg.conversation.thread,
+          autoInject: {
+            enabled: true,
+            minTextUnits: 1,
+            followUpMinTextUnits: 1,
+            limit: 3,
+            minScore: 0.1,
+            expansionMinConfidence: 0.57,
+            mode: "hybrid",
+            filterCurrentParticipants: false,
+          },
+        },
+      },
+    };
+    const statuses: Array<{ status: "start" | "end"; ok?: boolean }> = [];
+    let searchCalls = 0;
+    const errors: string[] = [];
+
+    const messages = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg: autoInjectCfg,
+      requestId: "retrieval-abstention",
+      raw: {},
+      userMessages: [{ role: "user", content: "A long incidental article excerpt" }],
+      conversationThreads: {
+        planAutoInjectSearch: async () => ({ searches: [] }),
+        search: async () => {
+          searchCalls += 1;
+          throw new Error("not used");
+        },
+        metadata: async () => ({ threads: [], missing: [] }),
+        read: async () => {
+          throw new Error("not used");
+        },
+        runSummarization: async () => {
+          throw new Error("not used");
+        },
+      },
+      publishToolStatus: async (status) => {
+        statuses.push({
+          status: status.status,
+          ...(status.ok === undefined ? {} : { ok: status.ok }),
+        });
+      },
+      onError: (message) => {
+        errors.push(message);
+      },
+    });
+
+    expect(messages).toEqual([]);
+    expect(searchCalls).toBe(0);
+    expect(statuses).toEqual([{ status: "start" }, { status: "end", ok: true }]);
+    expect(errors).toEqual([]);
+  });
+
   it("includes dynamically capped brief metadata", async () => {
     const cfg = parseCoreConfigV2ToUniversal({
       surface: {
@@ -9209,6 +9274,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 1,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9226,8 +9292,21 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       raw: {},
       userMessages: [{ role: "user", content: "A sufficiently meaningful message" }],
       conversationThreads: {
-        planAutoInjectSearch: async () =>
-          autoInjectPlanForQuery("meaningful message", "Find meaningful message threads."),
+        planAutoInjectSearch: async () => ({
+          searches: [
+            {
+              queries: ["meaningful message"],
+              aboutness: {
+                domains: [],
+                situations: ["meaningful message"],
+                targets: ["meaningful message"],
+                entities: [],
+                userWouldAskForThisAs: ["meaningful message"],
+                intentSummary: "Find meaningful message threads.",
+              },
+            },
+          ],
+        }),
         search: async () => ({
           meta: {
             query: "meaningful message",
@@ -9242,16 +9321,40 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               threadId: "thread-1",
               title: "Below display",
               brief: belowDisplayBrief,
+              retrievalHints: ["meaningful message"],
+              aboutness: {
+                domains: [],
+                situations: ["meaningful message"],
+                complaintTargets: ["meaningful message"],
+                entities: [],
+                userWouldAskForThisAs: ["meaningful message"],
+              },
             },
             {
               threadId: "thread-2",
               title: "Near threshold",
               brief: nearThresholdBrief,
+              retrievalHints: ["meaningful message"],
+              aboutness: {
+                domains: [],
+                situations: ["meaningful message"],
+                complaintTargets: ["meaningful message"],
+                entities: [],
+                userWouldAskForThisAs: ["meaningful message"],
+              },
             },
             {
               threadId: "thread-3",
               title: "Over threshold",
               brief: overThresholdBrief,
+              retrievalHints: ["meaningful message"],
+              aboutness: {
+                domains: [],
+                situations: ["meaningful message"],
+                complaintTargets: ["meaningful message"],
+                entities: [],
+                userWouldAskForThisAs: ["meaningful message"],
+              },
             },
           ],
         }),
@@ -9320,6 +9423,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9404,6 +9508,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.42,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9517,7 +9622,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     });
   });
 
-  it("selects one unique auto-injected result per planned search before score fill", async () => {
+  it("ranks planned searches globally without reserving a slot per category", async () => {
     const cfg = parseCoreConfigV2ToUniversal({
       surface: {
         discord: {
@@ -9538,6 +9643,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 1,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9646,16 +9752,12 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(result.output).toEqual({
       type: "json",
       value: {
-        entries: [
-          { threadId: "shared", title: "Shared top" },
-          { threadId: "work-second", title: "Work second" },
-          { threadId: "project-top", title: "Project top" },
-        ],
+        entries: [{ threadId: "project-top", title: "Project top" }],
       },
     });
   });
 
-  it("caps auto-injected category coverage by global limit and planner order", async () => {
+  it("caps globally ranked auto-injected results by the configured limit", async () => {
     const cfg = parseCoreConfigV2ToUniversal({
       surface: {
         discord: {
@@ -9676,6 +9778,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 1,
             limit: 2,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9742,14 +9845,14 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       type: "json",
       value: {
         entries: [
+          { threadId: "third category", title: "third category result" },
           { threadId: "first category", title: "first category result" },
-          { threadId: "second category", title: "second category result" },
         ],
       },
     });
   });
 
-  it("fetches extra per-search recall before deduping grouped auto-inject results", async () => {
+  it("overfetches one search so ranking can rescue a relevant fourth result", async () => {
     const cfg = parseCoreConfigV2ToUniversal({
       surface: {
         discord: {
@@ -9768,8 +9871,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             enabled: true,
             minTextUnits: 1,
             followUpMinTextUnits: 1,
-            limit: 2,
+            limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9777,6 +9881,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       },
     };
     const requestedLimits: number[] = [];
+    const highestRejectedThreadIds: string[] = [];
 
     const messages = await maybeBuildAutoInjectedThreadSearchMessages({
       cfg: autoInjectCfg,
@@ -9786,49 +9891,32 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       conversationThreads: {
         planAutoInjectSearch: async () => ({
           searches: [
-            autoInjectPlanForQuery("first category", "Find first category threads.").searches[0]!,
-            autoInjectPlanForQuery("second category", "Find second category threads.").searches[0]!,
+            autoInjectPlanForQuery("buried target", "Find the buried target thread.").searches[0]!,
           ],
         }),
         search: async (input) => {
           const query = String(Array.isArray(input.query) ? (input.query[0] ?? "") : input.query);
           const requestedLimit = input.limit ?? 5;
           requestedLimits.push(requestedLimit);
-          const resultsByQuery: Record<
-            string,
-            Array<{
-              threadId: string;
-              title: string;
-              brief: string;
-              score: number;
-            }>
-          > = {
-            "first category": [
-              { threadId: "shared-1", title: "Shared 1", brief: "", score: 1 },
-              {
-                threadId: "shared-2",
-                title: "Shared 2",
-                brief: "",
-                score: 0.9,
+          const results = [
+            { threadId: "generic-1", title: "General project notes", brief: "", score: 1 },
+            { threadId: "generic-2", title: "General status update", brief: "", score: 0.9 },
+            { threadId: "generic-3", title: "General coordination", brief: "", score: 0.8 },
+            {
+              threadId: "buried-target",
+              title: "Buried target incident",
+              brief: "",
+              score: 0.7,
+              retrievalHints: ["buried target"],
+              aboutness: {
+                domains: [],
+                situations: ["buried target"],
+                complaintTargets: ["buried target"],
+                entities: [],
+                userWouldAskForThisAs: ["buried target"],
               },
-            ],
-            "second category": [
-              { threadId: "shared-1", title: "Shared 1", brief: "", score: 1 },
-              {
-                threadId: "shared-2",
-                title: "Shared 2",
-                brief: "",
-                score: 0.9,
-              },
-              {
-                threadId: "second-unique",
-                title: "Second unique",
-                brief: "",
-                score: 0.8,
-              },
-            ],
-          };
-          const results = resultsByQuery[query]?.slice(0, requestedLimit) ?? [];
+            },
+          ].slice(0, requestedLimit);
           return {
             meta: {
               query,
@@ -9852,10 +9940,16 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
         },
       },
       publishToolStatus: async () => {},
+      onInjected: (event) => {
+        if (event.highestRejectedByConfidence) {
+          highestRejectedThreadIds.push(event.highestRejectedByConfidence.threadId);
+        }
+      },
       onError: () => {},
     });
 
-    expect(requestedLimits).toEqual([4, 4]);
+    expect(requestedLimits).toEqual([15]);
+    expect(highestRejectedThreadIds).toEqual(["generic-1"]);
     const toolMessage = messages[1];
     if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
       throw new Error("expected tool message");
@@ -9865,10 +9959,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(result.output).toEqual({
       type: "json",
       value: {
-        entries: [
-          { threadId: "shared-1", title: "Shared 1" },
-          { threadId: "second-unique", title: "Second unique" },
-        ],
+        entries: [{ threadId: "buried-target", title: "Buried target incident" }],
       },
     });
   });
@@ -9894,6 +9985,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 1,
             limit: 2,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9991,6 +10083,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 1,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -10068,6 +10161,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -10151,6 +10245,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -10243,6 +10338,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -10330,6 +10426,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: true,
           },
@@ -10403,6 +10500,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },

@@ -746,6 +746,7 @@ function coreConfigV1ToUniversal(
           followUpMinTextUnits: 110,
           limit: 3,
           minScore: 0.1,
+          expansionMinConfidence: 0.57,
           mode: "hybrid",
           filterCurrentParticipants: false,
         },
