@@ -1993,11 +1993,31 @@ describe("coding tools", () => {
     const jsonSchema = await asSchema(batchTool.inputSchema).jsonSchema;
     const schemaShape = jsonSchema as {
       properties?: {
-        tool_calls?: { items?: { properties?: { tool?: { enum?: string[] } } } };
+        tool_calls?: {
+          items?: {
+            properties?: {
+              tool?: { enum?: string[] };
+              parameters?: unknown;
+            };
+          };
+        };
       };
     };
     const exposedNames = schemaShape.properties?.tool_calls?.items?.properties?.tool?.enum ?? [];
     expect(exposedNames.sort()).toEqual(["glob", "grep", "read"]);
+    expect(schemaShape.properties?.tool_calls?.items?.properties?.parameters).toEqual({});
+
+    const validateBatchInput = asSchema(batchTool.inputSchema).validate;
+    expect(validateBatchInput).toBeDefined();
+    expect(
+      await validateBatchInput?.({
+        tool_calls: [{ tool: "read", parameters: "not an object" }],
+      }),
+    ).toMatchObject({ success: false });
+    expect(await validateBatchInput?.({ tool_calls: [{ tool: "read" }] })).toEqual({
+      success: true,
+      value: { tool_calls: [{ tool: "read", parameters: {} }] },
+    });
 
     const expansion = await executable(tools, "batch").execute(
       {
