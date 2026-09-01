@@ -194,6 +194,68 @@ describe("plugin hook adapters", () => {
     ).toBe("error");
   });
 
+  it("decodes legacy and structured Level 1 failure summaries", () => {
+    const legacy = level1({
+      summarizeFailure: () => ({ ok: false, failureKind: "soft", error: "legacy failure" }),
+    });
+    const structured = level1({
+      summarizeFailure: () => ({
+        ok: false,
+        failureKind: "soft",
+        failureClass: "tool",
+        failureCode: "nonzero_exit",
+        retryable: false,
+        exitCode: 17,
+        error: "command failed",
+      }),
+    });
+
+    expect(
+      invokeLevel1SummarizeFailure({
+        ...context,
+        spec: legacy,
+        value: { isError: false, result: null },
+      }).status,
+    ).toBe("ok");
+    const decoded = invokeLevel1SummarizeFailure({
+      ...context,
+      spec: structured,
+      value: { isError: false, result: null },
+    });
+    expect(decoded.status).toBe("ok");
+    if (decoded.status === "error") throw new Error("expected structured summary");
+    expect(decoded.value).toEqual({
+      ok: false,
+      failureKind: "soft",
+      failureClass: "tool",
+      failureCode: "nonzero_exit",
+      retryable: false,
+      exitCode: 17,
+      error: "command failed",
+    });
+  });
+
+  it("rejects invalid structured Level 1 failure fields", () => {
+    const invalidValues = [
+      { ok: false, failureClass: "host" },
+      { ok: false, failureCode: "Nonzero Exit" },
+      { ok: false, retryable: "no" },
+      { ok: false, exitCode: 1.5 },
+    ];
+
+    for (const value of invalidValues) {
+      const spec = level1();
+      Object.defineProperty(spec, "summarizeFailure", { value: () => value });
+      expect(
+        invokeLevel1SummarizeFailure({
+          ...context,
+          spec,
+          value: { isError: false, result: null },
+        }).status,
+      ).toBe("error");
+    }
+  });
+
   it("captures synchronous throws and asynchronous rejections", async () => {
     const sync = level1({
       formatArgs() {

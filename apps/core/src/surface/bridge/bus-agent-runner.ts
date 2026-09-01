@@ -7777,6 +7777,10 @@ export async function startBusAgentRunner(params: {
                     toolName: event.toolName,
                     durationMs: toolDurationMs,
                     failureKind: toolFailure.failureKind ?? "soft",
+                    failureClass: toolFailure.failureClass,
+                    failureCode: toolFailure.failureCode,
+                    retryable: toolFailure.retryable,
+                    exitCode: toolFailure.exitCode,
                     error: interruptedForShutdown ? "server shutting down" : toolFailureError,
                     argsPreview: formatToolLogPreview({
                       toolName: event.toolName,
@@ -7801,6 +7805,10 @@ export async function startBusAgentRunner(params: {
                 deferredAccepted,
                 durationMs: toolDurationMs,
                 failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
+                failureClass: ok ? undefined : toolFailure.failureClass,
+                failureCode: ok ? undefined : toolFailure.failureCode,
+                retryable: ok ? undefined : toolFailure.retryable,
+                exitCode: ok ? undefined : toolFailure.exitCode,
               });
               if (
                 shouldLogLevel1ToolCompletionAtInfo(event.toolName, activeBinding.toolset.catalog)

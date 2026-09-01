@@ -39,10 +39,7 @@ Entrypoints default-export a `LilacToolPlugin` from `@stanley2058/lilac-plugin-r
 import { z } from "zod";
 import { tool } from "ai";
 import { Result } from "better-result";
-import {
-  defineServerTool,
-  serverToolFailure,
-} from "@stanley2058/lilac-plugin-runtime";
+import { defineServerTool, serverToolFailure } from "@stanley2058/lilac-plugin-runtime";
 import type {
   Level1ToolSpec,
   LilacToolPlugin,
@@ -197,3 +194,10 @@ plugins:
 - Level 1 tools are batch-callable by default. Set `supportsBatch: false` when a tool must not be expanded into a batch child.
 - Batch children execute as ordinary Level 1 calls, so approval checks, streaming, `toModelOutput`, output normalization, media parts, and tool lifecycle events behave the same as direct calls.
 - Writer tools should implement `editTargets` so batch can reject children that would concurrently edit the same resource. Set `supportsBatch: false` when targets cannot be determined safely.
+- A Level 1 spec may implement `summarizeFailure({ isError, result })` to classify a model-visible
+  result. It returns `{ ok: true }` for success or `{ ok: false, ... }` for failure. `failureKind`
+  (`hard` or `soft`) and `error` remain optional compatibility fields. Structured failures may also
+  set `failureClass` (`input`, `policy`, `environment`, `timeout`, `cancelled`, `tool`, or `unknown`),
+  a stable lower-snake-case tool-owned `failureCode`, `retryable`, and an integer `exitCode`. These
+  fields are operational log data, so codes must not contain request-specific values or free-form
+  messages. Core decodes every returned summary before using it.

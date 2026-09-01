@@ -145,6 +145,7 @@ function toRestrictedTerminationError(
     case "wall_clock":
       return {
         type: "timeout",
+        code: "wall_clock_timeout",
         timeoutMs,
         timeoutKind: "wall_clock",
         signal: "ABORT",
@@ -152,6 +153,7 @@ function toRestrictedTerminationError(
     case "aborted":
       return {
         type: "aborted",
+        code: "execution_cancelled",
         signal: "ABORT",
       };
     case undefined:
@@ -1227,7 +1229,9 @@ export async function executeRestrictedBash(
       exitCode: -1,
       executionError: {
         type: "blocked",
-        reason: "restricted_bash_cwd",
+        code: "restricted_cwd",
+        reason: error.message,
+        hint: "Choose a cwd inside the approved workspace or the restricted session /tmp.",
       },
     }),
   });
@@ -1362,6 +1366,7 @@ export async function executeRestrictedBash(
     err: (error) => () => {
       const executionError = toRestrictedTerminationError(termination, wallClockTimeoutMs) ?? {
         type: "exception" as const,
+        code: "execution_failed" as const,
         phase: "unknown" as const,
         message: error.message,
       };

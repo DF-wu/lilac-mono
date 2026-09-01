@@ -228,7 +228,9 @@ describe("coding tools", () => {
       exitCode: -1,
       executionError: {
         type: "blocked",
+        code: "dynamic_recursive_delete",
         reason: expect.stringContaining("dynamic target"),
+        hint: expect.stringContaining("literal child paths"),
         segment: expect.stringContaining("rm -rf"),
       },
     });

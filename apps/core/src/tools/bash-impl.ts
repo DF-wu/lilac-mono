@@ -1,13 +1,14 @@
 import {
   createLogger,
   env,
+  errorCode,
   formatTaggedErrorForLog,
   isPanic,
   resolveVcsEnv,
   type CoreConfig,
   type NativeSubagentProfile,
 } from "@stanley2058/lilac-utils";
-import { analyzeBashCommand } from "@stanley2058/lilac-bash-safety";
+import { analyzeBashCommand, type BashSafetyCode } from "@stanley2058/lilac-bash-safety";
 import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
@@ -79,26 +80,44 @@ export type BashToolInput = {
 
 export type BashStdinMode = "error" | "eof";
 
+export type BashSpawnErrno = "EACCES" | "ENOENT" | "ENOTDIR" | "EPERM";
+
+export type BashExceptionCode =
+  | "cleanup_failed"
+  | "execution_failed"
+  | "exit_status_read_failed"
+  | "spawn_cwd_missing"
+  | "spawn_failed"
+  | "stderr_read_failed"
+  | "stdout_read_failed";
+
 export type BashExecutionError =
   | {
       type: "blocked";
+      code: BashSafetyCode | "restricted_cwd";
       reason: string;
+      hint?: string;
       segment?: string;
     }
   | {
       type: "aborted";
+      code: "execution_cancelled";
       signal?: string;
     }
   | {
       type: "timeout";
+      code: "no_output_timeout" | "wall_clock_timeout";
       timeoutMs: number;
       timeoutKind: "no_output" | "wall_clock";
       signal: string;
     }
   | {
       type: "exception";
+      code: BashExceptionCode;
       phase: "spawn" | "stdout" | "stderr" | "unknown";
       message: string;
+      errno?: BashSpawnErrno;
+      cwd?: string;
     };
 
 type BashTermination =
@@ -135,6 +154,7 @@ export type BashToolOutput = {
 class BashAdapterError extends TaggedError("BashAdapterError")<{
   readonly operation: string;
   readonly cause: unknown;
+  readonly errno?: BashSpawnErrno;
   readonly message: string;
 }> {}
 
@@ -165,20 +185,37 @@ const DEFAULT_SPILL_FILE_OPERATIONS: BashSpillFileOperations = {
   remove: (target) => fs.rm(target, { force: true }),
 };
 
-function settleBashExecution(
+function mapCapturedBashExecutionFailure(
+  capture: ReturnType<typeof captureRuntimeError>,
+): BashAdapterError | Panic {
+  if (capture.kind === "panic") return capture.panic;
+  const caught = projectCapturedRuntimeError(capture, "Opaque Bash execution failure");
+  const code = errorCode(caught);
+  let errno: BashSpawnErrno | undefined;
+  switch (code) {
+    case "EACCES":
+    case "ENOENT":
+    case "ENOTDIR":
+    case "EPERM":
+      errno = code;
+      break;
+  }
+  return new BashAdapterError({
+    operation: "execute",
+    cause: caught,
+    errno,
+    message: "Bash execution failed",
+  });
+}
+
+async function settleBashExecution(
   run: () => Promise<BashToolOutput>,
 ): Promise<ResultType<BashToolOutput, BashAdapterError | Panic>> {
-  return Result.tryPromise({
+  const captured = await Result.tryPromise({
     try: run,
-    catch: (caught) =>
-      Panic.is(caught)
-        ? caught
-        : new BashAdapterError({
-            operation: "execute",
-            cause: caught,
-            message: "Bash execution failed",
-          }),
+    catch: captureRuntimeError,
   });
+  return captured.mapError(mapCapturedBashExecutionFailure);
 }
 
 function selectResultValue<T, E extends Error>(result: ResultType<T, E>): T {
@@ -262,28 +299,72 @@ function surfaceBashCleanupFailure(
     exitCode: -1,
     executionError: {
       type: "exception",
+      code: "cleanup_failed",
       phase: "unknown",
       message: cleanup.message,
     },
   };
 }
 
-function toFailedExecutionError(
+async function failedSpawnCwdIsMissing(resolvedCwd: string): Promise<boolean> {
+  const inspected = await Result.tryPromise({
+    try: () => fs.stat(resolvedCwd),
+    catch: captureRuntimeError,
+  });
+  const outcome = inspected.match<
+    | { readonly kind: "stat"; readonly isDirectory: boolean }
+    | { readonly kind: "error"; readonly captured: ReturnType<typeof captureRuntimeError> }
+  >({
+    ok: (stat) => ({ kind: "stat", isDirectory: stat.isDirectory() }),
+    err: (captured) => ({ kind: "error", captured }),
+  });
+  if (outcome.kind === "stat") return !outcome.isDirectory;
+
+  const cause = projectCapturedRuntimeError(outcome.captured, "Opaque Bash cwd inspection failure");
+  preserveToolPanic(cause);
+  const code = errorCode(cause);
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+async function toFailedExecutionError(
   termination: BashTermination | undefined,
-  errorMessage: string,
-): BashExecutionError {
+  errno: BashSpawnErrno | undefined,
+  resolvedCwd: string,
+  local: boolean,
+): Promise<BashExecutionError> {
   if (!termination) {
+    const cwdMissing =
+      local &&
+      (errno === "ENOENT" || errno === "ENOTDIR") &&
+      (await failedSpawnCwdIsMissing(resolvedCwd));
+    if (cwdMissing) {
+      return {
+        type: "exception",
+        code: "spawn_cwd_missing",
+        phase: "spawn",
+        message: `Bash cwd does not exist or is not a directory: ${resolvedCwd}`,
+        errno,
+        cwd: resolvedCwd,
+      };
+    }
     return {
       type: "exception",
+      code: "spawn_failed",
       phase: "spawn",
-      message: errorMessage,
+      message: "Bash process could not be started",
+      ...(errno ? { errno } : {}),
+      cwd: resolvedCwd,
     };
   }
   switch (termination.type) {
     case "timeout":
-      return { ...termination, signal: DEFAULT_KILL_SIGNAL };
+      return {
+        ...termination,
+        code: termination.timeoutKind === "no_output" ? "no_output_timeout" : "wall_clock_timeout",
+        signal: DEFAULT_KILL_SIGNAL,
+      };
     case "aborted":
-      return { type: "aborted", signal: DEFAULT_KILL_SIGNAL };
+      return { type: "aborted", code: "execution_cancelled", signal: DEFAULT_KILL_SIGNAL };
   }
 }
 
@@ -901,6 +982,7 @@ export async function executeBash(
         stdout: "",
         stderr: formatBlockedMessage({
           reason: blocked.reason,
+          hint: blocked.hint,
           command,
           segment: blocked.segment,
           redact: redactSecrets,
@@ -908,7 +990,9 @@ export async function executeBash(
         exitCode: -1,
         executionError: {
           type: "blocked",
+          code: blocked.code,
           reason: blocked.reason,
+          hint: blocked.hint,
           segment: blocked.segment,
         },
       };
@@ -1135,6 +1219,10 @@ export async function executeBash(
             exitCode,
             executionError: {
               type: "timeout",
+              code:
+                termination.timeoutKind === "no_output"
+                  ? "no_output_timeout"
+                  : "wall_clock_timeout",
               timeoutMs: termination.timeoutMs,
               timeoutKind: termination.timeoutKind,
               signal: DEFAULT_KILL_SIGNAL,
@@ -1163,6 +1251,7 @@ export async function executeBash(
             exitCode,
             executionError: {
               type: "aborted",
+              code: "execution_cancelled",
               signal: DEFAULT_KILL_SIGNAL,
             },
           },
@@ -1190,6 +1279,7 @@ export async function executeBash(
             exitCode,
             executionError: {
               type: "timeout",
+              code: "wall_clock_timeout",
               timeoutMs: timeoutMs ?? execResult.durationMs,
               timeoutKind: "wall_clock",
               signal: DEFAULT_KILL_SIGNAL,
@@ -1399,6 +1489,7 @@ export async function executeBash(
           exitCode,
           executionError: {
             type: "aborted",
+            code: "execution_cancelled",
             signal: child.signalCode ?? DEFAULT_KILL_SIGNAL,
           },
         },
@@ -1426,6 +1517,8 @@ export async function executeBash(
           exitCode,
           executionError: {
             type: "timeout",
+            code:
+              termination.timeoutKind === "no_output" ? "no_output_timeout" : "wall_clock_timeout",
             timeoutMs: termination.timeoutMs,
             timeoutKind: termination.timeoutKind,
             signal: child.signalCode ?? DEFAULT_KILL_SIGNAL,
@@ -1450,6 +1543,7 @@ export async function executeBash(
           exitCode: -1,
           executionError: {
             type: "exception",
+            code: "stdout_read_failed",
             phase: "stdout",
             message: "Bash stdout read failed",
           },
@@ -1473,6 +1567,7 @@ export async function executeBash(
           exitCode: -1,
           executionError: {
             type: "exception",
+            code: "stderr_read_failed",
             phase: "stderr",
             message: "Bash stderr read failed",
           },
@@ -1496,6 +1591,7 @@ export async function executeBash(
           exitCode: -1,
           executionError: {
             type: "exception",
+            code: "exit_status_read_failed",
             phase: "unknown",
             message: "Bash exit status read failed",
           },
@@ -1561,7 +1657,15 @@ export async function executeBash(
 
   if (executionFailure) {
     const durationMs = Date.now() - startedAt;
+    const executionError = await toFailedExecutionError(
+      termination,
+      executionFailure.errno,
+      resolvedCwd,
+      cwdTarget.kind === "local",
+    );
     if (cleanupFailure) {
+      const executionMessage =
+        executionError.type === "exception" ? executionError.message : "Bash execution failed";
       const combined = new BashOperationAndCleanupError({
         primary: executionFailure,
         cleanup: cleanupFailure,
@@ -1575,13 +1679,9 @@ export async function executeBash(
       });
       return {
         stdout: "",
-        stderr: "Bash execution failed. Bash temporary output cleanup failed.",
+        stderr: `${executionMessage}. Bash temporary output cleanup failed.`,
         exitCode: -1,
-        executionError: {
-          type: "exception",
-          phase: "spawn",
-          message: combined.message,
-        },
+        executionError,
       };
     }
 
@@ -1592,7 +1692,6 @@ export async function executeBash(
       ...formatTaggedErrorForLog(executionFailure),
     });
 
-    const executionError = toFailedExecutionError(termination, executionFailure.message);
     return {
       stdout: "",
       stderr: "",

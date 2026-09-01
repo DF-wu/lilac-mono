@@ -313,6 +313,15 @@ export const serverToolListResultSchema = z.custom<ServerToolListResult>(
 const level1FailureSummaryShapeSchema = z.object({
   ok: z.boolean(),
   failureKind: z.enum(["hard", "soft"]).optional(),
+  failureClass: z
+    .enum(["input", "policy", "environment", "timeout", "cancelled", "tool", "unknown"])
+    .optional(),
+  failureCode: z
+    .string()
+    .regex(/^[a-z][a-z0-9_]*$/u)
+    .optional(),
+  retryable: z.boolean().optional(),
+  exitCode: z.number().int().finite().optional(),
   error: z.string().optional(),
 });
 
