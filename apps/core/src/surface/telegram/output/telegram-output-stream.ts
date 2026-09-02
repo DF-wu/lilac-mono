@@ -812,10 +812,15 @@ export class TelegramOutputStream implements SurfaceOutputStream {
     let retriedPlain = false;
 
     for (;;) {
-      try {
-        return await run(payload);
-      } catch (cause) {
-        const error = projectTelegramError(cause, "Telegram message delivery failed");
+      const attempted = await Result.tryPromise({
+        try: () => run(payload),
+        catch: (cause) => captureError(cause, "Telegram message delivery failed"),
+      });
+      if (attempted.isErr()) {
+        const error = projectTelegramError(
+          attempted.error.cause,
+          "Telegram message delivery failed",
+        );
         if (isTelegramNotModifiedError(error)) return "not_modified";
 
         const retryAfter = telegramRetryAfterSeconds(error);
@@ -833,6 +838,7 @@ export class TelegramOutputStream implements SurfaceOutputStream {
 
         throw new Error(`telegram: message delivery failed: ${error.message}`);
       }
+      return attempted.value;
     }
   }
 

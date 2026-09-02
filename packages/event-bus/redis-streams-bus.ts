@@ -2704,7 +2704,7 @@ export class RedisStreamsBus implements RawBus {
       });
     });
 
-    const cleanupGroup = async (): Promise<CleanupAttempt> => {
+    const performGroupCleanup = async (): Promise<CleanupAttempt> => {
       const cleanGroup = async (): Promise<CleanupAttempt> => {
         if (group && consumerId) {
           if (ephemeral && createdGroup) {
@@ -2774,8 +2774,21 @@ export class RedisStreamsBus implements RawBus {
       });
     };
 
+    let groupCleanupAttempt: Promise<CleanupAttempt> | null = null;
+    const cleanupGroup = (): Promise<CleanupAttempt> => {
+      if (groupCleanupAttempt) return groupCleanupAttempt;
+      const attempt = performGroupCleanup();
+      groupCleanupAttempt = attempt;
+      void attempt.then((outcome) => {
+        if (outcome.status === "error" && groupCleanupAttempt === attempt) {
+          groupCleanupAttempt = null;
+        }
+      });
+      return attempt;
+    };
+
     let ephemeralGroupDestroyed = false;
-    let stopSequence = Promise.resolve();
+    let stopAttempt: Promise<ResultType<void, EventDeliveryStopFailed>> | null = null;
     type StopDeliverySettlement =
       | {
           readonly kind: "result";
@@ -2785,11 +2798,7 @@ export class RedisStreamsBus implements RawBus {
           readonly kind: "failure";
           readonly failure: CapturedRedisStreamsFailure;
         };
-    const stop = async (): Promise<ResultType<void, EventDeliveryStopFailed>> => {
-      const previousStop = stopSequence;
-      const stopTurn = Promise.withResolvers<void>();
-      stopSequence = stopTurn.promise;
-      await previousStop;
+    const performStop = async (): Promise<ResultType<void, EventDeliveryStopFailed>> => {
       const stopDelivery = async (): Promise<StopDeliverySettlement> => {
         abortController.abort();
         activeAttempt?.shutdown();
@@ -2847,7 +2856,6 @@ export class RedisStreamsBus implements RawBus {
           catch: captureRedisStreamsFailure,
         }),
       );
-      stopTurn.resolve();
       const outcome = redisStreamsOutcome(stopped);
       if (outcome.kind === "error") {
         if (outcome.error.kind === "panic") return signalEventBusPanic(outcome.error.panic);
@@ -2872,6 +2880,24 @@ export class RedisStreamsBus implements RawBus {
         );
       }
       return outcome.value.result;
+    };
+    const stop = (): Promise<ResultType<void, EventDeliveryStopFailed>> => {
+      if (stopAttempt) return stopAttempt;
+      const attempt = performStop();
+      stopAttempt = attempt;
+      void Promise.allSettled([attempt]).then(([settled]) => {
+        if (settled.status === "fulfilled") {
+          settled.value.match({
+            ok: () => undefined,
+            err: () => {
+              if (stopAttempt === attempt) stopAttempt = null;
+            },
+          });
+        } else if (stopAttempt === attempt) {
+          stopAttempt = null;
+        }
+      });
+      return attempt;
     };
     this.activeSubscriptionStops.add(stop);
     return Result.ok({

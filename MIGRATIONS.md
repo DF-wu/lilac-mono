@@ -3,6 +3,26 @@
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
 
+## Automatic Transcript And Workflow Blob Migration
+
+The production Docker entrypoint now coordinates the one-way Core transcript schema 5 and workflow
+schema 25 migration before starting the default Core command. When both databases are at those exact
+legacy versions, startup first writes an immutable backup to
+`DATA_DIR/.migration-backups/blob-storage-v5-v25`, then applies transcript schema 6 and workflow schema
+26. Fresh data directories and databases already at transcript schema 6 through the current supported
+version and workflow schema 26 continue without creating a backup. Mixed, partial, or unknown schema
+states fail closed before startup changes persisted data.
+
+The backup contains the SQLite databases and sidecars that exist, transcript and workflow blob
+directories that exist, and a manifest of the original paths. A successful backup is never overwritten
+by later starts. If migration fails, stop the deployment, preserve the failed data directory for
+diagnosis, and restore the backup contents into their manifest paths before rolling back to a build that
+expects schema 5/25.
+
+Set `LILAC_AUTO_MIGRATE_BLOB_STORAGE=0` only as an operator-controlled temporary opt-out when the
+migration will be run manually with `bun run migrate:blob-storage`. The Docker gate applies only to the
+image's exact default Core command; maintenance and diagnostic commands do not trigger it.
+
 ## MCP 2026-07-28 client and OAuth credentials
 
 Core's configured MCP clients negotiate the stateless `2026-07-28` tool protocol and fall back to the

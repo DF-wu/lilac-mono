@@ -15,6 +15,7 @@ import {
   type SurfaceSendPreparationInput,
 } from "../adapter";
 import type { MsgRef, SendOpts, SessionRef, TelegramMsgRef, TelegramSessionRef } from "../types";
+import { captureError } from "../../shared/error-capture";
 import {
   projectTelegramError,
   TelegramAdapterUnavailable,
@@ -80,15 +81,19 @@ export async function captureTelegramOperation<T>(
   operation: SurfaceOperation,
   effect: () => Promise<T>,
 ): Promise<SurfaceOperationResult<T>> {
-  try {
-    return Result.ok(await effect());
-  } catch (cause) {
+  const captured = await Result.tryPromise({
+    try: effect,
+    catch: (cause) => captureError(cause, "Telegram operation failed"),
+  });
+  if (captured.isErr()) {
+    const cause = captured.error.cause;
     if (Panic.is(cause)) throw cause;
     const projected = projectTelegramError(cause, "Telegram operation failed");
     const classified = classifyTelegramSurfaceError(operation, projected);
     if (classified) return Result.err(classified);
     throw cause;
   }
+  return Result.ok(captured.value);
 }
 
 export function telegramSessionRefResult(

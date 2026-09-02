@@ -44,7 +44,7 @@ import type {
   ResourceStore,
   ResourceUnretainedFinalization,
 } from "../resource/store";
-import type { MsgRef } from "../surface/types";
+import { SURFACE_REF_PLATFORMS, type MsgRef } from "../surface/types";
 import { projectBuiltinSurfaceMessageRef } from "../surface/builtin-surface-protocols";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 import {
@@ -99,6 +99,11 @@ const CORE_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT = 32;
 const CORE_NAMED_CLAUDE_ACTIVE_ATTEMPT_LIMIT = 8;
 const CORE_PRIMARY_CLAUDE_ATTEMPT_RETENTION_LIMIT = 32;
 const CORE_PRIMARY_CLAUDE_ACTIVE_ATTEMPT_LIMIT = 8;
+
+function surfaceRefPlatformPlaceholders(firstParamIndex: number): string {
+  return SURFACE_REF_PLATFORMS.map((_, index) => `?${firstParamIndex + index}`).join(", ");
+}
+
 const MAX_DEFERRED_TRANSCRIPT_EVENTS = 128;
 const TRANSCRIPT_OWNED_BLOB_RESERVATION_MS = 5 * 60 * 1_000;
 const CORE_OWNED_BLOB_DELETION_CLAIM_LEASE_MS = 30 * 60 * 1_000;
@@ -5270,15 +5275,16 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
 
   listSurfaceMessagesForRequest(input: { requestId: string }): MsgRef[] {
     const rows = this.db
-      .query<PersistedSurfaceMessageLinkRow, [string]>(
+      .query<PersistedSurfaceMessageLinkRow, [string, string, string, string]>(
         `
         SELECT request_id, platform, channel_id, message_id
         FROM surface_message_to_request
-        WHERE request_id = ?
+        WHERE request_id = ?1
+          AND platform IN (${surfaceRefPlatformPlaceholders(2)})
         ORDER BY created_ts ASC, rowid ASC
         `,
       )
-      .all(input.requestId);
+      .all(input.requestId, ...SURFACE_REF_PLATFORMS);
 
     const refs: MsgRef[] = [];
     for (const row of rows) {
@@ -5313,7 +5319,10 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     const client = input?.client ?? null;
 
     const rows = this.db
-      .query<PersistedRecentAgentWriteRow, [AdapterPlatform | null, number, number]>(
+      .query<
+        PersistedRecentAgentWriteRow,
+        [AdapterPlatform | null, number, number, string, string, string]
+      >(
         `
         SELECT
           rt.request_id,
@@ -5335,11 +5344,12 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           LIMIT 1
         )
           AND (?1 IS NULL OR sm.platform = ?1)
+          AND sm.platform IN (${surfaceRefPlatformPlaceholders(4)})
         ORDER BY rt.updated_ts DESC, rt.created_ts DESC, sm.created_ts DESC, sm.rowid DESC
         LIMIT ?2 OFFSET ?3
         `,
       )
-      .all(client, limit, offset);
+      .all(client, limit, offset, ...SURFACE_REF_PLATFORMS);
 
     const out: RecentAgentWriteSnapshot[] = [];
     for (const row of rows) {
@@ -5378,7 +5388,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
 
   listDiscoveryRecords(): TranscriptDiscoveryRecord[] {
     const rows = this.db
-      .query<PersistedDiscoveryRecordRow, []>(
+      .query<PersistedDiscoveryRecordRow, [string, string, string]>(
         `
         SELECT
           rt.request_id,
@@ -5393,10 +5403,11 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         FROM request_transcripts rt
         LEFT JOIN surface_message_to_request sm
           ON sm.request_id = rt.request_id
+          AND sm.platform IN (${surfaceRefPlatformPlaceholders(1)})
         ORDER BY rt.updated_ts DESC, rt.created_ts DESC, sm.created_ts ASC, sm.rowid ASC
         `,
       )
-      .all();
+      .all(...SURFACE_REF_PLATFORMS);
 
     const byRequestId = new Map<string, TranscriptDiscoveryRecord>();
     for (const row of rows) {
