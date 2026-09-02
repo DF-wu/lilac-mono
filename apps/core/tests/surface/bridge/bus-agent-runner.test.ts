@@ -5412,12 +5412,22 @@ describe("startBusAgentRunner production path", () => {
         requestInitiator: { platform: "discord", userId: "user-a" },
         requestInitiatorSessionId: "turn-session",
         currentTurnUserId: "user-b",
+        currentTurnMessageRef: {
+          platform: "discord",
+          channelId: "turn-session",
+          messageId: "second-message",
+        },
       });
       expect(toolContexts).toEqual([
         expect.objectContaining({
           requestInitiator: { platform: "discord", userId: "user-a" },
           requestInitiatorSessionId: "turn-session",
           currentTurnUserId: "user-b",
+          currentTurnMessageRef: {
+            platform: "discord",
+            channelId: "turn-session",
+            messageId: "second-message",
+          },
         }),
       ]);
     } finally {
@@ -5987,6 +5997,11 @@ describe("startBusAgentRunner production path", () => {
       expect(contexts[1]).toMatchObject({
         requestInitiator: { platform: "discord", userId: "user-a" },
         currentTurnUserId: "user-b",
+        currentTurnMessageRef: {
+          platform: "discord",
+          channelId: "drain-coalescing",
+          messageId: "second-message",
+        },
       });
       releaseCoalesced.resolve(undefined);
       await expect(lifecycle.terminal).resolves.toBe("resolved");

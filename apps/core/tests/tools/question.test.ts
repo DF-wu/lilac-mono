@@ -47,6 +47,11 @@ describe("question tool", () => {
         requestInitiator: { platform: "discord", userId: "user-1" },
         requestInitiatorSessionId: "channel-1",
         currentTurnUserId: "user-1",
+        currentTurnMessageRef: {
+          platform: "discord",
+          channelId: "channel-1",
+          messageId: "message-1",
+        },
       },
     });
 
@@ -59,6 +64,11 @@ describe("question tool", () => {
       toolCallId: "tool-call-1",
       sessionId: "channel-1",
       userId: "user-1",
+      replyTo: {
+        platform: "discord",
+        channelId: "channel-1",
+        messageId: "message-1",
+      },
       questions,
     });
   });

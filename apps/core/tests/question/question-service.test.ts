@@ -17,6 +17,7 @@ import type {
   SurfaceQuestionPrompt,
 } from "../../src/surface/question";
 import type { SurfaceQuestionResolver } from "../../src/surface/runtime-descriptor";
+import type { MsgRefFor, SessionRefFor } from "../../src/surface/types";
 
 const temporaryDirectories: string[] = [];
 
@@ -53,14 +54,26 @@ class ReplaceFailingQuestionStore extends SqliteQuestionStore {
 
 class TestQuestionPort implements SurfaceQuestionPort<"discord"> {
   prompts: SurfaceQuestionPrompt[] = [];
+  presentations: Array<{
+    readonly sessionRef: SessionRefFor<"discord">;
+    readonly replyTo?: MsgRefFor<"discord">;
+  }> = [];
   finishes: SurfaceQuestionFinishInput<"discord">[] = [];
   interactionUpdates: SurfaceQuestionInteractionUpdate[] = [];
   handler: SurfaceQuestionAnswerHandler<"discord"> | null = null;
   finishGate: Promise<void> | null = null;
   finishStarted: (() => void) | null = null;
 
-  async present(input: { readonly prompt: SurfaceQuestionPrompt }) {
+  async present(input: {
+    readonly sessionRef: SessionRefFor<"discord">;
+    readonly replyTo?: MsgRefFor<"discord">;
+    readonly prompt: SurfaceQuestionPrompt;
+  }) {
     this.prompts.push(input.prompt);
+    this.presentations.push({
+      sessionRef: input.sessionRef,
+      ...(input.replyTo ? { replyTo: input.replyTo } : {}),
+    });
     return Result.ok({
       platform: "discord",
       channelId: "channel-1",
@@ -201,10 +214,17 @@ describe("question service", () => {
       toolCallId: "tool-call-1",
       sessionId: "channel-1",
       userId: "user-1",
+      replyTo: { platform: "discord", channelId: "channel-1", messageId: "turn-1" },
       questions: input,
     });
     await Promise.resolve();
     expect(port.prompts).toHaveLength(1);
+    expect(port.presentations).toEqual([
+      {
+        sessionRef: { platform: "discord", channelId: "channel-1" },
+        replyTo: { platform: "discord", channelId: "channel-1", messageId: "turn-1" },
+      },
+    ]);
 
     expect((await port.answerOption(2)).status).toBe("ok");
     expect(port.prompts).toHaveLength(1);

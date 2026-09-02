@@ -79,6 +79,7 @@ export type SurfaceQuestionAnswerSubscription = {
 export type SurfaceQuestionPort<P extends RegisteredSurfacePlatform> = {
   present(input: {
     readonly sessionRef: SessionRefFor<P>;
+    readonly replyTo?: MsgRefFor<P>;
     readonly prompt: SurfaceQuestionPrompt;
   }): Promise<ResultType<MsgRefFor<P>, SurfaceOperationError>>;
   finish(input: SurfaceQuestionFinishInput<P>): Promise<ResultType<void, SurfaceOperationError>>;

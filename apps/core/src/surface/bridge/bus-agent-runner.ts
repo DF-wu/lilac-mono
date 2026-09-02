@@ -281,7 +281,7 @@ import {
   resolveSessionAdditionalPrompts,
 } from "./bus-agent-runner/prompt-overlays";
 import { resolveSessionSafetyMode, type SessionSafetyMode } from "../session-policy";
-import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../types";
+import type { AuthenticatedSurfaceOrigin, MsgRef, SurfacePrincipal } from "../types";
 import type { SurfaceProtocolResolver } from "../runtime-descriptor";
 import type {
   CustomCommandExecutionError,
@@ -1793,6 +1793,7 @@ type Enqueued = {
   raw?: AgentRunnerRaw;
   authenticatedOrigin?: AuthenticatedSurfaceOrigin;
   currentTurnUserId?: string;
+  currentTurnMessageRef?: MsgRef;
   verifiedIngress?: boolean;
   identityOwner?: RequestMessageCacheOwner;
   restoredSafetyMode?: SessionSafetyMode;
@@ -2607,6 +2608,7 @@ type SessionQueue = {
     corePrimaryLineage?: CorePrimaryLineageV2;
     modelOverride?: string;
     currentTurnUserId?: string;
+    currentTurnMessageRef?: MsgRef;
     raw?: AgentRunnerRaw;
     resolvedModelSpec: string | null;
     resolvedReasoning: ModelReasoningEffort | undefined;
@@ -2623,7 +2625,7 @@ type SessionQueue = {
     ) => void;
     notifyWaiters: () => void;
     flushOutput: () => void;
-    setCurrentTurnUserId: (userId: string | undefined) => void;
+    setCurrentTurnContext: (userId: string | undefined, messageRef: MsgRef | undefined) => void;
     cancel: () => void;
     started: boolean;
     startedAt: number;
@@ -3867,6 +3869,7 @@ export async function startBusAgentRunner(params: {
               raw,
               authenticatedOrigin: authenticatedRequest?.authenticatedOrigin,
               currentTurnUserId: trustedProjection.authenticatedOrigin?.userId,
+              currentTurnMessageRef: trustedProjection.authenticatedOrigin?.messageRef,
               verifiedIngress: authenticatedRequest?.verifiedIngress,
             };
 
@@ -5199,6 +5202,7 @@ export async function startBusAgentRunner(params: {
       corePrimaryLineage: next.corePrimaryLineage,
       modelOverride: next.modelOverride,
       currentTurnUserId: next.currentTurnUserId,
+      currentTurnMessageRef: next.currentTurnMessageRef,
       raw: next.raw,
       resolvedModelSpec: null,
       resolvedReasoning: undefined,
@@ -5214,7 +5218,7 @@ export async function startBusAgentRunner(params: {
       },
       notifyWaiters: notifyContinuationWaiters,
       flushOutput: outputPublisher.flush,
-      setCurrentTurnUserId: () => undefined,
+      setCurrentTurnContext: () => undefined,
       cancel: () => {
         cancelledByRequestId.add(headers.request_id);
         customCommandAbortController?.abort();
@@ -5931,6 +5935,7 @@ export async function startBusAgentRunner(params: {
           const fallbackSurfaceForDelegation = trustedFallbackSurface;
           const executionCwd = path.resolve(workflowPolicy?.cwd ?? cwd);
           let currentTurnUserId = next.currentTurnUserId;
+          let currentTurnMessageRef = next.currentTurnMessageRef;
           const listSelectedCatalogIds = () =>
             params.transcriptStore?.listSessionToolIds?.({
               requestClient: next.requestClient,
@@ -6043,6 +6048,7 @@ export async function startBusAgentRunner(params: {
                   }
                 : {}),
               currentTurnUserId,
+              currentTurnMessageRef,
               metadata: {
                 controlCapability: controlCapability ?? undefined,
                 readFileDirectImageSupported: resourceProviderTarget.supportsImage,
@@ -6080,6 +6086,7 @@ export async function startBusAgentRunner(params: {
             );
             return toolsetResult.map((toolset) => {
               level1RequestContext.currentTurnUserId = currentTurnUserId;
+              level1RequestContext.currentTurnMessageRef = currentTurnMessageRef;
               return {
                 resolved,
                 capabilityInfo,
@@ -6551,10 +6558,16 @@ export async function startBusAgentRunner(params: {
           );
           activeAgent = agent;
 
-          const setCurrentTurnUserId = (userId: string | undefined) => {
+          const setCurrentTurnContext = (
+            userId: string | undefined,
+            messageRef: MsgRef | undefined,
+          ) => {
             currentTurnUserId = userId;
+            currentTurnMessageRef = messageRef;
             if (state.activeRun) state.activeRun.currentTurnUserId = userId;
+            if (state.activeRun) state.activeRun.currentTurnMessageRef = messageRef;
             activeBinding.requestContext.currentTurnUserId = userId;
+            activeBinding.requestContext.currentTurnMessageRef = messageRef;
             agent?.setContext({
               sessionId: next.sessionId,
               requestId: next.requestId,
@@ -6573,10 +6586,11 @@ export async function startBusAgentRunner(params: {
                   }
                 : {}),
               currentTurnUserId: userId,
+              currentTurnMessageRef: messageRef,
             });
           };
-          setCurrentTurnUserId(next.currentTurnUserId);
-          if (state.activeRun) state.activeRun.setCurrentTurnUserId = setCurrentTurnUserId;
+          setCurrentTurnContext(next.currentTurnUserId, next.currentTurnMessageRef);
+          if (state.activeRun) state.activeRun.setCurrentTurnContext = setCurrentTurnContext;
 
           // Drain all buffered messages at boundaries (better UX in chat surfaces).
           agent.setFollowUpMode("all");
@@ -7883,7 +7897,10 @@ export async function startBusAgentRunner(params: {
               coalesced.storedMessages,
               activeBinding,
             );
-            state.activeRun?.setCurrentTurnUserId(next.currentTurnUserId);
+            state.activeRun?.setCurrentTurnContext(
+              next.currentTurnUserId,
+              next.currentTurnMessageRef,
+            );
             for (const discarded of coalesced.discarded) {
               if (discarded.requestDeliveryId && state.activeRun) {
                 state.activeRun.retainedRequestDeliveries.set(discarded.requestDeliveryId, {
@@ -9259,6 +9276,8 @@ export async function startBusAgentRunner(params: {
     const restoredCurrentTurnUserId =
       recoveryHead?.checkpoint?.currentTurnUserId ??
       restoredIdentity?.projection.authenticatedOrigin?.userId;
+    const restoredCurrentTurnMessageRef =
+      restoredIdentity?.projection.authenticatedOrigin?.messageRef;
     const entry: Enqueued = {
       queueEntryId: record.publication?.streamId ?? `accepted:${record.requestDeliveryId}`,
       requestDeliveryId: record.requestDeliveryId,
@@ -9282,6 +9301,9 @@ export async function startBusAgentRunner(params: {
               ? { authenticatedOrigin: restoredIdentity.projection.authenticatedOrigin }
               : {}),
             ...(restoredCurrentTurnUserId ? { currentTurnUserId: restoredCurrentTurnUserId } : {}),
+            ...(restoredCurrentTurnMessageRef
+              ? { currentTurnMessageRef: restoredCurrentTurnMessageRef }
+              : {}),
             ...(restoredIdentity.projection.authenticatedOrigin?.userId
               ? {
                   acceptedCurrentTurnUserId: restoredIdentity.projection.authenticatedOrigin.userId,
@@ -9423,6 +9445,7 @@ function mergeQueuedControlsForRecovery(
       storedMessages.push(...entry.storedMessages);
       reapplied.push(entry);
       first.currentTurnUserId = entry.currentTurnUserId;
+      first.currentTurnMessageRef = entry.currentTurnMessageRef;
     }
     discarded.push(entry);
     queue.splice(index, 1);
@@ -9463,6 +9486,7 @@ function mergeQueuedForSameRequest(
     merged.push(...next.messages);
     storedMessages.push(...next.storedMessages);
     first.currentTurnUserId = next.currentTurnUserId;
+    first.currentTurnMessageRef = next.currentTurnMessageRef;
     discarded.push(next);
     queue.splice(i, 1);
   }
@@ -9525,7 +9549,9 @@ async function applyToRunningAgent(
     }
   };
 
-  if (!cancel) activeRun?.setCurrentTurnUserId(entry.currentTurnUserId);
+  if (!cancel) {
+    activeRun?.setCurrentTurnContext(entry.currentTurnUserId, entry.currentTurnMessageRef);
+  }
   if (!cancel && activeRun?.runProfile === "primary" && activeRun.requestClient === "discord") {
     activeRun.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
       entry.queue === "steer" || entry.queue === "interrupt"

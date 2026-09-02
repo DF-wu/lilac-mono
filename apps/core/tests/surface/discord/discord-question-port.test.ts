@@ -8,14 +8,14 @@ import {
   DISCORD_QUESTION_CANCELLED_COLOR,
   DISCORD_QUESTION_INTERRUPTED_COLOR,
 } from "../../../src/surface/discord/discord-question-port";
-import type { ContentOpts, MsgRef, SessionRef } from "../../../src/surface/types";
+import type { ContentOpts, MsgRef, SendOpts, SessionRef } from "../../../src/surface/types";
 
 describe("Discord question port", () => {
-  it("posts a separate indexed card", async () => {
-    const sends: Array<{ session: SessionRef; content: ContentOpts }> = [];
+  it("posts an indexed card as a reply to the current turn", async () => {
+    const sends: Array<{ session: SessionRef; content: ContentOpts; opts?: SendOpts }> = [];
     const adapter = {
-      sendMsg: async (session: SessionRef, content: ContentOpts) => {
-        sends.push({ session, content });
+      sendMsg: async (session: SessionRef, content: ContentOpts, opts?: SendOpts) => {
+        sends.push({ session, content, opts });
         return Result.ok({ platform: "discord", channelId: "channel", messageId: "card" } as const);
       },
     } as unknown as SurfaceAdapter;
@@ -39,6 +39,7 @@ describe("Discord question port", () => {
 
     const presented = await port.present({
       sessionRef: { platform: "discord", channelId: "channel" },
+      replyTo: { platform: "discord", channelId: "channel", messageId: "turn" },
       prompt,
     });
     expect(presented.status).toBe("ok");
@@ -64,6 +65,9 @@ describe("Discord question port", () => {
             { actionId: "question:v1:two:option:2", label: "2", style: "primary" },
             { actionId: "question:v1:custom:custom", label: "Other…", style: "secondary" },
           ],
+        },
+        opts: {
+          replyTo: { platform: "discord", channelId: "channel", messageId: "turn" },
         },
       },
     ]);

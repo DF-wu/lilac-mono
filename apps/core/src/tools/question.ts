@@ -16,6 +16,13 @@ const questionRequestContextSchema = z.object({
   sessionId: z.string().min(1),
   requestClient: z.literal("discord"),
   currentTurnUserId: z.string().min(1).optional(),
+  currentTurnMessageRef: z
+    .strictObject({
+      platform: z.literal("discord"),
+      channelId: z.string().min(1),
+      messageId: z.string().min(1),
+    })
+    .optional(),
   requestInitiator: z.strictObject({
     platform: z.literal("discord"),
     userId: z.string().min(1),
@@ -68,6 +75,7 @@ export function createQuestionTool(service: QuestionService) {
         toolCallId,
         sessionId: request.sessionId,
         userId: request.currentTurnUserId ?? request.requestInitiator.userId,
+        ...(request.currentTurnMessageRef ? { replyTo: request.currentTurnMessageRef } : {}),
         questions: input,
         signal: abortSignal,
       });

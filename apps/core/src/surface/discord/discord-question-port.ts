@@ -101,9 +101,13 @@ export function createDiscordQuestionPort(input: {
   readonly answers: DiscordQuestionAnswerSource;
 }): SurfaceQuestionPort<"discord"> {
   return {
-    present: async ({ sessionRef, prompt }) =>
+    present: async ({ sessionRef, replyTo, prompt }) =>
       await input.adapter
-        .sendMsg(sessionRef, discordQuestionInteractionContent({ state: "pending", prompt }))
+        .sendMsg(
+          sessionRef,
+          discordQuestionInteractionContent({ state: "pending", prompt }),
+          replyTo ? { replyTo } : undefined,
+        )
         .then((sent) =>
           sent.map((ref) => ({
             platform: "discord" as const,

@@ -145,6 +145,11 @@ export type Level1ExecutionRequestContext<P extends string = string> = {
   requestInitiator?: { platform: P; userId: string };
   requestInitiatorSessionId?: string;
   currentTurnUserId?: string;
+  currentTurnMessageRef?: {
+    platform: P;
+    channelId: string;
+    messageId: string;
+  };
   metadata?: Readonly<Record<string, unknown>>;
 };
 

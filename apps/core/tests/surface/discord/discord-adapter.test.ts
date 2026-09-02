@@ -471,6 +471,43 @@ describe("DiscordAdapter.sendMsg content validation", () => {
       field: "content.accentColor",
     });
   });
+
+  it("notifies the replied user for action cards unless the send is silent", async () => {
+    const sends: unknown[] = [];
+    const adapter = createTestDiscordAdapter();
+    (adapter as unknown as { client: unknown }).client = {
+      channels: {
+        fetch: async () => ({
+          send: async (payload: unknown) => {
+            sends.push(payload);
+            return { id: `sent-${sends.length}` };
+          },
+        }),
+      },
+    };
+    const sessionRef = { platform: "discord", channelId: "c1" } as const;
+    const replyTo = { platform: "discord", channelId: "c1", messageId: "turn-1" } as const;
+    const content = {
+      text: "Choose",
+      actions: [{ actionId: "choose", label: "1", style: "primary" as const }],
+    };
+
+    expect((await adapter.sendMsg(sessionRef, content, { replyTo })).status).toBe("ok");
+    expect((await adapter.sendMsg(sessionRef, content, { replyTo, silent: true })).status).toBe(
+      "ok",
+    );
+
+    expect(sends).toEqual([
+      expect.objectContaining({
+        reply: { messageReference: "turn-1" },
+        allowedMentions: { parse: [], repliedUser: true },
+      }),
+      expect.objectContaining({
+        reply: { messageReference: "turn-1" },
+        allowedMentions: { parse: [], repliedUser: false },
+      }),
+    ]);
+  });
 });
 
 describe("Discord question interactions", () => {

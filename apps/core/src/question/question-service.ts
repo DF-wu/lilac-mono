@@ -12,6 +12,7 @@ import {
 } from "../surface/question";
 import type { SurfaceQuestionResolver } from "../surface/runtime-descriptor";
 import type { SurfaceOperationError } from "../surface/adapter";
+import type { MsgRefFor } from "../surface/types";
 import { isAdapterPlatform } from "../shared/is-adapter-platform";
 import type { QuestionActionToken, QuestionAnswers, QuestionCall } from "./question-domain";
 import type { QuestionInput } from "./question-domain";
@@ -235,6 +236,7 @@ export class QuestionService {
     readonly toolCallId: string;
     readonly sessionId: string;
     readonly userId: string;
+    readonly replyTo?: MsgRefFor<"discord">;
     readonly questions: QuestionInput;
     readonly signal?: AbortSignal;
   }): Promise<ResultType<QuestionAnswers, QuestionServiceError>> {
@@ -309,6 +311,7 @@ export class QuestionService {
     const port = resolved.question as SurfaceQuestionPort<"discord">;
     const presented = await port.present({
       sessionRef: { platform: "discord", channelId: input.sessionId },
+      ...(input.replyTo ? { replyTo: input.replyTo } : {}),
       prompt: issued.prompt,
     });
     const presentedOutcome = presented.match<

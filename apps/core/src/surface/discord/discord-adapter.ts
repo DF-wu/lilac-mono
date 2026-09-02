@@ -1561,7 +1561,7 @@ export class DiscordAdapter implements SurfaceAdapter {
             opts?.replyTo?.platform === "discord"
               ? { messageReference: opts.replyTo.messageId }
               : undefined,
-          allowedMentions: { parse: [], repliedUser: false },
+          allowedMentions: { parse: [], repliedUser: opts?.silent !== true },
         }),
       );
       return sent.map((message) => asDiscordMsgRef(discordRef.channelId, message.id));
