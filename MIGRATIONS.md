@@ -42,6 +42,16 @@ callable itself failed to complete as expected.
 
 ## Core SQLite
 
+### Agent questions
+
+Core adds `agent_question_calls` and `agent_question_tokens` to `request-delivery.db`. The tables
+store pending Discord question tool calls and hashed one-time interaction tokens. Existing databases
+create both tables at startup and need no offline migration.
+
+Question calls belong to a request-delivery record and are removed with that record. A Core restart
+marks pending questions as interrupted and removes their live tokens. The Discord adapter then clears
+the stale controls after reconnecting. Core does not resume an interrupted question tool call.
+
 ### Agent-run WAL and graceful-restart clean cut
 
 Core adds `agent_run_wal_metadata`, `agent_run_wal_events`, and `agent_run_wal_heads` to

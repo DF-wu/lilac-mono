@@ -1484,6 +1484,17 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module: module!, exportName: exportName! },
         category: category as "wire" | "persistence",
       })),
+      {
+        identity: {
+          module: "src/question/question-store.ts",
+          exportName: "decodeQuestionCallRow",
+        },
+        category: "persistence",
+      },
+      ...["formatQuestionToolArgs", "createQuestionTool.execute"].map((exportName) => ({
+        identity: { module: "src/tools/question.ts", exportName },
+        category: "request" as const,
+      })),
       ...[
         ["src/transcript/transcript-persistence-codec.ts", "normalizeStoredMessagesV1"],
         ["src/surface/bridge/agent-run-journal/index.ts", "deserialize.andThen.<callback@1>"],
@@ -4122,6 +4133,15 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
     module: "src/workflow/workflow-migrations.ts",
     exportName: "applyWorkflowBlobStorageSchema26Migration",
   },
+  ...[
+    "SqliteQuestionStore.create",
+    "SqliteQuestionStore.replaceTokens",
+    "SqliteQuestionStore.applyAnswer",
+    "SqliteQuestionStore.interruptPending",
+  ].map((exportName) => ({
+    module: "src/question/question-store.ts",
+    exportName,
+  })),
   {
     module: "scripts/legacy-graceful-restart-blob-migration.ts",
     exportName: "commitLegacyGracefulRestartMigration",
@@ -4409,6 +4429,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "apps/core"
         ? [
             { include: "src/conversation/thread-store.ts" },
+            { include: "src/question/question-store.ts" },
             { include: "scripts/legacy-graceful-restart-blob-migration.ts" },
             { include: "src/surface/bridge/agent-run-journal/index.ts" },
             { include: "src/surface/bridge/request-delivery/sqlite-store.ts" },

@@ -1,5 +1,6 @@
 import type { CoreToolPlugin } from "../types";
 import { createBuiltinLocalToolsPlugin } from "./local-tools";
+import { createBuiltinQuestionPlugin } from "./question";
 import {
   createBuiltinAttachmentPlugin,
   createBuiltinCodexPlugin,
@@ -20,6 +21,7 @@ import {
 export function createBuiltinCoreToolPlugins(): CoreToolPlugin[] {
   return [
     createBuiltinLocalToolsPlugin(),
+    createBuiltinQuestionPlugin(),
     createBuiltinWebPlugin(),
     createBuiltinSkillsPlugin(),
     createBuiltinMcpPlugin(),
