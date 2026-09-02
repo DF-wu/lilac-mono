@@ -73,7 +73,7 @@ describe("Discord question port", () => {
     ]);
   });
 
-  it("colors cancelled and interrupted terminal cards distinctly", async () => {
+  it("renders cancelled, expired, and interrupted terminal cards", async () => {
     const edits: ContentOpts[] = [];
     const port = createDiscordQuestionPort({
       adapter: {
@@ -89,11 +89,18 @@ describe("Discord question port", () => {
     const messageRef = { platform: "discord", channelId: "channel", messageId: "card" } as const;
 
     await port.finish({ messageRef, state: "cancelled" });
+    await port.finish({ messageRef, state: "expired" });
     await port.finish({ messageRef, state: "interrupted" });
 
     expect(edits).toEqual([
       {
         text: "**Question cancelled**",
+        format: "markdown",
+        accentColor: DISCORD_QUESTION_CANCELLED_COLOR,
+        actions: [],
+      },
+      {
+        text: "**Question expired**",
         format: "markdown",
         accentColor: DISCORD_QUESTION_CANCELLED_COLOR,
         actions: [],

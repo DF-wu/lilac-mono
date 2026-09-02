@@ -82,6 +82,8 @@ function terminalText(state: SurfaceQuestionTerminalState): string {
   switch (state) {
     case "cancelled":
       return "**Question cancelled**";
+    case "expired":
+      return "**Question expired**";
     case "interrupted":
       return "**Question interrupted**";
   }
@@ -90,6 +92,7 @@ function terminalText(state: SurfaceQuestionTerminalState): string {
 function terminalColor(state: SurfaceQuestionTerminalState): number {
   switch (state) {
     case "cancelled":
+    case "expired":
       return DISCORD_QUESTION_CANCELLED_COLOR;
     case "interrupted":
       return DISCORD_QUESTION_INTERRUPTED_COLOR;

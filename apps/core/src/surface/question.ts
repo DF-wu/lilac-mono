@@ -24,7 +24,7 @@ export type SurfaceQuestionPrompt = {
   readonly customToken: string;
 };
 
-export type SurfaceQuestionTerminalState = "cancelled" | "interrupted";
+export type SurfaceQuestionTerminalState = "cancelled" | "expired" | "interrupted";
 
 export type SurfaceQuestionSummary = {
   readonly answers: readonly {

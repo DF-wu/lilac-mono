@@ -37,6 +37,10 @@ export class QuestionCancelled extends TaggedError("QuestionCancelled")<{
   readonly message: string;
 }> {}
 
+export class QuestionTimedOut extends TaggedError("QuestionTimedOut")<{
+  readonly message: string;
+}> {}
+
 export class QuestionInterrupted extends TaggedError("QuestionInterrupted")<{
   readonly message: string;
 }> {}
@@ -45,6 +49,7 @@ export type QuestionServiceError =
   | QuestionUnavailable
   | QuestionPresentationFailed
   | QuestionCancelled
+  | QuestionTimedOut
   | QuestionInterrupted
   | QuestionStoreFailed
   | QuestionStoreCorrupt;
@@ -55,7 +60,11 @@ type QuestionServiceLogger = {
 
 type PendingQuestion = {
   readonly resolve: (result: ResultType<QuestionAnswers, QuestionServiceError>) => void;
+  timeout: ReturnType<typeof setTimeout> | null;
+  terminalOperation: Promise<void> | null;
 };
+
+export const QUESTION_INACTIVITY_TIMEOUT_MS = 10 * 60 * 1_000;
 
 type IssuedPrompt = {
   readonly prompt: SurfaceQuestionPrompt;
@@ -217,15 +226,14 @@ export class QuestionService {
   async stop(): Promise<void> {
     for (const subscription of this.#subscriptions.splice(0)) await subscription.stop();
     for (const [questionCallId, waiter] of this.#waiters) {
-      this.input.store.transitionPending(questionCallId, "interrupted");
-      await this.finishCall(questionCallId, "interrupted");
-      waiter.resolve(
-        Result.err(
-          new QuestionInterrupted({
-            message: "Question interrupted by shutdown",
-          }),
-        ),
-      );
+      this.clearQuestionTimeout(questionCallId);
+      if (waiter.terminalOperation) {
+        await waiter.terminalOperation;
+        continue;
+      }
+      const operation = this.interruptPendingQuestion(questionCallId, waiter.resolve);
+      waiter.terminalOperation = operation;
+      await operation;
     }
     this.#waiters.clear();
   }
@@ -352,16 +360,24 @@ export class QuestionService {
     return await new Promise((resolve) => {
       const settle = (result: ResultType<QuestionAnswers, QuestionServiceError>) => {
         signal?.removeEventListener("abort", abort);
+        this.clearQuestionTimeout(questionCallId);
         this.#waiters.delete(questionCallId);
         resolve(result);
       };
       const abort = () => {
-        if (abortStarted) return;
-        abortStarted = true;
-        void this.cancelPendingQuestion(questionCallId, settle);
+        const waiter = this.#waiters.get(questionCallId);
+        if (!waiter || waiter.terminalOperation) return;
+        this.clearQuestionTimeout(questionCallId);
+        const operation = this.cancelPendingQuestion(questionCallId, settle);
+        waiter.terminalOperation = operation;
+        void operation;
       };
-      let abortStarted = false;
-      this.#waiters.set(questionCallId, { resolve: settle });
+      this.#waiters.set(questionCallId, {
+        resolve: settle,
+        timeout: null,
+        terminalOperation: null,
+      });
+      this.resetQuestionTimeout(questionCallId);
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) abort();
       const stored = this.input.store.getById(questionCallId);
@@ -374,6 +390,43 @@ export class QuestionService {
     });
   }
 
+  private clearQuestionTimeout(questionCallId: string): void {
+    const waiter = this.#waiters.get(questionCallId);
+    if (!waiter?.timeout) return;
+    clearTimeout(waiter.timeout);
+    waiter.timeout = null;
+  }
+
+  private resetQuestionTimeout(questionCallId: string): void {
+    const waiter = this.#waiters.get(questionCallId);
+    if (!waiter) return;
+    this.clearQuestionTimeout(questionCallId);
+    const timeout = setTimeout(() => {
+      const current = this.#waiters.get(questionCallId);
+      if (current?.timeout !== timeout) return;
+      current.timeout = null;
+      const operation = this.expirePendingQuestion(questionCallId, current.resolve);
+      current.terminalOperation = operation;
+      void operation;
+    }, QUESTION_INACTIVITY_TIMEOUT_MS);
+    waiter.timeout = timeout;
+  }
+
+  private async expirePendingQuestion(
+    questionCallId: string,
+    settle: (result: ResultType<QuestionAnswers, QuestionServiceError>) => void,
+  ): Promise<void> {
+    this.input.store.transitionPending(questionCallId, "cancelled");
+    await this.finishCall(questionCallId, "expired");
+    settle(
+      Result.err(
+        new QuestionTimedOut({
+          message: "Question timed out after 10 minutes without an answer",
+        }),
+      ),
+    );
+  }
+
   private async cancelPendingQuestion(
     questionCallId: string,
     settle: (result: ResultType<QuestionAnswers, QuestionServiceError>) => void,
@@ -381,6 +434,21 @@ export class QuestionService {
     this.input.store.transitionPending(questionCallId, "cancelled");
     await this.finishCall(questionCallId, "cancelled");
     settle(Result.err(new QuestionCancelled({ message: "Question cancelled" })));
+  }
+
+  private async interruptPendingQuestion(
+    questionCallId: string,
+    settle: (result: ResultType<QuestionAnswers, QuestionServiceError>) => void,
+  ): Promise<void> {
+    this.input.store.transitionPending(questionCallId, "interrupted");
+    await this.finishCall(questionCallId, "interrupted");
+    settle(
+      Result.err(
+        new QuestionInterrupted({
+          message: "Question interrupted by shutdown",
+        }),
+      ),
+    );
   }
 
   private async handleAnswer(
@@ -417,6 +485,7 @@ export class QuestionService {
 
     const call = outcome.result.call;
     if (call.state === "answered") {
+      this.clearQuestionTimeout(call.questionCallId);
       const finished = await updateInteraction({
         state: "answered",
         summary: questionSummary(call),
@@ -433,6 +502,7 @@ export class QuestionService {
       this.#waiters.get(call.questionCallId)?.resolve(Result.ok(call.answers));
       return Result.ok("accepted");
     }
+    this.resetQuestionTimeout(call.questionCallId);
     const issued = issuePrompt(call);
     const replaced = this.input.store.replaceTokens(call.questionCallId, issued.tokens);
     const replaceError = replaced.match({
@@ -463,7 +533,7 @@ export class QuestionService {
 
   private async finishCall(
     questionCallId: string,
-    state: "cancelled" | "interrupted",
+    state: "cancelled" | "expired" | "interrupted",
   ): Promise<void> {
     const call = this.input.store.getById(questionCallId).match({
       ok: (value) => value,

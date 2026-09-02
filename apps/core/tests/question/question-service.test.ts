@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, jest } from "bun:test";
 import { Database } from "bun:sqlite";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -6,7 +6,10 @@ import path from "node:path";
 import { Result } from "better-result";
 
 import type { QuestionActionToken, QuestionInput } from "../../src/question/question-domain";
-import { QuestionService } from "../../src/question/question-service";
+import {
+  QUESTION_INACTIVITY_TIMEOUT_MS,
+  QuestionService,
+} from "../../src/question/question-service";
 import { QuestionStoreFailed, SqliteQuestionStore } from "../../src/question/question-store";
 import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
 import type {
@@ -192,6 +195,7 @@ const input: QuestionInput = {
 };
 
 afterEach(async () => {
+  jest.useRealTimers();
   await Promise.all(
     temporaryDirectories
       .splice(0)
@@ -304,6 +308,73 @@ describe("question service", () => {
     const result = await pending;
     expect(result).toMatchObject({ status: "error", error: { _tag: "QuestionCancelled" } });
     expect(port.finishes).toEqual([expect.objectContaining({ state: "cancelled" })]);
+
+    await service.stop();
+    store.close();
+  });
+
+  it("expires an unanswered question after ten minutes", async () => {
+    jest.useFakeTimers({ now: 0 });
+    const store = await createStore();
+    const port = new TestQuestionPort();
+    const service = createService(store, port);
+    expect((await service.start()).status).toBe("ok");
+    const pending = service.ask({
+      requestDeliveryId: "delivery-1",
+      requestId: "request-1",
+      toolCallId: "tool-call-timeout",
+      sessionId: "channel-1",
+      userId: "user-1",
+      questions: input,
+    });
+    await Promise.resolve();
+
+    jest.advanceTimersByTime(QUESTION_INACTIVITY_TIMEOUT_MS);
+
+    expect(await pending).toMatchObject({
+      status: "error",
+      error: { _tag: "QuestionTimedOut" },
+    });
+    expect(port.finishes).toEqual([expect.objectContaining({ state: "expired" })]);
+
+    await service.stop();
+    store.close();
+  });
+
+  it("resets the timeout after each accepted answer", async () => {
+    jest.useFakeTimers({ now: 0 });
+    const store = await createStore();
+    const port = new TestQuestionPort();
+    const service = createService(store, port);
+    expect((await service.start()).status).toBe("ok");
+    let settled = false;
+    const pending = service
+      .ask({
+        requestDeliveryId: "delivery-1",
+        requestId: "request-1",
+        toolCallId: "tool-call-reset-timeout",
+        sessionId: "channel-1",
+        userId: "user-1",
+        questions: input,
+      })
+      .then((result) => {
+        settled = true;
+        return result;
+      });
+    await Promise.resolve();
+
+    jest.advanceTimersByTime(9 * 60 * 1_000);
+    expect((await port.answerOption(1)).status).toBe("ok");
+    jest.advanceTimersByTime(2 * 60 * 1_000);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    jest.advanceTimersByTime(8 * 60 * 1_000);
+    expect(await pending).toMatchObject({
+      status: "error",
+      error: { _tag: "QuestionTimedOut" },
+    });
+    expect(port.finishes).toEqual([expect.objectContaining({ state: "expired" })]);
 
     await service.stop();
     store.close();
