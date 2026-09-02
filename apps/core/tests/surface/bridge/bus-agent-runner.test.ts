@@ -5482,6 +5482,14 @@ describe("startBusAgentRunner production path", () => {
       }),
       execute: (_input, options) => {
         toolContexts.push(options.context);
+        const metadata = (
+          options.context as {
+            readonly metadata?: {
+              readonly onActivity?: (source: "tool" | "subagent") => void;
+            };
+          }
+        ).metadata;
+        metadata?.onActivity?.("tool");
         return "ok";
       },
     });
@@ -5604,6 +5612,9 @@ describe("startBusAgentRunner production path", () => {
             channelId: "turn-session",
             messageId: "second-message",
           },
+          metadata: expect.objectContaining({
+            onActivity: expect.any(Function),
+          }),
         }),
       ]);
     } finally {

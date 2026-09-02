@@ -78,6 +78,8 @@ class TestQuestionPort implements SurfaceQuestionPort<"discord"> {
   interactionUpdates: SurfaceQuestionInteractionUpdate[] = [];
   handler: SurfaceQuestionAnswerHandler<"discord"> | null = null;
   activityHandler: SurfaceQuestionActivityHandler<"discord"> | null = null;
+  interactionUpdateGate: Promise<void> | null = null;
+  interactionUpdateStarted: (() => void) | null = null;
   finishGate: Promise<void> | null = null;
   finishStarted: (() => void) | null = null;
 
@@ -154,10 +156,7 @@ class TestQuestionPort implements SurfaceQuestionPort<"discord"> {
         token: option.token,
         answer: { kind: "option", optionIndex },
       },
-      async (update) => {
-        this.interactionUpdates.push(update);
-        return Result.ok(undefined);
-      },
+      async (update) => await this.updateInteraction(update),
     );
   }
 
@@ -178,11 +177,15 @@ class TestQuestionPort implements SurfaceQuestionPort<"discord"> {
         token: prompt.customToken,
         answer: { kind: "custom", text },
       },
-      async (update) => {
-        this.interactionUpdates.push(update);
-        return Result.ok(undefined);
-      },
+      async (update) => await this.updateInteraction(update),
     );
+  }
+
+  private async updateInteraction(update: SurfaceQuestionInteractionUpdate) {
+    this.interactionUpdateStarted?.();
+    if (this.interactionUpdateGate) await this.interactionUpdateGate;
+    this.interactionUpdates.push(update);
+    return Result.ok(undefined);
   }
 }
 
@@ -228,6 +231,10 @@ const input: QuestionInput = {
       ],
     },
   ],
+};
+
+const singleQuestionInput: QuestionInput = {
+  questions: [input.questions[0]!],
 };
 
 afterEach(async () => {
@@ -346,6 +353,87 @@ describe("question service", () => {
     expect(port.finishes).toEqual([expect.objectContaining({ state: "cancelled" })]);
 
     await service.stop();
+    store.close();
+  });
+
+  it("lets an accepted final answer finish before a concurrent abort", async () => {
+    const store = await createStore();
+    const port = new TestQuestionPort();
+    const service = createService(store, port);
+    expect((await service.start()).status).toBe("ok");
+    const interactionUpdateStarted = Promise.withResolvers<void>();
+    const interactionUpdateGate = Promise.withResolvers<void>();
+    port.interactionUpdateStarted = interactionUpdateStarted.resolve;
+    port.interactionUpdateGate = interactionUpdateGate.promise;
+    const controller = new AbortController();
+    const pending = service.ask({
+      requestDeliveryId: "delivery-1",
+      requestId: "request-1",
+      toolCallId: "tool-call-final-answer-abort",
+      sessionId: "channel-1",
+      userId: "user-1",
+      questions: singleQuestionInput,
+      signal: controller.signal,
+    });
+    await Promise.resolve();
+
+    const answering = port.answerOption(1);
+    await interactionUpdateStarted.promise;
+    controller.abort();
+    expect(port.finishes).toEqual([]);
+    interactionUpdateGate.resolve();
+
+    expect(await answering).toMatchObject({ status: "ok", value: "accepted" });
+    expect(await pending).toMatchObject({
+      status: "ok",
+      value: [{ questionId: "environment" }],
+    });
+    expect(port.finishes).toEqual([]);
+
+    await service.stop();
+    store.close();
+  });
+
+  it("finishes an intermediate card update before concurrent shutdown interrupts it", async () => {
+    const store = await createStore();
+    const port = new TestQuestionPort();
+    const service = createService(store, port);
+    expect((await service.start()).status).toBe("ok");
+    const interactionUpdateStarted = Promise.withResolvers<void>();
+    const interactionUpdateGate = Promise.withResolvers<void>();
+    port.interactionUpdateStarted = interactionUpdateStarted.resolve;
+    port.interactionUpdateGate = interactionUpdateGate.promise;
+    const pending = service.ask({
+      requestDeliveryId: "delivery-1",
+      requestId: "request-1",
+      toolCallId: "tool-call-intermediate-answer-stop",
+      sessionId: "channel-1",
+      userId: "user-1",
+      questions: input,
+    });
+    await Promise.resolve();
+
+    const answering = port.answerOption(1);
+    await interactionUpdateStarted.promise;
+    const stopping = service.stop();
+    await Promise.resolve();
+    expect(port.interactionUpdates).toEqual([]);
+    expect(port.finishes).toEqual([]);
+    interactionUpdateGate.resolve();
+
+    expect(await answering).toMatchObject({ status: "ok", value: "accepted" });
+    await stopping;
+    expect(await pending).toMatchObject({
+      status: "error",
+      error: { _tag: "QuestionInterrupted" },
+    });
+    expect(port.interactionUpdates).toHaveLength(1);
+    expect(port.interactionUpdates[0]).toMatchObject({
+      state: "pending",
+      prompt: { ordinal: 2 },
+    });
+    expect(port.finishes).toEqual([expect.objectContaining({ state: "interrupted" })]);
+
     store.close();
   });
 

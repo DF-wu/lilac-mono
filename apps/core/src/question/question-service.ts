@@ -65,6 +65,7 @@ type PendingQuestion = {
   readonly resolve: (result: ResultType<QuestionAnswers, QuestionServiceError>) => void;
   readonly onActivity?: () => void;
   timeout: ReturnType<typeof setTimeout> | null;
+  interactionOperation: Promise<void> | null;
   terminalOperation: Promise<void> | null;
 };
 
@@ -237,8 +238,9 @@ export class QuestionService {
         await waiter.terminalOperation;
         continue;
       }
-      const operation = this.interruptPendingQuestion(questionCallId, waiter.resolve);
-      waiter.terminalOperation = operation;
+      const operation = this.queueTerminalOperation(questionCallId, waiter, () =>
+        this.interruptPendingQuestion(questionCallId, waiter.resolve),
+      );
       await operation;
     }
     this.#waiters.clear();
@@ -376,14 +378,16 @@ export class QuestionService {
         const waiter = this.#waiters.get(questionCallId);
         if (!waiter || waiter.terminalOperation) return;
         this.clearQuestionTimeout(questionCallId);
-        const operation = this.cancelPendingQuestion(questionCallId, settle);
-        waiter.terminalOperation = operation;
+        const operation = this.queueTerminalOperation(questionCallId, waiter, () =>
+          this.cancelPendingQuestion(questionCallId, settle),
+        );
         void operation;
       };
       this.#waiters.set(questionCallId, {
         resolve: settle,
         ...(onActivity ? { onActivity } : {}),
         timeout: null,
+        interactionOperation: null,
         terminalOperation: null,
       });
       this.resetQuestionTimeout(questionCallId);
@@ -414,11 +418,45 @@ export class QuestionService {
       const current = this.#waiters.get(questionCallId);
       if (current?.timeout !== timeout) return;
       current.timeout = null;
-      const operation = this.expirePendingQuestion(questionCallId, current.resolve);
-      current.terminalOperation = operation;
+      const operation = this.queueTerminalOperation(questionCallId, current, () =>
+        this.expirePendingQuestion(questionCallId, current.resolve),
+      );
       void operation;
     }, QUESTION_INACTIVITY_TIMEOUT_MS);
     waiter.timeout = timeout;
+  }
+
+  private queueTerminalOperation(
+    questionCallId: string,
+    waiter: PendingQuestion,
+    terminalize: () => Promise<void>,
+  ): Promise<void> {
+    if (waiter.terminalOperation) return waiter.terminalOperation;
+    const interactionOperation = waiter.interactionOperation;
+    const operation = (async () => {
+      if (interactionOperation) await interactionOperation;
+      if (this.#waiters.get(questionCallId) !== waiter) return;
+      await terminalize();
+    })();
+    waiter.terminalOperation = operation;
+    return operation;
+  }
+
+  private async runQuestionInteraction<T>(
+    questionCallId: string,
+    interact: () => Promise<T>,
+  ): Promise<T> {
+    const waiter = this.#waiters.get(questionCallId);
+    if (!waiter) return await interact();
+    const completed = Promise.withResolvers<void>();
+    waiter.interactionOperation = completed.promise;
+    return await interact().finally(() => {
+      completed.resolve();
+      const current = this.#waiters.get(questionCallId);
+      if (current?.interactionOperation === completed.promise) {
+        current.interactionOperation = null;
+      }
+    });
   }
 
   private async expirePendingQuestion(
@@ -529,6 +567,15 @@ export class QuestionService {
     if (outcome.result.disposition !== "accepted") return Result.ok(outcome.result.disposition);
 
     const call = outcome.result.call;
+    return await this.runQuestionInteraction(call.questionCallId, () =>
+      this.finishAcceptedAnswer(call, updateInteraction),
+    );
+  }
+
+  private async finishAcceptedAnswer(
+    call: QuestionCall,
+    updateInteraction: SurfaceQuestionInteractionUpdater,
+  ): Promise<ResultType<SurfaceQuestionAnswerDisposition, SurfaceQuestionAnswerHandlingFailed>> {
     this.#waiters.get(call.questionCallId)?.onActivity?.();
     if (call.state === "answered") {
       this.clearQuestionTimeout(call.questionCallId);

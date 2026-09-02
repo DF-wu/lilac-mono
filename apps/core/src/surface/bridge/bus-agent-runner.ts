@@ -6572,26 +6572,7 @@ export async function startBusAgentRunner(params: {
             if (state.activeRun) state.activeRun.currentTurnMessageRef = messageRef;
             activeBinding.requestContext.currentTurnUserId = userId;
             activeBinding.requestContext.currentTurnMessageRef = messageRef;
-            agent?.setContext({
-              sessionId: next.sessionId,
-              requestId: next.requestId,
-              ...(next.requestDeliveryId ? { requestDeliveryId: next.requestDeliveryId } : {}),
-              requestClient: next.requestClient,
-              subagentDepth: subagentMeta.depth,
-              subagentProfile: runProfile,
-              safetyMode,
-              ...(trustedFallbackSurface
-                ? {
-                    requestInitiator: {
-                      platform: trustedFallbackSurface.platform,
-                      userId: trustedFallbackSurface.userId,
-                    },
-                    requestInitiatorSessionId: trustedFallbackSurface.sessionId,
-                  }
-                : {}),
-              currentTurnUserId: userId,
-              currentTurnMessageRef: messageRef,
-            });
+            agent?.setContext(activeBinding.requestContext);
           };
           setCurrentTurnContext(next.currentTurnUserId, next.currentTurnMessageRef);
           if (state.activeRun) state.activeRun.setCurrentTurnContext = setCurrentTurnContext;
