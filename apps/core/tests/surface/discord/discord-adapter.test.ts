@@ -44,7 +44,10 @@ import { DiscordSurfaceStore } from "../../../src/surface/store/discord-surface-
 import { composeRequestMessages } from "../../../src/surface/bridge/request-composition";
 import type { CustomCommandManager } from "../../../src/custom-commands/manager";
 import { buildDiscordActionCustomIdResult } from "../../../src/surface/discord/discord-actions";
-import { buildDiscordQuestionOptionActionId } from "../../../src/surface/discord/discord-question-interactions";
+import {
+  buildDiscordQuestionCustomActionId,
+  buildDiscordQuestionOptionActionId,
+} from "../../../src/surface/discord/discord-question-interactions";
 import { DISCORD_QUESTION_ANSWERED_COLOR } from "../../../src/surface/discord/discord-question-port";
 
 describe("Discord command actor projection", () => {
@@ -472,7 +475,7 @@ describe("DiscordAdapter.sendMsg content validation", () => {
     });
   });
 
-  it("notifies the replied user for action cards unless the send is silent", async () => {
+  it("notifies action-card replies only when explicitly requested", async () => {
     const sends: unknown[] = [];
     const adapter = createTestDiscordAdapter();
     (adapter as unknown as { client: unknown }).client = {
@@ -493,11 +496,24 @@ describe("DiscordAdapter.sendMsg content validation", () => {
     };
 
     expect((await adapter.sendMsg(sessionRef, content, { replyTo })).status).toBe("ok");
-    expect((await adapter.sendMsg(sessionRef, content, { replyTo, silent: true })).status).toBe(
-      "ok",
-    );
+    expect(
+      (await adapter.sendMsg(sessionRef, content, { replyTo, notifyReply: true })).status,
+    ).toBe("ok");
+    expect(
+      (
+        await adapter.sendMsg(sessionRef, content, {
+          replyTo,
+          notifyReply: true,
+          silent: true,
+        })
+      ).status,
+    ).toBe("ok");
 
     expect(sends).toEqual([
+      expect.objectContaining({
+        reply: { messageReference: "turn-1" },
+        allowedMentions: { parse: [], repliedUser: false },
+      }),
       expect.objectContaining({
         reply: { messageReference: "turn-1" },
         allowedMentions: { parse: [], repliedUser: true },
@@ -527,32 +543,35 @@ describe("Discord question interactions", () => {
     }[] = [];
     let replyCount = 0;
     let followUpCount = 0;
-    await adapter.subscribeQuestionAnswers(async (answer, updateInteraction) => {
-      sequence.push("handle");
-      expect(answer).toMatchObject({
-        channelId: "channel-1",
-        messageRef: {
+    await adapter.subscribeQuestionAnswers(
+      async (answer, updateInteraction) => {
+        sequence.push("handle");
+        expect(answer).toMatchObject({
           channelId: "channel-1",
-          messageId: "message-1",
-        },
-        principal: { userId: "user-1" },
-        token: "question-token",
-        answer: { kind: "option", optionIndex: 2 },
-      });
-      const updated = await updateInteraction({
-        state: "answered",
-        summary: {
-          answers: [
-            {
-              header: "Environment",
-              answer: { kind: "option", label: "Production" },
-            },
-          ],
-        },
-      });
-      expect(updated.status).toBe("ok");
-      return Result.ok("accepted");
-    });
+          messageRef: {
+            channelId: "channel-1",
+            messageId: "message-1",
+          },
+          principal: { userId: "user-1" },
+          token: "question-token",
+          answer: { kind: "option", optionIndex: 2 },
+        });
+        const updated = await updateInteraction({
+          state: "answered",
+          summary: {
+            answers: [
+              {
+                header: "Environment",
+                answer: { kind: "option", label: "Production" },
+              },
+            ],
+          },
+        });
+        expect(updated.status).toBe("ok");
+        return Result.ok("accepted");
+      },
+      async () => Result.ok("accepted"),
+    );
     const interaction = {
       deferred: false,
       replied: false,
@@ -593,33 +612,80 @@ describe("Discord question interactions", () => {
     expect(followUpCount).toBe(0);
   });
 
+  it("records custom-input activity before opening the modal", async () => {
+    const adapter = createTestDiscordAdapter();
+    const actionId = buildDiscordActionCustomIdResult(
+      buildDiscordQuestionCustomActionId("custom-token"),
+    );
+    expect(actionId.status).toBe("ok");
+    if (actionId.status === "error") return;
+    const sequence: string[] = [];
+    await adapter.subscribeQuestionAnswers(
+      async () => Result.ok("accepted"),
+      async (activity) => {
+        sequence.push("activity");
+        expect(activity).toMatchObject({
+          channelId: "channel-1",
+          messageRef: { messageId: "message-1" },
+          principal: { userId: "user-1" },
+          token: "custom-token",
+        });
+        return Result.ok("accepted");
+      },
+    );
+    const interaction = {
+      customId: actionId.value,
+      channelId: "channel-1",
+      message: { id: "message-1" },
+      user: { id: "user-1" },
+      isChatInputCommand: () => false,
+      isAutocomplete: () => false,
+      isMessageContextMenuCommand: () => false,
+      isModalSubmit: () => false,
+      isButton: () => true,
+      showModal: async () => {
+        sequence.push("modal");
+      },
+    };
+    const onInteractionCreate = Reflect.get(adapter, "onInteractionCreate") as (
+      interaction: unknown,
+    ) => Promise<void>;
+
+    await onInteractionCreate.call(adapter, interaction);
+
+    expect(sequence).toEqual(["activity", "modal"]);
+  });
+
   it("renders an accepted modal summary through the interaction response", async () => {
     const adapter = createTestDiscordAdapter();
     const sequence: string[] = [];
     let updatedDescription: string | undefined;
     let replyCount = 0;
     let followUpCount = 0;
-    await adapter.subscribeQuestionAnswers(async (answer, updateInteraction) => {
-      sequence.push("handle");
-      expect(answer).toMatchObject({
-        channelId: "channel-1",
-        messageRef: {
+    await adapter.subscribeQuestionAnswers(
+      async (answer, updateInteraction) => {
+        sequence.push("handle");
+        expect(answer).toMatchObject({
           channelId: "channel-1",
-          messageId: "message-1",
-        },
-        principal: { userId: "user-1" },
-        token: "custom-token",
-        answer: { kind: "custom", text: "A private explanation" },
-      });
-      const updated = await updateInteraction({
-        state: "answered",
-        summary: {
-          answers: [{ header: "Notes", answer: { kind: "custom" } }],
-        },
-      });
-      expect(updated.status).toBe("ok");
-      return Result.ok("accepted");
-    });
+          messageRef: {
+            channelId: "channel-1",
+            messageId: "message-1",
+          },
+          principal: { userId: "user-1" },
+          token: "custom-token",
+          answer: { kind: "custom", text: "A private explanation" },
+        });
+        const updated = await updateInteraction({
+          state: "answered",
+          summary: {
+            answers: [{ header: "Notes", answer: { kind: "custom" } }],
+          },
+        });
+        expect(updated.status).toBe("ok");
+        return Result.ok("accepted");
+      },
+      async () => Result.ok("accepted"),
+    );
     const interaction = {
       deferred: false,
       replied: false,

@@ -59,6 +59,11 @@ export type SurfaceQuestionAnswer<P extends RegisteredSurfacePlatform> = {
     | { readonly kind: "custom"; readonly text: string };
 };
 
+export type SurfaceQuestionActivity<P extends RegisteredSurfacePlatform> = Omit<
+  SurfaceQuestionAnswer<P>,
+  "answer"
+>;
+
 export type SurfaceQuestionAnswerDisposition = "accepted" | "not-found" | "stale" | "unauthorized";
 
 export class SurfaceQuestionAnswerHandlingFailed extends TaggedError(
@@ -70,6 +75,10 @@ export class SurfaceQuestionAnswerHandlingFailed extends TaggedError(
 export type SurfaceQuestionAnswerHandler<P extends RegisteredSurfacePlatform> = (
   answer: SurfaceQuestionAnswer<P>,
   updateInteraction: SurfaceQuestionInteractionUpdater,
+) => Promise<ResultType<SurfaceQuestionAnswerDisposition, SurfaceQuestionAnswerHandlingFailed>>;
+
+export type SurfaceQuestionActivityHandler<P extends RegisteredSurfacePlatform> = (
+  activity: SurfaceQuestionActivity<P>,
 ) => Promise<ResultType<SurfaceQuestionAnswerDisposition, SurfaceQuestionAnswerHandlingFailed>>;
 
 export type SurfaceQuestionAnswerSubscription = {
@@ -85,6 +94,7 @@ export type SurfaceQuestionPort<P extends RegisteredSurfacePlatform> = {
   finish(input: SurfaceQuestionFinishInput<P>): Promise<ResultType<void, SurfaceOperationError>>;
   subscribeAnswers(
     handler: SurfaceQuestionAnswerHandler<P>,
+    handleActivity: SurfaceQuestionActivityHandler<P>,
   ): Promise<SurfaceQuestionAnswerSubscription>;
 };
 

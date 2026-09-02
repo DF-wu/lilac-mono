@@ -9276,8 +9276,9 @@ export async function startBusAgentRunner(params: {
     const restoredCurrentTurnUserId =
       recoveryHead?.checkpoint?.currentTurnUserId ??
       restoredIdentity?.projection.authenticatedOrigin?.userId;
-    const restoredCurrentTurnMessageRef =
-      restoredIdentity?.projection.authenticatedOrigin?.messageRef;
+    const restoredCurrentTurnMessageRef = recoveryHead?.checkpoint?.currentTurnUserId
+      ? undefined
+      : restoredIdentity?.projection.authenticatedOrigin?.messageRef;
     const entry: Enqueued = {
       queueEntryId: record.publication?.streamId ?? `accepted:${record.requestDeliveryId}`,
       requestDeliveryId: record.requestDeliveryId,

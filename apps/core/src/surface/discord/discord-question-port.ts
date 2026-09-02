@@ -2,6 +2,7 @@ import type { SurfaceAdapter } from "../adapter";
 import type {
   SurfaceQuestionAnswerHandler,
   SurfaceQuestionAnswerSubscription,
+  SurfaceQuestionActivityHandler,
   SurfaceQuestionInteractionUpdate,
   SurfaceQuestionPort,
   SurfaceQuestionPrompt,
@@ -16,6 +17,7 @@ import {
 export type DiscordQuestionAnswerSource = {
   subscribeQuestionAnswers(
     handler: SurfaceQuestionAnswerHandler<"discord">,
+    handleActivity: SurfaceQuestionActivityHandler<"discord">,
   ): Promise<SurfaceQuestionAnswerSubscription>;
 };
 
@@ -109,7 +111,7 @@ export function createDiscordQuestionPort(input: {
         .sendMsg(
           sessionRef,
           discordQuestionInteractionContent({ state: "pending", prompt }),
-          replyTo ? { replyTo } : undefined,
+          replyTo ? { replyTo, notifyReply: true } : undefined,
         )
         .then((sent) =>
           sent.map((ref) => ({
@@ -125,6 +127,7 @@ export function createDiscordQuestionPort(input: {
         accentColor: terminalColor(state),
         actions: [],
       }),
-    subscribeAnswers: async (handler) => await input.answers.subscribeQuestionAnswers(handler),
+    subscribeAnswers: async (handler, handleActivity) =>
+      await input.answers.subscribeQuestionAnswers(handler, handleActivity),
   };
 }

@@ -152,6 +152,10 @@ export type ApplyQuestionAnswerResult =
   | { readonly disposition: "not-found" | "stale" | "unauthorized" }
   | { readonly disposition: "accepted"; readonly call: QuestionCall };
 
+export type ValidateQuestionActivityResult =
+  | { readonly disposition: "not-found" | "stale" | "unauthorized" }
+  | { readonly disposition: "accepted"; readonly questionCallId: string };
+
 export class SqliteQuestionStore {
   readonly #database: Database;
   readonly #now: () => number;
@@ -309,6 +313,43 @@ export class SqliteQuestionStore {
       },
       (cause) => storeFailure("replace-tokens", cause),
     );
+  }
+
+  validateActivity(input: {
+    readonly tokenSha256: string;
+    readonly platform: "discord";
+    readonly channelId: string;
+    readonly messageId: string;
+    readonly userId: string;
+  }): ResultType<ValidateQuestionActivityResult, QuestionStoreError> {
+    const selected = captureStoreOperation("validate-activity", () => {
+      const token = this.#database
+        .query<QuestionTokenRow, [string]>(
+          "SELECT * FROM agent_question_tokens WHERE token_sha256 = ?",
+        )
+        .get(input.tokenSha256);
+      return {
+        token,
+        row: token ? this.#selectCall(token.question_call_id) : null,
+      };
+    });
+    return selected.andThen(({ token, row }) => {
+      if (!token || !row) return Result.ok({ disposition: "not-found" as const });
+      return decodeQuestionCallRow(row).map((call): ValidateQuestionActivityResult => {
+        if (call.state !== "pending" || token.question_index !== call.currentIndex) {
+          return { disposition: "stale" };
+        }
+        if (
+          call.platform !== input.platform ||
+          call.sessionId !== input.channelId ||
+          call.userId !== input.userId
+        ) {
+          return { disposition: "unauthorized" };
+        }
+        if (call.messageId !== input.messageId) return { disposition: "stale" };
+        return { disposition: "accepted", questionCallId: call.questionCallId };
+      });
+    });
   }
 
   applyAnswer(input: {

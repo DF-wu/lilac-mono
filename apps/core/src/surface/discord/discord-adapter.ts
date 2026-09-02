@@ -94,6 +94,8 @@ import type {
   SurfaceQuestionAnswer,
   SurfaceQuestionAnswerDisposition,
   SurfaceQuestionAnswerHandler,
+  SurfaceQuestionActivity,
+  SurfaceQuestionActivityHandler,
   SurfaceQuestionInteractionUpdate,
 } from "../question";
 
@@ -709,7 +711,10 @@ export class DiscordAdapter implements SurfaceAdapter {
   private coreConfigReloadHadError = false;
   private lastCoreConfigReloadError: string | null = null;
   private handlers = new Set<AdapterEventHandler>();
-  private questionAnswerHandlers = new Set<SurfaceQuestionAnswerHandler<"discord">>();
+  private questionHandlers = new Set<{
+    readonly answer: SurfaceQuestionAnswerHandler<"discord">;
+    readonly activity: SurfaceQuestionActivityHandler<"discord">;
+  }>();
   private sessionModelOverrides = new Map<string, string>();
   private readonly requestReadSnapshots = new AsyncLocalStorage<
     Map<string, Promise<Message | null>>
@@ -1561,7 +1566,10 @@ export class DiscordAdapter implements SurfaceAdapter {
             opts?.replyTo?.platform === "discord"
               ? { messageReference: opts.replyTo.messageId }
               : undefined,
-          allowedMentions: { parse: [], repliedUser: opts?.silent !== true },
+          allowedMentions: {
+            parse: [],
+            repliedUser: opts?.notifyReply === true && opts.silent !== true,
+          },
         }),
       );
       return sent.map((message) => asDiscordMsgRef(discordRef.channelId, message.id));
@@ -2531,11 +2539,15 @@ export class DiscordAdapter implements SurfaceAdapter {
     };
   }
 
-  async subscribeQuestionAnswers(handler: SurfaceQuestionAnswerHandler<"discord">) {
-    this.questionAnswerHandlers.add(handler);
+  async subscribeQuestionAnswers(
+    handler: SurfaceQuestionAnswerHandler<"discord">,
+    handleActivity: SurfaceQuestionActivityHandler<"discord">,
+  ) {
+    const subscription = { answer: handler, activity: handleActivity };
+    this.questionHandlers.add(subscription);
     return {
       stop: async () => {
-        this.questionAnswerHandlers.delete(handler);
+        this.questionHandlers.delete(subscription);
       },
     };
   }
@@ -2792,10 +2804,10 @@ export class DiscordAdapter implements SurfaceAdapter {
     answer: SurfaceQuestionAnswer<"discord">,
     interaction: ModalMessageModalSubmitInteraction<CacheType> | ButtonInteraction<CacheType>,
   ): Promise<DiscordQuestionDispatchResult> {
-    const handler = this.questionAnswerHandlers.values().next().value;
-    if (!handler) return { disposition: "not-found", interactionUpdate: "not-attempted" };
+    const subscription = this.questionHandlers.values().next().value;
+    if (!subscription) return { disposition: "not-found", interactionUpdate: "not-attempted" };
     let interactionUpdate: DiscordQuestionInteractionUpdateState = "not-attempted";
-    const handled = await handler(answer, async (update) => {
+    const handled = await subscription.answer(answer, async (update) => {
       const updated = await this.updateQuestionInteraction(interaction, update);
       interactionUpdate = updated.match<DiscordQuestionInteractionUpdateState>({
         ok: () => "succeeded",
@@ -2808,6 +2820,18 @@ export class DiscordAdapter implements SurfaceAdapter {
       err: () => "failed",
     });
     return { disposition, interactionUpdate };
+  }
+
+  private async dispatchQuestionActivity(
+    activity: SurfaceQuestionActivity<"discord">,
+  ): Promise<SurfaceQuestionAnswerDisposition | "failed"> {
+    const subscription = this.questionHandlers.values().next().value;
+    if (!subscription) return "not-found";
+    const handled = await subscription.activity(activity);
+    return handled.match<SurfaceQuestionAnswerDisposition | "failed">({
+      ok: (value) => value,
+      err: () => "failed",
+    });
   }
 
   private async updateQuestionInteraction(
@@ -3030,6 +3054,20 @@ export class DiscordAdapter implements SurfaceAdapter {
       }
       const questionAction = parseDiscordQuestionActionId(actionId);
       if (questionAction?.kind === "custom") {
+        const disposition = await this.dispatchQuestionActivity({
+          platform: "discord",
+          channelId,
+          messageRef: { platform: "discord", channelId, messageId },
+          principal: { platform: "discord", userId },
+          token: questionAction.token,
+        });
+        if (disposition !== "accepted") {
+          await this.acknowledgeQuestionAnswer(interaction, {
+            disposition,
+            interactionUpdate: "not-attempted",
+          });
+          return;
+        }
         const shown = settleSurfaceFallback(
           await Result.tryPromise({
             try: () => interaction.showModal(buildDiscordQuestionModal(questionAction.token)),

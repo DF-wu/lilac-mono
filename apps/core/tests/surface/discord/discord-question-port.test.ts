@@ -68,6 +68,7 @@ describe("Discord question port", () => {
         },
         opts: {
           replyTo: { platform: "discord", channelId: "channel", messageId: "turn" },
+          notifyReply: true,
         },
       },
     ]);

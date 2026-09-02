@@ -14,6 +14,7 @@ import { QuestionStoreFailed, SqliteQuestionStore } from "../../src/question/que
 import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
 import type {
   SurfaceQuestionAnswerHandler,
+  SurfaceQuestionActivityHandler,
   SurfaceQuestionFinishInput,
   SurfaceQuestionInteractionUpdate,
   SurfaceQuestionPort,
@@ -55,6 +56,18 @@ class ReplaceFailingQuestionStore extends SqliteQuestionStore {
   }
 }
 
+class TransitionFailingQuestionStore extends SqliteQuestionStore {
+  override transitionPending() {
+    return Result.err(
+      new QuestionStoreFailed({
+        operation: "transition-pending",
+        code: "SQLITE_IOERR",
+        message: "Question store SQLite transition-pending failed",
+      }),
+    );
+  }
+}
+
 class TestQuestionPort implements SurfaceQuestionPort<"discord"> {
   prompts: SurfaceQuestionPrompt[] = [];
   presentations: Array<{
@@ -64,6 +77,7 @@ class TestQuestionPort implements SurfaceQuestionPort<"discord"> {
   finishes: SurfaceQuestionFinishInput<"discord">[] = [];
   interactionUpdates: SurfaceQuestionInteractionUpdate[] = [];
   handler: SurfaceQuestionAnswerHandler<"discord"> | null = null;
+  activityHandler: SurfaceQuestionActivityHandler<"discord"> | null = null;
   finishGate: Promise<void> | null = null;
   finishStarted: (() => void) | null = null;
 
@@ -91,13 +105,35 @@ class TestQuestionPort implements SurfaceQuestionPort<"discord"> {
     return Result.ok(undefined);
   }
 
-  async subscribeAnswers(handler: SurfaceQuestionAnswerHandler<"discord">) {
+  async subscribeAnswers(
+    handler: SurfaceQuestionAnswerHandler<"discord">,
+    handleActivity: SurfaceQuestionActivityHandler<"discord">,
+  ) {
     this.handler = handler;
+    this.activityHandler = handleActivity;
     return {
       stop: async () => {
         this.handler = null;
+        this.activityHandler = null;
       },
     };
+  }
+
+  async openCustomInput() {
+    const latestUpdate = this.interactionUpdates.at(-1);
+    const prompt = latestUpdate?.state === "pending" ? latestUpdate.prompt : this.prompts.at(-1);
+    if (!prompt || !this.activityHandler) throw new Error("Question prompt is not ready");
+    return await this.activityHandler({
+      platform: "discord",
+      channelId: "channel-1",
+      messageRef: {
+        platform: "discord",
+        channelId: "channel-1",
+        messageId: "card-1",
+      },
+      principal: { platform: "discord", userId: "user-1" },
+      token: prompt.customToken,
+    });
   }
 
   async answerOption(optionIndex: number) {
@@ -365,6 +401,8 @@ describe("question service", () => {
 
     jest.advanceTimersByTime(9 * 60 * 1_000);
     expect((await port.answerOption(1)).status).toBe("ok");
+    jest.advanceTimersByTime(9 * 60 * 1_000);
+    expect((await port.openCustomInput()).status).toBe("ok");
     jest.advanceTimersByTime(2 * 60 * 1_000);
     await Promise.resolve();
     expect(settled).toBe(false);
@@ -375,6 +413,34 @@ describe("question service", () => {
       error: { _tag: "QuestionTimedOut" },
     });
     expect(port.finishes).toEqual([expect.objectContaining({ state: "expired" })]);
+
+    await service.stop();
+    store.close();
+  });
+
+  it("returns a timeout transition failure without changing the card", async () => {
+    jest.useFakeTimers({ now: 0 });
+    const store = await createStore((dbPath) => new TransitionFailingQuestionStore({ dbPath }));
+    const port = new TestQuestionPort();
+    const service = createService(store, port);
+    expect((await service.start()).status).toBe("ok");
+    const pending = service.ask({
+      requestDeliveryId: "delivery-1",
+      requestId: "request-1",
+      toolCallId: "tool-call-timeout-transition-failure",
+      sessionId: "channel-1",
+      userId: "user-1",
+      questions: input,
+    });
+    await Promise.resolve();
+
+    jest.advanceTimersByTime(QUESTION_INACTIVITY_TIMEOUT_MS);
+
+    expect(await pending).toMatchObject({
+      status: "error",
+      error: { _tag: "QuestionStoreFailed", operation: "transition-pending" },
+    });
+    expect(port.finishes).toEqual([]);
 
     await service.stop();
     store.close();

@@ -3,7 +3,9 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
   SurfaceQuestionAnswerHandlingFailed,
+  type SurfaceQuestionActivity,
   type SurfaceQuestionAnswer,
+  type SurfaceQuestionAnswerDisposition,
   type SurfaceQuestionInteractionUpdater,
   type SurfaceQuestionAnswerSubscription,
   type SurfaceQuestionPort,
@@ -21,6 +23,7 @@ import {
   QuestionStoreFailed,
   SqliteQuestionStore,
   type QuestionStoreError,
+  type ValidateQuestionActivityResult,
 } from "./question-store";
 
 export class QuestionUnavailable extends TaggedError("QuestionUnavailable")<{
@@ -180,6 +183,8 @@ export class QuestionService {
       const subscription = await resolved.question.subscribeAnswers(
         async (answer, updateInteraction) =>
           await this.handleAnswer(answer as SurfaceQuestionAnswer<"discord">, updateInteraction),
+        async (activity) =>
+          await this.handleActivity(activity as SurfaceQuestionActivity<"discord">),
       );
       this.#subscriptions.push(subscription);
     }
@@ -416,8 +421,15 @@ export class QuestionService {
     questionCallId: string,
     settle: (result: ResultType<QuestionAnswers, QuestionServiceError>) => void,
   ): Promise<void> {
-    this.input.store.transitionPending(questionCallId, "cancelled");
-    await this.finishCall(questionCallId, "expired");
+    const transitionError = await this.transitionAndFinishQuestion(
+      questionCallId,
+      "cancelled",
+      "expired",
+    );
+    if (transitionError) {
+      settle(Result.err(transitionError));
+      return;
+    }
     settle(
       Result.err(
         new QuestionTimedOut({
@@ -431,8 +443,15 @@ export class QuestionService {
     questionCallId: string,
     settle: (result: ResultType<QuestionAnswers, QuestionServiceError>) => void,
   ): Promise<void> {
-    this.input.store.transitionPending(questionCallId, "cancelled");
-    await this.finishCall(questionCallId, "cancelled");
+    const transitionError = await this.transitionAndFinishQuestion(
+      questionCallId,
+      "cancelled",
+      "cancelled",
+    );
+    if (transitionError) {
+      settle(Result.err(transitionError));
+      return;
+    }
     settle(Result.err(new QuestionCancelled({ message: "Question cancelled" })));
   }
 
@@ -440,8 +459,15 @@ export class QuestionService {
     questionCallId: string,
     settle: (result: ResultType<QuestionAnswers, QuestionServiceError>) => void,
   ): Promise<void> {
-    this.input.store.transitionPending(questionCallId, "interrupted");
-    await this.finishCall(questionCallId, "interrupted");
+    const transitionError = await this.transitionAndFinishQuestion(
+      questionCallId,
+      "interrupted",
+      "interrupted",
+    );
+    if (transitionError) {
+      settle(Result.err(transitionError));
+      return;
+    }
     settle(
       Result.err(
         new QuestionInterrupted({
@@ -449,6 +475,21 @@ export class QuestionService {
         }),
       ),
     );
+  }
+
+  private async transitionAndFinishQuestion(
+    questionCallId: string,
+    storeState: "cancelled" | "interrupted",
+    surfaceState: "cancelled" | "expired" | "interrupted",
+  ): Promise<QuestionStoreFailed | null> {
+    const transitioned = this.input.store.transitionPending(questionCallId, storeState);
+    const transitionError = transitioned.match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (transitionError) return transitionError;
+    await this.finishCall(questionCallId, surfaceState);
+    return null;
   }
 
   private async handleAnswer(
@@ -529,6 +570,30 @@ export class QuestionService {
       .get(call.questionCallId)
       ?.resolve(Result.err(presentationFailure("update", updateError)));
     return Result.err(answerHandlingFailure(updateError));
+  }
+
+  private async handleActivity(
+    activity: SurfaceQuestionActivity<"discord">,
+  ): Promise<ResultType<SurfaceQuestionAnswerDisposition, SurfaceQuestionAnswerHandlingFailed>> {
+    const validated = this.input.store.validateActivity({
+      tokenSha256: sha256(activity.token),
+      platform: activity.platform,
+      channelId: activity.channelId,
+      messageId: activity.messageRef.messageId,
+      userId: activity.principal.userId,
+    });
+    const outcome = validated.match<
+      | { readonly kind: "result"; readonly result: ValidateQuestionActivityResult }
+      | { readonly kind: "error"; readonly error: QuestionStoreError }
+    >({
+      ok: (result) => ({ kind: "result", result }),
+      err: (error) => ({ kind: "error", error }),
+    });
+    if (outcome.kind === "error") return Result.err(answerHandlingFailure(outcome.error));
+    if (outcome.result.disposition === "accepted") {
+      this.resetQuestionTimeout(outcome.result.questionCallId);
+    }
+    return Result.ok(outcome.result.disposition);
   }
 
   private async finishCall(
