@@ -180,6 +180,8 @@ import type { SurfacePrincipal } from "../surface/types";
 import { composeBuiltinSurfaceRuntimes } from "./compose-builtin-surface-runtimes";
 import { createCoreBlobStore, type CoreBlobStoreCreateError } from "./create-core-blob-store";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
+import { SqliteQuestionStore } from "../question/question-store";
+import { QuestionService } from "../question/question-service";
 import {
   adaptToolResultArtifactStoreInitToHost,
   createToolResultArtifactStore,
@@ -1979,6 +1981,7 @@ export async function createCoreRuntime(
   let blobStore: BlobStore | null = blobStoreCreation.store;
   let requestDeliveryStore: ReturnType<typeof createCoreRequestDelivery>["store"] | null = null;
   let agentRunJournal: SqliteAgentRunJournal | null = null;
+  let questionStore: SqliteQuestionStore | null = null;
   let durableWorkflowStore: DurableWorkflowStore | null = null;
   let transcriptStore: SqliteTranscriptStore | null = null;
   let resourceService: CoreResourceService | null = null;
@@ -2010,6 +2013,15 @@ export async function createCoreRuntime(
         ? async () => {
             agentRunJournal?.close();
             agentRunJournal = null;
+          }
+        : undefined,
+    );
+    await cleanup.run(
+      "questionStore.createFailure.close",
+      questionStore
+        ? async () => {
+            questionStore?.close();
+            questionStore = null;
           }
         : undefined,
     );
@@ -2133,6 +2145,37 @@ export async function createCoreRuntime(
       });
     },
   });
+  const questionStoreCreation = Result.try({
+    try: () =>
+      new SqliteQuestionStore({
+        dbPath: path.join(env.dataDir, "request-delivery.db"),
+      }),
+    catch: captureRuntimeError,
+  }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Question store creation failed"),
+  );
+  const questionStoreError = questionStoreCreation.match({
+    ok: (store) => {
+      questionStore = store;
+      return null;
+    },
+    err: (error) => error,
+  });
+  if (questionStoreError) {
+    if (isPanic(questionStoreError)) {
+      return finishCoreRuntimeCreateFailure({ kind: "panic", panic: questionStoreError });
+    }
+    return finishCoreRuntimeCreateFailure({
+      kind: "result",
+      result: Result.err(
+        new CoreRuntimeCreateFailed({
+          operation: "request-delivery",
+          cause: questionStoreError,
+          message: "Question store creation failed",
+        }),
+      ),
+    });
+  }
   const durableStoresCreated = Result.try({
     try: () => {
       const discordSearchDbPath = resolveDiscordSearchDbPath();
@@ -2343,6 +2386,7 @@ export async function createCoreRuntime(
   let workflowTriggerScheduler: WorkflowTriggerScheduler | null = null;
   let workflowLiveParentBridge: WorkflowLiveParentBridge | null = null;
   let workflowSubagentDispatcher: WorkflowSubagentDispatcher | null = null;
+  let questionService: QuestionService | null = null;
   let stopAgentRunner: Awaited<ReturnType<typeof startBusAgentRunner>> | null = null;
   let stopHeartbeat: HeartbeatService | null = null;
   let stopConversationThreadWorker: Awaited<
@@ -2981,6 +3025,7 @@ export async function createCoreRuntime(
           }
           const registryCreated = composeBuiltinSurfaceRuntimes({
             discordAdapter: adapter,
+            discordQuestionAnswers: adapter,
             githubAdapter,
             descriptorBoundDiscordEventSource: discordEventSource,
             discordHealth: createDiscordRuntimeHealthPort(adapter),
@@ -3277,12 +3322,50 @@ export async function createCoreRuntime(
           });
           await workflowWaitResolver.start();
 
+          const activeQuestionStore = questionStore;
+          if (!activeQuestionStore) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: undefined,
+                  message: "Question store is unavailable",
+                }),
+              ),
+            };
+          }
+          questionService = new QuestionService({
+            store: activeQuestionStore,
+            surfaces: registry.questionResolver(),
+            logger,
+          });
+          const questionsStarted = await questionService.start();
+          const questionStartError = questionsStarted.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (questionStartError) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: questionStartError,
+                  message: questionStartError.message,
+                }),
+              ),
+            };
+          }
+
           await connectAndValidateSurfaceAdapters({
             registry,
             connected: connectedSurfaceAdapters,
           });
 
           logger.debug("Surface adapters connected");
+
+          await questionService.finishStartupRecovery();
 
           workflowProgressProjector = new WorkflowProgressProjector({
             bus: durableBus,
@@ -3453,6 +3536,7 @@ export async function createCoreRuntime(
               toolResultArtifacts,
               durableWorkflowStore: activeDurableWorkflowStore,
               workflowProgressCards: workflowProgressProjector,
+              questions: questionService,
               mcpRegistry,
               mcpOAuthProviders,
               mcpOAuthCallback,
@@ -4073,6 +4157,8 @@ export async function createCoreRuntime(
     if (stopPass === "full") {
       // Stop in reverse order (best-effort).
       await safe("agentRunner.stop", () => stopAgentRunner?.stop() ?? Promise.resolve());
+      await safe("questionService.stop", () => questionService?.stop() ?? Promise.resolve());
+      questionService = null;
       await safe(
         "workflowLiveParentBridge.stop",
         () => workflowLiveParentBridge?.stop() ?? Promise.resolve(),
@@ -4204,6 +4290,10 @@ export async function createCoreRuntime(
       await safe("agentRunJournal.close", async () => {
         agentRunJournal?.close();
         agentRunJournal = null;
+      });
+      await safe("questionStore.close", async () => {
+        questionStore?.close();
+        questionStore = null;
       });
       await safe("requestDeliveryStore.close", async () => {
         requestDeliveryStore?.close();

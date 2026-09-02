@@ -167,6 +167,7 @@ export type SurfaceAction = {
 export type ContentOpts = {
   text?: string;
   format?: "markdown" | "plain";
+  accentColor?: number;
   attachments?: SurfaceAttachment[];
   actions?: SurfaceAction[];
 };
