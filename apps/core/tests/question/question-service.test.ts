@@ -384,6 +384,7 @@ describe("question service", () => {
     const service = createService(store, port);
     expect((await service.start()).status).toBe("ok");
     let settled = false;
+    let activityCount = 0;
     const pending = service
       .ask({
         requestDeliveryId: "delivery-1",
@@ -392,6 +393,9 @@ describe("question service", () => {
         sessionId: "channel-1",
         userId: "user-1",
         questions: input,
+        onActivity: () => {
+          activityCount += 1;
+        },
       })
       .then((result) => {
         settled = true;
@@ -401,8 +405,10 @@ describe("question service", () => {
 
     jest.advanceTimersByTime(9 * 60 * 1_000);
     expect((await port.answerOption(1)).status).toBe("ok");
+    expect(activityCount).toBe(1);
     jest.advanceTimersByTime(9 * 60 * 1_000);
     expect((await port.openCustomInput()).status).toBe("ok");
+    expect(activityCount).toBe(2);
     jest.advanceTimersByTime(2 * 60 * 1_000);
     await Promise.resolve();
     expect(settled).toBe(false);

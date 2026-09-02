@@ -28,6 +28,17 @@ const questionRequestContextSchema = z.object({
     userId: z.string().min(1),
   }),
   requestInitiatorSessionId: z.string().min(1),
+  metadata: z
+    .object({
+      onActivity: z
+        .function({
+          input: [z.enum(["tool", "subagent"])],
+          output: z.void(),
+        })
+        .optional(),
+    })
+    .passthrough()
+    .optional(),
 });
 
 export function formatQuestionToolArgs(input: unknown): string {
@@ -60,6 +71,7 @@ export function createQuestionTool(service: QuestionService) {
         );
       }
       const request = decoded.data;
+      const reportActivity = request.metadata?.onActivity;
       if (request.requestInitiatorSessionId !== request.sessionId) {
         return adaptToolResultToHost(
           Result.err(
@@ -78,6 +90,7 @@ export function createQuestionTool(service: QuestionService) {
         ...(request.currentTurnMessageRef ? { replyTo: request.currentTurnMessageRef } : {}),
         questions: input,
         signal: abortSignal,
+        ...(reportActivity ? { onActivity: () => reportActivity("tool") } : {}),
       });
       return { answers: adaptToolResultToHost(result) };
     },

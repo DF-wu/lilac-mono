@@ -22,9 +22,11 @@ const questions: QuestionInput = {
 describe("question tool", () => {
   it("accepts the full request context supplied by the agent runner", async () => {
     let received: Parameters<QuestionService["ask"]>[0] | null = null;
+    const activitySources: string[] = [];
     const service = {
       ask: async (input: Parameters<QuestionService["ask"]>[0]) => {
         received = input;
+        input.onActivity?.();
         return Result.ok([
           { questionId: "target", answer: { kind: "option", optionId: "staging" } },
         ]);
@@ -52,6 +54,11 @@ describe("question tool", () => {
           channelId: "channel-1",
           messageId: "message-1",
         },
+        metadata: {
+          onActivity: (source: string) => {
+            activitySources.push(source);
+          },
+        },
       },
     });
 
@@ -71,5 +78,6 @@ describe("question tool", () => {
       },
       questions,
     });
+    expect(activitySources).toEqual(["tool"]);
   });
 });

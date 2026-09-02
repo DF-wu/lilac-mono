@@ -3377,6 +3377,9 @@ export async function startBusAgentRunner(params: {
       input.checkpoint.corePrimaryLineage ?? input.entry.acceptedCorePrimaryLineage;
     input.entry.currentTurnUserId =
       input.checkpoint.currentTurnUserId ?? input.entry.acceptedCurrentTurnUserId;
+    input.entry.currentTurnMessageRef = input.checkpoint.currentTurnUserId
+      ? undefined
+      : input.entry.authenticatedOrigin?.messageRef;
     delete input.entry.previousRecoveryCheckpoint;
   };
 
@@ -3406,6 +3409,7 @@ export async function startBusAgentRunner(params: {
     delete input.entry.journalHandle;
     input.entry.corePrimaryLineage = input.entry.acceptedCorePrimaryLineage;
     input.entry.currentTurnUserId = input.entry.acceptedCurrentTurnUserId;
+    input.entry.currentTurnMessageRef = input.entry.authenticatedOrigin?.messageRef;
   };
 
   const markRunTerminal = (

@@ -63,6 +63,7 @@ type QuestionServiceLogger = {
 
 type PendingQuestion = {
   readonly resolve: (result: ResultType<QuestionAnswers, QuestionServiceError>) => void;
+  readonly onActivity?: () => void;
   timeout: ReturnType<typeof setTimeout> | null;
   terminalOperation: Promise<void> | null;
 };
@@ -252,6 +253,7 @@ export class QuestionService {
     readonly replyTo?: MsgRefFor<"discord">;
     readonly questions: QuestionInput;
     readonly signal?: AbortSignal;
+    readonly onActivity?: () => void;
   }): Promise<ResultType<QuestionAnswers, QuestionServiceError>> {
     if (input.signal?.aborted) {
       return Result.err(new QuestionCancelled({ message: "Question cancelled" }));
@@ -355,12 +357,13 @@ export class QuestionService {
       });
       return Result.err(boundError);
     }
-    return await this.waitForAnswer(questionCallId, input.signal);
+    return await this.waitForAnswer(questionCallId, input.signal, input.onActivity);
   }
 
   private async waitForAnswer(
     questionCallId: string,
     signal?: AbortSignal,
+    onActivity?: () => void,
   ): Promise<ResultType<QuestionAnswers, QuestionServiceError>> {
     return await new Promise((resolve) => {
       const settle = (result: ResultType<QuestionAnswers, QuestionServiceError>) => {
@@ -379,6 +382,7 @@ export class QuestionService {
       };
       this.#waiters.set(questionCallId, {
         resolve: settle,
+        ...(onActivity ? { onActivity } : {}),
         timeout: null,
         terminalOperation: null,
       });
@@ -525,6 +529,7 @@ export class QuestionService {
     if (outcome.result.disposition !== "accepted") return Result.ok(outcome.result.disposition);
 
     const call = outcome.result.call;
+    this.#waiters.get(call.questionCallId)?.onActivity?.();
     if (call.state === "answered") {
       this.clearQuestionTimeout(call.questionCallId);
       const finished = await updateInteraction({
@@ -591,6 +596,7 @@ export class QuestionService {
     });
     if (outcome.kind === "error") return Result.err(answerHandlingFailure(outcome.error));
     if (outcome.result.disposition === "accepted") {
+      this.#waiters.get(outcome.result.questionCallId)?.onActivity?.();
       this.resetQuestionTimeout(outcome.result.questionCallId);
     }
     return Result.ok(outcome.result.disposition);

@@ -4566,7 +4566,12 @@ describe("durable accepted runner recovery", () => {
 
   it("reseeds recovery from the previous checkpoint when the latest blob is unavailable", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
-    const pluginManager = corePrimaryTestPluginManager();
+    let level1RequestContext:
+      | Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
+      | undefined;
+    const pluginManager = corePrimaryTestPluginManager((requestContext) => {
+      level1RequestContext = requestContext;
+    });
     const modelCalled = deferred<void>();
     let observedPrompt = "";
     let resets = 0;
@@ -4620,6 +4625,7 @@ describe("durable accepted runner recovery", () => {
       config: parseCoreConfigV2ToUniversal({}),
       pluginManager,
       agentRunJournal: journal,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
       issueControlCapability: () => ({
         capability: "journal-previous-checkpoint",
         principal: null,
@@ -4637,12 +4643,26 @@ describe("durable accepted runner recovery", () => {
           }),
         }),
     });
+    const sessionId = "journal-previous-checkpoint";
+    const originalMessageId = "accepted-message";
     const accepted = acceptedRunnerDelivery({
       requestDeliveryId: crypto.randomUUID(),
-      requestId: "github:journal-previous-checkpoint",
-      sessionId: "journal-previous-checkpoint",
+      requestId: `discord:${sessionId}:${originalMessageId}`,
+      sessionId,
+      requestClient: "discord",
       queue: "prompt",
       messages: [{ role: "user", content: "accepted floor" }],
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "accepted-user",
+          messageRef: {
+            platform: "discord",
+            channelId: sessionId,
+            messageId: originalMessageId,
+          },
+        },
+      },
     });
     const head: AgentRunRecoveryHead = {
       handle: {
@@ -4677,6 +4697,7 @@ describe("durable accepted runner recovery", () => {
       previousCheckpoint: {
         version: 1,
         messages: [{ role: "user", content: "previous safe checkpoint" }],
+        currentTurnUserId: "checkpoint-user",
         retainedRequestDeliveries: [],
       },
       createdAt: 1,
@@ -4691,6 +4712,161 @@ describe("durable accepted runner recovery", () => {
       expect(observedPrompt).toContain("previous safe checkpoint");
       expect(observedPrompt).not.toContain("accepted floor");
       expect(observedPrompt).not.toContain("missing.png");
+      expect(level1RequestContext).toMatchObject({
+        currentTurnUserId: "checkpoint-user",
+      });
+      expect(level1RequestContext?.currentTurnMessageRef).toBeUndefined();
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("restores the accepted message relation when no recovery checkpoint can be loaded", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    let level1RequestContext:
+      | Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
+      | undefined;
+    const pluginManager = corePrimaryTestPluginManager((requestContext) => {
+      level1RequestContext = requestContext;
+    });
+    const modelCalled = deferred<void>();
+    let observedPrompt = "";
+    let resets = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) =>
+        Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        }),
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      loadRecoveryHeads: () => Result.ok({ heads: [], resets: [] }),
+      resetRun: () => {
+        resets += 1;
+        return Result.ok(undefined);
+      },
+      resetAll: () => Result.ok(undefined),
+      removeReconciled: () => Result.ok(undefined),
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "journal-accepted-fallback",
+      startPaused: true,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      agentRunJournal: journal,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
+      issueControlCapability: () => ({
+        capability: "journal-accepted-fallback",
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "journal-accepted-fallback",
+            doStream: async (call) => {
+              observedPrompt = JSON.stringify(call.prompt);
+              modelCalled.resolve(undefined);
+              return level1TextStep("recovered accepted work");
+            },
+          }),
+        }),
+    });
+    const sessionId = "journal-accepted-fallback";
+    const originalMessageId = "accepted-message";
+    const accepted = acceptedRunnerDelivery({
+      requestDeliveryId: crypto.randomUUID(),
+      requestId: `discord:${sessionId}:${originalMessageId}`,
+      sessionId,
+      requestClient: "discord",
+      queue: "prompt",
+      messages: [{ role: "user", content: "accepted floor" }],
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "accepted-user",
+          messageRef: {
+            platform: "discord",
+            channelId: sessionId,
+            messageId: originalMessageId,
+          },
+        },
+      },
+    });
+    const missingMessage = {
+      role: "assistant" as const,
+      content: [
+        {
+          type: "blob" as const,
+          blob: {
+            version: 1 as const,
+            objectId: `b1_${"11".repeat(16)}`,
+            sha256: "22".repeat(32),
+            byteLength: 1,
+          },
+          mediaType: "image/png",
+          filename: "missing.png",
+        },
+      ],
+    };
+    const head: AgentRunRecoveryHead = {
+      handle: {
+        runId: accepted.requestDeliveryId,
+        requestId: accepted.requestId,
+        sessionId,
+        sequence: 3,
+      },
+      state: "active",
+      checkpoint: {
+        version: 1,
+        messages: [missingMessage],
+        currentTurnUserId: "latest-checkpoint-user",
+        retainedRequestDeliveries: [],
+      },
+      previousCheckpoint: {
+        version: 1,
+        messages: [missingMessage],
+        currentTurnUserId: "previous-checkpoint-user",
+        retainedRequestDeliveries: [],
+      },
+      createdAt: 1,
+      updatedAt: 3,
+    };
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, head));
+      runner.activate();
+      await modelCalled.promise;
+      expect(resets).toBe(1);
+      expect(observedPrompt).toContain("accepted floor");
+      expect(observedPrompt).not.toContain("missing.png");
+      expect(level1RequestContext).toMatchObject({
+        currentTurnUserId: "accepted-user",
+        currentTurnMessageRef: {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: originalMessageId,
+        },
+      });
     } finally {
       await runner.stop();
       await pluginManager.destroy();
