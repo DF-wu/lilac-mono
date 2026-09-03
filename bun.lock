@@ -400,6 +400,7 @@
     },
   },
   "patchedDependencies": {
+    "@ai-sdk/mcp@2.0.39": "patches/@ai-sdk%2Fmcp@2.0.39.patch",
     "@opentui/core@0.4.3": "patches/@opentui%2Fcore@0.4.3.patch",
     "bun-types@1.4.0": "patches/bun-types@1.4.0.patch",
   },
