@@ -1,4 +1,5 @@
 import { extractShortOpts, getBasename, hasDynamicExpansion } from "./shell";
+import { bashSafetyViolation, type BashSafetyViolation } from "./types";
 
 const REASON_CHECKOUT_DOUBLE_DASH =
   "git checkout -- discards uncommitted changes permanently. Use 'git stash' first.";
@@ -120,7 +121,12 @@ function splitAtDoubleDash(tokens: readonly string[]): {
   };
 }
 
-export function analyzeGit(tokens: readonly string[]): string | null {
+export function analyzeGit(tokens: readonly string[]): BashSafetyViolation | null {
+  const reason = analyzeGitReason(tokens);
+  return reason ? bashSafetyViolation("dangerous_git_operation", reason) : null;
+}
+
+function analyzeGitReason(tokens: readonly string[]): string | null {
   const { subcommand, rest } = extractGitSubcommandAndRest(tokens);
 
   if (!subcommand) {

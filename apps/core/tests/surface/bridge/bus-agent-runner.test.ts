@@ -49,7 +49,10 @@ import {
   type ClaudeNativeSessionStart,
   type MaterializedClaudeCodeRun,
 } from "@stanley2058/lilac-claude-code-bridge";
-import type { ConversationThreadToolService } from "../../../src/conversation/thread-service";
+import type {
+  ConversationThreadAutoInjectUsageAccumulator,
+  ConversationThreadToolService,
+} from "../../../src/conversation/thread-service";
 
 import {
   AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH,
@@ -85,6 +88,7 @@ import {
   maybeBuildAutoInjectedThreadSearchMessages,
   buildPersistedHeartbeatMessages,
   buildSurfaceMetadataOverlay,
+  corePrimaryLineageHasCompactionCheckpoint,
   isActiveRuntimeModelCompatible,
   markAssistantTextPartEnded,
   markAssistantTextPartStarted,
@@ -137,6 +141,7 @@ import {
   type CustomCommandExecutionError,
 } from "../../../src/custom-commands/manager";
 import { createCorePrimaryClaudeRuntime as createCorePrimaryClaudeRuntimeResult } from "../../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
+import { resolveCorePrimaryLoadedCatalogIds } from "../../../src/surface/bridge/bus-agent-runner/lineage-tool-authority";
 
 function createCorePrimaryClaudeRuntime(
   input: Parameters<typeof createCorePrimaryClaudeRuntimeResult>[0],
@@ -2110,6 +2115,30 @@ describe("selectPersistedTranscriptMessages", () => {
     ).toBeUndefined();
     expect(resolveCompactionCheckpointMeta({ ...base, isPrimary: false })).toBeUndefined();
   });
+
+  it("detects compaction checkpoint ancestry in complete primary lineage", () => {
+    const messages = [{ role: "assistant", content: "compacted history" }] satisfies ModelMessage[];
+    const lineage = buildCoreLineageManifestV2([
+      {
+        atoms: [
+          {
+            kind: "checkpoint",
+            requestId: "discord:channel:checkpoint",
+            transcriptDigest: "0".repeat(64),
+          },
+        ],
+        canonicalMessages: messages,
+      },
+    ]);
+
+    expect(corePrimaryLineageHasCompactionCheckpoint(lineage)).toBe(true);
+    expect(
+      corePrimaryLineageHasCompactionCheckpoint(
+        degradeCorePrimaryLineageForMutation("test", messages.length),
+      ),
+    ).toBe(false);
+    expect(corePrimaryLineageHasCompactionCheckpoint(undefined)).toBe(false);
+  });
 });
 
 function formatExpectedLocalThreadTimeRange(start: string, end: string): string {
@@ -3284,6 +3313,7 @@ describe("durable accepted runner recovery", () => {
     const checkpoints: AgentRunCheckpointV1[] = [];
     let crashBoundaryCheckpoint: AgentRunCheckpointV1 | undefined;
     let controlQueued = false;
+    let failedControlCheckpoint = false;
     let journalSequence = 0;
     const journal = {
       openRun: (owner: {
@@ -3308,12 +3338,13 @@ describe("durable accepted runner recovery", () => {
         },
         checkpoint: AgentRunCheckpointV1,
       ) => {
+        const includesControl = JSON.stringify(checkpoint.messages).includes("apply queued steer");
+        if (includesControl && !failedControlCheckpoint) {
+          failedControlCheckpoint = true;
+          throw new Error("injected unexpected checkpoint writer failure");
+        }
         checkpoints.push(checkpoint);
-        if (
-          controlQueued &&
-          !JSON.stringify(checkpoint.messages).includes("apply queued steer") &&
-          !crashBoundaryCheckpoint
-        ) {
+        if (controlQueued && !includesControl && !crashBoundaryCheckpoint) {
           crashBoundaryCheckpoint = checkpoint;
         }
         journalSequence = handle.sequence + 1;
@@ -3352,9 +3383,23 @@ describe("durable accepted runner recovery", () => {
                 firstStarted.resolve(undefined);
                 await releaseFirst.promise;
               }
+              if (modelCalls === 2) {
+                return level1ToolCallStep([
+                  { toolCallId: "retry-checkpoint", toolName: "retry_checkpoint" },
+                ]);
+              }
               return level1TextStep("done");
             },
           }),
+          beforeStep: undefined,
+          normalizeToolResultOutput: undefined,
+          normalizeSettledToolResultOutputs: undefined,
+          tools: {
+            retry_checkpoint: tool({
+              inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+              execute: () => "checkpoint retry boundary",
+            }),
+          },
         });
         const steer = agent.steer.bind(agent);
         agent.steer = (message) => {
@@ -3411,7 +3456,8 @@ describe("durable accepted runner recovery", () => {
             ).length === 1,
         ),
       ).toBe(true);
-      expect(modelCalls).toBe(2);
+      expect(failedControlCheckpoint).toBe(true);
+      expect(modelCalls).toBe(3);
       expect(transcriptResultValue(store.load(controlDeliveryId)).state).toBe("terminal");
     } finally {
       releaseFirst.resolve(undefined);
@@ -3423,8 +3469,37 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
-  it("checkpoints before provider work and marks terminal after the surface write starts", async () => {
+  it("continues provider work while a checkpoint blob upload is pending", async () => {
     const order: string[] = [];
+    const uploadStarted = deferred<void>();
+    const secondModelStarted = deferred<void>();
+    const releaseUpload = deferred<void>();
+    let uploadReleased = false;
+    let modelAdvancedBeforeUpload = false;
+    const directory = await mkdtemp(path.join(tmpdir(), "lilac-runner-journal-background-"));
+    const transcriptStore = new SqliteTranscriptStore(path.join(directory, "transcripts.db"));
+    const baseBlobStore = transcriptResultValue(await createMemoryBlobStore());
+    let uploadCount = 0;
+    const blobStore: BlobStore = {
+      startUpload: async (input) => {
+        const started = await baseBlobStore.startUpload(input);
+        uploadCount += 1;
+        if (uploadCount !== 1) return started;
+        return started.map((upload) => ({
+          ...upload,
+          completion: (async () => {
+            uploadStarted.resolve(undefined);
+            await releaseUpload.promise;
+            return await upload.completion;
+          })(),
+        }));
+      },
+      resolve: (handle, options) => baseBlobStore.resolve(handle, options),
+      open: (ref) => baseBlobStore.open(ref),
+      delete: (target) => baseBlobStore.delete(target),
+      maintain: (input) => baseBlobStore.maintain(input),
+      close: (input) => baseBlobStore.close(input),
+    };
     const rawBus = createInMemoryRawBus({
       onPublish: (eventType) => {
         if (eventType === lilacEventTypes.EvtAgentOutputResponseText) order.push("surface-write");
@@ -3437,8 +3512,8 @@ describe("durable accepted runner recovery", () => {
     });
     const requestDelivery = new RequestDeliveryCoordinator({
       store,
-      blobStore: TEST_BLOB_STORE,
-      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+      blobStore,
+      admission: createCoreRequestDeliveryAdmission(blobStore),
     });
     const pluginManager = corePrimaryTestPluginManager();
     const requestDeliveryId = crypto.randomUUID();
@@ -3510,21 +3585,52 @@ describe("durable accepted runner recovery", () => {
       pluginManager,
       requestDelivery,
       agentRunJournal: journal,
+      blobStore,
+      transcriptStore,
       issueControlCapability: () => ({
         capability: "journal-order",
         principal: null,
       }),
-      createAgent: (options) =>
-        new AiSdkPiAgent({
+      createAgent: (options) => {
+        let modelCalls = 0;
+        return new AiSdkPiAgent({
           ...options,
           model: new MockLanguageModelV4({
             modelId: "journal-order",
             doStream: async () => {
-              order.push("model");
+              modelCalls += 1;
+              order.push(`model-${modelCalls}`);
+              if (modelCalls === 1) {
+                return level1ToolCallStep([{ toolCallId: "read-image", toolName: "read" }]);
+              }
+              modelAdvancedBeforeUpload = !uploadReleased;
+              secondModelStarted.resolve(undefined);
               return level1TextStep("journalled");
             },
           }),
-        }),
+          beforeStep: undefined,
+          normalizeToolResultOutput: undefined,
+          normalizeSettledToolResultOutputs: undefined,
+          tools: {
+            read: tool({
+              inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+              execute: () => ({ filename: "image.png" }),
+              toModelOutput: () => ({
+                type: "content",
+                value: [
+                  { type: "text", text: "Attached image.png" },
+                  {
+                    type: "file",
+                    data: { type: "data", data: "iVBORwE=" },
+                    mediaType: "image/png",
+                    filename: "image.png",
+                  },
+                ],
+              }),
+            }),
+          },
+        });
+      },
     });
     const lifecycle = await observeRequestLifecycle(bus, requestId);
     try {
@@ -3535,26 +3641,63 @@ describe("durable accepted runner recovery", () => {
         sessionId,
         text: "persist before work",
       });
+      await uploadStarted.promise;
+      await secondModelStarted.promise;
+      expect(modelAdvancedBeforeUpload).toBe(true);
+      uploadReleased = true;
+      releaseUpload.resolve(undefined);
       await expect(lifecycle.terminal).resolves.toBe("resolved");
       await runner.getActiveDrainOperation();
-      expect(order.indexOf("open")).toBeLessThan(order.indexOf("checkpoint"));
-      expect(order.indexOf("checkpoint")).toBeLessThan(order.indexOf("model"));
       expect(order.indexOf("surface-write")).toBeLessThan(order.indexOf("terminal"));
     } finally {
+      uploadReleased = true;
+      releaseUpload.resolve(undefined);
       await lifecycle.stop();
       await runner.stop();
       await pluginManager.destroy();
+      transcriptStore.close();
+      await baseBlobStore.close({ deadlineAtMs: Date.now() + 1_000 });
       store.close();
       await bus.close();
+      await rm(directory, { recursive: true });
     }
   });
 
   it("keeps recovery ownership when both terminal surface publications fail", async () => {
     let terminalSurfaceAttempts = 0;
+    const terminalSurfaceFailed = deferred<void>();
+    const uploadStarted = deferred<void>();
+    const releaseUpload = deferred<void>();
+    const liveParentClosed = deferred<void>();
+    const directory = await mkdtemp(path.join(tmpdir(), "lilac-runner-journal-failed-output-"));
+    const transcriptStore = new SqliteTranscriptStore(path.join(directory, "transcripts.db"));
+    const baseBlobStore = transcriptResultValue(await createMemoryBlobStore());
+    let uploadCount = 0;
+    const blobStore: BlobStore = {
+      startUpload: async (input) => {
+        const started = await baseBlobStore.startUpload(input);
+        uploadCount += 1;
+        if (uploadCount !== 1) return started;
+        return started.map((upload) => ({
+          ...upload,
+          completion: (async () => {
+            uploadStarted.resolve(undefined);
+            await releaseUpload.promise;
+            return await upload.completion;
+          })(),
+        }));
+      },
+      resolve: (handle, options) => baseBlobStore.resolve(handle, options),
+      open: (ref) => baseBlobStore.open(ref),
+      delete: (target) => baseBlobStore.delete(target),
+      maintain: (input) => baseBlobStore.maintain(input),
+      close: (input) => baseBlobStore.close(input),
+    };
     const rawBus = createInMemoryRawBus({
       onPublish: (eventType) => {
         if (eventType !== lilacEventTypes.EvtAgentOutputResponseText) return;
         terminalSurfaceAttempts += 1;
+        if (terminalSurfaceAttempts === 2) terminalSurfaceFailed.resolve(undefined);
         throw new Error("injected terminal surface publication failure");
       },
     });
@@ -3565,8 +3708,8 @@ describe("durable accepted runner recovery", () => {
     });
     const requestDelivery = new RequestDeliveryCoordinator({
       store,
-      blobStore: TEST_BLOB_STORE,
-      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+      blobStore,
+      admission: createCoreRequestDeliveryAdmission(blobStore),
     });
     const pluginManager = corePrimaryTestPluginManager();
     const requestDeliveryId = crypto.randomUUID();
@@ -3594,6 +3737,29 @@ describe("durable accepted runner recovery", () => {
     );
     let terminalMarks = 0;
     let reconciliations = 0;
+    const workflowLiveParentBridge = {
+      registerParent: () => ({
+        ready: Promise.resolve(),
+        snapshot: () => ({
+          signalVersion: 0,
+          hasPendingCompletions: false,
+          hasOutstandingRuns: false,
+        }),
+        waitForSignalSince: async () => undefined,
+        listPendingIdentities: () => [],
+        listPendingSettledAsync: async () => [],
+        acknowledge: async () => undefined,
+        isPending: () => false,
+        clearMaterializationFailure: () => undefined,
+        recordMaterializationFailure: () => 0,
+        cancelAll: async () => undefined,
+        close: async () => {
+          liveParentClosed.resolve(undefined);
+        },
+      }),
+    } as unknown as NonNullable<
+      Parameters<typeof startBusAgentRunner>[0]["workflowLiveParentBridge"]
+    >;
     const journal = {
       openRun: (owner: {
         readonly requestDeliveryId: string;
@@ -3635,18 +3801,49 @@ describe("durable accepted runner recovery", () => {
       pluginManager,
       requestDelivery,
       agentRunJournal: journal,
+      blobStore,
+      transcriptStore,
+      workflowLiveParentBridge,
       issueControlCapability: () => ({
         capability: "terminal-publication",
         principal: null,
       }),
-      createAgent: (options) =>
-        new AiSdkPiAgent({
+      createAgent: (options) => {
+        let modelCalls = 0;
+        return new AiSdkPiAgent({
           ...options,
           model: new MockLanguageModelV4({
             modelId: "journal-terminal-publication-failure",
-            doStream: async () => level1TextStep("surface must accept this"),
+            doStream: async () => {
+              modelCalls += 1;
+              return modelCalls === 1
+                ? level1ToolCallStep([{ toolCallId: "failed-output-read", toolName: "read" }])
+                : level1TextStep("surface must accept this");
+            },
           }),
-        }),
+          beforeStep: undefined,
+          normalizeToolResultOutput: undefined,
+          normalizeSettledToolResultOutputs: undefined,
+          tools: {
+            read: tool({
+              inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
+              execute: () => ({ filename: "failed-output.png" }),
+              toModelOutput: () => ({
+                type: "content",
+                value: [
+                  { type: "text", text: "Attached failed-output.png" },
+                  {
+                    type: "file",
+                    data: { type: "data", data: "iVBORwE=" },
+                    mediaType: "image/png",
+                    filename: "failed-output.png",
+                  },
+                ],
+              }),
+            }),
+          },
+        });
+      },
     });
     const lifecycle = await observeRequestLifecycle(bus, requestId);
     try {
@@ -3657,6 +3854,12 @@ describe("durable accepted runner recovery", () => {
         sessionId,
         text: "retain recovery ownership",
       });
+      await uploadStarted.promise;
+      await terminalSurfaceFailed.promise;
+      await liveParentClosed.promise;
+      await Promise.resolve();
+      expect(runner.getActiveLevel1Work()).toHaveLength(1);
+      releaseUpload.resolve(undefined);
       await expect(lifecycle.terminal).resolves.toBe("resolved");
       await runner.getActiveDrainOperation();
 
@@ -3665,11 +3868,15 @@ describe("durable accepted runner recovery", () => {
       expect(reconciliations).toBe(0);
       expect(transcriptResultValue(store.load(requestDeliveryId)).state).toBe("accepted");
     } finally {
+      releaseUpload.resolve(undefined);
       await lifecycle.stop();
       await runner.stop();
       await pluginManager.destroy();
+      transcriptStore.close();
+      await baseBlobStore.close({ deadlineAtMs: Date.now() + 1_000 });
       store.close();
       await bus.close();
+      await rm(directory, { recursive: true });
     }
   });
 
@@ -3819,7 +4026,7 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
-  it("resets one failed checkpoint, continues that run, and admits a later request", async () => {
+  it("keeps the previous checkpoint after one conflict and admits a later request", async () => {
     const rawBus = createInMemoryRawBus();
     const bus = createLilacBus(rawBus);
     const store = new SqliteRequestDeliveryStore({
@@ -3948,7 +4155,7 @@ describe("durable accepted runner recovery", () => {
         text: "second",
       });
       await expect(secondLifecycle.terminal).resolves.toBe("resolved");
-      expect(resets).toBe(1);
+      expect(resets).toBe(0);
       expect(modelCalls).toBe(2);
     } finally {
       await firstLifecycle.stop();
@@ -3960,7 +4167,7 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
-  it("disables the journal for the runner boot when reset fails", async () => {
+  it("stops checkpoint writes for each run after a conflict and still marks it terminal", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     const store = new SqliteRequestDeliveryStore({
       dbPath: ":memory:",
@@ -4105,13 +4312,11 @@ describe("durable accepted runner recovery", () => {
         await expect(lifecycles[index]!.terminal).resolves.toBe("resolved");
       }
       expect(modelCalls).toBe(2);
-      expect(journalCalls).toEqual({
-        open: 1,
-        checkpoint: 1,
-        reset: 1,
-        terminal: 0,
-        remove: 0,
-      });
+      expect(journalCalls.open).toBe(4);
+      expect(journalCalls.checkpoint).toBe(2);
+      expect(journalCalls.reset).toBe(0);
+      expect(journalCalls.terminal).toBe(2);
+      expect(journalCalls.remove).toBe(2);
     } finally {
       await Promise.all(lifecycles.map((lifecycle) => lifecycle.stop()));
       await runner.stop();
@@ -4121,160 +4326,157 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
-  it.each(["reopen", "checkpoint-retry"] as const)(
-    "disables the journal for later runs when the bounded %s attempt fails",
-    async (failureStage) => {
-      const bus = createLilacBus(createInMemoryRawBus());
-      const store = new SqliteRequestDeliveryStore({
-        dbPath: ":memory:",
-        codecs: coreRequestDeliveryCodecs,
-      });
-      const requestDelivery = new RequestDeliveryCoordinator({
-        store,
-        blobStore: TEST_BLOB_STORE,
-        admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
-      });
-      const pluginManager = corePrimaryTestPluginManager();
-      const journalCalls = { open: 0, checkpoint: 0, reset: 0, terminal: 0 };
-      let modelCalls = 0;
-      const journal = {
-        openRun: (owner: {
-          readonly requestDeliveryId: string;
-          readonly requestId: string;
-          readonly sessionId: string;
-        }) => {
-          journalCalls.open += 1;
-          if (failureStage === "reopen" && journalCalls.open === 2) {
-            return Result.err(
-              new AgentRunJournalConflict({
-                runId: owner.requestDeliveryId,
-                message: "injected journal reopen failure",
-              }),
-            );
-          }
-          return Result.ok({
-            runId: owner.requestDeliveryId,
-            requestId: owner.requestId,
-            sessionId: owner.sessionId,
-            sequence: 1,
-          });
-        },
-        writeCheckpoint: (handle: {
-          readonly runId: string;
-          readonly requestId: string;
-          readonly sessionId: string;
-          readonly sequence: number;
-        }) => {
-          journalCalls.checkpoint += 1;
+  it("resets a conflicted run only when its current handle cannot be reopened", async () => {
+    const failureStage = "reopen" as const;
+    const bus = createLilacBus(createInMemoryRawBus());
+    const store = new SqliteRequestDeliveryStore({
+      dbPath: ":memory:",
+      codecs: coreRequestDeliveryCodecs,
+    });
+    const requestDelivery = new RequestDeliveryCoordinator({
+      store,
+      blobStore: TEST_BLOB_STORE,
+      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+    });
+    const pluginManager = corePrimaryTestPluginManager();
+    const journalCalls = { open: 0, checkpoint: 0, reset: 0, terminal: 0 };
+    let modelCalls = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) => {
+        journalCalls.open += 1;
+        if (journalCalls.open === 2) {
           return Result.err(
             new AgentRunJournalConflict({
-              runId: handle.runId,
-              message: "injected journal checkpoint failure",
+              runId: owner.requestDeliveryId,
+              message: "injected journal reopen failure",
             }),
           );
-        },
-        markTerminal: (handle: {
-          readonly runId: string;
-          readonly requestId: string;
-          readonly sessionId: string;
-          readonly sequence: number;
-        }) => {
-          journalCalls.terminal += 1;
-          return Result.ok({ ...handle, sequence: handle.sequence + 1 });
-        },
-        resetRun: () => {
-          journalCalls.reset += 1;
-          return Result.ok(undefined);
-        },
-        removeReconciled: () => Result.ok(undefined),
-      };
-      const runner = await startBusAgentRunner({
-        bus,
-        subscriptionId: `journal-bounded-${failureStage}`,
-        reportFatalPanic: () => undefined,
-        config: parseCoreConfigV2ToUniversal({}),
-        pluginManager,
-        requestDelivery,
-        agentRunJournal: journal,
-        issueControlCapability: () => ({
-          capability: `journal-bounded-${failureStage}`,
-          principal: null,
-        }),
-        createAgent: (options) =>
-          new AiSdkPiAgent({
-            ...options,
-            model: new MockLanguageModelV4({
-              modelId: `journal-bounded-${failureStage}`,
-              doStream: async () => {
-                modelCalls += 1;
-                return level1TextStep("continued without journal");
-              },
-            }),
-          }),
-      });
-      const requests = [
-        {
-          requestDeliveryId: crypto.randomUUID(),
-          requestId: `github:journal-bounded-${failureStage}:first`,
-          sessionId: `journal-bounded-${failureStage}-first`,
-        },
-        {
-          requestDeliveryId: crypto.randomUUID(),
-          requestId: `github:journal-bounded-${failureStage}:second`,
-          sessionId: `journal-bounded-${failureStage}-second`,
-        },
-      ] as const;
-      for (const [index, request] of requests.entries()) {
-        transcriptResultValue(
-          store.prepare({
-            requestDeliveryId: request.requestDeliveryId,
-            requestId: request.requestId,
-            envelope: {
-              headers: {
-                request_id: request.requestId,
-                session_id: request.sessionId,
-                request_client: "github",
-              },
-              data: {
-                requestDeliveryId: request.requestDeliveryId,
-                queue: "prompt",
-                messages: [{ role: "user", content: `request ${index + 1}` }],
-              },
-            },
-            inputHandles: [],
-            createdAt: index + 1,
-          }),
-        );
-      }
-      const lifecycles = await Promise.all(
-        requests.map((request) => observeRequestLifecycle(bus, request.requestId)),
-      );
-      try {
-        for (const [index, request] of requests.entries()) {
-          await publishRunnerRequest({
-            bus,
-            requestDeliveryId: request.requestDeliveryId,
-            requestId: request.requestId,
-            sessionId: request.sessionId,
-            text: `request ${index + 1}`,
-          });
-          await expect(lifecycles[index]!.terminal).resolves.toBe("resolved");
         }
-        expect(modelCalls).toBe(2);
-        expect(journalCalls).toEqual(
-          failureStage === "reopen"
-            ? { open: 2, checkpoint: 1, reset: 1, terminal: 0 }
-            : { open: 2, checkpoint: 2, reset: 2, terminal: 0 },
+        return Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        });
+      },
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        journalCalls.checkpoint += 1;
+        return Result.err(
+          new AgentRunJournalConflict({
+            runId: handle.runId,
+            message: "injected journal checkpoint failure",
+          }),
         );
-      } finally {
-        await Promise.all(lifecycles.map((lifecycle) => lifecycle.stop()));
-        await runner.stop();
-        await pluginManager.destroy();
-        store.close();
-        await bus.close();
+      },
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        journalCalls.terminal += 1;
+        return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+      },
+      resetRun: () => {
+        journalCalls.reset += 1;
+        return Result.ok(undefined);
+      },
+      removeReconciled: () => Result.ok(undefined),
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: `journal-bounded-${failureStage}`,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      requestDelivery,
+      agentRunJournal: journal,
+      issueControlCapability: () => ({
+        capability: `journal-bounded-${failureStage}`,
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: `journal-bounded-${failureStage}`,
+            doStream: async () => {
+              modelCalls += 1;
+              return level1TextStep("continued without journal");
+            },
+          }),
+        }),
+    });
+    const requests = [
+      {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: `github:journal-bounded-${failureStage}:first`,
+        sessionId: `journal-bounded-${failureStage}-first`,
+      },
+      {
+        requestDeliveryId: crypto.randomUUID(),
+        requestId: `github:journal-bounded-${failureStage}:second`,
+        sessionId: `journal-bounded-${failureStage}-second`,
+      },
+    ] as const;
+    for (const [index, request] of requests.entries()) {
+      transcriptResultValue(
+        store.prepare({
+          requestDeliveryId: request.requestDeliveryId,
+          requestId: request.requestId,
+          envelope: {
+            headers: {
+              request_id: request.requestId,
+              session_id: request.sessionId,
+              request_client: "github",
+            },
+            data: {
+              requestDeliveryId: request.requestDeliveryId,
+              queue: "prompt",
+              messages: [{ role: "user", content: `request ${index + 1}` }],
+            },
+          },
+          inputHandles: [],
+          createdAt: index + 1,
+        }),
+      );
+    }
+    const lifecycles = await Promise.all(
+      requests.map((request) => observeRequestLifecycle(bus, request.requestId)),
+    );
+    try {
+      for (const [index, request] of requests.entries()) {
+        await publishRunnerRequest({
+          bus,
+          requestDeliveryId: request.requestDeliveryId,
+          requestId: request.requestId,
+          sessionId: request.sessionId,
+          text: `request ${index + 1}`,
+        });
+        await expect(lifecycles[index]!.terminal).resolves.toBe("resolved");
       }
-    },
-  );
+      expect(modelCalls).toBe(2);
+      expect(journalCalls.open).toBe(5);
+      expect(journalCalls.checkpoint).toBe(2);
+      expect(journalCalls.reset).toBe(1);
+      expect(journalCalls.terminal).toBe(2);
+    } finally {
+      await Promise.all(lifecycles.map((lifecycle) => lifecycle.stop()));
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+    }
+  });
 
   it("reconstructs original and checkpointed work across sessions and skips terminal heads", async () => {
     const rawBus = createInMemoryRawBus();
@@ -4376,6 +4578,449 @@ describe("durable accepted runner recovery", () => {
       expect(observedModelPrompts.some((messages) => messages.includes("must not rerun"))).toBe(
         false,
       );
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("restores loaded tools from a WAL checkpoint and persists them for the next descendant", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-tool-recovery-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    pluginManager.buildLevel1ToolsetResult = async () => Result.ok(level1TestToolset());
+    const offered: string[][] = [];
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "tool-authority-wal-recovery",
+      startPaused: true,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      transcriptStore: store,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
+      issueControlCapability: () => ({ capability: "tool-authority-recovery", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "tool-authority-wal-recovery",
+            doStream: async (modelOptions) => {
+              offered.push(level1OfferedToolNames(modelOptions));
+              return level1TextStep("recovered");
+            },
+          }),
+        }),
+    });
+
+    const sessionId = "tool-authority-recovery";
+    const inputMessageId = "recovered-input";
+    const recoveredRequestId = `discord:${sessionId}:${inputMessageId}`;
+    const recoveredMessages = [
+      { role: "user", content: "resume after crash" },
+    ] satisfies ModelMessage[];
+    const recoveredLineage = buildCoreLineageManifestV2([
+      admitPrimarySurface(store, sessionId, inputMessageId, recoveredMessages),
+    ]);
+    const accepted = acceptedRunnerDelivery({
+      requestDeliveryId: crypto.randomUUID(),
+      requestId: recoveredRequestId,
+      sessionId,
+      requestClient: "discord",
+      queue: "prompt",
+      messages: transcriptResultValue(projectStoredMessagesV1(recoveredMessages)),
+      corePrimaryLineage: recoveredLineage,
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "recovery-user",
+          messageRef: {
+            platform: "discord",
+            channelId: sessionId,
+            messageId: inputMessageId,
+          },
+        },
+      },
+    });
+    const recoveryHead: AgentRunRecoveryHead = {
+      handle: {
+        runId: accepted.requestDeliveryId,
+        requestId: accepted.requestId,
+        sessionId: accepted.work.sessionId,
+        sequence: 2,
+      },
+      state: "active",
+      checkpoint: {
+        version: 1,
+        messages: transcriptResultValue(projectStoredMessagesV1(recoveredMessages)),
+        corePrimaryLineage: recoveredLineage,
+        loadedCatalogIds: ["catalog-id"],
+        retainedRequestDeliveries: [],
+      },
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const recoveredLifecycle = await observeRequestLifecycle(bus, recoveredRequestId);
+
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, recoveryHead));
+      runner.activate();
+      await expect(recoveredLifecycle.terminal).resolves.toBe("resolved");
+      await recoveredLifecycle.stop();
+
+      expect(
+        getRequestTranscript(store, { requestId: recoveredRequestId })?.loadedCatalogIds,
+      ).toEqual(["catalog-id"]);
+
+      const descendantRequestId = "discord:tool-authority-recovery:descendant";
+      const descendantMessages = [
+        { role: "user", content: "continue after recovery" },
+      ] satisfies ModelMessage[];
+      const descendantLineage = extendPrimaryManifest({
+        store,
+        sessionId,
+        previous: recoveredLineage,
+        completedRequestId: recoveredRequestId,
+        outputMessageId: "recovered-output",
+        currentMessageId: "descendant-input",
+        currentMessages: descendantMessages,
+      });
+      const descendantLifecycle = await observeRequestLifecycle(bus, descendantRequestId);
+      await publishRunnerRequest({
+        bus,
+        requestId: descendantRequestId,
+        sessionId,
+        requestClient: "discord",
+        text: "continue after recovery",
+        messages: descendantLineage.segments.flatMap((segment) => segment.canonicalMessages),
+        corePrimaryLineage: descendantLineage,
+      });
+      await expect(descendantLifecycle.terminal).resolves.toBe("resolved");
+      await descendantLifecycle.stop();
+
+      expect(offered).toEqual([
+        ["builtin", "find_tools", "deferred_tool"],
+        ["builtin", "find_tools", "deferred_tool"],
+      ]);
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reseeds recovery from the previous checkpoint when the latest blob is unavailable", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    let level1RequestContext:
+      | Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
+      | undefined;
+    const pluginManager = corePrimaryTestPluginManager((requestContext) => {
+      level1RequestContext = requestContext;
+    });
+    const modelCalled = deferred<void>();
+    let observedPrompt = "";
+    let observedTools: string[] = [];
+    let resets = 0;
+    let promotions = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) =>
+        Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        }),
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      promotePreviousCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => {
+        promotions += 1;
+        return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+      },
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      loadRecoveryHeads: () => Result.ok({ heads: [], resets: [] }),
+      resetRun: () => {
+        resets += 1;
+        return Result.ok(undefined);
+      },
+      resetAll: () => Result.ok(undefined),
+      removeReconciled: () => Result.ok(undefined),
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "journal-previous-checkpoint",
+      startPaused: true,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      agentRunJournal: journal,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
+      issueControlCapability: () => ({
+        capability: "journal-previous-checkpoint",
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "journal-previous-checkpoint",
+            doStream: async (call) => {
+              observedPrompt = JSON.stringify(call.prompt);
+              observedTools = level1OfferedToolNames(call);
+              modelCalled.resolve(undefined);
+              return level1TextStep("recovered previous checkpoint");
+            },
+          }),
+        }),
+    });
+    const sessionId = "journal-previous-checkpoint";
+    const originalMessageId = "accepted-message";
+    const accepted = acceptedRunnerDelivery({
+      requestDeliveryId: crypto.randomUUID(),
+      requestId: `discord:${sessionId}:${originalMessageId}`,
+      sessionId,
+      requestClient: "discord",
+      queue: "prompt",
+      messages: [{ role: "user", content: "accepted floor" }],
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "accepted-user",
+          messageRef: {
+            platform: "discord",
+            channelId: sessionId,
+            messageId: originalMessageId,
+          },
+        },
+      },
+    });
+    const head: AgentRunRecoveryHead = {
+      handle: {
+        runId: accepted.requestDeliveryId,
+        requestId: accepted.requestId,
+        sessionId: accepted.work.sessionId,
+        sequence: 3,
+      },
+      state: "active",
+      checkpoint: {
+        version: 1,
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "blob",
+                blob: {
+                  version: 1,
+                  objectId: `b1_${"11".repeat(16)}`,
+                  sha256: "22".repeat(32),
+                  byteLength: 1,
+                },
+                mediaType: "image/png",
+                filename: "missing.png",
+              },
+            ],
+          },
+        ],
+        loadedCatalogIds: [],
+        retainedRequestDeliveries: [],
+      },
+      previousCheckpoint: {
+        version: 1,
+        messages: [{ role: "user", content: "previous safe checkpoint" }],
+        loadedCatalogIds: ["catalog-id"],
+        currentTurnUserId: "checkpoint-user",
+        retainedRequestDeliveries: [],
+      },
+      createdAt: 1,
+      updatedAt: 3,
+    };
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, head));
+      runner.activate();
+      await modelCalled.promise;
+      expect(promotions).toBe(1);
+      expect(resets).toBe(0);
+      expect(observedPrompt).toContain("previous safe checkpoint");
+      expect(observedPrompt).not.toContain("accepted floor");
+      expect(observedPrompt).not.toContain("missing.png");
+      expect(observedTools).toEqual(["builtin", "find_tools", "deferred_tool"]);
+      expect(level1RequestContext).toMatchObject({
+        currentTurnUserId: "checkpoint-user",
+      });
+      expect(level1RequestContext?.currentTurnMessageRef).toBeUndefined();
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+
+  it("restores the accepted message relation when no recovery checkpoint can be loaded", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    let level1RequestContext:
+      | Parameters<CoreToolPluginManager["buildLevel1ToolsetResult"]>[0]["requestContext"]
+      | undefined;
+    const pluginManager = corePrimaryTestPluginManager((requestContext) => {
+      level1RequestContext = requestContext;
+    });
+    const modelCalled = deferred<void>();
+    let observedPrompt = "";
+    let resets = 0;
+    const journal = {
+      openRun: (owner: {
+        readonly requestDeliveryId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+      }) =>
+        Result.ok({
+          runId: owner.requestDeliveryId,
+          requestId: owner.requestId,
+          sessionId: owner.sessionId,
+          sequence: 1,
+        }),
+      writeCheckpoint: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      markTerminal: (handle: {
+        readonly runId: string;
+        readonly requestId: string;
+        readonly sessionId: string;
+        readonly sequence: number;
+      }) => Result.ok({ ...handle, sequence: handle.sequence + 1 }),
+      loadRecoveryHeads: () => Result.ok({ heads: [], resets: [] }),
+      resetRun: () => {
+        resets += 1;
+        return Result.ok(undefined);
+      },
+      resetAll: () => Result.ok(undefined),
+      removeReconciled: () => Result.ok(undefined),
+    };
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "journal-accepted-fallback",
+      startPaused: true,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      agentRunJournal: journal,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
+      issueControlCapability: () => ({
+        capability: "journal-accepted-fallback",
+        principal: null,
+      }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "journal-accepted-fallback",
+            doStream: async (call) => {
+              observedPrompt = JSON.stringify(call.prompt);
+              modelCalled.resolve(undefined);
+              return level1TextStep("recovered accepted work");
+            },
+          }),
+        }),
+    });
+    const sessionId = "journal-accepted-fallback";
+    const originalMessageId = "accepted-message";
+    const accepted = acceptedRunnerDelivery({
+      requestDeliveryId: crypto.randomUUID(),
+      requestId: `discord:${sessionId}:${originalMessageId}`,
+      sessionId,
+      requestClient: "discord",
+      queue: "prompt",
+      messages: [{ role: "user", content: "accepted floor" }],
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "accepted-user",
+          messageRef: {
+            platform: "discord",
+            channelId: sessionId,
+            messageId: originalMessageId,
+          },
+        },
+      },
+    });
+    const missingMessage = {
+      role: "assistant" as const,
+      content: [
+        {
+          type: "blob" as const,
+          blob: {
+            version: 1 as const,
+            objectId: `b1_${"11".repeat(16)}`,
+            sha256: "22".repeat(32),
+            byteLength: 1,
+          },
+          mediaType: "image/png",
+          filename: "missing.png",
+        },
+      ],
+    };
+    const head: AgentRunRecoveryHead = {
+      handle: {
+        runId: accepted.requestDeliveryId,
+        requestId: accepted.requestId,
+        sessionId,
+        sequence: 3,
+      },
+      state: "active",
+      checkpoint: {
+        version: 1,
+        messages: [missingMessage],
+        currentTurnUserId: "latest-checkpoint-user",
+        retainedRequestDeliveries: [],
+      },
+      previousCheckpoint: {
+        version: 1,
+        messages: [missingMessage],
+        currentTurnUserId: "previous-checkpoint-user",
+        retainedRequestDeliveries: [],
+      },
+      createdAt: 1,
+      updatedAt: 3,
+    };
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, head));
+      runner.activate();
+      await modelCalled.promise;
+      expect(resets).toBe(1);
+      expect(observedPrompt).toContain("accepted floor");
+      expect(observedPrompt).not.toContain("missing.png");
+      expect(level1RequestContext).toMatchObject({
+        currentTurnUserId: "accepted-user",
+        currentTurnMessageRef: {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: originalMessageId,
+        },
+      });
     } finally {
       await runner.stop();
       await pluginManager.destroy();
@@ -4991,6 +5636,14 @@ describe("startBusAgentRunner production path", () => {
       }),
       execute: (_input, options) => {
         toolContexts.push(options.context);
+        const metadata = (
+          options.context as {
+            readonly metadata?: {
+              readonly onActivity?: (source: "tool" | "subagent") => void;
+            };
+          }
+        ).metadata;
+        metadata?.onActivity?.("tool");
         return "ok";
       },
     });
@@ -5097,12 +5750,25 @@ describe("startBusAgentRunner production path", () => {
         requestInitiator: { platform: "discord", userId: "user-a" },
         requestInitiatorSessionId: "turn-session",
         currentTurnUserId: "user-b",
+        currentTurnMessageRef: {
+          platform: "discord",
+          channelId: "turn-session",
+          messageId: "second-message",
+        },
       });
       expect(toolContexts).toEqual([
         expect.objectContaining({
           requestInitiator: { platform: "discord", userId: "user-a" },
           requestInitiatorSessionId: "turn-session",
           currentTurnUserId: "user-b",
+          currentTurnMessageRef: {
+            platform: "discord",
+            channelId: "turn-session",
+            messageId: "second-message",
+          },
+          metadata: expect.objectContaining({
+            onActivity: expect.any(Function),
+          }),
         }),
       ]);
     } finally {
@@ -5672,6 +6338,11 @@ describe("startBusAgentRunner production path", () => {
       expect(contexts[1]).toMatchObject({
         requestInitiator: { platform: "discord", userId: "user-a" },
         currentTurnUserId: "user-b",
+        currentTurnMessageRef: {
+          platform: "discord",
+          channelId: "drain-coalescing",
+          messageId: "second-message",
+        },
       });
       releaseCoalesced.resolve(undefined);
       await expect(lifecycle.terminal).resolves.toBe("resolved");
@@ -7170,6 +7841,415 @@ function extendPrimaryManifest(input: {
   );
 }
 
+describe("startBusAgentRunner prefix-lineage tool authority", () => {
+  it("keeps loaded tools on descendants and excludes them from earlier forks and new threads", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-tool-lineage-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    pluginManager.buildLevel1ToolsetResult = async (input) =>
+      Result.ok(
+        level1TestToolset({
+          searchExecute: () => {
+            input.onSelectCatalogIds?.(["catalog-id"]);
+            return "selected";
+          },
+        }),
+      );
+    const offered: string[][] = [];
+    let modelCall = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "prefix-lineage-tool-authority",
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      transcriptStore: store,
+      issueControlCapability: () => ({ capability: "test", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "prefix-lineage-tool-authority",
+            doStream: async (modelOptions) => {
+              offered.push(level1OfferedToolNames(modelOptions));
+              modelCall += 1;
+              return modelCall === 1
+                ? level1ToolCallStep([{ toolCallId: "search", toolName: "find_tools" }])
+                : level1TextStep(`done-${modelCall}`);
+            },
+          }),
+        }),
+    });
+
+    const sessionId = "tool-lineage-channel";
+    const firstRequestId = "discord:tool-lineage:first";
+    const firstMessages = [{ role: "user", content: "load a tool" }] satisfies ModelMessage[];
+    const firstManifest = buildCoreLineageManifestV2([
+      admitPrimarySurface(store, sessionId, "input-first", firstMessages),
+    ]);
+    const firstLifecycle = await observeRequestLifecycle(bus, firstRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: firstRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "load a tool",
+      corePrimaryLineage: firstManifest,
+    });
+    await expect(firstLifecycle.terminal).resolves.toBe("resolved");
+    await firstLifecycle.stop();
+
+    const secondRequestId = "discord:tool-lineage:second";
+    const secondMessages = [{ role: "user", content: "continue" }] satisfies ModelMessage[];
+    const secondManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: firstManifest,
+      completedRequestId: firstRequestId,
+      outputMessageId: "output-first",
+      currentMessageId: "input-second",
+      currentMessages: secondMessages,
+    });
+    const secondLifecycle = await observeRequestLifecycle(bus, secondRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: secondRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "continue",
+      messages: secondManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: secondManifest,
+    });
+    await expect(secondLifecycle.terminal).resolves.toBe("resolved");
+    await secondLifecycle.stop();
+
+    const forkAfterRequestId = "discord:tool-lineage:fork-after";
+    const forkAfterMessages = [
+      { role: "user", content: "fork after load" },
+    ] satisfies ModelMessage[];
+    const forkAfterManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: firstManifest,
+      completedRequestId: firstRequestId,
+      outputMessageId: "output-first-fork",
+      currentMessageId: "input-fork-after",
+      currentMessages: forkAfterMessages,
+    });
+    const forkAfterLifecycle = await observeRequestLifecycle(bus, forkAfterRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: forkAfterRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "fork after load",
+      messages: forkAfterManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: forkAfterManifest,
+    });
+    await expect(forkAfterLifecycle.terminal).resolves.toBe("resolved");
+    await forkAfterLifecycle.stop();
+
+    const thirdRequestId = "discord:tool-lineage:third";
+    const thirdMessages = [{ role: "user", content: "continue again" }] satisfies ModelMessage[];
+    const thirdManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: secondManifest,
+      completedRequestId: secondRequestId,
+      outputMessageId: "output-second",
+      currentMessageId: "input-third",
+      currentMessages: thirdMessages,
+    });
+    const thirdLifecycle = await observeRequestLifecycle(bus, thirdRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: thirdRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "continue again",
+      messages: thirdManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: thirdManifest,
+    });
+    await expect(thirdLifecycle.terminal).resolves.toBe("resolved");
+    await thirdLifecycle.stop();
+
+    const forkFromSecondRequestId = "discord:tool-lineage:fork-from-second";
+    const forkFromSecondMessages = [
+      { role: "user", content: "fork from second response" },
+    ] satisfies ModelMessage[];
+    const forkFromSecondManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: secondManifest,
+      completedRequestId: secondRequestId,
+      outputMessageId: "output-second-fork",
+      currentMessageId: "input-fork-from-second",
+      currentMessages: forkFromSecondMessages,
+    });
+    const forkFromSecondLifecycle = await observeRequestLifecycle(bus, forkFromSecondRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: forkFromSecondRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "fork from second response",
+      messages: forkFromSecondManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: forkFromSecondManifest,
+    });
+    await expect(forkFromSecondLifecycle.terminal).resolves.toBe("resolved");
+    await forkFromSecondLifecycle.stop();
+
+    const forkRequestId = "discord:tool-lineage:fork-before";
+    const forkMessages = [{ role: "user", content: "fork before load" }] satisfies ModelMessage[];
+    const forkManifest = buildCoreLineageManifestV2([
+      admitPrimarySurface(store, sessionId, "input-fork", forkMessages),
+    ]);
+    const forkLifecycle = await observeRequestLifecycle(bus, forkRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: forkRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "fork before load",
+      corePrimaryLineage: forkManifest,
+    });
+    await expect(forkLifecycle.terminal).resolves.toBe("resolved");
+    await forkLifecycle.stop();
+
+    const freshSessionId = "tool-lineage-new-thread";
+    const freshRequestId = "discord:tool-lineage:fresh";
+    const freshMessages = [{ role: "user", content: "new thread" }] satisfies ModelMessage[];
+    const freshManifest = buildCoreLineageManifestV2([
+      admitPrimarySurface(store, freshSessionId, "input-fresh", freshMessages),
+    ]);
+    const freshLifecycle = await observeRequestLifecycle(bus, freshRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: freshRequestId,
+      sessionId: freshSessionId,
+      requestClient: "discord",
+      text: "new thread",
+      corePrimaryLineage: freshManifest,
+    });
+    await expect(freshLifecycle.terminal).resolves.toBe("resolved");
+    await freshLifecycle.stop();
+
+    expect(offered).toEqual([
+      ["builtin", "find_tools"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools"],
+      ["builtin", "find_tools"],
+    ]);
+    expect(getRequestTranscript(store, { requestId: firstRequestId })?.loadedCatalogIds).toEqual([
+      "catalog-id",
+    ]);
+    expect(getRequestTranscript(store, { requestId: secondRequestId })?.loadedCatalogIds).toEqual([
+      "catalog-id",
+    ]);
+    expect(
+      getRequestTranscript(store, { requestId: forkAfterRequestId })?.loadedCatalogIds,
+    ).toEqual(["catalog-id"]);
+    expect(getRequestTranscript(store, { requestId: thirdRequestId })?.loadedCatalogIds).toEqual([
+      "catalog-id",
+    ]);
+    expect(
+      getRequestTranscript(store, { requestId: forkFromSecondRequestId })?.loadedCatalogIds,
+    ).toEqual(["catalog-id"]);
+    expect(getRequestTranscript(store, { requestId: forkRequestId })?.loadedCatalogIds).toEqual([]);
+    expect(getRequestTranscript(store, { requestId: freshRequestId })?.loadedCatalogIds).toEqual(
+      [],
+    );
+
+    await runner.stop();
+    await pluginManager.destroy();
+    store.close();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("carries loaded tools through a real compaction checkpoint into its descendant", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-tool-compaction-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    pluginManager.buildLevel1ToolsetResult = async () => Result.ok(level1TestToolset());
+    const config = parseCoreConfigV2ToUniversal({
+      models: {
+        main: { model: "openrouter/openai/gpt-4o" },
+        fast: { model: "openrouter/openai/gpt-4o" },
+        def: {},
+        capability: {
+          forceUnknownProviders: ["openrouter"],
+          overrides: {
+            "openrouter/openai/gpt-4o": {
+              limit: { context: 10_000, output: 1_000 },
+            },
+          },
+        },
+      },
+    });
+    const modelCalls: Array<{ prompt: string; tools: string[] }> = [];
+    const model = new MockLanguageModelV4({
+      modelId: "tool-authority-compaction",
+      doStream: async (modelOptions) => {
+        const tools = level1OfferedToolNames(modelOptions);
+        modelCalls.push({ prompt: JSON.stringify(modelOptions.prompt), tools });
+        return tools.length === 0
+          ? level1TextStep("## Objective\n- Preserve the loaded tool authority.")
+          : level1TextStep("compacted response");
+      },
+    });
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "prefix-lineage-tool-compaction",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      transcriptStore: store,
+      issueControlCapability: () => ({ capability: "tool-compaction", principal: null }),
+      createAgent: (options) => new AiSdkPiAgent({ ...options, model }),
+    });
+
+    const sessionId = "tool-compaction-channel";
+    const seedRequestId = "discord:tool-compaction:seed";
+    const historicalMessages = Array.from({ length: 12 }, (_, index) =>
+      index % 2 === 0
+        ? ({ role: "user", content: `historical question ${index} ${"x".repeat(10_000)}` } as const)
+        : ({ role: "assistant", content: `historical answer ${index}` } as const),
+    ) satisfies ModelMessage[];
+    const seedLineage = buildCoreLineageManifestV2([
+      admitPrimarySurface(store, sessionId, "seed-input", historicalMessages),
+    ]);
+    transcriptResultValue(
+      store.saveRequestTranscript({
+        requestId: seedRequestId,
+        sessionId,
+        requestClient: "discord",
+        messages: [{ role: "assistant", content: "seed response" }],
+        providerState: {
+          lastFamily: "ai-sdk",
+          containsCrossFamilyTurns: false,
+        },
+        loadedCatalogIds: ["catalog-id"],
+        corePrimaryLineage: seedLineage,
+      }),
+    );
+
+    const compactingRequestId = "discord:tool-compaction:compacting";
+    const compactingMessages = [
+      { role: "user", content: "compact this prefix" },
+    ] satisfies ModelMessage[];
+    const compactingLineage = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: seedLineage,
+      completedRequestId: seedRequestId,
+      outputMessageId: "seed-output",
+      currentMessageId: "compacting-input",
+      currentMessages: compactingMessages,
+    });
+    const compactingLifecycle = await observeRequestLifecycle(bus, compactingRequestId);
+
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId: compactingRequestId,
+        sessionId,
+        requestClient: "discord",
+        text: "compact this prefix",
+        messages: compactingLineage.segments.flatMap((segment) => segment.canonicalMessages),
+        corePrimaryLineage: compactingLineage,
+      });
+      const compactingTerminal = await compactingLifecycle.terminal;
+      if (compactingTerminal !== "resolved") {
+        throw new Error(
+          `compaction request ${compactingTerminal}: ${compactingLifecycle.details.join(" | ")}`,
+        );
+      }
+      await compactingLifecycle.stop();
+
+      const checkpoint = getRequestTranscript(store, { requestId: compactingRequestId });
+      expect(checkpoint?.contextMeta).toEqual({ type: "compaction", formatVersion: 1 });
+      expect(checkpoint?.loadedCatalogIds).toEqual(["catalog-id"]);
+      if (!checkpoint?.transcriptDigest) throw new Error("compaction checkpoint missing");
+      store.linkSurfaceMessagesToRequest({
+        requestId: compactingRequestId,
+        created: [
+          {
+            platform: "discord",
+            channelId: sessionId,
+            messageId: "compacting-output",
+          },
+        ],
+        last: {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: "compacting-output",
+        },
+      });
+
+      const descendantMessages = [
+        { role: "user", content: "continue after compaction" },
+      ] satisfies ModelMessage[];
+      const descendantLineage = buildCoreLineageManifestV2([
+        {
+          atoms: [
+            {
+              kind: "checkpoint",
+              requestId: compactingRequestId,
+              transcriptDigest: checkpoint.transcriptDigest,
+            },
+          ],
+          canonicalMessages: checkpoint.messages,
+        },
+        admitPrimarySurface(store, sessionId, "post-compaction-input", descendantMessages),
+      ]);
+      const descendantRequestId = "discord:tool-compaction:descendant";
+      expect(
+        transcriptResultValue(
+          store.validateCorePrimaryLineageReferences({
+            manifest: descendantLineage,
+            requestClient: "discord",
+            sessionId,
+            surfaceId: `discord:${sessionId}`,
+          }),
+        ),
+      ).toBeNull();
+      expect(
+        resolveCorePrimaryLoadedCatalogIds({ lineage: descendantLineage, transcriptStore: store }),
+      ).toEqual(["catalog-id"]);
+      const descendantLifecycle = await observeRequestLifecycle(bus, descendantRequestId);
+      await publishRunnerRequest({
+        bus,
+        requestId: descendantRequestId,
+        sessionId,
+        requestClient: "discord",
+        text: "continue after compaction",
+        messages: descendantLineage.segments.flatMap((segment) => segment.canonicalMessages),
+        corePrimaryLineage: descendantLineage,
+      });
+      await expect(descendantLifecycle.terminal).resolves.toBe("resolved");
+      await descendantLifecycle.stop();
+
+      expect(modelCalls.filter((call) => call.tools.length > 0).map((call) => call.tools)).toEqual([
+        ["builtin", "find_tools", "deferred_tool"],
+        ["builtin", "find_tools", "deferred_tool"],
+      ]);
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("startBusAgentRunner Core-primary Claude production path", () => {
   it("promotes an auto-injected first turn and forks the exact linked reply with suffix-only input", async () => {
     const config = parseCoreConfigV2ToUniversal({});
@@ -7187,6 +8267,7 @@ describe("startBusAgentRunner Core-primary Claude production path", () => {
       followUpMinTextUnits: 20,
       limit: 1,
       minScore: 0.1,
+      expansionMinConfidence: 0.57,
       mode: "hybrid",
       filterCurrentParticipants: false,
     };
@@ -8808,6 +9889,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -8876,6 +9958,83 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     );
   });
 
+  it("treats an empty planner result as a successful retrieval abstention", async () => {
+    const cfg = parseCoreConfigV2ToUniversal({
+      surface: { discord: { botName: "lilac", allowedChannelIds: ["c1"] } },
+    });
+    const autoInjectCfg: CoreConfig = {
+      ...cfg,
+      conversation: {
+        ...cfg.conversation,
+        thread: {
+          ...cfg.conversation.thread,
+          autoInject: {
+            enabled: true,
+            minTextUnits: 1,
+            followUpMinTextUnits: 1,
+            limit: 3,
+            minScore: 0.1,
+            expansionMinConfidence: 0.57,
+            mode: "hybrid",
+            filterCurrentParticipants: false,
+          },
+        },
+      },
+    };
+    const statuses: Array<{ status: "start" | "end"; ok?: boolean }> = [];
+    let searchCalls = 0;
+    const errors: string[] = [];
+    let plannerUsage: ConversationThreadAutoInjectUsageAccumulator | undefined;
+    const finishedUsage: Parameters<ConversationThreadAutoInjectUsageAccumulator["finish"]>[0][] =
+      [];
+    const autoInjectUsage: ConversationThreadAutoInjectUsageAccumulator = {
+      recordPlannerUsage: () => {},
+      recordEmbeddingUsage: () => {},
+      finish: (usage) => finishedUsage.push(usage),
+    };
+
+    const messages = await maybeBuildAutoInjectedThreadSearchMessages({
+      cfg: autoInjectCfg,
+      requestId: "retrieval-abstention",
+      raw: {},
+      userMessages: [{ role: "user", content: "A long incidental article excerpt" }],
+      conversationThreads: {
+        planAutoInjectSearch: async (input) => {
+          plannerUsage = input.autoInjectUsage;
+          return { searches: [] };
+        },
+        search: async () => {
+          searchCalls += 1;
+          throw new Error("not used");
+        },
+        metadata: async () => ({ threads: [], missing: [] }),
+        read: async () => {
+          throw new Error("not used");
+        },
+        runSummarization: async () => {
+          throw new Error("not used");
+        },
+      },
+      publishToolStatus: async (status) => {
+        statuses.push({
+          status: status.status,
+          ...(status.ok === undefined ? {} : { ok: status.ok }),
+        });
+      },
+      onError: (message) => {
+        errors.push(message);
+      },
+      autoInjectUsage,
+    });
+
+    expect(messages).toEqual([]);
+    expect(searchCalls).toBe(0);
+    expect(statuses).toEqual([{ status: "start" }, { status: "end", ok: true }]);
+    expect(errors).toEqual([]);
+    expect(plannerUsage).toBe(autoInjectUsage);
+    expect(finishedUsage).toEqual([{ status: "abstained", searchCount: 0, queryCount: 0 }]);
+  });
+
   it("includes dynamically capped brief metadata", async () => {
     const cfg = parseCoreConfigV2ToUniversal({
       surface: {
@@ -8897,6 +10056,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 1,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -8914,8 +10074,21 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       raw: {},
       userMessages: [{ role: "user", content: "A sufficiently meaningful message" }],
       conversationThreads: {
-        planAutoInjectSearch: async () =>
-          autoInjectPlanForQuery("meaningful message", "Find meaningful message threads."),
+        planAutoInjectSearch: async () => ({
+          searches: [
+            {
+              queries: ["meaningful message"],
+              aboutness: {
+                domains: [],
+                situations: ["meaningful message"],
+                targets: ["meaningful message"],
+                entities: [],
+                userWouldAskForThisAs: ["meaningful message"],
+                intentSummary: "Find meaningful message threads.",
+              },
+            },
+          ],
+        }),
         search: async () => ({
           meta: {
             query: "meaningful message",
@@ -8930,16 +10103,40 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
               threadId: "thread-1",
               title: "Below display",
               brief: belowDisplayBrief,
+              retrievalHints: ["meaningful message"],
+              aboutness: {
+                domains: [],
+                situations: ["meaningful message"],
+                complaintTargets: ["meaningful message"],
+                entities: [],
+                userWouldAskForThisAs: ["meaningful message"],
+              },
             },
             {
               threadId: "thread-2",
               title: "Near threshold",
               brief: nearThresholdBrief,
+              retrievalHints: ["meaningful message"],
+              aboutness: {
+                domains: [],
+                situations: ["meaningful message"],
+                complaintTargets: ["meaningful message"],
+                entities: [],
+                userWouldAskForThisAs: ["meaningful message"],
+              },
             },
             {
               threadId: "thread-3",
               title: "Over threshold",
               brief: overThresholdBrief,
+              retrievalHints: ["meaningful message"],
+              aboutness: {
+                domains: [],
+                situations: ["meaningful message"],
+                complaintTargets: ["meaningful message"],
+                entities: [],
+                userWouldAskForThisAs: ["meaningful message"],
+              },
             },
           ],
         }),
@@ -9008,6 +10205,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9092,6 +10290,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.42,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9205,7 +10404,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     });
   });
 
-  it("selects one unique auto-injected result per planned search before score fill", async () => {
+  it("ranks planned searches globally without reserving a slot per category", async () => {
     const cfg = parseCoreConfigV2ToUniversal({
       surface: {
         discord: {
@@ -9226,6 +10425,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 1,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9334,16 +10534,12 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(result.output).toEqual({
       type: "json",
       value: {
-        entries: [
-          { threadId: "shared", title: "Shared top" },
-          { threadId: "work-second", title: "Work second" },
-          { threadId: "project-top", title: "Project top" },
-        ],
+        entries: [{ threadId: "project-top", title: "Project top" }],
       },
     });
   });
 
-  it("caps auto-injected category coverage by global limit and planner order", async () => {
+  it("caps globally ranked auto-injected results by the configured limit", async () => {
     const cfg = parseCoreConfigV2ToUniversal({
       surface: {
         discord: {
@@ -9364,6 +10560,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 1,
             limit: 2,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9430,14 +10627,14 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       type: "json",
       value: {
         entries: [
+          { threadId: "third category", title: "third category result" },
           { threadId: "first category", title: "first category result" },
-          { threadId: "second category", title: "second category result" },
         ],
       },
     });
   });
 
-  it("fetches extra per-search recall before deduping grouped auto-inject results", async () => {
+  it("overfetches one search so ranking can rescue a relevant fourth result", async () => {
     const cfg = parseCoreConfigV2ToUniversal({
       surface: {
         discord: {
@@ -9456,8 +10653,9 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             enabled: true,
             minTextUnits: 1,
             followUpMinTextUnits: 1,
-            limit: 2,
+            limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9465,6 +10663,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       },
     };
     const requestedLimits: number[] = [];
+    const highestRejectedThreadIds: string[] = [];
 
     const messages = await maybeBuildAutoInjectedThreadSearchMessages({
       cfg: autoInjectCfg,
@@ -9474,49 +10673,32 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
       conversationThreads: {
         planAutoInjectSearch: async () => ({
           searches: [
-            autoInjectPlanForQuery("first category", "Find first category threads.").searches[0]!,
-            autoInjectPlanForQuery("second category", "Find second category threads.").searches[0]!,
+            autoInjectPlanForQuery("buried target", "Find the buried target thread.").searches[0]!,
           ],
         }),
         search: async (input) => {
           const query = String(Array.isArray(input.query) ? (input.query[0] ?? "") : input.query);
           const requestedLimit = input.limit ?? 5;
           requestedLimits.push(requestedLimit);
-          const resultsByQuery: Record<
-            string,
-            Array<{
-              threadId: string;
-              title: string;
-              brief: string;
-              score: number;
-            }>
-          > = {
-            "first category": [
-              { threadId: "shared-1", title: "Shared 1", brief: "", score: 1 },
-              {
-                threadId: "shared-2",
-                title: "Shared 2",
-                brief: "",
-                score: 0.9,
+          const results = [
+            { threadId: "generic-1", title: "General project notes", brief: "", score: 1 },
+            { threadId: "generic-2", title: "General status update", brief: "", score: 0.9 },
+            { threadId: "generic-3", title: "General coordination", brief: "", score: 0.8 },
+            {
+              threadId: "buried-target",
+              title: "Buried target incident",
+              brief: "",
+              score: 0.7,
+              retrievalHints: ["buried target"],
+              aboutness: {
+                domains: [],
+                situations: ["buried target"],
+                complaintTargets: ["buried target"],
+                entities: [],
+                userWouldAskForThisAs: ["buried target"],
               },
-            ],
-            "second category": [
-              { threadId: "shared-1", title: "Shared 1", brief: "", score: 1 },
-              {
-                threadId: "shared-2",
-                title: "Shared 2",
-                brief: "",
-                score: 0.9,
-              },
-              {
-                threadId: "second-unique",
-                title: "Second unique",
-                brief: "",
-                score: 0.8,
-              },
-            ],
-          };
-          const results = resultsByQuery[query]?.slice(0, requestedLimit) ?? [];
+            },
+          ].slice(0, requestedLimit);
           return {
             meta: {
               query,
@@ -9540,10 +10722,16 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
         },
       },
       publishToolStatus: async () => {},
+      onInjected: (event) => {
+        if (event.highestRejectedByConfidence) {
+          highestRejectedThreadIds.push(event.highestRejectedByConfidence.threadId);
+        }
+      },
       onError: () => {},
     });
 
-    expect(requestedLimits).toEqual([4, 4]);
+    expect(requestedLimits).toEqual([15]);
+    expect(highestRejectedThreadIds).toEqual(["generic-1"]);
     const toolMessage = messages[1];
     if (toolMessage?.role !== "tool" || typeof toolMessage.content === "string") {
       throw new Error("expected tool message");
@@ -9553,10 +10741,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
     expect(result.output).toEqual({
       type: "json",
       value: {
-        entries: [
-          { threadId: "shared-1", title: "Shared 1" },
-          { threadId: "second-unique", title: "Second unique" },
-        ],
+        entries: [{ threadId: "buried-target", title: "Buried target incident" }],
       },
     });
   });
@@ -9582,6 +10767,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 1,
             limit: 2,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9679,6 +10865,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 1,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9756,6 +10943,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9839,6 +11027,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -9931,6 +11120,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -10018,6 +11208,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: true,
           },
@@ -10091,6 +11282,7 @@ describe("maybeBuildAutoInjectedThreadSearchMessages", () => {
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           },
@@ -11200,6 +12392,13 @@ describe("shouldCancelRunPolicyRequest", () => {
 });
 
 describe("maybeAppendResponseCommentaryPrompt", () => {
+  it("describes commentary and final_answer as response phases", () => {
+    expect(RESPONSE_COMMENTARY_INSTRUCTIONS).toContain("response phases");
+    expect(RESPONSE_COMMENTARY_INSTRUCTIONS).toContain("`commentary` phase");
+    expect(RESPONSE_COMMENTARY_INSTRUCTIONS).toContain("`final_answer` phase");
+    expect(RESPONSE_COMMENTARY_INSTRUCTIONS).not.toContain("Use two channels");
+  });
+
   it("appends commentary guidance for openai provider when enabled", () => {
     const out = maybeAppendResponseCommentaryPrompt({
       baseSystemPrompt: "Base prompt",

@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 
-import { analyzeBashCommand } from "@stanley2058/lilac-bash-safety";
+import { analyzeBashCommand, type BashSafetyCode } from "@stanley2058/lilac-bash-safety";
 import { expandTilde } from "@stanley2058/lilac-fs";
 import { tool, type ToolSet } from "ai";
 import { Panic, Result, type Result as ResultType } from "better-result";
@@ -27,7 +27,13 @@ const DEFAULT_OUTPUT_CAP_BYTES = 40 * 1024;
 const HARD_KILL_DELAY_MS = 500;
 
 export type BashExecutionError =
-  | { type: "blocked"; reason: string; segment?: string }
+  | {
+      type: "blocked";
+      code: BashSafetyCode;
+      reason: string;
+      hint?: string;
+      segment?: string;
+    }
   | { type: "aborted"; signal: "SIGTERM" }
   | {
       type: "timeout";
@@ -624,6 +630,7 @@ export async function executeLocalBash(
   if (analysis || blockedPath || cwdBlockReason) {
     const reason =
       analysis?.reason ?? cwdBlockReason ?? `Access denied: '${blockedPath}' is protected`;
+    const code = analysis?.code ?? "protected_path";
     return {
       stdout: "",
       stderr: reason,
@@ -632,7 +639,9 @@ export async function executeLocalBash(
       stderrTruncated: false,
       executionError: {
         type: "blocked",
+        code,
         reason,
+        ...(analysis?.hint ? { hint: analysis.hint } : {}),
         ...(analysis ? { segment: analysis.segment } : {}),
       },
     };

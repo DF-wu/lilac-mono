@@ -65,8 +65,8 @@ function analyzeCommandAtCwd(
         { cwd: effectiveCwd },
       ),
     err: () => () => {
-      const reason = dangerousReasonInText(command, options);
-      return reason ? { reason, segment: command } : null;
+      const violation = dangerousReasonInText(command, options);
+      return violation ? { ...violation, segment: command } : null;
     },
   });
   return continueAnalysis();

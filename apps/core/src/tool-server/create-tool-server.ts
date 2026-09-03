@@ -7,8 +7,6 @@ import {
   isPanic,
   isRecord,
   isNativeSubagentProfile,
-  profileIncludes,
-  resolveNativeSubagentProfile,
   type CoreConfig,
   type NativeSubagentProfile,
 } from "@stanley2058/lilac-utils";
@@ -38,6 +36,8 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+
+import { isLevel2ContributionAllowedForNativeProfile } from "../plugins/profile-authority";
 
 import {
   BridgeFnRequest,
@@ -932,11 +932,12 @@ export function createToolServer(options: ToolServerOptions) {
     if (!options.getConfig) return options.pluginManager === undefined;
     const contribution = level2ContributionMapping.get(callableId);
     if (!contribution) return false;
-    const profile = resolveNativeSubagentProfile(await options.getConfig(), ctx.subagentProfile);
-    return (
-      profileIncludes(profile.level2.plugins, contribution.pluginId) &&
-      profileIncludes(profile.level2.callables, callableId)
-    );
+    return isLevel2ContributionAllowedForNativeProfile({
+      config: await options.getConfig(),
+      profileName: ctx.subagentProfile,
+      pluginId: contribution.pluginId,
+      callableId,
+    });
   }
 
   function isCallableAllowedForControlCapability(callableId: string, ctx: RequestContext): boolean {

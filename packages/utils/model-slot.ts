@@ -351,7 +351,11 @@ function withOpenAIParallelToolCallsDefault(
   };
 }
 
-function buildProviderOptionsResult(params: { provider: string; options?: JSONObject }): ResultType<
+function buildProviderOptionsResult(params: {
+  provider: string;
+  options?: JSONObject;
+  basePrompt?: string;
+}): ResultType<
   {
     providerOptions?: { [x: string]: JSONObject };
     responseCommentary?: boolean;
@@ -376,6 +380,10 @@ function buildProviderOptionsResult(params: { provider: string; options?: JSONOb
   const codexInstructions =
     typeof codex_instructions === "string" && codex_instructions.length > 0
       ? codex_instructions
+      : undefined;
+  const basePrompt =
+    typeof params.basePrompt === "string" && params.basePrompt.length > 0
+      ? params.basePrompt
       : undefined;
 
   const responseCommentary =
@@ -425,12 +433,7 @@ function buildProviderOptionsResult(params: { provider: string; options?: JSONOb
   // Codex: ensure OpenAI namespace exists + has instructions.
   const openaiKey = "openai";
   const existing = providerOptions?.[openaiKey] ?? {};
-  const existingInstructions =
-    typeof existing.instructions === "string" && existing.instructions.length > 0
-      ? existing.instructions
-      : undefined;
-
-  const resolvedInstructions = existingInstructions ?? codexInstructions ?? CODEX_BASE_INSTRUCTIONS;
+  const resolvedInstructions = codexInstructions ?? basePrompt ?? CODEX_BASE_INSTRUCTIONS;
 
   const nextOpenAI = {
     ...existing,
@@ -548,6 +551,7 @@ function resolveModelResult(params: {
   alias?: string;
   options?: JSONObject;
   reasoning?: ModelReasoningEffort;
+  basePrompt?: string;
 }): ResultType<ResolvedModelRef, ModelResolutionFailed> {
   const parsed = parseModelSpecifierResult(params.spec);
   const parsedSpec = parsed.match<{ provider: string; model: string } | string>({
@@ -568,6 +572,7 @@ function resolveModelResult(params: {
   const builtOptions = buildProviderOptionsResult({
     provider,
     options: params.options,
+    basePrompt: params.basePrompt,
   });
   const options = builtOptions.match<
     | {
@@ -655,6 +660,7 @@ export function resolveModelRefResult(
     alias: baseValue.alias,
     options: mergedOptions,
     reasoning,
+    basePrompt: cfg.basePrompt,
   });
 }
 
@@ -820,6 +826,7 @@ export function resolveModelSlotResult(
     alias,
     options: mergedOptions,
     reasoning,
+    basePrompt: cfg.basePrompt,
   });
   const resolvedValue = resolved.match<ResolvedModelRef | ModelResolutionFailed>({
     ok: (value) => value,

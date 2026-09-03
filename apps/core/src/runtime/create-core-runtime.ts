@@ -37,6 +37,7 @@ import {
   type EventDeliveryLogContext,
   type EventDeliveryLogger,
   type LilacBus,
+  type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
 
 import { DiscordAdapter } from "../surface/discord/discord-adapter";
@@ -151,6 +152,11 @@ import {
   type AgentRunRecoveryHead,
 } from "../surface/bridge/agent-run-journal";
 import { createCoreToolPluginManager, type CoreToolPluginManager } from "../plugins";
+import {
+  createDiscordContextReportProvider,
+  DiscordContextReportFailed,
+  type DiscordContextReportProvider,
+} from "../surface/discord/discord-context-report";
 import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
 import { loadOrCreateCoreDeadLetterKey, type CoreDeadLetterKeyError } from "./core-dead-letter-key";
@@ -183,6 +189,8 @@ import type { SurfacePrincipal } from "../surface/types";
 import { composeBuiltinSurfaceRuntimes } from "./compose-builtin-surface-runtimes";
 import { createCoreBlobStore, type CoreBlobStoreCreateError } from "./create-core-blob-store";
 import { prewarmFffFinders } from "@stanley2058/lilac-fs";
+import { SqliteQuestionStore } from "../question/question-store";
+import { QuestionService } from "../question/question-service";
 import {
   adaptToolResultArtifactStoreInitToHost,
   createToolResultArtifactStore,
@@ -681,7 +689,8 @@ export function removeFullyReconciledAgentRunTerminalHeads(input: {
   readonly heads: ReadonlyMap<string, AgentRunRecoveryHead>;
   readonly requestDeliveryStore: Pick<CoreRequestDeliveryStore, "load">;
   readonly journal: Pick<AgentRunJournal, "removeReconciled">;
-}): void {
+}): readonly string[] {
+  const removedRunIds: string[] = [];
   for (const [runId, head] of input.heads) {
     if (head.state !== "terminal" || !head.terminalOutcome) continue;
     const terminalOutcome = head.terminalOutcome;
@@ -705,8 +714,66 @@ export function removeFullyReconciledAgentRunTerminalHeads(input: {
         }),
     );
     if (!retainedAreTerminal) continue;
-    input.journal.removeReconciled(runId);
+    input.journal.removeReconciled(runId).match({
+      ok: () => removedRunIds.push(runId),
+      err: () => undefined,
+    });
   }
+  return removedRunIds;
+}
+
+export type AgentRunCheckpointBlobRecoveryDecision =
+  | { readonly kind: "retained" }
+  | {
+      readonly kind: "reset";
+      readonly reconciliationError: Error;
+      readonly cleanupError?: Error;
+    }
+  | {
+      readonly kind: "disabled";
+      readonly reconciliationError: Error;
+      readonly resetError: Error;
+    };
+
+export function recoverAgentRunCheckpointBlobReferences<
+  TReconciliationError extends Error,
+  TResetError extends Error,
+>(input: {
+  readonly heads: ReadonlyMap<string, AgentRunRecoveryHead>;
+  readonly reconcile: (checkpoints: {
+    readonly checkpoints: readonly {
+      readonly requestDeliveryId: string;
+      readonly messages: readonly StoredMessageV1[];
+    }[];
+  }) => ResultType<void, TReconciliationError>;
+  readonly resetAll: () => ResultType<void, TResetError>;
+}): AgentRunCheckpointBlobRecoveryDecision {
+  const checkpoints = [...input.heads.values()].flatMap((head) =>
+    head.checkpoint
+      ? [
+          {
+            requestDeliveryId: head.handle.runId,
+            messages: [...head.checkpoint.messages, ...(head.previousCheckpoint?.messages ?? [])],
+          },
+        ]
+      : [],
+  );
+  const reconciliationError = input
+    .reconcile({ checkpoints })
+    .match({ ok: () => null, err: (error) => error });
+  if (!reconciliationError) return { kind: "retained" };
+
+  const resetError = input.resetAll().match({ ok: () => null, err: (error) => error });
+  if (resetError) return { kind: "disabled", reconciliationError, resetError };
+
+  const cleanupError = input
+    .reconcile({ checkpoints: [] })
+    .match({ ok: () => undefined, err: (error) => error });
+  return {
+    kind: "reset",
+    reconciliationError,
+    ...(cleanupError ? { cleanupError } : {}),
+  };
 }
 
 export type AgentRunAcceptedRecoveryDecision =
@@ -1923,6 +1990,7 @@ export async function createCoreRuntime(
   let blobStore: BlobStore | null = blobStoreCreation.store;
   let requestDeliveryStore: ReturnType<typeof createCoreRequestDelivery>["store"] | null = null;
   let agentRunJournal: SqliteAgentRunJournal | null = null;
+  let questionStore: SqliteQuestionStore | null = null;
   let durableWorkflowStore: DurableWorkflowStore | null = null;
   let transcriptStore: SqliteTranscriptStore | null = null;
   let resourceService: CoreResourceService | null = null;
@@ -1954,6 +2022,15 @@ export async function createCoreRuntime(
         ? async () => {
             agentRunJournal?.close();
             agentRunJournal = null;
+          }
+        : undefined,
+    );
+    await cleanup.run(
+      "questionStore.createFailure.close",
+      questionStore
+        ? async () => {
+            questionStore?.close();
+            questionStore = null;
           }
         : undefined,
     );
@@ -2077,6 +2154,37 @@ export async function createCoreRuntime(
       });
     },
   });
+  const questionStoreCreation = Result.try({
+    try: () =>
+      new SqliteQuestionStore({
+        dbPath: path.join(env.dataDir, "request-delivery.db"),
+      }),
+    catch: captureRuntimeError,
+  }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Question store creation failed"),
+  );
+  const questionStoreError = questionStoreCreation.match({
+    ok: (store) => {
+      questionStore = store;
+      return null;
+    },
+    err: (error) => error,
+  });
+  if (questionStoreError) {
+    if (isPanic(questionStoreError)) {
+      return finishCoreRuntimeCreateFailure({ kind: "panic", panic: questionStoreError });
+    }
+    return finishCoreRuntimeCreateFailure({
+      kind: "result",
+      result: Result.err(
+        new CoreRuntimeCreateFailed({
+          operation: "request-delivery",
+          cause: questionStoreError,
+          message: "Question store creation failed",
+        }),
+      ),
+    });
+  }
   const durableStoresCreated = Result.try({
     try: () => {
       const discordSearchDbPath = resolveDiscordSearchDbPath();
@@ -2256,8 +2364,24 @@ export async function createCoreRuntime(
     logger.warn("custom command skipped", { warning });
   }
 
+  let pluginManager: CoreToolPluginManager | null = null;
+  let contextReportProvider: DiscordContextReportProvider | null = null;
+  const buildContextReport: DiscordContextReportProvider = (request) => {
+    const provider = contextReportProvider;
+    return provider
+      ? provider(request)
+      : Promise.resolve(
+          Result.err(
+            new DiscordContextReportFailed({
+              stage: "tools",
+              message: "Context reporting is not ready yet",
+            }),
+          ),
+        );
+  };
   const adapter = new DiscordAdapter({
     customCommands,
+    contextReport: buildContextReport,
     reportFatalPanic: reportFatalError,
   });
   const githubAdapter = new GithubAdapter();
@@ -2288,6 +2412,7 @@ export async function createCoreRuntime(
   let workflowTriggerScheduler: WorkflowTriggerScheduler | null = null;
   let workflowLiveParentBridge: WorkflowLiveParentBridge | null = null;
   let workflowSubagentDispatcher: WorkflowSubagentDispatcher | null = null;
+  let questionService: QuestionService | null = null;
   let stopAgentRunner: Awaited<ReturnType<typeof startBusAgentRunner>> | null = null;
   let stopHeartbeat: HeartbeatService | null = null;
   let stopConversationThreadWorker: Awaited<
@@ -2301,7 +2426,6 @@ export async function createCoreRuntime(
 
   let requestMessageCache: RequestMessageCache | null = null;
   const requestControlAuthority = new RequestControlAuthority();
-  let pluginManager: CoreToolPluginManager | null = null;
   const mcpConfigPath = resolveMcpConfigPath({ dataDir: env.dataDir });
   const mcpOAuthProviders = new McpOAuthProviderService({
     dataDir: env.dataDir,
@@ -2946,6 +3070,7 @@ export async function createCoreRuntime(
           }
           const registryCreated = composeBuiltinSurfaceRuntimes({
             discordAdapter: adapter,
+            discordQuestionAnswers: adapter,
             githubAdapter,
             descriptorBoundDiscordEventSource: discordEventSource,
             discordHealth: createDiscordRuntimeHealthPort(adapter),
@@ -3254,12 +3379,50 @@ export async function createCoreRuntime(
           });
           await workflowWaitResolver.start();
 
+          const activeQuestionStore = questionStore;
+          if (!activeQuestionStore) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: undefined,
+                  message: "Question store is unavailable",
+                }),
+              ),
+            };
+          }
+          questionService = new QuestionService({
+            store: activeQuestionStore,
+            surfaces: registry.questionResolver(),
+            logger,
+          });
+          const questionsStarted = await questionService.start();
+          const questionStartError = questionsStarted.match({
+            ok: () => null,
+            err: (error) => error,
+          });
+          if (questionStartError) {
+            return {
+              kind: "result",
+              result: Result.err(
+                new CoreRuntimeStartFailed({
+                  operation: "startup",
+                  cause: questionStartError,
+                  message: questionStartError.message,
+                }),
+              ),
+            };
+          }
+
           await connectAndValidateSurfaceAdapters({
             registry,
             connected: connectedSurfaceAdapters,
           });
 
           logger.debug("Surface adapters connected");
+
+          await questionService.finishStartupRecovery();
 
           workflowProgressProjector = new WorkflowProgressProjector({
             bus: durableBus,
@@ -3344,6 +3507,7 @@ export async function createCoreRuntime(
               requestDelivery: discordRequestDelivery,
               subscriptionId: subId(subscriptionPrefix, "router"),
               customCommands,
+              contextReport: buildContextReport,
               shouldSuppressAdapterEvent: async ({ evt }) =>
                 shouldSuppressRouterForWorkflowReply({
                   store: activeDurableWorkflowStore,
@@ -3436,12 +3600,18 @@ export async function createCoreRuntime(
               toolResultArtifacts,
               durableWorkflowStore: activeDurableWorkflowStore,
               workflowProgressCards: workflowProgressProjector,
+              questions: questionService,
               mcpRegistry,
               mcpOAuthProviders,
               mcpOAuthCallback,
               mcpConfigPath,
             },
             dataDir: env.dataDir,
+          });
+          contextReportProvider = createDiscordContextReportProvider({
+            pluginManager,
+            transcriptStore: transcriptStore ?? undefined,
+            cwd: canonicalWorkspaceRoot,
           });
 
           toolServer = createToolServer({
@@ -3557,7 +3727,79 @@ export async function createCoreRuntime(
               journalRecoveryJoin = joined;
             }
           }
-          const journalRecoveryHeads = journalRecoveryJoin.heads;
+          let journalRecoveryHeads = journalRecoveryJoin.heads;
+          const reconcileCheckpointBlobs = transcriptStore?.reconcileAgentRunCheckpointBlobs;
+          if (agentRunJournal && transcriptStore && reconcileCheckpointBlobs) {
+            const recoveryJournal = agentRunJournal;
+            const recoveryDecision = recoverAgentRunCheckpointBlobReferences({
+              heads: journalRecoveryHeads,
+              reconcile: (checkpoints) =>
+                reconcileCheckpointBlobs.call(transcriptStore, checkpoints),
+              resetAll: () => recoveryJournal.resetAll(),
+            });
+            const applyBlobReferenceRecoveryFailure = (
+              decision: Exclude<
+                AgentRunCheckpointBlobRecoveryDecision,
+                { readonly kind: "retained" }
+              >,
+            ): void => {
+              if (TaggedError.is(decision.reconciliationError)) {
+                logger.warn(
+                  "Agent run journal recovery reset after blob reference failure",
+                  formatTaggedErrorForLog(decision.reconciliationError),
+                );
+              } else {
+                logger.warn("Agent run journal recovery reset after blob reference failure", {
+                  errorTag: "CoreOwnedBlobIntegrityError",
+                  errorMessage: "Agent run checkpoint blob reference reconciliation failed",
+                });
+              }
+              journalRecoveryJoin = emptyAgentRunRecoveryJoin();
+              journalRecoveryHeads = new Map();
+              if (decision.kind === "reset") {
+                if (decision.cleanupError) {
+                  if (TaggedError.is(decision.cleanupError)) {
+                    logger.warn(
+                      "Agent run checkpoint blob reference cleanup deferred",
+                      formatTaggedErrorForLog(decision.cleanupError),
+                    );
+                  } else {
+                    logger.warn("Agent run checkpoint blob reference cleanup deferred", {
+                      errorTag: "CoreOwnedBlobIntegrityError",
+                      errorMessage: "Agent run checkpoint blob reference cleanup failed",
+                    });
+                  }
+                }
+                return;
+              }
+              if (TaggedError.is(decision.resetError)) {
+                logger.warn(
+                  "Agent run journal disabled after blob reference reset failure",
+                  formatTaggedErrorForLog(decision.resetError),
+                );
+              } else {
+                logger.warn("Agent run journal disabled after blob reference reset failure", {
+                  errorTag: "AgentRunJournalSqliteFailure",
+                  errorMessage: "Agent run journal reset failed",
+                });
+              }
+              const disabledJournal = recoveryJournal;
+              Result.try({
+                try: () => disabledJournal.close(),
+                catch: captureRuntimeError,
+              });
+              agentRunJournal = null;
+            };
+            switch (recoveryDecision.kind) {
+              case "retained":
+                break;
+              case "reset":
+              case "disabled": {
+                applyBlobReferenceRecoveryFailure(recoveryDecision);
+                break;
+              }
+            }
+          }
 
           // Start agent runner last so it can't publish replies before relay is online.
           const startedAgentRunner = await startBusAgentRunner({
@@ -3690,11 +3932,22 @@ export async function createCoreRuntime(
             };
           }
           if (agentRunJournal && requestDeliveryStore) {
-            removeFullyReconciledAgentRunTerminalHeads({
+            const removedRunIds = removeFullyReconciledAgentRunTerminalHeads({
               heads: journalRecoveryHeads,
               requestDeliveryStore,
               journal: agentRunJournal,
             });
+            for (const requestDeliveryId of removedRunIds) {
+              const releaseError = transcriptStore
+                ?.releaseAgentRunCheckpointBlobs?.({ requestDeliveryId })
+                .match({ ok: () => null, err: (error) => error });
+              if (releaseError) {
+                logger.warn(
+                  "Agent run checkpoint blob reference cleanup deferred",
+                  formatTaggedErrorForLog(releaseError),
+                );
+              }
+            }
           }
 
           const recoverableRootParentRequestIds =
@@ -3973,6 +4226,8 @@ export async function createCoreRuntime(
     if (stopPass === "full") {
       // Stop in reverse order (best-effort).
       await safe("agentRunner.stop", () => stopAgentRunner?.stop() ?? Promise.resolve());
+      await safe("questionService.stop", () => questionService?.stop() ?? Promise.resolve());
+      questionService = null;
       await safe(
         "workflowLiveParentBridge.stop",
         () => workflowLiveParentBridge?.stop() ?? Promise.resolve(),
@@ -4104,6 +4359,10 @@ export async function createCoreRuntime(
       await safe("agentRunJournal.close", async () => {
         agentRunJournal?.close();
         agentRunJournal = null;
+      });
+      await safe("questionStore.close", async () => {
+        questionStore?.close();
+        questionStore = null;
       });
       await safe("requestDeliveryStore.close", async () => {
         requestDeliveryStore?.close();

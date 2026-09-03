@@ -10,6 +10,7 @@ import {
   stripExpansionMarkers,
 } from "./shell";
 import { hasRecursiveFlag } from "./analyze/rm-flags";
+import { bashSafetyViolation, type BashSafetyViolation } from "./types";
 
 const REASON_GIT_METADATA =
   "destructive changes to active .git metadata are blocked to prevent repository corruption.";
@@ -63,7 +64,7 @@ function readGitMetadataFile(markerPath: string): ResultType<string, GitMetadata
 export function analyzeDestructiveFilesystemCommand(
   tokens: readonly string[],
   cwd: string | null | undefined,
-): string | null {
+): BashSafetyViolation | null {
   const command = getBasename(stripExpansionMarkers(tokens[0] ?? "")).toLowerCase();
 
   const { mutationTargets, treeRemovalTargets } = extractGitMetadataMutationTargets(
@@ -74,26 +75,28 @@ export function analyzeDestructiveFilesystemCommand(
     mutationTargets.some((target) => isActiveGitMetadataPath(target, cwd, false)) ||
     treeRemovalTargets.some((target) => isActiveGitMetadataPath(target, cwd, true))
   ) {
-    return REASON_GIT_METADATA;
+    return bashSafetyViolation("protected_git_metadata", REASON_GIT_METADATA);
   }
 
   if (command === "dd") {
     for (const token of tokens.slice(1)) {
       if (!token.startsWith("of=")) continue;
-      if (isStaticDevicePath(token.slice(3), cwd)) return REASON_DD_DEVICE;
+      if (isStaticDevicePath(token.slice(3), cwd)) {
+        return bashSafetyViolation("device_write", REASON_DD_DEVICE);
+      }
     }
   }
 
   if (MKFS_COMMAND.test(command)) {
     const targets = extractOperands(tokens);
     if (targets.some((target) => isStaticDevicePath(target, cwd))) {
-      return REASON_MKFS_DEVICE;
+      return bashSafetyViolation("device_format", REASON_MKFS_DEVICE);
     }
   }
 
   if (command === "shred") {
     const targets = extractShredTargets(tokens);
-    if (targets.some(isStaticPath)) return REASON_SHRED;
+    if (targets.some(isStaticPath)) return bashSafetyViolation("shred", REASON_SHRED);
   }
 
   return null;
@@ -146,8 +149,10 @@ function mutationTargets(targets: string[]): {
 export function analyzeGitMetadataOutputPath(
   target: string,
   cwd: string | null | undefined,
-): string | null {
-  return isActiveGitMetadataPath(target, cwd, false) ? REASON_GIT_METADATA : null;
+): BashSafetyViolation | null {
+  return isActiveGitMetadataPath(target, cwd, false)
+    ? bashSafetyViolation("protected_git_metadata", REASON_GIT_METADATA)
+    : null;
 }
 
 function extractOperands(tokens: readonly string[]): string[] {

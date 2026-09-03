@@ -1,13 +1,14 @@
 import { DYNAMIC_EXPANSION_MARKER } from "../shell";
+import type { BashSafetyViolation } from "../types";
 
 export interface XargsAnalyzeContext {
-  analyzeCommand: (tokens: string[]) => string | null;
+  analyzeCommand: (tokens: string[]) => BashSafetyViolation | null;
 }
 
 export function analyzeXargs(
   tokens: readonly string[],
   context: XargsAnalyzeContext,
-): string | null {
+): BashSafetyViolation | null {
   const { childTokens, replacementToken } = extractXargsChildCommandWithInfo(tokens);
   if (childTokens.length === 0) return null;
 

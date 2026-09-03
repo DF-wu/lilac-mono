@@ -1,5 +1,7 @@
 import {
   type AnalyzeOptions,
+  bashSafetyViolation,
+  type BashSafetyViolation,
   INTERPRETERS,
   PARANOID_INTERPRETERS_SUFFIX,
   SHELL_WRAPPERS,
@@ -141,7 +143,10 @@ const SENSITIVE_PATH_CONSUMERS = new Set([
 
 export type SegmentAnalyzeOptions = AnalyzeOptions & {
   effectiveCwd: string | null | undefined;
-  analyzeNested: (command: string, effectiveCwd?: string | null | undefined) => string | null;
+  analyzeNested: (
+    command: string,
+    effectiveCwd?: string | null | undefined,
+  ) => BashSafetyViolation | null;
 };
 
 function deriveCwdContext(options: Pick<SegmentAnalyzeOptions, "cwd" | "effectiveCwd">): {
@@ -155,7 +160,10 @@ function deriveCwdContext(options: Pick<SegmentAnalyzeOptions, "cwd" | "effectiv
   return { cwdUnknown, cwdForRm, originalCwd };
 }
 
-export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions): string | null {
+export function analyzeSegment(
+  tokens: string[],
+  options: SegmentAnalyzeOptions,
+): BashSafetyViolation | null {
   if (tokens.length === 0) {
     return null;
   }
@@ -288,7 +296,10 @@ export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions)
     const codeArg = extractInterpreterCodeArg(staticTokens);
     if (codeArg) {
       if (options.paranoidInterpreters) {
-        return REASON_INTERPRETER_BLOCKED + PARANOID_INTERPRETERS_SUFFIX;
+        return bashSafetyViolation(
+          "interpreter_one_liner",
+          REASON_INTERPRETER_BLOCKED + PARANOID_INTERPRETERS_SUFFIX,
+        );
       }
     }
   }
@@ -324,7 +335,11 @@ export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions)
       hasRecursiveForceFlags(staticTokens) &&
       hasDynamicRmTarget(stripped.slice(commandIndex + 1))
     ) {
-      return REASON_DYNAMIC_RM_TARGET;
+      return bashSafetyViolation(
+        "dynamic_recursive_delete",
+        REASON_DYNAMIC_RM_TARGET,
+        "Remove known literal child paths, then use rmdir for an empty directory.",
+      );
     }
 
     const rmResult = hasRecursiveFlag(stripped)
@@ -827,11 +842,17 @@ function unwrapChrt(tokens: readonly string[]): string[] | null {
   return tokens.slice(i);
 }
 
-export function analyzeSensitiveTokens(tokens: readonly string[]): string | null {
+export function analyzeSensitiveTokens(tokens: readonly string[]): BashSafetyViolation | null {
   for (const token of tokens) {
     if (!token) continue;
     for (const { re, reason } of SENSITIVE_TOKEN_PATTERNS) {
-      if (re.test(token)) return reason;
+      if (re.test(token)) {
+        return bashSafetyViolation(
+          "protected_path",
+          reason,
+          "Choose a source or destination outside the protected location.",
+        );
+      }
     }
   }
   return null;
@@ -842,7 +863,7 @@ export function analyzeProtectedPathTokens(
   options: Pick<SegmentAnalyzeOptions, "cwd" | "effectiveCwd" | "protectedPaths"> & {
     readonly inspectAttachedDirectoryOption?: boolean;
   },
-): string | null {
+): BashSafetyViolation | null {
   if (!options.protectedPaths || options.protectedPaths.length === 0) return null;
 
   const effectiveCwd =
@@ -883,7 +904,11 @@ export function analyzeProtectedPathTokens(
           resolvedCandidate === protectedPath ||
           relative(protectedPath, resolvedCandidate).split(sep)[0] !== ".."
         ) {
-          return "access to a configured protected path";
+          return bashSafetyViolation(
+            "protected_path",
+            "access to a configured protected path",
+            "Choose a source or destination outside the protected location.",
+          );
         }
       }
     }

@@ -1,11 +1,12 @@
 import { getBasename, stripWrappers } from "../shell";
+import { bashSafetyViolation, type BashSafetyViolation } from "../types";
 
 import { hasRecursiveForceFlags } from "./rm-flags";
 
 const REASON_FIND_DELETE = "find -delete permanently removes files. Use -print first to preview.";
 
 export interface AnalyzeFindOptions {
-  analyzeCommand?: (tokens: string[], cwdUnknown: boolean) => string | null;
+  analyzeCommand?: (tokens: string[], cwdUnknown: boolean) => BashSafetyViolation | null;
 }
 
 const FIND_EXEC_ACTIONS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
@@ -13,9 +14,9 @@ const FIND_EXEC_ACTIONS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
 export function analyzeFind(
   tokens: readonly string[],
   options: AnalyzeFindOptions = {},
-): string | null {
+): BashSafetyViolation | null {
   if (findHasDelete(tokens.slice(1))) {
-    return REASON_FIND_DELETE;
+    return bashSafetyViolation("find_delete", REASON_FIND_DELETE);
   }
 
   for (let i = 0; i < tokens.length; i++) {
@@ -41,7 +42,11 @@ export function analyzeFind(
           }
 
           if (head === "rm" && hasRecursiveForceFlags(execCommand)) {
-            return "find -exec rm -rf is dangerous. Use explicit file list instead.";
+            return bashSafetyViolation(
+              "dynamic_recursive_delete",
+              "find -exec rm -rf is dangerous. Use explicit file list instead.",
+              "Remove known literal child paths, then use rmdir for an empty directory.",
+            );
           }
         }
       }

@@ -56,7 +56,6 @@ import {
   decodeSurfaceMessageLinkRow as decodePersistedSurfaceMessageLinkRow,
   decodeTranscriptCompactionContext as decodePersistedTranscriptCompactionContext,
   decodeTranscriptMessages as decodePersistedTranscriptMessages,
-  decodeTranscriptProviderState as decodePersistedTranscriptProviderState,
   decodeTranscriptRow as decodePersistedTranscriptRow,
   defaultStoredBlobFilename,
   hashCanonicalStoredMessagesV2,
@@ -114,12 +113,6 @@ function decodeTranscriptCompactionContext(
   input: Parameters<typeof decodePersistedTranscriptCompactionContext>[0],
 ) {
   return decodePersistedTranscriptCompactionContext(input);
-}
-
-function decodeTranscriptProviderState(
-  input: Parameters<typeof decodePersistedTranscriptProviderState>[0],
-) {
-  return decodePersistedTranscriptProviderState(input);
 }
 
 function decodeRecentAgentWriteRow(
@@ -331,6 +324,7 @@ type TranscriptRow = {
   provider_state_json: string | null;
   stable_named_request_client: string | null;
   transcript_digest: string | null;
+  loaded_catalog_ids_json: string | null;
 };
 
 type CoreOwnedBlobRow = {
@@ -480,6 +474,7 @@ export type TranscriptSnapshot = {
   stableNamedRequestClient?: AdapterPlatform;
   canonicalHashVersion?: typeof CORE_TRANSCRIPT_DIGEST_VERSION;
   transcriptDigest?: string;
+  loadedCatalogIds?: string[];
 };
 
 export type CoreOwnedBlobReference = {
@@ -499,6 +494,15 @@ export type CoreOwnedBlobMaintenanceSummary = {
   readonly retained: number;
   readonly failed: number;
 };
+
+export type AgentRunCheckpointBlobOwner = {
+  readonly requestDeliveryId: string;
+  readonly messages: readonly StoredMessageV1[];
+};
+
+export type AgentRunCheckpointBlobReferenceError =
+  | CoreOwnedBlobIntegrityError
+  | TranscriptStoreSqliteDriverFailure;
 
 export type CoreSurfaceProjectionKey = {
   readonly requestClient: AdapterPlatform;
@@ -1025,6 +1029,7 @@ export type TranscriptStore = {
     providerState?: HistoryProviderState;
     stableNamedRequestClient?: AdapterPlatform;
     corePrimaryLineage?: CoreLineageManifestV2;
+    loadedCatalogIds?: readonly string[];
   }): ResultType<void, TranscriptStoreWriteError>;
 
   putCoreOwnedBlob?(input: {
@@ -1044,6 +1049,22 @@ export type TranscriptStore = {
     limit: number;
     now?: number;
   }): Promise<ResultType<CoreOwnedBlobMaintenanceSummary, CoreOwnedBlobIntegrityError>>;
+
+  retainAgentRunCheckpointBlobs?(
+    input: AgentRunCheckpointBlobOwner,
+  ): ResultType<void, AgentRunCheckpointBlobReferenceError>;
+
+  replaceAgentRunCheckpointBlobs?(
+    input: AgentRunCheckpointBlobOwner,
+  ): ResultType<void, AgentRunCheckpointBlobReferenceError>;
+
+  releaseAgentRunCheckpointBlobs?(input: {
+    readonly requestDeliveryId: string;
+  }): ResultType<void, TranscriptStoreSqliteDriverFailure>;
+
+  reconcileAgentRunCheckpointBlobs?(input: {
+    readonly checkpoints: readonly AgentRunCheckpointBlobOwner[];
+  }): ResultType<void, AgentRunCheckpointBlobReferenceError>;
 
   admitCoreSurfaceProjection?(
     input: AdmitCoreSurfaceProjection,
@@ -1213,14 +1234,6 @@ export type TranscriptStore = {
 
   listDiscoveryRecords?(): TranscriptDiscoveryRecord[];
 
-  selectSessionToolIds?(input: {
-    requestClient: AdapterPlatform;
-    sessionId: string;
-    catalogIds: readonly string[];
-  }): void;
-
-  listSessionToolIds?(input: { requestClient: AdapterPlatform; sessionId: string }): string[];
-
   close(): void;
 };
 
@@ -1366,7 +1379,8 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         context_meta_json TEXT,
         provider_state_json TEXT,
         stable_named_request_client TEXT,
-        transcript_digest TEXT
+        transcript_digest TEXT,
+        loaded_catalog_ids_json TEXT
       );
     `);
 
@@ -1418,6 +1432,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         ["provider_state_json", "TEXT"],
         ["stable_named_request_client", "TEXT"],
         ["transcript_digest", "TEXT"],
+        ["loaded_catalog_ids_json", "TEXT"],
       ] as const) {
         if (!transcriptColumns.some((entry) => entry.name === column[0])) {
           this.db.run(`ALTER TABLE request_transcripts ADD COLUMN ${column[0]} ${column[1]}`);
@@ -1449,21 +1464,6 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       CREATE INDEX IF NOT EXISTS idx_surface_message_to_request_request
       ON surface_message_to_request(request_id);
     `);
-
-      this.db.run(`
-      CREATE TABLE IF NOT EXISTS session_loaded_tools (
-        request_client TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        catalog_id TEXT NOT NULL,
-        selected_ts INTEGER NOT NULL,
-        PRIMARY KEY (request_client, session_id, catalog_id)
-      );
-    `);
-
-      this.db.run(`
-      CREATE INDEX IF NOT EXISTS idx_session_loaded_tools_session
-      ON session_loaded_tools(request_client, session_id);
-      `);
 
       this.db.run(`
         CREATE TABLE IF NOT EXISTS core_named_claude_bindings (
@@ -1893,6 +1893,31 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           [8, Date.now()],
         );
       }
+      if (version < 9) {
+        this.db.run(`
+          CREATE TABLE core_agent_run_checkpoint_blobs (
+            request_delivery_id TEXT NOT NULL CHECK (length(request_delivery_id) > 0),
+            blob_owner_id TEXT NOT NULL
+              REFERENCES core_owned_blobs(owner_id) ON DELETE RESTRICT,
+            PRIMARY KEY (request_delivery_id, blob_owner_id)
+          )
+        `);
+        this.db.run(`
+          CREATE INDEX idx_core_agent_run_checkpoint_blobs_blob
+          ON core_agent_run_checkpoint_blobs(blob_owner_id)
+        `);
+        this.db.run(
+          "INSERT INTO transcript_schema_migrations (version, applied_ts) VALUES (?, ?)",
+          [9, Date.now()],
+        );
+      }
+      if (version < 10) {
+        this.db.run("DROP TABLE IF EXISTS session_loaded_tools");
+        this.db.run(
+          "INSERT INTO transcript_schema_migrations (version, applied_ts) VALUES (?, ?)",
+          [10, Date.now()],
+        );
+      }
       const foreignKeyFailures = this.db
         .query<DecodedTranscriptForeignKeyFailureRow, []>("PRAGMA foreign_key_check")
         .all()
@@ -1931,47 +1956,6 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     migrate.immediate();
   }
 
-  selectSessionToolIds(input: {
-    requestClient: AdapterPlatform;
-    sessionId: string;
-    catalogIds: readonly string[];
-  }): void {
-    if (input.catalogIds.length === 0) return;
-
-    const selectedTs = Date.now();
-    const select = this.db.transaction(() => {
-      for (const catalogId of input.catalogIds) {
-        this.db.run(
-          `
-          INSERT INTO session_loaded_tools (
-            request_client, session_id, catalog_id, selected_ts
-          ) VALUES (?, ?, ?, ?)
-          ON CONFLICT(request_client, session_id, catalog_id) DO UPDATE SET
-            selected_ts=excluded.selected_ts;
-          `,
-          [input.requestClient, input.sessionId, catalogId, selectedTs],
-        );
-      }
-    });
-
-    select();
-  }
-
-  listSessionToolIds(input: { requestClient: AdapterPlatform; sessionId: string }): string[] {
-    const rows = this.db
-      .query<{ catalog_id: string }, [AdapterPlatform, string]>(
-        `
-        SELECT catalog_id
-        FROM session_loaded_tools
-        WHERE request_client = ? AND session_id = ?
-        ORDER BY catalog_id ASC
-        `,
-      )
-      .all(input.requestClient, input.sessionId);
-
-    return rows.map((row) => row.catalog_id);
-  }
-
   saveRequestTranscript(input: {
     requestId: string;
     sessionId: string;
@@ -1983,6 +1967,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     providerState?: HistoryProviderState;
     stableNamedRequestClient?: AdapterPlatform;
     corePrimaryLineage?: CoreLineageManifestV2;
+    loadedCatalogIds?: readonly string[];
   }): ResultType<void, TranscriptStoreWriteError> {
     const now = Date.now();
     const preparedMessages = Result.gen(function* () {
@@ -2006,6 +1991,9 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     const blobReferences = preparation.blobReferences;
     const providerState = input.providerState ?? null;
     const stableNamedRequestClient = input.stableNamedRequestClient ?? null;
+    const loadedCatalogIds = input.loadedCatalogIds
+      ? [...new Set(input.loadedCatalogIds)].sort((left, right) => left.localeCompare(right))
+      : undefined;
     const lineageResult: ResultType<CoreStoredLineageManifestV2 | null, TranscriptStoreWriteError> =
       input.corePrimaryLineage
         ? this.decodeCompleteCorePrimaryLineage(input.corePrimaryLineage, "save-request-transcript")
@@ -2045,6 +2033,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     const finalJson = JSON.stringify(normalizedMessages);
     const contextMetaJson = input.contextMeta ? JSON.stringify(input.contextMeta) : null;
     const providerStateJson = providerState ? JSON.stringify(providerState) : null;
+    const loadedCatalogIdsJson = loadedCatalogIds ? JSON.stringify(loadedCatalogIds) : null;
 
     const save = runBunSqliteTransaction<
       readonly DeferredTranscriptEvent[],
@@ -2072,8 +2061,8 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         INSERT INTO request_transcripts (
           request_id, session_id, request_client, created_ts, updated_ts, model_label, final_text,
           messages_json, context_meta_json, provider_state_json, stable_named_request_client,
-          transcript_digest
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          transcript_digest, loaded_catalog_ids_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(request_id) DO UPDATE SET
           session_id=excluded.session_id,
           request_client=excluded.request_client,
@@ -2084,7 +2073,8 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           context_meta_json=excluded.context_meta_json,
           provider_state_json=excluded.provider_state_json,
           stable_named_request_client=excluded.stable_named_request_client,
-          transcript_digest=excluded.transcript_digest;
+          transcript_digest=excluded.transcript_digest,
+          loaded_catalog_ids_json=excluded.loaded_catalog_ids_json;
         `,
             [
               input.requestId,
@@ -2099,6 +2089,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
               providerStateJson,
               stableNamedRequestClient,
               transcriptDigest,
+              loadedCatalogIdsJson,
             ],
           );
           const references = this.replaceTranscriptResourceReferences(input.requestId, resourceIds);
@@ -2141,11 +2132,10 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         };
 
         const existing = this.db
-          .query<
-            { transcript_digest: string | null; provider_state_json: string | null },
-            [string]
-          >(
-            `SELECT transcript_digest, provider_state_json
+          .query<TranscriptRow, [string]>(
+            `SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label,
+                    final_text, messages_json, context_meta_json, provider_state_json,
+                    stable_named_request_client, transcript_digest, loaded_catalog_ids_json
            FROM request_transcripts WHERE request_id = ?`,
           )
           .get(input.requestId);
@@ -2161,10 +2151,9 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           .get(input.requestId);
         const digestIsRetained = digestRetained !== null;
         const requestMetadataIsRetained = requestMetadataRetained !== null;
-        const providerStateDecision = decodeTranscriptProviderState({
-          raw: existing.provider_state_json,
+        const existingTranscriptDecision = decodeTranscriptRow({
+          row: existing,
           schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
-          recordId: input.requestId,
         })
           .mapError(deferTranscriptPersistenceFailure)
           .match<
@@ -2172,22 +2161,28 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
                 readonly kind: "error";
                 readonly error: TranscriptTransactionPersistenceFailure;
               }
-            | { readonly kind: "decoded"; readonly retainedByLineage: boolean }
+            | {
+                readonly kind: "decoded";
+                readonly value: DecodedTranscriptRow;
+              }
           >({
-            err: (error) => ({ kind: "error" as const, error }),
-            ok: (existingProviderState) => ({
-              kind: "decoded" as const,
-              retainedByLineage: Boolean(
-                (digestIsRetained && existing.transcript_digest !== transcriptDigest) ||
-                (requestMetadataIsRetained &&
-                  !isDeepStrictEqual(existingProviderState.value, providerState)),
-              ),
-            }),
+            err: (error) => ({ kind: "error", error }),
+            ok: (decoded) => ({ kind: "decoded", value: decoded.value }),
           });
-        if (providerStateDecision.kind === "error") {
-          return Result.err(providerStateDecision.error);
+        if (existingTranscriptDecision.kind === "error") {
+          return Result.err(existingTranscriptDecision.error);
         }
-        if (providerStateDecision.retainedByLineage) {
+        const retainedByLineage = Boolean(
+          (digestIsRetained &&
+            (existing.transcript_digest !== transcriptDigest ||
+              !isDeepStrictEqual(
+                existingTranscriptDecision.value.loadedCatalogIds,
+                loadedCatalogIds,
+              ))) ||
+          (requestMetadataIsRetained &&
+            !isDeepStrictEqual(existingTranscriptDecision.value.providerState, providerState)),
+        );
+        if (retainedByLineage) {
           return Result.err(
             new TranscriptRetainedByLineage({
               requestId: input.requestId,
@@ -2672,8 +2667,11 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
          )
          AND NOT EXISTS (
            SELECT 1 FROM core_transcript_blob_refs WHERE blob_owner_id = ?
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM core_agent_run_checkpoint_blobs WHERE blob_owner_id = ?
          )`,
-      [ownerId, ownerId, ownerId],
+      [ownerId, ownerId, ownerId, ownerId],
     );
     const deleted = result.changes > 0;
     if (deleted) {
@@ -2706,6 +2704,10 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
              SELECT 1 FROM core_transcript_blob_refs AS transcript_ref
              WHERE transcript_ref.blob_owner_id = blob.owner_id
            )
+           AND NOT EXISTS (
+             SELECT 1 FROM core_agent_run_checkpoint_blobs AS checkpoint_ref
+             WHERE checkpoint_ref.blob_owner_id = blob.owner_id
+           )
          ORDER BY blob.created_ts ASC, blob.owner_id ASC
          LIMIT ?`,
       )
@@ -2733,8 +2735,12 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
            AND NOT EXISTS (
              SELECT 1 FROM core_transcript_blob_refs
              WHERE blob_owner_id = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM core_agent_run_checkpoint_blobs
+             WHERE blob_owner_id = ?
            )`,
-        [now, row.owner_id, staleClaimCutoff, row.owner_id, row.owner_id],
+        [now, row.owner_id, staleClaimCutoff, row.owner_id, row.owner_id, row.owner_id],
       );
       if (claim.changes === 0) {
         retained += 1;
@@ -2754,8 +2760,11 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
            )
            AND NOT EXISTS (
              SELECT 1 FROM core_transcript_blob_refs WHERE blob_owner_id = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM core_agent_run_checkpoint_blobs WHERE blob_owner_id = ?
            )`,
-        [row.owner_id, now, row.owner_id, row.owner_id],
+        [row.owner_id, now, row.owner_id, row.owner_id, row.owner_id],
       );
       if (finalized.changes === 0) {
         return Result.err(
@@ -2771,6 +2780,100 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       });
     }
     return Result.ok({ inspected: rows.length, deleted, retained, failed });
+  }
+
+  retainAgentRunCheckpointBlobs(
+    input: AgentRunCheckpointBlobOwner,
+  ): ResultType<void, AgentRunCheckpointBlobReferenceError> {
+    return runBunSqliteTransaction<
+      void,
+      CoreOwnedBlobIntegrityError,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () =>
+        Result.gen(function* (this: SqliteTranscriptStore) {
+          const references = yield* collectStoredBlobReferences(input.messages);
+          for (const reference of references) {
+            yield* this.ensureTranscriptOwnedBlob(reference);
+            this.db.run(
+              `INSERT OR IGNORE INTO core_agent_run_checkpoint_blobs (
+                 request_delivery_id, blob_owner_id
+               ) VALUES (?, ?)`,
+              [input.requestDeliveryId, reference.ownerId],
+            );
+          }
+          return Result.ok(undefined);
+        }, this),
+      (cause) => classifyTranscriptSqliteDriverFailure("retain-agent-run-checkpoint-blobs", cause),
+    );
+  }
+
+  replaceAgentRunCheckpointBlobs(
+    input: AgentRunCheckpointBlobOwner,
+  ): ResultType<void, AgentRunCheckpointBlobReferenceError> {
+    return runBunSqliteTransaction<
+      void,
+      CoreOwnedBlobIntegrityError,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () =>
+        Result.gen(function* (this: SqliteTranscriptStore) {
+          const references = yield* collectStoredBlobReferences(input.messages);
+          for (const reference of references) yield* this.ensureTranscriptOwnedBlob(reference);
+          this.replaceAgentRunCheckpointBlobReferences(input.requestDeliveryId, references);
+          return Result.ok(undefined);
+        }, this),
+      (cause) => classifyTranscriptSqliteDriverFailure("replace-agent-run-checkpoint-blobs", cause),
+    );
+  }
+
+  releaseAgentRunCheckpointBlobs(input: {
+    readonly requestDeliveryId: string;
+  }): ResultType<void, TranscriptStoreSqliteDriverFailure> {
+    return this.readFromSqlite("release-agent-run-checkpoint-blobs", () => {
+      this.db.run("DELETE FROM core_agent_run_checkpoint_blobs WHERE request_delivery_id = ?", [
+        input.requestDeliveryId,
+      ]);
+    });
+  }
+
+  reconcileAgentRunCheckpointBlobs(input: {
+    readonly checkpoints: readonly AgentRunCheckpointBlobOwner[];
+  }): ResultType<void, AgentRunCheckpointBlobReferenceError> {
+    return runBunSqliteTransaction<
+      void,
+      CoreOwnedBlobIntegrityError,
+      TranscriptStoreSqliteDriverFailure
+    >(
+      this.db,
+      () =>
+        Result.gen(function* (this: SqliteTranscriptStore) {
+          const prepared: Array<{
+            readonly requestDeliveryId: string;
+            readonly references: readonly CoreOwnedBlobReference[];
+          }> = [];
+          for (const checkpoint of input.checkpoints) {
+            const references = yield* collectStoredBlobReferences(checkpoint.messages);
+            for (const reference of references) yield* this.ensureTranscriptOwnedBlob(reference);
+            prepared.push({
+              requestDeliveryId: checkpoint.requestDeliveryId,
+              references,
+            });
+          }
+          this.db.run("DELETE FROM core_agent_run_checkpoint_blobs");
+          for (const checkpoint of prepared) {
+            this.replaceAgentRunCheckpointBlobReferences(
+              checkpoint.requestDeliveryId,
+              checkpoint.references,
+            );
+          }
+          return Result.ok(undefined);
+        }, this),
+      (cause) =>
+        classifyTranscriptSqliteDriverFailure("reconcile-agent-run-checkpoint-blobs", cause),
+    );
   }
 
   admitCoreSurfaceProjection(
@@ -3079,7 +3182,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           .query<TranscriptRow, [string]>(
             `SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label,
                   final_text, messages_json, context_meta_json, provider_state_json,
-                  stable_named_request_client, transcript_digest
+                  stable_named_request_client, transcript_digest, loaded_catalog_ids_json
            FROM request_transcripts WHERE request_id = ?`,
           )
           .get(requestId),
@@ -3674,6 +3777,22 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     }
   }
 
+  private replaceAgentRunCheckpointBlobReferences(
+    requestDeliveryId: string,
+    references: readonly CoreOwnedBlobReference[],
+  ): void {
+    this.db.run("DELETE FROM core_agent_run_checkpoint_blobs WHERE request_delivery_id = ?", [
+      requestDeliveryId,
+    ]);
+    for (const reference of references) {
+      this.db.run(
+        `INSERT INTO core_agent_run_checkpoint_blobs (request_delivery_id, blob_owner_id)
+         VALUES (?, ?)`,
+        [requestDeliveryId, reference.ownerId],
+      );
+    }
+  }
+
   private decodeResourceRecord(
     row: PersistedResourceRecordRow,
     operation: string,
@@ -3998,7 +4117,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           `
         SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label, final_text,
                messages_json, context_meta_json, provider_state_json, stable_named_request_client,
-               transcript_digest
+               transcript_digest, loaded_catalog_ids_json
         FROM request_transcripts
         WHERE request_id = ?
         `,
@@ -4017,7 +4136,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           `
         SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label, final_text,
                messages_json, context_meta_json, provider_state_json, stable_named_request_client,
-               transcript_digest
+               transcript_digest, loaded_catalog_ids_json
         FROM request_transcripts
         WHERE session_id = ?
         ORDER BY updated_ts DESC, created_ts DESC, rowid DESC
@@ -4037,7 +4156,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         .query<TranscriptRow, [string]>(
           `SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label,
                 final_text, messages_json, context_meta_json, provider_state_json,
-                 stable_named_request_client, transcript_digest
+                 stable_named_request_client, transcript_digest, loaded_catalog_ids_json
          FROM request_transcripts WHERE request_id = ?`,
         )
         .get(input.requestId),
@@ -4055,7 +4174,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         .query<TranscriptRow, [string, AdapterPlatform]>(
           `SELECT request_id, session_id, request_client, created_ts, updated_ts, model_label,
                 final_text, messages_json, context_meta_json, provider_state_json,
-                 stable_named_request_client, transcript_digest
+                 stable_named_request_client, transcript_digest, loaded_catalog_ids_json
          FROM request_transcripts
          WHERE session_id = ? AND stable_named_request_client = ?
          ORDER BY updated_ts DESC, created_ts DESC, rowid DESC LIMIT 1`,
@@ -4654,12 +4773,18 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
                ) AND NOT EXISTS (
                  SELECT 1 FROM core_transcript_blob_refs AS reference
                  WHERE reference.blob_owner_id = blob.owner_id
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM core_agent_run_checkpoint_blobs AS reference
+                 WHERE reference.blob_owner_id = blob.owner_id
                ) THEN 1 ELSE 0 END), 0) AS unreferenced_count,
                COALESCE(SUM(CASE WHEN NOT EXISTS (
                  SELECT 1 FROM core_surface_projection_blobs AS reference
                  WHERE reference.blob_owner_id = blob.owner_id
                ) AND NOT EXISTS (
                  SELECT 1 FROM core_transcript_blob_refs AS reference
+                 WHERE reference.blob_owner_id = blob.owner_id
+               ) AND NOT EXISTS (
+                 SELECT 1 FROM core_agent_run_checkpoint_blobs AS reference
                  WHERE reference.blob_owner_id = blob.owner_id
                ) THEN blob.byte_length ELSE 0 END), 0) AS unreferenced_bytes
              FROM core_owned_blobs AS blob`,
@@ -6379,17 +6504,6 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
            AND NOT EXISTS (
              SELECT 1 FROM core_lineage_request_refs lineage_ref
              WHERE lineage_ref.referenced_request_id = request_transcripts.request_id
-           )`,
-        [cutoff],
-      );
-      this.db.run(
-        `DELETE FROM session_loaded_tools
-         WHERE selected_ts < ?
-           AND NOT EXISTS (
-             SELECT 1
-             FROM request_transcripts
-             WHERE request_transcripts.request_client = session_loaded_tools.request_client
-               AND request_transcripts.session_id = session_loaded_tools.session_id
            )`,
         [cutoff],
       );

@@ -1,7 +1,7 @@
 import type { CommandNode, ScriptNode, StatementNode, WordNode } from "just-bash";
 import { isAbsolute, resolve } from "node:path";
 
-import type { AnalyzeOptions, AnalyzeResult } from "../types";
+import type { AnalyzeOptions, AnalyzeResult, BashSafetyViolation } from "../types";
 import { MAX_RECURSION_DEPTH, SHELL_WRAPPERS } from "../types";
 import { analyzeGitMetadataOutputPath } from "../rules-filesystem";
 import {
@@ -457,17 +457,17 @@ function analyzeSimpleCommand(
   if (shellStdinResult) return shellStdinResult;
 
   if (command.name) {
-    const reason = analyzeSegment(tokens, {
+    const violation = analyzeSegment(tokens, {
       ...context.options,
       cwd: context.originalCwd,
       effectiveCwd: commandCwd,
       analyzeNested: (
         nestedCommand: string,
         nestedCwd: string | null | undefined = commandCwd,
-      ): string | null =>
-        context.analyzeNestedCommand(nestedCommand, context.depth + 1, nestedCwd)?.reason ?? null,
+      ): BashSafetyViolation | null =>
+        context.analyzeNestedCommand(nestedCommand, context.depth + 1, nestedCwd),
     });
-    if (reason) return { reason, segment };
+    if (violation) return { ...violation, segment };
   }
 
   updateEffectiveCwd(tokens, state);
@@ -791,7 +791,7 @@ function analyzeRedirections(
     if (analyzed.blocked) return analyzed.blocked;
 
     if (redirection.operator !== "<<<") {
-      const reason =
+      const violation =
         (OUTPUT_REDIRECTION_OPERATORS.has(redirection.operator)
           ? analyzeGitMetadataOutputPath(analyzed.value.text, state.cwd)
           : null) ??
@@ -801,7 +801,7 @@ function analyzeRedirections(
           effectiveCwd: state.cwd,
           protectedPaths: context.options.protectedPaths,
         });
-      if (reason) return { reason, segment };
+      if (violation) return { ...violation, segment };
     }
   }
   return null;
@@ -937,14 +937,14 @@ function analyzeConditionalExpression(
       const right = analyzeWord(expression.right, context, state, segment, stdinSource);
       if (right.blocked) return right.blocked;
       const tokens = [left.value.text, right.value.text];
-      const reason =
+      const violation =
         analyzeSensitiveTokens(tokens) ??
         analyzeProtectedPathTokens(tokens, {
           cwd: context.originalCwd,
           effectiveCwd: state.cwd,
           protectedPaths: context.options.protectedPaths,
         });
-      return reason ? { reason, segment } : null;
+      return violation ? { ...violation, segment } : null;
     }
     case "CondUnary":
     case "CondWord": {
@@ -956,14 +956,14 @@ function analyzeConditionalExpression(
         stdinSource,
       );
       if (word.blocked) return word.blocked;
-      const reason =
+      const violation =
         analyzeSensitiveTokens([word.value.text]) ??
         analyzeProtectedPathTokens([word.value.text], {
           cwd: context.originalCwd,
           effectiveCwd: state.cwd,
           protectedPaths: context.options.protectedPaths,
         });
-      return reason ? { reason, segment } : null;
+      return violation ? { ...violation, segment } : null;
     }
     case "CondNot":
       return analyzeConditionalExpression(expression.operand, context, state, segment, stdinSource);

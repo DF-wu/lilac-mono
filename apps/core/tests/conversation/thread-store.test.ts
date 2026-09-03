@@ -2659,7 +2659,9 @@ describe("conversation thread store", () => {
 
     expect(serialized).not.toContain("minItems");
     expect(serialized).not.toContain("maxItems");
-    expect(instructions).toContain("You must produce 1-3 searches");
+    expect(instructions).toContain('Return {"searches":[]} when retrieval would not help');
+    expect(instructions).toContain("Use one search for one substantive user intent");
+    expect(instructions).toContain("Use 2-3 searches only when the user explicitly asks");
     expect(instructions).toContain("Each search must contain 1-3 non-empty query variants");
   });
 

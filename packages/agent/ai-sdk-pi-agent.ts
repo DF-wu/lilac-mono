@@ -639,7 +639,7 @@ export type BeforeStepHandler = (context: {
 /** Stable identifier for one queued steering or follow-up input. */
 export type AgentInputQueueId = string;
 
-/** Awaited hook for persisting the current replay-safe transcript. */
+/** Hook for handing off the current replay-safe transcript to its persistence owner. */
 export type RecoveryCheckpointHandler = (
   messages: readonly ModelMessage[],
   canonicalInputIds: readonly AgentInputQueueId[],
@@ -688,7 +688,7 @@ export type AiSdkPiAgentOptions<TOOLS extends ToolSet> = {
   beforeSteeringDelivery?: BeforeSteeringDeliveryHandler;
   /** Refresh active tools and other per-step state before tool authority is frozen. */
   beforeStep?: BeforeStepHandler;
-  /** Persist replay-safe messages before later model or tool work starts. */
+  /** Hand off replay-safe messages without requiring persistence to finish before later work. */
   recoveryCheckpointHandler?: RecoveryCheckpointHandler;
   /** Normalize model-facing tool output before it enters the canonical transcript. */
   normalizeToolResultOutput?: NormalizeToolResultOutputFn;

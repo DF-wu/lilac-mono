@@ -1933,157 +1933,64 @@ describe("SqliteTranscriptStore", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("persists unbounded tool selections within their Lilac session namespace", async () => {
+  it("persists a canonical loaded-tool snapshot with its terminal request", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
     const dbPath = path.join(dir, "transcripts.db");
-    const catalogIds = Array.from(
-      { length: 5_000 },
-      (_, index) => `plugin_catalog_tool_${index.toString().padStart(4, "0")}`,
-    );
-
     const first = new SqliteTranscriptStore(dbPath);
-    first.selectSessionToolIds({
+    first.saveRequestTranscript({
+      requestId: "loaded-prefix",
       requestClient: "discord",
       sessionId: "shared-session-id",
-      catalogIds,
+      messages: [{ role: "assistant", content: "done" }],
+      loadedCatalogIds: ["mcp_zeta", "mcp_alpha", "mcp_zeta"],
     });
-    first.selectSessionToolIds({
+    first.saveRequestTranscript({
+      requestId: "empty-prefix",
       requestClient: "discord",
       sessionId: "shared-session-id",
-      catalogIds: [catalogIds[0]!],
-    });
-    first.selectSessionToolIds({
-      requestClient: "github",
-      sessionId: "shared-session-id",
-      catalogIds: ["mcp_github_only_tool"],
-    });
-    first.selectSessionToolIds({
-      requestClient: "discord",
-      sessionId: "other-session",
-      catalogIds: ["mcp_other_session_tool"],
+      messages: [{ role: "assistant", content: "fresh" }],
+      loadedCatalogIds: [],
     });
     first.close();
 
     const second = new SqliteTranscriptStore(dbPath);
-    expect(
-      second.listSessionToolIds({
-        requestClient: "discord",
-        sessionId: "shared-session-id",
-      }),
-    ).toEqual(catalogIds);
-    expect(
-      second.listSessionToolIds({
-        requestClient: "github",
-        sessionId: "shared-session-id",
-      }),
-    ).toEqual(["mcp_github_only_tool"]);
-    expect(
-      second.listSessionToolIds({ requestClient: "discord", sessionId: "other-session" }),
-    ).toEqual(["mcp_other_session_tool"]);
-    second.close();
-
-    const db = new Database(dbPath);
-    const row = db
-      .query(
-        `SELECT selected_ts FROM session_loaded_tools
-         WHERE request_client = ? AND session_id = ? AND catalog_id = ?`,
-      )
-      .get("discord", "shared-session-id", catalogIds[0]!) as {
-      selected_ts: number;
-    } | null;
-    expect(row?.selected_ts).toBeGreaterThan(0);
-    db.close();
-
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-
-  it("prunes tool selections after their session transcripts expire", async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
-    const dbPath = path.join(dir, "transcripts.db");
-    const store = new SqliteTranscriptStore(dbPath);
-
-    store.selectSessionToolIds({
-      requestClient: "discord",
-      sessionId: "abandoned-session",
-      catalogIds: ["mcp_abandoned_tool"],
-    });
-    store.selectSessionToolIds({
-      requestClient: "discord",
-      sessionId: "active-session",
-      catalogIds: ["mcp_active_tool"],
-    });
-    store.selectSessionToolIds({
-      requestClient: "discord",
-      sessionId: "in-flight-session",
-      catalogIds: ["mcp_in_flight_tool"],
-    });
-    const rawDb = new Database(dbPath);
-    rawDb.run("UPDATE session_loaded_tools SET selected_ts = 0 WHERE session_id = ?", [
-      "abandoned-session",
+    expect(getRequestTranscript(second, { requestId: "loaded-prefix" })?.loadedCatalogIds).toEqual([
+      "mcp_alpha",
+      "mcp_zeta",
     ]);
-    rawDb.close();
-    store.saveRequestTranscript({
-      requestId: "active-request",
-      sessionId: "active-session",
-      requestClient: "discord",
-      messages: [{ role: "user", content: "keep this session" }],
-    });
-
-    expect(
-      store.listSessionToolIds({ requestClient: "discord", sessionId: "abandoned-session" }),
-    ).toEqual([]);
-    expect(
-      store.listSessionToolIds({ requestClient: "discord", sessionId: "active-session" }),
-    ).toEqual(["mcp_active_tool"]);
-    expect(
-      store.listSessionToolIds({ requestClient: "discord", sessionId: "in-flight-session" }),
-    ).toEqual(["mcp_in_flight_tool"]);
-
-    store.close();
+    expect(getRequestTranscript(second, { requestId: "empty-prefix" })?.loadedCatalogIds).toEqual(
+      [],
+    );
+    second.close();
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("creates the generic selection table without migrating attempt-1 state", async () => {
+  it("removes legacy session-wide tool authority during migration", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transcripts-"));
     const dbPath = path.join(dir, "transcripts.db");
     const db = new Database(dbPath);
     db.run(`
-      CREATE TABLE session_loaded_mcp_tools (
+      CREATE TABLE session_loaded_tools (
         request_client TEXT NOT NULL,
         session_id TEXT NOT NULL,
-        server_id TEXT NOT NULL,
-        tool_name TEXT NOT NULL,
-        loaded_ts INTEGER NOT NULL
+        catalog_id TEXT NOT NULL,
+        selected_ts INTEGER NOT NULL
       )
     `);
-    db.run("INSERT INTO session_loaded_mcp_tools VALUES (?, ?, ?, ?, ?)", [
+    db.run("INSERT INTO session_loaded_tools VALUES (?, ?, ?, ?)", [
       "discord",
       "session",
-      "legacy-server",
-      "legacy-tool",
+      "legacy-tool-id",
       1,
     ]);
     db.close();
 
-    const store = new SqliteTranscriptStore(dbPath);
-    expect(store.listSessionToolIds({ requestClient: "discord", sessionId: "session" })).toEqual(
-      [],
-    );
-    store.close();
+    new SqliteTranscriptStore(dbPath).close();
 
     const rawDb = new Database(dbPath);
-    const columns = rawDb.query("PRAGMA table_info(session_loaded_tools)").all() as Array<{
-      name: string;
-    }>;
-    expect(columns.map((column) => column.name)).toEqual([
-      "request_client",
-      "session_id",
-      "catalog_id",
-      "selected_ts",
-    ]);
-    expect(rawDb.query("SELECT COUNT(*) AS count FROM session_loaded_mcp_tools").get()).toEqual({
-      count: 1,
-    });
+    expect(
+      rawDb.query("SELECT name FROM sqlite_master WHERE name = 'session_loaded_tools'").all(),
+    ).toEqual([]);
     rawDb.close();
 
     await fs.rm(dir, { recursive: true, force: true });
@@ -2125,13 +2032,14 @@ describe("SqliteTranscriptStore", () => {
     const version = migrated
       .query("SELECT MAX(version) AS version FROM transcript_schema_migrations")
       .get();
-    expect(version).toEqual({ version: 8 });
+    expect(version).toEqual({ version: 10 });
     expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
     const columns = migrated.query("PRAGMA table_info(request_transcripts)").all() as Array<{
       name: string;
     }>;
     expect(columns.map(({ name }) => name)).toContain("provider_state_json");
     expect(columns.map(({ name }) => name)).toContain("stable_named_request_client");
+    expect(columns.map(({ name }) => name)).toContain("loaded_catalog_ids_json");
     expect(
       migrated
         .query(
@@ -3094,9 +3002,10 @@ describe("SqliteTranscriptStore", () => {
     );
     store.close();
     const schema7 = new Database(dbPath);
+    schema7.run("DROP TABLE core_agent_run_checkpoint_blobs");
     schema7.run("DROP TABLE core_transcript_blob_refs");
     schema7.run("ALTER TABLE core_owned_blobs DROP COLUMN deletion_claim_ts");
-    schema7.run("DELETE FROM transcript_schema_migrations WHERE version = 8");
+    schema7.run("DELETE FROM transcript_schema_migrations WHERE version >= 8");
     schema7.close();
     store = new SqliteTranscriptStore(dbPath);
     expect(store.deleteCoreOwnedBlobIfUnreferenced({ ownerId: blob.objectId })).toBeNull();

@@ -27,6 +27,7 @@ import {
 } from "../../tools/batch";
 import { bashToolWithCwd } from "../../tools/bash";
 import { fsTool } from "../../tools/fs/fs";
+import { readRemoteMedia } from "../../tools/fs/remote-media-download";
 import {
   subagentTools,
   type SubagentDelegationHandle,
@@ -53,6 +54,7 @@ import {
 } from "../../tools/tool-args-display";
 import { defineLevel1Tool } from "./define-level1-tool";
 import { type CoreLevel1ToolSpec, type CoreToolPlugin } from "../types";
+import { isWebFetchAllowedForNativeProfile } from "../profile-authority";
 
 type CoreToolBuildContext = Parameters<CoreLevel1ToolSpec["createTool"]>[0];
 
@@ -106,6 +108,13 @@ function getReadFileDirectMediaSupport(context: CoreToolBuildContext): {
   };
 }
 
+function canReadRemoteMedia(context: CoreToolBuildContext): boolean {
+  const config = context.runtime.config;
+  if (!config || config.plugins.disabled.includes("web")) return false;
+  if (context.runProfile === "primary") return true;
+  return isWebFetchAllowedForNativeProfile({ config, profileName: context.runProfile });
+}
+
 function getFsTools(context: CoreToolBuildContext): ReturnType<typeof fsTool> {
   const cached = localFsToolsByBuildContext.get(context);
   if (cached) return cached;
@@ -119,6 +128,7 @@ function getFsTools(context: CoreToolBuildContext): ReturnType<typeof fsTool> {
     fsBackend: context.runtime.config?.tools.fsBackend,
     readFileDirectImageSupported: directMediaSupport.image,
     readFileDirectPdfSupported: directMediaSupport.pdf,
+    readRemoteMedia: canReadRemoteMedia(context) ? readRemoteMedia : undefined,
     maxOutputBytes: context.runtime.config?.tools.output.maxPreviewBytes,
     maxInlineMediaBytesPerPart: context.runtime.config?.tools.media.maxInlineBytesPerPart,
     artifactOnly: context.requestContext?.safetyMode === "restricted",

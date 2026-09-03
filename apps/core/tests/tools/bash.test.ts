@@ -299,8 +299,11 @@ rmdir "$media_dir"`,
     expect(res.executionError).toBeDefined();
     expect(res.executionError?.type).toBe("exception");
     if (res.executionError?.type === "exception") {
+      expect(res.executionError.code).toBe("spawn_cwd_missing");
       expect(res.executionError.phase).toBe("spawn");
-      expect(res.executionError.message.length).toBeGreaterThan(0);
+      expect(res.executionError.errno).toBe("ENOENT");
+      expect(res.executionError.cwd).toBe("/this/path/definitely/does/not/exist");
+      expect(res.executionError.message).toContain("cwd does not exist");
     }
   });
 
@@ -443,6 +446,7 @@ rmdir "$media_dir"`,
       expect(removed).toHaveLength(2);
       expect(result.executionError).toEqual({
         type: "exception",
+        code: "cleanup_failed",
         phase: "unknown",
         message: "Bash temporary output cleanup failed",
       });
@@ -473,13 +477,14 @@ rmdir "$media_dir"`,
     expect(attempted).toHaveLength(2);
     expect(result.executionError).toEqual({
       type: "exception",
+      code: "cleanup_failed",
       phase: "unknown",
       message: "Bash temporary output cleanup failed",
     });
   });
 
   it("surfaces operation and spill cleanup failure without leaking either cause", async () => {
-    const invalidCwd = "/private/workspace-secret/does-not-exist";
+    const invalidCwd = "/tmp/lilac-bash-cleanup-missing-cwd";
     const result = await executeBash(
       { command: "printf unreachable", cwd: invalidCwd },
       {
@@ -493,12 +498,15 @@ rmdir "$media_dir"`,
 
     expect(result.executionError).toEqual({
       type: "exception",
+      code: "spawn_cwd_missing",
       phase: "spawn",
-      message: "Bash execution failed and temporary output cleanup also failed",
+      message: `Bash cwd does not exist or is not a directory: ${invalidCwd}`,
+      errno: "ENOENT",
+      cwd: invalidCwd,
     });
     const wire = JSON.stringify(result);
     expect(wire).not.toContain("cleanup-secret");
-    expect(wire).not.toContain(invalidCwd);
+    expect(wire).toContain(invalidCwd);
   });
 
   it("attempts all spill cleanup before propagating the exact cleanup Panic", async () => {
@@ -688,7 +696,9 @@ describe("executeRestrictedBash", () => {
       );
       expect(result.executionError).toMatchObject({
         type: "blocked",
-        reason: "restricted_bash_cwd",
+        code: "restricted_cwd",
+        reason: expect.stringContaining("outside the approved workspace"),
+        hint: expect.stringContaining("approved workspace"),
       });
       expect(result.stderr).toContain("outside the approved workspace");
     } finally {
