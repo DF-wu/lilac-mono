@@ -148,6 +148,11 @@ import {
   type AgentRunRecoveryHead,
 } from "../surface/bridge/agent-run-journal";
 import { createCoreToolPluginManager, type CoreToolPluginManager } from "../plugins";
+import {
+  createDiscordContextReportProvider,
+  DiscordContextReportFailed,
+  type DiscordContextReportProvider,
+} from "../surface/discord/discord-context-report";
 import { CustomCommandManager } from "../custom-commands/manager";
 import { handleCoreConfigWatchEvent } from "./core-config-watch";
 import { loadOrCreateCoreDeadLetterKey, type CoreDeadLetterKeyError } from "./core-dead-letter-key";
@@ -2355,8 +2360,24 @@ export async function createCoreRuntime(
     logger.warn("custom command skipped", { warning });
   }
 
+  let pluginManager: CoreToolPluginManager | null = null;
+  let contextReportProvider: DiscordContextReportProvider | null = null;
+  const buildContextReport: DiscordContextReportProvider = (request) => {
+    const provider = contextReportProvider;
+    return provider
+      ? provider(request)
+      : Promise.resolve(
+          Result.err(
+            new DiscordContextReportFailed({
+              stage: "tools",
+              message: "Context reporting is not ready yet",
+            }),
+          ),
+        );
+  };
   const adapter = new DiscordAdapter({
     customCommands,
+    contextReport: buildContextReport,
     reportFatalPanic: reportFatalError,
   });
   const githubAdapter = new GithubAdapter();
@@ -2400,7 +2421,6 @@ export async function createCoreRuntime(
 
   let requestMessageCache: RequestMessageCache | null = null;
   const requestControlAuthority = new RequestControlAuthority();
-  let pluginManager: CoreToolPluginManager | null = null;
   const mcpConfigPath = resolveMcpConfigPath({ dataDir: env.dataDir });
   const mcpOAuthProviders = new McpOAuthProviderService({
     dataDir: env.dataDir,
@@ -3444,6 +3464,7 @@ export async function createCoreRuntime(
               requestDelivery: discordRequestDelivery,
               subscriptionId: subId(subscriptionPrefix, "router"),
               customCommands,
+              contextReport: buildContextReport,
               shouldSuppressAdapterEvent: async ({ evt }) =>
                 shouldSuppressRouterForWorkflowReply({
                   store: activeDurableWorkflowStore,
@@ -3543,6 +3564,11 @@ export async function createCoreRuntime(
               mcpConfigPath,
             },
             dataDir: env.dataDir,
+          });
+          contextReportProvider = createDiscordContextReportProvider({
+            pluginManager,
+            transcriptStore: transcriptStore ?? undefined,
+            cwd: canonicalWorkspaceRoot,
           });
 
           toolServer = createToolServer({

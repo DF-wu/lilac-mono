@@ -413,6 +413,52 @@ describe("DiscordAdapter custom command acknowledgement", () => {
   });
 });
 
+describe("DiscordAdapter context command", () => {
+  it("renders a resting context report as an ephemeral interaction reply", async () => {
+    const config = testConfigWithStatusMessage();
+    const requests: unknown[] = [];
+    const adapter = createTestDiscordAdapter({
+      config,
+      contextReport: async (request) => {
+        requests.push(request);
+        return Result.ok({ text: "**Resting context**", accentColor: 0x5865f2 });
+      },
+    });
+    Object.assign(adapter, {
+      client: {},
+      cfg: config,
+      self: { platform: "discord", userId: "bot", userName: "lilac" },
+    });
+    const replies: unknown[] = [];
+    const interaction = {
+      commandName: "context",
+      channelId: "c1",
+      guildId: null,
+      channel: null,
+      deferReply: async () => undefined,
+      editReply: async (reply: unknown) => {
+        replies.push(reply);
+      },
+    };
+    const onChatInputCommand = Reflect.get(adapter, "onChatInputCommand") as (
+      interaction: unknown,
+    ) => Promise<void>;
+
+    await onChatInputCommand.call(adapter, interaction);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      source: "rest",
+      sessionId: "c1",
+      messages: [],
+    });
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({
+      embeds: [{ data: { color: 0x5865f2, description: "**Resting context**" } }],
+    });
+  });
+});
+
 describe("DiscordAdapter.sendMsg content validation", () => {
   it("prepares sends without invoking the Discord provider", async () => {
     let providerCalls = 0;

@@ -249,6 +249,7 @@ import {
 } from "../../custom-commands/manager";
 import { adaptToolResultToHost } from "../../tools/tool-result-adapters";
 import { getSessionMode, resolveSessionConfigId } from "./discord-request-router/common";
+import type { DiscordContextReportProvider } from "./discord-context-report";
 
 export {
   hasExplicitDiscordUserMentionInContent,
@@ -265,6 +266,7 @@ export type DiscordAdapterOptions = {
   config?: CoreConfig;
   getConfig?: () => Promise<CoreConfig>;
   customCommands?: CustomCommandManager;
+  contextReport?: DiscordContextReportProvider;
   /** Direct Core fatal-supervisor handoff. */
   reportFatalPanic: (panic: Panic) => void;
 };
@@ -3272,6 +3274,11 @@ export class DiscordAdapter implements SurfaceAdapter {
       ],
     };
 
+    const contextSlashDefinition = {
+      name: "context",
+      description: "Show the resting context composition for this session",
+    };
+
     const cancelContextMenuDefinition = {
       name: CONTEXT_MENU_CANCEL_REQUEST_NAME,
       type: ApplicationCommandType.Message as const,
@@ -3280,7 +3287,12 @@ export class DiscordAdapter implements SurfaceAdapter {
     // Force-sync (bulk overwrite) so stale commands are removed.
     // This is intentional: we treat the current code's command list as the
     // source of truth for this application.
-    const desired = [slashDefinition, modelSlashDefinition, cancelContextMenuDefinition];
+    const desired = [
+      slashDefinition,
+      modelSlashDefinition,
+      contextSlashDefinition,
+      cancelContextMenuDefinition,
+    ];
     let syncFailed = false;
     const globalSync = settleSurfaceFallback(
       await Result.tryPromise({
@@ -3403,6 +3415,11 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     if (interaction.commandName === "model") {
       await this.onModelCommand(interaction, cfg);
+      return;
+    }
+
+    if (interaction.commandName === "context") {
+      await this.onContextCommand(interaction, cfg);
       return;
     }
 
@@ -3593,6 +3610,88 @@ export class DiscordAdapter implements SurfaceAdapter {
       ...(guildId ? { guildId } : {}),
       modelOverride,
     });
+  }
+
+  private async onContextCommand(
+    interaction: ChatInputCommandInteraction<CacheType>,
+    cfg: CoreConfig,
+  ): Promise<void> {
+    const channelId = interaction.channelId;
+    const guildId = interaction.guildId;
+    if (!channelId) {
+      await tryReplyEphemeral(interaction, "This command must be used in a channel.");
+      return;
+    }
+    if (!shouldAllowMessage({ cfg, channelId, guildId })) {
+      await tryReplyEphemeral(interaction, "Not allowed in this channel.");
+      return;
+    }
+
+    const contextReport = this.opts.contextReport;
+    if (!contextReport) {
+      await tryReplyEphemeral(interaction, "Context reporting is not ready yet.");
+      return;
+    }
+
+    settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => interaction.deferReply({ flags: MessageFlags.Ephemeral }),
+        catch: captureUndefinedSurfaceFallback,
+      }),
+    );
+
+    const parentChannelId = this.getParentChannelIdFromInteractionChannel(interaction);
+    const report = await contextReport({
+      source: "rest",
+      config: cfg,
+      sessionId: channelId,
+      requestId: formatDiscordSlashRequestId({
+        channelId,
+        interactionId: interaction.id,
+      }),
+      userId: interaction.user?.id,
+      ...(parentChannelId ? { parentChannelId } : {}),
+      ...(guildId ? { guildId } : {}),
+      modelOverride: this.getSessionModelRef({
+        cfg,
+        sessionId: channelId,
+        parentChannelId,
+        guildId,
+      }),
+      messages: [],
+    });
+    const reportError = report.match({ ok: () => null, err: (error) => error });
+    if (reportError) {
+      this.logger.warn("context report failed", {
+        source: "rest",
+        sessionId: channelId,
+        ...formatTaggedErrorForLog(reportError),
+      });
+      await tryEditOrReplyEphemeral(interaction, "Unable to build the context report.");
+      return;
+    }
+    const presentation = report.match({ ok: (value) => value, err: () => null });
+    if (!presentation) {
+      await tryEditOrReplyEphemeral(interaction, "Unable to build the context report.");
+      return;
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(presentation.accentColor)
+      .setDescription(presentation.text);
+    const edited = settleSurfaceFallback(
+      await Result.tryPromise({
+        try: () => interaction.editReply({ embeds: [embed] }),
+        catch: captureUndefinedSurfaceFallback,
+      }),
+    );
+    const editFailed = edited.match({ ok: () => false, err: () => true });
+    if (editFailed) {
+      this.logger.warn("context report reply failed", {
+        source: "rest",
+        sessionId: channelId,
+      });
+    }
   }
 
   private async onAutocomplete(interaction: AutocompleteInteraction<CacheType>): Promise<void> {

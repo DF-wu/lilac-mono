@@ -622,6 +622,221 @@ describe("Discord request composition failure policy", () => {
   });
 });
 
+describe("Discord context text command", () => {
+  const config: RouterConfigOverride = {
+    surface: {
+      discord: {
+        tokenEnv: "DISCORD_TOKEN",
+        allowedChannelIds: [],
+        allowedGuildIds: [],
+        botName: "lilac",
+        outputMode: "inline",
+        previewFinalOutputStyle: "embed",
+      },
+      router: {
+        defaultMode: "active",
+        sessionModes: {},
+        activeDebounceMs: 5,
+        activeGate: { enabled: true, timeoutMs: 2_500 },
+      },
+    },
+    agent: { systemPrompt: "(unused in tests; compiled at runtime)" },
+    models: {
+      def: {},
+      main: { model: "openrouter/openai/gpt-4o" },
+      fast: { model: "openrouter/openai/gpt-4o-mini" },
+    },
+  };
+
+  it("reports a snapshot at rest without publishing an agent request", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const message: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "channel", messageId: "context" },
+      session: { platform: "discord", channelId: "channel" },
+      userId: "user",
+      userName: "User",
+      text: "!context ignored trailing text",
+      ts: Date.now(),
+      raw: { discord: { isChat: true } },
+    };
+    const adapter = new FakeAdapter({ "channel:context": message });
+    const sendMsg = spyOn(adapter, "sendMsg");
+    const reports: Array<readonly { role: string; content: unknown }[]> = [];
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "context-rest-router-test",
+      config,
+      contextReport: async (request) => {
+        reports.push([...request.messages]);
+        return Result.ok({ text: "snapshot report", accentColor: 0x5865f2 });
+      },
+    });
+    const requests: unknown[] = [];
+    const requestSub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      { mode: "fanout", subscriptionId: "context-rest-requests", consumerId: "test" },
+      async (request) => {
+        requests.push(request);
+        return Result.ok(undefined);
+      },
+    );
+
+    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+      platform: "discord",
+      channelId: "channel",
+      messageId: "context",
+      userId: "user",
+      userName: "User",
+      text: message.text,
+      ts: message.ts,
+      raw: {
+        discord: {
+          isDMBased: false,
+          mentionsBot: false,
+          replyToBot: false,
+          botUserId: "bot",
+        },
+      },
+    });
+
+    expect(requests).toHaveLength(0);
+    expect(reports).toHaveLength(1);
+    expect(collectUserText(reports[0] as ModelMessage[])).toContain("!context");
+    expect(sendMsg).toHaveBeenCalledWith(
+      message.session,
+      { text: "snapshot report", accentColor: 0x5865f2 },
+      { replyTo: message.ref, silent: true },
+    );
+
+    sendMsg.mockRestore();
+    await requestSub.stop();
+    await router.stop();
+    await bus.close();
+  });
+
+  it("queues the command as a follow-up when the session has an active request", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const message: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "channel", messageId: "context" },
+      session: { platform: "discord", channelId: "channel" },
+      userId: "user",
+      userName: "User",
+      text: "!context",
+      ts: Date.now(),
+      raw: { discord: { isChat: true } },
+    };
+    const adapter = new FakeAdapter({ "channel:context": message });
+    let deliveryAttempts = 0;
+    let reportCount = 0;
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "context-active-router-test",
+      config,
+      requestDelivery: {
+        prepareAndPublish: async ({ envelope }) => {
+          deliveryAttempts += 1;
+          if (deliveryAttempts === 1) {
+            return Result.err(
+              new DiscordRequestDeliveryFailed({
+                message: "Injected context follow-up delivery failure",
+              }),
+            );
+          }
+          return (
+            await bus.publish(lilacEventTypes.CmdRequestMessage, envelope.data, {
+              headers: envelope.headers,
+            })
+          )
+            .map(() => undefined)
+            .mapError(
+              (cause) =>
+                new DiscordRequestDeliveryFailed({
+                  cause,
+                  message: "Test request publication failed",
+                }),
+            );
+        },
+      },
+      contextReport: async () => {
+        reportCount += 1;
+        return Result.ok({ text: "snapshot report", accentColor: 0x5865f2 });
+      },
+    });
+    const requests: Array<DecodedLilacMessageForTopic<"cmd.request">> = [];
+    const requestSub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      { mode: "fanout", subscriptionId: "context-active-requests", consumerId: "test" },
+      async (request) => {
+        requests.push(request);
+        return Result.ok(undefined);
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "running", ts: Date.now() },
+      {
+        headers: {
+          request_id: "discord:channel:active",
+          session_id: "channel",
+          request_client: "discord",
+        },
+      },
+    );
+
+    const eventData = {
+      platform: "discord",
+      channelId: "channel",
+      messageId: "context",
+      userId: "user",
+      userName: "User",
+      text: message.text,
+      ts: message.ts,
+      raw: {
+        discord: {
+          isDMBased: false,
+          mentionsBot: false,
+          replyToBot: false,
+          botUserId: "bot",
+        },
+      },
+    } as const;
+    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, eventData);
+
+    expect(requests).toHaveLength(0);
+    expect(reportCount).toBe(0);
+    expect(
+      raw.deliveryActions
+        .filter(({ topic }) => topic === "evt.adapter")
+        .map(({ action }) => action.disposition)
+        .at(-1),
+    ).toBe("park-pending");
+
+    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, eventData);
+
+    expect(requests).toHaveLength(1);
+    expect(reportCount).toBe(1);
+    expect(requests[0]?.headers?.request_id).toBe("discord:channel:active");
+    expect(requests[0]?.data.queue).toBe("followUp");
+    expect(collectUserText(requests[0]?.data.messages ?? [])).toContain("!context");
+    expect(
+      raw.deliveryActions
+        .filter(({ topic }) => topic === "evt.adapter")
+        .map(({ action }) => action.disposition)
+        .slice(-2),
+    ).toEqual(["park-pending", "commit"]);
+
+    await requestSub.stop();
+    await router.stop();
+    await bus.close();
+  });
+});
+
 describe("Discord authenticated-origin publication", () => {
   it("rejects an ingress identity whose complete message ref does not match", async () => {
     const logger = new Logger({ module: "discord-origin-correlation-test" });
