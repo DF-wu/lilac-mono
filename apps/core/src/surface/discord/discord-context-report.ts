@@ -1,5 +1,6 @@
 import type { ToolSet } from "ai";
 import { computeInputCompactionBudget } from "@stanley2058/lilac-agent";
+import type { CorePrimaryLineageV2 } from "@stanley2058/lilac-event-bus";
 import {
   deriveSubagentIdleTimeoutMs,
   ModelCapability,
@@ -13,6 +14,7 @@ import type { CoreToolPluginManager } from "../../plugins";
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import { resolveSessionSafetyMode } from "../session-policy";
 import { resolveAgentRunModelResult, selectedLevel1ToolNames } from "../bridge/bus-agent-runner";
+import { resolveCorePrimaryLoadedCatalogIds } from "../bridge/bus-agent-runner/lineage-tool-authority";
 import {
   estimateContextSnapshotTokens,
   type ContextSnapshotMessage,
@@ -43,6 +45,7 @@ export type DiscordContextReportRequest = {
   readonly guildId?: string;
   readonly modelOverride?: string;
   readonly messages: readonly ContextSnapshotMessage[];
+  readonly corePrimaryLineage?: CorePrimaryLineageV2;
 };
 
 export type DiscordContextReportProvider = (
@@ -272,11 +275,10 @@ export function createDiscordContextReportProvider(params: {
       );
     }
 
-    const selectedCatalogIds =
-      params.transcriptStore?.listSessionToolIds?.({
-        requestClient: "discord",
-        sessionId: request.sessionId,
-      }) ?? [];
+    const selectedCatalogIds = resolveCorePrimaryLoadedCatalogIds({
+      lineage: request.corePrimaryLineage,
+      transcriptStore: params.transcriptStore,
+    });
     const activeToolNames = selectedLevel1ToolNames(toolset, selectedCatalogIds);
     toolset.updateActiveBatchTools(activeToolNames);
     const activeTools = selectActiveTools(toolset.tools, activeToolNames);

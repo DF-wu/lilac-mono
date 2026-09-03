@@ -205,6 +205,7 @@ export async function persistBlobBackedAgentRunCheckpoint(input: {
   readonly transcriptStore?: TranscriptStore;
   readonly shouldAbandon?: () => boolean;
   readonly corePrimaryLineage?: CorePrimaryLineageV2;
+  readonly loadedCatalogIds?: readonly string[];
   readonly currentTurnUserId?: string;
   readonly retainedRequestDeliveries: readonly {
     readonly requestDeliveryId: string;
@@ -272,6 +273,7 @@ export async function persistBlobBackedAgentRunCheckpoint(input: {
   const checkpoint = createAgentRunCheckpoint({
     messages,
     ...(input.corePrimaryLineage ? { corePrimaryLineage: input.corePrimaryLineage } : {}),
+    ...(input.loadedCatalogIds ? { loadedCatalogIds: input.loadedCatalogIds } : {}),
     ...(input.currentTurnUserId ? { currentTurnUserId: input.currentTurnUserId } : {}),
     retainedRequestDeliveries: input.retainedRequestDeliveries,
   });

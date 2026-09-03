@@ -1069,6 +1069,7 @@ export async function startDiscordRequestRouter(
       ...(input.guildId ? { guildId: input.guildId } : {}),
       ...(input.modelOverride ? { modelOverride: input.modelOverride } : {}),
       messages: composition.messages,
+      corePrimaryLineage: composition.corePrimaryLineage,
     });
     const reportError = report.match({ ok: () => null, err: (error) => error });
     if (reportError) {

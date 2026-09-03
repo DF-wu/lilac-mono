@@ -105,6 +105,7 @@ describe("SqliteAgentRunJournal", () => {
     expect(second.sequence).toBe(3);
     const latestCheckpoint = createAgentRunCheckpoint({
       messages: [{ role: "user", content: "latest" }],
+      loadedCatalogIds: ["mcp_docs_search"],
       currentTurnUserId: "user-2",
     });
     const third = journal.writeCheckpoint(second, latestCheckpoint).match({
@@ -383,7 +384,9 @@ describe("SqliteAgentRunJournal", () => {
     });
     const stale = journal.writeCheckpoint(
       opened,
-      createAgentRunCheckpoint({ messages: [{ role: "user", content: "stale" }] }),
+      createAgentRunCheckpoint({
+        messages: [{ role: "user", content: "stale" }],
+      }),
     );
     expect(stale.match({ ok: () => null, err: (error) => error })).toBeInstanceOf(
       AgentRunJournalConflict,

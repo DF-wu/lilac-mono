@@ -264,6 +264,19 @@ describe("transcript persistence codecs", () => {
     expectCatalog(discoveryRecordRowCodecCases, decodeDiscoveryRecordRow);
   });
 
+  it("rejects non-canonical loaded catalog snapshots", () => {
+    const current = transcriptRowCodecCases.current.input;
+    const decoded = decodeTranscriptRow({
+      row: {
+        ...current.row,
+        loaded_catalog_ids_json: '["mcp_duplicate","mcp_duplicate"]',
+      },
+      schemaVersion: current.schemaVersion,
+    });
+
+    expect(decoded.status).toBe("error");
+  });
+
   it("keeps placeholder request and linked platforms broad at the persistence boundary", () => {
     const discovery = decodeDiscoveryRecordRow({
       row: {

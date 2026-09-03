@@ -9,7 +9,6 @@ import {
   isDiscordContextTextCommand,
 } from "../../../src/surface/discord/discord-context-report";
 import type { BuiltLevel1Toolset, CoreToolPluginManager } from "../../../src/plugins/manager";
-import type { TranscriptStore } from "../../../src/transcript/transcript-store";
 
 describe("isDiscordContextTextCommand", () => {
   it("matches only a leading context command token and ignores its trailing text", () => {
@@ -80,9 +79,6 @@ describe("createDiscordContextReportProvider", () => {
     const pluginManager = {
       buildLevel1ToolsetResult: async () => Result.ok(toolset),
     } as unknown as CoreToolPluginManager;
-    const transcriptStore = {
-      listSessionToolIds: () => ["plugin-id"],
-    } as unknown as TranscriptStore;
     const config = parseCoreConfigV1ToUniversal({
       models: {
         main: { model: "openrouter/openai/gpt-4o" },
@@ -100,7 +96,6 @@ describe("createDiscordContextReportProvider", () => {
     });
     const provider = createDiscordContextReportProvider({
       pluginManager,
-      transcriptStore,
       cwd: "/tmp",
     });
 
@@ -113,7 +108,7 @@ describe("createDiscordContextReportProvider", () => {
 
     expect(report.status).toBe("ok");
     if (report.status === "error") throw report.error;
-    expect(report.value.text).toContain("3 active · 1 selected");
+    expect(report.value.text).toContain("2 active");
     expect(report.value.text).toContain("Catalog: 1 plugin · 1 MCP, loaded on demand");
     expect(report.value.text).toContain("Active tool schemas");
     expect(report.value.text).toContain("128k tokens");

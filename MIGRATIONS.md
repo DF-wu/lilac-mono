@@ -42,6 +42,19 @@ callable itself failed to complete as expected.
 
 ## Core SQLite
 
+### Prefix-lineage tool authority
+
+Core transcript schema 10 adds `request_transcripts.loaded_catalog_ids_json`. Each completed request
+stores the cumulative deferred-tool selection for that exact conversation prefix. Continuations and
+forks inherit the newest reachable request or compaction-checkpoint snapshot from the existing Core
+primary lineage. A fresh lineage starts with no deferred tools selected.
+
+Startup drops the former `session_loaded_tools` table. Its session-wide union cannot be migrated safely
+because it does not record which branch selected a tool. Existing transcripts remain readable and gain
+an empty tool snapshot on their next completed descendant when no reachable schema-10 snapshot exists.
+Agent-run checkpoints also carry the current selection so crash recovery does not lose a tool loaded
+mid-run.
+
 ### Agent questions
 
 Core adds `agent_question_calls` and `agent_question_tokens` to `request-delivery.db`. The tables
@@ -114,7 +127,7 @@ Use `--dry-run` for a read-only preflight. The normal command preflights and the
 invocation. It accepts only supported legacy schemas, verifies every copied object's SHA-256 and byte
 length, rewrites each database only after its required objects exist, and removes replaced legacy byte
 columns and files. The offline command emits transcript schema 6 and workflow schema 26; current Core
-then applies the additive transcript schema 7 through 9 migrations during startup. Legacy or partially migrated
+then applies the additive transcript schema 7 through 10 migrations during startup. Legacy or partially migrated
 versions stop startup with the migration command.
 
 The migration copies durable transcript, projection, lineage, and workflow artifact content. It discards
@@ -322,6 +335,9 @@ SQLite migrations and do not change `core-config.yaml`; its current config contr
   removes stale pins left by a crash. If the latest checkpoint blob is unavailable, recovery
   atomically promotes the retained predecessor in the WAL. It resumes from the accepted request only
   when neither checkpoint is usable.
+- Transcript schema 10 adds a canonical deferred-tool snapshot to every new request transcript and
+  removes the session-wide selection table. Historical rows have no snapshot. Descendants use the
+  newest reachable prefix snapshot, or start empty when none exists.
 
 Core applies missing versions in one immediate transaction, validates foreign keys, marks interrupted
 native attempts uncertain during startup recovery, and promotes recovered pending successes only

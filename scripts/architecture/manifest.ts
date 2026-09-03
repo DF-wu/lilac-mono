@@ -3438,7 +3438,6 @@ const CORE_RESOURCE_PERSISTED_CONSUMER = {
 
 const CORE_TRANSCRIPT_PERSISTED_CONSUMERS = [
   ["decodeTranscriptCompactionContext", [0]],
-  ["decodeTranscriptProviderState", [1]],
   ["decodeTranscriptRow", [2]],
   ["decodeCoreSurfaceProjectionRow", [3]],
   ["decodeCoreLineageManifestRow", [4]],

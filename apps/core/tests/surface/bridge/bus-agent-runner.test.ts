@@ -141,6 +141,7 @@ import {
   type CustomCommandExecutionError,
 } from "../../../src/custom-commands/manager";
 import { createCorePrimaryClaudeRuntime as createCorePrimaryClaudeRuntimeResult } from "../../../src/surface/bridge/bus-agent-runner/core-primary-continuation";
+import { resolveCorePrimaryLoadedCatalogIds } from "../../../src/surface/bridge/bus-agent-runner/lineage-tool-authority";
 
 function createCorePrimaryClaudeRuntime(
   input: Parameters<typeof createCorePrimaryClaudeRuntimeResult>[0],
@@ -4564,6 +4565,134 @@ describe("durable accepted runner recovery", () => {
     }
   });
 
+  it("restores loaded tools from a WAL checkpoint and persists them for the next descendant", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-tool-recovery-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    pluginManager.buildLevel1ToolsetResult = async () => Result.ok(level1TestToolset());
+    const offered: string[][] = [];
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "tool-authority-wal-recovery",
+      startPaused: true,
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      transcriptStore: store,
+      resolveDiscordSessionContext: () => ({ parentChannelId: null, guildId: null }),
+      issueControlCapability: () => ({ capability: "tool-authority-recovery", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "tool-authority-wal-recovery",
+            doStream: async (modelOptions) => {
+              offered.push(level1OfferedToolNames(modelOptions));
+              return level1TextStep("recovered");
+            },
+          }),
+        }),
+    });
+
+    const sessionId = "tool-authority-recovery";
+    const inputMessageId = "recovered-input";
+    const recoveredRequestId = `discord:${sessionId}:${inputMessageId}`;
+    const recoveredMessages = [
+      { role: "user", content: "resume after crash" },
+    ] satisfies ModelMessage[];
+    const recoveredLineage = buildCoreLineageManifestV2([
+      admitPrimarySurface(store, sessionId, inputMessageId, recoveredMessages),
+    ]);
+    const accepted = acceptedRunnerDelivery({
+      requestDeliveryId: crypto.randomUUID(),
+      requestId: recoveredRequestId,
+      sessionId,
+      requestClient: "discord",
+      queue: "prompt",
+      messages: transcriptResultValue(projectStoredMessagesV1(recoveredMessages)),
+      corePrimaryLineage: recoveredLineage,
+      raw: {
+        authenticatedOrigin: {
+          platform: "discord",
+          userId: "recovery-user",
+          messageRef: {
+            platform: "discord",
+            channelId: sessionId,
+            messageId: inputMessageId,
+          },
+        },
+      },
+    });
+    const recoveryHead: AgentRunRecoveryHead = {
+      handle: {
+        runId: accepted.requestDeliveryId,
+        requestId: accepted.requestId,
+        sessionId: accepted.work.sessionId,
+        sequence: 2,
+      },
+      state: "active",
+      checkpoint: {
+        version: 1,
+        messages: transcriptResultValue(projectStoredMessagesV1(recoveredMessages)),
+        corePrimaryLineage: recoveredLineage,
+        loadedCatalogIds: ["catalog-id"],
+        retainedRequestDeliveries: [],
+      },
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const recoveredLifecycle = await observeRequestLifecycle(bus, recoveredRequestId);
+
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, recoveryHead));
+      runner.activate();
+      await expect(recoveredLifecycle.terminal).resolves.toBe("resolved");
+      await recoveredLifecycle.stop();
+
+      expect(
+        getRequestTranscript(store, { requestId: recoveredRequestId })?.loadedCatalogIds,
+      ).toEqual(["catalog-id"]);
+
+      const descendantRequestId = "discord:tool-authority-recovery:descendant";
+      const descendantMessages = [
+        { role: "user", content: "continue after recovery" },
+      ] satisfies ModelMessage[];
+      const descendantLineage = extendPrimaryManifest({
+        store,
+        sessionId,
+        previous: recoveredLineage,
+        completedRequestId: recoveredRequestId,
+        outputMessageId: "recovered-output",
+        currentMessageId: "descendant-input",
+        currentMessages: descendantMessages,
+      });
+      const descendantLifecycle = await observeRequestLifecycle(bus, descendantRequestId);
+      await publishRunnerRequest({
+        bus,
+        requestId: descendantRequestId,
+        sessionId,
+        requestClient: "discord",
+        text: "continue after recovery",
+        messages: descendantLineage.segments.flatMap((segment) => segment.canonicalMessages),
+        corePrimaryLineage: descendantLineage,
+      });
+      await expect(descendantLifecycle.terminal).resolves.toBe("resolved");
+      await descendantLifecycle.stop();
+
+      expect(offered).toEqual([
+        ["builtin", "find_tools", "deferred_tool"],
+        ["builtin", "find_tools", "deferred_tool"],
+      ]);
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it("reseeds recovery from the previous checkpoint when the latest blob is unavailable", async () => {
     const bus = createLilacBus(createInMemoryRawBus());
     let level1RequestContext:
@@ -4574,6 +4703,7 @@ describe("durable accepted runner recovery", () => {
     });
     const modelCalled = deferred<void>();
     let observedPrompt = "";
+    let observedTools: string[] = [];
     let resets = 0;
     let promotions = 0;
     const journal = {
@@ -4637,6 +4767,7 @@ describe("durable accepted runner recovery", () => {
             modelId: "journal-previous-checkpoint",
             doStream: async (call) => {
               observedPrompt = JSON.stringify(call.prompt);
+              observedTools = level1OfferedToolNames(call);
               modelCalled.resolve(undefined);
               return level1TextStep("recovered previous checkpoint");
             },
@@ -4692,11 +4823,13 @@ describe("durable accepted runner recovery", () => {
             ],
           },
         ],
+        loadedCatalogIds: [],
         retainedRequestDeliveries: [],
       },
       previousCheckpoint: {
         version: 1,
         messages: [{ role: "user", content: "previous safe checkpoint" }],
+        loadedCatalogIds: ["catalog-id"],
         currentTurnUserId: "checkpoint-user",
         retainedRequestDeliveries: [],
       },
@@ -4712,6 +4845,7 @@ describe("durable accepted runner recovery", () => {
       expect(observedPrompt).toContain("previous safe checkpoint");
       expect(observedPrompt).not.toContain("accepted floor");
       expect(observedPrompt).not.toContain("missing.png");
+      expect(observedTools).toEqual(["builtin", "find_tools", "deferred_tool"]);
       expect(level1RequestContext).toMatchObject({
         currentTurnUserId: "checkpoint-user",
       });
@@ -7686,6 +7820,415 @@ function extendPrimaryManifest(input: {
     { currentSegmentIndex: input.previous.segments.length + 1 },
   );
 }
+
+describe("startBusAgentRunner prefix-lineage tool authority", () => {
+  it("keeps loaded tools on descendants and excludes them from earlier forks and new threads", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-tool-lineage-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    pluginManager.buildLevel1ToolsetResult = async (input) =>
+      Result.ok(
+        level1TestToolset({
+          searchExecute: () => {
+            input.onSelectCatalogIds?.(["catalog-id"]);
+            return "selected";
+          },
+        }),
+      );
+    const offered: string[][] = [];
+    let modelCall = 0;
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "prefix-lineage-tool-authority",
+      reportFatalPanic: () => undefined,
+      config: parseCoreConfigV2ToUniversal({}),
+      pluginManager,
+      transcriptStore: store,
+      issueControlCapability: () => ({ capability: "test", principal: null }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "prefix-lineage-tool-authority",
+            doStream: async (modelOptions) => {
+              offered.push(level1OfferedToolNames(modelOptions));
+              modelCall += 1;
+              return modelCall === 1
+                ? level1ToolCallStep([{ toolCallId: "search", toolName: "find_tools" }])
+                : level1TextStep(`done-${modelCall}`);
+            },
+          }),
+        }),
+    });
+
+    const sessionId = "tool-lineage-channel";
+    const firstRequestId = "discord:tool-lineage:first";
+    const firstMessages = [{ role: "user", content: "load a tool" }] satisfies ModelMessage[];
+    const firstManifest = buildCoreLineageManifestV2([
+      admitPrimarySurface(store, sessionId, "input-first", firstMessages),
+    ]);
+    const firstLifecycle = await observeRequestLifecycle(bus, firstRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: firstRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "load a tool",
+      corePrimaryLineage: firstManifest,
+    });
+    await expect(firstLifecycle.terminal).resolves.toBe("resolved");
+    await firstLifecycle.stop();
+
+    const secondRequestId = "discord:tool-lineage:second";
+    const secondMessages = [{ role: "user", content: "continue" }] satisfies ModelMessage[];
+    const secondManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: firstManifest,
+      completedRequestId: firstRequestId,
+      outputMessageId: "output-first",
+      currentMessageId: "input-second",
+      currentMessages: secondMessages,
+    });
+    const secondLifecycle = await observeRequestLifecycle(bus, secondRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: secondRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "continue",
+      messages: secondManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: secondManifest,
+    });
+    await expect(secondLifecycle.terminal).resolves.toBe("resolved");
+    await secondLifecycle.stop();
+
+    const forkAfterRequestId = "discord:tool-lineage:fork-after";
+    const forkAfterMessages = [
+      { role: "user", content: "fork after load" },
+    ] satisfies ModelMessage[];
+    const forkAfterManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: firstManifest,
+      completedRequestId: firstRequestId,
+      outputMessageId: "output-first-fork",
+      currentMessageId: "input-fork-after",
+      currentMessages: forkAfterMessages,
+    });
+    const forkAfterLifecycle = await observeRequestLifecycle(bus, forkAfterRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: forkAfterRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "fork after load",
+      messages: forkAfterManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: forkAfterManifest,
+    });
+    await expect(forkAfterLifecycle.terminal).resolves.toBe("resolved");
+    await forkAfterLifecycle.stop();
+
+    const thirdRequestId = "discord:tool-lineage:third";
+    const thirdMessages = [{ role: "user", content: "continue again" }] satisfies ModelMessage[];
+    const thirdManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: secondManifest,
+      completedRequestId: secondRequestId,
+      outputMessageId: "output-second",
+      currentMessageId: "input-third",
+      currentMessages: thirdMessages,
+    });
+    const thirdLifecycle = await observeRequestLifecycle(bus, thirdRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: thirdRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "continue again",
+      messages: thirdManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: thirdManifest,
+    });
+    await expect(thirdLifecycle.terminal).resolves.toBe("resolved");
+    await thirdLifecycle.stop();
+
+    const forkFromSecondRequestId = "discord:tool-lineage:fork-from-second";
+    const forkFromSecondMessages = [
+      { role: "user", content: "fork from second response" },
+    ] satisfies ModelMessage[];
+    const forkFromSecondManifest = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: secondManifest,
+      completedRequestId: secondRequestId,
+      outputMessageId: "output-second-fork",
+      currentMessageId: "input-fork-from-second",
+      currentMessages: forkFromSecondMessages,
+    });
+    const forkFromSecondLifecycle = await observeRequestLifecycle(bus, forkFromSecondRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: forkFromSecondRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "fork from second response",
+      messages: forkFromSecondManifest.segments.flatMap((segment) => segment.canonicalMessages),
+      corePrimaryLineage: forkFromSecondManifest,
+    });
+    await expect(forkFromSecondLifecycle.terminal).resolves.toBe("resolved");
+    await forkFromSecondLifecycle.stop();
+
+    const forkRequestId = "discord:tool-lineage:fork-before";
+    const forkMessages = [{ role: "user", content: "fork before load" }] satisfies ModelMessage[];
+    const forkManifest = buildCoreLineageManifestV2([
+      admitPrimarySurface(store, sessionId, "input-fork", forkMessages),
+    ]);
+    const forkLifecycle = await observeRequestLifecycle(bus, forkRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: forkRequestId,
+      sessionId,
+      requestClient: "discord",
+      text: "fork before load",
+      corePrimaryLineage: forkManifest,
+    });
+    await expect(forkLifecycle.terminal).resolves.toBe("resolved");
+    await forkLifecycle.stop();
+
+    const freshSessionId = "tool-lineage-new-thread";
+    const freshRequestId = "discord:tool-lineage:fresh";
+    const freshMessages = [{ role: "user", content: "new thread" }] satisfies ModelMessage[];
+    const freshManifest = buildCoreLineageManifestV2([
+      admitPrimarySurface(store, freshSessionId, "input-fresh", freshMessages),
+    ]);
+    const freshLifecycle = await observeRequestLifecycle(bus, freshRequestId);
+    await publishRunnerRequest({
+      bus,
+      requestId: freshRequestId,
+      sessionId: freshSessionId,
+      requestClient: "discord",
+      text: "new thread",
+      corePrimaryLineage: freshManifest,
+    });
+    await expect(freshLifecycle.terminal).resolves.toBe("resolved");
+    await freshLifecycle.stop();
+
+    expect(offered).toEqual([
+      ["builtin", "find_tools"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools", "deferred_tool"],
+      ["builtin", "find_tools"],
+      ["builtin", "find_tools"],
+    ]);
+    expect(getRequestTranscript(store, { requestId: firstRequestId })?.loadedCatalogIds).toEqual([
+      "catalog-id",
+    ]);
+    expect(getRequestTranscript(store, { requestId: secondRequestId })?.loadedCatalogIds).toEqual([
+      "catalog-id",
+    ]);
+    expect(
+      getRequestTranscript(store, { requestId: forkAfterRequestId })?.loadedCatalogIds,
+    ).toEqual(["catalog-id"]);
+    expect(getRequestTranscript(store, { requestId: thirdRequestId })?.loadedCatalogIds).toEqual([
+      "catalog-id",
+    ]);
+    expect(
+      getRequestTranscript(store, { requestId: forkFromSecondRequestId })?.loadedCatalogIds,
+    ).toEqual(["catalog-id"]);
+    expect(getRequestTranscript(store, { requestId: forkRequestId })?.loadedCatalogIds).toEqual([]);
+    expect(getRequestTranscript(store, { requestId: freshRequestId })?.loadedCatalogIds).toEqual(
+      [],
+    );
+
+    await runner.stop();
+    await pluginManager.destroy();
+    store.close();
+    await bus.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  it("carries loaded tools through a real compaction checkpoint into its descendant", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "lilac-runner-tool-compaction-"));
+    const store = new SqliteTranscriptStore(path.join(dataDir, "transcripts.db"));
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    pluginManager.buildLevel1ToolsetResult = async () => Result.ok(level1TestToolset());
+    const config = parseCoreConfigV2ToUniversal({
+      models: {
+        main: { model: "openrouter/openai/gpt-4o" },
+        fast: { model: "openrouter/openai/gpt-4o" },
+        def: {},
+        capability: {
+          forceUnknownProviders: ["openrouter"],
+          overrides: {
+            "openrouter/openai/gpt-4o": {
+              limit: { context: 10_000, output: 1_000 },
+            },
+          },
+        },
+      },
+    });
+    const modelCalls: Array<{ prompt: string; tools: string[] }> = [];
+    const model = new MockLanguageModelV4({
+      modelId: "tool-authority-compaction",
+      doStream: async (modelOptions) => {
+        const tools = level1OfferedToolNames(modelOptions);
+        modelCalls.push({ prompt: JSON.stringify(modelOptions.prompt), tools });
+        return tools.length === 0
+          ? level1TextStep("## Objective\n- Preserve the loaded tool authority.")
+          : level1TextStep("compacted response");
+      },
+    });
+    const runner = await startBusAgentRunner({
+      bus,
+      subscriptionId: "prefix-lineage-tool-compaction",
+      reportFatalPanic: () => undefined,
+      config,
+      pluginManager,
+      transcriptStore: store,
+      issueControlCapability: () => ({ capability: "tool-compaction", principal: null }),
+      createAgent: (options) => new AiSdkPiAgent({ ...options, model }),
+    });
+
+    const sessionId = "tool-compaction-channel";
+    const seedRequestId = "discord:tool-compaction:seed";
+    const historicalMessages = Array.from({ length: 12 }, (_, index) =>
+      index % 2 === 0
+        ? ({ role: "user", content: `historical question ${index} ${"x".repeat(10_000)}` } as const)
+        : ({ role: "assistant", content: `historical answer ${index}` } as const),
+    ) satisfies ModelMessage[];
+    const seedLineage = buildCoreLineageManifestV2([
+      admitPrimarySurface(store, sessionId, "seed-input", historicalMessages),
+    ]);
+    transcriptResultValue(
+      store.saveRequestTranscript({
+        requestId: seedRequestId,
+        sessionId,
+        requestClient: "discord",
+        messages: [{ role: "assistant", content: "seed response" }],
+        providerState: {
+          lastFamily: "ai-sdk",
+          containsCrossFamilyTurns: false,
+        },
+        loadedCatalogIds: ["catalog-id"],
+        corePrimaryLineage: seedLineage,
+      }),
+    );
+
+    const compactingRequestId = "discord:tool-compaction:compacting";
+    const compactingMessages = [
+      { role: "user", content: "compact this prefix" },
+    ] satisfies ModelMessage[];
+    const compactingLineage = extendPrimaryManifest({
+      store,
+      sessionId,
+      previous: seedLineage,
+      completedRequestId: seedRequestId,
+      outputMessageId: "seed-output",
+      currentMessageId: "compacting-input",
+      currentMessages: compactingMessages,
+    });
+    const compactingLifecycle = await observeRequestLifecycle(bus, compactingRequestId);
+
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId: compactingRequestId,
+        sessionId,
+        requestClient: "discord",
+        text: "compact this prefix",
+        messages: compactingLineage.segments.flatMap((segment) => segment.canonicalMessages),
+        corePrimaryLineage: compactingLineage,
+      });
+      const compactingTerminal = await compactingLifecycle.terminal;
+      if (compactingTerminal !== "resolved") {
+        throw new Error(
+          `compaction request ${compactingTerminal}: ${compactingLifecycle.details.join(" | ")}`,
+        );
+      }
+      await compactingLifecycle.stop();
+
+      const checkpoint = getRequestTranscript(store, { requestId: compactingRequestId });
+      expect(checkpoint?.contextMeta).toEqual({ type: "compaction", formatVersion: 1 });
+      expect(checkpoint?.loadedCatalogIds).toEqual(["catalog-id"]);
+      if (!checkpoint?.transcriptDigest) throw new Error("compaction checkpoint missing");
+      store.linkSurfaceMessagesToRequest({
+        requestId: compactingRequestId,
+        created: [
+          {
+            platform: "discord",
+            channelId: sessionId,
+            messageId: "compacting-output",
+          },
+        ],
+        last: {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: "compacting-output",
+        },
+      });
+
+      const descendantMessages = [
+        { role: "user", content: "continue after compaction" },
+      ] satisfies ModelMessage[];
+      const descendantLineage = buildCoreLineageManifestV2([
+        {
+          atoms: [
+            {
+              kind: "checkpoint",
+              requestId: compactingRequestId,
+              transcriptDigest: checkpoint.transcriptDigest,
+            },
+          ],
+          canonicalMessages: checkpoint.messages,
+        },
+        admitPrimarySurface(store, sessionId, "post-compaction-input", descendantMessages),
+      ]);
+      const descendantRequestId = "discord:tool-compaction:descendant";
+      expect(
+        transcriptResultValue(
+          store.validateCorePrimaryLineageReferences({
+            manifest: descendantLineage,
+            requestClient: "discord",
+            sessionId,
+            surfaceId: `discord:${sessionId}`,
+          }),
+        ),
+      ).toBeNull();
+      expect(
+        resolveCorePrimaryLoadedCatalogIds({ lineage: descendantLineage, transcriptStore: store }),
+      ).toEqual(["catalog-id"]);
+      const descendantLifecycle = await observeRequestLifecycle(bus, descendantRequestId);
+      await publishRunnerRequest({
+        bus,
+        requestId: descendantRequestId,
+        sessionId,
+        requestClient: "discord",
+        text: "continue after compaction",
+        messages: descendantLineage.segments.flatMap((segment) => segment.canonicalMessages),
+        corePrimaryLineage: descendantLineage,
+      });
+      await expect(descendantLifecycle.terminal).resolves.toBe("resolved");
+      await descendantLifecycle.stop();
+
+      expect(modelCalls.filter((call) => call.tools.length > 0).map((call) => call.tools)).toEqual([
+        ["builtin", "find_tools", "deferred_tool"],
+        ["builtin", "find_tools", "deferred_tool"],
+      ]);
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+      await rm(dataDir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("startBusAgentRunner Core-primary Claude production path", () => {
   it("promotes an auto-injected first turn and forks the exact linked reply with suffix-only input", async () => {

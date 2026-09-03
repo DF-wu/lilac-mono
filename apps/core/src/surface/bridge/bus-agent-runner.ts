@@ -201,6 +201,10 @@ import {
   summarizeToolFailure,
 } from "./bus-agent-runner/tool-failure-logging";
 import {
+  LineageToolAuthority,
+  resolveCorePrimaryLoadedCatalogIds,
+} from "./bus-agent-runner/lineage-tool-authority";
+import {
   buildExperimentalDownloadForAnthropicFallback,
   isAnthropicModelSpec,
   withStableAnthropicUpstreamOrder,
@@ -1792,6 +1796,7 @@ type Enqueued = {
   };
   storedRecoveryCheckpoint?: StoredMessageV1[];
   previousRecoveryCheckpoint?: AgentRunCheckpointV1;
+  loadedCatalogIds?: readonly string[];
   acceptedCorePrimaryLineage?: CorePrimaryLineageV2;
   acceptedCurrentTurnUserId?: string;
   retainedRequestDeliveries?: readonly AgentRunnerRetainedRequestDelivery[];
@@ -2569,6 +2574,7 @@ type SessionQueue = {
     messages: ModelMessage[];
     storedMessages: StoredMessageV1[];
     corePrimaryLineage?: CorePrimaryLineageV2;
+    toolAuthority: LineageToolAuthority;
     modelOverride?: string;
     currentTurnUserId?: string;
     currentTurnMessageRef?: MsgRef;
@@ -3009,6 +3015,7 @@ export async function startBusAgentRunner(params: {
       transcriptStore: params.transcriptStore,
       shouldAbandon: () => run.checkpointWriter.abandoned,
       ...(run.corePrimaryLineage ? { corePrimaryLineage: run.corePrimaryLineage } : {}),
+      loadedCatalogIds: run.toolAuthority.snapshot(),
       ...(run.currentTurnUserId ? { currentTurnUserId: run.currentTurnUserId } : {}),
       retainedRequestDeliveries: [...run.retainedRequestDeliveries]
         .filter(([retainedRequestDeliveryId]) =>
@@ -3338,6 +3345,11 @@ export async function startBusAgentRunner(params: {
     input.entry.journalHandle = input.handle;
     input.entry.corePrimaryLineage =
       input.checkpoint.corePrimaryLineage ?? input.entry.acceptedCorePrimaryLineage;
+    if (input.checkpoint.loadedCatalogIds) {
+      input.entry.loadedCatalogIds = [...input.checkpoint.loadedCatalogIds];
+    } else {
+      delete input.entry.loadedCatalogIds;
+    }
     input.entry.currentTurnUserId =
       input.checkpoint.currentTurnUserId ?? input.entry.acceptedCurrentTurnUserId;
     input.entry.currentTurnMessageRef = input.checkpoint.currentTurnUserId
@@ -3370,6 +3382,7 @@ export async function startBusAgentRunner(params: {
     delete input.entry.previousRecoveryCheckpoint;
     delete input.entry.retainedRequestDeliveries;
     delete input.entry.journalHandle;
+    delete input.entry.loadedCatalogIds;
     input.entry.corePrimaryLineage = input.entry.acceptedCorePrimaryLineage;
     input.entry.currentTurnUserId = input.entry.acceptedCurrentTurnUserId;
     input.entry.currentTurnMessageRef = input.entry.authenticatedOrigin?.messageRef;
@@ -5155,6 +5168,15 @@ export async function startBusAgentRunner(params: {
           sessionId: next.sessionId,
         }))
       : null;
+    const toolAuthority = new LineageToolAuthority(
+      next.loadedCatalogIds ??
+        (runProfile === "primary"
+          ? resolveCorePrimaryLoadedCatalogIds({
+              lineage: next.corePrimaryLineage,
+              transcriptStore: params.transcriptStore,
+            })
+          : []),
+    );
     state.activeRun = {
       ...(next.requestDeliveryId ? { requestDeliveryId: next.requestDeliveryId } : {}),
       requestId: next.requestId,
@@ -5167,6 +5189,7 @@ export async function startBusAgentRunner(params: {
       messages: next.messages,
       storedMessages: next.storedMessages,
       corePrimaryLineage: next.corePrimaryLineage,
+      toolAuthority,
       modelOverride: next.modelOverride,
       currentTurnUserId: next.currentTurnUserId,
       currentTurnMessageRef: next.currentTurnMessageRef,
@@ -5561,6 +5584,7 @@ export async function startBusAgentRunner(params: {
                     messages,
                     finalText,
                     modelLabel: resolvedModelLabel,
+                    loadedCatalogIds: toolAuthority.snapshot(),
                   }),
                 );
                 const persistError = persisted.match({
@@ -5778,6 +5802,7 @@ export async function startBusAgentRunner(params: {
           let seededSessionMessages: ModelMessage[] = [];
           let seededStoredMessages: StoredMessageV1[] = [];
           let seededSessionTranscript: TranscriptSnapshot | null = null;
+          const seededToolState: { loadedCatalogIds: string[] } = { loadedCatalogIds: [] };
           if (!next.recovery && runProfile !== "primary" && params.transcriptStore) {
             const loadedTranscript = await captureBusAgentRunnerOperation(
               "subagent continuation transcript load",
@@ -5807,6 +5832,7 @@ export async function startBusAgentRunner(params: {
                     if (!latest || latest.messages.length === 0) return;
                     seededStoredMessages = [...latest.messages];
                     seededSessionTranscript = latest;
+                    seededToolState.loadedCatalogIds = [...(latest.loadedCatalogIds ?? [])];
                     logger.info(
                       "subagent continuation seeded from transcript",
                       formatBridgeLogContext({
@@ -5855,15 +5881,15 @@ export async function startBusAgentRunner(params: {
             }
           }
 
+          if (runProfile !== "primary" && !next.recovery) {
+            toolAuthority.select(seededToolState.loadedCatalogIds);
+          }
+
           const fallbackSurfaceForDelegation = trustedFallbackSurface;
           const executionCwd = path.resolve(workflowPolicy?.cwd ?? cwd);
           let currentTurnUserId = next.currentTurnUserId;
           let currentTurnMessageRef = next.currentTurnMessageRef;
-          const listSelectedCatalogIds = () =>
-            params.transcriptStore?.listSessionToolIds?.({
-              requestClient: next.requestClient,
-              sessionId: next.sessionId,
-            }) ?? [];
+          const listSelectedCatalogIds = () => toolAuthority.snapshot();
           const buildModelBinding = async (resolved: ResolvedModelRef) => {
             let capabilityInfo: ModelCapabilityInfo | null = null;
             let bindingCostEstimateStatus: "estimated" | "unavailable" = "unavailable";
@@ -6000,6 +6026,7 @@ export async function startBusAgentRunner(params: {
                   maxDepth: subagents.maxDepth,
                 },
                 requestContext: level1RequestContext,
+                onSelectCatalogIds: (catalogIds) => toolAuthority.select(catalogIds),
                 reportToolStatus: (update) => {
                   void publishAuxiliaryOutput("failed to publish batch tool status", () =>
                     outputPublisher.publishToolCall(update),
@@ -8096,6 +8123,7 @@ export async function startBusAgentRunner(params: {
                   finalText,
                   modelLabel: resolvedModelLabel,
                   contextMeta: checkpointMeta,
+                  loadedCatalogIds: toolAuthority.snapshot(),
                   ...(providerState && !coreNamedClaudeRuntime && !canPublishCorePrimaryClaude
                     ? { providerState }
                     : {}),
@@ -8549,6 +8577,7 @@ export async function startBusAgentRunner(params: {
                 messages: persistedMessages,
                 finalText: `Error: ${msg}`,
                 modelLabel: resolvedModelLabel,
+                loadedCatalogIds: toolAuthority.snapshot(),
                 ...(runProfile === "primary"
                   ? {
                       providerState: resolveCorePrimaryTranscriptProviderState({
@@ -9221,6 +9250,11 @@ export async function startBusAgentRunner(params: {
         ? {
             recovery: { checkpointMessages: [], partialText: "" },
             storedRecoveryCheckpoint: [...recoveryHead.checkpoint.messages],
+            ...(recoveryHead.checkpoint.loadedCatalogIds
+              ? {
+                  loadedCatalogIds: [...recoveryHead.checkpoint.loadedCatalogIds],
+                }
+              : {}),
             ...(recoveryHead.previousCheckpoint
               ? { previousRecoveryCheckpoint: recoveryHead.previousCheckpoint }
               : {}),

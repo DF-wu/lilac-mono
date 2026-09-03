@@ -194,12 +194,8 @@ describe("unified deferred tool catalog", () => {
     ).toMatchObject({ matches: [{ source: "plugin" }] });
   });
 
-  it("persists every returned stable ID for the requesting client and session", async () => {
-    const selections: Array<{
-      requestClient: string;
-      sessionId: string;
-      catalogIds: readonly string[];
-    }> = [];
+  it("reports every returned stable ID to the run authority", async () => {
+    const selections: Array<readonly string[]> = [];
     const catalog = buildUnifiedToolCatalog({
       candidates: [
         candidate({ source: "plugin", sourceId: "one", rawName: "search-one" }),
@@ -209,9 +205,7 @@ describe("unified deferred tool catalog", () => {
     const execute = executableSearch(
       createPortableToolSearch({
         catalog: catalog.entries,
-        transcriptStore: {
-          selectSessionToolIds: (input) => selections.push(input),
-        },
+        onSelectCatalogIds: (catalogIds) => selections.push(catalogIds),
         requestContext: { requestClient: "discord", sessionId: "session-1" },
       }),
     );
@@ -220,13 +214,7 @@ describe("unified deferred tool catalog", () => {
       { query: "search", max_results: 2 },
       { toolCallId: "selection", messages: [] },
     );
-    expect(selections).toEqual([
-      {
-        requestClient: "discord",
-        sessionId: "session-1",
-        catalogIds: catalog.entries.map((entry) => entry.stableId),
-      },
-    ]);
+    expect(selections).toEqual([catalog.entries.map((entry) => entry.stableId)]);
     expect(result).toMatchObject({
       matches: [{ stableId: expect.any(String) }, { stableId: expect.any(String) }],
     });
@@ -288,9 +276,7 @@ describe("unified deferred tool catalog", () => {
     const execute = executableSearch(
       createPortableToolSearch({
         catalog: catalog.entries,
-        transcriptStore: {
-          selectSessionToolIds: ({ catalogIds }) => selections.push([...catalogIds]),
-        },
+        onSelectCatalogIds: (catalogIds) => selections.push([...catalogIds]),
         requestContext: { requestClient: "discord", sessionId: "session-1" },
       }),
     );
@@ -361,16 +347,13 @@ describe("unified deferred tool catalog", () => {
     expect((expandedResult as { matches: unknown[] }).matches).toHaveLength(8);
   });
 
-  it("rejects an unrecognized request client instead of persisting it as unknown", () => {
+  it("rejects an unrecognized request client", () => {
     const catalog = buildUnifiedToolCatalog({
       candidates: [candidate({ source: "mcp", sourceId: "one", rawName: "search-one" })],
     });
 
     const search = createPortableToolSearchResult({
       catalog: catalog.entries,
-      transcriptStore: {
-        selectSessionToolIds: () => undefined,
-      },
       requestContext: { requestClient: "desktop", sessionId: "session-1" },
     });
     expect(search.status).toBe("error");

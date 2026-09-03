@@ -36,6 +36,7 @@ export const agentRunCheckpointV1Schema = z.strictObject({
   version: z.literal(1),
   messages: storedMessagesV1Schema,
   corePrimaryLineage: corePrimaryLineageV2Schema.optional(),
+  loadedCatalogIds: z.array(z.string().min(1)).optional(),
   currentTurnUserId: z.string().optional(),
   retainedRequestDeliveries: z.array(retainedDeliverySchema),
 });
@@ -965,6 +966,7 @@ export class SqliteAgentRunJournal implements AgentRunJournal {
 export function createAgentRunCheckpoint(input: {
   readonly messages: readonly StoredMessageV1[];
   readonly corePrimaryLineage?: CorePrimaryLineageV2;
+  readonly loadedCatalogIds?: readonly string[];
   readonly currentTurnUserId?: string;
   readonly retainedRequestDeliveries?: readonly {
     readonly requestDeliveryId: string;
@@ -975,6 +977,7 @@ export function createAgentRunCheckpoint(input: {
     version: 1,
     messages: [...input.messages],
     ...(input.corePrimaryLineage ? { corePrimaryLineage: input.corePrimaryLineage } : {}),
+    ...(input.loadedCatalogIds ? { loadedCatalogIds: [...input.loadedCatalogIds] } : {}),
     ...(input.currentTurnUserId ? { currentTurnUserId: input.currentTurnUserId } : {}),
     retainedRequestDeliveries: [...(input.retainedRequestDeliveries ?? [])],
   };

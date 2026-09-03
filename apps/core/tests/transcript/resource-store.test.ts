@@ -343,7 +343,7 @@ describe("Core resource SQLite store", () => {
     const inspected = new Database(dbPath);
     expect(
       inspected.query("SELECT MAX(version) AS version FROM transcript_schema_migrations").get(),
-    ).toEqual({ version: 9 });
+    ).toEqual({ version: 10 });
     expect(inspected.query("PRAGMA foreign_key_check").all()).toEqual([]);
     inspected.close();
     await fs.rm(directory, { recursive: true, force: true });

@@ -102,6 +102,7 @@ export type BuildLevel1ToolsetParams = {
     maxDepth: number;
   };
   requestContext?: Level1ExecutionRequestContext<RegisteredSurfacePlatform>;
+  onSelectCatalogIds?: (catalogIds: readonly string[]) => void;
   reportToolStatus?: (update: {
     toolCallId: string;
     status: "start" | "update" | "end";
@@ -554,7 +555,7 @@ export function createCoreToolPluginManager(params: {
         {
           catalog: catalog.entries,
           namespaceSummaries: mcpNamespaceSummaries,
-          transcriptStore: params.runtime.transcriptStore,
+          onSelectCatalogIds: buildParams.onSelectCatalogIds,
           requestContext: buildParams.requestContext,
         },
       );
