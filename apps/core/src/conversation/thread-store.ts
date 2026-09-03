@@ -1885,6 +1885,20 @@ export class ConversationThreadStore {
     }));
   }
 
+  listAutoInjectRankingDocuments(): string[] {
+    const rows = this.db
+      .query(
+        `
+        SELECT text
+        FROM conversation_thread_facets
+        WHERE facet = 'combined'
+        ORDER BY thread_id ASC
+        `,
+      )
+      .all() as Array<{ text: string }>;
+    return rows.map((row) => row.text);
+  }
+
   computeEmbeddingInputHash(threadId: string): string | null {
     const facets = this.listFacets(threadId);
     return facets.length > 0 ? computeFacetHash(facets) : null;

@@ -325,6 +325,7 @@ describe("Core resource SQLite store", () => {
     initial.close();
 
     const schema6 = new Database(dbPath);
+    schema6.run("DROP TABLE core_agent_run_checkpoint_blobs");
     schema6.run("DROP TABLE core_transcript_blob_refs");
     schema6.run("ALTER TABLE core_owned_blobs DROP COLUMN deletion_claim_ts");
     schema6.run("DROP TABLE core_surface_projection_resource_refs");
@@ -342,7 +343,7 @@ describe("Core resource SQLite store", () => {
     const inspected = new Database(dbPath);
     expect(
       inspected.query("SELECT MAX(version) AS version FROM transcript_schema_migrations").get(),
-    ).toEqual({ version: 8 });
+    ).toEqual({ version: 10 });
     expect(inspected.query("PRAGMA foreign_key_check").all()).toEqual([]);
     inspected.close();
     await fs.rm(directory, { recursive: true, force: true });

@@ -112,9 +112,22 @@ export type Level1RunProfile = "primary" | "explore" | "general" | "self";
 
 export type Level1ToolFailureKind = "hard" | "soft";
 
+export type Level1ToolFailureClass =
+  | "input"
+  | "policy"
+  | "environment"
+  | "timeout"
+  | "cancelled"
+  | "tool"
+  | "unknown";
+
 export type Level1ToolFailureSummary = {
   ok: boolean;
   failureKind?: Level1ToolFailureKind;
+  failureClass?: Level1ToolFailureClass;
+  failureCode?: string;
+  retryable?: boolean;
+  exitCode?: number;
   error?: string;
 };
 
@@ -135,6 +148,11 @@ export type Level1ExecutionRequestContext<P extends string = string> = {
   requestInitiator?: { platform: P; userId: string };
   requestInitiatorSessionId?: string;
   currentTurnUserId?: string;
+  currentTurnMessageRef?: {
+    platform: P;
+    channelId: string;
+    messageId: string;
+  };
   metadata?: Readonly<Record<string, unknown>>;
 };
 

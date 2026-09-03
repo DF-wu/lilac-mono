@@ -4,7 +4,6 @@ import { z } from "zod";
 import type { ClaudeCodeToolCatalogMetadataMap } from "@stanley2058/lilac-claude-code-bridge";
 import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 
-import type { TranscriptStore } from "../transcript/transcript-store";
 import {
   assignCatalogToolNames,
   catalogToolStableId,
@@ -382,7 +381,7 @@ function portableRequestClient(value: string): AdapterPlatform | null {
 export function createPortableToolSearchResult(params: {
   catalog: readonly CatalogToolEntry[];
   namespaceSummaries?: readonly CatalogNamespaceSummary[];
-  transcriptStore?: Pick<TranscriptStore, "selectSessionToolIds">;
+  onSelectCatalogIds?: (catalogIds: readonly string[]) => void;
   requestContext?: {
     readonly requestClient: string;
     readonly sessionId: string;
@@ -398,13 +397,6 @@ export function createPortableToolSearchResult(params: {
       }),
     );
   }
-  const requestContext =
-    params.requestContext && requestClient
-      ? {
-          requestClient,
-          sessionId: params.requestContext.sessionId,
-        }
-      : undefined;
   const namespaceCatalog = [...(params.namespaceSummaries ?? [])]
     .sort(
       (left, right) =>
@@ -435,13 +427,7 @@ export function createPortableToolSearchResult(params: {
             : rankedToolMatches(params.catalog, parsedQuery);
         const matches = allMatches.slice(0, max_results ?? 5);
 
-        if (requestContext) {
-          params.transcriptStore?.selectSessionToolIds?.({
-            requestClient: requestContext.requestClient,
-            sessionId: requestContext.sessionId,
-            catalogIds: matches.map((entry) => entry.stableId),
-          });
-        }
+        params.onSelectCatalogIds?.(matches.map((entry) => entry.stableId));
 
         return {
           query,

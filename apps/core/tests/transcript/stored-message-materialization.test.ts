@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import type { ModelMessage } from "ai";
-import { createMemoryBlobStore } from "@stanley2058/lilac-blob-storage";
+import { createMemoryBlobStore, type BlobStore } from "@stanley2058/lilac-blob-storage";
 import type { StoredFilePartV1, StoredMessageV1 } from "@stanley2058/lilac-event-bus";
 import { Result, type Result as ResultType } from "better-result";
 
@@ -591,6 +591,111 @@ describe("stored message materialization", () => {
     resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
   });
 
+  it("does not retain an uploaded provider file after persistence is abandoned", async () => {
+    const baseBlobStore = resultValue(await createMemoryBlobStore());
+    const uploadStarted = Promise.withResolvers<void>();
+    const releaseUpload = Promise.withResolvers<void>();
+    let abandoned = false;
+    let retainCalls = 0;
+    const blobStore: Pick<BlobStore, "startUpload" | "delete"> = {
+      startUpload: async (input) => {
+        const started = await baseBlobStore.startUpload(input);
+        return started.map((upload) => ({
+          ...upload,
+          completion: (async () => {
+            uploadStarted.resolve();
+            await releaseUpload.promise;
+            return await upload.completion;
+          })(),
+        }));
+      },
+      delete: (target) => baseBlobStore.delete(target),
+    };
+    const projection = createStoredMessageIdentityProjectionV1().projectForPersistence({
+      providerMessages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "file",
+              data: Buffer.from("abandoned provider file").toString("base64"),
+              mediaType: "text/plain",
+              filename: "abandoned.txt",
+            },
+          ],
+        },
+      ],
+      blobStore,
+      shouldAbandon: () => abandoned,
+      retainUploadedFile: () => {
+        retainCalls += 1;
+        return Result.ok(undefined);
+      },
+    });
+
+    await uploadStarted.promise;
+    abandoned = true;
+    releaseUpload.resolve();
+
+    expect((await projection).status).toBe("error");
+    expect(retainCalls).toBe(0);
+    resultValue(await baseBlobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
+  it("deletes an upload handle when persistence is abandoned as the upload starts", async () => {
+    const baseBlobStore = resultValue(await createMemoryBlobStore());
+    const uploadStarted = Promise.withResolvers<void>();
+    const releaseUploadStart = Promise.withResolvers<void>();
+    let abandoned = false;
+    let startedHandle: Parameters<BlobStore["delete"]>[0] | undefined;
+    let deletedTarget: Parameters<BlobStore["delete"]>[0] | undefined;
+    const blobStore: Pick<BlobStore, "startUpload" | "delete"> = {
+      startUpload: async (input) => {
+        const started = await baseBlobStore.startUpload(input);
+        started.match({
+          ok: (upload) => {
+            startedHandle = upload.handle;
+          },
+          err: () => undefined,
+        });
+        uploadStarted.resolve();
+        await releaseUploadStart.promise;
+        return started;
+      },
+      delete: (target) => {
+        deletedTarget = target;
+        return baseBlobStore.delete(target);
+      },
+    };
+    const projection = createStoredMessageIdentityProjectionV1().projectForPersistence({
+      providerMessages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "file",
+              data: Buffer.from("abandoned provider upload").toString("base64"),
+              mediaType: "text/plain",
+              filename: "abandoned-start.txt",
+            },
+          ],
+        },
+      ],
+      blobStore,
+      shouldAbandon: () => abandoned,
+      retainUploadedFile: () => Result.ok(undefined),
+    });
+
+    await uploadStarted.promise;
+    abandoned = true;
+    releaseUploadStart.resolve();
+
+    expect((await projection).status).toBe("error");
+    expect(startedHandle).toBeDefined();
+    expect(deletedTarget).toEqual(startedHandle);
+    resultValue(await baseBlobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
   it("correlates reused read call IDs with their results in transcript order", () => {
     const firstUri = "resource://r1_00000000000000000000000000000001";
     const secondUri = "resource://r1_00000000000000000000000000000002";
@@ -657,12 +762,14 @@ describe("stored message materialization", () => {
   it("adds verified byte-backed images for a capable AI SDK provider", async () => {
     const blobStore = resultValue(await createMemoryBlobStore());
     const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const identityProjection = createStoredMessageIdentityProjectionV1();
     let openedWith = 0;
 
     const materialized = resultValue(
       await materializeStoredMessagesV1({
         messages: storedImageResource,
         blobStore,
+        identityProjection,
         resourceAccess: resourceAccess({
           bytes,
           mediaType: "image/png",
@@ -692,6 +799,112 @@ describe("stored message materialization", () => {
         filename: "image.png",
       },
     ]);
+    const agentClone = materialized.map((message): ModelMessage => {
+      if (message.role === "assistant") {
+        return {
+          ...message,
+          content: Array.isArray(message.content)
+            ? message.content.map((part) => ({ ...part }))
+            : message.content,
+        };
+      }
+      if (message.role === "tool") {
+        return { ...message, content: message.content.map((part) => ({ ...part })) };
+      }
+      if (message.role === "user" && Array.isArray(message.content)) {
+        return { ...message, content: message.content.map((part) => ({ ...part })) };
+      }
+      return { ...message };
+    });
+    expect(resultValue(identityProjection.project(agentClone))).toEqual(storedImageResource);
+
+    resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
+  it("wraps resource bytes embedded in tool results for the provider contract", async () => {
+    const blobStore = resultValue(await createMemoryBlobStore());
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const identityProjection = createStoredMessageIdentityProjectionV1();
+    const uri = "resource://r1_00000000000000000000000000000001" as const;
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "read-resource-image",
+            toolName: "read",
+            input: { path: uri },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "read-resource-image",
+            toolName: "read",
+            output: {
+              type: "content",
+              value: [
+                { type: "text", text: "Attached file from read: image.png" },
+                { type: "resource", uri, filename: "image.png", mediaType: "image/png" },
+              ],
+            },
+          },
+        ],
+      },
+    ] satisfies StoredMessageV1[];
+
+    const materialized = resultValue(
+      await materializeStoredMessagesV1({
+        messages,
+        blobStore,
+        identityProjection,
+        resourceAccess: resourceAccess({
+          bytes,
+          mediaType: "image/png",
+          classification: { kind: "image", mediaType: "image/png" },
+        }),
+        resourceTarget: {
+          family: "ai-sdk",
+          supportsImage: true,
+          supportsPdf: true,
+        },
+      }),
+    );
+
+    expect(materialized[1]).toMatchObject({
+      role: "tool",
+      content: [
+        {
+          output: {
+            type: "content",
+            value: [
+              { type: "text", text: "Attached file from read: image.png" },
+              { type: "text" },
+              {
+                type: "file",
+                data: { type: "data", data: Buffer.from(bytes).toString("base64") },
+                mediaType: "image/png",
+                filename: "image.png",
+              },
+            ],
+          },
+        },
+      ],
+    });
+    const agentClone = materialized.map((message): ModelMessage => {
+      if (message.role === "tool") {
+        return { ...message, content: message.content.map((part) => ({ ...part })) };
+      }
+      if (message.role === "assistant" && Array.isArray(message.content)) {
+        return { ...message, content: message.content.map((part) => ({ ...part })) };
+      }
+      return { ...message };
+    });
+    expect(resultValue(identityProjection.project(agentClone))).toEqual(messages);
 
     resultValue(await blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
   });

@@ -3,7 +3,12 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { discoverSkills, parseSkillMarkdown, parseSkillMarkdownResult } from "../skills";
+import {
+  DEFAULT_SKILL_DESCRIPTION_MAX_CHARS,
+  discoverSkills,
+  parseSkillMarkdown,
+  parseSkillMarkdownResult,
+} from "../skills";
 import { formatAvailableSkillsSection, type DiscoveredSkill } from "../skills";
 
 async function mkdirp(p: string) {
@@ -142,7 +147,12 @@ describe("skills discovery", () => {
       dataDir,
       homeDir: path.join(tmpRoot, "home"),
     });
-    for (const name of ["coding-agent", "mcp-management", "workflow-authoring"]) {
+    for (const name of [
+      "coding-agent",
+      "customize-lilac",
+      "mcp-management",
+      "workflow-authoring",
+    ]) {
       expect(bundled.skills.find((skill) => skill.name === name)).toMatchObject({
         source: "lilac-builtin",
       });
@@ -358,6 +368,24 @@ describe("bundled skills", () => {
       expect(result.error._tag).toBe("SkillMarkdownInvalid");
       expect(result.error.issue).toBe("missing-frontmatter");
     }
+  });
+
+  it("routes Lilac deployment and config work to separate references", async () => {
+    const skillDir = path.join(import.meta.dir, "..", "builtin-skills", "customize-lilac");
+    const skill = parseSkillMarkdown(await Bun.file(path.join(skillDir, "SKILL.md")).text());
+
+    expect(skill.name).toBe("customize-lilac");
+    expect(skill.description.length).toBeLessThanOrEqual(DEFAULT_SKILL_DESCRIPTION_MAX_CHARS);
+    expect(skill.description).toContain("/app");
+    expect(skill.description).toContain("core-config.yaml");
+    expect(skill.body).toContain("references/self-debugging.md");
+    expect(skill.body).toContain("references/core-config.md");
+    await expect(
+      Bun.file(path.join(skillDir, "references", "self-debugging.md")).exists(),
+    ).resolves.toBe(true);
+    await expect(
+      Bun.file(path.join(skillDir, "references", "core-config.md")).exists(),
+    ).resolves.toBe(true);
   });
 
   it("includes a strong built-in coding-agent skill", async () => {

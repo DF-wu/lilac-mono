@@ -2047,6 +2047,52 @@ describe("RedisStreamsBus", () => {
     await bus.close();
   });
 
+  it("omits successful publish logs for agent output deltas", async () => {
+    const redis = new Redis(TEST_REDIS_URL);
+    const keyPrefix = `test:lilac-event-bus:${randomId("quiet-output-deltas")}`;
+    const raw = createRedisStreamsBus({ redis, keyPrefix });
+    const bus = createLilacBus(raw);
+    const logger = Reflect.get(raw, "logger") as {
+      debug(event: string, context: Record<string, unknown>): void;
+    };
+    const publishedTypes: unknown[] = [];
+    const debug = spyOn(logger, "debug").mockImplementation((event, context) => {
+      if (event === "event_bus.publish") publishedTypes.push(context.type);
+    });
+    const requestId = randomId("req");
+
+    try {
+      requireOk(
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputDeltaText,
+          { delta: "hello" },
+          { headers: { request_id: requestId } },
+        ),
+      );
+      requireOk(
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputDeltaReasoning,
+          { delta: "thinking" },
+          { headers: { request_id: requestId } },
+        ),
+      );
+      requireOk(
+        await bus.publish(
+          lilacEventTypes.EvtAgentOutputResponseText,
+          { finalText: "hello" },
+          { headers: { request_id: requestId } },
+        ),
+      );
+
+      expect(publishedTypes).toEqual([lilacEventTypes.EvtAgentOutputResponseText]);
+    } finally {
+      debug.mockRestore();
+      await bus.close();
+      await redis.del(`${keyPrefix}:v2:${outReqTopic(requestId)}`);
+      redis.disconnect();
+    }
+  });
+
   it("refreshes a 24-hour TTL on request output streams", async () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-event-bus:${randomId("output-ttl")}`;

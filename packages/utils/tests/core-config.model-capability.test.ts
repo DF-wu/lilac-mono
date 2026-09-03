@@ -22,6 +22,7 @@ describe("coreConfigSchema models.capability", () => {
       followUpMinTextUnits: 110,
       limit: 3,
       minScore: 0.1,
+      expansionMinConfidence: 0.57,
       mode: "hybrid",
       filterCurrentParticipants: false,
     });
@@ -65,6 +66,7 @@ describe("coreConfigSchema models.capability", () => {
             followUpMinTextUnits: 150,
             limit: 4,
             minScore: 0.2,
+            expansionMinConfidence: 0.68,
             mode: "semantic",
             filterCurrentParticipants: true,
           },
@@ -80,9 +82,23 @@ describe("coreConfigSchema models.capability", () => {
       followUpMinTextUnits: 150,
       limit: 4,
       minScore: 0.2,
+      expansionMinConfidence: 0.68,
       mode: "semantic",
       filterCurrentParticipants: true,
     });
+  });
+
+  it("rejects auto-inject expansion confidence outside zero through one", () => {
+    expect(() =>
+      coreConfigInputSchemaV2.parse({
+        configVersion: 2,
+        conversation: {
+          thread: {
+            autoInject: { expansionMinConfidence: 1.01 },
+          },
+        },
+      }),
+    ).toThrow();
   });
 
   it("defaults forceUnknownProviders and empty overrides", () => {

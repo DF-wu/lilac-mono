@@ -6,7 +6,7 @@ import {
   type ExpandedToolCall,
 } from "@stanley2058/lilac-agent";
 import { expandTilde } from "@stanley2058/lilac-fs";
-import { asSchema, tool, type FlexibleSchema, type ToolSet } from "ai";
+import { asSchema, jsonSchema, tool, type FlexibleSchema, type ToolSet } from "ai";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
@@ -298,7 +298,7 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
           return name;
       }
     };
-    const inputSchema = z.object({
+    const runtimeInputSchema = z.object({
       tool_calls: z
         .array(
           z.object({
@@ -309,9 +309,35 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
         .min(1)
         .max(maxCalls),
     });
+    const inputSchema = jsonSchema<z.output<typeof runtimeInputSchema>>(
+      {
+        type: "object",
+        properties: {
+          tool_calls: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                tool: { type: "string", enum: allowedNames },
+                parameters: {},
+              },
+              required: ["tool"],
+              additionalProperties: false,
+            },
+            minItems: 1,
+            maxItems: maxCalls,
+          },
+        },
+        required: ["tool_calls"],
+        additionalProperties: false,
+      },
+      {
+        validate: asSchema(runtimeInputSchema).validate,
+      },
+    );
 
     async function executeBatch(
-      input: z.output<typeof inputSchema>,
+      input: z.output<typeof runtimeInputSchema>,
       toolCallId: string,
     ): Promise<ResultType<ToolExpansion, BatchRejected>> {
       if (input.tool_calls.length > maxCalls) {

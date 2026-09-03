@@ -1035,11 +1035,11 @@ function reconcilePendingCompactionReason(params: {
   return params.pendingReason;
 }
 
-function computeInputCompactionBudget(params: {
+export function computeInputCompactionBudget(params: {
   contextLimit: number;
   outputLimit: number;
-  thresholdFraction: number;
-}): InputCompactionBudget {
+  thresholdFraction?: number;
+}): CompactionBudget {
   const contextLimit = Math.max(1, Math.floor(params.contextLimit));
   const boundedThreshold = normalizeThresholdFraction(params.thresholdFraction);
   const earlyInputBudget = Math.max(1, Math.floor(contextLimit * boundedThreshold));

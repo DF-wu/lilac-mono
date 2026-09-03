@@ -639,6 +639,7 @@ const conversationSchemaV2 = z
             followUpMinTextUnits: z.number().int().positive().default(110),
             limit: z.number().int().positive().max(10).default(3),
             minScore: z.number().nonnegative().default(0.1),
+            expansionMinConfidence: z.number().min(0).max(1).default(0.57),
             mode: z.enum(["hybrid", "semantic", "lexical"]).default("hybrid"),
             filterCurrentParticipants: z.boolean().default(false),
           })
@@ -648,6 +649,7 @@ const conversationSchemaV2 = z
             followUpMinTextUnits: 110,
             limit: 3,
             minScore: 0.1,
+            expansionMinConfidence: 0.57,
             mode: "hybrid",
             filterCurrentParticipants: false,
           }),
@@ -667,6 +669,7 @@ const conversationSchemaV2 = z
           followUpMinTextUnits: 110,
           limit: 3,
           minScore: 0.1,
+          expansionMinConfidence: 0.57,
           mode: "hybrid",
           filterCurrentParticipants: false,
         },
@@ -688,6 +691,7 @@ const conversationSchemaV2 = z
         followUpMinTextUnits: 110,
         limit: 3,
         minScore: 0.1,
+        expansionMinConfidence: 0.57,
         mode: "hybrid",
         filterCurrentParticipants: false,
       },
@@ -980,6 +984,7 @@ function coreConfigV2ToUniversal(
         },
       },
       systemPrompt: "",
+      workerSystemPrompt: "",
     },
   };
 }

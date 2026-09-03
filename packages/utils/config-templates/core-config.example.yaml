@@ -19,6 +19,8 @@ configVersion: 2
 #   sessionTokenEnv: LILAC_S3_SESSION_TOKEN
 #   forcePathStyle: true
 
+# Codex uses this for Responses instructions when codex_instructions is absent.
+# Other providers prepend it to data/prompts/*.
 basePrompt: "You are Lilac."
 
 tools:
@@ -124,6 +126,11 @@ conversation:
       # Minimum final search score after semantic/lexical ranking and aboutness
       # coverage. Use 0 for broad/debug recall.
       minScore: 0.1
+      # Confidence cutoff for optional results 2..limit. The best remaining
+      # candidate is kept when search returns one. 0.45-0.55 favors recall;
+      # 0.65-0.75 favors precision. Tune this before minScore, which removes
+      # candidates before confidence ranking.
+      expansionMinConfidence: 0.57
       # Search mode for auto-injected metadata: hybrid, semantic, or lexical.
       mode: hybrid
       # Only inject threads containing at least one user visible in the composed
@@ -480,7 +487,8 @@ agent:
         # promptOverlay: |
         #   Assume no prior conversation context; restate assumptions briefly.
 
-# Optional: extra system prompt text prepended to data/prompts/*.
+# Optional base instructions. Codex uses this for Responses instructions when
+# codex_instructions is absent; other providers prepend it to data/prompts/*.
 # basePrompt: |
 #   You are lilac.
 

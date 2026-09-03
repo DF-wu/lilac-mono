@@ -9,6 +9,7 @@ import {
   createDiscordRelayPolicy,
   createDiscordSurfaceRuntimeDescriptor,
 } from "../surface/discord/discord-runtime-descriptor";
+import type { DiscordQuestionAnswerSource } from "../surface/discord/discord-question-port";
 import {
   createConfiguredGithubSurfaceRuntimeDescriptor,
   createGithubRelayPolicy,
@@ -33,6 +34,7 @@ type BuiltinSurfaceRuntimeLogger = {
 
 export type ComposeBuiltinSurfaceRuntimesInput = {
   readonly discordAdapter: SurfaceAdapter;
+  readonly discordQuestionAnswers?: DiscordQuestionAnswerSource;
   readonly githubAdapter: SurfaceAdapter;
   readonly descriptorBoundDiscordEventSource: SurfaceAdapterEventSource;
   readonly discordHealth?: SurfaceRuntimeHealthPort;
@@ -58,6 +60,7 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
   return SurfaceRuntimeRegistry.create([
     createDiscordSurfaceRuntimeDescriptor({
       adapter: input.discordAdapter,
+      ...(input.discordQuestionAnswers ? { questionAnswers: input.discordQuestionAnswers } : {}),
       ...(input.discordHealth ? { health: input.discordHealth } : {}),
       adapterIngress: {
         start: async () => {

@@ -218,10 +218,14 @@ describe("resolveModelSlot", () => {
 
   it("uses codex_instructions as a top-level meta option for codex", () => {
     const cfg = baseConfig();
+    cfg.basePrompt = "base prompt";
     cfg.models.main = {
       model: "codex/gpt-4o",
       options: {
         codex_instructions: "hello",
+        openai: {
+          instructions: "direct provider instruction",
+        },
       },
     };
 
@@ -232,6 +236,22 @@ describe("resolveModelSlot", () => {
 
     // Ensure the meta key is not forwarded.
     expect(resolved.providerOptions?.codex_instructions).toBeUndefined();
+  });
+
+  it("uses basePrompt for codex instructions when codex_instructions is absent", () => {
+    const cfg = baseConfig();
+    cfg.basePrompt = "base prompt";
+    cfg.models.main = {
+      model: "codex/gpt-4o",
+      options: {
+        openai: {
+          instructions: "direct provider instruction",
+        },
+      },
+    };
+
+    const resolved = resolveModelSlot(cfg, "main");
+    expect(resolved.providerOptions?.openai?.instructions).toBe("base prompt");
   });
 
   it("uses response_commentary as a top-level meta option for openai", () => {
@@ -381,6 +401,11 @@ describe("resolveModelSlot", () => {
     const cfg = baseConfig();
     cfg.models.main = {
       model: "codex/gpt-4o",
+      options: {
+        openai: {
+          instructions: "direct provider instruction",
+        },
+      },
     };
 
     const resolved = resolveModelSlot(cfg, "main");

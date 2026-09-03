@@ -264,6 +264,7 @@ export type UniversalCoreConfig = {
         followUpMinTextUnits: number;
         limit: number;
         minScore: number;
+        expansionMinConfidence: number;
         mode: "hybrid" | "semantic" | "lexical";
         filterCurrentParticipants: boolean;
       };
@@ -381,6 +382,7 @@ export type UniversalCoreConfig = {
 
   agent: {
     systemPrompt: string;
+    workerSystemPrompt: string;
     statsForNerds: boolean | { verbose: boolean };
     reasoningDisplay: "none" | "simple" | "detailed";
     idleTimeoutMs: number;

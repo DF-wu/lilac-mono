@@ -501,7 +501,7 @@ export async function getCoreConfig(options?: {
 
   // Always use file-based system prompt (data/prompts/*).
   // This also ensures missing files are created from templates.
-  const built = await buildAgentSystemPrompt({ basePrompt: cfg.basePrompt });
+  const built = await buildAgentSystemPrompt();
   const pendingPromptNewFiles = await listPromptTemplateNewFiles(built.promptDir);
   warnPendingPromptTemplateMerges(pendingPromptNewFiles);
 
@@ -510,6 +510,7 @@ export async function getCoreConfig(options?: {
     agent: {
       ...cfg.agent,
       systemPrompt: built.systemPrompt,
+      workerSystemPrompt: built.workerSystemPrompt,
     },
   };
 

@@ -1,8 +1,8 @@
-import type { AnalyzeOptions, AnalyzeResult } from "./types";
+import type { AnalyzeOptions, AnalyzeResult, BashSafetyCode, BashSafetyViolation } from "./types";
 
 import { analyzeCommandInternal } from "./analyze/analyze-command";
 
-export type { AnalyzeOptions, AnalyzeResult };
+export type { AnalyzeOptions, AnalyzeResult, BashSafetyCode, BashSafetyViolation };
 
 export function analyzeBashCommand(
   command: string,

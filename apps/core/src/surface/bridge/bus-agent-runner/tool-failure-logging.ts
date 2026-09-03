@@ -9,6 +9,7 @@ import { isRecord } from "@stanley2058/lilac-utils";
 import { Result } from "better-result";
 
 import { redactSecrets } from "../../../tools/bash-safety/format";
+import { bashOutputSchema } from "../../../tools/bash";
 
 const SENSITIVE_KEYS = new Set([
   "authorization",
@@ -103,22 +104,69 @@ function defaultErrorFromResult(result: unknown): string {
 }
 
 export function summarizeBashFailure(result: unknown): ToolFailureSummary {
-  const executionError = isRecord(result) ? result["executionError"] : undefined;
-  const exitCode = getNumberField(result, "exitCode");
-
-  if (executionError !== undefined) {
+  const decoded = bashOutputSchema.safeParse(result);
+  if (!decoded.success) {
     return {
       ok: false,
       failureKind: "hard",
-      error: `bash execution error: ${oneLine(toSerializablePreview(executionError, 500))}`,
+      failureClass: "unknown",
+      failureCode: "invalid_result",
+      error: "bash returned an invalid result",
     };
   }
 
-  if (typeof exitCode === "number" && exitCode !== 0) {
+  const { executionError, exitCode } = decoded.data;
+
+  if (executionError !== undefined) {
+    switch (executionError.type) {
+      case "blocked":
+        return {
+          ok: false,
+          failureKind: "hard",
+          failureClass: "policy",
+          failureCode: executionError.code,
+          retryable: false,
+          error: executionError.hint
+            ? `${executionError.reason} Hint: ${executionError.hint}`
+            : executionError.reason,
+        };
+      case "timeout":
+        return {
+          ok: false,
+          failureKind: "hard",
+          failureClass: "timeout",
+          failureCode: executionError.code,
+          error: `bash timed out after ${executionError.timeoutMs}ms`,
+        };
+      case "aborted":
+        return {
+          ok: false,
+          failureKind: "hard",
+          failureClass: "cancelled",
+          failureCode: executionError.code,
+          retryable: false,
+          error: "bash execution was cancelled",
+        };
+      case "exception":
+        return {
+          ok: false,
+          failureKind: "hard",
+          failureClass: executionError.phase === "spawn" ? "environment" : "tool",
+          failureCode: executionError.code,
+          ...(executionError.code === "spawn_cwd_missing" ? { retryable: false } : {}),
+          error: executionError.message,
+        };
+    }
+  }
+
+  if (exitCode !== 0) {
     return {
       ok: false,
       failureKind: "soft",
-      error: `bash exited with code ${exitCode}`,
+      failureClass: "tool",
+      failureCode: "nonzero_exit",
+      exitCode,
+      error: "bash command exited with a nonzero status",
     };
   }
 
@@ -209,6 +257,8 @@ export function summarizeToolFailure(params: {
     return {
       ok: false,
       failureKind: "hard",
+      failureClass: "unknown",
+      failureCode: "host_execution_error",
       error: defaultErrorFromResult(result),
     };
   }

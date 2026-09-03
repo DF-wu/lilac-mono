@@ -6,6 +6,7 @@ type RedactFn = (text: string) => string;
 
 export interface FormatBlockedMessageInput {
   reason: string;
+  hint?: string;
   command?: string;
   segment?: string;
   maxLen?: number;
@@ -13,7 +14,7 @@ export interface FormatBlockedMessageInput {
 }
 
 export function formatBlockedMessage(input: FormatBlockedMessageInput): string {
-  const { reason, command, segment } = input;
+  const { reason, hint, command, segment } = input;
   const maxLen = input.maxLen ?? 200;
   const redact = input.redact ?? ((t: string) => t);
 
@@ -29,7 +30,9 @@ export function formatBlockedMessage(input: FormatBlockedMessageInput): string {
     message += `\n\nSegment: ${excerpt(safeSegment, maxLen)}`;
   }
 
-  message += "\n\nIf this operation is truly needed, set dangerouslyAllow=true and re-run.";
+  if (hint) {
+    message += `\n\nHint: ${hint}`;
+  }
 
   return message;
 }

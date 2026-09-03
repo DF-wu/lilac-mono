@@ -33,6 +33,7 @@ import {
 } from "../../transcript/transcript-store";
 import {
   composeRequestMessages,
+  composeRecentChannelMessages,
   composeSingleMessageWithLineage,
   DiscordRequestCompositionAndCleanupFailed,
   type RequestCompositionError,
@@ -109,6 +110,10 @@ import {
   type CustomCommandManager,
 } from "../../custom-commands/manager";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "../bridge/bridge-log";
+import {
+  isDiscordContextTextCommand,
+  type DiscordContextReportProvider,
+} from "./discord-context-report";
 
 function continueResult<T, E, ROk, RErr>(
   result: ResultType<T, E>,
@@ -859,6 +864,7 @@ export type StartDiscordRequestRouterInput = {
   requestDelivery: DiscordRequestDeliveryPort;
   subscriptionId: string;
   customCommands?: CustomCommandManager;
+  contextReport?: DiscordContextReportProvider;
   /** Optionally inject config; defaults to getCoreConfig(). */
   config?: CoreConfig;
   transcriptStore?: TranscriptStore;
@@ -962,6 +968,130 @@ export async function startDiscordRequestRouter(
       ? params.routerGate(input)
       : shouldForwardByGate({ cfg, input, logger });
   };
+
+  async function sendContextCommandReply(input: {
+    ingressMessage: SurfaceMessage;
+    text: string;
+    accentColor?: number;
+  }): Promise<void> {
+    const sent = await adapter.sendMsg(
+      input.ingressMessage.session,
+      {
+        text: input.text,
+        ...(input.accentColor === undefined ? {} : { accentColor: input.accentColor }),
+      },
+      { replyTo: input.ingressMessage.ref, silent: true },
+    );
+    const sendError = sent.match({ ok: () => null, err: (error) => error });
+    if (!sendError) return;
+    logger.warn("context report reply failed", {
+      source: "snapshot",
+      sessionId: input.ingressMessage.session.channelId,
+      ...formatTaggedErrorForLog(sendError),
+    });
+  }
+
+  async function reportContextTextCommand(input: {
+    cfg: CoreConfig;
+    sessionId: string;
+    parentChannelId?: string;
+    guildId?: string;
+    msgRef: MsgRef;
+    ingressMessage: SurfaceMessage;
+    requestId?: string;
+    modelOverride?: string;
+    botMentionNames: readonly string[];
+  }): Promise<void> {
+    const requestId = formatDiscordMessageRequestId({
+      channelId: input.sessionId,
+      messageId: input.msgRef.messageId,
+    });
+    const discordUserAliasById = buildDiscordUserAliasById(input.cfg);
+    const composed = await composeRecentChannelMessages(adapter, {
+      platform: "discord",
+      sessionId: input.sessionId,
+      botUserId: self.userId,
+      botName: input.cfg.surface.discord.botName,
+      botMentionNames: input.botMentionNames,
+      limit: 8,
+      transcriptStore: params.transcriptStore,
+      blobStore: params.blobStore,
+      resourceRegistry: params.resourceRegistry,
+      attachmentCache: params.attachmentCache,
+      attachmentCacheTtl: input.cfg.surface.discord.attachmentCache.ttlMs,
+      messageCache: params.messageCache,
+      ingressMessages: [input.ingressMessage],
+      currentRequestId: input.requestId ?? requestId,
+      currentMessageIds: [input.msgRef.messageId],
+      discordUserAliasById,
+      triggerMsgRef: input.msgRef,
+    });
+    const compositionError = composed.match({ ok: () => null, err: (error) => error });
+    if (compositionError) {
+      logDiscordRequestCompositionFailure(logger, requestId, input.sessionId, compositionError);
+      await sendContextCommandReply({
+        ingressMessage: input.ingressMessage,
+        text: "Unable to build the context snapshot.",
+      });
+      return;
+    }
+    const composition = composed.match({ ok: (value) => value, err: () => null });
+    if (!composition) return;
+
+    const cleanup = await deleteDiscordRequestBlobHandles(
+      params.blobStore,
+      composition.inputHandles,
+    );
+    const cleanupError = cleanup.match({ ok: () => null, err: (error) => error });
+    if (cleanupError) {
+      logger.warn("context snapshot input cleanup failed", {
+        sessionId: input.sessionId,
+        requestId,
+        ...formatTaggedErrorForLog(cleanupError),
+      });
+    }
+
+    const contextReport = params.contextReport;
+    if (!contextReport) {
+      await sendContextCommandReply({
+        ingressMessage: input.ingressMessage,
+        text: "Context reporting is not ready yet.",
+      });
+      return;
+    }
+    const report = await contextReport({
+      source: "snapshot",
+      config: input.cfg,
+      sessionId: input.sessionId,
+      requestId: input.requestId ?? requestId,
+      userId: input.ingressMessage.userId,
+      ...(input.parentChannelId ? { parentChannelId: input.parentChannelId } : {}),
+      ...(input.guildId ? { guildId: input.guildId } : {}),
+      ...(input.modelOverride ? { modelOverride: input.modelOverride } : {}),
+      messages: composition.messages,
+      corePrimaryLineage: composition.corePrimaryLineage,
+    });
+    const reportError = report.match({ ok: () => null, err: (error) => error });
+    if (reportError) {
+      logger.warn("context report failed", {
+        source: "snapshot",
+        sessionId: input.sessionId,
+        ...formatTaggedErrorForLog(reportError),
+      });
+      await sendContextCommandReply({
+        ingressMessage: input.ingressMessage,
+        text: "Unable to build the context snapshot.",
+      });
+      return;
+    }
+    const presentation = report.match({ ok: (value) => value, err: () => null });
+    if (!presentation) return;
+    await sendContextCommandReply({
+      ingressMessage: input.ingressMessage,
+      text: presentation.text,
+      accentColor: presentation.accentColor,
+    });
+  }
 
   async function resolvePreviousMessageText(input: {
     msgRef: MsgRef;
@@ -1411,6 +1541,45 @@ export async function startDiscordRequestRouter(
                 ? previewText(msg.data.text)
                 : undefined,
           });
+
+          if (isDiscordContextTextCommand(msg.data.text)) {
+            if (active) {
+              const published = await publishSingleMessageToActiveRequest({
+                adapter,
+                bus,
+                cfg,
+                requestId: active.requestId,
+                sessionId,
+                sessionConfigId,
+                parentChannelId,
+                queue: "followUp",
+                msgRef,
+                ingressMessage,
+                sessionMode: mode,
+                modelOverride,
+              });
+              const publishError = published.match({ ok: () => null, err: (error) => error });
+              if (publishError) return Result.err(publishError);
+            }
+
+            await reportContextTextCommand({
+              cfg,
+              sessionId,
+              parentChannelId,
+              guildId: flags.guildId,
+              msgRef,
+              ingressMessage,
+              ...(active ? { requestId: active.requestId } : {}),
+              modelOverride,
+              botMentionNames,
+            });
+            logRouteDecision(
+              active
+                ? { decision: "queue_followup", reason: "context_snapshot" }
+                : { decision: "skip", reason: "context_snapshot_no_active_run" },
+            );
+            return;
+          }
 
           const customName = customCommands?.peekTextName(msg.data.text) ?? null;
           if (customName) {

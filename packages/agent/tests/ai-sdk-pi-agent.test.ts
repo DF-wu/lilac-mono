@@ -832,6 +832,27 @@ describe("AiSdkPiAgent recovery checkpoints", () => {
     expect(model.doStreamCalls).toHaveLength(2);
   });
 
+  it("hands canonical input IDs off once the checkpoint handler accepts them", async () => {
+    const checkpointAttempts: string[][] = [];
+    const model = new MockLanguageModelV4({
+      doStream: [textStream("first", "initial answer"), textStream("second", "redirected")],
+    });
+    const agent = new AiSdkPiAgent({
+      system: "test",
+      model,
+      recoveryCheckpointHandler: (_messages, canonicalInputIds) => {
+        if (canonicalInputIds.length === 0) return;
+        checkpointAttempts.push([...canonicalInputIds]);
+      },
+    });
+    const followUpId = agent.followUp("queued follow-up");
+    const steeringId = agent.steer("change direction");
+
+    await agent.prompt("start");
+
+    expect(checkpointAttempts).toEqual([[followUpId, steeringId]]);
+  });
+
   it("checkpoints only the replay-safe tool prefix after idle recovery normalization", async () => {
     const checkpointEntered = deferred();
     const releaseCheckpoint = deferred();

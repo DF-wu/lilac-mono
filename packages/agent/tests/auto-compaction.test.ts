@@ -8,6 +8,7 @@ import {
   attachAutoCompaction,
   buildSummaryProviderOptions,
   compactMessages,
+  computeInputCompactionBudget,
   __autoCompactionInternals,
   type CompactionProgress,
 } from "../auto-compaction";
@@ -539,7 +540,7 @@ describe("auto-compaction internals", () => {
   });
 
   it("computes input budget from safe and early thresholds", () => {
-    const largeWindow = __autoCompactionInternals.computeInputCompactionBudget({
+    const largeWindow = computeInputCompactionBudget({
       contextLimit: 200_000,
       outputLimit: 16_000,
       thresholdFraction: 0.8,
@@ -549,7 +550,7 @@ describe("auto-compaction internals", () => {
     expect(largeWindow.safeInputBudget).toBe(160_000);
     expect(largeWindow.inputBudget).toBe(160_000);
 
-    const smallWindow = __autoCompactionInternals.computeInputCompactionBudget({
+    const smallWindow = computeInputCompactionBudget({
       contextLimit: 32_000,
       outputLimit: 12_000,
       thresholdFraction: 0.8,
@@ -559,7 +560,7 @@ describe("auto-compaction internals", () => {
     expect(smallWindow.safeInputBudget).toBe(20_000);
     expect(smallWindow.inputBudget).toBe(20_000);
 
-    const fullOutputWindow = __autoCompactionInternals.computeInputCompactionBudget({
+    const fullOutputWindow = computeInputCompactionBudget({
       contextLimit: 500_000,
       outputLimit: 500_000,
       thresholdFraction: 0.8,

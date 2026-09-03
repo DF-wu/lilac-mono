@@ -66,8 +66,26 @@ describe("analyzeBashCommand", () => {
 
     expect(analyzeBashCommand("git reset --hard", { cwd })).not.toBeNull();
     expect(analyzeBashCommand("rm -rf /", { cwd })).not.toBeNull();
-    expect(analyzeBashCommand('rm -rf "$target"', { cwd })?.reason).toContain("dynamic target");
+    expect(analyzeBashCommand('rm -rf "$target"', { cwd })).toMatchObject({
+      code: "dynamic_recursive_delete",
+      reason: expect.stringContaining("dynamic target"),
+      hint: expect.stringContaining("literal child paths"),
+    });
     expect(analyzeBashCommand("cd .. && rm -rf build", { cwd })).not.toBeNull();
+  });
+
+  it("returns stable codes and safe hints without changing recursive-delete decisions", () => {
+    const cwd = "/tmp/lilac-project";
+
+    expect(analyzeBashCommand("rm -r ../outside", { cwd })).toMatchObject({
+      code: "delete_outside_cwd",
+      hint: expect.stringContaining("literal child path"),
+    });
+    expect(analyzeBashCommand("rm -rf /", { cwd })).toMatchObject({
+      code: "delete_root_or_home",
+      hint: expect.stringContaining("specific child path"),
+    });
+    expect(analyzeBashCommand("rm -rf build", { cwd })).toBeNull();
   });
 
   it("analyzes nested static commands", () => {
@@ -77,9 +95,14 @@ describe("analyzeBashCommand", () => {
   });
 
   it("falls back to text analysis when shell parsing fails", () => {
-    expect(analyzeBashCommand("git reset --hard &&")?.reason).toContain(
-      "destroys all uncommitted changes",
-    );
+    expect(analyzeBashCommand("git reset --hard &&")).toMatchObject({
+      code: "dangerous_git_operation",
+      reason: expect.stringContaining("destroys all uncommitted changes"),
+    });
+    expect(analyzeBashCommand('rm -rf "$target" &&')).toMatchObject({
+      code: "dynamic_recursive_delete",
+      hint: expect.stringContaining("literal child paths"),
+    });
     expect(analyzeBashCommand("echo ok &&")).toBeNull();
   });
 
@@ -337,9 +360,11 @@ describe("analyzeBashCommand", () => {
       protectedPaths: ["/data/secret"],
     };
 
-    expect(analyzeBashCommand("cat /data/secret/mcp-oauth/docs.json", options)?.reason).toBe(
-      "access to a configured protected path",
-    );
+    expect(analyzeBashCommand("cat /data/secret/mcp-oauth/docs.json", options)).toMatchObject({
+      code: "protected_path",
+      reason: "access to a configured protected path",
+      hint: expect.stringContaining("outside the protected location"),
+    });
     expect(analyzeBashCommand("cat ../secret/mcp-oauth/docs.json", options)).not.toBeNull();
     expect(
       analyzeBashCommand("printf nope > /data/secret/mcp-oauth/docs.json", options),

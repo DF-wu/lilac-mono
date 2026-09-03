@@ -222,12 +222,15 @@ export type SurfaceAction = {
 export type ContentOpts = {
   text?: string;
   format?: "markdown" | "plain";
+  accentColor?: number;
   attachments?: SurfaceAttachment[];
   actions?: SurfaceAction[];
 };
 
 export type SendOpts = {
   replyTo?: MsgRef;
-  /** Suppress surface notifications for this send (mentions + reply ping). */
+  /** Notify the author of replyTo. Shared action cards otherwise remain quiet. */
+  notifyReply?: boolean;
+  /** Disable all Discord notifications for this send (mentions + reply ping). */
   silent?: boolean;
 };

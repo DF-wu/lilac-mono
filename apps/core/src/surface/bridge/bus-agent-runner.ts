@@ -33,19 +33,16 @@ import type {
 } from "@stanley2058/lilac-utils";
 import {
   CUSTOM_COMMAND_TOOL_NAME,
-  discoverSkills,
+  applyBasePromptForProvider,
   deriveSubagentIdleTimeoutMs,
   env,
   extractAiErrorLogDetails,
-  findWorkspaceRootResult,
-  formatAvailableSkillsSection,
   getCoreConfig,
   isPanic,
   isRecord,
   opaqueErrorMessage,
   ModelCapability,
   openAIMessagePhase,
-  resolveCoreConfigPath,
   createLogger,
   resolveEditingToolMode,
   fromDurableResolvedModelPlanResult,
@@ -152,10 +149,16 @@ import {
   type TranscriptSnapshot,
   type TranscriptStore,
 } from "../../transcript/transcript-store";
-import type {
-  ConversationThreadSearchResult,
-  ConversationThreadToolService,
+import {
+  createConversationThreadAutoInjectUsageAccumulator,
+  type ConversationThreadAutoInjectUsageAccumulator,
+  type ConversationThreadSearchResult,
+  type ConversationThreadToolService,
 } from "../../conversation/thread-service";
+import {
+  rankAutoInjectedThreadSearchResults,
+  type RankedAutoInjectThread,
+} from "../../conversation/thread-auto-inject-ranking";
 import {
   createStoredMessageIdentityProjectionV1,
   materializeStoredMessagesV1,
@@ -178,19 +181,29 @@ import type {
 } from "./request-delivery";
 import type { AcceptedRequestDelivery } from "./request-delivery/types";
 import {
-  createAgentRunCheckpoint,
+  AgentRunJournalConflict,
+  type AgentRunCheckpointV1,
   type AgentRunJournal,
   type AgentRunJournalHandle,
   type AgentRunRecoveryHead,
 } from "./agent-run-journal";
+import {
+  AgentRunCheckpointOwnershipRollbackFailed,
+  AgentRunCheckpointPreparationFailed,
+  persistBlobBackedAgentRunCheckpoint,
+} from "./agent-run-checkpoint-persistence";
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
 import { recordRequestLatencyStage } from "./request-latency-trace";
-import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
+import { selectWorkspaceSystemPrompt } from "./bus-agent-runner/subagent-prompt";
 import {
   formatToolLogPreview,
   summarizeToolFailure,
 } from "./bus-agent-runner/tool-failure-logging";
+import {
+  LineageToolAuthority,
+  resolveCorePrimaryLoadedCatalogIds,
+} from "./bus-agent-runner/lineage-tool-authority";
 import {
   buildExperimentalDownloadForAnthropicFallback,
   isAnthropicModelSpec,
@@ -255,17 +268,13 @@ import {
   systemPromptToText,
 } from "./bus-agent-runner/stats";
 import {
-  appendAdditionalSessionMemoBlock,
-  appendConfiguredAliasPromptBlock,
-  buildAutoInjectedThreadSearchOverlay,
   buildHeartbeatOverlayForRequest,
-  buildRestrictedSessionOverlay,
-  buildSurfaceMetadataOverlay,
-  maybeAppendResponseCommentaryPrompt,
   resolveSessionAdditionalPrompts,
 } from "./bus-agent-runner/prompt-overlays";
+import { maybeBuildSkillsSectionForPrimary } from "./bus-agent-runner/skills-context";
+import { buildAgentRunSystemPrompt } from "./bus-agent-runner/system-prompt";
 import { resolveSessionSafetyMode, type SessionSafetyMode } from "../session-policy";
-import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../types";
+import type { AuthenticatedSurfaceOrigin, MsgRef, SurfacePrincipal } from "../types";
 import type { SurfaceProtocolResolver } from "../runtime-descriptor";
 import type {
   CustomCommandExecutionError,
@@ -1112,19 +1121,29 @@ export type AutoInjectedThreadSearchPayload = {
 
 type AutoInjectedThreadSearchEntry = AutoInjectedThreadSearchPayload["entries"][number];
 
-type AutoInjectedThreadSearchCandidate = AutoInjectedThreadSearchEntry & {
-  score: number;
+type AutoInjectedThreadRankingDiagnostic = {
+  threadId: string;
+  rawScore: number;
+  confidence: number;
   searchIndex: number;
   rank: number;
+  breakdown: RankedAutoInjectThread["breakdown"];
 };
 
 type AutoInjectedThreadSearchAppendedEvent = {
   toolCallId: string;
   mode: "hybrid" | "semantic" | "lexical";
   limit: number;
+  minScore: number;
   searches: readonly (readonly string[])[];
   participantFilterUserCount: number;
   entries: readonly AutoInjectedThreadSearchEntry[];
+  ranking: readonly (AutoInjectedThreadRankingDiagnostic & {
+    selection: RankedAutoInjectThread["selection"];
+  })[];
+  highestRejectedByConfidence: AutoInjectedThreadRankingDiagnostic | null;
+  expansionMinConfidence: number;
+  corpusDocumentCount: number;
 };
 
 export function buildAutoInjectedThreadSearchMessages(params: {
@@ -1179,94 +1198,19 @@ function formatAutoInjectedThreadBrief(brief: string): string | undefined {
   return `${trimmed.slice(0, AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH).trimEnd()} ...(${trimmed.length - AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH} remaining)`;
 }
 
-function compareAutoInjectedThreadSearchCandidates(
-  left: AutoInjectedThreadSearchCandidate,
-  right: AutoInjectedThreadSearchCandidate,
-): number {
-  if (left.score !== right.score) return right.score - left.score;
-  if (left.searchIndex !== right.searchIndex) return left.searchIndex - right.searchIndex;
-  return left.rank - right.rank;
-}
-
-function stripAutoInjectedThreadSearchCandidate(
-  candidate: AutoInjectedThreadSearchCandidate,
+function formatRankedAutoInjectedThread(
+  candidate: RankedAutoInjectThread,
 ): AutoInjectedThreadSearchEntry {
+  const timeRange = candidate.result.timeRange
+    ? formatInjectedThreadTimeRange(candidate.result.timeRange)
+    : undefined;
+  const brief = formatAutoInjectedThreadBrief(candidate.result.brief);
   return {
-    threadId: candidate.threadId,
-    title: candidate.title,
-    ...(candidate.brief ? { brief: candidate.brief } : {}),
-    ...(candidate.timeRange ? { timeRange: candidate.timeRange } : {}),
+    threadId: candidate.result.threadId,
+    title: candidate.result.title,
+    ...(brief ? { brief } : {}),
+    ...(timeRange ? { timeRange } : {}),
   };
-}
-
-function selectAutoInjectedThreadSearchEntries(
-  groups: readonly (readonly AutoInjectedThreadSearchCandidate[])[],
-  limit: number,
-): AutoInjectedThreadSearchEntry[] {
-  const selected: AutoInjectedThreadSearchCandidate[] = [];
-  const selectedThreadIds = new Set<string>();
-  const earlierGroupThreadIds = new Set<string>();
-
-  for (const group of groups) {
-    if (selected.length >= limit) break;
-    const candidate = group.find(
-      (item) => !selectedThreadIds.has(item.threadId) && !earlierGroupThreadIds.has(item.threadId),
-    );
-    for (const item of group) {
-      earlierGroupThreadIds.add(item.threadId);
-    }
-    if (!candidate) continue;
-    selected.push(candidate);
-    selectedThreadIds.add(candidate.threadId);
-  }
-
-  if (selected.length < limit) {
-    const remainingByThreadId = new Map<string, AutoInjectedThreadSearchCandidate>();
-    for (const group of groups) {
-      for (const candidate of group) {
-        if (selectedThreadIds.has(candidate.threadId)) continue;
-        const existing = remainingByThreadId.get(candidate.threadId);
-        if (!existing || compareAutoInjectedThreadSearchCandidates(candidate, existing) < 0) {
-          remainingByThreadId.set(candidate.threadId, candidate);
-        }
-      }
-    }
-
-    const remaining = [...remainingByThreadId.values()].sort(
-      compareAutoInjectedThreadSearchCandidates,
-    );
-    for (const candidate of remaining) {
-      if (selected.length >= limit) break;
-      selected.push(candidate);
-      selectedThreadIds.add(candidate.threadId);
-    }
-  }
-
-  return selected.map(stripAutoInjectedThreadSearchCandidate);
-}
-
-function buildAutoInjectedThreadSearchCandidates(input: {
-  search: ConversationThreadSearchResult;
-  searchIndex: number;
-  previouslyInjectedThreadIds: ReadonlySet<string>;
-}): AutoInjectedThreadSearchCandidate[] {
-  return input.search.results
-    .filter((result) => !input.previouslyInjectedThreadIds.has(result.threadId))
-    .map((result, index) => {
-      const timeRange = result.timeRange
-        ? formatInjectedThreadTimeRange(result.timeRange)
-        : undefined;
-      const brief = formatAutoInjectedThreadBrief(result.brief);
-      return {
-        threadId: result.threadId,
-        title: result.title,
-        ...(brief ? { brief } : {}),
-        ...(timeRange ? { timeRange } : {}),
-        score: result.score ?? 0,
-        searchIndex: input.searchIndex,
-        rank: index + 1,
-      };
-    });
 }
 
 function collectAutoInjectedThreadIds(messages: readonly ModelMessage[]): Set<string> {
@@ -1337,6 +1281,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   }) => Promise<void>;
   onInjected?: (event: AutoInjectedThreadSearchAppendedEvent) => void;
   onError: (message: string, error: BusAgentRunnerErrorProjection) => void;
+  autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
 }): Promise<ModelMessage[]> {
   const autoInject = params.cfg.conversation.thread.autoInject;
   if (!autoInject.enabled) return [];
@@ -1364,6 +1309,13 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
     ? getParticipantUserIdsFromRaw(params.raw)
     : [];
   if (autoInject.filterCurrentParticipants && participantIds.length === 0) return [];
+
+  const autoInjectUsage =
+    params.autoInjectUsage ??
+    createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
+  let usageStatus: "completed" | "abstained" | "partial" | "failed" = "failed";
+  let usageSearchCount = 0;
+  let usageQueryCount = 0;
 
   const toolCallId = buildAutoInjectedThreadSearchToolCallId(params.requestId);
   const display = `${AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME} auto-injected metadata`;
@@ -1400,8 +1352,24 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
         const plan = await conversationThreads.planAutoInjectSearch({
           text,
           content: latestInput.content,
+          autoInjectUsage,
         });
-        const searchRecallLimit = Math.min(50, autoInject.limit * plan.searches.length);
+        usageSearchCount = plan.searches.length;
+        usageQueryCount = plan.searches.reduce(
+          (sum, searchPlan) => sum + searchPlan.queries.length,
+          0,
+        );
+        if (plan.searches.length === 0) {
+          usageStatus = "abstained";
+          await publishToolStatusBestEffort({
+            toolCallId,
+            status: "end",
+            display,
+            ok: true,
+          });
+          return [];
+        }
+        const searchRecallLimit = Math.min(50, Math.max(autoInject.limit * 5, 10));
         const settledSearches = await Promise.allSettled(
           plan.searches.map((searchPlan) =>
             conversationThreads.search({
@@ -1411,26 +1379,27 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
               minScore: autoInject.minScore,
               mode: autoInject.mode,
               verbose: true,
+              autoInjectUsage,
               ...(participantIds.length > 0 ? { participantIdsAny: participantIds } : {}),
             }),
           ),
         );
         let fulfilledSearches = 0;
-        const candidateGroups = settledSearches.map((result, searchIndex) => {
+        const successfulSearches: Array<{
+          searchIndex: number;
+          result: ConversationThreadSearchResult;
+        }> = [];
+        settledSearches.forEach((result, searchIndex) => {
           if (result.status === "fulfilled") {
             fulfilledSearches += 1;
-            return buildAutoInjectedThreadSearchCandidates({
-              search: result.value,
-              searchIndex,
-              previouslyInjectedThreadIds,
-            });
+            successfulSearches.push({ searchIndex, result: result.value });
+            return;
           }
 
           params.onError(
             "auto-injected thread search failed; continuing with partial metadata",
             projectBusAgentRunnerError(result.reason, `Search ${searchIndex} failed`),
           );
-          return [];
         });
         if (fulfilledSearches === 0) {
           const failure = projectBusAgentRunnerError(
@@ -1449,7 +1418,18 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
           );
           return [];
         }
-        const entries = selectAutoInjectedThreadSearchEntries(candidateGroups, autoInject.limit);
+        usageStatus = fulfilledSearches === plan.searches.length ? "completed" : "partial";
+        const corpusDocuments = conversationThreads.getAutoInjectRankingCorpusDocuments?.() ?? [];
+        const rankingResult = rankAutoInjectedThreadSearchResults({
+          plan,
+          searches: successfulSearches,
+          corpusDocuments,
+          excludedThreadIds: previouslyInjectedThreadIds,
+          limit: autoInject.limit,
+          expansionMinConfidence: autoInject.expansionMinConfidence,
+        });
+        const rankedEntries = rankingResult.selected;
+        const entries = rankedEntries.map(formatRankedAutoInjectedThread);
 
         await publishToolStatusBestEffort({
           toolCallId,
@@ -1466,9 +1446,31 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
                 toolCallId,
                 mode: autoInject.mode,
                 limit: autoInject.limit,
+                minScore: autoInject.minScore,
                 searches: plan.searches.map((searchPlan) => searchPlan.queries),
                 participantFilterUserCount: participantIds.length,
                 entries,
+                ranking: rankedEntries.map((entry) => ({
+                  threadId: entry.result.threadId,
+                  rawScore: entry.rawScore,
+                  confidence: entry.confidence,
+                  selection: entry.selection,
+                  searchIndex: entry.searchIndex,
+                  rank: entry.rank,
+                  breakdown: entry.breakdown,
+                })),
+                highestRejectedByConfidence: rankingResult.highestRejectedByConfidence
+                  ? {
+                      threadId: rankingResult.highestRejectedByConfidence.result.threadId,
+                      rawScore: rankingResult.highestRejectedByConfidence.rawScore,
+                      confidence: rankingResult.highestRejectedByConfidence.confidence,
+                      searchIndex: rankingResult.highestRejectedByConfidence.searchIndex,
+                      rank: rankingResult.highestRejectedByConfidence.rank,
+                      breakdown: rankingResult.highestRejectedByConfidence.breakdown,
+                    }
+                  : null,
+                expansionMinConfidence: autoInject.expansionMinConfidence,
+                corpusDocumentCount: corpusDocuments.length,
               });
             },
             catch: captureError,
@@ -1498,8 +1500,18 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
         error: projected.message,
       });
       params.onError("auto-injected thread search failed; continuing without metadata", projected);
+      autoInjectUsage.finish({
+        status: "failed",
+        searchCount: usageSearchCount,
+        queryCount: usageQueryCount,
+      });
       return [];
     }
+    autoInjectUsage.finish({
+      status: usageStatus,
+      searchCount: usageSearchCount,
+      queryCount: usageQueryCount,
+    });
     return attempt.value;
   }
 }
@@ -1774,6 +1786,7 @@ type Enqueued = {
   raw?: AgentRunnerRaw;
   authenticatedOrigin?: AuthenticatedSurfaceOrigin;
   currentTurnUserId?: string;
+  currentTurnMessageRef?: MsgRef;
   verifiedIngress?: boolean;
   identityOwner?: RequestMessageCacheOwner;
   restoredSafetyMode?: SessionSafetyMode;
@@ -1782,6 +1795,10 @@ type Enqueued = {
     partialText: string;
   };
   storedRecoveryCheckpoint?: StoredMessageV1[];
+  previousRecoveryCheckpoint?: AgentRunCheckpointV1;
+  loadedCatalogIds?: readonly string[];
+  acceptedCorePrimaryLineage?: CorePrimaryLineageV2;
+  acceptedCurrentTurnUserId?: string;
   retainedRequestDeliveries?: readonly AgentRunnerRetainedRequestDelivery[];
   journalHandle?: AgentRunJournalHandle;
 };
@@ -1884,6 +1901,15 @@ export function degradeCorePrimaryLineageForMutation(
   currentCanonicalStart = 0,
 ): CorePrimaryLineageV2 {
   return createFreshOnlyLineage(reason, currentCanonicalStart);
+}
+
+export function corePrimaryLineageHasCompactionCheckpoint(
+  lineage: CorePrimaryLineageV2 | undefined,
+): boolean {
+  return (
+    lineage?.state === "complete" &&
+    lineage.segments.some((segment) => segment.atoms.some((atom) => atom.kind === "checkpoint"))
+  );
 }
 
 const AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE = "conversation-thread-auto-inject";
@@ -2139,32 +2165,6 @@ function groupQueueCancellationEntries(entries: readonly Enqueued[]): QueueCance
     });
   }
   return [...groups.values()];
-}
-
-async function maybeBuildSkillsSectionForPrimary(): Promise<string | null> {
-  const workspaceRoot = findWorkspaceRootResult();
-  const root = workspaceRoot.match({ ok: (value) => value, err: () => null });
-  if (root === null) return null;
-  {
-    const attempt = await Result.tryPromise({
-      try: async () => {
-        const { skills } = await discoverSkills({
-          workspaceRoot: root,
-          dataDir: env.dataDir,
-        });
-        return formatAvailableSkillsSection(skills);
-      },
-      catch: captureError,
-    });
-
-    if (attempt.isErr()) {
-      const cause = attempt.error.cause;
-      if (isPanic(cause)) throw cause;
-      // Best-effort: never fail a run due to skill discovery.
-      return null;
-    }
-    return attempt.value;
-  }
 }
 
 export function buildPersistedHeartbeatMessages(finalText: string): StoredMessageV1[] {
@@ -2574,8 +2574,10 @@ type SessionQueue = {
     messages: ModelMessage[];
     storedMessages: StoredMessageV1[];
     corePrimaryLineage?: CorePrimaryLineageV2;
+    toolAuthority: LineageToolAuthority;
     modelOverride?: string;
     currentTurnUserId?: string;
+    currentTurnMessageRef?: MsgRef;
     raw?: AgentRunnerRaw;
     resolvedModelSpec: string | null;
     resolvedReasoning: ModelReasoningEffort | undefined;
@@ -2592,7 +2594,7 @@ type SessionQueue = {
     ) => void;
     notifyWaiters: () => void;
     flushOutput: () => void;
-    setCurrentTurnUserId: (userId: string | undefined) => void;
+    setCurrentTurnContext: (userId: string | undefined, messageRef: MsgRef | undefined) => void;
     cancel: () => void;
     started: boolean;
     startedAt: number;
@@ -2601,6 +2603,22 @@ type SessionQueue = {
     checkpointedRetainedRequestDeliveryIds: Set<string>;
     retainedRequestDeliveryByInputId: Map<AgentInputQueueId, string>;
     journalHandle: AgentRunJournalHandle | null;
+    checkpointWriter: {
+      disabled: boolean;
+      pending: {
+        readonly messages: readonly ModelMessage[];
+        readonly canonicalInputIds: ReadonlySet<AgentInputQueueId>;
+        readonly identityProjection: StoredMessageIdentityProjectionV1;
+      } | null;
+      operation: Promise<void> | null;
+      closed: boolean;
+      abandoned: boolean;
+      retryInputIds: Set<AgentInputQueueId>;
+      inFlightInputIds: ReadonlySet<AgentInputQueueId> | null;
+      lastCommittedProviderMessages: readonly ModelMessage[];
+      lastCommittedStoredMessages: readonly StoredMessageV1[];
+      retainedPredecessorStoredMessages: readonly StoredMessageV1[];
+    };
   } | null;
   /** Track toolCallIds whose outputs are compacted in the model-facing view. */
   compactedToolCallIds: Set<string>;
@@ -2726,7 +2744,8 @@ export async function startBusAgentRunner(params: {
   agentRunJournal?: Pick<
     AgentRunJournal,
     "openRun" | "writeCheckpoint" | "markTerminal" | "resetRun" | "removeReconciled"
-  >;
+  > &
+    Partial<Pick<AgentRunJournal, "promotePreviousCheckpoint">>;
   subscriptionId: string;
   config?: CoreConfig;
   pluginManager: CoreToolPluginManager;
@@ -2897,6 +2916,21 @@ export async function startBusAgentRunner(params: {
     });
   };
 
+  const releaseRunCheckpointBlobs = (input: {
+    readonly requestDeliveryId: string;
+    readonly requestId: string;
+    readonly sessionId: string;
+  }): void => {
+    const releaseError = params.transcriptStore
+      ?.releaseAgentRunCheckpointBlobs?.({ requestDeliveryId: input.requestDeliveryId })
+      .match({ ok: () => null, err: (error) => error });
+    if (!releaseError) return;
+    logger.warn(
+      "agent run checkpoint blob reference cleanup deferred",
+      formatBridgeTaggedErrorForLog(releaseError, input),
+    );
+  };
+
   const resetRunJournal = (input: {
     readonly requestDeliveryId: string;
     readonly requestId: string;
@@ -2906,7 +2940,10 @@ export async function startBusAgentRunner(params: {
     if (!journal) return false;
     const reset = journal.resetRun(input.requestDeliveryId);
     const resetError = reset.match({ ok: () => null, err: (error) => error });
-    if (!resetError) return true;
+    if (!resetError) {
+      releaseRunCheckpointBlobs(input);
+      return true;
+    }
     logJournalReset({ ...input, error: resetError });
     activeAgentRunJournal = null;
     return false;
@@ -2940,104 +2977,415 @@ export async function startBusAgentRunner(params: {
     });
   };
 
-  const persistRunCheckpoint = (
+  const persistRunCheckpoint = async (
     run: NonNullable<SessionQueue["activeRun"]>,
     messages: readonly ModelMessage[],
     canonicalInputIds: readonly AgentInputQueueId[],
-  ): void => {
+    identityProjection: StoredMessageIdentityProjectionV1,
+  ): Promise<"written" | "kept-previous"> => {
     const journal = activeAgentRunJournal;
     const requestDeliveryId = run.requestDeliveryId;
-    if (!journal || !requestDeliveryId) return;
-    const projected = projectStoredMessagesV1(messages);
-    const projection = projected.match<
-      | {
-          readonly kind: "messages";
-          readonly messages: readonly StoredMessageV1[];
-        }
-      | { readonly kind: "reset"; readonly error: Error }
-    >({
-      ok: (storedMessages) => ({ kind: "messages", messages: storedMessages }),
-      err: (error) => ({ kind: "reset", error }),
-    });
-    if (projection.kind === "reset") {
-      logJournalReset({
-        requestDeliveryId,
-        requestId: run.requestId,
-        sessionId: run.sessionId,
-        error: projection.error,
-      });
-      resetRunJournal({
-        requestDeliveryId,
-        requestId: run.requestId,
-        sessionId: run.sessionId,
-      });
-      run.journalHandle = null;
-      return;
-    }
+    if (!journal || !requestDeliveryId || run.checkpointWriter.disabled) return "written";
+    const nextCheckpointedRetainedRequestDeliveryIds = new Set(
+      run.checkpointedRetainedRequestDeliveryIds,
+    );
     for (const inputId of canonicalInputIds) {
       const retainedRequestDeliveryId = run.retainedRequestDeliveryByInputId.get(inputId);
       if (!retainedRequestDeliveryId) continue;
-      run.retainedRequestDeliveryByInputId.delete(inputId);
-      run.checkpointedRetainedRequestDeliveryIds.add(retainedRequestDeliveryId);
+      nextCheckpointedRetainedRequestDeliveryIds.add(retainedRequestDeliveryId);
     }
-    const checkpoint = createAgentRunCheckpoint({
-      messages: projection.messages,
-      ...(run.corePrimaryLineage ? { corePrimaryLineage: run.corePrimaryLineage } : {}),
-      ...(run.currentTurnUserId ? { currentTurnUserId: run.currentTurnUserId } : {}),
-      retainedRequestDeliveries: [...run.retainedRequestDeliveries]
-        .filter(([retainedRequestDeliveryId]) =>
-          run.checkpointedRetainedRequestDeliveryIds.has(retainedRequestDeliveryId),
-        )
-        .map(([retainedRequestDeliveryId, outcome]) => ({
-          requestDeliveryId: retainedRequestDeliveryId,
-          outcome,
-        })),
-    });
     const owner = {
       requestDeliveryId,
       requestId: run.requestId,
       sessionId: run.sessionId,
     };
     const handle = run.journalHandle ?? openRunJournal(owner);
-    if (!handle) return;
-    const written = journal.writeCheckpoint(handle, checkpoint);
-    const writeDecision = written.match<
-      | { readonly kind: "written"; readonly handle: AgentRunJournalHandle }
-      | { readonly kind: "reset"; readonly error: Error }
+    if (!handle) return activeAgentRunJournal ? "kept-previous" : "written";
+    const persisted = await persistBlobBackedAgentRunCheckpoint({
+      handle,
+      journal,
+      messages,
+      previousCheckpoint: {
+        providerMessages: run.checkpointWriter.lastCommittedProviderMessages,
+        storedMessages: run.checkpointWriter.lastCommittedStoredMessages,
+      },
+      retainedPredecessorMessages: run.checkpointWriter.retainedPredecessorStoredMessages,
+      identityProjection,
+      blobStore: params.blobStore,
+      transcriptStore: params.transcriptStore,
+      shouldAbandon: () => run.checkpointWriter.abandoned,
+      ...(run.corePrimaryLineage ? { corePrimaryLineage: run.corePrimaryLineage } : {}),
+      loadedCatalogIds: run.toolAuthority.snapshot(),
+      ...(run.currentTurnUserId ? { currentTurnUserId: run.currentTurnUserId } : {}),
+      retainedRequestDeliveries: [...run.retainedRequestDeliveries]
+        .filter(([retainedRequestDeliveryId]) =>
+          nextCheckpointedRetainedRequestDeliveryIds.has(retainedRequestDeliveryId),
+        )
+        .map(([retainedRequestDeliveryId, outcome]) => ({
+          requestDeliveryId: retainedRequestDeliveryId,
+          outcome,
+        })),
+    });
+    const decision = persisted.match<
+      | {
+          readonly kind: "written";
+          readonly handle: AgentRunJournalHandle;
+          readonly messages: readonly StoredMessageV1[];
+          readonly advanced: boolean;
+          readonly cleanupError?: Error;
+        }
+      | { readonly kind: "kept-previous"; readonly error: Error }
     >({
-      ok: (nextHandle) => ({ kind: "written", handle: nextHandle }),
-      err: (error) => ({ kind: "reset", error }),
+      ok: ({ handle: nextHandle, messages: storedMessages, advanced, cleanupError }) => ({
+        kind: "written",
+        handle: nextHandle,
+        messages: storedMessages,
+        advanced,
+        ...(cleanupError ? { cleanupError } : {}),
+      }),
+      err: (error) => ({ kind: "kept-previous", error }),
     });
-    if (writeDecision.kind === "written") {
-      run.journalHandle = writeDecision.handle;
+    if (decision.kind === "kept-previous") {
+      logger.warn(
+        "agent run checkpoint kept previous",
+        formatBridgeTaggedErrorForLog(decision.error, {
+          requestDeliveryId,
+          requestId: run.requestId,
+          sessionId: run.sessionId,
+          ...(AgentRunCheckpointPreparationFailed.is(decision.error)
+            ? { stage: decision.error.stage }
+            : {}),
+        }),
+      );
+      const journalError = AgentRunCheckpointOwnershipRollbackFailed.is(decision.error)
+        ? decision.error.journalError
+        : decision.error;
+      if (AgentRunCheckpointOwnershipRollbackFailed.is(decision.error)) {
+        logger.warn(
+          "agent run checkpoint blob reference cleanup deferred",
+          formatBridgeTaggedErrorForLog(decision.error.cleanupError, {
+            requestDeliveryId,
+            requestId: run.requestId,
+            sessionId: run.sessionId,
+          }),
+        );
+      }
+      if (AgentRunJournalConflict.is(journalError)) {
+        run.journalHandle = openRunJournal(owner);
+        run.checkpointWriter.disabled = true;
+      }
+      return "kept-previous";
+    }
+    const priorCommittedCheckpointMessages = run.checkpointWriter.lastCommittedStoredMessages;
+    run.journalHandle = decision.handle;
+    if (decision.advanced) {
+      run.checkpointWriter.retainedPredecessorStoredMessages = priorCommittedCheckpointMessages;
+    }
+    run.checkpointWriter.lastCommittedProviderMessages = messages;
+    run.checkpointWriter.lastCommittedStoredMessages = decision.messages;
+    for (const inputId of canonicalInputIds) {
+      run.retainedRequestDeliveryByInputId.delete(inputId);
+    }
+    run.checkpointedRetainedRequestDeliveryIds = nextCheckpointedRetainedRequestDeliveryIds;
+    if (decision.cleanupError) {
+      logger.warn(
+        "agent run checkpoint blob reference cleanup deferred",
+        formatBridgeTaggedErrorForLog(decision.cleanupError, {
+          requestDeliveryId,
+          requestId: run.requestId,
+          sessionId: run.sessionId,
+        }),
+      );
+    }
+    return "written";
+  };
+
+  const enqueueRunCheckpoint = (
+    run: NonNullable<SessionQueue["activeRun"]>,
+    messages: readonly ModelMessage[],
+    canonicalInputIds: readonly AgentInputQueueId[],
+    identityProjection: StoredMessageIdentityProjectionV1,
+  ): void => {
+    if (
+      run.checkpointWriter.closed ||
+      run.checkpointWriter.disabled ||
+      !activeAgentRunJournal ||
+      !run.requestDeliveryId
+    ) {
       return;
     }
-    logJournalReset({ ...owner, error: writeDecision.error });
-    if (!resetRunJournal(owner)) {
-      run.journalHandle = null;
-      return;
+    const pendingInputIds = new Set(run.checkpointWriter.pending?.canonicalInputIds ?? []);
+    for (const inputId of canonicalInputIds) pendingInputIds.add(inputId);
+    run.checkpointWriter.pending = {
+      messages,
+      canonicalInputIds: pendingInputIds,
+      identityProjection,
+    };
+    startRunCheckpointWriter(run);
+  };
+
+  function startRunCheckpointWriter(run: NonNullable<SessionQueue["activeRun"]>): void {
+    if (run.checkpointWriter.operation || !run.checkpointWriter.pending) return;
+    const operation = deferRunCheckpointWriter(run);
+    run.checkpointWriter.operation = operation;
+  }
+
+  async function deferRunCheckpointWriter(
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await superviseRunCheckpointWriter(run);
+  }
+
+  async function superviseRunCheckpointWriter(
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> {
+    const completed = await Result.tryPromise({
+      try: () => drainRunCheckpointWriter(run),
+      catch: captureError,
+    });
+    const failure = completed.match({
+      ok: () => null,
+      err: ({ cause }) => ({ cause }),
+    });
+    const inFlightInputIds = run.checkpointWriter.inFlightInputIds;
+    run.checkpointWriter.inFlightInputIds = null;
+    run.checkpointWriter.operation = null;
+    if (failure) {
+      for (const inputId of inFlightInputIds ?? []) {
+        run.checkpointWriter.retryInputIds.add(inputId);
+      }
+      if (Panic.is(failure.cause)) {
+        reportFatalPanic(failure.cause);
+      } else {
+        const error = projectBusAgentRunnerError(
+          failure.cause,
+          "Agent run checkpoint background write failed",
+        );
+        logger.error("agent run checkpoint background write failed", {
+          requestDeliveryId: run.requestDeliveryId,
+          requestId: run.requestId,
+          sessionId: run.sessionId,
+          errorMessage: error.message,
+        });
+      }
     }
-    run.journalHandle = journal.openRun(owner).match({
-      ok: (reopenedHandle) => reopenedHandle,
-      err: (error) => {
-        logJournalReset({ ...owner, error });
-        activeAgentRunJournal = null;
-        return null;
-      },
+    if (run.checkpointWriter.pending) startRunCheckpointWriter(run);
+  }
+
+  async function drainRunCheckpointWriter(
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> {
+    while (run.checkpointWriter.pending) {
+      const pending = run.checkpointWriter.pending;
+      run.checkpointWriter.pending = null;
+      const canonicalInputIds = new Set(run.checkpointWriter.retryInputIds);
+      for (const inputId of pending.canonicalInputIds) canonicalInputIds.add(inputId);
+      run.checkpointWriter.inFlightInputIds = canonicalInputIds;
+      const outcome = await persistRunCheckpoint(
+        run,
+        pending.messages,
+        [...canonicalInputIds],
+        pending.identityProjection,
+      );
+      run.checkpointWriter.inFlightInputIds = null;
+      if (outcome === "kept-previous") {
+        for (const inputId of canonicalInputIds) run.checkpointWriter.retryInputIds.add(inputId);
+        continue;
+      }
+      for (const inputId of canonicalInputIds) run.checkpointWriter.retryInputIds.delete(inputId);
+    }
+  }
+
+  const flushRunCheckpointWriter = async (
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> => {
+    run.checkpointWriter.closed = true;
+    while (run.checkpointWriter.operation) {
+      await run.checkpointWriter.operation;
+    }
+  };
+
+  const stopRunCheckpointWriters = async (): Promise<void> => {
+    const operations = [...bySession.values()].flatMap((state) => {
+      const run = state.activeRun;
+      if (!run) return [];
+      run.checkpointWriter.closed = true;
+      run.checkpointWriter.abandoned = true;
+      run.checkpointWriter.pending = null;
+      return run.checkpointWriter.operation ? [run.checkpointWriter.operation] : [];
     });
-    if (!run.journalHandle) return;
-    const retried = journal.writeCheckpoint(run.journalHandle, checkpoint);
-    retried.match({
-      ok: (nextHandle) => {
-        run.journalHandle = nextHandle;
-      },
-      err: (error) => {
-        logJournalReset({ ...owner, error });
-        resetRunJournal(owner);
-        activeAgentRunJournal = null;
-        run.journalHandle = null;
-      },
+    if (operations.length === 0) return;
+
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    const completed = await Promise.race([
+      Promise.all(operations).then(() => true),
+      new Promise<false>((resolve) => {
+        deadlineTimer = setTimeout(() => resolve(false), TERMINAL_CLEANUP_SHUTDOWN_WAIT_MS);
+        deadlineTimer.unref?.();
+      }),
+    ]).finally(() => {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
     });
+    if (completed) return;
+    logger.warn("agent run checkpoint writes exceeded shutdown wait", {
+      timeoutMs: TERMINAL_CLEANUP_SHUTDOWN_WAIT_MS,
+      pendingCount: operations.length,
+    });
+  };
+
+  const restorePreviousRunCheckpoint = async (input: {
+    readonly entry: Enqueued;
+    readonly checkpoint: AgentRunCheckpointV1;
+  }): Promise<AgentRunJournalHandle | null> => {
+    const journal = activeAgentRunJournal;
+    const requestDeliveryId = input.entry.requestDeliveryId;
+    if (!journal || !requestDeliveryId || !journal.promotePreviousCheckpoint) return null;
+    const owner = {
+      requestDeliveryId,
+      requestId: input.entry.requestId,
+      sessionId: input.entry.sessionId,
+    };
+    const currentHandle = input.entry.journalHandle;
+    if (!currentHandle) return null;
+    const promoted = journal.promotePreviousCheckpoint(currentHandle, input.checkpoint);
+    const decision = promoted.match<
+      | {
+          readonly kind: "restored";
+          readonly handle: AgentRunJournalHandle;
+        }
+      | { readonly kind: "failed"; readonly error: Error }
+    >({
+      ok: (handle) => ({ kind: "restored", handle }),
+      err: (error) => ({ kind: "failed", error }),
+    });
+    if (decision.kind === "failed") {
+      logger.warn(
+        "agent run previous checkpoint restore failed",
+        formatBridgeTaggedErrorForLog(decision.error, owner),
+      );
+      return null;
+    }
+    const cleanupError = params.transcriptStore?.replaceAgentRunCheckpointBlobs
+      ?.call(params.transcriptStore, {
+        requestDeliveryId,
+        messages: input.checkpoint.messages,
+      })
+      .match({ ok: () => undefined, err: (error) => error });
+    if (cleanupError) {
+      logger.warn(
+        "agent run checkpoint blob reference cleanup deferred",
+        formatBridgeTaggedErrorForLog(cleanupError, owner),
+      );
+    }
+    return decision.handle;
+  };
+
+  const materializePreviousRunCheckpoint = async (input: {
+    readonly entry: Enqueued;
+    readonly identityProjection: StoredMessageIdentityProjectionV1;
+  }): Promise<
+    | {
+        readonly kind: "restored";
+        readonly checkpoint: AgentRunCheckpointV1;
+        readonly messages: ModelMessage[];
+        readonly handle: AgentRunJournalHandle;
+      }
+    | { readonly kind: "unavailable" }
+  > => {
+    const checkpoint = input.entry.previousRecoveryCheckpoint;
+    if (!checkpoint) return { kind: "unavailable" };
+    const materialized = await materializeStoredMessagesV1({
+      messages: checkpoint.messages,
+      blobStore: params.blobStore,
+      identityProjection: input.identityProjection,
+    });
+    const decision = materialized.match<
+      | { readonly kind: "messages"; readonly messages: ModelMessage[] }
+      | { readonly kind: "unavailable"; readonly error: Error }
+    >({
+      ok: (messages) => ({ kind: "messages", messages }),
+      err: (error) => ({ kind: "unavailable", error }),
+    });
+    if (decision.kind === "unavailable") {
+      logger.warn(
+        "agent run previous checkpoint blob unavailable",
+        formatBridgeTaggedErrorForLog(decision.error, {
+          requestDeliveryId: input.entry.requestDeliveryId,
+          requestId: input.entry.requestId,
+          sessionId: input.entry.sessionId,
+        }),
+      );
+      return { kind: "unavailable" };
+    }
+    const handle = await restorePreviousRunCheckpoint({
+      entry: input.entry,
+      checkpoint,
+    });
+    return handle
+      ? { kind: "restored", checkpoint, messages: decision.messages, handle }
+      : { kind: "unavailable" };
+  };
+
+  const installPreviousRunCheckpoint = (input: {
+    readonly entry: Enqueued;
+    readonly recovery: NonNullable<Enqueued["recovery"]>;
+    readonly checkpoint: AgentRunCheckpointV1;
+    readonly messages: ModelMessage[];
+    readonly handle: AgentRunJournalHandle;
+  }): void => {
+    logger.warn("agent run checkpoint restore used previous checkpoint", {
+      requestDeliveryId: input.entry.requestDeliveryId,
+      requestId: input.entry.requestId,
+      sessionId: input.entry.sessionId,
+    });
+    input.recovery.checkpointMessages = input.messages;
+    input.entry.storedRecoveryCheckpoint = [...input.checkpoint.messages];
+    input.entry.retainedRequestDeliveries = input.checkpoint.retainedRequestDeliveries;
+    input.entry.journalHandle = input.handle;
+    input.entry.corePrimaryLineage =
+      input.checkpoint.corePrimaryLineage ?? input.entry.acceptedCorePrimaryLineage;
+    if (input.checkpoint.loadedCatalogIds) {
+      input.entry.loadedCatalogIds = [...input.checkpoint.loadedCatalogIds];
+    } else {
+      delete input.entry.loadedCatalogIds;
+    }
+    input.entry.currentTurnUserId =
+      input.checkpoint.currentTurnUserId ?? input.entry.acceptedCurrentTurnUserId;
+    input.entry.currentTurnMessageRef = input.checkpoint.currentTurnUserId
+      ? undefined
+      : input.entry.authenticatedOrigin?.messageRef;
+    delete input.entry.previousRecoveryCheckpoint;
+  };
+
+  const fallBackRunCheckpointToAcceptedWork = (input: {
+    readonly entry: Enqueued;
+    readonly error: Error;
+  }): void => {
+    logger.warn(
+      "agent run checkpoint restore fell back to accepted work",
+      formatBridgeTaggedErrorForLog(input.error, {
+        requestDeliveryId: input.entry.requestDeliveryId,
+        requestId: input.entry.requestId,
+        sessionId: input.entry.sessionId,
+      }),
+    );
+    if (input.entry.requestDeliveryId) {
+      resetRunJournal({
+        requestDeliveryId: input.entry.requestDeliveryId,
+        requestId: input.entry.requestId,
+        sessionId: input.entry.sessionId,
+      });
+    }
+    delete input.entry.recovery;
+    delete input.entry.storedRecoveryCheckpoint;
+    delete input.entry.previousRecoveryCheckpoint;
+    delete input.entry.retainedRequestDeliveries;
+    delete input.entry.journalHandle;
+    delete input.entry.loadedCatalogIds;
+    input.entry.corePrimaryLineage = input.entry.acceptedCorePrimaryLineage;
+    input.entry.currentTurnUserId = input.entry.acceptedCurrentTurnUserId;
+    input.entry.currentTurnMessageRef = input.entry.authenticatedOrigin?.messageRef;
   };
 
   const markRunTerminal = (
@@ -3501,6 +3849,7 @@ export async function startBusAgentRunner(params: {
               raw,
               authenticatedOrigin: authenticatedRequest?.authenticatedOrigin,
               currentTurnUserId: trustedProjection.authenticatedOrigin?.userId,
+              currentTurnMessageRef: trustedProjection.authenticatedOrigin?.messageRef,
               verifiedIngress: authenticatedRequest?.verifiedIngress,
             };
 
@@ -4425,13 +4774,27 @@ export async function startBusAgentRunner(params: {
         err: (error) => error,
       });
       if (materializationError) {
-        state.queue.unshift(next);
-        return signalBusAgentRunnerHostFailure(materializationError);
+        const previous = await materializePreviousRunCheckpoint({
+          entry: next,
+          identityProjection: storedMessageIdentity,
+        });
+        if (previous.kind === "restored") {
+          installPreviousRunCheckpoint({
+            entry: next,
+            recovery: next.recovery,
+            checkpoint: previous.checkpoint,
+            messages: previous.messages,
+            handle: previous.handle,
+          });
+        } else {
+          fallBackRunCheckpointToAcceptedWork({ entry: next, error: materializationError });
+        }
+      } else {
+        next.recovery.checkpointMessages = materialized.match({
+          ok: (value) => value,
+          err: () => [],
+        });
       }
-      next.recovery.checkpointMessages = materialized.match({
-        ok: (value) => value,
-        err: () => [],
-      });
     }
     if (next.recovery) {
       const mergedControls = mergeQueuedControlsForRecovery(
@@ -4805,6 +5168,15 @@ export async function startBusAgentRunner(params: {
           sessionId: next.sessionId,
         }))
       : null;
+    const toolAuthority = new LineageToolAuthority(
+      next.loadedCatalogIds ??
+        (runProfile === "primary"
+          ? resolveCorePrimaryLoadedCatalogIds({
+              lineage: next.corePrimaryLineage,
+              transcriptStore: params.transcriptStore,
+            })
+          : []),
+    );
     state.activeRun = {
       ...(next.requestDeliveryId ? { requestDeliveryId: next.requestDeliveryId } : {}),
       requestId: next.requestId,
@@ -4817,8 +5189,10 @@ export async function startBusAgentRunner(params: {
       messages: next.messages,
       storedMessages: next.storedMessages,
       corePrimaryLineage: next.corePrimaryLineage,
+      toolAuthority,
       modelOverride: next.modelOverride,
       currentTurnUserId: next.currentTurnUserId,
+      currentTurnMessageRef: next.currentTurnMessageRef,
       raw: next.raw,
       resolvedModelSpec: null,
       resolvedReasoning: undefined,
@@ -4834,7 +5208,7 @@ export async function startBusAgentRunner(params: {
       },
       notifyWaiters: notifyContinuationWaiters,
       flushOutput: outputPublisher.flush,
-      setCurrentTurnUserId: () => undefined,
+      setCurrentTurnContext: () => undefined,
       cancel: () => {
         cancelledByRequestId.add(headers.request_id);
         customCommandAbortController?.abort();
@@ -4854,6 +5228,18 @@ export async function startBusAgentRunner(params: {
       ),
       retainedRequestDeliveryByInputId: new Map(),
       journalHandle: runJournalHandle,
+      checkpointWriter: {
+        disabled: false,
+        pending: null,
+        operation: null,
+        closed: false,
+        abandoned: false,
+        retryInputIds: new Set(),
+        inFlightInputIds: null,
+        lastCommittedProviderMessages: next.recovery?.checkpointMessages ?? [],
+        lastCommittedStoredMessages: next.storedRecoveryCheckpoint ?? [],
+        retainedPredecessorStoredMessages: next.previousRecoveryCheckpoint?.messages ?? [],
+      },
     };
 
     let initialMessages: ModelMessage[] = [];
@@ -4861,6 +5247,9 @@ export async function startBusAgentRunner(params: {
     let customCommandMessages: ModelMessage[] = [];
     let initialMessagesEndWithInjectedTool = false;
     let responseStartIndex = 0;
+    let transcriptHasCompactionCheckpoint = corePrimaryLineageHasCompactionCheckpoint(
+      next.corePrimaryLineage,
+    );
     const runStats: {
       totalUsage?: LanguageModelUsage;
       finalMessages?: ModelMessage[];
@@ -4886,14 +5275,21 @@ export async function startBusAgentRunner(params: {
     let requestTerminalKind: "completed" | "failed" | "cancelled" = "failed";
     let shouldTerminalizeRequest = true;
     let terminalMarkerAttempted = false;
+    let terminalMarkerOperation: Promise<void> | null = null;
     let terminalSurfaceWriteAttempted = false;
     let terminalSurfaceWriteInitiated = false;
     const markActiveRunTerminal = (): void => {
       if (terminalMarkerAttempted || terminalPanic || !shouldTerminalizeRequest) return;
       const run = state.activeRun;
-      if (!run) return;
+      if (!run || run.checkpointWriter.abandoned) return;
       terminalMarkerAttempted = true;
-      markRunTerminal(run, { kind: requestTerminalKind }, outputPublisher.getFinalReplayDeadline());
+      const outcome = { kind: requestTerminalKind } as const;
+      const finalReplayDeadline = outputPublisher.getFinalReplayDeadline();
+      terminalMarkerOperation = (async () => {
+        await flushRunCheckpointWriter(run);
+        if (terminalPanic || run.checkpointWriter.abandoned) return;
+        markRunTerminal(run, outcome, finalReplayDeadline);
+      })();
     };
     const publishTerminalResponseText = async (
       input: Parameters<typeof outputPublisher.publishResponseText>[0],
@@ -4904,6 +5300,7 @@ export async function startBusAgentRunner(params: {
       terminalSurfaceWriteInitiated = true;
       requestTerminalKind = terminalKind;
       markActiveRunTerminal();
+      await terminalMarkerOperation;
     };
     const outcome = await (async () => {
       const runResult = await captureBusAgentRunnerOperation(
@@ -5187,6 +5584,7 @@ export async function startBusAgentRunner(params: {
                     messages,
                     finalText,
                     modelLabel: resolvedModelLabel,
+                    loadedCatalogIds: toolAuthority.snapshot(),
                   }),
                 );
                 const persistError = persisted.match({
@@ -5378,65 +5776,33 @@ export async function startBusAgentRunner(params: {
             nowMs: Date.now(),
           });
 
-          const autoInjectedThreadSearchOverlay = buildAutoInjectedThreadSearchOverlay({
-            cfg,
-            runProfile,
-          });
-
-          const surfaceMetadataOverlay = buildSurfaceMetadataOverlay(next.messages);
-
-          const restrictedSessionOverlay =
-            safetyMode === "restricted"
-              ? buildRestrictedSessionOverlay({ sessionId: next.sessionId })
-              : null;
-
           const buildSystemPrompt = (
             resolved: ResolvedModelRef,
             editingToolMode: ReturnType<typeof resolveEditingToolMode>,
-          ): string => {
-            const profilePrompt = {
-              baseSystemPrompt: cfg.agent.systemPrompt,
-              activeEditingTool: runProfile === "explore" ? null : editingToolMode,
-              exploreOverlay: subagents.profiles.explore.promptOverlay,
-              generalOverlay: subagents.profiles.general.promptOverlay,
-              selfOverlay: subagents.profiles.self.promptOverlay,
-              skillsSection,
-            };
-            const baseSystemPrompt =
-              runProfile === "primary"
-                ? buildSystemPromptForProfile({
-                    ...profilePrompt,
-                    profile: "primary",
-                  })
-                : buildSystemPromptForProfile({
-                    ...profilePrompt,
-                    profile: runProfile,
-                    profileConfig: resolveNativeSubagentProfile(cfg, runProfile),
-                  });
-            let prompt = appendConfiguredAliasPromptBlock({
-              baseSystemPrompt,
+          ): string =>
+            buildAgentRunSystemPrompt({
               cfg,
-              coreConfigPath: resolveCoreConfigPath(),
-            });
-            prompt = appendAdditionalSessionMemoBlock(prompt, additionalSessionPrompts);
-            for (const overlay of [
+              runProfile,
+              resolved,
+              editingToolMode,
+              skillsSection,
+              additionalSessionPrompts,
+              messages: next.messages,
+              safetyMode,
+              sessionId: next.sessionId,
               heartbeatOverlay,
-              autoInjectedThreadSearchOverlay,
-              surfaceMetadataOverlay,
-              restrictedSessionOverlay,
-            ]) {
-              if (overlay?.trim()) prompt = `${prompt}\n\n${overlay}`;
-            }
-            return maybeAppendResponseCommentaryPrompt({
-              baseSystemPrompt: prompt,
-              provider: resolved.provider,
-              responseCommentary: resolved.responseCommentary,
             });
-          };
+
+          const workspaceSystemPrompt = selectWorkspaceSystemPrompt({
+            profile: runProfile,
+            primarySystemPrompt: cfg.agent.systemPrompt,
+            workerSystemPrompt: cfg.agent.workerSystemPrompt,
+          });
 
           let seededSessionMessages: ModelMessage[] = [];
           let seededStoredMessages: StoredMessageV1[] = [];
           let seededSessionTranscript: TranscriptSnapshot | null = null;
+          const seededToolState: { loadedCatalogIds: string[] } = { loadedCatalogIds: [] };
           if (!next.recovery && runProfile !== "primary" && params.transcriptStore) {
             const loadedTranscript = await captureBusAgentRunnerOperation(
               "subagent continuation transcript load",
@@ -5466,6 +5832,7 @@ export async function startBusAgentRunner(params: {
                     if (!latest || latest.messages.length === 0) return;
                     seededStoredMessages = [...latest.messages];
                     seededSessionTranscript = latest;
+                    seededToolState.loadedCatalogIds = [...(latest.loadedCatalogIds ?? [])];
                     logger.info(
                       "subagent continuation seeded from transcript",
                       formatBridgeLogContext({
@@ -5514,14 +5881,15 @@ export async function startBusAgentRunner(params: {
             }
           }
 
+          if (runProfile !== "primary" && !next.recovery) {
+            toolAuthority.select(seededToolState.loadedCatalogIds);
+          }
+
           const fallbackSurfaceForDelegation = trustedFallbackSurface;
           const executionCwd = path.resolve(workflowPolicy?.cwd ?? cwd);
           let currentTurnUserId = next.currentTurnUserId;
-          const listSelectedCatalogIds = () =>
-            params.transcriptStore?.listSessionToolIds?.({
-              requestClient: next.requestClient,
-              sessionId: next.sessionId,
-            }) ?? [];
+          let currentTurnMessageRef = next.currentTurnMessageRef;
+          const listSelectedCatalogIds = () => toolAuthority.snapshot();
           const buildModelBinding = async (resolved: ResolvedModelRef) => {
             let capabilityInfo: ModelCapabilityInfo | null = null;
             let bindingCostEstimateStatus: "estimated" | "unavailable" = "unavailable";
@@ -5629,6 +5997,7 @@ export async function startBusAgentRunner(params: {
                   }
                 : {}),
               currentTurnUserId,
+              currentTurnMessageRef,
               metadata: {
                 controlCapability: controlCapability ?? undefined,
                 readFileDirectImageSupported: resourceProviderTarget.supportsImage,
@@ -5657,6 +6026,7 @@ export async function startBusAgentRunner(params: {
                   maxDepth: subagents.maxDepth,
                 },
                 requestContext: level1RequestContext,
+                onSelectCatalogIds: (catalogIds) => toolAuthority.select(catalogIds),
                 reportToolStatus: (update) => {
                   void publishAuxiliaryOutput("failed to publish batch tool status", () =>
                     outputPublisher.publishToolCall(update),
@@ -5666,6 +6036,7 @@ export async function startBusAgentRunner(params: {
             );
             return toolsetResult.map((toolset) => {
               level1RequestContext.currentTurnUserId = currentTurnUserId;
+              level1RequestContext.currentTurnMessageRef = currentTurnMessageRef;
               return {
                 resolved,
                 capabilityInfo,
@@ -5966,7 +6337,11 @@ export async function startBusAgentRunner(params: {
                     }
                   : null,
                 systemPolicy: {
-                  base: cfg.agent.systemPrompt,
+                  base: applyBasePromptForProvider({
+                    systemPrompt: workspaceSystemPrompt,
+                    basePrompt: cfg.basePrompt,
+                    provider: activeBinding.resolved.provider,
+                  }),
                   profileOverlay: profileConfig?.promptOverlay ?? null,
                   additionalSessionPrompts,
                   skillsSection,
@@ -6093,7 +6468,7 @@ export async function startBusAgentRunner(params: {
             recoveryCheckpointHandler: (messages, canonicalInputIds) => {
               const activeRun = state.activeRun;
               if (!activeRun || activeRun.requestId !== next.requestId) return;
-              persistRunCheckpoint(activeRun, messages, canonicalInputIds);
+              enqueueRunCheckpoint(activeRun, messages, canonicalInputIds, storedMessageIdentity);
             },
             beforeStep:
               activeBinding.resolved.provider !== "claude-code"
@@ -6133,32 +6508,20 @@ export async function startBusAgentRunner(params: {
           );
           activeAgent = agent;
 
-          const setCurrentTurnUserId = (userId: string | undefined) => {
+          const setCurrentTurnContext = (
+            userId: string | undefined,
+            messageRef: MsgRef | undefined,
+          ) => {
             currentTurnUserId = userId;
+            currentTurnMessageRef = messageRef;
             if (state.activeRun) state.activeRun.currentTurnUserId = userId;
+            if (state.activeRun) state.activeRun.currentTurnMessageRef = messageRef;
             activeBinding.requestContext.currentTurnUserId = userId;
-            agent?.setContext({
-              sessionId: next.sessionId,
-              requestId: next.requestId,
-              ...(next.requestDeliveryId ? { requestDeliveryId: next.requestDeliveryId } : {}),
-              requestClient: next.requestClient,
-              subagentDepth: subagentMeta.depth,
-              subagentProfile: runProfile,
-              safetyMode,
-              ...(trustedFallbackSurface
-                ? {
-                    requestInitiator: {
-                      platform: trustedFallbackSurface.platform,
-                      userId: trustedFallbackSurface.userId,
-                    },
-                    requestInitiatorSessionId: trustedFallbackSurface.sessionId,
-                  }
-                : {}),
-              currentTurnUserId: userId,
-            });
+            activeBinding.requestContext.currentTurnMessageRef = messageRef;
+            agent?.setContext(activeBinding.requestContext);
           };
-          setCurrentTurnUserId(next.currentTurnUserId);
-          if (state.activeRun) state.activeRun.setCurrentTurnUserId = setCurrentTurnUserId;
+          setCurrentTurnContext(next.currentTurnUserId, next.currentTurnMessageRef);
+          if (state.activeRun) state.activeRun.setCurrentTurnContext = setCurrentTurnContext;
 
           // Drain all buffered messages at boundaries (better UX in chat surfaces).
           agent.setFollowUpMode("all");
@@ -7359,6 +7722,10 @@ export async function startBusAgentRunner(params: {
                     toolName: event.toolName,
                     durationMs: toolDurationMs,
                     failureKind: toolFailure.failureKind ?? "soft",
+                    failureClass: toolFailure.failureClass,
+                    failureCode: toolFailure.failureCode,
+                    retryable: toolFailure.retryable,
+                    exitCode: toolFailure.exitCode,
                     error: interruptedForShutdown ? "server shutting down" : toolFailureError,
                     argsPreview: formatToolLogPreview({
                       toolName: event.toolName,
@@ -7383,6 +7750,10 @@ export async function startBusAgentRunner(params: {
                 deferredAccepted,
                 durationMs: toolDurationMs,
                 failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
+                failureClass: ok ? undefined : toolFailure.failureClass,
+                failureCode: ok ? undefined : toolFailure.failureCode,
+                retryable: ok ? undefined : toolFailure.retryable,
+                exitCode: ok ? undefined : toolFailure.exitCode,
               });
               if (
                 shouldLogLevel1ToolCompletionAtInfo(event.toolName, activeBinding.toolset.catalog)
@@ -7457,7 +7828,10 @@ export async function startBusAgentRunner(params: {
               coalesced.storedMessages,
               activeBinding,
             );
-            state.activeRun?.setCurrentTurnUserId(next.currentTurnUserId);
+            state.activeRun?.setCurrentTurnContext(
+              next.currentTurnUserId,
+              next.currentTurnMessageRef,
+            );
             for (const discarded of coalesced.discarded) {
               if (discarded.requestDeliveryId && state.activeRun) {
                 state.activeRun.retainedRequestDeliveries.set(discarded.requestDeliveryId, {
@@ -7521,6 +7895,7 @@ export async function startBusAgentRunner(params: {
                           toolCallId: event.toolCallId,
                           mode: event.mode,
                           limit: event.limit,
+                          minScore: event.minScore,
                           searchCount: event.searches.length,
                           queryCount: event.searches.reduce(
                             (sum, queries) => sum + queries.length,
@@ -7530,6 +7905,10 @@ export async function startBusAgentRunner(params: {
                           participantFilterUserCount: event.participantFilterUserCount,
                           appendedCount: event.entries.length,
                           entries: event.entries,
+                          ranking: event.ranking,
+                          highestRejectedByConfidence: event.highestRejectedByConfidence,
+                          expansionMinConfidence: event.expansionMinConfidence,
+                          corpusDocumentCount: event.corpusDocumentCount,
                         });
                       },
                     }),
@@ -7744,6 +8123,7 @@ export async function startBusAgentRunner(params: {
                   finalText,
                   modelLabel: resolvedModelLabel,
                   contextMeta: checkpointMeta,
+                  loadedCatalogIds: toolAuthority.snapshot(),
                   ...(providerState && !coreNamedClaudeRuntime && !canPublishCorePrimaryClaude
                     ? { providerState }
                     : {}),
@@ -7881,6 +8261,7 @@ export async function startBusAgentRunner(params: {
                   corePrimaryClaudeRuntime.markTerminalFailure(false);
                 }
                 if (isCompactionCheckpoint) {
+                  transcriptHasCompactionCheckpoint = true;
                   logger.info(
                     "compaction checkpoint persisted",
                     formatBridgeLogContext({
@@ -8025,6 +8406,8 @@ export async function startBusAgentRunner(params: {
               model: activeBinding.resolved.spec,
               durationMs: Date.now() - runStartedAt,
               turns: turnEndCount,
+              transcriptMessageCount: (runStats.finalMessages ?? agent.state.messages).length,
+              transcriptHasCompactionCheckpoint,
               finalTextChars: finalText.length,
               ttftMs,
               tokensPerSecond: tps,
@@ -8194,6 +8577,7 @@ export async function startBusAgentRunner(params: {
                 messages: persistedMessages,
                 finalText: `Error: ${msg}`,
                 modelLabel: resolvedModelLabel,
+                loadedCatalogIds: toolAuthority.snapshot(),
                 ...(runProfile === "primary"
                   ? {
                       providerState: resolveCorePrimaryTranscriptProviderState({
@@ -8490,9 +8874,16 @@ export async function startBusAgentRunner(params: {
       const terminalSurfaceWriteSatisfied =
         !terminalSurfaceWriteAttempted || terminalSurfaceWriteInitiated;
       if (terminalSurfaceWriteSatisfied) markActiveRunTerminal();
+      if (terminalMarkerOperation) {
+        await terminalMarkerOperation;
+      } else if (state.activeRun) {
+        await flushRunCheckpointWriter(state.activeRun);
+      }
+      const checkpointWriterAbandoned = state.activeRun?.checkpointWriter.abandoned === true;
       let owningDeliveryTerminalized = false;
       if (
         !terminalPanic &&
+        !checkpointWriterAbandoned &&
         shouldTerminalizeRequest &&
         terminalSurfaceWriteSatisfied &&
         next.requestDeliveryId &&
@@ -8528,6 +8919,7 @@ export async function startBusAgentRunner(params: {
       let retainedDeliveriesTerminalized = true;
       if (
         !terminalPanic &&
+        !checkpointWriterAbandoned &&
         shouldTerminalizeRequest &&
         terminalSurfaceWriteSatisfied &&
         params.requestDelivery
@@ -8556,8 +8948,21 @@ export async function startBusAgentRunner(params: {
           });
         }
       }
-      if (owningDeliveryTerminalized && retainedDeliveriesTerminalized && next.requestDeliveryId) {
-        activeAgentRunJournal?.removeReconciled(next.requestDeliveryId);
+      if (
+        !checkpointWriterAbandoned &&
+        owningDeliveryTerminalized &&
+        retainedDeliveriesTerminalized &&
+        next.requestDeliveryId
+      ) {
+        const removed = activeAgentRunJournal?.removeReconciled(next.requestDeliveryId);
+        const removeError = removed?.match({ ok: () => null, err: (error) => error });
+        if (removed && !removeError) {
+          releaseRunCheckpointBlobs({
+            requestDeliveryId: next.requestDeliveryId,
+            requestId: next.requestId,
+            sessionId: next.sessionId,
+          });
+        }
       }
       state.agent = null;
       state.activeRequestId = null;
@@ -8565,7 +8970,7 @@ export async function startBusAgentRunner(params: {
       state.running = false;
       cancelledByRequestId.delete(headers.request_id);
       shutdownAbortRequestIds.delete(headers.request_id);
-      if (!terminalPanic) {
+      if (!terminalPanic && !checkpointWriterAbandoned) {
         startSessionQueueDrain(sessionId, state);
       }
     });
@@ -8804,6 +9209,9 @@ export async function startBusAgentRunner(params: {
     const restoredCurrentTurnUserId =
       recoveryHead?.checkpoint?.currentTurnUserId ??
       restoredIdentity?.projection.authenticatedOrigin?.userId;
+    const restoredCurrentTurnMessageRef = recoveryHead?.checkpoint?.currentTurnUserId
+      ? undefined
+      : restoredIdentity?.projection.authenticatedOrigin?.messageRef;
     const entry: Enqueued = {
       queueEntryId: record.publication?.streamId ?? `accepted:${record.requestDeliveryId}`,
       requestDeliveryId: record.requestDeliveryId,
@@ -8817,6 +9225,7 @@ export async function startBusAgentRunner(params: {
       storedMessages: [...work.data.messages],
       corePrimaryLineage:
         recoveryHead?.checkpoint?.corePrimaryLineage ?? work.data.corePrimaryLineage,
+      acceptedCorePrimaryLineage: work.data.corePrimaryLineage,
       modelOverride: work.data.modelOverride,
       raw: preserveAgentRunnerRaw({ data: work.data }),
       ...(restoredIdentity
@@ -8826,6 +9235,14 @@ export async function startBusAgentRunner(params: {
               ? { authenticatedOrigin: restoredIdentity.projection.authenticatedOrigin }
               : {}),
             ...(restoredCurrentTurnUserId ? { currentTurnUserId: restoredCurrentTurnUserId } : {}),
+            ...(restoredCurrentTurnMessageRef
+              ? { currentTurnMessageRef: restoredCurrentTurnMessageRef }
+              : {}),
+            ...(restoredIdentity.projection.authenticatedOrigin?.userId
+              ? {
+                  acceptedCurrentTurnUserId: restoredIdentity.projection.authenticatedOrigin.userId,
+                }
+              : {}),
             verifiedIngress: restoredIdentity.projection.verifiedIngress,
           }
         : { restoredSafetyMode: "restricted" as const }),
@@ -8833,6 +9250,14 @@ export async function startBusAgentRunner(params: {
         ? {
             recovery: { checkpointMessages: [], partialText: "" },
             storedRecoveryCheckpoint: [...recoveryHead.checkpoint.messages],
+            ...(recoveryHead.checkpoint.loadedCatalogIds
+              ? {
+                  loadedCatalogIds: [...recoveryHead.checkpoint.loadedCatalogIds],
+                }
+              : {}),
+            ...(recoveryHead.previousCheckpoint
+              ? { previousRecoveryCheckpoint: recoveryHead.previousCheckpoint }
+              : {}),
             retainedRequestDeliveries: recoveryHead.checkpoint.retainedRequestDeliveries,
           }
         : {}),
@@ -8877,6 +9302,7 @@ export async function startBusAgentRunner(params: {
     stop: async () => {
       stopRunnerAdmission();
       await stopSubscription();
+      await stopRunCheckpointWriters();
       if (terminalCleanupCompletion) {
         let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
         const completed = await Promise.race([
@@ -8958,6 +9384,7 @@ function mergeQueuedControlsForRecovery(
       storedMessages.push(...entry.storedMessages);
       reapplied.push(entry);
       first.currentTurnUserId = entry.currentTurnUserId;
+      first.currentTurnMessageRef = entry.currentTurnMessageRef;
     }
     discarded.push(entry);
     queue.splice(index, 1);
@@ -8998,6 +9425,7 @@ function mergeQueuedForSameRequest(
     merged.push(...next.messages);
     storedMessages.push(...next.storedMessages);
     first.currentTurnUserId = next.currentTurnUserId;
+    first.currentTurnMessageRef = next.currentTurnMessageRef;
     discarded.push(next);
     queue.splice(i, 1);
   }
@@ -9060,7 +9488,9 @@ async function applyToRunningAgent(
     }
   };
 
-  if (!cancel) activeRun?.setCurrentTurnUserId(entry.currentTurnUserId);
+  if (!cancel) {
+    activeRun?.setCurrentTurnContext(entry.currentTurnUserId, entry.currentTurnMessageRef);
+  }
   if (!cancel && activeRun?.runProfile === "primary" && activeRun.requestClient === "discord") {
     activeRun.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
       entry.queue === "steer" || entry.queue === "interrupt"

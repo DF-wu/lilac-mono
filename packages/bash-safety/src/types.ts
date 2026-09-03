@@ -1,6 +1,34 @@
-export interface AnalyzeResult {
+export type BashSafetyCode =
+  | "dangerous_git_operation"
+  | "delete_current_cwd"
+  | "delete_outside_cwd"
+  | "delete_root_or_home"
+  | "device_format"
+  | "device_write"
+  | "dynamic_recursive_delete"
+  | "find_delete"
+  | "interpreter_one_liner"
+  | "paranoid_recursive_delete"
+  | "protected_git_metadata"
+  | "protected_path"
+  | "shred";
+
+export interface BashSafetyViolation {
+  code: BashSafetyCode;
   reason: string;
+  hint?: string;
+}
+
+export interface AnalyzeResult extends BashSafetyViolation {
   segment: string;
+}
+
+export function bashSafetyViolation(
+  code: BashSafetyCode,
+  reason: string,
+  hint?: string,
+): BashSafetyViolation {
+  return hint ? { code, reason, hint } : { code, reason };
 }
 
 export interface AnalyzeOptions {

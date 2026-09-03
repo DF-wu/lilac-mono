@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
 import {
+  applyBasePromptForProvider,
   buildAgentSystemPrompt,
   CORE_PROMPT_FILES,
   DEFAULT_PROMPT_DIRNAME,
@@ -12,6 +13,7 @@ import {
   HEARTBEAT_PROMPT_FILENAME,
   PROMPT_TEMPLATE_BASELINE_DIRNAME,
   PROMPT_TEMPLATE_STATE_FILENAME,
+  WORKER_PROMPT_FILES,
   ensurePromptWorkspace,
 } from "../agent-prompts";
 
@@ -141,7 +143,38 @@ describe("agent prompts", () => {
       for (const name of CORE_PROMPT_FILES) {
         expect(built.systemPrompt).toContain(`# ${name}`);
       }
+      for (const name of WORKER_PROMPT_FILES) {
+        expect(built.workerSystemPrompt).toContain(`# ${name}`);
+      }
+      for (const name of CORE_PROMPT_FILES) {
+        if ((WORKER_PROMPT_FILES as readonly string[]).includes(name)) continue;
+        expect(built.workerSystemPrompt).not.toContain(`# ${name}`);
+      }
+      expect(built.systemPrompt).toContain(
+        "These local files provide workspace instructions and context for this agent.",
+      );
+      expect(built.systemPrompt).not.toContain("are authoritative");
     });
+  });
+
+  it("applies basePrompt to non-codex provider system prompts", () => {
+    expect(
+      applyBasePromptForProvider({
+        systemPrompt: "Workspace prompt",
+        basePrompt: "Base prompt",
+        provider: "openai",
+      }),
+    ).toBe("Base prompt\n\nWorkspace prompt");
+  });
+
+  it("omits basePrompt from codex provider system prompts", () => {
+    expect(
+      applyBasePromptForProvider({
+        systemPrompt: "Workspace prompt",
+        basePrompt: "Base prompt",
+        provider: "codex",
+      }),
+    ).toBe("Workspace prompt");
   });
 
   it("reflects prompt file edits", async () => {

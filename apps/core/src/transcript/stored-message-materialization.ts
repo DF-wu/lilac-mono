@@ -12,6 +12,7 @@ import {
   type StoredResourcePartV1,
 } from "@stanley2058/lilac-event-bus";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 
 import {
@@ -59,6 +60,7 @@ export type StoredMessageIdentityProjectionV1 = {
   projectForPersistence(input: {
     readonly providerMessages: readonly (ModelMessage | StoredMessageV1)[];
     readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+    readonly shouldAbandon?: () => boolean;
     readonly retainUploadedFile: (
       file: StoredFilePartV1,
     ) => ResultType<void, StoredMessageProjectionError>;
@@ -91,6 +93,14 @@ type ModelFilePart = Extract<
     readonly type: "file";
   }
 >;
+
+type RememberedProviderMessage =
+  | { readonly kind: "remembered"; readonly message: StoredMessageV1 }
+  | { readonly kind: "ambiguous" };
+type ProviderFileIdentityPart = {
+  readonly type: string;
+  readonly data?: ModelFilePart["data"];
+};
 
 const resourceReadInputSchema = z.object({ path: storedResourcePartV1Schema.shape.uri });
 type PendingResourcesByToolCallId = Map<string, Array<StoredResourcePartV1 | undefined>>;
@@ -209,13 +219,34 @@ function byteBackedProviderFile(part: ModelFilePart): Uint8Array | null {
   return null;
 }
 
+async function abandonProviderFileUpload(input: {
+  readonly blobStore: Pick<BlobStore, "delete">;
+  readonly target: Parameters<BlobStore["delete"]>[0];
+}): Promise<StoredMessageProjectionError> {
+  const deletionError = (await input.blobStore.delete(input.target)).match({
+    ok: () => null,
+    err: (error) => error,
+  });
+  return new StoredMessageProjectionError({
+    message: deletionError
+      ? `Provider file persistence was abandoned; upload cleanup failed: ${deletionError.message}`
+      : "Provider file persistence was abandoned",
+  });
+}
+
 async function persistProviderFile(input: {
   readonly part: ModelFilePart;
   readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly shouldAbandon?: () => boolean;
   readonly retainUploadedFile: (
     file: StoredFilePartV1,
   ) => ResultType<void, StoredMessageProjectionError>;
 }): Promise<ResultType<StoredFilePartV1, StoredMessageProjectionError>> {
+  if (input.shouldAbandon?.()) {
+    return Result.err(
+      new StoredMessageProjectionError({ message: "Provider file persistence was abandoned" }),
+    );
+  }
   const bytes = byteBackedProviderFile(input.part);
   if (bytes === null) {
     return Result.err(
@@ -237,6 +268,14 @@ async function persistProviderFile(input: {
           ),
         ),
     );
+    if (input.shouldAbandon?.()) {
+      return Result.err(
+        await abandonProviderFileUpload({
+          blobStore: input.blobStore,
+          target: upload.handle,
+        }),
+      );
+    }
     const blob = yield* Result.await(
       upload.completion.then((completed) =>
         completed.mapError(
@@ -247,6 +286,11 @@ async function persistProviderFile(input: {
         ),
       ),
     );
+    if (input.shouldAbandon?.()) {
+      return Result.err(
+        await abandonProviderFileUpload({ blobStore: input.blobStore, target: blob }),
+      );
+    }
     const file = {
       type: "blob" as const,
       blob,
@@ -288,6 +332,7 @@ async function settleUnretainedProviderFile(input: {
 async function persistProviderToolResult(input: {
   readonly part: ModelToolResultPart;
   readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly shouldAbandon?: () => boolean;
   readonly retainUploadedFile: (
     file: StoredFilePartV1,
   ) => ResultType<void, StoredMessageProjectionError>;
@@ -317,6 +362,7 @@ async function persistProviderToolResult(input: {
 async function persistProviderPart(input: {
   readonly part: ModelPart;
   readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly shouldAbandon?: () => boolean;
   readonly retainUploadedFile: (
     file: StoredFilePartV1,
   ) => ResultType<void, StoredMessageProjectionError>;
@@ -342,6 +388,7 @@ async function persistProviderMessage(input: {
   readonly reconstructResourceReads: boolean;
   readonly pendingResourcesByToolCallId: PendingResourcesByToolCallId;
   readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly shouldAbandon?: () => boolean;
   readonly retainUploadedFile: (
     file: StoredFilePartV1,
   ) => ResultType<void, StoredMessageProjectionError>;
@@ -405,6 +452,7 @@ async function projectMessagesWithDurableProviderFiles(input: {
     readonly reconstructResourceReads: boolean;
   }[];
   readonly blobStore: Pick<BlobStore, "startUpload" | "delete">;
+  readonly shouldAbandon?: () => boolean;
   readonly retainUploadedFile: (
     file: StoredFilePartV1,
   ) => ResultType<void, StoredMessageProjectionError>;
@@ -416,6 +464,7 @@ async function projectMessagesWithDurableProviderFiles(input: {
     const persisted = await persistProviderMessage({
       ...candidate,
       blobStore: input.blobStore,
+      ...(input.shouldAbandon ? { shouldAbandon: input.shouldAbandon } : {}),
       retainUploadedFile: input.retainUploadedFile,
       pendingResourcesByToolCallId,
       uploadedFiles,
@@ -430,6 +479,78 @@ async function projectMessagesWithDurableProviderFiles(input: {
 /** Keeps structured durable identity beside provider-only message representations. */
 export function createStoredMessageIdentityProjectionV1(): StoredMessageIdentityProjectionV1 {
   const storedByProviderMessage = new WeakMap<object, StoredMessageV1>();
+  const storedByProviderFileData = new WeakMap<object, RememberedProviderMessage>();
+
+  const providerFileData = (message: ModelMessage | StoredMessageV1): object[] => {
+    if (typeof message.content === "string") return [];
+    const identities: object[] = [];
+    const rememberFile = (part: ProviderFileIdentityPart): void => {
+      if (part.type !== "file" || typeof part.data !== "object" || part.data === null) return;
+      identities.push(part.data);
+    };
+    for (const part of message.content) {
+      rememberFile(part);
+      if (part.type !== "tool-result" || part.output.type !== "content") continue;
+      for (const output of part.output.value) rememberFile(output);
+    }
+    return identities;
+  };
+
+  const rememberProviderFileData = (
+    providerMessage: ModelMessage,
+    storedMessage: StoredMessageV1,
+  ): void => {
+    for (const identity of providerFileData(providerMessage)) {
+      const existing = storedByProviderFileData.get(identity);
+      if (existing?.kind === "ambiguous") continue;
+      if (existing?.kind === "remembered") {
+        if (isDeepStrictEqual(existing.message, storedMessage)) continue;
+        storedByProviderFileData.set(identity, { kind: "ambiguous" });
+        continue;
+      }
+      storedByProviderFileData.set(identity, { kind: "remembered", message: storedMessage });
+    }
+  };
+
+  const findRememberedProviderMessage = (
+    providerMessage: ModelMessage | StoredMessageV1,
+  ): StoredMessageV1 | undefined => {
+    let candidate: StoredMessageV1 | undefined;
+    for (const identity of providerFileData(providerMessage)) {
+      const remembered = storedByProviderFileData.get(identity);
+      if (remembered?.kind !== "remembered") continue;
+      if (!candidate) {
+        candidate = remembered.message;
+        continue;
+      }
+      if (!isDeepStrictEqual(candidate, remembered.message)) return undefined;
+    }
+    return candidate;
+  };
+
+  const rememberMessages = (
+    providerMessages: readonly ModelMessage[],
+    storedMessages: readonly StoredMessageV1[],
+  ): void => {
+    for (let index = 0; index < providerMessages.length; index += 1) {
+      const providerMessage = providerMessages[index];
+      const storedMessage = storedMessages[index];
+      if (!providerMessage || !storedMessage) continue;
+      storedByProviderMessage.set(providerMessage, storedMessage);
+      rememberProviderFileData(providerMessage, storedMessage);
+    }
+  };
+
+  const projectCandidate = (providerMessage: ModelMessage | StoredMessageV1) => {
+    const remembered =
+      storedByProviderMessage.get(providerMessage) ??
+      findRememberedProviderMessage(providerMessage);
+    return {
+      message: remembered ?? providerMessage,
+      reconstructResourceReads: remembered === undefined,
+    };
+  };
+
   return {
     remember(providerMessages, storedMessages) {
       if (providerMessages.length !== storedMessages.length) {
@@ -439,36 +560,19 @@ export function createStoredMessageIdentityProjectionV1(): StoredMessageIdentity
           }),
         );
       }
-      for (let index = 0; index < providerMessages.length; index += 1) {
-        const providerMessage = providerMessages[index];
-        const storedMessage = storedMessages[index];
-        if (providerMessage && storedMessage) {
-          storedByProviderMessage.set(providerMessage, storedMessage);
-        }
-      }
+      rememberMessages(providerMessages, storedMessages);
       return Result.ok(undefined);
     },
     project(providerMessages) {
-      const candidates = providerMessages.map((providerMessage) => {
-        const remembered = storedByProviderMessage.get(providerMessage);
-        return {
-          message: remembered ?? providerMessage,
-          reconstructResourceReads: remembered === undefined,
-        };
-      });
-      return projectStoredMessagesV1(projectResourceReadResultsForStorage(candidates));
+      return projectStoredMessagesV1(
+        projectResourceReadResultsForStorage(providerMessages.map(projectCandidate)),
+      );
     },
     async projectForPersistence(input) {
-      const candidates = input.providerMessages.map((providerMessage) => {
-        const remembered = storedByProviderMessage.get(providerMessage);
-        return {
-          message: remembered ?? providerMessage,
-          reconstructResourceReads: remembered === undefined,
-        };
-      });
       return projectMessagesWithDurableProviderFiles({
-        messages: candidates,
+        messages: input.providerMessages.map(projectCandidate),
         blobStore: input.blobStore,
+        ...(input.shouldAbandon ? { shouldAbandon: input.shouldAbandon } : {}),
         retainUploadedFile: input.retainUploadedFile,
       });
     },
@@ -659,6 +763,7 @@ async function materializeStoredResource(input: {
   readonly part: StoredResourcePartV1;
   readonly resourceAccess: Pick<ResourceAccess, "describe" | "open"> | undefined;
   readonly target: StoredResourceProviderTarget | undefined;
+  readonly toolResult?: boolean;
 }): Promise<object[]> {
   const marker = {
     type: "text",
@@ -736,15 +841,16 @@ async function materializeStoredResource(input: {
     return [marker, ...resourceInlineGuidance({ part: input.part, code: "unsupported" })];
   }
 
-  return [
-    marker,
-    {
-      type: "file",
-      data: consumed.value,
-      mediaType: verifiedMediaType,
-      ...(input.part.filename === undefined ? {} : { filename: input.part.filename }),
-    },
-  ];
+  const data = input.toolResult
+    ? { type: "data" as const, data: Buffer.from(consumed.value).toString("base64") }
+    : consumed.value;
+  const file = {
+    type: "file" as const,
+    data,
+    mediaType: verifiedMediaType,
+    ...(input.part.filename === undefined ? {} : { filename: input.part.filename }),
+  };
+  return [marker, file];
 }
 
 async function materializeStoredFile(input: {
@@ -790,6 +896,7 @@ async function materializeToolResult(input: {
             part,
             resourceAccess: input.resourceAccess,
             target: input.resourceTarget,
+            toolResult: true,
           })),
         );
       } else {
