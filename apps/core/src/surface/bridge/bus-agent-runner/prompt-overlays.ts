@@ -1,5 +1,4 @@
 import { captureError } from "../../../shared/error-capture";
-import type { ModelMessage } from "ai";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import {
   getDiscordSessionAliasValue,
@@ -17,7 +16,7 @@ import {
   buildOrdinaryHeartbeatOverlay,
   isHeartbeatSessionId,
 } from "../../../heartbeat/common";
-import { messagesContainSurfaceMetadata } from "../surface-metadata";
+import { messagesContainSurfaceMetadata, type SurfaceMetadataMessage } from "../surface-metadata";
 import type { AgentRunProfile } from "./raw";
 
 const DEFAULT_PROMPT_USER_ALIAS_LIMIT = 25;
@@ -256,7 +255,9 @@ export function buildAutoInjectedThreadSearchOverlay(params: {
   ].join("\n");
 }
 
-export function buildSurfaceMetadataOverlay(messages: readonly ModelMessage[]): string | null {
+export function buildSurfaceMetadataOverlay(
+  messages: readonly SurfaceMetadataMessage[],
+): string | null {
   if (!messagesContainSurfaceMetadata(messages)) return null;
 
   return [

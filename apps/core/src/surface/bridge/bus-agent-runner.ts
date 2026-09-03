@@ -34,19 +34,15 @@ import type {
 import {
   CUSTOM_COMMAND_TOOL_NAME,
   applyBasePromptForProvider,
-  discoverSkills,
   deriveSubagentIdleTimeoutMs,
   env,
   extractAiErrorLogDetails,
-  findWorkspaceRootResult,
-  formatAvailableSkillsSection,
   getCoreConfig,
   isPanic,
   isRecord,
   opaqueErrorMessage,
   ModelCapability,
   openAIMessagePhase,
-  resolveCoreConfigPath,
   createLogger,
   resolveEditingToolMode,
   fromDurableResolvedModelPlanResult,
@@ -199,10 +195,7 @@ import {
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
 import { recordRequestLatencyStage } from "./request-latency-trace";
-import {
-  buildSystemPromptForProfile,
-  selectWorkspaceSystemPrompt,
-} from "./bus-agent-runner/subagent-prompt";
+import { selectWorkspaceSystemPrompt } from "./bus-agent-runner/subagent-prompt";
 import {
   formatToolLogPreview,
   summarizeToolFailure,
@@ -271,15 +264,11 @@ import {
   systemPromptToText,
 } from "./bus-agent-runner/stats";
 import {
-  appendAdditionalSessionMemoBlock,
-  appendConfiguredAliasPromptBlock,
-  buildAutoInjectedThreadSearchOverlay,
   buildHeartbeatOverlayForRequest,
-  buildRestrictedSessionOverlay,
-  buildSurfaceMetadataOverlay,
-  maybeAppendResponseCommentaryPrompt,
   resolveSessionAdditionalPrompts,
 } from "./bus-agent-runner/prompt-overlays";
+import { maybeBuildSkillsSectionForPrimary } from "./bus-agent-runner/skills-context";
+import { buildAgentRunSystemPrompt } from "./bus-agent-runner/system-prompt";
 import { resolveSessionSafetyMode, type SessionSafetyMode } from "../session-policy";
 import type { AuthenticatedSurfaceOrigin, MsgRef, SurfacePrincipal } from "../types";
 import type { SurfaceProtocolResolver } from "../runtime-descriptor";
@@ -2171,32 +2160,6 @@ function groupQueueCancellationEntries(entries: readonly Enqueued[]): QueueCance
     });
   }
   return [...groups.values()];
-}
-
-async function maybeBuildSkillsSectionForPrimary(): Promise<string | null> {
-  const workspaceRoot = findWorkspaceRootResult();
-  const root = workspaceRoot.match({ ok: (value) => value, err: () => null });
-  if (root === null) return null;
-  {
-    const attempt = await Result.tryPromise({
-      try: async () => {
-        const { skills } = await discoverSkills({
-          workspaceRoot: root,
-          dataDir: env.dataDir,
-        });
-        return formatAvailableSkillsSection(skills);
-      },
-      catch: captureError,
-    });
-
-    if (attempt.isErr()) {
-      const cause = attempt.error.cause;
-      if (isPanic(cause)) throw cause;
-      // Best-effort: never fail a run due to skill discovery.
-      return null;
-    }
-    return attempt.value;
-  }
 }
 
 export function buildPersistedHeartbeatMessages(finalText: string): StoredMessageV1[] {
@@ -5789,72 +5752,28 @@ export async function startBusAgentRunner(params: {
             nowMs: Date.now(),
           });
 
-          const autoInjectedThreadSearchOverlay = buildAutoInjectedThreadSearchOverlay({
-            cfg,
-            runProfile,
-          });
-
-          const surfaceMetadataOverlay = buildSurfaceMetadataOverlay(next.messages);
-
-          const restrictedSessionOverlay =
-            safetyMode === "restricted"
-              ? buildRestrictedSessionOverlay({ sessionId: next.sessionId })
-              : null;
+          const buildSystemPrompt = (
+            resolved: ResolvedModelRef,
+            editingToolMode: ReturnType<typeof resolveEditingToolMode>,
+          ): string =>
+            buildAgentRunSystemPrompt({
+              cfg,
+              runProfile,
+              resolved,
+              editingToolMode,
+              skillsSection,
+              additionalSessionPrompts,
+              messages: next.messages,
+              safetyMode,
+              sessionId: next.sessionId,
+              heartbeatOverlay,
+            });
 
           const workspaceSystemPrompt = selectWorkspaceSystemPrompt({
             profile: runProfile,
             primarySystemPrompt: cfg.agent.systemPrompt,
             workerSystemPrompt: cfg.agent.workerSystemPrompt,
           });
-
-          const buildSystemPrompt = (
-            resolved: ResolvedModelRef,
-            editingToolMode: ReturnType<typeof resolveEditingToolMode>,
-          ): string => {
-            const providerSystemPrompt = applyBasePromptForProvider({
-              systemPrompt: workspaceSystemPrompt,
-              basePrompt: cfg.basePrompt,
-              provider: resolved.provider,
-            });
-            const profilePrompt = {
-              baseSystemPrompt: providerSystemPrompt,
-              activeEditingTool: runProfile === "explore" ? null : editingToolMode,
-              exploreOverlay: subagents.profiles.explore.promptOverlay,
-              generalOverlay: subagents.profiles.general.promptOverlay,
-              selfOverlay: subagents.profiles.self.promptOverlay,
-              skillsSection,
-            };
-            const baseSystemPrompt =
-              runProfile === "primary"
-                ? buildSystemPromptForProfile({
-                    ...profilePrompt,
-                    profile: "primary",
-                  })
-                : buildSystemPromptForProfile({
-                    ...profilePrompt,
-                    profile: runProfile,
-                    profileConfig: resolveNativeSubagentProfile(cfg, runProfile),
-                  });
-            let prompt = appendConfiguredAliasPromptBlock({
-              baseSystemPrompt,
-              cfg,
-              coreConfigPath: resolveCoreConfigPath(),
-            });
-            prompt = appendAdditionalSessionMemoBlock(prompt, additionalSessionPrompts);
-            for (const overlay of [
-              heartbeatOverlay,
-              autoInjectedThreadSearchOverlay,
-              surfaceMetadataOverlay,
-              restrictedSessionOverlay,
-            ]) {
-              if (overlay?.trim()) prompt = `${prompt}\n\n${overlay}`;
-            }
-            return maybeAppendResponseCommentaryPrompt({
-              baseSystemPrompt: prompt,
-              provider: resolved.provider,
-              responseCommentary: resolved.responseCommentary,
-            });
-          };
 
           let seededSessionMessages: ModelMessage[] = [];
           let seededStoredMessages: StoredMessageV1[] = [];

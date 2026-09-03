@@ -219,7 +219,11 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
       "adaptModelResolutionToBusRunnerHost.err.<callback>",
       "signal",
     ],
-    ["src/surface/bridge/bus-agent-runner.ts", "maybeBuildSkillsSectionForPrimary", "signal"],
+    [
+      "src/surface/bridge/bus-agent-runner/skills-context.ts",
+      "maybeBuildSkillsSectionForPrimary",
+      "signal",
+    ],
     ["src/surface/bridge/bus-agent-runner.ts", "rethrowBusAgentRunnerPanic", "signal"],
     ["src/surface/bridge/bus-agent-runner.ts", "signalBusAgentRunnerHostFailure", "signal"],
     [

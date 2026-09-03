@@ -1,4 +1,3 @@
-import type { ModelMessage } from "ai";
 import { Result } from "better-result";
 
 export const SURFACE_METADATA_VERSION = 1;
@@ -44,20 +43,28 @@ function getFirstLine(text: string): string {
   return newlineIndex >= 0 ? text.slice(0, newlineIndex) : text;
 }
 
-function extractLeadingTextContent(content: ModelMessage["content"]): string | null {
+type SurfaceMetadataContentPart = {
+  readonly type: string;
+  readonly text?: string;
+  readonly value?: string;
+};
+
+export type SurfaceMetadataMessage = {
+  readonly role: string;
+  readonly content: string | readonly SurfaceMetadataContentPart[];
+};
+
+function extractLeadingTextContent(content: SurfaceMetadataMessage["content"]): string | null {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return null;
 
   for (const part of content) {
-    if (!part || typeof part !== "object") continue;
-
-    const candidate = part as Record<string, unknown>;
-    if (typeof candidate.text === "string") {
-      return candidate.text;
+    if (typeof part.text === "string") {
+      return part.text;
     }
 
-    if (candidate.type === "text" && typeof candidate.value === "string") {
-      return candidate.value;
+    if (part.type === "text" && typeof part.value === "string") {
+      return part.value;
     }
   }
 
@@ -114,7 +121,9 @@ export function stripSurfaceMetadataLines(text: string): string {
   return text.replace(SURFACE_METADATA_LINE_GLOBAL_RE, "$1");
 }
 
-export function messagesContainSurfaceMetadata(messages: readonly ModelMessage[]): boolean {
+export function messagesContainSurfaceMetadata(
+  messages: readonly SurfaceMetadataMessage[],
+): boolean {
   return messages.some((message) => {
     if (message.role !== "user") return false;
     const text = extractLeadingTextContent(message.content);
