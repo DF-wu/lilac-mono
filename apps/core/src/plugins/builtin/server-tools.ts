@@ -162,6 +162,9 @@ export function createBuiltinAttachmentPlugin(): CoreToolPlugin {
             blobStore: runtime.blobStore,
             outputLifecycle: runtime.attachmentOutputLifecycle,
             ...(runtime.resourceAccess ? { resourceAccess: runtime.resourceAccess } : {}),
+            ...(runtime.toolResultArtifacts
+              ? { toolResultArtifacts: runtime.toolResultArtifacts }
+              : {}),
           }),
         ],
       };

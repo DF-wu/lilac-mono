@@ -48,6 +48,13 @@ export type ScopedTransientResourceAccess = {
       readonly maxOutputBytes?: number;
     },
   ): Promise<ResultType<ToolResultArtifactReadWindow, ToolResultArtifactError>>;
+  readContent(
+    uri: string,
+    options: {
+      readonly maxBytes: number;
+      readonly signal?: AbortSignal;
+    },
+  ): Promise<ResultType<TransientResourceContent, ResourceAccessError>>;
   materialize(
     uri: string,
     options: {
@@ -56,6 +63,12 @@ export type ScopedTransientResourceAccess = {
       readonly signal?: AbortSignal;
     },
   ): Promise<ResultType<MaterializedResource, ResourceAccessError>>;
+};
+
+export type TransientResourceContent = {
+  readonly filename: string;
+  readonly mimeType: "text/plain";
+  readonly data: Uint8Array;
 };
 
 type CapturedFileFailure = {
@@ -197,14 +210,13 @@ async function transientResourceWriteFailure(input: {
   });
 }
 
-async function materializeTransientResource(input: {
+async function readTransientResourceContent(input: {
   readonly store: ToolResultArtifactStore;
   readonly scopeId: string;
   readonly uri: string;
-  readonly targetDirectory: string;
   readonly maxBytes: number;
   readonly signal?: AbortSignal;
-}): Promise<ResultType<MaterializedResource, ResourceAccessError>> {
+}): Promise<ResultType<TransientResourceContent, ResourceAccessError>> {
   const artifactId = coreToolResultArtifactIdFromUri(input.uri);
   if (artifactId === null) {
     return Result.err(
@@ -215,7 +227,7 @@ async function materializeTransientResource(input: {
     return Result.err(
       new ResourceCancelled({
         uri: input.uri,
-        message: "Transient resource materialization was cancelled",
+        message: "Transient resource read was cancelled",
       }),
     );
   }
@@ -254,13 +266,37 @@ async function materializeTransientResource(input: {
     return Result.err(
       new ResourceCancelled({
         uri: input.uri,
-        message: "Transient resource materialization was cancelled",
+        message: "Transient resource read was cancelled",
       }),
     );
   }
 
-  const filename = `tool-result-${artifactId.replaceAll("-", "").slice(0, 8)}.txt`;
-  const destination = join(input.targetDirectory, filename);
+  return Result.ok({
+    filename: `tool-result-${artifactId.replaceAll("-", "").slice(0, 8)}.txt`,
+    mimeType: "text/plain",
+    data: Buffer.from(read.read.content, "utf8"),
+  });
+}
+
+async function materializeTransientResource(input: {
+  readonly store: ToolResultArtifactStore;
+  readonly scopeId: string;
+  readonly uri: string;
+  readonly targetDirectory: string;
+  readonly maxBytes: number;
+  readonly signal?: AbortSignal;
+}): Promise<ResultType<MaterializedResource, ResourceAccessError>> {
+  const content = await readTransientResourceContent(input);
+  const contentDecision = content.match<
+    | { readonly kind: "content"; readonly value: TransientResourceContent }
+    | { readonly kind: "error"; readonly error: ResourceAccessError }
+  >({
+    ok: (value) => ({ kind: "content", value }),
+    err: (error) => ({ kind: "error", error }),
+  });
+  if (contentDecision.kind === "error") return Result.err(contentDecision.error);
+
+  const destination = join(input.targetDirectory, contentDecision.value.filename);
   const opened = await Result.tryPromise({
     try: () => fs.open(destination, "wx", 0o600),
     catch: captureFileFailure,
@@ -278,10 +314,10 @@ async function materializeTransientResource(input: {
 
   const written = await Result.tryPromise({
     try: () =>
-      openDecision.handle.writeFile(read.read.content, {
-        encoding: "utf8",
-        ...(input.signal ? { signal: input.signal } : {}),
-      }),
+      openDecision.handle.writeFile(
+        contentDecision.value.data,
+        input.signal ? { signal: input.signal } : undefined,
+      ),
     catch: captureFileFailure,
   });
   const writeFailure = capturedFailure(written);
@@ -305,10 +341,10 @@ async function materializeTransientResource(input: {
   return Result.ok({
     uri: input.uri,
     path: destination,
-    filename,
-    mimeType: "text/plain",
-    bytes: read.read.bytes,
-    sha256: createHash("sha256").update(read.read.content, "utf8").digest("hex"),
+    filename: contentDecision.value.filename,
+    mimeType: contentDecision.value.mimeType,
+    bytes: contentDecision.value.data.byteLength,
+    sha256: createHash("sha256").update(contentDecision.value.data).digest("hex"),
   });
 }
 
@@ -319,6 +355,8 @@ export function bindTransientResourceAccess(
   return {
     read: (uri) => store.read(uri, scopeId),
     readWindow: (uri, options) => store.readWindow(uri, scopeId, options),
+    readContent: (uri, options) =>
+      readTransientResourceContent({ store, scopeId, uri, ...options }),
     materialize: (uri, options) =>
       materializeTransientResource({ store, scopeId, uri, ...options }),
   };

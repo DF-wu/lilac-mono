@@ -8,7 +8,7 @@ Keep a compact existence map for tools hidden behind the `tools` CLI. Add detail
 - `generate.{image,video}` creates media.
 - `skills.{list,brief,full}` finds and loads installed skills.
 - `ssh.{hosts,probe,run}` discovers hosts and runs remote shell work.
-- `attachment.add_files` attaches local files to a reply; `resource.materialize` writes `resource://` references locally.
+- `attachment.add_files` attaches local files or `resource://` references to a reply; `resource.materialize` writes resources locally.
 - `discovery.search` finds exact phrases and raw prompt or transcript context.
 - `conversation.thread.{search,metadata,read}` finds semantic conversation threads, compares candidates, and reads transcripts when thread indexing is enabled.
 - `surface.sessions.{list,listParticipants}` inspects sessions and participants.

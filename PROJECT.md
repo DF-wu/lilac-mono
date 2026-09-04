@@ -147,17 +147,18 @@ Request capabilities bind request context, cwd, profile, callable authority, and
 
 Core ingress resources use opaque `resource://r1_<128-bit-id>` capabilities. The shared Core resource
 module validates and resolves them for provider media, Level 1 `read` and `grep`, Level 2
-`resource.materialize`, and the hidden deprecated `attachment.download` compatibility callable.
+`resource.materialize` and `attachment.add_files`, and the hidden deprecated `attachment.download`
+compatibility callable.
 `resource.materialize` writes an ordered selection into the invoking `tools` CLI process cwd without
 overwriting existing files. The server keeps the capability-authorized cwd separate from that
 invocation cwd, and restricted requests can materialize only under their private `/tmp` mapping. Text
 and unsupported binary attachments stay marker-only until a tool opens or materializes them.
 
-Core transient tool results use `resource://t1_<128-bit-id>` through the same `read`, `grep`, and
-`resource.materialize` entry points. The run-scoped transient adapter keeps session authority, TTL,
-quota eviction, encryption, and paging in `packages/tool-results`; it does not create retained resource
-rows or transcript references. Core still accepts `tool-result://<uuid>` as a compatibility input.
-Mini Lilac retains that older URI as its current contract.
+Core transient tool results use `resource://t1_<128-bit-id>` through the same `read`, `grep`,
+`resource.materialize`, and `attachment.add_files` entry points. The run-scoped transient adapter keeps
+session authority, TTL, quota eviction, encryption, and paging in `packages/tool-results`; it does not
+create retained resource rows or transcript references. Core still accepts `tool-result://<uuid>` as a
+compatibility input. Mini Lilac retains that older URI as its current contract.
 
 ### Level 3: Skills
 
