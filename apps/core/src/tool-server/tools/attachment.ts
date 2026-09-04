@@ -50,10 +50,16 @@ import { preserveToolPanic } from "../../tools/tool-result-adapters";
 import type { AttachmentOutputLifecycle } from "../../tools/attachment-output-lifecycle";
 import {
   RESOURCE_MATERIALIZE_CALL_MAX_BYTES,
+  bindTransientResourceAccess,
+  consumeVerifiedResourceRead,
+  isCoreToolResultResourceUri,
   type MaterializedResource,
   type ResourceAccess,
   type ResourceAccessError,
+  type ScopedTransientResourceAccess,
 } from "../../resource";
+import type { ToolResultArtifactStore } from "../../artifacts/tool-result-artifact-store";
+import { captureError, type CapturedError } from "../../shared/error-capture";
 
 function attachmentFailure(kind: ServerToolFailure["kind"], message: string): ServerToolFailure {
   return serverToolFailure({
@@ -277,7 +283,7 @@ const attachmentAddFilesInputSchema = z
     normalizeAttachmentAddFilesInput,
     z.object({
       paths: nonEmptyStringListInputSchema.describe(
-        "Local file paths to attach (resolved relative to request cwd; alias: files)",
+        "Local file paths or resource:// URIs to attach (paths resolve relative to request cwd; alias: files)",
       ),
       filenames: optionalNonEmptyStringListInputSchema.describe(
         "Optional filenames for each attachment",
@@ -287,7 +293,7 @@ const attachmentAddFilesInputSchema = z
       ),
     }),
   )
-  .describe("Add one or more attachments from local files.");
+  .describe("Add one or more attachments from local files or resources.");
 
 const attachmentDownloadInputSchema = z.object({
   downloadDir: z
@@ -457,6 +463,156 @@ async function downloadLegacyBlobToBuffer(params: {
   return bytes.map((value) => ({ bytes: Buffer.from(value) }));
 }
 
+type OutboundAttachmentSource = {
+  readonly bytes: Buffer;
+  readonly filename: string;
+  readonly mimeType?: string;
+};
+
+function captureAttachmentFileFailure(cause: unknown): CapturedError {
+  return captureError(cause, "Attachment file read failed");
+}
+
+async function readLocalOutboundAttachment(input: {
+  readonly path: string;
+  readonly cwd: string;
+  readonly context: RequestContext | undefined;
+  readonly signal: AbortSignal | undefined;
+}): Promise<ResultType<OutboundAttachmentSource, ServerToolFailure>> {
+  const resolvedPathResult = resolveToolPathForRequestContextResult({
+    cwd: input.cwd,
+    inputPath: input.path,
+    context: input.context,
+  }).mapError((error) => attachmentFailure("denied", error.message));
+  const resolvedPathBranch = resultBranch(resolvedPathResult);
+  if ("failure" in resolvedPathBranch) return Result.err(resolvedPathBranch.failure);
+  const resolvedPath = resolvedPathBranch.value;
+
+  const stat = (
+    await Result.tryPromise({
+      try: () => fs.stat(resolvedPath),
+      catch: captureAttachmentFileFailure,
+    })
+  ).mapError((failure) =>
+    attachmentFailureFromUnknown(failure.cause, `Unable to read ${resolvedPath}`),
+  );
+  const statBranch = resultBranch(stat);
+  if ("failure" in statBranch) return Result.err(statBranch.failure);
+  const file = statBranch.value;
+  if (!file.isFile()) {
+    return Result.err(
+      attachmentFailure(
+        "usage",
+        `Not a file: ${formatToolPathForRequestContext({ path: resolvedPath, context: input.context })}`,
+      ),
+    );
+  }
+  if (file.size > DEFAULT_OUTBOUND_MAX_FILE_BYTES) {
+    return Result.err(
+      attachmentFailure(
+        "usage",
+        `Attachment too large (${file.size} bytes). Max is ${DEFAULT_OUTBOUND_MAX_FILE_BYTES} bytes: ${formatToolPathForRequestContext({ path: resolvedPath, context: input.context })}`,
+      ),
+    );
+  }
+
+  const read = (
+    await Result.tryPromise({
+      try: () => fs.readFile(resolvedPath, input.signal ? { signal: input.signal } : {}),
+      catch: captureAttachmentFileFailure,
+    })
+  ).mapError((failure) =>
+    attachmentFailureFromUnknown(failure.cause, `Unable to read ${resolvedPath}`),
+  );
+  return read.map((bytes) => ({ bytes, filename: basename(resolvedPath) }));
+}
+
+async function readRetainedOutboundAttachment(input: {
+  readonly uri: string;
+  readonly resourceAccess: ResourceAccess | undefined;
+  readonly signal: AbortSignal | undefined;
+}): Promise<ResultType<OutboundAttachmentSource, ServerToolFailure>> {
+  if (!input.resourceAccess) {
+    return Result.err(attachmentFailure("unavailable", "Resource access is unavailable"));
+  }
+
+  const opened = (
+    await input.resourceAccess.open(input.uri, {
+      maxBytes: DEFAULT_OUTBOUND_MAX_FILE_BYTES,
+      expected: "any",
+      ...(input.signal ? { signal: input.signal } : {}),
+    })
+  ).mapError(attachmentFailureFromResource);
+  const openedBranch = resultBranch(opened);
+  if ("failure" in openedBranch) return Result.err(openedBranch.failure);
+  const read = openedBranch.value;
+
+  const consumed = (await consumeVerifiedResourceRead(read)).mapError(
+    attachmentFailureFromResource,
+  );
+  return consumed.map((bytes) => ({
+    bytes: Buffer.from(bytes),
+    filename: read.descriptor.filename ?? "resource",
+    ...(read.classification.mediaType === undefined
+      ? {}
+      : { mimeType: read.classification.mediaType }),
+  }));
+}
+
+async function readTransientOutboundAttachment(input: {
+  readonly uri: string;
+  readonly transientAccess: ScopedTransientResourceAccess | undefined;
+  readonly signal: AbortSignal | undefined;
+}): Promise<ResultType<OutboundAttachmentSource, ServerToolFailure>> {
+  if (!input.transientAccess) {
+    return Result.err(
+      attachmentFailure("not_found", "Transient resource is unavailable without a session scope"),
+    );
+  }
+
+  const read = (
+    await input.transientAccess.readContent(input.uri, {
+      maxBytes: DEFAULT_OUTBOUND_MAX_FILE_BYTES,
+      ...(input.signal ? { signal: input.signal } : {}),
+    })
+  ).mapError(attachmentFailureFromResource);
+  return read.map((content) => ({
+    bytes: Buffer.from(content.data),
+    filename: content.filename,
+    mimeType: content.mimeType,
+  }));
+}
+
+async function readOutboundAttachment(input: {
+  readonly source: string;
+  readonly cwd: string;
+  readonly context: RequestContext | undefined;
+  readonly signal: AbortSignal | undefined;
+  readonly resourceAccess: ResourceAccess | undefined;
+  readonly transientAccess: ScopedTransientResourceAccess | undefined;
+}): Promise<ResultType<OutboundAttachmentSource, ServerToolFailure>> {
+  if (isCoreToolResultResourceUri(input.source)) {
+    return readTransientOutboundAttachment({
+      uri: input.source,
+      transientAccess: input.transientAccess,
+      signal: input.signal,
+    });
+  }
+  if (input.source.startsWith("resource://")) {
+    return readRetainedOutboundAttachment({
+      uri: input.source,
+      resourceAccess: input.resourceAccess,
+      signal: input.signal,
+    });
+  }
+  return readLocalOutboundAttachment({
+    path: input.source,
+    cwd: input.cwd,
+    context: input.context,
+    signal: input.signal,
+  });
+}
+
 export class Attachment implements ServerTool {
   id = "attachment";
   private readonly tool: ServerTool;
@@ -467,6 +623,7 @@ export class Attachment implements ServerTool {
       blobStore: BlobStore;
       outputLifecycle: AttachmentOutputLifecycle;
       resourceAccess?: ResourceAccess;
+      toolResultArtifacts?: ToolResultArtifactStore;
     },
   ) {
     this.tool = defineServerTool({
@@ -474,7 +631,7 @@ export class Attachment implements ServerTool {
       callables: ({ callable }) => ({
         "attachment.add_files": callable({
           name: "Attachment Add Files",
-          description: "Reads local files and attaches them to the current reply.",
+          description: "Reads local files or resources and attaches them to the current reply.",
           inputSchema: attachmentAddFilesInputSchema,
           primaryPositional: {
             field: "paths",
@@ -483,12 +640,12 @@ export class Attachment implements ServerTool {
           cli: {
             shortInput: ["--paths=<string | string[]>"],
             input: [
-              "--paths=<string | string[]> | Local file paths (preferred; alias: files)",
+              "--paths=<string | string[]> | Local file paths or resource:// URIs (preferred; alias: files)",
               "--filenames=<string | string[]> | Optional filenames (same length as paths)",
               "--mimeTypes=<string | string[]> | Optional mime types (same length as paths)",
             ],
           },
-          run: (input, opts) => this.callAddFiles(input, opts?.context),
+          run: (input, opts) => this.callAddFiles(input, opts?.context, opts?.signal),
         }),
         "attachment.download": callable({
           name: "Attachment Download",
@@ -539,6 +696,7 @@ export class Attachment implements ServerTool {
   private async callAddFiles(
     input: z.output<typeof attachmentAddFilesInputSchema>,
     ctx: RequestContext | undefined,
+    signal: AbortSignal | undefined,
   ): Promise<ServerToolResult> {
     const headersResult = toHeaders(ctx);
     const headersBranch = resultBranch(headersResult);
@@ -546,52 +704,30 @@ export class Attachment implements ServerTool {
     const headers = headersBranch.value;
 
     const cwd = ctx?.cwd ?? process.cwd();
+    const transientAccess =
+      this.params.toolResultArtifacts && ctx?.sessionId
+        ? bindTransientResourceAccess(this.params.toolResultArtifacts, ctx.sessionId)
+        : undefined;
 
     let totalBytes = 0;
 
     const out: Array<{ filename: string; mimeType: string; bytes: number }> = [];
 
     for (let i = 0; i < input.paths.length; i++) {
-      const p = input.paths[i]!;
-      const resolvedPathResult = resolveToolPathForRequestContextResult({
+      const sourceInput = input.paths[i]!;
+      const loaded = await readOutboundAttachment({
+        source: sourceInput,
         cwd,
-        inputPath: p,
         context: ctx,
-      }).mapError((error) => attachmentFailure("denied", error.message));
-      const resolvedPathBranch = resultBranch(resolvedPathResult);
-      if ("failure" in resolvedPathBranch) return Result.err(resolvedPathBranch.failure);
-      const resolvedPath = resolvedPathBranch.value;
+        signal,
+        resourceAccess: this.params.resourceAccess,
+        transientAccess,
+      });
+      const loadedBranch = resultBranch(loaded);
+      if ("failure" in loadedBranch) return Result.err(loadedBranch.failure);
+      const source = loadedBranch.value;
 
-      const stat = (
-        await Result.tryPromise({
-          try: () => fs.stat(resolvedPath),
-          catch: (cause) => ({ cause }),
-        })
-      ).mapError(({ cause }) =>
-        attachmentFailureFromUnknown(cause, `Unable to read ${resolvedPath}`),
-      );
-      const statBranch = resultBranch(stat);
-      if ("failure" in statBranch) return Result.err(statBranch.failure);
-      const st = statBranch.value;
-      if (!st.isFile()) {
-        return Result.err(
-          attachmentFailure(
-            "usage",
-            `Not a file: ${formatToolPathForRequestContext({ path: resolvedPath, context: ctx })}`,
-          ),
-        );
-      }
-
-      if (st.size > DEFAULT_OUTBOUND_MAX_FILE_BYTES) {
-        return Result.err(
-          attachmentFailure(
-            "usage",
-            `Attachment too large (${st.size} bytes). Max is ${DEFAULT_OUTBOUND_MAX_FILE_BYTES} bytes: ${formatToolPathForRequestContext({ path: resolvedPath, context: ctx })}`,
-          ),
-        );
-      }
-
-      totalBytes += st.size;
+      totalBytes += source.bytes.byteLength;
       if (totalBytes > DEFAULT_OUTBOUND_MAX_TOTAL_BYTES) {
         return Result.err(
           attachmentFailure(
@@ -601,25 +737,15 @@ export class Attachment implements ServerTool {
         );
       }
 
-      const read = (
-        await Result.tryPromise({
-          try: () => fs.readFile(resolvedPath),
-          catch: (cause) => ({ cause }),
-        })
-      ).mapError(({ cause }) =>
-        attachmentFailureFromUnknown(cause, `Unable to read ${resolvedPath}`),
-      );
-      const readBranch = resultBranch(read);
-      if ("failure" in readBranch) return Result.err(readBranch.failure);
-      const bytes = readBranch.value;
-
-      const filename = (input.filenames && input.filenames[i]) || basename(resolvedPath);
+      const bytes = source.bytes;
+      const filename = (input.filenames && input.filenames[i]) || source.filename;
 
       const typeFromBytes = await fileTypeFromBuffer(bytes);
 
       const mimeType =
         (input.mimeTypes && input.mimeTypes[i]) ||
         typeFromBytes?.mime ||
+        source.mimeType ||
         inferMimeTypeFromFilename(filename);
 
       const uploadResult = (

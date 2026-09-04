@@ -22,9 +22,17 @@ import { resolveRestrictedSessionTmpDir } from "../src/shared/attachment-utils";
 import { Panic, Result } from "better-result";
 import {
   ResourceOriginUnavailable,
+  ResourceTooLarge,
   type MaterializedResource,
   type ResourceAccess,
+  type ResourceDescriptor,
+  type VerifiedResourceRead,
 } from "../src/resource";
+import {
+  createToolResultArtifactStore,
+  type ToolResultArtifactStore,
+} from "../src/artifacts/tool-result-artifact-store";
+import { getTestBlobStore } from "./helpers/blob-store";
 
 type MockFetch = (
   input: Parameters<typeof fetch>[0],
@@ -142,6 +150,7 @@ function createAttachment(
     readonly objectId: string;
   }) => void,
   resourceAccess?: ResourceAccess,
+  toolResultArtifacts?: ToolResultArtifactStore,
 ): Attachment {
   let nextObjectId = 0;
   const blobStore: BlobStore = {
@@ -182,11 +191,46 @@ function createAttachment(
       },
     },
     ...(resourceAccess ? { resourceAccess } : {}),
+    ...(toolResultArtifacts ? { toolResultArtifacts } : {}),
   });
 }
 
 function fakeResourceAccess(materialize: ResourceAccess["materialize"]): ResourceAccess {
   return { materialize } as ResourceAccess;
+}
+
+function fakeOpenResourceAccess(open: ResourceAccess["open"]): ResourceAccess {
+  return { open } as ResourceAccess;
+}
+
+function verifiedTextResource(
+  uri: string,
+  content: Uint8Array,
+  filename: string,
+): VerifiedResourceRead {
+  const sha256 = "a".repeat(64);
+  return {
+    descriptor: {
+      uri: uri as ResourceDescriptor["uri"],
+      filename,
+      detectedMediaType: "text/plain",
+      cachedByteLength: content.byteLength,
+    },
+    classification: { kind: "text", mediaType: "text/plain", encoding: "utf-8" },
+    blob: {
+      version: 1,
+      objectId: "b1_00000000000000000000000000000001",
+      sha256,
+      byteLength: content.byteLength,
+    },
+    stream: new ReadableStream({
+      start(controller) {
+        controller.enqueue(content);
+        controller.close();
+      },
+    }),
+    completion: Promise.resolve(Result.ok({ sha256, byteLength: content.byteLength })),
+  };
 }
 
 function isAddFilesResult(
@@ -216,6 +260,9 @@ describe("tool-server attachment", () => {
       field: "paths",
       variadic: true,
     });
+    expect(addFiles?.description).toBe(
+      "Reads local files or resources and attaches them to the current reply.",
+    );
   });
 
   it("keeps attachment.download callable but marks it deprecated and hidden", async () => {
@@ -345,6 +392,194 @@ describe("tool-server attachment", () => {
       expect(res.attachments[0]?.filename).toBe("aliased.txt");
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("attaches retained resource URIs without resolving them as filesystem paths", async () => {
+    const uri = "resource://r1_00000000000000000000000000000001";
+    const content = Buffer.from("retained resource", "utf8");
+    let openOptions: Parameters<ResourceAccess["open"]>[1] | undefined;
+    const resourceAccess = fakeOpenResourceAccess(async (inputUri, options) => {
+      openOptions = options;
+      return Result.ok(verifiedTextResource(inputUri, content, "retained.txt"));
+    });
+    const tool = createAttachment(
+      createLilacBus(createInMemoryRawBus()),
+      undefined,
+      resourceAccess,
+    );
+
+    const value = await callValue(
+      tool,
+      "attachment.add_files",
+      { paths: uri },
+      {
+        context: {
+          requestId: "discord:c1:m1",
+          sessionId: "c1",
+          requestClient: "discord",
+          cwd: "/workspace",
+          safetyMode: "restricted",
+        },
+      },
+    );
+
+    expect(value).toEqual({
+      ok: true,
+      attachments: [
+        { filename: "retained.txt", mimeType: "text/plain", bytes: content.byteLength },
+      ],
+    });
+    expect(openOptions).toMatchObject({ maxBytes: 8 * 1024 * 1024, expected: "any" });
+  });
+
+  it("rejects an oversized retained resource before publishing it", async () => {
+    const uri = "resource://r1_00000000000000000000000000000001";
+    let publishCount = 0;
+    const raw = createInMemoryRawBus(() => {
+      publishCount += 1;
+    });
+    const resourceAccess = fakeOpenResourceAccess(async (inputUri, options) =>
+      Result.err(
+        new ResourceTooLarge({
+          uri: inputUri,
+          limit: options.maxBytes,
+          limitKind: "operation",
+          reportedBytes: options.maxBytes + 1,
+          message: `Resource exceeds the ${options.maxBytes}-byte limit`,
+        }),
+      ),
+    );
+    const tool = createAttachment(createLilacBus(raw), undefined, resourceAccess);
+
+    const result = await tool.call(
+      "attachment.add_files",
+      { paths: uri },
+      {
+        context: {
+          requestId: "discord:c1:m1",
+          sessionId: "c1",
+          requestClient: "discord",
+          cwd: "/workspace",
+        },
+      },
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error).toMatchObject({ kind: "usage" });
+    }
+    expect(publishCount).toBe(0);
+  });
+
+  it("enforces the total byte limit across mixed local and resource sources", async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), "lilac-att-mixed-limit-"));
+    const localPath = join(root, "local.txt");
+    await fs.writeFile(localPath, "x", "utf8");
+    const resourceBytes = Buffer.alloc(8 * 1024 * 1024, 1);
+    const firstUri = "resource://r1_00000000000000000000000000000001";
+    const secondUri = "resource://r1_00000000000000000000000000000002";
+    let publishCount = 0;
+    const raw = createInMemoryRawBus(() => {
+      publishCount += 1;
+    });
+    const resourceAccess = fakeOpenResourceAccess(async (uri) =>
+      Result.ok(verifiedTextResource(uri, resourceBytes, `${uri.slice(-2)}.txt`)),
+    );
+    const tool = createAttachment(createLilacBus(raw), undefined, resourceAccess);
+
+    try {
+      const result = await tool.call(
+        "attachment.add_files",
+        { paths: [localPath, firstUri, secondUri] },
+        {
+          context: {
+            requestId: "discord:c1:m1",
+            sessionId: "c1",
+            requestClient: "discord",
+            cwd: root,
+          },
+        },
+      );
+
+      expect(result.status).toBe("error");
+      if (result.status === "error") {
+        expect(result.error).toMatchObject({
+          kind: "usage",
+          message: expect.stringContaining("Total attachment bytes too large"),
+        });
+      }
+      expect(publishCount).toBe(2);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("attaches transient resource URIs only within their session scope", async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), "lilac-att-transient-resource-"));
+    try {
+      const artifacts = createToolResultArtifactStore(
+        join(root, "artifacts"),
+        await getTestBlobStore(),
+      );
+      await artifacts.init();
+      const created = (
+        await artifacts.create({
+          scopeId: "session-a",
+          requestId: "request-a",
+          toolCallId: "call-a",
+          toolName: "bash",
+          content: "transient content",
+          ttlMs: 60_000,
+          maxBytesPerScope: 1024,
+        })
+      ).match({
+        ok: (value) => value,
+        err: (error) => {
+          throw error;
+        },
+      });
+      const tool = createAttachment(
+        createLilacBus(createInMemoryRawBus()),
+        undefined,
+        undefined,
+        artifacts,
+      );
+      const context = {
+        requestId: "request-a",
+        sessionId: "session-a",
+        requestClient: "discord",
+        cwd: root,
+      };
+
+      const value = await callValue(
+        tool,
+        "attachment.add_files",
+        { paths: created.uri },
+        { context },
+      );
+      expect(value).toEqual({
+        ok: true,
+        attachments: [
+          {
+            filename: `tool-result-${created.id.replaceAll("-", "").slice(0, 8)}.txt`,
+            mimeType: "text/plain",
+            bytes: Buffer.byteLength("transient content"),
+          },
+        ],
+      });
+
+      const foreign = await tool.call(
+        "attachment.add_files",
+        { paths: created.uri },
+        { context: { ...context, sessionId: "session-b" } },
+      );
+      expect(foreign.status).toBe("error");
+      if (foreign.status === "error") {
+        expect(foreign.error).toMatchObject({ kind: "not_found" });
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
     }
   });
 
