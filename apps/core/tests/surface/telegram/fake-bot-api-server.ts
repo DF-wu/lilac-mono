@@ -221,6 +221,11 @@ export class FakeBotApiServer {
   private readonly failures = new Map<string, ProgrammedFailure[]>();
   /** Remote message state, including existence and all text-editable fields. */
   private readonly messages = new Map<number, StoredMessage>();
+  /** Downloadable files, keyed by file_id, served under /file/bot<token>/<path>. */
+  private readonly files = new Map<
+    string,
+    { filePath: string; bytes: Uint8Array; declaredSize?: number | null }
+  >();
 
   private nextUpdateId = 1;
   private nextMessageId = 1000;
@@ -268,6 +273,29 @@ export class FakeBotApiServer {
    */
   enqueueMessage(message: NonNullable<Update["message"]>): number {
     return this.enqueueUpdate({ message });
+  }
+
+  /**
+   * Registers a downloadable file. `getFile` for this `file_id` returns
+   * `filePath`, and a request to `/file/bot<token>/<filePath>` returns the
+   * bytes — mirroring the two-step resolution the real Bot API requires.
+   *
+   * `declaredSize` controls the `file_size` that `getFile` reports: omitted
+   * means "truthful", `null` means "absent", and a number lets a test lie —
+   * the Bot API's declared size is advisory and download limits must not
+   * trust it.
+   */
+  setFile(input: {
+    fileId: string;
+    filePath: string;
+    bytes: Uint8Array;
+    declaredSize?: number | null;
+  }): void {
+    this.files.set(input.fileId, {
+      filePath: input.filePath,
+      bytes: input.bytes,
+      ...(input.declaredSize === undefined ? {} : { declaredSize: input.declaredSize }),
+    });
   }
 
   /** Makes the next call to `method` fail. Failures are consumed in order. */
@@ -319,12 +347,7 @@ export class FakeBotApiServer {
 
   // --- transport ------------------------------------------------------------
 
-  private async handle(req: Request): Promise<Response> {
-    // grammY calls POST {apiRoot}/bot{token}/{method}
-    const method = new URL(req.url).pathname.split("/").pop() ?? "";
-
-    const params = await readParams(req);
-
+  private recordCall(method: string, params: Record<string, unknown>): void {
     this.calls.push({ method, params });
     this.callWaiters = this.callWaiters.filter((waiter) => {
       const matching = this.callsOf(waiter.method);
@@ -332,6 +355,30 @@ export class FakeBotApiServer {
       waiter.resolve(matching[waiter.count - 1] as RecordedCall);
       return false;
     });
+  }
+
+  private async handle(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+
+    // File downloads use GET {apiRoot}/file/bot{token}/{file_path}, not the
+    // method-call shape. The token segment is deliberately not recorded, so a
+    // test asserting on recorded calls can also prove the token never has to
+    // be part of any assertion.
+    const fileMatch = /^\/file\/bot[^/]+\/(.+)$/u.exec(url.pathname);
+    if (fileMatch) {
+      const filePath = fileMatch[1] ?? "";
+      this.recordCall("downloadFile", { file_path: filePath });
+      const stored = [...this.files.values()].find((file) => file.filePath === filePath);
+      if (!stored) return new Response("Not Found", { status: 404 });
+      return new Response(stored.bytes.slice());
+    }
+
+    // grammY calls POST {apiRoot}/bot{token}/{method}
+    const method = url.pathname.split("/").pop() ?? "";
+
+    const params = await readParams(req);
+
+    this.recordCall(method, params);
 
     const failure = this.failures.get(method)?.shift();
     if (failure) {
@@ -386,8 +433,21 @@ export class FakeBotApiServer {
       case "deleteMessage":
         return this.deleteMessage(params);
 
-      case "getFile":
+      case "getFile": {
+        const fileId = typeof params.file_id === "string" ? params.file_id : "";
+        const stored = this.files.get(fileId);
+        if (stored) {
+          const declaredSize =
+            stored.declaredSize === undefined ? stored.bytes.byteLength : stored.declaredSize;
+          return {
+            file_id: fileId,
+            file_unique_id: `u-${fileId}`,
+            file_path: stored.filePath,
+            ...(declaredSize === null ? {} : { file_size: declaredSize }),
+          };
+        }
         return { file_id: "f", file_unique_id: "u", file_path: "photos/file_0.jpg" };
+      }
 
       case "setMyCommands":
       case "sendChatAction":

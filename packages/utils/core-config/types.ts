@@ -147,6 +147,11 @@ export const TELEGRAM_SURFACE_DEFAULTS = {
     maxWidth: 50,
     fallbackMode: "list",
   },
+  inboundMedia: {
+    enabled: true,
+    maxBytesPerAttachment: 5 * 1024 * 1024,
+    maxBytesPerRequest: 10 * 1024 * 1024,
+  },
 } as const;
 
 /**
@@ -161,6 +166,7 @@ export function cloneDefaultTelegramSurface(): UniversalCoreConfig["surface"]["t
     allowedUserIds: [],
     workingIndicators: cloneDefaultWorkingIndicators(),
     markdownTableRender: { ...TELEGRAM_SURFACE_DEFAULTS.markdownTableRender },
+    inboundMedia: { ...TELEGRAM_SURFACE_DEFAULTS.inboundMedia },
   };
 }
 
@@ -363,6 +369,20 @@ export type UniversalCoreConfig = {
         style: "unicode" | "ascii";
         maxWidth: number;
         fallbackMode: "list" | "passthrough";
+      };
+      /**
+       * Inbound photo/document delivery to the model. Media is resolved from
+       * Telegram at composition time via the stable `file_id` (never a URL, so
+       * the bot token cannot leak into composed content or transcripts) and is
+       * bounded by decoded-byte budgets before anything is published.
+       */
+      inboundMedia: {
+        /** When false, media messages route on caption text only (media dropped). */
+        enabled: boolean;
+        /** Decoded-byte cap per attachment; larger media degrade to a metadata marker. */
+        maxBytesPerAttachment: number;
+        /** Decoded-byte budget across every attachment in one composed request. */
+        maxBytesPerRequest: number;
       };
     };
 

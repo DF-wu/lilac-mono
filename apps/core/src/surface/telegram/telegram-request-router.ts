@@ -7,6 +7,7 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import { getCoreConfig, parseCoreConfigResult, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 
 import type { CustomCommandManager } from "../../custom-commands/manager";
 import { captureError } from "../../shared/error-capture";
@@ -52,6 +53,7 @@ export type TelegramRequestRouter = {
 export type StartTelegramRequestRouterInput = {
   readonly adapter: SurfaceAdapter;
   readonly bus: LilacBus;
+  readonly blobStore: BlobStore;
   readonly subscriptionId: string;
   readonly customCommands?: CustomCommandManager;
   readonly config?: TelegramRouterConfig;
@@ -77,32 +79,39 @@ function configFromOverride(config: TelegramRouterConfig): CoreConfig {
 export async function startTelegramRequestRouter(
   input: StartTelegramRequestRouterInput,
 ): Promise<TelegramRequestRouter> {
-  const cfg = input.config ? configFromOverride(input.config) : await getCoreConfig();
+  let cfg = input.config ? configFromOverride(input.config) : await getCoreConfig();
   const buffers = new Map<string, DebounceBuffer>();
+
+  async function currentConfig(): Promise<CoreConfig> {
+    if (input.config) return cfg;
+    cfg = await getCoreConfig();
+    return cfg;
+  }
 
   const publishEvent = async (event: EvtAdapterMessageCreatedData): Promise<void> => {
     const self = await input.adapter.getSelf();
     if (self.platform !== "telegram") {
       throw new Panic({ message: "Telegram request router requires a Telegram adapter" });
     }
+    const liveCfg = await currentConfig();
     const flags = telegramFlags(event);
     const isDm = flags.isDMBased === true;
-    const mode = isDm ? "active" : getSessionMode(cfg, event.channelId, flags.parentChannelId);
+    const mode = isDm ? "active" : getSessionMode(liveCfg, event.channelId, flags.parentChannelId);
     const botNames = resolveTelegramBotMentionNames({
-      botName: cfg.surface.telegram.botName,
-      botUsername: cfg.surface.telegram.botUsername,
+      botName: liveCfg.surface.telegram.botName,
+      botUsername: liveCfg.surface.telegram.botUsername,
     });
     const modelOverride =
       parseLeadingModelOverride({ text: event.text, botNames }) ??
-      resolveSessionModelOverride(cfg, event.channelId, flags.parentChannelId);
+      resolveSessionModelOverride(liveCfg, event.channelId, flags.parentChannelId);
     const customCommand = input.customCommands
-      ? commandMetadata(input.customCommands, event.text, cfg.surface.telegram.botUsername)
+      ? commandMetadata(input.customCommands, event.text, liveCfg.surface.telegram.botUsername)
       : null;
     if (!customCommand && mode === "mention" && !flags.mentionsBot && !flags.replyToBot) return;
 
     if (
       !isDm &&
-      resolveSessionGateEnabled(cfg, event.channelId, flags.parentChannelId) &&
+      resolveSessionGateEnabled(liveCfg, event.channelId, flags.parentChannelId) &&
       shouldRunDirectReplyMentionGate({
         replyToBot: flags.replyToBot === true,
         mentionsBot: flags.mentionsBot === true,
@@ -119,7 +128,7 @@ export async function startTelegramRequestRouter(
         : null;
       const decision = await input.routerGate?.({
         sessionId: event.channelId,
-        botName: cfg.surface.telegram.botName,
+        botName: liveCfg.surface.telegram.botName,
         messages: [
           {
             msgRef: messageRef(event),
@@ -144,7 +153,9 @@ export async function startTelegramRequestRouter(
       event,
       botUserId: self.userId,
       botNames,
+      blobStore: input.blobStore,
       modelOverride,
+      inboundMedia: liveCfg.surface.telegram.inboundMedia,
     });
     const requestId = formatTelegramMessageRequestId({
       sessionId: event.channelId,
@@ -210,17 +221,18 @@ export async function startTelegramRequestRouter(
         try: async () => {
           const suppressed = await input.shouldSuppressAdapterEvent?.({ evt: message.data });
           if (suppressed?.suppress) return Result.ok(undefined);
+          const liveCfg = await currentConfig();
           const flags = telegramFlags(message.data);
           const mode = flags.isDMBased
             ? "active"
-            : getSessionMode(cfg, message.data.channelId, flags.parentChannelId);
+            : getSessionMode(liveCfg, message.data.channelId, flags.parentChannelId);
           if (mode === "active" && !flags.isDMBased && !flags.mentionsBot && !flags.replyToBot) {
             const previous = buffers.get(message.data.channelId);
             if (previous?.timer) clearTimeout(previous.timer);
             const buffer: DebounceBuffer = { event: message.data, timer: null };
             buffer.timer = setTimeout(
               () => void flush(message.data.channelId),
-              cfg.surface.router.activeDebounceMs,
+              liveCfg.surface.router.activeDebounceMs,
             );
             buffers.set(message.data.channelId, buffer);
             return Result.ok(undefined);

@@ -99,14 +99,34 @@ describe("isRoutableTelegramMessage", () => {
     expect(isRoutableTelegramMessage({ message })).toBe(true);
   });
 
-  it("ignores media with no caption, which would start an empty run", () => {
-    // Inbound attachments are not forwarded to the model yet, so an uncaptioned
-    // photo would produce a request containing only attribution metadata.
+  it("ignores uncaptioned media while inbound media delivery is disabled", () => {
+    // With delivery off the media is dropped, so an uncaptioned photo would
+    // produce a request containing only attribution metadata.
     const message = makeMessage({
       text: undefined,
       document: { file_id: "f", file_unique_id: "u" },
     });
     expect(isRoutableTelegramMessage({ message })).toBe(false);
+    expect(isRoutableTelegramMessage({ message, allowUncaptionedMedia: false })).toBe(false);
+  });
+
+  it("routes uncaptioned media when inbound media delivery is enabled", () => {
+    const message = makeMessage({
+      text: undefined,
+      document: { file_id: "f", file_unique_id: "u" },
+    });
+    expect(isRoutableTelegramMessage({ message, allowUncaptionedMedia: true })).toBe(true);
+  });
+
+  it("does not let media rescue a bot or service message", () => {
+    const fromBot = makeMessage({
+      text: undefined,
+      photo: [{ file_id: "f", file_unique_id: "u", width: 1, height: 1 }],
+      from: makeUser({ id: 99, is_bot: true }),
+    });
+    expect(isRoutableTelegramMessage({ message: fromBot, allowUncaptionedMedia: true })).toBe(
+      false,
+    );
   });
 });
 

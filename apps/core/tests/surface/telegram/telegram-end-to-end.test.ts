@@ -14,6 +14,7 @@ import { bridgeAdapterToBus } from "../../../src/surface/bridge/publish-to-bus";
 import { TelegramAdapter } from "../../../src/surface/telegram/telegram-adapter";
 import { startTelegramRequestRouter } from "../../../src/surface/telegram/telegram-request-router";
 import { createInMemoryDeliveryBus } from "../../helpers/in-memory-delivery-bus";
+import { getTestBlobStore } from "../../helpers/blob-store";
 import { FakeBotApiServer } from "./fake-bot-api-server";
 import { BOT_USER_ID, BOT_USERNAME, makeMessage, makeSupergroupChat } from "./telegram-fixtures";
 
@@ -128,6 +129,7 @@ async function startChain(cfg: CoreConfig = testConfig(), customCommands?: Custo
   stopRouter = await startTelegramRequestRouter({
     adapter: created,
     bus,
+    blobStore: await getTestBlobStore(),
     subscriptionId: "e2e-router",
     ...(customCommands ? { customCommands } : {}),
     config: {

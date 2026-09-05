@@ -3083,6 +3083,8 @@ export async function createCoreRuntime(
                       telegramAdapter,
                     ),
                     healthProvider: telegramAdapter,
+                    customCommands,
+                    getWorkflowStore: () => activeDurableWorkflowStore,
                   },
                 }
               : {}),

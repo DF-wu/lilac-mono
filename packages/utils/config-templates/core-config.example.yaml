@@ -330,6 +330,24 @@ surface:
     # false leaves the bot's existing menu untouched.
     commandMenu: true
 
+    # Inbound photo/document delivery to the model.
+    #
+    # Media is resolved from Telegram at composition time via the permanent
+    # file_id (never a URL, so the bot token cannot reach composed content or
+    # transcripts). Images and PDFs become inline file parts, text documents
+    # are inlined as text, and audio/video/voice degrade to metadata markers.
+    # Budgets bound decoded bytes; oversized media degrades to a marker.
+    inboundMedia:
+      # false restores caption-only behavior: media is dropped and an
+      # uncaptioned photo does not start a run.
+      enabled: true
+      # Decoded-byte cap per attachment. Accepts friendly sizes ("5MiB").
+      maxBytesPerAttachment: 5MiB
+      # One decoded-byte budget across every attachment in a composed request,
+      # including reply-chain history. The trigger message wins the budget
+      # over older history.
+      maxBytesPerRequest: 10MiB
+
     # Streaming title phrases for in-progress updates.
     # Defaults live in packages/utils/working-indicators.ts.
     # workingIndicators: []

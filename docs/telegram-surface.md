@@ -26,7 +26,7 @@ groups the bot only receives:
 - commands (`/foo`, `/foo@yourbot`).
 
 That maps naturally onto the router's `mention` session mode, and it is the safer
-default. If you want the agent to see *every* group message (needed for the
+default. If you want the agent to see _every_ group message (needed for the
 router's `active` mode), disable privacy mode:
 
 ```
@@ -81,15 +81,20 @@ surface:
     # botUsername: "Catalina_agentbot"   # resolved from getMe when omitted
 
     allowedChatIds:
-      - "1001"              # your DM
-      - "-1001234567890"    # a group
-    allowedUserIds: []      # empty = any user inside an allowed chat
+      - "1001" # your DM
+      - "-1001234567890" # a group
+    allowedUserIds: [] # empty = any user inside an allowed chat
 
     outputMode: preview
     parseMode: html
     streamEditIntervalMs: 1500
     outputNotification: true
     commandMenu: true
+
+    inboundMedia:
+      enabled: true
+      maxBytesPerAttachment: 5MiB
+      maxBytesPerRequest: 10MiB
 
     markdownTableRender:
       enabled: true
@@ -105,23 +110,26 @@ the grammY client receives it when the adapter is constructed.
 
 ### Option reference
 
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `enabled` | `false` | The adapter is only constructed when true. |
-| `token` | — | Bot API token stored directly in `core-config.yaml`. Treat the config file as secret material. |
-| `botName` | `lilac` | Identity used for mention detection and prompt attribution. No spaces. |
-| `botUsername` | — | The `@handle` without the `@`. Resolved from `getMe` on connect when omitted. |
-| `allowedChatIds` | `[]` | **Fails closed.** Empty means the bot ignores every chat. |
-| `allowedUserIds` | `[]` | Empty means no user-level restriction; the chat allowlist still applies. |
-| `dbPath` | `<dataDir>/telegram-surface.db` | Local message index (see §7). |
-| `apiRoot` | `https://api.telegram.org` | Bot API endpoint. Set this to use a [self-hosted Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server). Must be a full URL. Read once at connect, so a change needs a restart. |
-| `outputMode` | `preview` | Cancellation behaviour only. Telegram edits the streamed message in place, so a **successful** run is identical in both modes. `preview` deletes the streamed messages when a request is cancelled; `inline` leaves the partial answer visible. |
-| `parseMode` | `html` | `html` renders markdown as Telegram HTML; `plain` sends unformatted text. |
-| `streamEditIntervalMs` | `1500` | Minimum gap between streaming edits. Minimum accepted value is 500. |
-| `outputNotification` | `true` | `false` sends with `disable_notification`. |
-| `commandMenu` | `true` | Publishes the custom-command menu via `setMyCommands` on connect (see §7). `false` leaves whatever menu the bot already has untouched. |
-| `workingIndicators` | shared default | Streaming progress phrases. |
-| `markdownTableRender` | enabled | Renders markdown tables as fixed-width blocks. |
+| Key                                  | Default                         | Meaning                                                                                                                                                                                                                                         |
+| ------------------------------------ | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`                            | `false`                         | The adapter is only constructed when true.                                                                                                                                                                                                      |
+| `token`                              | —                               | Bot API token stored directly in `core-config.yaml`. Treat the config file as secret material.                                                                                                                                                  |
+| `botName`                            | `lilac`                         | Identity used for mention detection and prompt attribution. No spaces.                                                                                                                                                                          |
+| `botUsername`                        | —                               | The `@handle` without the `@`. Resolved from `getMe` on connect when omitted.                                                                                                                                                                   |
+| `allowedChatIds`                     | `[]`                            | **Fails closed.** Empty means the bot ignores every chat.                                                                                                                                                                                       |
+| `allowedUserIds`                     | `[]`                            | Empty means no user-level restriction; the chat allowlist still applies.                                                                                                                                                                        |
+| `dbPath`                             | `<dataDir>/telegram-surface.db` | Local message index (see §7).                                                                                                                                                                                                                   |
+| `apiRoot`                            | `https://api.telegram.org`      | Bot API endpoint. Set this to use a [self-hosted Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server). Must be a full URL. Read once at connect, so a change needs a restart.                                       |
+| `outputMode`                         | `preview`                       | Cancellation behaviour only. Telegram edits the streamed message in place, so a **successful** run is identical in both modes. `preview` deletes the streamed messages when a request is cancelled; `inline` leaves the partial answer visible. |
+| `parseMode`                          | `html`                          | `html` renders markdown as Telegram HTML; `plain` sends unformatted text.                                                                                                                                                                       |
+| `streamEditIntervalMs`               | `1500`                          | Minimum gap between streaming edits. Minimum accepted value is 500.                                                                                                                                                                             |
+| `outputNotification`                 | `true`                          | `false` sends with `disable_notification`.                                                                                                                                                                                                      |
+| `commandMenu`                        | `true`                          | Publishes the custom-command menu via `setMyCommands` on connect (see §7). `false` leaves whatever menu the bot already has untouched.                                                                                                          |
+| `workingIndicators`                  | shared default                  | Streaming progress phrases.                                                                                                                                                                                                                     |
+| `markdownTableRender`                | enabled                         | Renders markdown tables as fixed-width blocks.                                                                                                                                                                                                  |
+| `inboundMedia.enabled`               | `true`                          | Deliver inbound photos/documents to the model. `false` restores caption-only routing: media is dropped and an uncaptioned photo does not start a run.                                                                                           |
+| `inboundMedia.maxBytesPerAttachment` | `5MiB`                          | Decoded-byte cap per attachment. Larger media degrades to a metadata marker instead of being delivered.                                                                                                                                         |
+| `inboundMedia.maxBytesPerRequest`    | `10MiB`                         | One decoded-byte budget across every attachment in a composed request, including reply-chain history. The trigger message wins the budget over older history.                                                                                   |
 
 Routing behaviour (mention vs active mode, the ML gate, debounce) is configured
 under `surface.router` and applies to Telegram exactly as it does to Discord.
@@ -156,10 +164,10 @@ and continues without Telegram rather than failing startup.
 
 ## 5. Session ids
 
-| Chat kind | Session id | Example |
-|-----------|------------|---------|
-| Private / group / supergroup / channel | `<chat_id>` | `1001`, `-1001234567890` |
-| Forum topic | `<chat_id>:<topic_id>` | `-1001234567890:7` |
+| Chat kind                              | Session id             | Example                  |
+| -------------------------------------- | ---------------------- | ------------------------ |
+| Private / group / supergroup / channel | `<chat_id>`            | `1001`, `-1001234567890` |
+| Forum topic                            | `<chat_id>:<topic_id>` | `-1001234567890:7`       |
 
 Each forum topic is a **separate session**, so `surface.router.sessionModes` can
 be configured per topic:
@@ -276,6 +284,30 @@ tracking are therefore served from a local SQLite index at `dbPath`, populated a
 messages arrive. A freshly-provisioned bot has no history of a chat, even one it
 has been in for a while.
 
+**Inbound media is re-resolved from `file_id`, never fetched by URL.** Telegram
+download URLs embed the bot token and the underlying `file_path` expires after
+about an hour, so neither may enter composed content, transcripts, or logs.
+Composition instead carries the permanent `file_id` (persisted with the message
+in the local index) and asks the adapter to resolve it at request time:
+`getFile`, then an authenticated download that streams and aborts the moment a
+byte budget is exceeded — Telegram's declared sizes are treated as advisory
+because they can be absent or wrong. Historical messages in a reply chain
+re-resolve the same way, which is what makes re-composition after a restart
+work. Accepted image and PDF bytes are written to the configured BlobStore and
+cross the request wire as durable blob handles; the durable request coordinator
+resolves and owns those blobs before admission. Large bytes therefore do not
+enter Redis request payloads or the request-message cache. Ordinary transcripts
+keep only response-side messages, while compaction checkpoints retain the
+resolved blob references needed to resume safely. Images and PDFs become file
+parts at the model boundary, text-extractable documents are inlined as text, and
+audio/video/voice degrade to one-line `[telegram_attachment …]` markers — a
+partial file would be corrupt rather than smaller, so oversized or unavailable
+media degrades to a marker too. Declared Telegram sizes and MIME types are
+advisory: the download stream is authoritative, and delivery policy is applied
+after sniffing the bytes. A self-hosted Bot API server running in `--local`
+mode returns filesystem paths instead of downloadable ones and is not supported
+for inbound media.
+
 **Edit rate limits.** Telegram throttles `editMessageText` at roughly one call
 per second per chat and rejects an edit whose content is unchanged. Streaming
 therefore throttles to `streamEditIntervalMs` and skips no-op edits. A `429` is
@@ -312,7 +344,7 @@ apparently left blank.
 
 **Attachment batches fail forward, not atomically.** Each attachment is a
 separate upload, and one that has returned is already visible in the chat and
-cannot be recalled. When upload *n* fails, the run stops there: the uploads
+cannot be recalled. When upload _n_ fails, the run stops there: the uploads
 before it keep their refs and are indexed as normal, and the ones behind it are
 never attempted. Continuing past the failure would leave a gap in the sequence
 (1 and 3 delivered, 2 missing) that is harder to read than a truncated prefix,
@@ -327,10 +359,10 @@ Telegram's command grammar is `[a-z0-9_]{1,32}`, which the canonical
 command is therefore also given a **menu alias**, `lilac_<name>` with hyphens
 mapped to underscores, and that is what `setMyCommands` advertises:
 
-| Command in `<dataDir>/cmds` | Menu entry | Typed form |
-|---|---|---|
-| `tarot` | `/lilac_tarot` | `/lilac:tarot` |
-| `daily-standup` | `/lilac_daily_standup` | `/lilac:daily-standup` |
+| Command in `<dataDir>/cmds` | Menu entry             | Typed form             |
+| --------------------------- | ---------------------- | ---------------------- |
+| `tarot`                     | `/lilac_tarot`         | `/lilac:tarot`         |
+| `daily-standup`             | `/lilac_daily_standup` | `/lilac:daily-standup` |
 
 Both spellings resolve to the same definition and take the same arguments, so
 `/lilac_daily_standup team=core keep it short` behaves exactly like the typed
@@ -435,17 +467,17 @@ cleaned up.
 
 ## 9. Troubleshooting
 
-| Symptom | Cause |
-|---------|-------|
-| Bot never responds in a DM | The chat id is not in `allowedChatIds`. The allowlist fails closed. |
-| Bot responds in DMs but not in a group | Privacy mode is on and the message did not mention or reply to the bot. See §1. |
-| Bot responds to mentions but never to plain group messages | Same as above; `active` mode needs privacy mode disabled. |
-| `telegram surface enabled but no token available` | `enabled: true` but `surface.telegram.token` is unset in `core-config.yaml`. |
-| Answers arrive all at once, not streamed | `streamEditIntervalMs` is high, or the answer was short enough to be a single send. |
-| Formatting looks broken | Try `parseMode: plain` to isolate whether the HTML renderer is at fault, and report the input. |
-| `409 Conflict` in logs | Two processes are polling the same bot token. Only one runtime may poll a given bot. |
-| A due workflow schedule logs `progress target is no longer authorized` and creates no run | Its chat was removed from `allowedChatIds`. Restore the chat to retry the still-due occurrence, or cancel the trigger. |
-| A reply resumes a workflow but does not start a normal agent response | Expected. A message matching a pending or consumed `waitForReply` is reserved for that workflow and suppressed from ordinary routing. |
+| Symptom                                                                                   | Cause                                                                                                                                 |
+| ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Bot never responds in a DM                                                                | The chat id is not in `allowedChatIds`. The allowlist fails closed.                                                                   |
+| Bot responds in DMs but not in a group                                                    | Privacy mode is on and the message did not mention or reply to the bot. See §1.                                                       |
+| Bot responds to mentions but never to plain group messages                                | Same as above; `active` mode needs privacy mode disabled.                                                                             |
+| `telegram surface enabled but no token available`                                         | `enabled: true` but `surface.telegram.token` is unset in `core-config.yaml`.                                                          |
+| Answers arrive all at once, not streamed                                                  | `streamEditIntervalMs` is high, or the answer was short enough to be a single send.                                                   |
+| Formatting looks broken                                                                   | Try `parseMode: plain` to isolate whether the HTML renderer is at fault, and report the input.                                        |
+| `409 Conflict` in logs                                                                    | Two processes are polling the same bot token. Only one runtime may poll a given bot.                                                  |
+| A due workflow schedule logs `progress target is no longer authorized` and creates no run | Its chat was removed from `allowedChatIds`. Restore the chat to retry the still-due occurrence, or cancel the trigger.                |
+| A reply resumes a workflow but does not start a normal agent response                     | Expected. A message matching a pending or consumed `waitForReply` is reserved for that workflow and suppressed from ordinary routing. |
 
 ---
 
@@ -454,16 +486,11 @@ cleaned up.
 The conversational path is complete: messages in, routing, streamed replies,
 chunking, HTML rendering, reply-chain context, cancellation, custom commands and
 their menu, outbound attachments, reactions, typing indicators, and history
-served from the local index. Everything below is a gap in something *else* that
+served from the local index. Everything below is a gap in something _else_ that
 Discord has, stated precisely so nobody has to infer it from silence.
 
 ### Not implemented
 
-- **Inbound attachments.** A photo or document *sent to* the bot reaches the
-  agent as its caption text only; the media itself is dropped, and an
-  uncaptioned photo does not start a run at all. Outbound attachments work.
-  Tracked in [#42](https://github.com/DF-wu/lilac-mono/issues/42), which carries
-  the agreed design.
 - **Webhook ingress.** Long polling only.
 - **A Telegram-side conversation search index.** Discord has a dedicated search
   store; Telegram relies on the shared transcript store.
@@ -475,6 +502,14 @@ Discord has, stated precisely so nobody has to infer it from silence.
 These are platform consequences rather than omissions. They are listed because
 code that assumes Discord semantics will be surprised.
 
+- **Inbound attachments are delivered as bytes, not URLs.** Photos and
+  documents sent to the bot reach the model as inline file parts (images and
+  PDFs) or inlined text (text-extractable documents), bounded by the
+  `inboundMedia` budgets; audio, video, voice, and oversized or unavailable
+  media degrade to `[telegram_attachment …]` metadata markers. Discord hands
+  the provider a CDN URL instead; Telegram has no token-free URL to hand over.
+  See §7 and [#42](https://github.com/DF-wu/lilac-mono/issues/42) for the
+  design.
 - **Workflow progress cards use inline keyboards.** Pause, resume and cancel
   actions are projected to Telegram and consumed through the same durable
   workflow action store as Discord/GitHub. Callback data over Telegram's

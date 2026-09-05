@@ -1,4 +1,5 @@
-import type { EvtAdapterMessageCreatedData, StoredMessageV1 } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
+import type { BusMessageV2, EvtAdapterMessageCreatedData } from "@stanley2058/lilac-event-bus";
 import { z } from "zod";
 
 import {
@@ -6,9 +7,16 @@ import {
   type CustomCommandArgumentValue,
   type CustomCommandManager,
 } from "../../custom-commands/manager";
-import type { SurfaceAdapter } from "../adapter";
+import { hasSurfaceAttachmentResolver, type SurfaceAdapter } from "../adapter";
 import type { MsgRef, SurfaceMessage } from "../types";
 import { formatSurfaceAttributionHeader } from "../bridge/request-composition/normalization";
+import {
+  appendTelegramMediaToUserContent,
+  createTelegramInboundMediaBudget,
+  telegramInboundMediaFromRaw,
+  type TelegramBusUserContentPart,
+  type TelegramInboundMediaConfig,
+} from "./telegram-inbound-media";
 
 const telegramFlagsSchema = z
   .object({
@@ -135,8 +143,14 @@ export async function composeTelegramMessages(input: {
   readonly event: EvtAdapterMessageCreatedData;
   readonly botUserId: string;
   readonly botNames: readonly string[];
+  readonly blobStore: BlobStore;
   readonly modelOverride?: string;
-}): Promise<{ readonly messages: StoredMessageV1[]; readonly chainMessageIds: string[] }> {
+  readonly inboundMedia?: TelegramInboundMediaConfig;
+}): Promise<{
+  readonly messages: BusMessageV2[];
+  readonly chainMessageIds: string[];
+  readonly mediaDelivered: boolean;
+}> {
   const chain: SurfaceMessage[] = [];
   const seen = new Set<string>();
   const triggerFlags = telegramFlags(input.event);
@@ -158,8 +172,17 @@ export async function composeTelegramMessages(input: {
     if (!ancestor) break;
     current = ancestor;
   }
+
+  const mediaPartsByMessageId = await resolveChainMediaParts({
+    adapter: input.adapter,
+    chain,
+    botUserId: input.botUserId,
+    blobStore: input.blobStore,
+    inboundMedia: input.inboundMedia,
+  });
+  let mediaDelivered = false;
   return {
-    messages: chain.map((message) => {
+    messages: chain.map((message): BusMessageV2 => {
       const text =
         message.ref.messageId === input.event.messageId
           ? visibleTelegramText(message.text, input.botNames, input.modelOverride)
@@ -172,8 +195,49 @@ export async function composeTelegramMessages(input: {
         messageId: message.ref.messageId,
         messageTs: message.ts,
       });
-      return { role: "user", content: `${header}\n${text}` };
+      const mainText = `${header}\n${text}`.trimEnd();
+      const mediaParts = mediaPartsByMessageId.get(message.ref.messageId);
+      if (!mediaParts || mediaParts.length === 0) {
+        return { role: "user", content: mainText };
+      }
+      if (mediaParts.some((part) => part.type === "blob")) mediaDelivered = true;
+      return {
+        role: "user",
+        content: [{ type: "text", text: mainText }, ...mediaParts],
+      };
     }),
     chainMessageIds: chain.map((message) => message.ref.messageId),
+    mediaDelivered,
   };
+}
+
+async function resolveChainMediaParts(input: {
+  readonly adapter: SurfaceAdapter;
+  readonly chain: readonly SurfaceMessage[];
+  readonly botUserId: string;
+  readonly blobStore: BlobStore;
+  readonly inboundMedia?: TelegramInboundMediaConfig;
+}): Promise<ReadonlyMap<string, readonly TelegramBusUserContentPart[]>> {
+  const parts = new Map<string, readonly TelegramBusUserContentPart[]>();
+  const config = input.inboundMedia;
+  if (!config?.enabled || !hasSurfaceAttachmentResolver(input.adapter)) return parts;
+
+  const budget = createTelegramInboundMediaBudget(config);
+  for (let index = input.chain.length - 1; index >= 0; index -= 1) {
+    const message = input.chain[index];
+    if (!message || message.userId === input.botUserId) continue;
+    const media = telegramInboundMediaFromRaw(message);
+    if (media.length === 0) continue;
+
+    const messageParts: TelegramBusUserContentPart[] = [];
+    await appendTelegramMediaToUserContent({
+      parts: messageParts,
+      media,
+      resolver: input.adapter,
+      blobStore: input.blobStore,
+      budget,
+    });
+    parts.set(message.ref.messageId, messageParts);
+  }
+  return parts;
 }

@@ -431,6 +431,7 @@ export const CORE_FINAL_BOUNDARY_IDENTITIES = [
 export const CORE_FINAL_CAPABILITY_IDENTITIES = [
   ["src/surface/adapter.ts", "hasCacheBurstProvider"],
   ["src/surface/adapter.ts", "hasRequestReadScopeProvider"],
+  ["src/surface/adapter.ts", "hasSurfaceAttachmentResolver"],
   ["src/surface/discord/discord-adapter.ts", "classifyDiscordSurfaceNotFound"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "isModelReasoningEffort"],
   ["src/surface/bridge/bus-agent-runner/raw.ts", "requestRawReferencesMessage"],

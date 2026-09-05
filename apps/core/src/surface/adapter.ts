@@ -46,6 +46,7 @@ export function settleSurfaceFallback<T, E>(
 export type SurfaceOperation =
   | "list-sessions"
   | "list-session-participants"
+  | "resolve-attachment"
   | "start-output"
   | "push-output"
   | "finish-output"
@@ -322,6 +323,64 @@ export interface SurfaceRequestReadScopeProvider {
 
 export interface SurfaceGuildIdResolver {
   fetchGuildIdForChannel(channelId: string): Promise<string | null>;
+}
+
+/**
+ * Stable, platform-tagged reference to an inbound attachment.
+ *
+ * Deliberately a union without a URL member for Telegram: resolving a Telegram
+ * file requires the bot token in the download URL, so the ref carries only the
+ * permanent `file_id` and the resolver keeps the credentialed URL internal.
+ * Token safety is a type property, not a reviewer's responsibility.
+ */
+export type SurfaceAttachmentRef = {
+  readonly platform: "telegram";
+  readonly fileId: string;
+  readonly filename?: string;
+  /** Client-declared MIME type; advisory only — resolvers sniff the bytes. */
+  readonly mimeType?: string;
+  /** Platform-declared size; advisory only — limits are enforced on the wire. */
+  readonly size?: number;
+};
+
+export type ResolvedSurfaceAttachment = {
+  readonly kind: "bytes";
+  readonly bytes: Uint8Array;
+  /** Sniffed from the bytes when possible, falling back to declared metadata. */
+  readonly mediaType: string;
+};
+
+/**
+ * The attachment exceeded the caller-supplied byte cap. Distinct from the
+ * generic operation errors so composition can degrade to an explicit
+ * "too large" marker instead of a generic failure note.
+ */
+export class SurfaceAttachmentTooLarge extends TaggedError("SurfaceAttachmentTooLarge")<{
+  readonly platform: RegisteredSurfacePlatform;
+  readonly maxBytes: number;
+  readonly message: string;
+}> {}
+
+export type SurfaceAttachmentResolveError = SurfaceOperationError | SurfaceAttachmentTooLarge;
+
+/**
+ * Optional capability: resolve an inbound attachment ref into bytes.
+ *
+ * Downloads stream and abort as soon as `maxBytes` is exceeded; implementations
+ * must never buffer past the cap and must keep credentials out of every error
+ * and log path.
+ */
+export interface SurfaceAttachmentResolver {
+  resolveAttachment(
+    ref: SurfaceAttachmentRef,
+    opts: { readonly maxBytes: number; readonly signal?: AbortSignal },
+  ): Promise<ResultType<ResolvedSurfaceAttachment, SurfaceAttachmentResolveError>>;
+}
+
+export function hasSurfaceAttachmentResolver(
+  adapter: SurfaceAdapter,
+): adapter is SurfaceAdapter & SurfaceAttachmentResolver {
+  return "resolveAttachment" in adapter && typeof adapter.resolveAttachment === "function";
 }
 
 export function hasCacheBurstProvider(

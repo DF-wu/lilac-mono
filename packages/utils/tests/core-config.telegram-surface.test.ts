@@ -206,3 +206,59 @@ describe("telegram surface gating", () => {
     if (result.status === "error") expect(result.error._tag).toBe("TelegramTokenMissing");
   });
 });
+
+describe("core config surface.telegram.inboundMedia", () => {
+  it("defaults to enabled with the documented byte budgets", async () => {
+    const cfg = await parseCoreConfig({ configVersion: 2 });
+
+    expect(cfg.surface.telegram.inboundMedia).toEqual({
+      enabled: true,
+      maxBytesPerAttachment: 5 * 1024 * 1024,
+      maxBytesPerRequest: 10 * 1024 * 1024,
+    });
+  });
+
+  it("accepts friendly byte sizes and an explicit opt-out", async () => {
+    const cfg = await parseCoreConfig({
+      configVersion: 2,
+      surface: {
+        telegram: {
+          enabled: true,
+          token: "123:abc",
+          inboundMedia: {
+            enabled: false,
+            maxBytesPerAttachment: "2MiB",
+            maxBytesPerRequest: "6MiB",
+          },
+        },
+      },
+    });
+
+    expect(cfg.surface.telegram.inboundMedia).toEqual({
+      enabled: false,
+      maxBytesPerAttachment: 2 * 1024 * 1024,
+      maxBytesPerRequest: 6 * 1024 * 1024,
+    });
+  });
+
+  it("rejects a non-positive attachment budget", async () => {
+    await expect(
+      parseCoreConfig({
+        configVersion: 2,
+        surface: {
+          telegram: { inboundMedia: { maxBytesPerAttachment: 0 } },
+        },
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("gives frozen v1 configs the same defaults", async () => {
+    const cfg = await parseCoreConfig({ configVersion: 1 });
+
+    expect(cfg.surface.telegram.inboundMedia).toEqual({
+      enabled: true,
+      maxBytesPerAttachment: 5 * 1024 * 1024,
+      maxBytesPerRequest: 10 * 1024 * 1024,
+    });
+  });
+});

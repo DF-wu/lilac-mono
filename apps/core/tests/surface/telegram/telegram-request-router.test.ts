@@ -23,6 +23,7 @@ import type {
   SurfaceSession,
 } from "../../../src/surface/types";
 import { createInMemoryDeliveryBus } from "../../helpers/in-memory-delivery-bus";
+import { getTestBlobStore } from "../../helpers/blob-store";
 import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 
 const CHAT = "1001";
@@ -197,6 +198,7 @@ async function startRouter(
   const router = await startTelegramRequestRouter({
     adapter,
     bus,
+    blobStore: await getTestBlobStore(),
     subscriptionId: "telegram-router-test",
     config: opts.config ?? routerConfig(),
     routerGate: opts.routerGate,

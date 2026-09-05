@@ -403,6 +403,9 @@ const discordSurfaceSchema = z
     },
   });
 
+const byteSizeSchema = z.preprocess(parseFriendlyByteSize, z.number().int().positive());
+const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
+
 const telegramSurfaceSchema = z
   .object({
     enabled: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.enabled),
@@ -446,11 +449,19 @@ const telegramSurfaceSchema = z
       .default(() => cloneDefaultWorkingIndicators()),
     commandMenu: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.commandMenu),
     markdownTableRender: discordMarkdownTableRenderSchema,
+    inboundMedia: z
+      .object({
+        enabled: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.inboundMedia.enabled),
+        maxBytesPerAttachment: byteSizeSchema.default(
+          TELEGRAM_SURFACE_DEFAULTS.inboundMedia.maxBytesPerAttachment,
+        ),
+        maxBytesPerRequest: byteSizeSchema.default(
+          TELEGRAM_SURFACE_DEFAULTS.inboundMedia.maxBytesPerRequest,
+        ),
+      })
+      .default(() => ({ ...TELEGRAM_SURFACE_DEFAULTS.inboundMedia })),
   })
   .default(() => cloneDefaultTelegramSurface());
-
-const byteSizeSchema = z.preprocess(parseFriendlyByteSize, z.number().int().positive());
-const durationMsSchema = z.preprocess(parseFriendlyDurationMs, z.number().int().positive());
 
 const webConfigSchemaV2 = z
   .preprocess(
