@@ -63,4 +63,15 @@ describe("bash output redaction", () => {
     expect(message).not.toContain("command-state");
     expect(message).not.toContain("segment-token");
   });
+
+  it("shows a safe correction without recommending the guardrail bypass", () => {
+    const message = formatBlockedMessage({
+      reason: "dynamic deletion target",
+      hint: "Remove known literal child paths, then use rmdir.",
+      command: 'rm -rf "$target"',
+    });
+
+    expect(message).toContain("Hint: Remove known literal child paths, then use rmdir.");
+    expect(message).not.toContain("dangerouslyAllow");
+  });
 });

@@ -1,21 +1,38 @@
-import type { RoutedSurfacePlatform } from "../../types";
-import type { ModelMessage } from "ai";
-import type { CorePrimaryLineageV1 } from "@stanley2058/lilac-event-bus";
+import type { BlobHandleV1, BlobStore } from "@stanley2058/lilac-blob-storage";
+import type { BusMessageV2, CorePrimaryLineageV2 } from "@stanley2058/lilac-event-bus";
+import type { RetentionLimit } from "@stanley2058/lilac-utils";
 
-import type { MsgRef } from "../../types";
-import type { DiscordAttachmentMeta } from "../../discord/discord-attachment";
+import type { MsgRef, SurfaceMessage } from "../../types";
+import type {
+  DiscordAttachmentCacheAccess,
+  DiscordAttachmentMeta,
+} from "../../discord/discord-attachment";
+import type { DiscordMessageCacheAccess } from "../../store/discord-search-store";
 
 import type { TranscriptStore } from "../../../transcript/transcript-store";
+import type { ResourceRegistry } from "../../../resource";
 
 export type RequestCompositionResult = {
-  messages: ModelMessage[];
+  messages: BusMessageV2[];
+  inputHandles: readonly BlobHandleV1[];
   chainMessageIds: string[];
   mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
-  corePrimaryLineage: CorePrimaryLineageV1;
+  corePrimaryLineage: CorePrimaryLineageV2;
 };
 
-export type ComposeRecentChannelMessagesOpts = {
-  platform: RoutedSurfacePlatform;
+type RequestCompositionDependencies = {
+  blobStore?: BlobStore;
+  /** Required when a newly observed Discord message contains visible attachments. */
+  resourceRegistry?: ResourceRegistry;
+  attachmentCache?: DiscordAttachmentCacheAccess;
+  attachmentCacheTtl?: RetentionLimit;
+  messageCache?: DiscordMessageCacheAccess;
+  /** Trusted messages already carried by the admitted adapter event. */
+  ingressMessages?: readonly SurfaceMessage[];
+};
+
+export type ComposeRecentChannelMessagesOpts = RequestCompositionDependencies & {
+  platform: "discord";
   sessionId: string;
   botUserId: string;
   botName: string;
@@ -33,8 +50,8 @@ export type ComposeRecentChannelMessagesOpts = {
   transformUserText?: (text: string) => string;
 };
 
-export type ComposeSingleMessageOpts = {
-  platform: RoutedSurfacePlatform;
+export type ComposeSingleMessageOpts = RequestCompositionDependencies & {
+  platform: "discord";
   botUserId: string;
   botName: string;
   msgRef: MsgRef;
@@ -44,8 +61,8 @@ export type ComposeSingleMessageOpts = {
   transformUserText?: (text: string) => string;
 };
 
-export type ComposeRequestOpts = {
-  platform: RoutedSurfacePlatform;
+export type ComposeRequestOpts = RequestCompositionDependencies & {
+  platform: "discord";
   botUserId: string;
   botName: string;
   transcriptStore?: TranscriptStore;

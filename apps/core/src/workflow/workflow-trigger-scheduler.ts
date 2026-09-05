@@ -1,3 +1,5 @@
+import { captureError } from "../shared/error-capture";
+import { Result } from "better-result";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
 import { createLogger, isPanic } from "@stanley2058/lilac-utils";
 import type { Panic } from "better-result";
@@ -81,21 +83,32 @@ export class WorkflowTriggerScheduler {
   async tick(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    try {
-      const [settled] = await Promise.allSettled([this.tickOnce()]);
-      if (settled.status === "rejected") {
-        if (isPanic(settled.reason)) preserveToolPanic(settled.reason);
-        const error =
-          settled.reason instanceof Error
-            ? settled.reason
-            : new Error("Opaque workflow trigger reconciliation failure");
-        this.logger.error(
-          "Workflow trigger reconciliation failed",
-          formatWorkflowErrorForLog(error),
-        );
-      }
-    } finally {
-      this.running = false;
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          const [settled] = await Promise.allSettled([this.tickOnce()]);
+          if (settled.status === "rejected") {
+            if (isPanic(settled.reason)) preserveToolPanic(settled.reason);
+            const error =
+              settled.reason instanceof Error
+                ? settled.reason
+                : new Error("Opaque workflow trigger reconciliation failure");
+            this.logger.error(
+              "Workflow trigger reconciliation failed",
+              formatWorkflowErrorForLog(error),
+            );
+          }
+        },
+        catch: captureError,
+      });
+      const cleanupAttempt = Result.try({
+        try: () => {
+          this.running = false;
+        },
+        catch: captureError,
+      });
+      if (cleanupAttempt.isErr()) throw cleanupAttempt.error.cause;
+      if (attempt.isErr()) throw attempt.error.cause;
     }
   }
 
@@ -212,7 +225,7 @@ export class WorkflowTriggerScheduler {
       progressTarget: trigger.progressTarget,
       terminalDetail: null,
       result: null,
-      resultArtifactId: null,
+      resultArtifact: null,
       claimedBy: null,
       claimedAt: null,
       createdAt: now,

@@ -34,6 +34,19 @@ describe("Docker image identity variants", () => {
     expect(entrypoint).not.toContain("id -g lilac");
   });
 
+  it("runs the automatic blob migration only for the exact Core image command", async () => {
+    const entrypoint = await readRepoFile("docker/direct-entrypoint.sh");
+
+    expect(entrypoint).toContain('[ "$#" -eq 2 ]');
+    expect(entrypoint).toContain('[ "$1" = "/usr/local/bin/bun" ]');
+    expect(entrypoint).toContain('[ "$2" = "apps/core/src/runtime/main.ts" ]');
+    expect(entrypoint).toContain("${LILAC_AUTO_MIGRATE_BLOB_STORAGE:-1}");
+    expect(entrypoint).toContain("apps/core/scripts/startup-blob-storage-migration.ts");
+    expect(entrypoint.indexOf("startup-blob-storage-migration.ts")).toBeLessThan(
+      entrypoint.indexOf('exec /usr/bin/setpriv --reuid="$uid"'),
+    );
+  });
+
   it("verifies each published variant before pushing its tags", async () => {
     const workflow = await readRepoFile(".github/workflows/build-image.yml");
     const verifyIndex = workflow.indexOf("Verify image identity and runtime isolation");

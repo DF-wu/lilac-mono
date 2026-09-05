@@ -1,6 +1,5 @@
-import { Buffer } from "node:buffer";
-
-import type { UserContent } from "ai";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
+import type { BusFilePartV2, BusMessageV2 } from "@stanley2058/lilac-event-bus";
 import { z } from "zod";
 
 import type { Message, PhotoSize } from "grammy/types";
@@ -223,9 +222,14 @@ export function formatTelegramAttachmentMarker(ref: TelegramInboundMediaRef): st
   return `[telegram_attachment ${fields.join(" ")}]`;
 }
 
-type TelegramMediaPart = Exclude<UserContent, string>[number];
+export type TelegramBusUserContentPart =
+  | Extract<
+      Exclude<Extract<BusMessageV2, { role: "user" }>["content"], string>[number],
+      { type: "text" }
+    >
+  | BusFilePartV2;
 
-function markerPart(ref: TelegramInboundMediaRef, reason: string): TelegramMediaPart {
+function markerPart(ref: TelegramInboundMediaRef, reason: string): TelegramBusUserContentPart {
   return { type: "text", text: `${formatTelegramAttachmentMarker(ref)}\n(${reason})` };
 }
 
@@ -255,9 +259,10 @@ function isPdfMimeType(mimeType: string): boolean {
  * non-goal of the surface.
  */
 export async function appendTelegramMediaToUserContent(input: {
-  readonly parts: Exclude<UserContent, string>;
+  readonly parts: TelegramBusUserContentPart[];
   readonly media: readonly TelegramInboundMediaRef[];
   readonly resolver: SurfaceAttachmentResolver;
+  readonly blobStore: BlobStore;
   readonly budget: TelegramInboundMediaBudget;
   readonly signal?: AbortSignal;
 }): Promise<void> {
@@ -284,23 +289,26 @@ export async function appendTelegramMediaToUserContent(input: {
       { maxBytes, ...(input.signal === undefined ? {} : { signal: input.signal }) },
     );
 
-    const part = resolved.match<TelegramMediaPart | null>({
-      err: (error) =>
+    const part = await resolved.match<Promise<TelegramBusUserContentPart | null>>({
+      err: async (error) =>
         error._tag === "SurfaceAttachmentTooLarge"
           ? markerPart(ref, "media exceeds the inbound media limit; not delivered")
           : markerPart(ref, "media unavailable; not delivered"),
-      ok: (attachment) => {
+      ok: async (attachment) => {
         const sniffed = attachment.mediaType;
         const declaredMime = declaredOrInferredMimeType(ref);
         const filePartType =
           isImageMimeType(sniffed) || isPdfMimeType(sniffed) ? sniffed : undefined;
-        const textType = isTextExtractableMimeType(sniffed)
-          ? sniffed
-          : sniffed === "application/octet-stream" &&
-              declaredMime &&
-              isTextExtractableMimeType(declaredMime)
-            ? declaredMime
-            : undefined;
+        let textType: string | undefined;
+        if (isTextExtractableMimeType(sniffed)) {
+          textType = sniffed;
+        } else if (
+          sniffed === "application/octet-stream" &&
+          declaredMime &&
+          isTextExtractableMimeType(declaredMime)
+        ) {
+          textType = declaredMime;
+        }
         if (!filePartType && !textType) {
           return markerPart(ref, "unsupported media type; not delivered");
         }
@@ -308,16 +316,20 @@ export async function appendTelegramMediaToUserContent(input: {
         input.budget.remainingRequestBytes -= attachment.bytes.byteLength;
 
         if (filePartType) {
-          return {
-            type: "file",
-            // Base64 rather than a typed array: it survives every JSON
-            // serialization boundary (bus, cache, transcript) with a
-            // predictable 4/3 expansion instead of SuperJSON's ~4x numeric
-            // encoding, and providers accept it as DataContent unchanged.
-            data: Buffer.from(attachment.bytes).toString("base64"),
-            mediaType: filePartType,
-            ...(ref.filename === undefined ? {} : { filename: ref.filename }),
-          };
+          const started = await input.blobStore.startUpload({
+            source: attachment.bytes,
+            retention: { kind: "durable" },
+            expectedByteLength: attachment.bytes.byteLength,
+          });
+          return started.match<TelegramBusUserContentPart>({
+            err: () => markerPart(ref, "media storage unavailable; not delivered"),
+            ok: (upload) => ({
+              type: "blob",
+              blob: upload.handle,
+              mediaType: filePartType,
+              ...(ref.filename === undefined ? {} : { filename: ref.filename }),
+            }),
+          });
         }
 
         if (textType) {

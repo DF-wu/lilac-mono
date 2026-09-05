@@ -10,6 +10,7 @@ import {
   stripExpansionMarkers,
 } from "./shell";
 import { hasRecursiveFlag } from "./analyze/rm-flags";
+import { bashSafetyViolation, type BashSafetyViolation } from "./types";
 
 const REASON_GIT_METADATA =
   "destructive changes to active .git metadata are blocked to prevent repository corruption.";
@@ -41,23 +42,29 @@ class GitMetadataReadFailed extends TaggedError("GitMetadataReadFailed")<{
 }> {}
 
 function readGitMetadataFile(markerPath: string): ResultType<string, GitMetadataReadFailed> {
-  return Result.try({
+  const captured = Result.try({
     try: () => readFileSync(markerPath, "utf8"),
-    catch: (cause) => {
-      if (Panic.is(cause)) throw cause;
-      return new GitMetadataReadFailed({
-        markerPath,
-        cause,
-        message: "Git metadata marker could not be read",
-      });
-    },
+    catch: (cause) => ({ cause }),
   });
+  const outcome = captured.match<{ readonly value: string } | { readonly cause: unknown }>({
+    ok: (value) => ({ value }),
+    err: ({ cause }) => ({ cause }),
+  });
+  if ("value" in outcome) return Result.ok(outcome.value);
+  if (Panic.is(outcome.cause)) throw outcome.cause;
+  return Result.err(
+    new GitMetadataReadFailed({
+      markerPath,
+      cause: outcome.cause,
+      message: "Git metadata marker could not be read",
+    }),
+  );
 }
 
 export function analyzeDestructiveFilesystemCommand(
   tokens: readonly string[],
   cwd: string | null | undefined,
-): string | null {
+): BashSafetyViolation | null {
   const command = getBasename(stripExpansionMarkers(tokens[0] ?? "")).toLowerCase();
 
   const { mutationTargets, treeRemovalTargets } = extractGitMetadataMutationTargets(
@@ -68,26 +75,28 @@ export function analyzeDestructiveFilesystemCommand(
     mutationTargets.some((target) => isActiveGitMetadataPath(target, cwd, false)) ||
     treeRemovalTargets.some((target) => isActiveGitMetadataPath(target, cwd, true))
   ) {
-    return REASON_GIT_METADATA;
+    return bashSafetyViolation("protected_git_metadata", REASON_GIT_METADATA);
   }
 
   if (command === "dd") {
     for (const token of tokens.slice(1)) {
       if (!token.startsWith("of=")) continue;
-      if (isStaticDevicePath(token.slice(3), cwd)) return REASON_DD_DEVICE;
+      if (isStaticDevicePath(token.slice(3), cwd)) {
+        return bashSafetyViolation("device_write", REASON_DD_DEVICE);
+      }
     }
   }
 
   if (MKFS_COMMAND.test(command)) {
     const targets = extractOperands(tokens);
     if (targets.some((target) => isStaticDevicePath(target, cwd))) {
-      return REASON_MKFS_DEVICE;
+      return bashSafetyViolation("device_format", REASON_MKFS_DEVICE);
     }
   }
 
   if (command === "shred") {
     const targets = extractShredTargets(tokens);
-    if (targets.some(isStaticPath)) return REASON_SHRED;
+    if (targets.some(isStaticPath)) return bashSafetyViolation("shred", REASON_SHRED);
   }
 
   return null;
@@ -140,8 +149,10 @@ function mutationTargets(targets: string[]): {
 export function analyzeGitMetadataOutputPath(
   target: string,
   cwd: string | null | undefined,
-): string | null {
-  return isActiveGitMetadataPath(target, cwd, false) ? REASON_GIT_METADATA : null;
+): BashSafetyViolation | null {
+  return isActiveGitMetadataPath(target, cwd, false)
+    ? bashSafetyViolation("protected_git_metadata", REASON_GIT_METADATA)
+    : null;
 }
 
 function extractOperands(tokens: readonly string[]): string[] {
@@ -343,16 +354,24 @@ function activeGitMetadataPaths(cwd: string): string[] {
     const candidate = join(current, ".git");
     if (existsSync(candidate)) {
       paths.push(candidate);
-      const gitDir = readGitMetadataFile(candidate).match({
-        ok: (content) => parseGitDirMarker(content, candidate),
-        err: () => null,
+      const gitMetadata = readGitMetadataFile(candidate).match<
+        { readonly value: string } | { readonly value: null }
+      >({
+        ok: (value) => ({ value }),
+        err: () => ({ value: null }),
       });
+      const gitDir =
+        gitMetadata.value === null ? null : parseGitDirMarker(gitMetadata.value, candidate);
       if (gitDir) {
         paths.push(gitDir);
-        const commonDir = readGitMetadataFile(join(gitDir, "commondir")).match({
-          ok: (content) => parseCommonDir(content, gitDir),
-          err: () => null,
+        const commonMetadata = readGitMetadataFile(join(gitDir, "commondir")).match<
+          { readonly value: string } | { readonly value: null }
+        >({
+          ok: (value) => ({ value }),
+          err: () => ({ value: null }),
         });
+        const commonDir =
+          commonMetadata.value === null ? null : parseCommonDir(commonMetadata.value, gitDir);
         if (commonDir) paths.push(commonDir);
       }
     }

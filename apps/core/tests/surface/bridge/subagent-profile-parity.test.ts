@@ -1,10 +1,45 @@
 import { describe, expect, it } from "bun:test";
 import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
 
-import { buildSystemPromptForProfile } from "../../../src/surface/bridge/bus-agent-runner/subagent-prompt";
+import {
+  buildSystemPromptForProfile,
+  selectWorkspaceSystemPrompt,
+} from "../../../src/surface/bridge/bus-agent-runner/subagent-prompt";
 
 describe("native subagent profile prompt parity", () => {
   const config = parseCoreConfigV2ToUniversal({ configVersion: 2 });
+
+  it("uses the worker prompt only for explore and general profiles", () => {
+    for (const profile of ["explore", "general"] as const) {
+      expect(
+        selectWorkspaceSystemPrompt({
+          profile,
+          primarySystemPrompt: "primary",
+          workerSystemPrompt: "worker",
+        }),
+      ).toBe("worker");
+    }
+
+    for (const profile of ["primary", "self"] as const) {
+      expect(
+        selectWorkspaceSystemPrompt({
+          profile,
+          primarySystemPrompt: "primary",
+          workerSystemPrompt: "worker",
+        }),
+      ).toBe("primary");
+    }
+  });
+
+  it("falls back to the primary prompt when a worker prompt has not been loaded", () => {
+    expect(
+      selectWorkspaceSystemPrompt({
+        profile: "general",
+        primarySystemPrompt: "primary",
+        workerSystemPrompt: "",
+      }),
+    ).toBe("primary");
+  });
 
   for (const profile of ["explore", "general", "self"] as const) {
     it(`uses one ${profile} prompt for direct and workflow launches`, () => {
@@ -22,6 +57,9 @@ describe("native subagent profile prompt parity", () => {
       const workflow = buildSystemPromptForProfile(params);
       expect(workflow).toBe(direct);
       expect(workflow).not.toContain("Workflow Tool Surface");
+      if (profile === "explore" || profile === "general") {
+        expect(workflow).toContain("TOOLS.md describes capabilities and conventions");
+      }
     });
   }
 

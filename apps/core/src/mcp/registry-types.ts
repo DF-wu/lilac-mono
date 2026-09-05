@@ -1,5 +1,4 @@
 import type { ListToolsResult, MCPClient, MCPClientConfig, OAuthClientProvider } from "@ai-sdk/mcp";
-import type { Tool } from "ai";
 import type { Result } from "better-result";
 
 import type { CatalogToolIdentity } from "./catalog-identity";
@@ -15,6 +14,20 @@ export type McpConvertedTool = ReturnType<MCPClient["toolsFromDefinitions"]>[str
 export type McpRegistryConfigStatus =
   | { readonly status: "valid" }
   | { readonly status: "invalid"; readonly error: string };
+
+export type McpServerInfo = {
+  readonly name: string;
+  readonly version: string;
+  readonly title?: string;
+  readonly description?: string;
+};
+
+export type McpCatalogServer = {
+  readonly serverId: string;
+  readonly serverInfo: McpServerInfo;
+  /** Configured description first, then the server-advertised description. */
+  readonly description?: string;
+};
 
 type McpServerStatusBase = {
   readonly serverId: string;
@@ -40,7 +53,7 @@ export type McpCatalogTool = {
   readonly description?: string;
   readonly identity: CatalogToolIdentity;
   readonly stableId: string;
-  readonly tool: McpConvertedTool | Tool;
+  readonly tool: McpConvertedTool;
 };
 
 export type McpReloadReconciliation =
@@ -60,6 +73,7 @@ export type McpReloadOutcome = {
 };
 
 export interface McpRegistryClient {
+  readonly serverInfo: MCPClient["serverInfo"];
   listTools(options?: Parameters<MCPClient["listTools"]>[0]): Promise<ListToolsResult>;
   toolsFromDefinitions(definitions: ListToolsResult): ReturnType<MCPClient["toolsFromDefinitions"]>;
   close(): Promise<void>;
@@ -107,6 +121,7 @@ export interface McpRegistryApi {
   reload(serverId?: string): Promise<Result<readonly McpReloadOutcome[], McpRegistryReloadFailure>>;
   getConfigStatus?(): McpRegistryConfigStatus;
   list(): readonly McpServerStatus[];
+  getCatalogServers(): readonly McpCatalogServer[];
   getTools(): readonly McpCatalogTool[];
   shutdown(): Promise<void>;
 }

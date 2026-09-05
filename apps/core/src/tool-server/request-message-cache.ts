@@ -19,80 +19,13 @@ export {
 };
 export type AuthenticatedRequestOrigin = AuthenticatedRequestProjection;
 
-const messageWeightCache = new WeakMap<object, number>();
-
-/**
- * Approximate retained size of one cached message, in bytes.
- *
- * Message-count clamping stops being a memory bound the moment attachment
- * bytes live inside messages (inline base64 file parts, typed arrays), so the
- * cache also clamps on this estimate. Weights are memoized per message object:
- * cached messages are treated as immutable once admitted.
- *
- * Registered boundary interpreter: cached messages are deliberately opaque
- * (`unknown`) and this walk is the one place their structure is inspected.
- */
-export function estimateCachedMessageBytes(message: unknown): number {
-  const memoizable = typeof message === "object" && message !== null;
-  if (memoizable) {
-    const cached = messageWeightCache.get(message);
-    if (cached !== undefined) return cached;
-  }
-
-  let weight = 0;
-  const pending: unknown[] = [message];
-  while (pending.length > 0) {
-    const value = pending.pop();
-    if (typeof value === "string") {
-      weight += value.length;
-    } else if (typeof value === "number" || typeof value === "boolean") {
-      weight += 8;
-    } else if (value === null || value === undefined) {
-      weight += 4;
-    } else if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
-      weight += value.byteLength;
-    } else if (Array.isArray(value)) {
-      weight += 2;
-      for (const entry of value) pending.push(entry);
-    } else if (typeof value === "object") {
-      weight += 2;
-      for (const [key, entry] of Object.entries(value)) {
-        weight += key.length + 4;
-        pending.push(entry);
-      }
-    } else {
-      weight += 8;
-    }
-  }
-
-  if (memoizable) messageWeightCache.set(message, weight);
-  return weight;
-}
-
 export function projectCachedRequestMessageLineage(
   existing: readonly unknown[],
   incoming: readonly unknown[] = [],
   maxMessages = Number.POSITIVE_INFINITY,
-  maxBytes = Number.POSITIVE_INFINITY,
 ): readonly unknown[] {
   const merged = [...existing, ...incoming];
-  const clamped = merged.length > maxMessages ? merged.slice(merged.length - maxMessages) : merged;
-
-  if (!Number.isFinite(maxBytes)) return clamped;
-
-  let total = 0;
-  // Walk newest-first so the byte clamp drops the oldest messages, mirroring
-  // the count clamp. The newest message is always retained even when it alone
-  // exceeds the budget: an empty lineage would break follow-up composition
-  // outright, which is worse than one oversized entry.
-  let firstKept = clamped.length;
-  for (let index = clamped.length - 1; index >= 0; index -= 1) {
-    const weight = estimateCachedMessageBytes(clamped[index]);
-    if (index < clamped.length - 1 && total + weight > maxBytes) break;
-    total += weight;
-    firstKept = index;
-  }
-  return firstKept === 0 ? clamped : clamped.slice(firstKept);
+  return merged.length > maxMessages ? merged.slice(merged.length - maxMessages) : merged;
 }
 
 export class RequestMessageCacheRequestIdMissing extends TaggedError(
@@ -147,16 +80,7 @@ type CacheEntry = {
 export type RequestMessageCacheOptions = {
   readonly ttlMs?: number;
   readonly maxEntries?: number;
-  /** Byte-weighted clamp for one request's retained lineage. */
-  readonly maxBytesPerRequest?: number;
-  /** Byte-weighted clamp across every cached request, including retained ones. */
-  readonly maxBytesTotal?: number;
   readonly now?: () => number;
-};
-
-export type RequestMessageCacheRestoreAttempt = {
-  apply(): ResultType<void, AuthenticatedRequestIdentityConflict>;
-  rollback(): void;
 };
 
 export type RequestMessageCache = {
@@ -166,12 +90,6 @@ export type RequestMessageCache = {
     msg: LilacMessageForTopic<"cmd.request">,
     projection?: AuthenticatedRequestProjection,
   ): ResultType<AuthenticatedRequestOrigin | undefined, RequestMessageCacheAdmissionError>;
-  prepareRestore(
-    input: readonly {
-      readonly projection: AuthenticatedRequestProjection;
-      readonly parkedEventIds: readonly string[];
-    }[],
-  ): ResultType<RequestMessageCacheRestoreAttempt, AuthenticatedRequestIdentityConflict>;
   acquireOwner(
     requestId: string,
   ): ResultType<RequestMessageCacheOwner, RequestIdentitySourceMissing>;
@@ -201,13 +119,7 @@ export type RequestMessageCache = {
 export function createRequestMessageCache(
   options: RequestMessageCacheOptions = {},
 ): RequestMessageCache {
-  const {
-    ttlMs = 30 * 60 * 1000,
-    maxEntries = 256,
-    maxBytesPerRequest = 32 * 1024 * 1024,
-    maxBytesTotal = 256 * 1024 * 1024,
-    now = Date.now,
-  } = options;
+  const { ttlMs = 30 * 60 * 1000, maxEntries = 256, now = Date.now } = options;
   const maxMessagesPerRequest = 512;
   const logger = createLogger({ module: "tool-server:request-message-cache" });
   const entries = new Map<string, CacheEntry>();
@@ -231,49 +143,16 @@ export function createRequestMessageCache(
     }
   }
 
-  function entryWeight(entry: CacheEntry): number {
-    let total = 0;
-    for (const message of entry.messages) total += estimateCachedMessageBytes(message);
-    return total;
-  }
-
-  function mapBytes(target: ReadonlyMap<string, CacheEntry>): number {
-    let total = 0;
-    for (const entry of target.values()) total += entryWeight(entry);
-    return total;
-  }
-
-  function oldestEvictableKey(
-    target: ReadonlyMap<string, CacheEntry>,
-    allowRetained: boolean,
-  ): string | undefined {
-    let oldestKey: string | undefined;
-    let oldestUpdatedAt = Infinity;
-    for (const [requestId, entry] of target) {
-      if (!allowRetained && isRetained(entry)) continue;
-      if (entry.updatedAt >= oldestUpdatedAt) continue;
-      oldestUpdatedAt = entry.updatedAt;
-      oldestKey = requestId;
-    }
-    return oldestKey;
-  }
-
   function pruneMapToCapacity(target: Map<string, CacheEntry>): string[] {
     const evicted: string[] = [];
     while (target.size > maxEntries) {
-      const oldestKey = oldestEvictableKey(target, false) ?? oldestEvictableKey(target, true);
-      if (!oldestKey) break;
-      target.delete(oldestKey);
-      evicted.push(oldestKey);
-    }
-    return evicted;
-  }
-
-  function pruneMapToByteBudget(target: Map<string, CacheEntry>): string[] {
-    if (!Number.isFinite(maxBytesTotal)) return [];
-    const evicted: string[] = [];
-    while (mapBytes(target) > maxBytesTotal && target.size > 0) {
-      const oldestKey = oldestEvictableKey(target, false) ?? oldestEvictableKey(target, true);
+      let oldestKey: string | undefined;
+      let oldestUpdatedAt = Infinity;
+      for (const [requestId, entry] of target) {
+        if (isRetained(entry) || entry.updatedAt >= oldestUpdatedAt) continue;
+        oldestUpdatedAt = entry.updatedAt;
+        oldestKey = requestId;
+      }
       if (!oldestKey) break;
       target.delete(oldestKey);
       evicted.push(oldestKey);
@@ -292,20 +171,8 @@ export function createRequestMessageCache(
     }
   }
 
-  function logByteEvictions(evicted: readonly string[], sizeAfter: number): void {
-    for (const requestId of evicted) {
-      logger.info("request_message_cache.evicted", {
-        requestId,
-        reason: "max_bytes_total",
-        maxBytesTotal,
-        sizeAfter,
-      });
-    }
-  }
-
   function pruneMax(): void {
     logCapacityEvictions(pruneMapToCapacity(entries), entries.size);
-    logByteEvictions(pruneMapToByteBudget(entries), entries.size);
   }
 
   function cacheMessage(
@@ -366,7 +233,6 @@ export function createRequestMessageCache(
                 existing.messages,
                 msg.data.messages,
                 maxMessagesPerRequest,
-                maxBytesPerRequest,
               );
             }
             existing.expiresAt = at + ttlMs;
@@ -399,7 +265,6 @@ export function createRequestMessageCache(
             msg.data.messages,
             [],
             maxMessagesPerRequest,
-            maxBytesPerRequest,
           ),
           projection,
           intakeEventIds: new Set([msg.id]),
@@ -416,176 +281,6 @@ export function createRequestMessageCache(
     return continueProjected();
   }
 
-  function cloneCacheEntry(entry: CacheEntry): CacheEntry {
-    return {
-      messages: entry.messages,
-      projection: entry.projection,
-      intakeEventIds: new Set(entry.intakeEventIds),
-      parkedEventIds: new Set(entry.parkedEventIds),
-      owners: new Set(entry.owners),
-      expiresAt: entry.expiresAt,
-      updatedAt: entry.updatedAt,
-    };
-  }
-
-  function cloneEntries(source: ReadonlyMap<string, CacheEntry>): Map<string, CacheEntry> {
-    return new Map([...source].map(([requestId, entry]) => [requestId, cloneCacheEntry(entry)]));
-  }
-
-  function replaceEntries(source: ReadonlyMap<string, CacheEntry>): void {
-    entries.clear();
-    for (const [requestId, entry] of source) entries.set(requestId, cloneCacheEntry(entry));
-  }
-
-  function prepareRestore(
-    input: readonly {
-      readonly projection: AuthenticatedRequestProjection;
-      readonly parkedEventIds: readonly string[];
-    }[],
-  ): ResultType<RequestMessageCacheRestoreAttempt, AuthenticatedRequestIdentityConflict> {
-    const proposed = new Map<
-      string,
-      { projection: AuthenticatedRequestProjection; parkedEventIds: Set<string> }
-    >();
-    const mergeInputAt = (
-      index: number,
-    ): ResultType<void, AuthenticatedRequestIdentityConflict> => {
-      const record = input[index];
-      if (!record) return Result.ok(undefined);
-      const current = proposed.get(record.projection.requestId);
-      if (current) {
-        const latched = latchAuthenticatedRequest(
-          current.projection,
-          record.projection,
-          "graceful-restart",
-        );
-        const continueLatched = latched.match<
-          () => ResultType<void, AuthenticatedRequestIdentityConflict>
-        >({
-          err: (error) => () => Result.err(error),
-          ok: (projection) => () => {
-            current.projection = projection;
-            for (const eventId of record.parkedEventIds) current.parkedEventIds.add(eventId);
-            return mergeInputAt(index + 1);
-          },
-        });
-        return continueLatched();
-      }
-      proposed.set(record.projection.requestId, {
-        projection: record.projection,
-        parkedEventIds: new Set(record.parkedEventIds),
-      });
-      return mergeInputAt(index + 1);
-    };
-    const proposedEntries = () => [...proposed];
-    const mergeExistingAt = (
-      records: ReturnType<typeof proposedEntries>,
-      index: number,
-    ): ResultType<void, AuthenticatedRequestIdentityConflict> => {
-      const pair = records[index];
-      if (!pair) return Result.ok(undefined);
-      const [requestId, record] = pair;
-      const existing = entries.get(requestId);
-      if (!existing) return mergeExistingAt(records, index + 1);
-      const latched = latchAuthenticatedRequest(
-        existing.projection,
-        record.projection,
-        "graceful-restart",
-      );
-      const continueLatched = latched.match<
-        () => ResultType<void, AuthenticatedRequestIdentityConflict>
-      >({
-        err: (error) => () => Result.err(error),
-        ok: (projection) => () => {
-          record.projection = projection;
-          return mergeExistingAt(records, index + 1);
-        },
-      });
-      return continueLatched();
-    };
-
-    let before = new Map<string, CacheEntry>();
-    let applied = false;
-    const merged = mergeInputAt(0).andThen(() => mergeExistingAt(proposedEntries(), 0));
-    const continueMerged = merged.match<
-      () => ResultType<RequestMessageCacheRestoreAttempt, AuthenticatedRequestIdentityConflict>
-    >({
-      err: (error) => () => Result.err(error),
-      ok: () => () =>
-        Result.ok({
-          apply: () => {
-            if (applied) return Result.ok(undefined);
-            const at = now();
-            const staged = cloneEntries(entries);
-            const stagedRecords = proposedEntries();
-            const stageAt = (
-              index: number,
-            ): ResultType<void, AuthenticatedRequestIdentityConflict> => {
-              const pair = stagedRecords[index];
-              if (!pair) return Result.ok(undefined);
-              const [requestId, record] = pair;
-              const existing = staged.get(requestId);
-              if (existing) {
-                const latched = latchAuthenticatedRequest(
-                  existing.projection,
-                  record.projection,
-                  "graceful-restart",
-                );
-                const continueLatched = latched.match<
-                  () => ResultType<void, AuthenticatedRequestIdentityConflict>
-                >({
-                  err: (error) => () => Result.err(error),
-                  ok: (projection) => () => {
-                    const next = cloneCacheEntry(existing);
-                    next.projection = projection;
-                    for (const eventId of record.parkedEventIds) next.parkedEventIds.add(eventId);
-                    next.expiresAt = at + ttlMs;
-                    next.updatedAt = at;
-                    staged.set(requestId, next);
-                    return stageAt(index + 1);
-                  },
-                });
-                return continueLatched();
-              }
-              staged.set(requestId, {
-                messages: [],
-                projection: record.projection,
-                intakeEventIds: new Set(),
-                parkedEventIds: new Set(record.parkedEventIds),
-                owners: new Set(),
-                expiresAt: at + ttlMs,
-                updatedAt: at,
-              });
-              return stageAt(index + 1);
-            };
-            const stagedResult = stageAt(0);
-            const continueStaged = stagedResult.match<
-              () => ResultType<void, AuthenticatedRequestIdentityConflict>
-            >({
-              err: (error) => () => Result.err(error),
-              ok: () => () => {
-                const evicted = pruneMapToCapacity(staged);
-                const byteEvicted = pruneMapToByteBudget(staged);
-                before = cloneEntries(entries);
-                replaceEntries(staged);
-                applied = true;
-                logCapacityEvictions(evicted, entries.size);
-                logByteEvictions(byteEvicted, entries.size);
-                return Result.ok(undefined);
-              },
-            });
-            return continueStaged();
-          },
-          rollback: () => {
-            if (!applied) return;
-            replaceEntries(before);
-            applied = false;
-          },
-        }),
-    });
-    return continueMerged();
-  }
-
   return {
     get: (requestId) => {
       pruneExpired();
@@ -596,7 +291,6 @@ export function createRequestMessageCache(
       return entries.get(requestId)?.projection;
     },
     cacheMessage,
-    prepareRestore,
     acquireOwner: (requestId) => {
       const entry = entries.get(requestId);
       if (!entry) {

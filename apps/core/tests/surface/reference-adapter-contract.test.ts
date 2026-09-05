@@ -16,10 +16,7 @@ import {
   projectBuiltinSurfaceMessageRef,
   resolveBuiltinSurfaceRequestMessageRef,
 } from "../../src/surface/builtin-surface-protocols";
-import {
-  bridgeBusToAdapter,
-  type BusToAdapterRelaySnapshot,
-} from "../../src/surface/bridge/subscribe-from-bus";
+import { bridgeBusToAdapter } from "../../src/surface/bridge/subscribe-from-bus";
 import { DiscordAdapter } from "../../src/surface/discord/discord-adapter";
 import {
   createDiscordRelayPolicy,
@@ -42,15 +39,8 @@ import type { ReplyTargetResolution } from "../../src/surface/protocol";
 import { DiscordOutputStream } from "../../src/surface/discord/output/discord-output-stream";
 import { GithubOutputStream } from "../../src/surface/github/output/github-output-stream";
 import { clearGithubAck, getGithubAck, setGithubAck } from "../../src/github/github-state";
-import {
-  applySurfaceRecovery,
-  prepareSurfaceRecovery,
-} from "../../src/runtime/surface-runtime-lifecycle";
-import {
-  GRACEFUL_RESTART_SNAPSHOT_VERSION,
-  type GracefulRestartSnapshotInput,
-} from "../../src/runtime/graceful-restart-store";
 import { createInMemoryDeliveryBus } from "../helpers/in-memory-delivery-bus";
+import { getTestBlobStore } from "../helpers/blob-store";
 
 type ProtocolLog = {
   readonly creates: string[];
@@ -278,9 +268,10 @@ const DISCORD_REFERENCE: ReferenceContract = {
       }),
     }),
   createRelayPolicy: (adapter) => createDiscordRelayPolicy(adapter),
-  createBridge: (adapter, bus) =>
+  createBridge: async (adapter, bus) =>
     bridgeBusToAdapter({
       adapter,
+      blobStore: await getTestBlobStore(),
       bus,
       platform: "discord",
       policy: createDiscordRelayPolicy(adapter),
@@ -362,9 +353,10 @@ const GITHUB_REFERENCE: ReferenceContract = {
       }),
     }),
   createRelayPolicy: () => createGithubRelayPolicy(),
-  createBridge: (adapter, bus) =>
+  createBridge: async (adapter, bus) =>
     bridgeBusToAdapter({
       adapter,
+      blobStore: await getTestBlobStore(),
       bus,
       platform: "github",
       policy: createGithubRelayPolicy(),
@@ -419,20 +411,6 @@ const REFERENCE_CASES = [
   ["GitHub", GITHUB_REFERENCE],
 ] as const;
 
-function relaySnapshot(reference: ReferenceContract): BusToAdapterRelaySnapshot {
-  return {
-    requestId: reference.requestId,
-    sessionId: reference.sessionId,
-    requestClient: reference.platform,
-    platform: reference.platform,
-    replyTo: reference.createMessageRef(),
-    createdOutputRefs: [reference.createMessageRef("output-1")],
-    activeOutputRefs: [reference.createMessageRef("output-1")],
-    visibleText: "partial output",
-    toolStatus: [],
-  };
-}
-
 function registryFor(descriptors: readonly RegisteredSurfaceRuntimeDescriptor[]) {
   const created = SurfaceRuntimeRegistry.create(descriptors);
   if (created.status === "error") throw created.error;
@@ -452,18 +430,6 @@ function operationError<T>(result: ResultType<T, SurfaceOperationError>): Surfac
   expect(result.status).toBe("error");
   if (result.status === "ok") throw new Error("Expected a surface operation error");
   return result.error;
-}
-
-function recoverySnapshot(reference: ReferenceContract): GracefulRestartSnapshotInput {
-  return {
-    version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
-    createdAt: Date.now(),
-    deadlineMs: 3_000,
-    queueAttemptProof: "complete",
-    agent: [],
-    queueAttempts: [],
-    relays: [relaySnapshot(reference)],
-  };
 }
 
 describe("shared Discord/GitHub adapter and descriptor contract", () => {
@@ -547,60 +513,6 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
     },
   );
 
-  it("selects exactly one real relay from request_client with all descriptors active", async () => {
-    const bus = createLilacBus(createInMemoryDeliveryBus());
-    const bridges = await Promise.all(
-      REFERENCE_CASES.map(async ([, reference]) => {
-        const descriptor = bindReferenceDescriptor(reference, reference.createAdapter());
-        return {
-          reference,
-          bridge: await reference.createBridge(descriptor.adapter, bus),
-        };
-      }),
-    );
-    try {
-      for (const target of bridges) {
-        await bus.publish(
-          lilacEventTypes.EvtRequestReply,
-          {},
-          {
-            headers: {
-              request_id: target.reference.requestId,
-              session_id: target.reference.sessionId,
-              request_client: target.reference.platform,
-            },
-          },
-        );
-        await bus.publish(
-          lilacEventTypes.EvtAgentOutputDeltaText,
-          { delta: `${target.reference.platform} output` },
-          { headers: { request_id: target.reference.requestId } },
-        );
-
-        for (const candidate of bridges) {
-          const matching = candidate.bridge
-            .snapshotRelays()
-            .filter((snapshot) => snapshot.requestId === target.reference.requestId);
-          expect(matching).toMatchObject(
-            candidate.reference === target.reference
-              ? [
-                  {
-                    requestId: target.reference.requestId,
-                    requestClient: target.reference.platform,
-                    platform: target.reference.platform,
-                    visibleText: `${target.reference.platform} output`,
-                  },
-                ]
-              : [],
-          );
-        }
-      }
-    } finally {
-      for (const { bridge } of bridges.toReversed()) await bridge.stop();
-      await bus.close();
-    }
-  });
-
   it.each(REFERENCE_CASES)(
     "%s reanchors and cancels through shared relay bus handlers",
     async (_name, reference) => {
@@ -626,10 +538,6 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
           { delta: "before" },
           { headers: { request_id: reference.requestId } },
         );
-        expect(bridge.snapshotRelays()).toMatchObject([
-          { requestId: reference.requestId, visibleText: "before", streamTextPrefixChars: 0 },
-        ]);
-
         await bus.publish(
           lilacEventTypes.CmdSurfaceOutputReanchor,
           { inheritReplyTo: true },
@@ -642,21 +550,16 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
           },
         );
         expect(abortReasons).toContain("reanchor");
-        expect(bridge.snapshotRelays()).toMatchObject([
-          { requestId: reference.requestId, streamTextPrefixChars: 6, activeOutputRefs: [] },
-        ]);
 
         await bus.publish(
           lilacEventTypes.EvtAgentOutputDeltaText,
           { delta: " after" },
           { headers: { request_id: reference.requestId } },
         );
-        expect(bridge.snapshotRelays()).toMatchObject([
-          { visibleText: " after", streamTextPrefixChars: 6 },
-        ]);
         await bus.publish(
           lilacEventTypes.CmdRequestMessage,
           {
+            requestDeliveryId: crypto.randomUUID(),
             queue: "interrupt",
             messages: [],
             raw: { cancel: true, requiresActive: true },
@@ -670,7 +573,6 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
           },
         );
         expect(abortReasons).toContain("cancel");
-        expect(bridge.snapshotRelays()).toEqual([]);
       } finally {
         restoreAbortObserver();
         await bridge.stop();
@@ -793,51 +695,6 @@ describe("shared Discord/GitHub adapter and descriptor contract", () => {
         { text: "Running" },
       );
       expect(edited.status).toBe("ok");
-    },
-  );
-
-  it.each(REFERENCE_CASES)(
-    "%s preserves one real guarded-stream hydration through recovery apply",
-    async (_name, reference) => {
-      const log = createProtocolLog();
-      const registry = registryFor([reference.createDescriptor(reference.createAdapter(log))]);
-      const [descriptor] = registry.entries();
-      if (!descriptor) throw new Error("Reference descriptor is missing");
-      const bus = createLilacBus(createInMemoryDeliveryBus());
-      const bridge = await reference.createBridge(descriptor.adapter, bus);
-      try {
-        const probed = await descriptor.adapter.startOutput(reference.createSessionRef(), {
-          preparationMode: "paused-recovery",
-          resume: { created: [reference.createMessageRef("output-1")] },
-        });
-        if (probed.status === "error") throw probed.error;
-        expect(probed.value.hydrateRecovery).toBeFunction();
-        expect(
-          probed.value.hydrateRecovery?.([{ type: "text.set", text: "hydration probe" }]),
-        ).toBe("visible");
-        expect((await probed.value.abort("restore_probe")).status).toBe("ok");
-
-        const prepared = prepareSurfaceRecovery({
-          registry,
-          snapshot: recoverySnapshot(reference),
-          relays: new Map([[reference.platform, bridge]]),
-          agentRunner: {
-            prepareRecovery: () =>
-              Result.ok({
-                apply: () => Result.ok(undefined),
-                rollback: () => undefined,
-                activate: () => undefined,
-              }),
-          },
-        });
-        if (prepared.status === "error") throw prepared.error;
-        expect((await applySurfaceRecovery(prepared.value)).status).toBe("ok");
-        expect(bridge.snapshotRelays()).toEqual([]);
-        expect(log.creates).toEqual([]);
-      } finally {
-        await bridge.stop();
-        await bus.close();
-      }
     },
   );
 });

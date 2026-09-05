@@ -195,14 +195,12 @@ export function createFilesystemTools(params: {
     maxInlineMediaBytesPerPart = DEFAULT_MAX_INLINE_MEDIA_BYTES_PER_PART,
     maxOutputBytes = DEFAULT_MAX_READ_FILE_OUTPUT_BYTES,
   } = params;
-  const readFileInputSchema = createReadFileInputSchema({
-    directAttachmentSupported: readFileDirectAttachmentSupported,
-  });
+  const readFileInputSchema = createReadFileInputSchema();
   const binaryCacheByToolCallId = new Map<string, Buffer>();
   const instructionClaims = createReadFileInstructionClaims();
   const tools: ToolSet = {
     read: tool({
-      description: `${readFileDirectAttachmentSupported ? "Read a local text file, supported image or PDF, or a transient tool-result:// URI. Supported images and PDFs are attached to your context for native visual or document analysis, including when read is an independent batch child." : "Read a local text file or a transient tool-result:// URI."} Artifact URIs ignore cwd and support start/maxCharacters/maxLines paging; reuse nextStart unchanged while hasMore is true. Reading a local file records its hash so edit can safely edit it later. ${READ_FILE_INSTRUCTION_HINT}`,
+      description: `Reads text from a local filesystem path or transient tool-result:// URI. ${readFileDirectAttachmentSupported ? "Analyze supported images and PDFs already attached to context directly. Use read to attach supported images and PDFs available only through a local filesystem path, including as an independent batch child. " : ""}Continue a paged text read by passing a returned nextStart back unchanged. ${READ_FILE_INSTRUCTION_HINT}`,
       inputSchema: readFileInputSchema,
       execute: async ({ cwd: operationCwd, ...input }, options) => {
         if (input.path.startsWith(TOOL_RESULT_URI_PREFIX)) {

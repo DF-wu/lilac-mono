@@ -10,6 +10,7 @@ import { Panic } from "better-result";
 import {
   coreLineageManifestRowCodecCases,
   coreSurfaceProjectionRowCodecCases,
+  decodeResourceRecordRow,
   decodeCoreLineageManifestRow,
   decodeCoreSurfaceProjectionRow,
   decodeDiscoveryRecordRow,
@@ -21,11 +22,15 @@ import {
   decodeTranscriptRow,
   discoveryRecordRowCodecCases,
   recentAgentWriteRowCodecCases,
+  resourceRecordRowCodecCases,
+  hashCanonicalStoredMessagesV2,
+  normalizeStoredMessagesV1,
   surfaceMessageLinkRowCodecCases,
   transcriptCompactionContextCodecCases,
   transcriptProviderStateCodecCases,
   transcriptRowCodecCases,
   transcriptStoreRowFixtures,
+  type StoredMessageV1,
 } from "../../src/transcript/transcript-persistence-codec";
 import { SqliteTranscriptStore } from "../../src/transcript/transcript-store";
 import {
@@ -53,6 +58,181 @@ function expectCatalog(
 }
 
 describe("transcript persistence codecs", () => {
+  it("covers the strict current-schema resource record persistence cases", () => {
+    expectCatalog(resourceRecordRowCodecCases, decodeResourceRecordRow as never);
+    expect(
+      decodeResourceRecordRow({
+        ...resourceRecordRowCodecCases.current.input,
+        row: {
+          ...resourceRecordRowCodecCases.current.input.row,
+          origin_key: '{"version":1}',
+        },
+      }).status,
+    ).toBe("error");
+  });
+
+  it("omits explicit undefined optional fields before hashing or persistence", () => {
+    const messages = [
+      {
+        role: "assistant",
+        providerOptions: undefined,
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-undefined",
+            toolName: "inspect",
+            input: { path: "note.txt" },
+            providerOptions: undefined,
+            providerExecuted: undefined,
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-undefined",
+            toolName: "inspect",
+            providerOptions: undefined,
+            output: { type: "text", value: "done", providerOptions: undefined },
+          },
+        ],
+      },
+    ] satisfies StoredMessageV1[];
+
+    const normalized = normalizeStoredMessagesV1(messages);
+    expect(normalized).toEqual([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool-call",
+            toolCallId: "call-undefined",
+            toolName: "inspect",
+            input: { path: "note.txt" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-undefined",
+            toolName: "inspect",
+            output: { type: "text", value: "done" },
+          },
+        ],
+      },
+    ]);
+    expect(hashCanonicalStoredMessagesV2(messages).status).toBe("ok");
+  });
+
+  it("hashes nested blobs by content and media identity instead of object ownership", () => {
+    const messagesFor = (
+      objectId: string,
+      sha256: string,
+      mediaType = "image/png",
+    ): StoredMessageV1[] => [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "inspect",
+            output: {
+              type: "content",
+              value: [
+                {
+                  type: "blob",
+                  blob: { version: 1, objectId, sha256, byteLength: 3 },
+                  mediaType,
+                  filename: "pixel.png",
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ];
+    const digest = (messages: readonly StoredMessageV1[]) => {
+      const result = hashCanonicalStoredMessagesV2(messages);
+      if (result.status === "error") throw result.error;
+      return result.value.hash;
+    };
+    const sha = "11".repeat(32);
+    expect(digest(messagesFor(`b1_${"01".repeat(16)}`, sha))).toBe(
+      digest(messagesFor(`b1_${"02".repeat(16)}`, sha)),
+    );
+    expect(digest(messagesFor(`b1_${"01".repeat(16)}`, sha))).not.toBe(
+      digest(messagesFor(`b1_${"01".repeat(16)}`, "22".repeat(32))),
+    );
+    expect(digest(messagesFor(`b1_${"01".repeat(16)}`, sha))).not.toBe(
+      digest(messagesFor(`b1_${"01".repeat(16)}`, sha, "image/jpeg")),
+    );
+  });
+
+  it("round-trips resource marker metadata but hashes only resource URI identity", () => {
+    const messagesFor = (
+      uri: string,
+      metadata: { readonly filename: string; readonly mediaType: string; readonly size: number },
+    ): StoredMessageV1[] => [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "inspect" },
+          { type: "resource", uri, ...metadata },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "resource-call",
+            toolName: "inspect",
+            output: {
+              type: "content",
+              value: [{ type: "resource", uri, ...metadata }],
+            },
+          },
+        ],
+      },
+    ];
+    const first = messagesFor(`resource://r1_${"12".repeat(16)}`, {
+      filename: "notes.txt",
+      mediaType: "text/plain",
+      size: 7,
+    });
+    expect(normalizeStoredMessagesV1(first)).toEqual(first);
+
+    const digest = (messages: readonly StoredMessageV1[]) => {
+      const result = hashCanonicalStoredMessagesV2(messages);
+      if (result.status === "error") throw result.error;
+      return result.value.hash;
+    };
+    expect(digest(first)).not.toBe(
+      digest(
+        messagesFor(`resource://r1_${"13".repeat(16)}`, {
+          filename: "notes.txt",
+          mediaType: "text/plain",
+          size: 7,
+        }),
+      ),
+    );
+    expect(digest(first)).toBe(
+      digest(
+        messagesFor(`resource://r1_${"12".repeat(16)}`, {
+          filename: "transformed.png",
+          mediaType: "image/png",
+          size: 83,
+        }),
+      ),
+    );
+  });
+
   it("preserves Panic thrown while decoding serialized data", () => {
     const panic = new Panic({ message: "serialized transcript invariant failed" });
     const originalParse = globalThis.JSON.parse;
@@ -82,6 +262,19 @@ describe("transcript persistence codecs", () => {
     expectCatalog(recentAgentWriteRowCodecCases, decodeRecentAgentWriteRow);
     expectCatalog(surfaceMessageLinkRowCodecCases, decodeSurfaceMessageLinkRow);
     expectCatalog(discoveryRecordRowCodecCases, decodeDiscoveryRecordRow);
+  });
+
+  it("rejects non-canonical loaded catalog snapshots", () => {
+    const current = transcriptRowCodecCases.current.input;
+    const decoded = decodeTranscriptRow({
+      row: {
+        ...current.row,
+        loaded_catalog_ids_json: '["mcp_duplicate","mcp_duplicate"]',
+      },
+      schemaVersion: current.schemaVersion,
+    });
+
+    expect(decoded.status).toBe("error");
   });
 
   it("keeps placeholder request and linked platforms broad at the persistence boundary", () => {
@@ -136,67 +329,24 @@ describe("transcript persistence codecs", () => {
   });
 
   for (const startVersion of SUPPORTED_TRANSCRIPT_SCHEMA_STARTS) {
-    it(`migrates an independent schema-v${startVersion} fixture without rewriting serialized fields on read`, async () => {
+    it(`rejects an independent schema-v${startVersion} fixture with the offline migration command`, async () => {
       const dir = await fs.mkdtemp(
         path.join(os.tmpdir(), `lilac-transcript-schema-v${startVersion}-`),
       );
       const dbPath = path.join(dir, "transcripts.db");
-      const fixture = createTranscriptSchemaMigrationFixture(dbPath, startVersion);
-      const store = new SqliteTranscriptStore(dbPath);
+      createTranscriptSchemaMigrationFixture(dbPath, startVersion);
+      expect(() => new SqliteTranscriptStore(dbPath)).toThrow(
+        "bun run migrate:blob-storage -- --config /path/to/core-config.yaml --data-dir /path/to/data",
+      );
       const inspection = new Database(dbPath, { strict: true });
       try {
-        const afterMigration = inspection
-          .query<
-            {
-              messages_json: string;
-              context_meta_json: string;
-              provider_state_json: string;
-            },
-            [string]
-          >(
-            `SELECT messages_json, context_meta_json, provider_state_json
-             FROM request_transcripts WHERE request_id = ?`,
-          )
-          .get(fixture.requestId);
-        expect(afterMigration).toEqual({
-          messages_json: fixture.messagesJson,
-          context_meta_json: fixture.contextMetaJson,
-          provider_state_json: fixture.providerStateJson,
-        });
-
-        const read = store.getRequestTranscript({ requestId: fixture.requestId });
-        expect(read.status).toBe("ok");
-        if (read.status === "ok") {
-          expect(read.value?.messages).toEqual(fixture.messages);
-          expect(read.value?.contextMeta).toEqual({ type: "compaction", formatVersion: 1 });
-          expect(read.value?.providerState).toEqual({
-            lastFamily: "ai-sdk",
-            containsCrossFamilyTurns: false,
-          });
-        }
-
-        const afterRead = inspection
-          .query<
-            {
-              messages_json: string;
-              context_meta_json: string;
-              provider_state_json: string;
-            },
-            [string]
-          >(
-            `SELECT messages_json, context_meta_json, provider_state_json
-             FROM request_transcripts WHERE request_id = ?`,
-          )
-          .get(fixture.requestId);
-        expect(afterRead).toEqual(afterMigration);
         expect(
           inspection
             .query("SELECT version FROM transcript_schema_migrations ORDER BY version")
             .all(),
-        ).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
+        ).toEqual(Array.from({ length: startVersion }, (_, index) => ({ version: index + 1 })));
       } finally {
         inspection.close();
-        store.close();
         await fs.rm(dir, { recursive: true, force: true });
       }
     });
@@ -207,7 +357,7 @@ describe("transcript persistence codecs", () => {
     const plain = '[{"role":"assistant","content":"literal"}]';
     const superJson = SuperJSON.stringify(messages);
     for (const raw of [plain, superJson]) {
-      const decoded = decodeTranscriptMessages({ raw, schemaVersion: 5, recordId: "literal" });
+      const decoded = decodeTranscriptMessages({ raw, schemaVersion: 6, recordId: "literal" });
       expect(decoded.status).toBe("ok");
       if (decoded.status === "ok") expect(decoded.value.value).toEqual(messages);
     }

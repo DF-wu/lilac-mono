@@ -62,15 +62,16 @@ export type BunSqliteErrorClassification = {
 };
 
 export function classifyBunSqliteError(cause: Error): BunSqliteErrorClassification | undefined {
-  try {
-    if (!(cause instanceof SQLiteError)) return undefined;
-    const code = cause.code;
-    if (typeof code === "string") return { code };
-    const errno = cause.errno;
-    return typeof errno === "number" ? { code: `SQLITE_ERRNO_${errno}` } : undefined;
-  } catch {
-    return undefined;
-  }
+  return Result.try({
+    try: () => {
+      if (!(cause instanceof SQLiteError)) return undefined;
+      const code = cause.code;
+      if (typeof code === "string") return { code };
+      const errno = cause.errno;
+      return typeof errno === "number" ? { code: `SQLITE_ERRNO_${errno}` } : undefined;
+    },
+    catch: () => undefined,
+  }).match({ ok: (value) => value, err: () => undefined });
 }
 
 class BunSqliteRollbackSentinel<T, TOperationError> {
@@ -105,48 +106,66 @@ export function runBunSqliteTransaction<T, TOperationError, TDriverError extends
   let rollbackSentinel: BunSqliteRollbackSentinel<T, TOperationError> | undefined;
   let callbackCompleted = false;
 
-  try {
-    const value = database
-      .transaction((): T => {
-        const result = operation();
-        if (result.status === "error") {
-          rollbackSentinel = new BunSqliteRollbackSentinel(result);
-          throw rollbackSentinel;
-        }
+  const transaction = Result.try({
+    try: () => ({
+      value: database
+        .transaction((): T => {
+          const result = operation();
+          if (result.status === "error") {
+            rollbackSentinel = new BunSqliteRollbackSentinel(result);
+            throw rollbackSentinel;
+          }
 
-        callbackCompleted = true;
-        return result.value;
-      })
-      .immediate();
-    return Result.ok(value);
-  } catch (cause) {
-    if (rollbackSentinel !== undefined && cause === rollbackSentinel) {
-      return rollbackSentinel.result();
-    }
-
-    let causeIsPanic: boolean;
-    try {
-      causeIsPanic = Panic.is(cause);
-    } catch {
-      throw cause;
-    }
-    if (causeIsPanic) throw cause;
-
-    if (rollbackSentinel !== undefined || callbackCompleted) {
-      throw new Panic({
-        message: "Bun SQLite transaction finalization failed; atomicity is unknown",
-        cause,
-      });
-    }
-
-    try {
-      if (!(cause instanceof Error)) throw cause;
-    } catch {
-      throw cause;
-    }
-
-    const driverFailure = classifyBunSqliteDriverFailure(cause, classifyDriverFailure);
-    if (driverFailure !== undefined) return Result.err(driverFailure);
-    throw cause;
+          callbackCompleted = true;
+          return result.value;
+        })
+        .immediate(),
+    }),
+    catch: (cause) => ({ cause }),
+  });
+  const transactionOutcome = transaction.match<
+    | { readonly kind: "value"; readonly value: T }
+    | { readonly kind: "cause"; readonly cause: unknown }
+  >({
+    ok: ({ value }) => ({ kind: "value", value }),
+    err: ({ cause }) => ({ kind: "cause", cause }),
+  });
+  if (transactionOutcome.kind === "value") return Result.ok(transactionOutcome.value);
+  const cause = transactionOutcome.cause;
+  if (rollbackSentinel !== undefined && cause === rollbackSentinel) {
+    return rollbackSentinel.result();
   }
+
+  const panicObservation = Result.try({
+    try: () => {
+      if (Panic.is(cause)) throw cause;
+    },
+    catch: () => true,
+  });
+  const panicMustRethrow = panicObservation.match({
+    ok: () => false,
+    err: (value) => value,
+  });
+  if (panicMustRethrow) throw cause;
+
+  if (rollbackSentinel !== undefined || callbackCompleted) {
+    throw new Panic({
+      message: "Bun SQLite transaction finalization failed; atomicity is unknown",
+      cause,
+    });
+  }
+
+  const causeIsError = Result.try({
+    try: () => cause instanceof Error,
+    catch: () => false,
+  }).match({
+    ok: (value) => value,
+    err: (value) => value,
+  });
+  if (!causeIsError) throw cause;
+  if (!(cause instanceof Error)) throw cause;
+
+  const driverFailure = classifyBunSqliteDriverFailure(cause, classifyDriverFailure);
+  if (driverFailure !== undefined) return Result.err(driverFailure);
+  throw cause;
 }

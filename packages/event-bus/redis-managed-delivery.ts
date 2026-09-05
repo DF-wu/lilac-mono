@@ -222,8 +222,11 @@ export function managedRedisRetryDelayMs(deliveryId: string, nextAttempt: Manage
   return Math.min(MANAGED_REDIS_MAX_RETRY_DELAY_MS, baseDelay + bucket - jitterBound);
 }
 
-function panic(message: string): never {
-  throw new Panic({ message: `Managed Redis delivery state is invalid: ${message}` });
+export function panic(failure: Panic): never;
+export function panic(message: string): never;
+export function panic(failure: Panic | string): never {
+  if (typeof failure !== "string") throw failure;
+  throw new Panic({ message: `Managed Redis delivery state is invalid: ${failure}` });
 }
 
 function boundReasonText(value: string): string {

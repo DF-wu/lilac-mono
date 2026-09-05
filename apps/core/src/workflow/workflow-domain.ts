@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { blobRefV1Schema, type BlobRefV1 } from "@stanley2058/lilac-blob-storage";
 import { MODEL_REASONING_EFFORTS } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
@@ -158,13 +159,28 @@ export const workflowRevisionIdentitySchema = z.strictObject({
 });
 export type WorkflowRevisionIdentity = z.infer<typeof workflowRevisionIdentitySchema>;
 
+export const workflowArtifactIdSchema = z
+  .string()
+  .regex(/^workflow-(?:source|value):[a-f0-9]{64}$/u);
+
+export const workflowArtifactReferenceSchema = z.strictObject({
+  artifactId: workflowArtifactIdSchema,
+  blobRef: blobRefV1Schema.refine((value) => value.expiresAt === undefined, {
+    message: "Workflow artifact blobs must use durable retention",
+  }),
+});
+export type WorkflowArtifactReference = {
+  readonly artifactId: string;
+  readonly blobRef: BlobRefV1;
+};
+
 export const workflowRevisionSchema = workflowRevisionIdentitySchema.extend({
   revisionId: idSchema,
   name: z
     .string()
     .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/)
     .max(64),
-  snapshotArtifactId: idSchema,
+  snapshotArtifact: workflowArtifactReferenceSchema,
   metadata: workflowMetadataSchema,
   inputSchema: jsonObjectSchema,
   resources: workflowResourcePolicySchema,
@@ -258,7 +274,7 @@ export const workflowRunSchema = z.strictObject({
   progressTarget: workflowProgressTargetSchema.nullable(),
   terminalDetail: boundedTextSchema.nullable(),
   result: jsonValueSchema.nullable(),
-  resultArtifactId: idSchema.nullable(),
+  resultArtifact: workflowArtifactReferenceSchema.nullable(),
   claimedBy: idSchema.nullable(),
   claimedAt: nullableTimestampSchema,
   createdAt: timestampSchema,
@@ -310,7 +326,7 @@ export const workflowOperationSchema = z.strictObject({
   attempt: z.number().int().nonnegative(),
   requestId: idSchema.nullable(),
   output: jsonValueSchema.nullable(),
-  resultArtifactId: idSchema.nullable(),
+  resultArtifact: workflowArtifactReferenceSchema.nullable(),
   error: boundedTextSchema.nullable(),
   usage: workflowUsageSchema.nullable(),
   claimedBy: idSchema.nullable(),

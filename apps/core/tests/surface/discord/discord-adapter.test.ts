@@ -43,6 +43,12 @@ import { toBusDiscordCommandInvokedData } from "../../../src/surface/discord/dis
 import { DiscordSurfaceStore } from "../../../src/surface/store/discord-surface-store";
 import { composeRequestMessages } from "../../../src/surface/bridge/request-composition";
 import type { CustomCommandManager } from "../../../src/custom-commands/manager";
+import { buildDiscordActionCustomIdResult } from "../../../src/surface/discord/discord-actions";
+import {
+  buildDiscordQuestionCustomActionId,
+  buildDiscordQuestionOptionActionId,
+} from "../../../src/surface/discord/discord-question-interactions";
+import { DISCORD_QUESTION_ANSWERED_COLOR } from "../../../src/surface/discord/discord-question-port";
 
 describe("Discord command actor projection", () => {
   it("omits an anonymous actor instead of emitting an incomplete actor", () => {
@@ -57,9 +63,15 @@ describe("Discord command actor projection", () => {
       ts: 1,
       sessionMode: "mention",
       sessionConfigId: "channel",
+      parentChannelId: "parent",
+      guildId: "guild",
     });
 
     expect(Object.hasOwn(projected.raw ?? {}, "authenticatedActor")).toBe(false);
+    expect(projected.raw).toMatchObject({
+      parentChannelId: "parent",
+      guildId: "guild",
+    });
   });
 });
 
@@ -186,37 +198,31 @@ describe("classifyDiscordSurfaceError", () => {
     ).toBeInstanceOf(SurfaceUnavailable);
     expect(classifyDiscordSurfaceError("send-message", new Error("unknown"))).toBeNull();
   });
-});
 
-describe("DiscordAdapter nested refs", () => {
-  it("starts a resumable output stream without invoking Discord", async () => {
-    let providerCalls = 0;
-    const config = testConfigWithStatusMessage();
-    const adapter = createTestDiscordAdapter({ config });
-    const internals = adapter as unknown as { client: unknown; cfg: CoreConfig };
-    internals.client = {
+  it("classifies a plain Discord rejection before defect propagation", async () => {
+    const adapter = createTestDiscordAdapter();
+    const state = adapter as unknown as {
+      cfg: CoreConfig | null;
+      client: { channels: { fetch(channelId: string): Promise<unknown> } } | null;
+    };
+    state.cfg = testConfigWithStatusMessage();
+    state.client = {
       channels: {
         fetch: async () => {
-          providerCalls += 1;
-          return null;
+          throw { code: 10_003 };
         },
       },
     };
-    internals.cfg = config;
 
-    const result = await adapter.startOutput(
-      { platform: "discord", channelId: "c1" },
-      {
-        resume: {
-          created: [{ platform: "discord", channelId: "c1", messageId: "existing" }],
-        },
-      },
-    );
+    const listed = await adapter.listMsg({ platform: "discord", channelId: "missing" });
 
-    expect(result.status).toBe("ok");
-    expect(providerCalls).toBe(0);
+    expect(listed.status).toBe("error");
+    if (listed.status === "ok") throw new Error("expected missing channel failure");
+    expect(listed.error).toBeInstanceOf(SurfaceMessageNotFound);
   });
+});
 
+describe("DiscordAdapter nested refs", () => {
   it("threads enabled math options into output streams and omits disabled options", async () => {
     const base = testConfigWithStatusMessage();
     const enabledConfig: CoreConfig = {
@@ -279,22 +285,6 @@ describe("DiscordAdapter nested refs", () => {
       expect(result.error).toMatchObject({ operation: "start-output", refRole });
     },
   );
-
-  it("identifies the mismatched resumed ref", async () => {
-    const result = await createTestDiscordAdapter().startOutput(
-      { platform: "discord", channelId: "c1" },
-      {
-        resume: {
-          created: [{ platform: "discord", channelId: "c2", messageId: "m1" }],
-        },
-      },
-    );
-
-    expect(result.status).toBe("error");
-    if (result.status === "ok") throw new Error("expected nested-ref failure");
-    expect(result.error).toBeInstanceOf(SurfaceSessionMismatch);
-    expect(result.error).toMatchObject({ refRole: "resume.created[0]" });
-  });
 });
 
 describe("DiscordAdapter typing", () => {
@@ -302,6 +292,8 @@ describe("DiscordAdapter typing", () => {
     const config = testConfigWithStatusMessage();
     const typingStarted = Promise.withResolvers<void>();
     const typingRelease = Promise.withResolvers<void>();
+    const typingConfirmed = Promise.withResolvers<void>();
+    let confirmed = false;
     const adapter = createTestDiscordAdapter({ config });
     Object.assign(adapter, {
       client: {
@@ -317,14 +309,24 @@ describe("DiscordAdapter typing", () => {
       cfg: config,
     });
 
-    const started = await adapter.startTyping({ platform: "discord", channelId: "c1" });
+    const started = await adapter.startTyping(
+      { platform: "discord", channelId: "c1" },
+      {
+        onStarted: () => {
+          confirmed = true;
+          typingConfirmed.resolve();
+        },
+      },
+    );
     expect(started.status).toBe("ok");
     if (started.status === "error") throw started.error;
     await typingStarted.promise;
+    expect(confirmed).toBe(false);
 
     expect(await started.value.stop()).toEqual(Result.ok(undefined));
     typingRelease.resolve();
-    await typingRelease.promise;
+    await typingConfirmed.promise;
+    expect(confirmed).toBe(true);
   });
 
   it("reports a detached typing Panic to the fatal supervisor", async () => {
@@ -411,6 +413,52 @@ describe("DiscordAdapter custom command acknowledgement", () => {
   });
 });
 
+describe("DiscordAdapter context command", () => {
+  it("renders a resting context report as an ephemeral interaction reply", async () => {
+    const config = testConfigWithStatusMessage();
+    const requests: unknown[] = [];
+    const adapter = createTestDiscordAdapter({
+      config,
+      contextReport: async (request) => {
+        requests.push(request);
+        return Result.ok({ text: "**Resting context**", accentColor: 0x5865f2 });
+      },
+    });
+    Object.assign(adapter, {
+      client: {},
+      cfg: config,
+      self: { platform: "discord", userId: "bot", userName: "lilac" },
+    });
+    const replies: unknown[] = [];
+    const interaction = {
+      commandName: "context",
+      channelId: "c1",
+      guildId: null,
+      channel: null,
+      deferReply: async () => undefined,
+      editReply: async (reply: unknown) => {
+        replies.push(reply);
+      },
+    };
+    const onChatInputCommand = Reflect.get(adapter, "onChatInputCommand") as (
+      interaction: unknown,
+    ) => Promise<void>;
+
+    await onChatInputCommand.call(adapter, interaction);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      source: "rest",
+      sessionId: "c1",
+      messages: [],
+    });
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toMatchObject({
+      embeds: [{ data: { color: 0x5865f2, description: "**Resting context**" } }],
+    });
+  });
+});
+
 describe("DiscordAdapter.sendMsg content validation", () => {
   it("prepares sends without invoking the Discord provider", async () => {
     let providerCalls = 0;
@@ -458,6 +506,268 @@ describe("DiscordAdapter.sendMsg content validation", () => {
       expect(result.error).toBeInstanceOf(SurfaceUnavailable);
     },
   );
+  it("rejects embed accent colors outside Discord's RGB range", async () => {
+    const result = await createTestDiscordAdapter().sendMsg(
+      { platform: "discord", channelId: "c1" },
+      { text: "question", accentColor: 0x1000000, actions: [] },
+    );
+
+    expect(result.status).toBe("error");
+    if (result.status === "ok") throw new Error("expected accent color failure");
+    expect(result.error).toBeInstanceOf(SurfaceInvalidInput);
+    expect(result.error).toMatchObject({
+      operation: "send-message",
+      field: "content.accentColor",
+    });
+  });
+
+  it("notifies action-card replies only when explicitly requested", async () => {
+    const sends: unknown[] = [];
+    const adapter = createTestDiscordAdapter();
+    (adapter as unknown as { client: unknown }).client = {
+      channels: {
+        fetch: async () => ({
+          send: async (payload: unknown) => {
+            sends.push(payload);
+            return { id: `sent-${sends.length}` };
+          },
+        }),
+      },
+    };
+    const sessionRef = { platform: "discord", channelId: "c1" } as const;
+    const replyTo = { platform: "discord", channelId: "c1", messageId: "turn-1" } as const;
+    const content = {
+      text: "Choose",
+      actions: [{ actionId: "choose", label: "1", style: "primary" as const }],
+    };
+
+    expect((await adapter.sendMsg(sessionRef, content, { replyTo })).status).toBe("ok");
+    expect(
+      (await adapter.sendMsg(sessionRef, content, { replyTo, notifyReply: true })).status,
+    ).toBe("ok");
+    expect(
+      (
+        await adapter.sendMsg(sessionRef, content, {
+          replyTo,
+          notifyReply: true,
+          silent: true,
+        })
+      ).status,
+    ).toBe("ok");
+
+    expect(sends).toEqual([
+      expect.objectContaining({
+        reply: { messageReference: "turn-1" },
+        allowedMentions: { parse: [], repliedUser: false },
+      }),
+      expect.objectContaining({
+        reply: { messageReference: "turn-1" },
+        allowedMentions: { parse: [], repliedUser: true },
+      }),
+      expect.objectContaining({
+        reply: { messageReference: "turn-1" },
+        allowedMentions: { parse: [], repliedUser: false },
+      }),
+    ]);
+  });
+});
+
+describe("Discord question interactions", () => {
+  it("renders an accepted option summary through the interaction response", async () => {
+    const adapter = createTestDiscordAdapter();
+    const actionId = buildDiscordActionCustomIdResult(
+      buildDiscordQuestionOptionActionId("question-token", 2),
+    );
+    expect(actionId.status).toBe("ok");
+    if (actionId.status === "error") return;
+    const sequence: string[] = [];
+    const updatePayloads: {
+      readonly embeds: readonly {
+        toJSON(): { readonly description?: string; readonly color?: number };
+      }[];
+      readonly components: readonly unknown[];
+    }[] = [];
+    let replyCount = 0;
+    let followUpCount = 0;
+    await adapter.subscribeQuestionAnswers(
+      async (answer, updateInteraction) => {
+        sequence.push("handle");
+        expect(answer).toMatchObject({
+          channelId: "channel-1",
+          messageRef: {
+            channelId: "channel-1",
+            messageId: "message-1",
+          },
+          principal: { userId: "user-1" },
+          token: "question-token",
+          answer: { kind: "option", optionIndex: 2 },
+        });
+        const updated = await updateInteraction({
+          state: "answered",
+          summary: {
+            answers: [
+              {
+                header: "Environment",
+                answer: { kind: "option", label: "Production" },
+              },
+            ],
+          },
+        });
+        expect(updated.status).toBe("ok");
+        return Result.ok("accepted");
+      },
+      async () => Result.ok("accepted"),
+    );
+    const interaction = {
+      deferred: false,
+      replied: false,
+      customId: actionId.value,
+      channelId: "channel-1",
+      message: { id: "message-1" },
+      user: { id: "user-1" },
+      isChatInputCommand: () => false,
+      isAutocomplete: () => false,
+      isMessageContextMenuCommand: () => false,
+      isModalSubmit: () => false,
+      isButton: () => true,
+      update: async (payload: (typeof updatePayloads)[number]) => {
+        sequence.push("update");
+        updatePayloads.push(payload);
+        interaction.replied = true;
+      },
+      reply: async () => {
+        replyCount += 1;
+      },
+      followUp: async () => {
+        followUpCount += 1;
+      },
+    };
+    const onInteractionCreate = Reflect.get(adapter, "onInteractionCreate") as (
+      interaction: unknown,
+    ) => Promise<void>;
+
+    await onInteractionCreate.call(adapter, interaction);
+
+    expect(sequence).toEqual(["handle", "update"]);
+    expect(updatePayloads[0]?.embeds[0]?.toJSON()).toMatchObject({
+      description: "**Answers**\n\n1. **Environment:** Production",
+      color: DISCORD_QUESTION_ANSWERED_COLOR,
+    });
+    expect(updatePayloads[0]?.components).toEqual([]);
+    expect(replyCount).toBe(0);
+    expect(followUpCount).toBe(0);
+  });
+
+  it("records custom-input activity before opening the modal", async () => {
+    const adapter = createTestDiscordAdapter();
+    const actionId = buildDiscordActionCustomIdResult(
+      buildDiscordQuestionCustomActionId("custom-token"),
+    );
+    expect(actionId.status).toBe("ok");
+    if (actionId.status === "error") return;
+    const sequence: string[] = [];
+    await adapter.subscribeQuestionAnswers(
+      async () => Result.ok("accepted"),
+      async (activity) => {
+        sequence.push("activity");
+        expect(activity).toMatchObject({
+          channelId: "channel-1",
+          messageRef: { messageId: "message-1" },
+          principal: { userId: "user-1" },
+          token: "custom-token",
+        });
+        return Result.ok("accepted");
+      },
+    );
+    const interaction = {
+      customId: actionId.value,
+      channelId: "channel-1",
+      message: { id: "message-1" },
+      user: { id: "user-1" },
+      isChatInputCommand: () => false,
+      isAutocomplete: () => false,
+      isMessageContextMenuCommand: () => false,
+      isModalSubmit: () => false,
+      isButton: () => true,
+      showModal: async () => {
+        sequence.push("modal");
+      },
+    };
+    const onInteractionCreate = Reflect.get(adapter, "onInteractionCreate") as (
+      interaction: unknown,
+    ) => Promise<void>;
+
+    await onInteractionCreate.call(adapter, interaction);
+
+    expect(sequence).toEqual(["activity", "modal"]);
+  });
+
+  it("renders an accepted modal summary through the interaction response", async () => {
+    const adapter = createTestDiscordAdapter();
+    const sequence: string[] = [];
+    let updatedDescription: string | undefined;
+    let replyCount = 0;
+    let followUpCount = 0;
+    await adapter.subscribeQuestionAnswers(
+      async (answer, updateInteraction) => {
+        sequence.push("handle");
+        expect(answer).toMatchObject({
+          channelId: "channel-1",
+          messageRef: {
+            channelId: "channel-1",
+            messageId: "message-1",
+          },
+          principal: { userId: "user-1" },
+          token: "custom-token",
+          answer: { kind: "custom", text: "A private explanation" },
+        });
+        const updated = await updateInteraction({
+          state: "answered",
+          summary: {
+            answers: [{ header: "Notes", answer: { kind: "custom" } }],
+          },
+        });
+        expect(updated.status).toBe("ok");
+        return Result.ok("accepted");
+      },
+      async () => Result.ok("accepted"),
+    );
+    const interaction = {
+      deferred: false,
+      replied: false,
+      channelId: "channel-1",
+      message: { id: "message-1" },
+      user: { id: "user-1" },
+      isFromMessage: () => true,
+      fields: { getTextInputValue: () => "A private explanation" },
+      update: async (payload: {
+        readonly embeds: readonly {
+          toJSON(): { readonly description?: string };
+        }[];
+      }) => {
+        sequence.push("update");
+        updatedDescription = payload.embeds[0]?.toJSON().description;
+        interaction.replied = true;
+      },
+      reply: async () => {
+        replyCount += 1;
+      },
+      followUp: async () => {
+        followUpCount += 1;
+      },
+    };
+    const onQuestionModalSubmit = Reflect.get(adapter, "onQuestionModalSubmit") as (
+      interaction: unknown,
+      token: string,
+    ) => Promise<void>;
+
+    await onQuestionModalSubmit.call(adapter, interaction, "custom-token");
+
+    expect(sequence).toEqual(["handle", "update"]);
+    expect(updatedDescription).toBe("**Answers**\n\n1. **Notes:** Custom response submitted");
+    expect(replyCount).toBe(0);
+    expect(followUpCount).toBe(0);
+  });
 });
 
 describe("isRoutableDiscordUserMessage", () => {
@@ -1325,27 +1635,6 @@ describe("DiscordAdapter.refreshCoreConfig", () => {
     internals.appliedStatusMessage = "previous presence";
     cfg = changedConfig;
 
-    const prepared = await adapter.startOutput(
-      { platform: "discord", channelId: "c1" },
-      {
-        preparationMode: "paused-recovery",
-        resume: {
-          created: [{ platform: "discord", channelId: "c1", messageId: "restored-output" }],
-        },
-      },
-    );
-    expect(prepared.status).toBe("ok");
-    if (prepared.status === "error") throw prepared.error;
-    expect(
-      prepared.value.hydrateRecovery?.([{ type: "text.set", text: "restored response" }]),
-    ).toBe("visible");
-    await expect(prepared.value.abort("restore_rollback")).resolves.toEqual(Result.ok(undefined));
-    expect({ configReads, channelFetches, providerMutations }).toEqual({
-      configReads: 0,
-      channelFetches: 0,
-      providerMutations: [],
-    });
-
     const normal = await adapter.startOutput({ platform: "discord", channelId: "c1" });
     expect(normal.status).toBe("ok");
     expect(configReads).toBe(0);
@@ -1463,7 +1752,7 @@ describe("DiscordAdapter.editMsg", () => {
 
     await adapter.editMsg(
       { platform: "discord", channelId: "c1", messageId: "m1" },
-      { text: "new-description" },
+      { text: "new-description", accentColor: 0x57f287 },
     );
 
     expect(editCalls).toHaveLength(1);
@@ -1476,6 +1765,7 @@ describe("DiscordAdapter.editMsg", () => {
     const edited = embeds?.[0]?.toJSON();
     expect(edited?.title).toBe("keep-title");
     expect(edited?.description).toBe("new-description");
+    expect(edited?.color).toBe(0x57f287);
     expect(edited?.fields).toEqual([{ name: "field-1", value: "value-1" }]);
     expect(edited?.footer).toEqual({ text: "keep-footer" });
   });

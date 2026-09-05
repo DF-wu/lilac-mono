@@ -119,18 +119,33 @@ export class AcpHarnessClient {
         const input = Writable.toWeb(child.stdin);
         const output = new ReadableStream<Uint8Array>({
           async start(controller) {
-            try {
-              for await (const rawChunk of child.stdout) {
-                const chunk: unknown = rawChunk;
-                if (!(chunk instanceof Uint8Array)) {
-                  throw new TypeError("ACP harness stdout emitted a non-byte chunk");
-                }
-                controller.enqueue(chunk);
-              }
-              controller.close();
-            } catch (cause) {
-              controller.error(cause);
+            function captureFailure(readCause: () => unknown): void {
+              (() => controller.error(readCause()))();
             }
+
+            const pumped = await Result.tryPromise({
+              try: async () => {
+                for await (const rawChunk of child.stdout) {
+                  const chunk: unknown = rawChunk;
+                  if (!(chunk instanceof Uint8Array)) {
+                    return new TypeError("ACP harness stdout emitted a non-byte chunk");
+                  }
+                  controller.enqueue(chunk);
+                }
+                controller.close();
+                return null;
+              },
+              catch:
+                (cause): (() => unknown) =>
+                () =>
+                  cause,
+            });
+            const failure = pumped.match<TypeError | (() => unknown) | null>({
+              ok: (value) => value,
+              err: (signal) => signal,
+            });
+            if (failure instanceof TypeError) controller.error(failure);
+            else if (failure) captureFailure(failure);
           },
           cancel(reason) {
             child.stdout.destroy(reason instanceof Error ? reason : undefined);

@@ -9,9 +9,11 @@ import {
   resolveNativeSubagentProfile,
 } from "@stanley2058/lilac-utils";
 import fs from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { Panic } from "better-result";
 
+import { getTestBlobStore } from "../helpers/blob-store";
 import {
   BASH_NO_OUTPUT_TIMEOUT_MS,
   executeBash,
@@ -244,6 +246,23 @@ rmdir "$media_dir"`,
     expect(lines[1]).toBe(path.join(env.dataDir, "secret", "gnupg"));
   });
 
+  it("forwards request delivery identity to trusted Bash", async () => {
+    const res = await executeBash(
+      { command: 'printf "%s" "$LILAC_REQUEST_DELIVERY_ID"' },
+      {
+        context: {
+          requestId: "request-123",
+          requestDeliveryId: "delivery-456",
+          sessionId: "session-789",
+          requestClient: "discord",
+        },
+      },
+    );
+
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout).toBe("delivery-456");
+  });
+
   it("does not set executionError for command failures", async () => {
     const res = await executeBash({ command: "exit 2" });
 
@@ -280,8 +299,11 @@ rmdir "$media_dir"`,
     expect(res.executionError).toBeDefined();
     expect(res.executionError?.type).toBe("exception");
     if (res.executionError?.type === "exception") {
+      expect(res.executionError.code).toBe("spawn_cwd_missing");
       expect(res.executionError.phase).toBe("spawn");
-      expect(res.executionError.message.length).toBeGreaterThan(0);
+      expect(res.executionError.errno).toBe("ENOENT");
+      expect(res.executionError.cwd).toBe("/this/path/definitely/does/not/exist");
+      expect(res.executionError.message).toContain("cwd does not exist");
     }
   });
 
@@ -304,9 +326,12 @@ rmdir "$media_dir"`,
 
   it("stores large output as an artifact without changing execution success", async () => {
     const artifactDir = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-bash-artifact-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-bash-artifact-"),
     );
-    const artifacts = createToolResultArtifactStore(path.join(artifactDir, "tool-results"));
+    const artifacts = createToolResultArtifactStore(
+      path.join(artifactDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await artifacts.init();
     const testId = crypto.randomUUID();
     const requestId = `bash-trunc-test-request-${testId}`;
@@ -421,6 +446,7 @@ rmdir "$media_dir"`,
       expect(removed).toHaveLength(2);
       expect(result.executionError).toEqual({
         type: "exception",
+        code: "cleanup_failed",
         phase: "unknown",
         message: "Bash temporary output cleanup failed",
       });
@@ -451,13 +477,14 @@ rmdir "$media_dir"`,
     expect(attempted).toHaveLength(2);
     expect(result.executionError).toEqual({
       type: "exception",
+      code: "cleanup_failed",
       phase: "unknown",
       message: "Bash temporary output cleanup failed",
     });
   });
 
   it("surfaces operation and spill cleanup failure without leaking either cause", async () => {
-    const invalidCwd = "/private/workspace-secret/does-not-exist";
+    const invalidCwd = "/tmp/lilac-bash-cleanup-missing-cwd";
     const result = await executeBash(
       { command: "printf unreachable", cwd: invalidCwd },
       {
@@ -471,12 +498,15 @@ rmdir "$media_dir"`,
 
     expect(result.executionError).toEqual({
       type: "exception",
+      code: "spawn_cwd_missing",
       phase: "spawn",
-      message: "Bash execution failed and temporary output cleanup also failed",
+      message: `Bash cwd does not exist or is not a directory: ${invalidCwd}`,
+      errno: "ENOENT",
+      cwd: invalidCwd,
     });
     const wire = JSON.stringify(result);
     expect(wire).not.toContain("cleanup-secret");
-    expect(wire).not.toContain(invalidCwd);
+    expect(wire).toContain(invalidCwd);
   });
 
   it("attempts all spill cleanup before propagating the exact cleanup Panic", async () => {
@@ -505,9 +535,12 @@ rmdir "$media_dir"`,
 
   it("reports incomplete retention after bounded pre-cap ANSI output", async () => {
     const artifactDir = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-bash-bounded-spill-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-bash-bounded-spill-"),
     );
-    const artifacts = createToolResultArtifactStore(path.join(artifactDir, "tool-results"));
+    const artifacts = createToolResultArtifactStore(
+      path.join(artifactDir, "tool-results"),
+      await getTestBlobStore(),
+    );
     await artifacts.init();
 
     try {
@@ -571,7 +604,7 @@ rmdir "$media_dir"`,
 
   it("selects Bash mode from the profile without weakening restricted sessions", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-profile-bash-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-profile-bash-workspace-"),
     );
     const config = parseCoreConfigV2ToUniversal({ configVersion: 2 });
     const cases = [
@@ -608,7 +641,7 @@ rmdir "$media_dir"`,
 describe("executeRestrictedBash", () => {
   it("uses caller timeoutMs as a restricted wall deadline", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-timeout-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-timeout-workspace-"),
     );
     try {
       // test-wait-justification: verifies the restricted just-bash wall deadline
@@ -629,7 +662,7 @@ describe("executeRestrictedBash", () => {
 
   it("preserves writable primary-profile behavior through the Bash tool", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-primary-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-primary-workspace-"),
     );
     const sessionId = "restricted-primary-profile";
     try {
@@ -653,7 +686,7 @@ describe("executeRestrictedBash", () => {
   });
 
   it("rejects cwd outside the workspace instead of silently substituting it", async () => {
-    const temp = await fs.mkdtemp(path.join(await fs.realpath("/tmp"), "lilac-restricted-cwd-"));
+    const temp = await fs.mkdtemp(path.join(await fs.realpath(tmpdir()), "lilac-restricted-cwd-"));
     const workspace = path.join(temp, "workspace");
     await fs.mkdir(workspace);
     try {
@@ -663,7 +696,9 @@ describe("executeRestrictedBash", () => {
       );
       expect(result.executionError).toMatchObject({
         type: "blocked",
-        reason: "restricted_bash_cwd",
+        code: "restricted_cwd",
+        reason: expect.stringContaining("outside the approved workspace"),
+        hint: expect.stringContaining("approved workspace"),
       });
       expect(result.stderr).toContain("outside the approved workspace");
     } finally {
@@ -673,10 +708,10 @@ describe("executeRestrictedBash", () => {
 
   it("sanitizes previews and encrypted artifacts before returning them", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-sanitize-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-sanitize-workspace-"),
     );
     const artifactRoot = path.join(workspace, ".artifacts");
-    const store = createToolResultArtifactStore(artifactRoot);
+    const store = createToolResultArtifactStore(artifactRoot, await getTestBlobStore());
     await store.init();
 
     try {
@@ -705,7 +740,7 @@ describe("executeRestrictedBash", () => {
 
       expect(result.stdout).not.toContain("\u001b");
       expect(result.stdout).not.toContain("abcdefghijklmnopqrstuvwxyz1234567890");
-      expect(result.truncation?.artifactUri).toStartWith("tool-result://");
+      expect(result.truncation?.artifactUri).toStartWith("resource://t1_");
       const stored = await store.read(
         result.truncation?.artifactUri ?? "",
         "restricted-sanitize-session",
@@ -723,7 +758,7 @@ describe("executeRestrictedBash", () => {
 
   it("uses an overlay workspace and persistent per-session /tmp", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-workspace-"),
     );
     const testId = crypto.randomUUID();
     const sessionId = `restricted-bash-test-session-${testId}`;
@@ -782,7 +817,7 @@ describe("executeRestrictedBash", () => {
 
   it("does not share cached shell state across sessions with the same request ID", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-isolation-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-isolation-workspace-"),
     );
     const testId = crypto.randomUUID();
     const requestId = `restricted-shared-request-${testId}`;
@@ -817,9 +852,10 @@ describe("executeRestrictedBash", () => {
 
   it("passes variadic tool positionals through the nested tools command", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     let capturedCallInput: unknown;
+    const capturedRequestDeliveryIds: Array<string | null> = [];
 
     const restoreFetch = installMockFetch(async (input, init) => {
       const url = String(input);
@@ -827,6 +863,9 @@ describe("executeRestrictedBash", () => {
         return Response.json({ primaryPositional: { field: "paths", variadic: true } });
       }
       if (url.endsWith("/call")) {
+        capturedRequestDeliveryIds.push(
+          new Headers(init?.headers).get("x-lilac-request-delivery-id"),
+        );
         capturedCallInput = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
         return Response.json({ status: "ok", value: { ok: true } });
       }
@@ -843,6 +882,22 @@ describe("executeRestrictedBash", () => {
           workspaceRoot: workspace,
           context: {
             requestId: "restricted-tools-variadic-test-req",
+            requestDeliveryId: "delivery-1",
+            sessionId: "restricted-tools-variadic-test-session",
+            requestClient: "discord",
+          },
+        },
+      );
+      const nextDeliveryResult = await executeRestrictedBash(
+        {
+          command: "tools attachment.add_files a.png b.png",
+          cwd: workspace,
+        },
+        {
+          workspaceRoot: workspace,
+          context: {
+            requestId: "restricted-tools-variadic-test-req",
+            requestDeliveryId: "delivery-2",
             sessionId: "restricted-tools-variadic-test-session",
             requestClient: "discord",
           },
@@ -850,8 +905,10 @@ describe("executeRestrictedBash", () => {
       );
 
       expect(result.exitCode).toBe(0);
+      expect(nextDeliveryResult.exitCode).toBe(0);
       expect(result.stdout).toBe('{"ok":true}\n');
       expect(result.stderr).toBe("");
+      expect(capturedRequestDeliveryIds).toEqual(["delivery-1", "delivery-2"]);
       expect(capturedCallInput).toEqual({
         callableId: "attachment.add_files",
         input: { paths: ["a.png", "b.png"] },
@@ -864,7 +921,7 @@ describe("executeRestrictedBash", () => {
 
   it("treats nested --output as a CLI option and honors compact and pretty JSON", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     const capturedInputs: unknown[] = [];
     const restoreFetch = installMockFetch(async (_input, init) => {
@@ -923,7 +980,7 @@ describe("executeRestrictedBash", () => {
 
   it("allows mixed flags with variadic positionals in the nested tools command", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     let capturedCallInput: unknown;
 
@@ -972,7 +1029,7 @@ describe("executeRestrictedBash", () => {
 
   it("keeps bare nested tool flags boolean without consuming following positionals", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     let capturedCallInput: unknown;
 
@@ -1017,7 +1074,7 @@ describe("executeRestrictedBash", () => {
 
   it("explains that nested tools flags require equals syntax for values", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     let calledTool = false;
 
@@ -1062,7 +1119,7 @@ describe("executeRestrictedBash", () => {
 
   it("keeps scalar tool positionals limited to one argument in the nested tools command", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     let calledTool = false;
 
@@ -1105,7 +1162,7 @@ describe("executeRestrictedBash", () => {
 
   it("writes nested tool failures as JSON to stderr with the shared exit code", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     const failure: ServerToolFailure = {
       kind: "denied",
@@ -1147,7 +1204,7 @@ describe("executeRestrictedBash", () => {
 
   it("rejects legacy nested tool responses as structured protocol failures", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     const restoreFetch = installMockFetch(async () =>
       Response.json({ isError: false, output: { legacy: true } }),
@@ -1174,7 +1231,7 @@ describe("executeRestrictedBash", () => {
 
   it("rejects nested tool failures with an empty code", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     const restoreFetch = installMockFetch(async () =>
       Response.json({
@@ -1207,7 +1264,7 @@ describe("executeRestrictedBash", () => {
 
   it("maps nested tool network failures to retryable structured unavailable failures", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     const restoreFetch = installMockFetch(async () => {
       throw new Error("backend unavailable");
@@ -1234,7 +1291,7 @@ describe("executeRestrictedBash", () => {
 
   it("maps malformed JSON and every HTTP status class to structured local failures", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     let responseStatus: number | undefined;
     const restoreFetch = installMockFetch(async () =>
@@ -1293,7 +1350,7 @@ describe("executeRestrictedBash", () => {
 
   it("returns cancelled envelopes for aborted nested fetch and response reads", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     try {
       for (const phase of ["fetch", "read"] as const) {
@@ -1349,7 +1406,7 @@ describe("executeRestrictedBash", () => {
 
   it("returns timeout envelopes for nested fetch and response reads at the wall deadline", async () => {
     const workspace = await fs.mkdtemp(
-      path.join(await fs.realpath("/tmp"), "lilac-restricted-tools-workspace-"),
+      path.join(await fs.realpath(tmpdir()), "lilac-restricted-tools-workspace-"),
     );
     try {
       for (const phase of ["fetch", "read"] as const) {

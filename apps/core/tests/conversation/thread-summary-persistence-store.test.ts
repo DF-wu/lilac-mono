@@ -33,7 +33,7 @@ async function databasePath(): Promise<string> {
 }
 
 function createLegacySummaryTable(database: Database): void {
-  database.exec(`
+  database.run(`
     CREATE TABLE conversation_thread_summaries (
       thread_id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -189,7 +189,7 @@ describe("conversation thread summary persisted store", () => {
     const store = new ConversationThreadStore(filename);
     const setup = new Database(filename, { strict: true });
     try {
-      setup.exec(`
+      setup.run(`
         CREATE TRIGGER reject_summary_facet
         BEFORE INSERT ON conversation_thread_facets
         BEGIN

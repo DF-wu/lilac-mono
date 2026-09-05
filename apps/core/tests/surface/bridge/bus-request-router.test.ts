@@ -1,8 +1,5 @@
 import { afterEach, describe, expect, it, jest, spyOn } from "bun:test";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
 
 import {
   createLilacBus,
@@ -22,8 +19,10 @@ import {
   type RawDeliveryAction,
   type RawDeliveryHandler,
   type SubscriptionOptions,
+  type BusMessageV2,
+  type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
-import { parseCoreConfigV1ToUniversal } from "@stanley2058/lilac-utils";
+import { parseCoreConfigV1ToUniversal, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Logger } from "@stanley2058/simple-module-logger";
 
 import {
@@ -32,22 +31,23 @@ import {
   DiscordRequestRouterStartupAndCleanupFailed,
   DiscordRequestRouterSubscriptionStopRejected,
   discordRequestCompositionFailurePolicy,
-  startDiscordRequestRouter,
+  startDiscordRequestRouter as startDiscordRequestRouterImpl,
   type StartDiscordRequestRouterInput,
 } from "../../../src/surface/discord/discord-request-router";
+import {
+  withDefaultToolsConfig,
+  type RouterConfigOverride,
+} from "../../../src/surface/discord/discord-request-router/common";
 import {
   resolvePreviousMessageText,
   resolveRepliedToMessageText,
 } from "../../../src/surface/discord/discord-request-router/context";
 import { formatBufferedMessageForGateTranscript } from "../../../src/surface/discord/discord-request-router/gate";
-import { publishSingleMessagePrompt } from "../../../src/surface/discord/discord-request-router/publish";
-import { createDiscordRelayPolicy } from "../../../src/surface/discord/discord-runtime-descriptor";
-import { bridgeBusToAdapter } from "../../../src/surface/bridge/subscribe-from-bus";
 import {
-  GRACEFUL_RESTART_SNAPSHOT_VERSION,
-  GracefulRestartDispositionConflict,
-  SqliteGracefulRestartStore,
-} from "../../../src/runtime/graceful-restart-store";
+  DiscordRequestDeliveryFailed,
+  publishSingleMessagePrompt,
+} from "../../../src/surface/discord/discord-request-router/publish";
+import { getTestBlobStore } from "../../helpers/blob-store";
 import {
   SurfaceInvalidInput,
   SurfacePermissionDenied,
@@ -73,6 +73,8 @@ import {
 } from "../../../src/transcript/transcript-store";
 import type { ModelMessage } from "ai";
 import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
+import { createTestResourceRegistry } from "../../helpers/resource-registry";
+import { ResourceStoreFailure, type ResourceRegistry } from "../../../src/resource";
 
 type TestRawBus = RawBus & {
   readonly deliveryActions: Array<{ readonly topic: string; readonly action: RawDeliveryAction }>;
@@ -91,12 +93,58 @@ type TestRawBus = RawBus & {
   finishDelivery(topic: string, error: EventDeliveryDoneError): void;
 };
 
+type TestDiscordRequestRouterInput = Omit<
+  StartDiscordRequestRouterInput,
+  "blobStore" | "resourceRegistry" | "requestDelivery" | "config"
+> &
+  Partial<
+    Pick<StartDiscordRequestRouterInput, "blobStore" | "resourceRegistry" | "requestDelivery">
+  > & {
+    config?: CoreConfig | RouterConfigOverride;
+  };
+
+function normalizeTestRouterConfig(
+  config: CoreConfig | RouterConfigOverride | undefined,
+): CoreConfig | undefined {
+  if (!config) return undefined;
+  if ("configVersion" in config) return config as CoreConfig;
+  const parsed = withDefaultToolsConfig(config);
+  if (parsed.status === "ok") return parsed.value;
+  throw parsed.error;
+}
+
+async function startDiscordRequestRouter(input: TestDiscordRequestRouterInput) {
+  return startDiscordRequestRouterImpl({
+    ...input,
+    config: normalizeTestRouterConfig(input.config),
+    blobStore: input.blobStore ?? (await getTestBlobStore()),
+    resourceRegistry: input.resourceRegistry ?? createTestResourceRegistry(),
+    requestDelivery: input.requestDelivery ?? {
+      async prepareAndPublish({ envelope }) {
+        return (
+          await input.bus.publish(lilacEventTypes.CmdRequestMessage, envelope.data, {
+            headers: envelope.headers,
+          })
+        )
+          .map(() => undefined)
+          .mapError(
+            (cause) =>
+              new DiscordRequestDeliveryFailed({
+                cause,
+                message: "Test request publication failed",
+              }),
+          );
+      },
+    },
+  });
+}
+
 class RouterTestHookFailure extends TaggedError("RouterTestHookFailure")<{
   readonly cause: unknown;
   readonly message: string;
 }> {}
 
-async function startBusRequestRouter(input: StartDiscordRequestRouterInput) {
+async function startBusRequestRouter(input: TestDiscordRequestRouterInput) {
   return adaptDiscordRequestRouterStartOutcomeToHost(
     await startDiscordRequestRouter(input),
     () => {},
@@ -506,7 +554,7 @@ class FakeAdapter extends SurfaceAdapterTestBase {
   }
 }
 
-function collectUserText(messages: readonly ModelMessage[]): string {
+function collectUserText(messages: readonly (ModelMessage | BusMessageV2)[]): string {
   const parts: string[] = [];
 
   for (const msg of messages) {
@@ -574,7 +622,278 @@ describe("Discord request composition failure policy", () => {
   });
 });
 
+describe("Discord context text command", () => {
+  const config: RouterConfigOverride = {
+    surface: {
+      discord: {
+        tokenEnv: "DISCORD_TOKEN",
+        allowedChannelIds: [],
+        allowedGuildIds: [],
+        botName: "lilac",
+        outputMode: "inline",
+        previewFinalOutputStyle: "embed",
+      },
+      router: {
+        defaultMode: "active",
+        sessionModes: {},
+        activeDebounceMs: 5,
+        activeGate: { enabled: true, timeoutMs: 2_500 },
+      },
+    },
+    agent: { systemPrompt: "(unused in tests; compiled at runtime)" },
+    models: {
+      def: {},
+      main: { model: "openrouter/openai/gpt-4o" },
+      fast: { model: "openrouter/openai/gpt-4o-mini" },
+    },
+  };
+
+  it("reports a snapshot at rest without publishing an agent request", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const message: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "channel", messageId: "context" },
+      session: { platform: "discord", channelId: "channel" },
+      userId: "user",
+      userName: "User",
+      text: "!context ignored trailing text",
+      ts: Date.now(),
+      raw: { discord: { isChat: true } },
+    };
+    const adapter = new FakeAdapter({ "channel:context": message });
+    const sendMsg = spyOn(adapter, "sendMsg");
+    const reports: Array<readonly { role: string; content: unknown }[]> = [];
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "context-rest-router-test",
+      config,
+      contextReport: async (request) => {
+        reports.push([...request.messages]);
+        return Result.ok({ text: "snapshot report", accentColor: 0x5865f2 });
+      },
+    });
+    const requests: unknown[] = [];
+    const requestSub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      { mode: "fanout", subscriptionId: "context-rest-requests", consumerId: "test" },
+      async (request) => {
+        requests.push(request);
+        return Result.ok(undefined);
+      },
+    );
+
+    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
+      platform: "discord",
+      channelId: "channel",
+      messageId: "context",
+      userId: "user",
+      userName: "User",
+      text: message.text,
+      ts: message.ts,
+      raw: {
+        discord: {
+          isDMBased: false,
+          mentionsBot: false,
+          replyToBot: false,
+          botUserId: "bot",
+        },
+      },
+    });
+
+    expect(requests).toHaveLength(0);
+    expect(reports).toHaveLength(1);
+    expect(collectUserText(reports[0] as ModelMessage[])).toContain("!context");
+    expect(sendMsg).toHaveBeenCalledWith(
+      message.session,
+      { text: "snapshot report", accentColor: 0x5865f2 },
+      { replyTo: message.ref, silent: true },
+    );
+
+    sendMsg.mockRestore();
+    await requestSub.stop();
+    await router.stop();
+    await bus.close();
+  });
+
+  it("queues the command as a follow-up when the session has an active request", async () => {
+    const raw = createInMemoryRawBus();
+    const bus = createLilacBus(raw);
+    const message: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "channel", messageId: "context" },
+      session: { platform: "discord", channelId: "channel" },
+      userId: "user",
+      userName: "User",
+      text: "!context",
+      ts: Date.now(),
+      raw: { discord: { isChat: true } },
+    };
+    const adapter = new FakeAdapter({ "channel:context": message });
+    let deliveryAttempts = 0;
+    let reportCount = 0;
+    const router = await startBusRequestRouter({
+      adapter,
+      bus,
+      subscriptionId: "context-active-router-test",
+      config,
+      requestDelivery: {
+        prepareAndPublish: async ({ envelope }) => {
+          deliveryAttempts += 1;
+          if (deliveryAttempts === 1) {
+            return Result.err(
+              new DiscordRequestDeliveryFailed({
+                message: "Injected context follow-up delivery failure",
+              }),
+            );
+          }
+          return (
+            await bus.publish(lilacEventTypes.CmdRequestMessage, envelope.data, {
+              headers: envelope.headers,
+            })
+          )
+            .map(() => undefined)
+            .mapError(
+              (cause) =>
+                new DiscordRequestDeliveryFailed({
+                  cause,
+                  message: "Test request publication failed",
+                }),
+            );
+        },
+      },
+      contextReport: async () => {
+        reportCount += 1;
+        return Result.ok({ text: "snapshot report", accentColor: 0x5865f2 });
+      },
+    });
+    const requests: Array<DecodedLilacMessageForTopic<"cmd.request">> = [];
+    const requestSub = await subscribeTopicForTest(
+      bus,
+      "cmd.request",
+      { mode: "fanout", subscriptionId: "context-active-requests", consumerId: "test" },
+      async (request) => {
+        requests.push(request);
+        return Result.ok(undefined);
+      },
+    );
+    await bus.publish(
+      lilacEventTypes.EvtRequestLifecycleChanged,
+      { state: "running", ts: Date.now() },
+      {
+        headers: {
+          request_id: "discord:channel:active",
+          session_id: "channel",
+          request_client: "discord",
+        },
+      },
+    );
+
+    const eventData = {
+      platform: "discord",
+      channelId: "channel",
+      messageId: "context",
+      userId: "user",
+      userName: "User",
+      text: message.text,
+      ts: message.ts,
+      raw: {
+        discord: {
+          isDMBased: false,
+          mentionsBot: false,
+          replyToBot: false,
+          botUserId: "bot",
+        },
+      },
+    } as const;
+    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, eventData);
+
+    expect(requests).toHaveLength(0);
+    expect(reportCount).toBe(0);
+    expect(
+      raw.deliveryActions
+        .filter(({ topic }) => topic === "evt.adapter")
+        .map(({ action }) => action.disposition)
+        .at(-1),
+    ).toBe("park-pending");
+
+    await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, eventData);
+
+    expect(requests).toHaveLength(1);
+    expect(reportCount).toBe(1);
+    expect(requests[0]?.headers?.request_id).toBe("discord:channel:active");
+    expect(requests[0]?.data.queue).toBe("followUp");
+    expect(collectUserText(requests[0]?.data.messages ?? [])).toContain("!context");
+    expect(
+      raw.deliveryActions
+        .filter(({ topic }) => topic === "evt.adapter")
+        .map(({ action }) => action.disposition)
+        .slice(-2),
+    ).toEqual(["park-pending", "commit"]);
+
+    await requestSub.stop();
+    await router.stop();
+    await bus.close();
+  });
+});
+
 describe("Discord authenticated-origin publication", () => {
+  it("rejects an ingress identity whose complete message ref does not match", async () => {
+    const logger = new Logger({ module: "discord-origin-correlation-test" });
+    const msgRef = { platform: "discord" as const, channelId: "channel", messageId: "message" };
+    const message: SurfaceMessage = {
+      ref: msgRef,
+      session: { platform: "discord", channelId: "channel" },
+      userId: "authenticated-user",
+      text: "hello",
+      ts: 1,
+      raw: { discord: { isChat: true } },
+    };
+    const mismatchedIngress: SurfaceMessage = {
+      ...message,
+      ref: { ...msgRef, channelId: "other-channel" },
+      session: { platform: "discord", channelId: "other-channel" },
+      userId: "uncorrelated-user",
+    };
+    const adapter = new FakeAdapter({ "channel:message": message });
+    const readMsg = spyOn(adapter, "readMsg").mockResolvedValue(Result.ok(message));
+    const blobStore = await getTestBlobStore();
+    let publishedRaw: unknown;
+
+    const result = await publishSingleMessagePrompt({
+      adapter,
+      blobStore,
+      resourceRegistry: createTestResourceRegistry(),
+      requestDelivery: {
+        prepareAndPublish: async (input) => {
+          publishedRaw = input.envelope.data.raw;
+          return Result.ok(undefined);
+        },
+      },
+      cfg: parseCoreConfigV1ToUniversal({}),
+      logger,
+      input: {
+        requestId: "discord:channel:message",
+        sessionId: "channel",
+        sessionConfigId: "channel",
+        msgRef,
+        ingressMessage: mismatchedIngress,
+        sessionMode: "mention",
+      },
+    });
+
+    expect(result).toEqual(Result.ok(undefined));
+    expect(readMsg).toHaveBeenCalledTimes(2);
+    expect(publishedRaw).toMatchObject({
+      authenticatedOrigin: {
+        platform: "discord",
+        userId: "authenticated-user",
+        messageRef: msgRef,
+      },
+    });
+    readMsg.mockRestore();
+  });
+
   it("does not publish when the authenticated-origin re-read fails", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
@@ -586,6 +905,19 @@ describe("Discord authenticated-origin publication", () => {
       userId: "authenticated-user",
       text: "hello",
       ts: 1,
+      raw: {
+        discord: {
+          attachments: [
+            {
+              id: "attachment-1",
+              url: "https://cdn.discordapp.com/attachments/1/2/image.png",
+              filename: "image.png",
+              mimeType: "image/png",
+              size: 4,
+            },
+          ],
+        },
+      },
     };
     const adapter = new FakeAdapter({ "channel:message": message });
     const failure = new SurfaceUnavailable({
@@ -599,11 +931,27 @@ describe("Discord authenticated-origin publication", () => {
       return reads === 1 ? Result.ok(message) : Result.err(failure);
     });
     const publish = spyOn(raw, "publish");
+    const fetchAttachment = spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(new Uint8Array([1, 2, 3, 4]), {
+        headers: { "content-type": "image/png" },
+      }),
+    );
+    const blobStore = await getTestBlobStore();
+    const deletedRequestHandles: string[] = [];
+    const originalDelete = blobStore.delete.bind(blobStore);
+    const deleteBlob = spyOn(blobStore, "delete").mockImplementation(async (target) => {
+      if (!("sha256" in target)) deletedRequestHandles.push(target.objectId);
+      return originalDelete(target);
+    });
 
     try {
       const result = await publishSingleMessagePrompt({
         adapter,
-        bus,
+        blobStore,
+        resourceRegistry: createTestResourceRegistry(),
+        requestDelivery: {
+          prepareAndPublish: async () => Result.ok(undefined),
+        },
         cfg: parseCoreConfigV1ToUniversal({}),
         logger,
         input: {
@@ -617,8 +965,12 @@ describe("Discord authenticated-origin publication", () => {
 
       expect(result).toEqual(Result.err(failure));
       expect(reads).toBe(2);
+      expect(deletedRequestHandles).toHaveLength(0);
+      expect(fetchAttachment).not.toHaveBeenCalled();
       expect(publish).not.toHaveBeenCalled();
     } finally {
+      deleteBlob.mockRestore();
+      fetchAttachment.mockRestore();
       await bus.close();
     }
   });
@@ -646,6 +998,77 @@ describe("formatBufferedMessageForGateTranscript", () => {
 });
 
 describe("Discord request router context fallbacks", () => {
+  it("uses cached neighboring context without calling Discord", async () => {
+    const adapter = new FakeAdapter({});
+    const getReplyContext = spyOn(adapter, "getReplyContext").mockRejectedValue(
+      new Panic({ message: "live context should not be read" }),
+    );
+    const input = {
+      msgRef: { platform: "discord" as const, channelId: "channel", messageId: "message" },
+      triggerTs: 2,
+    };
+
+    const resolved = await resolvePreviousMessageText({
+      adapter,
+      messageCache: {
+        getIndexedMessage: () => null,
+        listIndexedMessagesBefore: () => [
+          {
+            ref: { platform: "discord", channelId: "channel", messageId: "previous" },
+            session: { platform: "discord", channelId: "channel" },
+            userId: "user",
+            text: "cached previous",
+            ts: 1,
+            deleted: false,
+            updatedTs: 1,
+            attachments: [],
+          },
+        ],
+      },
+      input,
+    });
+
+    expect(resolved).toBe("cached previous");
+    expect(getReplyContext).not.toHaveBeenCalled();
+    getReplyContext.mockRestore();
+  });
+
+  it("uses a linked bot transcript for replied-message context without calling Discord", async () => {
+    const adapter = new FakeAdapter({});
+    const readMsg = spyOn(adapter, "readMsg").mockRejectedValue(
+      new Panic({ message: "live message should not be read" }),
+    );
+    const transcriptStore = new SqliteTranscriptStore(":memory:");
+    transcriptStore.saveRequestTranscript({
+      requestId: "request",
+      sessionId: "channel",
+      requestClient: "discord",
+      messages: [{ role: "assistant", content: "stored answer" }],
+      finalText: "stored answer",
+    });
+    const replyRef = {
+      platform: "discord" as const,
+      channelId: "channel",
+      messageId: "answer",
+    };
+    transcriptStore.linkSurfaceMessagesToRequest({
+      requestId: "request",
+      created: [replyRef],
+      last: replyRef,
+    });
+
+    const resolved = await resolveRepliedToMessageText({
+      adapter,
+      transcriptStore,
+      input: { sessionId: "channel", replyToMessageId: "answer" },
+    });
+
+    expect(resolved).toBe("stored answer");
+    expect(readMsg).not.toHaveBeenCalled();
+    transcriptStore.close();
+    readMsg.mockRestore();
+  });
+
   it("preserves Panic from previous-message context and falls back for a typed failure", async () => {
     const adapter = new FakeAdapter({});
     const panic = new Panic({ message: "reply context invariant failed" });
@@ -1455,9 +1878,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     const evt = received[0];
     expect(evt.data.queue).toBe("prompt");
@@ -1523,7 +1943,7 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    const baseTranscript: ModelMessage[] = [
+    const baseTranscript: StoredMessageV1[] = [
       { role: "assistant", content: "stored assistant context" },
     ];
 
@@ -1609,14 +2029,11 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
     expect(received[0].data.corePrimaryLineage).toEqual({
       state: "fresh-only",
-      lineageVersion: 1,
+      lineageVersion: 2,
       currentCanonicalStart: 1,
       reason: "projection-store-unavailable",
     });
@@ -1708,9 +2125,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: false, mentionsBot: true, replyToBot: false },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -1806,9 +2220,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(0);
 
     await sub.stop();
@@ -1836,7 +2247,7 @@ describe("startBusRequestRouter", () => {
       subscriptionId: "router-suppression-log",
       config: parseCoreConfigV1ToUniversal({}),
       logger,
-      shouldSuppressAdapterEvent: async () => {
+      shouldSuppressAdapterEvent: () => {
         throw new RouterTestHookFailure({
           cause: { authorization: "Bearer cause-secret" },
           message: "hook failed token=sk-super-secret",
@@ -2264,7 +2675,7 @@ describe("startBusRequestRouter", () => {
     await router.stop();
   });
 
-  it("inherits parent mode and guild additionalPrompts for Discord threads", async () => {
+  it("inherits guild mode, gate, and additionalPrompts for Discord threads", async () => {
     const raw = createInMemoryRawBus();
     const bus = createLilacBus(raw);
 
@@ -2306,8 +2717,12 @@ describe("startBusRequestRouter", () => {
           router: {
             defaultMode: "mention",
             sessionModes: {
-              [parentChannelId]: { mode: "active", gate: false },
-              [guildId]: { additionalPrompts: ["guild memo"] },
+              [parentChannelId]: { model: "parent-model" },
+              [guildId]: {
+                mode: "active",
+                gate: false,
+                additionalPrompts: ["guild memo"],
+              },
             },
             activeDebounceMs: 5,
             activeGate: { enabled: true, timeoutMs: 2500 },
@@ -2912,7 +3327,6 @@ describe("startBusRequestRouter", () => {
         raw: { reference: {} },
       },
     });
-
     let gateInput: any = null;
     const router = await startBusRequestRouter({
       adapter,
@@ -3399,9 +3813,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(collectUserText(received[0].data.messages as ModelMessage[])).toContain("tell me more");
     expect(collectUserText(received[0].data.messages as ModelMessage[])).not.toContain("!cont=");
@@ -3610,11 +4021,39 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
+    const getReplyContext = spyOn(adapter, "getReplyContext");
+    const readMsg = spyOn(adapter, "readMsg");
 
     let gateInput: any = null;
     const router = await startBusRequestRouter({
       adapter,
       bus,
+      messageCache: {
+        getIndexedMessage: () => ({
+          ref: { platform: "discord", channelId: sessionId, messageId: repliedToId },
+          session: { platform: "discord", channelId: sessionId },
+          userId: "bot",
+          userName: "lilac",
+          text: "bot answer to prior question",
+          ts: now - 20,
+          deleted: false,
+          updatedTs: now - 20,
+          attachments: [],
+        }),
+        listIndexedMessagesBefore: () => [
+          {
+            ref: { platform: "discord", channelId: sessionId, messageId: beforeId },
+            session: { platform: "discord", channelId: sessionId },
+            userId: "u2",
+            userName: "user2",
+            text: "side note before the new reply",
+            ts: now - 5,
+            deleted: false,
+            updatedTs: now - 5,
+            attachments: [],
+          },
+        ],
+      },
       subscriptionId: "router-test",
       routerGate: async (input) => {
         gateInput = input;
@@ -3683,18 +4122,19 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(0);
     expect(gateInput).not.toBeNull();
     expect(gateInput.context?.mode).toBe("direct-reply-mention-disambiguation");
     expect(gateInput.context?.triggerMessageText).toContain("@otherbot what do you think?");
     expect(gateInput.context?.repliedToMessageText).toContain("bot answer");
     expect(gateInput.context?.previousMessageText).toContain("side note");
+    expect(getReplyContext).not.toHaveBeenCalled();
+    expect(readMsg).not.toHaveBeenCalled();
 
     await sub.stop();
     await router.stop();
+    getReplyContext.mockRestore();
+    readMsg.mockRestore();
   });
 
   it("routes in-flight active channel non-reply messages as buffered prompts", async () => {
@@ -3792,9 +4232,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: false, mentionsBot: false, replyToBot: false },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -3903,9 +4340,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: true, mentionsBot: false, replyToBot: false },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("followUp");
@@ -4073,9 +4507,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(3);
     expect(received.map((m) => m.data.queue)).toEqual(["prompt", "prompt", "steer"]);
     expect(received[0].headers?.request_id).toBe(`queued:${activeRequestId}`);
@@ -4227,9 +4658,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: false, mentionsBot: true, replyToBot: false },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(2);
     expect(received[0].data.queue).toBe("prompt");
@@ -4399,9 +4827,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(2);
     expect(received[0].data.queue).toBe("prompt");
     expect(received[0].headers?.request_id).toBe(`discord:${sessionId}:${replyMsgId}`);
@@ -4415,827 +4840,6 @@ describe("startBusRequestRouter", () => {
     await subSurface.stop();
     await sub.stop();
     await router.stop();
-  });
-
-  it.each([
-    {
-      name: "matching terminal before seed",
-      terminalTiming: "before",
-      terminalSession: "matching",
-      expectedQueue: "prompt",
-      expectedRequest: "fresh",
-      expectedTerminalDisposition: "commit",
-      publishRunningBeforeActivation: false,
-      advanceClockBeforeActivation: true,
-    },
-    {
-      name: "wrong-session terminal before seed",
-      terminalTiming: "before",
-      terminalSession: "wrong",
-      expectedQueue: "steer",
-      expectedRequest: "restored",
-      expectedTerminalDisposition: "commit",
-      publishRunningBeforeActivation: false,
-      advanceClockBeforeActivation: false,
-    },
-    {
-      name: "matching terminal followed by an explicit new running lifecycle",
-      terminalTiming: "before",
-      terminalSession: "matching",
-      expectedQueue: "steer",
-      expectedRequest: "restored",
-      expectedTerminalDisposition: "commit",
-      publishRunningBeforeActivation: true,
-      advanceClockBeforeActivation: false,
-    },
-    {
-      name: "matching terminal after seed",
-      terminalTiming: "after",
-      terminalSession: "matching",
-      expectedQueue: "prompt",
-      expectedRequest: "fresh",
-      expectedTerminalDisposition: "commit",
-      publishRunningBeforeActivation: false,
-      advanceClockBeforeActivation: false,
-    },
-    {
-      name: "wrong-session terminal after seed",
-      terminalTiming: "after",
-      terminalSession: "wrong",
-      expectedQueue: "steer",
-      expectedRequest: "restored",
-      expectedTerminalDisposition: "dead-letter",
-      publishRunningBeforeActivation: false,
-      advanceClockBeforeActivation: false,
-    },
-  ] as const)(
-    "handles $name without resurrecting or suppressing the wrong route",
-    async (testCase) => {
-      const raw = createInMemoryRawBus();
-      const bus = createLilacBus(raw);
-      const sessionId = `terminal-race-${testCase.terminalTiming}-${testCase.terminalSession}`;
-      const requestId = `discord:${sessionId}:restored-anchor`;
-      const restoredOutputId = "restored-output";
-      const replyMessageId = "reply-to-restored-output";
-      const now = Date.now();
-      const nowSpy = spyOn(Date, "now");
-      const adapter = new FakeAdapter({
-        [`${sessionId}:${replyMessageId}`]: {
-          ref: { platform: "discord", channelId: sessionId, messageId: replyMessageId },
-          session: { platform: "discord", channelId: sessionId },
-          userId: "u1",
-          userName: "user1",
-          text: "<@bot> route after terminal race",
-          ts: now,
-          raw: { reference: {} },
-        },
-      });
-      const config = parseCoreConfigV1ToUniversal({});
-      config.surface.router.defaultMode = "mention";
-      const router = await startBusRequestRouter({
-        adapter,
-        bus,
-        subscriptionId: `terminal-race-router-${testCase.terminalTiming}-${testCase.terminalSession}`,
-        config,
-        routerGate: async () => ({ forward: true, reason: "deterministic terminal route" }),
-      });
-      let activatedGeneration: Parameters<typeof router.restoreActiveOutputChains>[0] | null = null;
-      const relay = await bridgeBusToAdapter({
-        adapter,
-        bus,
-        platform: "discord",
-        policy: createDiscordRelayPolicy(adapter, {
-          activateRestoredOutputChains: (generation, chains) => {
-            activatedGeneration = generation;
-            router.restoreActiveOutputChains(generation, chains);
-          },
-        }),
-        subscriptionId: `terminal-race-relay-${testCase.terminalTiming}-${testCase.terminalSession}`,
-      });
-      const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
-      const requestSub = await subscribeTopicForTest(
-        bus,
-        "cmd.request",
-        {
-          mode: "fanout",
-          subscriptionId: `terminal-race-requests-${testCase.terminalTiming}-${testCase.terminalSession}`,
-          consumerId: `terminal-race-consumer-${testCase.terminalTiming}-${testCase.terminalSession}`,
-        },
-        async (message) => {
-          if (message.type === lilacEventTypes.CmdRequestMessage) {
-            requests.push({
-              requestId: message.headers?.request_id,
-              queue: message.data.queue,
-            });
-          }
-          return Result.ok(undefined);
-        },
-      );
-      const publishTerminal = () =>
-        bus.publish(
-          lilacEventTypes.EvtRequestLifecycleChanged,
-          { state: "resolved", ts: now },
-          {
-            headers: {
-              request_id: requestId,
-              session_id:
-                testCase.terminalSession === "matching" ? sessionId : `${sessionId}-wrong`,
-              request_client: "discord",
-            },
-          },
-        );
-      try {
-        if (testCase.terminalTiming === "before") {
-          await publishTerminal();
-          expect(raw.deliveryActions.at(-1)?.action.disposition).toBe(
-            testCase.expectedTerminalDisposition,
-          );
-        }
-        if (testCase.advanceClockBeforeActivation) {
-          nowSpy.mockReturnValue(now + 10 * 365 * 24 * 60 * 60 * 1000);
-        }
-        if (testCase.publishRunningBeforeActivation) {
-          await bus.publish(
-            lilacEventTypes.EvtRequestLifecycleChanged,
-            { state: "running", ts: now + 1 },
-            {
-              headers: {
-                request_id: requestId,
-                session_id: sessionId,
-                request_client: "discord",
-              },
-            },
-          );
-        }
-        const recoveryChain = {
-          requestId,
-          sessionId,
-          createdOutputRefs: [
-            { platform: "discord" as const, channelId: sessionId, messageId: restoredOutputId },
-          ],
-          activeOutputRefs: [
-            { platform: "discord" as const, channelId: sessionId, messageId: restoredOutputId },
-          ],
-        };
-        const prepared = relay.prepareRestoreRelays([
-          {
-            ...recoveryChain,
-            requestClient: "discord",
-            platform: "discord",
-            visibleText: "restored response",
-            toolStatus: [],
-          },
-        ]);
-        if (prepared.status === "error") throw prepared.error;
-        expect((await prepared.value.apply()).status).toBe("ok");
-        prepared.value.activate();
-        prepared.value.activate();
-        if (testCase.terminalTiming === "after") {
-          await publishTerminal();
-          expect(raw.deliveryActions.at(-1)?.action.disposition).toBe(
-            testCase.expectedTerminalDisposition,
-          );
-          if (testCase.terminalSession === "wrong") {
-            expect(
-              raw.deliveryActions.some(
-                ({ topic, action }) =>
-                  topic === "evt.request" && action.disposition === "dead-letter",
-              ),
-            ).toBe(true);
-          }
-        }
-        const generation = activatedGeneration;
-        if (!generation) throw new Error("Expected restored output-chain activation generation");
-        router.restoreActiveOutputChains(generation, [recoveryChain]);
-
-        await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-          platform: "discord",
-          channelId: sessionId,
-          messageId: replyMessageId,
-          userId: "u1",
-          userName: "user1",
-          text: "<@bot> route after terminal race",
-          ts: now,
-          raw: {
-            discord: {
-              isDMBased: false,
-              mentionsBot: true,
-              replyToBot: true,
-              replyToMessageId: restoredOutputId,
-            },
-          },
-        });
-
-        expect(requests).toEqual([
-          {
-            requestId:
-              testCase.expectedRequest === "restored"
-                ? requestId
-                : `discord:${sessionId}:${replyMessageId}`,
-            queue: testCase.expectedQueue,
-          },
-        ]);
-      } finally {
-        nowSpy.mockRestore();
-        await requestSub.stop();
-        await relay.stop();
-        await router.stop();
-        await bus.close();
-      }
-    },
-  );
-
-  it.each([
-    { name: "at exact capacity", terminalCount: 2, expectedInitialQueue: "steer" },
-    { name: "after overflow", terminalCount: 3, expectedInitialQueue: "prompt" },
-  ] as const)("keeps restored-chain admission fail-closed $name", async (testCase) => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const sessions = ["capacity-target-a", "capacity-target-b"] as const;
-    const requestsBySession = new Map(
-      sessions.map((sessionId) => [sessionId, `discord:${sessionId}:restored-anchor`] as const),
-    );
-    const repliesBySession = new Map(
-      sessions.map((sessionId) => [sessionId, `${sessionId}-reply`] as const),
-    );
-    const outputId = "restored-output";
-    const reuseReplyId = "capacity-target-a-reuse-reply";
-    const now = Date.now();
-    const messages: Record<string, SurfaceMessage> = {};
-    for (const sessionId of sessions) {
-      const replyMessageId = repliesBySession.get(sessionId);
-      if (!replyMessageId) throw new Error("Expected capacity reply identity");
-      messages[`${sessionId}:${replyMessageId}`] = {
-        ref: { platform: "discord", channelId: sessionId, messageId: replyMessageId },
-        session: { platform: "discord", channelId: sessionId },
-        userId: "u1",
-        userName: "user1",
-        text: "<@bot> route capacity reply",
-        ts: now,
-        raw: { reference: {} },
-      };
-    }
-    messages[`capacity-target-a:${reuseReplyId}`] = {
-      ref: { platform: "discord", channelId: "capacity-target-a", messageId: reuseReplyId },
-      session: { platform: "discord", channelId: "capacity-target-a" },
-      userId: "u1",
-      userName: "user1",
-      text: "<@bot> route after overflow finalization",
-      ts: now + 1,
-      raw: { reference: {} },
-    };
-    const adapter = new FakeAdapter(messages);
-    const config = parseCoreConfigV1ToUniversal({});
-    config.surface.router.defaultMode = "mention";
-    const router = await startBusRequestRouter({
-      adapter,
-      bus,
-      subscriptionId: `capacity-router-${testCase.terminalCount}`,
-      config,
-      recoveryTombstoneCapacity: 2,
-      routerGate: async () => ({ forward: true, reason: "deterministic capacity route" }),
-    });
-    const relay = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      policy: createDiscordRelayPolicy(adapter, {
-        activateRestoredOutputChains: (generation, chains) =>
-          router.restoreActiveOutputChains(generation, chains),
-      }),
-      subscriptionId: `capacity-relay-${testCase.terminalCount}`,
-    });
-    const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
-    const requestSub = await subscribeTopicForTest(
-      bus,
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: `capacity-requests-${testCase.terminalCount}`,
-        consumerId: `capacity-consumer-${testCase.terminalCount}`,
-      },
-      async (message) => {
-        if (message.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push({ requestId: message.headers?.request_id, queue: message.data.queue });
-        }
-        return Result.ok(undefined);
-      },
-    );
-    try {
-      for (let index = 0; index < testCase.terminalCount; index += 1) {
-        await bus.publish(
-          lilacEventTypes.EvtRequestLifecycleChanged,
-          { state: "resolved", ts: now + index },
-          {
-            headers: {
-              request_id: `discord:capacity-terminal-${index}:anchor`,
-              session_id: `capacity-terminal-${index}`,
-              request_client: "discord",
-            },
-          },
-        );
-      }
-      const snapshots = sessions.map((sessionId) => {
-        const requestId = requestsBySession.get(sessionId);
-        if (!requestId) throw new Error("Expected capacity request identity");
-        return {
-          requestId,
-          sessionId,
-          requestClient: "discord",
-          platform: "discord" as const,
-          createdOutputRefs: [
-            { platform: "discord" as const, channelId: sessionId, messageId: outputId },
-          ],
-          activeOutputRefs: [
-            { platform: "discord" as const, channelId: sessionId, messageId: outputId },
-          ],
-          visibleText: "restored response",
-          toolStatus: [],
-        };
-      });
-      const prepared = relay.prepareRestoreRelays(snapshots);
-      if (prepared.status === "error") throw prepared.error;
-      expect((await prepared.value.apply()).status).toBe("ok");
-      prepared.value.activate();
-
-      for (const sessionId of sessions) {
-        const replyMessageId = repliesBySession.get(sessionId);
-        if (!replyMessageId) throw new Error("Expected capacity reply identity");
-        await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-          platform: "discord",
-          channelId: sessionId,
-          messageId: replyMessageId,
-          userId: "u1",
-          userName: "user1",
-          text: "<@bot> route capacity reply",
-          ts: now,
-          raw: {
-            discord: {
-              isDMBased: false,
-              mentionsBot: true,
-              replyToBot: true,
-              replyToMessageId: outputId,
-            },
-          },
-        });
-      }
-
-      expect(requests.map((request) => request.queue)).toEqual([
-        testCase.expectedInitialQueue,
-        testCase.expectedInitialQueue,
-      ]);
-      if (testCase.terminalCount === 3) {
-        expect(requests.map((request) => request.requestId)).toEqual(
-          sessions.map((sessionId) => `discord:${sessionId}:${repliesBySession.get(sessionId)}`),
-        );
-        const reuseSessionId = sessions[0];
-        const reuseRequestId = requestsBySession.get(reuseSessionId);
-        if (!reuseRequestId) throw new Error("Expected reuse request identity");
-        await bus.publish(
-          lilacEventTypes.EvtRequestLifecycleChanged,
-          { state: "running", ts: now + 1 },
-          {
-            headers: {
-              request_id: reuseRequestId,
-              session_id: reuseSessionId,
-              request_client: "discord",
-            },
-          },
-        );
-        await bus.publish(
-          lilacEventTypes.EvtSurfaceOutputMessageCreated,
-          {
-            msgRef: { platform: "discord", channelId: reuseSessionId, messageId: outputId },
-          },
-          {
-            headers: {
-              request_id: reuseRequestId,
-              session_id: reuseSessionId,
-              request_client: "discord",
-            },
-          },
-        );
-        await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-          platform: "discord",
-          channelId: reuseSessionId,
-          messageId: reuseReplyId,
-          userId: "u1",
-          userName: "user1",
-          text: "<@bot> route after overflow finalization",
-          ts: now + 1,
-          raw: {
-            discord: {
-              isDMBased: false,
-              mentionsBot: true,
-              replyToBot: true,
-              replyToMessageId: outputId,
-            },
-          },
-        });
-        expect(requests.at(-1)).toEqual({ requestId: reuseRequestId, queue: "steer" });
-      } else {
-        expect(requests.map((request) => request.requestId)).toEqual(
-          sessions.map((sessionId) => requestsBySession.get(sessionId)),
-        );
-      }
-    } finally {
-      await requestSub.stop();
-      await relay.stop();
-      await router.stop();
-      await bus.close();
-    }
-  });
-
-  it("routes replies through a restored output chain only after recovery activation", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const sessionId = "restored-chain";
-    const requestId = `discord:${sessionId}:anchor`;
-    const restoredOutputId = "restored-output";
-    const newOutputId = "new-output";
-    const steerMessageId = "reply-steer";
-    const followUpMessageId = "reply-follow-up";
-    const now = Date.now();
-    const adapter = new FakeAdapter({
-      [`${sessionId}:${steerMessageId}`]: {
-        ref: { platform: "discord", channelId: sessionId, messageId: steerMessageId },
-        session: { platform: "discord", channelId: sessionId },
-        userId: "u1",
-        userName: "user1",
-        text: "<@bot> steer restored request",
-        ts: now,
-        raw: { reference: {} },
-      },
-      [`${sessionId}:${followUpMessageId}`]: {
-        ref: { platform: "discord", channelId: sessionId, messageId: followUpMessageId },
-        session: { platform: "discord", channelId: sessionId },
-        userId: "u1",
-        userName: "user1",
-        text: "continue on new output",
-        ts: now + 1,
-        raw: { reference: {} },
-      },
-    });
-    const config = parseCoreConfigV1ToUniversal({});
-    config.surface.router.defaultMode = "active";
-    const router = await startBusRequestRouter({
-      adapter,
-      bus,
-      subscriptionId: "restored-chain-router",
-      config,
-      routerGate: async () => ({ forward: true, reason: "deterministic recovery route" }),
-    });
-    const relay = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      policy: createDiscordRelayPolicy(adapter, {
-        activateRestoredOutputChains: (generation, chains) =>
-          router.restoreActiveOutputChains(generation, chains),
-      }),
-      subscriptionId: "restored-chain-relay",
-    });
-    const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
-    const requestSub = await subscribeTopicForTest(
-      bus,
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "restored-chain-requests",
-        consumerId: "restored-chain-consumer",
-      },
-      async (message) => {
-        if (message.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push({
-            requestId: message.headers?.request_id,
-            queue: message.data.queue,
-          });
-        }
-        return Result.ok(undefined);
-      },
-    );
-    const publish = spyOn(raw, "publish");
-    try {
-      const prepared = relay.prepareRestoreRelays([
-        {
-          requestId,
-          sessionId,
-          requestClient: "discord",
-          platform: "discord",
-          createdOutputRefs: [
-            { platform: "discord", channelId: sessionId, messageId: "older-output" },
-            { platform: "discord", channelId: sessionId, messageId: restoredOutputId },
-          ],
-          activeOutputRefs: [
-            { platform: "discord", channelId: sessionId, messageId: restoredOutputId },
-          ],
-          visibleText: "restored response",
-          toolStatus: [],
-        },
-      ]);
-      if (prepared.status === "error") throw prepared.error;
-      expect((await prepared.value.apply()).status).toBe("ok");
-      expect(publish).not.toHaveBeenCalled();
-
-      prepared.value.activate();
-      prepared.value.activate();
-      expect(publish).not.toHaveBeenCalled();
-
-      await bus.publish(
-        lilacEventTypes.EvtRequestLifecycleChanged,
-        { state: "running", ts: Date.now() },
-        {
-          headers: {
-            request_id: requestId,
-            session_id: sessionId,
-            request_client: "discord",
-          },
-        },
-      );
-      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-        platform: "discord",
-        channelId: sessionId,
-        messageId: steerMessageId,
-        userId: "u1",
-        userName: "user1",
-        text: "<@bot> steer restored request",
-        ts: now,
-        raw: {
-          discord: {
-            isDMBased: false,
-            mentionsBot: true,
-            replyToBot: true,
-            replyToMessageId: restoredOutputId,
-          },
-        },
-      });
-      expect(requests).toEqual([{ requestId, queue: "steer" }]);
-
-      await bus.publish(
-        lilacEventTypes.EvtSurfaceOutputMessageCreated,
-        {
-          msgRef: { platform: "discord", channelId: sessionId, messageId: newOutputId },
-        },
-        {
-          headers: {
-            request_id: requestId,
-            session_id: sessionId,
-            request_client: "discord",
-          },
-        },
-      );
-      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-        platform: "discord",
-        channelId: sessionId,
-        messageId: followUpMessageId,
-        userId: "u1",
-        userName: "user1",
-        text: "continue on new output",
-        ts: now + 1,
-        raw: {
-          discord: {
-            isDMBased: false,
-            mentionsBot: false,
-            replyToBot: true,
-            replyToMessageId: newOutputId,
-          },
-        },
-      });
-      expect(requests).toEqual([
-        { requestId, queue: "steer" },
-        { requestId, queue: "followUp" },
-      ]);
-    } finally {
-      publish.mockRestore();
-      await requestSub.stop();
-      await relay.stop();
-      await router.stop();
-      await bus.close();
-    }
-  });
-
-  it("preserves a newer active request when stale recovery activates", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const sessionId = "newer-active-before-recovery";
-    const restoredRequestId = `discord:${sessionId}:restored-anchor`;
-    const newerRequestId = `discord:${sessionId}:newer-anchor`;
-    const messageId = "steer-newer-request";
-    const now = Date.now();
-    const adapter = new FakeAdapter({
-      [`${sessionId}:${messageId}`]: {
-        ref: { platform: "discord", channelId: sessionId, messageId },
-        session: { platform: "discord", channelId: sessionId },
-        userId: "u1",
-        userName: "user1",
-        text: "<@bot> keep the live request",
-        ts: now,
-        raw: { reference: {} },
-      },
-    });
-    const config = parseCoreConfigV1ToUniversal({});
-    config.surface.router.defaultMode = "active";
-    const router = await startBusRequestRouter({
-      adapter,
-      bus,
-      subscriptionId: "newer-active-before-recovery-router",
-      config,
-      routerGate: async () => ({ forward: true, reason: "deterministic recovery conflict" }),
-    });
-    const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
-    const requestSub = await subscribeTopicForTest(
-      bus,
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "newer-active-before-recovery-requests",
-        consumerId: "newer-active-before-recovery-consumer",
-      },
-      async (message) => {
-        if (message.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push({ requestId: message.headers?.request_id, queue: message.data.queue });
-        }
-        return Result.ok(undefined);
-      },
-    );
-    try {
-      await bus.publish(
-        lilacEventTypes.EvtRequestLifecycleChanged,
-        { state: "running", ts: now },
-        {
-          headers: {
-            request_id: newerRequestId,
-            session_id: sessionId,
-            request_client: "discord",
-          },
-        },
-      );
-      router.restoreActiveOutputChains({ generation: Symbol("stale-recovery") }, [
-        {
-          requestId: restoredRequestId,
-          sessionId,
-          createdOutputRefs: [
-            {
-              platform: "discord",
-              channelId: sessionId,
-              messageId: "restored-output",
-            },
-          ],
-        },
-      ]);
-
-      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-        platform: "discord",
-        channelId: sessionId,
-        messageId,
-        userId: "u1",
-        userName: "user1",
-        text: "<@bot> keep the live request",
-        ts: now,
-        raw: {
-          discord: {
-            isDMBased: false,
-            mentionsBot: true,
-            replyToBot: false,
-          },
-        },
-      });
-
-      expect(requests).toEqual([{ requestId: newerRequestId, queue: "steer" }]);
-    } finally {
-      await requestSub.stop();
-      await router.stop();
-      await bus.close();
-    }
-  });
-
-  it("leaves the Discord router unseeded when exact snapshot consume conflicts", async () => {
-    const raw = createInMemoryRawBus();
-    const bus = createLilacBus(raw);
-    const sessionId = "restore-consume-failure";
-    const restoredRequestId = `discord:${sessionId}:restored-anchor`;
-    const restoredOutputId = "restored-output";
-    const replyMessageId = "reply-after-conflict";
-    const now = Date.now();
-    const adapter = new FakeAdapter({
-      [`${sessionId}:${replyMessageId}`]: {
-        ref: { platform: "discord", channelId: sessionId, messageId: replyMessageId },
-        session: { platform: "discord", channelId: sessionId },
-        userId: "u1",
-        userName: "user1",
-        text: "<@bot> start fresh",
-        ts: now,
-        raw: { reference: {} },
-      },
-    });
-    const config = parseCoreConfigV1ToUniversal({});
-    config.surface.router.defaultMode = "mention";
-    const router = await startBusRequestRouter({
-      adapter,
-      bus,
-      subscriptionId: "restore-consume-failure-router",
-      config,
-      routerGate: async () => ({ forward: true, reason: "deterministic recovery route" }),
-    });
-    const relay = await bridgeBusToAdapter({
-      adapter,
-      bus,
-      platform: "discord",
-      policy: createDiscordRelayPolicy(adapter, {
-        activateRestoredOutputChains: (generation, chains) =>
-          router.restoreActiveOutputChains(generation, chains),
-      }),
-      subscriptionId: "restore-consume-failure-relay",
-    });
-    const directory = await mkdtemp(path.join(tmpdir(), "lilac-router-restore-conflict-"));
-    const store = new SqliteGracefulRestartStore(path.join(directory, "restart.db"));
-    const requests: Array<{ readonly requestId?: string; readonly queue: string }> = [];
-    const requestSub = await subscribeTopicForTest(
-      bus,
-      "cmd.request",
-      {
-        mode: "fanout",
-        subscriptionId: "restore-consume-failure-requests",
-        consumerId: "restore-consume-failure-consumer",
-      },
-      async (message) => {
-        if (message.type === lilacEventTypes.CmdRequestMessage) {
-          requests.push({
-            requestId: message.headers?.request_id,
-            queue: message.data.queue,
-          });
-        }
-        return Result.ok(undefined);
-      },
-    );
-    try {
-      const relaySnapshot = {
-        requestId: restoredRequestId,
-        sessionId,
-        requestClient: "discord",
-        platform: "discord" as const,
-        createdOutputRefs: [
-          { platform: "discord" as const, channelId: sessionId, messageId: restoredOutputId },
-        ],
-        visibleText: "restored response",
-        toolStatus: [],
-      };
-      const snapshot = {
-        version: GRACEFUL_RESTART_SNAPSHOT_VERSION,
-        createdAt: Date.now(),
-        deadlineMs: 60_000,
-        queueAttemptProof: "complete" as const,
-        agent: [],
-        queueAttempts: [],
-        relays: [relaySnapshot],
-      };
-      const saved = store.saveCompletedSnapshot(snapshot);
-      if (saved.status === "error") throw saved.error;
-      const read = store.readCompletedSnapshot();
-      if (read.status === "error" || read.value.state !== "loaded") {
-        throw new Error("Expected restorable Discord snapshot");
-      }
-      const prepared = relay.prepareRestoreRelays([relaySnapshot]);
-      if (prepared.status === "error") throw prepared.error;
-      expect((await prepared.value.apply()).status).toBe("ok");
-
-      const replacement = store.saveCompletedSnapshot({ ...snapshot, createdAt: Date.now() + 1 });
-      if (replacement.status === "error") throw replacement.error;
-      const consumed = store.consumeCompletedSnapshot(read.value.rowToken);
-      expect(consumed.status).toBe("error");
-      if (consumed.status === "ok") throw new Error("Expected snapshot disposition conflict");
-      expect(consumed.error).toBeInstanceOf(GracefulRestartDispositionConflict);
-      expect((await prepared.value.rollback()).status).toBe("ok");
-
-      await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
-        platform: "discord",
-        channelId: sessionId,
-        messageId: replyMessageId,
-        userId: "u1",
-        userName: "user1",
-        text: "<@bot> start fresh",
-        ts: now,
-        raw: {
-          discord: {
-            isDMBased: false,
-            mentionsBot: true,
-            replyToBot: true,
-            replyToMessageId: restoredOutputId,
-          },
-        },
-      });
-
-      expect(requests).toEqual([
-        { requestId: `discord:${sessionId}:${replyMessageId}`, queue: "prompt" },
-      ]);
-    } finally {
-      await requestSub.stop();
-      await relay.stop();
-      await router.stop();
-      await bus.close();
-      store.close();
-      await rm(directory, { recursive: true, force: true });
-    }
   });
 
   it("treats replies to active output as followUp, and reply+mention as steer", async () => {
@@ -5407,9 +5011,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(2);
     expect(received[0].data.queue).toBe("followUp");
     expect(received[0].headers?.request_id).toBe(requestId);
@@ -5544,9 +5145,6 @@ describe("startBusRequestRouter", () => {
         discord: { isDMBased: false, mentionsBot: true, replyToBot: false },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("interrupt");
@@ -5702,9 +5300,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("interrupt");
@@ -5870,9 +5465,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("interrupt");
     expect(received[0].headers?.request_id).toBe(requestId);
@@ -6014,9 +5606,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
     expect(received[0].headers?.request_id).toBe(`discord:${sessionId}:${msgMention}`);
@@ -6152,8 +5741,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(0);
 
     await bus.publish(
@@ -6167,9 +5754,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     );
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -6336,8 +5920,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(0);
 
     await bus.publish(
@@ -6351,9 +5933,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     );
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.queue).toBe("prompt");
@@ -6647,8 +6226,9 @@ describe("startBusRequestRouter", () => {
           discord: {
             attachments: [
               {
-                url: "https://cdn.discordapp.com/attachments/1/2/file.txt",
-                filename: "file.txt",
+                url: "https://cdn.discordapp.com/attachments/1/2/file.png",
+                filename: "file.png",
+                mimeType: "image/png",
               },
             ],
           },
@@ -6680,17 +6260,20 @@ describe("startBusRequestRouter", () => {
       },
     });
     const transcriptStore = new SqliteTranscriptStore(":memory:");
-    const putCoreOwnedBlob = transcriptStore.putCoreOwnedBlob.bind(transcriptStore);
     let failComposition = true;
-    const putCoreOwnedBlobStub = spyOn(transcriptStore, "putCoreOwnedBlob").mockImplementation(
-      (input) =>
-        failComposition
-          ? Result.err(new CoreOwnedBlobIntegrityError("forced typed composition failure"))
-          : putCoreOwnedBlob(input),
-    );
-    const fetchStub = spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response("attachment", { headers: { "content-type": "text/plain" } }),
-    );
+    const workingResourceRegistry = createTestResourceRegistry();
+    const resourceRegistry: ResourceRegistry = {
+      async register(input) {
+        return failComposition
+          ? Result.err(
+              new ResourceStoreFailure({
+                operation: "register",
+                message: "forced typed composition failure",
+              }),
+            )
+          : workingResourceRegistry.register(input);
+      },
+    };
     const logger = new Logger({ module: "typed-composition-source-handoff-test" });
     const debugStub = spyOn(logger, "debug").mockImplementation(() => undefined);
     const infoStub = spyOn(logger, "info").mockImplementation(() => undefined);
@@ -6701,6 +6284,7 @@ describe("startBusRequestRouter", () => {
       bus,
       subscriptionId: "router-typed-composition-source-handoff",
       transcriptStore,
+      resourceRegistry,
       logger,
       config: {
         surface: {
@@ -6773,6 +6357,11 @@ describe("startBusRequestRouter", () => {
       readonly userId: string;
       readonly text: string;
       readonly ts: number;
+      readonly attachments?: readonly {
+        readonly url: string;
+        readonly filename: string;
+        readonly mimeType: string;
+      }[];
     }) => {
       await bus.publish(lilacEventTypes.EvtAdapterMessageCreated, {
         platform: "discord",
@@ -6782,11 +6371,13 @@ describe("startBusRequestRouter", () => {
         text: input.text,
         ts: input.ts,
         raw: {
+          ...(input.attachments ? { attachments: input.attachments } : {}),
           discord: {
             isDMBased: false,
             mentionsBot: false,
             replyToBot: true,
             replyToMessageId: input.outputMessageId,
+            ...(input.attachments ? { attachments: input.attachments } : {}),
           },
         },
       });
@@ -6801,6 +6392,13 @@ describe("startBusRequestRouter", () => {
         userId: "user-one",
         text: "first deferred reply A",
         ts: now + 1,
+        attachments: [
+          {
+            url: "https://cdn.discordapp.com/attachments/1/2/file.png",
+            filename: "file.png",
+            mimeType: "image/png",
+          },
+        ],
       });
       await publishReply({
         messageId: replyOneB,
@@ -6883,8 +6481,6 @@ describe("startBusRequestRouter", () => {
       await sub.stop();
       await router.stop();
       transcriptStore.close();
-      putCoreOwnedBlobStub.mockRestore();
-      fetchStub.mockRestore();
       debugStub.mockRestore();
       infoStub.mockRestore();
       warnStub.mockRestore();
@@ -7092,9 +6688,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(3);
     expect(received.map((m) => m.data.queue)).toEqual(["steer", "followUp", "followUp"]);
     expect(received.map((m) => m.headers?.request_id)).toEqual([
@@ -7126,8 +6719,6 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(3);
 
     await subSurface.stop();
@@ -7307,9 +6898,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(2);
     expect(received[0].data.queue).toBe("interrupt");
     expect(received[1].data.queue).toBe("followUp");
@@ -7336,8 +6924,6 @@ describe("startBusRequestRouter", () => {
       },
     );
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
     expect(received.length).toBe(2);
 
     await subSurface.stop();
@@ -7428,9 +7014,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe("sonnet");
@@ -7524,9 +7107,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe(oneShot);
@@ -7624,9 +7204,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe(oneShot);
@@ -7727,9 +7304,6 @@ describe("startBusRequestRouter", () => {
       },
     });
 
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
-
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe("sonnet");
 
@@ -7825,9 +7399,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(1);
     expect(received[0].data.modelOverride).toBe("sonnet");
@@ -8007,9 +7578,6 @@ describe("startBusRequestRouter", () => {
         },
       },
     });
-
-    // test-wait-justification: drains the in-memory router and request-subscriber callbacks triggered above
-    await new Promise((r) => setTimeout(r, 0));
 
     expect(received.length).toBe(4);
     expect(received[0].data.modelOverride).toBe("one-shot");

@@ -1,22 +1,33 @@
+import { captureError } from "../../shared/error-capture";
 import { isDeepStrictEqual } from "node:util";
 
-import type { ModelMessage, UserContent } from "ai";
-import { Result, type Result as ResultType } from "better-result";
-import { hashCanonicalMessagesV1 } from "@stanley2058/lilac-agent";
+import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
-  buildCoreLineageManifestV1,
-  createCorePrimaryLineageFreshOnlyV1,
-  type CoreLineageAtomV1,
-  type CoreLineageSegmentInputV1,
-  type CorePrimaryLineageV1,
+  buildCoreLineageManifestV2,
+  areCoreCanonicalMessagesIdentityEqualV2,
+  createCorePrimaryLineageFreshOnlyV2,
+  type BusMessageV2,
+  type CoreLineageAtomV2,
+  type CoreLineageSegmentInputV2,
+  type CorePrimaryLineageV2,
+  type StoredResourcePartV1,
+  type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
+import type { RetentionLimit } from "@stanley2058/lilac-utils";
 import {
   withSurfaceRequestReadScope,
   type SurfaceAdapter,
   type SurfaceOperationError,
   type SurfaceOperationResult,
 } from "../adapter";
-import type { MsgRef, RoutedSurfacePlatform, SurfaceMessage } from "../types";
+import type { MsgRef, SurfaceMessage } from "../types";
+import {
+  ResourceStoreFailure,
+  type ResourceDescriptor,
+  type ResourceRegistrationError,
+  type ResourceRegistry,
+} from "../../resource";
 
 import {
   parseLeadingContinueDirective,
@@ -38,15 +49,29 @@ import {
   type TranscriptStore,
 } from "../../transcript/transcript-store";
 import {
-  appendDiscordAttachmentsToUserContent,
+  hashCanonicalStoredMessagesV2,
+  StoredMessageValidationError,
+} from "../../transcript/transcript-persistence-codec";
+import {
   createDiscordAttachmentState,
+  deleteDiscordRequestBlobHandles,
+  type DiscordAttachmentPreparationFailed,
+  type DiscordRequestBlobCleanupFailed,
   getDiscordAttachmentOwnershipError,
   getDiscordOwnedBlobReferences,
-  takeDiscordCurrentBlobReferences,
+  getDiscordRequestBlobHandles,
+  rememberDiscordRequestBlobHandles,
 } from "./request-composition/attachments";
+import type { DiscordAttachmentCacheAccess } from "../discord/discord-attachment";
+import type { DiscordMessageCacheAccess } from "../store/discord-search-store";
+import {
+  prepareStoredMessagesForBus,
+  type DiscordStoredBlobPreparationError,
+} from "./request-composition/prepare-bus-messages";
 import { selectNewestReachableCheckpoint } from "./request-composition/checkpoint-selection";
 import {
-  formatSurfaceAttributionHeader,
+  buildAssistantOnlyMessageFromTranscript,
+  formatDiscordAttributionHeader,
   normalizeAssistantContextText,
   normalizeText,
 } from "./request-composition/normalization";
@@ -54,11 +79,12 @@ import { escapeSurfaceMetadataTags } from "./surface-metadata";
 import {
   fetchMentionThreadContext,
   fetchReplyChainFrom,
-  findEarliestReplyAnchor,
+  findEarliestEffectiveReplyAnchor,
   getForwardSnapshotTextFromRaw,
   mergeChainByDiscordWindow,
   resolveMergeBlockEndingAt,
   toReplyChainMessage,
+  type ResolveDiscordMessagesByRefs,
 } from "./request-composition/reply-chain";
 import type {
   ComposeRecentChannelMessagesOpts,
@@ -76,17 +102,40 @@ export type {
   RequestCompositionResult,
 } from "./request-composition/types";
 
-export type RequestCompositionError = CoreOwnedBlobIntegrityError | SurfaceOperationError;
+export type RequestCompositionPrimaryError =
+  | CoreOwnedBlobIntegrityError
+  | DiscordAttachmentPreparationFailed
+  | DiscordStoredBlobPreparationError
+  | ResourceRegistrationError
+  | StoredMessageValidationError
+  | SurfaceOperationError;
 
+export class DiscordRequestCompositionAndCleanupFailed extends TaggedError(
+  "DiscordRequestCompositionAndCleanupFailed",
+)<{
+  readonly primary: RequestCompositionError;
+  readonly cleanup: DiscordRequestBlobCleanupFailed;
+  readonly message: string;
+}> {}
+
+export type RequestCompositionError =
+  | RequestCompositionPrimaryError
+  | DiscordRequestCompositionAndCleanupFailed;
+
+const DISCORD_SURFACE_ID_PREFIX = "discord:";
 const ACTIVE_REQUEST_READ_SCOPE = Symbol("active-request-read-scope");
 
-function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
-  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
-  return created.match<CorePrimaryLineageV1>({
+type StoredLineageSegmentInputV2 = Omit<CoreLineageSegmentInputV2, "canonicalMessages"> & {
+  readonly canonicalMessages: readonly StoredMessageV1[];
+};
+
+function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV2 {
+  const created = createCorePrimaryLineageFreshOnlyV2(reason, currentCanonicalStart);
+  return created.match<CorePrimaryLineageV2>({
     ok: (value) => value,
     err: () => ({
       state: "fresh-only",
-      lineageVersion: 1,
+      lineageVersion: 2,
       currentCanonicalStart: 0,
       reason: "lineage-fallback-construction-failed",
     }),
@@ -117,25 +166,21 @@ function isProjectionCapableStore(
   );
 }
 
-function surfaceIdForSession(platform: RoutedSurfacePlatform, sessionId: string): string {
-  return `${platform}:${sessionId}`;
+function surfaceIdForDiscordSession(sessionId: string): string {
+  return `${DISCORD_SURFACE_ID_PREFIX}${sessionId}`;
 }
 
-function surfaceProjectionKey(
-  platform: RoutedSurfacePlatform,
-  sessionId: string,
-  messageId: string,
-) {
+function surfaceProjectionKey(sessionId: string, messageId: string) {
   return {
-    requestClient: platform,
-    surfaceId: surfaceIdForSession(platform, sessionId),
+    requestClient: "discord" as const,
+    surfaceId: surfaceIdForDiscordSession(sessionId),
     sessionId,
     messageId,
     projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
   };
 }
 
-function mergeProjectedSurfaceMessages(messages: readonly ModelMessage[]): ModelMessage[] {
+function mergeProjectedSurfaceMessages(messages: readonly StoredMessageV1[]): StoredMessageV1[] {
   if (messages.length <= 1) return [...messages];
   const role = messages[0]?.role;
   if (role === "assistant" && messages.every((message) => message.role === "assistant")) {
@@ -168,7 +213,7 @@ function mergeProjectedSurfaceMessages(messages: readonly ModelMessage[]): Model
     ];
   }
 
-  const parts: UserContent = [];
+  const parts: Exclude<Extract<StoredMessageV1, { role: "user" }>["content"], string> = [];
   for (const [index, message] of messages.entries()) {
     if (index > 0) parts.push({ type: "text", text: "\n\n" });
     if (typeof message.content === "string") parts.push({ type: "text", text: message.content });
@@ -201,8 +246,191 @@ function storedNumberFact(
   return typeof value === "number" ? value : fallback;
 }
 
+function storedProjectionText(projection: CoreSurfaceProjection): string {
+  return projection.canonicalMessages
+    .flatMap((message) => {
+      if (typeof message.content === "string") return [message.content];
+      if (!Array.isArray(message.content)) return [];
+      return message.content.flatMap((part) =>
+        part.type === "text" && typeof part.text === "string" ? [part.text] : [],
+      );
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function surfaceMessageFromStoredProjection(input: {
+  projection: CoreSurfaceProjection;
+  sessionId: string;
+  messageId: string;
+}): SurfaceMessage | null {
+  const authorId = input.projection.sourceFacts["authorId"];
+  const messageTs = input.projection.sourceFacts["messageTs"];
+  if (typeof authorId !== "string" || typeof messageTs !== "number") return null;
+
+  const authorName = input.projection.sourceFacts["authorName"];
+  return {
+    ref: {
+      platform: "discord",
+      channelId: input.sessionId,
+      messageId: input.messageId,
+    },
+    session: { platform: "discord", channelId: input.sessionId },
+    userId: authorId,
+    ...(typeof authorName === "string" ? { userName: authorName } : {}),
+    text: storedProjectionText(input.projection),
+    ts: messageTs,
+    raw: { discord: { isChat: true, attachments: [] } },
+  };
+}
+
+function surfaceMessageFromLinkedTranscript(input: {
+  snapshot: TranscriptSnapshot;
+  sessionId: string;
+  messageId: string;
+  botUserId: string;
+  botName: string;
+}): SurfaceMessage | null {
+  const assistant = buildAssistantOnlyMessageFromTranscript(input.snapshot);
+  if (!assistant || typeof assistant.content !== "string") return null;
+
+  return {
+    ref: {
+      platform: "discord",
+      channelId: input.sessionId,
+      messageId: input.messageId,
+    },
+    session: { platform: "discord", channelId: input.sessionId },
+    userId: input.botUserId,
+    userName: input.botName,
+    text: assistant.content,
+    ts: input.snapshot.updatedTs,
+    raw: { discord: { isChat: true, attachments: [] } },
+  };
+}
+
+function createLayeredDiscordMessageResolver(input: {
+  adapter: SurfaceAdapter;
+  sessionId: string;
+  botUserId: string;
+  botName: string;
+  transcriptStore?: TranscriptStore;
+  ingressMessages?: readonly SurfaceMessage[];
+  currentMessageIds?: readonly string[];
+}): {
+  resolveMessagesByRefs: ResolveDiscordMessagesByRefs;
+  projections: ReadonlyMap<string, CoreSurfaceProjection | null>;
+} {
+  const projectionStore = isProjectionCapableStore(input.transcriptStore)
+    ? input.transcriptStore
+    : undefined;
+  const ingressByMessageId = new Map(
+    (input.ingressMessages ?? [])
+      .filter(
+        (message) =>
+          message.ref.platform === "discord" && message.ref.channelId === input.sessionId,
+      )
+      .map((message) => [message.ref.messageId, message]),
+  );
+  const projections = new Map<string, CoreSurfaceProjection | null>();
+  const linkedTranscripts = new Map<string, TranscriptSnapshot | null>();
+  const currentMessageIds = new Set(input.currentMessageIds ?? []);
+
+  const getProjection = (messageId: string): CoreSurfaceProjection | null => {
+    if (projections.has(messageId)) return projections.get(messageId) ?? null;
+    const stored = projectionStore?.getCoreSurfaceProjection(
+      surfaceProjectionKey(input.sessionId, messageId),
+    );
+    const projection = stored?.match({ ok: (value) => value, err: () => null }) ?? null;
+    projections.set(messageId, projection);
+    return projection;
+  };
+
+  const getLinkedTranscript = (messageId: string): TranscriptSnapshot | null => {
+    if (linkedTranscripts.has(messageId)) return linkedTranscripts.get(messageId) ?? null;
+    const stored = input.transcriptStore?.getTranscriptBySurfaceMessage({
+      platform: "discord",
+      channelId: input.sessionId,
+      messageId,
+    });
+    const snapshot =
+      stored?.match({
+        ok: (value) =>
+          value?.requestClient === "discord" && value.sessionId === input.sessionId ? value : null,
+        err: () => null,
+      }) ?? null;
+    linkedTranscripts.set(messageId, snapshot);
+    return snapshot;
+  };
+
+  const resolveMessagesByRefs: ResolveDiscordMessagesByRefs = async (refs) => {
+    const resolvedByMessageId = new Map<string, SurfaceMessage>();
+    const refsToFetch: MsgRef[] = [];
+
+    for (const ref of refs) {
+      const ingress = ingressByMessageId.get(ref.messageId);
+      if (ingress) {
+        resolvedByMessageId.set(ref.messageId, ingress);
+        continue;
+      }
+
+      const projection = getProjection(ref.messageId);
+      const projected = projection
+        ? surfaceMessageFromStoredProjection({
+            projection,
+            sessionId: input.sessionId,
+            messageId: ref.messageId,
+          })
+        : null;
+      if (projected) {
+        resolvedByMessageId.set(ref.messageId, projected);
+        continue;
+      }
+
+      const snapshot = currentMessageIds.has(ref.messageId)
+        ? null
+        : getLinkedTranscript(ref.messageId);
+      const linked = snapshot
+        ? surfaceMessageFromLinkedTranscript({
+            snapshot,
+            sessionId: input.sessionId,
+            messageId: ref.messageId,
+            botUserId: input.botUserId,
+            botName: input.botName,
+          })
+        : null;
+      if (linked) {
+        resolvedByMessageId.set(ref.messageId, linked);
+        continue;
+      }
+      refsToFetch.push(ref);
+    }
+
+    const fetched = await mapWithConcurrency({
+      items: refsToFetch,
+      concurrency: 8,
+      run: (ref) => input.adapter.readMsg(ref),
+    });
+    const fetchedResult = Result.all(fetched);
+    const fetchedError = fetchedResult.match({ ok: () => null, err: (error) => error });
+    if (fetchedError) return Result.err(fetchedError);
+    const fetchedMessages = fetchedResult.match({ ok: (messages) => messages, err: () => [] });
+    for (const message of fetchedMessages) {
+      if (message) resolvedByMessageId.set(message.ref.messageId, message);
+    }
+
+    return Result.ok(
+      refs.flatMap((ref) => {
+        const message = resolvedByMessageId.get(ref.messageId);
+        return message ? [message] : [];
+      }),
+    );
+  };
+
+  return { resolveMessagesByRefs, projections };
+}
+
 function collectStoredBoundaryBreaks(input: {
-  platform: RoutedSurfacePlatform;
   chain: readonly ReplyChainMessage[];
   sessionId: string;
   projections: ReadonlyMap<string, CoreSurfaceProjection | null>;
@@ -210,9 +438,12 @@ function collectStoredBoundaryBreaks(input: {
 }): Set<string> {
   const boundaryKeys = input.chain.map((message) => {
     const stored = input.transcriptStore?.getLatestCoreSurfaceSegment?.(
-      surfaceProjectionKey(input.platform, input.sessionId, message.messageId),
+      surfaceProjectionKey(input.sessionId, message.messageId),
     );
-    const storedValue = stored?.match({ ok: (value) => value, err: () => null });
+    const storedValue = stored?.match({
+      ok: (value) => value,
+      err: () => null,
+    });
     if (storedValue) return `${storedValue.requestId}:${storedValue.segmentIndex}`;
     const admittedIds = storedProjectionSegmentIds(
       input.projections.get(message.messageId) ?? null,
@@ -231,7 +462,7 @@ function collectStoredBoundaryBreaks(input: {
 }
 
 function appendPersistedSyntheticSuffix(input: {
-  segmentInputs: CoreLineageSegmentInputV1[];
+  segmentInputs: StoredLineageSegmentInputV2[];
   requestId: string;
   transcriptStore?: TranscriptStore;
 }): boolean {
@@ -239,7 +470,10 @@ function appendPersistedSyntheticSuffix(input: {
     requestId: input.requestId,
   });
   if (!manifest) return true;
-  const manifestValue = manifest.match({ ok: (value) => value, err: () => null });
+  const manifestValue = manifest.match({
+    ok: (value) => value,
+    err: () => null,
+  });
   if (
     !manifestValue ||
     !manifestValue.segments.some((segment) => segment.atoms[0]?.kind === "synthetic")
@@ -253,7 +487,10 @@ function appendPersistedSyntheticSuffix(input: {
     return (
       stored !== undefined &&
       isDeepStrictEqual(segment.atoms, stored.atoms) &&
-      isDeepStrictEqual(segment.canonicalMessages, stored.canonicalMessages) &&
+      areCoreCanonicalMessagesIdentityEqualV2(
+        segment.canonicalMessages,
+        stored.canonicalMessages,
+      ) &&
       isDeepStrictEqual(segment.requestSource, stored.requestSource)
     );
   });
@@ -272,59 +509,117 @@ function appendPersistedSyntheticSuffix(input: {
 }
 
 async function renderSurfaceProjectionCandidate(input: {
-  platform: RoutedSurfacePlatform;
   message: ReplyChainMessage;
   isBot: boolean;
   sessionId: string;
   reactions: readonly string[];
   discordUserAliasById?: ReadonlyMap<string, string>;
-  attachmentState: ReturnType<typeof createDiscordAttachmentState>;
-}): Promise<{ messages: ModelMessage[]; ownedBlobs: CoreOwnedBlobReference[] }> {
+  resourceRegistry?: ResourceRegistry;
+}): Promise<
+  ResultType<
+    {
+      messages: StoredMessageV1[];
+      ownedBlobs: CoreOwnedBlobReference[];
+    },
+    RequestCompositionError
+  >
+> {
   const normalized = normalizeText(input.message.text, {});
-  if (input.isBot) {
+  const registered = await registerDiscordResourceParts({
+    attachments: input.message.attachments,
+    channelId: input.sessionId,
+    messageId: input.message.messageId,
+    resourceRegistry: input.resourceRegistry,
+  });
+  return registered.map((resourceParts) => {
+    if (input.isBot) {
+      const assistantText = normalizeAssistantContextText(normalized);
+      return {
+        messages: [
+          resourceParts.length === 0
+            ? { role: "assistant" as const, content: assistantText }
+            : {
+                role: "assistant" as const,
+                content: [{ type: "text" as const, text: assistantText }, ...resourceParts],
+              },
+        ],
+        ownedBlobs: [],
+      };
+    }
+
+    const header = formatDiscordAttributionHeader({
+      authorId: input.message.authorId,
+      authorName: input.message.authorName,
+      userAlias: input.discordUserAliasById?.get(input.message.authorId),
+      messageId: input.message.messageId,
+      messageTs: input.message.ts,
+      reactions: input.reactions,
+    });
+    const mainText = `${header}\n${escapeSurfaceMetadataTags(normalized)}`.trimEnd();
     return {
       messages: [
-        {
-          role: "assistant",
-          content: normalizeAssistantContextText(normalized),
-        },
+        resourceParts.length === 0
+          ? { role: "user" as const, content: mainText }
+          : {
+              role: "user" as const,
+              content: [{ type: "text" as const, text: mainText }, ...resourceParts],
+            },
       ],
       ownedBlobs: [],
     };
-  }
-
-  const header = formatSurfaceAttributionHeader({
-    platform: input.platform,
-    authorId: input.message.authorId,
-    authorName: input.message.authorName,
-    userAlias:
-      input.platform === "discord"
-        ? input.discordUserAliasById?.get(input.message.authorId)
-        : undefined,
-    messageId: input.message.messageId,
-    messageTs: input.message.ts,
-    reactions: input.reactions,
   });
-  const mainText = `${header}\n${escapeSurfaceMetadataTags(normalized)}`.trimEnd();
-  if (input.message.attachments.length === 0) {
-    return { messages: [{ role: "user", content: mainText }], ownedBlobs: [] };
-  }
+}
 
-  const parts: UserContent = [{ type: "text", text: mainText }];
-  await appendDiscordAttachmentsToUserContent(
-    parts,
-    input.message.attachments,
-    input.attachmentState,
-  );
-  return {
-    messages: [{ role: "user", content: parts }],
-    ownedBlobs: takeDiscordCurrentBlobReferences(input.attachmentState),
-  };
+async function registerDiscordResourceParts(input: {
+  attachments: Readonly<ReplyChainMessage["attachments"]>;
+  channelId: string;
+  messageId: string;
+  resourceRegistry?: ResourceRegistry;
+}): Promise<ResultType<StoredResourcePartV1[], ResourceRegistrationError>> {
+  if (input.attachments.length === 0) return Result.ok([]);
+  if (!input.resourceRegistry) {
+    return Result.err(
+      new ResourceStoreFailure({
+        operation: "register",
+        message: "Discord attachment composition requires a ResourceRegistry",
+      }),
+    );
+  }
+  const registry = input.resourceRegistry;
+  return Result.gen(async function* () {
+    const parts: StoredResourcePartV1[] = [];
+    for (const [ordinal, attachment] of input.attachments.entries()) {
+      const descriptor: ResourceDescriptor = yield* Result.await(
+        registry.register({
+          origin: {
+            version: 1,
+            kind: "discord-attachment",
+            channelId: input.channelId,
+            messageId: input.messageId,
+            ordinal,
+            ...(attachment.id ? { attachmentId: attachment.id } : {}),
+          },
+          ...(attachment.filename ? { filename: attachment.filename } : {}),
+          ...(attachment.mimeType ? { declaredMediaType: attachment.mimeType } : {}),
+          ...(attachment.size !== undefined ? { reportedByteLength: attachment.size } : {}),
+        }),
+      );
+      parts.push({
+        type: "resource",
+        uri: descriptor.uri,
+        ...(descriptor.filename ? { filename: descriptor.filename } : {}),
+        ...(descriptor.declaredMediaType ? { mediaType: descriptor.declaredMediaType } : {}),
+        ...(descriptor.reportedByteLength !== undefined
+          ? { size: descriptor.reportedByteLength }
+          : {}),
+      });
+    }
+    return Result.ok(parts);
+  });
 }
 
 async function composeSelectedDiscordChain(input: {
   adapter: SurfaceAdapter;
-  platform: RoutedSurfacePlatform;
   sessionId: string;
   botUserId: string;
   chain: readonly ReplyChainMessage[];
@@ -332,12 +627,18 @@ async function composeSelectedDiscordChain(input: {
   currentMessageIds: readonly string[];
   transcriptStore?: TranscriptStore;
   discordUserAliasById?: ReadonlyMap<string, string>;
+  blobStore?: BlobStore;
+  attachmentCache?: DiscordAttachmentCacheAccess;
+  attachmentCacheTtl?: RetentionLimit;
+  resourceRegistry?: ResourceRegistry;
+  resolvedProjections?: ReadonlyMap<string, CoreSurfaceProjection | null>;
 }): Promise<
   ResultType<
     {
-      messages: ModelMessage[];
+      messages: RequestCompositionResult["messages"];
+      inputHandles: RequestCompositionResult["inputHandles"];
       mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
-      corePrimaryLineage: CorePrimaryLineageV1;
+      corePrimaryLineage: CorePrimaryLineageV2;
     },
     RequestCompositionError
   >
@@ -346,17 +647,31 @@ async function composeSelectedDiscordChain(input: {
     ? input.transcriptStore
     : undefined;
   const attachmentState = createDiscordAttachmentState({
-    ownBlob: projectionStore
-      ? ({ bytes, mediaType, filename }) => {
-          return projectionStore.putCoreOwnedBlob({ bytes, mediaType, filename });
+    blobStore: input.blobStore,
+    attachmentCache: input.attachmentCache,
+    attachmentCacheTtl: input.attachmentCacheTtl,
+    ownStoredBlob: projectionStore
+      ? ({ blob, mediaType, filename }) => {
+          return projectionStore.putCoreOwnedBlob({
+            blob,
+            mediaType,
+            filename,
+          });
         }
       : undefined,
   });
-  try {
+  const outcome = await (async () => {
     const projections = new Map<string, CoreSurfaceProjection | null>();
     for (const message of input.chain) {
+      if (input.resolvedProjections?.has(message.messageId)) {
+        projections.set(
+          message.messageId,
+          input.resolvedProjections.get(message.messageId) ?? null,
+        );
+        continue;
+      }
       const stored = projectionStore?.getCoreSurfaceProjection(
-        surfaceProjectionKey(input.platform, input.sessionId, message.messageId),
+        surfaceProjectionKey(input.sessionId, message.messageId),
       );
       projections.set(
         message.messageId,
@@ -374,7 +689,6 @@ async function composeSelectedDiscordChain(input: {
       };
     });
     const hardBreaks = collectStoredBoundaryBreaks({
-      platform: input.platform,
       chain: immutableChain,
       sessionId: input.sessionId,
       projections,
@@ -394,7 +708,7 @@ async function composeSelectedDiscordChain(input: {
       .map(
         (message) =>
           ({
-            platform: input.platform,
+            platform: "discord",
             channelId: input.sessionId,
             messageId: message.messageId,
           }) satisfies MsgRef,
@@ -403,13 +717,16 @@ async function composeSelectedDiscordChain(input: {
       adapter: input.adapter,
       refs: unknownUserRefs,
     });
-    const reactionsError = reactionsByMessageId.match({ ok: () => null, err: (error) => error });
-    if (reactionsError) return Result.err(reactionsError);
+    const reactionsError = reactionsByMessageId.match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (reactionsError) return { status: "return", value: Result.err(reactionsError) } as const;
     const reactionValues = reactionsByMessageId.match({
       ok: (value) => value,
       err: () => new Map<string, readonly string[]>(),
     });
-    const projectedByMessageId = new Map<string, readonly ModelMessage[]>();
+    const projectedByMessageId = new Map<string, readonly StoredMessageV1[]>();
     const candidateOwnedBlobsByMessageId = new Map<string, readonly CoreOwnedBlobReference[]>();
     let lineageComplete = Boolean(projectionStore);
     const transcriptSnapshotByMessageId = new Map<string, TranscriptSnapshot>();
@@ -418,7 +735,7 @@ async function composeSelectedDiscordChain(input: {
       for (const message of immutableChain) {
         if (message.authorId !== input.botUserId) continue;
         const snapshot = resolveTranscriptSnapshot({
-          platform: input.platform,
+          platform: "discord",
           channelId: input.sessionId,
           messageId: message.messageId,
           transcriptStore: input.transcriptStore,
@@ -426,7 +743,7 @@ async function composeSelectedDiscordChain(input: {
             input.checkpointSelection.resolvedSnapshotsBySurfaceMessageId,
         });
         if (!snapshot) continue;
-        if (snapshot.requestClient !== input.platform || snapshot.sessionId !== input.sessionId) {
+        if (snapshot.requestClient !== "discord" || snapshot.sessionId !== input.sessionId) {
           lineageComplete = false;
           continue;
         }
@@ -446,15 +763,38 @@ async function composeSelectedDiscordChain(input: {
         }
         // `merged` is derived from `immutableChain`, so every selected ID has this source entry.
         const source = messageById.get(messageId)!;
-        const candidate = await renderSurfaceProjectionCandidate({
-          platform: input.platform,
+        const candidateResult = await renderSurfaceProjectionCandidate({
           message: source,
           isBot: source.authorId === input.botUserId,
           sessionId: input.sessionId,
           reactions: reactionValues.get(messageId) ?? [],
           discordUserAliasById: input.discordUserAliasById,
-          attachmentState,
+          resourceRegistry: input.resourceRegistry,
         });
+        const candidateError = candidateResult.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (candidateError) {
+          return {
+            status: "return",
+            value: Result.err(candidateError),
+          } as const;
+        }
+        const candidate = candidateResult.match<{
+          messages: StoredMessageV1[];
+          ownedBlobs: CoreOwnedBlobReference[];
+        }>({
+          ok: (value) => value,
+          err: () => ({ messages: [], ownedBlobs: [] }),
+        });
+        const candidateOwnershipError = getDiscordAttachmentOwnershipError(attachmentState);
+        if (candidateOwnershipError) {
+          return {
+            status: "return",
+            value: Result.err(candidateOwnershipError),
+          } as const;
+        }
         if (!projectionStore) {
           projectedByMessageId.set(messageId, candidate.messages);
           continue;
@@ -493,21 +833,38 @@ async function composeSelectedDiscordChain(input: {
         const segmentMessages = mergeProjectedSurfaceMessages(
           segmentMessageIds.flatMap((id) => projectedByMessageId.get(id) ?? []),
         );
+        const segmentDigestResult = hashCanonicalStoredMessagesV2(segmentMessages);
+        const segmentDigestError = segmentDigestResult.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (segmentDigestError) {
+          return {
+            status: "return",
+            value: Result.err(segmentDigestError),
+          } as const;
+        }
+        const segmentDigest = segmentDigestResult.match({
+          ok: (value) => value.hash,
+          err: () => "",
+        });
         const admitted = projectionStore.admitCoreSurfaceProjection({
-          ...surfaceProjectionKey(input.platform, input.sessionId, messageId),
+          ...surfaceProjectionKey(input.sessionId, messageId),
           canonicalMessages: projectedByMessageId.get(messageId) ?? [],
           sourceFacts: {
             authorId: source.authorId,
             authorName: source.authorName,
             messageTs: source.ts,
             reactions: [...(reactionValues.get(messageId) ?? [])],
-            attachments: source.attachments.map((attachment) => ({ ...attachment })),
             segmentMessageIds: [...segmentMessageIds],
-            segmentDigest: hashCanonicalMessagesV1(segmentMessages).hash,
+            segmentDigest,
           },
           ownedBlobs: candidateOwnedBlobsByMessageId.get(messageId) ?? [],
         });
-        const admittedValue = admitted.match({ ok: (value) => value, err: () => null });
+        const admittedValue = admitted.match({
+          ok: (value) => value,
+          err: () => null,
+        });
         if (!admittedValue) {
           lineageComplete = false;
           continue;
@@ -516,13 +873,34 @@ async function composeSelectedDiscordChain(input: {
       }
     }
 
-    const segmentInputs: CoreLineageSegmentInputV1[] = [];
+    const segmentInputs: StoredLineageSegmentInputV2[] = [];
     if (input.checkpointSelection.checkpoint) {
       const checkpoint = input.checkpointSelection.checkpoint;
+      const checkpointDigestResult = hashCanonicalStoredMessagesV2(checkpoint.messages);
+      const checkpointDigestError = checkpointDigestResult.match({
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (!checkpoint.transcriptDigest && checkpointDigestError) {
+        return {
+          status: "return",
+          value: Result.err(checkpointDigestError),
+        } as const;
+      }
       const digest =
-        checkpoint.transcriptDigest ?? hashCanonicalMessagesV1(checkpoint.messages).hash;
+        checkpoint.transcriptDigest ??
+        checkpointDigestResult.match({
+          ok: (value) => value.hash,
+          err: () => "",
+        });
       segmentInputs.push({
-        atoms: [{ kind: "checkpoint", requestId: checkpoint.requestId, transcriptDigest: digest }],
+        atoms: [
+          {
+            kind: "checkpoint",
+            requestId: checkpoint.requestId,
+            transcriptDigest: digest,
+          },
+        ],
         canonicalMessages: checkpoint.messages,
       });
     }
@@ -537,16 +915,17 @@ async function composeSelectedDiscordChain(input: {
           (messageId) =>
             ({
               kind: "surface",
-              requestClient: input.platform,
-              surfaceId: surfaceIdForSession(input.platform, input.sessionId),
+              requestClient: "discord",
+              surfaceId: surfaceIdForDiscordSession(input.sessionId),
               sessionId: input.sessionId,
               messageId,
-            }) satisfies CoreLineageAtomV1,
+            }) satisfies CoreLineageAtomV2,
         );
         const canonicalMessages = mergeProjectedSurfaceMessages(
           messageIds.flatMap((messageId) => projectedByMessageId.get(messageId) ?? []),
         );
-        segmentInputs.push({ atoms, canonicalMessages });
+        const segment = { atoms, canonicalMessages };
+        segmentInputs.push(segment);
       };
 
       const pendingSurfaceIds: string[] = [];
@@ -574,13 +953,27 @@ async function composeSelectedDiscordChain(input: {
         });
         const metadataValue = metadata?.match({ ok: (value) => value, err: () => null }) ?? null;
         if (!metadataValue) lineageComplete = false;
-        const requestAtom: CoreLineageAtomV1 = {
+        const snapshotDigestResult = hashCanonicalStoredMessagesV2(snapshot.messages);
+        const snapshotDigestError = snapshotDigestResult.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (!metadataValue?.transcriptDigest && !snapshot.transcriptDigest && snapshotDigestError) {
+          return {
+            status: "return",
+            value: Result.err(snapshotDigestError),
+          } as const;
+        }
+        const requestAtom: CoreLineageAtomV2 = {
           kind: "request",
           requestId: snapshot.requestId,
           transcriptDigest:
             metadataValue?.transcriptDigest ??
             snapshot.transcriptDigest ??
-            hashCanonicalMessagesV1(snapshot.messages).hash,
+            snapshotDigestResult.match({
+              ok: (value) => value.hash,
+              err: () => "",
+            }),
           providerFamily:
             metadataValue?.providerFamily ?? snapshot.providerState?.lastFamily ?? "ai-sdk",
           containsCrossFamilyTurns:
@@ -590,8 +983,8 @@ async function composeSelectedDiscordChain(input: {
         };
         const aliases = [...new Set(aliasMessageIdsByRequestId.get(snapshot.requestId) ?? [])].map(
           (aliasMessageId) => ({
-            requestClient: input.platform,
-            surfaceId: surfaceIdForSession(input.platform, input.sessionId),
+            requestClient: "discord",
+            surfaceId: surfaceIdForDiscordSession(input.sessionId),
             sessionId: input.sessionId,
             messageId: aliasMessageId,
           }),
@@ -605,7 +998,9 @@ async function composeSelectedDiscordChain(input: {
       appendSurfaceSegment(pendingSurfaceIds);
     }
 
-    const messages = segmentInputs.flatMap((segment) => segment.canonicalMessages);
+    const messages: StoredMessageV1[] = segmentInputs.flatMap(
+      (segment) => segment.canonicalMessages,
+    );
     const currentSegmentIndex = segmentInputs.findIndex((segment) =>
       segment.atoms.some(
         (atom) => atom.kind === "surface" && currentMessageIds.has(atom.messageId),
@@ -624,15 +1019,17 @@ async function composeSelectedDiscordChain(input: {
     const hasEmptyLineageSegment = segmentInputs.some(
       (segment) => segment.canonicalMessages.length === 0,
     );
-    let corePrimaryLineage: CorePrimaryLineageV1;
+    let corePrimaryLineage: CorePrimaryLineageV2;
     if (lineageComplete && segmentInputs.length > 0 && !hasEmptyLineageSegment) {
-      const built = buildCoreLineageManifestV1(segmentInputs, { currentSegmentIndex });
+      const built = buildCoreLineageManifestV2(segmentInputs, {
+        currentSegmentIndex,
+      });
       corePrimaryLineage = built.match({
         ok: (value) => value,
         err: () => createFreshOnlyLineage("lineage-manifest-build-failed", currentCanonicalStart),
       });
     } else {
-      let reason: Parameters<typeof createCorePrimaryLineageFreshOnlyV1>[0];
+      let reason: Parameters<typeof createCorePrimaryLineageFreshOnlyV2>[0];
       if (hasEmptyLineageSegment) {
         reason = "empty-lineage-segment";
       } else if (currentSegmentIndex < 0) {
@@ -645,27 +1042,103 @@ async function composeSelectedDiscordChain(input: {
       corePrimaryLineage = createFreshOnlyLineage(reason, currentCanonicalStart);
     }
     const ownershipError = getDiscordAttachmentOwnershipError(attachmentState);
-    if (ownershipError) return Result.err(ownershipError);
-    return Result.ok({
-      messages,
-      mergedGroups: merged.map((chunk) => ({
-        authorId: chunk.authorId,
-        messageIds: [...chunk.messageIds],
-      })),
-      corePrimaryLineage,
-    });
-  } finally {
+    if (ownershipError) return { status: "return", value: Result.err(ownershipError) } as const;
+    const preparedMessages: BusMessageV2[] = [];
+    for (const segment of segmentInputs) {
+      const prepared = await prepareStoredMessagesForBus({
+        blobStore: input.blobStore,
+        messages: segment.canonicalMessages,
+      });
+      const preparationError = prepared.match({
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (preparationError) {
+        return {
+          status: "return",
+          value: Result.err(preparationError),
+        } as const;
+      }
+      prepared.match({
+        ok: (value) => {
+          rememberDiscordRequestBlobHandles(attachmentState, value.inputHandles);
+          preparedMessages.push(...value.messages);
+        },
+        err: () => undefined,
+      });
+    }
+    return {
+      status: "return",
+      value: Result.ok({
+        messages: preparedMessages,
+        inputHandles: [...getDiscordRequestBlobHandles(attachmentState)],
+        mergedGroups: merged.map((chunk) => ({
+          authorId: chunk.authorId,
+          messageIds: [...chunk.messageIds],
+        })),
+        corePrimaryLineage,
+      }),
+    } as const;
+  })().finally(() => {
     if (projectionStore) {
       for (const reference of getDiscordOwnedBlobReferences(attachmentState)) {
-        projectionStore.deleteCoreOwnedBlobIfUnreferenced({ sha256: reference.sha256 });
+        const deleted = projectionStore.deleteCoreOwnedBlobIfUnreferenced({
+          ownerId: reference.ownerId,
+        });
+        if (deleted && input.blobStore) void input.blobStore.delete(deleted);
       }
     }
-  }
+  });
+  const compositionResult: ResultType<
+    {
+      messages: RequestCompositionResult["messages"];
+      inputHandles: RequestCompositionResult["inputHandles"];
+      mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
+      corePrimaryLineage: CorePrimaryLineageV2;
+    },
+    RequestCompositionPrimaryError
+  > = outcome.value;
+  const cleanupFailedComposition = compositionResult.match<
+    () => Promise<
+      ResultType<
+        {
+          messages: RequestCompositionResult["messages"];
+          inputHandles: RequestCompositionResult["inputHandles"];
+          mergedGroups: Array<{ authorId: string; messageIds: string[] }>;
+          corePrimaryLineage: CorePrimaryLineageV2;
+        },
+        RequestCompositionError
+      >
+    >
+  >({
+    ok: (value) => async () => Result.ok(value),
+    err: (error) => async () => {
+      if (input.blobStore) {
+        const cleanup = await deleteDiscordRequestBlobHandles(
+          input.blobStore,
+          getDiscordRequestBlobHandles(attachmentState),
+        );
+        return cleanup.match<ResultType<never, RequestCompositionError>>({
+          ok: () => Result.err(error),
+          err: (cleanupError) =>
+            Result.err(
+              new DiscordRequestCompositionAndCleanupFailed({
+                primary: error,
+                cleanup: cleanupError,
+                message: "Discord request composition and input handle cleanup failed",
+              }),
+            ),
+        });
+      }
+      return Result.err(error);
+    },
+  });
+  return cleanupFailedComposition();
 }
 
 function resolveTranscriptSnapshot(input: {
   messageId: string;
-  platform: RoutedSurfacePlatform;
+  platform: "discord";
   channelId: string;
   transcriptStore: TranscriptStore;
   resolvedSnapshotsBySurfaceMessageId: ReadonlyMap<string, TranscriptSnapshot | null>;
@@ -905,14 +1378,22 @@ async function listRecentMessagesEndingAt(params: {
 }
 
 function compareDiscordSnowflakeLike(a: string, b: string): number {
-  try {
-    const ai = BigInt(a);
-    const bi = BigInt(b);
-    if (ai < bi) return -1;
-    if (ai > bi) return 1;
-    return 0;
-  } catch {
-    return a.localeCompare(b);
+  {
+    const attempt = Result.try({
+      try: () => {
+        const ai = BigInt(a);
+        const bi = BigInt(b);
+        if (ai < bi) return -1;
+        if (ai > bi) return 1;
+        return 0;
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      return a.localeCompare(b);
+    }
+    return attempt.value;
   }
 }
 
@@ -1114,12 +1595,54 @@ function applyDiscordSessionDividerCutoffToReplyChain(params: {
 
 async function findLastDiscordSessionDividerBefore(params: {
   adapter: SurfaceAdapter;
+  messageCache?: DiscordMessageCacheAccess;
   channelId: string;
   botUserId: string;
   beforeMessageId: string;
-  stopAtMessageId?: string;
+  beforeTs: number;
+  stopAt?: { messageId: string; ts: number };
 }): Promise<SurfaceOperationResult<{ ts: number; messageId: string } | null>> {
-  const sessionRef = { platform: "discord", channelId: params.channelId } as const;
+  if (params.messageCache) {
+    let before = { messageId: params.beforeMessageId, ts: params.beforeTs };
+    let scanned = 0;
+    const maxMessages = 2000;
+    const pageSize = 200;
+
+    while (scanned < maxMessages) {
+      const page = params.messageCache.listIndexedMessagesBefore({
+        channelId: params.channelId,
+        before,
+        limit: Math.min(pageSize, maxMessages - scanned),
+      });
+      if (page.length === 0) return Result.ok(null);
+      scanned += page.length;
+
+      let newestDivider: { ts: number; messageId: string } | null = null;
+      for (const message of page) {
+        if (message.userId !== params.botUserId || !isDiscordSessionDividerText(message.text)) {
+          continue;
+        }
+        const position = { ts: message.ts, messageId: message.ref.messageId };
+        if (params.stopAt && compareDiscordMsgPosition(position, params.stopAt) <= 0) continue;
+        if (!newestDivider || compareDiscordMsgPosition(newestDivider, position) < 0) {
+          newestDivider = position;
+        }
+      }
+      if (newestDivider) return Result.ok(newestDivider);
+
+      const oldest = page[0]!;
+      before = { ts: oldest.ts, messageId: oldest.ref.messageId };
+      if (params.stopAt && compareDiscordMsgPosition(before, params.stopAt) <= 0) {
+        return Result.ok(null);
+      }
+    }
+    return Result.ok(null);
+  }
+
+  const sessionRef = {
+    platform: "discord",
+    channelId: params.channelId,
+  } as const;
   let cursor: string | undefined = params.beforeMessageId;
   let scanned = 0;
   const maxMessages = 2000;
@@ -1146,8 +1669,8 @@ async function findLastDiscordSessionDividerBefore(params: {
     }
     if (newestDivider) return Result.ok(newestDivider);
     if (
-      params.stopAtMessageId &&
-      pageValues.some((message) => message.ref.messageId === params.stopAtMessageId)
+      params.stopAt &&
+      pageValues.some((message) => message.ref.messageId === params.stopAt?.messageId)
     ) {
       return Result.ok(null);
     }
@@ -1235,15 +1758,31 @@ export async function composeRequestMessages(
       composeRequestMessages(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
     );
   }
-  // Step 1: fetch reply chain from the adapter store / platform.
-  // Mention triggers get merge-window parity even if messages are not linked via reply references.
-  const triggerMsg = await adapter.readMsg(opts.trigger.msgRef);
-  const triggerError = triggerMsg.match({ ok: () => null, err: (error) => error });
+  const layered = createLayeredDiscordMessageResolver({
+    adapter,
+    sessionId: opts.trigger.msgRef.channelId,
+    botUserId: opts.botUserId,
+    botName: opts.botName,
+    transcriptStore: opts.transcriptStore,
+    ingressMessages: opts.ingressMessages,
+    currentMessageIds: opts.currentMessageIds ?? [opts.trigger.msgRef.messageId],
+  });
+  const triggerMsg = await layered
+    .resolveMessagesByRefs([opts.trigger.msgRef])
+    .then((resolved) => resolved.map((messages) => messages[0] ?? null));
+  const triggerError = triggerMsg.match({
+    ok: () => null,
+    err: (error) => error,
+  });
   if (triggerError) return Result.err(triggerError);
-  const triggerValue = triggerMsg.match({ ok: (value) => value, err: () => null });
+  const triggerValue = triggerMsg.match({
+    ok: (value) => value,
+    err: () => null,
+  });
   if (!triggerValue) {
     return Result.ok({
       messages: [],
+      inputHandles: [],
       chainMessageIds: [],
       mergedGroups: [],
       corePrimaryLineage: createFreshOnlyLineage("empty-selection"),
@@ -1253,21 +1792,26 @@ export async function composeRequestMessages(
   const chainResult =
     opts.trigger.type === "mention"
       ? await fetchMentionThreadContext(adapter, {
-          platform: "discord",
+          platform: opts.platform,
           botUserId: opts.botUserId,
           botName: opts.botName,
           triggerMsg: triggerValue,
           maxDepth: opts.maxDepth,
+          resolveMessagesByRefs: layered.resolveMessagesByRefs,
         })
       : await fetchReplyChainFrom(adapter, {
-          platform: "discord",
+          platform: opts.platform,
           botUserId: opts.botUserId,
           botName: opts.botName,
           trigger: opts.trigger,
           startMsgRef: opts.trigger.msgRef,
           maxDepth: opts.maxDepth,
+          resolveMessagesByRefs: layered.resolveMessagesByRefs,
         });
-  const chainError = chainResult.match({ ok: () => null, err: (error) => error });
+  const chainError = chainResult.match({
+    ok: () => null,
+    err: (error) => error,
+  });
   if (chainError) return Result.err(chainError);
   const chain = chainResult.match({ ok: (value) => value, err: () => [] });
 
@@ -1310,7 +1854,6 @@ export async function composeRequestMessages(
 
   const composed = await composeSelectedDiscordChain({
     adapter,
-    platform: opts.platform,
     sessionId: opts.trigger.msgRef.channelId,
     botUserId: opts.botUserId,
     chain: checkpointSelection.descendants,
@@ -1318,9 +1861,15 @@ export async function composeRequestMessages(
     currentMessageIds: opts.currentMessageIds ?? [opts.trigger.msgRef.messageId],
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
+    blobStore: opts.blobStore,
+    attachmentCache: opts.attachmentCache,
+    attachmentCacheTtl: opts.attachmentCacheTtl,
+    resourceRegistry: opts.resourceRegistry,
+    resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({
     messages: value.messages,
+    inputHandles: value.inputHandles,
     chainMessageIds: transformedChain.map((m) => m.messageId),
     mergedGroups: value.mergedGroups,
     corePrimaryLineage: value.corePrimaryLineage,
@@ -1337,48 +1886,86 @@ export async function composeRecentChannelMessages(
       composeRecentChannelMessages(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
     );
   }
-  // Reply precedence: if the trigger is a Discord reply (even when the router
-  // classified it as a "mention" trigger because it wasn't a reply-to-bot),
-  // treat it as an explicit reply-chain continuation.
+  const layered = createLayeredDiscordMessageResolver({
+    adapter,
+    sessionId: opts.sessionId,
+    botUserId: opts.botUserId,
+    botName: opts.botName,
+    transcriptStore: opts.transcriptStore,
+    ingressMessages: opts.ingressMessages,
+    currentMessageIds:
+      opts.currentMessageIds ?? (opts.triggerMsgRef ? [opts.triggerMsgRef.messageId] : []),
+  });
+  // Reply precedence: a mention burst keeps its existing "any reply in the
+  // burst" behavior. An active-channel trigger only checks the ingress head.
   //
   // IMPORTANT: this bypasses active-burst guardrails (age/gap/transcript-age).
   // A reply is a strong "continue" signal.
-  if (opts.triggerMsgRef && opts.triggerType === "mention") {
-    const triggerMsgResult = await adapter.readMsg(opts.triggerMsgRef);
-    const triggerError = triggerMsgResult.match({ ok: () => null, err: (error) => error });
+  if (opts.triggerMsgRef && opts.triggerType !== "reply") {
+    const triggerMsgResult = await layered
+      .resolveMessagesByRefs([opts.triggerMsgRef])
+      .then((resolved) => resolved.map((messages) => messages[0] ?? null));
+    const triggerError = triggerMsgResult.match({
+      ok: () => null,
+      err: (error) => error,
+    });
     if (triggerError) return Result.err(triggerError);
-    const triggerMsg = triggerMsgResult.match({ ok: (value) => value, err: () => null });
+    const triggerMsg = triggerMsgResult.match({
+      ok: (value) => value,
+      err: () => null,
+    });
     if (triggerMsg) {
-      // "Merge block" = a user's short burst of consecutive messages.
-      // If ANY message in the burst is a reply, treat the entire burst as a
-      // continuation of that reply thread.
-      const blockResult = await resolveMergeBlockEndingAt(adapter, triggerMsg);
-      const blockError = blockResult.match({ ok: () => null, err: (error) => error });
-      if (blockError) return Result.err(blockError);
-      const block = blockResult.match({ ok: (value) => value, err: () => [] });
-      const anchor = findEarliestReplyAnchor(block);
+      let anchor: SurfaceMessage | null;
+      if (opts.triggerType === undefined) {
+        anchor = await findEarliestEffectiveReplyAnchor(adapter, [triggerMsg]);
+      } else {
+        // "Merge block" = a user's short burst of consecutive messages.
+        // Mention mode treats the entire burst as a continuation when any
+        // message in that burst is a reply.
+        const blockResult = await resolveMergeBlockEndingAt(adapter, triggerMsg, {
+          resolveMessagesByRefs: layered.resolveMessagesByRefs,
+        });
+        const blockError = blockResult.match({ ok: () => null, err: (error) => error });
+        if (blockError) return Result.err(blockError);
+        const block = blockResult.match({ ok: (value) => value, err: () => [] });
+        anchor = await findEarliestEffectiveReplyAnchor(adapter, block);
+      }
       if (anchor) {
         const anchoredResult = await fetchMentionThreadContext(adapter, {
-          platform: "discord",
+          platform: opts.platform,
           botUserId: opts.botUserId,
           botName: opts.botName,
           triggerMsg,
+          resolveMessagesByRefs: layered.resolveMessagesByRefs,
         });
-        const anchoredError = anchoredResult.match({ ok: () => null, err: (error) => error });
+        const anchoredError = anchoredResult.match({
+          ok: () => null,
+          err: (error) => error,
+        });
         if (anchoredError) return Result.err(anchoredError);
-        const anchored = anchoredResult.match({ ok: (value) => value, err: () => [] });
+        const anchored = anchoredResult.match({
+          ok: (value) => value,
+          err: () => [],
+        });
 
         const oldestAnchoredMessageId = anchored[0]?.messageId;
         const dividerResult = oldestAnchoredMessageId
           ? await findLastDiscordSessionDividerBefore({
               adapter,
+              messageCache: opts.messageCache,
               channelId: opts.sessionId,
               botUserId: opts.botUserId,
               beforeMessageId: triggerMsg.ref.messageId,
-              stopAtMessageId: oldestAnchoredMessageId,
+              beforeTs: triggerMsg.ts,
+              stopAt: anchored[0]
+                ? { messageId: anchored[0].messageId, ts: anchored[0].ts }
+                : undefined,
             })
           : Result.ok(null);
-        const divider = dividerResult.match({ ok: (value) => value, err: () => null });
+        const divider = dividerResult.match({
+          ok: (value) => value,
+          err: () => null,
+        });
         const anchoredAfterDivider = divider
           ? anchored.filter(
               (message) =>
@@ -1420,7 +2007,6 @@ export async function composeRecentChannelMessages(
         });
         const composed = await composeSelectedDiscordChain({
           adapter,
-          platform: opts.platform,
           sessionId: opts.sessionId,
           botUserId: opts.botUserId,
           chain: checkpointSelection.descendants,
@@ -1428,9 +2014,14 @@ export async function composeRecentChannelMessages(
           currentMessageIds: opts.currentMessageIds ?? [triggerMsg.ref.messageId],
           transcriptStore: opts.transcriptStore,
           discordUserAliasById: opts.discordUserAliasById,
+          blobStore: opts.blobStore,
+          attachmentCache: opts.attachmentCache,
+          attachmentCacheTtl: opts.attachmentCacheTtl,
+          resolvedProjections: layered.projections,
         });
         return composed.map((value) => ({
           messages: value.messages,
+          inputHandles: value.inputHandles,
           chainMessageIds: transformedAnchored.map((m) => m.messageId),
           mergedGroups: value.mergedGroups,
           corePrimaryLineage: value.corePrimaryLineage,
@@ -1453,10 +2044,18 @@ export async function composeRecentChannelMessages(
   let orderedList: SurfaceMessage[];
 
   if (shouldApplyActiveBurstRules && opts.triggerMsgRef) {
-    const triggerMsgResult = await adapter.readMsg(opts.triggerMsgRef);
-    const triggerError = triggerMsgResult.match({ ok: () => null, err: (error) => error });
+    const triggerMsgResult = await layered
+      .resolveMessagesByRefs([opts.triggerMsgRef])
+      .then((resolved) => resolved.map((messages) => messages[0] ?? null));
+    const triggerError = triggerMsgResult.match({
+      ok: () => null,
+      err: (error) => error,
+    });
     if (triggerError) return Result.err(triggerError);
-    const triggerMsg = triggerMsgResult.match({ ok: (value) => value, err: () => null });
+    const triggerMsg = triggerMsgResult.match({
+      ok: (value) => value,
+      err: () => null,
+    });
     if (triggerMsg) {
       const recent = await listRecentMessagesEndingAt({
         adapter,
@@ -1491,7 +2090,10 @@ export async function composeRecentChannelMessages(
           });
         },
       });
-      const recentError = recent.match({ ok: () => null, err: (error) => error });
+      const recentError = recent.match({
+        ok: () => null,
+        err: (error) => error,
+      });
       if (recentError) return Result.err(recentError);
       orderedList = recent.match({ ok: (value) => value, err: () => [] });
     } else {
@@ -1506,10 +2108,18 @@ export async function composeRecentChannelMessages(
     if (opts.triggerMsgRef) {
       const exists = orderedList.some((m) => m.ref.messageId === opts.triggerMsgRef!.messageId);
       if (!exists) {
-        const fetchedTrigger = await adapter.readMsg(opts.triggerMsgRef);
-        const fetchError = fetchedTrigger.match({ ok: () => null, err: (error) => error });
+        const fetchedTrigger = await layered
+          .resolveMessagesByRefs([opts.triggerMsgRef])
+          .then((resolved) => resolved.map((messages) => messages[0] ?? null));
+        const fetchError = fetchedTrigger.match({
+          ok: () => null,
+          err: (error) => error,
+        });
         if (fetchError) return Result.err(fetchError);
-        const fetchedValue = fetchedTrigger.match({ ok: (value) => value, err: () => null });
+        const fetchedValue = fetchedTrigger.match({
+          ok: (value) => value,
+          err: () => null,
+        });
         if (fetchedValue) orderedList.push(fetchedValue);
       }
     }
@@ -1609,7 +2219,6 @@ export async function composeRecentChannelMessages(
   }
   const composed = await composeSelectedDiscordChain({
     adapter,
-    platform: opts.platform,
     sessionId: opts.sessionId,
     botUserId: opts.botUserId,
     chain: checkpointSelection.descendants,
@@ -1617,9 +2226,15 @@ export async function composeRecentChannelMessages(
     currentMessageIds,
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
+    blobStore: opts.blobStore,
+    attachmentCache: opts.attachmentCache,
+    attachmentCacheTtl: opts.attachmentCacheTtl,
+    resourceRegistry: opts.resourceRegistry,
+    resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({
     messages: value.messages,
+    inputHandles: value.inputHandles,
     chainMessageIds: chain.map((m) => m.messageId),
     mergedGroups: value.mergedGroups,
     corePrimaryLineage: value.corePrimaryLineage,
@@ -1629,7 +2244,7 @@ export async function composeRecentChannelMessages(
 export async function composeSingleMessage(
   adapter: SurfaceAdapter,
   opts: ComposeSingleMessageOpts,
-): Promise<ResultType<ModelMessage | null, RequestCompositionError>> {
+): Promise<ResultType<BusMessageV2 | null, RequestCompositionError>> {
   const composed = await composeSingleMessageWithLineage(adapter, opts);
   return composed.map((value) => value?.messages[0] ?? null);
 }
@@ -1644,7 +2259,18 @@ export async function composeSingleMessageWithLineage(
       composeSingleMessageWithLineage(adapter, opts, ACTIVE_REQUEST_READ_SCOPE),
     );
   }
-  const m = await adapter.readMsg(opts.msgRef);
+  const layered = createLayeredDiscordMessageResolver({
+    adapter,
+    sessionId: opts.msgRef.channelId,
+    botUserId: opts.botUserId,
+    botName: opts.botName,
+    transcriptStore: opts.transcriptStore,
+    ingressMessages: opts.ingressMessages,
+    currentMessageIds: opts.currentMessageIds ?? [opts.msgRef.messageId],
+  });
+  const m = await layered
+    .resolveMessagesByRefs([opts.msgRef])
+    .then((resolved) => resolved.map((messages) => messages[0] ?? null));
   const readError = m.match({ ok: () => null, err: (error) => error });
   if (readError) return Result.err(readError);
   const message = m.match({ ok: (value) => value, err: () => null });
@@ -1674,7 +2300,7 @@ export async function composeSingleMessageWithLineage(
   const checkpointSelection = selectNewestReachableCheckpoint({
     chainOldestToNewest: chain,
     botUserId: opts.botUserId,
-    platform: opts.platform,
+    platform: "discord",
     channelId: opts.msgRef.channelId,
     transcriptStore: opts.transcriptStore,
     getAuthorId: (message) => message.authorId,
@@ -1682,7 +2308,6 @@ export async function composeSingleMessageWithLineage(
   });
   const composed = await composeSelectedDiscordChain({
     adapter,
-    platform: opts.platform,
     sessionId: opts.msgRef.channelId,
     botUserId: opts.botUserId,
     chain: checkpointSelection.descendants,
@@ -1690,9 +2315,15 @@ export async function composeSingleMessageWithLineage(
     currentMessageIds: opts.currentMessageIds ?? [message.ref.messageId],
     transcriptStore: opts.transcriptStore,
     discordUserAliasById: opts.discordUserAliasById,
+    blobStore: opts.blobStore,
+    attachmentCache: opts.attachmentCache,
+    attachmentCacheTtl: opts.attachmentCacheTtl,
+    resourceRegistry: opts.resourceRegistry,
+    resolvedProjections: layered.projections,
   });
   return composed.map((value) => ({
     messages: value.messages,
+    inputHandles: value.inputHandles,
     chainMessageIds: [message.ref.messageId],
     mergedGroups: value.mergedGroups,
     corePrimaryLineage: value.corePrimaryLineage,

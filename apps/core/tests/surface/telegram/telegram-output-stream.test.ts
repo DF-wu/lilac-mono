@@ -784,7 +784,7 @@ describe("TelegramOutputStream lifecycle", () => {
   it("edits resumed messages rather than creating new ones", async () => {
     const harness = new TestHarness();
     const resumed: MsgRef = { platform: "telegram", channelId: "12345", messageId: "555" };
-    const stream = createStream(harness, { opts: { resume: { created: [resumed] } } });
+    const stream = createStream(harness, { opts: { resumeAt: resumed } });
 
     resultValue(await stream.push({ type: "text.set", text: "continued" }));
     await stream.settled();

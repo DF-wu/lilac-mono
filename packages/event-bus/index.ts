@@ -7,6 +7,7 @@ export * from "./redis-event-dead-letter";
 export * from "./event-dead-letter";
 export * from "./event-delivery";
 
+export * from "./blob-messages";
 export * from "./core-primary-lineage";
 export * from "./define-lilac-events";
 export * from "./lilac-spec";

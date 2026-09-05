@@ -1,0 +1,28 @@
+diff --git a/overrides.d.ts b/overrides.d.ts
+index ec4f620289d9ee01ce6b09d7d8837255b3e730b2..e511891317fa8b0df44475370580a2863ba0e735 100644
+--- a/overrides.d.ts
++++ b/overrides.d.ts
+@@ -107,8 +107,23 @@ declare global {
+        *
+        * This listener does not keep the event loop alive.
+        */
++      on<E extends keyof process.ProcessEventMap>(
++        event: E,
++        listener: (...args: process.ProcessEventMap[E]) => void,
++      ): this;
++      on(event: string | symbol, listener: (...args: any[]) => void): this;
+       on(event: "memoryPressure", listener: (level: "warning" | "critical") => void): this;
++      once<E extends keyof process.ProcessEventMap>(
++        event: E,
++        listener: (...args: process.ProcessEventMap[E]) => void,
++      ): this;
++      once(event: string | symbol, listener: (...args: any[]) => void): this;
+       once(event: "memoryPressure", listener: (level: "warning" | "critical") => void): this;
++      off<E extends keyof process.ProcessEventMap>(
++        event: E,
++        listener: (...args: process.ProcessEventMap[E]) => void,
++      ): this;
++      off(event: string | symbol, listener: (...args: any[]) => void): this;
+       off(event: "memoryPressure", listener: (level: "warning" | "critical") => void): this;
+       addListener(event: "memoryPressure", listener: (level: "warning" | "critical") => void): this;
+       removeListener(event: "memoryPressure", listener: (level: "warning" | "critical") => void): this;

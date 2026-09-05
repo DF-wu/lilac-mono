@@ -114,20 +114,13 @@ function withAbortSignal<T>(signal: AbortSignal | undefined, run: () => Promise<
   const pending = run();
   if (!signal) return pending;
 
-  return new Promise<T>((resolve, reject) => {
+  let removeAbortListener: () => void = () => undefined;
+  const aborted = new Promise<never>((_, reject) => {
     const onAbort = () => reject(getAbortReasonError(signal));
     signal.addEventListener("abort", onAbort, { once: true });
-    pending.then(
-      (value) => {
-        signal.removeEventListener("abort", onAbort);
-        resolve(value);
-      },
-      (error) => {
-        signal.removeEventListener("abort", onAbort);
-        reject(error);
-      },
-    );
+    removeAbortListener = () => signal.removeEventListener("abort", onAbort);
   });
+  return Promise.race([pending, aborted]).finally(removeAbortListener);
 }
 
 export class DefaultProviderPageExtractor implements ProviderPageExtractor {
@@ -216,7 +209,7 @@ export class DefaultProviderPageExtractor implements ProviderPageExtractor {
       };
     }
 
-    try {
+    const outcome = await (async () => {
       const timeoutSignal = AbortSignal.timeout(timeout);
       const signal = AbortSignal.any([timeoutSignal, ...(opts?.signal ? [opts.signal] : [])]);
       const response = await this.dependencies.fetch(`${apiBaseUrl}/v2/scrape`, {
@@ -247,46 +240,71 @@ export class DefaultProviderPageExtractor implements ProviderPageExtractor {
           err: () => "invalid JSON response",
         });
         return {
-          isError: true,
-          error: `Firecrawl scrape failed (${response.status}): ${invalidKind}.`,
-        };
+          status: "return",
+          value: {
+            isError: true,
+            error: `Firecrawl scrape failed (${response.status}): ${invalidKind}.`,
+          },
+        } as const;
       }
       if (!response.ok || payload.success === false) {
         return {
-          isError: true,
-          error: `Firecrawl scrape failed (${response.status}): ${response.statusText || "request failed"}`,
-        };
+          status: "return",
+          value: {
+            isError: true,
+            error: `Firecrawl scrape failed (${response.status}): ${response.statusText || "request failed"}`,
+          },
+        } as const;
       }
-      if (!payload.data) return { isError: true, error: "Firecrawl scrape returned no content." };
+      if (!payload.data)
+        return {
+          status: "return",
+          value: { isError: true, error: "Firecrawl scrape returned no content." },
+        } as const;
 
       const resultUrl = payload.data.metadata?.sourceURL?.trim() || payload.data.url?.trim() || url;
       const title = getFirecrawlTitle(payload, resultUrl);
       if (format === "html") {
         const html = payload.data.html?.trim();
-        if (!html) return { isError: true, error: "Firecrawl scrape returned no html content." };
+        if (!html)
+          return {
+            status: "return",
+            value: { isError: true, error: "Firecrawl scrape returned no html content." },
+          } as const;
         const text = simpleHtmlToText(html);
         return {
-          isError: false,
-          content: { url: resultUrl, title, markdown: text, text, raw: html },
-        };
+          status: "return",
+          value: {
+            isError: false,
+            content: { url: resultUrl, title, markdown: text, text, raw: html },
+          },
+        } as const;
       }
 
       const markdown = payload.data.markdown?.trim() ?? payload.data.content?.trim();
-      if (!markdown) return { isError: true, error: "Firecrawl scrape returned no content." };
+      if (!markdown)
+        return {
+          status: "return",
+          value: { isError: true, error: "Firecrawl scrape returned no content." },
+        } as const;
       const text = format === "text" ? markdownToText(markdown) : markdown;
       return {
-        isError: false,
-        content: buildTextContent({
-          url: resultUrl,
-          title,
-          text,
-          markdown,
-          raw: markdown,
-        }),
-      };
-    } finally {
+        status: "return",
+        value: {
+          isError: false,
+          content: buildTextContent({
+            url: resultUrl,
+            title,
+            text,
+            markdown,
+            raw: markdown,
+          }),
+        },
+      } as const;
+    })().finally(() => {
       acquired.permit.release();
-    }
+    });
+    return outcome.value;
   }
 
   private async extractTavily(

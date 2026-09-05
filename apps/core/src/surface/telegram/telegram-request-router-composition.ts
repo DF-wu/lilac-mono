@@ -1,5 +1,5 @@
-import type { ModelMessage, UserContent } from "ai";
-import type { EvtAdapterMessageCreatedData } from "@stanley2058/lilac-event-bus";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
+import type { BusMessageV2, EvtAdapterMessageCreatedData } from "@stanley2058/lilac-event-bus";
 import { z } from "zod";
 
 import {
@@ -14,6 +14,7 @@ import {
   appendTelegramMediaToUserContent,
   createTelegramInboundMediaBudget,
   telegramInboundMediaFromRaw,
+  type TelegramBusUserContentPart,
   type TelegramInboundMediaConfig,
 } from "./telegram-inbound-media";
 
@@ -142,13 +143,12 @@ export async function composeTelegramMessages(input: {
   readonly event: EvtAdapterMessageCreatedData;
   readonly botUserId: string;
   readonly botNames: readonly string[];
+  readonly blobStore: BlobStore;
   readonly modelOverride?: string;
-  /** Inbound media delivery settings (`surface.telegram.inboundMedia`). */
   readonly inboundMedia?: TelegramInboundMediaConfig;
 }): Promise<{
-  readonly messages: ModelMessage[];
+  readonly messages: BusMessageV2[];
   readonly chainMessageIds: string[];
-  /** True when at least one media file part was inlined into the messages. */
   readonly mediaDelivered: boolean;
 }> {
   const chain: SurfaceMessage[] = [];
@@ -177,61 +177,50 @@ export async function composeTelegramMessages(input: {
     adapter: input.adapter,
     chain,
     botUserId: input.botUserId,
+    blobStore: input.blobStore,
     inboundMedia: input.inboundMedia,
   });
-
   let mediaDelivered = false;
-  const messages = chain.map((message): ModelMessage => {
-    const text =
-      message.ref.messageId === input.event.messageId
-        ? visibleTelegramText(message.text, input.botNames, input.modelOverride)
-        : message.text;
-    if (message.userId === input.botUserId) return { role: "assistant", content: text };
-    const header = formatSurfaceAttributionHeader({
-      platform: "telegram",
-      authorId: message.userId,
-      authorName: message.userName ?? `user_${message.userId}`,
-      messageId: message.ref.messageId,
-      messageTs: message.ts,
-    });
-    const mainText = `${header}\n${text}`.trimEnd();
-    const mediaParts = mediaPartsByMessageId.get(message.ref.messageId);
-    if (!mediaParts || mediaParts.length === 0) {
-      return { role: "user", content: mainText };
-    }
-    if (mediaParts.some((part) => part.type === "file")) mediaDelivered = true;
-    return {
-      role: "user",
-      content: [{ type: "text", text: mainText }, ...mediaParts],
-    };
-  });
-
   return {
-    messages,
+    messages: chain.map((message): BusMessageV2 => {
+      const text =
+        message.ref.messageId === input.event.messageId
+          ? visibleTelegramText(message.text, input.botNames, input.modelOverride)
+          : message.text;
+      if (message.userId === input.botUserId) return { role: "assistant", content: text };
+      const header = formatSurfaceAttributionHeader({
+        platform: "telegram",
+        authorId: message.userId,
+        authorName: message.userName ?? `user_${message.userId}`,
+        messageId: message.ref.messageId,
+        messageTs: message.ts,
+      });
+      const mainText = `${header}\n${text}`.trimEnd();
+      const mediaParts = mediaPartsByMessageId.get(message.ref.messageId);
+      if (!mediaParts || mediaParts.length === 0) {
+        return { role: "user", content: mainText };
+      }
+      if (mediaParts.some((part) => part.type === "blob")) mediaDelivered = true;
+      return {
+        role: "user",
+        content: [{ type: "text", text: mainText }, ...mediaParts],
+      };
+    }),
     chainMessageIds: chain.map((message) => message.ref.messageId),
     mediaDelivered,
   };
 }
 
-/**
- * Resolve media for every user message in the chain under one request-scoped
- * budget.
- *
- * Allocation runs newest-first so the message that triggered the request wins
- * the budget over older history: dropping a photo the user just sent because a
- * week-old document exhausted the allowance would be the wrong degradation.
- * The returned parts are then assembled in chronological order as usual.
- */
 async function resolveChainMediaParts(input: {
   readonly adapter: SurfaceAdapter;
   readonly chain: readonly SurfaceMessage[];
   readonly botUserId: string;
+  readonly blobStore: BlobStore;
   readonly inboundMedia?: TelegramInboundMediaConfig;
-}): Promise<ReadonlyMap<string, readonly Exclude<UserContent, string>[number][]>> {
-  const parts = new Map<string, readonly Exclude<UserContent, string>[number][]>();
+}): Promise<ReadonlyMap<string, readonly TelegramBusUserContentPart[]>> {
+  const parts = new Map<string, readonly TelegramBusUserContentPart[]>();
   const config = input.inboundMedia;
-  if (!config?.enabled) return parts;
-  if (!hasSurfaceAttachmentResolver(input.adapter)) return parts;
+  if (!config?.enabled || !hasSurfaceAttachmentResolver(input.adapter)) return parts;
 
   const budget = createTelegramInboundMediaBudget(config);
   for (let index = input.chain.length - 1; index >= 0; index -= 1) {
@@ -240,11 +229,12 @@ async function resolveChainMediaParts(input: {
     const media = telegramInboundMediaFromRaw(message);
     if (media.length === 0) continue;
 
-    const messageParts: Exclude<UserContent, string> = [];
+    const messageParts: TelegramBusUserContentPart[] = [];
     await appendTelegramMediaToUserContent({
       parts: messageParts,
       media,
       resolver: input.adapter,
+      blobStore: input.blobStore,
       budget,
     });
     parts.set(message.ref.messageId, messageParts);

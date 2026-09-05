@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
@@ -13,6 +14,7 @@ import {
 } from "./config-types";
 import { mcpServerIdSchema, parseMcpConfigYaml, serializeMcpConfigYaml } from "./config";
 import { opaqueErrorMessage, rethrowPanic } from "./error-format";
+import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
 const errorCodeSchema = z.object({ code: z.string() });
 const mutationQueues = new Map<string, Promise<void>>();
@@ -155,35 +157,83 @@ async function captureFileOperation<T>(options: {
   readonly operation: McpConfigFileOperation;
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, McpConfigFileOperationError>> {
-  try {
-    return Result.ok(await options.run());
-  } catch (cause) {
-    rethrowPanic(cause);
-    return Result.err(
-      new McpConfigFileOperationError({
-        configPath: options.configPath,
-        operation: options.operation,
-        cause,
-        message: `Failed to ${options.operation.replaceAll("_", " ")} for MCP configuration at ${options.configPath}: ${opaqueErrorMessage(cause)}`,
-      }),
-    );
-  }
+  const message = `Failed to ${options.operation.replaceAll("_", " ")} for MCP configuration at ${options.configPath}`;
+  const captured = await Result.tryPromise({
+    try: options.run,
+    catch: (cause) => {
+      if (Panic.is(cause)) return { kind: "panic", panic: cause } as const;
+      if (cause instanceof Error) return { kind: "error", cause } as const;
+      return {
+        kind: "failure",
+        error: new McpConfigFileOperationError({
+          configPath: options.configPath,
+          operation: options.operation,
+          cause,
+          message: `${message}: Unknown error`,
+        }),
+      } as const;
+    },
+  });
+  return captured.match<() => ResultType<T, McpConfigFileOperationError>>({
+    ok: (value) => () => Result.ok(value),
+    err: (failure) => () => {
+      if (failure.kind === "panic") {
+        rethrowPanic(failure.panic);
+        return Result.err(
+          new McpConfigFileOperationError({
+            configPath: options.configPath,
+            operation: options.operation,
+            cause: failure.panic,
+            message,
+          }),
+        );
+      }
+      if (failure.kind === "error") {
+        return Result.err(
+          new McpConfigFileOperationError({
+            configPath: options.configPath,
+            operation: options.operation,
+            cause: failure.cause,
+            message: `${message}: ${opaqueErrorMessage(failure.cause)}`,
+          }),
+        );
+      }
+      return Result.err(failure.error);
+    },
+  })();
 }
 
 async function superviseMcpConfigFilePanicCleanup<T>(
   operation: () => Promise<T>,
   cleanup: () => Promise<void>,
 ): Promise<T> {
-  try {
-    return await operation();
-  } catch (cause) {
-    if (!Panic.is(cause)) throw cause;
-    try {
-      await cleanup();
-    } catch {
-      throw cause;
+  {
+    const captured = await Result.tryPromise({
+      try: async () => {
+        return await operation();
+      },
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const cause = captured.error.cause;
+      if (!Panic.is(cause)) return adaptToolResultToHost(Result.err(cause));
+      {
+        const captured = await Result.tryPromise({
+          try: async () => {
+            await cleanup();
+          },
+          catch: captureError,
+        });
+
+        if (captured.isErr()) {
+          void captured.error.cause;
+        }
+      }
+      rethrowPanic(cause);
+      return adaptToolResultToHost(Result.err(cause));
     }
-    throw cause;
+    return captured.value;
   }
 }
 
@@ -191,17 +241,43 @@ function serializeConfig(
   configPath: string,
   config: UniversalMcpConfig,
 ): ResultType<string, McpConfigSerializationError> {
-  return Result.try({
+  const serialized = Result.try({
     try: () => serializeMcpConfigYaml(config),
-    catch: (cause) => {
-      rethrowPanic(cause);
-      return new McpConfigSerializationError({
-        configPath,
-        cause,
-        message: `Failed to serialize MCP configuration at ${configPath}: ${opaqueErrorMessage(cause)}`,
-      });
-    },
+    catch: (cause) =>
+      Panic.is(cause)
+        ? ({ kind: "panic", panic: cause } as const)
+        : ({
+            kind: "failure",
+            ...captureError(cause, "MCP config serialization failed"),
+          } as const),
+  }).match<
+    | { readonly kind: "success"; readonly source: string }
+    | { readonly kind: "panic"; readonly panic: Panic }
+    | { readonly kind: "failure"; readonly cause: Error; readonly captured: unknown }
+  >({
+    ok: (source) => ({ kind: "success", source }),
+    err: (failure) => failure,
   });
+  if (serialized.kind === "panic") {
+    rethrowPanic(serialized.panic);
+    return Result.err(
+      new McpConfigSerializationError({
+        configPath,
+        cause: serialized.panic,
+        message: `Failed to serialize MCP configuration at ${configPath}`,
+      }),
+    );
+  }
+  if (serialized.kind === "failure") {
+    return Result.err(
+      new McpConfigSerializationError({
+        configPath,
+        cause: serialized.cause,
+        message: `Failed to serialize MCP configuration at ${configPath}: ${opaqueErrorMessage(serialized.cause)}`,
+      }),
+    );
+  }
+  return Result.ok(serialized.source);
 }
 
 function combineOperationAndCleanup(
@@ -249,21 +325,30 @@ export function resolveMcpConfigPath(options: { dataDir: string }): string {
 }
 
 export async function readMcpConfigFile(configPath: string): Promise<McpConfigFileResult> {
-  let source: string;
-  try {
-    source = await fs.readFile(configPath, "utf8");
-  } catch (cause) {
-    rethrowPanic(cause);
-    if (isMissingFileError(cause)) {
-      return Result.ok({ configPath, exists: false, config: createEmptyMcpConfig() });
+  let source!: string;
+  {
+    const readConfig = await Result.tryPromise({
+      try: async () => {
+        source = await fs.readFile(configPath, "utf8");
+
+        return { status: "fallthrough" } as const;
+      },
+      catch: captureError,
+    });
+    if (readConfig.isErr()) {
+      const cause = readConfig.error.cause;
+      rethrowPanic(cause);
+      if (isMissingFileError(cause)) {
+        return Result.ok({ configPath, exists: false, config: createEmptyMcpConfig() });
+      }
+      return Result.err(
+        new McpConfigError({
+          configPath,
+          issues: [`<root>: failed to read file: ${opaqueErrorMessage(cause)}`],
+          cause,
+        }),
+      );
     }
-    return Result.err(
-      new McpConfigError({
-        configPath,
-        issues: [`<root>: failed to read file: ${opaqueErrorMessage(cause)}`],
-        cause,
-      }),
-    );
   }
 
   const parsed = parseMcpConfigYaml(source);
@@ -359,11 +444,7 @@ export async function writeMcpConfigFileAtomic(
       return result;
     },
     async () => {
-      try {
-        await closeTemporary();
-      } finally {
-        await removeTemporary();
-      }
+      await closeTemporary().finally(removeTemporary);
     },
   );
 

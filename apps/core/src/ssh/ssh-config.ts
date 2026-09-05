@@ -1,8 +1,10 @@
+import { captureError } from "../shared/error-capture.js";
 import { homedir } from "node:os";
 import path from "node:path";
 
 import { isPanic, opaqueErrorCause, opaqueErrorMessage } from "@stanley2058/lilac-utils";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { preserveToolPanic } from "../tools/tool-result-adapters";
 
 /**
  * Shared SSH config helpers used by both:
@@ -95,22 +97,31 @@ export async function readConfiguredSshHostsResult(
 ): Promise<ResultType<ConfiguredSshHosts, SshConfigReadError>> {
   const configPath = resolveSshConfigPath();
   let exists = false;
-  try {
-    exists = await dependencies.exists(configPath);
-    if (!exists) return Result.ok({ configPath, hosts: [], exists: false });
-    const text = await dependencies.readText(configPath);
-    return Result.ok({ configPath, hosts: parseSshHostsFromConfigText(text), exists: true });
-  } catch (caught) {
-    if (isPanic(caught)) throw caught;
-    const cause = opaqueErrorCause(caught, "Opaque SSH config read failure");
-    return Result.err(
-      new SshConfigReadError({
-        configPath,
-        exists,
-        cause,
-        message: opaqueErrorMessage(cause, "Failed to read SSH config"),
-      }),
-    );
+  {
+    const captured = await Result.tryPromise({
+      try: async () => {
+        exists = await dependencies.exists(configPath);
+        if (!exists) return Result.ok({ configPath, hosts: [], exists: false });
+        const text = await dependencies.readText(configPath);
+        return Result.ok({ configPath, hosts: parseSshHostsFromConfigText(text), exists: true });
+      },
+      catch: captureError,
+    });
+
+    if (captured.isErr()) {
+      const caught = captured.error.cause;
+      if (isPanic(caught)) preserveToolPanic(caught);
+      const cause = opaqueErrorCause(caught, "Opaque SSH config read failure");
+      return Result.err(
+        new SshConfigReadError({
+          configPath,
+          exists,
+          cause,
+          message: opaqueErrorMessage(cause, "Failed to read SSH config"),
+        }),
+      );
+    }
+    return captured.value;
   }
 }
 

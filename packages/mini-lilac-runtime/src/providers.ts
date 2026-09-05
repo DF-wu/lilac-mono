@@ -227,29 +227,40 @@ type ProviderCapture<T, E> =
   | { readonly status: "error"; readonly error: E }
   | { readonly status: "panic"; readonly panic: Panic };
 
+type OpaqueProviderValue = {} | null | undefined;
+
+function captureProviderFailure(cause: unknown): OpaqueProviderValue {
+  return cause;
+}
+
 function throwProviderPanic(panic: Panic): never {
   throw panic;
 }
 
-function captureProviderSync<T, E>(operation: () => T, error: E): ProviderCapture<T, E> {
-  try {
-    return { status: "ok", value: operation() };
-  } catch (cause) {
-    if (isPanic(cause)) return { status: "panic", panic: cause };
-    return { status: "error", error };
-  }
+function captureProviderSync<T, E>(operation: () => Awaited<T>, error: E): ProviderCapture<T, E> {
+  return Result.try<T, OpaqueProviderValue>({
+    try: operation,
+    catch: captureProviderFailure,
+  }).match<ProviderCapture<T, E>>({
+    ok: (value) => ({ status: "ok", value }),
+    err: (cause) =>
+      isPanic(cause) ? { status: "panic", panic: cause } : { status: "error", error },
+  });
 }
 
 async function captureProviderPromise<T, E>(
   operation: () => Promise<T>,
   error: E,
 ): Promise<ProviderCapture<T, E>> {
-  try {
-    return { status: "ok", value: await operation() };
-  } catch (cause) {
-    if (isPanic(cause)) return { status: "panic", panic: cause };
-    return { status: "error", error };
-  }
+  const captured = await Result.tryPromise<T, OpaqueProviderValue>({
+    try: operation,
+    catch: captureProviderFailure,
+  });
+  return captured.match<ProviderCapture<T, E>>({
+    ok: (value) => ({ status: "ok", value }),
+    err: (cause) =>
+      isPanic(cause) ? { status: "panic", panic: cause } : { status: "error", error },
+  });
 }
 
 export function decodeProviderConfig(

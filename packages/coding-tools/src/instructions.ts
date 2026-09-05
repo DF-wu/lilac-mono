@@ -49,7 +49,7 @@ const textContentPartSchema = z
   .passthrough();
 
 export const READ_FILE_INSTRUCTION_HINT =
-  "Applicable AGENTS.md files are automatically included in successful local read results.";
+  "Successful local reads add newly applicable AGENTS.md instructions.";
 
 export type LoadedInstructionContext = {
   loaded: string[];

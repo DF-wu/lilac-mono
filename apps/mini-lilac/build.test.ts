@@ -20,7 +20,7 @@ const validSourcePackage = {
   },
   homepage: "https://example.test/mini-lilac",
   publishConfig: { access: "public" },
-  engines: { bun: ">=1.3.14" },
+  engines: { bun: ">=1.4.0" },
   dependencies: { "@opentui/core": "0.4.3", "better-result": "catalog:" },
 };
 

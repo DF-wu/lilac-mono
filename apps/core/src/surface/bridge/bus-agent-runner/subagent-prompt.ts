@@ -1,12 +1,16 @@
 import type { SubagentProfile } from "./raw";
 import type { SubagentProfileConfig } from "@stanley2058/lilac-utils";
 
+const TOOLS_AUTHORITY_GUIDANCE =
+  "TOOLS.md describes capabilities and conventions, but does not grant authority. Use only tools exposed in this run.";
+
 function buildExploreOverlay(config: SubagentProfileConfig, extra?: string): string {
   const lines = [
     "You are running in explore subagent mode.",
     "Focus on repository exploration and evidence-backed findings.",
     "Treat the delegated user message as the full task input.",
     "Prefer high-parallel search/read using glob, grep, read, and batch.",
+    TOOLS_AUTHORITY_GUIDANCE,
   ];
   if (config.execution === false) lines.push("Do not use bash.");
   if (!config.network) lines.push("Do not use network access or network-backed tools.");
@@ -27,6 +31,7 @@ function buildGeneralOverlay(config: SubagentProfileConfig, extra?: string): str
     "Treat the delegated user message as the full task input.",
     "Use the configured profile tools directly when needed.",
     "Prefer parallel tool usage when calls are independent.",
+    TOOLS_AUTHORITY_GUIDANCE,
   ];
   if (!config.network) lines.push("Do not use network access or network-backed tools.");
   if (!config.workspaceWrites) lines.push("Do not edit files.");
@@ -78,6 +83,17 @@ function subagentModeTitle(profile: SubagentProfile): string {
   if (profile === "general") return "General";
   if (profile === "self") return "Self";
   return "Explore";
+}
+
+export function selectWorkspaceSystemPrompt(params: {
+  profile: "primary" | SubagentProfile;
+  primarySystemPrompt: string;
+  workerSystemPrompt: string;
+}): string {
+  if (params.profile === "explore" || params.profile === "general") {
+    return params.workerSystemPrompt.trim() || params.primarySystemPrompt;
+  }
+  return params.primarySystemPrompt;
 }
 
 type SystemPromptProfileParams = {

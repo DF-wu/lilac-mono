@@ -88,6 +88,13 @@ Core attempts every configured server at startup. Status distinguishes `availabl
 
 `mcp.add` and `mcp.remove` reconcile the registry after changing configuration. Removing a server closes its client and removes its tools, but deliberately retains its credential file. There is no logout or credential-removal command.
 
+## Protocol support
+
+Core negotiates the stateless MCP `2026-07-28` tool protocol over HTTP and stdio, then falls back to
+the legacy initialization handshake when needed. Core exposes tool discovery and execution. It does
+not advertise elicitation, sampling, or roots capabilities, and a server response that requires
+multi-round-trip client input fails that tool call without removing the server's other tools.
+
 ## Browser OAuth flow
 
 1. Run `tools mcp.auth <server-id>` and send the returned authorization URL to the user.

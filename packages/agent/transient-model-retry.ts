@@ -2,7 +2,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import { createLogger, extractAiErrorLogDetails, isRecord } from "@stanley2058/lilac-utils";
 
-import { rethrowAgentPanic } from "./failure-adapters";
+import { captureAgentOperation, captureAgentPromise, rethrowAgentPanic } from "./failure-adapters";
 import { isLikelyContextOverflowError } from "./context-overflow";
 import type { TurnErrorHandler, TurnErrorHandlerDecision } from "./ai-sdk-pi-agent";
 import { computeRetryBackoffDelayMs, type RetryBackoffConfig } from "./retry-backoff";
@@ -122,12 +122,16 @@ export function computeTransientRetryDelayMs(params: {
 function defaultErrorSummary(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === "string") return error;
-  try {
-    return JSON.stringify(error);
-  } catch (cause) {
-    rethrowAgentPanic(cause);
-    return String(error);
-  }
+  const serialized = captureAgentOperation(() => JSON.stringify(error));
+  const outcome = serialized.match<
+    { readonly ok: true; readonly value: string } | { readonly ok: false; readonly error: unknown }
+  >({
+    ok: (value) => ({ ok: true, value }),
+    err: (cause) => ({ ok: false, error: cause }),
+  });
+  if (outcome.ok) return outcome.value;
+  rethrowAgentPanic(outcome.error);
+  return String(error);
 }
 
 export function createTransientModelRetryController(params: {
@@ -268,11 +272,13 @@ export function createTransientModelRetryController(params: {
       });
 
       if (delayMs > 0) {
-        try {
-          await sleep(delayMs, undefined, { signal: context.abortSignal });
-        } catch (cause) {
-          rethrowAgentPanic(cause);
-          if (!context.abortSignal?.aborted) throw cause;
+        const delayed = await captureAgentPromise(() =>
+          sleep(delayMs, undefined, { signal: context.abortSignal }),
+        );
+        const delayError = delayed.match({ ok: () => undefined, err: (cause) => cause });
+        if (delayError !== undefined) {
+          rethrowAgentPanic(delayError);
+          if (!context.abortSignal?.aborted) throw delayError;
           logSkipped("aborted-during-backoff");
           return "fail";
         }

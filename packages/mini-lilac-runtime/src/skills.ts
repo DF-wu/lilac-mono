@@ -99,29 +99,39 @@ type SkillCapture<T, E> =
   | { readonly status: "error"; readonly error: E }
   | { readonly status: "panic"; readonly panic: Panic };
 
+type OpaqueSkillValue = {} | null | undefined;
+
+function captureSkillFailure(cause: unknown): OpaqueSkillValue {
+  return cause;
+}
+
 function throwSkillPanic(panic: Panic): never {
   throw panic;
 }
 
-function captureSkillSync<T, E>(operation: () => T, error: E): SkillCapture<T, E> {
-  try {
-    return { status: "ok", value: operation() };
-  } catch (cause) {
-    if (isPanic(cause)) return { status: "panic", panic: cause };
-    return { status: "error", error };
-  }
+function captureSkillSync<T, E>(operation: () => Awaited<T>, error: E): SkillCapture<T, E> {
+  return Result.try<T, OpaqueSkillValue>({ try: operation, catch: captureSkillFailure }).match<
+    SkillCapture<T, E>
+  >({
+    ok: (value) => ({ status: "ok", value }),
+    err: (cause) =>
+      isPanic(cause) ? { status: "panic", panic: cause } : { status: "error", error },
+  });
 }
 
 async function captureSkillPromise<T, E>(
   operation: () => Promise<T>,
   error: E,
 ): Promise<SkillCapture<T, E>> {
-  try {
-    return { status: "ok", value: await operation() };
-  } catch (cause) {
-    if (isPanic(cause)) return { status: "panic", panic: cause };
-    return { status: "error", error };
-  }
+  const captured = await Result.tryPromise<T, OpaqueSkillValue>({
+    try: operation,
+    catch: captureSkillFailure,
+  });
+  return captured.match<SkillCapture<T, E>>({
+    ok: (value) => ({ status: "ok", value }),
+    err: (cause) =>
+      isPanic(cause) ? { status: "panic", panic: cause } : { status: "error", error },
+  });
 }
 
 export class MiniLilacSkillCatalogSnapshot {

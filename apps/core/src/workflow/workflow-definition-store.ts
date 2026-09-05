@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { errorCode, isPanic, opaqueErrorMessage } from "@stanley2058/lilac-utils";
 
 import { projectRuntimeError } from "../runtime/error-format";
@@ -13,6 +14,9 @@ import {
   workflowDefinitionNameSchema,
   type ValidatedWorkflowDefinition,
 } from "./workflow-definition";
+import type { DurableWorkflowStore } from "./durable-workflow-store";
+import { readWorkflowSourceArtifact, writeWorkflowSourceArtifact } from "./workflow-artifact-store";
+import type { WorkflowArtifactReference } from "./workflow-domain";
 import { compareCodeUnits, workflowScopeSchema, type WorkflowScope } from "./workflow-domain";
 
 export type WorkflowDefinitionScope = WorkflowScope | "auto";
@@ -181,6 +185,8 @@ export class WorkflowDefinitionStore {
   private constructor(
     canonicalWorkspaceRoot: string,
     private readonly canonicalDataDir: string,
+    private readonly blobStore: BlobStore,
+    private readonly workflowStore: DurableWorkflowStore,
   ) {
     this.canonicalWorkspaceRoot = canonicalWorkspaceRoot;
     this.canonicalProjectId = `project:${sha256(canonicalWorkspaceRoot)}`;
@@ -189,6 +195,8 @@ export class WorkflowDefinitionStore {
   static async createResult(params: {
     workspaceRoot: string;
     dataDir: string;
+    blobStore: BlobStore;
+    workflowStore: DurableWorkflowStore;
   }): Promise<ResultType<WorkflowDefinitionStore, WorkflowDefinitionStoreFailed>> {
     return captureWorkflowDefinitionStoreOperation("create", async () => {
       const workspaceStats = await fs.lstat(params.workspaceRoot);
@@ -203,7 +211,13 @@ export class WorkflowDefinitionStore {
       const canonicalWorkspaceRoot = await fs.realpath(params.workspaceRoot);
       const canonicalDataDir = await canonicalDirectory(params.dataDir, "create");
       return canonicalDataDir.map(
-        (dataDir) => new WorkflowDefinitionStore(canonicalWorkspaceRoot, dataDir),
+        (dataDir) =>
+          new WorkflowDefinitionStore(
+            canonicalWorkspaceRoot,
+            dataDir,
+            params.blobStore,
+            params.workflowStore,
+          ),
       );
     });
   }
@@ -415,7 +429,7 @@ export class WorkflowDefinitionStore {
       );
     }
     const lock = openedLock.value;
-    try {
+    const outcome = await (async () => {
       const existingStats = await lstatOrNull(location.candidate);
       if (existingStats) {
         const existingResult = await readBoundedRegularFile(location.candidate, "save");
@@ -426,48 +440,59 @@ export class WorkflowDefinitionStore {
           ok: (existing) => ({ kind: "ok", ...existing }),
           err: (error) => ({ kind: "error", error }),
         });
-        if (existingOutcome.kind === "error") return Result.err(existingOutcome.error);
+        if (existingOutcome.kind === "error")
+          return { status: "return", value: Result.err(existingOutcome.error) } as const;
         const existing = existingOutcome;
         if (!isContained(location.root, existing.canonicalPath)) {
-          return Result.err(
-            storeFailure(
-              "save",
-              `Workflow definition escapes canonical scope root: ${existing.canonicalPath}`,
+          return {
+            status: "return",
+            value: Result.err(
+              storeFailure(
+                "save",
+                `Workflow definition escapes canonical scope root: ${existing.canonicalPath}`,
+              ),
             ),
-          );
+          } as const;
         }
         const currentSha256 = sha256(existing.source);
         if (!params.expectedSha256) {
-          return Result.err(
-            storeFailure(
-              "save",
-              `Workflow already exists; expectedSha256 is required (current ${currentSha256})`,
+          return {
+            status: "return",
+            value: Result.err(
+              storeFailure(
+                "save",
+                `Workflow already exists; expectedSha256 is required (current ${currentSha256})`,
+              ),
             ),
-          );
+          } as const;
         }
         if (params.expectedSha256 !== currentSha256) {
-          return Result.err(
-            storeFailure(
-              "save",
-              `Workflow optimistic hash mismatch: expected ${params.expectedSha256}, current ${currentSha256}`,
+          return {
+            status: "return",
+            value: Result.err(
+              storeFailure(
+                "save",
+                `Workflow optimistic hash mismatch: expected ${params.expectedSha256}, current ${currentSha256}`,
+              ),
             ),
-          );
+          } as const;
         }
       } else if (params.expectedSha256 !== undefined) {
-        return Result.err(
-          storeFailure("save", "Workflow does not exist, but expectedSha256 was provided"),
-        );
+        return {
+          status: "return",
+          value: Result.err(
+            storeFailure("save", "Workflow does not exist, but expectedSha256 was provided"),
+          ),
+        } as const;
       }
 
       const tempPath = path.join(location.root, `.${location.name}.${crypto.randomUUID()}.tmp`);
       const mode = scope === "personal" ? 0o600 : 0o644;
       const handle = await fs.open(tempPath, "wx", mode);
-      try {
+      await (async () => {
         await handle.writeFile(params.source, "utf8");
         await handle.sync();
-      } finally {
-        await handle.close();
-      }
+      })().finally(() => handle.close());
       const [renamed] = await Promise.allSettled([
         fs.rename(tempPath, location.candidate).then(async () => {
           if (scope === "personal") await fs.chmod(location.candidate, 0o600);
@@ -476,12 +501,15 @@ export class WorkflowDefinitionStore {
       if (renamed.status === "rejected") {
         if (isPanic(renamed.reason)) preserveToolPanic(renamed.reason);
         await fs.rm(tempPath, { force: true });
-        return Result.err(
-          storeFailure(
-            "save",
-            `Could not commit workflow ${location.name}: ${opaqueErrorMessage(renamed.reason, "opaque save failure")}`,
+        return {
+          status: "return",
+          value: Result.err(
+            storeFailure(
+              "save",
+              `Could not commit workflow ${location.name}: ${opaqueErrorMessage(renamed.reason, "opaque save failure")}`,
+            ),
           ),
-        );
+        } as const;
       }
 
       const saved = await readBoundedRegularFile(location.candidate, "save");
@@ -492,25 +520,33 @@ export class WorkflowDefinitionStore {
         ok: ({ canonicalPath }) => ({ kind: "ok", canonicalPath }),
         err: (error) => ({ kind: "error", error }),
       });
-      if (savedOutcome.kind === "error") return Result.err(savedOutcome.error);
+      if (savedOutcome.kind === "error")
+        return { status: "return", value: Result.err(savedOutcome.error) } as const;
       const { canonicalPath } = savedOutcome;
       if (!isContained(location.root, canonicalPath)) {
-        return Result.err(
-          storeFailure("save", `Saved workflow escapes canonical scope root: ${canonicalPath}`),
-        );
+        return {
+          status: "return",
+          value: Result.err(
+            storeFailure("save", `Saved workflow escapes canonical scope root: ${canonicalPath}`),
+          ),
+        } as const;
       }
-      return Result.ok({
-        scope,
-        name: location.name,
-        normalizedPath: `${location.name}.js`,
-        canonicalPath,
-        source: params.source,
-        validation,
-      });
-    } finally {
+      return {
+        status: "return",
+        value: Result.ok({
+          scope,
+          name: location.name,
+          normalizedPath: `${location.name}.js`,
+          canonicalPath,
+          source: params.source,
+          validation,
+        }),
+      } as const;
+    })().finally(async () => {
       await lock.close();
       await fs.rm(lockPath, { force: true });
-    }
+    });
+    return outcome.value;
   }
 
   async saveResult(params: {
@@ -626,149 +662,46 @@ export class WorkflowDefinitionStore {
   private async createSnapshotUnchecked(
     source: string,
     sourceSha256: string,
-  ): Promise<ResultType<{ artifactId: string; path: string }, WorkflowDefinitionStoreFailed>> {
-    if (sha256(source) !== sourceSha256) {
-      return Result.err(storeFailure("create-snapshot", "Snapshot source hash mismatch"));
-    }
-    const rootResult = await ensureDirectoryWithoutSymlinks(
-      this.canonicalDataDir,
-      ["workflow-snapshots"],
-      "create-snapshot",
-    );
-    const rootOutcome = rootResult.match<
-      | { readonly kind: "ok"; readonly root: string }
-      | { readonly kind: "error"; readonly error: WorkflowDefinitionStoreFailed }
-    >({
-      ok: (root) => ({ kind: "ok", root }),
-      err: (error) => ({ kind: "error", error }),
-    });
-    if (rootOutcome.kind === "error") return Result.err(rootOutcome.error);
-    const root = rootOutcome.root;
-    const snapshotPath = path.join(root, `${sourceSha256}.js`);
-    const existing = await lstatOrNull(snapshotPath);
-    if (existing) {
-      const storedResult = await readBoundedRegularFile(snapshotPath, "create-snapshot");
-      const storedOutcome = storedResult.match<
-        | { readonly kind: "ok"; readonly source: string; readonly canonicalPath: string }
-        | { readonly kind: "error"; readonly error: WorkflowDefinitionStoreFailed }
-      >({
-        ok: (stored) => ({ kind: "ok", ...stored }),
-        err: (error) => ({ kind: "error", error }),
-      });
-      if (storedOutcome.kind === "error") return Result.err(storedOutcome.error);
-      const stored = storedOutcome;
-      if (!isContained(root, stored.canonicalPath) || sha256(stored.source) !== sourceSha256) {
-        return Result.err(
-          storeFailure(
-            "create-snapshot",
-            `Workflow snapshot hash collision or containment failure: ${sourceSha256}`,
-          ),
-        );
-      }
-      return Result.ok({
-        artifactId: `workflow-source:${sourceSha256}`,
-        path: stored.canonicalPath,
-      });
-    }
-    const [opened] = await Promise.allSettled([fs.open(snapshotPath, "wx", 0o600)]);
-    if (opened.status === "rejected") {
-      if (isPanic(opened.reason)) preserveToolPanic(opened.reason);
-      const storedResult = await readBoundedRegularFile(snapshotPath, "create-snapshot");
-      const stored = storedResult.match({
-        ok: (value) => value,
-        err: () => null,
-      });
-      if (stored) {
-        if (isContained(root, stored.canonicalPath) && sha256(stored.source) === sourceSha256) {
-          return Result.ok({
-            artifactId: `workflow-source:${sourceSha256}`,
-            path: stored.canonicalPath,
-          });
-        }
-      }
-      return Result.err(
-        storeFailure(
-          "create-snapshot",
-          `Could not create workflow snapshot: ${opaqueErrorMessage(opened.reason, "opaque snapshot failure")}`,
-        ),
-      );
-    }
-    const handle = opened.value;
-    try {
-      await handle.writeFile(source, "utf8");
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await fs.chmod(snapshotPath, 0o600);
-    return Result.ok({
-      artifactId: `workflow-source:${sourceSha256}`,
-      path: await fs.realpath(snapshotPath),
-    });
+  ): Promise<ResultType<{ artifact: WorkflowArtifactReference }, WorkflowDefinitionStoreFailed>> {
+    return (
+      await writeWorkflowSourceArtifact({
+        blobStore: this.blobStore,
+        workflowStore: this.workflowStore,
+        source,
+        sourceSha256,
+        maxBytes: MAX_WORKFLOW_SOURCE_BYTES,
+      })
+    )
+      .map((artifact) => ({ artifact }))
+      .mapError((error) => storeFailure("create-snapshot", error.message));
   }
 
   async createSnapshotResult(
     source: string,
     sourceSha256: string,
-  ): Promise<ResultType<{ artifactId: string; path: string }, WorkflowDefinitionStoreFailed>> {
+  ): Promise<ResultType<{ artifact: WorkflowArtifactReference }, WorkflowDefinitionStoreFailed>> {
     return captureWorkflowDefinitionStoreOperation("create-snapshot", () =>
       this.createSnapshotUnchecked(source, sourceSha256),
     );
   }
 
   private async readSnapshotUnchecked(
-    sourceSha256: string,
+    artifact: WorkflowArtifactReference,
   ): Promise<ResultType<string, WorkflowDefinitionStoreFailed>> {
-    if (!/^[a-f0-9]{64}$/u.test(sourceSha256)) {
-      return Result.err(storeFailure("read-snapshot", "Invalid workflow source hash"));
-    }
-    const rootResult = await this.scopeRootForSnapshots("read-snapshot");
-    const continueWithRoot = rootResult.match<
-      () => Promise<ResultType<string, WorkflowDefinitionStoreFailed>>
-    >({
-      err: (error) => async () => Result.err(error),
-      ok: (root) => async () => {
-        const snapshotPath = path.join(root, `${sourceSha256}.js`);
-        const storedResult = await readBoundedRegularFile(snapshotPath, "read-snapshot");
-        return storedResult.andThen((stored) => {
-          if (
-            !isContained(root, stored.canonicalPath) ||
-            path.dirname(stored.canonicalPath) !== root
-          ) {
-            return Result.err(
-              storeFailure(
-                "read-snapshot",
-                `Workflow snapshot escapes canonical root: ${stored.canonicalPath}`,
-              ),
-            );
-          }
-          if (sha256(stored.source) !== sourceSha256) {
-            return Result.err(
-              storeFailure("read-snapshot", `Workflow snapshot hash mismatch: ${sourceSha256}`),
-            );
-          }
-          return Result.ok(stored.source);
-        });
-      },
-    });
-    return continueWithRoot();
+    return (
+      await readWorkflowSourceArtifact({
+        blobStore: this.blobStore,
+        reference: artifact,
+        maxBytes: MAX_WORKFLOW_SOURCE_BYTES,
+      })
+    ).mapError((error) => storeFailure("read-snapshot", error.message));
   }
 
   async readSnapshotResult(
-    sourceSha256: string,
+    artifact: WorkflowArtifactReference,
   ): Promise<ResultType<string, WorkflowDefinitionStoreFailed>> {
     return captureWorkflowDefinitionStoreOperation("read-snapshot", () =>
-      this.readSnapshotUnchecked(sourceSha256),
-    );
-  }
-
-  private async scopeRootForSnapshots(
-    operation: WorkflowDefinitionStoreOperation,
-  ): Promise<ResultType<string, WorkflowDefinitionStoreFailed>> {
-    return await ensureDirectoryWithoutSymlinks(
-      this.canonicalDataDir,
-      ["workflow-snapshots"],
-      operation,
+      this.readSnapshotUnchecked(artifact),
     );
   }
 }

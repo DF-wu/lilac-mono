@@ -13,7 +13,12 @@ import type {
 } from "./ai-sdk-pi-agent";
 import { AiSdkPiAgent } from "./ai-sdk-pi-agent";
 import { isLikelyContextOverflowError } from "./context-overflow";
-import { rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
+import {
+  captureAgentOperation,
+  captureAgentPromise,
+  rethrowAgentPanic,
+  type OpaqueAgentValue,
+} from "./failure-adapters";
 import {
   readOpenAIServerCompactionArtifact,
   type OpenAIServerCompactionArtifact,
@@ -31,12 +36,10 @@ function getString(value: unknown): string | undefined {
 
 function stringifyUnknown(value: unknown): string {
   if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch (cause) {
-    rethrowAgentPanic(cause);
-    return String(value);
-  }
+  const serialized = resultOutcome(captureAgentOperation(() => JSON.stringify(value, null, 2)));
+  if (serialized.ok) return serialized.value;
+  rethrowAgentPanic(serialized.error);
+  return String(value);
 }
 
 function estimateTokensFromText(text: string): number {
@@ -196,49 +199,51 @@ function withoutInlineMediaPayload(value: unknown): unknown {
 }
 
 function stringifyTextOnly(value: unknown, space?: number): string {
-  try {
-    const serialized = JSON.stringify(
-      value,
-      (_key, item: unknown) => {
-        if (item instanceof ArrayBuffer || ArrayBuffer.isView(item) || isDataUrl(item)) {
-          return INLINE_MEDIA_TEXT_PLACEHOLDER;
-        }
-        if (!item || typeof item !== "object" || Array.isArray(item)) return item;
-        const record = item as Record<string, unknown>;
-        const type = record["type"];
-        if (type === "Buffer") return INLINE_MEDIA_TEXT_PLACEHOLDER;
-        if (type === "file-data" || type === "image-data") {
-          return { ...record, data: INLINE_MEDIA_TEXT_PLACEHOLDER };
-        }
-        if (type === "file" || type === "reasoning-file") {
-          return { ...record, data: withoutInlineMediaPayload(record["data"]) };
-        }
-        if (type === "image") {
-          return {
-            ...record,
-            ...(record["data"] === undefined
-              ? {}
-              : { data: withoutInlineMediaPayload(record["data"]) }),
-            ...(record["image"] === undefined
-              ? {}
-              : { image: withoutInlineMediaPayload(record["image"]) }),
-          };
-        }
-        if (type === "file-url" || type === "image-url") {
-          return {
-            ...record,
-            url: isDataUrl(String(record["url"])) ? INLINE_MEDIA_TEXT_PLACEHOLDER : record["url"],
-          };
-        }
-        return item;
-      },
-      space,
-    );
-    return serialized ?? String(value);
-  } catch (cause) {
-    rethrowAgentPanic(cause);
-    return "[unserializable text content omitted]";
-  }
+  const attempted = resultOutcome(
+    captureAgentOperation(() => {
+      const serialized = JSON.stringify(
+        value,
+        (_key, item: unknown) => {
+          if (item instanceof ArrayBuffer || ArrayBuffer.isView(item) || isDataUrl(item)) {
+            return INLINE_MEDIA_TEXT_PLACEHOLDER;
+          }
+          if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+          const record = item as Record<string, unknown>;
+          const type = record["type"];
+          if (type === "Buffer") return INLINE_MEDIA_TEXT_PLACEHOLDER;
+          if (type === "file-data" || type === "image-data") {
+            return { ...record, data: INLINE_MEDIA_TEXT_PLACEHOLDER };
+          }
+          if (type === "file" || type === "reasoning-file") {
+            return { ...record, data: withoutInlineMediaPayload(record["data"]) };
+          }
+          if (type === "image") {
+            return {
+              ...record,
+              ...(record["data"] === undefined
+                ? {}
+                : { data: withoutInlineMediaPayload(record["data"]) }),
+              ...(record["image"] === undefined
+                ? {}
+                : { image: withoutInlineMediaPayload(record["image"]) }),
+            };
+          }
+          if (type === "file-url" || type === "image-url") {
+            return {
+              ...record,
+              url: isDataUrl(String(record["url"])) ? INLINE_MEDIA_TEXT_PLACEHOLDER : record["url"],
+            };
+          }
+          return item;
+        },
+        space,
+      );
+      return serialized ?? String(value);
+    }),
+  );
+  if (attempted.ok) return attempted.value;
+  rethrowAgentPanic(attempted.error);
+  return "[unserializable text content omitted]";
 }
 
 function estimateMessageTokens(message: ModelMessage): number {
@@ -856,50 +861,52 @@ async function summarizeMessagesHierarchicalResult(
   let lastError: OpaqueAgentValue;
 
   for (let pass = 0; pass < maxPasses; pass++) {
-    try {
-      // Flatten up front so the request count is known before the first call.
-      // Segments are still rendered per chunk, so no segment spans a chunk.
-      const segments = chunkMessagesByEstimatedTokens(options.messages, budget)
-        .flatMap((chunk) =>
-          renderMessagesForSummarySegments(chunk, { maxCharsPerMessage, maxCharsTotal }),
-        )
-        .filter((segment) => segment.trim().length > 0);
-      let summary: string | null = null;
+    const summarized = resultOutcome(
+      await captureAgentPromise(async () => {
+        // Flatten up front so the request count is known before the first call.
+        // Segments are still rendered per chunk, so no segment spans a chunk.
+        const segments = chunkMessagesByEstimatedTokens(options.messages, budget)
+          .flatMap((chunk) =>
+            renderMessagesForSummarySegments(chunk, { maxCharsPerMessage, maxCharsTotal }),
+          )
+          .filter((segment) => segment.trim().length > 0);
+        let summary: string | null = null;
 
-      for (const [index, transcriptText] of segments.entries()) {
-        // A cancel partway through a refine chain should stop at the next
-        // boundary instead of running the remaining requests to completion.
-        options.abortSignal?.throwIfAborted();
-        const progress: CompactionProgress = {
-          stage: options.stage,
-          step: index + 1,
-          stepCount: segments.length,
-          pass: pass + 1,
-        };
-        options.onProgress?.(progress);
-        summary = await options.summarizeChunk(
-          transcriptText,
-          summary,
-          options.abortSignal,
-          progress,
-        );
-      }
+        for (const [index, transcriptText] of segments.entries()) {
+          // A cancel partway through a refine chain should stop at the next
+          // boundary instead of running the remaining requests to completion.
+          options.abortSignal?.throwIfAborted();
+          const progress: CompactionProgress = {
+            stage: options.stage,
+            step: index + 1,
+            stepCount: segments.length,
+            pass: pass + 1,
+          };
+          options.onProgress?.(progress);
+          summary = await options.summarizeChunk(
+            transcriptText,
+            summary,
+            options.abortSignal,
+            progress,
+          );
+        }
 
-      return Result.ok((summary ?? "").trim());
-    } catch (error) {
-      rethrowAgentPanic(error);
-      lastError = error;
-      if (!isLikelyContextOverflowError(error)) {
-        return Result.err(autoCompactionFailure(error));
-      }
-      // Keep token and character budgets in lockstep.
-      budget = Math.max(1, Math.floor(budget * SUMMARY_OVERFLOW_RETRY_SCALE));
-      maxCharsPerMessage = Math.max(
-        200,
-        Math.floor(maxCharsPerMessage * SUMMARY_OVERFLOW_RETRY_SCALE),
-      );
-      maxCharsTotal = Math.max(500, Math.floor(maxCharsTotal * SUMMARY_OVERFLOW_RETRY_SCALE));
+        return (summary ?? "").trim();
+      }),
+    );
+    if (summarized.ok) return Result.ok(summarized.value);
+    rethrowAgentPanic(summarized.error);
+    lastError = summarized.error;
+    if (!isLikelyContextOverflowError(summarized.error)) {
+      return Result.err(autoCompactionFailure(summarized.error));
     }
+    // Keep token and character budgets in lockstep.
+    budget = Math.max(1, Math.floor(budget * SUMMARY_OVERFLOW_RETRY_SCALE));
+    maxCharsPerMessage = Math.max(
+      200,
+      Math.floor(maxCharsPerMessage * SUMMARY_OVERFLOW_RETRY_SCALE),
+    );
+    maxCharsTotal = Math.max(500, Math.floor(maxCharsTotal * SUMMARY_OVERFLOW_RETRY_SCALE));
   }
 
   return Result.err(
@@ -1028,11 +1035,11 @@ function reconcilePendingCompactionReason(params: {
   return params.pendingReason;
 }
 
-function computeInputCompactionBudget(params: {
+export function computeInputCompactionBudget(params: {
   contextLimit: number;
   outputLimit: number;
-  thresholdFraction: number;
-}): InputCompactionBudget {
+  thresholdFraction?: number;
+}): CompactionBudget {
   const contextLimit = Math.max(1, Math.floor(params.contextLimit));
   const boundedThreshold = normalizeThresholdFraction(params.thresholdFraction);
   const earlyInputBudget = Math.max(1, Math.floor(contextLimit * boundedThreshold));
@@ -1643,13 +1650,18 @@ async function compactRepairedMessages(
     return Result.ok(localCompaction);
   }
 
-  try {
-    const artifact = await options.serverCompaction({
-      messages: serverCompactionMessages,
-      portableSummary: localCompaction.summary,
-      context: options.serverCompactionContext,
-      abortSignal: options.abortSignal,
-    });
+  const serverCompacted = resultOutcome(
+    await captureAgentPromise(() =>
+      options.serverCompaction!({
+        messages: serverCompactionMessages,
+        portableSummary: localCompaction.summary,
+        context: options.serverCompactionContext,
+        abortSignal: options.abortSignal,
+      }),
+    ),
+  );
+  if (serverCompacted.ok) {
+    const artifact = serverCompacted.value;
     const retainedUserBudget = resolveRetainedTailTokenCap(
       options.budget.inputBudget,
       options.keepRecentTokens,
@@ -1680,14 +1692,14 @@ async function compactRepairedMessages(
         ? { ...localCompaction, serverMessages: nativeMessages }
         : localCompaction,
     );
-  } catch (error) {
-    rethrowAgentPanic(error);
-    if (options.abortSignal?.aborted === true) {
-      return Result.err(autoCompactionFailure(error));
-    }
-    options.onServerCompactionError?.(error);
-    return Result.ok(localCompaction);
   }
+  const error = serverCompacted.error;
+  rethrowAgentPanic(error);
+  if (options.abortSignal?.aborted === true) {
+    return Result.err(autoCompactionFailure(error));
+  }
+  options.onServerCompactionError?.(error);
+  return Result.ok(localCompaction);
 }
 
 /**
@@ -1848,24 +1860,16 @@ async function resolveContextLimit(params: {
     };
   }
 
-  let modelInfo:
-    | {
-        limit: {
-          context: number;
-          output: number;
-        };
-      }
-    | undefined;
-  let modelResolveError: unknown;
-  try {
-    modelInfo = await params.options.modelCapability.resolve(spec, {
-      signal: params.abortSignal,
-    });
-  } catch (error) {
-    rethrowAgentPanic(error);
-    modelInfo = undefined;
-    modelResolveError = error;
-  }
+  const resolvedModel = resultOutcome(
+    await captureAgentPromise(() =>
+      params.options.modelCapability.resolve(spec, {
+        signal: params.abortSignal,
+      }),
+    ),
+  );
+  if (!resolvedModel.ok) rethrowAgentPanic(resolvedModel.error);
+  const modelInfo = resolvedModel.ok ? resolvedModel.value : undefined;
+  const modelResolveError = resolvedModel.ok ? undefined : resolvedModel.error;
   const outputLimit = modelInfo?.limit.output ?? 0;
 
   if (!modelInfo) {
@@ -2489,142 +2493,146 @@ export async function attachAutoCompaction(
     };
 
     inCompaction = true;
-    try {
-      options.onCompactionStart?.(compactionEventBase);
+    const compactedAttempt = resultOutcome(
+      await captureAgentPromise(async () => {
+        options.onCompactionStart?.(compactionEventBase);
 
-      const preparedTrailer = await prepareBudgetBase(separated.trailer, {
-        ...context,
-        canonicalStartIndex: separated.messages.length,
-      });
-      const trailerTokens = estimateMessagesTokens(preparedTrailer);
-      if (trailerTokens >= activeBudget.inputBudget) {
-        return signalAutoCompactionHost(
-          autoCompactionFailure(
-            new Error("Compaction continuation trailer exceeds the input budget."),
-          ),
-        );
-      }
-      const contentBudget = {
-        ...activeBudget,
-        inputBudget: activeBudget.inputBudget - trailerTokens,
-      };
+        const preparedTrailer = await prepareBudgetBase(separated.trailer, {
+          ...context,
+          canonicalStartIndex: separated.messages.length,
+        });
+        const trailerTokens = estimateMessagesTokens(preparedTrailer);
+        if (trailerTokens >= activeBudget.inputBudget) {
+          return signalAutoCompactionHost(
+            autoCompactionFailure(
+              new Error("Compaction continuation trailer exceeds the input budget."),
+            ),
+          );
+        }
+        const contentBudget = {
+          ...activeBudget,
+          inputBudget: activeBudget.inputBudget - trailerTokens,
+        };
 
-      const summaryContextLimit = pickSummaryContextLimit({
-        summaryContextLimit: await options.resolveSummaryContextLimit?.({
+        const summaryContextLimit = pickSummaryContextLimit({
+          summaryContextLimit: await options.resolveSummaryContextLimit?.({
+            abortSignal: context.abortSignal,
+          }),
+          fallbackContextLimit: latestCapability.known
+            ? latestCapability.contextLimit
+            : Math.max(2_048, Math.floor(activeBudget.inputBudget * 1.5)),
+        });
+        const compactionResult = await compactCanonicalMessages({
+          canonicalMessages: compactableMessages,
+          prepareFullModelView: prepareBudgetBase,
+          overlay,
+          context,
+          budget: contentBudget,
+          summaryContextLimit,
+          resolveModel: () => resolveSummaryModel(summaryModel, agent.state.model),
+          providerOptions: buildSummaryProviderOptions(agent.state.providerOptions),
+          serverCompaction: options.serverCompaction,
+          serverCompactionEnabled: options.serverCompactionEnabled,
+          onServerCompactionError: options.onServerCompactionError,
+          keepRecentTurns,
+          keepRecentTokens,
+          summarySystem,
+          buildSummaryPrompt,
+          buildSummaryUpdatePrompt,
+          forceCompaction: pendingReason === "overflow",
+          onProgress: options.onProgress,
+          onSummaryDelta: options.onSummaryDelta,
           abortSignal: context.abortSignal,
-        }),
-        fallbackContextLimit: latestCapability.known
-          ? latestCapability.contextLimit
-          : Math.max(2_048, Math.floor(activeBudget.inputBudget * 1.5)),
-      });
-      const compactionResult = await compactCanonicalMessages({
-        canonicalMessages: compactableMessages,
-        prepareFullModelView: prepareBudgetBase,
-        overlay,
-        context,
-        budget: contentBudget,
-        summaryContextLimit,
-        resolveModel: () => resolveSummaryModel(summaryModel, agent.state.model),
-        providerOptions: buildSummaryProviderOptions(agent.state.providerOptions),
-        serverCompaction: options.serverCompaction,
-        serverCompactionEnabled: options.serverCompactionEnabled,
-        onServerCompactionError: options.onServerCompactionError,
-        keepRecentTurns,
-        keepRecentTokens,
-        summarySystem,
-        buildSummaryPrompt,
-        buildSummaryUpdatePrompt,
-        forceCompaction: pendingReason === "overflow",
-        onProgress: options.onProgress,
-        onSummaryDelta: options.onSummaryDelta,
-        abortSignal: context.abortSignal,
-        maximumCanonicalSuffixStart: (() => {
-          const currentStart = options.resolveCurrentInputCanonicalStart?.(canonicalMessages);
-          if (currentStart === null || currentStart === undefined) return undefined;
-          if (
-            !Number.isSafeInteger(currentStart) ||
-            currentStart < 0 ||
-            currentStart > canonicalMessages.length
-          ) {
-            return signalAutoCompactionHost(
-              autoCompactionFailure(
-                new RangeError(
-                  "Current-input canonical start is outside the compaction transcript",
+          maximumCanonicalSuffixStart: (() => {
+            const currentStart = options.resolveCurrentInputCanonicalStart?.(canonicalMessages);
+            if (currentStart === null || currentStart === undefined) return undefined;
+            if (
+              !Number.isSafeInteger(currentStart) ||
+              currentStart < 0 ||
+              currentStart > canonicalMessages.length
+            ) {
+              return signalAutoCompactionHost(
+                autoCompactionFailure(
+                  new RangeError(
+                    "Current-input canonical start is outside the compaction transcript",
+                  ),
                 ),
-              ),
-            );
-          }
-          return Math.min(currentStart, compactableMessages.length);
-        })(),
-      });
-      const compactionResultOutcome = resultOutcome(compactionResult);
-      if (!compactionResultOutcome.ok) {
-        return signalAutoCompactionHost(compactionResultOutcome.error);
-      }
-      const compactionOutcome = compactionResultOutcome.value;
+              );
+            }
+            return Math.min(currentStart, compactableMessages.length);
+          })(),
+        });
+        const compactionResultOutcome = resultOutcome(compactionResult);
+        if (!compactionResultOutcome.ok) {
+          return signalAutoCompactionHost(compactionResultOutcome.error);
+        }
+        const compactionOutcome = compactionResultOutcome.value;
 
-      if (!compactionOutcome)
-        return signalAutoCompactionHost(
-          autoCompactionFailure(
-            new Error("Compaction could not select transcript content for summarization."),
-          ),
-        );
-      const compacted = [...compactionOutcome.canonicalMessages, ...separated.trailer];
-      const preparedCompacted = [...compactionOutcome.preparedMessages, ...preparedTrailer];
-      nativeCompactionView = compactionOutcome.usesServerCompaction
-        ? {
-            canonicalPrefix: cloneMessages(compacted),
-            preparedPrefix: cloneMessages(preparedCompacted),
-          }
-        : undefined;
+        if (!compactionOutcome)
+          return signalAutoCompactionHost(
+            autoCompactionFailure(
+              new Error("Compaction could not select transcript content for summarization."),
+            ),
+          );
+        const compacted = [...compactionOutcome.canonicalMessages, ...separated.trailer];
+        const preparedCompacted = [...compactionOutcome.preparedMessages, ...preparedTrailer];
+        nativeCompactionView = compactionOutcome.usesServerCompaction
+          ? {
+              canonicalPrefix: cloneMessages(compacted),
+              preparedPrefix: cloneMessages(preparedCompacted),
+            }
+          : undefined;
 
-      agent.replaceMessages(compacted, { reason: "compaction" });
+        agent.replaceMessages(compacted, { reason: "compaction" });
 
-      const refreshedOverlay = options.buildEphemeralOverlay
-        ? await options.buildEphemeralOverlay(context)
-        : [];
-      const refreshedFullView = [...preparedCompacted, ...refreshedOverlay];
-      const refreshedInputEstimateResult = await resolveInputEstimate({
-        canonicalMessages: compacted,
-        preparedFullView: preparedCompacted,
-        overlay: refreshedOverlay,
-        context,
-      });
-      const refreshedInputEstimateOutcome = resultOutcome(refreshedInputEstimateResult);
-      if (!refreshedInputEstimateOutcome.ok) {
-        return signalAutoCompactionHost(refreshedInputEstimateOutcome.error);
-      }
-      const refreshedInputEstimate = refreshedInputEstimateOutcome.value;
-      lastModelInputEstimate = refreshedInputEstimate.effective;
-      if (latestCapability.known) {
-        pendingCompactionReason =
-          refreshedInputEstimate.effective > activeBudget.inputBudget ? "threshold" : null;
-      } else {
-        pendingCompactionReason = null;
-      }
+        const refreshedOverlay = options.buildEphemeralOverlay
+          ? await options.buildEphemeralOverlay(context)
+          : [];
+        const refreshedFullView = [...preparedCompacted, ...refreshedOverlay];
+        const refreshedInputEstimateResult = await resolveInputEstimate({
+          canonicalMessages: compacted,
+          preparedFullView: preparedCompacted,
+          overlay: refreshedOverlay,
+          context,
+        });
+        const refreshedInputEstimateOutcome = resultOutcome(refreshedInputEstimateResult);
+        if (!refreshedInputEstimateOutcome.ok) {
+          return signalAutoCompactionHost(refreshedInputEstimateOutcome.error);
+        }
+        const refreshedInputEstimate = refreshedInputEstimateOutcome.value;
+        lastModelInputEstimate = refreshedInputEstimate.effective;
+        if (latestCapability.known) {
+          pendingCompactionReason =
+            refreshedInputEstimate.effective > activeBudget.inputBudget ? "threshold" : null;
+        } else {
+          pendingCompactionReason = null;
+        }
 
-      const refreshedMessageEstimate = estimateMessagesTokens(refreshedFullView);
-      const refreshedEventEstimate =
-        refreshedInputEstimate.floor === null
-          ? refreshedMessageEstimate
-          : refreshedInputEstimate.effective;
-      options.onCompactionEnd?.({
-        ...compactionEventBase,
-        durationMs: Math.max(0, Date.now() - compactionStart),
-        messageCountAfter: compacted.length,
-        estimatedInputTokensAfter: refreshedEventEstimate,
-        status: "completed",
-        summary: compactionOutcome.summary,
-        canonicalReplacement: {
-          mode: compactionOutcome.usesServerCompaction ? "server" : "local",
-          originalMessageCount: canonicalMessages.length,
-          originalSuffixStart: compactionOutcome.originalCanonicalSuffixStart,
-          replacementMessageCount: compacted.length,
-          replacementSuffixStart: 1,
-        },
-      });
-      return;
-    } catch (error) {
+        const refreshedMessageEstimate = estimateMessagesTokens(refreshedFullView);
+        const refreshedEventEstimate =
+          refreshedInputEstimate.floor === null
+            ? refreshedMessageEstimate
+            : refreshedInputEstimate.effective;
+        options.onCompactionEnd?.({
+          ...compactionEventBase,
+          durationMs: Math.max(0, Date.now() - compactionStart),
+          messageCountAfter: compacted.length,
+          estimatedInputTokensAfter: refreshedEventEstimate,
+          status: "completed",
+          summary: compactionOutcome.summary,
+          canonicalReplacement: {
+            mode: compactionOutcome.usesServerCompaction ? "server" : "local",
+            originalMessageCount: canonicalMessages.length,
+            originalSuffixStart: compactionOutcome.originalCanonicalSuffixStart,
+            replacementMessageCount: compacted.length,
+            replacementSuffixStart: 1,
+          },
+        });
+      }),
+    );
+    inCompaction = false;
+    if (!compactedAttempt.ok) {
+      const error = compactedAttempt.error;
       rethrowAgentPanic(error);
       // An aborted turn is a deliberate stop, not a compaction defect; reporting
       // it as `failed` would surface a scary error line for an ordinary cancel.
@@ -2645,9 +2653,8 @@ export async function attachAutoCompaction(
         });
       }
       throw error;
-    } finally {
-      inCompaction = false;
     }
+    return;
   };
 
   agent.setPrepareFullModelView(preparePayloadModelView);

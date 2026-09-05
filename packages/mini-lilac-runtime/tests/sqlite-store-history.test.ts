@@ -370,7 +370,7 @@ async function createV4Database(
 }> {
   const { directory, file: databasePath } = await temporaryDatabasePath("mini-lilac-v4-history-");
   const database = new Database(databasePath, { create: true, strict: true });
-  database.exec(`
+  database.run(`
     PRAGMA foreign_keys = ON;
     CREATE TABLE sessions (
       id TEXT PRIMARY KEY, active_run_id TEXT, cwd TEXT NOT NULL, model TEXT NOT NULL,
@@ -440,7 +440,7 @@ async function createV4Database(
        VALUES ('session-1', ?, 'test/mock', 'reader', 'high', 'Migrated', 'idle', ?, ?)`,
     )
     .run(directory, createdAt, createdAt);
-  database.exec(`
+  database.run(`
     INSERT INTO runs
       (id, session_id, profile, depth, status, started_at, finished_at)
     VALUES ('run-1', 'session-1', 'reader', 0, 'completed',
@@ -636,7 +636,7 @@ async function createV4Database(
 type SupportedHistoricalVersion = 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
 
 function createV2Layout(database: Database): void {
-  database.exec(`
+  database.run(`
     PRAGMA foreign_keys = ON;
     CREATE TABLE sessions (
       id TEXT PRIMARY KEY, active_run_id TEXT, cwd TEXT NOT NULL, model TEXT NOT NULL,
@@ -686,7 +686,7 @@ function createV2Layout(database: Database): void {
 }
 
 function migrateFixtureV2ToV3(database: Database): void {
-  database.exec(`
+  database.run(`
     CREATE TABLE transcript_nodes (
       id INTEGER PRIMARY KEY,
       session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -728,37 +728,37 @@ function migrateFixtureV2ToV3(database: Database): void {
 }
 
 function createIntermediateHistoricalLayout(databasePath: string, targetVersion: 5 | 6 | 7): void {
-  const originalExec = Database.prototype.exec;
-  const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+  const originalRun = Database.prototype.run;
+  const run = spyOn(Database.prototype, "run").mockImplementation(function (
     this: Database,
     sql: string,
   ) {
     if (targetVersion < 6 && sql.includes("CREATE TABLE history_states_v6")) {
-      return originalExec.call(this, "SELECT 1");
+      return originalRun.call(this, "SELECT 1");
     }
     if (
       targetVersion < 7 &&
       sql.includes("ALTER TABLE history_states ADD COLUMN last_provider_family")
     ) {
-      return originalExec.call(this, "SELECT 1");
+      return originalRun.call(this, "SELECT 1");
     }
     if (
       targetVersion < 8 &&
       sql.includes("ALTER TABLE pending_run_finalizations") &&
       sql.includes("named_claude_binding_promotion_json")
     ) {
-      return originalExec.call(this, "SELECT 1");
+      return originalRun.call(this, "SELECT 1");
     }
     if (sql.includes(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION}`)) {
-      return originalExec.call(this, `PRAGMA user_version = ${targetVersion}`);
+      return originalRun.call(this, `PRAGMA user_version = ${targetVersion}`);
     }
-    return originalExec.call(this, sql);
+    return originalRun.call(this, sql);
   });
   try {
     const store = new MiniLilacSqliteStore(databasePath);
     store.close();
   } finally {
-    exec.mockRestore();
+    run.mockRestore();
   }
 }
 
@@ -793,7 +793,7 @@ async function createHistoricalLayout(version: SupportedHistoricalVersion): Prom
     }
   }
   const marker = new Database(databasePath, { strict: true });
-  marker.exec(
+  marker.run(
     "CREATE TABLE migration_fixture_marker (value TEXT NOT NULL); INSERT INTO migration_fixture_marker VALUES ('preserved')",
   );
   marker.close();
@@ -877,22 +877,22 @@ describe("MiniLilacSqliteStore history schema", () => {
       expect(before.version).toEqual({ user_version: version });
 
       if (version < 8) {
-        const originalExec = Database.prototype.exec;
-        const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+        const originalRun = Database.prototype.run;
+        const run = spyOn(Database.prototype, "run").mockImplementation(function (
           this: Database,
           sql: string,
         ) {
           if (sql.includes(`PRAGMA user_version = ${MINI_LILAC_DATABASE_SCHEMA_VERSION}`)) {
-            return originalExec.call(this, "INVALID MIGRATION FINALIZATION SQL");
+            return originalRun.call(this, "INVALID MIGRATION FINALIZATION SQL");
           }
-          return originalExec.call(this, sql);
+          return originalRun.call(this, sql);
         });
         try {
           expect(() => new MiniLilacSqliteStore(databasePath)).toThrow(
             MiniLilacSqliteDriverFailure,
           );
         } finally {
-          exec.mockRestore();
+          run.mockRestore();
         }
         expect(historicalLayoutSnapshot(databasePath)).toEqual(before);
       }
@@ -910,7 +910,7 @@ describe("MiniLilacSqliteStore history schema", () => {
   it("preserves a migration Err with a recognized pragma-cleanup failure", async () => {
     const { databasePath } = await createV4Database();
     const corrupt = new Database(databasePath, { strict: true });
-    corrupt.exec("PRAGMA foreign_keys = OFF");
+    corrupt.run("PRAGMA foreign_keys = OFF");
     corrupt
       .query(
         `INSERT INTO user_checkpoints
@@ -921,15 +921,15 @@ describe("MiniLilacSqliteStore history schema", () => {
       .run();
     corrupt.close();
 
-    const originalExec = Database.prototype.exec;
-    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+    const originalRun = Database.prototype.run;
+    const run = spyOn(Database.prototype, "run").mockImplementation(function (
       this: Database,
       sql: string,
     ) {
       if (sql.includes("PRAGMA legacy_alter_table = OFF")) {
-        return originalExec.call(this, "INVALID CLEANUP SQL");
+        return originalRun.call(this, "INVALID CLEANUP SQL");
       }
-      return originalExec.call(this, sql);
+      return originalRun.call(this, sql);
     });
     try {
       let failure: unknown;
@@ -944,7 +944,7 @@ describe("MiniLilacSqliteStore history schema", () => {
         expect(failure.cleanup).toBeInstanceOf(MiniLilacSqliteDriverFailure);
       }
     } finally {
-      exec.mockRestore();
+      run.mockRestore();
     }
     const unchanged = new Database(databasePath, { strict: true });
     expect(unchanged.query("PRAGMA user_version").get()).toEqual({ user_version: 4 });
@@ -960,13 +960,13 @@ describe("MiniLilacSqliteStore history schema", () => {
       new Error("migration defect fixture"),
     ]) {
       const { file } = await temporaryDatabasePath("mini-lilac-migration-defect-");
-      const originalExec = Database.prototype.exec;
-      const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+      const originalRun = Database.prototype.run;
+      const run = spyOn(Database.prototype, "run").mockImplementation(function (
         this: Database,
         sql: string,
       ) {
         if (sql.includes("CREATE TABLE history_store_metadata")) throw failure;
-        return originalExec.call(this, sql);
+        return originalRun.call(this, sql);
       });
       try {
         let caught: unknown;
@@ -977,7 +977,7 @@ describe("MiniLilacSqliteStore history schema", () => {
         }
         expect(caught).toBe(failure);
       } finally {
-        exec.mockRestore();
+        run.mockRestore();
       }
     }
   });
@@ -989,16 +989,16 @@ describe("MiniLilacSqliteStore history schema", () => {
     ]) {
       const { file } = await temporaryDatabasePath("mini-lilac-migration-cleanup-defect-");
       const reports: Array<{ readonly operation: string; readonly cleanupFailure: unknown }> = [];
-      const originalExec = Database.prototype.exec;
-      const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+      const originalRun = Database.prototype.run;
+      const run = spyOn(Database.prototype, "run").mockImplementation(function (
         this: Database,
         sql: string,
       ) {
         if (sql.includes("CREATE TABLE history_store_metadata")) throw primary;
         if (sql.includes("PRAGMA legacy_alter_table = OFF")) {
-          return originalExec.call(this, "INVALID CLEANUP SQL");
+          return originalRun.call(this, "INVALID CLEANUP SQL");
         }
-        return originalExec.call(this, sql);
+        return originalRun.call(this, sql);
       });
       try {
         let caught: unknown;
@@ -1012,7 +1012,7 @@ describe("MiniLilacSqliteStore history schema", () => {
         expect(reports[0]?.operation).toBe("initializeSchema.restorePragmas");
         expect(reports[0]?.cleanupFailure).toBeInstanceOf(MiniLilacSqliteDriverFailure);
       } finally {
-        exec.mockRestore();
+        run.mockRestore();
       }
     }
   });
@@ -1022,14 +1022,14 @@ describe("MiniLilacSqliteStore history schema", () => {
     const primary = new Error("constructor defect fixture");
     const closeDefect = new Error("database close defect fixture");
     const reports: Array<{ readonly operation: string; readonly cleanupFailure: unknown }> = [];
-    const originalExec = Database.prototype.exec;
+    const originalRun = Database.prototype.run;
     const originalClose = Database.prototype.close;
-    const exec = spyOn(Database.prototype, "exec").mockImplementation(function (
+    const run = spyOn(Database.prototype, "run").mockImplementation(function (
       this: Database,
       sql: string,
     ) {
       if (sql.includes("PRAGMA journal_mode = WAL")) throw primary;
-      return originalExec.call(this, sql);
+      return originalRun.call(this, sql);
     });
     const close = spyOn(Database.prototype, "close").mockImplementation(function (this: Database) {
       originalClose.call(this);
@@ -1051,7 +1051,7 @@ describe("MiniLilacSqliteStore history schema", () => {
       ]);
     } finally {
       close.mockRestore();
-      exec.mockRestore();
+      run.mockRestore();
     }
   });
 
@@ -1069,7 +1069,7 @@ describe("MiniLilacSqliteStore history schema", () => {
     });
     createSession(store, "corrupt-session", directory);
     const state = store.getCurrentHistoryState("corrupt-session");
-    store.database.exec("PRAGMA ignore_check_constraints = ON");
+    store.database.run("PRAGMA ignore_check_constraints = ON");
     store.database
       .query(
         `UPDATE history_states
@@ -1077,7 +1077,7 @@ describe("MiniLilacSqliteStore history schema", () => {
          WHERE id = ?`,
       )
       .run(state.id);
-    store.database.exec("PRAGMA ignore_check_constraints = OFF");
+    store.database.run("PRAGMA ignore_check_constraints = OFF");
 
     const read = store.getHistoryStateResult(state.id);
     expect(read.status).toBe("error");
@@ -1172,7 +1172,7 @@ describe("MiniLilacSqliteStore history schema", () => {
     original.close();
 
     const legacy = new Database(file, { strict: true });
-    legacy.exec(`
+    legacy.run(`
       PRAGMA foreign_keys = OFF;
       DROP TABLE mini_named_claude_attempts;
       DROP TABLE mini_named_claude_bindings;
@@ -1285,7 +1285,7 @@ describe("MiniLilacSqliteStore history schema", () => {
     original.close();
 
     const legacy = new Database(file, { strict: true });
-    legacy.exec(`
+    legacy.run(`
       PRAGMA foreign_keys = OFF;
       DROP TABLE mini_named_claude_attempts;
       DROP TABLE mini_named_claude_bindings;
@@ -2336,7 +2336,7 @@ describe("MiniLilacSqliteStore history schema", () => {
   it("rolls back v4 migration on structural transcript corruption", async () => {
     const { databasePath } = await createV4Database();
     const database = new Database(databasePath, { strict: true });
-    database.exec("PRAGMA foreign_keys = OFF;");
+    database.run("PRAGMA foreign_keys = OFF;");
     database.query("DELETE FROM transcript_nodes WHERE id = 4").run();
     database.close();
 
@@ -2469,7 +2469,7 @@ describe("MiniLilacSqliteStore history schema", () => {
         },
       }),
     ).toThrow("wrong filesystem outcome");
-    store.database.exec(`
+    store.database.run(`
       CREATE TRIGGER reject_navigation_result BEFORE UPDATE OF result_json ON commands
       WHEN NEW.command_id = 'undo-a'
       BEGIN SELECT RAISE(ABORT, 'reject navigation result'); END;
@@ -2483,7 +2483,7 @@ describe("MiniLilacSqliteStore history schema", () => {
     expect(store.getCurrentHistoryState("session-1").id).toBe("state-a");
     expect(store.peekHistoryRedo("session-1")).toBeNull();
     expect(store.getHistoryOperation("operation-undo-a")?.id).toBe("operation-undo-a");
-    store.database.exec("DROP TRIGGER reject_navigation_result;");
+    store.database.run("DROP TRIGGER reject_navigation_result;");
     store.commitHistoryNavigation({
       operationId: "operation-undo-a",
       result: undoResult,
@@ -3002,7 +3002,7 @@ describe("MiniLilacSqliteStore history schema", () => {
       user,
     });
     store.reserveCommand("session-1", "undo-1", { kind: "undo", runId: null, payload: {} });
-    store.database.exec(`
+    store.database.run(`
       CREATE TRIGGER fail_history_operation BEFORE INSERT ON history_operations
       BEGIN SELECT RAISE(ABORT, 'forced journal failure'); END;
     `);
@@ -3068,7 +3068,7 @@ describe("MiniLilacSqliteStore history schema", () => {
       terminalResult: undefined,
       inputTokens: null,
     });
-    store.database.exec(`
+    store.database.run(`
       CREATE TRIGGER fail_run_finalization BEFORE UPDATE ON runs
       WHEN OLD.id = 'run-1' AND NEW.status <> 'active'
       BEGIN SELECT RAISE(ABORT, 'forced run finalization failure'); END;

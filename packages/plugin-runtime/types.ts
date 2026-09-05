@@ -5,6 +5,7 @@ export type PluginSource = "builtin" | "external";
 
 export type RequestContext<P extends string = string> = {
   requestId?: string;
+  requestDeliveryId?: string;
   sessionId?: string;
   /** Server-issued surface origin when sessionId is a synthetic workflow session. */
   originSessionId?: string;
@@ -111,9 +112,22 @@ export type Level1RunProfile = "primary" | "explore" | "general" | "self";
 
 export type Level1ToolFailureKind = "hard" | "soft";
 
+export type Level1ToolFailureClass =
+  | "input"
+  | "policy"
+  | "environment"
+  | "timeout"
+  | "cancelled"
+  | "tool"
+  | "unknown";
+
 export type Level1ToolFailureSummary = {
   ok: boolean;
   failureKind?: Level1ToolFailureKind;
+  failureClass?: Level1ToolFailureClass;
+  failureCode?: string;
+  retryable?: boolean;
+  exitCode?: number;
   error?: string;
 };
 
@@ -125,6 +139,7 @@ export type Level1SubagentConfig = {
 
 export type Level1ExecutionRequestContext<P extends string = string> = {
   requestId: string;
+  requestDeliveryId?: string;
   sessionId: string;
   requestClient: string;
   subagentDepth: number;
@@ -133,6 +148,11 @@ export type Level1ExecutionRequestContext<P extends string = string> = {
   requestInitiator?: { platform: P; userId: string };
   requestInitiatorSessionId?: string;
   currentTurnUserId?: string;
+  currentTurnMessageRef?: {
+    platform: P;
+    channelId: string;
+    messageId: string;
+  };
   metadata?: Readonly<Record<string, unknown>>;
 };
 

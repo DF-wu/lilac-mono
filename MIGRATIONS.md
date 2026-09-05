@@ -3,6 +3,38 @@
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
 
+## Automatic Transcript And Workflow Blob Migration
+
+The production Docker entrypoint now coordinates the one-way Core transcript schema 5 and workflow
+schema 25 migration before starting the default Core command. When both databases are at those exact
+legacy versions, startup first writes an immutable backup to
+`DATA_DIR/.migration-backups/blob-storage-v5-v25`, then applies transcript schema 6 and workflow schema
+26. Fresh data directories and databases already at transcript schema 6 through the current supported
+version and workflow schema 26 continue without creating a backup. Mixed, partial, or unknown schema
+states fail closed before startup changes persisted data.
+
+The backup contains the SQLite databases and sidecars that exist, transcript and workflow blob
+directories that exist, and a manifest of the original paths. A successful backup is never overwritten
+by later starts. If migration fails, stop the deployment, preserve the failed data directory for
+diagnosis, and restore the backup contents into their manifest paths before rolling back to a build that
+expects schema 5/25.
+
+Set `LILAC_AUTO_MIGRATE_BLOB_STORAGE=0` only as an operator-controlled temporary opt-out when the
+migration will be run manually with `bun run migrate:blob-storage`. The Docker gate applies only to the
+image's exact default Core command; maintenance and diagnostic commands do not trigger it.
+
+## MCP 2026-07-28 client and OAuth credentials
+
+Core's configured MCP clients negotiate the stateless `2026-07-28` tool protocol and fall back to the
+legacy initialization handshake. The MCP configuration contract remains version 1.
+
+OAuth credential files remain version 1 and now accept optional issuer pins on stored tokens, client
+information, and authorization-server information. Existing files need no rewrite and acquire the pin
+on their next authorization flow. Before rolling back to an older Core build, back up and delete each
+affected file under `DATA_DIR/secret/mcp-oauth`, or remove every `issuer` field from its stored tokens,
+client information, and authorization-server information. Run `mcp.auth` again after the older build
+starts.
+
 ## Level-2 Result, Wire, And CLI Clean Break
 
 Level-2 callable settlement is a clean break with no compatibility layer. Every external Level-2
@@ -30,11 +62,121 @@ callable itself failed to complete as expected.
 
 ## Core SQLite
 
+### Prefix-lineage tool authority
+
+Core transcript schema 10 adds `request_transcripts.loaded_catalog_ids_json`. Each completed request
+stores the cumulative deferred-tool selection for that exact conversation prefix. Continuations and
+forks inherit the newest reachable request or compaction-checkpoint snapshot from the existing Core
+primary lineage. A fresh lineage starts with no deferred tools selected.
+
+Startup drops the former `session_loaded_tools` table. Its session-wide union cannot be migrated safely
+because it does not record which branch selected a tool. Existing transcripts remain readable and gain
+an empty tool snapshot on their next completed descendant when no reachable schema-10 snapshot exists.
+Agent-run checkpoints also carry the current selection so crash recovery does not lose a tool loaded
+mid-run.
+
+### Agent questions
+
+Core adds `agent_question_calls` and `agent_question_tokens` to `request-delivery.db`. The tables
+store pending Discord question tool calls and hashed one-time interaction tokens. Existing databases
+create both tables at startup and need no offline migration.
+
+Question calls belong to a request-delivery record and are removed with that record. A Core restart
+marks pending questions as interrupted and removes their live tokens. The Discord adapter then clears
+the stale controls after reconnecting. Core does not resume an interrupted question tool call.
+
+### Agent-run WAL and graceful-restart clean cut
+
+Core adds `agent_run_wal_metadata`, `agent_run_wal_events`, and `agent_run_wal_heads` to
+`request-delivery.db`. The request-delivery record remains the durable admission queue. The WAL stores
+replaceable execution progress for every primary and subagent run admitted through the Core bus runner.
+Existing accepted records have no WAL head and recover from their original accepted messages.
+
+This recovery contract is at-least-once. A crash may repeat model calls, tool calls, controls, workflow
+dispatches, external effects, or terminal output. Core records a terminal run after it initiates the
+terminal surface write. Surface delivery after that point is best effort, and recovery does not recreate
+the same Discord or GitHub message.
+
+Checkpoint writes run in a serialized, latest-pending-wins background worker and do not delay later model
+or tool work. A failed write keeps the last committed checkpoint. A corrupt run payload deletes that
+run's journal progress. An incompatible journal contract recreates only the journal-owned tables. None of
+these cases deletes or rewrites accepted request records or blocks startup or new admission. If journal
+storage remains unavailable after a reset attempt, Core disables journaling for that boot and continues
+from accepted work.
+
+The former runtime graceful-restart snapshot subsystem is removed. Runtime startup does not open,
+import, migrate, or delete `graceful-restart.db`; existing files remain inert. The offline unified blob
+migration retains its frozen decoder only to classify supported historical snapshots during that explicit
+operator command.
+
+Before the first upgrade, stop and drain Core and back up `request-delivery.db` when avoiding duplicate
+effects matters. No graceful snapshot is imported. Work accepted by an older build may restart from its
+original messages if it has no agent-run WAL head.
+
 `discord-search.db` now records URL-free Discord attachment identity metadata in
 `discord_search_message_attachments` and an attachment fingerprint on `discord_search_messages`.
 Existing rows retain an unknown attachment fingerprint and are not backfilled. Newly indexed or updated
 messages record known empty or populated attachment state; attachment bytes and signed Discord CDN URLs
 are not persisted.
+
+Discord attachment cache references now interpret `blob_expires_at IS NULL` as durable when the other
+reference fields and `blob_cached_at` form a valid cache entry. No table rewrite or backfill runs. A
+finite `surface.discord.attachmentCache.ttl` still rejects a durable entry after its recorded cache time
+crosses the configured lifetime, then clears that reference lazily when the attachment is next read.
+
+## Core Unified Blob Storage Clean Break
+
+Core now stores managed opaque bytes through `packages/blob-storage`. Current Redis messages and Core
+databases carry versioned `BlobHandleV1` or `BlobRefV1` values, not `dataBase64`, data URLs, SQLite byte
+columns, or private domain-owned content paths. Local and S3-compatible adapters share the same
+adapter-neutral references. Tool-result encryption and domain retention metadata remain owned by their
+domains.
+
+This transition is offline and fail-closed. Runtime startup does not read or rewrite legacy blob state.
+Before starting the new runtime, stop Core, back up its data, and run:
+
+```sh
+bun run migrate:blob-storage -- --config /path/to/core-config.yaml --data-dir /path/to/data
+```
+
+If Core sets `SQLITE_URL`, run the migration with the same environment value. The command resolves
+`SQLITE_URL` from its working directory exactly as Core does. Without `SQLITE_URL`, it migrates
+`<data-dir>/data.sqlite3`.
+
+Use `--dry-run` for a read-only preflight. The normal command preflights and then applies in one
+invocation. It accepts only supported legacy schemas, verifies every copied object's SHA-256 and byte
+length, rewrites each database only after its required objects exist, and removes replaced legacy byte
+columns and files. The offline command emits transcript schema 6 and workflow schema 26; current Core
+then applies the additive transcript schema 7 through 10 migrations during startup. Legacy or partially migrated
+versions stop startup with the migration command.
+
+The migration copies durable transcript, projection, lineage, and workflow artifact content. It discards
+rebuildable Discord downloads, Anthropic fallback media, and legacy tool-result artifacts. It does not
+translate queued Redis requests, output events, pending entries, consumer groups, or dead-letter
+payloads. Drain accepted work before cutover when it must finish. Export any required legacy Redis
+evidence, then remove the inert old versioned namespaces separately.
+
+The operator-approved graceful-restart exception is narrower and explicit. The offline command discards
+one exact, valid snapshot v1, v2, v3, or v4 instead of preserving it. Graceful snapshots contain live
+process recovery state whose inline provider bytes have no safe owner after the singleton row is consumed;
+adding another durable ownership subsystem is outside this clean break. Stop and drain Core before cutover.
+`--dry-run` reports the planned graceful snapshot discard without deleting it. Malformed rows, corrupt v5
+rows, future versions, and drifted table layouts remain blockers and are never classified for discard.
+
+The operation is transactional per database, not across the object store and every database. If apply
+fails after mutation starts, keep Core stopped, restore the operator backup, and rerun. Do not point Core
+at a partially copied local root, bucket, or prefix. Whole-store local-to-S3 or S3-to-local moves are also
+offline: preserve object IDs, verify all durable references at the destination, then switch configuration.
+
+Configuration remains version 2. An omitted `blobStorage` field, including the universal projection of a
+frozen v1 config, selects the local default under `DATA_DIR`. Only v2 can set a local root or select S3.
+S3 credentials are names of environment variables in config; literal credentials are invalid.
+
+Core now emits transient tool-result references as `resource://t1_<128-bit-id>`. Existing
+`tool-result://<uuid>` references remain readable by Core until their ordinary TTL or eviction removes
+them, so this URI change needs no persisted-data migration. Tool-result metadata, session scope,
+encryption, quota accounting, and expiry remain separate from retained `resource://r1_` records. Mini
+Lilac continues to emit and consume `tool-result://` references.
 
 ## Redis Managed Event Delivery V2
 
@@ -44,8 +186,8 @@ replayed or migrated. They remain in Redis until an operator deliberately remove
 the v2 runtime never treats them as managed work.
 
 The v2 delivery path stores lease, attempt, retry, and terminalization metadata in a separate versioned
-Redis namespace. Existing v1 dead-letter records remain under their old keys and are not readable through
-the v2 record codec. New encrypted records use the `:v2:` dead-letter namespace and are finalized
+Redis namespace. Existing v1 and v2 dead-letter records remain under their old keys and are not readable
+through the v3 record codec. New encrypted records use the `:v3:` dead-letter namespace and are finalized
 atomically with source acknowledgement. Deployments that need old event or dead-letter evidence must
 export it before switching versions.
 
@@ -195,7 +337,7 @@ in one transaction. Migration uses `foreign_keys = OFF` and `legacy_alter_table 
 table rebuilds, verifies foreign keys before setting `user_version = 8`, restores both pragmas, and
 does not expose an intermediate schema as the completed startup state.
 
-## Core Transcript Database Schemas 1-5
+## Core Transcript Database Schemas 1-9
 
 Core's `agent-transcripts.db` has its own `transcript_schema_migrations` sequence. These are internal
 SQLite migrations and do not change `core-config.yaml`; its current config contract remains
@@ -220,6 +362,28 @@ SQLite migrations and do not change `core-config.yaml`; its current config contr
   recomputed and accepted only when its client/session, provider state, lineage version, atom count,
   digest, and canonical count match exactly. Bindings without one exact durable terminal request are
   deleted rather than guessed.
+- Transcript schema 6 is the managed-blob reference baseline produced by the offline blob migration.
+  Runtime still refuses schemas below 6 because those databases may contain legacy inline bytes.
+- Transcript schema 7 adds strict resource records, transcript resource references, and surface
+  projection resource references. The v6 to v7 step is additive and does not rewrite historical
+  messages or blobs. A resource row uses one stable canonical-origin key and an optional verified
+  BlobStore cache reference. Transcript and projection deletion cascades their reference rows;
+  maintenance deletes a zero-reference cache before removing its resource row.
+- Transcript schema 8 adds transcript-to-blob ownership references. Provider file bytes are uploaded
+  to durable BlobStore objects before persistence, stored in messages as strict blob references, and
+  materialized back into provider files on replay. Migration backfills ownership for existing blob
+  parts. Transcript retention cascades reference rows. Maintenance claims an unreferenced owned blob
+  before deleting its object, which prevents a transcript or surface projection from attaching while
+  deletion is in progress.
+- Transcript schema 9 adds agent-run-checkpoint blob ownership references. A checkpoint pins every
+  referenced blob before replacing the agent-run WAL head, then replaces its ownership set with the
+  blobs reachable from the latest checkpoint and its retained predecessor. Startup reconciliation
+  removes stale pins left by a crash. If the latest checkpoint blob is unavailable, recovery
+  atomically promotes the retained predecessor in the WAL. It resumes from the accepted request only
+  when neither checkpoint is usable.
+- Transcript schema 10 adds a canonical deferred-tool snapshot to every new request transcript and
+  removes the session-wide selection table. Historical rows have no snapshot. Descendants use the
+  newest reachable prefix snapshot, or start empty when none exists.
 
 Core applies missing versions in one immediate transaction, validates foreign keys, marks interrupted
 native attempts uncertain during startup recovery, and promotes recovered pending successes only
@@ -234,23 +398,12 @@ surface projections, total Core-owned blob bytes, and unreferenced blob counts/b
 pruning emits per-owner metadata-pruned diagnostics. These are internal retention/operational
 diagnostics and do not add a `core-config.yaml` key; the config contract remains `configVersion: 2`.
 
-## Graceful Restart Snapshot v4
+## Historical graceful restart snapshot v5
 
-Graceful restart snapshot v4 adds the optional non-empty `currentTurnUserId` to active and queued
-agent recovery entries. Persisted snapshots v1, v2, and v3 remain readable and are normalized to v4
-in memory; reads do not rewrite the SQLite row.
-
-- v1 and v2 relay entries default a missing `requestClient` to their relay `platform`; an explicit
-  disagreement is corrupt. Agent entries receive synthetic per-entry queue IDs, no queue-attempt
-  records, `currentTurnUserId: undefined`, and restricted recovery identity because those versions
-  persisted no durable proof. Their queue-attempt proof is `legacy-ambiguous` when any queued entry
-  exists and `complete` for active-only snapshots.
-- v3 preserves its complete queue-attempt proof, queue attempts, relay correlation, and durable
-  recovery identity. It receives only `currentTurnUserId: undefined`; the value is not inferred from
-  the original authenticated initiator.
-- v4 requires its current strict shape, including a non-empty value when `currentTurnUserId` is
-  present. Unsupported versions and malformed or correlation-invalid snapshots fail the persisted
-  boundary instead of being guessed or partially restored.
+Snapshot v5 used strict `StoredMessageV1` messages and `CorePrimaryLineageV2`. Runtime recovery no longer
+reads this database. Existing rows remain inert. The offline unified blob migration still recognizes its
+supported historical schemas for explicit discard; malformed, future, corrupt-current, or
+correlation-invalid rows remain blocking evidence for that offline command.
 
 ## Historical Workflow Schema 18
 

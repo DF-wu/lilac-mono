@@ -14,6 +14,7 @@ import {
   workflowTriggerSchema,
   workflowWaitSchema,
 } from "../../src/workflow/workflow-domain";
+import { workflowSourceArtifactReferenceForTest } from "./workflow-test-blob-store";
 
 function normalizeWorkflowResourcePolicy(input: unknown) {
   const result = normalizeWorkflowResourcePolicyResult(input);
@@ -48,7 +49,7 @@ describe("durable workflow domain", () => {
         scope: "project",
         normalizedPath: "audit.js",
         name: "audit",
-        snapshotArtifactId: "artifact-1",
+        snapshotArtifact: workflowSourceArtifactReferenceForTest("artifact-1"),
         sourceSha256: HASH,
         inputSchemaSha256: HASH,
         resourcePolicySha256: HASH,
@@ -88,7 +89,7 @@ describe("durable workflow domain", () => {
       scope: "project",
       normalizedPath: "audit.js",
       name: "audit",
-      snapshotArtifactId: "artifact-1",
+      snapshotArtifact: workflowSourceArtifactReferenceForTest("artifact-1"),
       sourceSha256: HASH,
       inputSchemaSha256: HASH,
       resourcePolicySha256: HASH,
@@ -122,7 +123,7 @@ describe("durable workflow domain", () => {
       progressTarget: { platform: "discord", channelId: "channel-1", replyToMessageId: null },
       terminalDetail: null,
       result: null,
-      resultArtifactId: null,
+      resultArtifact: null,
       claimedBy: null,
       claimedAt: null,
       createdAt: 1,
@@ -144,7 +145,7 @@ describe("durable workflow domain", () => {
       attempt: 0,
       requestId: null,
       output: null,
-      resultArtifactId: null,
+      resultArtifact: null,
       error: null,
       usage: null,
       claimedBy: null,

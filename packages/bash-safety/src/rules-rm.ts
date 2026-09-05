@@ -5,11 +5,16 @@ import { normalize, resolve } from "node:path";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { hasRecursiveFlag } from "./analyze/rm-flags";
+import { bashSafetyViolation, type BashSafetyViolation } from "./types";
 
 const REASON_RM_RF =
   "recursive rm outside cwd is blocked. Use explicit paths within the current directory, or delete manually.";
 const REASON_RM_RF_ROOT_HOME =
   "recursive rm targeting root or home directory is extremely dangerous and always blocked.";
+const HINT_LITERAL_CHILD_DELETE =
+  "Select the intended parent as cwd and remove a literal child path within it.";
+const HINT_ROOT_HOME_DELETE =
+  "Target a specific child path inside the selected cwd; root and home cannot be removed.";
 
 export interface AnalyzeRmOptions {
   cwd?: string;
@@ -51,21 +56,32 @@ function resolveRmPaths(
   cwd: string,
   target: string,
 ): ResultType<ResolvedRmPaths, RmPathResolutionFailed> {
-  return Result.try({
+  const captured = Result.try({
     try: () => ({ cwd: realpathSync(cwd), target: realpathSync(resolve(cwd, target)) }),
-    catch: (cause) => {
-      if (Panic.is(cause)) throw cause;
-      return new RmPathResolutionFailed({
-        cwd,
-        target,
-        cause,
-        message: "rm target paths could not be resolved",
-      });
-    },
+    catch: (cause) => ({ cause }),
   });
+  const outcome = captured.match<{ readonly value: ResolvedRmPaths } | { readonly cause: unknown }>(
+    {
+      ok: (value) => ({ value }),
+      err: ({ cause }) => ({ cause }),
+    },
+  );
+  if ("value" in outcome) return Result.ok(outcome.value);
+  if (Panic.is(outcome.cause)) throw outcome.cause;
+  return Result.err(
+    new RmPathResolutionFailed({
+      cwd,
+      target,
+      cause: outcome.cause,
+      message: "rm target paths could not be resolved",
+    }),
+  );
 }
 
-export function analyzeRm(tokens: string[], options: AnalyzeRmOptions = {}): string | null {
+export function analyzeRm(
+  tokens: string[],
+  options: AnalyzeRmOptions = {},
+): BashSafetyViolation | null {
   const {
     cwd,
     originalCwd,
@@ -165,21 +181,29 @@ function classifyTarget(target: string, ctx: RmContext): TargetClassification {
 function reasonForClassification(
   classification: TargetClassification,
   ctx: RmContext,
-): string | null {
+): BashSafetyViolation | null {
   switch (classification.kind) {
     case "root_or_home_target":
-      return REASON_RM_RF_ROOT_HOME;
+      return bashSafetyViolation(
+        "delete_root_or_home",
+        REASON_RM_RF_ROOT_HOME,
+        HINT_ROOT_HOME_DELETE,
+      );
     case "cwd_self_target":
-      return REASON_RM_RF;
+      return bashSafetyViolation("delete_current_cwd", REASON_RM_RF, HINT_LITERAL_CHILD_DELETE);
     case "temp_target":
       return null;
     case "within_anchored_cwd":
       if (ctx.paranoid) {
-        return `${REASON_RM_RF} (PARANOID_RM enabled)`;
+        return bashSafetyViolation(
+          "paranoid_recursive_delete",
+          `${REASON_RM_RF} (PARANOID_RM enabled)`,
+          HINT_LITERAL_CHILD_DELETE,
+        );
       }
       return null;
     case "outside_anchored_cwd":
-      return REASON_RM_RF;
+      return bashSafetyViolation("delete_outside_cwd", REASON_RM_RF, HINT_LITERAL_CHILD_DELETE);
     case "unknown":
       return null;
   }
@@ -258,15 +282,16 @@ function isCwdSelfTarget(target: string, cwd: string): boolean {
   }
 
   const resolvedPaths = resolveRmPaths(cwd, target);
-  return resolvedPaths.match({
-    ok: (paths) => paths.target === paths.cwd,
-    err: () => {
+  const compare = resolvedPaths.match<() => boolean>({
+    ok: (paths) => () => paths.target === paths.cwd,
+    err: () => () => {
       // Missing paths cannot be canonicalized, so preserve the lexical fallback.
       const resolved = resolve(cwd, target);
       const normalizedCwd = normalize(cwd);
       return resolved === normalizedCwd;
     },
   });
+  return compare();
 }
 
 function isTargetWithinCwd(target: string, originalCwd: string, effectiveCwd?: string): boolean {

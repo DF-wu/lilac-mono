@@ -21,6 +21,14 @@ export type CoreConfigParseOptions = {
   onUnknownModelOption?: (warning: CoreConfigModelOptionWarning, source: string) => void;
 };
 
+export type RetentionLimit =
+  | { readonly kind: "bounded"; readonly value: number }
+  | { readonly kind: "unlimited" };
+
+export const DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000;
+export const DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS = 10_000;
+export const DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
 export type DiscordUserAliasConfig = {
   discord: string;
   comment?: string;
@@ -108,6 +116,23 @@ export type ModelCapabilityOverride = {
   };
 };
 
+export type BlobStorageConfig =
+  | {
+      kind: "local";
+      root?: string;
+    }
+  | {
+      kind: "s3";
+      bucket: string;
+      prefix: string;
+      endpoint: string;
+      region: string;
+      accessKeyIdEnv: string;
+      secretAccessKeyEnv: string;
+      sessionTokenEnv?: string;
+      forcePathStyle: boolean;
+    };
+
 export const TELEGRAM_SURFACE_DEFAULTS = {
   enabled: false,
   botName: "lilac",
@@ -165,6 +190,8 @@ export type ImageGenerationModelAlias = (typeof IMAGE_GENERATION_MODEL_ALIASES)[
 
 export type UniversalCoreConfig = {
   configVersion: CoreConfigVersion;
+
+  blobStorage: BlobStorageConfig;
 
   tools: {
     fsBackend: "fff" | "node-rg";
@@ -243,6 +270,7 @@ export type UniversalCoreConfig = {
         followUpMinTextUnits: number;
         limit: number;
         minScore: number;
+        expansionMinConfidence: number;
         mode: "hybrid" | "semantic" | "lexical";
         filterCurrentParticipants: boolean;
       };
@@ -283,8 +311,12 @@ export type UniversalCoreConfig = {
       memberPresence?: boolean;
       outputMode: "inline" | "preview";
       outputPreviewModeFinalStyle: "embed" | "plain";
+      outputPreviewModeFinalText: "flat" | "reply-chain";
       outputNotification?: boolean;
       workingIndicators: string[];
+      attachmentCache: {
+        ttlMs: RetentionLimit;
+      };
       markdownTableRender: {
         enabled: boolean;
         style: "unicode" | "ascii";
@@ -370,9 +402,14 @@ export type UniversalCoreConfig = {
 
   agent: {
     systemPrompt: string;
+    workerSystemPrompt: string;
     statsForNerds: boolean | { verbose: boolean };
     reasoningDisplay: "none" | "simple" | "detailed";
     idleTimeoutMs: number;
+    transcriptRetention: {
+      maxAgeMs: RetentionLimit;
+      maxRequests: RetentionLimit;
+    };
     retry: {
       enabled: boolean;
       maxRetries: number;
@@ -432,6 +469,14 @@ export type UniversalCoreConfig = {
 };
 
 export type CoreConfig = UniversalCoreConfig;
+
+export type RouterSessionConfig = CoreConfig["surface"]["router"]["sessionModes"][string];
+
+export type RouterSessionConfigScope = {
+  sessionId: string;
+  parentChannelId?: string | null;
+  guildId?: string | null;
+};
 
 export interface ConfigParser {
   readonly version: CoreConfigVersion;

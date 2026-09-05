@@ -1,3 +1,4 @@
+import { captureError } from "../shared/error-capture.js";
 import {
   AISDKError,
   generateText,
@@ -60,7 +61,6 @@ import {
 import { stripLeadingContinueDirective } from "../surface/discord/discord-request-router/common";
 import { isSqliteBusyError } from "../shared/sqlite";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
-import { projectRuntimeError } from "../runtime/error-format";
 
 const SUMMARY_QUIET_MS = 60 * 60 * 1000;
 const SUMMARY_HEAD_MESSAGES = 40;
@@ -242,6 +242,7 @@ export type ConversationThreadToolService = {
   planAutoInjectSearch(
     input: Parameters<ConversationThreadService["planAutoInjectSearch"]>[0],
   ): Promise<ConversationThreadAutoInjectQueryPlan>;
+  getAutoInjectRankingCorpusDocuments?(): readonly string[];
 };
 
 export type ConversationThreadSearchResult = {
@@ -476,6 +477,51 @@ type ThreadLanguageModelUsageOperation = "summary" | "query_aboutness" | "auto_i
 type ThreadEmbeddingUsageOperation = "thread_facets" | "search_query";
 type ThreadEmbeddingUsageStatus = "completed" | "failed";
 
+export type ConversationThreadAutoInjectUsageAccumulator = {
+  recordPlannerUsage(usage: {
+    model: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+    reasoningTokens?: number;
+  }): void;
+  recordEmbeddingUsage(usage: {
+    model: string;
+    calls: number;
+    inputChars: number;
+    tokens: number;
+    warnings: number;
+  }): void;
+  finish(input: {
+    status: "completed" | "abstained" | "partial" | "failed";
+    searchCount?: number;
+    queryCount?: number;
+  }): void;
+};
+
+type AutoInjectUsageLogRecord = {
+  status: "completed" | "abstained" | "partial" | "failed";
+  requestId?: string;
+  elapsedMs: number;
+  searches: number;
+  queries: number;
+  planner?: {
+    model: string;
+    calls: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    reasoningTokens: number;
+  };
+  embedding?: {
+    model: string;
+    calls: number;
+    inputChars: number;
+    tokens: number;
+    warnings: number;
+  };
+};
+
 type ThreadLanguageModelCallEndEvent = {
   provider: string;
   modelId: string;
@@ -498,8 +544,19 @@ function createThreadLanguageModelUsageLogger(input: {
   omittedMessages?: number;
   queryCount?: number;
   inputChars?: number;
+  autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
 }) {
   return (event: ThreadLanguageModelCallEndEvent) => {
+    if (input.autoInjectUsage) {
+      input.autoInjectUsage.recordPlannerUsage({
+        model: input.modelSpec,
+        inputTokens: event.usage.inputTokens,
+        outputTokens: event.usage.outputTokens,
+        cacheReadTokens: event.usage.inputTokenDetails.cacheReadTokens,
+        reasoningTokens: event.usage.outputTokenDetails.reasoningTokens,
+      });
+      return;
+    }
     threadLogger.info("conversation.thread.llm.usage", {
       operation: input.operation,
       jobId: input.jobId,
@@ -528,7 +585,10 @@ function createThreadLanguageModelUsageLogger(input: {
   };
 }
 
-function createThreadEmbeddingUsageAccumulator(operation: ThreadEmbeddingUsageOperation) {
+function createThreadEmbeddingUsageAccumulator(
+  operation: ThreadEmbeddingUsageOperation,
+  autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator,
+) {
   let calls = 0;
   let inputChars = 0;
   let tokens = 0;
@@ -560,7 +620,7 @@ function createThreadEmbeddingUsageAccumulator(operation: ThreadEmbeddingUsageOp
       error?: string;
     }) {
       if (calls === 0) return;
-      threadLogger.info("conversation.thread.embedding.usage", {
+      const usage = {
         operation,
         status: input.status,
         jobId: input.jobId,
@@ -579,7 +639,95 @@ function createThreadEmbeddingUsageAccumulator(operation: ThreadEmbeddingUsageOp
         dimensions: input.dimensions,
         persistedEmbeddings: input.persistedEmbeddings,
         error: input.error,
-      });
+      };
+      if (autoInjectUsage) {
+        autoInjectUsage.recordEmbeddingUsage({
+          model: modelSpec ?? modelId ?? "unknown",
+          calls,
+          inputChars,
+          tokens,
+          warnings,
+        });
+        return;
+      }
+      threadLogger.info("conversation.thread.embedding.usage", usage);
+    },
+  };
+}
+
+export function createConversationThreadAutoInjectUsageAccumulator(input: {
+  requestId?: string;
+  now?: () => number;
+  log?: (message: string, record: AutoInjectUsageLogRecord) => void;
+}): ConversationThreadAutoInjectUsageAccumulator {
+  const now = input.now ?? performance.now.bind(performance);
+  const startedAt = now();
+  const log =
+    input.log ??
+    ((message: string, record: AutoInjectUsageLogRecord) => threadLogger.info(message, record));
+  let finished = false;
+  let plannerModel: string | undefined;
+  let plannerCalls = 0;
+  let plannerInputTokens = 0;
+  let plannerOutputTokens = 0;
+  let plannerCacheReadTokens = 0;
+  let plannerReasoningTokens = 0;
+  let embeddingModel: string | undefined;
+  let embeddingCalls = 0;
+  let embeddingInputChars = 0;
+  let embeddingTokens = 0;
+  let embeddingWarnings = 0;
+
+  return {
+    recordPlannerUsage(usage) {
+      plannerModel ??= usage.model;
+      plannerCalls += 1;
+      plannerInputTokens += usage.inputTokens ?? 0;
+      plannerOutputTokens += usage.outputTokens ?? 0;
+      plannerCacheReadTokens += usage.cacheReadTokens ?? 0;
+      plannerReasoningTokens += usage.reasoningTokens ?? 0;
+    },
+    recordEmbeddingUsage(usage) {
+      embeddingModel ??= usage.model;
+      embeddingCalls += usage.calls;
+      embeddingInputChars += usage.inputChars;
+      embeddingTokens += usage.tokens;
+      embeddingWarnings += usage.warnings;
+    },
+    finish(finishInput) {
+      if (finished) return;
+      finished = true;
+      const record: AutoInjectUsageLogRecord = {
+        status: finishInput.status,
+        ...(input.requestId ? { requestId: input.requestId } : {}),
+        elapsedMs: Math.round(now() - startedAt),
+        searches: finishInput.searchCount ?? 0,
+        queries: finishInput.queryCount ?? 0,
+        ...(plannerCalls > 0 && plannerModel
+          ? {
+              planner: {
+                model: plannerModel,
+                calls: plannerCalls,
+                inputTokens: plannerInputTokens,
+                outputTokens: plannerOutputTokens,
+                cacheReadTokens: plannerCacheReadTokens,
+                reasoningTokens: plannerReasoningTokens,
+              },
+            }
+          : {}),
+        ...(embeddingCalls > 0 && embeddingModel
+          ? {
+              embedding: {
+                model: embeddingModel,
+                calls: embeddingCalls,
+                inputChars: embeddingInputChars,
+                tokens: embeddingTokens,
+                warnings: embeddingWarnings,
+              },
+            }
+          : {}),
+      };
+      log("conversation.thread.auto_inject.usage", record);
     },
   };
 }
@@ -632,16 +780,18 @@ function captureConversationThreadSqliteOperation(
 ): ResultType<void, ConversationThreadOperationFailed> {
   const captured = Result.try({
     try: run,
-    catch: (cause) => projectRuntimeError(cause, "Conversation thread SQLite operation defect"),
+    catch: (cause) => captureError(cause, "Conversation thread SQLite operation defect"),
   });
   return captured.match<() => ResultType<void, ConversationThreadOperationFailed>>({
     ok: (value) => () => Result.ok(value),
-    err: (error) => () => {
-      if (error instanceof Error && classifyBunSqliteError(error) !== undefined) {
-        return Result.err(conversationThreadOperationFailed(operation, message));
-      }
-      return signalConversationThreadDefect(error);
-    },
+    err:
+      ({ cause: error }) =>
+      () => {
+        if (error instanceof Error && classifyBunSqliteError(error) !== undefined) {
+          return Result.err(conversationThreadOperationFailed(operation, message));
+        }
+        return signalConversationThreadDefect(error);
+      },
   })();
 }
 
@@ -833,10 +983,13 @@ function normalizeAutoInjectQueryPlan(
   plan: ConversationThreadAutoInjectQueryPlan,
 ): ConversationThreadAutoInjectQueryPlan {
   return {
-    searches: plan.searches.slice(0, AUTO_INJECT_SEARCH_MAX).map((search) => ({
-      queries: normalizeSearchQueries(search.queries, AUTO_INJECT_QUERIES_PER_SEARCH_MAX),
-      aboutness: normalizeQueryAboutness(search.aboutness),
-    })),
+    searches: plan.searches
+      .slice(0, AUTO_INJECT_SEARCH_MAX)
+      .map((search) => ({
+        queries: normalizeSearchQueries(search.queries, AUTO_INJECT_QUERIES_PER_SEARCH_MAX),
+        aboutness: normalizeQueryAboutness(search.aboutness),
+      }))
+      .filter((search) => search.queries.length > 0),
   };
 }
 
@@ -1507,6 +1660,7 @@ async function defaultAutoInjectQueryPlanner(input: {
   cfg: CoreConfig;
   text: string;
   content?: UserContent;
+  autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
 }): Promise<ResultType<ConversationThreadAutoInjectQueryPlan, ConversationThreadGenerationError>> {
   const resolvedResult = resolveAutoInjectPlannerModel(input.cfg, input.content);
   const resolvedError = resultErrorOrNull(resolvedResult);
@@ -1538,6 +1692,7 @@ async function defaultAutoInjectQueryPlanner(input: {
     operation: "auto_inject_query_plan",
     modelSpec: resolved.spec,
     inputChars: input.text.length,
+    autoInjectUsage: input.autoInjectUsage,
   });
 
   if (resolved.provider === "codex") {
@@ -1601,8 +1756,11 @@ export function buildAutoInjectQueryPlanInstructions(): string {
     'Shape: {"searches":[{"queries":["..."],"aboutness":{"domains":["..."],"situations":["..."],"targets":["..."],"entities":["..."],"userWouldAskForThisAs":["..."],"intentSummary":"..."}}]}',
     "",
     "The input is a newly received user message, possibly a long article or essay.",
-    "Do not summarize the article for the final answer. Instead, generate semantic search queries that would find prior conversation threads useful for responding to it.",
-    "You must produce 1-3 searches, ordered by expected usefulness. Each search is one distinct retrieval category or intent.",
+    "Do not summarize the article for the final answer. Generate semantic search queries only when a prior conversation thread would materially help answer the user's current request.",
+    'Return {"searches":[]} when retrieval would not help. Abstain for casual reactions, transient coordination, reply-only context, attachment-only messages without a clear durable subject, and incidental mentions of a person, product, or topic.',
+    "Use one search for one substantive user intent. Use 2-3 searches only when the user explicitly asks about distinct durable intents and each could retrieve independently useful history.",
+    "Do not create separate searches from examples, links, quoted text, article sections, or background clauses unless the user asks about them.",
+    "Order multiple searches by expected usefulness.",
     "Each search must contain 1-3 non-empty query variants/facets for the same intent. Prefer 1 query unless aliases, exact entities, or meaningfully different wording improve recall.",
     "Do not split near-duplicate phrasings into separate searches; keep them as query variants inside one search.",
     "Queries should name the durable subject, task, decision, complaint target, project, technology, entities, or situation.",
@@ -1702,6 +1860,7 @@ export class ConversationThreadService {
     minScore?: number;
     verbose?: boolean;
     queryAboutness?: ConversationThreadQueryAboutness;
+    autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
   }): Promise<ResultType<ConversationThreadSearchResult, ConversationThreadSearchError>> {
     const cfg = await this.params.getConfig();
     const limit = Math.min(50, Math.max(1, Math.floor(input.limit ?? 5)));
@@ -1722,7 +1881,7 @@ export class ConversationThreadService {
     const filters = buildSearchFilters(input);
     const recallLimit =
       mode === "lexical" ? limit : Math.min(50, Math.max(limit * COVERAGE_RECALL_MULTIPLIER, 10));
-    const usage = createThreadEmbeddingUsageAccumulator("search_query");
+    const usage = createThreadEmbeddingUsageAccumulator("search_query", input.autoInjectUsage);
     const recallHits = await this.searchHitsForQueries({
       queries,
       limit: recallLimit,
@@ -1773,6 +1932,7 @@ export class ConversationThreadService {
   async planAutoInjectSearch(input: {
     text: string;
     content?: UserContent;
+    autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
   }): Promise<
     ResultType<
       ConversationThreadAutoInjectQueryPlan,
@@ -1797,8 +1957,17 @@ export class ConversationThreadService {
           "summarize-thread",
           "Query planning failed",
         )
-      : await defaultAutoInjectQueryPlanner({ cfg, text, content: input.content });
+      : await defaultAutoInjectQueryPlanner({
+          cfg,
+          text,
+          content: input.content,
+          autoInjectUsage: input.autoInjectUsage,
+        });
     return planned.map(normalizeAutoInjectQueryPlan);
+  }
+
+  getAutoInjectRankingCorpusDocuments(): readonly string[] {
+    return this.params.store.listAutoInjectRankingDocuments();
   }
 
   async read(input: {
@@ -2965,6 +3134,7 @@ export function createConversationThreadToolService(
     runSummarization: (input) => service.runSummarization(input),
     planAutoInjectSearch: (input) =>
       resolvePersistenceOperation(service.planAutoInjectSearch(input)),
+    getAutoInjectRankingCorpusDocuments: () => service.getAutoInjectRankingCorpusDocuments(),
   };
 }
 

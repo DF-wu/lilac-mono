@@ -6,7 +6,12 @@ import { miniLilacReasoningSchema } from "@stanley2058/mini-lilac-client";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-import { captureTuiOperationAsync } from "./failure-adapter";
+import {
+  captureTuiFailure,
+  captureTuiOperationAsync,
+  signalTuiDefect,
+  type CapturedTuiFailure,
+} from "./failure-adapter";
 
 const bindingPreferenceSchema = z.object({
   model: z.string().min(1).optional(),
@@ -103,19 +108,27 @@ export function decodeBindingPreferences(input: {
   }
   const { filePath } = input;
   const serialized = input.serialized;
-  const parsedJson = Result.try({
+  const parsedJson = Result.try<unknown, CapturedTuiFailure>({
     try: () => JSON.parse(serialized),
-    catch: () =>
+    catch: captureTuiFailure,
+  });
+  const settlement = parsedJson.match<
+    | { readonly kind: "success"; readonly value: unknown }
+    | { readonly kind: "failure"; readonly failure: CapturedTuiFailure }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: (failure) => ({ kind: "failure", failure }),
+  });
+  if (settlement.kind === "failure") {
+    if (settlement.failure.kind === "panic") return signalTuiDefect(settlement.failure.panic);
+    return Result.err(
       new BindingPreferencesMalformed({
         filePath,
         message: "Preferences are not valid JSON",
       }),
-  });
-  const json: unknown = parsedJson.match<unknown>({
-    ok: (value) => value,
-    err: (error) => error,
-  });
-  if (BindingPreferencesMalformed.is(json)) return Result.err(json);
+    );
+  }
+  const json = settlement.value;
   const version = preferenceVersionSchema.safeParse(json);
   if (!version.success) {
     const legacy = legacyBindingPreferencesSchema.safeParse(json);

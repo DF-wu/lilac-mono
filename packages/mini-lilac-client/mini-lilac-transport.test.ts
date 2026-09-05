@@ -547,7 +547,7 @@ describe("MiniLilacTransport", () => {
     }
     const ownedReader = ownedAdmission.value.getReader();
     const ownedPending = ownedReader.read();
-    const ownedReason = new Error("owned cancellation");
+    const ownedReason = "owned cancellation";
     ownedController.abort(ownedReason);
     if (ownedBodyController === undefined) throw new Error("expected owned body controller");
     ownedBodyController.error(ownedReason);
@@ -682,6 +682,7 @@ describe("MiniLilacTransport", () => {
     const firstResponse = new Promise<Response>((resolve) => {
       resolveFirst = resolve;
     });
+    const firstRequestStarted = Promise.withResolvers<void>();
     let bindingCall = 0;
     const transport = new MiniLilacTransport({
       baseUrl: "/mini",
@@ -693,7 +694,10 @@ describe("MiniLilacTransport", () => {
         calls.push({ input, init });
         if (!String(input).endsWith("/bindings")) return sseResponse([]);
         bindingCall += 1;
-        if (bindingCall === 1) return firstResponse;
+        if (bindingCall === 1) {
+          firstRequestStarted.resolve();
+          return firstResponse;
+        }
         return jsonResponse({
           id: "session-1",
           activeRunId: null,
@@ -716,8 +720,7 @@ describe("MiniLilacTransport", () => {
       model: "test/newer",
       reasoning: "high",
     });
-    // test-wait-justification: lets the first serialized binding request start while its response remains gated
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await firstRequestStarted.promise;
     expect(calls).toHaveLength(1);
 
     resolveFirst(

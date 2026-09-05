@@ -110,6 +110,15 @@ describe("formatToolArgsForDisplay", () => {
     ).toBe(" foo tool-result://00000000-...");
   });
 
+  it("formats grep resource paths without treating them as SSH targets", () => {
+    expect(
+      formatBuiltinArgs("grep", {
+        pattern: "foo",
+        path: "resource://r1_00000000000000000000000000000000",
+      }),
+    ).toBe(" foo resource://r1_000000000...");
+  });
+
   it("formats glob as patterns + cwd", () => {
     expect(
       formatBuiltinArgs("glob", {

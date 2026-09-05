@@ -1,3 +1,4 @@
+import { captureError } from "../../shared/error-capture";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import { formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
@@ -153,40 +154,49 @@ export async function deleteGithubAcknowledgement(
   },
   api: GithubAcknowledgementApi,
 ): Promise<ResultType<void, GithubAcknowledgementDeleteFailed>> {
-  try {
-    const meta = getGithubRequestMeta(input.requestId);
-    const thread = (() => {
-      if (meta?.repoFullName) {
-        const [owner, repo] = meta.repoFullName.split("/");
-        if (owner && repo) return { owner, repo };
-      }
-      return parseGithubSessionId(input.sessionId);
-    })();
-    if (input.ack.target.kind === "issue") {
-      await api.deleteIssueReactionById({
-        owner: thread.owner,
-        repo: thread.repo,
-        issueNumber: input.ack.target.issueNumber,
-        reactionId: input.ack.reactionId,
-      });
-    } else {
-      await api.deleteIssueCommentReactionById({
-        owner: thread.owner,
-        repo: thread.repo,
-        commentId: input.ack.target.commentId,
-        reactionId: input.ack.reactionId,
-      });
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        const meta = getGithubRequestMeta(input.requestId);
+        const thread = (() => {
+          if (meta?.repoFullName) {
+            const [owner, repo] = meta.repoFullName.split("/");
+            if (owner && repo) return { owner, repo };
+          }
+          return parseGithubSessionId(input.sessionId);
+        })();
+        if (input.ack.target.kind === "issue") {
+          await api.deleteIssueReactionById({
+            owner: thread.owner,
+            repo: thread.repo,
+            issueNumber: input.ack.target.issueNumber,
+            reactionId: input.ack.reactionId,
+          });
+        } else {
+          await api.deleteIssueCommentReactionById({
+            owner: thread.owner,
+            repo: thread.repo,
+            commentId: input.ack.target.commentId,
+            reactionId: input.ack.reactionId,
+          });
+        }
+        return Result.ok(undefined);
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      preserveGithubRelayPolicyPanic(cause);
+      return Result.err(
+        new GithubAcknowledgementDeleteFailed({
+          cause,
+          isNotFound: cause instanceof GithubApiError && cause.status === 404,
+          message: "Failed to delete GitHub acknowledgement reaction",
+        }),
+      );
     }
-    return Result.ok(undefined);
-  } catch (cause) {
-    preserveGithubRelayPolicyPanic(cause);
-    return Result.err(
-      new GithubAcknowledgementDeleteFailed({
-        cause,
-        isNotFound: cause instanceof GithubApiError && cause.status === 404,
-        message: "Failed to delete GitHub acknowledgement reaction",
-      }),
-    );
+    return attempt.value;
   }
 }
 
@@ -200,19 +210,16 @@ async function clearGithubIngressAcknowledgement(
   const ack = getGithubAck(input.requestId);
   if (!ack) return Result.ok(undefined);
 
-  let deleted: ResultType<void, GithubAcknowledgementDeleteFailed>;
-  try {
-    deleted = await deleteGithubAcknowledgement(
-      {
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        ack,
-      },
-      api,
-    );
-  } finally {
+  const deleted = await deleteGithubAcknowledgement(
+    {
+      requestId: input.requestId,
+      sessionId: input.sessionId,
+      ack,
+    },
+    api,
+  ).finally(() => {
     clearGithubAck(input.requestId);
-  }
+  });
 
   return deleted.match<ResultType<void, SurfaceIngressAcknowledgementCleanupFailed>>({
     ok: () => Result.ok(undefined),

@@ -1,5 +1,25 @@
 import { Panic, Result } from "better-result";
 
+export type OpaqueErrorCapture =
+  | { readonly kind: "panic"; readonly panic: Panic }
+  | { readonly kind: "error"; readonly error: Error }
+  | { readonly kind: "opaque" };
+
+export function captureOpaqueErrorCause(cause: unknown): OpaqueErrorCapture {
+  if (Panic.is(cause)) return { kind: "panic", panic: cause };
+  if (cause instanceof Error) return { kind: "error", error: cause };
+  return { kind: "opaque" };
+}
+
+export function projectOpaqueErrorCapture(
+  captured: OpaqueErrorCapture,
+  fallback: string,
+): Error | Panic {
+  if (captured.kind === "panic") return captured.panic;
+  if (captured.kind === "error") return captured.error;
+  return new Error(fallback);
+}
+
 export function isPanic(cause: unknown): cause is Panic {
   const inspected = Result.try({
     try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),

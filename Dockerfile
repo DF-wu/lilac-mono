@@ -169,6 +169,7 @@ COPY apps/mini-lilac-server/package.json apps/mini-lilac-server/package.json
 COPY apps/mini-lilac-tui/package.json apps/mini-lilac-tui/package.json
 COPY packages/agent/package.json packages/agent/package.json
 COPY packages/bash-safety/package.json packages/bash-safety/package.json
+COPY packages/blob-storage/package.json packages/blob-storage/package.json
 COPY packages/claude-code-bridge/package.json packages/claude-code-bridge/package.json
 COPY packages/coding-tools/package.json packages/coding-tools/package.json
 COPY packages/event-bus/package.json packages/event-bus/package.json

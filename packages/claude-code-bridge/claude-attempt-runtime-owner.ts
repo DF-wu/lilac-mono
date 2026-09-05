@@ -115,6 +115,14 @@ function resultOutcome<T, E>(
   });
 }
 
+type OpaqueCandidateValue = {} | null | undefined;
+
+function captureCandidatePromise<T>(
+  operation: () => Promise<T>,
+): Promise<ResultType<T, OpaqueCandidateValue>> {
+  return Result.tryPromise<T, OpaqueCandidateValue>({ try: operation, catch: (cause) => cause });
+}
+
 function stateError(message: string): ClaudeAttemptRuntimeStateFailed {
   return new ClaudeAttemptRuntimeStateFailed({ message });
 }
@@ -126,17 +134,15 @@ function candidateError(message: string): ClaudeAttemptRuntimeCandidateFailed {
 async function captureCandidateFactory(
   create: () => Promise<ClaudeAttemptRuntimeCandidate>,
 ): Promise<ResultType<ClaudeAttemptRuntimeCandidate, ClaudeAttemptRuntimeCandidateFailed>> {
-  try {
-    return Result.ok(await create());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new ClaudeAttemptRuntimeCandidateFailed({
-        cause,
-        message: "Claude candidate factory failed",
-      }),
-    );
-  }
+  const captured = resultOutcome(await captureCandidatePromise(create));
+  if (captured.ok) return Result.ok(captured.value);
+  if (Panic.is(captured.error)) throw captured.error;
+  return Result.err(
+    new ClaudeAttemptRuntimeCandidateFailed({
+      cause: captured.error,
+      message: "Claude candidate factory failed",
+    }),
+  );
 }
 
 async function disposeRun(

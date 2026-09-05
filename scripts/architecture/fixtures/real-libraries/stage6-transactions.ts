@@ -28,29 +28,45 @@ export function runFixtureSqliteTransaction<T, E>(
   database: Database,
   operation: () => ResultType<T, E>,
 ): ResultType<T, E | FixtureDriverFailed> {
-  try {
-    const value = database
-      .transaction((): T => {
-        const result = operation();
-        const inspectAdapterOwnedStatus = (): string => result.status;
-        void inspectAdapterOwnedStatus;
-        if (result.status === "error") {
-          const rollbackSentinel = new FixtureRollback(result);
-          throw rollbackSentinel;
-        }
-        return result.value;
-      })
-      .immediate();
-    return Result.ok(value);
-  } catch (cause) {
-    if (cause instanceof FixtureRollback) return cause.result;
-    if (Panic.is(cause)) throw cause;
-    if (cause instanceof Error) {
-      const driverFailure = classifyFixtureSqliteDriverError(cause);
-      if (driverFailure) return Result.err(driverFailure);
-    }
-    throw cause;
+  let rollbackSentinel: FixtureRollback<T, E> | undefined;
+  let callbackCompleted = false;
+  const transaction = Result.try({
+    try: () => ({
+      value: database
+        .transaction((): T => {
+          const result = operation();
+          const inspectAdapterOwnedStatus = (): string => result.status;
+          void inspectAdapterOwnedStatus;
+          if (result.status === "error") {
+            rollbackSentinel = new FixtureRollback(result);
+            throw rollbackSentinel;
+          }
+          callbackCompleted = true;
+          return result.value;
+        })
+        .immediate(),
+    }),
+    catch: (cause) => cause,
+  });
+  const transactionOutcome = transaction.match<
+    | { readonly kind: "value"; readonly value: T }
+    | { readonly kind: "cause"; readonly cause: unknown }
+  >({
+    ok: ({ value }) => ({ kind: "value", value }),
+    err: (cause) => ({ kind: "cause", cause }),
+  });
+  if (transactionOutcome.kind === "value") return Result.ok(transactionOutcome.value);
+  const cause = transactionOutcome.cause;
+  if (rollbackSentinel !== undefined && cause === rollbackSentinel) return rollbackSentinel.result;
+  if (Panic.is(cause)) throw cause;
+  if (rollbackSentinel !== undefined || callbackCompleted) {
+    throw new Panic({ message: "fixture transaction atomicity is unknown", cause });
   }
+  if (cause instanceof Error) {
+    const driverFailure = classifyFixtureSqliteDriverError(cause);
+    if (driverFailure) return Result.err(driverFailure);
+  }
+  throw cause;
 }
 
 export function goodFixtureTransactionConsumer(database: Database, fail: boolean) {

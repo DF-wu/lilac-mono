@@ -2,7 +2,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { rethrowAgentPanic } from "./failure-adapters";
+import { captureAgentPromise, rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
 
 export type RetryBackoffConfig = {
   enabled: boolean;
@@ -61,23 +61,36 @@ export function createRetryBackoffBudget(retry: RetryBackoffConfig): RetryBackof
         baseDelayMs: retry.baseDelayMs,
         maxDelayMs: retry.maxDelayMs,
       });
-      try {
+      const delayed = await captureAgentPromise(async () => {
         if (delayMs > 0) await sleep(delayMs, undefined, { signal: abortSignal });
         else abortSignal?.throwIfAborted();
-      } catch (error) {
+      });
+      const delaySettlement = delayed.match<
+        | { readonly kind: "completed" }
+        | { readonly kind: "failed"; readonly error: OpaqueAgentValue }
+      >({
+        ok: () => ({ kind: "completed" }),
+        err: (error) => ({ kind: "failed", error }),
+      });
+      if (delaySettlement.kind === "failed") {
         attempts -= 1;
-        rethrowAgentPanic(error);
+        const delayError = delaySettlement.error;
+        rethrowAgentPanic(delayError);
+        const cause =
+          delayError instanceof Error
+            ? delayError
+            : new Error("Retry backoff failed", { cause: delayError });
         if (!abortSignal?.aborted) {
           return Result.err(
             new RetryBackoffDelayFailed({
-              cause: error,
+              cause,
               message: "Retry backoff delay failed",
             }),
           );
         }
         return Result.err(
           new RetryBackoffAborted({
-            cause: error,
+            cause,
             message: "Retry backoff was aborted",
           }),
         );

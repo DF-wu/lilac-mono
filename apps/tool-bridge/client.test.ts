@@ -41,9 +41,10 @@ async function runToolBridgeCli(params: {
   backendUrl: string;
   stdin?: string;
   env?: Record<string, string>;
+  cwd?: string;
 }): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   const proc = Bun.spawn(["bun", CLIENT_ENTRY, ...params.args], {
-    cwd: import.meta.dir,
+    cwd: params.cwd ?? import.meta.dir,
     env: {
       ...process.env,
       ...params.env,
@@ -306,8 +307,9 @@ describe("tool-bridge CLI runtime", () => {
     }
   });
 
-  it("posts stdin JSON to the backend and forwards Lilac request headers", async () => {
+  it("posts stdin JSON and reports the live process cwd instead of the inherited cwd hint", async () => {
     const requests: Array<{ pathname: string; headers: Headers; body: unknown }> = [];
+    const invocationCwd = await fs.mkdtemp(path.join(tmpdir(), "tool-bridge-cwd-"));
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
@@ -339,15 +341,17 @@ describe("tool-bridge CLI runtime", () => {
         stdin: JSON.stringify({ message: "hello", nested: { count: 2 } }),
         env: {
           LILAC_REQUEST_ID: "request-123",
+          LILAC_REQUEST_DELIVERY_ID: "delivery-234",
           LILAC_SESSION_ID: "session-456",
           LILAC_ORIGIN_SESSION_ID: "origin-session-789",
           LILAC_REQUEST_CLIENT: "test-client",
-          LILAC_CWD: "/workspace/project",
+          LILAC_CWD: "/stale/workspace/project",
         },
+        cwd: invocationCwd,
       });
 
-      expect(result.exitCode).toBe(0);
       expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
       expect(result.stdout).toBe('{"ok":true,"value":42}\n');
 
       expect(requests).toHaveLength(1);
@@ -358,10 +362,11 @@ describe("tool-bridge CLI runtime", () => {
       expect(request.pathname).toBe("/call");
       expect(request.headers.get("content-type")).toContain("application/json");
       expect(request.headers.get("x-lilac-request-id")).toBe("request-123");
+      expect(request.headers.get("x-lilac-request-delivery-id")).toBe("delivery-234");
       expect(request.headers.get("x-lilac-session-id")).toBe("session-456");
       expect(request.headers.get("x-lilac-origin-session-id")).toBe("origin-session-789");
       expect(request.headers.get("x-lilac-request-client")).toBe("test-client");
-      expect(request.headers.get("x-lilac-cwd")).toBe("/workspace/project");
+      expect(request.headers.get("x-lilac-cwd")).toBe(invocationCwd);
       expect(request.body).toEqual({
         callableId: "demo.echo",
         input: {
@@ -371,6 +376,7 @@ describe("tool-bridge CLI runtime", () => {
       });
     } finally {
       server.stop(true);
+      await fs.rm(invocationCwd, { recursive: true, force: true });
     }
   });
 

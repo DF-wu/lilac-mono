@@ -3,8 +3,10 @@ import { RuleTester } from "oxlint/plugins-dev";
 import { noFixedTestWaitRule } from "./test-waits.mts";
 import {
   noExceptionFlowRule,
+  noElseAfterTerminalRule,
   noInlineAsyncResultCallbackRule,
   noLocalIsRecordRule,
+  preferSwitchTrueChainRule,
 } from "./production-syntax.mts";
 
 const ruleTester = new RuleTester({
@@ -21,18 +23,32 @@ ruleTester.run("lilac/no-fixed-test-wait", noFixedTestWaitRule, {
       code: "await Bun.sleep(5);",
       errors: [{ message: /fixed Bun\.sleep progression delay/u, line: 1, column: 6 }],
     },
+    {
+      code: "// test-wait-justification: event-loop yield\nawait Bun.sleep(0);",
+      errors: [{ message: /zero-duration progression timers cannot be justified/u, line: 2 }],
+    },
   ],
 });
 
 const productionFile = "apps/example/src/example.ts";
 
 ruleTester.run("lilac/no-exception-flow", noExceptionFlowRule, {
-  valid: [{ code: "try { operation(); } finally { cleanup(); }", filename: productionFile }],
+  valid: [
+    {
+      code: "Result.try({ try: () => operation(), catch: (cause) => mapCause(cause) });",
+      filename: productionFile,
+    },
+  ],
   invalid: [
     {
       code: "function run() { throw new Error('bad'); }",
       filename: productionFile,
       errors: [{ message: /Return a typed Result error/u, line: 1, column: 17 }],
+    },
+    {
+      code: "try { operation(); } finally { cleanup(); }",
+      filename: productionFile,
+      errors: [{ message: /production try statements are forbidden/u, line: 1, column: 0 }],
     },
   ],
 });
@@ -60,6 +76,38 @@ ruleTester.run("lilac/no-inline-async-result-callback", noInlineAsyncResultCallb
       code: 'import { Result } from "better-result"; Result.andThenAsync(async (value) => Result.ok(value));',
       filename: productionFile,
       errors: [{ message: /named Result-returning adapter/u, line: 1, column: 60 }],
+    },
+  ],
+});
+
+ruleTester.run("lilac/prefer-switch-true-chain", preferSwitchTrueChainRule, {
+  valid: [
+    {
+      code: "if (a || b) first(); else fallback();",
+      filename: productionFile,
+    },
+  ],
+  invalid: [
+    {
+      code: "if (a || b) first(); else if (c || d) second(); else if (e) third(); else fallback();",
+      filename: productionFile,
+      errors: [{ message: /Use switch \(true\)/u, line: 1, column: 0 }],
+    },
+  ],
+});
+
+ruleTester.run("lilac/no-else-after-terminal", noElseAfterTerminalRule, {
+  valid: [
+    {
+      code: "if (ready) returnValue(); else fallback();",
+      filename: productionFile,
+    },
+  ],
+  invalid: [
+    {
+      code: "function run() { if (ready) return value; else return fallback; }",
+      filename: productionFile,
+      errors: [{ message: /Remove this else/u, line: 1, column: 47 }],
     },
   ],
 });

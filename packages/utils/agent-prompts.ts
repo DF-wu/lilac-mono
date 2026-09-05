@@ -2,10 +2,11 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
+import { Result } from "better-result";
 import { z } from "zod";
 
 import { findWorkspaceRoot } from "./find-root";
-import { isPanic } from "./runtime-utils";
+import { captureResultOutcome, isPanic, settlePromiseResult } from "./runtime-utils";
 
 export const DEFAULT_PROMPT_DIRNAME = "prompts";
 export const HEARTBEAT_PROMPT_FILENAME = "HEARTBEAT.md";
@@ -40,6 +41,11 @@ export const PROMPT_TEMPLATE_BASELINE_DIRNAME = ".prompt-template-baselines";
 const PROMPT_TEMPLATE_STATE_SCHEMA_VERSION = 1 as const;
 
 export type CorePromptFileName = (typeof CORE_PROMPT_FILES)[number];
+
+export const WORKER_PROMPT_FILES = [
+  "AGENTS.md",
+  "TOOLS.md",
+] as const satisfies readonly CorePromptFileName[];
 
 type EnsureResult = {
   promptDir: string;
@@ -120,13 +126,9 @@ async function ensureHeartbeatWorkspace(options?: { dataDir?: string }): Promise
 }
 
 async function exists(filePath: string): Promise<boolean> {
-  try {
-    await Bun.file(filePath).stat();
-    return true;
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return false;
-  }
+  const settlement = await settlePromiseResult(() => Bun.file(filePath).stat());
+  if (settlement.kind === "panic") throw settlement.panic;
+  return settlement.kind === "value";
 }
 
 async function safeMkdir(dir: string) {
@@ -138,13 +140,14 @@ function sha256HexText(text: string): string {
 }
 
 function parsePromptTemplateState(raw: string): PromptTemplateState | null {
-  let parsedRaw: unknown;
-  try {
-    parsedRaw = JSON.parse(raw) as unknown;
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return null;
-  }
+  const decoded = Result.try({
+    try: () => JSON.parse(raw) as unknown,
+    catch: (cause) => ({ cause }),
+  });
+  const decodeOutcome = captureResultOutcome(decoded);
+  if (!decodeOutcome.ok && isPanic(decodeOutcome.error.cause)) throw decodeOutcome.error.cause;
+  if (!decodeOutcome.ok) return null;
+  const parsedRaw = decodeOutcome.value;
 
   const parsed = promptTemplateStateSchema.safeParse(parsedRaw);
   if (!parsed.success) return null;
@@ -167,13 +170,10 @@ function parsePromptTemplateState(raw: string): PromptTemplateState | null {
 async function loadPromptTemplateState(promptDir: string): Promise<PromptTemplateState | null> {
   const statePath = path.join(promptDir, PROMPT_TEMPLATE_STATE_FILENAME);
 
-  let raw: string;
-  try {
-    raw = await Bun.file(statePath).text();
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return null;
-  }
+  const read = await settlePromiseResult(() => Bun.file(statePath).text());
+  if (read.kind === "panic") throw read.panic;
+  if (read.kind === "failure") return null;
+  const raw = read.value;
 
   return parsePromptTemplateState(raw);
 }
@@ -210,12 +210,9 @@ function promptTemplateBaselinePath(promptDir: string, name: CorePromptFileName)
 }
 
 async function readTextIfExists(filePath: string): Promise<string | null> {
-  try {
-    return await Bun.file(filePath).text();
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return null;
-  }
+  const settlement = await settlePromiseResult(() => Bun.file(filePath).text());
+  if (settlement.kind === "panic") throw settlement.panic;
+  return settlement.kind === "value" ? settlement.value : null;
 }
 
 async function loadPreviousTemplateContent(params: {
@@ -293,15 +290,18 @@ async function withTemporaryTemplateFiles<T>(params: {
   run: (paths: { oldPath: string; newPath: string }) => Promise<T>;
 }): Promise<T> {
   const dir = await fs.mkdtemp(path.join(tmpdir(), "lilac-prompt-template-"));
-  try {
+  const operated = (async () => {
     const oldPath = path.join(dir, `upstream-before-${params.name}`);
     const newPath = path.join(dir, `upstream-after-${params.name}`);
     await Bun.write(oldPath, params.oldContent);
     await Bun.write(newPath, params.newContent);
     return await params.run({ oldPath, newPath });
-  } finally {
-    await fs.rm(dir, { recursive: true, force: true });
-  }
+  })();
+  await Promise.allSettled([operated]);
+  const cleaned = fs.rm(dir, { recursive: true, force: true });
+  const [cleanupSettlement] = await Promise.allSettled([cleaned]);
+  if (cleanupSettlement.status === "rejected") await cleaned;
+  return operated;
 }
 
 async function buildUpstreamTemplatePatch(params: {
@@ -593,14 +593,10 @@ export async function loadPromptFiles(options?: { dataDir?: string }): Promise<P
   return files;
 }
 
-export function compileSystemPromptFromFiles(
-  files: readonly PromptFile[],
-  basePrompt?: string,
-): string {
-  const lines: string[] = basePrompt ? [basePrompt] : [];
-
+export function compileSystemPromptFromFiles(files: readonly PromptFile[]): string {
+  const lines: string[] = [];
   lines.push("Your system behavior is defined by a set of workspace prompt files.");
-  lines.push("These files are loaded from the local data directory and are authoritative.");
+  lines.push("These local files provide workspace instructions and context for this agent.");
   lines.push("");
 
   for (const f of files) {
@@ -611,20 +607,42 @@ export function compileSystemPromptFromFiles(
   return lines.join("\n").trim();
 }
 
-export async function buildAgentSystemPrompt(options?: {
-  dataDir?: string;
-  basePrompt?: string;
-}): Promise<{
+function selectPromptFiles(
+  files: readonly PromptFile[],
+  names: readonly CorePromptFileName[],
+): PromptFile[] {
+  const included = new Set<CorePromptFileName>(names);
+  return files.filter((file) => included.has(file.name as CorePromptFileName));
+}
+
+export async function buildAgentSystemPrompt(options?: { dataDir?: string }): Promise<{
   systemPrompt: string;
+  workerSystemPrompt: string;
   promptDir: string;
   filePaths: string[];
 }> {
   const files = await loadPromptFiles({ dataDir: options?.dataDir });
   return {
-    systemPrompt: compileSystemPromptFromFiles(files, options?.basePrompt),
+    systemPrompt: compileSystemPromptFromFiles(files),
+    workerSystemPrompt: compileSystemPromptFromFiles(selectPromptFiles(files, WORKER_PROMPT_FILES)),
     promptDir: resolvePromptDir({ dataDir: options?.dataDir }),
     filePaths: files.map((f) => f.path),
   };
+}
+
+export function applyBasePromptForProvider(params: {
+  systemPrompt: string;
+  basePrompt?: string;
+  provider: string;
+}): string {
+  const systemPrompt = params.systemPrompt.trim();
+  if (params.provider === "codex") return systemPrompt;
+
+  const basePrompt = params.basePrompt?.trim();
+  if (!basePrompt) return systemPrompt;
+  if (!systemPrompt) return basePrompt;
+
+  return `${basePrompt}\n\n${systemPrompt}`;
 }
 
 export async function promptWorkspaceSignature(options?: { dataDir?: string }): Promise<{
@@ -637,14 +655,10 @@ export async function promptWorkspaceSignature(options?: { dataDir?: string }): 
 
   for (const name of CORE_PROMPT_FILES) {
     const p = path.join(promptDir, name);
-    try {
-      const stat = await Bun.file(p).stat();
-      maxMtimeMs = Math.max(maxMtimeMs ?? 0, stat.mtimeMs);
-    } catch (cause) {
-      if (isPanic(cause)) throw cause;
-      // Missing files will be created by ensurePromptWorkspace(); signature remains stable.
-      continue;
-    }
+    const inspected = await settlePromiseResult(() => Bun.file(p).stat());
+    if (inspected.kind === "panic") throw inspected.panic;
+    if (inspected.kind === "failure") continue;
+    maxMtimeMs = Math.max(maxMtimeMs ?? 0, inspected.value.mtimeMs);
   }
 
   return { promptDir, maxMtimeMs };

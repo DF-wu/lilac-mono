@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { Panic } from "better-result";
 
-import { parseRequestControlFromRaw } from "../../../src/surface/bridge/bus-agent-runner/raw";
+import {
+  parseGuildIdFromRaw,
+  parseParentChannelIdFromRaw,
+  parseRequestControlFromRaw,
+} from "../../../src/surface/bridge/bus-agent-runner/raw";
 
 const EMPTY_REQUEST_CONTROL = {
   requiresActive: false,
@@ -9,6 +13,15 @@ const EMPTY_REQUEST_CONTROL = {
   cancelQueued: false,
   targetMessageId: null,
 };
+
+describe("session hierarchy raw projection", () => {
+  it("projects normalized parent channel and guild ids", () => {
+    const raw = { parentChannelId: " parent ", guildId: " guild " };
+
+    expect(parseParentChannelIdFromRaw(raw)).toBe("parent");
+    expect(parseGuildIdFromRaw(raw)).toBe("guild");
+  });
+});
 
 describe("request control raw projection", () => {
   it("projects valid own request-control fields", () => {

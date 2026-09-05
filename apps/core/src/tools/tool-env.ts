@@ -5,7 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
-import { projectRuntimeError } from "../runtime/error-format";
+import { captureRuntimeError, projectCapturedRuntimeError } from "../runtime/error-format";
 import { adaptToolResultToHost, preserveToolPanic } from "./tool-result-adapters";
 
 const logger = createLogger({ module: "tool:env" });
@@ -72,10 +72,11 @@ async function captureToolEnvFileOperation<T>(params: {
   readonly operation: "inspect" | "read";
   readonly run: () => Promise<T>;
 }): Promise<ResultType<T, ToolEnvFileOperationError>> {
-  const captured = await Result.tryPromise({
-    try: params.run,
-    catch: projectRuntimeError(`Opaque tool env ${params.operation} failure`),
-  });
+  const captured = (
+    await Result.tryPromise({ try: params.run, catch: captureRuntimeError })
+  ).mapError((error) =>
+    projectCapturedRuntimeError(error, `Opaque tool env ${params.operation} failure`),
+  );
   return captured.match<() => ResultType<T, ToolEnvFileOperationError>>({
     ok: (value) => () => Result.ok(value),
     err: (error) => () => {
@@ -220,8 +221,10 @@ export async function loadToolEnv(dataDir: string): Promise<Record<string, strin
   if (contentValue === null) return {};
   const json = Result.try({
     try: () => Bun.JSONC.parse(contentValue),
-    catch: projectRuntimeError("Opaque tool env JSONC parse failure"),
-  });
+    catch: captureRuntimeError,
+  }).mapError((captured) =>
+    projectCapturedRuntimeError(captured, "Opaque tool env JSONC parse failure"),
+  );
   const continueJson = json.match<() => Record<string, string>>({
     ok: (value) => () =>
       parseToolEnvResult(value).match<() => Record<string, string>>({

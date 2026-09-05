@@ -20,4 +20,22 @@ describe("session safety mode", () => {
 
     expect(resolveSessionSafetyMode(parsed.value, "child", "parent")).toBe("restricted");
   });
+
+  it("inherits guild safety mode when channel and parent omit it", () => {
+    const parsed = parseCoreConfigResult({
+      surface: {
+        router: {
+          sessionModes: {
+            guild: { safetyMode: "restricted" },
+            parent: { gate: false },
+            child: { model: "sonnet" },
+          },
+        },
+      },
+    });
+    expect(parsed.status).toBe("ok");
+    if (parsed.status === "error") return;
+
+    expect(resolveSessionSafetyMode(parsed.value, "child", "parent", "guild")).toBe("restricted");
+  });
 });

@@ -4,12 +4,12 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import type { SurfaceAdapter } from "./adapter";
 import type { SurfaceOperationError } from "./adapter";
 import type { ContentOpts, MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from "./types";
-import type { BusToAdapterRelaySnapshot } from "./bridge/subscribe-from-bus";
 import {
   createDescriptorBoundSurfaceAdapter,
   createDescriptorBoundWorkflowProgressPort,
 } from "./produced-ref-guard";
 import type { SurfaceProtocolRouting } from "./protocol";
+import type { RegisteredSurfaceQuestionPort, SurfaceQuestionPort } from "./question";
 
 export {
   SurfaceRefInvalid,
@@ -41,42 +41,11 @@ export type SurfaceRequestIngressHandle = SurfaceLifecycleHandle;
 
 export interface SurfaceRequestIngress extends SurfaceLifecyclePort<SurfaceRequestIngressHandle> {}
 
-export type SurfaceRelaySnapshotFor<P extends RegisteredSurfacePlatform> = Omit<
-  BusToAdapterRelaySnapshot,
-  "platform"
-> & {
-  readonly platform: P;
-};
-
-export class SurfaceRelayRestoreApplyFailed extends TaggedError("SurfaceRelayRestoreApplyFailed")<{
-  readonly platform: AdapterPlatform;
-  readonly requestId: string;
-  readonly message: string;
-}> {}
-
-export class SurfaceRelayRestoreRollbackFailed extends TaggedError(
-  "SurfaceRelayRestoreRollbackFailed",
-)<{
-  readonly platform: RegisteredSurfacePlatform;
-  readonly message: string;
-}> {}
-
-export type SurfaceRelayRestoreAttempt<P extends RegisteredSurfacePlatform> = {
-  readonly platform: P;
-  apply(): Promise<ResultType<void, SurfaceRelayRestoreApplyFailed>>;
-  rollback(): Promise<ResultType<void, SurfaceRelayRestoreRollbackFailed>>;
-  activate(): void;
-};
-
 export interface SurfaceRelayHandle<
   P extends RegisteredSurfacePlatform,
 > extends SurfaceLifecycleHandle {
   readonly platform: P;
   beginDrain(options: { readonly deadlineMs: number }): Promise<void>;
-  snapshotRelays(): SurfaceRelaySnapshotFor<P>[];
-  prepareRestoreRelays(
-    snapshots: readonly SurfaceRelaySnapshotFor<P>[],
-  ): ResultType<SurfaceRelayRestoreAttempt<P>, SurfaceRelayRestoreApplyFailed>;
 }
 
 export interface SurfaceRelayLifecyclePort<
@@ -119,28 +88,9 @@ export type SurfaceRelayFinalization<P extends RegisteredSurfacePlatform> = {
   cleanupSkippedOutput?(input: { readonly ref: MsgRefFor<P> }): Promise<void>;
 };
 
-export type SurfaceRestoredOutputChain<P extends RegisteredSurfacePlatform> = {
-  readonly requestId: string;
-  readonly sessionId: string;
-  readonly createdOutputRefs: readonly MsgRefFor<P>[];
-  readonly activeOutputRefs?: readonly MsgRefFor<P>[];
-};
-
-export type SurfaceRecoveryGeneration = {
-  readonly generation: symbol;
-};
-
-export type SurfaceRelayRecovery<P extends RegisteredSurfacePlatform> = {
-  activateRestoredOutputChains(
-    generation: SurfaceRecoveryGeneration,
-    chains: readonly SurfaceRestoredOutputChain<P>[],
-  ): void;
-};
-
 export type SurfaceRelayPolicy<P extends RegisteredSurfacePlatform> = {
   readonly refs: SurfaceRelayRefs<P>;
   readonly finalization?: SurfaceRelayFinalization<P>;
-  readonly recovery?: SurfaceRelayRecovery<P>;
 };
 
 export type SurfaceRelayDescriptor<P extends RegisteredSurfacePlatform> = {
@@ -355,6 +305,7 @@ export type SurfaceRuntimeDescriptor<P extends RegisteredSurfacePlatform> = {
   readonly createWorkflowProgress?: (
     guardedAdapter: SurfaceAdapter,
   ) => SurfaceWorkflowProgressPort<P>;
+  readonly createQuestion?: (guardedAdapter: SurfaceAdapter) => SurfaceQuestionPort<P>;
 };
 
 export type RegisteredSurfaceRuntimeDescriptor = {
@@ -370,6 +321,7 @@ export type BoundSurfaceRuntimeDescriptor<P extends RegisteredSurfacePlatform> =
   readonly health?: SurfaceRuntimeHealthPort;
   readonly relay?: SurfaceRelayDescriptor<P>;
   readonly workflowProgress?: SurfaceWorkflowProgressPort<P>;
+  readonly question?: SurfaceQuestionPort<P>;
 };
 
 export type RegisteredBoundSurfaceRuntimeDescriptor = {
@@ -390,6 +342,14 @@ export type ResolvedSurfaceAdapter =
 export type ResolvedSurfaceProtocol =
   ResolvedSurfaceProtocolDescriptor<RegisteredBoundSurfaceRuntimeDescriptor>;
 
+export type ResolvedSurfaceQuestion = {
+  [P in RegisteredSurfacePlatform]: {
+    readonly platform: P;
+    readonly protocol: SurfaceProtocolRouting<P>;
+    readonly question: SurfaceQuestionPort<P>;
+  };
+}[RegisteredSurfacePlatform];
+
 export type SurfaceProtocolResolver = {
   resolve(platform: AdapterPlatform): ResolvedSurfaceProtocol | null;
 };
@@ -397,6 +357,11 @@ export type SurfaceProtocolResolver = {
 export type SurfaceAdapterResolver = {
   registeredPlatforms(): readonly RegisteredSurfacePlatform[];
   resolve(platform: AdapterPlatform): ResolvedSurfaceAdapter | null;
+};
+
+export type SurfaceQuestionResolver = {
+  entries(): readonly ResolvedSurfaceQuestion[];
+  resolve(platform: AdapterPlatform): ResolvedSurfaceQuestion | null;
 };
 
 export class SurfaceRuntimeRegistrationDuplicate extends TaggedError(
@@ -412,6 +377,7 @@ function bindRuntimeDescriptor(
   const platform = descriptor.protocol.platform;
   const adapter = createDescriptorBoundSurfaceAdapter(platform, descriptor.adapter);
   const workflowProgress = descriptor.createWorkflowProgress?.(adapter);
+  const question = descriptor.createQuestion?.(adapter);
   return {
     platform,
     protocol: descriptor.protocol,
@@ -428,6 +394,7 @@ function bindRuntimeDescriptor(
           ),
         }
       : {}),
+    ...(question ? { question } : {}),
   } as RegisteredBoundSurfaceRuntimeDescriptor;
 }
 
@@ -491,6 +458,32 @@ export class SurfaceRuntimeRegistry {
           protocol: descriptor.protocol,
         } as ResolvedSurfaceProtocol;
       },
+    };
+  }
+
+  questionResolver(): SurfaceQuestionResolver {
+    const entries = this.#descriptors
+      .filter(
+        (
+          descriptor,
+        ): descriptor is RegisteredBoundSurfaceRuntimeDescriptor & {
+          readonly question: RegisteredSurfaceQuestionPort;
+        } => descriptor.question !== undefined,
+      )
+      .map(
+        (descriptor) =>
+          ({
+            platform: descriptor.platform,
+            protocol: descriptor.protocol,
+            question: descriptor.question,
+          }) as ResolvedSurfaceQuestion,
+      );
+    const byPlatform = new Map<AdapterPlatform, ResolvedSurfaceQuestion>(
+      entries.map((entry) => [entry.platform, entry]),
+    );
+    return {
+      entries: () => entries,
+      resolve: (platform) => byPlatform.get(platform) ?? null,
     };
   }
 

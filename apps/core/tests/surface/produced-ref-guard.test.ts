@@ -302,7 +302,6 @@ describe("descriptor-bound produced ref guard", () => {
       startOutput: async () =>
         Result.ok({
           ...outputStream(),
-          hydrateRecovery: () => "terminal" as const,
           getFinalTextMode: () => "full" as const,
         }),
     } satisfies SurfaceAdapter &
@@ -327,9 +326,6 @@ describe("descriptor-bound produced ref guard", () => {
 
     const started = await guarded.startOutput(DISCORD_SESSION);
     if (started.status === "error") throw started.error;
-    expect(started.value.hydrateRecovery?.([{ type: "text.set", text: "restored" }])).toBe(
-      "terminal",
-    );
     expect(started.value.getFinalTextMode?.()).toBe("full");
   });
 

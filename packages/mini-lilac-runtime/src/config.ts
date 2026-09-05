@@ -168,7 +168,13 @@ export type LoadRuntimeConfigError =
   | RuntimeConfigInvalid
   | RuntimeConfigAuthTokenMissing;
 
-function throwRuntimeConfigPanic(panic: Panic | LoadRuntimeConfigError): never {
+type OpaqueRuntimeConfigValue = {} | null | undefined;
+
+function captureRuntimeConfigFailure(cause: unknown): OpaqueRuntimeConfigValue {
+  return cause;
+}
+
+export function throwRuntimeConfigPanic(panic: Panic | LoadRuntimeConfigError): never {
   throw panic;
 }
 
@@ -176,33 +182,43 @@ function captureRuntimeConfigYaml(
   source: string,
   configFile: string,
 ): ResultType<RuntimeConfig, RuntimeConfigYamlInvalid | RuntimeConfigInvalid> {
-  try {
-    return decodeRuntimeConfig(Bun.YAML.parse(source), configFile);
-  } catch (cause) {
-    if (isPanic(cause)) return throwRuntimeConfigPanic(cause);
-    return Result.err(
-      new RuntimeConfigYamlInvalid({
-        configFile,
-        message: `Failed to parse YAML file '${configFile}'`,
-      }),
-    );
-  }
+  const captured = Result.try<unknown, OpaqueRuntimeConfigValue>({
+    try: () => Bun.YAML.parse(source),
+    catch: captureRuntimeConfigFailure,
+  });
+  const outcome = captured.match<
+    | { readonly ok: true; readonly value: unknown }
+    | { readonly ok: false; readonly error: OpaqueRuntimeConfigValue }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+  if (outcome.ok) return decodeRuntimeConfig(outcome.value, configFile);
+  if (isPanic(outcome.error)) return throwRuntimeConfigPanic(outcome.error);
+  return Result.err(
+    new RuntimeConfigYamlInvalid({
+      configFile,
+      message: `Failed to parse YAML file '${configFile}'`,
+    }),
+  );
 }
 
 async function captureRuntimeConfigRead(
   configFile: string,
 ): Promise<ResultType<string, RuntimeConfigReadFailed>> {
-  try {
-    return Result.ok(await readFile(configFile, "utf8"));
-  } catch (cause) {
-    if (isPanic(cause)) return throwRuntimeConfigPanic(cause);
-    return Result.err(
-      new RuntimeConfigReadFailed({
-        configFile,
-        message: `Failed to read runtime config '${configFile}'`,
-      }),
-    );
-  }
+  const captured = await Result.tryPromise<string, OpaqueRuntimeConfigValue>({
+    try: () => readFile(configFile, "utf8"),
+    catch: captureRuntimeConfigFailure,
+  });
+  const outcome = captured.match<
+    | { readonly ok: true; readonly value: string }
+    | { readonly ok: false; readonly error: OpaqueRuntimeConfigValue }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+  if (outcome.ok) return Result.ok(outcome.value);
+  if (isPanic(outcome.error)) return throwRuntimeConfigPanic(outcome.error);
+  return Result.err(
+    new RuntimeConfigReadFailed({
+      configFile,
+      message: `Failed to read runtime config '${configFile}'`,
+    }),
+  );
 }
 
 export function decodeRuntimeConfig(

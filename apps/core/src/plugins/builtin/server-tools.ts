@@ -11,6 +11,7 @@ import {
   McpManagement,
   Onboarding,
   ProgrammaticWorkflow,
+  Resource,
   SSH,
   Skills,
   Surface,
@@ -151,8 +152,44 @@ export function createBuiltinAttachmentPlugin(): CoreToolPlugin {
       if (!runtime.bus) {
         return signalBuiltinPluginSkip("attachment requires bus");
       }
+      if (!runtime.blobStore || !runtime.attachmentOutputLifecycle) {
+        return signalBuiltinPluginSkip("attachment requires blob output lifecycle");
+      }
       return {
-        level2: [new Attachment({ bus: runtime.bus })],
+        level2: [
+          new Attachment({
+            bus: runtime.bus,
+            blobStore: runtime.blobStore,
+            outputLifecycle: runtime.attachmentOutputLifecycle,
+            ...(runtime.resourceAccess ? { resourceAccess: runtime.resourceAccess } : {}),
+            ...(runtime.toolResultArtifacts
+              ? { toolResultArtifacts: runtime.toolResultArtifacts }
+              : {}),
+          }),
+        ],
+      };
+    },
+  };
+}
+
+export function createBuiltinResourcePlugin(): CoreToolPlugin {
+  return {
+    meta: {
+      id: "resource",
+    },
+    create({ runtime }) {
+      if (!runtime.resourceAccess) {
+        return signalBuiltinPluginSkip("resource requires resource access");
+      }
+      return {
+        level2: [
+          new Resource({
+            access: runtime.resourceAccess,
+            ...(runtime.toolResultArtifacts
+              ? { toolResultArtifacts: runtime.toolResultArtifacts }
+              : {}),
+          }),
+        ],
       };
     },
   };
@@ -167,6 +204,9 @@ export function createBuiltinWorkflowPlugin(): CoreToolPlugin {
       if (!runtime.bus) {
         return signalBuiltinPluginSkip("workflow requires bus");
       }
+      if (!runtime.blobStore) {
+        return signalBuiltinPluginSkip("workflow requires blob storage");
+      }
       const getConfig = runtime.getConfig;
       const config = runtime.config;
       let getMaxActiveRuns: (() => Promise<number>) | (() => number) | undefined;
@@ -179,10 +219,10 @@ export function createBuiltinWorkflowPlugin(): CoreToolPlugin {
         level2: [
           new ProgrammaticWorkflow({
             dataDir,
+            blobStore: runtime.blobStore,
             store: runtime.durableWorkflowStore,
             bus: runtime.bus,
             progressCards: runtime.workflowProgressCards,
-            getConfig: getConfig ?? (config ? async () => config : undefined),
             getMaxActiveRuns,
           }),
         ],

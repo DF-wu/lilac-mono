@@ -18,7 +18,7 @@ import {
   bundledRemoteRunnerErrorMessage,
   rethrowBundledRemoteRunnerPanic,
 } from "./bundled-runner-failure";
-import { opaqueErrorCause } from "./remote-runner-utils";
+import { captureOpaqueErrorCause, projectOpaqueErrorCapture } from "./remote-runner-utils";
 
 type ReadTextRequest = Extract<BundledRemoteRunnerRequest, { op: "fs.read_text" }>;
 type ReadBytesRequest = Extract<BundledRemoteRunnerRequest, { op: "fs.read_bytes" }>;
@@ -209,10 +209,11 @@ async function runRequest(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  const executed = await Result.tryPromise({
-    try: runRequest,
-    catch: opaqueErrorCause("Opaque bundled remote runner failure"),
-  });
+  const executed = (
+    await Result.tryPromise({ try: runRequest, catch: captureOpaqueErrorCause })
+  ).mapError((captured) =>
+    projectOpaqueErrorCapture(captured, "Opaque bundled remote runner failure"),
+  );
   executed.match({
     ok: () => undefined,
     err: (caught) => () => {

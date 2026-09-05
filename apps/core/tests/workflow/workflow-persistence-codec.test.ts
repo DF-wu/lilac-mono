@@ -19,6 +19,8 @@ describe("workflow persistence row codec catalog", () => {
       for (const [outcome, fixture] of Object.entries(fixtures)) {
         const result = (() => {
           switch (fixture.input.kind) {
+            case "artifact":
+              return decodeWorkflowPersistenceRow(fixture.input);
             case "revision":
               return decodeWorkflowPersistenceRow(fixture.input);
             case "run":

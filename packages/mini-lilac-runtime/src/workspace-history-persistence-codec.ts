@@ -1,5 +1,7 @@
-import { Result, TaggedError, type Result as ResultType } from "better-result";
+import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
+
+import { throwRuntimeConfigPanic } from "./config";
 
 export const WORKSPACE_HISTORY_FORMAT_VERSION = 1 as const;
 export const WORKSPACE_HISTORY_INDEX_VERSION = 1 as const;
@@ -239,11 +241,16 @@ function parseJson(
   recordKind: WorkspaceHistoryPersistenceRecordKind,
   serialized: string,
 ): ResultType<unknown, WorkspaceHistoryPersistenceMalformed> {
-  try {
-    return Result.ok(JSON.parse(serialized));
-  } catch {
-    return Result.err(malformed(recordKind));
-  }
+  const parsed = Result.try<unknown, unknown>({
+    try: () => JSON.parse(serialized),
+    catch: (cause) => cause,
+  });
+  const outcome = parsed.match<
+    { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly error: unknown }
+  >({ ok: (value) => ({ ok: true, value }), err: (error) => ({ ok: false, error }) });
+  if (outcome.ok) return Result.ok(outcome.value);
+  if (Panic.is(outcome.error)) return throwRuntimeConfigPanic(outcome.error);
+  return Result.err(malformed(recordKind));
 }
 
 function detectFormatVersion(

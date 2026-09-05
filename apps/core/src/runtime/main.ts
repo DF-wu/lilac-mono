@@ -1,9 +1,10 @@
-import { createLogger } from "@stanley2058/lilac-utils";
+import { createLogger, formatTaggedErrorForLog } from "@stanley2058/lilac-utils";
 import { Panic, Result } from "better-result";
 
-import { createCoreRuntime, type CoreRuntime } from "./create-core-runtime";
-import { projectRuntimeError, safeRuntimeErrorText } from "./error-format";
+import type { CoreRuntime } from "./create-core-runtime";
+import { projectRuntimeError } from "./error-format";
 import { createProcessHandlers } from "./process-handlers";
+import { startCoreRuntime } from "./start-core-runtime";
 
 const logger = createLogger({
   module: "core-main",
@@ -12,8 +13,8 @@ const logger = createLogger({
 let runtime: CoreRuntime | null = null;
 const handlers = createProcessHandlers({
   logger,
-  stop: async (fatalError) => {
-    await runtime?.stop(fatalError && Panic.is(fatalError) ? fatalError : null);
+  stop: async (fatalError, hardDeadlineAtMs) => {
+    await runtime?.stop(fatalError && Panic.is(fatalError) ? fatalError : null, hardDeadlineAtMs);
   },
   recordUnhandledRejection: (reason) => {
     runtime?.recordUnhandledRejection(reason);
@@ -37,40 +38,29 @@ process.on("uncaughtException", (error) => {
   handlers.handleUncaughtException(projectProcessFailure(error, "Opaque uncaught exception"));
 });
 
-const started = await Result.tryPromise({
-  try: async (): Promise<boolean> => {
-    const created = await createCoreRuntime({
-      reportFatalError: (error) => handlers.reportFatalError(error),
-      onUnhealthy: async (snapshot) => {
-        logger.error("Core runtime unhealthy; exiting", {
-          checks: snapshot.checks.filter((check) => !check.ok),
-        });
-        handlers.handleUncaughtException(new Error("runtime watchdog detected unhealthy state"));
-      },
+const started = await startCoreRuntime({
+  reportFatalError: (error) => handlers.reportFatalError(error),
+  onUnhealthy: async (snapshot) => {
+    logger.error("Core runtime unhealthy; exiting", {
+      checks: snapshot.checks.filter((check) => !check.ok),
     });
-    if (created.kind === "panic") return false;
-    return created.result.match({
-      err: () => async () => false,
-      ok: (createdRuntime) => async () => {
-        runtime = createdRuntime;
-        const startup = await runtime.start();
-        if (startup.kind !== "result") return false;
-        return startup.result.match({ ok: () => true, err: () => false });
-      },
-    })();
+    handlers.handleUncaughtException(new Error("runtime watchdog detected unhealthy state"));
   },
-  catch: (cause) => safeRuntimeErrorText(cause, "Opaque core startup failure"),
 });
-const runtimeStarted = started.match({ ok: (value) => value, err: () => false });
-if (!runtimeStarted) {
-  logger.error("Failed to start core runtime");
-  process.exit(1);
-}
+started.match({
+  ok: (startedRuntime) => {
+    runtime = startedRuntime;
+  },
+  err: (error) => {
+    logger.error("Failed to start core runtime", formatTaggedErrorForLog(error));
+    process.exit(1);
+  },
+});
 
 async function handleProcessSignal(signal: "SIGINT" | "SIGTERM"): Promise<void> {
   const handled = await Result.tryPromise({
     try: () => handlers.handleSignal(signal),
-    catch: (cause) => safeRuntimeErrorText(cause, "Opaque shutdown handler failure"),
+    catch: () => "Opaque shutdown handler failure",
   });
   handled.match({
     ok: () => undefined,

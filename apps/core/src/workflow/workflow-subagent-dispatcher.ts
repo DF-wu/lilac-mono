@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { isPanic, opaqueErrorMessage } from "@stanley2058/lilac-utils";
 
 import type {
@@ -115,7 +116,7 @@ export default defineWorkflow({
 async function completionStatus(
   run: WorkflowRun,
   store: DurableWorkflowStore,
-  dataDir: string,
+  blobStore: BlobStore,
   toolResultArtifacts?: ToolResultArtifactStore,
 ): Promise<WorkflowSubagentDispatchResult<SubagentDelegationOutcome>> {
   if (run.state === "succeeded") {
@@ -129,11 +130,11 @@ async function completionStatus(
         );
       }
       let result = run.result;
-      if (run.resultArtifactId) {
+      if (run.resultArtifact) {
         result = yield* Result.await(
           readWorkflowValueArtifact({
-            dataDir,
-            artifactId: run.resultArtifactId,
+            blobStore,
+            reference: run.resultArtifact,
             maxBytes: revision.limits.maxResultBytes,
           }).then((loaded) => loaded.mapError((error) => subagentDispatchFailure(error.message))),
         );
@@ -185,6 +186,7 @@ export class WorkflowSubagentDispatcher {
     private readonly input: {
       store: DurableWorkflowStore;
       dataDir: string;
+      blobStore: BlobStore;
       toolResultArtifacts?: ToolResultArtifactStore;
       now?: () => number;
       pollMs?: number;
@@ -197,6 +199,7 @@ export class WorkflowSubagentDispatcher {
   static create(input: {
     store: DurableWorkflowStore;
     dataDir: string;
+    blobStore: BlobStore;
     toolResultArtifacts?: ToolResultArtifactStore;
     now?: () => number;
     pollMs?: number;
@@ -229,6 +232,8 @@ export class WorkflowSubagentDispatcher {
         definitions = WorkflowDefinitionStore.createResult({
           workspaceRoot: canonicalRoot,
           dataDir: this.input.dataDir,
+          blobStore: this.input.blobStore,
+          workflowStore: this.input.store,
         }).then((created) =>
           created.mapError((error) => {
             this.definitionsStores.delete(canonicalRoot);
@@ -284,7 +289,7 @@ export class WorkflowSubagentDispatcher {
         scope: "project",
         normalizedPath: ".lilac/internal/subagent-delegate.js",
         name: GENERATED_WORKFLOW_NAME,
-        snapshotArtifactId: snapshot.artifactId,
+        snapshotArtifact: snapshot.artifact,
         sourceSha256: validation.sourceSha256,
         inputSchemaSha256: validation.inputSchemaSha256,
         resourcePolicySha256: validation.resourcePolicySha256,
@@ -336,7 +341,7 @@ export class WorkflowSubagentDispatcher {
         progressTarget: null,
         terminalDetail: null,
         result: null,
-        resultArtifactId: null,
+        resultArtifact: null,
         claimedBy: null,
         claimedAt: null,
         createdAt: now,
@@ -417,7 +422,7 @@ export class WorkflowSubagentDispatcher {
             completionStatus(
               run,
               this.input.store,
-              this.input.dataDir,
+              this.input.blobStore,
               this.input.toolResultArtifacts,
             ),
           );

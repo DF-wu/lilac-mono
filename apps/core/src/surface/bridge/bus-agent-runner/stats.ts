@@ -1,10 +1,31 @@
-import { asSchema, type CallWarning, type FinishReason, type LanguageModelUsage } from "ai";
-import type { ModelMessage } from "ai";
+import {
+  asSchema,
+  type CallWarning,
+  type FinishReason,
+  type LanguageModelUsage,
+  type ModelMessage,
+  type ToolSet,
+} from "ai";
+import type { BusMessageV2 } from "@stanley2058/lilac-event-bus";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 
 import { formatInt, formatSeconds, safeStringify } from "./formatting";
 
-type ToolsLike = Record<string, { description?: string; inputSchema?: unknown }>;
+type ToolsLike = Record<string, { description?: unknown; inputSchema?: unknown }>;
+
+export type ContextSnapshotMessage = ModelMessage | BusMessageV2;
+
+export type ContextSnapshotTokenEstimate = {
+  readonly systemPrompt: number;
+  readonly skills: number;
+  readonly additionalPrompts: number;
+  readonly activeToolSchemas: number;
+  readonly userMessages: number;
+  readonly assistantMessages: number;
+  readonly toolResults: number;
+  readonly total: number;
+};
 
 function getToolDefsText(tools: ToolsLike | null): string {
   if (!tools) return "";
@@ -12,15 +33,14 @@ function getToolDefsText(tools: ToolsLike | null): string {
   if (entries.length === 0) return "";
 
   const toolDesc = entries.map(([name, tool]) => {
-    let jsonSchema: unknown = {};
-    try {
-      jsonSchema = asSchema(tool?.inputSchema as never).jsonSchema;
-    } catch {
-      jsonSchema = {};
-    }
+    const schema = Result.try({
+      try: () => asSchema(tool?.inputSchema as never).jsonSchema,
+      catch: () => null,
+    });
+    const jsonSchema: unknown = schema.match({ ok: (value) => value, err: () => ({}) });
     return {
       name,
-      description: tool?.description ?? "",
+      description: typeof tool?.description === "string" ? tool.description : "",
       jsonSchema,
     };
   });
@@ -38,7 +58,7 @@ function isAssistantToolCallMessage(message: ModelMessage): boolean {
   });
 }
 
-function countCharsInMessage(message: ModelMessage): {
+function countCharsInMessage(message: ContextSnapshotMessage): {
   systemChars: number;
   assistantChars: number;
   userChars: number;
@@ -84,6 +104,48 @@ function countCharsInMessage(message: ModelMessage): {
 
   assistantChars += safeStringify(message.content).length;
   return { systemChars, assistantChars, userChars, toolResultChars };
+}
+
+function estimateTokensFromChars(chars: number): number {
+  return Math.ceil(Math.max(0, chars) / 4);
+}
+
+export function estimateContextSnapshotTokens(input: {
+  readonly system: string;
+  readonly skillsSection?: string | null;
+  readonly additionalSessionPrompts?: readonly string[];
+  readonly messages: readonly ContextSnapshotMessage[];
+  readonly tools: ToolSet | null;
+}): ContextSnapshotTokenEstimate {
+  const skillsChars = input.skillsSection?.length ?? 0;
+  const additionalPromptChars = (input.additionalSessionPrompts ?? []).join("\n\n").length;
+  let systemChars = Math.max(0, input.system.length - skillsChars - additionalPromptChars);
+  let assistantChars = 0;
+  let userChars = 0;
+  let toolResultChars = 0;
+
+  for (const message of input.messages) {
+    const counts = countCharsInMessage(message);
+    systemChars += counts.systemChars;
+    assistantChars += counts.assistantChars;
+    userChars += counts.userChars;
+    toolResultChars += counts.toolResultChars;
+  }
+
+  const estimate = {
+    systemPrompt: estimateTokensFromChars(systemChars),
+    skills: estimateTokensFromChars(skillsChars),
+    additionalPrompts: estimateTokensFromChars(additionalPromptChars),
+    activeToolSchemas: estimateTokensFromChars(getToolDefsText(input.tools).length),
+    userMessages: estimateTokensFromChars(userChars),
+    assistantMessages: estimateTokensFromChars(assistantChars),
+    toolResults: estimateTokensFromChars(toolResultChars),
+  };
+
+  return {
+    ...estimate,
+    total: Object.values(estimate).reduce((sum, value) => sum + value, 0),
+  };
 }
 
 function buildPromptSnapshots(params: {

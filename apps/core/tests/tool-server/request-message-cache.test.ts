@@ -1,9 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { lilacEventTypes, type LilacMessageForTopic } from "@stanley2058/lilac-event-bus";
+import {
+  lilacEventTypes,
+  type BusMessageV2,
+  type LilacMessageForTopic,
+} from "@stanley2058/lilac-event-bus";
 
 import {
   createRequestMessageCache,
-  estimateCachedMessageBytes,
   projectCachedRequestMessageLineage,
   type AuthenticatedRequestOrigin,
 } from "../../src/tool-server/request-message-cache";
@@ -22,8 +25,12 @@ function requestMessage(input: {
   readonly sessionId?: string;
   readonly requestClient?: "discord" | "github" | "unknown";
   readonly text?: string;
+  readonly messages?: BusMessageV2[];
   readonly raw?: Record<string, unknown>;
 }): LilacMessageForTopic<"cmd.request"> {
+  const messages: BusMessageV2[] = input.messages ?? [
+    { role: "user", content: input.text ?? input.eventId },
+  ];
   return {
     id: input.eventId,
     topic: "cmd.request",
@@ -36,8 +43,9 @@ function requestMessage(input: {
       request_client: input.requestClient ?? "discord",
     },
     data: {
+      requestDeliveryId: crypto.randomUUID(),
       queue: "prompt",
-      messages: [{ role: "user", content: input.text ?? input.eventId }],
+      messages,
       ...(input.raw ? { raw: input.raw } : {}),
     },
   };
@@ -68,6 +76,40 @@ describe("request message cache", () => {
     const message = requestMessage({ eventId: "1-0", requestId: "request-1" });
     expect(cache.cacheMessage(message).status).toBe("ok");
     expect(cache.get("request-1")).toHaveLength(1);
+  });
+
+  it("preserves structured resources in current-request and alias message caches", () => {
+    const cache = createRequestMessageCache();
+    const resource = {
+      type: "resource" as const,
+      uri: `resource://r1_${"ab".repeat(16)}`,
+      filename: "diagram.png",
+      mediaType: "image/png",
+      size: 321,
+    };
+    const message = requestMessage({
+      eventId: "1-0",
+      requestId: "resource-source",
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "inspect" }, resource],
+        },
+      ],
+    });
+
+    expect(cache.cacheMessage(message).status).toBe("ok");
+    const alias = cache.createAliasOwner({
+      sourceRequestId: "resource-source",
+      aliasRequestId: "resource-alias",
+      requestClient: "discord",
+      sessionId: "channel-1",
+    });
+    if (alias.status === "error") throw alias.error;
+
+    expect(cache.get("resource-source")).toEqual(message.data.messages);
+    expect(cache.get("resource-alias")).toEqual(message.data.messages);
+    expect(cache.releaseOwner(alias.value)).toBe(true);
   });
 
   it("keeps slow intake alive beyond TTL and releases it after committed handling", () => {
@@ -319,66 +361,6 @@ describe("request message cache", () => {
     expect(cache.getOrigin(requestId)?.authenticatedOrigin?.userId).toBe("user-1");
   });
 
-  it("validates a restore batch fully at apply time before mutating any entry", () => {
-    const cache = createRequestMessageCache();
-    const first = requestMessage({ eventId: "1-0", requestId: "first" });
-    expect(cache.cacheMessage(first).status).toBe("ok");
-    const firstProjection = cache.getOrigin(first.key);
-    if (!firstProjection) throw new Error("Expected first projection");
-
-    const projectionSource = createRequestMessageCache();
-    const second = requestMessage({ eventId: "2-0", requestId: "second" });
-    expect(projectionSource.cacheMessage(second).status).toBe("ok");
-    const secondProjection = projectionSource.getOrigin(second.key);
-    if (!secondProjection) throw new Error("Expected second projection");
-
-    const prepared = cache.prepareRestore([
-      { projection: firstProjection, parkedEventIds: ["parked-first"] },
-      { projection: secondProjection, parkedEventIds: ["parked-second"] },
-    ]);
-    if (prepared.status === "error") throw prepared.error;
-    expect(
-      cache.cacheMessage(
-        requestMessage({ eventId: "3-0", requestId: "second", sessionId: "other-channel" }),
-      ).status,
-    ).toBe("ok");
-
-    expect(prepared.value.apply().status).toBe("error");
-    expect(cache.snapshot("first")?.parkedEventIds).toEqual([]);
-    expect(cache.getOrigin("second")?.sessionId).toBe("other-channel");
-  });
-
-  it("restores unrelated capacity evictions on rollback", () => {
-    let now = 1;
-    const cache = createRequestMessageCache({ maxEntries: 2, now: () => now++ });
-    const projections = ["first", "second", "third"].map((requestId, index) => {
-      const source = createRequestMessageCache();
-      const message = requestMessage({ eventId: `${index + 1}-0`, requestId });
-      expect(source.cacheMessage(message).status).toBe("ok");
-      const projection = source.getOrigin(requestId);
-      if (!projection) throw new Error(`Expected ${requestId} projection`);
-      return projection;
-    });
-    const initial = cache.prepareRestore(
-      projections.slice(0, 2).map((projection) => ({ projection, parkedEventIds: [] })),
-    );
-    if (initial.status === "error") throw initial.error;
-    expect(initial.value.apply().status).toBe("ok");
-
-    const overCapacity = cache.prepareRestore([
-      { projection: projections[2]!, parkedEventIds: [] },
-    ]);
-    if (overCapacity.status === "error") throw overCapacity.error;
-    expect(overCapacity.value.apply().status).toBe("ok");
-    expect(cache.getOrigin("first")).toBeUndefined();
-    expect(cache.getOrigin("third")).toBeDefined();
-
-    overCapacity.value.rollback();
-    expect(cache.getOrigin("first")).toBeDefined();
-    expect(cache.getOrigin("second")).toBeDefined();
-    expect(cache.getOrigin("third")).toBeUndefined();
-  });
-
   it("creates a restricted actor-based Discord alias without message proof", () => {
     const cache = createRequestMessageCache();
     const source = requestMessage({
@@ -619,105 +601,5 @@ describe("request message cache", () => {
     });
     expect(cache.cacheMessage(second).status).toBe("ok");
     expect(cache.getOrigin("reused")?.authenticatedOrigin?.userId).toBe("new-user");
-  });
-});
-
-describe("byte-weighted lineage clamping", () => {
-  it("drops the oldest messages once the byte budget is exceeded", () => {
-    const oldMessage = { role: "user", content: "x".repeat(600) };
-    const midMessage = { role: "user", content: "y".repeat(600) };
-    const newMessage = { role: "user", content: "z".repeat(600) };
-
-    const projected = projectCachedRequestMessageLineage(
-      [oldMessage, midMessage],
-      [newMessage],
-      Number.POSITIVE_INFINITY,
-      1400,
-    );
-
-    expect(projected).toEqual([midMessage, newMessage]);
-  });
-
-  it("always retains the newest message even when it alone exceeds the budget", () => {
-    const oversized = { role: "user", content: "x".repeat(10_000) };
-
-    const projected = projectCachedRequestMessageLineage([], [oversized], 512, 100);
-
-    expect(projected).toEqual([oversized]);
-  });
-
-  it("keeps the count clamp when the byte budget is unbounded", () => {
-    const messages = ["a", "b", "c", "d"].map((content) => ({ role: "user", content }));
-
-    const projected = projectCachedRequestMessageLineage(messages, [], 2);
-
-    expect(projected).toEqual(messages.slice(2));
-  });
-
-  it("weighs inline attachment payloads, not just text", () => {
-    const filePart = {
-      role: "user",
-      content: [
-        { type: "text", text: "photo" },
-        { type: "file", data: "A".repeat(4096), mediaType: "image/png" },
-      ],
-    };
-    const typedArrayPart = {
-      role: "user",
-      content: [{ type: "file", data: new Uint8Array(4096), mediaType: "image/png" }],
-    };
-
-    expect(estimateCachedMessageBytes(filePart)).toBeGreaterThan(4096);
-    expect(estimateCachedMessageBytes(typedArrayPart)).toBeGreaterThan(4096);
-    expect(estimateCachedMessageBytes({ role: "user", content: "hi" })).toBeLessThan(100);
-  });
-
-  it("clamps merged lineage by bytes inside the cache", () => {
-    const cache = createRequestMessageCache({ maxBytesPerRequest: 1500 });
-    const first = requestMessage({
-      eventId: "byte-1",
-      requestId: "byte-req",
-      text: "x".repeat(1200),
-    });
-    expect(cache.cacheMessage(first).status).toBe("ok");
-    const second = requestMessage({
-      eventId: "byte-2",
-      requestId: "byte-req",
-      text: "y".repeat(1200),
-    });
-    expect(cache.cacheMessage(second).status).toBe("ok");
-
-    const messages = cache.get("byte-req");
-    expect(messages).toHaveLength(1);
-    expect(JSON.stringify(messages)).toContain("y".repeat(32));
-    expect(JSON.stringify(messages)).not.toContain("x".repeat(32));
-  });
-
-  it("evicts oldest requests when the global byte ceiling is exceeded, including retained ones", () => {
-    const cache = createRequestMessageCache({
-      maxEntries: 8,
-      maxBytesPerRequest: 10_000,
-      maxBytesTotal: 2_500,
-    });
-    expect(
-      cache.cacheMessage(
-        requestMessage({ eventId: "g-1", requestId: "old", text: "a".repeat(1200) }),
-      ).status,
-    ).toBe("ok");
-    expect(cache.acquireOwner("old").status).toBe("ok");
-    expect(
-      cache.cacheMessage(
-        requestMessage({ eventId: "g-2", requestId: "mid", text: "b".repeat(1200) }),
-      ).status,
-    ).toBe("ok");
-    expect(
-      cache.cacheMessage(
-        requestMessage({ eventId: "g-3", requestId: "new", text: "c".repeat(1200) }),
-      ).status,
-    ).toBe("ok");
-
-    expect(cache.get("old")).toBeUndefined();
-    expect(cache.get("mid")).toBeDefined();
-    expect(cache.get("new")).toBeDefined();
   });
 });

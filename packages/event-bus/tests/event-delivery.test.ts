@@ -5,8 +5,10 @@ import Redis from "ioredis";
 import SuperJSON from "superjson";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { env } from "@stanley2058/lilac-utils";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 
 import {
+  captureDeadLetterAcceptance,
   RedisEventDeadLetterAuthenticationFailed,
   RedisEventDeadLetterCiphertextInvalid,
   RedisEventDeadLetterConfigInvalid,
@@ -31,6 +33,32 @@ import {
 
 const TEST_REDIS_URL = env.redisUrl || "redis://127.0.0.1:6379";
 const TEST_DEAD_LETTER_KEY = Buffer.alloc(32, 0x42);
+
+function testEvidenceBlobStore(
+  contents = new Map<string, Uint8Array>(),
+): Pick<BlobStore, "startUpload"> {
+  let sequence = 0;
+  return {
+    startUpload: async ({ source, retention }) => {
+      if (!(source instanceof Uint8Array)) throw new Error("Expected byte evidence fixture");
+      sequence += 1;
+      const objectId = `b1_${sequence.toString(16).padStart(32, "0")}`;
+      contents.set(objectId, source);
+      return Result.ok({
+        handle: { version: 1, objectId },
+        completion: Promise.resolve(
+          Result.ok({
+            version: 1,
+            objectId,
+            sha256: sequence.toString(16).padStart(64, "0"),
+            byteLength: source.byteLength,
+            ...(retention.kind === "expires" ? { expiresAt: retention.expiresAt } : {}),
+          }),
+        ),
+      });
+    },
+  };
+}
 
 class HandlerFailure extends TaggedError("HandlerFailure")<{
   readonly message: string;
@@ -109,7 +137,7 @@ function managedDeliveryKeys(streamKey: string, physicalGroup: string, messageId
 }
 
 async function removeDeadLetters(redis: Redis, keyPrefix: string): Promise<void> {
-  const keys = await redis.keys(`${keyPrefix}:v2:*`);
+  const keys = await redis.keys(`${keyPrefix}:v3:*`);
   if (keys.length > 0) await redis.del(...keys);
 }
 
@@ -119,7 +147,11 @@ async function publishRequest(
 ): Promise<string> {
   const published = await bus.publish(
     lilacEventTypes.CmdRequestMessage,
-    { queue: "prompt", messages: [{ role: "user", content: "deliver" }] },
+    {
+      requestDeliveryId: crypto.randomUUID(),
+      queue: "prompt",
+      messages: [{ role: "user", content: "deliver" }],
+    },
     { headers: { request_id: requestId } },
   );
   if (published.status === "error") throw published.error;
@@ -152,7 +184,7 @@ function deadLetterRecordFixture(): EventDeadLetterRecord {
       },
       wire: {
         kind: "bounded-complete",
-        fields: ["type", "cmd.request.message"],
+        fields: [],
       },
     },
   });
@@ -269,11 +301,46 @@ function inconsistentDeadLetterRecordFixtures(): readonly EventDeadLetterRecord[
       source: { ...record.source, mode: "tail" },
       delivery: { kind: "tail" },
     },
+    {
+      ...record,
+      evidence: {
+        ...record.evidence,
+        wire: {
+          kind: "bounded-complete",
+          fields: [{ kind: "string", value: "data:text/plain;base64,c2VjcmV0", truncated: false }],
+        },
+      },
+    } as unknown as EventDeadLetterRecord,
     { ...record, delivery: undefined } as unknown as EventDeadLetterRecord,
   ];
 }
 
 describe("result-based event delivery", () => {
+  it("preserves an opaque dead-letter rejection cause by identity", async () => {
+    const cause = Object.create(null);
+    const accepted = await captureDeadLetterAcceptance(async () => {
+      throw cause;
+    });
+
+    expect(accepted.status).toBe("error");
+    if (accepted.status === "error") expect(accepted.error.cause).toBe(cause);
+  });
+
+  it("signals a captured dead-letter Panic outside Result projection", async () => {
+    const panic = new Panic({ message: "dead-letter acceptance invariant" });
+    let caught: unknown;
+
+    try {
+      await captureDeadLetterAcceptance(async () => {
+        throw panic;
+      });
+    } catch (cause) {
+      caught = cause;
+    }
+
+    expect(caught).toBe(panic);
+  });
+
   it("rejects malformed XRANGE evidence before starting a dead-letter transaction", async () => {
     const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
     let xrangeResponse: unknown = [];
@@ -312,7 +379,7 @@ describe("result-based event delivery", () => {
     redis.disconnect();
   });
 
-  it("rejects malformed and semantically inconsistent v2 records before preparation work", async () => {
+  it("rejects malformed and semantically inconsistent v3 records before preparation work", async () => {
     const redis = new Redis(TEST_REDIS_URL, { lazyConnect: true });
     let timeCalls = 0;
     let xrangeCalls = 0;
@@ -393,15 +460,6 @@ describe("result-based event delivery", () => {
       }
     }
 
-    Reflect.set(redis, "xrange", async () => [["1-0", ["type", "cmd.request.message"]]]);
-    const referenced = referencedDeadLetterRecordFixture();
-    receipts = [
-      [null, "OK"],
-      [null, "OK"],
-      [null, 1],
-    ];
-    const truncatedReferenced = await deadLetter.accept(referenced);
-    expect(truncatedReferenced.status).toBe("error");
     redis.disconnect();
   });
 
@@ -454,7 +512,7 @@ describe("result-based event delivery", () => {
       const redis = new Redis(TEST_REDIS_URL);
       const keyPrefix = `test:lilac-delivery:${randomId(disposition)}`;
       const deadLetterPrefix = `${keyPrefix}:dead`;
-      const streamKey = `${keyPrefix}:cmd.request`;
+      const streamKey = `${keyPrefix}:v2:cmd.request`;
       const subscriptionId = `group-${disposition}`;
       const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
       const deadLetter = new RedisEventDeadLetter({
@@ -496,7 +554,7 @@ describe("result-based event delivery", () => {
         const pending = await eventually(
           async () => ({
             ids: await pendingIds(redis, streamKey, physicalGroup),
-            deadLetterCount: await redis.zcard(`${deadLetterPrefix}:v2:records`),
+            deadLetterCount: await redis.zcard(`${deadLetterPrefix}:v3:records`),
           }),
           ({ ids, deadLetterCount }) =>
             ids.length === expectedPending &&
@@ -518,13 +576,14 @@ describe("result-based event delivery", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-delivery:${randomId("retry-fresh-work")}`;
     const deadLetterPrefix = `${keyPrefix}:dead`;
-    const streamKey = `${keyPrefix}:cmd.request`;
+    const streamKey = `${keyPrefix}:v2:cmd.request`;
     const subscriptionId = randomId("retry-fresh-work-group");
     const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
     const deadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
       keyPrefix: deadLetterPrefix,
+      evidenceBlobStore: testEvidenceBlobStore(),
     });
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const bus = createLilacBus(raw, { deadLetter });
@@ -608,7 +667,7 @@ describe("result-based event delivery", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const originalDuplicate = redis.duplicate.bind(redis);
     const keyPrefix = `test:lilac-delivery:${randomId("recovery-source-failure")}`;
-    const streamKey = `${keyPrefix}:cmd.request`;
+    const streamKey = `${keyPrefix}:v2:cmd.request`;
     const subscriptionId = randomId("recovery-source-failure-group");
     const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
     const raw = createRedisStreamsBus({ redis, keyPrefix });
@@ -696,13 +755,14 @@ describe("result-based event delivery", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-delivery:${randomId("expired-attempt-five")}`;
     const deadLetterPrefix = `${keyPrefix}:dead`;
-    const streamKey = `${keyPrefix}:cmd.request`;
+    const streamKey = `${keyPrefix}:v2:cmd.request`;
     const subscriptionId = randomId("expired-attempt-five-group");
     const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
     const deadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
       keyPrefix: deadLetterPrefix,
+      evidenceBlobStore: testEvidenceBlobStore(),
     });
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const bus = createLilacBus(raw, { deadLetter });
@@ -790,7 +850,7 @@ describe("result-based event delivery", () => {
         const terminal = await eventually(
           async () => ({
             pending: await pendingIds(redis, streamKey, physicalGroup),
-            records: await deadLetterIndexEntries(redis, `${deadLetterPrefix}:v2:records`),
+            records: await deadLetterIndexEntries(redis, `${deadLetterPrefix}:v3:records`),
           }),
           (value) => value.pending.length === 0 && value.records.length === 1,
         );
@@ -821,7 +881,7 @@ describe("result-based event delivery", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-delivery:${randomId("active-stop")}`;
     const deadLetterPrefix = `${keyPrefix}:dead`;
-    const streamKey = `${keyPrefix}:cmd.request`;
+    const streamKey = `${keyPrefix}:v2:cmd.request`;
     const subscriptionId = randomId("active-stop-group");
     const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
     const deadLetter = new RedisEventDeadLetter({
@@ -899,11 +959,12 @@ describe("result-based event delivery", () => {
     const deadLetterPrefix = `${keyPrefix}:dead`;
     const requestId = randomId("durable-output-request");
     const topic = outReqTopic(requestId);
-    const streamKey = `${keyPrefix}:${topic}`;
+    const streamKey = `${keyPrefix}:v2:${topic}`;
     const deadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
       keyPrefix: deadLetterPrefix,
+      evidenceBlobStore: testEvidenceBlobStore(),
     });
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const bus = createLilacBus(raw, { deadLetter });
@@ -954,13 +1015,14 @@ describe("result-based event delivery", () => {
 
     const keyPrefix = `test:lilac-delivery:${randomId("dead-evidence-invalid")}`;
     const deadLetterPrefix = `${keyPrefix}:dead`;
-    const streamKey = `${keyPrefix}:cmd.request`;
+    const streamKey = `${keyPrefix}:v2:cmd.request`;
     const subscriptionId = "dead-evidence-invalid";
     const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
     const deadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
       keyPrefix: deadLetterPrefix,
+      evidenceBlobStore: testEvidenceBlobStore(),
     });
     const raw = createRedisStreamsBus({ redis, keyPrefix, subscriberPool: { max: 1 } });
     const bus = createLilacBus(raw, { deadLetter });
@@ -1009,7 +1071,7 @@ describe("result-based event delivery", () => {
       expect(preparingState.terminal_reason).toBeDefined();
       expect(preparingState.terminal_record_value).toBeUndefined();
       expect(preparingState.terminal_evidence_value).toBeUndefined();
-      expect(await redis.zcard(`${deadLetterPrefix}:v2:records`)).toBe(0);
+      expect(await redis.zcard(`${deadLetterPrefix}:v3:records`)).toBe(0);
 
       await started.value.stop();
       Reflect.set(redis, "xrange", originalXrange);
@@ -1034,7 +1096,7 @@ describe("result-based event delivery", () => {
         await eventually(
           async () => ({
             pending: await pendingIds(redis, streamKey, physicalGroup),
-            records: await redis.zcard(`${deadLetterPrefix}:v2:records`),
+            records: await redis.zcard(`${deadLetterPrefix}:v3:records`),
           }),
           (value) => value.pending.length === 0 && value.records === 1,
         );
@@ -1086,7 +1148,7 @@ describe("result-based event delivery", () => {
           expect(seen).toEqual([firstId, secondId]);
           if (disposition === "dead-letter") {
             const records = await eventually(
-              () => deadLetterIndexEntries(redis, `${deadLetterPrefix}:v2:records`),
+              () => deadLetterIndexEntries(redis, `${deadLetterPrefix}:v3:records`),
               (entries) => entries.length === 2,
             );
             expect(records).toHaveLength(2);
@@ -1094,7 +1156,7 @@ describe("result-based event delivery", () => {
               expect(redisFields(fields).reason).toBe("handler-error");
             }
           } else {
-            expect(await redis.zcard(`${deadLetterPrefix}:v2:records`)).toBe(0);
+            expect(await redis.zcard(`${deadLetterPrefix}:v3:records`)).toBe(0);
           }
         } else {
           const done = await started.value.done;
@@ -1108,7 +1170,7 @@ describe("result-based event delivery", () => {
         }
       } finally {
         await started.value.stop();
-        await redis.del(`${keyPrefix}:cmd.request`);
+        await redis.del(`${keyPrefix}:v2:cmd.request`);
         await removeDeadLetters(redis, deadLetterPrefix);
         await bus.close();
         await redis.quit();
@@ -1120,7 +1182,7 @@ describe("result-based event delivery", () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-delivery:${randomId("tail-stop")}`;
     const deadLetterPrefix = `${keyPrefix}:dead`;
-    const streamKey = `${keyPrefix}:cmd.request`;
+    const streamKey = `${keyPrefix}:v2:cmd.request`;
     const deadLetter = new RedisEventDeadLetter({
       redis,
       encryptionKey: TEST_DEAD_LETTER_KEY,
@@ -1128,7 +1190,7 @@ describe("result-based event delivery", () => {
     });
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const bus = createLilacBus(raw, { deadLetter });
-    await redis.set(`${deadLetterPrefix}:v2:records`, "wrong-type");
+    await redis.set(`${deadLetterPrefix}:v3:records`, "wrong-type");
     const firstId = await publishRequest(bus, randomId("request"));
 
     const seen: string[] = [];
@@ -1193,7 +1255,7 @@ describe("result-based event delivery", () => {
         expect(reported).toEqual([cause]);
       } finally {
         await started.value.stop().catch(() => undefined);
-        await redis.del(`${keyPrefix}:cmd.request`);
+        await redis.del(`${keyPrefix}:v2:cmd.request`);
         await bus.close();
         await redis.quit();
       }
@@ -1226,92 +1288,95 @@ describe("result-based event delivery", () => {
       expect(Panic.is(reported[0])).toBe(true);
     } finally {
       await started.value.stop().catch(() => undefined);
-      await redis.del(`${keyPrefix}:cmd.request`);
+      await redis.del(`${keyPrefix}:v2:cmd.request`);
       await bus.close();
       await redis.quit();
     }
   });
 
-  const malformedResults: ReadonlyArray<[string, () => ResultType<void, HandlerFailure>]> = [
+  const panicErrCause = new Panic({ message: "not an expected handler error" });
+  const malformedResults: ReadonlyArray<[string, () => ResultType<void, HandlerFailure>, Panic?]> =
     [
-      "forged prototype",
-      () => {
-        const result = Result.ok(undefined);
-        Object.setPrototypeOf(result, Object.prototype);
-        return result;
-      },
-    ],
-    [
-      "missing Ok value",
-      () => {
-        const result = Result.ok(undefined);
-        Reflect.deleteProperty(result, "value");
-        return result;
-      },
-    ],
-    [
-      "non-undefined Ok value",
-      () => {
-        const result = Result.ok(undefined);
-        Reflect.set(result, "value", "forged");
-        return result;
-      },
-    ],
-    [
-      "missing Err error",
-      () => {
-        const result = Result.err(new HandlerFailure({ message: "missing" }));
-        Reflect.deleteProperty(result, "error");
-        return result;
-      },
-    ],
-    [
-      "invalid Err status",
-      () => {
-        const result = Result.err(new HandlerFailure({ message: "invalid status" }));
-        Reflect.set(result, "status", "ok");
-        return result;
-      },
-    ],
-    [
-      "non-tagged Err error",
-      () => {
-        const result = Result.err(new HandlerFailure({ message: "replaced" }));
-        Reflect.set(result, "error", new Error("not owned"));
-        return result;
-      },
-    ],
-    [
-      "incomplete tagged Err error",
-      () => {
-        const result = Result.err(new HandlerFailure({ message: "incomplete" }));
-        Reflect.deleteProperty(result.error, "message");
-        return result;
-      },
-    ],
-    [
-      "Panic Err error",
-      () => {
-        const result = Result.err(new HandlerFailure({ message: "replaced" }));
-        Reflect.set(result, "error", new Panic({ message: "not an expected handler error" }));
-        return result;
-      },
-    ],
-    [
-      "revoked Result",
-      () => {
-        const { proxy, revoke } = Proxy.revocable(Result.ok(undefined), {});
-        revoke();
-        return proxy;
-      },
-    ],
-  ];
+      [
+        "forged prototype",
+        () => {
+          const result = Result.ok(undefined);
+          Object.setPrototypeOf(result, Object.prototype);
+          return result;
+        },
+      ],
+      [
+        "missing Ok value",
+        () => {
+          const result = Result.ok(undefined);
+          Reflect.deleteProperty(result, "value");
+          return result;
+        },
+      ],
+      [
+        "non-undefined Ok value",
+        () => {
+          const result = Result.ok(undefined);
+          Reflect.set(result, "value", "forged");
+          return result;
+        },
+      ],
+      [
+        "missing Err error",
+        () => {
+          const result = Result.err(new HandlerFailure({ message: "missing" }));
+          Reflect.deleteProperty(result, "error");
+          return result;
+        },
+      ],
+      [
+        "invalid Err status",
+        () => {
+          const result = Result.err(new HandlerFailure({ message: "invalid status" }));
+          Reflect.set(result, "status", "ok");
+          return result;
+        },
+      ],
+      [
+        "non-tagged Err error",
+        () => {
+          const result = Result.err(new HandlerFailure({ message: "replaced" }));
+          Reflect.set(result, "error", new Error("not owned"));
+          return result;
+        },
+      ],
+      [
+        "incomplete tagged Err error",
+        () => {
+          const result = Result.err(new HandlerFailure({ message: "incomplete" }));
+          Reflect.deleteProperty(result.error, "message");
+          return result;
+        },
+      ],
+      [
+        "Panic Err error",
+        () => {
+          const result = Result.err(new HandlerFailure({ message: "replaced" }));
+          Reflect.set(result, "error", panicErrCause);
+          return result;
+        },
+        panicErrCause,
+      ],
+      [
+        "revoked Result",
+        () => {
+          const { proxy, revoke } = Proxy.revocable(Result.ok(undefined), {});
+          revoke();
+          return proxy;
+        },
+      ],
+    ];
 
-  for (const [label, malformedResult] of malformedResults) {
+  for (const [label, malformedResult, expectedPanic] of malformedResults) {
     it(`reports ${label} handler Result and preserves its pending entry`, async () => {
       const redis = new Redis(TEST_REDIS_URL);
       const keyPrefix = `test:lilac-delivery:${randomId(`handler-${label}`)}`;
-      const streamKey = `${keyPrefix}:cmd.request`;
+      const streamKey = `${keyPrefix}:v2:cmd.request`;
       const subscriptionId = "malformed-handler";
       const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
       const reported = Promise.withResolvers<unknown>();
@@ -1333,8 +1398,13 @@ describe("result-based event delivery", () => {
       if (started.status === "error") throw started.error;
       try {
         const id = await publishRequest(bus, randomId("request"));
-        await reported.promise;
-        await expect(started.value.done).rejects.toBeDefined();
+        const reportedCause = await reported.promise;
+        if (expectedPanic) {
+          expect(reportedCause).toBe(expectedPanic);
+          await expect(started.value.done).rejects.toBe(expectedPanic);
+        } else {
+          await expect(started.value.done).rejects.toBeDefined();
+        }
         expect(await pendingIds(redis, streamKey, physicalGroup)).toEqual([id]);
       } finally {
         await started.value.stop().catch(() => undefined);
@@ -1375,13 +1445,14 @@ describe("result-based event delivery", () => {
     await redis.quit();
   });
 
-  it("atomically acknowledges one source with a deterministic encrypted v2 dead letter", async () => {
+  it("atomically acknowledges one source with a deterministic encrypted v3 dead letter", async () => {
     const redis = new Redis(TEST_REDIS_URL);
     const keyPrefix = `test:lilac-delivery:${randomId("redis-dead-letter")}`;
     const deadLetterPrefix = `${keyPrefix}:dead`;
-    const streamKey = `${keyPrefix}:cmd.request`;
+    const streamKey = `${keyPrefix}:v2:cmd.request`;
     const subscriptionId = "invalid-contract";
     const physicalGroup = managedRedisPhysicalGroup("work", subscriptionId);
+    const evidenceBlobs = new Map<string, Uint8Array>();
     const raw = createRedisStreamsBus({ redis, keyPrefix });
     const bus = createLilacBus(raw, {
       deadLetter: new RedisEventDeadLetter({
@@ -1390,6 +1461,7 @@ describe("result-based event delivery", () => {
         keyPrefix: deadLetterPrefix,
         recordTtlSeconds: 60,
         indexMaxLen: 2,
+        evidenceBlobStore: testEvidenceBlobStore(evidenceBlobs),
       }),
     });
     const started = await bus.subscribeTopic(
@@ -1405,6 +1477,9 @@ describe("result-based event delivery", () => {
     if (started.status === "error") throw started.error;
     try {
       const secretSentinel = `dead-letter-secret-${randomId("sentinel")}`;
+      const base64Sentinel = `dead-letter-base64-${randomId("sentinel")}`;
+      const dataUrlSentinel = `dead-letter-data-url-${randomId("sentinel")}`;
+      const sourcePayload = `{"dataBase64":"${base64Sentinel}","url":"data:text/plain;base64,${dataUrlSentinel}","opaque":"${secretSentinel.repeat(100)}"`;
       const id = await redis.xadd(
         streamKey,
         "*",
@@ -1413,13 +1488,13 @@ describe("result-based event delivery", () => {
         "ts",
         "1",
         "data",
-        secretSentinel.repeat(100),
+        sourcePayload,
       );
       if (typeof id !== "string") throw new Error("Redis did not return an entry id");
       const finalized = await eventually(
         async () => ({
           pending: await pendingIds(redis, streamKey, physicalGroup),
-          records: await deadLetterIndexEntries(redis, `${deadLetterPrefix}:v2:records`),
+          records: await deadLetterIndexEntries(redis, `${deadLetterPrefix}:v3:records`),
         }),
         ({ pending, records }) => pending.length === 0 && records.length === 1,
       );
@@ -1431,8 +1506,10 @@ describe("result-based event delivery", () => {
       expect(index.reason).toBe("contract-invalid");
       expect(index.physicalGroup).toBe(physicalGroup);
       expect(index.attempt).toBe("1");
-      expect(index.recordKey?.startsWith(`${deadLetterPrefix}:v2:record:`)).toBe(true);
+      expect(index.recordKey?.startsWith(`${deadLetterPrefix}:v3:record:`)).toBe(true);
       expect(JSON.stringify(indexFields)).not.toContain(secretSentinel);
+      expect(JSON.stringify(indexFields)).not.toContain(base64Sentinel);
+      expect(JSON.stringify(indexFields)).not.toContain(dataUrlSentinel);
       expect(indexFields).not.toContain("record");
       const recordKey = index.recordKey;
       if (!recordKey) throw new Error("Dead-letter record locator is missing");
@@ -1444,13 +1521,15 @@ describe("result-based event delivery", () => {
       const encodedRecord = await redis.get(recordKey);
       if (encodedRecord === null) throw new Error("Dead-letter record is missing");
       expect(encodedRecord).not.toContain(secretSentinel);
+      expect(encodedRecord).not.toContain(base64Sentinel);
+      expect(encodedRecord).not.toContain(dataUrlSentinel);
       const recovered = decryptRedisEventDeadLetterRecord({
         encryptionKey: TEST_DEAD_LETTER_KEY,
         expectedIdentity: { deadLetterId, storageKey: recordKey },
         ciphertextEnvelope: encodedRecord,
       });
       if (recovered.status === "error") throw recovered.error;
-      expect(recovered.value.version).toBe(2);
+      expect(recovered.value.version).toBe(3);
       expect(recovered.value.source.messageId).toBe(id);
       expect(recovered.value.delivery).toEqual({
         kind: "managed-v2",
@@ -1471,16 +1550,24 @@ describe("result-based event delivery", () => {
       expect(sameSourceIdentity.deadLetterId).toBe(deadLetterId);
       expect(recovered.value.evidence.wire.kind).toBe("controlled-reference");
       const wire = recovered.value.evidence.wire;
-      if (wire.kind === "controlled-reference" && wire.locator.kind === "redis-key") {
-        const evidenceKey = wire.locator.key;
-        expect(await redis.exists(evidenceKey)).toBe(1);
-        const evidenceTtl = await redis.ttl(evidenceKey);
-        expect(evidenceTtl).toBeGreaterThan(0);
-        expect(evidenceTtl).toBeLessThanOrEqual(60);
-        const encryptedEvidence = await redis.get(evidenceKey);
-        expect(encryptedEvidence).not.toBeNull();
-        expect(encryptedEvidence).not.toContain(secretSentinel);
-        await redis.del(evidenceKey);
+      if (wire.kind === "controlled-reference" && wire.locator.kind === "blob-ref") {
+        expect(wire.preview.fields[5]).toEqual({
+          kind: "string",
+          path: "fields[5]",
+          role: "field-value",
+          field: "data",
+          valueKind: "data-url",
+          charLength: sourcePayload.length,
+        });
+        const preview = JSON.stringify(wire.preview);
+        expect(preview).not.toContain(secretSentinel);
+        expect(preview).not.toContain(base64Sentinel);
+        expect(preview).not.toContain(dataUrlSentinel);
+        expect(preview).not.toContain("data:text/plain;base64");
+        const encryptedEvidence = evidenceBlobs.get(wire.locator.blob.objectId);
+        expect(encryptedEvidence).toBeDefined();
+        expect(Buffer.from(encryptedEvidence ?? []).toString("utf8")).not.toContain(secretSentinel);
+        expect(await redis.keys(`${deadLetterPrefix}:v3:evidence:*`)).toEqual([]);
       }
       await redis.del(recordKey);
     } finally {
@@ -1517,7 +1604,7 @@ describe("result-based event delivery", () => {
           },
           wire: {
             kind: "bounded-complete",
-            fields: ["data", `private-payload-${index}`],
+            fields: [],
           },
         };
         const record = createManagedEventDeadLetterRecord({
@@ -1534,19 +1621,19 @@ describe("result-based event delivery", () => {
           },
           evidence,
         });
-        const recordKey = `${deadLetterPrefix}:v2:record:${record.deadLetterId}`;
+        const recordKey = `${deadLetterPrefix}:v3:record:${record.deadLetterId}`;
         recordKeys.push(recordKey);
         sourceRecords.push(record);
         const accepted = await deadLetter.accept(record);
         expect(accepted.status).toBe("ok");
       }
 
-      const indexEntries = await deadLetterIndexEntries(redis, `${deadLetterPrefix}:v2:records`);
+      const indexEntries = await deadLetterIndexEntries(redis, `${deadLetterPrefix}:v3:records`);
       expect(indexEntries).toHaveLength(2);
       expect(JSON.stringify(indexEntries)).not.toContain("private-payload");
       expect(JSON.stringify(indexEntries)).not.toContain("private-error");
       for (const recordKey of recordKeys) {
-        expect(recordKey.startsWith(`${deadLetterPrefix}:v2:record:`)).toBe(true);
+        expect(recordKey.startsWith(`${deadLetterPrefix}:v3:record:`)).toBe(true);
         expect(await redis.exists(recordKey)).toBe(1);
         const ttl = await redis.ttl(recordKey);
         expect(ttl).toBeGreaterThan(0);
@@ -1570,18 +1657,18 @@ describe("result-based event delivery", () => {
 
       const repeated = await deadLetter.accept(sourceRecords[4]!);
       expect(repeated).toEqual(Result.ok({ id: sourceRecords[4]!.deadLetterId }));
-      expect(await deadLetterIndexEntries(redis, `${deadLetterPrefix}:v2:records`)).toEqual(
+      expect(await deadLetterIndexEntries(redis, `${deadLetterPrefix}:v3:records`)).toEqual(
         indexEntries,
       );
     } finally {
-      await redis.del(`${deadLetterPrefix}:v2:records`, ...recordKeys);
+      await redis.del(`${deadLetterPrefix}:v3:records`, ...recordKeys);
       await redis.quit();
     }
   });
 
-  it("returns typed record-invalid errors for recovered inconsistent v2 records", () => {
+  it("returns typed record-invalid errors for recovered inconsistent v3 records", () => {
     for (const record of inconsistentDeadLetterRecordFixtures()) {
-      const storageKey = `dead-letter:v2:record:${record.deadLetterId}`;
+      const storageKey = `dead-letter:v3:record:${record.deadLetterId}`;
       const encrypted = encryptRedisEventDeadLetterRecoveryValue({
         encryptionKey: TEST_DEAD_LETTER_KEY,
         kind: "record",
@@ -1627,10 +1714,10 @@ describe("result-based event delivery", () => {
             topic: "test.topic",
             messageId: "1-0",
           },
-          wire: { kind: "bounded-complete", fields: ["data", "secret"] },
+          wire: { kind: "bounded-complete", fields: [] },
         },
       });
-      const recordKey = `${deadLetterPrefix}:v2:record:${sourceRecord.deadLetterId}`;
+      const recordKey = `${deadLetterPrefix}:v3:record:${sourceRecord.deadLetterId}`;
       const accepted = await deadLetter.accept(sourceRecord);
       if (accepted.status === "error") throw accepted.error;
       const encrypted = await redis.get(recordKey);
@@ -1677,11 +1764,11 @@ describe("result-based event delivery", () => {
   it("rejects ciphertext substitution between record storage identities", () => {
     const firstIdentity = {
       deadLetterId: "record-a",
-      storageKey: "dead-letter:v2:record:record-a",
+      storageKey: "dead-letter:v3:record:record-a",
     };
     const secondIdentity = {
       deadLetterId: "record-b",
-      storageKey: "dead-letter:v2:record:record-b",
+      storageKey: "dead-letter:v3:record:record-b",
     };
     const encrypted = encryptRedisEventDeadLetterRecoveryValue({
       encryptionKey: TEST_DEAD_LETTER_KEY,
@@ -1714,11 +1801,11 @@ describe("result-based event delivery", () => {
   it("rejects cross-evidence substitution and record/evidence swaps", () => {
     const firstIdentity = {
       deadLetterId: "evidence-a",
-      storageKey: "dead-letter:v2:evidence:evidence-a",
+      storageKey: "dead-letter:v3:evidence:evidence-a",
     };
     const secondIdentity = {
       deadLetterId: "evidence-b",
-      storageKey: "dead-letter:v2:evidence:evidence-b",
+      storageKey: "dead-letter:v3:evidence:evidence-b",
     };
     const encryptedEvidence = encryptRedisEventDeadLetterRecoveryValue({
       encryptionKey: TEST_DEAD_LETTER_KEY,

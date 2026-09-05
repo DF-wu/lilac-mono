@@ -169,15 +169,29 @@ async function captureManagerHook<TInput, TOutput = TInput, E = never>(params: {
     value: Awaited<TInput>,
   ) => Promise<ResultType<TOutput, E>> | ResultType<TOutput, E>;
 }): Promise<ResultType<Awaited<TInput> | TOutput, ToolPluginManagerHookError | E>> {
-  try {
-    const value = await params.run();
-    return params.continueWith ? await params.continueWith(value) : Result.ok(value);
-  } catch (cause) {
-    if (isPluginPanic(cause)) throw cause;
-    return Result.err(
-      mapPluginManagerHookException({ ...params, cause: safePluginExceptionCause(cause) }),
-    );
-  }
+  const captured = await Result.tryPromise({
+    try: async () => {
+      const value = await params.run();
+      return params.continueWith ? await params.continueWith(value) : Result.ok(value);
+    },
+    catch: (cause) => ({ restoreCause: () => cause }),
+  });
+  const outcome = captured.match<
+    | { readonly kind: "result"; readonly result: ResultType<Awaited<TInput> | TOutput, E> }
+    | { readonly kind: "failure"; readonly restoreCause: () => unknown }
+  >({
+    ok: (result) => ({ kind: "result", result }),
+    err: ({ restoreCause }) => ({ kind: "failure", restoreCause }),
+  });
+  if (outcome.kind === "result") return outcome.result;
+  const cause = outcome.restoreCause();
+  if (isPluginPanic(cause)) throw cause;
+  return Result.err(
+    mapPluginManagerHookException({
+      ...params,
+      cause: safePluginExceptionCause(cause),
+    }),
+  );
 }
 
 function cleanupError(failures: readonly ToolPluginCleanupFailure[]): ToolPluginCleanupError {
@@ -191,7 +205,7 @@ function combineOperationAndCleanup(
   primary: ToolPluginOperationError,
   cleanup: ResultType<void, ToolPluginCleanupError>,
 ): ToolPluginManagerError {
-  return cleanup.match<ToolPluginManagerError>({
+  return continueResult(cleanup, {
     ok: () => primary,
     err: (error) =>
       new ToolPluginOperationAndCleanupError({
@@ -206,7 +220,7 @@ function appendCleanup(
   error: ToolPluginManagerError,
   cleanup: ResultType<void, ToolPluginCleanupError>,
 ): ToolPluginManagerError {
-  return cleanup.match<ToolPluginManagerError>({
+  return continueResult(cleanup, {
     ok: () => error,
     err: (cleanupFailure) => {
       if (error._tag === "ToolPluginCleanupError") {
@@ -1112,7 +1126,7 @@ export class ToolPluginManager<
       }
       if (state.panic === undefined) state.panic = settled.reason;
     } else {
-      settled.value.match({
+      continueResult(settled.value, {
         ok: () => undefined,
         err: (error) => state.failures.push(error),
       });
@@ -1141,7 +1155,7 @@ export class ToolPluginManager<
         }
         if (state.panic === undefined) state.panic = settled.reason;
       } else {
-        settled.value.match({
+        continueResult(settled.value, {
           ok: () => undefined,
           err: (error) => state.failures.push(error),
         });

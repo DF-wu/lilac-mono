@@ -76,6 +76,8 @@ export type AdapterCommandInvokedEvent = Omit<AdapterEventBase, "platform"> & {
   userName?: string;
   sessionMode: "mention" | "active";
   sessionConfigId: string;
+  parentChannelId?: string;
+  guildId?: string;
   modelOverride?: string;
 };
 

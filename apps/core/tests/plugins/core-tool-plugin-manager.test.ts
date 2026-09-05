@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { asSchema, jsonSchema, tool } from "ai";
+import { asSchema } from "ai";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import {
   parseCoreConfigV1ToUniversal,
@@ -17,6 +17,7 @@ import { McpRegistry } from "../../src/mcp";
 import { catalogToolStableId } from "../../src/mcp/catalog-identity";
 import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
+import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
 import type { SurfaceAdapter } from "../../src/surface/adapter";
 import { BUILTIN_SURFACE_PROTOCOLS } from "../../src/surface/builtin-surface-protocols";
 import { SurfaceRuntimeRegistry } from "../../src/surface/runtime-descriptor";
@@ -28,6 +29,8 @@ import {
   mcpToolDefinition,
   stdioDefinition,
 } from "../mcp/fixtures/registry-fixture";
+import { getTestBlobStore } from "../helpers/blob-store";
+import type { ResourceAccess } from "../../src/resource";
 
 function createCoreToolPluginManager(
   params: Parameters<typeof createCoreToolPluginManagerResult>[0],
@@ -43,12 +46,20 @@ function createCoreToolPluginManager(
   };
 }
 
+function convertedMcpTool(name: string) {
+  const client = new FakeMcpClient();
+  const converted = client.toolsFromDefinitions({ tools: [mcpToolDefinition(name)] })[name];
+  if (!converted) throw new Error(`missing converted MCP tool: ${name}`);
+  return converted;
+}
+
 const TEST_SURFACE_REGISTRY = SurfaceRuntimeRegistry.create([
   { protocol: BUILTIN_SURFACE_PROTOCOLS.discord, adapter: {} as SurfaceAdapter },
   { protocol: BUILTIN_SURFACE_PROTOCOLS.github, adapter: {} as SurfaceAdapter },
 ]);
 if (TEST_SURFACE_REGISTRY.status === "error") throw TEST_SURFACE_REGISTRY.error;
 const TEST_SURFACE_ADAPTER_RESOLVER = TEST_SURFACE_REGISTRY.value.adapterResolver();
+const TEST_RESOURCE_ACCESS = {} as ResourceAccess;
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
@@ -133,6 +144,7 @@ const EXPECTED_STABLE_LEVEL2_CALLABLE_IDS = [
   "onboarding.reload_tools",
   "onboarding.restart",
   "onboarding.vcs_env",
+  "resource.materialize",
   "search",
   "skills.brief",
   "skills.full",
@@ -209,8 +221,11 @@ async function writeExternalPlugin(params: {
 
 describe("core tool plugin manager", () => {
   let tmpRoot: string | null = null;
+  let workflowStore: DurableWorkflowStore | null = null;
 
   afterEach(async () => {
+    workflowStore?.close();
+    workflowStore = null;
     if (!tmpRoot) return;
     await fs.rm(tmpRoot, { recursive: true, force: true });
     tmpRoot = null;
@@ -226,12 +241,16 @@ describe("core tool plugin manager", () => {
 
     const decoded = decodeCoreToolRequestMetadata({
       readFileDirectAttachmentSupported: false,
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: false,
       controlCapability: "level-2-control-capability",
       onSubagentDelegate,
       onActivity,
     });
 
     expect(decoded.readFileDirectAttachmentSupported).toBe(false);
+    expect(decoded.readFileDirectImageSupported).toBe(true);
+    expect(decoded.readFileDirectPdfSupported).toBe(false);
     expect(decoded.controlCapability).toBe("level-2-control-capability");
     expect(decoded.onSubagentDelegate).toBe(onSubagentDelegate);
     expect(decoded.onActivity).toBe(onActivity);
@@ -309,7 +328,7 @@ describe("core tool plugin manager", () => {
       "read",
       "subagent_delegate",
     ]);
-    expect(applyPatchTools.tools).not.toHaveProperty("tool_search");
+    expect(applyPatchTools.tools).not.toHaveProperty("find_tools");
 
     const editFileTools = await manager.buildLevel1Toolset({
       cwd: dataDir,
@@ -418,7 +437,6 @@ describe("core tool plugin manager", () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
-
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
@@ -481,14 +499,101 @@ describe("core tool plugin manager", () => {
         subagentDepth: 0,
         subagentProfile: "primary",
         metadata: {
-          readFileDirectAttachmentSupported: true,
+          readFileDirectImageSupported: true,
+          readFileDirectPdfSupported: true,
         },
       },
     });
 
     expect(getToolDescription(toolset.tools, "read")).toContain(
-      "calling read attaches the original file to your context for native visual or document analysis",
+      "Analyze supported images and PDFs already attached to context directly",
     );
+    expect(getToolDescription(toolset.tools, "read")).toContain("direct HTTP(S) URL");
+  });
+
+  it("gates URL reads with the web.fetch native-profile authority", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfigV2({
+      configVersion: 2,
+      agent: {
+        subagents: {
+          profiles: {
+            explore: {
+              network: true,
+              level2: { plugins: ["web"], callables: ["search"] },
+            },
+            general: { network: false },
+          },
+        },
+      },
+    });
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
+        discovery: {} as DiscoveryService,
+        config: cfg,
+      },
+      dataDir,
+    });
+    await manager.init();
+
+    const build = (runProfile: "primary" | "explore" | "general") =>
+      manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile,
+        editingToolMode: "none",
+        subagentDepth: runProfile === "primary" ? 0 : 1,
+        subagentConfig: cfg.agent.subagents,
+        requestContext: {
+          requestId: `req:url-read-${runProfile}`,
+          sessionId: "test-session",
+          requestClient: "test",
+          subagentDepth: runProfile === "primary" ? 0 : 1,
+          subagentProfile: runProfile,
+          metadata: { readFileDirectImageSupported: true },
+        },
+      });
+
+    const primary = await build("primary");
+    const missingFetch = await build("explore");
+    const networkDisabled = await build("general");
+
+    expect(getToolDescription(primary.tools, "read")).toContain("direct HTTP(S) URL");
+    expect(getToolDescription(missingFetch.tools, "read")).not.toContain("HTTP(S)");
+    expect(getToolDescription(networkDisabled.tools, "read")).not.toContain("HTTP(S)");
+
+    const webDisabledCfg: CoreConfig = {
+      ...cfg,
+      plugins: { ...cfg.plugins, disabled: [...cfg.plugins.disabled, "web"] },
+    };
+    const webDisabledManager = createCoreToolPluginManager({
+      runtime: {
+        bus: {} as LilacBus,
+        surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
+        discovery: {} as DiscoveryService,
+        config: webDisabledCfg,
+      },
+      dataDir: path.join(dataDir, "web-disabled"),
+    });
+    await webDisabledManager.init();
+    const webDisabled = await webDisabledManager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: webDisabledCfg.agent.subagents,
+      requestContext: {
+        requestId: "req:url-read-web-disabled",
+        sessionId: "test-session",
+        requestClient: "test",
+        subagentDepth: 0,
+        subagentProfile: "primary",
+        metadata: { readFileDirectImageSupported: true },
+      },
+    });
+    expect(getToolDescription(webDisabled.tools, "read")).not.toContain("HTTP(S)");
   });
 
   it("retains delegation and Level 2 metadata when direct attachment support is false", async () => {
@@ -567,7 +672,7 @@ describe("core tool plugin manager", () => {
     });
     expect(delegationCount).toBe(1);
     expect(getToolDescription(toolset.tools, "read")).not.toContain(
-      "calling read attaches the original file to your context for native visual or document analysis",
+      "Analyze supported images and PDFs already attached to context directly",
     );
   });
 
@@ -753,10 +858,19 @@ describe("core tool plugin manager", () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
+    const blobStore = await getTestBlobStore();
+    await fs.mkdir(dataDir, { recursive: true });
+    workflowStore = new DurableWorkflowStore(path.join(dataDir, "workflow.sqlite"));
 
     const manager = createCoreToolPluginManager({
       runtime: {
         bus: {} as LilacBus,
+        blobStore,
+        durableWorkflowStore: workflowStore,
+        attachmentOutputLifecycle: {
+          registerOutputHandle: () => Result.ok(undefined),
+        },
+        resourceAccess: TEST_RESOURCE_ACCESS,
         surfaceAdapterResolver: TEST_SURFACE_ADAPTER_RESOLVER,
         discovery: {} as DiscoveryService,
         conversationThreads: {} as ConversationThreadToolService,
@@ -765,7 +879,10 @@ describe("core tool plugin manager", () => {
       dataDir,
     });
 
-    await manager.init();
+    const initialized = await manager.init();
+    if (initialized.status === "error") {
+      throw new Error(initialized.error.message, { cause: initialized.error });
+    }
 
     const callableIds = (
       await Promise.all(
@@ -1087,10 +1204,7 @@ export default {
         rawName,
         identity,
         stableId: catalogToolStableId(identity),
-        tool: tool({
-          inputSchema: jsonSchema<unknown>({ type: "object", properties: {} }),
-          execute: () => `${serverId}:${rawName}`,
-        }),
+        tool: convertedMcpTool(rawName),
       };
     };
     const entries = [
@@ -1109,6 +1223,18 @@ export default {
           },
           getConfigStatus: () => ({ status: "valid" }),
           list: () => [],
+          getCatalogServers: () => [
+            {
+              serverId: "allowed",
+              serverInfo: { name: "allowed", version: "1.0.0" },
+              description: "Allowed server tools.",
+            },
+            {
+              serverId: "blocked",
+              serverInfo: { name: "blocked", version: "1.0.0" },
+              description: "Blocked server tools.",
+            },
+          ],
           getTools: () => entries,
           async shutdown() {},
         },
@@ -1138,10 +1264,17 @@ export default {
       "mcp_allowed_model_raw",
       "mcp_allowed_raw_allowed",
     ]);
-    expect(general.directToolNames.has("tool_search")).toBe(true);
+    expect(general.catalogMetadata.mcp_allowed_model_raw?.namespaceSummary).toBe(
+      "mcp_allowed.* — 2 tools: Allowed server tools.",
+    );
+    expect(getToolDescription(general.tools, "find_tools")).toContain(
+      "mcp_allowed.* — 2 tools: Allowed server tools.",
+    );
+    expect(getToolDescription(general.tools, "find_tools")).not.toContain("mcp_blocked.*");
+    expect(general.directToolNames.has("find_tools")).toBe(true);
   });
 
-  it("reuses one registry client and its tool wrappers across concurrent Level 1 sessions", async () => {
+  it("reuses one registry client while creating run-scoped MCP model projections", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
     const cfg = testConfig({});
@@ -1161,6 +1294,12 @@ export default {
       },
     });
     await registry.init();
+    const registryTool = registry.getTools()[0];
+    if (!registryTool) throw new Error("missing shared MCP tool");
+    registryTool.tool.toModelOutput = () => ({
+      type: "content",
+      value: [{ type: "text", text: "projected" }],
+    });
     const manager = createCoreToolPluginManager({
       runtime: { config: cfg, mcpRegistry: registry },
       dataDir,
@@ -1183,19 +1322,17 @@ export default {
       });
 
     const [first, second] = await Promise.all([buildSession("first"), buildSession("second")]);
-    const registryTool = registry.getTools()[0];
-    const firstEntry = first.catalog.find((entry) => entry.stableId === registryTool?.stableId);
-    const secondEntry = second.catalog.find((entry) => entry.stableId === registryTool?.stableId);
-    if (!registryTool || !firstEntry || !secondEntry) throw new Error("missing shared MCP tool");
+    const firstEntry = first.catalog.find((entry) => entry.stableId === registryTool.stableId);
+    const secondEntry = second.catalog.find((entry) => entry.stableId === registryTool.stableId);
+    if (!firstEntry || !secondEntry) throw new Error("missing run-scoped MCP tool");
 
     expect(factory.configs).toHaveLength(1);
     expect(factory.created).toEqual([client]);
-    expect(firstEntry.tool).toBe(registryTool.tool);
-    expect(secondEntry.tool).toBe(registryTool.tool);
-    expect(Object.is(first.tools[firstEntry.modelName], registryTool.tool)).toBe(true);
-    expect(Object.is(second.tools[secondEntry.modelName], first.tools[firstEntry.modelName])).toBe(
-      true,
-    );
+    expect(Object.is(firstEntry.tool, registryTool.tool)).toBe(false);
+    expect(Object.is(secondEntry.tool, registryTool.tool)).toBe(false);
+    expect(Object.is(firstEntry.tool, secondEntry.tool)).toBe(false);
+    expect(Object.is(first.tools[firstEntry.modelName], firstEntry.tool)).toBe(true);
+    expect(Object.is(second.tools[secondEntry.modelName], secondEntry.tool)).toBe(true);
 
     await manager.destroy();
     await registry.shutdown();
@@ -1228,19 +1365,14 @@ export default {
           },
           getConfigStatus: () => ({ status: "valid" }),
           list: () => [],
+          getCatalogServers: () => [],
           getTools: () => [
             {
               serverId: "server",
               rawName: "remote",
               identity,
               stableId: catalogToolStableId(identity),
-              tool: tool({
-                inputSchema: jsonSchema<unknown>({
-                  type: "object",
-                  properties: {},
-                }),
-                execute: () => "remote",
-              }),
+              tool: convertedMcpTool("remote"),
             },
           ],
           async shutdown() {},

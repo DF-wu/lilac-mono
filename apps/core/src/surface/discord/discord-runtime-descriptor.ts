@@ -7,13 +7,16 @@ import type {
   SurfaceAdapterIngress,
   SurfaceRelayDescriptor,
   SurfaceRelayPolicy,
-  SurfaceRelayRecovery,
   SurfaceRuntimeHealthPort,
   SurfaceRuntimeDescriptor,
   SurfaceWorkflowProgressPort,
   WorkflowProgressOperationFailed,
 } from "../runtime-descriptor";
 import { workflowProgressOperationFailure } from "../runtime-descriptor";
+import {
+  createDiscordQuestionPort,
+  type DiscordQuestionAnswerSource,
+} from "./discord-question-port";
 
 type DiscordWorkflowProgressOperation = "check-message" | "send" | "edit";
 type DiscordCheckMessageResult = Awaited<
@@ -124,10 +127,7 @@ async function adaptDiscordSkippedOutputCleanupResultToHost(
   })();
 }
 
-export function createDiscordRelayPolicy(
-  adapter: SurfaceAdapter,
-  recovery?: SurfaceRelayRecovery<"discord">,
-): SurfaceRelayPolicy<"discord"> {
+export function createDiscordRelayPolicy(adapter: SurfaceAdapter): SurfaceRelayPolicy<"discord"> {
   return {
     refs: {
       createSessionRef: discordSurfaceProtocol.refs.createSessionRef,
@@ -143,16 +143,17 @@ export function createDiscordRelayPolicy(
       cleanupSkippedOutput: async ({ ref }) =>
         adaptDiscordSkippedOutputCleanupResultToHost(adapter, ref),
     },
-    ...(recovery ? { recovery } : {}),
   };
 }
 
 export function createDiscordSurfaceRuntimeDescriptor(input: {
   readonly adapter: SurfaceAdapter;
+  readonly questionAnswers?: DiscordQuestionAnswerSource;
   readonly adapterIngress: SurfaceAdapterIngress<"discord">;
   readonly health?: SurfaceRuntimeHealthPort;
   readonly createRelay: (guardedAdapter: SurfaceAdapter) => SurfaceRelayDescriptor<"discord">;
 }): SurfaceRuntimeDescriptor<"discord"> {
+  const questionAnswers = input.questionAnswers;
   return {
     protocol: discordSurfaceProtocol,
     adapter: input.adapter,
@@ -160,5 +161,11 @@ export function createDiscordSurfaceRuntimeDescriptor(input: {
     ...(input.health ? { health: input.health } : {}),
     createRelay: input.createRelay,
     createWorkflowProgress: createDiscordWorkflowProgressPort,
+    ...(questionAnswers
+      ? {
+          createQuestion: (guardedAdapter: SurfaceAdapter) =>
+            createDiscordQuestionPort({ adapter: guardedAdapter, answers: questionAnswers }),
+        }
+      : {}),
   };
 }

@@ -5,10 +5,11 @@
  * event-bus trust boundary.
  */
 
-import { modelMessageSchema } from "ai";
+import { blobHandleV1Schema } from "@stanley2058/lilac-blob-storage";
 import { z } from "zod";
 
-import { corePrimaryLineageV1Schema, decodeCorePrimaryLineageV1 } from "./core-primary-lineage";
+import { busMessagesV2Schema } from "./blob-messages";
+import { corePrimaryLineageV2Schema } from "./core-primary-lineage";
 import {
   createLilacEventTypes,
   dataKey,
@@ -75,32 +76,72 @@ export const requestOriginSchema = z.strictObject({
 export type RequestOrigin = z.output<typeof requestOriginSchema>;
 
 const cmdRequestMessageDataShapeSchema = z.strictObject({
+  requestDeliveryId: z.uuid(),
   queue: requestQueueModeSchema,
-  messages: z.array(modelMessageSchema),
-  corePrimaryLineage: corePrimaryLineageV1Schema.optional(),
+  messages: busMessagesV2Schema,
+  corePrimaryLineage: corePrimaryLineageV2Schema.optional(),
   runPolicy: requestRunPolicySchema.optional(),
   origin: requestOriginSchema.optional(),
   modelOverride: z.string().optional(),
   raw: z.unknown().optional(),
 });
 
-/** Command payload, including cross-field validation of Core primary lineage. */
+function findManagedInlineData(value: unknown): PropertyKey[] | null {
+  const seen = new WeakSet<object>();
+  const pending: Array<{ readonly value: unknown; readonly path: PropertyKey[] }> = [
+    { value, path: [] },
+  ];
+  while (pending.length > 0) {
+    const entry = pending.pop();
+    if (entry === undefined) break;
+    if (
+      entry.value instanceof Uint8Array ||
+      entry.value instanceof ArrayBuffer ||
+      (ArrayBuffer.isView(entry.value) && !(entry.value instanceof DataView))
+    ) {
+      return entry.path;
+    }
+    if (typeof entry.value === "string" && /^data:[^,]*,/iu.test(entry.value)) {
+      return entry.path;
+    }
+    if (entry.value instanceof URL && entry.value.protocol === "data:") return entry.path;
+    if (entry.value === null || typeof entry.value !== "object") continue;
+    if (seen.has(entry.value)) continue;
+    seen.add(entry.value);
+    if (entry.value instanceof Map) {
+      for (const [key, mapValue] of entry.value) {
+        pending.push({ value: key, path: [...entry.path, "<map-key>"] });
+        pending.push({ value: mapValue, path: [...entry.path, "<map-value>"] });
+      }
+      continue;
+    }
+    if (entry.value instanceof Set) {
+      for (const setValue of entry.value) {
+        pending.push({ value: setValue, path: [...entry.path, "<set-value>"] });
+      }
+      continue;
+    }
+    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(entry.value))) {
+      if (key === "dataBase64") return [...entry.path, key];
+      if ("value" in descriptor) {
+        pending.push({ value: descriptor.value, path: [...entry.path, key] });
+      }
+    }
+  }
+  return null;
+}
+
+/** Command payload. Content-dependent lineage validation runs after every handle resolves. */
 export const cmdRequestMessageDataSchema = cmdRequestMessageDataShapeSchema.superRefine(
   (data, context) => {
-    if (!data.corePrimaryLineage) return;
-    const decoded = decodeCorePrimaryLineageV1(data.corePrimaryLineage, data.messages);
-    decoded.match({
-      ok: () => undefined,
-      err: (error) => {
-        for (const issue of error.issues) {
-          context.addIssue({
-            code: "custom",
-            path: ["corePrimaryLineage", ...issue.path],
-            message: issue.message,
-          });
-        }
-      },
-    });
+    const path = findManagedInlineData(data);
+    if (path !== null) {
+      context.addIssue({
+        code: "custom",
+        path,
+        message: "Managed inline binary content and data URLs are not allowed",
+      });
+    }
   },
 );
 export type CmdRequestMessageData = z.output<typeof cmdRequestMessageDataSchema>;
@@ -340,8 +381,8 @@ export const evtAgentOutputResponseTextDataSchema = z.strictObject({
 export type EvtAgentOutputResponseTextData = z.output<typeof evtAgentOutputResponseTextDataSchema>;
 
 export const evtAgentOutputResponseBinaryDataSchema = z.strictObject({
+  blob: blobHandleV1Schema,
   mimeType: nonemptyStringSchema,
-  dataBase64: z.string(),
   filename: z.string().optional(),
 });
 export type EvtAgentOutputResponseBinaryData = z.output<

@@ -27,8 +27,8 @@ import {
   startCodexOAuthLogin,
   writeCodexTokens,
   type CodexOAuthLoginWithResult,
-  opaqueErrorMessage,
   errorCode,
+  opaqueErrorMessage,
 } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
@@ -86,6 +86,35 @@ export type MiniLilacLifecycleFailure =
   | MiniLilacCleanupFailure
   | MiniLilacServerOperationAndCleanupFailure;
 
+type CapturedThrown =
+  | { readonly kind: "panic"; readonly panic: Panic }
+  | { readonly kind: "failure"; readonly restoreCause: () => unknown };
+
+type CapturedSettlement<T> = { readonly kind: "success"; readonly value: T } | CapturedThrown;
+
+function captureThrown<Cause>(cause: Cause): CapturedThrown {
+  return Panic.is(cause)
+    ? { kind: "panic", panic: cause }
+    : { kind: "failure", restoreCause: () => cause };
+}
+
+async function settlePromise<T>(effect: () => Promise<T>): Promise<CapturedSettlement<T>> {
+  const attempted = await Result.tryPromise({ try: effect, catch: captureThrown });
+  return attempted.match<CapturedSettlement<T>>({
+    ok: (value) => ({ kind: "success", value }),
+    err: (failure) => failure,
+  });
+}
+
+function settleResult<T>(effect: () => Awaited<T>): CapturedSettlement<T> {
+  return Result.try<T, CapturedThrown>({ try: effect, catch: captureThrown }).match<
+    CapturedSettlement<T>
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: (failure) => failure,
+  });
+}
+
 export class MiniLilacDatabaseLockError extends Error {
   constructor(
     message: string,
@@ -117,37 +146,34 @@ async function captureServerOperation<T>(
   operation: string,
   effect: () => Promise<T>,
 ): Promise<ResultType<T, MiniLilacServerFailure>> {
-  try {
-    return Result.ok(await effect());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new MiniLilacServerFailure({
-        operation,
-        ...(cause instanceof Error ? { cause, code: errorCode(cause) } : {}),
-        message: opaqueErrorMessage(cause, `${operation} failed`),
-      }),
-    );
-  }
+  const settlement = await settlePromise(effect);
+  if (settlement.kind === "success") return Result.ok(settlement.value);
+  if (settlement.kind === "panic") throw settlement.panic;
+  const cause = settlement.restoreCause();
+  return Result.err(
+    new MiniLilacServerFailure({
+      operation,
+      ...(cause instanceof Error ? { cause, code: errorCode(cause) } : {}),
+      message: opaqueErrorMessage(cause, `${operation} failed`),
+    }),
+  );
 }
 
 async function captureServerCleanup(
   operation: string,
   effect: () => void | Promise<void>,
 ): Promise<ResultType<void, MiniLilacServerCleanupFailure>> {
-  try {
-    await effect();
-    return Result.ok(undefined);
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new MiniLilacServerCleanupFailure({
-        operation,
-        ...(cause instanceof Error ? { cause } : {}),
-        message: opaqueErrorMessage(cause, `${operation} cleanup failed`),
-      }),
-    );
-  }
+  const settlement = await settlePromise(async () => effect());
+  if (settlement.kind === "success") return Result.ok(undefined);
+  if (settlement.kind === "panic") throw settlement.panic;
+  const cause = settlement.restoreCause();
+  return Result.err(
+    new MiniLilacServerCleanupFailure({
+      operation,
+      ...(cause instanceof Error ? { cause } : {}),
+      message: opaqueErrorMessage(cause, `${operation} cleanup failed`),
+    }),
+  );
 }
 
 function adaptLifecycleResultToHost<T>(result: ResultType<T, MiniLilacLifecycleFailure>): T {
@@ -377,18 +403,20 @@ async function settleShutdownEffect(
   effect: () => void | Promise<void>,
   onSettled: (settlement: ShutdownEffectSettlement) => void = () => {},
 ): Promise<ShutdownEffectSettlement> {
-  try {
-    await effect();
-    const settlement = { kind: "success" } as const;
-    onSettled(settlement);
-    return settlement;
-  } catch (cause) {
-    const settlement: ShutdownEffectSettlement = Panic.is(cause)
-      ? { kind: "panic", panic: cause }
-      : { kind: "failure" };
+  const captured = await settlePromise(() => Promise.resolve(effect()));
+  let settlement: ShutdownEffectSettlement;
+  if (captured.kind !== "success") {
+    settlement = captured.kind === "panic" ? captured : { kind: "failure" };
     onSettled(settlement);
     return settlement;
   }
+
+  settlement = { kind: "success" };
+  const observed = settleResult(() => onSettled(settlement));
+  if (observed.kind === "success") return settlement;
+  settlement = observed.kind === "panic" ? observed : { kind: "failure" };
+  onSettled(settlement);
+  return settlement;
 }
 
 type SettledLifecycleResult<T> =
@@ -411,64 +439,62 @@ async function settleLifecycleResult<T>(
   operation: string,
   effect: () => Promise<ResultType<T, MiniLilacLifecycleFailure>>,
 ): Promise<SettledLifecycleResult<T>> {
-  try {
-    return { kind: "result", result: await effect() };
-  } catch (cause) {
-    if (Panic.is(cause)) return { kind: "panic", panic: cause };
-    return {
-      kind: "result",
-      result: Result.err(
-        new MiniLilacServerFailure({
-          operation,
-          ...(cause instanceof Error ? { cause, code: errorCode(cause) } : {}),
-          message: opaqueErrorMessage(cause, `${operation} failed`),
-        }),
-      ),
-    };
-  }
+  const settlement = await settlePromise(effect);
+  if (settlement.kind === "success") return { kind: "result", result: settlement.value };
+  if (settlement.kind === "panic") return settlement;
+  const cause = settlement.restoreCause();
+  return {
+    kind: "result",
+    result: Result.err(
+      new MiniLilacServerFailure({
+        operation,
+        ...(cause instanceof Error ? { cause, code: errorCode(cause) } : {}),
+        message: opaqueErrorMessage(cause, `${operation} failed`),
+      }),
+    ),
+  };
 }
 
 async function settleCleanupEffect(
   operation: string,
   effect: () => void | Promise<void>,
 ): Promise<SettledCleanupResult> {
-  try {
-    await effect();
+  const settlement = await settlePromise(async () => effect());
+  if (settlement.kind === "success") {
     return { kind: "result", result: Result.ok(undefined) };
-  } catch (cause) {
-    if (Panic.is(cause)) return { kind: "panic", panic: cause };
-    return {
-      kind: "result",
-      result: Result.err(
-        new MiniLilacServerCleanupFailure({
-          operation,
-          ...(cause instanceof Error ? { cause } : {}),
-          message: opaqueErrorMessage(cause, `${operation} cleanup failed`),
-        }),
-      ),
-    };
   }
+  if (settlement.kind === "panic") return settlement;
+  const cause = settlement.restoreCause();
+  return {
+    kind: "result",
+    result: Result.err(
+      new MiniLilacServerCleanupFailure({
+        operation,
+        ...(cause instanceof Error ? { cause } : {}),
+        message: opaqueErrorMessage(cause, `${operation} cleanup failed`),
+      }),
+    ),
+  };
 }
 
 async function settleCleanupResult(
   operation: string,
   effect: () => Promise<ResultType<void, MiniLilacServerCleanupFailure>>,
 ): Promise<SettledCleanupResult> {
-  try {
-    return { kind: "result", result: await effect() };
-  } catch (cause) {
-    if (Panic.is(cause)) return { kind: "panic", panic: cause };
-    return {
-      kind: "result",
-      result: Result.err(
-        new MiniLilacServerCleanupFailure({
-          operation,
-          ...(cause instanceof Error ? { cause } : {}),
-          message: opaqueErrorMessage(cause, `${operation} cleanup failed`),
-        }),
-      ),
-    };
-  }
+  const settlement = await settlePromise(effect);
+  if (settlement.kind === "success") return { kind: "result", result: settlement.value };
+  if (settlement.kind === "panic") return settlement;
+  const cause = settlement.restoreCause();
+  return {
+    kind: "result",
+    result: Result.err(
+      new MiniLilacServerCleanupFailure({
+        operation,
+        ...(cause instanceof Error ? { cause } : {}),
+        message: opaqueErrorMessage(cause, `${operation} cleanup failed`),
+      }),
+    ),
+  };
 }
 
 export async function shutdownMiniLilacServerResult(
@@ -511,6 +537,7 @@ export async function shutdownMiniLilacServerResult(
       trackEffect(async () => options.requestRuntimeShutdown?.()),
     ];
     const cancellations = Promise.all(effects);
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     while (
       shutdownPanic === undefined &&
@@ -660,19 +687,20 @@ function decodeMiniLilacCliOptions<T>(
   );
 }
 
-function captureNodeCliParsing<T>(operation: () => T): ResultType<T, MiniLilacServerFailure> {
-  try {
-    return Result.ok(operation());
-  } catch (cause) {
-    if (Panic.is(cause)) throw cause;
-    return Result.err(
-      new MiniLilacServerFailure({
-        operation: "parse Mini Lilac CLI",
-        ...(cause instanceof Error ? { cause, code: errorCode(cause) } : {}),
-        message: opaqueErrorMessage(cause, "Invalid CLI arguments"),
-      }),
-    );
-  }
+function captureNodeCliParsing<T>(
+  operation: () => Awaited<T>,
+): ResultType<T, MiniLilacServerFailure> {
+  const settlement = settleResult(operation);
+  if (settlement.kind === "success") return Result.ok(settlement.value);
+  if (settlement.kind === "panic") throw settlement.panic;
+  const cause = settlement.restoreCause();
+  return Result.err(
+    new MiniLilacServerFailure({
+      operation: "parse Mini Lilac CLI",
+      ...(cause instanceof Error ? { cause, code: errorCode(cause) } : {}),
+      message: opaqueErrorMessage(cause, "Invalid CLI arguments"),
+    }),
+  );
 }
 
 export function parseCliArgsResult(

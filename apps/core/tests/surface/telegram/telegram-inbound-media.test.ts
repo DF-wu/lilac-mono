@@ -1,8 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { Buffer } from "node:buffer";
 import { Result } from "better-result";
-
-import type { UserContent } from "ai";
 
 import {
   SurfaceAttachmentTooLarge,
@@ -17,8 +14,10 @@ import {
   formatTelegramAttachmentMarker,
   telegramInboundMedia,
   telegramInboundMediaFromRaw,
+  type TelegramBusUserContentPart,
   type TelegramInboundMediaRef,
 } from "../../../src/surface/telegram/telegram-inbound-media";
+import { getTestBlobStore } from "../../helpers/blob-store";
 import { toTelegramRawEnvelope } from "../../../src/surface/telegram/telegram-raw";
 import { makeMessage } from "./telegram-fixtures";
 
@@ -57,6 +56,12 @@ function budget(perAttachment: number, perRequest: number) {
     maxBytesPerAttachment: perAttachment,
     maxBytesPerRequest: perRequest,
   });
+}
+
+async function appendMedia(
+  input: Omit<Parameters<typeof appendTelegramMediaToUserContent>[0], "blobStore">,
+): Promise<void> {
+  await appendTelegramMediaToUserContent({ ...input, blobStore: await getTestBlobStore() });
 }
 
 describe("telegramInboundMedia", () => {
@@ -137,36 +142,35 @@ describe("telegramInboundMediaFromRaw", () => {
 });
 
 describe("appendTelegramMediaToUserContent", () => {
-  it("delivers a photo as a base64 file part", async () => {
+  it("delivers a photo as a blob part", async () => {
     const resolver = stubResolver({});
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
 
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media: [{ kind: "photo", fileId: "p-1", mimeType: "image/jpeg" }],
       resolver,
       budget: budget(1024, 4096),
     });
 
-    expect(parts).toEqual([
-      {
-        type: "file",
-        data: Buffer.from(PNG_BYTES).toString("base64"),
-        mediaType: "image/png",
-      },
-    ]);
+    expect(parts).toHaveLength(1);
+    expect(parts[0]).toMatchObject({
+      type: "blob",
+      blob: { version: 1, objectId: expect.any(String) },
+      mediaType: "image/png",
+    });
     expect(resolver.calls).toEqual([
       { ref: { platform: "telegram", fileId: "p-1", mimeType: "image/jpeg" }, maxBytes: 1024 },
     ]);
   });
 
-  it("delivers a PDF document as a file part with its filename", async () => {
+  it("delivers a PDF document as a blob part with its filename", async () => {
     const resolver = stubResolver({
       fallback: { kind: "bytes", bytes: PNG_BYTES, mediaType: "application/pdf" },
     });
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
 
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media: [
         {
@@ -180,14 +184,13 @@ describe("appendTelegramMediaToUserContent", () => {
       budget: budget(1024, 4096),
     });
 
-    expect(parts).toEqual([
-      {
-        type: "file",
-        data: Buffer.from(PNG_BYTES).toString("base64"),
-        mediaType: "application/pdf",
-        filename: "report.pdf",
-      },
-    ]);
+    expect(parts).toHaveLength(1);
+    expect(parts[0]).toMatchObject({
+      type: "blob",
+      blob: { version: 1, objectId: expect.any(String) },
+      mediaType: "application/pdf",
+      filename: "report.pdf",
+    });
   });
 
   it("inlines a text-extractable document with its marker header", async () => {
@@ -199,7 +202,7 @@ describe("appendTelegramMediaToUserContent", () => {
         mediaType: "text/plain",
       },
     });
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
     const ref: TelegramInboundMediaRef = {
       kind: "document",
       fileId: "d-2",
@@ -208,7 +211,7 @@ describe("appendTelegramMediaToUserContent", () => {
       size: text.length,
     };
 
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media: [ref],
       resolver,
@@ -222,14 +225,14 @@ describe("appendTelegramMediaToUserContent", () => {
 
   it("degrades voice, audio and video to markers without resolving", async () => {
     const resolver = stubResolver({});
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
     const media: TelegramInboundMediaRef[] = [
       { kind: "voice", fileId: "v-1", mimeType: "audio/ogg", size: 900 },
       { kind: "audio", fileId: "a-1", filename: "song.mp3", mimeType: "audio/mpeg" },
       { kind: "video", fileId: "vid-1", mimeType: "video/mp4" },
     ];
 
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media,
       resolver,
@@ -255,7 +258,7 @@ describe("appendTelegramMediaToUserContent", () => {
         ],
       ]),
     });
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
     const ref: TelegramInboundMediaRef = {
       kind: "document",
       fileId: "d-3",
@@ -263,7 +266,7 @@ describe("appendTelegramMediaToUserContent", () => {
       mimeType: "application/zip",
     };
 
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media: [ref],
       resolver,
@@ -293,7 +296,7 @@ describe("appendTelegramMediaToUserContent", () => {
     const resolver = stubResolver({
       fallback: { kind: "bytes", bytes: PNG_BYTES, mediaType: "image/png" },
     });
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
     const ref: TelegramInboundMediaRef = {
       kind: "document",
       fileId: "png-1",
@@ -301,7 +304,7 @@ describe("appendTelegramMediaToUserContent", () => {
       mimeType: "application/octet-stream",
     };
 
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media: [ref],
       resolver,
@@ -309,14 +312,13 @@ describe("appendTelegramMediaToUserContent", () => {
     });
 
     expect(resolver.calls).toHaveLength(1);
-    expect(parts).toEqual([
-      {
-        type: "file",
-        data: Buffer.from(PNG_BYTES).toString("base64"),
-        mediaType: "image/png",
-        filename: "photo.bin",
-      },
-    ]);
+    expect(parts).toHaveLength(1);
+    expect(parts[0]).toMatchObject({
+      type: "blob",
+      blob: { version: 1, objectId: expect.any(String) },
+      mediaType: "image/png",
+      filename: "photo.bin",
+    });
   });
 
   it("does not promote uns sniffed bytes just because they were declared as an image", async () => {
@@ -327,7 +329,7 @@ describe("appendTelegramMediaToUserContent", () => {
         mediaType: "application/octet-stream",
       },
     });
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
     const ref: TelegramInboundMediaRef = {
       kind: "document",
       fileId: "fake-1",
@@ -335,7 +337,7 @@ describe("appendTelegramMediaToUserContent", () => {
       mimeType: "image/png",
     };
 
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media: [ref],
       resolver,
@@ -365,10 +367,10 @@ describe("appendTelegramMediaToUserContent", () => {
         ],
       ]),
     });
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
     const ref: TelegramInboundMediaRef = { kind: "photo", fileId: "p-1", mimeType: "image/jpeg" };
 
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media: [ref],
       resolver,
@@ -398,10 +400,10 @@ describe("appendTelegramMediaToUserContent", () => {
         ],
       ]),
     });
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
     const ref: TelegramInboundMediaRef = { kind: "photo", fileId: "p-1", mimeType: "image/jpeg" };
 
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media: [ref],
       resolver,
@@ -418,7 +420,7 @@ describe("appendTelegramMediaToUserContent", () => {
 
   it("spans one request budget across attachments and degrades past it", async () => {
     const resolver = stubResolver({});
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
     const first: TelegramInboundMediaRef = { kind: "photo", fileId: "p-1", mimeType: "image/jpeg" };
     const second: TelegramInboundMediaRef = {
       kind: "photo",
@@ -427,7 +429,7 @@ describe("appendTelegramMediaToUserContent", () => {
     };
 
     // Request budget covers exactly one resolved photo.
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media: [first, second],
       resolver,
@@ -435,26 +437,25 @@ describe("appendTelegramMediaToUserContent", () => {
     });
 
     expect(resolver.calls.map((call) => call.ref.fileId)).toEqual(["p-1"]);
-    expect(parts).toEqual([
-      {
-        type: "file",
-        data: Buffer.from(PNG_BYTES).toString("base64"),
-        mediaType: "image/png",
-      },
-      {
-        type: "text",
-        text: `${formatTelegramAttachmentMarker(second)}\n(inbound media budget exhausted; not delivered)`,
-      },
-    ]);
+    expect(parts).toHaveLength(2);
+    expect(parts[0]).toMatchObject({
+      type: "blob",
+      blob: { version: 1, objectId: expect.any(String) },
+      mediaType: "image/png",
+    });
+    expect(parts[1]).toEqual({
+      type: "text",
+      text: `${formatTelegramAttachmentMarker(second)}\n(inbound media budget exhausted; not delivered)`,
+    });
   });
 
   it("caps each resolve at the smaller of the per-attachment and remaining budget", async () => {
     const resolver = stubResolver({
       fallback: { kind: "bytes", bytes: new Uint8Array(8), mediaType: "image/png" },
     });
-    const parts: Exclude<UserContent, string> = [];
+    const parts: TelegramBusUserContentPart[] = [];
 
-    await appendTelegramMediaToUserContent({
+    await appendMedia({
       parts,
       media: [
         { kind: "photo", fileId: "p-1", mimeType: "image/jpeg" },

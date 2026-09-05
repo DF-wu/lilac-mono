@@ -6,8 +6,10 @@ import {
   type Level1ToolSpec,
 } from "@stanley2058/lilac-plugin-runtime";
 import { isRecord } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 
 import { redactSecrets } from "../../../tools/bash-safety/format";
+import { bashOutputSchema } from "../../../tools/bash";
 
 const SENSITIVE_KEYS = new Set([
   "authorization",
@@ -53,33 +55,33 @@ function getBooleanField(value: unknown, key: string): boolean | undefined {
 function toSerializablePreview(value: unknown, maxChars?: number): string {
   const seen = new WeakSet<object>();
 
-  let raw = "";
-  try {
-    raw = JSON.stringify(value, (key, nested) => {
-      if (SENSITIVE_KEYS.has(key)) return "<redacted>";
+  const serialized = Result.try({
+    try: () =>
+      JSON.stringify(value, (key, nested) => {
+        if (SENSITIVE_KEYS.has(key)) return "<redacted>";
 
-      if (nested instanceof Error) {
-        return {
-          name: nested.name,
-          message: nested.message,
-          stack: nested.stack,
-        };
-      }
+        if (nested instanceof Error) {
+          return {
+            name: nested.name,
+            message: nested.message,
+            stack: nested.stack,
+          };
+        }
 
-      if (typeof nested === "bigint") {
-        return nested.toString();
-      }
+        if (typeof nested === "bigint") {
+          return nested.toString();
+        }
 
-      if (isRecord(nested)) {
-        if (seen.has(nested)) return "<circular>";
-        seen.add(nested);
-      }
+        if (isRecord(nested)) {
+          if (seen.has(nested)) return "<circular>";
+          seen.add(nested);
+        }
 
-      return nested;
-    });
-  } catch {
-    raw = String(value);
-  }
+        return nested;
+      }),
+    catch: () => undefined,
+  });
+  const raw = serialized.match({ ok: (text) => text, err: () => String(value) });
 
   const redacted = redactSecrets(raw);
   if (maxChars === undefined || maxChars <= 0) return redacted;
@@ -102,22 +104,69 @@ function defaultErrorFromResult(result: unknown): string {
 }
 
 export function summarizeBashFailure(result: unknown): ToolFailureSummary {
-  const executionError = isRecord(result) ? result["executionError"] : undefined;
-  const exitCode = getNumberField(result, "exitCode");
-
-  if (executionError !== undefined) {
+  const decoded = bashOutputSchema.safeParse(result);
+  if (!decoded.success) {
     return {
       ok: false,
       failureKind: "hard",
-      error: `bash execution error: ${oneLine(toSerializablePreview(executionError, 500))}`,
+      failureClass: "unknown",
+      failureCode: "invalid_result",
+      error: "bash returned an invalid result",
     };
   }
 
-  if (typeof exitCode === "number" && exitCode !== 0) {
+  const { executionError, exitCode } = decoded.data;
+
+  if (executionError !== undefined) {
+    switch (executionError.type) {
+      case "blocked":
+        return {
+          ok: false,
+          failureKind: "hard",
+          failureClass: "policy",
+          failureCode: executionError.code,
+          retryable: false,
+          error: executionError.hint
+            ? `${executionError.reason} Hint: ${executionError.hint}`
+            : executionError.reason,
+        };
+      case "timeout":
+        return {
+          ok: false,
+          failureKind: "hard",
+          failureClass: "timeout",
+          failureCode: executionError.code,
+          error: `bash timed out after ${executionError.timeoutMs}ms`,
+        };
+      case "aborted":
+        return {
+          ok: false,
+          failureKind: "hard",
+          failureClass: "cancelled",
+          failureCode: executionError.code,
+          retryable: false,
+          error: "bash execution was cancelled",
+        };
+      case "exception":
+        return {
+          ok: false,
+          failureKind: "hard",
+          failureClass: executionError.phase === "spawn" ? "environment" : "tool",
+          failureCode: executionError.code,
+          ...(executionError.code === "spawn_cwd_missing" ? { retryable: false } : {}),
+          error: executionError.message,
+        };
+    }
+  }
+
+  if (exitCode !== 0) {
     return {
       ok: false,
       failureKind: "soft",
-      error: `bash exited with code ${exitCode}`,
+      failureClass: "tool",
+      failureCode: "nonzero_exit",
+      exitCode,
+      error: "bash command exited with a nonzero status",
     };
   }
 
@@ -196,16 +245,20 @@ export function summarizeSubagentFailure(result: unknown): ToolFailureSummary {
 export function summarizeToolFailure(params: {
   toolName: string;
   isError: boolean;
-  result: unknown;
+  result?: unknown;
+  event?: { readonly result: unknown };
   toolSpecs?: ReadonlyMap<string, Level1ToolSpec<unknown>>;
   contributionInfo?: ReadonlyMap<Level1ToolSpec<unknown>, Level1ContributionInfo>;
 }): ToolFailureSummary {
-  const { toolName, isError, result, toolSpecs, contributionInfo } = params;
+  const { toolName, isError, toolSpecs, contributionInfo } = params;
+  const result = params.event ? params.event.result : params.result;
 
   if (isError) {
     return {
       ok: false,
       failureKind: "hard",
+      failureClass: "unknown",
+      failureCode: "host_execution_error",
       error: defaultErrorFromResult(result),
     };
   }
@@ -234,10 +287,13 @@ export function summarizeToolFailure(params: {
 
 export function formatToolLogPreview(params: {
   toolName: string;
-  value: unknown;
+  value?: unknown;
+  event?: { readonly args: unknown; readonly result: unknown };
+  field?: "args" | "result";
   untruncated?: boolean;
 }): string {
-  const { value, untruncated } = params;
+  const { untruncated } = params;
+  const value = params.event && params.field ? params.event[params.field] : params.value;
   const maxChars = untruncated ? undefined : DEFAULT_PREVIEW_MAX_CHARS;
   return toSerializablePreview(value, maxChars);
 }

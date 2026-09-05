@@ -7,8 +7,10 @@ import {
 } from "@stanley2058/lilac-event-bus";
 import { getCoreConfig, parseCoreConfigResult, type CoreConfig } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
+import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 
 import type { CustomCommandManager } from "../../custom-commands/manager";
+import { captureError } from "../../shared/error-capture";
 import { adaptEventPublishResultToHost } from "../../shared/event-bus-result";
 import type { SurfaceAdapter } from "../adapter";
 import { formatTelegramMessageRequestId } from "../bridge/request-ids";
@@ -51,6 +53,7 @@ export type TelegramRequestRouter = {
 export type StartTelegramRequestRouterInput = {
   readonly adapter: SurfaceAdapter;
   readonly bus: LilacBus;
+  readonly blobStore: BlobStore;
   readonly subscriptionId: string;
   readonly customCommands?: CustomCommandManager;
   readonly config?: TelegramRouterConfig;
@@ -95,20 +98,20 @@ export async function startTelegramRequestRouter(
     const isDm = flags.isDMBased === true;
     const mode = isDm ? "active" : getSessionMode(liveCfg, event.channelId, flags.parentChannelId);
     const botNames = resolveTelegramBotMentionNames({
-      botName: cfg.surface.telegram.botName,
-      botUsername: cfg.surface.telegram.botUsername,
+      botName: liveCfg.surface.telegram.botName,
+      botUsername: liveCfg.surface.telegram.botUsername,
     });
     const modelOverride =
       parseLeadingModelOverride({ text: event.text, botNames }) ??
-      resolveSessionModelOverride(cfg, event.channelId, flags.parentChannelId);
+      resolveSessionModelOverride(liveCfg, event.channelId, flags.parentChannelId);
     const customCommand = input.customCommands
-      ? commandMetadata(input.customCommands, event.text, cfg.surface.telegram.botUsername)
+      ? commandMetadata(input.customCommands, event.text, liveCfg.surface.telegram.botUsername)
       : null;
     if (!customCommand && mode === "mention" && !flags.mentionsBot && !flags.replyToBot) return;
 
     if (
       !isDm &&
-      resolveSessionGateEnabled(cfg, event.channelId, flags.parentChannelId) &&
+      resolveSessionGateEnabled(liveCfg, event.channelId, flags.parentChannelId) &&
       shouldRunDirectReplyMentionGate({
         replyToBot: flags.replyToBot === true,
         mentionsBot: flags.mentionsBot === true,
@@ -125,7 +128,7 @@ export async function startTelegramRequestRouter(
         : null;
       const decision = await input.routerGate?.({
         sessionId: event.channelId,
-        botName: cfg.surface.telegram.botName,
+        botName: liveCfg.surface.telegram.botName,
         messages: [
           {
             msgRef: messageRef(event),
@@ -150,6 +153,7 @@ export async function startTelegramRequestRouter(
       event,
       botUserId: self.userId,
       botNames,
+      blobStore: input.blobStore,
       modelOverride,
       inboundMedia: liveCfg.surface.telegram.inboundMedia,
     });
@@ -164,6 +168,7 @@ export async function startTelegramRequestRouter(
       await input.bus.publish(
         lilacEventTypes.CmdRequestMessage,
         {
+          requestDeliveryId: crypto.randomUUID(),
           queue: "prompt",
           messages: composed.messages,
           ...(modelOverride ? { modelOverride } : {}),
@@ -212,28 +217,33 @@ export async function startTelegramRequestRouter(
       ) {
         return Result.ok(undefined);
       }
-      try {
-        const suppressed = await input.shouldSuppressAdapterEvent?.({ evt: message.data });
-        if (suppressed?.suppress) return Result.ok(undefined);
-        const liveCfg = await currentConfig();
-        const flags = telegramFlags(message.data);
-        const mode = flags.isDMBased
-          ? "active"
-          : getSessionMode(liveCfg, message.data.channelId, flags.parentChannelId);
-        if (mode === "active" && !flags.isDMBased && !flags.mentionsBot && !flags.replyToBot) {
-          const previous = buffers.get(message.data.channelId);
-          if (previous?.timer) clearTimeout(previous.timer);
-          const buffer: DebounceBuffer = { event: message.data, timer: null };
-          buffer.timer = setTimeout(
-            () => void flush(message.data.channelId),
-            liveCfg.surface.router.activeDebounceMs,
-          );
-          buffers.set(message.data.channelId, buffer);
+      const routed = await Result.tryPromise({
+        try: async () => {
+          const suppressed = await input.shouldSuppressAdapterEvent?.({ evt: message.data });
+          if (suppressed?.suppress) return Result.ok(undefined);
+          const liveCfg = await currentConfig();
+          const flags = telegramFlags(message.data);
+          const mode = flags.isDMBased
+            ? "active"
+            : getSessionMode(liveCfg, message.data.channelId, flags.parentChannelId);
+          if (mode === "active" && !flags.isDMBased && !flags.mentionsBot && !flags.replyToBot) {
+            const previous = buffers.get(message.data.channelId);
+            if (previous?.timer) clearTimeout(previous.timer);
+            const buffer: DebounceBuffer = { event: message.data, timer: null };
+            buffer.timer = setTimeout(
+              () => void flush(message.data.channelId),
+              liveCfg.surface.router.activeDebounceMs,
+            );
+            buffers.set(message.data.channelId, buffer);
+            return Result.ok(undefined);
+          }
+          await publishEvent(message.data);
           return Result.ok(undefined);
-        }
-        await publishEvent(message.data);
-        return Result.ok(undefined);
-      } catch (cause) {
+        },
+        catch: (cause) => captureError(cause, "Telegram request routing failed"),
+      });
+      if (routed.isErr()) {
+        const cause = routed.error.cause;
         if (Panic.is(cause)) throw cause;
         return Result.err(
           new TelegramRequestRoutingFailed({
@@ -242,6 +252,7 @@ export async function startTelegramRequestRouter(
           }),
         );
       }
+      return routed.value;
     },
     deliveryPolicy,
   );

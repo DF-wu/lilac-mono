@@ -12,6 +12,7 @@ import { hasSurfaceAttachmentResolver } from "../../../src/surface/adapter";
 import { TelegramAdapter } from "../../../src/surface/telegram/telegram-adapter";
 import { composeTelegramMessages } from "../../../src/surface/telegram/telegram-request-router-composition";
 import type { AdapterEvent } from "../../../src/surface/events";
+import { getTestBlobStore } from "../../helpers/blob-store";
 import { FakeBotApiServer } from "./fake-bot-api-server";
 import { makeMessage } from "./telegram-fixtures";
 
@@ -63,7 +64,7 @@ async function connectAdapter(cfg: CoreConfig): Promise<TelegramAdapter> {
 
 beforeEach(async () => {
   server = new FakeBotApiServer();
-  scratchDir = await mkdtemp(path.join(tmpdir(), "lilac-telegram-media-"));
+  scratchDir = await mkdtemp(path.join(tmpdir(), "lilac-telegram-it-"));
 });
 
 afterEach(async () => {
@@ -90,6 +91,21 @@ describe("TelegramAdapter.resolveAttachment", () => {
     expect(server.callsOf("downloadFile")).toEqual([
       { method: "downloadFile", params: { file_path: "photos/photo-1.jpg" } },
     ]);
+  });
+
+  it("does not trust an image filename when byte sniffing fails", async () => {
+    const connected = await connectAdapter(testConfig());
+    const bytes = Uint8Array.from([0, 1, 2, 3, 4]);
+    server.setFile({ fileId: "fake-image", filePath: "documents/payload.png", bytes });
+
+    const resolved = await connected.resolveAttachment(
+      { platform: "telegram", fileId: "fake-image", filename: "payload.png" },
+      { maxBytes: 1024 },
+    );
+
+    const value = resolved.unwrap();
+    expect(value.mediaType).toBe("application/octet-stream");
+    expect([...value.bytes]).toEqual([...bytes]);
   });
 
   it("streams an overdeclared but actually small file instead of trusting the ref size", async () => {
@@ -224,7 +240,7 @@ describe("composeTelegramMessages with inbound media", () => {
     };
   }
 
-  it("delivers an uncaptioned photo as a base64 file part with no token anywhere", async () => {
+  it("delivers an uncaptioned photo as a blob part with no token anywhere", async () => {
     const cfg = testConfig();
     const connected = await connectAdapter(cfg);
     expect(hasSurfaceAttachmentResolver(connected)).toBe(true);
@@ -235,6 +251,7 @@ describe("composeTelegramMessages with inbound media", () => {
       event,
       botUserId: "8792842071",
       botNames: ["lilac"],
+      blobStore: await getTestBlobStore(),
       inboundMedia: cfg.surface.telegram.inboundMedia,
     });
 
@@ -243,14 +260,13 @@ describe("composeTelegramMessages with inbound media", () => {
     if (!last || typeof last.content === "string" || !Array.isArray(last.content)) {
       throw new Error("expected part-based user content");
     }
-    const fileParts = last.content.filter((part) => part.type === "file");
-    expect(fileParts).toEqual([
-      {
-        type: "file",
-        data: Buffer.from(PNG_BYTES).toString("base64"),
-        mediaType: "image/png",
-      },
-    ]);
+    const blobParts = last.content.filter((part) => part.type === "blob");
+    expect(blobParts).toHaveLength(1);
+    expect(blobParts[0]).toMatchObject({
+      type: "blob",
+      blob: { version: 1, objectId: expect.any(String) },
+      mediaType: "image/png",
+    });
 
     const serialized = JSON.stringify(composed.messages);
     expect(serialized).not.toContain(FAKE_TOKEN);
@@ -271,6 +287,7 @@ describe("composeTelegramMessages with inbound media", () => {
       event,
       botUserId: "8792842071",
       botNames: ["lilac"],
+      blobStore: await getTestBlobStore(),
       inboundMedia: cfg.surface.telegram.inboundMedia,
     });
     const again = await composeTelegramMessages({
@@ -278,6 +295,7 @@ describe("composeTelegramMessages with inbound media", () => {
       event,
       botUserId: "8792842071",
       botNames: ["lilac"],
+      blobStore: await getTestBlobStore(),
       inboundMedia: cfg.surface.telegram.inboundMedia,
     });
 
@@ -326,6 +344,7 @@ describe("composeTelegramMessages with inbound media", () => {
       },
       botUserId: "8792842071",
       botNames: ["lilac"],
+      blobStore: await getTestBlobStore(),
       inboundMedia: cfg.surface.telegram.inboundMedia,
     });
 

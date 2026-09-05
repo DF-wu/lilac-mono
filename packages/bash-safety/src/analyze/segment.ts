@@ -1,5 +1,7 @@
 import {
   type AnalyzeOptions,
+  bashSafetyViolation,
+  type BashSafetyViolation,
   INTERPRETERS,
   PARANOID_INTERPRETERS_SUFFIX,
   SHELL_WRAPPERS,
@@ -141,7 +143,10 @@ const SENSITIVE_PATH_CONSUMERS = new Set([
 
 export type SegmentAnalyzeOptions = AnalyzeOptions & {
   effectiveCwd: string | null | undefined;
-  analyzeNested: (command: string, effectiveCwd?: string | null | undefined) => string | null;
+  analyzeNested: (
+    command: string,
+    effectiveCwd?: string | null | undefined,
+  ) => BashSafetyViolation | null;
 };
 
 function deriveCwdContext(options: Pick<SegmentAnalyzeOptions, "cwd" | "effectiveCwd">): {
@@ -155,7 +160,10 @@ function deriveCwdContext(options: Pick<SegmentAnalyzeOptions, "cwd" | "effectiv
   return { cwdUnknown, cwdForRm, originalCwd };
 }
 
-export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions): string | null {
+export function analyzeSegment(
+  tokens: string[],
+  options: SegmentAnalyzeOptions,
+): BashSafetyViolation | null {
   if (tokens.length === 0) {
     return null;
   }
@@ -288,7 +296,10 @@ export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions)
     const codeArg = extractInterpreterCodeArg(staticTokens);
     if (codeArg) {
       if (options.paranoidInterpreters) {
-        return REASON_INTERPRETER_BLOCKED + PARANOID_INTERPRETERS_SUFFIX;
+        return bashSafetyViolation(
+          "interpreter_one_liner",
+          REASON_INTERPRETER_BLOCKED + PARANOID_INTERPRETERS_SUFFIX,
+        );
       }
     }
   }
@@ -324,7 +335,11 @@ export function analyzeSegment(tokens: string[], options: SegmentAnalyzeOptions)
       hasRecursiveForceFlags(staticTokens) &&
       hasDynamicRmTarget(stripped.slice(commandIndex + 1))
     ) {
-      return REASON_DYNAMIC_RM_TARGET;
+      return bashSafetyViolation(
+        "dynamic_recursive_delete",
+        REASON_DYNAMIC_RM_TARGET,
+        "Remove known literal child paths, then use rmdir for an empty directory.",
+      );
     }
 
     const rmResult = hasRecursiveFlag(stripped)
@@ -530,13 +545,16 @@ export function unwrapStaticExecutionWrapper(tokens: readonly string[]): string[
       if (token === "-a") {
         if (!tokens[i + 1]) return null;
         i += 2;
-      } else if (token && /^-[cl]+$/u.test(token)) {
-        i++;
-      } else if (token?.startsWith("-")) {
-        return null;
-      } else {
-        break;
+        continue;
       }
+      if (token && /^-[cl]+$/u.test(token)) {
+        i++;
+        continue;
+      }
+      if (token?.startsWith("-")) {
+        return null;
+      }
+      break;
     }
     return tokens.slice(i);
   }
@@ -549,22 +567,24 @@ export function unwrapStaticExecutionWrapper(tokens: readonly string[]): string[
     let i = 1;
     while (i < tokens.length) {
       const token = tokens[i];
-      if (token === "-n" || token === "--adjustment") {
-        if (!tokens[i + 1]) return null;
-        i += 2;
-      } else if (
-        token?.startsWith("--adjustment=") ||
-        /^-n.+$/u.test(token ?? "") ||
-        /^-\d+$/u.test(token ?? "")
-      ) {
-        i++;
-      } else if (token === "--") {
-        return tokens.slice(i + 1);
-      } else if (token?.startsWith("-")) {
-        return null;
-      } else {
-        break;
+      switch (true) {
+        case token === "-n" || token === "--adjustment":
+          if (!tokens[i + 1]) return null;
+          i += 2;
+          continue;
+        case token?.startsWith("--adjustment=") ||
+          /^-n.+$/u.test(token ?? "") ||
+          /^-\d+$/u.test(token ?? ""):
+          i++;
+          continue;
+        case token === "--":
+          return tokens.slice(i + 1);
+        case token?.startsWith("-"):
+          return null;
+        default:
+          break;
       }
+      break;
     }
     return tokens.slice(i);
   }
@@ -590,11 +610,12 @@ export function unwrapStaticExecutionWrapper(tokens: readonly string[]): string[
         (token !== undefined && /^-[cfw]+$/u.test(token))
       ) {
         i++;
-      } else if (token?.startsWith("-")) {
-        return null;
-      } else {
-        break;
+        continue;
       }
+      if (token?.startsWith("-")) {
+        return null;
+      }
+      break;
     }
     return tokens.slice(i);
   }
@@ -608,18 +629,21 @@ export function unwrapStaticExecutionWrapper(tokens: readonly string[]): string[
       if (["-i", "-o", "-e", "--input", "--output", "--error"].includes(token ?? "")) {
         if (!tokens[i + 1]) return null;
         i += 2;
-      } else if (
+        continue;
+      }
+      if (
         token?.startsWith("--input=") ||
         token?.startsWith("--output=") ||
         token?.startsWith("--error=") ||
         /^-[ioe].+$/u.test(token ?? "")
       ) {
         i++;
-      } else if (token?.startsWith("-")) {
-        return null;
-      } else {
-        break;
+        continue;
       }
+      if (token?.startsWith("-")) {
+        return null;
+      }
+      break;
     }
     return tokens.slice(i);
   }
@@ -630,21 +654,23 @@ export function unwrapStaticExecutionWrapper(tokens: readonly string[]): string[
       const token = tokens[i];
       if (token === "--") return tokens.slice(i + 1);
       if (token === "--help" || token === "--version") return [];
-      if (token === "-f" || token === "--format" || token === "-o" || token === "--output") {
-        if (!tokens[i + 1]) return null;
-        i += 2;
-      } else if (
-        token?.startsWith("--format=") ||
-        token?.startsWith("--output=") ||
-        /^-[fo].+$/u.test(token ?? "") ||
-        /^-[apqv]+$/u.test(token ?? "")
-      ) {
-        i++;
-      } else if (token?.startsWith("-")) {
-        return null;
-      } else {
-        break;
+      switch (true) {
+        case token === "-f" || token === "--format" || token === "-o" || token === "--output":
+          if (!tokens[i + 1]) return null;
+          i += 2;
+          continue;
+        case token?.startsWith("--format=") ||
+          token?.startsWith("--output=") ||
+          /^-[fo].+$/u.test(token ?? "") ||
+          /^-[apqv]+$/u.test(token ?? ""):
+          i++;
+          continue;
+        case token?.startsWith("-"):
+          return null;
+        default:
+          break;
       }
+      break;
     }
     return tokens.slice(i);
   }
@@ -653,31 +679,30 @@ export function unwrapStaticExecutionWrapper(tokens: readonly string[]): string[
     let i = 1;
     while (i < tokens.length) {
       const token = tokens[i];
-      if (token === "-k" || token === "--kill-after" || token === "-s" || token === "--signal") {
-        if (!tokens[i + 1]) return null;
-        i += 2;
-      } else if (
-        token?.startsWith("--kill-after=") ||
-        token?.startsWith("--signal=") ||
-        /^-[ks].+$/u.test(token ?? "")
-      ) {
-        i++;
-      } else if (token === "--") {
-        i++;
-        break;
-      } else if (
-        token === "--foreground" ||
-        token === "--preserve-status" ||
-        token === "--verbose"
-      ) {
-        i++;
-      } else if (token === "--help" || token === "--version") {
-        return [];
-      } else if (token?.startsWith("-")) {
-        return null;
-      } else {
-        break;
+      switch (true) {
+        case token === "-k" || token === "--kill-after" || token === "-s" || token === "--signal":
+          if (!tokens[i + 1]) return null;
+          i += 2;
+          continue;
+        case token?.startsWith("--kill-after=") ||
+          token?.startsWith("--signal=") ||
+          /^-[ks].+$/u.test(token ?? ""):
+          i++;
+          continue;
+        case token === "--":
+          i++;
+          break;
+        case token === "--foreground" || token === "--preserve-status" || token === "--verbose":
+          i++;
+          continue;
+        case token === "--help" || token === "--version":
+          return [];
+        case token?.startsWith("-"):
+          return null;
+        default:
+          break;
       }
+      break;
     }
     if (!tokens[i]) return null;
     return tokens.slice(i + 1);
@@ -696,14 +721,18 @@ function unwrapIonice(tokens: readonly string[]): string[] | null {
     }
     if (token === "-t" || token === "--ignore") {
       i++;
-    } else if (
+      continue;
+    }
+    if (
       ["-c", "--class", "-n", "--classdata", "-p", "--pid", "-P", "--pgid", "-u", "--uid"].includes(
         token ?? "",
       )
     ) {
       if (!tokens[i + 1]) return null;
       i += 2;
-    } else if (
+      continue;
+    }
+    if (
       token?.startsWith("--class=") ||
       token?.startsWith("--classdata=") ||
       token?.startsWith("--pid=") ||
@@ -712,11 +741,12 @@ function unwrapIonice(tokens: readonly string[]): string[] | null {
       /^-[cnpPu].+$/u.test(token ?? "")
     ) {
       i++;
-    } else if (token?.startsWith("-")) {
-      return null;
-    } else {
-      break;
+      continue;
     }
+    if (token?.startsWith("-")) {
+      return null;
+    }
+    break;
   }
   return tokens.slice(i);
 }
@@ -738,13 +768,19 @@ function unwrapChrt(tokens: readonly string[]): string[] | null {
       if (token?.includes("p")) processMode = true;
       if (!groupedValueOption[2] && !tokens[i + 1]) return null;
       i += groupedValueOption[2] ? 1 : 2;
-    } else if (token !== undefined && /^-[abdefimopRrv]+$/u.test(token)) {
+      continue;
+    }
+    if (token !== undefined && /^-[abdefimopRrv]+$/u.test(token)) {
       if (token.includes("p")) processMode = true;
       i++;
-    } else if (token === "-p" || token === "--pid") {
+      continue;
+    }
+    if (token === "-p" || token === "--pid") {
       processMode = true;
       i++;
-    } else if (
+      continue;
+    }
+    if (
       [
         "-a",
         "--all-tasks",
@@ -771,25 +807,30 @@ function unwrapChrt(tokens: readonly string[]): string[] | null {
       ].includes(token ?? "")
     ) {
       i++;
-    } else if (
+      continue;
+    }
+    if (
       ["-T", "--sched-runtime", "-P", "--sched-period", "-D", "--sched-deadline"].includes(
         token ?? "",
       )
     ) {
       if (!tokens[i + 1]) return null;
       i += 2;
-    } else if (
+      continue;
+    }
+    if (
       token?.startsWith("--sched-runtime=") ||
       token?.startsWith("--sched-period=") ||
       token?.startsWith("--sched-deadline=") ||
       /^-[TPD].+$/u.test(token ?? "")
     ) {
       i++;
-    } else if (token?.startsWith("-")) {
-      return null;
-    } else {
-      break;
+      continue;
     }
+    if (token?.startsWith("-")) {
+      return null;
+    }
+    break;
   }
 
   if (processMode) return [];
@@ -801,11 +842,17 @@ function unwrapChrt(tokens: readonly string[]): string[] | null {
   return tokens.slice(i);
 }
 
-export function analyzeSensitiveTokens(tokens: readonly string[]): string | null {
+export function analyzeSensitiveTokens(tokens: readonly string[]): BashSafetyViolation | null {
   for (const token of tokens) {
     if (!token) continue;
     for (const { re, reason } of SENSITIVE_TOKEN_PATTERNS) {
-      if (re.test(token)) return reason;
+      if (re.test(token)) {
+        return bashSafetyViolation(
+          "protected_path",
+          reason,
+          "Choose a source or destination outside the protected location.",
+        );
+      }
     }
   }
   return null;
@@ -816,7 +863,7 @@ export function analyzeProtectedPathTokens(
   options: Pick<SegmentAnalyzeOptions, "cwd" | "effectiveCwd" | "protectedPaths"> & {
     readonly inspectAttachedDirectoryOption?: boolean;
   },
-): string | null {
+): BashSafetyViolation | null {
   if (!options.protectedPaths || options.protectedPaths.length === 0) return null;
 
   const effectiveCwd =
@@ -857,7 +904,11 @@ export function analyzeProtectedPathTokens(
           resolvedCandidate === protectedPath ||
           relative(protectedPath, resolvedCandidate).split(sep)[0] !== ".."
         ) {
-          return "access to a configured protected path";
+          return bashSafetyViolation(
+            "protected_path",
+            "access to a configured protected path",
+            "Choose a source or destination outside the protected location.",
+          );
         }
       }
     }

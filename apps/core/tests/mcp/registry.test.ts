@@ -8,7 +8,6 @@ import {
   type OAuthClientProvider,
   type OAuthTokens,
 } from "@ai-sdk/mcp";
-import { Experimental_StdioMCPTransport } from "@ai-sdk/mcp/mcp-stdio";
 import { Panic, Result } from "better-result";
 import { z } from "zod";
 
@@ -34,7 +33,115 @@ const mcpHttpRequestSchema = z.object({
   jsonrpc: z.literal("2.0"),
   id: z.union([z.string(), z.number()]).optional(),
   method: z.string(),
+  params: z.record(z.string(), z.unknown()).optional(),
 });
+
+type StdioServerMode =
+  | "invalid-result"
+  | "legacy"
+  | "legacy-version-error"
+  | "missing-cache"
+  | "modern";
+
+function stdioServerSource(mode: StdioServerMode): string {
+  return `
+const mode = ${JSON.stringify(mode)};
+let buffer = "";
+const modernMeta = {
+  "io.modelcontextprotocol/serverInfo": { name: mode + "-stdio-server", version: "1.0.0" }
+};
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+const complete = (body) => ({ ...body, resultType: "complete", _meta: modernMeta });
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  while (buffer.includes("\\n")) {
+    const newline = buffer.indexOf("\\n");
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const message = JSON.parse(line);
+    if (message.method === "server/discover") {
+      if (mode === "legacy") {
+        send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } });
+        continue;
+      }
+      if (mode === "legacy-version-error") {
+        send({
+          jsonrpc: "2.0",
+          id: message.id,
+          error: {
+            code: -32022,
+            message: "Unsupported protocol version",
+            data: { requested: "2026-07-28", supported: ["2025-11-25"] }
+          }
+        });
+        continue;
+      }
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: complete({
+          supportedVersions: ["2026-07-28"],
+          capabilities: { tools: {} },
+          ttlMs: 0,
+          cacheScope: "private"
+        })
+      });
+      continue;
+    }
+    if (message.method === "initialize") {
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          protocolVersion: "2025-11-25",
+          capabilities: { tools: {} },
+          serverInfo: { name: "legacy-stdio-server", version: "1.0.0" }
+        }
+      });
+      continue;
+    }
+    if (message.method === "notifications/initialized") continue;
+    if (message.method === "tools/list") {
+      const result = {
+        tools: [{ name: mode + "-stdio-tool", inputSchema: { type: "object" } }],
+        ...(mode === "legacy" || mode === "legacy-version-error" || mode === "missing-cache"
+          ? {}
+          : { ttlMs: 0, cacheScope: "private" })
+      };
+      send({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: mode === "legacy" || mode === "legacy-version-error" ? result : complete(result)
+      });
+      continue;
+    }
+    if (message.method === "tools/call") {
+      const result = { content: [{ type: "text", text: mode + " stdio call" }] };
+      const responseResult = mode === "legacy" || mode === "legacy-version-error"
+        ? result
+        : mode === "invalid-result"
+          ? { ...result, resultType: "task", _meta: modernMeta }
+          : complete(result);
+      send({ jsonrpc: "2.0", id: message.id, result: responseResult });
+    }
+  }
+});
+`;
+}
+
+function realStdioDefinition(id: string, mode: StdioServerMode) {
+  return {
+    id,
+    transportConfig: {
+      transport: "stdio" as const,
+      command: process.execPath,
+      args: ["-e", stdioServerSource(mode)],
+      env: {},
+    },
+  };
+}
 
 async function reloadRegistry(registry: McpRegistry, serverId?: string) {
   const result = await registry.reload(serverId);
@@ -217,15 +324,586 @@ describe("McpRegistry startup and discovery", () => {
     await registry.init();
     expect(factory.configs).toHaveLength(2);
     expect(factory.configs.every((clientConfig) => clientConfig.maxRetries === 0)).toBe(true);
+    expect(
+      factory.configs.every((clientConfig) => clientConfig.protocolVersionDiscovery === true),
+    ).toBe(true);
     const localConfig = factory.configs.find((value) => value.clientName === "lilac-mcp-local");
     const remoteConfig = factory.configs.find((value) => value.clientName === "lilac-mcp-remote");
-    expect(localConfig?.transport).toBeInstanceOf(Experimental_StdioMCPTransport);
+    expect(localConfig?.transport).toMatchObject({ supportsProtocolVersionDiscovery: true });
     expect(remoteConfig?.transport).toMatchObject({
       type: "http",
       url: "https://example.invalid/mcp",
       headers: { Authorization: "Bearer http-secret" },
       onSessionExpired: expect.any(Function),
     });
+    await registry.shutdown();
+  });
+
+  it("uses stateless 2026-07-28 discovery and request headers over HTTP", async () => {
+    const requests: Array<{
+      readonly headers: Headers;
+      readonly message: z.infer<typeof mcpHttpRequestSchema>;
+    }> = [];
+    let getCount = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        if (request.method === "GET") {
+          getCount += 1;
+          return new Response(null, { status: 405 });
+        }
+
+        const message = mcpHttpRequestSchema.parse(await request.json());
+        requests.push({ headers: new Headers(request.headers), message });
+        const response = (result: Record<string, unknown>) =>
+          Response.json({ jsonrpc: "2.0", id: message.id, result });
+        const complete = (result: Record<string, unknown>) => ({
+          ...result,
+          resultType: "complete",
+          _meta: {
+            "io.modelcontextprotocol/serverInfo": {
+              name: "modern-http-server",
+              version: "1.0.0",
+            },
+          },
+        });
+
+        if (message.method === "server/discover") {
+          return response(
+            complete({
+              supportedVersions: ["2026-07-28"],
+              capabilities: { tools: {} },
+              ttlMs: 0,
+              cacheScope: "private",
+            }),
+          );
+        }
+        if (message.method === "tools/list") {
+          return response(
+            complete({
+              tools: [{ name: "modern-http-tool", inputSchema: { type: "object" } }],
+              ttlMs: 0,
+              cacheScope: "private",
+            }),
+          );
+        }
+        if (message.method === "tools/call") {
+          return response(complete({ content: [{ type: "text", text: "modern http call" }] }));
+        }
+        return response(complete({}));
+      },
+    });
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () =>
+          configSnapshot(mcpConfig([httpDefinition("modern-http", server.url.toString())])),
+      },
+    });
+
+    try {
+      await registry.init();
+      const execute = registry.getTools()[0]?.tool.execute;
+      if (!execute) throw new Error("Expected modern HTTP tool");
+      await expect(
+        execute({}, { toolCallId: "modern-http-call", messages: [], context: {} }),
+      ).resolves.toMatchObject({ content: [{ type: "text", text: "modern http call" }] });
+
+      expect(requests.map(({ message }) => message.method)).toEqual([
+        "server/discover",
+        "tools/list",
+        "tools/call",
+      ]);
+      expect(getCount).toBe(0);
+      for (const { headers, message } of requests) {
+        expect(headers.get("mcp-protocol-version")).toBe("2026-07-28");
+        expect(headers.get("mcp-method")).toBe(message.method);
+        expect(message.params?._meta).toMatchObject({
+          "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          "io.modelcontextprotocol/clientCapabilities": {},
+          "io.modelcontextprotocol/clientInfo": {
+            name: "lilac-mcp-modern-http",
+          },
+        });
+      }
+      expect(requests[0]?.headers.get("mcp-name")).toBeNull();
+      expect(requests[1]?.headers.get("mcp-name")).toBeNull();
+      expect(requests[2]?.headers.get("mcp-name")).toBe("modern-http-tool");
+    } finally {
+      await registry.shutdown();
+      server.stop(true);
+    }
+  });
+
+  it("does not fall back after a malformed modern discovery result", async () => {
+    const methods: string[] = [];
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        if (request.method === "GET") return new Response(null, { status: 405 });
+        const message = mcpHttpRequestSchema.parse(await request.json());
+        methods.push(message.method);
+        if (message.method === "server/discover") {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              resultType: "complete",
+              capabilities: { tools: {} },
+            },
+          });
+        }
+        return Response.json({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            protocolVersion: "2025-11-25",
+            capabilities: { tools: {} },
+            serverInfo: { name: "legacy-server", version: "1.0.0" },
+          },
+        });
+      },
+    });
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () =>
+          configSnapshot(mcpConfig([httpDefinition("bad-discovery", server.url.toString())])),
+      },
+    });
+
+    try {
+      await registry.init();
+
+      expect(methods).toEqual(["server/discover"]);
+      expect(registry.list()[0]).toMatchObject({ status: "unavailable", phase: "connection" });
+      expect(registry.getTools()).toEqual([]);
+    } finally {
+      await registry.shutdown();
+      server.stop(true);
+    }
+  });
+
+  for (const downgrade of [
+    "unsupported-version-error",
+    "legacy-discover-result",
+    "method-not-found",
+    "unknown-json-rpc-error",
+  ] as const) {
+    const responseKind = {
+      "unsupported-version-error": "a structured unsupported-version error",
+      "legacy-discover-result": "a legacy-only discovery result",
+      "method-not-found": "an HTTP method-not-found response",
+      "unknown-json-rpc-error": "an unknown HTTP JSON-RPC error",
+    }[downgrade];
+    it(`falls back after ${responseKind}`, async () => {
+      const methods: string[] = [];
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          if (request.method === "GET") return new Response(null, { status: 405 });
+          const message = mcpHttpRequestSchema.parse(await request.json());
+          methods.push(message.method);
+          if (message.method === "server/discover") {
+            if (downgrade === "legacy-discover-result") {
+              return Response.json({
+                jsonrpc: "2.0",
+                id: message.id,
+                result: {
+                  resultType: "complete",
+                  supportedVersions: ["2025-11-25"],
+                  capabilities: { tools: {} },
+                  ttlMs: 0,
+                  cacheScope: "private",
+                },
+              });
+            }
+            if (downgrade === "method-not-found") {
+              return Response.json(
+                {
+                  jsonrpc: "2.0",
+                  id: message.id,
+                  error: { code: -32601, message: "Method not found" },
+                },
+                { status: 404 },
+              );
+            }
+            if (downgrade === "unknown-json-rpc-error") {
+              return Response.json(
+                {
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32000, message: "Server not initialized" },
+                },
+                { status: 400 },
+              );
+            }
+            return Response.json(
+              {
+                jsonrpc: "2.0",
+                id: message.id,
+                error: {
+                  code: -32022,
+                  message: "Unsupported protocol version",
+                  data: { requested: "2026-07-28", supported: ["2025-11-25"] },
+                },
+              },
+              { status: 400 },
+            );
+          }
+          if (message.method === "initialize") {
+            return Response.json({
+              jsonrpc: "2.0",
+              id: message.id,
+              result: {
+                protocolVersion: "2025-11-25",
+                capabilities: { tools: {} },
+                serverInfo: { name: "legacy-version-server", version: "1.0.0" },
+              },
+            });
+          }
+          if (message.method === "tools/list") {
+            return Response.json({
+              jsonrpc: "2.0",
+              id: message.id,
+              result: {
+                tools: [{ name: "legacy-version-tool", inputSchema: { type: "object" } }],
+              },
+            });
+          }
+          return new Response(null, { status: 202 });
+        },
+      });
+      const registry = new McpRegistry({
+        configPath: "/data/mcp-config.yaml",
+        reportFatalError: reportUnexpectedFatalError,
+        dependencies: {
+          readConfig: async () =>
+            configSnapshot(mcpConfig([httpDefinition("legacy-version", server.url.toString())])),
+        },
+      });
+
+      try {
+        await registry.init();
+
+        expect(methods).toEqual([
+          "server/discover",
+          "initialize",
+          "notifications/initialized",
+          "tools/list",
+        ]);
+        expect(registry.list()).toEqual([
+          { serverId: "legacy-version", transport: "http", status: "available", toolCount: 1 },
+        ]);
+      } finally {
+        await registry.shutdown();
+        server.stop(true);
+      }
+    });
+  }
+
+  it("does not fall back when modern discovery returns an empty accepted response", async () => {
+    const methods: string[] = [];
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const message = mcpHttpRequestSchema.parse(await request.json());
+        methods.push(message.method);
+        if (message.method === "server/discover") {
+          return new Response(null, { status: 202 });
+        }
+        return Response.json({
+          jsonrpc: "2.0",
+          id: message.id,
+          result: {
+            protocolVersion: "2025-11-25",
+            capabilities: { tools: {} },
+            serverInfo: { name: "legacy-server", version: "1.0.0" },
+          },
+        });
+      },
+    });
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () =>
+          configSnapshot(mcpConfig([httpDefinition("empty-discovery", server.url.toString())])),
+      },
+    });
+
+    try {
+      await registry.init();
+
+      expect(methods).toEqual(["server/discover"]);
+      expect(registry.list()[0]).toMatchObject({ status: "unavailable", phase: "connection" });
+      expect(registry.getTools()).toEqual([]);
+    } finally {
+      await registry.shutdown();
+      server.stop(true);
+    }
+  });
+
+  for (const failure of [
+    "http",
+    "http-json-success",
+    "http-method-not-found",
+    "modern-protocol-error",
+  ] as const) {
+    it(`does not fall back after a modern discovery ${failure} failure`, async () => {
+      const methods: string[] = [];
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          const message = mcpHttpRequestSchema.parse(await request.json());
+          methods.push(message.method);
+          if (message.method === "server/discover") {
+            if (failure === "http") return new Response("unavailable", { status: 503 });
+            if (failure === "http-method-not-found") {
+              return Response.json(
+                {
+                  jsonrpc: "2.0",
+                  id: message.id,
+                  error: { code: -32601, message: "Method not found" },
+                },
+                { status: 503 },
+              );
+            }
+            if (failure === "http-json-success") {
+              return Response.json(
+                {
+                  jsonrpc: "2.0",
+                  id: message.id,
+                  result: {
+                    resultType: "complete",
+                    supportedVersions: ["2026-07-28"],
+                    capabilities: { tools: {} },
+                    ttlMs: 0,
+                    cacheScope: "private",
+                  },
+                },
+                { status: 503 },
+              );
+            }
+            return Response.json(
+              {
+                jsonrpc: "2.0",
+                id: message.id,
+                error: { code: -32020, message: "Modern request header mismatch" },
+              },
+              { status: 400 },
+            );
+          }
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              protocolVersion: "2025-11-25",
+              capabilities: { tools: {} },
+              serverInfo: { name: "legacy-server", version: "1.0.0" },
+            },
+          });
+        },
+      });
+      const registry = new McpRegistry({
+        configPath: "/data/mcp-config.yaml",
+        reportFatalError: reportUnexpectedFatalError,
+        dependencies: {
+          readConfig: async () =>
+            configSnapshot(mcpConfig([httpDefinition(`failed-${failure}`, server.url.toString())])),
+        },
+      });
+
+      try {
+        await registry.init();
+
+        expect(methods).toEqual(["server/discover"]);
+        expect(registry.list()[0]).toMatchObject({ status: "unavailable", phase: "connection" });
+        expect(registry.getTools()).toEqual([]);
+      } finally {
+        await registry.shutdown();
+        server.stop(true);
+      }
+    });
+  }
+
+  it("preserves a Panic from OAuth recovery during modern discovery", async () => {
+    const panic = new Panic({ message: "OAuth recovery invariant failed" });
+    const methods: string[] = [];
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        if (request.method === "GET") return new Response("not found", { status: 404 });
+        const message = mcpHttpRequestSchema.parse(await request.json());
+        methods.push(message.method);
+        return Response.json(
+          {
+            jsonrpc: "2.0",
+            id: message.id,
+            error: { code: -32601, message: "Method not found" },
+          },
+          { status: 401 },
+        );
+      },
+    });
+    const definition = {
+      id: "oauth-panic",
+      transportConfig: {
+        transport: "http" as const,
+        url: server.url.toString(),
+        headers: {},
+        auth: {
+          type: "oauth" as const,
+          grant: "authorization_code" as const,
+          client: { type: "dynamic" as const },
+        },
+      },
+    };
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([definition])),
+        createAuthProvider: async () => ({
+          ...fakeAuthProvider({ access_token: "stale-token", token_type: "Bearer" }),
+          validateAuthorizationServerURL: () => {
+            throw panic;
+          },
+        }),
+      },
+    });
+
+    try {
+      await expect(registry.init()).rejects.toBe(panic);
+      expect(methods).toEqual(["server/discover"]);
+    } finally {
+      await registry.shutdown();
+      server.stop(true);
+    }
+  });
+
+  for (const invalidResultType of [undefined, "task"] as const) {
+    const expectation = invalidResultType === undefined ? "omits" : "uses an unsupported";
+    it(`fails closed when a modern tools/list result ${expectation} resultType`, async () => {
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        async fetch(request) {
+          const message = mcpHttpRequestSchema.parse(await request.json());
+          const response = (result: Record<string, unknown>) =>
+            Response.json({ jsonrpc: "2.0", id: message.id, result });
+
+          if (message.method === "server/discover") {
+            return response({
+              supportedVersions: ["2026-07-28"],
+              capabilities: { tools: {} },
+              resultType: "complete",
+              ttlMs: 0,
+              cacheScope: "private",
+              _meta: {
+                "io.modelcontextprotocol/serverInfo": {
+                  name: "modern-http-server",
+                  version: "1.0.0",
+                },
+              },
+            });
+          }
+
+          return response({
+            tools: [],
+            ...(invalidResultType === undefined ? {} : { resultType: invalidResultType }),
+          });
+        },
+      });
+      const registry = new McpRegistry({
+        configPath: "/data/mcp-config.yaml",
+        reportFatalError: reportUnexpectedFatalError,
+        dependencies: {
+          readConfig: async () =>
+            configSnapshot(mcpConfig([httpDefinition("bad-modern", server.url.toString())])),
+        },
+      });
+
+      try {
+        await registry.init();
+
+        expect(registry.list()[0]).toMatchObject({ status: "unavailable", phase: "discovery" });
+        expect(registry.getTools()).toEqual([]);
+      } finally {
+        await registry.shutdown();
+        server.stop(true);
+      }
+    });
+  }
+
+  for (const mode of ["modern", "legacy", "legacy-version-error"] as const) {
+    it(`negotiates ${mode} MCP tools over stdio`, async () => {
+      const serverId = `${mode}-stdio`;
+      const registry = new McpRegistry({
+        configPath: "/data/mcp-config.yaml",
+        reportFatalError: reportUnexpectedFatalError,
+        dependencies: {
+          readConfig: async () => configSnapshot(mcpConfig([realStdioDefinition(serverId, mode)])),
+        },
+      });
+
+      await registry.init();
+      const execute = registry.getTools()[0]?.tool.execute;
+      if (!execute) throw new Error(`Expected ${mode} stdio tool`);
+      await expect(
+        execute({}, { toolCallId: `${mode}-stdio-call`, messages: [], context: {} }),
+      ).resolves.toMatchObject({ content: [{ type: "text", text: `${mode} stdio call` }] });
+      expect(registry.list()).toEqual([
+        { serverId, transport: "stdio", status: "available", toolCount: 1 },
+      ]);
+      await registry.shutdown();
+    });
+  }
+
+  it("fails closed when a modern tools/list stdio result omits cache metadata", async () => {
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () =>
+          configSnapshot(mcpConfig([realStdioDefinition("missing-cache-stdio", "missing-cache")])),
+      },
+    });
+
+    await registry.init();
+    expect(registry.list()[0]).toMatchObject({ status: "unavailable", phase: "discovery" });
+    expect(registry.getTools()).toEqual([]);
+    await registry.shutdown();
+  });
+
+  it("rejects an unsupported modern result type over stdio without retiring the server", async () => {
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () =>
+          configSnapshot(
+            mcpConfig([realStdioDefinition("invalid-result-stdio", "invalid-result")]),
+          ),
+      },
+    });
+
+    await registry.init();
+    const execute = registry.getTools()[0]?.tool.execute;
+    if (!execute) throw new Error("Expected invalid-result stdio tool");
+    await expect(
+      execute({}, { toolCallId: "invalid-result-call", messages: [], context: {} }),
+    ).rejects.toThrow('Unsupported modern MCP resultType "task"');
+    expect(registry.list()[0]).toMatchObject({ status: "available", toolCount: 1 });
+    expect(registry.getTools()).toHaveLength(1);
     await registry.shutdown();
   });
 
@@ -240,6 +918,13 @@ describe("McpRegistry startup and discovery", () => {
         }
 
         const message = mcpHttpRequestSchema.parse(await request.json());
+        if (message.method === "server/discover" && message.id !== undefined) {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            error: { code: -32601, message: "Method not found" },
+          });
+        }
         if (message.method === "initialize" && message.id !== undefined) {
           return Response.json({
             jsonrpc: "2.0",
@@ -324,6 +1009,13 @@ describe("McpRegistry startup and discovery", () => {
         }
 
         const message = mcpHttpRequestSchema.parse(await request.json());
+        if (message.method === "server/discover" && message.id !== undefined) {
+          return Response.json({
+            jsonrpc: "2.0",
+            id: message.id,
+            error: { code: -32601, message: "Method not found" },
+          });
+        }
         if (message.method === "initialize" && message.id !== undefined) {
           return Response.json(
             {
@@ -691,6 +1383,128 @@ describe("McpRegistry startup and discovery", () => {
     expect(Object.isFrozen(tools[2_000])).toBe(true);
     expect("modelName" in (tools[2_000] ?? {})).toBe(false);
     expect(registry.getTools()).toBe(tools);
+    await registry.shutdown();
+  });
+
+  it("retains serverInfo and resolves configured descriptions before advertised descriptions", async () => {
+    const configuredDefinition = {
+      ...stdioDefinition("configured"),
+      description: "Configured catalog description.",
+    };
+    const advertisedDefinition = stdioDefinition("advertised");
+    let config = mcpConfig([configuredDefinition, advertisedDefinition]);
+    const clients = new Map([
+      [
+        "configured",
+        new FakeMcpClient(
+          { first: { tools: [mcpToolDefinition("configured-tool")] } },
+          {
+            name: "configured-server",
+            title: "Configured Server",
+            version: "1.0.0",
+            description: "Advertised description that must lose precedence.",
+          },
+        ),
+      ],
+      [
+        "advertised",
+        new FakeMcpClient(
+          { first: { tools: [mcpToolDefinition("advertised-tool")] } },
+          {
+            name: "advertised-server",
+            version: "2.0.0",
+            description: "Advertised catalog description.",
+          },
+        ),
+      ],
+    ]);
+    let createCount = 0;
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () => configSnapshot(config),
+        createClient: async (clientConfig) => {
+          createCount += 1;
+          const serverId = clientConfig.clientName?.replace(/^lilac-mcp-/, "") ?? "";
+          const client = clients.get(serverId);
+          if (!client) throw new Error(`Missing client for ${serverId}`);
+          return client;
+        },
+      },
+    });
+
+    await registry.init();
+    const initial = registry.getCatalogServers();
+    expect(initial).toEqual([
+      {
+        serverId: "advertised",
+        serverInfo: {
+          name: "advertised-server",
+          version: "2.0.0",
+          description: "Advertised catalog description.",
+        },
+        description: "Advertised catalog description.",
+      },
+      {
+        serverId: "configured",
+        serverInfo: {
+          name: "configured-server",
+          title: "Configured Server",
+          version: "1.0.0",
+          description: "Advertised description that must lose precedence.",
+        },
+        description: "Configured catalog description.",
+      },
+    ]);
+    expect(Object.isFrozen(initial)).toBe(true);
+    expect(Object.isFrozen(initial[0])).toBe(true);
+    expect(Object.isFrozen(initial[0]?.serverInfo)).toBe(true);
+
+    config = mcpConfig([
+      { ...configuredDefinition, description: "Updated configured description." },
+      advertisedDefinition,
+    ]);
+    expect(await reloadRegistry(registry, "configured")).toEqual([
+      { serverId: "configured", reconciliation: "unchanged", result: "available" },
+    ]);
+    expect(createCount).toBe(2);
+    expect(registry.getCatalogServers()[1]?.description).toBe("Updated configured description.");
+    await registry.shutdown();
+  });
+
+  it("rejects malformed advertised serverInfo before publishing catalog metadata", async () => {
+    const client = new FakeMcpClient(
+      { first: { tools: [mcpToolDefinition("must-not-be-discovered")] } },
+      {
+        name: "malformed-server",
+        version: "1.0.0",
+        description: 123,
+      },
+    );
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("malformed")])),
+        createClient: async () => client,
+      },
+    });
+
+    await registry.init();
+    expect(registry.list()).toEqual([
+      {
+        serverId: "malformed",
+        transport: "stdio",
+        status: "unavailable",
+        phase: "discovery",
+        error: expect.stringContaining("Invalid MCP serverInfo"),
+      },
+    ]);
+    expect(registry.getCatalogServers()).toEqual([]);
+    expect(registry.getTools()).toEqual([]);
+    expect(client.cursors).toEqual([]);
+    expect(client.closeCount).toBe(1);
     await registry.shutdown();
   });
 
@@ -1619,6 +2433,37 @@ describe("McpRegistry reload and terminal failures", () => {
       error: "transport request rejected",
     });
     expect(client.closeCount).toBe(1);
+    await registry.shutdown();
+  });
+
+  it("keeps the server available when a modern tool requires unsupported client input", async () => {
+    const client = new FakeMcpClient({ first: { tools: [mcpToolDefinition("interactive")] } });
+    client.executeTool = async () => {
+      throw Object.assign(
+        new Error(
+          "Server requested additional input, but multi round-trip requests are not supported yet",
+        ),
+        { name: "MCPClientError" },
+      );
+    };
+    const registry = new McpRegistry({
+      configPath: "/data/mcp-config.yaml",
+      reportFatalError: reportUnexpectedFatalError,
+      dependencies: {
+        readConfig: async () => configSnapshot(mcpConfig([stdioDefinition("interactive")])),
+        createClient: async () => client,
+      },
+    });
+    await registry.init();
+    const execute = registry.getTools()[0]?.tool.execute;
+    if (!execute) throw new Error("Expected interactive MCP tool");
+
+    await expect(
+      execute({}, { toolCallId: "interactive", messages: [], context: {} }),
+    ).rejects.toThrow("multi round-trip requests are not supported yet");
+    expect(registry.list()[0]).toMatchObject({ status: "available", toolCount: 1 });
+    expect(registry.getTools()).toHaveLength(1);
+    expect(client.closeCount).toBe(0);
     await registry.shutdown();
   });
 

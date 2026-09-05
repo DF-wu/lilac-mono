@@ -1,5 +1,7 @@
 /* oxlint-disable eslint/no-control-regex */
 
+import { captureError } from "../../shared/error-capture";
+
 import {
   type CallWarning,
   type FinishReason,
@@ -11,10 +13,10 @@ import {
   type UserContent,
 } from "ai";
 import {
+  Panic,
   Result,
   TaggedError,
   type AnyTaggedError,
-  type Panic,
   type Result as ResultType,
 } from "better-result";
 import { boundToolResultMediaForModelView } from "@stanley2058/lilac-tool-results/tool-result-media";
@@ -31,19 +33,16 @@ import type {
 } from "@stanley2058/lilac-utils";
 import {
   CUSTOM_COMMAND_TOOL_NAME,
-  discoverSkills,
+  applyBasePromptForProvider,
   deriveSubagentIdleTimeoutMs,
   env,
   extractAiErrorLogDetails,
-  findWorkspaceRootResult,
-  formatAvailableSkillsSection,
   getCoreConfig,
   isPanic,
   isRecord,
   opaqueErrorMessage,
   ModelCapability,
   openAIMessagePhase,
-  resolveCoreConfigPath,
   createLogger,
   resolveEditingToolMode,
   fromDurableResolvedModelPlanResult,
@@ -51,18 +50,19 @@ import {
   resolveModelChainResult,
   resolveModelPlanResult,
   resolveNativeSubagentProfile,
+  resolveRouterSessionConfig,
   withModelPlanReasoning,
 } from "@stanley2058/lilac-utils";
 import {
-  corePrimaryLineageV1Schema,
-  createCorePrimaryLineageFreshOnlyV1,
-  decodeCorePrimaryLineageV1,
+  corePrimaryLineageV2Schema,
+  createCorePrimaryLineageFreshOnlyV2,
+  decodeCorePrimaryLineageV2,
   EventDeliveryStopped,
-  extendCoreLineagePrefixDigestV1,
+  extendCoreLineagePrefixDigestV2,
   lilacEventTypes,
   type AdapterPlatform,
-  type CoreLineageManifestV1,
-  type CorePrimaryLineageV1,
+  type CoreLineageManifestV2,
+  type CorePrimaryLineageV2,
   type DecodedLilacMessageForTopic,
   type DeliveryDisposition,
   type LilacBus,
@@ -70,6 +70,7 @@ import {
   type RequestOrigin,
   type RequestQueueMode,
   type RequestRunPolicy,
+  type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
 import {
   advanceHistoryProviderState,
@@ -84,10 +85,10 @@ import {
   createRetryBackoffBudget,
   hasMatchingOpenAIServerCompaction,
   hasOpenAIServerCompaction,
-  hashCanonicalMessagesV1,
   materializeOpenAIServerCompaction,
   type AiSdkPiAgentOptions,
   type AiSdkPiAgentEvent,
+  type AgentInputQueueId,
   type HistoryProviderState,
   type RetryBackoffAborted,
   type RetryBackoffAttempt,
@@ -127,18 +128,14 @@ import {
   type RequestMessageCacheAdmissionError,
   type RequestMessageCacheAliasOwner,
   type RequestMessageCacheOwner,
-  type RequestMessageCacheRestoreAttempt,
 } from "../../tool-server/request-message-cache";
 import {
   AuthenticatedRequestProjectionInvalid,
-  isAuthenticatedRequestProjectionSemanticallyValid,
+  isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid,
   projectAuthenticatedRequest,
   type AuthenticatedRequestProjection,
 } from "../authenticated-request";
-import {
-  getBuiltinSurfaceProtocol,
-  resolveAuthenticatedRequestSafetyMode,
-} from "../builtin-surface-protocols";
+import { getBuiltinSurfaceProtocol } from "../builtin-surface-protocols";
 import { formatToolArgsForDisplayWithSpecs } from "../../tools/tool-args-display";
 import { isHeartbeatAckText, isHeartbeatSessionId } from "../../heartbeat/common";
 
@@ -152,21 +149,66 @@ import {
   type TranscriptSnapshot,
   type TranscriptStore,
 } from "../../transcript/transcript-store";
-import type {
-  ConversationThreadSearchResult,
-  ConversationThreadToolService,
+import {
+  createConversationThreadAutoInjectUsageAccumulator,
+  type ConversationThreadAutoInjectUsageAccumulator,
+  type ConversationThreadSearchResult,
+  type ConversationThreadToolService,
 } from "../../conversation/thread-service";
+import {
+  rankAutoInjectedThreadSearchResults,
+  type RankedAutoInjectThread,
+} from "../../conversation/thread-auto-inject-ranking";
+import {
+  createStoredMessageIdentityProjectionV1,
+  materializeStoredMessagesV1,
+  projectStoredMessagesV1,
+  StoredMessageProjectionError,
+  type StoredMessageIdentityProjectionV1,
+  type StoredResourceProviderTarget,
+} from "../../transcript/stored-message-materialization";
+import type { ResourceAccess } from "../../resource";
+import {
+  defaultStoredBlobFilename,
+  hashCanonicalStoredMessagesV2,
+} from "../../transcript/transcript-persistence-codec";
+import type {
+  CoreAcceptedRequestWork,
+  CorePreparedRequestEnvelope,
+  CoreRequestOutputMetadata,
+  RequestDeliveryCoordinator,
+  RequestDeliveryTerminalOutcome,
+} from "./request-delivery";
+import type { AcceptedRequestDelivery } from "./request-delivery/types";
+import {
+  AgentRunJournalConflict,
+  type AgentRunCheckpointV1,
+  type AgentRunJournal,
+  type AgentRunJournalHandle,
+  type AgentRunRecoveryHead,
+} from "./agent-run-journal";
+import {
+  AgentRunCheckpointOwnershipRollbackFailed,
+  AgentRunCheckpointPreparationFailed,
+  persistBlobBackedAgentRunCheckpoint,
+} from "./agent-run-checkpoint-persistence";
 import { isPossibleNoReplyPrefix, resolveReplyDeliveryFromFinalText } from "./reply-directive";
 import { formatBridgeLogContext, formatBridgeTaggedErrorForLog } from "./bridge-log";
-import { buildSystemPromptForProfile } from "./bus-agent-runner/subagent-prompt";
+import { recordRequestLatencyStage } from "./request-latency-trace";
+import { selectWorkspaceSystemPrompt } from "./bus-agent-runner/subagent-prompt";
 import {
   formatToolLogPreview,
   summarizeToolFailure,
 } from "./bus-agent-runner/tool-failure-logging";
 import {
+  LineageToolAuthority,
+  resolveCorePrimaryLoadedCatalogIds,
+} from "./bus-agent-runner/lineage-tool-authority";
+import {
   buildExperimentalDownloadForAnthropicFallback,
   isAnthropicModelSpec,
   withStableAnthropicUpstreamOrder,
+  type AnthropicFallbackBlobStore,
 } from "./bus-agent-runner/anthropic-fallback-media";
 import { formatUnknownErrorForDisplay } from "./bus-agent-runner/error-display";
 import {
@@ -190,6 +232,8 @@ import {
   getParticipantUserIdsFromRaw,
   parseRequestControlFromRaw,
   parseRequestModelOverrideFromRaw,
+  parseParentChannelIdFromRaw,
+  parseGuildIdFromRaw,
   parseRouterSessionModeFromRaw,
   parseSessionConfigIdFromRaw,
   parseSubagentMetaFromRaw,
@@ -224,17 +268,13 @@ import {
   systemPromptToText,
 } from "./bus-agent-runner/stats";
 import {
-  appendAdditionalSessionMemoBlock,
-  appendConfiguredAliasPromptBlock,
-  buildAutoInjectedThreadSearchOverlay,
   buildHeartbeatOverlayForRequest,
-  buildRestrictedSessionOverlay,
-  buildSurfaceMetadataOverlay,
-  maybeAppendResponseCommentaryPrompt,
   resolveSessionAdditionalPrompts,
 } from "./bus-agent-runner/prompt-overlays";
+import { maybeBuildSkillsSectionForPrimary } from "./bus-agent-runner/skills-context";
+import { buildAgentRunSystemPrompt } from "./bus-agent-runner/system-prompt";
 import { resolveSessionSafetyMode, type SessionSafetyMode } from "../session-policy";
-import type { AuthenticatedSurfaceOrigin, SurfacePrincipal } from "../types";
+import type { AuthenticatedSurfaceOrigin, MsgRef, SurfacePrincipal } from "../types";
 import type { SurfaceProtocolResolver } from "../runtime-descriptor";
 import type {
   CustomCommandExecutionError,
@@ -319,17 +359,26 @@ export function shouldUsePersistentCoreClaudeRuntime(input: {
   runProfile: AgentRunProfile;
   requestClient: AdapterPlatform;
   stableNamedContinuation: NonNullable<WorkflowRequestPolicy["stableNamedContinuation"]> | null;
-  corePrimaryLineage?: CorePrimaryLineageV1;
+  corePrimaryLineage?: CorePrimaryLineageV2;
 }): boolean {
   if (input.runProfile === "primary") return input.requestClient === "discord";
   return input.stableNamedContinuation !== null;
 }
 
-function supportsReadFileDirectAttachments(info: ModelCapabilityInfo | null): boolean {
-  if (info?.attachment !== true) return false;
-  const inputModalities = info?.modalities?.input;
-  if (!inputModalities) return false;
-  return inputModalities.includes("image") && inputModalities.includes("pdf");
+export function resolveStoredResourceProviderTarget(input: {
+  readonly provider: ResolvedModelRef["provider"];
+  readonly capability: ModelCapabilityInfo | null;
+}): StoredResourceProviderTarget {
+  if (input.provider === "claude-code") {
+    return { family: "claude-code", supportsImage: true, supportsPdf: false };
+  }
+  const supportsAttachments = input.capability?.attachment === true;
+  const inputModalities = input.capability?.modalities?.input ?? [];
+  return {
+    family: "ai-sdk",
+    supportsImage: supportsAttachments && inputModalities.includes("image"),
+    supportsPdf: supportsAttachments && inputModalities.includes("pdf"),
+  };
 }
 
 function consumerId(prefix: string): string {
@@ -383,7 +432,7 @@ export class BusAgentRunnerAuthenticationProjectionInvalid extends TaggedError(
 export class BusAgentRunnerOperationFailed extends TaggedError("BusAgentRunnerOperationFailed")<{
   readonly operation: string;
   readonly cause: unknown;
-  readonly failureKind: "idle-timeout" | "pre-agent-cancelled" | "restart-draining" | "other";
+  readonly failureKind: "idle-timeout" | "pre-agent-cancelled" | "shutdown-draining" | "other";
   readonly displayMessage: string;
   readonly details?: ReturnType<typeof extractAiErrorLogDetails>;
   readonly message: string;
@@ -394,25 +443,34 @@ export async function captureBusAgentRunnerOperation<T>(
   run: () => T | Promise<T>,
   beforePanicRethrow?: (panic: Panic) => void,
 ): Promise<ResultType<Awaited<T>, BusAgentRunnerOperationFailed>> {
-  try {
-    return Result.ok(await run());
-  } catch (cause) {
-    rethrowBusAgentRunnerPanic(cause, beforePanicRethrow);
-    const projection = projectBusAgentRunnerError(cause, `${operation} failed`);
-    let failureKind: BusAgentRunnerOperationFailed["failureKind"] = "other";
-    if (cause instanceof AgentIdleTimeoutError) failureKind = "idle-timeout";
-    if (cause instanceof PreAgentRunCancelledError) failureKind = "pre-agent-cancelled";
-    if (cause instanceof RestartDrainingAbort) failureKind = "restart-draining";
-    return Result.err(
-      new BusAgentRunnerOperationFailed({
-        operation,
-        cause,
-        failureKind,
-        displayMessage: formatUnknownErrorForDisplay(cause),
-        details: projection.details,
-        message: projection.message,
-      }),
-    );
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        return Result.ok(await run());
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      const cause = attempt.error.cause;
+      rethrowBusAgentRunnerPanic(cause, beforePanicRethrow);
+      const projection = projectBusAgentRunnerError(cause, `${operation} failed`);
+      let failureKind: BusAgentRunnerOperationFailed["failureKind"] = "other";
+      if (cause instanceof AgentIdleTimeoutError) failureKind = "idle-timeout";
+      if (cause instanceof PreAgentRunCancelledError) failureKind = "pre-agent-cancelled";
+      if (cause instanceof ShutdownDrainingAbort) failureKind = "shutdown-draining";
+      return Result.err(
+        new BusAgentRunnerOperationFailed({
+          operation,
+          cause,
+          failureKind,
+          displayMessage: formatUnknownErrorForDisplay(cause),
+          details: projection.details,
+          message: projection.message,
+        }),
+      );
+    }
+    return attempt.value;
   }
 }
 
@@ -420,10 +478,16 @@ export function toIdleRetryDecision(
   backoff: ResultType<RetryBackoffAttempt | null, RetryBackoffAborted | RetryBackoffDelayFailed>,
 ):
   | { readonly status: "retry"; readonly attempt: RetryBackoffAttempt }
-  | { readonly status: "fail"; readonly reason: "aborted" | "delay-failed" | "exhausted" } {
+  | {
+      readonly status: "fail";
+      readonly reason: "aborted" | "delay-failed" | "exhausted";
+    } {
   return backoff.match<
     | { readonly status: "retry"; readonly attempt: RetryBackoffAttempt }
-    | { readonly status: "fail"; readonly reason: "aborted" | "delay-failed" | "exhausted" }
+    | {
+        readonly status: "fail";
+        readonly reason: "aborted" | "delay-failed" | "exhausted";
+      }
   >({
     ok: (attempt) =>
       attempt === null ? { status: "fail", reason: "exhausted" } : { status: "retry", attempt },
@@ -442,6 +506,50 @@ export function signalBusAgentRunnerHostFailure(
   failure: Error | BusAgentRunnerOperationFailed,
 ): never {
   throw failure instanceof BusAgentRunnerOperationFailed ? failure.cause : failure;
+}
+
+export function settleStoredMessageIdentityRemember(
+  result: ResultType<void, StoredMessageProjectionError>,
+): void {
+  const failure = result.match({ ok: () => null, err: (error) => error });
+  if (failure) signalBusAgentRunnerHostFailure(failure);
+}
+
+export async function projectTranscriptMessagesForPersistence(input: {
+  readonly identityProjection: StoredMessageIdentityProjectionV1;
+  readonly providerMessages: readonly (ModelMessage | StoredMessageV1)[];
+  readonly blobStore: AnthropicFallbackBlobStore;
+  readonly transcriptStore: TranscriptStore;
+}): Promise<StoredMessageV1[]> {
+  const retainUploadedFile = input.transcriptStore.putCoreOwnedBlob;
+  if (!retainUploadedFile) {
+    return signalBusAgentRunnerHostFailure(
+      new Error("Transcript store cannot retain provider file blobs"),
+    );
+  }
+  const projected = await input.identityProjection.projectForPersistence({
+    providerMessages: input.providerMessages,
+    blobStore: input.blobStore,
+    retainUploadedFile: (file) =>
+      retainUploadedFile
+        .call(input.transcriptStore, {
+          blob: file.blob,
+          mediaType: file.mediaType,
+          filename: defaultStoredBlobFilename(file),
+        })
+        .map(() => undefined)
+        .mapError(
+          (error) =>
+            new StoredMessageProjectionError({
+              message: `Provider file blob could not be retained: ${error.message}`,
+            }),
+        ),
+  });
+  const projection = projected.match({
+    ok: (value) => () => value,
+    err: (error) => () => signalBusAgentRunnerHostFailure(error),
+  })();
+  return projection.messages;
 }
 
 function adaptModelResolutionToBusRunnerHost<T>(result: ResultType<T, ModelResolutionFailed>): T {
@@ -468,11 +576,19 @@ export function projectBusAgentRunnerError(
   const projectedCause =
     isRecord(cause) && cause["loaded"] === false && "error" in cause ? cause["error"] : cause;
   const message = opaqueErrorMessage(projectedCause, fallback);
-  try {
-    const details = extractAiErrorLogDetails(projectedCause);
-    return details ? { message, details } : { message };
-  } catch {
-    return { message };
+  {
+    const attempt = Result.try({
+      try: () => {
+        const details = extractAiErrorLogDetails(projectedCause);
+        return details ? { message, details } : { message };
+      },
+      catch: captureError,
+    });
+
+    if (attempt.isErr()) {
+      return { message };
+    }
+    return attempt.value;
   }
 }
 
@@ -846,24 +962,27 @@ export function scrubLargeBinaryForModelView(
   return boundToolResultMediaForModelView(messages, limits);
 }
 
-function getBatchOkFromResult(result: unknown): boolean | null {
+function getBatchOkFromResult(event: { readonly result: unknown }): boolean | null {
+  const { result } = event;
   if (!result || typeof result !== "object" || Array.isArray(result)) return null;
   const v = (result as Record<string, unknown>)["ok"];
   return typeof v === "boolean" ? v : null;
 }
 
-function getSubagentOkFromResult(result: unknown): boolean | null {
+function getSubagentOkFromResult(event: { readonly result: unknown }): boolean | null {
+  const { result } = event;
   if (!result || typeof result !== "object" || Array.isArray(result)) return null;
   const v = (result as Record<string, unknown>)["ok"];
   return typeof v === "boolean" ? v : null;
 }
 
-function decodeDeferredSubagentAcceptedResult(result: unknown): {
+function decodeDeferredSubagentAcceptedResult(event: { readonly result: unknown }): {
   ok: true;
   mode: "deferred";
   status: "accepted";
   sessionName: string;
 } | null {
+  const { result } = event;
   if (!isRecord(result)) return null;
   const sessionName = result["sessionName"];
   if (
@@ -1002,19 +1121,29 @@ export type AutoInjectedThreadSearchPayload = {
 
 type AutoInjectedThreadSearchEntry = AutoInjectedThreadSearchPayload["entries"][number];
 
-type AutoInjectedThreadSearchCandidate = AutoInjectedThreadSearchEntry & {
-  score: number;
+type AutoInjectedThreadRankingDiagnostic = {
+  threadId: string;
+  rawScore: number;
+  confidence: number;
   searchIndex: number;
   rank: number;
+  breakdown: RankedAutoInjectThread["breakdown"];
 };
 
 type AutoInjectedThreadSearchAppendedEvent = {
   toolCallId: string;
   mode: "hybrid" | "semantic" | "lexical";
   limit: number;
+  minScore: number;
   searches: readonly (readonly string[])[];
   participantFilterUserCount: number;
   entries: readonly AutoInjectedThreadSearchEntry[];
+  ranking: readonly (AutoInjectedThreadRankingDiagnostic & {
+    selection: RankedAutoInjectThread["selection"];
+  })[];
+  highestRejectedByConfidence: AutoInjectedThreadRankingDiagnostic | null;
+  expansionMinConfidence: number;
+  corpusDocumentCount: number;
 };
 
 export function buildAutoInjectedThreadSearchMessages(params: {
@@ -1069,94 +1198,19 @@ function formatAutoInjectedThreadBrief(brief: string): string | undefined {
   return `${trimmed.slice(0, AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH).trimEnd()} ...(${trimmed.length - AUTO_INJECTED_THREAD_BRIEF_DISPLAY_LENGTH} remaining)`;
 }
 
-function compareAutoInjectedThreadSearchCandidates(
-  left: AutoInjectedThreadSearchCandidate,
-  right: AutoInjectedThreadSearchCandidate,
-): number {
-  if (left.score !== right.score) return right.score - left.score;
-  if (left.searchIndex !== right.searchIndex) return left.searchIndex - right.searchIndex;
-  return left.rank - right.rank;
-}
-
-function stripAutoInjectedThreadSearchCandidate(
-  candidate: AutoInjectedThreadSearchCandidate,
+function formatRankedAutoInjectedThread(
+  candidate: RankedAutoInjectThread,
 ): AutoInjectedThreadSearchEntry {
+  const timeRange = candidate.result.timeRange
+    ? formatInjectedThreadTimeRange(candidate.result.timeRange)
+    : undefined;
+  const brief = formatAutoInjectedThreadBrief(candidate.result.brief);
   return {
-    threadId: candidate.threadId,
-    title: candidate.title,
-    ...(candidate.brief ? { brief: candidate.brief } : {}),
-    ...(candidate.timeRange ? { timeRange: candidate.timeRange } : {}),
+    threadId: candidate.result.threadId,
+    title: candidate.result.title,
+    ...(brief ? { brief } : {}),
+    ...(timeRange ? { timeRange } : {}),
   };
-}
-
-function selectAutoInjectedThreadSearchEntries(
-  groups: readonly (readonly AutoInjectedThreadSearchCandidate[])[],
-  limit: number,
-): AutoInjectedThreadSearchEntry[] {
-  const selected: AutoInjectedThreadSearchCandidate[] = [];
-  const selectedThreadIds = new Set<string>();
-  const earlierGroupThreadIds = new Set<string>();
-
-  for (const group of groups) {
-    if (selected.length >= limit) break;
-    const candidate = group.find(
-      (item) => !selectedThreadIds.has(item.threadId) && !earlierGroupThreadIds.has(item.threadId),
-    );
-    for (const item of group) {
-      earlierGroupThreadIds.add(item.threadId);
-    }
-    if (!candidate) continue;
-    selected.push(candidate);
-    selectedThreadIds.add(candidate.threadId);
-  }
-
-  if (selected.length < limit) {
-    const remainingByThreadId = new Map<string, AutoInjectedThreadSearchCandidate>();
-    for (const group of groups) {
-      for (const candidate of group) {
-        if (selectedThreadIds.has(candidate.threadId)) continue;
-        const existing = remainingByThreadId.get(candidate.threadId);
-        if (!existing || compareAutoInjectedThreadSearchCandidates(candidate, existing) < 0) {
-          remainingByThreadId.set(candidate.threadId, candidate);
-        }
-      }
-    }
-
-    const remaining = [...remainingByThreadId.values()].sort(
-      compareAutoInjectedThreadSearchCandidates,
-    );
-    for (const candidate of remaining) {
-      if (selected.length >= limit) break;
-      selected.push(candidate);
-      selectedThreadIds.add(candidate.threadId);
-    }
-  }
-
-  return selected.map(stripAutoInjectedThreadSearchCandidate);
-}
-
-function buildAutoInjectedThreadSearchCandidates(input: {
-  search: ConversationThreadSearchResult;
-  searchIndex: number;
-  previouslyInjectedThreadIds: ReadonlySet<string>;
-}): AutoInjectedThreadSearchCandidate[] {
-  return input.search.results
-    .filter((result) => !input.previouslyInjectedThreadIds.has(result.threadId))
-    .map((result, index) => {
-      const timeRange = result.timeRange
-        ? formatInjectedThreadTimeRange(result.timeRange)
-        : undefined;
-      const brief = formatAutoInjectedThreadBrief(result.brief);
-      return {
-        threadId: result.threadId,
-        title: result.title,
-        ...(brief ? { brief } : {}),
-        ...(timeRange ? { timeRange } : {}),
-        score: result.score ?? 0,
-        searchIndex: input.searchIndex,
-        rank: index + 1,
-      };
-    });
 }
 
 function collectAutoInjectedThreadIds(messages: readonly ModelMessage[]): Set<string> {
@@ -1227,6 +1281,7 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
   }) => Promise<void>;
   onInjected?: (event: AutoInjectedThreadSearchAppendedEvent) => void;
   onError: (message: string, error: BusAgentRunnerErrorProjection) => void;
+  autoInjectUsage?: ConversationThreadAutoInjectUsageAccumulator;
 }): Promise<ModelMessage[]> {
   const autoInject = params.cfg.conversation.thread.autoInject;
   if (!autoInject.enabled) return [];
@@ -1242,7 +1297,10 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
       : autoInject.minTextUnits;
   if (
     !latestInput.hasAttachment &&
-    !shouldRunAutoInjectedThreadSearch({ text: latestInput.authoredText, minTextUnits })
+    !shouldRunAutoInjectedThreadSearch({
+      text: latestInput.authoredText,
+      minTextUnits,
+    })
   ) {
     return [];
   }
@@ -1251,6 +1309,13 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
     ? getParticipantUserIdsFromRaw(params.raw)
     : [];
   if (autoInject.filterCurrentParticipants && participantIds.length === 0) return [];
+
+  const autoInjectUsage =
+    params.autoInjectUsage ??
+    createConversationThreadAutoInjectUsageAccumulator({ requestId: params.requestId });
+  let usageStatus: "completed" | "abstained" | "partial" | "failed" = "failed";
+  let usageSearchCount = 0;
+  let usageQueryCount = 0;
 
   const toolCallId = buildAutoInjectedThreadSearchToolCallId(params.requestId);
   const display = `${AUTO_INJECTED_THREAD_SEARCH_TOOL_NAME} auto-injected metadata`;
@@ -1261,105 +1326,193 @@ export async function maybeBuildAutoInjectedThreadSearchMessages(params: {
     ok?: boolean;
     error?: string;
   }) => {
-    try {
-      await params.publishToolStatus(update);
-    } catch (error) {
-      params.onError(
-        "auto-injected thread search status publish failed; continuing",
-        projectBusAgentRunnerError(error),
-      );
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          await params.publishToolStatus(update);
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        const error = attempt.error.cause;
+        params.onError(
+          "auto-injected thread search status publish failed; continuing",
+          projectBusAgentRunnerError(error),
+        );
+      }
     }
   };
 
   await publishToolStatusBestEffort({ toolCallId, status: "start", display });
 
-  try {
-    const plan = await conversationThreads.planAutoInjectSearch({
-      text,
-      content: latestInput.content,
-    });
-    const searchRecallLimit = Math.min(50, autoInject.limit * plan.searches.length);
-    const settledSearches = await Promise.allSettled(
-      plan.searches.map((searchPlan) =>
-        conversationThreads.search({
-          query: searchPlan.queries,
-          queryAboutness: searchPlan.aboutness,
-          limit: searchRecallLimit,
-          minScore: autoInject.minScore,
-          mode: autoInject.mode,
-          verbose: true,
-          ...(participantIds.length > 0 ? { participantIdsAny: participantIds } : {}),
-        }),
-      ),
-    );
-    let fulfilledSearches = 0;
-    const candidateGroups = settledSearches.map((result, searchIndex) => {
-      if (result.status === "fulfilled") {
-        fulfilledSearches += 1;
-        return buildAutoInjectedThreadSearchCandidates({
-          search: result.value,
-          searchIndex,
-          previouslyInjectedThreadIds,
+  {
+    const attempt = await Result.tryPromise({
+      try: async () => {
+        const plan = await conversationThreads.planAutoInjectSearch({
+          text,
+          content: latestInput.content,
+          autoInjectUsage,
         });
-      }
+        usageSearchCount = plan.searches.length;
+        usageQueryCount = plan.searches.reduce(
+          (sum, searchPlan) => sum + searchPlan.queries.length,
+          0,
+        );
+        if (plan.searches.length === 0) {
+          usageStatus = "abstained";
+          await publishToolStatusBestEffort({
+            toolCallId,
+            status: "end",
+            display,
+            ok: true,
+          });
+          return [];
+        }
+        const searchRecallLimit = Math.min(50, Math.max(autoInject.limit * 5, 10));
+        const settledSearches = await Promise.allSettled(
+          plan.searches.map((searchPlan) =>
+            conversationThreads.search({
+              query: searchPlan.queries,
+              queryAboutness: searchPlan.aboutness,
+              limit: searchRecallLimit,
+              minScore: autoInject.minScore,
+              mode: autoInject.mode,
+              verbose: true,
+              autoInjectUsage,
+              ...(participantIds.length > 0 ? { participantIdsAny: participantIds } : {}),
+            }),
+          ),
+        );
+        let fulfilledSearches = 0;
+        const successfulSearches: Array<{
+          searchIndex: number;
+          result: ConversationThreadSearchResult;
+        }> = [];
+        settledSearches.forEach((result, searchIndex) => {
+          if (result.status === "fulfilled") {
+            fulfilledSearches += 1;
+            successfulSearches.push({ searchIndex, result: result.value });
+            return;
+          }
 
-      params.onError(
-        "auto-injected thread search failed; continuing with partial metadata",
-        projectBusAgentRunnerError(result.reason, `Search ${searchIndex} failed`),
-      );
-      return [];
+          params.onError(
+            "auto-injected thread search failed; continuing with partial metadata",
+            projectBusAgentRunnerError(result.reason, `Search ${searchIndex} failed`),
+          );
+        });
+        if (fulfilledSearches === 0) {
+          const failure = projectBusAgentRunnerError(
+            new Error("all auto-injected thread searches failed"),
+          );
+          await publishToolStatusBestEffort({
+            toolCallId,
+            status: "end",
+            display,
+            ok: false,
+            error: failure.message,
+          });
+          params.onError(
+            "auto-injected thread search failed; continuing without metadata",
+            failure,
+          );
+          return [];
+        }
+        usageStatus = fulfilledSearches === plan.searches.length ? "completed" : "partial";
+        const corpusDocuments = conversationThreads.getAutoInjectRankingCorpusDocuments?.() ?? [];
+        const rankingResult = rankAutoInjectedThreadSearchResults({
+          plan,
+          searches: successfulSearches,
+          corpusDocuments,
+          excludedThreadIds: previouslyInjectedThreadIds,
+          limit: autoInject.limit,
+          expansionMinConfidence: autoInject.expansionMinConfidence,
+        });
+        const rankedEntries = rankingResult.selected;
+        const entries = rankedEntries.map(formatRankedAutoInjectedThread);
+
+        await publishToolStatusBestEffort({
+          toolCallId,
+          status: "end",
+          display,
+          ok: true,
+        });
+
+        if (entries.length === 0) return [];
+        {
+          const attempt = Result.try({
+            try: () => {
+              params.onInjected?.({
+                toolCallId,
+                mode: autoInject.mode,
+                limit: autoInject.limit,
+                minScore: autoInject.minScore,
+                searches: plan.searches.map((searchPlan) => searchPlan.queries),
+                participantFilterUserCount: participantIds.length,
+                entries,
+                ranking: rankedEntries.map((entry) => ({
+                  threadId: entry.result.threadId,
+                  rawScore: entry.rawScore,
+                  confidence: entry.confidence,
+                  selection: entry.selection,
+                  searchIndex: entry.searchIndex,
+                  rank: entry.rank,
+                  breakdown: entry.breakdown,
+                })),
+                highestRejectedByConfidence: rankingResult.highestRejectedByConfidence
+                  ? {
+                      threadId: rankingResult.highestRejectedByConfidence.result.threadId,
+                      rawScore: rankingResult.highestRejectedByConfidence.rawScore,
+                      confidence: rankingResult.highestRejectedByConfidence.confidence,
+                      searchIndex: rankingResult.highestRejectedByConfidence.searchIndex,
+                      rank: rankingResult.highestRejectedByConfidence.rank,
+                      breakdown: rankingResult.highestRejectedByConfidence.breakdown,
+                    }
+                  : null,
+                expansionMinConfidence: autoInject.expansionMinConfidence,
+                corpusDocumentCount: corpusDocuments.length,
+              });
+            },
+            catch: captureError,
+          });
+
+          if (attempt.isErr()) {
+            const error = attempt.error.cause;
+            params.onError(
+              "auto-injected thread search append log failed; continuing",
+              projectBusAgentRunnerError(error),
+            );
+          }
+        }
+        return buildAutoInjectedThreadSearchMessages({ toolCallId, entries });
+      },
+      catch: captureError,
     });
-    if (fulfilledSearches === 0) {
-      const failure = projectBusAgentRunnerError(
-        new Error("all auto-injected thread searches failed"),
-      );
+
+    if (attempt.isErr()) {
+      const error = attempt.error.cause;
+      const projected = projectBusAgentRunnerError(error);
       await publishToolStatusBestEffort({
         toolCallId,
         status: "end",
         display,
         ok: false,
-        error: failure.message,
+        error: projected.message,
       });
-      params.onError("auto-injected thread search failed; continuing without metadata", failure);
+      params.onError("auto-injected thread search failed; continuing without metadata", projected);
+      autoInjectUsage.finish({
+        status: "failed",
+        searchCount: usageSearchCount,
+        queryCount: usageQueryCount,
+      });
       return [];
     }
-    const entries = selectAutoInjectedThreadSearchEntries(candidateGroups, autoInject.limit);
-
-    await publishToolStatusBestEffort({
-      toolCallId,
-      status: "end",
-      display,
-      ok: true,
+    autoInjectUsage.finish({
+      status: usageStatus,
+      searchCount: usageSearchCount,
+      queryCount: usageQueryCount,
     });
-
-    if (entries.length === 0) return [];
-    try {
-      params.onInjected?.({
-        toolCallId,
-        mode: autoInject.mode,
-        limit: autoInject.limit,
-        searches: plan.searches.map((searchPlan) => searchPlan.queries),
-        participantFilterUserCount: participantIds.length,
-        entries,
-      });
-    } catch (error) {
-      params.onError(
-        "auto-injected thread search append log failed; continuing",
-        projectBusAgentRunnerError(error),
-      );
-    }
-    return buildAutoInjectedThreadSearchMessages({ toolCallId, entries });
-  } catch (error) {
-    const projected = projectBusAgentRunnerError(error);
-    await publishToolStatusBestEffort({
-      toolCallId,
-      status: "end",
-      display,
-      ok: false,
-      error: projected.message,
-    });
-    params.onError("auto-injected thread search failed; continuing without metadata", projected);
-    return [];
+    return attempt.value;
   }
 }
 
@@ -1572,11 +1725,28 @@ function persistHeartbeatSurfaceHandoffs(params: {
     const handoff = extracted[i] ?? fallback;
     const handoffRequestId = buildHeartbeatHandoffRequestId(params.requestId, i);
 
+    const storedHandoff = projectStoredMessagesV1(handoff.messages);
+    const storedHandoffError = storedHandoff.match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (storedHandoffError) {
+      params.logger.warn(
+        "heartbeat handoff transcript projection failed",
+        formatBridgeTaggedErrorForLog(storedHandoffError, {
+          requestId: handoffRequestId,
+        }),
+      );
+      continue;
+    }
     const saved = params.transcriptStore.saveRequestTranscript({
       requestId: handoffRequestId,
       sessionId: HEARTBEAT_HANDOFF_SESSION_ID,
       requestClient: params.requestClient,
-      messages: handoff.messages,
+      messages: storedHandoff.match({
+        ok: (messages) => messages,
+        err: () => [],
+      }),
       finalText: handoff.finalText,
       modelLabel: params.modelLabel,
     });
@@ -1602,6 +1772,7 @@ function persistHeartbeatSurfaceHandoffs(params: {
 
 type Enqueued = {
   queueEntryId: string;
+  requestDeliveryId?: string;
   requestId: string;
   sessionId: string;
   requestClient: AdapterPlatform;
@@ -1609,11 +1780,13 @@ type Enqueued = {
   runPolicy: RequestRunPolicy;
   origin?: RequestOrigin;
   messages: ModelMessage[];
-  corePrimaryLineage?: CorePrimaryLineageV1;
+  storedMessages: StoredMessageV1[];
+  corePrimaryLineage?: CorePrimaryLineageV2;
   modelOverride?: string;
   raw?: AgentRunnerRaw;
   authenticatedOrigin?: AuthenticatedSurfaceOrigin;
   currentTurnUserId?: string;
+  currentTurnMessageRef?: MsgRef;
   verifiedIngress?: boolean;
   identityOwner?: RequestMessageCacheOwner;
   restoredSafetyMode?: SessionSafetyMode;
@@ -1621,6 +1794,13 @@ type Enqueued = {
     checkpointMessages: ModelMessage[];
     partialText: string;
   };
+  storedRecoveryCheckpoint?: StoredMessageV1[];
+  previousRecoveryCheckpoint?: AgentRunCheckpointV1;
+  loadedCatalogIds?: readonly string[];
+  acceptedCorePrimaryLineage?: CorePrimaryLineageV2;
+  acceptedCurrentTurnUserId?: string;
+  retainedRequestDeliveries?: readonly AgentRunnerRetainedRequestDelivery[];
+  journalHandle?: AgentRunJournalHandle;
 };
 
 type QueueCancellationGroup = {
@@ -1640,99 +1820,27 @@ type QueueLifecycleAttempt = {
   controlApplied: boolean;
 };
 
-export type AgentRunnerRecoveryIdentity =
-  | {
-      readonly state: "durable";
-      readonly projection: AuthenticatedRequestProjection;
-      readonly assertedSafetyMode: SessionSafetyMode;
-      readonly parkedEventIds: readonly string[];
-      readonly delegationProof?: {
-        readonly kind: "workflow";
-        readonly runId: string;
-        readonly operationId: string;
-        readonly dispatchEpoch: string;
-      };
-    }
-  | {
-      readonly state: "restricted";
-      readonly reason: "legacy-no-durable-proof" | "missing-cache-proof";
-    };
-
-export type AgentRunnerQueueAttempt = {
-  readonly eventId: string;
-  readonly controlRequestId: string;
-  readonly controlRequestClient: AdapterPlatform;
-  readonly sessionId: string;
-  readonly kind: "queued-cancellation" | "buffered-absorption";
-  readonly detail: string;
-  readonly controlApplied: boolean;
-  readonly controlIdentity: AgentRunnerRecoveryIdentity;
-  readonly pendingGroups: readonly {
-    readonly publicationIndex: number;
-    readonly requestId: string;
-    readonly requestClient: AdapterPlatform;
-    readonly targetQueueEntryIds: readonly string[];
-  }[];
+export type AgentRunnerRetainedRequestDelivery = {
+  readonly requestDeliveryId: string;
+  readonly outcome: RequestDeliveryTerminalOutcome;
 };
 
-export type AgentRunnerRecoveryEntry = {
-  queueEntryId?: string;
-  kind: "active" | "queued";
-  requestId: string;
-  sessionId: string;
-  requestClient: AdapterPlatform;
-  queue: RequestQueueMode;
-  runPolicy?: RequestRunPolicy;
-  origin?: RequestOrigin;
-  messages: ModelMessage[];
-  corePrimaryLineage?: CorePrimaryLineageV1;
-  modelOverride?: string;
-  currentTurnUserId?: string;
-  raw?: AgentRunnerRaw;
-  recovery?: {
-    checkpointMessages: ModelMessage[];
-    partialText: string;
-  };
-  identity?: AgentRunnerRecoveryIdentity;
-};
+export type BusAgentRunnerRequestDelivery = Pick<
+  RequestDeliveryCoordinator<
+    CorePreparedRequestEnvelope,
+    CoreAcceptedRequestWork,
+    CoreRequestOutputMetadata
+  >,
+  "handleDelivery" | "replaceAcceptedWork" | "terminalize"
+>;
 
-export type AgentRunnerRecoveryState = {
-  readonly entries: readonly AgentRunnerRecoveryEntry[];
-  readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
-};
-
-export class AgentRecoveryUnavailable extends TaggedError("AgentRecoveryUnavailable")<{
-  readonly requestId: string;
-  readonly reason:
-    | "cache-conflict"
-    | "delegation-proof-unavailable"
-    | "identity-conflict"
-    | "queue-admission-conflict"
-    | "queue-attempt-conflict";
-  readonly message: string;
-}> {}
-
-export type AgentRecoveryAttempt = {
-  apply(): ResultType<void, AgentRecoveryUnavailable>;
-  rollback(): void;
-  activate(): void;
-};
-
-export function isWorkflowAgentRecoveryEntry(entry: AgentRunnerRecoveryEntry): boolean {
-  return (
-    parseWorkflowRequestHintFromRaw(entry.raw) !== null ||
-    entry.requestId.startsWith("wfr:") ||
-    entry.sessionId.startsWith("workflow:")
-  );
-}
-
-function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV1 {
-  const created = createCorePrimaryLineageFreshOnlyV1(reason, currentCanonicalStart);
-  const selectLineage = created.match<() => CorePrimaryLineageV1>({
+function createFreshOnlyLineage(reason: string, currentCanonicalStart = 0): CorePrimaryLineageV2 {
+  const created = createCorePrimaryLineageFreshOnlyV2(reason, currentCanonicalStart);
+  const selectLineage = created.match<() => CorePrimaryLineageV2>({
     ok: (lineage) => () => lineage,
     err: () => () => ({
       state: "fresh-only",
-      lineageVersion: 1,
+      lineageVersion: 2,
       currentCanonicalStart: 0,
       reason: "lineage-fallback-construction-failed",
     }),
@@ -1747,7 +1855,7 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
   messages: readonly ModelMessage[];
   corePrimaryLineage: unknown;
   transcriptStore?: TranscriptStore;
-}): CorePrimaryLineageV1 | undefined {
+}): CorePrimaryLineageV2 | undefined {
   if (input.requestClient !== "discord" || input.runProfile !== "primary") return undefined;
   const fallbackCurrentCanonicalStart = Math.max(
     0,
@@ -1756,8 +1864,8 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
   if (input.corePrimaryLineage === undefined) {
     return createFreshOnlyLineage("missing-manifest", fallbackCurrentCanonicalStart);
   }
-  const decoded = decodeCorePrimaryLineageV1(input.corePrimaryLineage, input.messages);
-  const continueDecoded = decoded.match<() => CorePrimaryLineageV1>({
+  const decoded = decodeCorePrimaryLineageV2(input.corePrimaryLineage, input.messages);
+  const continueDecoded = decoded.match<() => CorePrimaryLineageV2>({
     err: () => () =>
       createFreshOnlyLineage("malformed-or-unaligned-manifest", fallbackCurrentCanonicalStart),
     ok: (lineage) => () => {
@@ -1774,7 +1882,7 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
         sessionId: input.sessionId,
         surfaceId: `discord:${input.sessionId}`,
       });
-      const continueValidation = invalidReason.match<() => CorePrimaryLineageV1>({
+      const continueValidation = invalidReason.match<() => CorePrimaryLineageV2>({
         err: () => () =>
           createFreshOnlyLineage("lineage-store-unavailable", lineage.currentCanonicalStart),
         ok: (storedInvalidReason) => () =>
@@ -1791,8 +1899,17 @@ export function validateCorePrimaryLineageAtRunnerIntake(input: {
 export function degradeCorePrimaryLineageForMutation(
   reason: string,
   currentCanonicalStart = 0,
-): CorePrimaryLineageV1 {
+): CorePrimaryLineageV2 {
   return createFreshOnlyLineage(reason, currentCanonicalStart);
+}
+
+export function corePrimaryLineageHasCompactionCheckpoint(
+  lineage: CorePrimaryLineageV2 | undefined,
+): boolean {
+  return (
+    lineage?.state === "complete" &&
+    lineage.segments.some((segment) => segment.atoms.some((atom) => atom.kind === "checkpoint"))
+  );
 }
 
 const AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE = "conversation-thread-auto-inject";
@@ -1801,8 +1918,8 @@ export function appendAutoInjectedThreadSearchLineage(input: {
   lineage: unknown;
   canonicalMessages: readonly ModelMessage[];
   injectedMessages: readonly ModelMessage[];
-}): CorePrimaryLineageV1 {
-  const parsedShape = corePrimaryLineageV1Schema.safeParse(input.lineage);
+}): CorePrimaryLineageV2 {
+  const parsedShape = corePrimaryLineageV2Schema.safeParse(input.lineage);
   const fallbackCurrentCanonicalStart = parsedShape.success
     ? parsedShape.data.currentCanonicalStart
     : Math.max(
@@ -1815,8 +1932,8 @@ export function appendAutoInjectedThreadSearchLineage(input: {
       fallbackCurrentCanonicalStart,
     );
 
-  const decoded = decodeCorePrimaryLineageV1(input.lineage, input.canonicalMessages);
-  const continueDecoded = decoded.match<() => CorePrimaryLineageV1>({
+  const decoded = decodeCorePrimaryLineageV2(input.lineage, input.canonicalMessages);
+  const continueDecoded = decoded.match<() => CorePrimaryLineageV2>({
     err: () => failClosed,
     ok: (lineage) => () => {
       if (lineage.state !== "complete" || input.injectedMessages.length === 0) {
@@ -1827,18 +1944,29 @@ export function appendAutoInjectedThreadSearchLineage(input: {
         return failClosed();
       }
 
+      const preparedInjected = projectStoredMessagesV1(input.injectedMessages).andThen((messages) =>
+        hashCanonicalStoredMessagesV2(messages).map((digest) => ({
+          messages,
+          messageDigest: digest.hash,
+        })),
+      );
+      const prepared = preparedInjected.match({
+        ok: (value) => value,
+        err: () => null,
+      });
+      if (!prepared) return failClosed();
       const atom = {
         kind: "synthetic" as const,
         source: AUTO_INJECTED_THREAD_SEARCH_LINEAGE_SOURCE,
-        messageDigest: hashCanonicalMessagesV1(input.injectedMessages).hash,
+        messageDigest: prepared.messageDigest,
       };
       const cumulativeAtomCount = previous.cumulativeAtomCount + 1;
-      const extended = extendCoreLineagePrefixDigestV1(
+      const extended = extendCoreLineagePrefixDigestV2(
         previous.cumulativePrefixDigest,
         cumulativeAtomCount,
         atom,
       );
-      const continueExtended = extended.match<() => CorePrimaryLineageV1>({
+      const continueExtended = extended.match<() => CorePrimaryLineageV2>({
         err: () => failClosed,
         ok: (cumulativePrefixDigest) => () => {
           const candidate = {
@@ -1847,7 +1975,7 @@ export function appendAutoInjectedThreadSearchLineage(input: {
               ...lineage.segments,
               {
                 atoms: [atom],
-                canonicalMessages: [...input.injectedMessages],
+                canonicalMessages: prepared.messages,
                 canonicalStart: previous.canonicalEnd,
                 canonicalEnd: previous.canonicalEnd + input.injectedMessages.length,
                 cumulativeAtomCount,
@@ -1855,11 +1983,11 @@ export function appendAutoInjectedThreadSearchLineage(input: {
               },
             ],
           };
-          const parsed = decodeCorePrimaryLineageV1(candidate, [
+          const parsed = decodeCorePrimaryLineageV2(candidate, [
             ...input.canonicalMessages,
-            ...input.injectedMessages,
+            ...prepared.messages,
           ]);
-          const continueParsed = parsed.match<() => CorePrimaryLineageV1>({
+          const continueParsed = parsed.match<() => CorePrimaryLineageV2>({
             ok: (value) => () => (value.state === "complete" ? value : failClosed()),
             err: () => failClosed,
           });
@@ -1889,15 +2017,22 @@ export function mapCorePrimaryCompactionCurrentCanonicalStart(input: {
   );
 }
 
-function persistedCompleteLineage(lineage: CorePrimaryLineageV1 | undefined): {
-  corePrimaryLineage?: CoreLineageManifestV1;
+function persistedCompleteLineage(lineage: CorePrimaryLineageV2 | undefined): {
+  corePrimaryLineage?: CoreLineageManifestV2;
 } {
   return lineage?.state === "complete" ? { corePrimaryLineage: lineage } : {};
 }
 
+function requireStoredMessageHash(messages: readonly StoredMessageV1[]): string {
+  return hashCanonicalStoredMessagesV2(messages).match({
+    ok: (digest) => () => digest.hash,
+    err: (error) => () => signalBusAgentRunnerHostFailure(error),
+  })();
+}
+
 export function resolveCorePrimaryTranscriptProviderState(input: {
   targetFamily: HistoryProviderState["lastFamily"];
-  lineage?: CorePrimaryLineageV1;
+  lineage?: CorePrimaryLineageV2;
   transcriptStore?: TranscriptStore;
 }): HistoryProviderState {
   const lineage = input.lineage;
@@ -1956,10 +2091,10 @@ export function resolveCorePrimaryTranscriptProviderState(input: {
   };
 }
 
-class RestartDrainingAbort extends Error {
+class ShutdownDrainingAbort extends Error {
   constructor() {
-    super("server restarting");
-    this.name = "RestartDrainingAbort";
+    super("server shutting down");
+    this.name = "ShutdownDrainingAbort";
   }
 }
 
@@ -2017,7 +2152,10 @@ function groupQueueCancellationEntries(entries: readonly Enqueued[]): QueueCance
   for (const entry of entries) {
     const existing = groups.get(entry.requestId);
     if (existing) {
-      groups.set(entry.requestId, { ...existing, entries: [...existing.entries, entry] });
+      groups.set(entry.requestId, {
+        ...existing,
+        entries: [...existing.entries, entry],
+      });
       continue;
     }
     groups.set(entry.requestId, {
@@ -2029,25 +2167,8 @@ function groupQueueCancellationEntries(entries: readonly Enqueued[]): QueueCance
   return [...groups.values()];
 }
 
-async function maybeBuildSkillsSectionForPrimary(): Promise<string | null> {
-  const workspaceRoot = findWorkspaceRootResult();
-  const root = workspaceRoot.match({ ok: (value) => value, err: () => null });
-  if (root === null) return null;
-  try {
-    const { skills } = await discoverSkills({
-      workspaceRoot: root,
-      dataDir: env.dataDir,
-    });
-    return formatAvailableSkillsSection(skills);
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    // Best-effort: never fail a run due to skill discovery.
-    return null;
-  }
-}
-
-export function buildPersistedHeartbeatMessages(finalText: string): ModelMessage[] {
-  return [{ role: "assistant", content: finalText } satisfies ModelMessage];
+export function buildPersistedHeartbeatMessages(finalText: string): StoredMessageV1[] {
+  return [{ role: "assistant", content: finalText }];
 }
 
 function toolCallIdsFromMessages(messages: readonly ModelMessage[]): Set<string> {
@@ -2228,7 +2349,10 @@ function resolveAgentRunFallbackSource(params: {
 
   if (params.requestModelOverride) {
     if (params.requestModelOverride.includes("/")) {
-      return { entries: [], source: "cmd.request.message.modelOverride.fallback" };
+      return {
+        entries: [],
+        source: "cmd.request.message.modelOverride.fallback",
+      };
     }
     const preset = params.cfg.models.def[params.requestModelOverride];
     if (!preset) return null;
@@ -2307,7 +2431,10 @@ export function resolveAgentRunModelFallbacksResult(params: {
       });
     }
     return params.reasoningOverride
-      ? fallbacks.map((fallback) => ({ ...fallback, reasoning: params.reasoningOverride }))
+      ? fallbacks.map((fallback) => ({
+          ...fallback,
+          reasoning: params.reasoningOverride,
+        }))
       : fallbacks;
   });
 }
@@ -2329,7 +2456,9 @@ export function selectNextNativeModelFallback(params: {
   const candidates = [params.plan.head, ...params.plan.fallbacks];
   const current = candidates[params.activeIndex];
   if (!current) return null;
-  const latchedFamily = classifyHistoryProviderFamily({ type: params.plan.head.provider });
+  const latchedFamily = classifyHistoryProviderFamily({
+    type: params.plan.head.provider,
+  });
   if (latchedFamily === "claude-code") return null;
 
   for (let index = params.activeIndex + 1; index < candidates.length; index += 1) {
@@ -2386,6 +2515,16 @@ export function selectedLevel1ToolNames(
   return active;
 }
 
+export function shouldLogLevel1ToolCompletionAtInfo(
+  toolName: string,
+  catalog: BuiltLevel1Toolset["catalog"],
+): boolean {
+  return (
+    toolName === "find_tools" ||
+    catalog.some((entry) => entry.source === "mcp" && entry.modelName === toolName)
+  );
+}
+
 export async function refreshSelectedLevel1Tools(params: {
   target: Pick<Level1ToolAuthorityTarget, "setActiveTools">;
   toolset: BuiltLevel1Toolset;
@@ -2424,6 +2563,7 @@ type SessionQueue = {
   queue: Enqueued[];
   activeRequestId: string | null;
   activeRun: {
+    requestDeliveryId?: string;
     requestId: string;
     sessionId: string;
     requestClient: AdapterPlatform;
@@ -2432,9 +2572,12 @@ type SessionQueue = {
     runPolicy: RequestRunPolicy;
     origin?: RequestOrigin;
     messages: ModelMessage[];
-    corePrimaryLineage?: CorePrimaryLineageV1;
+    storedMessages: StoredMessageV1[];
+    corePrimaryLineage?: CorePrimaryLineageV2;
+    toolAuthority: LineageToolAuthority;
     modelOverride?: string;
     currentTurnUserId?: string;
+    currentTurnMessageRef?: MsgRef;
     raw?: AgentRunnerRaw;
     resolvedModelSpec: string | null;
     resolvedReasoning: ModelReasoningEffort | undefined;
@@ -2442,13 +2585,40 @@ type SessionQueue = {
     partialText: string;
     liveParent: ReturnType<WorkflowLiveParentBridge["registerParent"]> | undefined;
     claudeCodeControl: ClaudeCodeRunControl | null;
+    materializeStoredMessages:
+      | ((messages: readonly StoredMessageV1[]) => Promise<ModelMessage[]>)
+      | null;
+    rememberStoredMessages: (
+      providerMessages: readonly ModelMessage[],
+      storedMessages: readonly StoredMessageV1[],
+    ) => void;
     notifyWaiters: () => void;
     flushOutput: () => void;
-    setCurrentTurnUserId: (userId: string | undefined) => void;
+    setCurrentTurnContext: (userId: string | undefined, messageRef: MsgRef | undefined) => void;
     cancel: () => void;
     started: boolean;
     startedAt: number;
     activeTools: Map<string, { toolName: string; startedAt: number }>;
+    retainedRequestDeliveries: Map<string, RequestDeliveryTerminalOutcome>;
+    checkpointedRetainedRequestDeliveryIds: Set<string>;
+    retainedRequestDeliveryByInputId: Map<AgentInputQueueId, string>;
+    journalHandle: AgentRunJournalHandle | null;
+    checkpointWriter: {
+      disabled: boolean;
+      pending: {
+        readonly messages: readonly ModelMessage[];
+        readonly canonicalInputIds: ReadonlySet<AgentInputQueueId>;
+        readonly identityProjection: StoredMessageIdentityProjectionV1;
+      } | null;
+      operation: Promise<void> | null;
+      closed: boolean;
+      abandoned: boolean;
+      retryInputIds: Set<AgentInputQueueId>;
+      inFlightInputIds: ReadonlySet<AgentInputQueueId> | null;
+      lastCommittedProviderMessages: readonly ModelMessage[];
+      lastCommittedStoredMessages: readonly StoredMessageV1[];
+      retainedPredecessorStoredMessages: readonly StoredMessageV1[];
+    };
   } | null;
   /** Track toolCallIds whose outputs are compacted in the model-facing view. */
   compactedToolCallIds: Set<string>;
@@ -2568,6 +2738,14 @@ export function formatBusAgentRunnerDrainFailureForLog(
 
 export async function startBusAgentRunner(params: {
   bus: LilacBus;
+  blobStore: AnthropicFallbackBlobStore;
+  resourceAccess?: Pick<ResourceAccess, "describe" | "open">;
+  requestDelivery?: BusAgentRunnerRequestDelivery;
+  agentRunJournal?: Pick<
+    AgentRunJournal,
+    "openRun" | "writeCheckpoint" | "markTerminal" | "resetRun" | "removeReconciled"
+  > &
+    Partial<Pick<AgentRunJournal, "promotePreviousCheckpoint">>;
   subscriptionId: string;
   config?: CoreConfig;
   pluginManager: CoreToolPluginManager;
@@ -2595,7 +2773,13 @@ export async function startBusAgentRunner(params: {
   beforeRequestIntake?: (
     message: DecodedLilacMessageForTopic<"cmd.request">,
   ) => void | Promise<void>;
-  resolveParentChannelId?: (sessionId: string) => string | null | undefined;
+  /** Resolve trusted stored Discord hierarchy for config inheritance and safety policy. */
+  resolveDiscordSessionContext?: (sessionId: string) =>
+    | {
+        parentChannelId: string | null;
+        guildId: string | null;
+      }
+    | undefined;
   issueControlCapability?: (input: {
     requestId: string;
     sessionId: string;
@@ -2638,6 +2822,7 @@ export async function startBusAgentRunner(params: {
   const logger = createLogger({
     module: "bus-agent-runner",
   });
+  const storedMessageIdentity = createStoredMessageIdentityProjectionV1();
 
   let cfg = params.config ?? (await getCoreConfig());
   let coreConfigReloadHadError = false;
@@ -2653,7 +2838,9 @@ export async function startBusAgentRunner(params: {
         if (!coreConfigReloadHadError || lastCoreConfigReloadError !== message) {
           logger.warn(
             "core-config reload failed; using last known config",
-            formatBridgeTaggedErrorForLog(loadError, { path: "core-config.yaml" }),
+            formatBridgeTaggedErrorForLog(loadError, {
+              path: "core-config.yaml",
+            }),
           );
         }
         coreConfigReloadHadError = true;
@@ -2679,8 +2866,7 @@ export async function startBusAgentRunner(params: {
   const cancelledByRequestId = new Set<string>();
   const reservedQueueEntries = new Set<Enqueued>();
   const queueLifecycleAttempts = new Map<string, QueueLifecycleAttempt>();
-  const restartAbortRequestIds = new Set<string>();
-  const forcedRecoveryByRequestId = new Map<string, AgentRunnerRecoveryEntry>();
+  const shutdownAbortRequestIds = new Set<string>();
   const requestMessageCache = params.requestMessageCache ?? createRequestMessageCache();
   let draining = false;
   let terminalPanic: Panic | null = null;
@@ -2690,6 +2876,7 @@ export async function startBusAgentRunner(params: {
   let terminalCleanupCompletion: Promise<void> | null = null;
   let runnerActivated = params.startPaused !== true;
   let runnerAdmissionStopped = false;
+  let activeAgentRunJournal = params.agentRunJournal ?? null;
   let resolveRunnerAdmission: ((outcome: "active" | "stopped") => void) | null = null;
   const runnerActivation = runnerActivated
     ? Promise.resolve("active" as const)
@@ -2715,6 +2902,523 @@ export async function startBusAgentRunner(params: {
     params.reportFatalPanic(panic);
   };
 
+  const logJournalReset = (input: {
+    readonly requestDeliveryId: string;
+    readonly requestId: string;
+    readonly sessionId: string;
+    readonly error: Error;
+  }): void => {
+    logger.warn("agent run journal reset", {
+      requestDeliveryId: input.requestDeliveryId,
+      requestId: input.requestId,
+      sessionId: input.sessionId,
+      errorTag: input.error.name,
+    });
+  };
+
+  const releaseRunCheckpointBlobs = (input: {
+    readonly requestDeliveryId: string;
+    readonly requestId: string;
+    readonly sessionId: string;
+  }): void => {
+    const releaseError = params.transcriptStore
+      ?.releaseAgentRunCheckpointBlobs?.({ requestDeliveryId: input.requestDeliveryId })
+      .match({ ok: () => null, err: (error) => error });
+    if (!releaseError) return;
+    logger.warn(
+      "agent run checkpoint blob reference cleanup deferred",
+      formatBridgeTaggedErrorForLog(releaseError, input),
+    );
+  };
+
+  const resetRunJournal = (input: {
+    readonly requestDeliveryId: string;
+    readonly requestId: string;
+    readonly sessionId: string;
+  }): boolean => {
+    const journal = activeAgentRunJournal;
+    if (!journal) return false;
+    const reset = journal.resetRun(input.requestDeliveryId);
+    const resetError = reset.match({ ok: () => null, err: (error) => error });
+    if (!resetError) {
+      releaseRunCheckpointBlobs(input);
+      return true;
+    }
+    logJournalReset({ ...input, error: resetError });
+    activeAgentRunJournal = null;
+    return false;
+  };
+
+  const openRunJournal = (input: {
+    readonly requestDeliveryId: string;
+    readonly requestId: string;
+    readonly sessionId: string;
+  }): AgentRunJournalHandle | null => {
+    const journal = activeAgentRunJournal;
+    if (!journal) return null;
+    const opened = journal.openRun(input);
+    const decision = opened.match<
+      | { readonly kind: "opened"; readonly handle: AgentRunJournalHandle }
+      | { readonly kind: "reset"; readonly error: Error }
+    >({
+      ok: (handle) => ({ kind: "opened", handle }),
+      err: (error) => ({ kind: "reset", error }),
+    });
+    if (decision.kind === "opened") return decision.handle;
+    logJournalReset({ ...input, error: decision.error });
+    if (!resetRunJournal(input)) return null;
+    return journal.openRun(input).match({
+      ok: (handle) => handle,
+      err: (error) => {
+        logJournalReset({ ...input, error });
+        activeAgentRunJournal = null;
+        return null;
+      },
+    });
+  };
+
+  const persistRunCheckpoint = async (
+    run: NonNullable<SessionQueue["activeRun"]>,
+    messages: readonly ModelMessage[],
+    canonicalInputIds: readonly AgentInputQueueId[],
+    identityProjection: StoredMessageIdentityProjectionV1,
+  ): Promise<"written" | "kept-previous"> => {
+    const journal = activeAgentRunJournal;
+    const requestDeliveryId = run.requestDeliveryId;
+    if (!journal || !requestDeliveryId || run.checkpointWriter.disabled) return "written";
+    const nextCheckpointedRetainedRequestDeliveryIds = new Set(
+      run.checkpointedRetainedRequestDeliveryIds,
+    );
+    for (const inputId of canonicalInputIds) {
+      const retainedRequestDeliveryId = run.retainedRequestDeliveryByInputId.get(inputId);
+      if (!retainedRequestDeliveryId) continue;
+      nextCheckpointedRetainedRequestDeliveryIds.add(retainedRequestDeliveryId);
+    }
+    const owner = {
+      requestDeliveryId,
+      requestId: run.requestId,
+      sessionId: run.sessionId,
+    };
+    const handle = run.journalHandle ?? openRunJournal(owner);
+    if (!handle) return activeAgentRunJournal ? "kept-previous" : "written";
+    const persisted = await persistBlobBackedAgentRunCheckpoint({
+      handle,
+      journal,
+      messages,
+      previousCheckpoint: {
+        providerMessages: run.checkpointWriter.lastCommittedProviderMessages,
+        storedMessages: run.checkpointWriter.lastCommittedStoredMessages,
+      },
+      retainedPredecessorMessages: run.checkpointWriter.retainedPredecessorStoredMessages,
+      identityProjection,
+      blobStore: params.blobStore,
+      transcriptStore: params.transcriptStore,
+      shouldAbandon: () => run.checkpointWriter.abandoned,
+      ...(run.corePrimaryLineage ? { corePrimaryLineage: run.corePrimaryLineage } : {}),
+      loadedCatalogIds: run.toolAuthority.snapshot(),
+      ...(run.currentTurnUserId ? { currentTurnUserId: run.currentTurnUserId } : {}),
+      retainedRequestDeliveries: [...run.retainedRequestDeliveries]
+        .filter(([retainedRequestDeliveryId]) =>
+          nextCheckpointedRetainedRequestDeliveryIds.has(retainedRequestDeliveryId),
+        )
+        .map(([retainedRequestDeliveryId, outcome]) => ({
+          requestDeliveryId: retainedRequestDeliveryId,
+          outcome,
+        })),
+    });
+    const decision = persisted.match<
+      | {
+          readonly kind: "written";
+          readonly handle: AgentRunJournalHandle;
+          readonly messages: readonly StoredMessageV1[];
+          readonly advanced: boolean;
+          readonly cleanupError?: Error;
+        }
+      | { readonly kind: "kept-previous"; readonly error: Error }
+    >({
+      ok: ({ handle: nextHandle, messages: storedMessages, advanced, cleanupError }) => ({
+        kind: "written",
+        handle: nextHandle,
+        messages: storedMessages,
+        advanced,
+        ...(cleanupError ? { cleanupError } : {}),
+      }),
+      err: (error) => ({ kind: "kept-previous", error }),
+    });
+    if (decision.kind === "kept-previous") {
+      logger.warn(
+        "agent run checkpoint kept previous",
+        formatBridgeTaggedErrorForLog(decision.error, {
+          requestDeliveryId,
+          requestId: run.requestId,
+          sessionId: run.sessionId,
+          ...(AgentRunCheckpointPreparationFailed.is(decision.error)
+            ? { stage: decision.error.stage }
+            : {}),
+        }),
+      );
+      const journalError = AgentRunCheckpointOwnershipRollbackFailed.is(decision.error)
+        ? decision.error.journalError
+        : decision.error;
+      if (AgentRunCheckpointOwnershipRollbackFailed.is(decision.error)) {
+        logger.warn(
+          "agent run checkpoint blob reference cleanup deferred",
+          formatBridgeTaggedErrorForLog(decision.error.cleanupError, {
+            requestDeliveryId,
+            requestId: run.requestId,
+            sessionId: run.sessionId,
+          }),
+        );
+      }
+      if (AgentRunJournalConflict.is(journalError)) {
+        run.journalHandle = openRunJournal(owner);
+        run.checkpointWriter.disabled = true;
+      }
+      return "kept-previous";
+    }
+    const priorCommittedCheckpointMessages = run.checkpointWriter.lastCommittedStoredMessages;
+    run.journalHandle = decision.handle;
+    if (decision.advanced) {
+      run.checkpointWriter.retainedPredecessorStoredMessages = priorCommittedCheckpointMessages;
+    }
+    run.checkpointWriter.lastCommittedProviderMessages = messages;
+    run.checkpointWriter.lastCommittedStoredMessages = decision.messages;
+    for (const inputId of canonicalInputIds) {
+      run.retainedRequestDeliveryByInputId.delete(inputId);
+    }
+    run.checkpointedRetainedRequestDeliveryIds = nextCheckpointedRetainedRequestDeliveryIds;
+    if (decision.cleanupError) {
+      logger.warn(
+        "agent run checkpoint blob reference cleanup deferred",
+        formatBridgeTaggedErrorForLog(decision.cleanupError, {
+          requestDeliveryId,
+          requestId: run.requestId,
+          sessionId: run.sessionId,
+        }),
+      );
+    }
+    return "written";
+  };
+
+  const enqueueRunCheckpoint = (
+    run: NonNullable<SessionQueue["activeRun"]>,
+    messages: readonly ModelMessage[],
+    canonicalInputIds: readonly AgentInputQueueId[],
+    identityProjection: StoredMessageIdentityProjectionV1,
+  ): void => {
+    if (
+      run.checkpointWriter.closed ||
+      run.checkpointWriter.disabled ||
+      !activeAgentRunJournal ||
+      !run.requestDeliveryId
+    ) {
+      return;
+    }
+    const pendingInputIds = new Set(run.checkpointWriter.pending?.canonicalInputIds ?? []);
+    for (const inputId of canonicalInputIds) pendingInputIds.add(inputId);
+    run.checkpointWriter.pending = {
+      messages,
+      canonicalInputIds: pendingInputIds,
+      identityProjection,
+    };
+    startRunCheckpointWriter(run);
+  };
+
+  function startRunCheckpointWriter(run: NonNullable<SessionQueue["activeRun"]>): void {
+    if (run.checkpointWriter.operation || !run.checkpointWriter.pending) return;
+    const operation = deferRunCheckpointWriter(run);
+    run.checkpointWriter.operation = operation;
+  }
+
+  async function deferRunCheckpointWriter(
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await superviseRunCheckpointWriter(run);
+  }
+
+  async function superviseRunCheckpointWriter(
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> {
+    const completed = await Result.tryPromise({
+      try: () => drainRunCheckpointWriter(run),
+      catch: captureError,
+    });
+    const failure = completed.match({
+      ok: () => null,
+      err: ({ cause }) => ({ cause }),
+    });
+    const inFlightInputIds = run.checkpointWriter.inFlightInputIds;
+    run.checkpointWriter.inFlightInputIds = null;
+    run.checkpointWriter.operation = null;
+    if (failure) {
+      for (const inputId of inFlightInputIds ?? []) {
+        run.checkpointWriter.retryInputIds.add(inputId);
+      }
+      if (Panic.is(failure.cause)) {
+        reportFatalPanic(failure.cause);
+      } else {
+        const error = projectBusAgentRunnerError(
+          failure.cause,
+          "Agent run checkpoint background write failed",
+        );
+        logger.error("agent run checkpoint background write failed", {
+          requestDeliveryId: run.requestDeliveryId,
+          requestId: run.requestId,
+          sessionId: run.sessionId,
+          errorMessage: error.message,
+        });
+      }
+    }
+    if (run.checkpointWriter.pending) startRunCheckpointWriter(run);
+  }
+
+  async function drainRunCheckpointWriter(
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> {
+    while (run.checkpointWriter.pending) {
+      const pending = run.checkpointWriter.pending;
+      run.checkpointWriter.pending = null;
+      const canonicalInputIds = new Set(run.checkpointWriter.retryInputIds);
+      for (const inputId of pending.canonicalInputIds) canonicalInputIds.add(inputId);
+      run.checkpointWriter.inFlightInputIds = canonicalInputIds;
+      const outcome = await persistRunCheckpoint(
+        run,
+        pending.messages,
+        [...canonicalInputIds],
+        pending.identityProjection,
+      );
+      run.checkpointWriter.inFlightInputIds = null;
+      if (outcome === "kept-previous") {
+        for (const inputId of canonicalInputIds) run.checkpointWriter.retryInputIds.add(inputId);
+        continue;
+      }
+      for (const inputId of canonicalInputIds) run.checkpointWriter.retryInputIds.delete(inputId);
+    }
+  }
+
+  const flushRunCheckpointWriter = async (
+    run: NonNullable<SessionQueue["activeRun"]>,
+  ): Promise<void> => {
+    run.checkpointWriter.closed = true;
+    while (run.checkpointWriter.operation) {
+      await run.checkpointWriter.operation;
+    }
+  };
+
+  const stopRunCheckpointWriters = async (): Promise<void> => {
+    const operations = [...bySession.values()].flatMap((state) => {
+      const run = state.activeRun;
+      if (!run) return [];
+      run.checkpointWriter.closed = true;
+      run.checkpointWriter.abandoned = true;
+      run.checkpointWriter.pending = null;
+      return run.checkpointWriter.operation ? [run.checkpointWriter.operation] : [];
+    });
+    if (operations.length === 0) return;
+
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    const completed = await Promise.race([
+      Promise.all(operations).then(() => true),
+      new Promise<false>((resolve) => {
+        deadlineTimer = setTimeout(() => resolve(false), TERMINAL_CLEANUP_SHUTDOWN_WAIT_MS);
+        deadlineTimer.unref?.();
+      }),
+    ]).finally(() => {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+    });
+    if (completed) return;
+    logger.warn("agent run checkpoint writes exceeded shutdown wait", {
+      timeoutMs: TERMINAL_CLEANUP_SHUTDOWN_WAIT_MS,
+      pendingCount: operations.length,
+    });
+  };
+
+  const restorePreviousRunCheckpoint = async (input: {
+    readonly entry: Enqueued;
+    readonly checkpoint: AgentRunCheckpointV1;
+  }): Promise<AgentRunJournalHandle | null> => {
+    const journal = activeAgentRunJournal;
+    const requestDeliveryId = input.entry.requestDeliveryId;
+    if (!journal || !requestDeliveryId || !journal.promotePreviousCheckpoint) return null;
+    const owner = {
+      requestDeliveryId,
+      requestId: input.entry.requestId,
+      sessionId: input.entry.sessionId,
+    };
+    const currentHandle = input.entry.journalHandle;
+    if (!currentHandle) return null;
+    const promoted = journal.promotePreviousCheckpoint(currentHandle, input.checkpoint);
+    const decision = promoted.match<
+      | {
+          readonly kind: "restored";
+          readonly handle: AgentRunJournalHandle;
+        }
+      | { readonly kind: "failed"; readonly error: Error }
+    >({
+      ok: (handle) => ({ kind: "restored", handle }),
+      err: (error) => ({ kind: "failed", error }),
+    });
+    if (decision.kind === "failed") {
+      logger.warn(
+        "agent run previous checkpoint restore failed",
+        formatBridgeTaggedErrorForLog(decision.error, owner),
+      );
+      return null;
+    }
+    const cleanupError = params.transcriptStore?.replaceAgentRunCheckpointBlobs
+      ?.call(params.transcriptStore, {
+        requestDeliveryId,
+        messages: input.checkpoint.messages,
+      })
+      .match({ ok: () => undefined, err: (error) => error });
+    if (cleanupError) {
+      logger.warn(
+        "agent run checkpoint blob reference cleanup deferred",
+        formatBridgeTaggedErrorForLog(cleanupError, owner),
+      );
+    }
+    return decision.handle;
+  };
+
+  const materializePreviousRunCheckpoint = async (input: {
+    readonly entry: Enqueued;
+    readonly identityProjection: StoredMessageIdentityProjectionV1;
+  }): Promise<
+    | {
+        readonly kind: "restored";
+        readonly checkpoint: AgentRunCheckpointV1;
+        readonly messages: ModelMessage[];
+        readonly handle: AgentRunJournalHandle;
+      }
+    | { readonly kind: "unavailable" }
+  > => {
+    const checkpoint = input.entry.previousRecoveryCheckpoint;
+    if (!checkpoint) return { kind: "unavailable" };
+    const materialized = await materializeStoredMessagesV1({
+      messages: checkpoint.messages,
+      blobStore: params.blobStore,
+      identityProjection: input.identityProjection,
+    });
+    const decision = materialized.match<
+      | { readonly kind: "messages"; readonly messages: ModelMessage[] }
+      | { readonly kind: "unavailable"; readonly error: Error }
+    >({
+      ok: (messages) => ({ kind: "messages", messages }),
+      err: (error) => ({ kind: "unavailable", error }),
+    });
+    if (decision.kind === "unavailable") {
+      logger.warn(
+        "agent run previous checkpoint blob unavailable",
+        formatBridgeTaggedErrorForLog(decision.error, {
+          requestDeliveryId: input.entry.requestDeliveryId,
+          requestId: input.entry.requestId,
+          sessionId: input.entry.sessionId,
+        }),
+      );
+      return { kind: "unavailable" };
+    }
+    const handle = await restorePreviousRunCheckpoint({
+      entry: input.entry,
+      checkpoint,
+    });
+    return handle
+      ? { kind: "restored", checkpoint, messages: decision.messages, handle }
+      : { kind: "unavailable" };
+  };
+
+  const installPreviousRunCheckpoint = (input: {
+    readonly entry: Enqueued;
+    readonly recovery: NonNullable<Enqueued["recovery"]>;
+    readonly checkpoint: AgentRunCheckpointV1;
+    readonly messages: ModelMessage[];
+    readonly handle: AgentRunJournalHandle;
+  }): void => {
+    logger.warn("agent run checkpoint restore used previous checkpoint", {
+      requestDeliveryId: input.entry.requestDeliveryId,
+      requestId: input.entry.requestId,
+      sessionId: input.entry.sessionId,
+    });
+    input.recovery.checkpointMessages = input.messages;
+    input.entry.storedRecoveryCheckpoint = [...input.checkpoint.messages];
+    input.entry.retainedRequestDeliveries = input.checkpoint.retainedRequestDeliveries;
+    input.entry.journalHandle = input.handle;
+    input.entry.corePrimaryLineage =
+      input.checkpoint.corePrimaryLineage ?? input.entry.acceptedCorePrimaryLineage;
+    if (input.checkpoint.loadedCatalogIds) {
+      input.entry.loadedCatalogIds = [...input.checkpoint.loadedCatalogIds];
+    } else {
+      delete input.entry.loadedCatalogIds;
+    }
+    input.entry.currentTurnUserId =
+      input.checkpoint.currentTurnUserId ?? input.entry.acceptedCurrentTurnUserId;
+    input.entry.currentTurnMessageRef = input.checkpoint.currentTurnUserId
+      ? undefined
+      : input.entry.authenticatedOrigin?.messageRef;
+    delete input.entry.previousRecoveryCheckpoint;
+  };
+
+  const fallBackRunCheckpointToAcceptedWork = (input: {
+    readonly entry: Enqueued;
+    readonly error: Error;
+  }): void => {
+    logger.warn(
+      "agent run checkpoint restore fell back to accepted work",
+      formatBridgeTaggedErrorForLog(input.error, {
+        requestDeliveryId: input.entry.requestDeliveryId,
+        requestId: input.entry.requestId,
+        sessionId: input.entry.sessionId,
+      }),
+    );
+    if (input.entry.requestDeliveryId) {
+      resetRunJournal({
+        requestDeliveryId: input.entry.requestDeliveryId,
+        requestId: input.entry.requestId,
+        sessionId: input.entry.sessionId,
+      });
+    }
+    delete input.entry.recovery;
+    delete input.entry.storedRecoveryCheckpoint;
+    delete input.entry.previousRecoveryCheckpoint;
+    delete input.entry.retainedRequestDeliveries;
+    delete input.entry.journalHandle;
+    delete input.entry.loadedCatalogIds;
+    input.entry.corePrimaryLineage = input.entry.acceptedCorePrimaryLineage;
+    input.entry.currentTurnUserId = input.entry.acceptedCurrentTurnUserId;
+    input.entry.currentTurnMessageRef = input.entry.authenticatedOrigin?.messageRef;
+  };
+
+  const markRunTerminal = (
+    run: NonNullable<SessionQueue["activeRun"]>,
+    outcome: RequestDeliveryTerminalOutcome,
+    finalReplayDeadline: number | undefined,
+  ): void => {
+    const journal = activeAgentRunJournal;
+    const requestDeliveryId = run.requestDeliveryId;
+    if (!journal || !requestDeliveryId) return;
+    const owner = {
+      requestDeliveryId,
+      requestId: run.requestId,
+      sessionId: run.sessionId,
+    };
+    const handle = run.journalHandle ?? openRunJournal(owner);
+    if (!handle) return;
+    const terminal = journal.markTerminal(handle, {
+      outcome,
+      ...(finalReplayDeadline === undefined ? {} : { finalReplayDeadline }),
+    });
+    terminal.match({
+      ok: (nextHandle) => {
+        run.journalHandle = nextHandle;
+      },
+      err: (error) => {
+        logJournalReset({ ...owner, error });
+        resetRunJournal(owner);
+        run.journalHandle = null;
+      },
+    });
+  };
+
   async function resumeQueueLifecycleAttempt(
     attempt: QueueLifecycleAttempt,
     state: SessionQueue,
@@ -2736,6 +3440,26 @@ export async function startBusAgentRunner(params: {
         state: "cancelled",
         detail: attempt.detail,
       });
+      if (params.requestDelivery) {
+        for (const queued of group.entries) {
+          if (!queued.requestDeliveryId) continue;
+          const terminalized = await params.requestDelivery.terminalize({
+            requestDeliveryId: queued.requestDeliveryId,
+            outcome: {
+              kind: "cancelled",
+              code:
+                attempt.kind === "buffered-absorption"
+                  ? "absorbed-into-active-control"
+                  : "cancelled-while-queued",
+            },
+            transportCommitRequired: true,
+          });
+          terminalized.match({
+            ok: () => undefined,
+            err: (error) => signalBusAgentRunnerHostFailure(error),
+          });
+        }
+      }
       removeQueuedEntriesByReference(state.queue, group.entries);
       for (const queued of group.entries) {
         reservedQueueEntries.delete(queued);
@@ -2763,17 +3487,28 @@ export async function startBusAgentRunner(params: {
     state: SessionQueue,
     requestId?: string,
   ): void {
-    const superviseDetachedDrain = (error: unknown): void => {
+    const superviseDetachedDrain = <ErrorCause>(error: ErrorCause): void => {
       rethrowBusAgentRunnerPanic(error, reportFatalPanic);
       logger.error(
         "drainSessionQueue failed",
         formatBusAgentRunnerDrainFailureForLog(error, { sessionId, requestId }),
       );
     };
-    const observeSupervisedDrainRejection = (): void => undefined;
-    const operation = drainSessionQueue(sessionId, state).catch(superviseDetachedDrain);
+    const operation = superviseDrain();
     activeDrainOperation = operation;
-    void operation.catch(observeSupervisedDrainRejection);
+    void ignoreDetachedFailure(operation);
+
+    async function superviseDrain(): Promise<void> {
+      const drained = await Result.tryPromise({
+        try: () => drainSessionQueue(sessionId, state),
+        catch: captureError,
+      });
+      const failure = drained.match({
+        ok: () => null,
+        err: ({ cause }) => ({ cause }),
+      });
+      if (failure) superviseDetachedDrain(failure.cause);
+    }
   }
 
   type CmdRequestMessage = Extract<
@@ -2784,6 +3519,15 @@ export async function startBusAgentRunner(params: {
   async function handleCmdRequestMessage(
     msg: CmdRequestMessage,
   ): Promise<ResultType<void, BusAgentRunnerDeliveryError>> {
+    const runnerReceivedAt = Date.now();
+    let requestId = msg.headers?.request_id;
+    let sessionId = msg.headers?.session_id;
+    let requestClient = msg.headers?.request_client ?? "unknown";
+    if (requestId && requestClient === "discord") {
+      recordRequestLatencyStage(requestId, "requestPublishedAt", msg.ts);
+      recordRequestLatencyStage(requestId, "runnerReceivedAt", runnerReceivedAt);
+    }
+
     if ((await runnerActivation) === "stopped") {
       return Result.err(
         new BusAgentRunnerRecoveryStopped({
@@ -2791,9 +3535,6 @@ export async function startBusAgentRunner(params: {
         }),
       );
     }
-    const requestId = msg.headers?.request_id;
-    const sessionId = msg.headers?.session_id;
-    const requestClient = msg.headers?.request_client ?? "unknown";
     const pendingAttempt = queueLifecycleAttempts.get(msg.id);
     if (
       pendingAttempt &&
@@ -2821,8 +3562,111 @@ export async function startBusAgentRunner(params: {
       );
     }
 
+    const requestDelivery = params.requestDelivery;
+    const acceptedDelivery = requestDelivery
+      ? await captureBusAgentRunnerOperation("durable request delivery admission", () =>
+          requestDelivery.handleDelivery(msg.data.requestDeliveryId),
+        )
+      : null;
+    type DurableAdmissionDecision =
+      | {
+          readonly disposition: "accepted";
+          readonly record: AcceptedRequestDelivery<CoreAcceptedRequestWork>;
+        }
+      | { readonly disposition: "owned-commit" }
+      | { readonly disposition: "park"; readonly error: Error };
+    const acceptedDecision = acceptedDelivery?.match<DurableAdmissionDecision>({
+      ok: (delivery) =>
+        delivery.match<DurableAdmissionDecision>({
+          ok: (outcome) => {
+            if (outcome.disposition === "accepted") return outcome;
+            if (outcome.disposition === "commit") return { disposition: "owned-commit" };
+            return outcome;
+          },
+          err: (error) => ({
+            disposition: "park",
+            error: captureError(error, "Durable request delivery handler failed").cause,
+          }),
+        }),
+      err: (error) => ({ disposition: "park", error }),
+    });
+    if (acceptedDecision?.disposition === "owned-commit") return Result.ok(undefined);
+    if (acceptedDecision?.disposition === "park") {
+      return Result.err(
+        new BusAgentRunnerIntakeFailed({
+          cause: acceptedDecision.error,
+          message: "Durable request delivery admission is pending",
+        }),
+      );
+    }
+    const acceptedRecord = acceptedDecision?.record ?? null;
+    const reconcileAcceptedProjectionFailure = async (
+      error: BusAgentRunnerDeliveryError,
+    ): Promise<ResultType<void, BusAgentRunnerDeliveryError>> => {
+      if (!acceptedRecord) return Result.err(error);
+      const resumed = await resumeAcceptedDelivery(acceptedRecord);
+      return resumed.match<() => ResultType<void, BusAgentRunnerDeliveryError>>({
+        ok: () => () => Result.ok(undefined),
+        err: (cause) => () =>
+          Result.err(
+            new BusAgentRunnerIntakeFailed({
+              cause,
+              message: "Accepted durable work could not enter the recovery queue",
+            }),
+          ),
+      })();
+    };
+    const intakeMessage: CmdRequestMessage = msg;
+    if (!requestId || !sessionId) {
+      return Result.err(
+        new BusAgentRunnerRequestHeadersInvalid({
+          missing: [
+            ...(!requestId ? ["request_id" as const] : []),
+            ...(!sessionId ? ["session_id" as const] : []),
+          ],
+          message: "Accepted request delivery is missing durable request/session identity",
+        }),
+      );
+    }
+    const storedMessages = acceptedRecord
+      ? [...acceptedRecord.work.data.messages]
+      : projectStoredMessagesV1(msg.data.messages).match({
+          ok: (messages) => messages,
+          err: () => null,
+        });
+    if (storedMessages === null) {
+      return Result.err(
+        new BusAgentRunnerIntakeFailed({
+          cause: new Error("Request messages are not durable stored messages"),
+          message: "cmd.request.message durable projection failed",
+        }),
+      );
+    }
+    const materializedMessages = await materializeStoredMessagesV1({
+      messages: storedMessages,
+      blobStore: params.blobStore,
+      identityProjection: storedMessageIdentity,
+    });
+    const messageMaterializationError = materializedMessages.match({
+      ok: () => null,
+      err: (error) => error,
+    });
+    if (messageMaterializationError) {
+      return reconcileAcceptedProjectionFailure(
+        new BusAgentRunnerIntakeFailed({
+          cause: messageMaterializationError,
+          message: "Durable request message materialization failed",
+        }),
+      );
+    }
+    const messages = materializedMessages.match({
+      ok: (value) => value,
+      err: () => [],
+    });
+    const deliveryData = acceptedRecord?.work.data ?? msg.data;
+
     const projectedRequest = (params.projectAuthenticatedRequest ?? projectAuthenticatedRequest)(
-      msg,
+      intakeMessage,
     );
     let projectionFailure: BusAgentRunnerAuthenticationProjectionInvalid | null = null;
     const selectRequestProjection = projectedRequest.match<
@@ -2840,13 +3684,21 @@ export async function startBusAgentRunner(params: {
     const requestProjection = selectRequestProjection();
     if (projectionFailure) {
       if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
-      return Result.err(projectionFailure);
+      return reconcileAcceptedProjectionFailure(projectionFailure);
     }
     if (!requestProjection) {
       if (!pendingAttempt) abandonQueueLifecycleAttempt(msg.id);
+      if (acceptedRecord) {
+        return reconcileAcceptedProjectionFailure(
+          new BusAgentRunnerIntakeFailed({
+            cause: new Error("Accepted request has no authenticated runtime projection"),
+            message: "Accepted durable work must enter restricted recovery",
+          }),
+        );
+      }
       return Result.ok(undefined);
     }
-    const raw = preserveAgentRunnerRaw(msg.data.raw);
+    const raw = preserveAgentRunnerRaw({ data: deliveryData });
     let cacheAdmitted = false;
     let identityError:
       | RequestIdentitySourceMissing
@@ -2855,684 +3707,907 @@ export async function startBusAgentRunner(params: {
       | undefined;
     let intakeError: BusAgentRunnerOperationFailed | undefined;
     let parkPending = false;
-    try {
-      const cachedExternal = requestMessageCache.cacheMessage(msg, requestProjection);
-      let cachedExternalError: RequestMessageCacheAdmissionError | null = null;
-      const selectExternalProjection = cachedExternal.match<
-        () => AuthenticatedRequestProjection | undefined
-      >({
-        err: (error) => () => {
-          cachedExternalError = error;
-          return undefined;
-        },
-        ok: (projection) => () => projection,
-      });
-      const externalProjection = selectExternalProjection();
-      if (cachedExternalError) {
-        return Result.err(
-          new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: cachedExternalError,
-            message: "cmd.request.message cache admission is invalid",
-          }),
-        );
-      }
-      if (!externalProjection) return Result.ok(undefined);
-      cacheAdmitted = true;
-      const trustedProjection = projectDurableWorkflowRequestIdentity({
-        projection: requestProjection,
-        raw,
-        store: params.durableWorkflowStore,
-      });
-      const cachedTrusted = requestMessageCache.cacheMessage(msg, trustedProjection);
-      let cachedTrustedError: RequestMessageCacheAdmissionError | null = null;
-      const selectAuthenticatedRequest = cachedTrusted.match<
-        () => AuthenticatedRequestProjection | undefined
-      >({
-        err: (error) => () => {
-          cachedTrustedError = error;
-          return undefined;
-        },
-        ok: (projection) => () => projection ?? externalProjection,
-      });
-      const authenticatedRequest = selectAuthenticatedRequest();
-      if (cachedTrustedError) {
-        return Result.err(
-          new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: cachedTrustedError,
-            message: "cmd.request.message trusted cache admission is invalid",
-          }),
-        );
-      }
-      if (!authenticatedRequest) return Result.ok(undefined);
-      await (async () => {
-        rethrowBusAgentRunnerPanic(terminalPanic);
-        await params.beforeRequestIntake?.(msg);
-
-        if (env.perf.log) {
-          const lagMs = Date.now() - msg.ts;
-          const shouldWarn = lagMs >= env.perf.lagWarnMs;
-          const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
-          if (shouldWarn || shouldSample) {
-            if (shouldWarn) {
-              logger.warn("perf.bus_lag", {
-                stage: "cmd.request->agent_runner",
-                lagMs,
-                requestId,
-                sessionId,
-                requestClient,
-                queue: msg.data.queue,
-              });
-            } else {
-              logger.info("perf.bus_lag", {
-                stage: "cmd.request->agent_runner",
-                lagMs,
-                requestId,
-                sessionId,
-                requestClient,
-                queue: msg.data.queue,
-              });
-            }
-          }
-        }
-
-        logger.debug("cmd.request.message received", {
-          requestId,
-          sessionId,
-          requestClient,
-          queue: msg.data.queue,
-          runPolicy: msg.data.runPolicy ?? "normal",
-          originKind: msg.data.origin?.kind,
-          modelOverride: msg.data.modelOverride,
-          messageCount: msg.data.messages.length,
-        });
-
-        // reload config opportunistically (mtime cached in getCoreConfig).
-        // If reload fails, keep using the last known good config.
-        await reloadCoreConfigIfNeeded();
-
-        const intakeRunProfile = parseSubagentMetaFromRaw(raw).profile;
-        const entry: Enqueued = {
-          queueEntryId: msg.id,
-          requestId,
-          sessionId,
-          requestClient,
-          queue: msg.data.queue,
-          runPolicy: msg.data.runPolicy ?? "normal",
-          origin: msg.data.origin,
-          messages: msg.data.messages,
-          corePrimaryLineage: validateCorePrimaryLineageAtRunnerIntake({
-            requestClient,
-            sessionId,
-            runProfile: intakeRunProfile,
-            messages: msg.data.messages,
-            corePrimaryLineage: msg.data.corePrimaryLineage,
-            transcriptStore: params.transcriptStore,
-          }),
-          modelOverride: msg.data.modelOverride,
-          raw,
-          authenticatedOrigin: authenticatedRequest?.authenticatedOrigin,
-          currentTurnUserId: trustedProjection.authenticatedOrigin?.userId,
-          verifiedIngress: authenticatedRequest?.verifiedIngress,
-        };
-
-        const requestControl = parseRequestControlFromRaw(entry.raw);
-
-        const state =
-          bySession.get(sessionId) ??
-          ({
-            running: false,
-            agent: null,
-            queue: [] as Enqueued[],
-            activeRequestId: null,
-            activeRun: null,
-            compactedToolCallIds: new Set<string>(),
-          } satisfies SessionQueue);
-        bySession.set(sessionId, state);
-
-        const logQueueTransition = (input: {
-          action: string;
-          queueDepthBefore: number;
-          queueDepthAfter: number;
-          reason?: string;
-          activeRequestId?: string | null;
-        }) => {
-          logger.debug(
-            "agent.queue.transition",
-            formatBridgeLogContext({
-              requestId,
-              sessionId,
-              requestClient,
-              queueMode: entry.queue,
-              running: state.running,
-              queueDepthBefore: input.queueDepthBefore,
-              queueDepthAfter: input.queueDepthAfter,
-              action: input.action,
-              reason: input.reason,
-              activeRequestId: input.activeRequestId ?? state.activeRequestId,
-              draining,
-            }),
-          );
-        };
-        const logQueuedBehindActiveRun = (queuedRequestId: string) => {
-          logger.info("request queued behind active run", {
-            requestId: queuedRequestId,
-            activeRequestId: state.activeRequestId,
-            queueDepth: state.queue.length,
-          });
-        };
-
-        if (pendingAttempt) {
-          await resumeQueueLifecycleAttempt(pendingAttempt, state);
-          return;
-        }
-        const enqueueWithLifecycle = async (
-          queuedEntry: Enqueued,
-          detail: string,
-        ): Promise<ResultType<void, BusAgentRunnerOperationFailed>> => {
-          state.queue.push(queuedEntry);
-          const published = await captureBusAgentRunnerOperation(
-            "queued lifecycle publication",
-            () =>
-              publishLifecycle({
-                bus,
-                headers: {
-                  request_id: queuedEntry.requestId,
-                  session_id: sessionId,
-                  request_client: queuedEntry.requestClient,
-                },
-                state: "queued",
-                detail,
-              }),
-          );
-          const publishError = published.match({ ok: () => null, err: (error) => error });
-          if (publishError) {
-            removeQueuedEntriesByReference(state.queue, [queuedEntry]);
-            if (queuedEntry.identityOwner) {
-              requestMessageCache.releaseOwner(queuedEntry.identityOwner);
-            }
-            return Result.err(publishError);
-          }
-          return Result.ok(undefined);
-        };
-
-        if (
-          !requestControl.cancel &&
-          shouldCancelRunPolicyRequest({ runPolicy: entry.runPolicy, sessionId, states: bySession })
-        ) {
-          await publishLifecycle({
-            bus,
-            headers: {
-              request_id: requestId,
-              session_id: sessionId,
-              request_client: requestClient,
+    const intakeResult: ResultType<void, BusAgentRunnerDeliveryError> = await (async (): Promise<
+      ResultType<void, BusAgentRunnerDeliveryError>
+    > => {
+      const attempted = await Result.tryPromise({
+        try: async () => {
+          const cachedExternal = requestMessageCache.cacheMessage(intakeMessage, requestProjection);
+          let cachedExternalError: RequestMessageCacheAdmissionError | null = null;
+          const selectExternalProjection = cachedExternal.match<
+            () => AuthenticatedRequestProjection | undefined
+          >({
+            err: (error) => () => {
+              cachedExternalError = error;
+              return undefined;
             },
-            state: "cancelled",
-            detail:
-              entry.runPolicy === "idle_only_session"
-                ? "idle_only_session_busy"
-                : "idle_only_global_busy",
+            ok: (projection) => () => projection,
           });
-          logQueueTransition({
-            action: "drop",
-            queueDepthBefore: state.queue.length,
-            queueDepthAfter: state.queue.length,
-            reason:
-              entry.runPolicy === "idle_only_session"
-                ? "idle_only_session_busy"
-                : "idle_only_global_busy",
-          });
-          return;
-        }
-
-        if (draining) {
-          logger.debug("dropping request message while draining", {
-            requestId,
-            sessionId,
-            queue: msg.data.queue,
-          });
-          logQueueTransition({
-            action: "drop",
-            queueDepthBefore: state.queue.length,
-            queueDepthAfter: state.queue.length,
-            reason: "draining",
-          });
-          return;
-        }
-
-        const dropCancelNoTarget = async (reason: string) => {
-          logger.debug(
-            "dropping cancel request with no target",
-            formatBridgeLogContext({
-              requestId,
-              sessionId,
-              queue: entry.queue,
-              activeRequestId: state.activeRequestId,
-              reason,
-            }),
-          );
-          logQueueTransition({
-            action: "drop",
-            queueDepthBefore: state.queue.length,
-            queueDepthAfter: state.queue.length,
-            reason,
-          });
-        };
-
-        if (requestControl.cancel && requestControl.cancelQueued) {
-          const matchedEntries: Enqueued[] = [];
-
-          for (const queued of state.queue) {
-            if (queued.requestId === requestId && !reservedQueueEntries.has(queued)) {
-              matchedEntries.push(queued);
-            }
+          const externalProjection = selectExternalProjection();
+          if (cachedExternalError) {
+            return {
+              status: "return",
+              value: Result.err(
+                new BusAgentRunnerAuthenticationProjectionInvalid({
+                  cause: cachedExternalError,
+                  message: "cmd.request.message cache admission is invalid",
+                }),
+              ),
+            } as const;
           }
+          if (!externalProjection)
+            return { status: "return", value: Result.ok(undefined) } as const;
+          cacheAdmitted = true;
+          const trustedProjection = projectDurableWorkflowRequestIdentity({
+            projection: requestProjection,
+            raw,
+            store: params.durableWorkflowStore,
+          });
+          const cachedTrusted = requestMessageCache.cacheMessage(intakeMessage, trustedProjection);
+          let cachedTrustedError: RequestMessageCacheAdmissionError | null = null;
+          const selectAuthenticatedRequest = cachedTrusted.match<
+            () => AuthenticatedRequestProjection | undefined
+          >({
+            err: (error) => () => {
+              cachedTrustedError = error;
+              return undefined;
+            },
+            ok: (projection) => () => projection ?? externalProjection,
+          });
+          const authenticatedRequest = selectAuthenticatedRequest();
+          if (cachedTrustedError) {
+            return {
+              status: "return",
+              value: Result.err(
+                new BusAgentRunnerAuthenticationProjectionInvalid({
+                  cause: cachedTrustedError,
+                  message: "cmd.request.message trusted cache admission is invalid",
+                }),
+              ),
+            } as const;
+          }
+          if (!authenticatedRequest)
+            return { status: "return", value: Result.ok(undefined) } as const;
+          await (async () => {
+            rethrowBusAgentRunnerPanic(terminalPanic);
+            await params.beforeRequestIntake?.(intakeMessage);
 
-          const targetMessageId = requestControl.targetMessageId;
-          if (targetMessageId) {
-            for (const queued of state.queue) {
-              if (
-                !matchedEntries.includes(queued) &&
-                !reservedQueueEntries.has(queued) &&
-                requestRawReferencesMessage(queued.raw, targetMessageId)
-              ) {
-                matchedEntries.push(queued);
+            if (env.perf.log) {
+              const lagMs = Date.now() - msg.ts;
+              const shouldWarn = lagMs >= env.perf.lagWarnMs;
+              const shouldSample = env.perf.sampleRate > 0 && Math.random() < env.perf.sampleRate;
+              if (shouldWarn || shouldSample) {
+                if (shouldWarn) {
+                  logger.warn(
+                    "perf.bus_lag",
+                    formatBridgeLogContext({
+                      stage: "cmd.request->agent_runner",
+                      lagMs,
+                      requestId,
+                      sessionId,
+                      requestClient,
+                      queue: deliveryData.queue,
+                    }),
+                  );
+                } else {
+                  logger.info(
+                    "perf.bus_lag",
+                    formatBridgeLogContext({
+                      stage: "cmd.request->agent_runner",
+                      lagMs,
+                      requestId,
+                      sessionId,
+                      requestClient,
+                      queue: deliveryData.queue,
+                    }),
+                  );
+                }
               }
             }
-          }
 
-          if (matchedEntries.length > 0) {
-            for (const queued of matchedEntries) reservedQueueEntries.add(queued);
-            const attempt: QueueLifecycleAttempt = {
-              eventId: msg.id,
-              controlRequestId: requestId,
-              controlRequestClient: requestClient,
-              sessionId,
-              kind: "queued-cancellation",
-              detail: "cancelled while queued",
-              pendingGroups: groupQueueCancellationEntries(matchedEntries),
-              controlApplied: true,
-            };
-            queueLifecycleAttempts.set(msg.id, attempt);
-            await resumeQueueLifecycleAttempt(attempt, state);
-
-            logger.debug("queued request cancelled", {
-              requestId,
-              sessionId,
-              cancelledRequestIds: [...new Set(matchedEntries.map((queued) => queued.requestId))],
-              queueDepth: state.queue.length,
-            });
-            logQueueTransition({
-              action: "cancel_queued",
-              queueDepthBefore: state.queue.length + matchedEntries.length,
-              queueDepthAfter: state.queue.length,
-              reason: "cancel_queued",
-            });
-
-            return;
-          }
-
-          const targetMessageIdForActive = requestControl.targetMessageId;
-          const targetMatchesActive =
-            typeof targetMessageIdForActive === "string" &&
-            requestRawReferencesMessage(state.activeRun?.raw, targetMessageIdForActive);
-
-          if (
-            !state.running ||
-            !state.activeRequestId ||
-            (!state.agent && !state.activeRun?.cancel)
-          ) {
-            await dropCancelNoTarget("request not queued or active");
-            return;
-          }
-
-          if (state.activeRequestId === requestId || targetMatchesActive) {
-            const activeCancelEntry: Enqueued = {
-              ...entry,
-              requestId: state.activeRequestId,
-              requestClient: state.activeRun?.requestClient ?? entry.requestClient,
-            };
-            if (state.activeRun?.started === false) {
-              state.activeRun.cancel();
-            } else if (state.agent) {
-              await applyToRunningAgent(
-                state.agent,
-                activeCancelEntry,
-                cancelledByRequestId,
-                state.activeRun,
-              );
-            }
-            logQueueTransition({
-              action: "apply_to_active",
-              queueDepthBefore: state.queue.length,
-              queueDepthAfter: state.queue.length,
-              reason: targetMatchesActive
-                ? "cancel_active_by_message_id"
-                : "cancel_active_by_request_id",
-            });
-            return;
-          }
-
-          await dropCancelNoTarget("request not queued or active");
-          return;
-        }
-
-        if (!state.running) {
-          if (requestControl.cancel) {
-            await dropCancelNoTarget("request not active");
-            return;
-          }
-
-          // Some messages only make sense when a run is already active.
-          if (requestControl.requiresActive && entry.queue !== "prompt") {
             logger.debug(
-              "dropping request message (requires active run)",
+              "cmd.request.message received",
               formatBridgeLogContext({
                 requestId,
                 sessionId,
-                queue: entry.queue,
+                requestClient,
+                queue: deliveryData.queue,
+                runPolicy: deliveryData.runPolicy ?? "normal",
+                originKind: deliveryData.origin?.kind,
+                modelOverride: deliveryData.modelOverride,
+                messageCount: storedMessages.length,
               }),
             );
-            logQueueTransition({
-              action: "drop",
-              queueDepthBefore: state.queue.length,
-              queueDepthAfter: state.queue.length,
-              reason: "requires_active_without_run",
-            });
-            return;
-          }
 
-          const queueDepthBefore = state.queue.length;
-          const owner = requestMessageCache.acquireOwner(requestId);
-          const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
-            err: (error) => () => {
-              identityError = error;
-              return null;
-            },
-            ok: (identityOwner) => () => identityOwner,
-          });
-          const identityOwner = selectOwner();
-          if (!identityOwner) return;
-          entry.identityOwner = identityOwner;
-          state.queue.push(entry);
-          logQueueTransition({
-            action: "enqueue",
-            queueDepthBefore,
-            queueDepthAfter: state.queue.length,
-            reason: "start_when_idle",
-          });
-          startSessionQueueDrain(sessionId, state, requestId);
-        } else {
-          if (
-            state.activeRequestId === requestId &&
-            requestControl.cancel &&
-            state.activeRun?.started === false &&
-            state.activeRun?.cancel
-          ) {
-            state.activeRun.cancel();
-            logQueueTransition({
-              action: "apply_to_active",
-              queueDepthBefore: state.queue.length,
-              queueDepthAfter: state.queue.length,
-              reason: "cancel_active_before_agent_start",
-            });
-            return;
-          }
+            // reload config opportunistically (mtime cached in getCoreConfig).
+            // If reload fails, keep using the last known good config.
+            await reloadCoreConfigIfNeeded();
 
-          if (
-            state.activeRequestId === requestId &&
-            !requestControl.cancel &&
-            state.activeRun?.runProfile === "primary"
-          ) {
-            const activeRun = state.activeRun;
-            const incomingOverride =
-              entry.modelOverride ?? parseRequestModelOverrideFromRaw(entry.raw) ?? undefined;
-            let incompatible =
-              activeRun.resolvedModelSpec === null &&
-              incomingOverride !== undefined &&
-              incomingOverride !== activeRun.modelOverride;
-            if (
-              incomingOverride !== undefined &&
-              activeRun.resolvedModelSpec !== null &&
-              activeRun.resolvedProviderFamily !== null
-            ) {
-              const activeSpec = activeRun.resolvedModelSpec;
-              const activeFamily = activeRun.resolvedProviderFamily;
-              const requestedPlan = resolveAgentRunModelResult({
-                cfg,
-                runProfile: "primary",
-                requestModelOverride: incomingOverride,
-              });
-              incompatible = requestedPlan.match({
-                ok: (plan) =>
-                  shouldQueueIncompatibleActiveRuntimeModel({
-                    activeSpec,
-                    activeReasoning: activeRun.resolvedReasoning,
-                    activeFamily,
-                    requested: plan.head,
-                  }),
-                err: () => true,
-              });
-            }
-            if (incompatible) {
-              const aliasRequestId = deriveModelChangingRequestId(entry);
-              const aliased = requestMessageCache.createAliasOwner({
-                sourceRequestId: requestId,
-                aliasRequestId,
-                requestClient,
-                sessionId,
-              });
-              const selectAlias = aliased.match<() => RequestMessageCacheAliasOwner | null>({
-                err: (error) => () => {
-                  identityError = error;
-                  return null;
-                },
-                ok: (aliasOwner) => () => aliasOwner,
-              });
-              const alias = selectAlias();
-              if (!alias) return;
-              const aliasProjection = alias.projection;
-              const queuedEntry: Enqueued = {
-                ...entry,
-                requestId: aliasProjection.requestId,
-                sessionId: aliasProjection.sessionId,
-                requestClient: aliasProjection.requestClient,
-                queue: "prompt",
-                authenticatedOrigin: aliasProjection.authenticatedOrigin,
-                verifiedIngress: aliasProjection.verifiedIngress,
-                identityOwner: {
-                  requestId: alias.requestId,
-                  ownerId: alias.ownerId,
-                },
-              };
-              const queueDepthBefore = state.queue.length;
-              const enqueued = await enqueueWithLifecycle(
-                queuedEntry,
-                "queued for incompatible model or reasoning selection",
-              );
-              const enqueueError = enqueued.match({ ok: () => null, err: (error) => error });
-              if (enqueueError) {
-                intakeError = enqueueError;
-                return;
-              }
-              logQueueTransition({
-                action: "enqueue",
-                queueDepthBefore,
-                queueDepthAfter: state.queue.length,
-                reason: "incompatible_active_model",
-              });
-              logQueuedBehindActiveRun(queuedEntry.requestId);
-              return;
-            }
-          }
+            const intakeRunProfile = parseSubagentMetaFromRaw(raw).profile;
+            const entry: Enqueued = {
+              queueEntryId: msg.id,
+              ...(acceptedRecord ? { requestDeliveryId: acceptedRecord.requestDeliveryId } : {}),
+              requestId,
+              sessionId,
+              requestClient,
+              queue: deliveryData.queue,
+              runPolicy: deliveryData.runPolicy ?? "normal",
+              origin: deliveryData.origin,
+              messages,
+              storedMessages,
+              corePrimaryLineage:
+                acceptedRecord?.work.data.corePrimaryLineage ??
+                validateCorePrimaryLineageAtRunnerIntake({
+                  requestClient,
+                  sessionId,
+                  runProfile: intakeRunProfile,
+                  messages,
+                  corePrimaryLineage: deliveryData.corePrimaryLineage,
+                  transcriptStore: params.transcriptStore,
+                }),
+              modelOverride: deliveryData.modelOverride,
+              raw,
+              authenticatedOrigin: authenticatedRequest?.authenticatedOrigin,
+              currentTurnUserId: trustedProjection.authenticatedOrigin?.userId,
+              currentTurnMessageRef: trustedProjection.authenticatedOrigin?.messageRef,
+              verifiedIngress: authenticatedRequest?.verifiedIngress,
+            };
 
-          // If the message is intended for the currently active request, apply immediately.
-          if (state.activeRequestId && state.activeRequestId === requestId && state.agent) {
-            const runningAgent = state.agent;
-            const queueDepthBefore = state.queue.length;
-            const shouldAbsorbBufferedPrompts =
-              (entry.queue === "steer" || entry.queue === "interrupt") &&
-              !isCancelControlEntry(entry);
+            const requestControl = parseRequestControlFromRaw(entry.raw);
 
-            const bufferedPrompts = shouldAbsorbBufferedPrompts
-              ? collectBufferedPromptEntriesForActiveRequest({
-                  queue: state.queue,
-                  activeRequestId: requestId,
-                }).filter((queued) => !reservedQueueEntries.has(queued))
-              : [];
+            const state =
+              bySession.get(sessionId) ??
+              ({
+                running: false,
+                agent: null,
+                queue: [] as Enqueued[],
+                activeRequestId: null,
+                activeRun: null,
+                compactedToolCallIds: new Set<string>(),
+              } satisfies SessionQueue);
+            bySession.set(sessionId, state);
 
-            const mergedEntry =
-              bufferedPrompts.length > 0
-                ? ({
-                    ...entry,
-                    messages: [
-                      ...bufferedPrompts.flatMap((queuedPrompt) => queuedPrompt.messages),
-                      ...entry.messages,
-                    ],
-                    corePrimaryLineage: degradeCorePrimaryLineageForMutation(
-                      "queued-buffer-absorbed-into-steering",
-                      runningAgent.state.messages.length,
-                    ),
-                  } satisfies Enqueued)
-                : entry;
-
-            if (bufferedPrompts.length > 0) {
-              const absorbMode: "steer" | "interrupt" =
-                entry.queue === "interrupt" ? "interrupt" : "steer";
-              for (const bufferedPrompt of bufferedPrompts) {
-                reservedQueueEntries.add(bufferedPrompt);
-              }
-              const attempt: QueueLifecycleAttempt = {
-                eventId: msg.id,
-                controlRequestId: requestId,
-                controlRequestClient: requestClient,
-                sessionId,
-                kind: "buffered-absorption",
-                detail:
-                  absorbMode === "interrupt"
-                    ? "cancelled: absorbed into active interrupt"
-                    : "cancelled: absorbed into active steer",
-                pendingGroups: groupQueueCancellationEntries(bufferedPrompts),
-                controlApplied: false,
-              };
-              queueLifecycleAttempts.set(msg.id, attempt);
-              const applied = await captureBusAgentRunnerOperation(
-                "buffered prompt control application",
-                () =>
-                  applyToRunningAgent(
-                    runningAgent,
-                    mergedEntry,
-                    cancelledByRequestId,
-                    state.activeRun,
-                  ),
-              );
-              const applyError = applied.match({ ok: () => null, err: (error) => error });
-              if (applyError) {
-                for (const bufferedPrompt of bufferedPrompts) {
-                  reservedQueueEntries.delete(bufferedPrompt);
-                }
-                queueLifecycleAttempts.delete(msg.id);
-                signalBusAgentRunnerHostFailure(applyError);
-              }
-              attempt.controlApplied = true;
-              await resumeQueueLifecycleAttempt(attempt, state);
-            } else {
-              await applyToRunningAgent(
-                runningAgent,
-                mergedEntry,
-                cancelledByRequestId,
-                state.activeRun,
-              );
-            }
-
-            logQueueTransition({
-              action: "apply_to_active",
-              queueDepthBefore,
-              queueDepthAfter: state.queue.length,
-              reason:
-                bufferedPrompts.length > 0
-                  ? `same_request_id_absorbed_${bufferedPrompts.length}`
-                  : "same_request_id",
-            });
-          } else {
-            // Prevent stale surface controls (e.g. Cancel button) from enqueueing behind
-            // an unrelated active request.
-            if (requestControl.requiresActive || requestControl.cancel) {
+            const logQueueTransition = (input: {
+              action: string;
+              queueDepthBefore: number;
+              queueDepthAfter: number;
+              reason?: string;
+              activeRequestId?: string | null;
+            }) => {
               logger.debug(
-                "dropping request message (requires active request id)",
+                "agent.queue.transition",
                 formatBridgeLogContext({
                   requestId,
                   sessionId,
-                  activeRequestId: state.activeRequestId,
-                  queue: entry.queue,
+                  requestClient,
+                  queueMode: entry.queue,
+                  running: state.running,
+                  queueDepthBefore: input.queueDepthBefore,
+                  queueDepthAfter: input.queueDepthAfter,
+                  action: input.action,
+                  reason: input.reason,
+                  activeRequestId: input.activeRequestId ?? state.activeRequestId,
+                  draining,
+                }),
+              );
+            };
+            const logQueuedBehindActiveRun = (queuedRequestId: string) => {
+              logger.info("request queued behind active run", {
+                requestId: queuedRequestId,
+                activeRequestId: state.activeRequestId,
+                queueDepth: state.queue.length,
+              });
+            };
+
+            const enqueueWithLifecycle = async (
+              queuedEntry: Enqueued,
+              detail: string,
+            ): Promise<ResultType<void, BusAgentRunnerOperationFailed>> => {
+              state.queue.push(queuedEntry);
+              const published = await captureBusAgentRunnerOperation(
+                "queued lifecycle publication",
+                () =>
+                  publishLifecycle({
+                    bus,
+                    headers: {
+                      request_id: queuedEntry.requestId,
+                      session_id: sessionId,
+                      request_client: queuedEntry.requestClient,
+                    },
+                    state: "queued",
+                    detail,
+                  }),
+              );
+              const publishError = published.match({
+                ok: () => null,
+                err: (error) => error,
+              });
+              if (publishError) {
+                removeQueuedEntriesByReference(state.queue, [queuedEntry]);
+                if (queuedEntry.identityOwner) {
+                  requestMessageCache.releaseOwner(queuedEntry.identityOwner);
+                }
+                return Result.err(publishError);
+              }
+              return Result.ok(undefined);
+            };
+            const terminalizeProjectedDelivery = async (
+              kind: "completed" | "cancelled" | "abandoned",
+              code: string,
+            ): Promise<boolean> => {
+              if (!entry.requestDeliveryId || !params.requestDelivery) return true;
+              const terminalized = await params.requestDelivery.terminalize({
+                requestDeliveryId: entry.requestDeliveryId,
+                outcome: { kind, code },
+                transportCommitRequired: true,
+              });
+              const terminalError = terminalized.match({
+                ok: () => null,
+                err: (error) => error,
+              });
+              if (!terminalError) return true;
+              intakeError = new BusAgentRunnerOperationFailed({
+                cause: terminalError,
+                operation: "request delivery projection terminalization",
+                failureKind: "other",
+                displayMessage: terminalError.message,
+                message: "Applied request delivery could not be terminalized",
+              });
+              return false;
+            };
+            const retainProjectedDeliveryUntilRunTerminal = (
+              kind: "completed" | "cancelled" | "abandoned",
+              code: string,
+              checkpoint:
+                | { readonly kind: "canonical" }
+                | {
+                    readonly kind: "queued";
+                    readonly inputId: AgentInputQueueId;
+                  }
+                | { readonly kind: "pending" } = { kind: "pending" },
+            ): void => {
+              if (!entry.requestDeliveryId || !params.requestDelivery || !state.activeRun) return;
+              if (!state.activeRun.retainedRequestDeliveries.has(entry.requestDeliveryId)) {
+                state.activeRun.retainedRequestDeliveries.set(entry.requestDeliveryId, {
+                  kind,
+                  code,
+                });
+                state.activeRun.storedMessages = [
+                  ...state.activeRun.storedMessages,
+                  ...entry.storedMessages,
+                ];
+              }
+              if (checkpoint.kind === "canonical") {
+                state.activeRun.checkpointedRetainedRequestDeliveryIds.add(entry.requestDeliveryId);
+                return;
+              }
+              if (checkpoint.kind === "queued") {
+                state.activeRun.retainedRequestDeliveryByInputId.set(
+                  checkpoint.inputId,
+                  entry.requestDeliveryId,
+                );
+              }
+            };
+
+            if (pendingAttempt) {
+              await resumeQueueLifecycleAttempt(pendingAttempt, state);
+              if (pendingAttempt.kind === "buffered-absorption") {
+                retainProjectedDeliveryUntilRunTerminal(
+                  "completed",
+                  "active-control-projection-recovered",
+                );
+              } else {
+                await terminalizeProjectedDelivery("completed", "control-projection-recovered");
+              }
+              return;
+            }
+
+            if (
+              !requestControl.cancel &&
+              shouldCancelRunPolicyRequest({
+                runPolicy: entry.runPolicy,
+                sessionId,
+                states: bySession,
+              })
+            ) {
+              await publishLifecycle({
+                bus,
+                headers: {
+                  request_id: requestId,
+                  session_id: sessionId,
+                  request_client: requestClient,
+                },
+                state: "cancelled",
+                detail:
+                  entry.runPolicy === "idle_only_session"
+                    ? "idle_only_session_busy"
+                    : "idle_only_global_busy",
+              });
+              logQueueTransition({
+                action: "drop",
+                queueDepthBefore: state.queue.length,
+                queueDepthAfter: state.queue.length,
+                reason:
+                  entry.runPolicy === "idle_only_session"
+                    ? "idle_only_session_busy"
+                    : "idle_only_global_busy",
+              });
+              await terminalizeProjectedDelivery("cancelled", "idle-run-policy-drop");
+              return;
+            }
+
+            if (draining) {
+              logger.debug(
+                "dropping request message while draining",
+                formatBridgeLogContext({
+                  requestId,
+                  sessionId,
+                  queue: deliveryData.queue,
                 }),
               );
               logQueueTransition({
                 action: "drop",
                 queueDepthBefore: state.queue.length,
                 queueDepthAfter: state.queue.length,
-                reason: "requires_active_different_request_id",
+                reason: "draining",
               });
+              await terminalizeProjectedDelivery("abandoned", "runner-draining-drop");
               return;
             }
 
-            // No parallel runs: queue prompt messages for later.
-            const queueDepthBefore = state.queue.length;
-            const owner = requestMessageCache.acquireOwner(requestId);
-            const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
-              err: (error) => () => {
-                identityError = error;
-                return null;
-              },
-              ok: (identityOwner) => () => identityOwner,
-            });
-            const identityOwner = selectOwner();
-            if (!identityOwner) return;
-            entry.identityOwner = identityOwner;
-            const enqueued = await enqueueWithLifecycle(entry, "queued behind active request");
-            const enqueueError = enqueued.match({ ok: () => null, err: (error) => error });
-            if (enqueueError) {
-              intakeError = enqueueError;
+            const dropCancelNoTarget = async (reason: string) => {
+              logger.debug(
+                "dropping cancel request with no target",
+                formatBridgeLogContext({
+                  requestId,
+                  sessionId,
+                  queue: entry.queue,
+                  activeRequestId: state.activeRequestId,
+                  reason,
+                }),
+              );
+              logQueueTransition({
+                action: "drop",
+                queueDepthBefore: state.queue.length,
+                queueDepthAfter: state.queue.length,
+                reason,
+              });
+              await terminalizeProjectedDelivery("abandoned", "control-target-absent");
+            };
+
+            if (requestControl.cancel && requestControl.cancelQueued) {
+              const matchedEntries: Enqueued[] = [];
+
+              for (const queued of state.queue) {
+                if (queued.requestId === requestId && !reservedQueueEntries.has(queued)) {
+                  matchedEntries.push(queued);
+                }
+              }
+
+              const targetMessageId = requestControl.targetMessageId;
+              if (targetMessageId) {
+                for (const queued of state.queue) {
+                  if (
+                    !matchedEntries.includes(queued) &&
+                    !reservedQueueEntries.has(queued) &&
+                    requestRawReferencesMessage(queued.raw, targetMessageId)
+                  ) {
+                    matchedEntries.push(queued);
+                  }
+                }
+              }
+
+              if (matchedEntries.length > 0) {
+                for (const queued of matchedEntries) reservedQueueEntries.add(queued);
+                const attempt: QueueLifecycleAttempt = {
+                  eventId: msg.id,
+                  controlRequestId: requestId,
+                  controlRequestClient: requestClient,
+                  sessionId,
+                  kind: "queued-cancellation",
+                  detail: "cancelled while queued",
+                  pendingGroups: groupQueueCancellationEntries(matchedEntries),
+                  controlApplied: true,
+                };
+                queueLifecycleAttempts.set(msg.id, attempt);
+                await resumeQueueLifecycleAttempt(attempt, state);
+
+                logger.debug("queued request cancelled", {
+                  requestId,
+                  sessionId,
+                  cancelledRequestIds: [
+                    ...new Set(matchedEntries.map((queued) => queued.requestId)),
+                  ],
+                  queueDepth: state.queue.length,
+                });
+                logQueueTransition({
+                  action: "cancel_queued",
+                  queueDepthBefore: state.queue.length + matchedEntries.length,
+                  queueDepthAfter: state.queue.length,
+                  reason: "cancel_queued",
+                });
+
+                await terminalizeProjectedDelivery("completed", "queued-cancel-applied");
+                return;
+              }
+
+              const targetMessageIdForActive = requestControl.targetMessageId;
+              const targetMatchesActive =
+                typeof targetMessageIdForActive === "string" &&
+                requestRawReferencesMessage(state.activeRun?.raw, targetMessageIdForActive);
+
+              if (
+                !state.running ||
+                !state.activeRequestId ||
+                (!state.agent && !state.activeRun?.cancel)
+              ) {
+                await dropCancelNoTarget("request not queued or active");
+                return;
+              }
+
+              if (state.activeRequestId === requestId || targetMatchesActive) {
+                const activeCancelEntry: Enqueued = {
+                  ...entry,
+                  requestId: state.activeRequestId,
+                  requestClient: state.activeRun?.requestClient ?? entry.requestClient,
+                };
+                if (state.activeRun?.started === false) {
+                  state.activeRun.cancel();
+                } else if (state.agent) {
+                  await applyToRunningAgent(
+                    state.agent,
+                    activeCancelEntry,
+                    cancelledByRequestId,
+                    state.activeRun,
+                    (checkpoint) =>
+                      retainProjectedDeliveryUntilRunTerminal(
+                        "completed",
+                        "active-cancel-applied",
+                        checkpoint,
+                      ),
+                  );
+                }
+                logQueueTransition({
+                  action: "apply_to_active",
+                  queueDepthBefore: state.queue.length,
+                  queueDepthAfter: state.queue.length,
+                  reason: targetMatchesActive
+                    ? "cancel_active_by_message_id"
+                    : "cancel_active_by_request_id",
+                });
+                if (state.activeRun?.started === false) {
+                  retainProjectedDeliveryUntilRunTerminal("completed", "active-cancel-applied");
+                }
+                return;
+              }
+
+              await dropCancelNoTarget("request not queued or active");
               return;
             }
 
-            logQueuedBehindActiveRun(requestId);
-            logQueueTransition({
-              action: "enqueue",
-              queueDepthBefore,
-              queueDepthAfter: state.queue.length,
-              reason: "queued_behind_active",
-            });
+            if (!state.running) {
+              if (requestControl.cancel) {
+                await dropCancelNoTarget("request not active");
+                return;
+              }
+
+              // Some messages only make sense when a run is already active.
+              if (requestControl.requiresActive && entry.queue !== "prompt") {
+                logger.debug(
+                  "dropping request message (requires active run)",
+                  formatBridgeLogContext({
+                    requestId,
+                    sessionId,
+                    queue: entry.queue,
+                  }),
+                );
+                logQueueTransition({
+                  action: "drop",
+                  queueDepthBefore: state.queue.length,
+                  queueDepthAfter: state.queue.length,
+                  reason: "requires_active_without_run",
+                });
+                await terminalizeProjectedDelivery("abandoned", "active-run-required");
+                return;
+              }
+
+              const queueDepthBefore = state.queue.length;
+              const owner = requestMessageCache.acquireOwner(requestId);
+              const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
+                err: (error) => () => {
+                  identityError = error;
+                  return null;
+                },
+                ok: (identityOwner) => () => identityOwner,
+              });
+              const identityOwner = selectOwner();
+              if (!identityOwner) return;
+              entry.identityOwner = identityOwner;
+              state.queue.push(entry);
+              logQueueTransition({
+                action: "enqueue",
+                queueDepthBefore,
+                queueDepthAfter: state.queue.length,
+                reason: "start_when_idle",
+              });
+              startSessionQueueDrain(sessionId, state, requestId);
+            } else {
+              if (
+                state.activeRequestId === requestId &&
+                requestControl.cancel &&
+                state.activeRun?.started === false &&
+                state.activeRun?.cancel
+              ) {
+                state.activeRun.cancel();
+                logQueueTransition({
+                  action: "apply_to_active",
+                  queueDepthBefore: state.queue.length,
+                  queueDepthAfter: state.queue.length,
+                  reason: "cancel_active_before_agent_start",
+                });
+                retainProjectedDeliveryUntilRunTerminal("completed", "active-cancel-applied");
+                return;
+              }
+
+              if (
+                state.activeRequestId === requestId &&
+                !requestControl.cancel &&
+                state.activeRun?.runProfile === "primary"
+              ) {
+                const activeRun = state.activeRun;
+                const incomingOverride =
+                  entry.modelOverride ?? parseRequestModelOverrideFromRaw(entry.raw) ?? undefined;
+                let incompatible =
+                  activeRun.resolvedModelSpec === null &&
+                  incomingOverride !== undefined &&
+                  incomingOverride !== activeRun.modelOverride;
+                if (
+                  incomingOverride !== undefined &&
+                  activeRun.resolvedModelSpec !== null &&
+                  activeRun.resolvedProviderFamily !== null
+                ) {
+                  const activeSpec = activeRun.resolvedModelSpec;
+                  const activeFamily = activeRun.resolvedProviderFamily;
+                  const requestedPlan = resolveAgentRunModelResult({
+                    cfg,
+                    runProfile: "primary",
+                    requestModelOverride: incomingOverride,
+                  });
+                  incompatible = requestedPlan.match({
+                    ok: (plan) =>
+                      shouldQueueIncompatibleActiveRuntimeModel({
+                        activeSpec,
+                        activeReasoning: activeRun.resolvedReasoning,
+                        activeFamily,
+                        requested: plan.head,
+                      }),
+                    err: () => true,
+                  });
+                }
+                if (incompatible) {
+                  const aliasRequestId = deriveModelChangingRequestId(entry);
+                  const aliased = requestMessageCache.createAliasOwner({
+                    sourceRequestId: requestId,
+                    aliasRequestId,
+                    requestClient,
+                    sessionId,
+                  });
+                  const selectAlias = aliased.match<() => RequestMessageCacheAliasOwner | null>({
+                    err: (error) => () => {
+                      identityError = error;
+                      return null;
+                    },
+                    ok: (aliasOwner) => () => aliasOwner,
+                  });
+                  const alias = selectAlias();
+                  if (!alias) return;
+                  const aliasProjection = alias.projection;
+                  const queuedEntry: Enqueued = {
+                    ...entry,
+                    requestId: aliasProjection.requestId,
+                    sessionId: aliasProjection.sessionId,
+                    requestClient: aliasProjection.requestClient,
+                    queue: "prompt",
+                    authenticatedOrigin: aliasProjection.authenticatedOrigin,
+                    verifiedIngress: aliasProjection.verifiedIngress,
+                    identityOwner: {
+                      requestId: alias.requestId,
+                      ownerId: alias.ownerId,
+                    },
+                  };
+                  if (acceptedRecord && params.requestDelivery) {
+                    const projectedWork = {
+                      ...acceptedRecord.work,
+                      requestId: aliasProjection.requestId,
+                      sessionId: aliasProjection.sessionId,
+                      requestClient: aliasProjection.requestClient,
+                      headers: {
+                        ...acceptedRecord.work.headers,
+                        request_id: aliasProjection.requestId,
+                        session_id: aliasProjection.sessionId,
+                        request_client: aliasProjection.requestClient,
+                      },
+                      data: {
+                        ...acceptedRecord.work.data,
+                        queue: "prompt" as const,
+                      },
+                    } satisfies CoreAcceptedRequestWork;
+                    const replaced = params.requestDelivery.replaceAcceptedWork({
+                      requestDeliveryId: acceptedRecord.requestDeliveryId,
+                      requestId: projectedWork.requestId,
+                      work: projectedWork,
+                    });
+                    const replaceError = replaced.match({
+                      ok: () => null,
+                      err: (error) => error,
+                    });
+                    if (replaceError) {
+                      requestMessageCache.releaseOwner({
+                        requestId: alias.requestId,
+                        ownerId: alias.ownerId,
+                      });
+                      intakeError = new BusAgentRunnerOperationFailed({
+                        operation: "durable incompatible-model queue projection",
+                        cause: replaceError,
+                        failureKind: "other",
+                        displayMessage: replaceError.message,
+                        message: "Incompatible-model queue projection could not be persisted",
+                      });
+                      return;
+                    }
+                  }
+                  const queueDepthBefore = state.queue.length;
+                  const enqueued = await enqueueWithLifecycle(
+                    queuedEntry,
+                    "queued for incompatible model or reasoning selection",
+                  );
+                  const enqueueError = enqueued.match({
+                    ok: () => null,
+                    err: (error) => error,
+                  });
+                  if (enqueueError) {
+                    intakeError = enqueueError;
+                    return;
+                  }
+                  logQueueTransition({
+                    action: "enqueue",
+                    queueDepthBefore,
+                    queueDepthAfter: state.queue.length,
+                    reason: "incompatible_active_model",
+                  });
+                  logQueuedBehindActiveRun(queuedEntry.requestId);
+                  return;
+                }
+              }
+
+              // If the message is intended for the currently active request, apply immediately.
+              if (state.activeRequestId && state.activeRequestId === requestId && state.agent) {
+                const runningAgent = state.agent;
+                const queueDepthBefore = state.queue.length;
+                const shouldAbsorbBufferedPrompts =
+                  (entry.queue === "steer" || entry.queue === "interrupt") &&
+                  !isCancelControlEntry(entry);
+
+                const bufferedPrompts = shouldAbsorbBufferedPrompts
+                  ? collectBufferedPromptEntriesForActiveRequest({
+                      queue: state.queue,
+                      activeRequestId: requestId,
+                    }).filter((queued) => !reservedQueueEntries.has(queued))
+                  : [];
+
+                const mergedEntry =
+                  bufferedPrompts.length > 0
+                    ? ({
+                        ...entry,
+                        messages: [
+                          ...bufferedPrompts.flatMap((queuedPrompt) => queuedPrompt.messages),
+                          ...entry.messages,
+                        ],
+                        storedMessages: [
+                          ...bufferedPrompts.flatMap((queuedPrompt) => queuedPrompt.storedMessages),
+                          ...entry.storedMessages,
+                        ],
+                        corePrimaryLineage: degradeCorePrimaryLineageForMutation(
+                          "queued-buffer-absorbed-into-steering",
+                          runningAgent.state.messages.length,
+                        ),
+                      } satisfies Enqueued)
+                    : entry;
+
+                if (bufferedPrompts.length > 0) {
+                  const absorbMode: "steer" | "interrupt" =
+                    entry.queue === "interrupt" ? "interrupt" : "steer";
+                  for (const bufferedPrompt of bufferedPrompts) {
+                    reservedQueueEntries.add(bufferedPrompt);
+                  }
+                  const attempt: QueueLifecycleAttempt = {
+                    eventId: msg.id,
+                    controlRequestId: requestId,
+                    controlRequestClient: requestClient,
+                    sessionId,
+                    kind: "buffered-absorption",
+                    detail:
+                      absorbMode === "interrupt"
+                        ? "cancelled: absorbed into active interrupt"
+                        : "cancelled: absorbed into active steer",
+                    pendingGroups: groupQueueCancellationEntries(bufferedPrompts),
+                    controlApplied: false,
+                  };
+                  queueLifecycleAttempts.set(msg.id, attempt);
+                  const applied = await captureBusAgentRunnerOperation(
+                    "buffered prompt control application",
+                    () =>
+                      applyToRunningAgent(
+                        runningAgent,
+                        mergedEntry,
+                        cancelledByRequestId,
+                        state.activeRun,
+                        (checkpoint) =>
+                          retainProjectedDeliveryUntilRunTerminal(
+                            "completed",
+                            "active-input-applied",
+                            checkpoint,
+                          ),
+                      ),
+                  );
+                  const applyError = applied.match({
+                    ok: () => null,
+                    err: (error) => error,
+                  });
+                  if (applyError) {
+                    for (const bufferedPrompt of bufferedPrompts) {
+                      reservedQueueEntries.delete(bufferedPrompt);
+                    }
+                    queueLifecycleAttempts.delete(msg.id);
+                    signalBusAgentRunnerHostFailure(applyError);
+                  }
+                  attempt.controlApplied = true;
+                  await resumeQueueLifecycleAttempt(attempt, state);
+                } else {
+                  await applyToRunningAgent(
+                    runningAgent,
+                    mergedEntry,
+                    cancelledByRequestId,
+                    state.activeRun,
+                    (checkpoint) =>
+                      retainProjectedDeliveryUntilRunTerminal(
+                        "completed",
+                        "active-input-applied",
+                        checkpoint,
+                      ),
+                  );
+                }
+
+                logQueueTransition({
+                  action: "apply_to_active",
+                  queueDepthBefore,
+                  queueDepthAfter: state.queue.length,
+                  reason:
+                    bufferedPrompts.length > 0
+                      ? `same_request_id_absorbed_${bufferedPrompts.length}`
+                      : "same_request_id",
+                });
+              } else {
+                // Prevent stale surface controls (e.g. Cancel button) from enqueueing behind
+                // an unrelated active request.
+                if (requestControl.requiresActive || requestControl.cancel) {
+                  logger.debug(
+                    "dropping request message (requires active request id)",
+                    formatBridgeLogContext({
+                      requestId,
+                      sessionId,
+                      activeRequestId: state.activeRequestId,
+                      queue: entry.queue,
+                    }),
+                  );
+                  logQueueTransition({
+                    action: "drop",
+                    queueDepthBefore: state.queue.length,
+                    queueDepthAfter: state.queue.length,
+                    reason: "requires_active_different_request_id",
+                  });
+                  await terminalizeProjectedDelivery("abandoned", "active-request-mismatch");
+                  return;
+                }
+
+                // No parallel runs: queue prompt messages for later.
+                const queueDepthBefore = state.queue.length;
+                const owner = requestMessageCache.acquireOwner(requestId);
+                const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
+                  err: (error) => () => {
+                    identityError = error;
+                    return null;
+                  },
+                  ok: (identityOwner) => () => identityOwner,
+                });
+                const identityOwner = selectOwner();
+                if (!identityOwner) return;
+                entry.identityOwner = identityOwner;
+                const enqueued = await enqueueWithLifecycle(entry, "queued behind active request");
+                const enqueueError = enqueued.match({
+                  ok: () => null,
+                  err: (error) => error,
+                });
+                if (enqueueError) {
+                  intakeError = enqueueError;
+                  return;
+                }
+
+                logQueuedBehindActiveRun(requestId);
+                logQueueTransition({
+                  action: "enqueue",
+                  queueDepthBefore,
+                  queueDepthAfter: state.queue.length,
+                  reason: "queued_behind_active",
+                });
+              }
+            }
+          })();
+          if (intakeError) {
+            parkPending = true;
+            return {
+              status: "return",
+              value: Result.err(
+                new BusAgentRunnerIntakeFailed({
+                  cause: intakeError,
+                  message: "cmd.request.message intake failed",
+                }),
+              ),
+            } as const;
           }
-        }
-      })();
-      if (intakeError) {
-        parkPending = true;
+          if (identityError) {
+            return {
+              status: "return",
+              value: Result.err(
+                new BusAgentRunnerAuthenticationProjectionInvalid({
+                  cause: identityError,
+                  message: "cmd.request.message identity ownership is invalid",
+                }),
+              ),
+            } as const;
+          }
+          return { status: "return", value: Result.ok(undefined) } as const;
+        },
+        catch: (cause) =>
+          Panic.is(cause)
+            ? ({ kind: "panic", panic: cause } as const)
+            : ({
+                kind: "failure",
+                error: new BusAgentRunnerIntakeFailed({
+                  cause,
+                  message: "cmd.request.message intake failed",
+                }),
+              } as const),
+      });
+      const outcome = attempted.match<
+        | {
+            readonly kind: "success";
+            readonly operation: import("better-result").InferOk<typeof attempted>;
+          }
+        | { readonly kind: "panic"; readonly panic: Panic }
+        | {
+            readonly kind: "failure";
+            readonly error: BusAgentRunnerIntakeFailed;
+          }
+      >({
+        ok: (operation) => ({ kind: "success", operation }),
+        err: (failure) => failure,
+      });
+      if (outcome.kind === "panic") {
+        rethrowBusAgentRunnerPanic(outcome.panic);
         return Result.err(
           new BusAgentRunnerIntakeFailed({
-            cause: intakeError,
+            cause: outcome.panic,
             message: "cmd.request.message intake failed",
           }),
         );
       }
-      if (identityError) {
-        return Result.err(
-          new BusAgentRunnerAuthenticationProjectionInvalid({
-            cause: identityError,
-            message: "cmd.request.message identity ownership is invalid",
-          }),
-        );
+      if (outcome.kind === "failure") {
+        parkPending = true;
+        return Result.err(outcome.error);
       }
-      return Result.ok(undefined);
-    } catch (cause) {
-      rethrowBusAgentRunnerPanic(cause);
-      parkPending = true;
-      return Result.err(
-        new BusAgentRunnerIntakeFailed({
-          cause,
-          message: "cmd.request.message intake failed",
-        }),
-      );
-    } finally {
+      return outcome.operation.value;
+    })().finally(() => {
       if (!parkPending) abandonQueueLifecycleAttempt(msg.id);
       if (cacheAdmitted) {
         requestMessageCache.finishDelivery({
@@ -3541,17 +4616,25 @@ export async function startBusAgentRunner(params: {
           disposition: parkPending ? "park" : "release",
         });
       }
-    }
+    });
+    return intakeResult.match<() => Promise<ResultType<void, BusAgentRunnerDeliveryError>>>({
+      ok: () => async () => Result.ok(undefined),
+      err: (error) => () => reconcileAcceptedProjectionFailure(error),
+    })();
   }
 
   let stopStartedSubscription: (() => Promise<void>) | null = null;
   let subscriptionStart: Promise<void> | null = null;
-  const superviseAgentRunnerBackgroundFailure = (cause: unknown): void => {
+  const superviseAgentRunnerBackgroundFailure = <Cause>(cause: Cause): void => {
     rethrowBusAgentRunnerPanic(cause, reportFatalPanic);
     const error = projectBusAgentRunnerError(cause, "agent runner background operation failed");
-    logger.error("agent runner background operation failed", { error: error.message });
+    logger.error("agent runner background operation failed", {
+      error: error.message,
+    });
   };
-  const observeSupervisedSubscriptionDoneRejection = (): void => undefined;
+  const ignoreDetachedFailure = async (operation: Promise<unknown>): Promise<void> => {
+    await Result.tryPromise({ try: () => operation, catch: () => undefined });
+  };
   const isRunnerAdmissionStop = (error: EventDeliveryStopped): boolean =>
     runnerAdmissionStopped && error.reason === "requested";
   const startSubscription = (): Promise<void> => {
@@ -3587,10 +4670,20 @@ export async function startBusAgentRunner(params: {
           },
         })();
       });
-      const supervisedSubscriptionDone = subscriptionDone.catch(
-        superviseAgentRunnerBackgroundFailure,
-      );
-      void supervisedSubscriptionDone.catch(observeSupervisedSubscriptionDoneRejection);
+      const supervisedSubscriptionDone = superviseSubscriptionDone();
+      void ignoreDetachedFailure(supervisedSubscriptionDone);
+
+      async function superviseSubscriptionDone(): Promise<void> {
+        const completed = await Result.tryPromise({
+          try: () => subscriptionDone,
+          catch: captureError,
+        });
+        const failure = completed.match({
+          ok: () => null,
+          err: ({ cause }) => ({ cause }),
+        });
+        if (failure) superviseAgentRunnerBackgroundFailure(failure.cause);
+      }
       stopStartedSubscription = async () => {
         const stopped = await sub.stop();
         stopped.match({
@@ -3618,603 +4711,26 @@ export async function startBusAgentRunner(params: {
     await stopStartedSubscription?.();
   };
 
-  function buildRecoveryIdentity(input: {
-    readonly requestId: string;
-    readonly requestClient: AdapterPlatform;
-    readonly sessionId: string;
-  }): AgentRunnerRecoveryIdentity {
-    const projection = requestMessageCache.getOrigin(input.requestId);
-    if (!projection) return { state: "restricted", reason: "missing-cache-proof" };
-    const cacheState = requestMessageCache.snapshot(input.requestId);
-    let safetyMode: SessionSafetyMode =
-      projection.source === "external"
-        ? currentSurfaceSafetyMode({
-            platform: projection.requestClient,
-            sessionId: input.sessionId,
-            verifiedIngress: projection.verifiedIngress,
-          })
-        : "restricted";
-    if (projection.source === "internal-delegated") {
-      const authorized = params.durableWorkflowStore?.authorizeWorkflowRequest({
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        platform: input.requestClient,
-      });
-      if (!authorized) return { state: "restricted", reason: "missing-cache-proof" };
-      return {
-        state: "durable",
-        projection,
-        assertedSafetyMode: safetyMode,
-        parkedEventIds: cacheState?.parkedEventIds ?? [],
-        delegationProof: {
-          kind: "workflow",
-          runId: authorized.policy.runId,
-          operationId: authorized.policy.operationId,
-          dispatchEpoch: authorized.policy.dispatchEpoch,
-        },
-      };
-    }
-    return {
-      state: "durable",
-      projection,
-      assertedSafetyMode: safetyMode,
-      parkedEventIds: cacheState?.parkedEventIds ?? [],
-    };
-  }
-
-  function buildActiveRecoveryEntry(state: SessionQueue): AgentRunnerRecoveryEntry | null {
-    if (!state.running || !state.activeRun) return null;
-
-    if (!state.agent) {
-      return {
-        queueEntryId: `active:${state.activeRun.requestId}`,
-        kind: "active",
-        requestId: state.activeRun.requestId,
-        sessionId: state.activeRun.sessionId,
-        requestClient: state.activeRun.requestClient,
-        queue: "prompt",
-        runPolicy: state.activeRun.runPolicy,
-        origin: state.activeRun.origin,
-        messages: state.activeRun.messages,
-        corePrimaryLineage: state.activeRun.corePrimaryLineage,
-        ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
-        currentTurnUserId: state.activeRun.currentTurnUserId,
-        raw: state.activeRun.raw,
-        identity: buildRecoveryIdentity(state.activeRun),
-      };
-    }
-
-    const checkpointMessages = buildSafeRecoveryCheckpoint(
-      state.agent.getRecoverableMessages(),
-      "server restarted",
-    );
-
-    return {
-      queueEntryId: `active:${state.activeRun.requestId}`,
-      kind: "active",
-      requestId: state.activeRun.requestId,
-      sessionId: state.activeRun.sessionId,
-      requestClient: state.activeRun.requestClient,
-      queue: "prompt",
-      runPolicy: state.activeRun.runPolicy,
-      origin: state.activeRun.origin,
-      messages: [],
-      corePrimaryLineage: degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint"),
-      ...(state.activeRun.modelOverride ? { modelOverride: state.activeRun.modelOverride } : {}),
-      currentTurnUserId: state.activeRun.currentTurnUserId,
-      raw: state.activeRun.raw,
-      identity: buildRecoveryIdentity(state.activeRun),
-      recovery: {
-        checkpointMessages,
-        partialText: state.activeRun.partialText,
-      },
-    };
-  }
-
   async function beginDrain(opts?: { deadlineMs?: number }) {
     draining = true;
     await stopSubscription();
 
     const deadlineMs = Math.max(1, opts?.deadlineMs ?? 3_000);
     const startedAt = Date.now();
-
-    const hasRunning = () => [...bySession.values()].some((s) => s.running);
+    const hasRunning = () => [...bySession.values()].some((state) => state.running);
 
     while (hasRunning() && Date.now() - startedAt < deadlineMs) {
-      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
-
     if (!hasRunning()) return;
 
     for (const state of bySession.values()) {
       if (!state.running || !state.activeRun) continue;
-
-      const recovery = buildActiveRecoveryEntry(state);
-      if (recovery) {
-        forcedRecoveryByRequestId.set(recovery.requestId, recovery);
-        restartAbortRequestIds.add(recovery.requestId);
-      }
-
+      shutdownAbortRequestIds.add(state.activeRun.requestId);
       state.agent?.abort();
     }
 
-    await new Promise((r) => setTimeout(r, 150));
-  }
-
-  function snapshotRecoverables(): AgentRunnerRecoveryEntry[] {
-    const out: AgentRunnerRecoveryEntry[] = [];
-    const seenActive = new Set<string>();
-
-    for (const forced of forcedRecoveryByRequestId.values()) {
-      out.push(forced);
-      seenActive.add(forced.requestId);
-    }
-
-    for (const state of bySession.values()) {
-      const active = buildActiveRecoveryEntry(state);
-      if (active && !seenActive.has(active.requestId)) {
-        out.push(active);
-        seenActive.add(active.requestId);
-      }
-
-      for (const queued of state.queue) {
-        out.push({
-          queueEntryId: queued.queueEntryId,
-          kind: "queued",
-          requestId: queued.requestId,
-          sessionId: queued.sessionId,
-          requestClient: queued.requestClient,
-          queue: queued.queue,
-          runPolicy: queued.runPolicy,
-          origin: queued.origin,
-          messages: queued.messages,
-          corePrimaryLineage: queued.corePrimaryLineage,
-          ...(queued.modelOverride ? { modelOverride: queued.modelOverride } : {}),
-          currentTurnUserId: queued.currentTurnUserId,
-          raw: queued.raw,
-          identity: buildRecoveryIdentity(queued),
-        });
-      }
-    }
-
-    return out;
-  }
-
-  function snapshotQueueAttempts(): AgentRunnerQueueAttempt[] {
-    return [...queueLifecycleAttempts.values()].map((attempt) => ({
-      eventId: attempt.eventId,
-      controlRequestId: attempt.controlRequestId,
-      controlRequestClient: attempt.controlRequestClient,
-      sessionId: attempt.sessionId,
-      kind: attempt.kind,
-      detail: attempt.detail,
-      controlApplied: attempt.controlApplied,
-      controlIdentity: buildRecoveryIdentity({
-        requestId: attempt.controlRequestId,
-        requestClient: attempt.controlRequestClient,
-        sessionId: attempt.sessionId,
-      }),
-      pendingGroups: attempt.pendingGroups.map((group, publicationIndex) => ({
-        publicationIndex,
-        requestId: group.requestId,
-        requestClient: group.requestClient,
-        targetQueueEntryIds: group.entries.map((entry) => entry.queueEntryId),
-      })),
-    }));
-  }
-
-  function sameRestoredOrigin(
-    left: AuthenticatedSurfaceOrigin | undefined,
-    right: AuthenticatedSurfaceOrigin | undefined,
-  ): boolean {
-    if (!left || !right) return left === right;
-    return (
-      left.platform === right.platform &&
-      left.userId === right.userId &&
-      left.sessionRef.channelId === right.sessionRef.channelId &&
-      left.messageRef?.messageId === right.messageRef?.messageId
-    );
-  }
-
-  function currentSurfaceSafetyMode(input: {
-    readonly platform: AdapterPlatform;
-    readonly sessionId: string;
-    readonly verifiedIngress: boolean;
-  }): SessionSafetyMode {
-    let assertedSafetyMode: SessionSafetyMode = "restricted";
-    if (input.platform === "discord") {
-      const parentResolution = params.resolveParentChannelId?.(input.sessionId);
-      if (parentResolution !== undefined) {
-        assertedSafetyMode = resolveSessionSafetyMode(
-          cfg,
-          input.sessionId,
-          parentResolution ?? undefined,
-        );
-      }
-    }
-    return resolveAuthenticatedRequestSafetyMode({
-      projection: {
-        requestClient: input.platform,
-        source: "external",
-        verifiedIngress: input.verifiedIngress,
-      },
-      assertedSafetyMode,
-      correlatedAuthority: true,
-    });
-  }
-
-  function resolveRecoveryIdentity(input: {
-    readonly requestId: string;
-    readonly sessionId: string;
-    readonly requestClient: AdapterPlatform;
-    readonly identity: AgentRunnerRecoveryIdentity | undefined;
-  }): ResultType<
-    {
-      readonly projection?: AuthenticatedRequestProjection;
-      readonly safetyMode: SessionSafetyMode;
-      readonly parkedEventIds: readonly string[];
-    },
-    AgentRecoveryUnavailable
-  > {
-    const identity = input.identity;
-    if (!identity || identity.state === "restricted") {
-      return Result.ok({ safetyMode: "restricted", parkedEventIds: [] });
-    }
-    const projection = identity.projection;
-    if (
-      projection.requestId !== input.requestId ||
-      projection.requestClient !== input.requestClient ||
-      projection.sessionId !== input.sessionId ||
-      !isAuthenticatedRequestProjectionSemanticallyValid(projection)
-    ) {
-      return Result.err(
-        new AgentRecoveryUnavailable({
-          requestId: input.requestId,
-          reason: "identity-conflict",
-          message: "Persisted recovery identity conflicts with its request route",
-        }),
-      );
-    }
-    if (projection.source === "internal-delegated") {
-      const proof = identity.delegationProof;
-      const authorized = params.durableWorkflowStore?.authorizeWorkflowRequest({
-        requestId: input.requestId,
-        sessionId: input.sessionId,
-        platform: input.requestClient,
-      });
-      if (
-        !proof ||
-        !authorized ||
-        authorized.policy.runId !== proof.runId ||
-        authorized.policy.operationId !== proof.operationId ||
-        authorized.policy.dispatchEpoch !== proof.dispatchEpoch
-      ) {
-        return Result.err(
-          new AgentRecoveryUnavailable({
-            requestId: input.requestId,
-            reason: "delegation-proof-unavailable",
-            message: "Persisted delegated recovery proof is unavailable or stale",
-          }),
-        );
-      }
-      const origin = authorized.policy.originSession;
-      const authenticatedOrigin = projectAuthorizedWorkflowOrigin(origin);
-      if (!sameRestoredOrigin(projection.authenticatedOrigin, authenticatedOrigin)) {
-        return Result.err(
-          new AgentRecoveryUnavailable({
-            requestId: input.requestId,
-            reason: "identity-conflict",
-            message: "Persisted delegated identity conflicts with durable workflow authority",
-          }),
-        );
-      }
-      const safetyMode = "restricted" as const;
-      if (identity.assertedSafetyMode !== safetyMode) {
-        return Result.err(
-          new AgentRecoveryUnavailable({
-            requestId: input.requestId,
-            reason: "identity-conflict",
-            message: "Persisted delegated safety assertion is not durably authorized",
-          }),
-        );
-      }
-      return Result.ok({
-        projection: { ...projection, authenticatedOrigin, verifiedIngress: false },
-        safetyMode,
-        parkedEventIds: identity.parkedEventIds,
-      });
-    }
-    const safetyMode = currentSurfaceSafetyMode({
-      platform: projection.requestClient,
-      sessionId: projection.sessionId,
-      verifiedIngress: projection.verifiedIngress,
-    });
-    if (identity.assertedSafetyMode !== safetyMode) {
-      return Result.err(
-        new AgentRecoveryUnavailable({
-          requestId: input.requestId,
-          reason: "identity-conflict",
-          message: "Persisted safety assertion conflicts with current surface policy",
-        }),
-      );
-    }
-    return Result.ok({
-      projection,
-      safetyMode,
-      parkedEventIds: identity.parkedEventIds,
-    });
-  }
-
-  function prepareRecovery(
-    recoveryState: AgentRunnerRecoveryState,
-  ): ResultType<AgentRecoveryAttempt, AgentRecoveryUnavailable> {
-    const queueEntries = new Map<string, AgentRunnerRecoveryEntry>();
-    const resolvedIdentities = new Map<
-      string,
-      {
-        readonly projection?: AuthenticatedRequestProjection;
-        readonly safetyMode: SessionSafetyMode;
-        readonly parkedEventIds: readonly string[];
-      }
-    >();
-    const cacheRecords: Array<{
-      readonly projection: AuthenticatedRequestProjection;
-      readonly parkedEventIds: readonly string[];
-    }> = [];
-    for (const entry of recoveryState.entries) {
-      const queueEntryId = entry.queueEntryId;
-      if (!queueEntryId || queueEntries.has(queueEntryId) || bySession.has(entry.sessionId)) {
-        return Result.err(
-          new AgentRecoveryUnavailable({
-            requestId: entry.requestId,
-            reason: "queue-admission-conflict",
-            message: "Persisted recovery queue admission conflicts with active state",
-          }),
-        );
-      }
-      queueEntries.set(queueEntryId, entry);
-      const resolved = resolveRecoveryIdentity({
-        requestId: entry.requestId,
-        sessionId: entry.sessionId,
-        requestClient: entry.requestClient,
-        identity: entry.identity,
-      });
-      const continueResolved = resolved.match<() => AgentRecoveryUnavailable | null>({
-        err: (error) => () => error,
-        ok: (identity) => () => {
-          resolvedIdentities.set(queueEntryId, identity);
-          if (identity.projection) {
-            cacheRecords.push({
-              projection: identity.projection,
-              parkedEventIds: identity.parkedEventIds,
-            });
-          }
-          return null;
-        },
-      });
-      const resolveError = continueResolved();
-      if (resolveError) return Result.err(resolveError);
-    }
-
-    const reservedIds = new Set<string>();
-    const attemptEventIds = new Set<string>();
-    for (const attempt of recoveryState.queueAttempts) {
-      if (
-        attemptEventIds.has(attempt.eventId) ||
-        queueEntries.has(attempt.eventId) ||
-        queueLifecycleAttempts.has(attempt.eventId)
-      ) {
-        return Result.err(
-          new AgentRecoveryUnavailable({
-            requestId: attempt.controlRequestId,
-            reason: "queue-attempt-conflict",
-            message: "Persisted control delivery event identity is duplicated",
-          }),
-        );
-      }
-      attemptEventIds.add(attempt.eventId);
-      const control = resolveRecoveryIdentity({
-        requestId: attempt.controlRequestId,
-        sessionId: attempt.sessionId,
-        requestClient: attempt.controlRequestClient,
-        identity: attempt.controlIdentity,
-      });
-      const continueControl = control.match<() => AgentRecoveryUnavailable | null>({
-        err: (error) => () => error,
-        ok: (controlIdentity) => () => {
-          if (
-            !controlIdentity.projection ||
-            !controlIdentity.parkedEventIds.includes(attempt.eventId) ||
-            (attempt.kind === "queued-cancellation" && !attempt.controlApplied)
-          ) {
-            return new AgentRecoveryUnavailable({
-              requestId: attempt.controlRequestId,
-              reason: "queue-attempt-conflict",
-              message: "Persisted control delivery ownership is incomplete",
-            });
-          }
-          cacheRecords.push({
-            projection: controlIdentity.projection,
-            parkedEventIds: controlIdentity.parkedEventIds,
-          });
-          return null;
-        },
-      });
-      const controlError = continueControl();
-      if (controlError) return Result.err(controlError);
-      for (const group of attempt.pendingGroups) {
-        for (const queueEntryId of group.targetQueueEntryIds) {
-          const target = queueEntries.get(queueEntryId);
-          if (
-            !target ||
-            reservedIds.has(queueEntryId) ||
-            target.kind !== "queued" ||
-            target.requestId !== group.requestId ||
-            target.requestClient !== group.requestClient ||
-            target.sessionId !== attempt.sessionId
-          ) {
-            return Result.err(
-              new AgentRecoveryUnavailable({
-                requestId: attempt.controlRequestId,
-                reason: "queue-attempt-conflict",
-                message: "Persisted queue reservation conflicts with its target entry",
-              }),
-            );
-          }
-          reservedIds.add(queueEntryId);
-        }
-      }
-    }
-    const cacheAttempt = requestMessageCache.prepareRestore(cacheRecords);
-    const selectRestoreCache = cacheAttempt.match<() => RequestMessageCacheRestoreAttempt | null>({
-      err: () => () => null,
-      ok: (attempt) => () => attempt,
-    });
-    const restoreCache = selectRestoreCache();
-    if (!restoreCache) {
-      return Result.err(
-        new AgentRecoveryUnavailable({
-          requestId: recoveryState.entries[0]?.requestId ?? "recovery",
-          reason: "cache-conflict",
-          message: "Persisted recovery identity conflicts with request cache state",
-        }),
-      );
-    }
-
-    const inserted = new Map<string, Enqueued>();
-    const owners: RequestMessageCacheOwner[] = [];
-    const sessions = new Set<string>();
-    let applied = false;
-    let activated = false;
-    const rollback = (): void => {
-      if (!applied || activated) return;
-      for (const attempt of recoveryState.queueAttempts) {
-        queueLifecycleAttempts.delete(attempt.eventId);
-      }
-      for (const queued of inserted.values()) reservedQueueEntries.delete(queued);
-      for (const sessionId of sessions) bySession.delete(sessionId);
-      for (const owner of owners) requestMessageCache.releaseOwner(owner);
-      restoreCache.rollback();
-      inserted.clear();
-      owners.length = 0;
-      sessions.clear();
-      applied = false;
-    };
-    return Result.ok({
-      apply: () => {
-        if (applied) return Result.ok(undefined);
-        const cached = restoreCache.apply();
-        const cacheError = cached.match({ ok: () => null, err: (error) => error });
-        if (cacheError) {
-          return Result.err(
-            new AgentRecoveryUnavailable({
-              requestId: recoveryState.entries[0]?.requestId ?? "recovery",
-              reason: "cache-conflict",
-              message: "Request cache changed during paused recovery admission",
-            }),
-          );
-        }
-        applied = true;
-        for (const entry of recoveryState.entries) {
-          const queueEntryId = entry.queueEntryId;
-          if (!queueEntryId) continue;
-          const identity = resolvedIdentities.get(queueEntryId);
-          let identityOwner: RequestMessageCacheOwner | undefined;
-          if (identity?.projection) {
-            const owner = requestMessageCache.acquireOwner(entry.requestId);
-            const selectOwner = owner.match<() => RequestMessageCacheOwner | null>({
-              err: () => () => null,
-              ok: (acquiredOwner) => () => acquiredOwner,
-            });
-            const acquiredOwner = selectOwner();
-            if (!acquiredOwner) {
-              rollback();
-              return Result.err(
-                new AgentRecoveryUnavailable({
-                  requestId: entry.requestId,
-                  reason: "cache-conflict",
-                  message: "Persisted recovery queue owner could not be acquired",
-                }),
-              );
-            }
-            identityOwner = acquiredOwner;
-            owners.push(identityOwner);
-          }
-          const queued: Enqueued = {
-            queueEntryId,
-            requestId: entry.requestId,
-            sessionId: entry.sessionId,
-            requestClient: entry.requestClient,
-            queue: entry.queue,
-            runPolicy: entry.runPolicy ?? "normal",
-            origin: entry.origin,
-            messages: entry.messages,
-            corePrimaryLineage: entry.recovery
-              ? degradeCorePrimaryLineageForMutation("restart-recovery-checkpoint")
-              : entry.corePrimaryLineage,
-            modelOverride: entry.modelOverride,
-            currentTurnUserId: entry.currentTurnUserId,
-            raw: entry.raw,
-            recovery: entry.recovery,
-            authenticatedOrigin: identity?.projection?.authenticatedOrigin,
-            verifiedIngress: identity?.projection?.verifiedIngress,
-            restoredSafetyMode: identity?.safetyMode ?? "restricted",
-            ...(identityOwner ? { identityOwner } : {}),
-          };
-          const state =
-            bySession.get(entry.sessionId) ??
-            ({
-              running: false,
-              agent: null,
-              queue: [] as Enqueued[],
-              activeRequestId: null,
-              activeRun: null,
-              compactedToolCallIds: new Set<string>(),
-            } satisfies SessionQueue);
-          state.queue.push(queued);
-          bySession.set(entry.sessionId, state);
-          sessions.add(entry.sessionId);
-          inserted.set(queueEntryId, queued);
-        }
-        for (const persisted of recoveryState.queueAttempts) {
-          const pendingGroups = persisted.pendingGroups
-            .toSorted((left, right) => left.publicationIndex - right.publicationIndex)
-            .map((group) => ({
-              requestId: group.requestId,
-              requestClient: group.requestClient,
-              entries: group.targetQueueEntryIds.flatMap((id) => {
-                const queued = inserted.get(id);
-                return queued ? [queued] : [];
-              }),
-            }));
-          const attempt: QueueLifecycleAttempt = {
-            eventId: persisted.eventId,
-            controlRequestId: persisted.controlRequestId,
-            controlRequestClient: persisted.controlRequestClient,
-            sessionId: persisted.sessionId,
-            kind: persisted.kind,
-            detail: persisted.detail,
-            pendingGroups,
-            controlApplied: persisted.controlApplied,
-          };
-          queueLifecycleAttempts.set(attempt.eventId, attempt);
-          for (const group of pendingGroups) {
-            for (const queued of group.entries) reservedQueueEntries.add(queued);
-          }
-        }
-        return Result.ok(undefined);
-      },
-      rollback,
-      activate: () => {
-        if (!applied || activated) return;
-        activated = true;
-        activateRunnerAdmission();
-        for (const sessionId of sessions) {
-          const state = bySession.get(sessionId);
-          if (state && !state.running) startSessionQueueDrain(sessionId, state);
-        }
-      },
-    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
   }
 
   async function drainSessionQueue(sessionId: string, state: SessionQueue) {
@@ -4226,6 +4742,92 @@ export async function startBusAgentRunner(params: {
     if (!next) return;
     if (reservedQueueEntries.has(next)) return;
     state.queue.shift();
+    let recoveredQueuedControlStoredMessages: StoredMessageV1[] = [];
+
+    if (next.messages.length === 0 && next.storedMessages.length > 0) {
+      const materialized = await materializeStoredMessagesV1({
+        messages: next.storedMessages,
+        blobStore: params.blobStore,
+        identityProjection: storedMessageIdentity,
+      });
+      const materializationError = materialized.match({
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (materializationError) {
+        state.queue.unshift(next);
+        return signalBusAgentRunnerHostFailure(materializationError);
+      }
+      next.messages = materialized.match({
+        ok: (value) => value,
+        err: () => [],
+      });
+    }
+    if (next.recovery && next.storedRecoveryCheckpoint) {
+      const materialized = await materializeStoredMessagesV1({
+        messages: next.storedRecoveryCheckpoint,
+        blobStore: params.blobStore,
+        identityProjection: storedMessageIdentity,
+      });
+      const materializationError = materialized.match({
+        ok: () => null,
+        err: (error) => error,
+      });
+      if (materializationError) {
+        const previous = await materializePreviousRunCheckpoint({
+          entry: next,
+          identityProjection: storedMessageIdentity,
+        });
+        if (previous.kind === "restored") {
+          installPreviousRunCheckpoint({
+            entry: next,
+            recovery: next.recovery,
+            checkpoint: previous.checkpoint,
+            messages: previous.messages,
+            handle: previous.handle,
+          });
+        } else {
+          fallBackRunCheckpointToAcceptedWork({ entry: next, error: materializationError });
+        }
+      } else {
+        next.recovery.checkpointMessages = materialized.match({
+          ok: (value) => value,
+          err: () => [],
+        });
+      }
+    }
+    if (next.recovery) {
+      const mergedControls = mergeQueuedControlsForRecovery(
+        next,
+        state.queue,
+        reservedQueueEntries,
+      );
+      recoveredQueuedControlStoredMessages = [...mergedControls.storedMessages];
+      next.storedMessages = [...next.storedMessages, ...mergedControls.storedMessages];
+      const retained = new Map(
+        next.retainedRequestDeliveries?.map(
+          ({ requestDeliveryId, outcome }) => [requestDeliveryId, outcome] as const,
+        ),
+      );
+      for (const entry of mergedControls.reapplied) {
+        if (entry.requestDeliveryId && !retained.has(entry.requestDeliveryId)) {
+          retained.set(entry.requestDeliveryId, {
+            kind: "completed",
+            code: "active-control-projection-recovered",
+          });
+        }
+        for (const nested of entry.retainedRequestDeliveries ?? []) {
+          retained.set(nested.requestDeliveryId, nested.outcome);
+        }
+      }
+      next.retainedRequestDeliveries = [...retained].map(([requestDeliveryId, outcome]) => ({
+        requestDeliveryId,
+        outcome,
+      }));
+      for (const discarded of mergedControls.discarded) {
+        if (discarded.identityOwner) requestMessageCache.releaseOwner(discarded.identityOwner);
+      }
+    }
 
     logger.debug("agent.queue.transition", {
       requestId: next.requestId,
@@ -4274,7 +4876,10 @@ export async function startBusAgentRunner(params: {
       corePrimaryClaudeRuntime;
     let activeRunOperation: Promise<unknown> | null = null;
     let customCommandAbortController: AbortController | null = null;
-    let activeCustomCommandTool: { toolCallId: string; display: string } | null = null;
+    let activeCustomCommandTool: {
+      toolCallId: string;
+      display: string;
+    } | null = null;
     let rejectPreAgentCancellation: ((error: PreAgentRunCancelledError) => void) | null = null;
     const preAgentCancellationPromise = new Promise<never>((_, reject) => {
       rejectPreAgentCancellation = reject;
@@ -4290,12 +4895,14 @@ export async function startBusAgentRunner(params: {
       request_id: string;
       session_id: string;
       request_client: AdapterPlatform;
+      request_delivery_id?: string;
       workflow_dispatch_epoch?: string;
       router_session_mode?: "mention" | "active";
     } = {
       request_id: next.requestId,
       session_id: next.sessionId,
       request_client: next.requestClient,
+      ...(next.requestDeliveryId ? { request_delivery_id: next.requestDeliveryId } : {}),
       ...(workflowDispatchEpoch ? { workflow_dispatch_epoch: workflowDispatchEpoch } : {}),
       ...(routerSessionMode ? { router_session_mode: routerSessionMode } : {}),
     };
@@ -4546,18 +5153,32 @@ export async function startBusAgentRunner(params: {
     ) => {
       if (!liveParentSession) return;
       const controller = new AbortController();
-      try {
-        await Promise.race([
-          liveParentSession.waitForSignalSince(liveParentSignalVersion, controller.signal),
-          waitForContinuationSignalSince(continuationVersion, controller.signal),
-          Bun.sleep(LIVE_PARENT_RECONCILE_MS),
-        ]);
-      } finally {
-        controller.abort();
-      }
+      await Promise.race([
+        liveParentSession.waitForSignalSince(liveParentSignalVersion, controller.signal),
+        waitForContinuationSignalSince(continuationVersion, controller.signal),
+        Bun.sleep(LIVE_PARENT_RECONCILE_MS),
+      ]).finally(() => controller.abort());
     };
 
+    const runJournalHandle = next.requestDeliveryId
+      ? (next.journalHandle ??
+        openRunJournal({
+          requestDeliveryId: next.requestDeliveryId,
+          requestId: next.requestId,
+          sessionId: next.sessionId,
+        }))
+      : null;
+    const toolAuthority = new LineageToolAuthority(
+      next.loadedCatalogIds ??
+        (runProfile === "primary"
+          ? resolveCorePrimaryLoadedCatalogIds({
+              lineage: next.corePrimaryLineage,
+              transcriptStore: params.transcriptStore,
+            })
+          : []),
+    );
     state.activeRun = {
+      ...(next.requestDeliveryId ? { requestDeliveryId: next.requestDeliveryId } : {}),
       requestId: next.requestId,
       sessionId: next.sessionId,
       requestClient: next.requestClient,
@@ -4566,9 +5187,12 @@ export async function startBusAgentRunner(params: {
       runPolicy: next.runPolicy,
       origin: next.origin,
       messages: next.messages,
+      storedMessages: next.storedMessages,
       corePrimaryLineage: next.corePrimaryLineage,
+      toolAuthority,
       modelOverride: next.modelOverride,
       currentTurnUserId: next.currentTurnUserId,
+      currentTurnMessageRef: next.currentTurnMessageRef,
       raw: next.raw,
       resolvedModelSpec: null,
       resolvedReasoning: undefined,
@@ -4576,9 +5200,15 @@ export async function startBusAgentRunner(params: {
       partialText: next.recovery?.partialText ?? "",
       liveParent: liveParentSession,
       claudeCodeControl: null,
+      materializeStoredMessages: null,
+      rememberStoredMessages: (providerMessages, storedMessages) => {
+        settleStoredMessageIdentityRemember(
+          storedMessageIdentity.remember(providerMessages, storedMessages),
+        );
+      },
       notifyWaiters: notifyContinuationWaiters,
       flushOutput: outputPublisher.flush,
-      setCurrentTurnUserId: () => undefined,
+      setCurrentTurnContext: () => undefined,
       cancel: () => {
         cancelledByRequestId.add(headers.request_id);
         customCommandAbortController?.abort();
@@ -4588,6 +5218,28 @@ export async function startBusAgentRunner(params: {
       started: false,
       startedAt: runStartedAt,
       activeTools: new Map(),
+      retainedRequestDeliveries: new Map(
+        next.retainedRequestDeliveries?.map(
+          ({ requestDeliveryId, outcome }) => [requestDeliveryId, outcome] as const,
+        ),
+      ),
+      checkpointedRetainedRequestDeliveryIds: new Set(
+        next.retainedRequestDeliveries?.map(({ requestDeliveryId }) => requestDeliveryId),
+      ),
+      retainedRequestDeliveryByInputId: new Map(),
+      journalHandle: runJournalHandle,
+      checkpointWriter: {
+        disabled: false,
+        pending: null,
+        operation: null,
+        closed: false,
+        abandoned: false,
+        retryInputIds: new Set(),
+        inFlightInputIds: null,
+        lastCommittedProviderMessages: next.recovery?.checkpointMessages ?? [],
+        lastCommittedStoredMessages: next.storedRecoveryCheckpoint ?? [],
+        retainedPredecessorStoredMessages: next.previousRecoveryCheckpoint?.messages ?? [],
+      },
     };
 
     let initialMessages: ModelMessage[] = [];
@@ -4595,6 +5247,9 @@ export async function startBusAgentRunner(params: {
     let customCommandMessages: ModelMessage[] = [];
     let initialMessagesEndWithInjectedTool = false;
     let responseStartIndex = 0;
+    let transcriptHasCompactionCheckpoint = corePrimaryLineageHasCompactionCheckpoint(
+      next.corePrimaryLineage,
+    );
     const runStats: {
       totalUsage?: LanguageModelUsage;
       finalMessages?: ModelMessage[];
@@ -4617,7 +5272,37 @@ export async function startBusAgentRunner(params: {
 
     let resolvedModelLabel = "unknown";
     let resolvedProviderFamily: HistoryProviderState["lastFamily"] = "ai-sdk";
-    try {
+    let requestTerminalKind: "completed" | "failed" | "cancelled" = "failed";
+    let shouldTerminalizeRequest = true;
+    let terminalMarkerAttempted = false;
+    let terminalMarkerOperation: Promise<void> | null = null;
+    let terminalSurfaceWriteAttempted = false;
+    let terminalSurfaceWriteInitiated = false;
+    const markActiveRunTerminal = (): void => {
+      if (terminalMarkerAttempted || terminalPanic || !shouldTerminalizeRequest) return;
+      const run = state.activeRun;
+      if (!run || run.checkpointWriter.abandoned) return;
+      terminalMarkerAttempted = true;
+      const outcome = { kind: requestTerminalKind } as const;
+      const finalReplayDeadline = outputPublisher.getFinalReplayDeadline();
+      terminalMarkerOperation = (async () => {
+        await flushRunCheckpointWriter(run);
+        if (terminalPanic || run.checkpointWriter.abandoned) return;
+        markRunTerminal(run, outcome, finalReplayDeadline);
+      })();
+    };
+    const publishTerminalResponseText = async (
+      input: Parameters<typeof outputPublisher.publishResponseText>[0],
+      terminalKind: typeof requestTerminalKind = requestTerminalKind,
+    ): Promise<void> => {
+      terminalSurfaceWriteAttempted = true;
+      await outputPublisher.publishResponseText(input);
+      terminalSurfaceWriteInitiated = true;
+      requestTerminalKind = terminalKind;
+      markActiveRunTerminal();
+      await terminalMarkerOperation;
+    };
+    const outcome = await (async () => {
       const runResult = await captureBusAgentRunnerOperation(
         "agent queue run",
         async () => {
@@ -4711,7 +5396,9 @@ export async function startBusAgentRunner(params: {
               detail,
               output: `Error: ${detail}`,
             });
-            await outputPublisher.publishResponseText({ finalText: `Error: ${detail}` });
+            await publishTerminalResponseText({
+              finalText: `Error: ${detail}`,
+            });
             return;
           }
 
@@ -4787,10 +5474,10 @@ export async function startBusAgentRunner(params: {
               }
               customCommandAbortController = new AbortController();
               runIdleWatchdog?.start();
-              try {
+              await (async () => {
                 const executed = await waitForPreAgent(
                   waitForRunAtHost(
-                    params.customCommands.execute({
+                    params.customCommands!.execute({
                       command,
                       args: parsedCustomCommand.args,
                       context: {
@@ -4800,7 +5487,7 @@ export async function startBusAgentRunner(params: {
                         commandName: command.def.name,
                         requestId: next.requestId,
                         sessionId: next.sessionId,
-                        abortSignal: customCommandAbortController.signal,
+                        abortSignal: customCommandAbortController!.signal,
                         reportActivity: () => markRunActivity("tool"),
                       },
                     }),
@@ -4814,15 +5501,16 @@ export async function startBusAgentRunner(params: {
                     customError = customCommandExecutionErrorText(error);
                   },
                 });
-              } finally {
+              })().finally(() => {
                 runIdleWatchdog?.pause();
                 customCommandAbortController = null;
-              }
+              });
             }
 
             const customCancelled = cancelledByRequestId.has(headers.request_id);
 
             if (customCancelled) {
+              requestTerminalKind = "cancelled";
               const finalText = "Cancelled.";
               await outputPublisher.publishToolCall({
                 toolCallId,
@@ -4837,7 +5525,7 @@ export async function startBusAgentRunner(params: {
                 detail: "cancelled by interrupt",
                 output: finalText,
               });
-              await outputPublisher.publishResponseText({ finalText });
+              await publishTerminalResponseText({ finalText });
               return;
             }
 
@@ -4881,18 +5569,28 @@ export async function startBusAgentRunner(params: {
               resolvedModelLabel = CUSTOM_COMMAND_TOOL_NAME;
 
               if (params.transcriptStore) {
-                const persisted = params.transcriptStore.saveRequestTranscript({
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                  requestClient: headers.request_client,
-                  messages: [
-                    ...customCommandMessages,
-                    { role: "assistant", content: finalText } satisfies ModelMessage,
-                  ],
-                  finalText,
-                  modelLabel: resolvedModelLabel,
+                const storedCustomMessages = projectStoredMessagesV1([
+                  ...customCommandMessages,
+                  {
+                    role: "assistant",
+                    content: finalText,
+                  } satisfies ModelMessage,
+                ]);
+                const persisted = storedCustomMessages.andThen((messages) =>
+                  params.transcriptStore!.saveRequestTranscript({
+                    requestId: headers.request_id,
+                    sessionId: headers.session_id,
+                    requestClient: headers.request_client,
+                    messages,
+                    finalText,
+                    modelLabel: resolvedModelLabel,
+                    loadedCatalogIds: toolAuthority.snapshot(),
+                  }),
+                );
+                const persistError = persisted.match({
+                  ok: () => null,
+                  err: (error) => error,
                 });
-                const persistError = persisted.match({ ok: () => null, err: (error) => error });
                 if (persistError) {
                   logger.error(
                     "failed to persist transcript after custom command error",
@@ -4911,7 +5609,7 @@ export async function startBusAgentRunner(params: {
                 detail: customError,
                 output: finalText,
               });
-              await outputPublisher.publishResponseText({ finalText });
+              await publishTerminalResponseText({ finalText });
 
               logger.warn(
                 "custom command failed",
@@ -4968,14 +5666,32 @@ export async function startBusAgentRunner(params: {
               : await waitForPreAgent(maybeBuildSkillsSectionForPrimary());
 
           const sessionConfigId = parseSessionConfigIdFromRaw(next.raw) ?? sessionId;
-          const parentChannelResolution =
-            next.requestClient === "discord" ? params.resolveParentChannelId?.(sessionId) : null;
-          const parentChannelId = parentChannelResolution ?? undefined;
+          const discordSessionContext =
+            next.requestClient === "discord"
+              ? params.resolveDiscordSessionContext?.(sessionId)
+              : null;
+          const rawParentChannelId = parseParentChannelIdFromRaw(next.raw);
+          const rawGuildId = parseGuildIdFromRaw(next.raw);
+          const parentChannelId =
+            rawParentChannelId ?? discordSessionContext?.parentChannelId ?? undefined;
+          const guildId = rawGuildId ?? discordSessionContext?.guildId ?? undefined;
+          const legacyConfigFallbackId =
+            sessionConfigId === sessionId ? undefined : sessionConfigId;
+          const sessionConfig = resolveRouterSessionConfig(cfg, {
+            sessionId,
+            parentChannelId,
+            guildId: guildId ?? legacyConfigFallbackId,
+          });
           let safetyMode: SessionSafetyMode =
             next.restoredSafetyMode ??
-            (next.requestClient === "discord" && parentChannelResolution === undefined
+            (next.requestClient === "discord" && discordSessionContext === undefined
               ? "restricted"
-              : resolveSessionSafetyMode(cfg, sessionId, parentChannelId));
+              : resolveSessionSafetyMode(
+                  cfg,
+                  sessionId,
+                  discordSessionContext?.parentChannelId ?? undefined,
+                  discordSessionContext?.guildId ?? undefined,
+                ));
           if (runProfile === "primary" && !workflowPolicy && isHeartbeatSessionId(next.sessionId)) {
             controlCapability =
               (await params.issueHeartbeatCapability?.({
@@ -5037,7 +5753,7 @@ export async function startBusAgentRunner(params: {
 
           const additionalSessionPrompts = await waitForPreAgent(
             resolveSessionAdditionalPrompts({
-              entries: cfg.surface.router.sessionModes[sessionConfigId]?.additionalPrompts,
+              entries: sessionConfig.additionalPrompts,
               onWarn: (warning) => {
                 logger.warn("skipping invalid session additionalPrompts entry", {
                   requestId: next.requestId,
@@ -5060,61 +5776,33 @@ export async function startBusAgentRunner(params: {
             nowMs: Date.now(),
           });
 
-          const autoInjectedThreadSearchOverlay = buildAutoInjectedThreadSearchOverlay({
-            cfg,
-            runProfile,
-          });
-
-          const surfaceMetadataOverlay = buildSurfaceMetadataOverlay(next.messages);
-
-          const restrictedSessionOverlay =
-            safetyMode === "restricted"
-              ? buildRestrictedSessionOverlay({ sessionId: next.sessionId })
-              : null;
-
           const buildSystemPrompt = (
             resolved: ResolvedModelRef,
             editingToolMode: ReturnType<typeof resolveEditingToolMode>,
-          ): string => {
-            const profilePrompt = {
-              baseSystemPrompt: cfg.agent.systemPrompt,
-              activeEditingTool: runProfile === "explore" ? null : editingToolMode,
-              exploreOverlay: subagents.profiles.explore.promptOverlay,
-              generalOverlay: subagents.profiles.general.promptOverlay,
-              selfOverlay: subagents.profiles.self.promptOverlay,
-              skillsSection,
-            };
-            const baseSystemPrompt =
-              runProfile === "primary"
-                ? buildSystemPromptForProfile({ ...profilePrompt, profile: "primary" })
-                : buildSystemPromptForProfile({
-                    ...profilePrompt,
-                    profile: runProfile,
-                    profileConfig: resolveNativeSubagentProfile(cfg, runProfile),
-                  });
-            let prompt = appendConfiguredAliasPromptBlock({
-              baseSystemPrompt,
+          ): string =>
+            buildAgentRunSystemPrompt({
               cfg,
-              coreConfigPath: resolveCoreConfigPath(),
-            });
-            prompt = appendAdditionalSessionMemoBlock(prompt, additionalSessionPrompts);
-            for (const overlay of [
+              runProfile,
+              resolved,
+              editingToolMode,
+              skillsSection,
+              additionalSessionPrompts,
+              messages: next.messages,
+              safetyMode,
+              sessionId: next.sessionId,
               heartbeatOverlay,
-              autoInjectedThreadSearchOverlay,
-              surfaceMetadataOverlay,
-              restrictedSessionOverlay,
-            ]) {
-              if (overlay?.trim()) prompt = `${prompt}\n\n${overlay}`;
-            }
-            return maybeAppendResponseCommentaryPrompt({
-              baseSystemPrompt: prompt,
-              provider: resolved.provider,
-              responseCommentary: resolved.responseCommentary,
             });
-          };
+
+          const workspaceSystemPrompt = selectWorkspaceSystemPrompt({
+            profile: runProfile,
+            primarySystemPrompt: cfg.agent.systemPrompt,
+            workerSystemPrompt: cfg.agent.workerSystemPrompt,
+          });
 
           let seededSessionMessages: ModelMessage[] = [];
+          let seededStoredMessages: StoredMessageV1[] = [];
           let seededSessionTranscript: TranscriptSnapshot | null = null;
+          const seededToolState: { loadedCatalogIds: string[] } = { loadedCatalogIds: [] };
           if (!next.recovery && runProfile !== "primary" && params.transcriptStore) {
             const loadedTranscript = await captureBusAgentRunnerOperation(
               "subagent continuation transcript load",
@@ -5142,8 +5830,9 @@ export async function startBusAgentRunner(params: {
                 const applyDecodedTranscript = transcript?.match<() => void>({
                   ok: (latest) => () => {
                     if (!latest || latest.messages.length === 0) return;
-                    seededSessionMessages = latest.messages;
+                    seededStoredMessages = [...latest.messages];
                     seededSessionTranscript = latest;
+                    seededToolState.loadedCatalogIds = [...(latest.loadedCatalogIds ?? [])];
                     logger.info(
                       "subagent continuation seeded from transcript",
                       formatBridgeLogContext({
@@ -5168,16 +5857,39 @@ export async function startBusAgentRunner(params: {
               },
             });
             applyLoadedTranscript();
+            if (seededStoredMessages.length > 0) {
+              const materialized = await materializeStoredMessagesV1({
+                messages: seededStoredMessages,
+                blobStore: params.blobStore,
+                identityProjection: storedMessageIdentity,
+              });
+              materialized.match({
+                ok: (messages) => {
+                  seededSessionMessages = messages;
+                },
+                err: (error) => {
+                  logger.warn(
+                    "failed to materialize subagent continuation transcript",
+                    formatBridgeTaggedErrorForLog(error, {
+                      requestId: next.requestId,
+                      sessionId: next.sessionId,
+                    }),
+                  );
+                  seededSessionTranscript = null;
+                },
+              });
+            }
+          }
+
+          if (runProfile !== "primary" && !next.recovery) {
+            toolAuthority.select(seededToolState.loadedCatalogIds);
           }
 
           const fallbackSurfaceForDelegation = trustedFallbackSurface;
           const executionCwd = path.resolve(workflowPolicy?.cwd ?? cwd);
           let currentTurnUserId = next.currentTurnUserId;
-          const listSelectedCatalogIds = () =>
-            params.transcriptStore?.listSessionToolIds?.({
-              requestClient: next.requestClient,
-              sessionId: next.sessionId,
-            }) ?? [];
+          let currentTurnMessageRef = next.currentTurnMessageRef;
+          const listSelectedCatalogIds = () => toolAuthority.snapshot();
           const buildModelBinding = async (resolved: ResolvedModelRef) => {
             let capabilityInfo: ModelCapabilityInfo | null = null;
             let bindingCostEstimateStatus: "estimated" | "unavailable" = "unavailable";
@@ -5258,12 +5970,18 @@ export async function startBusAgentRunner(params: {
                 }
               : systemPrompt;
             const experimentalDownload = buildExperimentalDownloadForAnthropicFallback({
+              blobStore: params.blobStore,
               spec: resolved.spec,
               provider: resolved.provider,
               providerOptions: providerOptionsForAgent,
             });
+            const resourceProviderTarget = resolveStoredResourceProviderTarget({
+              provider: resolved.provider,
+              capability: capabilityInfo,
+            });
             const level1RequestContext = {
               requestId: next.requestId,
+              ...(next.requestDeliveryId ? { requestDeliveryId: next.requestDeliveryId } : {}),
               sessionId: next.sessionId,
               requestClient: next.requestClient,
               subagentDepth: subagentMeta.depth,
@@ -5279,10 +5997,11 @@ export async function startBusAgentRunner(params: {
                   }
                 : {}),
               currentTurnUserId,
+              currentTurnMessageRef,
               metadata: {
                 controlCapability: controlCapability ?? undefined,
-                readFileDirectAttachmentSupported:
-                  supportsReadFileDirectAttachments(capabilityInfo),
+                readFileDirectImageSupported: resourceProviderTarget.supportsImage,
+                readFileDirectPdfSupported: resourceProviderTarget.supportsPdf,
                 onActivity: (source: "tool" | "subagent") => markRunActivity(source),
                 onSubagentDelegate:
                   workflowSubagentDispatcher && liveParentSession && fallbackSurfaceForDelegation
@@ -5307,6 +6026,7 @@ export async function startBusAgentRunner(params: {
                   maxDepth: subagents.maxDepth,
                 },
                 requestContext: level1RequestContext,
+                onSelectCatalogIds: (catalogIds) => toolAuthority.select(catalogIds),
                 reportToolStatus: (update) => {
                   void publishAuxiliaryOutput("failed to publish batch tool status", () =>
                     outputPublisher.publishToolCall(update),
@@ -5316,6 +6036,7 @@ export async function startBusAgentRunner(params: {
             );
             return toolsetResult.map((toolset) => {
               level1RequestContext.currentTurnUserId = currentTurnUserId;
+              level1RequestContext.currentTurnMessageRef = currentTurnMessageRef;
               return {
                 resolved,
                 capabilityInfo,
@@ -5344,6 +6065,43 @@ export async function startBusAgentRunner(params: {
             ok: (value) => () => value,
             err: (error) => () => signalBusAgentRunnerHostFailure(error),
           })();
+          const materializeForBinding = async (
+            storedMessages: readonly StoredMessageV1[],
+            binding: BuiltModelBinding,
+          ): Promise<ModelMessage[]> =>
+            await materializeStoredMessagesV1({
+              messages: storedMessages,
+              blobStore: params.blobStore,
+              identityProjection: storedMessageIdentity,
+              resourceAccess: params.resourceAccess,
+              resourceTarget: resolveStoredResourceProviderTarget({
+                provider: binding.resolved.provider,
+                capability: binding.capabilityInfo,
+              }),
+            }).then((materialized) =>
+              materialized.match({
+                ok: (messages) => () => messages,
+                err: (error) => () => signalBusAgentRunnerHostFailure(error),
+              })(),
+            );
+          next.messages = await materializeForBinding(next.storedMessages, activeBinding);
+          if (next.recovery && next.storedRecoveryCheckpoint) {
+            next.recovery.checkpointMessages = await materializeForBinding(
+              next.storedRecoveryCheckpoint,
+              activeBinding,
+            );
+          }
+          if (seededStoredMessages.length > 0) {
+            seededSessionMessages = await materializeForBinding(
+              seededStoredMessages,
+              activeBinding,
+            );
+          }
+          if (state.activeRun) {
+            state.activeRun.messages = next.messages;
+            state.activeRun.materializeStoredMessages = (messages) =>
+              materializeForBinding(messages, activeBinding);
+          }
           modelCapabilityInfo = activeBinding.capabilityInfo;
           costEstimateStatus = activeBinding.costEstimateStatus;
           costEstimateReason = activeBinding.costEstimateReason;
@@ -5388,6 +6146,17 @@ export async function startBusAgentRunner(params: {
               ok: (value) => () => value,
               err: (error) => () => signalBusAgentRunnerHostFailure(error),
             })();
+            const storedCanonicalMessages = storedMessageIdentity
+              .project(agent.state.messages)
+              .match({
+                ok: (messages) => () => messages,
+                err: (error) => () => signalBusAgentRunnerHostFailure(error),
+              })();
+            const reboundMessages = await materializeForBinding(
+              storedCanonicalMessages,
+              nextBinding,
+            );
+            agent.replaceMessages(reboundMessages);
             nextBinding.toolset.updateActiveBatchTools(nextBinding.activeToolNames);
             agent.setModel(
               nextBinding.resolved.model,
@@ -5435,8 +6204,8 @@ export async function startBusAgentRunner(params: {
           });
           const disabledServerCompactionReplayKeys = new Set<string>();
           let activeNativeServerCompactionReplayKey: string | null = null;
-          const turnErrorHandler = async (
-            error: unknown,
+          const turnErrorHandler = async <ErrorCause>(
+            error: ErrorCause,
             errorContext: Parameters<
               NonNullable<Parameters<typeof attachAutoCompaction>[1]["baseTurnErrorHandler"]>
             >[1],
@@ -5494,22 +6263,29 @@ export async function startBusAgentRunner(params: {
                   return await activeAgent.executeExternalToolCall(request);
                 },
               } satisfies Parameters<typeof materializeClaudeCodeRunResult>[0];
-              const run = params.materializeClaudeCodeRun
-                ? await params.materializeClaudeCodeRun(options)
-                : (await materializeClaudeCodeRunResult(options)).match({
-                    ok: (value) => () => value,
-                    err: (error) => () => {
-                      switch (error._tag) {
-                        case "ClaudeCodeRunInvalidConfiguration":
-                        case "ClaudeNativeSessionPreflightError":
-                        case "ClaudeCodeRunExternalFailure":
-                        case "ClaudeCodeBuiltInToolUnsupported":
-                        case "ClaudeCodeToolBridgeConfigurationFailed":
-                        case "ClaudeCodeRunOperationAndCleanupFailed":
-                          throw error;
-                      }
-                    },
-                  })();
+              let run;
+              if (params.materializeClaudeCodeRun) {
+                run = await params.materializeClaudeCodeRun(options);
+              } else {
+                const materializedResult = await materializeClaudeCodeRunResult(options);
+                const materialized = materializedResult.match<
+                  | {
+                      readonly kind: "success";
+                      readonly value: import("better-result").InferOk<typeof materializedResult>;
+                    }
+                  | {
+                      readonly kind: "failure";
+                      readonly error: import("better-result").InferErr<typeof materializedResult>;
+                    }
+                >({
+                  ok: (value) => ({ kind: "success" as const, value }),
+                  err: (error) => ({ kind: "failure" as const, error }),
+                });
+                run =
+                  materialized.kind === "success"
+                    ? materialized.value
+                    : signalBusAgentRunnerHostFailure(materialized.error);
+              }
               if (state.activeRun) state.activeRun.claudeCodeControl = run.control;
               return run;
             };
@@ -5561,7 +6337,11 @@ export async function startBusAgentRunner(params: {
                     }
                   : null,
                 systemPolicy: {
-                  base: cfg.agent.systemPrompt,
+                  base: applyBasePromptForProvider({
+                    systemPrompt: workspaceSystemPrompt,
+                    basePrompt: cfg.basePrompt,
+                    provider: activeBinding.resolved.provider,
+                  }),
                   profileOverlay: profileConfig?.promptOverlay ?? null,
                   additionalSessionPrompts,
                   skillsSection,
@@ -5596,6 +6376,8 @@ export async function startBusAgentRunner(params: {
                   executionScopeHash: executionScope.hash,
                   executionCwd,
                   getLineage: () => state.activeRun?.corePrimaryLineage ?? next.corePrimaryLineage,
+                  projectCanonicalStoredMessages: (messages) =>
+                    storedMessageIdentity.project(messages),
                   materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
                   onDiagnostic: (event, detail, error) => {
                     const fields = formatClaudeLifecycleLogFields(event, detail, error);
@@ -5635,6 +6417,7 @@ export async function startBusAgentRunner(params: {
                   executionScopeHash: executionScope.hash,
                   executionCwd,
                   sourceTranscript: seededSessionTranscript,
+                  sourceMessages: seededSessionMessages,
                   getCurrentTurnMessages: () => initialMessages,
                   materialize: (nativeSession) => waitForPreAgent(materializeClaude(nativeSession)),
                   onDiagnostic: (event, detail, error) => {
@@ -5682,6 +6465,11 @@ export async function startBusAgentRunner(params: {
               ? { streamTextMaxRetries: 0 }
               : {}),
             turnErrorHandler,
+            recoveryCheckpointHandler: (messages, canonicalInputIds) => {
+              const activeRun = state.activeRun;
+              if (!activeRun || activeRun.requestId !== next.requestId) return;
+              enqueueRunCheckpoint(activeRun, messages, canonicalInputIds, storedMessageIdentity);
+            },
             beforeStep:
               activeBinding.resolved.provider !== "claude-code"
                 ? async () => {
@@ -5720,31 +6508,20 @@ export async function startBusAgentRunner(params: {
           );
           activeAgent = agent;
 
-          const setCurrentTurnUserId = (userId: string | undefined) => {
+          const setCurrentTurnContext = (
+            userId: string | undefined,
+            messageRef: MsgRef | undefined,
+          ) => {
             currentTurnUserId = userId;
+            currentTurnMessageRef = messageRef;
             if (state.activeRun) state.activeRun.currentTurnUserId = userId;
+            if (state.activeRun) state.activeRun.currentTurnMessageRef = messageRef;
             activeBinding.requestContext.currentTurnUserId = userId;
-            agent?.setContext({
-              sessionId: next.sessionId,
-              requestId: next.requestId,
-              requestClient: next.requestClient,
-              subagentDepth: subagentMeta.depth,
-              subagentProfile: runProfile,
-              safetyMode,
-              ...(trustedFallbackSurface
-                ? {
-                    requestInitiator: {
-                      platform: trustedFallbackSurface.platform,
-                      userId: trustedFallbackSurface.userId,
-                    },
-                    requestInitiatorSessionId: trustedFallbackSurface.sessionId,
-                  }
-                : {}),
-              currentTurnUserId: userId,
-            });
+            activeBinding.requestContext.currentTurnMessageRef = messageRef;
+            agent?.setContext(activeBinding.requestContext);
           };
-          setCurrentTurnUserId(next.currentTurnUserId);
-          if (state.activeRun) state.activeRun.setCurrentTurnUserId = setCurrentTurnUserId;
+          setCurrentTurnContext(next.currentTurnUserId, next.currentTurnMessageRef);
+          if (state.activeRun) state.activeRun.setCurrentTurnContext = setCurrentTurnContext;
 
           // Drain all buffered messages at boundaries (better UX in chat surfaces).
           agent.setFollowUpMode("all");
@@ -5904,7 +6681,7 @@ export async function startBusAgentRunner(params: {
 
             auxiliaryOutputTail = auxiliaryOutputTail.then(publishOne);
           };
-          const reportServerCompactionError = (cause: unknown): void => {
+          const reportServerCompactionError = <Cause>(cause: Cause): void => {
             const error = projectBusAgentRunnerError(cause, "OpenAI server compaction failed");
             logger.warn(
               "OpenAI server compaction failed; using portable summary",
@@ -6004,17 +6781,22 @@ export async function startBusAgentRunner(params: {
                   reasoning: agent.state.reasoning,
                   abortSignal,
                 });
-                return compacted.match({
-                  ok: (value) => () => value,
-                  err: (error) => () => {
-                    switch (error._tag) {
-                      case "OpenAIServerCompactionAborted":
-                      case "OpenAIServerCompactionRequestFailed":
-                      case "OpenAIServerCompactionOutputInvalid":
-                        throw error;
+                const outcome = compacted.match<
+                  | {
+                      readonly kind: "success";
+                      readonly value: import("better-result").InferOk<typeof compacted>;
                     }
-                  },
-                })();
+                  | {
+                      readonly kind: "failure";
+                      readonly error: import("better-result").InferErr<typeof compacted>;
+                    }
+                >({
+                  ok: (value) => ({ kind: "success" as const, value }),
+                  err: (error) => ({ kind: "failure" as const, error }),
+                });
+                return outcome.kind === "success"
+                  ? outcome.value
+                  : signalBusAgentRunnerHostFailure(outcome.error);
               },
               serverCompactionEnabled: () => {
                 if (!activeBinding.resolved.openaiServerCompaction) return false;
@@ -6022,17 +6804,13 @@ export async function startBusAgentRunner(params: {
                 return !disabledServerCompactionReplayKeys.has(replayKey);
               },
               onServerCompactionError: reportServerCompactionError,
-              onUnknownCapability: ({ spec, reason, error }) => {
-                logger.warn(
-                  "auto-compaction capability unknown; disabling threshold compaction",
-                  {
-                    requestId: headers.request_id,
-                    sessionId: headers.session_id,
-                    modelSpec: spec,
-                    reason,
-                  },
-                  error,
-                );
+              onUnknownCapability: ({ spec, reason }) => {
+                logger.warn("auto-compaction capability unknown; disabling threshold compaction", {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  modelSpec: spec,
+                  reason,
+                });
               },
               onOverflowRecoveryAttempt: ({ spec, attempt, maxAttempts }) => {
                 logger.info("auto-compaction overflow recovery retry", {
@@ -6100,7 +6878,6 @@ export async function startBusAgentRunner(params: {
                 estimatedInputTokensAfter,
                 durationMs,
                 status,
-                error,
                 canonicalReplacement,
               }) => {
                 const toolCallId =
@@ -6159,11 +6936,7 @@ export async function startBusAgentRunner(params: {
                   logger.info("auto-compaction end", payload);
                   return;
                 }
-                logger.warn(
-                  "auto-compaction end",
-                  { ...payload, ...extractAiErrorLogDetails(error) },
-                  error,
-                );
+                logger.warn("auto-compaction end", payload);
               },
             }),
           );
@@ -6329,7 +7102,9 @@ export async function startBusAgentRunner(params: {
                 err: (error) => {
                   logger.warn(
                     "workflow subagent completion publish failed",
-                    formatBridgeTaggedErrorForLog(error, { runId: completion.runId }),
+                    formatBridgeTaggedErrorForLog(error, {
+                      runId: completion.runId,
+                    }),
                   );
                 },
               });
@@ -6460,7 +7235,11 @@ export async function startBusAgentRunner(params: {
               previous.delta += delta;
               return;
             }
-            pendingNoReplyTurnOutputs.push({ delta, phase, phaseBoundaryPrefixChars });
+            pendingNoReplyTurnOutputs.push({
+              delta,
+              phase,
+              phaseBoundaryPrefixChars,
+            });
           };
           const publishPendingNoReplyOutputs = (): void => {
             for (const output of pendingNoReplyTurnOutputs) {
@@ -6839,7 +7618,10 @@ export async function startBusAgentRunner(params: {
             ) {
               const chunkId = event.assistantMessageEvent.id;
               retryAttemptHadReasoning = true;
-              consumeReasoningChunkEvent(reasoningChunkState, { type: "start", chunkId });
+              consumeReasoningChunkEvent(reasoningChunkState, {
+                type: "start",
+                chunkId,
+              });
 
               void publishAuxiliaryOutput("failed to publish reasoning start", () =>
                 outputPublisher.publishReasoningBoundary({ delta: "" }),
@@ -6874,7 +7656,10 @@ export async function startBusAgentRunner(params: {
               event.assistantMessageEvent.type === "thinking_end"
             ) {
               const chunkId = event.assistantMessageEvent.id;
-              consumeReasoningChunkEvent(reasoningChunkState, { type: "end", chunkId });
+              consumeReasoningChunkEvent(reasoningChunkState, {
+                type: "end",
+                chunkId,
+              });
               outputPublisher.flush();
             }
 
@@ -6892,7 +7677,7 @@ export async function startBusAgentRunner(params: {
                   outputPublisher.publishToolCall({
                     toolCallId: event.toolCallId,
                     status: "start",
-                    display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
+                    display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event)}`,
                   }),
                 );
               }
@@ -6905,26 +7690,26 @@ export async function startBusAgentRunner(params: {
               const toolFailure = summarizeToolFailure({
                 toolName: event.toolName,
                 isError: event.isError,
-                result: event.result,
+                event,
                 toolSpecs: activeBinding.toolset.specs,
               });
               const deferredAccepted =
                 event.toolName === "subagent_delegate" &&
-                decodeDeferredSubagentAcceptedResult(event.result) !== null;
+                decodeDeferredSubagentAcceptedResult(event) !== null;
 
               let ok: boolean;
               switch (event.toolName) {
                 case "batch":
-                  ok = getBatchOkFromResult(event.result) ?? toolFailure.ok;
+                  ok = getBatchOkFromResult(event) ?? toolFailure.ok;
                   break;
                 case "subagent_delegate":
-                  ok = getSubagentOkFromResult(event.result) ?? toolFailure.ok;
+                  ok = getSubagentOkFromResult(event) ?? toolFailure.ok;
                   break;
                 default:
                   ok = toolFailure.ok;
                   break;
               }
-              const interruptedForRestart = restartAbortRequestIds.has(headers.request_id);
+              const interruptedForShutdown = shutdownAbortRequestIds.has(headers.request_id);
               const toolFailureError = toolFailure.error ?? "tool failed";
 
               if (!ok) {
@@ -6937,32 +7722,46 @@ export async function startBusAgentRunner(params: {
                     toolName: event.toolName,
                     durationMs: toolDurationMs,
                     failureKind: toolFailure.failureKind ?? "soft",
-                    error: interruptedForRestart ? "server restarted" : toolFailureError,
+                    failureClass: toolFailure.failureClass,
+                    failureCode: toolFailure.failureCode,
+                    retryable: toolFailure.retryable,
+                    exitCode: toolFailure.exitCode,
+                    error: interruptedForShutdown ? "server shutting down" : toolFailureError,
                     argsPreview: formatToolLogPreview({
                       toolName: event.toolName,
-                      value: event.args,
+                      event,
+                      field: "args",
                     }),
                     resultPreview: formatToolLogPreview({
                       toolName: event.toolName,
-                      value: event.result,
+                      event,
+                      field: "result",
                     }),
                   }),
                 );
               }
 
-              logger.debug(
-                "tool finished",
-                formatBridgeLogContext({
-                  requestId: headers.request_id,
-                  sessionId: headers.session_id,
-                  toolCallId: event.toolCallId,
-                  toolName: event.toolName,
-                  ok,
-                  deferredAccepted,
-                  durationMs: toolDurationMs,
-                  failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
-                }),
-              );
+              const toolCompletionLogContext = formatBridgeLogContext({
+                requestId: headers.request_id,
+                sessionId: headers.session_id,
+                toolCallId: event.toolCallId,
+                toolName: event.toolName,
+                ok,
+                deferredAccepted,
+                durationMs: toolDurationMs,
+                failureKind: ok ? undefined : (toolFailure.failureKind ?? "soft"),
+                failureClass: ok ? undefined : toolFailure.failureClass,
+                failureCode: ok ? undefined : toolFailure.failureCode,
+                retryable: ok ? undefined : toolFailure.retryable,
+                exitCode: ok ? undefined : toolFailure.exitCode,
+              });
+              if (
+                shouldLogLevel1ToolCompletionAtInfo(event.toolName, activeBinding.toolset.catalog)
+              ) {
+                logger.info("tool finished", toolCompletionLogContext);
+              } else {
+                logger.debug("tool finished", toolCompletionLogContext);
+              }
 
               if (event.toolName === "batch" || deferredAccepted) {
                 return;
@@ -6970,13 +7769,15 @@ export async function startBusAgentRunner(params: {
 
               let publishedToolError: string | undefined;
               if (!ok) {
-                publishedToolError = interruptedForRestart ? "server restarted" : toolFailureError;
+                publishedToolError = interruptedForShutdown
+                  ? "server shutting down"
+                  : toolFailureError;
               }
               void publishAuxiliaryOutput("failed to publish tool end", () =>
                 outputPublisher.publishToolCall({
                   toolCallId: event.toolCallId,
                   status: "end",
-                  display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, event.args, activeBinding.toolset.specs)}`,
+                  display: `${event.toolName}${formatToolArgsForDisplayWithSpecs(event.toolName, undefined, activeBinding.toolset.specs, undefined, event)}`,
                   ok,
                   error: publishedToolError,
                 }),
@@ -7004,7 +7805,14 @@ export async function startBusAgentRunner(params: {
           });
 
           if (next.recovery) {
-            initialMessages = [buildResumePrompt(next.recovery.partialText)];
+            const recoveredQueuedControls = await materializeForBinding(
+              recoveredQueuedControlStoredMessages,
+              activeBinding,
+            );
+            initialMessages = [
+              buildResumePrompt(next.recovery.partialText),
+              ...recoveredQueuedControls,
+            ];
             responseStartIndex = agent.state.messages.length + initialMessages.length;
           } else if (parsedCustomCommand) {
             initialMessages = [...next.messages];
@@ -7016,9 +7824,37 @@ export async function startBusAgentRunner(params: {
             // If additional messages for the same request id were queued before the run started,
             // merge them into the initial prompt so they don't become separate runs.
             const coalesced = mergeQueuedForSameRequest(next, state.queue, reservedQueueEntries);
-            const mergedInitial = coalesced.messages;
-            state.activeRun?.setCurrentTurnUserId(next.currentTurnUserId);
+            const mergedInitial = await materializeForBinding(
+              coalesced.storedMessages,
+              activeBinding,
+            );
+            state.activeRun?.setCurrentTurnContext(
+              next.currentTurnUserId,
+              next.currentTurnMessageRef,
+            );
             for (const discarded of coalesced.discarded) {
+              if (discarded.requestDeliveryId && state.activeRun) {
+                state.activeRun.retainedRequestDeliveries.set(discarded.requestDeliveryId, {
+                  kind: "completed",
+                  code: "coalesced-into-active-run",
+                });
+                state.activeRun.checkpointedRetainedRequestDeliveryIds.add(
+                  discarded.requestDeliveryId,
+                );
+                for (const retained of discarded.retainedRequestDeliveries ?? []) {
+                  state.activeRun.retainedRequestDeliveries.set(
+                    retained.requestDeliveryId,
+                    retained.outcome,
+                  );
+                  state.activeRun.checkpointedRetainedRequestDeliveryIds.add(
+                    retained.requestDeliveryId,
+                  );
+                }
+                state.activeRun.storedMessages = [
+                  ...state.activeRun.storedMessages,
+                  ...discarded.storedMessages,
+                ];
+              }
               if (discarded.identityOwner)
                 requestMessageCache.releaseOwner(discarded.identityOwner);
             }
@@ -7059,6 +7895,7 @@ export async function startBusAgentRunner(params: {
                           toolCallId: event.toolCallId,
                           mode: event.mode,
                           limit: event.limit,
+                          minScore: event.minScore,
                           searchCount: event.searches.length,
                           queryCount: event.searches.reduce(
                             (sum, queries) => sum + queries.length,
@@ -7068,6 +7905,10 @@ export async function startBusAgentRunner(params: {
                           participantFilterUserCount: event.participantFilterUserCount,
                           appendedCount: event.entries.length,
                           entries: event.entries,
+                          ranking: event.ranking,
+                          highestRejectedByConfidence: event.highestRejectedByConfidence,
+                          expansionMinConfidence: event.expansionMinConfidence,
+                          corpusDocumentCount: event.corpusDocumentCount,
                         });
                       },
                     }),
@@ -7091,13 +7932,14 @@ export async function startBusAgentRunner(params: {
           }
 
           if (cancelledByRequestId.has(headers.request_id)) {
+            requestTerminalKind = "cancelled";
             const finalText = "Cancelled.";
             await publishCurrentLifecycle({
               state: "cancelled",
               detail: "cancelled by interrupt",
               output: finalText,
             });
-            await outputPublisher.publishResponseText({ finalText });
+            await publishTerminalResponseText({ finalText });
             return;
           }
 
@@ -7116,8 +7958,8 @@ export async function startBusAgentRunner(params: {
           while (true) {
             await waitForRunAtHost(agent.waitForIdle());
 
-            if (restartAbortRequestIds.delete(headers.request_id)) {
-              return signalBusAgentRunnerHostFailure(new RestartDrainingAbort());
+            if (shutdownAbortRequestIds.delete(headers.request_id)) {
+              return signalBusAgentRunnerHostFailure(new ShutdownDrainingAbort());
             }
 
             const continuationWaitVersion = continuationSignalVersion;
@@ -7213,7 +8055,7 @@ export async function startBusAgentRunner(params: {
                   completedCompactionCount,
                 });
                 const isCompactionCheckpoint = checkpointMeta !== undefined;
-                const persistedMessages = (() => {
+                const persistenceCandidates = (() => {
                   if (isHeartbeatSessionId(headers.session_id)) {
                     return buildPersistedHeartbeatMessages(finalText);
                   }
@@ -7225,6 +8067,12 @@ export async function startBusAgentRunner(params: {
                     didCompact: isCompactionCheckpoint,
                   });
                 })();
+                const persistedMessages = await projectTranscriptMessagesForPersistence({
+                  identityProjection: storedMessageIdentity,
+                  providerMessages: persistenceCandidates,
+                  blobStore: params.blobStore,
+                  transcriptStore,
+                });
                 const targetProviderFamily = classifyHistoryProviderFamily({
                   type: activeBinding.resolved.provider,
                 });
@@ -7275,6 +8123,7 @@ export async function startBusAgentRunner(params: {
                   finalText,
                   modelLabel: resolvedModelLabel,
                   contextMeta: checkpointMeta,
+                  loadedCatalogIds: toolAuthority.snapshot(),
                   ...(providerState && !coreNamedClaudeRuntime && !canPublishCorePrimaryClaude
                     ? { providerState }
                     : {}),
@@ -7282,10 +8131,15 @@ export async function startBusAgentRunner(params: {
                     ? persistedCompleteLineage(terminalPrimaryLineage)
                     : {}),
                   ...(stableNamedContinuation && !isCancelled && !coreNamedClaudeRuntime
-                    ? { stableNamedRequestClient: stableNamedContinuation.requestClient }
+                    ? {
+                        stableNamedRequestClient: stableNamedContinuation.requestClient,
+                      }
                     : {}),
                 });
-                const saveError = savedTranscript.match({ ok: () => null, err: (error) => error });
+                const saveError = savedTranscript.match({
+                  ok: () => null,
+                  err: (error) => error,
+                });
                 if (saveError) {
                   coreNamedClaudeRuntime?.markTerminalFailure(false);
                   corePrimaryClaudeRuntime?.markTerminalFailure(false);
@@ -7310,20 +8164,34 @@ export async function startBusAgentRunner(params: {
                     requestId: headers.request_id,
                   });
                   const verifiedTranscript =
-                    verified?.match({ ok: (value) => value, err: () => null }) ?? null;
-                  const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
+                    verified?.match({
+                      ok: (value) => value,
+                      err: () => null,
+                    }) ?? null;
+                  const expectedHash = requireStoredMessageHash(persistedMessages);
                   if (
                     !verifiedTranscript ||
                     verifiedTranscript.messages.length !== persistedMessages.length ||
-                    hashCanonicalMessagesV1(verifiedTranscript.messages).hash !== expectedHash
+                    requireStoredMessageHash(verifiedTranscript.messages) !== expectedHash
                   ) {
                     return signalBusAgentRunnerHostFailure(
                       new Error("persisted Core named transcript failed canonical re-read"),
                     );
                   }
+                  const canonicalMessages = await materializeStoredMessagesV1({
+                    messages: persistedMessages,
+                    blobStore: params.blobStore,
+                    identityProjection: storedMessageIdentity,
+                  }).then((result) =>
+                    result.match({
+                      ok: (messages) => () => messages,
+                      err: (error) => () => signalBusAgentRunnerHostFailure(error),
+                    })(),
+                  );
                   const promoted = await coreNamedClaudeRuntime.finalize({
                     terminalTranscript: verifiedTranscript,
-                    canonicalMessages: persistedMessages,
+                    canonicalMessages,
+                    storedCanonicalMessages: persistedMessages,
                     providerState,
                     isCancellationRequested: () => cancelledByRequestId.has(headers.request_id),
                   });
@@ -7351,17 +8219,23 @@ export async function startBusAgentRunner(params: {
                     requestId: headers.request_id,
                   });
                   const verifiedTranscript =
-                    verified?.match({ ok: (value) => value, err: () => null }) ?? null;
+                    verified?.match({
+                      ok: (value) => value,
+                      err: () => null,
+                    }) ?? null;
                   const manifest =
-                    verifiedManifest?.match({ ok: (value) => value, err: () => null }) ?? null;
-                  const expectedHash = hashCanonicalMessagesV1(persistedMessages).hash;
+                    verifiedManifest?.match({
+                      ok: (value) => value,
+                      err: () => null,
+                    }) ?? null;
+                  const expectedHash = requireStoredMessageHash(persistedMessages);
                   const terminalCanonicalMessages = runStats.finalMessages ?? agent.state.messages;
                   if (
                     !verifiedTranscript ||
                     !manifest ||
                     verifiedTranscript.providerState != null ||
                     verifiedTranscript.messages.length !== persistedMessages.length ||
-                    hashCanonicalMessagesV1(verifiedTranscript.messages).hash !== expectedHash
+                    requireStoredMessageHash(verifiedTranscript.messages) !== expectedHash
                   ) {
                     return signalBusAgentRunnerHostFailure(
                       new Error("persisted Core primary transcript failed canonical re-read"),
@@ -7387,6 +8261,7 @@ export async function startBusAgentRunner(params: {
                   corePrimaryClaudeRuntime.markTerminalFailure(false);
                 }
                 if (isCompactionCheckpoint) {
+                  transcriptHasCompactionCheckpoint = true;
                   logger.info(
                     "compaction checkpoint persisted",
                     formatBridgeLogContext({
@@ -7452,7 +8327,10 @@ export async function startBusAgentRunner(params: {
                   responseMessages,
                 }),
             );
-            const handoffError = persistedHandoffs.match({ ok: () => null, err: (error) => error });
+            const handoffError = persistedHandoffs.match({
+              ok: () => null,
+              err: (error) => error,
+            });
             if (handoffError) {
               logger.error(
                 "failed to persist heartbeat handoff transcripts",
@@ -7506,19 +8384,21 @@ export async function startBusAgentRunner(params: {
               : undefined,
           });
 
-          await outputPublisher.publishResponseText({
-            finalText,
-            delivery,
-            statsForNerdsLine,
-            usage: runStats.totalUsage
-              ? {
-                  inputTokens: runStats.totalUsage.inputTokens ?? 0,
-                  outputTokens: runStats.totalUsage.outputTokens ?? 0,
-                  totalTokens: runStats.totalUsage.totalTokens ?? 0,
-                }
-              : undefined,
-          });
-
+          await publishTerminalResponseText(
+            {
+              finalText,
+              delivery,
+              statsForNerdsLine,
+              usage: runStats.totalUsage
+                ? {
+                    inputTokens: runStats.totalUsage.inputTokens ?? 0,
+                    outputTokens: runStats.totalUsage.outputTokens ?? 0,
+                    totalTokens: runStats.totalUsage.totalTokens ?? 0,
+                  }
+                : undefined,
+            },
+            isCancelled ? "cancelled" : "completed",
+          );
           logger.info(
             "agent run resolved",
             formatBridgeLogContext({
@@ -7526,6 +8406,8 @@ export async function startBusAgentRunner(params: {
               model: activeBinding.resolved.spec,
               durationMs: Date.now() - runStartedAt,
               turns: turnEndCount,
+              transcriptMessageCount: (runStats.finalMessages ?? agent.state.messages).length,
+              transcriptHasCompactionCheckpoint,
               finalTextChars: finalText.length,
               ttftMs,
               tokensPerSecond: tps,
@@ -7550,14 +8432,18 @@ export async function startBusAgentRunner(params: {
           terminalPanic = panic;
         },
       );
-      const runFailure = runResult.match({ ok: () => null, err: (error) => error });
+      const runFailure = runResult.match({
+        ok: () => null,
+        err: (error) => error,
+      });
       if (runFailure) {
         const failure = runFailure;
         const failedCoreNamedRuntime = getCoreNamedClaudeRuntime();
         const failedCorePrimaryRuntime = getCorePrimaryClaudeRuntime();
         runIdleWatchdog?.stop();
 
-        if (failure.failureKind === "restart-draining") {
+        if (failure.failureKind === "shutdown-draining") {
+          shouldTerminalizeRequest = false;
           failedCoreNamedRuntime?.markUncertain();
           failedCorePrimaryRuntime?.markUncertain();
         } else if (failure.failureKind === "pre-agent-cancelled") {
@@ -7618,7 +8504,7 @@ export async function startBusAgentRunner(params: {
           }
         }
 
-        if (failure.failureKind === "restart-draining") {
+        if (failure.failureKind === "shutdown-draining") {
           preserveWorkflowClaim = true;
           if (workflowHint) {
             params.durableWorkflowStore?.releaseWorkflowRequestClaim(
@@ -7627,15 +8513,16 @@ export async function startBusAgentRunner(params: {
               Date.now(),
             );
           }
-          logger.info("agent run interrupted for graceful restart", {
+          logger.info("agent run interrupted after shutdown drain deadline", {
             requestId: headers.request_id,
             sessionId: headers.session_id,
             durationMs: Date.now() - runStartedAt,
           });
-          return;
+          return { status: "return", value: undefined } as const;
         }
 
         if (failure.failureKind === "pre-agent-cancelled") {
+          requestTerminalKind = "cancelled";
           if (liveParentSession) {
             await captureBusAgentRunnerOperation("cancel deferred subagents", () =>
               liveParentSession.cancelAll("parent request cancelled"),
@@ -7647,8 +8534,8 @@ export async function startBusAgentRunner(params: {
             detail: "cancelled by interrupt",
             output: finalText,
           });
-          await outputPublisher.publishResponseText({ finalText });
-          return;
+          await publishTerminalResponseText({ finalText });
+          return { status: "return", value: undefined } as const;
         }
 
         const rawMsg = failure.displayMessage;
@@ -7661,7 +8548,7 @@ export async function startBusAgentRunner(params: {
         if (failureTranscriptStore) {
           const persistedFailure = await captureBusAgentRunnerOperation(
             "failed run transcript persistence",
-            () => {
+            async () => {
               const finalMessagesForPersistence =
                 runStats.finalMessages ?? activeAgent?.getRecoverableMessages() ?? [];
               const safeFinalMessages = buildSafeRecoveryCheckpoint(
@@ -7669,13 +8556,19 @@ export async function startBusAgentRunner(params: {
                 "agent run failed",
               );
               const responseMessages = safeFinalMessages.slice(responseStartIndex);
-              const persistedMessages = (() => {
+              const persistenceCandidates = (() => {
                 if (isHeartbeatSessionId(headers.session_id)) {
                   return buildPersistedHeartbeatMessages(`Error: ${msg}`);
                 }
 
                 return runProfile === "primary" ? responseMessages : safeFinalMessages;
               })();
+              const persistedMessages = await projectTranscriptMessagesForPersistence({
+                identityProjection: storedMessageIdentity,
+                providerMessages: persistenceCandidates,
+                blobStore: params.blobStore,
+                transcriptStore: failureTranscriptStore,
+              });
 
               return failureTranscriptStore.saveRequestTranscript({
                 requestId: headers.request_id,
@@ -7684,6 +8577,7 @@ export async function startBusAgentRunner(params: {
                 messages: persistedMessages,
                 finalText: `Error: ${msg}`,
                 modelLabel: resolvedModelLabel,
+                loadedCatalogIds: toolAuthority.snapshot(),
                 ...(runProfile === "primary"
                   ? {
                       providerState: resolveCorePrimaryTranscriptProviderState({
@@ -7798,7 +8692,9 @@ export async function startBusAgentRunner(params: {
               }
             : undefined,
         });
-        await outputPublisher.publishResponseText({ finalText: `Error: ${msg}` });
+        await publishTerminalResponseText({
+          finalText: `Error: ${msg}`,
+        });
 
         const projectedError: BusAgentRunnerErrorProjection = {
           message: failure.message,
@@ -7816,7 +8712,9 @@ export async function startBusAgentRunner(params: {
           }),
         );
       }
-    } finally {
+
+      return { status: "continue" } as const;
+    })().finally(async () => {
       const cleanupCoreNamedRuntime = getCoreNamedClaudeRuntime();
       const cleanupCorePrimaryRuntime = getCorePrimaryClaudeRuntime();
       const cleanupClaudeCodeRun = getClaudeCodeRun();
@@ -7861,7 +8759,10 @@ export async function startBusAgentRunner(params: {
         terminalCleanups.push(
           { label: "agent-unsubscribe", run: unsubscribe },
           { label: "compaction-unsubscribe", run: unsubscribeCompaction },
-          { label: "output-publisher-drain", run: () => outputPublisher.drain() },
+          {
+            label: "output-publisher-drain",
+            run: () => outputPublisher.drain(),
+          },
         );
         if (cleanupCoreNamedRuntime) {
           const runtime = cleanupCoreNamedRuntime;
@@ -7879,11 +8780,17 @@ export async function startBusAgentRunner(params: {
         }
         if (cleanupClaudeCodeRun) {
           const run = cleanupClaudeCodeRun;
-          terminalCleanups.push({ label: "claude-dispose", run: () => run.dispose() });
+          terminalCleanups.push({
+            label: "claude-dispose",
+            run: () => run.dispose(),
+          });
         }
         if (liveParentSession) {
           const session = liveParentSession;
-          terminalCleanups.push({ label: "live-close", run: () => session.close() });
+          terminalCleanups.push({
+            label: "live-close",
+            run: () => session.close(),
+          });
         }
         const cleanupBatch = startBusAgentRunnerTerminalCleanup(terminalCleanups);
         terminalCleanupOperations = [...terminalCleanupOperations, ...cleanupBatch.operations];
@@ -7963,16 +8870,111 @@ export async function startBusAgentRunner(params: {
         }
         await liveParentSession?.close();
       }
+      const finalReplayDeadline = outputPublisher.getFinalReplayDeadline();
+      const terminalSurfaceWriteSatisfied =
+        !terminalSurfaceWriteAttempted || terminalSurfaceWriteInitiated;
+      if (terminalSurfaceWriteSatisfied) markActiveRunTerminal();
+      if (terminalMarkerOperation) {
+        await terminalMarkerOperation;
+      } else if (state.activeRun) {
+        await flushRunCheckpointWriter(state.activeRun);
+      }
+      const checkpointWriterAbandoned = state.activeRun?.checkpointWriter.abandoned === true;
+      let owningDeliveryTerminalized = false;
+      if (
+        !terminalPanic &&
+        !checkpointWriterAbandoned &&
+        shouldTerminalizeRequest &&
+        terminalSurfaceWriteSatisfied &&
+        next.requestDeliveryId &&
+        params.requestDelivery
+      ) {
+        const terminalized = await params.requestDelivery.terminalize({
+          requestDeliveryId: next.requestDeliveryId,
+          outcome: { kind: requestTerminalKind },
+          ...(finalReplayDeadline === undefined
+            ? {}
+            : {
+                finalReplayDeadline,
+              }),
+          transportCommitRequired: true,
+        });
+        const terminalError = terminalized.match({
+          ok: () => null,
+          err: (error) => error,
+        });
+        if (terminalError) {
+          logger.error(
+            "request delivery terminalization failed",
+            formatBridgeTaggedErrorForLog(terminalError, {
+              requestId: headers.request_id,
+              sessionId: headers.session_id,
+              requestDeliveryId: next.requestDeliveryId,
+            }),
+          );
+        } else {
+          owningDeliveryTerminalized = true;
+        }
+      }
+      let retainedDeliveriesTerminalized = true;
+      if (
+        !terminalPanic &&
+        !checkpointWriterAbandoned &&
+        shouldTerminalizeRequest &&
+        terminalSurfaceWriteSatisfied &&
+        params.requestDelivery
+      ) {
+        for (const [requestDeliveryId, retainedOutcome] of state.activeRun
+          ?.retainedRequestDeliveries ?? []) {
+          const terminalized = await params.requestDelivery.terminalize({
+            requestDeliveryId,
+            outcome: retainedOutcome,
+            ...(finalReplayDeadline === undefined ? {} : { finalReplayDeadline }),
+            transportCommitRequired: true,
+          });
+          terminalized.match({
+            ok: () => undefined,
+            err: (error) => {
+              retainedDeliveriesTerminalized = false;
+              logger.error(
+                "retained request delivery terminalization failed",
+                formatBridgeTaggedErrorForLog(error, {
+                  requestId: headers.request_id,
+                  sessionId: headers.session_id,
+                  requestDeliveryId,
+                }),
+              );
+            },
+          });
+        }
+      }
+      if (
+        !checkpointWriterAbandoned &&
+        owningDeliveryTerminalized &&
+        retainedDeliveriesTerminalized &&
+        next.requestDeliveryId
+      ) {
+        const removed = activeAgentRunJournal?.removeReconciled(next.requestDeliveryId);
+        const removeError = removed?.match({ ok: () => null, err: (error) => error });
+        if (removed && !removeError) {
+          releaseRunCheckpointBlobs({
+            requestDeliveryId: next.requestDeliveryId,
+            requestId: next.requestId,
+            sessionId: next.sessionId,
+          });
+        }
+      }
       state.agent = null;
       state.activeRequestId = null;
       state.activeRun = null;
       state.running = false;
       cancelledByRequestId.delete(headers.request_id);
-      restartAbortRequestIds.delete(headers.request_id);
-      if (!terminalPanic) {
+      shutdownAbortRequestIds.delete(headers.request_id);
+      if (!terminalPanic && !checkpointWriterAbandoned) {
         startSessionQueueDrain(sessionId, state);
       }
-    }
+    });
+    if (outcome.status === "return") return outcome.value;
   }
 
   function getActiveLevel1Work(): readonly AgentRunnerActiveWork[] {
@@ -8004,23 +9006,303 @@ export async function startBusAgentRunner(params: {
     return active;
   }
 
+  function discardPausedRecoveredDelivery(requestDeliveryId: string): ResultType<void, Error> {
+    for (const [sessionId, state] of bySession) {
+      if (
+        state.activeRun?.requestDeliveryId === requestDeliveryId ||
+        state.activeRun?.retainedRequestDeliveries.has(requestDeliveryId)
+      ) {
+        return Result.err(
+          new Error("A running recovery entry cannot be discarded before replay terminalization"),
+        );
+      }
+      const retainedOwner = state.queue.find((entry) =>
+        entry.retainedRequestDeliveries?.some(
+          (retained) => retained.requestDeliveryId === requestDeliveryId,
+        ),
+      );
+      if (retainedOwner) {
+        return Result.err(
+          new Error("A merged retained recovery delivery cannot be discarded independently"),
+        );
+      }
+      const matches = state.queue.filter((entry) => entry.requestDeliveryId === requestDeliveryId);
+      if (matches.some((entry) => reservedQueueEntries.has(entry))) {
+        return Result.err(
+          new Error("A reserved recovery entry cannot be discarded before replay terminalization"),
+        );
+      }
+      if (matches.length === 0) continue;
+      removeQueuedEntriesByReference(state.queue, matches);
+      for (const entry of matches) {
+        if (entry.identityOwner) requestMessageCache.releaseOwner(entry.identityOwner);
+      }
+      if (!state.running && state.queue.length === 0) bySession.delete(sessionId);
+      return Result.ok(undefined);
+    }
+    return Result.ok(undefined);
+  }
+
+  function restoreAcceptedRequestIdentity(
+    record: AcceptedRequestDelivery<CoreAcceptedRequestWork>,
+  ):
+    | {
+        readonly identityOwner: RequestMessageCacheOwner;
+        readonly projection: AuthenticatedRequestProjection;
+      }
+    | undefined {
+    const work = record.work;
+    const eventId = record.publication?.streamId ?? `accepted:${record.requestDeliveryId}`;
+    const message: CmdRequestMessage = {
+      id: eventId,
+      topic: "cmd.request",
+      type: lilacEventTypes.CmdRequestMessage,
+      ts: record.acceptedAt,
+      key: work.requestId,
+      headers: work.headers,
+      data: work.data,
+    };
+    const projected = (params.projectAuthenticatedRequest ?? projectAuthenticatedRequest)(message);
+    let projectionError: AuthenticatedRequestProjectionInvalid | undefined;
+    const selectProjection = projected.match<() => AuthenticatedRequestProjection | undefined>({
+      err: (error) => () => {
+        projectionError = error;
+        return undefined;
+      },
+      ok: (projection) => () => projection,
+    });
+    const externalProjection = selectProjection();
+    if (projectionError || !externalProjection) {
+      logger.warn(
+        "accepted request recovery identity restricted",
+        formatBridgeLogContext({
+          requestDeliveryId: record.requestDeliveryId,
+          requestId: work.requestId,
+          sessionId: work.sessionId,
+          reason: projectionError ? "projection-invalid" : "projection-absent",
+          errorTag: projectionError?.name,
+        }),
+      );
+      return undefined;
+    }
+
+    const projection = projectDurableWorkflowRequestIdentity({
+      projection: externalProjection,
+      raw: preserveAgentRunnerRaw({ data: work.data }),
+      store: params.durableWorkflowStore,
+    });
+    if (!isPersistedRecoveryAuthenticatedRequestProjectionSemanticallyValid(projection)) {
+      logger.warn(
+        "accepted request recovery identity restricted",
+        formatBridgeLogContext({
+          requestDeliveryId: record.requestDeliveryId,
+          requestId: work.requestId,
+          sessionId: work.sessionId,
+          reason: "durable-proof-invalid",
+        }),
+      );
+      return undefined;
+    }
+
+    const cached = requestMessageCache.cacheMessage(message, projection);
+    let cacheError: RequestMessageCacheAdmissionError | undefined;
+    const selectCachedProjection = cached.match<() => AuthenticatedRequestProjection | undefined>({
+      err: (error) => () => {
+        cacheError = error;
+        return undefined;
+      },
+      ok: (value) => () => value,
+    });
+    const cachedProjection = selectCachedProjection();
+    if (cacheError) {
+      logger.warn(
+        "accepted request recovery identity restricted",
+        formatBridgeLogContext({
+          requestDeliveryId: record.requestDeliveryId,
+          requestId: work.requestId,
+          sessionId: work.sessionId,
+          reason: "cache-admission-failed",
+          errorTag: cacheError.name,
+        }),
+      );
+      return undefined;
+    }
+    if (!cachedProjection) {
+      requestMessageCache.finishDelivery({
+        requestId: work.requestId,
+        eventId,
+        disposition: "release",
+      });
+      logger.warn(
+        "accepted request recovery identity restricted",
+        formatBridgeLogContext({
+          requestDeliveryId: record.requestDeliveryId,
+          requestId: work.requestId,
+          sessionId: work.sessionId,
+          reason: "cache-admission-empty",
+        }),
+      );
+      return undefined;
+    }
+
+    const owner = requestMessageCache.acquireOwner(work.requestId);
+    let ownerError: RequestIdentitySourceMissing | undefined;
+    const selectOwner = owner.match<() => RequestMessageCacheOwner | undefined>({
+      err: (error) => () => {
+        ownerError = error;
+        return undefined;
+      },
+      ok: (identityOwner) => () => identityOwner,
+    });
+    const identityOwner = selectOwner();
+    requestMessageCache.finishDelivery({
+      requestId: work.requestId,
+      eventId,
+      disposition: "release",
+    });
+    if (ownerError || !identityOwner) {
+      logger.warn(
+        "accepted request recovery identity restricted",
+        formatBridgeLogContext({
+          requestDeliveryId: record.requestDeliveryId,
+          requestId: work.requestId,
+          sessionId: work.sessionId,
+          reason: "cache-owner-failed",
+          errorTag: ownerError?.name,
+        }),
+      );
+      return undefined;
+    }
+    return { identityOwner, projection: cachedProjection };
+  }
+
+  async function resumeAcceptedDelivery(
+    record: AcceptedRequestDelivery<CoreAcceptedRequestWork>,
+    recoveryHead?: AgentRunRecoveryHead,
+  ): Promise<ResultType<void, Error>> {
+    const work = record.work;
+    if (
+      work.requestDeliveryId !== record.requestDeliveryId ||
+      work.requestId !== record.requestId
+    ) {
+      return Result.err(
+        new Error("Accepted request delivery identity does not match its durable work"),
+      );
+    }
+    if (recoveryHead?.state === "terminal") return Result.ok(undefined);
+    for (const state of bySession.values()) {
+      if (
+        state.activeRun?.requestDeliveryId === record.requestDeliveryId ||
+        state.activeRun?.retainedRequestDeliveries.has(record.requestDeliveryId) ||
+        state.queue.some(
+          (entry) =>
+            entry.requestDeliveryId === record.requestDeliveryId ||
+            entry.retainedRequestDeliveries?.some(
+              (retained) => retained.requestDeliveryId === record.requestDeliveryId,
+            ),
+        )
+      ) {
+        return Result.ok(undefined);
+      }
+    }
+    const restoredIdentity = restoreAcceptedRequestIdentity(record);
+    const restoredCurrentTurnUserId =
+      recoveryHead?.checkpoint?.currentTurnUserId ??
+      restoredIdentity?.projection.authenticatedOrigin?.userId;
+    const restoredCurrentTurnMessageRef = recoveryHead?.checkpoint?.currentTurnUserId
+      ? undefined
+      : restoredIdentity?.projection.authenticatedOrigin?.messageRef;
+    const entry: Enqueued = {
+      queueEntryId: record.publication?.streamId ?? `accepted:${record.requestDeliveryId}`,
+      requestDeliveryId: record.requestDeliveryId,
+      requestId: work.requestId,
+      sessionId: work.sessionId,
+      requestClient: work.requestClient,
+      queue: work.data.queue,
+      runPolicy: work.data.runPolicy ?? "normal",
+      origin: work.data.origin,
+      messages: [],
+      storedMessages: [...work.data.messages],
+      corePrimaryLineage:
+        recoveryHead?.checkpoint?.corePrimaryLineage ?? work.data.corePrimaryLineage,
+      acceptedCorePrimaryLineage: work.data.corePrimaryLineage,
+      modelOverride: work.data.modelOverride,
+      raw: preserveAgentRunnerRaw({ data: work.data }),
+      ...(restoredIdentity
+        ? {
+            identityOwner: restoredIdentity.identityOwner,
+            ...(restoredIdentity.projection.authenticatedOrigin
+              ? { authenticatedOrigin: restoredIdentity.projection.authenticatedOrigin }
+              : {}),
+            ...(restoredCurrentTurnUserId ? { currentTurnUserId: restoredCurrentTurnUserId } : {}),
+            ...(restoredCurrentTurnMessageRef
+              ? { currentTurnMessageRef: restoredCurrentTurnMessageRef }
+              : {}),
+            ...(restoredIdentity.projection.authenticatedOrigin?.userId
+              ? {
+                  acceptedCurrentTurnUserId: restoredIdentity.projection.authenticatedOrigin.userId,
+                }
+              : {}),
+            verifiedIngress: restoredIdentity.projection.verifiedIngress,
+          }
+        : { restoredSafetyMode: "restricted" as const }),
+      ...(recoveryHead?.checkpoint
+        ? {
+            recovery: { checkpointMessages: [], partialText: "" },
+            storedRecoveryCheckpoint: [...recoveryHead.checkpoint.messages],
+            ...(recoveryHead.checkpoint.loadedCatalogIds
+              ? {
+                  loadedCatalogIds: [...recoveryHead.checkpoint.loadedCatalogIds],
+                }
+              : {}),
+            ...(recoveryHead.previousCheckpoint
+              ? { previousRecoveryCheckpoint: recoveryHead.previousCheckpoint }
+              : {}),
+            retainedRequestDeliveries: recoveryHead.checkpoint.retainedRequestDeliveries,
+          }
+        : {}),
+      ...(recoveryHead ? { journalHandle: recoveryHead.handle } : {}),
+    };
+    const state =
+      bySession.get(work.sessionId) ??
+      ({
+        running: false,
+        agent: null,
+        queue: [] as Enqueued[],
+        activeRequestId: null,
+        activeRun: null,
+        compactedToolCallIds: new Set<string>(),
+      } satisfies SessionQueue);
+    state.queue.push(entry);
+    bySession.set(work.sessionId, state);
+    if (runnerActivated && !state.running) {
+      startSessionQueueDrain(work.sessionId, state, work.requestId);
+    }
+    return Result.ok(undefined);
+  }
+
   await startSubscription();
   const activate = (): void => {
     activateRunnerAdmission();
+    for (const [sessionId, state] of bySession) {
+      if (!state.running && state.queue.length > 0) {
+        startSessionQueueDrain(sessionId, state, state.queue[0]?.requestId);
+      }
+    }
   };
 
   return {
     activate,
     beginDrain,
     getActiveLevel1Work,
-    snapshotRecoverables,
-    snapshotQueueAttempts,
-    prepareRecovery,
+    resumeAcceptedDelivery,
+    discardPausedRecoveredDelivery,
     getActiveDrainOperation: () => activeDrainOperation,
     getTerminalCleanupOperations: () => terminalCleanupOperations,
     stop: async () => {
       stopRunnerAdmission();
       await stopSubscription();
+      await stopRunCheckpointWriters();
       if (terminalCleanupCompletion) {
         let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
         const completed = await Promise.race([
@@ -8042,8 +9324,7 @@ export async function startBusAgentRunner(params: {
       bySession.clear();
       queueLifecycleAttempts.clear();
       reservedQueueEntries.clear();
-      forcedRecoveryByRequestId.clear();
-      restartAbortRequestIds.clear();
+      shutdownAbortRequestIds.clear();
     },
   };
 }
@@ -8070,12 +9351,66 @@ async function publishLifecycle(params: {
   })();
 }
 
+function mergeQueuedControlsForRecovery(
+  first: Enqueued,
+  queue: Enqueued[],
+  reservedQueueEntries: ReadonlySet<Enqueued>,
+): {
+  readonly storedMessages: readonly StoredMessageV1[];
+  readonly reapplied: readonly Enqueued[];
+  readonly discarded: readonly Enqueued[];
+} {
+  const retainedRequestDeliveryIds = new Set(
+    first.retainedRequestDeliveries?.map(({ requestDeliveryId }) => requestDeliveryId),
+  );
+  const storedMessages: StoredMessageV1[] = [];
+  const reapplied: Enqueued[] = [];
+  const discarded: Enqueued[] = [];
+
+  for (let index = 0; index < queue.length; ) {
+    const entry = queue[index]!;
+    const control = parseRequestControlFromRaw(entry.raw);
+    const targetsRecoveredRun = entry.requestId === first.requestId || control.requiresActive;
+    const isActiveControl = entry.queue !== "prompt" && !control.cancel && targetsRecoveredRun;
+    if (!isActiveControl || reservedQueueEntries.has(entry)) {
+      index += 1;
+      continue;
+    }
+
+    const alreadyRetained =
+      entry.requestDeliveryId !== undefined &&
+      retainedRequestDeliveryIds.has(entry.requestDeliveryId);
+    if (!alreadyRetained) {
+      storedMessages.push(...entry.storedMessages);
+      reapplied.push(entry);
+      first.currentTurnUserId = entry.currentTurnUserId;
+      first.currentTurnMessageRef = entry.currentTurnMessageRef;
+    }
+    discarded.push(entry);
+    queue.splice(index, 1);
+  }
+
+  if (reapplied.length > 0) {
+    first.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
+      "queued-request-coalesced",
+      first.corePrimaryLineage?.currentCanonicalStart,
+    );
+  }
+
+  return { storedMessages, reapplied, discarded };
+}
+
 function mergeQueuedForSameRequest(
   first: Enqueued,
   queue: Enqueued[],
   reservedQueueEntries: ReadonlySet<Enqueued>,
-): { readonly messages: ModelMessage[]; readonly discarded: readonly Enqueued[] } {
+): {
+  readonly messages: ModelMessage[];
+  readonly storedMessages: StoredMessageV1[];
+  readonly discarded: readonly Enqueued[];
+} {
   const merged: ModelMessage[] = [...first.messages];
+  const storedMessages: StoredMessageV1[] = [...first.storedMessages];
   const discarded: Enqueued[] = [];
 
   // Pull in any already-queued items for the same request id so they become
@@ -8088,7 +9423,9 @@ function mergeQueuedForSameRequest(
     }
 
     merged.push(...next.messages);
+    storedMessages.push(...next.storedMessages);
     first.currentTurnUserId = next.currentTurnUserId;
+    first.currentTurnMessageRef = next.currentTurnMessageRef;
     discarded.push(next);
     queue.splice(i, 1);
   }
@@ -8100,7 +9437,7 @@ function mergeQueuedForSameRequest(
     );
   }
 
-  return { messages: merged, discarded };
+  return { messages: merged, storedMessages, discarded };
 }
 
 async function applyToRunningAgent(
@@ -8108,30 +9445,52 @@ async function applyToRunningAgent(
   entry: Enqueued,
   cancelledByRequestId: Set<string>,
   activeRun: SessionQueue["activeRun"],
+  retainAppliedControl: (
+    checkpoint:
+      | { readonly kind: "canonical" }
+      | { readonly kind: "queued"; readonly inputId: AgentInputQueueId }
+      | { readonly kind: "pending" },
+  ) => void,
 ) {
   activeRun?.flushOutput();
-  const merged = mergeToSingleUserMessage(entry.messages);
   const liveParent = activeRun?.liveParent;
   const claudeCodeControl = activeRun?.claudeCodeControl;
   const notifyWaiters = activeRun?.notifyWaiters;
+  const cancel = parseRequestControlFromRaw(entry.raw).cancel;
+  const providerMessages =
+    !cancel && activeRun?.materializeStoredMessages
+      ? await activeRun.materializeStoredMessages(entry.storedMessages)
+      : entry.messages;
+  const merged = mergeToSingleUserMessage(providerMessages);
+  if (!cancel) {
+    activeRun?.rememberStoredMessages(
+      [merged],
+      [mergeToSingleStoredUserMessage(entry.storedMessages)],
+    );
+  }
   const queueWhileIdle = (mode: "followUp" | "steer") => {
-    if (mode === "steer") {
-      agent.steer(merged);
-    } else {
-      agent.followUp(merged);
-    }
+    const inputId = mode === "steer" ? agent.steer(merged) : agent.followUp(merged);
+    retainAppliedControl({ kind: "queued", inputId });
     notifyWaiters?.();
   };
 
   const promptWhileIdle = () => {
-    void agent.prompt(merged).catch(() => {
-      notifyWaiters?.();
-    });
+    retainAppliedControl({ kind: "canonical" });
+    void observePrompt();
     notifyWaiters?.();
+
+    async function observePrompt(): Promise<void> {
+      const prompted = await Result.tryPromise({
+        try: () => agent.prompt(merged),
+        catch: () => undefined,
+      });
+      if (prompted.match({ ok: () => false, err: () => true })) notifyWaiters?.();
+    }
   };
 
-  const cancel = parseRequestControlFromRaw(entry.raw).cancel;
-  if (!cancel) activeRun?.setCurrentTurnUserId(entry.currentTurnUserId);
+  if (!cancel) {
+    activeRun?.setCurrentTurnContext(entry.currentTurnUserId, entry.currentTurnMessageRef);
+  }
   if (!cancel && activeRun?.runProfile === "primary" && activeRun.requestClient === "discord") {
     activeRun.corePrimaryLineage = degradeCorePrimaryLineageForMutation(
       entry.queue === "steer" || entry.queue === "interrupt"
@@ -8164,6 +9523,7 @@ async function applyToRunningAgent(
       }
       case "interrupt": {
         if (cancel) {
+          retainAppliedControl({ kind: "pending" });
           cancelledByRequestId.add(entry.requestId);
           await liveParent?.cancelAll("parent request aborted");
           agent.cancel();
@@ -8174,6 +9534,7 @@ async function applyToRunningAgent(
           queueWhileIdle("steer");
           return;
         }
+        retainAppliedControl({ kind: "canonical" });
         await agent.interrupt(merged);
         notifyWaiters?.();
         return;
@@ -8188,6 +9549,7 @@ async function applyToRunningAgent(
   switch (entry.queue) {
     case "steer": {
       const steeringId = agent.steer(merged);
+      retainAppliedControl({ kind: "queued", inputId: steeringId });
       if (merged.role === "user" && typeof merged.content === "string") {
         claudeCodeControl?.inject(merged.content, (delivered) => {
           if (delivered) agent.acknowledgeSteeringDelivery(steeringId);
@@ -8197,12 +9559,14 @@ async function applyToRunningAgent(
       return;
     }
     case "followUp": {
-      agent.followUp(merged);
+      const followUpId = agent.followUp(merged);
+      retainAppliedControl({ kind: "queued", inputId: followUpId });
       notifyWaiters?.();
       return;
     }
     case "interrupt": {
       if (cancel) {
+        retainAppliedControl({ kind: "pending" });
         cancelledByRequestId.add(entry.requestId);
         await liveParent?.cancelAll("parent request aborted");
         await claudeCodeControl?.interrupt();
@@ -8210,7 +9574,8 @@ async function applyToRunningAgent(
         notifyWaiters?.();
         return;
       }
-      agent.steer(merged);
+      const steeringId = agent.steer(merged);
+      retainAppliedControl({ kind: "queued", inputId: steeringId });
       const interruptedNatively = (await claudeCodeControl?.interrupt()) ?? false;
       if (!interruptedNatively) agent.interruptQueuedSteering();
       notifyWaiters?.();
@@ -8218,7 +9583,8 @@ async function applyToRunningAgent(
     }
     case "prompt": {
       // Cannot prompt while streaming; treat as followUp.
-      agent.followUp(merged);
+      const followUpId = agent.followUp(merged);
+      retainAppliedControl({ kind: "queued", inputId: followUpId });
       notifyWaiters?.();
       return;
     }
@@ -8305,4 +9671,36 @@ export function mergeToSingleUserMessage(messages: ModelMessage[]): ModelMessage
     role: "user",
     content: parts.join("\n\n").trim(),
   };
+}
+
+function mergeToSingleStoredUserMessage(messages: readonly StoredMessageV1[]): StoredMessageV1 {
+  const userMessages = messages.filter(
+    (message): message is Extract<StoredMessageV1, { readonly role: "user" }> =>
+      message.role === "user",
+  );
+  if (userMessages.length === 0) return { role: "user", content: "" };
+  const hasMultipart = userMessages.some((message) => typeof message.content !== "string");
+  if (!hasMultipart) {
+    return {
+      role: "user",
+      content: userMessages
+        .flatMap((message) => (typeof message.content === "string" ? [message.content] : []))
+        .join("\n\n")
+        .trim(),
+    };
+  }
+
+  const content: Exclude<Extract<StoredMessageV1, { readonly role: "user" }>["content"], string> =
+    [];
+  for (let index = 0; index < userMessages.length; index += 1) {
+    const message = userMessages[index];
+    if (!message) continue;
+    if (index > 0) content.push({ type: "text", text: "\n\n" });
+    if (typeof message.content === "string") {
+      if (message.content.length > 0) content.push({ type: "text", text: message.content });
+      continue;
+    }
+    content.push(...message.content);
+  }
+  return { role: "user", content };
 }

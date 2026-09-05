@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { DecodedPersistedValue } from "@stanley2058/lilac-utils";
 
 import { canonicalJson, sha256 } from "./workflow-definition";
-import { jsonValueSchema, type JsonValue } from "./workflow-domain";
+import { jsonValueSchema, type JsonValue, type WorkflowArtifactReference } from "./workflow-domain";
 
 export const WORKFLOW_VALUE_ARTIFACT_FORMAT_VERSION = 1;
 
@@ -100,6 +100,21 @@ export function encodeWorkflowValueArtifact(value: JsonValue): {
   };
 }
 
+export function encodeWorkflowArtifactReference(reference: WorkflowArtifactReference): string {
+  return canonicalJson({
+    artifactId: reference.artifactId,
+    blobRef: {
+      byteLength: reference.blobRef.byteLength,
+      ...(reference.blobRef.expiresAt === undefined
+        ? {}
+        : { expiresAt: reference.blobRef.expiresAt }),
+      objectId: reference.blobRef.objectId,
+      sha256: reference.blobRef.sha256,
+      version: reference.blobRef.version,
+    },
+  });
+}
+
 export function workflowValueArtifactFileByteLimit(maxValueBytes: number): number {
   const empty = encodeWorkflowValueArtifact(null);
   return maxValueBytes + Buffer.byteLength(empty.encoded, "utf8") - empty.payloadBytes;
@@ -108,17 +123,23 @@ export function workflowValueArtifactFileByteLimit(maxValueBytes: number): numbe
 export function decodeWorkflowValueArtifact(
   input: WorkflowValueArtifactCodecInput,
 ): ResultType<DecodedPersistedValue<JsonValue>, WorkflowArtifactCodecError> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(input.encoded);
-  } catch {
-    return Result.err(
+  const parsedResult = Result.try({
+    try: (): unknown => JSON.parse(input.encoded),
+    catch: () =>
       new WorkflowArtifactMalformedJson({
         artifactId: input.artifactId,
         message: "Workflow value artifact contains malformed JSON",
       }),
-    );
-  }
+  });
+  const parsedOutcome = parsedResult.match<
+    | { readonly kind: "success"; readonly parsed: unknown }
+    | { readonly kind: "failure"; readonly error: WorkflowArtifactMalformedJson }
+  >({
+    ok: (parsed) => ({ kind: "success", parsed }),
+    err: (error) => ({ kind: "failure", error }),
+  });
+  if (parsedOutcome.kind === "failure") return Result.err(parsedOutcome.error);
+  const { parsed } = parsedOutcome;
 
   const json = jsonValueSchema.safeParse(parsed);
   if (!json.success) return Result.err(corrupt(input.artifactId, "invalid-json-value"));

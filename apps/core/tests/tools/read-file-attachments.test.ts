@@ -6,6 +6,7 @@ import path from "node:path";
 import { asSchema, type ToolModelMessage, type ToolSet } from "ai";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { AiSdkPiAgent } from "@stanley2058/lilac-agent";
+import { Result } from "better-result";
 
 import { createToolResultOutputNormalizer } from "../../src/artifacts/tool-result-output-normalizer";
 import { batchTool } from "../../src/tools/batch";
@@ -98,40 +99,74 @@ describe("read attachments", () => {
     await rm(baseDir, { recursive: true, force: true });
   });
 
-  it("advertises direct image and PDF reads only when enabled", () => {
+  it("advertises the direct-media branches only when enabled", () => {
     const unsupportedDescription = getToolDescription(fsTool(baseDir).read);
     expect(unsupportedDescription).not.toContain("image");
     expect(unsupportedDescription).not.toContain("PDF");
     expect(unsupportedDescription).not.toContain("attachment");
 
     const supportedDescription = getToolDescription(
-      fsTool(baseDir, { readFileDirectAttachmentSupported: true }).read,
+      fsTool(baseDir, {
+        readFileDirectImageSupported: true,
+        readFileDirectPdfSupported: true,
+      }).read,
     );
     expect(supportedDescription).toContain(
-      "calling read attaches the original file to your context for native visual or document analysis",
+      "Analyze supported images and PDFs already attached to context directly",
     );
     expect(supportedDescription).toContain(
-      "Call read first for an image or PDF path, either directly or as an independent batch child",
+      "Use read to attach supported images and PDFs available only through a filesystem path or resource:// URI",
+    );
+    expect(supportedDescription).toContain(
+      "If read reports unsupported or oversized media, use shell tools to create a supported file, then read that file",
     );
     expect(supportedDescription).not.toContain("OCR");
     expect(supportedDescription).not.toContain("upstream provider");
+
+    const urlDescription = getToolDescription(
+      fsTool(baseDir, {
+        readFileDirectImageSupported: true,
+        readFileDirectPdfSupported: true,
+        readRemoteMedia: async () => Result.err(new Error("unused")),
+      }).read,
+    );
+    expect(urlDescription).toContain("direct HTTP(S) URL");
+    expect(urlDescription).toContain("Use fetch for web pages and text URLs");
   });
 
-  it("describes native media paths and text-only options when enabled", () => {
+  it("keeps path syntax separate from media behavior", () => {
     const unsupported = getInputPropertyDescriptions(fsTool(baseDir).read);
     expect(unsupported.path).not.toContain("images");
     expect(unsupported.path).not.toContain("PDFs");
 
     const supported = getInputPropertyDescriptions(
-      fsTool(baseDir, { readFileDirectAttachmentSupported: true }).read,
+      fsTool(baseDir, {
+        readFileDirectImageSupported: true,
+        readFileDirectPdfSupported: true,
+      }).read,
     );
-    expect(supported.path).toContain(
-      "Supported images and PDFs are attached to your context for native visual or document analysis.",
-    );
+    expect(supported.path).toBe("Filesystem path or resource:// URI.");
     expect(supported.start).toStartWith("Text files only.");
     expect(supported.maxLines).toStartWith("Text files only.");
     expect(supported.maxCharacters).toStartWith("Text files only.");
     expect(supported.format).toStartWith("Text files only.");
+
+    const imageOnlyDescription = getToolDescription(
+      fsTool(baseDir, {
+        readFileDirectImageSupported: true,
+        readFileDirectPdfSupported: false,
+      }).read,
+    );
+    expect(imageOnlyDescription).toContain("Analyze supported images already attached");
+    expect(imageOnlyDescription).not.toContain("PDFs");
+
+    const urlSupported = getInputPropertyDescriptions(
+      fsTool(baseDir, {
+        readFileDirectImageSupported: true,
+        readRemoteMedia: async () => Result.err(new Error("unused")),
+      }).read,
+    );
+    expect(urlSupported.path).toContain("HTTP(S) URL");
   });
 
   it("does not emit attachment output when the model lacks direct media support", async () => {
@@ -153,7 +188,10 @@ describe("read attachments", () => {
 
   it("rejects mislabeled attachment content and preserves failure semantics", async () => {
     await writeFile(path.join(baseDir, "fake.png"), "not an image");
-    const readFile = fsTool(baseDir, { readFileDirectAttachmentSupported: true }).read;
+    const readFile = fsTool(baseDir, {
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: true,
+    }).read;
     const output = await resolveExecuteResult(
       readFile.execute!(
         { path: "fake.png" },
@@ -178,7 +216,10 @@ describe("read attachments", () => {
 
     await writeFile(path.join(baseDir, "img.png"), pngBytes);
 
-    const tools = fsTool(baseDir, { readFileDirectAttachmentSupported: true });
+    const tools = fsTool(baseDir, {
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: true,
+    });
     const readFile = tools.read;
 
     expect(readFile.execute).toBeDefined();
@@ -216,7 +257,10 @@ describe("read attachments", () => {
     );
     await writeFile(path.join(baseDir, "doc.pdf"), pdf);
 
-    const tools = fsTool(baseDir, { readFileDirectAttachmentSupported: true });
+    const tools = fsTool(baseDir, {
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: true,
+    });
     const readFile = tools.read;
 
     expect(readFile.execute).toBeDefined();
@@ -248,13 +292,140 @@ describe("read attachments", () => {
     expect(parts[1]!.data).toEqual({ type: "data", data: pdf.toString("base64") });
   });
 
+  it("returns URL images through the existing attachment output", async () => {
+    const pngBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=";
+    const pngBytes = Buffer.from(pngBase64, "base64");
+    const downloads: Array<{ url: string; maxBytes: number }> = [];
+    const read = fsTool(baseDir, {
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: true,
+      maxInlineMediaBytesPerPart: 123_456,
+      readRemoteMedia: async ({ url, maxBytes }) => {
+        downloads.push({ url: url.toString(), maxBytes });
+        return Result.ok({ data: pngBytes });
+      },
+    }).read;
+
+    const inputUrl = "https://cdn.example.test/assets/photo?signature=secret";
+    const output = await resolveExecuteResult(
+      read.execute!({ path: inputUrl }, { toolCallId: "url-image", messages: [], context: {} }),
+    );
+
+    expect(downloads).toEqual([{ url: inputUrl, maxBytes: 123_456 }]);
+    expect(output).toMatchObject({
+      success: true,
+      kind: "attachment",
+      resolvedPath: "https://cdn.example.test/assets/photo",
+      filename: "photo",
+      mimeType: "image/png",
+      bytes: pngBytes.byteLength,
+    });
+    if (!isAttachmentResult(output)) return;
+
+    const modelOutput = await read.toModelOutput!({
+      toolCallId: "url-image",
+      input: { path: inputUrl },
+      output,
+    });
+    expect(modelOutput).toMatchObject({
+      type: "content",
+      value: [
+        { type: "text" },
+        {
+          type: "file",
+          mediaType: "image/png",
+          filename: "photo",
+          data: { type: "data", data: pngBase64 },
+        },
+      ],
+    });
+  });
+
+  it("does not let dangerouslyAllow bypass URL-read authority", async () => {
+    const read = fsTool(baseDir, {
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: true,
+    }).read;
+
+    const output = await resolveExecuteResult(
+      read.execute!(
+        { path: "https://example.test/image.png", dangerouslyAllow: true },
+        { toolCallId: "url-denied", messages: [], context: {} },
+      ),
+    );
+
+    expect(output).toMatchObject({
+      success: false,
+      error: { code: "PERMISSION", message: expect.stringContaining("web.fetch") },
+    });
+  });
+
+  it("directs remote text and web pages back to fetch", async () => {
+    const read = fsTool(baseDir, {
+      readFileDirectImageSupported: true,
+      readRemoteMedia: async () =>
+        Result.ok({ data: Buffer.from("<html><body>hello</body></html>") }),
+    }).read;
+
+    const output = await resolveExecuteResult(
+      read.execute!(
+        { path: "https://example.test/page" },
+        { toolCallId: "url-html", messages: [], context: {} },
+      ),
+    );
+
+    expect(output).toMatchObject({
+      success: false,
+      error: { code: "UNKNOWN", message: expect.stringContaining("Use fetch") },
+    });
+  });
+
+  it("keeps image-only models from attaching local PDFs", async () => {
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=",
+      "base64",
+    );
+    await writeFile(path.join(baseDir, "image.png"), png);
+    await writeFile(path.join(baseDir, "document.pdf"), "%PDF-1.4\n%%EOF\n");
+    const read = fsTool(baseDir, {
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: false,
+    }).read;
+
+    const image = await resolveExecuteResult(
+      read.execute!(
+        { path: "image.png" },
+        { toolCallId: "image-only-image", messages: [], context: {} },
+      ),
+    );
+    const pdf = await resolveExecuteResult(
+      read.execute!(
+        { path: "document.pdf" },
+        { toolCallId: "image-only-pdf", messages: [], context: {} },
+      ),
+    );
+
+    expect(image).toMatchObject({ success: true, kind: "attachment", mimeType: "image/png" });
+    expect(pdf).toMatchObject({
+      success: false,
+      error: { message: expect.stringContaining("does not accept this file type") },
+    });
+  });
+
   it("returns image content through an expanded batch child result", async () => {
     const pngBase64 =
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axh8h0AAAAASUVORK5CYII=";
     const pngBytes = Buffer.concat([Buffer.from(pngBase64, "base64"), Buffer.alloc(50 * 1024)]);
     await writeFile(path.join(baseDir, "batched.png"), pngBytes);
     const tools: ToolSet = {} as ToolSet;
-    Object.assign(tools, fsTool(baseDir, { readFileDirectAttachmentSupported: true }));
+    Object.assign(
+      tools,
+      fsTool(baseDir, {
+        readFileDirectImageSupported: true,
+        readFileDirectPdfSupported: true,
+      }),
+    );
     Object.assign(
       tools,
       batchTool({ defaultCwd: baseDir, getTools: () => tools, editingMode: "none" }),
@@ -340,7 +511,8 @@ describe("read attachments", () => {
   it("rejects oversized images before attachment caching with resize guidance", async () => {
     await writeFile(path.join(baseDir, "large.png"), Buffer.alloc(32));
     const readFile = fsTool(baseDir, {
-      readFileDirectAttachmentSupported: true,
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: true,
       maxInlineMediaBytesPerPart: 16,
     }).read;
 
@@ -361,7 +533,8 @@ describe("read attachments", () => {
   it("rejects oversized PDFs with file-reduction guidance", async () => {
     await writeFile(path.join(baseDir, "large.pdf"), Buffer.alloc(32));
     const readFile = fsTool(baseDir, {
-      readFileDirectAttachmentSupported: true,
+      readFileDirectImageSupported: true,
+      readFileDirectPdfSupported: true,
       maxInlineMediaBytesPerPart: 16,
     }).read;
 

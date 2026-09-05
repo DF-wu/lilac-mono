@@ -116,44 +116,76 @@ function preservePanic(error: Panic): never {
 }
 
 function opaqueErrorMessage(error: Error): string {
-  try {
-    return error.message;
-  } catch {
-    return "Opaque remote fs runner failure";
-  }
+  return Result.try({
+    try: () => error.message,
+    catch: () => "Opaque remote fs runner failure",
+  }).match({ ok: (message) => message, err: () => "Opaque remote fs runner failure" });
 }
 
 type ExternalErrorProjection =
   | { readonly kind: "panic"; readonly panic: Panic }
   | { readonly kind: "error"; readonly error: Error; readonly code?: string };
 
-function opaqueErrorCause(error: unknown): ExternalErrorProjection {
-  try {
-    if (Panic.is(error)) return { kind: "panic", panic: error };
-    if (error instanceof Error) {
-      const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
-      return { kind: "error", error, code };
-    }
-  } catch (inspectionCause) {
-    if (Panic.is(inspectionCause)) return { kind: "panic", panic: inspectionCause };
-    return { kind: "error", error: new Error("Opaque remote fs runner failure") };
-  }
-  return { kind: "error", error: new Error("Opaque remote fs runner failure") };
+type ExternalErrorSettlement = () => ExternalErrorProjection;
+
+function opaqueErrorCause(error: unknown): ExternalErrorSettlement {
+  return () => {
+    const inspectedPanic = Result.try({
+      try: (): Panic | undefined => (Panic.is(error) ? error : undefined),
+      catch: () => undefined,
+    });
+    const panic = inspectedPanic.match({ ok: (value) => value, err: () => undefined });
+    if (panic) return { kind: "panic", panic };
+    return Result.try({
+      try: (): ExternalErrorProjection => {
+        if (!(error instanceof Error)) {
+          return { kind: "error", error: new Error("Opaque remote fs runner failure") };
+        }
+        const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
+        return { kind: "error", error, code };
+      },
+      catch: (inspectionCause): ExternalErrorSettlement => {
+        return () => {
+          const inspected = Result.try({
+            try: (): Panic | undefined => (Panic.is(inspectionCause) ? inspectionCause : undefined),
+            catch: () => undefined,
+          });
+          const inspectionPanic = inspected.match({
+            ok: (value) => value,
+            err: () => undefined,
+          });
+          return inspectionPanic
+            ? { kind: "panic", panic: inspectionPanic }
+            : { kind: "error", error: new Error("Opaque remote fs runner failure") };
+        };
+      },
+    }).match({ ok: (projection) => projection, err: (settle) => settle() });
+  };
+}
+
+function settleExternalCapture<T>(
+  result: ResultType<T, ExternalErrorSettlement>,
+): ResultType<T, ExternalErrorProjection> {
+  return result.mapError((settle) => settle());
 }
 
 async function captureRuntimeOperation<T>(
   message: string,
   operation: () => Promise<T>,
 ): Promise<ResultType<T, RemoteFsRuntimeSetupError>> {
-  try {
-    return Result.ok(await operation());
-  } catch (caught) {
-    const cause = opaqueErrorCause(caught);
-    if (cause.kind === "panic") preservePanic(cause.panic);
-    return Result.err(
-      new RemoteFsRuntimeSetupError({ cause: cause.error, code: cause.code, message }),
-    );
-  }
+  const captured = settleExternalCapture(
+    await Result.tryPromise({ try: operation, catch: opaqueErrorCause }),
+  );
+  const outcome = resultOutcome(captured);
+  if (outcome.ok) return Result.ok(outcome.value);
+  if (outcome.error.kind === "panic") return preservePanic(outcome.error.panic);
+  return Result.err(
+    new RemoteFsRuntimeSetupError({
+      cause: outcome.error.error,
+      code: outcome.error.code,
+      message,
+    }),
+  );
 }
 
 function numberOrUndefined(value: string | undefined): number | undefined {
@@ -200,22 +232,25 @@ export async function ensureRuntimeDir(
 }
 
 async function readStdinText(): Promise<ResultType<string, RemoteFsStdinReadError>> {
-  try {
+  const readStdin = async () => {
     const chunks: Buffer[] = [];
     for await (const chunk of process.stdin) {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
-    return Result.ok(Buffer.concat(chunks).toString("utf8"));
-  } catch (caught) {
-    const projected = opaqueErrorCause(caught);
-    if (projected.kind === "panic") preservePanic(projected.panic);
-    return Result.err(
-      new RemoteFsStdinReadError({
-        cause: projected.error,
-        message: "failed to read remote fs CLI stdin",
-      }),
-    );
-  }
+    return Buffer.concat(chunks).toString("utf8");
+  };
+  const captured = settleExternalCapture(
+    await Result.tryPromise({ try: readStdin, catch: opaqueErrorCause }),
+  );
+  const outcome = resultOutcome(captured);
+  if (outcome.ok) return Result.ok(outcome.value);
+  if (outcome.error.kind === "panic") return preservePanic(outcome.error.panic);
+  return Result.err(
+    new RemoteFsStdinReadError({
+      cause: outcome.error.error,
+      message: "failed to read remote fs CLI stdin",
+    }),
+  );
 }
 
 function writeJson(value: ResponseEnvelope): void {
@@ -456,19 +491,20 @@ export async function spawnDaemon(
       env: process.env,
     }),
 ): Promise<ResultType<void, RemoteFsDaemonSpawnError>> {
-  let child;
-  try {
-    child = launchDaemon();
-  } catch (caught) {
-    const projected = opaqueErrorCause(caught);
-    if (projected.kind === "panic") preservePanic(projected.panic);
+  const launched = settleExternalCapture(
+    Result.try({ try: launchDaemon, catch: opaqueErrorCause }),
+  );
+  const launchOutcome = resultOutcome(launched);
+  if (!launchOutcome.ok) {
+    if (launchOutcome.error.kind === "panic") preservePanic(launchOutcome.error.panic);
     return Result.err(
       new RemoteFsDaemonSpawnError({
-        cause: projected.error,
+        cause: launchOutcome.error.error,
         message: "failed to spawn remote fs daemon",
       }),
     );
   }
+  const child = launchOutcome.value;
 
   return await new Promise((resolve) => {
     let settled = false;
@@ -571,20 +607,22 @@ export async function releaseStartupLock(
   },
 ): Promise<ResultType<void, RemoteFsStartupLockCleanupError>> {
   const target = lockPath();
-  try {
-    await removeLock(target);
-    return Result.ok(undefined);
-  } catch (caught) {
-    const projected = opaqueErrorCause(caught);
-    if (projected.kind === "panic") preservePanic(projected.panic);
-    return Result.err(
-      new RemoteFsStartupLockCleanupError({
-        lockPath: target,
-        cause: projected.error,
-        message: `failed to release remote fs startup lock: ${target}`,
-      }),
-    );
-  }
+  const removed = settleExternalCapture(
+    await Result.tryPromise({
+      try: () => removeLock(target),
+      catch: opaqueErrorCause,
+    }),
+  );
+  const outcome = resultOutcome(removed);
+  if (outcome.ok) return Result.ok(undefined);
+  if (outcome.error.kind === "panic") return preservePanic(outcome.error.panic);
+  return Result.err(
+    new RemoteFsStartupLockCleanupError({
+      lockPath: target,
+      cause: outcome.error.error,
+      message: `failed to release remote fs startup lock: ${target}`,
+    }),
+  );
 }
 
 export function applyStartupLockCleanup(
@@ -618,15 +656,16 @@ type StartupLockOperationOutcome =
 async function captureStartupLockOperation(
   operation: () => Promise<ResultType<ResponseEnvelope, RemoteFsRequestOperationError>>,
 ): Promise<StartupLockOperationOutcome> {
-  try {
-    return { kind: "result", result: await operation() };
-  } catch (cause) {
-    const projected = opaqueErrorCause(cause);
-    return {
+  const captured = settleExternalCapture(
+    await Result.tryPromise({ try: operation, catch: opaqueErrorCause }),
+  );
+  return captured.match({
+    ok: (result): StartupLockOperationOutcome => ({ kind: "result", result }),
+    err: (projected): StartupLockOperationOutcome => ({
       kind: "rejection",
       cause: projected.kind === "panic" ? projected.panic : projected.error,
-    };
-  }
+    }),
+  });
 }
 
 type CleanupFailureReporter = (failure: { readonly message: string }) => void;
@@ -635,11 +674,7 @@ function reportCleanupFailureWithoutMaskingOperation(
   report: CleanupFailureReporter,
   failure: { readonly message: string },
 ): void {
-  try {
-    report(failure);
-  } catch {
-    // The original operation defect retains precedence over secondary reporting failure.
-  }
+  Result.try({ try: () => report(failure), catch: () => undefined });
 }
 
 function reportStartupLockCleanupAfterOperationDefect(failure: { readonly message: string }): void {
@@ -652,17 +687,21 @@ async function superviseStartupLockCleanupAfterOperationDefect(
   cleanup: () => Promise<ResultType<void, RemoteFsStartupLockCleanupError>>,
   report: CleanupFailureReporter,
 ): Promise<void> {
-  try {
-    const cleanupResult = await cleanup();
-    cleanupResult.match({
-      ok: () => undefined,
-      err: (error) => reportCleanupFailureWithoutMaskingOperation(report, error),
-    });
-  } catch (cause) {
-    const failure =
-      cause instanceof Error ? cause : new Error("unknown startup-lock cleanup defect");
-    reportCleanupFailureWithoutMaskingOperation(report, failure);
-  }
+  const cleaned = settleExternalCapture(
+    await Result.tryPromise({ try: cleanup, catch: opaqueErrorCause }),
+  );
+  cleaned.match({
+    ok: (cleanupResult) =>
+      cleanupResult.match({
+        ok: () => undefined,
+        err: (error) => reportCleanupFailureWithoutMaskingOperation(report, error),
+      }),
+    err: (cause) =>
+      reportCleanupFailureWithoutMaskingOperation(
+        report,
+        cause.kind === "panic" ? cause.panic : cause.error,
+      ),
+  });
 }
 
 export async function runWithStartupLockCleanup(
@@ -671,18 +710,11 @@ export async function runWithStartupLockCleanup(
   report: CleanupFailureReporter = reportStartupLockCleanupAfterOperationDefect,
 ): Promise<ResultType<ResponseEnvelope, RemoteFsRunRequestError>> {
   const outcome = await captureStartupLockOperation(operation);
-  let cleanupResult: ResultType<void, RemoteFsStartupLockCleanupError> = Result.ok(undefined);
-
-  try {
-    if (outcome.kind === "rejection") throw outcome.cause;
-  } finally {
-    if (outcome.kind === "rejection") {
-      await superviseStartupLockCleanupAfterOperationDefect(cleanup, report);
-    } else {
-      cleanupResult = await cleanup();
-    }
+  if (outcome.kind === "rejection") {
+    await superviseStartupLockCleanupAfterOperationDefect(cleanup, report);
+    throw outcome.cause;
   }
-
+  const cleanupResult = await cleanup();
   return applyStartupLockCleanup(outcome.result, cleanupResult);
 }
 
@@ -738,18 +770,21 @@ export async function executeDaemonRequest(
   request: RemoteFsDaemonRequest,
   execute: (request: RemoteFsDaemonRequest) => Promise<RemoteFsResponse> = handleRequest,
 ): Promise<ResultType<RemoteFsResponse, RemoteFsSocketTransportError>> {
-  try {
-    return Result.ok(await execute(request));
-  } catch (caught) {
-    const projected = opaqueErrorCause(caught);
-    if (projected.kind === "panic") preservePanic(projected.panic);
-    return Result.err(
-      new RemoteFsSocketTransportError({
-        cause: projected.error,
-        message: `remote fs daemon failed to execute ${request.op}`,
-      }),
-    );
-  }
+  const executed = settleExternalCapture(
+    await Result.tryPromise({
+      try: () => execute(request),
+      catch: opaqueErrorCause,
+    }),
+  );
+  const outcome = resultOutcome(executed);
+  if (outcome.ok) return Result.ok(outcome.value);
+  if (outcome.error.kind === "panic") return preservePanic(outcome.error.panic);
+  return Result.err(
+    new RemoteFsSocketTransportError({
+      cause: outcome.error.error,
+      message: `remote fs daemon failed to execute ${request.op}`,
+    }),
+  );
 }
 
 function createServer(idleMs: number): net.Server {
@@ -918,15 +953,23 @@ async function main(): Promise<void> {
   writeJson({ ok: false, error: `Unknown command: ${command}` } satisfies ResponseEnvelope);
 }
 
-export function reportMainFailure(error: unknown): void {
-  const projected = opaqueErrorCause(error);
+export function reportMainFailure(error: Error): void {
+  const projected = opaqueErrorCause(error)();
   if (projected.kind === "panic") preservePanic(projected.panic);
   writeJson({ ok: false, error: opaqueErrorMessage(projected.error) } satisfies ResponseEnvelope);
   process.exitCode = 1;
 }
 
-function startMain(): void {
-  void main().catch(reportMainFailure);
+async function startMain(): Promise<void> {
+  const captured = settleExternalCapture(
+    await Result.tryPromise({ try: main, catch: opaqueErrorCause }),
+  );
+  const failure = captured.match<ExternalErrorProjection | undefined>({
+    ok: () => undefined,
+    err: (error) => error,
+  });
+  if (!failure) return;
+  reportMainFailure(failure.kind === "panic" ? failure.panic : failure.error);
 }
 
-if (import.meta.main) startMain();
+if (import.meta.main) await startMain();

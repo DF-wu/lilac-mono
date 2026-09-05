@@ -1,5 +1,6 @@
 import type { CoreToolPlugin } from "../types";
 import { createBuiltinLocalToolsPlugin } from "./local-tools";
+import { createBuiltinQuestionPlugin } from "./question";
 import {
   createBuiltinAttachmentPlugin,
   createBuiltinCodexPlugin,
@@ -9,6 +10,7 @@ import {
   createBuiltinGeneratePlugin,
   createBuiltinMcpPlugin,
   createBuiltinOnboardingPlugin,
+  createBuiltinResourcePlugin,
   createBuiltinSkillsPlugin,
   createBuiltinSshPlugin,
   createBuiltinSurfacePlugin,
@@ -19,6 +21,7 @@ import {
 export function createBuiltinCoreToolPlugins(): CoreToolPlugin[] {
   return [
     createBuiltinLocalToolsPlugin(),
+    createBuiltinQuestionPlugin(),
     createBuiltinWebPlugin(),
     createBuiltinSkillsPlugin(),
     createBuiltinMcpPlugin(),
@@ -27,6 +30,7 @@ export function createBuiltinCoreToolPlugins(): CoreToolPlugin[] {
     createBuiltinWorkflowPlugin(),
     createBuiltinSurfacePlugin(),
     createBuiltinAttachmentPlugin(),
+    createBuiltinResourcePlugin(),
     createBuiltinOnboardingPlugin(),
     createBuiltinGeneratePlugin(),
     createBuiltinCodexPlugin(),

@@ -1,100 +1,17 @@
-import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
-import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
-
 import type { SurfaceAdapter } from "../surface/adapter";
-import { getBuiltinSurfaceProtocol } from "../surface/builtin-surface-protocols";
-import type {
-  AgentRecoveryAttempt,
-  AgentRecoveryUnavailable,
-  AgentRunnerQueueAttempt,
-  AgentRunnerRecoveryEntry,
-} from "../surface/bridge/bus-agent-runner";
-import type { BusToAdapterRelaySnapshot } from "../surface/bridge/subscribe-from-bus";
 import type {
   RegisteredSurfacePlatform,
   RegisteredSurfaceWorkflowProgressRegistration,
   SurfaceAdapterIngressHandle,
   SurfaceRelayHandle,
-  SurfaceRelayRestoreAttempt,
-  SurfaceRelayRestoreRollbackFailed,
   SurfaceRequestIngressHandle,
   SurfaceRuntimeRegistry,
 } from "../surface/runtime-descriptor";
-import { SurfaceRelayRestoreApplyFailed } from "../surface/runtime-descriptor";
-import {
-  requireDescriptorPlatform,
-  requireSurfaceRelaySnapshot,
-} from "../surface/produced-ref-guard";
+import { requireDescriptorPlatform } from "../surface/produced-ref-guard";
 
-type AgentRecovery = {
+type AgentDrain = {
   beginDrain(options: { readonly deadlineMs: number }): Promise<void>;
-  snapshotRecoverables(): AgentRunnerRecoveryEntry[];
-  snapshotQueueAttempts(): AgentRunnerQueueAttempt[];
-  prepareRecovery(input: {
-    readonly entries: readonly AgentRunnerRecoveryEntry[];
-    readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
-  }): ResultType<AgentRecoveryAttempt, AgentRecoveryUnavailable>;
 };
-
-export class SurfaceRecoveryUnavailable extends TaggedError("SurfaceRecoveryUnavailable")<{
-  readonly requestId: string;
-  readonly platform: AdapterPlatform;
-  readonly sessionId: string;
-  readonly reason:
-    | "descriptor-unavailable"
-    | "relay-port-unavailable"
-    | "relay-handle-unavailable"
-    | "agent-attempt-unavailable"
-    | "legacy-queue-proof-ambiguous";
-  readonly message: string;
-}> {}
-
-export type SurfaceRecoveryPlan = {
-  readonly snapshot: {
-    readonly createdAt: number;
-    readonly deadlineMs: number;
-    readonly agent: readonly AgentRunnerRecoveryEntry[];
-    readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
-    readonly queueAttemptProof: "complete" | "legacy-ambiguous";
-    readonly relays: readonly BusToAdapterRelaySnapshot[];
-  };
-  readonly attempts: readonly SurfaceRelayRestoreAttempt<RegisteredSurfacePlatform>[];
-  readonly agentAttempt: AgentRecoveryAttempt;
-};
-
-const activatedRecoveryPlans = new WeakSet<SurfaceRecoveryPlan>();
-
-export type PausedSurfaceRecoveryOwnership = {
-  readonly plan: SurfaceRecoveryPlan;
-  activate(): void;
-  rollback(): Promise<void>;
-};
-
-export function createPausedSurfaceRecoveryOwnership(
-  plan: SurfaceRecoveryPlan,
-): PausedSurfaceRecoveryOwnership {
-  let state: "pending" | "active" | "rolled-back" = "pending";
-  return {
-    plan,
-    activate: () => {
-      if (state !== "pending") return;
-      state = "active";
-      activateSurfaceRecovery(plan);
-    },
-    rollback: async () => {
-      if (state !== "pending") return;
-      state = "rolled-back";
-      await rollbackSurfaceRecovery(plan);
-    },
-  };
-}
-
-function signalSurfaceRecoveryRollbackAtomicityUnknown(
-  message: string,
-  failures: readonly SurfaceRelayRestoreRollbackFailed[],
-): never {
-  throw new Panic({ message, cause: failures });
-}
 
 type CleanupRunner = (label: string, cleanup: (() => Promise<void>) | undefined) => Promise<void>;
 
@@ -119,7 +36,7 @@ function reverseEntries(registry: SurfaceRuntimeRegistry) {
 function surfaceCleanupLabel(input: {
   readonly platform: RegisteredSurfacePlatform;
   readonly resource: "adapter" | "adapter-ingress" | "relay" | "request-ingress";
-  readonly operation: "beginDrain" | "disconnect" | "snapshotRelays" | "stop";
+  readonly operation: "beginDrain" | "disconnect" | "stop";
   readonly graceful?: boolean;
 }): string {
   return `${input.graceful ? "graceful." : ""}surface.${input.platform}.${input.resource}.${input.operation}`;
@@ -130,13 +47,12 @@ export function createSurfaceWorkflowProgressPortMap(
 ): Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration> {
   const ports = new Map<RegisteredSurfacePlatform, RegisteredSurfaceWorkflowProgressRegistration>();
   for (const descriptor of registry.entries()) {
-    if (descriptor.workflowProgress) {
-      ports.set(descriptor.platform, {
-        platform: descriptor.platform,
-        protocol: descriptor.protocol,
-        port: descriptor.workflowProgress,
-      } as RegisteredSurfaceWorkflowProgressRegistration);
-    }
+    if (!descriptor.workflowProgress) continue;
+    ports.set(descriptor.platform, {
+      platform: descriptor.platform,
+      protocol: descriptor.protocol,
+      port: descriptor.workflowProgress,
+    } as RegisteredSurfaceWorkflowProgressRegistration);
   }
   return ports;
 }
@@ -173,301 +89,11 @@ export async function startSurfaceOutputs(input: {
       const handle = await descriptor.requestIngress.start();
       input.requestIngress.set(descriptor.platform, handle);
     }
-    if (descriptor.relay) {
-      const handle = await descriptor.relay.lifecycle.start();
-      requireDescriptorPlatform(
-        descriptor.platform,
-        handle.platform,
-        "surfaceRelay.lifecycle.start",
-      );
-      input.relays.set(descriptor.platform, handle);
-    }
+    if (!descriptor.relay) continue;
+    const handle = await descriptor.relay.lifecycle.start();
+    requireDescriptorPlatform(descriptor.platform, handle.platform, "surfaceRelay.lifecycle.start");
+    input.relays.set(descriptor.platform, handle);
   }
-}
-
-export function prepareSurfaceRecovery(input: {
-  readonly registry: SurfaceRuntimeRegistry;
-  readonly snapshot: {
-    readonly createdAt: number;
-    readonly deadlineMs: number;
-    readonly agent: readonly AgentRunnerRecoveryEntry[];
-    readonly queueAttempts: readonly AgentRunnerQueueAttempt[];
-    readonly queueAttemptProof: "complete" | "legacy-ambiguous";
-    readonly relays: readonly BusToAdapterRelaySnapshot[];
-  };
-  readonly relays: SurfaceRelayHandles;
-  readonly agentRunner: Pick<AgentRecovery, "prepareRecovery">;
-}): ResultType<
-  SurfaceRecoveryPlan,
-  SurfaceRecoveryUnavailable | SurfaceRelayRestoreApplyFailed | AgentRecoveryUnavailable
-> {
-  if (input.snapshot.queueAttemptProof === "legacy-ambiguous" && input.snapshot.agent.length > 0) {
-    const first = input.snapshot.agent[0];
-    return Result.err(
-      new SurfaceRecoveryUnavailable({
-        requestId: first?.requestId ?? "legacy-recovery",
-        platform: first?.requestClient ?? "unknown",
-        sessionId: first?.sessionId ?? "legacy-recovery",
-        reason: "legacy-queue-proof-ambiguous",
-        message: "Legacy recovery cannot prove the absence of parked queue reservations",
-      }),
-    );
-  }
-  const unsafeAttempt = input.snapshot.queueAttempts.find(
-    (attempt) => attempt.kind === "buffered-absorption" && !attempt.controlApplied,
-  );
-  if (unsafeAttempt) {
-    return Result.err(
-      new SurfaceRecoveryUnavailable({
-        requestId: unsafeAttempt.controlRequestId,
-        platform: unsafeAttempt.controlRequestClient,
-        sessionId: unsafeAttempt.sessionId,
-        reason: "agent-attempt-unavailable",
-        message: "Buffered queue control was not durably applied before process replacement",
-      }),
-    );
-  }
-  const requiredAgentSurfaces = new Map<
-    RegisteredSurfacePlatform,
-    { readonly requestId: string; readonly sessionId: string }
-  >();
-  for (const entry of input.snapshot.agent) {
-    const protocol = getBuiltinSurfaceProtocol(entry.requestClient);
-    if (protocol) {
-      requiredAgentSurfaces.set(protocol.platform, {
-        requestId: entry.requestId,
-        sessionId: entry.sessionId,
-      });
-    }
-    const identity = entry.identity;
-    if (identity?.state === "durable" && identity.projection.authenticatedOrigin) {
-      const origin = identity.projection.authenticatedOrigin;
-      requiredAgentSurfaces.set(origin.platform, {
-        requestId: entry.requestId,
-        sessionId: origin.sessionRef.channelId,
-      });
-    }
-  }
-  for (const [platform, required] of requiredAgentSurfaces) {
-    const descriptor = input.registry.entries().find((entry) => entry.platform === platform);
-    if (!descriptor) {
-      return Result.err(
-        new SurfaceRecoveryUnavailable({
-          ...required,
-          platform,
-          reason: "descriptor-unavailable",
-          message: "Recovery agent surface descriptor is unavailable",
-        }),
-      );
-    }
-    if (!descriptor.relay) {
-      return Result.err(
-        new SurfaceRecoveryUnavailable({
-          ...required,
-          platform,
-          reason: "relay-port-unavailable",
-          message: "Recovery agent surface relay port is unavailable",
-        }),
-      );
-    }
-    if (!input.relays.has(platform)) {
-      return Result.err(
-        new SurfaceRecoveryUnavailable({
-          ...required,
-          platform,
-          reason: "relay-handle-unavailable",
-          message: "Recovery agent surface relay handle is unavailable",
-        }),
-      );
-    }
-  }
-  const agentAttempt = input.agentRunner.prepareRecovery({
-    entries: input.snapshot.agent,
-    queueAttempts: input.snapshot.queueAttempts,
-  });
-  const continueWithAgentAttempt = (
-    agentRecoveryAttempt: AgentRecoveryAttempt,
-  ): ResultType<
-    SurfaceRecoveryPlan,
-    SurfaceRecoveryUnavailable | SurfaceRelayRestoreApplyFailed | AgentRecoveryUnavailable
-  > => {
-    const identities = new Set<string>();
-    for (const snapshot of input.snapshot.relays) {
-      const identity = `${snapshot.requestId}\u0000${snapshot.platform}\u0000${snapshot.sessionId}`;
-      if (identities.has(identity)) {
-        return Result.err(
-          new SurfaceRelayRestoreApplyFailed({
-            platform: snapshot.platform,
-            requestId: snapshot.requestId,
-            message: "Graceful restart snapshot contains a duplicate relay identity",
-          }),
-        );
-      }
-      identities.add(identity);
-      const descriptor = input.registry
-        .entries()
-        .find((candidate) => candidate.platform === snapshot.platform);
-      if (!descriptor) {
-        return Result.err(
-          new SurfaceRecoveryUnavailable({
-            requestId: snapshot.requestId,
-            platform: snapshot.platform,
-            sessionId: snapshot.sessionId,
-            reason: "descriptor-unavailable",
-            message: "Graceful restart surface descriptor is unavailable",
-          }),
-        );
-      }
-      if (!descriptor.relay) {
-        return Result.err(
-          new SurfaceRecoveryUnavailable({
-            requestId: snapshot.requestId,
-            platform: snapshot.platform,
-            sessionId: snapshot.sessionId,
-            reason: "relay-port-unavailable",
-            message: "Graceful restart surface relay port is unavailable",
-          }),
-        );
-      }
-      const relay = input.relays.get(snapshot.platform);
-      if (!relay) {
-        return Result.err(
-          new SurfaceRecoveryUnavailable({
-            requestId: snapshot.requestId,
-            platform: snapshot.platform,
-            sessionId: snapshot.sessionId,
-            reason: "relay-handle-unavailable",
-            message: "Graceful restart surface relay handle is unavailable",
-          }),
-        );
-      }
-      requireDescriptorPlatform(
-        snapshot.platform,
-        relay.platform,
-        "gracefulRestart.restoreRelayHandle",
-      );
-      requireSurfaceRelaySnapshot(
-        snapshot.platform,
-        snapshot,
-        "gracefulRestart.prepareRestoreRelays",
-      );
-    }
-
-    const descriptors = input.registry.entries();
-    const prepareAt = (
-      index: number,
-      attempts: readonly SurfaceRelayRestoreAttempt<RegisteredSurfacePlatform>[],
-    ): ResultType<SurfaceRecoveryPlan, SurfaceRelayRestoreApplyFailed> => {
-      const descriptor = descriptors[index];
-      if (!descriptor) {
-        return Result.ok({
-          snapshot: input.snapshot,
-          attempts,
-          agentAttempt: agentRecoveryAttempt,
-        });
-      }
-      const snapshots = input.snapshot.relays.filter(
-        (snapshot) => snapshot.platform === descriptor.platform,
-      );
-      const relay = input.relays.get(descriptor.platform);
-      if (snapshots.length === 0 || !relay) return prepareAt(index + 1, attempts);
-      const prepared = relay.prepareRestoreRelays(snapshots);
-      const continuePrepared = prepared.match<
-        () => ResultType<SurfaceRecoveryPlan, SurfaceRelayRestoreApplyFailed>
-      >({
-        err: (error) => () => Result.err(error),
-        ok: (attempt) => () => prepareAt(index + 1, [...attempts, attempt]),
-      });
-      return continuePrepared();
-    };
-
-    return prepareAt(0, []);
-  };
-  const continueAgentAttempt = agentAttempt.match<
-    () => ResultType<
-      SurfaceRecoveryPlan,
-      SurfaceRecoveryUnavailable | SurfaceRelayRestoreApplyFailed | AgentRecoveryUnavailable
-    >
-  >({
-    err: (error) => () => Result.err(error),
-    ok: (attempt) => () => continueWithAgentAttempt(attempt),
-  });
-  return continueAgentAttempt();
-}
-
-export async function applySurfaceRecovery(
-  plan: SurfaceRecoveryPlan,
-): Promise<ResultType<void, SurfaceRelayRestoreApplyFailed>> {
-  const applied: SurfaceRelayRestoreAttempt<RegisteredSurfacePlatform>[] = [];
-  const rollbackApplied = async (): Promise<void> => {
-    const failures: SurfaceRelayRestoreRollbackFailed[] = [];
-    for (const rollback of applied.toReversed()) {
-      const rolledBack = await rollback.rollback();
-      rolledBack.match({ ok: () => undefined, err: (error) => failures.push(error) });
-    }
-    plan.agentAttempt.rollback();
-    if (failures.length > 0) {
-      signalSurfaceRecoveryRollbackAtomicityUnknown(
-        "Graceful relay restore rollback left recovery atomicity unknown",
-        failures,
-      );
-    }
-  };
-  for (const attempt of plan.attempts) {
-    applied.push(attempt);
-    const result = await attempt.apply();
-    const failure = await result.match<
-      () => Promise<ResultType<void, SurfaceRelayRestoreApplyFailed> | null>
-    >({
-      ok: () => async () => null,
-      err: (error) => async () => {
-        await rollbackApplied();
-        return Result.err(error);
-      },
-    })();
-    if (failure) return failure;
-  }
-  const agentApplied = plan.agentAttempt.apply();
-  return agentApplied.match<() => Promise<ResultType<void, SurfaceRelayRestoreApplyFailed>>>({
-    ok: () => async () => Result.ok(undefined),
-    err: (error) => async () => {
-      await rollbackApplied();
-      const failedAgent = plan.snapshot.agent.find((entry) => entry.requestId === error.requestId);
-      return Result.err(
-        new SurfaceRelayRestoreApplyFailed({
-          platform:
-            failedAgent?.requestClient ??
-            plan.snapshot.agent[0]?.requestClient ??
-            plan.snapshot.relays[0]?.platform ??
-            "unknown",
-          requestId: error.requestId,
-          message: error.message,
-        }),
-      );
-    },
-  })();
-}
-
-export async function rollbackSurfaceRecovery(plan: SurfaceRecoveryPlan): Promise<void> {
-  const failures: SurfaceRelayRestoreRollbackFailed[] = [];
-  for (const attempt of plan.attempts.toReversed()) {
-    const rolledBack = await attempt.rollback();
-    rolledBack.match({ ok: () => undefined, err: (error) => failures.push(error) });
-  }
-  plan.agentAttempt.rollback();
-  if (failures.length > 0) {
-    signalSurfaceRecoveryRollbackAtomicityUnknown(
-      "Graceful paused recovery rollback left atomicity unknown",
-      failures,
-    );
-  }
-}
-
-export function activateSurfaceRecovery(plan: SurfaceRecoveryPlan): void {
-  if (activatedRecoveryPlans.has(plan)) return;
-  activatedRecoveryPlans.add(plan);
-  for (const attempt of plan.attempts) attempt.activate();
-  plan.agentAttempt.activate();
 }
 
 export async function stopSurfaceAdapterIngress(input: {
@@ -514,7 +140,7 @@ export async function stopSurfaceRequestIngress(input: {
   }
 }
 
-export async function stopIngressAndDrainSurfaceRecovery(input: {
+export async function stopIngressAndDrainSurfaces(input: {
   readonly stopAdapterIngress: () => Promise<void>;
   readonly stopRouterIngress: () => Promise<void>;
   readonly stopWorkflowRequestProducers: () => Promise<void>;
@@ -522,14 +148,14 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
   readonly stopRemainingRequestProducers: () => Promise<void>;
   readonly registry: SurfaceRuntimeRegistry;
   readonly deadlineMs: number;
+  readonly now?: () => number;
   readonly runCleanup: CleanupRunner;
-  readonly agentRunner: AgentRecovery;
+  readonly agentRunner: AgentDrain;
   readonly relays: SurfaceRelayHandles;
-}): Promise<{
-  readonly agent: AgentRunnerRecoveryEntry[];
-  readonly relays: BusToAdapterRelaySnapshot[];
-  readonly queueAttempts: AgentRunnerQueueAttempt[];
-}> {
+}): Promise<void> {
+  const now = input.now ?? Date.now;
+  const drainDeadlineAtMs = now() + input.deadlineMs;
+  const remainingDrainMs = (): number => Math.max(0, drainDeadlineAtMs - now());
   await input.stopAdapterIngress();
   await input.stopRouterIngress();
   await input.stopWorkflowRequestProducers();
@@ -537,16 +163,12 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
   await input.stopRemainingRequestProducers();
 
   await input.runCleanup("graceful.agentRunner.beginDrain", () =>
-    input.agentRunner.beginDrain({ deadlineMs: input.deadlineMs }),
+    input.agentRunner.beginDrain({ deadlineMs: remainingDrainMs() }),
   );
   for (const descriptor of input.registry.entries()) {
     const relay = input.relays.get(descriptor.platform);
     if (!relay) continue;
-    requireDescriptorPlatform(
-      descriptor.platform,
-      relay.platform,
-      "gracefulRestart.drainRelayHandle",
-    );
+    requireDescriptorPlatform(descriptor.platform, relay.platform, "surfaceRelay.drainHandle");
     await input.runCleanup(
       surfaceCleanupLabel({
         platform: descriptor.platform,
@@ -554,52 +176,9 @@ export async function stopIngressAndDrainSurfaceRecovery(input: {
         operation: "beginDrain",
         graceful: true,
       }),
-      () => relay.beginDrain({ deadlineMs: input.deadlineMs }),
+      () => relay.beginDrain({ deadlineMs: remainingDrainMs() }),
     );
   }
-
-  let agent: AgentRunnerRecoveryEntry[] = [];
-  let queueAttempts: AgentRunnerQueueAttempt[] = [];
-  await input.runCleanup("graceful.agentRunner.snapshotRecoverables", async () => {
-    const capturedAgent = await input.agentRunner.snapshotRecoverables();
-    const capturedQueueAttempts = await input.agentRunner.snapshotQueueAttempts();
-    agent = capturedAgent;
-    queueAttempts = capturedQueueAttempts;
-  });
-  const relays: BusToAdapterRelaySnapshot[] = [];
-  for (const descriptor of input.registry.entries()) {
-    const relay = input.relays.get(descriptor.platform);
-    if (!relay) continue;
-    await input.runCleanup(
-      surfaceCleanupLabel({
-        platform: descriptor.platform,
-        resource: "relay",
-        operation: "snapshotRelays",
-        graceful: true,
-      }),
-      async () => {
-        requireDescriptorPlatform(
-          descriptor.platform,
-          relay.platform,
-          "gracefulRestart.snapshotRelayHandle",
-        );
-        const snapshots = await relay.snapshotRelays();
-        for (const snapshot of snapshots) {
-          requireSurfaceRelaySnapshot(
-            descriptor.platform,
-            snapshot,
-            "gracefulRestart.snapshotRelays",
-          );
-          relays.push(snapshot);
-        }
-      },
-    );
-  }
-  return {
-    agent,
-    queueAttempts,
-    relays,
-  };
 }
 
 export async function stopSurfaceOutputs(input: {
@@ -622,17 +201,16 @@ export async function stopSurfaceOutputs(input: {
       input.relays.delete(descriptor.platform);
     }
     const ingress = input.requestIngress.get(descriptor.platform);
-    if (ingress) {
-      await input.runCleanup(
-        surfaceCleanupLabel({
-          platform: descriptor.platform,
-          resource: "request-ingress",
-          operation: "stop",
-        }),
-        () => ingress.stop(),
-      );
-      input.requestIngress.delete(descriptor.platform);
-    }
+    if (!ingress) continue;
+    await input.runCleanup(
+      surfaceCleanupLabel({
+        platform: descriptor.platform,
+        resource: "request-ingress",
+        operation: "stop",
+      }),
+      () => ingress.stop(),
+    );
+    input.requestIngress.delete(descriptor.platform);
   }
 }
 

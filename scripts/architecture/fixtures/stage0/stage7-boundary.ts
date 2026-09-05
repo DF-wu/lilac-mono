@@ -1,5 +1,64 @@
+import { Panic } from "better-result";
+
 interface DecodedMember {
   readonly id: string;
+}
+
+export function exactPanicObserver(cause: unknown): boolean {
+  if (Panic.is(cause)) throw cause;
+  return false;
+}
+
+export function stringOnlyPanicObserver(cause: unknown): boolean {
+  return "Panic.is(cause)" === String(cause);
+}
+
+function preservePanicText(cause: unknown): boolean {
+  return String(cause).length > 0;
+}
+
+export function staleNamedPanicObserver(cause: unknown): boolean {
+  return preservePanicText(cause);
+}
+
+export function unrelatedPanicObserver(cause: unknown, unrelated: unknown): boolean {
+  if (Panic.is(unrelated)) throw cause;
+  return false;
+}
+
+export function discardedPanicObserver(cause: unknown): boolean {
+  void Panic.is(cause);
+  throw cause;
+}
+
+export function negatedPanicObserver(cause: unknown): boolean {
+  if (!Panic.is(cause)) throw cause;
+  return false;
+}
+
+export function mixedControlPanicObserver(cause: unknown, enabled: boolean): boolean {
+  if (Panic.is(cause) && enabled) throw cause;
+  return false;
+}
+
+export function commonRootDifferentCauseObserver(input: {
+  readonly classified: unknown;
+  readonly signaled: unknown;
+}): boolean {
+  if (Panic.is(input.classified)) throw input.signaled;
+  return false;
+}
+
+export function elseBranchPanicObserver(cause: unknown): boolean {
+  if (Panic.is(cause)) return true;
+  else throw cause;
+}
+
+export function partialBranchPanicObserver(cause: unknown, enabled: boolean): boolean {
+  if (Panic.is(cause)) {
+    if (enabled) throw cause;
+  }
+  return false;
 }
 
 export function readUnknownMember(value: Record<string, unknown>): string | undefined {

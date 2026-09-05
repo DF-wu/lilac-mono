@@ -1,14 +1,15 @@
 import { DYNAMIC_EXPANSION_MARKER } from "../shell";
+import type { BashSafetyViolation } from "../types";
 
 export interface ParallelAnalyzeContext {
-  analyzeNested: (command: string) => string | null;
-  analyzeCommand: (tokens: string[]) => string | null;
+  analyzeNested: (command: string) => BashSafetyViolation | null;
+  analyzeCommand: (tokens: string[]) => BashSafetyViolation | null;
 }
 
 export function analyzeParallel(
   tokens: readonly string[],
   context: ParallelAnalyzeContext,
-): string | null {
+): BashSafetyViolation | null {
   const parseResult = parseParallelCommand(tokens);
   if (!parseResult) return null;
 
@@ -44,7 +45,7 @@ export function analyzeParallel(
 function analyzeExpandedParallelCommand(
   tokens: string[],
   context: ParallelAnalyzeContext,
-): string | null {
+): BashSafetyViolation | null {
   return context.analyzeCommand(tokens) ?? context.analyzeNested(tokens.join(" "));
 }
 

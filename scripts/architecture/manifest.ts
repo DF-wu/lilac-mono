@@ -10,8 +10,8 @@ import {
   CORE_FATAL_SIGNAL_IDENTITIES,
   CORE_REVIEWED_PANIC_IDENTITIES,
   PRECISE_EXCEPTION_IDENTITIES,
-  type PreciseExceptionIdentity,
 } from "./precise-exception-identities.ts";
+import { REVIEWED_EXCEPTION_ADAPTERS } from "./reviewed-exception-adapters.ts";
 
 export type BoundaryCategory = "request" | "wire" | "persistence" | "projection" | "plugin";
 export type CompatibilityCategory =
@@ -23,12 +23,11 @@ export type CompatibilityCategory =
   | "tool"
   | "plugin";
 export type ExceptionAdapterCategory =
-  | "external-to-result"
   | "result-to-framework"
   | "rollback"
   | "compatibility"
   | "defect-supervisor";
-export type ExceptionDirection = "capture-external" | "signal-host" | "observe-panic";
+export type ExceptionDirection = "signal-host" | "observe-panic";
 
 export interface SymbolIdentity {
   readonly module: string;
@@ -37,6 +36,25 @@ export interface SymbolIdentity {
 
 export interface PackageSymbolIdentity extends SymbolIdentity {
   readonly package?: string;
+}
+
+export interface PackageModuleIdentity {
+  readonly workspace: string;
+  readonly module: string;
+}
+
+export interface BlobStorageArchitecturePolicy {
+  readonly storageWorkspace: string;
+  readonly storagePackage: string;
+  readonly coreWorkspace: string;
+  readonly eventSchemaModules: readonly PackageModuleIdentity[];
+  readonly adapterFactoryExports: readonly string[];
+  readonly adapterFactoryOwners: readonly PackageModuleIdentity[];
+  readonly closeOwnerModules: readonly PackageModuleIdentity[];
+  readonly materializationModules: readonly PackageModuleIdentity[];
+  readonly migrationEntrypoint: string;
+  readonly migrationModules: readonly PackageModuleIdentity[];
+  readonly allowedCoreBlobColumns: readonly string[];
 }
 
 export interface ExternalSymbolIdentity {
@@ -78,8 +96,6 @@ export interface ExceptionAdapter {
 }
 
 export type ExceptionAdapterSyntaxKind =
-  | "catch-clause"
-  | "rejection-callback"
   | "throw-statement"
   | "host-rejection-call"
   | "registered-host-signal-call"
@@ -89,14 +105,11 @@ export type ExceptionAdapterProvenance =
   | "precise-exception-identities"
   | "core-reviewed-panic-identities"
   | "core-fatal-signal-identities"
-  | "reviewed-injected-external-effect"
   | "workspace-reviewed-manifest";
 
 export type ExceptionAdapterRelationship =
   | "external-package"
-  | "external-rejection"
   | "host-contract"
-  | "injected-external-effect"
   | "language-runtime"
   | "panic-brand";
 
@@ -167,12 +180,14 @@ export const PERSISTED_CODEC_FIXTURE_CASES = [
 export type PersistedCodecFixtureCase = (typeof PERSISTED_CODEC_FIXTURE_CASES)[number];
 export type PersistedValueProvenance = "current" | "migrated" | "missing-defaulted";
 export type PersistedMissingOutcome = "missing-defaulted" | "missing-rejected";
+export type PersistedLegacyOutcome = "migrated" | "rejected";
 
 export interface PersistedCodecRegistration {
   readonly identity: SymbolIdentity;
   readonly inputParameter: number;
   readonly fixtureCatalog: SymbolIdentity;
   readonly provenance: readonly PersistedValueProvenance[];
+  readonly legacyOutcome?: PersistedLegacyOutcome;
   readonly missingOutcomes?: Readonly<Record<string, PersistedMissingOutcome>>;
 }
 
@@ -346,6 +361,7 @@ export const ACTIVE_WORKSPACES = [
   ["apps/tool-bridge", "@stanley2058/lilac-tool-bridge"],
   ["packages/agent", "@stanley2058/lilac-agent"],
   ["packages/bash-safety", "@stanley2058/lilac-bash-safety"],
+  ["packages/blob-storage", "@stanley2058/lilac-blob-storage"],
   ["packages/claude-code-bridge", "@stanley2058/lilac-claude-code-bridge"],
   ["packages/coding-tools", "@stanley2058/lilac-coding-tools"],
   ["packages/event-bus", "@stanley2058/lilac-event-bus"],
@@ -358,13 +374,109 @@ export const ACTIVE_WORKSPACES = [
   ["packages/utils", "@stanley2058/lilac-utils"],
 ] as const;
 
+export const BLOB_STORAGE_ARCHITECTURE_POLICY = {
+  storageWorkspace: "packages/blob-storage",
+  storagePackage: "@stanley2058/lilac-blob-storage",
+  coreWorkspace: "apps/core",
+  eventSchemaModules: [{ workspace: "packages/event-bus", module: "lilac-spec" }],
+  adapterFactoryExports: ["createLocalBlobStore", "createS3BlobStore"],
+  adapterFactoryOwners: [
+    { workspace: "apps/core", module: "src/runtime/create-core-blob-store" },
+    { workspace: "apps/core", module: "scripts/blob-migration-target" },
+  ],
+  closeOwnerModules: [
+    { workspace: "apps/core", module: "src/runtime/main" },
+    { workspace: "apps/core", module: "scripts/bench-blob-storage" },
+    { workspace: "apps/core", module: "scripts/migrate-blob-storage" },
+  ],
+  materializationModules: [
+    {
+      workspace: "apps/core",
+      module: "src/surface/bridge/bus-agent-runner/anthropic-fallback-media",
+    },
+    {
+      workspace: "apps/core",
+      module: "src/surface/bridge/generated-output-materialization",
+    },
+    {
+      workspace: "apps/core",
+      module: "src/surface/bridge/request-composition/attachments",
+    },
+    {
+      workspace: "apps/core",
+      module: "src/surface/bridge/request-composition/prepare-bus-messages",
+    },
+    { workspace: "apps/core", module: "src/resource/service" },
+    { workspace: "apps/core", module: "src/tool-server/tools/attachment" },
+    { workspace: "apps/core", module: "src/workflow/workflow-artifact-store" },
+    {
+      workspace: "packages/tool-results",
+      module: "src/blob-tool-result-artifact-store",
+    },
+    {
+      workspace: "apps/core",
+      module: "src/transcript/stored-message-materialization",
+    },
+    { workspace: "apps/core", module: "scripts/blob-migration-target" },
+    { workspace: "apps/core", module: "scripts/bench-blob-storage" },
+    {
+      workspace: "apps/core",
+      module: "scripts/legacy-workflow-blob-migration",
+    },
+  ],
+  migrationEntrypoint: "apps/core/scripts/migrate-blob-storage",
+  migrationModules: [
+    { workspace: "apps/core", module: "scripts/migrate-blob-storage" },
+    { workspace: "apps/core", module: "scripts/blob-migration-target" },
+    {
+      workspace: "apps/core",
+      module: "scripts/legacy-graceful-restart-blob-migration",
+    },
+    {
+      workspace: "apps/core",
+      module: "scripts/legacy-transcript-blob-migration",
+    },
+    { workspace: "apps/core", module: "scripts/legacy-transient-blob-state" },
+    {
+      workspace: "apps/core",
+      module: "scripts/legacy-workflow-blob-migration",
+    },
+  ],
+  allowedCoreBlobColumns: ["embedding"],
+} as const satisfies BlobStorageArchitecturePolicy;
+
 export type ActiveWorkspaceRoot = (typeof ACTIVE_WORKSPACES)[number][0];
 
 const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[]>([
   [
+    "packages/blob-storage",
+    [
+      ...[
+        "createLocalBlobStore",
+        "createS3BlobStore",
+        "createMemoryBlobStore",
+        "preflightLocalBlobStore",
+        "preflightS3BlobStore",
+      ].map((exportName) => ({ module: "src/factories.ts", exportName })),
+      { module: "src/backend.ts", exportName: "captureAdapterOperation" },
+      ...[
+        "SupervisedBlobStore.startUpload",
+        "SupervisedBlobStore.resolve",
+        "SupervisedBlobStore.open",
+        "SupervisedBlobStore.delete",
+        "SupervisedBlobStore.maintain",
+        "SupervisedBlobStore.close",
+        "materializeBlobRead",
+      ].map((exportName) => ({ module: "src/store.ts", exportName })),
+    ],
+  ],
+  [
     "packages/bash-safety",
     [
-      { module: "src/analyze/analyze-command.ts", exportName: "parseBashCommand" },
+      {
+        module: "src/analyze/analyze-command.ts",
+        exportName: "parseBashCommand",
+      },
       { module: "src/rules-filesystem.ts", exportName: "readGitMetadataFile" },
       { module: "src/rules-rm.ts", exportName: "resolveRmPaths" },
     ],
@@ -401,9 +513,15 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         exportName: "startConversationThreadSummarizationWorker.runSummarization",
       },
       ...["importCustomCommandModule", "invokeCustomCommand", "settleCustomCommand"].map(
-        (exportName) => ({ module: "src/custom-commands/manager.ts", exportName }),
+        (exportName) => ({
+          module: "src/custom-commands/manager.ts",
+          exportName,
+        }),
       ),
-      { module: "src/custom-commands/manager.ts", exportName: "CustomCommandManager.execute" },
+      {
+        module: "src/custom-commands/manager.ts",
+        exportName: "CustomCommandManager.execute",
+      },
       {
         module: "src/heartbeat/heartbeat-service.ts",
         exportName: "startHeartbeatServiceResult.startHeartbeatLifecycleResult",
@@ -422,7 +540,10 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         "remoteGrep",
         "remoteFuzzySearch",
         "remoteEditFile",
-      ].map((exportName) => ({ module: "src/tools/fs/remote-fs.ts", exportName })),
+      ].map((exportName) => ({
+        module: "src/tools/fs/remote-fs.ts",
+        exportName,
+      })),
       ...[
         "validateToolServerOptions",
         "decodeToolRequestHeaders",
@@ -440,6 +561,36 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
       {
         module: "src/runtime/core-dead-letter-key.ts",
         exportName: "loadOrCreateCoreDeadLetterKey",
+      },
+      {
+        module: "src/runtime/create-core-blob-store.ts",
+        exportName: "createCoreBlobStore",
+      },
+      {
+        module: "scripts/legacy-workflow-blob-migration.ts",
+        exportName: "inspectLegacyWorkflowBlobMigration",
+      },
+      ...["preflightLegacyGracefulRestartMigration", "commitLegacyGracefulRestartMigration"].map(
+        (exportName) => ({
+          module: "scripts/legacy-graceful-restart-blob-migration.ts",
+          exportName,
+        }),
+      ),
+      ...[
+        "createCoreRequestDeliveryAdmission.validateAndBuildWork",
+        "createLilacBusRequestDeliveryPublisher.acquire",
+        "createLilacBusRequestDeliveryPublisher.publish",
+        "createLilacBusRequestDeliveryPublisher.confirm",
+        "createLilacBusRequestDeliveryPublisher.abandon",
+        "createRequestDeliveryPostCommitObserver.observe",
+        "corePreparedEnvelopeFromCommand",
+      ].map((exportName) => ({
+        module: "src/surface/bridge/request-delivery/core-integration.ts",
+        exportName,
+      })),
+      {
+        module: "src/surface/bridge/request-delivery/durable-request-bus.ts",
+        exportName: "createDurableCoreRequestBus.bus.publish",
       },
       ...[
         "readStreamChunk",
@@ -463,15 +614,24 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
   [
     "packages/fs",
     [
-      { module: "src/filesystem-operation.ts", exportName: "captureFilesystemOperation" },
-      { module: "src/filesystem-operation.ts", exportName: "captureFilesystemOperationSync" },
+      {
+        module: "src/filesystem-operation.ts",
+        exportName: "captureFilesystemOperation",
+      },
+      {
+        module: "src/filesystem-operation.ts",
+        exportName: "captureFilesystemOperationSync",
+      },
       { module: "src/fs-impl.ts", exportName: "canonicalizePathAsFarAsExists" },
       { module: "src/fs-impl.ts", exportName: "compileEditRegex" },
       { module: "src/hashline.ts", exportName: "applyHashlineEdits" },
       { module: "src/ripgrep.ts", exportName: "decodeRipgrepMatchLine" },
       { module: "src/ripgrep.ts", exportName: "ripgrep" },
       { module: "src/search-backend.ts", exportName: "captureFffOperation" },
-      { module: "src/search-backend.ts", exportName: "captureFffSyncOperation" },
+      {
+        module: "src/search-backend.ts",
+        exportName: "captureFffSyncOperation",
+      },
       ...[
         "decodeBundledRemoteRunnerRequest",
         "decodeBundledRemoteRunnerRequestJson",
@@ -482,7 +642,10 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         "decodeRemoteRunnerResponse",
         "decodeRemoteRunnerResponseJson",
         "decodeRemoteRunnerResponseValue",
-      ].map((exportName) => ({ module: "src/remote-runner-protocol.ts", exportName })),
+      ].map((exportName) => ({
+        module: "src/remote-runner-protocol.ts",
+        exportName,
+      })),
     ],
   ],
   [
@@ -492,8 +655,14 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         module: "src/tool-result-artifact-store.ts",
         exportName: "createToolResultArtifactStore.captureOperation",
       },
-      { module: "src/tool-result-artifact-store.ts", exportName: "validateHardLimit" },
-      { module: "src/tool-result-output-normalizer.ts", exportName: "serializeOutput" },
+      {
+        module: "src/tool-result-artifact-store.ts",
+        exportName: "validateHardLimit",
+      },
+      {
+        module: "src/tool-result-output-normalizer.ts",
+        exportName: "serializeOutput",
+      },
     ],
   ],
   [
@@ -501,12 +670,21 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
     [
       { module: "src/apply-patch.ts", exportName: "parsePatchResult" },
       { module: "src/apply-patch.ts", exportName: "applyPatchResult" },
-      { module: "src/batch.ts", exportName: "collectApplyPatchTouchedPathsResult" },
-      { module: "src/batch.ts", exportName: "collectEditFileTouchedPathsResult" },
+      {
+        module: "src/batch.ts",
+        exportName: "collectApplyPatchTouchedPathsResult",
+      },
+      {
+        module: "src/batch.ts",
+        exportName: "collectEditFileTouchedPathsResult",
+      },
       { module: "src/batch.ts", exportName: "createBatchToolResult" },
       { module: "src/guardrails.ts", exportName: "guardrailBypassAllowed" },
       { module: "src/guardrails.ts", exportName: "validateLocalCwd" },
-      { module: "src/guardrails.ts", exportName: "canonicalizeAsFarAsExistsResult" },
+      {
+        module: "src/guardrails.ts",
+        exportName: "canonicalizeAsFarAsExistsResult",
+      },
       { module: "src/guardrails.ts", exportName: "canonicalPathAllowed" },
       { module: "src/index.ts", exportName: "createCodingToolsetResult" },
     ],
@@ -514,12 +692,30 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
   [
     "packages/event-bus",
     [
-      { module: "core-primary-lineage.ts", exportName: "extendCoreLineagePrefixDigestV1" },
-      { module: "core-primary-lineage.ts", exportName: "buildCoreLineageManifestV1" },
-      { module: "core-primary-lineage.ts", exportName: "decodeCorePrimaryLineageV1" },
-      { module: "core-primary-lineage.ts", exportName: "createCorePrimaryLineageFreshOnlyV1" },
-      { module: "redis-connection-pool.ts", exportName: "RedisConnectionPool.acquire" },
-      { module: "redis-event-dead-letter.ts", exportName: "validateRedisEventDeadLetterConfig" },
+      {
+        module: "core-primary-lineage.ts",
+        exportName: "extendCoreLineagePrefixDigestV2",
+      },
+      {
+        module: "core-primary-lineage.ts",
+        exportName: "buildCoreLineageManifestV2",
+      },
+      {
+        module: "core-primary-lineage.ts",
+        exportName: "decodeCorePrimaryLineageV2",
+      },
+      {
+        module: "core-primary-lineage.ts",
+        exportName: "createCorePrimaryLineageFreshOnlyV2",
+      },
+      {
+        module: "redis-connection-pool.ts",
+        exportName: "RedisConnectionPool.acquire",
+      },
+      {
+        module: "redis-event-dead-letter.ts",
+        exportName: "validateRedisEventDeadLetterConfig",
+      },
       {
         module: "redis-event-dead-letter.ts",
         exportName: "decodeRedisEventDeadLetterCiphertextEnvelope",
@@ -537,12 +733,16 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         exportName: "decryptRedisEventDeadLetterRecord",
       },
       { module: "lilac-bus.ts", exportName: "LilacBus.subscribeTopic" },
+      { module: "lilac-bus.ts", exportName: "LilacBus.getOutputStreamExpiry" },
     ],
   ],
   [
     "packages/mini-lilac-client",
     [
-      { module: "mini-lilac-transport.ts", exportName: "decodeMiniLilacBoundary" },
+      {
+        module: "mini-lilac-transport.ts",
+        exportName: "decodeMiniLilacBoundary",
+      },
       ...[
         "sendMessagesResult",
         "reconnectToStreamResult",
@@ -603,22 +803,46 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
       { module: "codex-oauth.ts", exportName: "clearCodexTokensResult" },
       { module: "codex-oauth.ts", exportName: "exchangeCodeForTokensResult" },
       { module: "codex-oauth.ts", exportName: "refreshAccessTokenResult" },
-      { module: "codex-oauth.ts", exportName: "startCodexOAuthLogin.runExchangeResult" },
-      { module: "codex-oauth.ts", exportName: "startCodexOAuthLogin.exchangeResult" },
+      {
+        module: "codex-oauth.ts",
+        exportName: "startCodexOAuthLogin.runExchangeResult",
+      },
+      {
+        module: "codex-oauth.ts",
+        exportName: "startCodexOAuthLogin.exchangeResult",
+      },
       { module: "core-config.ts", exportName: "decodeCoreConfigYaml" },
       { module: "core-config.ts", exportName: "readCoreConfigVersionResult" },
       { module: "core-config.ts", exportName: "parseCoreConfigResult" },
       { module: "core-config.ts", exportName: "resolveDiscordTokenResult" },
       { module: "core-config/v1.ts", exportName: "decodeCoreConfigV1" },
-      { module: "core-config/v1.ts", exportName: "decodeCoreConfigV1ToUniversal" },
+      {
+        module: "core-config/v1.ts",
+        exportName: "decodeCoreConfigV1ToUniversal",
+      },
       { module: "core-config/v2.ts", exportName: "decodeCoreConfigV2" },
-      { module: "core-config/v2.ts", exportName: "decodeCoreConfigV2ToUniversal" },
+      {
+        module: "core-config/v2.ts",
+        exportName: "decodeCoreConfigV2ToUniversal",
+      },
       { module: "find-root.ts", exportName: "hasWorkspacesFieldResult" },
       { module: "find-root.ts", exportName: "findWorkspaceRootResult" },
-      { module: "friendly-units.ts", exportName: "parseFriendlyByteSizeResult" },
-      { module: "friendly-units.ts", exportName: "parseFriendlyDurationMsResult" },
-      { module: "model-capability.ts", exportName: "parseModelSpecifierResult" },
-      { module: "model-capability.ts", exportName: "ModelCapability.resolveResult" },
+      {
+        module: "friendly-units.ts",
+        exportName: "parseFriendlyByteSizeResult",
+      },
+      {
+        module: "friendly-units.ts",
+        exportName: "parseFriendlyDurationMsResult",
+      },
+      {
+        module: "model-capability.ts",
+        exportName: "parseModelSpecifierResult",
+      },
+      {
+        module: "model-capability.ts",
+        exportName: "ModelCapability.resolveResult",
+      },
       {
         module: "model-provider.ts",
         exportName: "normalizeCodexResponsesRequestRecordResult",
@@ -631,7 +855,10 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
         "resolveModelPlanResult",
         "resolveModelSlotResult",
       ].map((exportName) => ({ module: "model-slot.ts", exportName })),
-      { module: "openai-responses-websocket-fetch.ts", exportName: "decodeResponsesRequestBody" },
+      {
+        module: "openai-responses-websocket-fetch.ts",
+        exportName: "decodeResponsesRequestBody",
+      },
       {
         module: "server-compaction-request.ts",
         exportName: "decodeServerCompactionPayload",
@@ -712,222 +939,6 @@ const STAGE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[
   ],
 ]);
 
-const CORE_PARTITION_8_EXCEPTION_ADAPTERS = [
-  ...[
-    ["build-remote-runner.ts", "captureBuildOperation.catch", "better-result", "Result.tryPromise"],
-    [
-      "src/discovery/discovery-service.ts",
-      "DiscoveryService.searchResult.catch",
-      "better-result",
-      "Result.tryPromise",
-    ],
-    [
-      "src/discovery/discovery-service.ts",
-      "DiscoveryService.closeResult.catch",
-      "better-result",
-      "Result.try",
-    ],
-    [
-      "src/heartbeat/heartbeat-service.ts",
-      "reloadHeartbeatCoreConfig",
-      "@stanley2058/lilac-utils",
-      "getCoreConfig",
-    ],
-    [
-      "src/heartbeat/heartbeat-service.ts",
-      "computeHeartbeatCronAtMs",
-      "@stanley2058/lilac-utils",
-      "computeNextCronAtMs",
-    ],
-    [
-      "src/ssh/ssh-config.ts",
-      "readConfiguredSshHostsResult",
-      "node:fs/promises",
-      "injected stat/readFile dependencies",
-    ],
-  ].flatMap(([module, exportName, packageName, externalExportName]) => [
-    {
-      identity: { module, exportName },
-      category: "external-to-result" as const,
-      externalApi: { package: packageName, exportName: externalExportName },
-      direction: "capture-external" as const,
-      reason: "Maps one immediate external failure to an owned typed Result error.",
-    },
-    {
-      identity: { module, exportName },
-      category: "defect-supervisor" as const,
-      externalApi: { package: "better-result", exportName: "Panic.is" },
-      direction: "observe-panic" as const,
-      reason: "Preserves exact Panic identity at the same immediate external boundary.",
-    },
-  ]),
-  ...[
-    ["src/discovery/discovery-service.ts", "adaptDiscoverySearchInputResultToHost.err.<callback>"],
-    ["src/discovery/discovery-service.ts", "adaptDiscoverySearchResultToHost.err.<callback>"],
-    ["src/discovery/discovery-service.ts", "adaptDiscoveryCloseResultToHost.err.<callback>"],
-    [
-      "src/shared/attachment-utils.ts",
-      "resolveToolPathForRequestContext.err.<callback>",
-      "resolveToolPathForRequestContextResult",
-    ],
-    ["src/shared/attachment-utils.ts", "decodeDataUrl.err.<callback>", "decodeDataUrlResult"],
-    ["src/shared/req-context.ts", "requireRequestContext"],
-    ["src/shared/tool-server-context.ts", "requireToolServerHeaders"],
-    ["src/ssh/ssh-config.ts", "requireConfiguredSshHost.err.<callback>"],
-  ].map(([module, exportName, externalExportName]) => ({
-    identity: { module: module!, exportName: exportName! },
-    category: "result-to-framework" as const,
-    externalApi: {
-      package: "@stanley2058/lilac-core",
-      exportName: externalExportName ?? "legacy caller exception contract",
-    },
-    direction: "signal-host" as const,
-    reason: "Adapts one typed validation Result to the preserved caller exception contract.",
-  })),
-  ...[["src/heartbeat/common.ts", "createQuietHoursFormatter"]].flatMap(([module, exportName]) => [
-    {
-      identity: { module: module!, exportName: exportName! },
-      category: "compatibility" as const,
-      externalApi: { package: "Intl", exportName: "DateTimeFormat" },
-      direction: "capture-external" as const,
-      reason: "Falls back to local time only for an invalid configured timezone.",
-    },
-    {
-      identity: { module: module!, exportName: exportName! },
-      category: "defect-supervisor" as const,
-      externalApi: { package: "better-result", exportName: "Panic.is" },
-      direction: "observe-panic" as const,
-      reason: "Preserves exact Panic identity before applying the compatibility fallback.",
-    },
-  ]),
-] as const satisfies readonly ExceptionAdapter[];
-
-function preciseExceptionAdapters(
-  identities: readonly PreciseExceptionIdentity[],
-): readonly ExceptionAdapter[] {
-  return identities.flatMap(([module, exportName, mode]) => {
-    const capture: ExceptionAdapter = {
-      identity: { module, exportName },
-      category: "compatibility",
-      externalApi: { package: "global", exportName: "language exception capture" },
-      direction: "capture-external",
-      reason: "Captures an exception or rejection in this exact callable.",
-    };
-    const signal: ExceptionAdapter = {
-      identity: { module, exportName },
-      category: "compatibility",
-      externalApi: { package: "global", exportName: "language host failure signal" },
-      direction: "signal-host",
-      reason: "Signals an owned failure through this exact callable's host contract.",
-    };
-    switch (mode) {
-      case "capture":
-        return [capture];
-      case "signal":
-        return [signal];
-      case "both":
-        return [capture, signal];
-    }
-  });
-}
-
-const MINI_WORKSPACE_HISTORY_EXCEPTION_ADAPTERS = [
-  ...["attemptHost", "attemptHostSync"].flatMap((exportName) => [
-    {
-      identity: { module: "src/workspace-history-store.ts", exportName },
-      category: "external-to-result" as const,
-      externalApi: { package: "global", exportName: "language exception capture" },
-      direction: "capture-external" as const,
-      reason:
-        "Maps exactly one immediate host operation failure to the closed workspace-history Result.",
-    },
-    {
-      identity: { module: "src/workspace-history-store.ts", exportName },
-      category: "defect-supervisor" as const,
-      externalApi: { package: "better-result", exportName: "Panic.is" },
-      direction: "observe-panic" as const,
-      reason: "Preserves Panic identity while classifying only owned host failures.",
-    },
-  ]),
-  ...["superviseOutcome", "WorkspaceHistoryStore.writeCaptureCache.<callback>"].map(
-    (exportName) => ({
-      identity: { module: "src/workspace-history-store.ts", exportName },
-      category: "defect-supervisor" as const,
-      externalApi: { package: "better-result", exportName: "Panic.is" },
-      direction: "observe-panic" as const,
-      reason: "Preserves the first Panic while the exact cleanup region settles.",
-    }),
-  ),
-] satisfies readonly ExceptionAdapter[];
-
-const CORE_REVIEWED_PANIC_ADAPTERS = CORE_REVIEWED_PANIC_IDENTITIES.map(
-  ([module, exportName]): ExceptionAdapter => ({
-    identity: { module, exportName },
-    category: "defect-supervisor",
-    externalApi: { package: "better-result", exportName: "Panic.is" },
-    direction: "observe-panic",
-    reason: "Preserves exact Panic identity at this reviewed Core defect boundary.",
-  }),
-);
-
-const CORE_FATAL_SIGNAL_ADAPTERS = CORE_FATAL_SIGNAL_IDENTITIES.map(
-  ([module, exportName]): ExceptionAdapter => ({
-    identity: { module, exportName },
-    category: "defect-supervisor",
-    externalApi: { package: "@stanley2058/lilac-core", exportName: "fatal Panic reporter" },
-    direction: "signal-host",
-    reason: "Reports a detached Panic through the exact Core fatal host callback.",
-  }),
-);
-
-const CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS = [
-  {
-    identity: {
-      module: "src/surface/bridge/adapter-event-projection.ts",
-      exportName: "signalAdapterEventPlatformMismatch",
-    },
-    category: "defect-supervisor",
-    externalApi: { package: "better-result", exportName: "Panic" },
-    direction: "signal-host",
-    reason: "Signals a hard invariant when a normalized adapter event contains mixed platforms.",
-  },
-  {
-    identity: {
-      module: "src/surface/produced-ref-guard.ts",
-      exportName: "signalSurfaceAdapterContractViolation",
-    },
-    category: "defect-supervisor",
-    externalApi: { package: "better-result", exportName: "Panic" },
-    direction: "signal-host",
-    reason:
-      "Signals a hard descriptor-bound contract defect before an adapter-produced ref crosses a shared publication or persistence seam.",
-  },
-  {
-    identity: {
-      module: "src/surface/github/github-runtime-descriptor.ts",
-      exportName: "deleteGithubAcknowledgement",
-    },
-    category: "external-to-result",
-    externalApi: {
-      package: "@stanley2058/lilac-core",
-      exportName: "GitHub reaction deletion compatibility operation",
-    },
-    direction: "capture-external",
-    reason:
-      "Captures GitHub acknowledgement reaction deletion rejection before the descriptor finalization policy clears process-local acknowledgement state.",
-  },
-  {
-    identity: {
-      module: "src/surface/github/github-runtime-descriptor.ts",
-      exportName: "preserveGithubRelayPolicyPanic",
-    },
-    category: "defect-supervisor",
-    externalApi: { package: "better-result", exportName: "Panic.is" },
-    direction: "observe-panic",
-    reason: "Preserves exact Panic identity at the GitHub acknowledgement deletion boundary.",
-  },
-] as const satisfies readonly ExceptionAdapter[];
-
 const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
   ...[
     "isCurrentSessionScopedSurfaceCall",
@@ -944,6 +955,8 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     "asBuffer",
     "downloadToBuffer",
     "Attachment.callDownload",
+    "collectUserResourceUris",
+    "collectUserBlobAttachments",
   ].map((exportName) => ({
     identity: { module: "src/tool-server/tools/attachment.ts", exportName },
     category: "plugin" as const,
@@ -1038,11 +1051,17 @@ const CORE_TOOL_SERVER_BOUNDARY_DECODERS = [
     category: "plugin" as const,
   })),
   {
-    identity: { module: "src/tool-server/tools/ssh.ts", exportName: "readStreamText" },
+    identity: {
+      module: "src/tool-server/tools/ssh.ts",
+      exportName: "readStreamText",
+    },
     category: "wire",
   },
   {
-    identity: { module: "src/tool-server/tools/ssh.ts", exportName: "decodeSshProbeOutput" },
+    identity: {
+      module: "src/tool-server/tools/ssh.ts",
+      exportName: "decodeSshProbeOutput",
+    },
     category: "wire",
   },
   {
@@ -1111,7 +1130,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
     "apps/acp-controller",
     [
       {
-        identity: { module: "external-adapters.ts", exportName: "projectExternalFailure" },
+        identity: {
+          module: "external-adapters.ts",
+          exportName: "projectExternalFailure",
+        },
         category: "projection",
       },
       ...["decodeRunRecord", "decodeRunCancellation", "decodeSessionIndex"].map((exportName) => ({
@@ -1119,7 +1141,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "persistence" as const,
       })),
       {
-        identity: { module: "external-adapters.ts", exportName: "replaceExternalFailureMessage" },
+        identity: {
+          module: "external-adapters.ts",
+          exportName: "replaceExternalFailureMessage",
+        },
         category: "projection",
       },
     ],
@@ -1127,9 +1152,15 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
   [
     "apps/mini-lilac",
     [
-      { identity: { module: "build.ts", exportName: "decodeSourcePackage" }, category: "request" },
       {
-        identity: { module: "install-local.ts", exportName: "decodeNpmPackOutput" },
+        identity: { module: "build.ts", exportName: "decodeSourcePackage" },
+        category: "request",
+      },
+      {
+        identity: {
+          module: "install-local.ts",
+          exportName: "decodeNpmPackOutput",
+        },
         category: "wire",
       },
       {
@@ -1137,7 +1168,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "projection",
       },
       {
-        identity: { module: "install-local.ts", exportName: "signalLocalInstallFailure" },
+        identity: {
+          module: "install-local.ts",
+          exportName: "signalLocalInstallFailure",
+        },
         category: "projection",
       },
     ],
@@ -1234,7 +1268,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "projection" as const,
       })),
       {
-        identity: { module: "auto-compaction.ts", exportName: "cloneMessage.map.<callback@1>" },
+        identity: {
+          module: "auto-compaction.ts",
+          exportName: "cloneMessage.map.<callback@1>",
+        },
         category: "projection",
       },
       {
@@ -1293,7 +1330,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
     "packages/mini-lilac-runtime",
     [
       {
-        identity: { module: "src/config.ts", exportName: "decodeRuntimeConfig" },
+        identity: {
+          module: "src/config.ts",
+          exportName: "decodeRuntimeConfig",
+        },
         category: "request",
       },
       ...[
@@ -1428,6 +1468,13 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module, exportName },
         category: "projection" as const,
       })),
+      ...["binaryContent", "binaryContent.flatMap.<callback@1>"].map((exportName) => ({
+        identity: {
+          module: "src/mcp/binary-result-materializer.ts",
+          exportName,
+        },
+        category: "projection" as const,
+      })),
       ...[
         ["src/github/github-api.ts", "decodeGithubApiErrorResponse", "wire"],
         ["src/github/github-api.ts", "githubFetchJsonResult", "wire"],
@@ -1436,6 +1483,193 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       ].map(([module, exportName, category]) => ({
         identity: { module: module!, exportName: exportName! },
         category: category as "wire" | "persistence",
+      })),
+      {
+        identity: {
+          module: "src/question/question-store.ts",
+          exportName: "decodeQuestionCallRow",
+        },
+        category: "persistence",
+      },
+      ...["formatQuestionToolArgs", "createQuestionTool.execute"].map((exportName) => ({
+        identity: { module: "src/tools/question.ts", exportName },
+        category: "request" as const,
+      })),
+      ...[
+        ["src/transcript/transcript-persistence-codec.ts", "normalizeStoredMessagesV1"],
+        ["src/surface/bridge/agent-run-journal/index.ts", "deserialize.andThen.<callback@1>"],
+        ["src/transcript/transcript-persistence-codec.ts", "decodeStoredBlobRefV1"],
+        [
+          "src/transcript/stored-message-materialization.ts",
+          "projectResourceReadResultsForStorage",
+        ],
+        ["src/transcript/stored-message-materialization.ts", "projectStoredMessagesV1"],
+        ["src/transcript/stored-message-materialization.ts", "decodeProviderMessageForPersistence"],
+        ["src/transcript/stored-message-materialization.ts", "decodeResourceReadCallForStorage"],
+        ["src/transcript/stored-message-materialization.ts", "materializeStoredMessage"],
+        ["src/transcript/transcript-store.ts", "parseNormalizedCanonicalMessages"],
+        [
+          "src/surface/bridge/bus-agent-runner/anthropic-fallback-cache-codec.ts",
+          "decodeAnthropicFallbackCacheRecord",
+        ],
+      ].map(([module, exportName]) => ({
+        identity: { module: module!, exportName: exportName! },
+        category: "persistence" as const,
+      })),
+      ...[
+        "zodCodec.decode",
+        "zodCodec.serialize",
+        "zodCodec.deserialize",
+        "replaceHandles",
+        "collectHandles",
+        "decodeStoredMessages",
+        "createCoreRequestDeliveryAdmission.validateAndBuildWork",
+      ].map((exportName) => ({
+        identity: {
+          module: "src/surface/bridge/request-delivery/core-integration.ts",
+          exportName,
+        },
+        category: "persistence" as const,
+      })),
+      ...[
+        "decodeJson",
+        "blobHandleCodec.decode",
+        "blobRefCodec.decode",
+        "arrayCodec.decode",
+        "decodeRequestDeliveryInputTarget",
+        "decodeRequestDeliveryTerminalOutcome",
+      ].map((exportName) => ({
+        identity: {
+          module: "src/surface/bridge/request-delivery/sqlite-store.ts",
+          exportName,
+        },
+        category: "persistence" as const,
+      })),
+      ...[
+        "decodeSerialized",
+        "inspectBinaryData",
+        "inspectToolResult",
+        "inspectLegacyMessages",
+        "inspectTranscriptRow",
+        "findDataUrl",
+        "inspectProjectionRow",
+        "canonicalizeJson",
+        "inspectLineageRow",
+        "preflightUnsafe",
+        "decodeBinaryPayload",
+        "migrateToolOutput",
+        "migrateMessages",
+        "rewriteProjectionDigests",
+        "stageMigrationArtifacts",
+      ].map((exportName) => ({
+        identity: {
+          module: "scripts/legacy-transcript-blob-migration.ts",
+          exportName,
+        },
+        category: "persistence" as const,
+      })),
+      {
+        identity: {
+          module: "scripts/blob-migration-target.ts",
+          exportName: "decodeCoreConfig",
+        },
+        category: "persistence",
+      },
+      {
+        identity: {
+          module: "scripts/legacy-graceful-restart-blob-migration.ts",
+          exportName: "decodeFormerGracefulRestartSnapshot",
+        },
+        category: "persistence",
+      },
+      {
+        identity: {
+          module: "scripts/legacy-graceful-restart-blob-migration.ts",
+          exportName: "preflightUnsafe",
+        },
+        category: "persistence",
+      },
+      {
+        identity: {
+          module: "scripts/legacy-graceful-restart-blob-migration.ts",
+          exportName: "decodeGracefulRestartMigrationRow",
+        },
+        category: "persistence",
+      },
+      ...["decodeLimits", "isWorkflowArtifactId"].map((exportName) => ({
+        identity: {
+          module: "scripts/legacy-workflow-blob-migration.ts",
+          exportName,
+        },
+        category: "persistence" as const,
+      })),
+      ...[
+        ["scripts/legacy-workflow-blob-migration.ts", "capturedFailure"],
+        ["scripts/legacy-workflow-blob-migration.ts", "inspectLegacyDirectory"],
+        ["scripts/legacy-workflow-blob-migration.ts", "readLegacyArtifact"],
+        ["scripts/legacy-workflow-blob-migration.ts", "blobErrorCode"],
+        ["scripts/legacy-workflow-blob-migration.ts", "removeLegacyDirectory"],
+        ["scripts/migrate-blob-storage.ts", "classifyCapturedOperationFailure"],
+        ["scripts/migrate-blob-storage.ts", "captureOperation"],
+        ["scripts/legacy-transient-blob-state.ts", "inspectRoot.catch@1"],
+        ["scripts/legacy-transient-blob-state.ts", "inspectRoot.catch@2"],
+      ].map(([module, exportName]) => ({
+        identity: { module: module!, exportName: exportName! },
+        category: "projection" as const,
+      })),
+      {
+        identity: {
+          module: "src/surface/bridge/request-delivery/core-integration.ts",
+          exportName: "refine.<callback@1>@3",
+        },
+        category: "request",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/request-delivery/core-integration.ts",
+          exportName: "createRequestDeliveryPostCommitObserver.observe",
+        },
+        category: "wire",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/request-delivery/core-integration.ts",
+          exportName: "corePreparedEnvelopeFromCommand",
+        },
+        category: "request",
+      },
+      {
+        identity: {
+          module: "src/surface/bridge/request-delivery/durable-request-bus.ts",
+          exportName: "createDurableCoreRequestBus.bus.publish",
+        },
+        category: "request",
+      },
+      ...[
+        [
+          "src/surface/bridge/bus-agent-runner/core-named-continuation.ts",
+          "decodeStoredContinuationModelMessages",
+          "persistence",
+        ],
+        ["src/surface/store/discord-search-store.ts", "decodeCachedBlobReference", "persistence"],
+        [
+          "src/surface/bridge/request-composition/prepare-bus-messages.ts",
+          "preparePart",
+          "request",
+        ],
+        [
+          "src/surface/bridge/request-composition/prepare-bus-messages.ts",
+          "prepareMessage",
+          "request",
+        ],
+        [
+          "src/surface/bridge/request-composition.ts",
+          "composeSelectedDiscordChain.<callback>@2",
+          "request",
+        ],
+      ].map(([module, exportName, category]) => ({
+        identity: { module: module!, exportName: exportName! },
+        category: category as "persistence" | "request",
       })),
       {
         identity: {
@@ -1536,7 +1770,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "projection" as const,
       })),
       {
-        identity: { module: "src/batch.ts", exportName: "decodeBatchEditInput" },
+        identity: {
+          module: "src/batch.ts",
+          exportName: "decodeBatchEditInput",
+        },
         category: "plugin",
       },
       {
@@ -1544,7 +1781,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "plugin",
       },
       {
-        identity: { module: "src/batch.ts", exportName: "resolveBatchEditTargets" },
+        identity: {
+          module: "src/batch.ts",
+          exportName: "resolveBatchEditTargets",
+        },
         category: "plugin",
       },
       {
@@ -1588,27 +1828,45 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "wire",
       },
       {
-        identity: { module: "redis-streams-bus.ts", exportName: "deliveryAction" },
+        identity: {
+          module: "redis-streams-bus.ts",
+          exportName: "deliveryAction",
+        },
         category: "request",
       },
       {
-        identity: { module: "redis-streams-bus.ts", exportName: "decodeRedisReadResponse" },
+        identity: {
+          module: "redis-streams-bus.ts",
+          exportName: "decodeRedisReadResponse",
+        },
         category: "wire",
       },
       {
-        identity: { module: "redis-streams-bus.ts", exportName: "decodeRedisWatermarkResponse" },
+        identity: {
+          module: "redis-streams-bus.ts",
+          exportName: "decodeRedisWatermarkResponse",
+        },
         category: "wire",
       },
       {
-        identity: { module: "redis-streams-bus.ts", exportName: "decodeRedisPendingSummary" },
+        identity: {
+          module: "redis-streams-bus.ts",
+          exportName: "decodeRedisPendingSummary",
+        },
         category: "wire",
       },
       {
-        identity: { module: "redis-streams-bus.ts", exportName: "decodeRedisOldestPendingIdle" },
+        identity: {
+          module: "redis-streams-bus.ts",
+          exportName: "decodeRedisOldestPendingIdle",
+        },
         category: "wire",
       },
       {
-        identity: { module: "redis-streams-bus.ts", exportName: "decodeRedisRangeResponse" },
+        identity: {
+          module: "redis-streams-bus.ts",
+          exportName: "decodeRedisRangeResponse",
+        },
         category: "wire",
       },
       {
@@ -1656,11 +1914,17 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
     "apps/mini-lilac-tui",
     [
       {
-        identity: { module: "src/opentui-boundary.ts", exportName: "decodeDraftExtmarkData" },
+        identity: {
+          module: "src/opentui-boundary.ts",
+          exportName: "decodeDraftExtmarkData",
+        },
         category: "plugin",
       },
       {
-        identity: { module: "src/preferences.ts", exportName: "decodeBindingPreferences" },
+        identity: {
+          module: "src/preferences.ts",
+          exportName: "decodeBindingPreferences",
+        },
         category: "persistence",
       },
       {
@@ -1704,7 +1968,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "request" as const,
       })),
       {
-        identity: { module: "src/main.ts", exportName: "decodeMiniLilacCliOptions" },
+        identity: {
+          module: "src/main.ts",
+          exportName: "decodeMiniLilacCliOptions",
+        },
         category: "request",
       },
       {
@@ -1712,11 +1979,17 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "request",
       },
       {
-        identity: { module: "src/server.ts", exportName: "adaptMiniLilacPersistenceResult" },
+        identity: {
+          module: "src/server.ts",
+          exportName: "adaptMiniLilacPersistenceResult",
+        },
         category: "projection",
       },
       {
-        identity: { module: "src/server.ts", exportName: "classifyHttpOperationFailure" },
+        identity: {
+          module: "src/server.ts",
+          exportName: "classifyHttpOperationFailure",
+        },
         category: "projection",
       },
     ],
@@ -1725,7 +1998,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
     "packages/mini-lilac-client",
     [
       {
-        identity: { module: "mini-lilac-transport.ts", exportName: "decodeMiniLilacBoundary" },
+        identity: {
+          module: "mini-lilac-transport.ts",
+          exportName: "decodeMiniLilacBoundary",
+        },
         category: "wire",
       },
       {
@@ -1743,7 +2019,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "projection",
       },
       {
-        identity: { module: "mini-lilac-transport.ts", exportName: "normalizeStreamChunkResult" },
+        identity: {
+          module: "mini-lilac-transport.ts",
+          exportName: "normalizeStreamChunkResult",
+        },
         category: "wire",
       },
     ],
@@ -1770,7 +2049,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "plugin",
       },
       {
-        identity: { module: "claude-code-run.ts", exportName: "readSessionInfo" },
+        identity: {
+          module: "claude-code-run.ts",
+          exportName: "readSessionInfo",
+        },
         category: "plugin",
       },
       {
@@ -1781,7 +2063,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "plugin",
       },
       {
-        identity: { module: "claude-code-run.ts", exportName: "boundedExternalFailure" },
+        identity: {
+          module: "claude-code-run.ts",
+          exportName: "boundedExternalFailure",
+        },
         category: "projection",
       },
       {
@@ -1797,11 +2082,17 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
     "packages/fs",
     [
       {
-        identity: { module: "src/remote-runner-protocol.ts", exportName: "decodeJson" },
+        identity: {
+          module: "src/remote-runner-protocol.ts",
+          exportName: "decodeJson",
+        },
         category: "wire",
       },
       {
-        identity: { module: "src/remote-runner-protocol.ts", exportName: "decodeRequest" },
+        identity: {
+          module: "src/remote-runner-protocol.ts",
+          exportName: "decodeRequest",
+        },
         category: "wire",
       },
       {
@@ -1840,11 +2131,17 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "wire",
       },
       {
-        identity: { module: "src/filesystem-operation.ts", exportName: "decodeFilesystemFailure" },
+        identity: {
+          module: "src/filesystem-operation.ts",
+          exportName: "decodeFilesystemFailure",
+        },
         category: "projection",
       },
       {
-        identity: { module: "src/ripgrep.ts", exportName: "decodeRipgrepMatchLine" },
+        identity: {
+          module: "src/ripgrep.ts",
+          exportName: "decodeRipgrepMatchLine",
+        },
         category: "wire",
       },
     ],
@@ -1889,15 +2186,24 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "plugin" as const,
       })),
       {
-        identity: { module: "discovery.ts", exportName: "decodePluginFilesystemErrorCode" },
+        identity: {
+          module: "discovery.ts",
+          exportName: "decodePluginFilesystemErrorCode",
+        },
         category: "projection",
       },
       {
-        identity: { module: "discovery.ts", exportName: "decodePluginPackageJsonText" },
+        identity: {
+          module: "discovery.ts",
+          exportName: "decodePluginPackageJsonText",
+        },
         category: "plugin",
       },
       {
-        identity: { module: "server-tool-result.ts", exportName: "decodeServerToolResult" },
+        identity: {
+          module: "server-tool-result.ts",
+          exportName: "decodeServerToolResult",
+        },
         category: "plugin",
       },
       ...["transform.<callback@1>@1", "transform.<callback@1>@2"].map((exportName) => ({
@@ -1910,19 +2216,31 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
     "packages/utils",
     [
       {
-        identity: { module: "custom-commands.ts", exportName: "decodeCustomCommandResult" },
+        identity: {
+          module: "custom-commands.ts",
+          exportName: "decodeCustomCommandResult",
+        },
         category: "plugin",
       },
       {
-        identity: { module: "custom-commands.ts", exportName: "readCustomCommandDefinition" },
+        identity: {
+          module: "custom-commands.ts",
+          exportName: "readCustomCommandDefinition",
+        },
         category: "plugin",
       },
       {
-        identity: { module: "agent-prompts.ts", exportName: "parsePromptTemplateState" },
+        identity: {
+          module: "agent-prompts.ts",
+          exportName: "parsePromptTemplateState",
+        },
         category: "persistence",
       },
       {
-        identity: { module: "ai-error.ts", exportName: "parseProviderErrorDetails" },
+        identity: {
+          module: "ai-error.ts",
+          exportName: "parseProviderErrorDetails",
+        },
         category: "projection",
       },
       {
@@ -1930,7 +2248,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "projection",
       },
       {
-        identity: { module: "ai-error.ts", exportName: "extractAiErrorLogDetails" },
+        identity: {
+          module: "ai-error.ts",
+          exportName: "extractAiErrorLogDetails",
+        },
         category: "projection",
       },
       ...["readString", "readStringOrNumber"].map((exportName) => ({
@@ -1946,7 +2267,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "wire",
       },
       {
-        identity: { module: "codex-oauth.ts", exportName: "extractAccountIdFromClaims" },
+        identity: {
+          module: "codex-oauth.ts",
+          exportName: "extractAccountIdFromClaims",
+        },
         category: "wire",
       },
       ...[
@@ -1979,7 +2303,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "request" as const,
       })),
       {
-        identity: { module: "core-config.ts", exportName: "projectLegacyCoreConfigFailure" },
+        identity: {
+          module: "core-config.ts",
+          exportName: "projectLegacyCoreConfigFailure",
+        },
         category: "projection",
       },
       ...[
@@ -2009,11 +2336,17 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "projection" as const,
       })),
       {
-        identity: { module: "model-capability.ts", exportName: "decodeModelsDevRegistry" },
+        identity: {
+          module: "model-capability.ts",
+          exportName: "decodeModelsDevRegistry",
+        },
         category: "wire",
       },
       {
-        identity: { module: "model-capability.ts", exportName: "ModelCapability.resolve" },
+        identity: {
+          module: "model-capability.ts",
+          exportName: "ModelCapability.resolve",
+        },
         category: "projection",
       },
       {
@@ -2066,13 +2399,12 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         identity: { module: "openai-responses-websocket-fetch.ts", exportName },
         category: "projection" as const,
       })),
-      ...[
-        "createOpenAIResponsesWebSocketFetch.reportAutoFallback",
-        "createOpenAIResponsesWebSocketFetch.websocketFetch.start.onMessage.catch.<callback@1>",
-      ].map((exportName) => ({
-        identity: { module: "openai-responses-websocket-fetch.ts", exportName },
-        category: "projection" as const,
-      })),
+      ...["createOpenAIResponsesWebSocketFetch.reportAutoFallback", "captureResponsesFailure"].map(
+        (exportName) => ({
+          identity: { module: "openai-responses-websocket-fetch.ts", exportName },
+          category: "projection" as const,
+        }),
+      ),
       ...[
         "parseFriendlyUnitResult",
         "parseFriendlyByteSizeResult",
@@ -2086,7 +2418,7 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
       ...[
         "addNormalizedArgFields",
         "normalizeRecordForOpenObserve",
-        "projectOpenObserveRequestFailure",
+        "captureOpenObserveRequestFailure",
         "signalOpenObservePanic",
       ].map((exportName) => ({
         identity: { module: "logging.ts", exportName },
@@ -2097,11 +2429,17 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "projection",
       },
       {
-        identity: { module: "llm-wire-debug.ts", exportName: "projectWireDebugEventType" },
+        identity: {
+          module: "llm-wire-debug.ts",
+          exportName: "projectWireDebugEventType",
+        },
         category: "projection",
       },
       {
-        identity: { module: "llm-wire-debug.ts", exportName: "createWriter.<callback>" },
+        identity: {
+          module: "llm-wire-debug.ts",
+          exportName: "createWriter.<callback>",
+        },
         category: "projection",
       },
       ...["errorMessage", "errorCode"].map((exportName) => ({
@@ -2158,7 +2496,10 @@ const INTEGRATED_BOUNDARY_DECODERS = new Map<string, readonly BoundaryDecoder[]>
         category: "request",
       },
       {
-        identity: { module: "skills.ts", exportName: "parseSkillMarkdownResult" },
+        identity: {
+          module: "skills.ts",
+          exportName: "parseSkillMarkdownResult",
+        },
         category: "plugin",
       },
       ...[
@@ -2193,7 +2534,10 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
         reason: "Classifies an opaque top-level CLI defect only for bounded process reporting.",
       },
       {
-        identity: { module: "index.ts", exportName: "recordUnhandledRejection" },
+        identity: {
+          module: "index.ts",
+          exportName: "recordUnhandledRejection",
+        },
         reason: "Carries the process rejection reason opaquely to the Core server supervisor.",
       },
     ],
@@ -2202,12 +2546,18 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
     "packages/agent",
     [
       {
-        identity: { module: "ai-sdk-pi-agent.ts", exportName: "AiSdkPiAgent.requestIdleRecovery" },
+        identity: {
+          module: "ai-sdk-pi-agent.ts",
+          exportName: "AiSdkPiAgent.requestIdleRecovery",
+        },
         reason:
           "Carries the model provider's idle failure opaquely to the configured retry policy.",
       },
       {
-        identity: { module: "auto-compaction.ts", exportName: "compactCanonicalMessages" },
+        identity: {
+          module: "auto-compaction.ts",
+          exportName: "compactCanonicalMessages",
+        },
         reason:
           "Carries a server-compaction callback failure opaquely to the caller-owned observer.",
       },
@@ -2217,7 +2567,10 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
     "packages/mini-lilac-runtime",
     [
       {
-        identity: { module: "src/session-service.ts", exportName: "sha256Fingerprint" },
+        identity: {
+          module: "src/session-service.ts",
+          exportName: "sha256Fingerprint",
+        },
         reason:
           "Serializes an opaque provider-owned value only to derive a stable content fingerprint.",
       },
@@ -2230,7 +2583,10 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
           "Carries a supervised defect opaquely through the public legacy lock host contract.",
       },
       {
-        identity: { module: "src/session-service.ts", exportName: "rethrowSessionPanic" },
+        identity: {
+          module: "src/session-service.ts",
+          exportName: "rethrowSessionPanic",
+        },
         reason: "Observes an opaque failure only to preserve Panic identity.",
       },
       {
@@ -2310,7 +2666,10 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
         reason: "Carries an AI SDK tool-call payload opaquely to the selected child tool boundary.",
       },
       {
-        identity: { module: "src/batch.ts", exportName: "createBatchToolResult" },
+        identity: {
+          module: "src/batch.ts",
+          exportName: "createBatchToolResult",
+        },
         reason: "Carries an AI SDK tool-call payload opaquely to the selected child tool boundary.",
       },
     ],
@@ -2327,11 +2686,17 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
           "Carries the SDK callback value opaquely to the registered Claude message projector and optional observer.",
       },
       {
-        identity: { module: "claude-code-tools.ts", exportName: "stringifyJson" },
+        identity: {
+          module: "claude-code-tools.ts",
+          exportName: "stringifyJson",
+        },
         reason: "Serializes plugin-owned tool output without interpreting its domain structure.",
       },
       {
-        identity: { module: "claude-code-run.ts", exportName: "boundedExternalFailure" },
+        identity: {
+          module: "claude-code-run.ts",
+          exportName: "boundedExternalFailure",
+        },
         reason: "Bounds an opaque external failure cause for a callback-safe diagnostic.",
       },
     ],
@@ -2344,37 +2709,61 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
         reason: "Formats generic Zod literal and default values without interpreting domain data.",
       },
       {
-        identity: { module: "capabilities.ts", exportName: "opaquePluginExceptionMessage" },
+        identity: {
+          module: "capabilities.ts",
+          exportName: "opaquePluginExceptionMessage",
+        },
         reason: "Formats an opaque plugin exception without treating it as domain data.",
       },
       {
-        identity: { module: "capabilities.ts", exportName: "safePluginExceptionCause" },
+        identity: {
+          module: "capabilities.ts",
+          exportName: "safePluginExceptionCause",
+        },
         reason: "Projects an opaque plugin exception into a safe plain Error cause.",
       },
       {
-        identity: { module: "discovery.ts", exportName: "opaquePluginDiscoveryExceptionMessage" },
+        identity: {
+          module: "discovery.ts",
+          exportName: "opaquePluginDiscoveryExceptionMessage",
+        },
         reason: "Formats an opaque filesystem exception without treating it as domain data.",
       },
       {
-        identity: { module: "types.ts", exportName: "Level1ToolBuildContext.resolveEditTargets" },
+        identity: {
+          module: "types.ts",
+          exportName: "Level1ToolBuildContext.resolveEditTargets",
+        },
         reason:
           "Public plugin compatibility contract carries tool arguments opaquely to the owning plugin.",
       },
       {
-        identity: { module: "types.ts", exportName: "Level1ToolSpec.editTargets" },
+        identity: {
+          module: "types.ts",
+          exportName: "Level1ToolSpec.editTargets",
+        },
         reason: "Public plugin hook receives its plugin-owned tool argument shape opaquely.",
       },
       {
-        identity: { module: "types.ts", exportName: "Level1ToolSpec.formatArgs" },
+        identity: {
+          module: "types.ts",
+          exportName: "Level1ToolSpec.formatArgs",
+        },
         reason: "Public plugin hook formats its plugin-owned tool argument shape opaquely.",
       },
       {
-        identity: { module: "types.ts", exportName: "Level1ToolSpec.summarizeFailure" },
+        identity: {
+          module: "types.ts",
+          exportName: "Level1ToolSpec.summarizeFailure",
+        },
         reason:
           "Public plugin hook receives the host tool result as an opaque compatibility value.",
       },
       {
-        identity: { module: "manager.ts", exportName: "ToolPluginManagerOptions.getPluginConfig" },
+        identity: {
+          module: "manager.ts",
+          exportName: "ToolPluginManagerOptions.getPluginConfig",
+        },
         reason:
           "Public plugin configuration remains opaque until the selected plugin interprets it.",
       },
@@ -2384,15 +2773,24 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
     "packages/utils",
     [
       {
-        identity: { module: "runtime-utils.ts", exportName: "opaqueErrorMessage" },
+        identity: {
+          module: "runtime-utils.ts",
+          exportName: "opaqueErrorMessage",
+        },
         reason: "Formats an opaque external exception without interpreting domain data.",
       },
       {
-        identity: { module: "runtime-utils.ts", exportName: "opaqueErrorCause" },
+        identity: {
+          module: "runtime-utils.ts",
+          exportName: "opaqueErrorCause",
+        },
         reason: "Carries an inspectable exception cause or substitutes a plain opaque Error.",
       },
       {
-        identity: { module: "codex-oauth.ts", exportName: "startCodexOAuthLogin.fail" },
+        identity: {
+          module: "codex-oauth.ts",
+          exportName: "startCodexOAuthLogin.fail",
+        },
         reason: "Carries an opaque callback-server failure to the established Promise rejection.",
       },
       {
@@ -2404,11 +2802,17 @@ const INTEGRATED_OPAQUE_UNKNOWN = new Map<string, readonly ReasonedSymbolExcepti
         reason: "Serializes generic logger values without interpreting application domain data.",
       },
       {
-        identity: { module: "logging.ts", exportName: "addNormalizedArgFields" },
+        identity: {
+          module: "logging.ts",
+          exportName: "addNormalizedArgFields",
+        },
         reason: "Projects generic logger arguments into bounded structured fields.",
       },
       {
-        identity: { module: "logging.ts", exportName: "normalizeRecordForOpenObserve" },
+        identity: {
+          module: "logging.ts",
+          exportName: "normalizeRecordForOpenObserve",
+        },
         reason: "Projects a generic logger record into the OpenObserve transport shape.",
       },
       {
@@ -2453,7 +2857,10 @@ const INTEGRATED_CAPABILITY_PREDICATES = new Map<string, readonly ReasonedSymbol
     "apps/acp-controller",
     [
       {
-        identity: { module: "acp-harness-client.ts", exportName: "isAuthRequiredError" },
+        identity: {
+          module: "acp-harness-client.ts",
+          exportName: "isAuthRequiredError",
+        },
         reason:
           "Checks the exact ACP RequestError authorization code on an owned external failure.",
       },
@@ -2467,11 +2874,17 @@ const INTEGRATED_CAPABILITY_PREDICATES = new Map<string, readonly ReasonedSymbol
         reason: "Checks exact Panic identity without interpreting an ordinary failure.",
       },
       {
-        identity: { module: "tool-call-expansion.ts", exportName: "isToolExpansion" },
+        identity: {
+          module: "tool-call-expansion.ts",
+          exportName: "isToolExpansion",
+        },
         reason: "Checks the exact project-owned ToolExpansion class and brand.",
       },
       {
-        identity: { module: "atomic-tool-execution.ts", exportName: "isAsyncIterable" },
+        identity: {
+          module: "atomic-tool-execution.ts",
+          exportName: "isAsyncIterable",
+        },
         reason: "Checks only the standard async-iterator capability on tool output.",
       },
       {
@@ -2482,7 +2895,10 @@ const INTEGRATED_CAPABILITY_PREDICATES = new Map<string, readonly ReasonedSymbol
         reason: "Checks exact AI SDK, Zod, and owned invalid-input error identities.",
       },
       {
-        identity: { module: "atomic-tool-execution.ts", exportName: "isJsonToolOutputValue" },
+        identity: {
+          module: "atomic-tool-execution.ts",
+          exportName: "isJsonToolOutputValue",
+        },
         reason:
           "Checks complete recursive JSON output representability, including finite numbers and cycles.",
       },
@@ -2495,7 +2911,10 @@ const INTEGRATED_CAPABILITY_PREDICATES = new Map<string, readonly ReasonedSymbol
           "Performs the recursive JSON output representability check with explicit cycle tracking.",
       },
       {
-        identity: { module: "ai-sdk-pi-agent.ts", exportName: "isClonedModelMessage" },
+        identity: {
+          module: "ai-sdk-pi-agent.ts",
+          exportName: "isClonedModelMessage",
+        },
         reason:
           "Checks the closed model-message role capability after the structure-preserving clone.",
       },
@@ -2513,7 +2932,10 @@ const INTEGRATED_CAPABILITY_PREDICATES = new Map<string, readonly ReasonedSymbol
           "Checks only whether a persisted opaque value survives the exact SuperJSON representation round trip.",
       },
       {
-        identity: { module: "src/workspace-history-store.ts", exportName: "isMissingExecutable" },
+        identity: {
+          module: "src/workspace-history-store.ts",
+          exportName: "isMissingExecutable",
+        },
         reason:
           "Checks only the exact Node filesystem ENOENT capability on an opaque process failure.",
       },
@@ -2569,7 +2991,10 @@ const INTEGRATED_CAPABILITY_PREDICATES = new Map<string, readonly ReasonedSymbol
         reason: "Delegates to the complete OpenAI compaction-part schema decoder.",
       },
       {
-        identity: { module: "subagent-profile.ts", exportName: "isNativeSubagentProfile" },
+        identity: {
+          module: "subagent-profile.ts",
+          exportName: "isNativeSubagentProfile",
+        },
         reason:
           "Checks the closed native subagent profile literals without projecting richer data.",
       },
@@ -2582,7 +3007,10 @@ const INTEGRATED_OPEN_PROTOCOL_ADAPTERS = new Map<string, readonly OpenProtocolA
     "packages/agent",
     [
       {
-        identity: { module: "ai-sdk-pi-agent.ts", exportName: "projectAiSdkTextStreamPart" },
+        identity: {
+          module: "ai-sdk-pi-agent.ts",
+          exportName: "projectAiSdkTextStreamPart",
+        },
         externalProtocol: { package: "ai", exportName: "TextStreamPart" },
         protocolParameter: 0,
         fallbackVariant: { discriminant: "kind", value: "unsupported" },
@@ -2595,8 +3023,14 @@ const INTEGRATED_OPEN_PROTOCOL_ADAPTERS = new Map<string, readonly OpenProtocolA
     "apps/acp-controller",
     [
       {
-        identity: { module: "session-history.ts", exportName: "projectSessionUpdate" },
-        externalProtocol: { package: "@agentclientprotocol/sdk", exportName: "SessionUpdate" },
+        identity: {
+          module: "session-history.ts",
+          exportName: "projectSessionUpdate",
+        },
+        externalProtocol: {
+          package: "@agentclientprotocol/sdk",
+          exportName: "SessionUpdate",
+        },
         protocolParameter: 0,
         fallbackVariant: { discriminant: "type", value: "unsupported" },
         reason:
@@ -2627,3408 +3061,16 @@ const OPEN_PROTOCOL_RULE_ZONES = new Map<string, readonly RuleZone[]>([
   ["apps/mini-lilac-tui", [{ include: "src/ui-message-chunk-projection.ts" }]],
 ]);
 
-const CORE_TOOL_SERVER_EXCEPTION_ADAPTERS = [
-  {
-    identity: {
-      module: "src/tool-server/tools/ssh.ts",
-      exportName: "decodeSshProbeOutput",
-    },
-    category: "external-to-result",
-    externalApi: { package: "global", exportName: "JSON.parse" },
-    direction: "capture-external",
-    reason: "Maps malformed remote probe JSON to an owned SSH probe Result error.",
-  },
-] as const satisfies readonly ExceptionAdapter[];
-
-export const LEGACY_UNENFORCED_EXCEPTION_ADAPTERS = new Map<string, readonly ExceptionAdapter[]>([
-  [
-    "apps/acp-controller",
-    [
-      ["external-adapters.ts", "captureExternal", "ACP SDK or process operation"],
-      ["run-store.ts", "parseJson", "JSON.parse"],
-    ].flatMap(([module, exportName, externalExportName]) => [
-      {
-        identity: { module, exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "external", exportName: externalExportName },
-        direction: "capture-external" as const,
-        reason: "Maps one immediate ACP external failure to an owned Result error.",
-      },
-      {
-        identity: { module, exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason: "Preserves Panic identity at the exact ACP exception boundary.",
-      },
-    ]),
-  ],
-  [
-    "apps/mini-lilac",
-    [
-      ...[
-        ["build.ts", "captureBuildOperation", "build filesystem or Bun operation"],
-        ["install-local.ts", "captureInstallOperation", "local install process operation"],
-        ["src/main.ts", "captureCommand", "Mini Lilac command runner"],
-      ].flatMap(([module, exportName, externalExportName]) => [
-        {
-          identity: { module, exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "external", exportName: externalExportName },
-          direction: "capture-external" as const,
-          reason: "Maps one immediate CLI, build, or installer failure to an owned Result error.",
-        },
-        {
-          identity: { module, exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity at the exact Mini Lilac operation boundary.",
-        },
-      ]),
-      ...[
-        ["build.ts", "signalBuildFailure", "build script"],
-        ["install-local.ts", "signalLocalInstallFailure", "local install script"],
-      ].map(([module, exportName, externalExportName]) => ({
-        identity: { module, exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/mini-lilac", exportName: externalExportName },
-        direction: "signal-host" as const,
-        reason: "Adapts an owned CLI Result to the executable host's throwing contract.",
-      })),
-    ],
-  ],
-  [
-    "apps/mini-lilac-server",
-    [
-      ...[
-        ["src/main.ts", "captureServerOperation", "server operation"],
-        ["src/main.ts", "captureServerCleanup", "server cleanup"],
-        ["src/main.ts", "captureNodeCliParsing", "node:util.parseArgs"],
-        ["src/server.ts", "captureSessionCreation", "session creation"],
-        ["src/server.ts", "canonicalDirectory", "node:fs/promises.realpath"],
-      ].flatMap(([module, exportName, externalExportName]) => [
-        {
-          identity: { module, exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "external", exportName: externalExportName },
-          direction: "capture-external" as const,
-          reason:
-            "Maps one immediate server, CLI, filesystem, or cleanup failure to an owned Result.",
-        },
-        {
-          identity: { module, exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity at the same Mini Lilac server boundary.",
-        },
-      ]),
-      {
-        identity: { module: "src/main.ts", exportName: "settleShutdownEffect" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Settles every shutdown effect while retaining the first observed Panic.",
-      },
-      ...[
-        ["src/main.ts", "adaptLifecycleResultToHost", "server lifecycle"],
-        ["src/main.ts", "acquireDatabaseLock", "database lock compatibility API"],
-        ["src/main.ts", "shutdownMiniLilacServer", "server shutdown compatibility API"],
-        ["src/server.ts", "invalidServerConfiguration", "Elysia server construction"],
-      ].map(([module, exportName, externalExportName]) => ({
-        identity: { module, exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/mini-lilac-server", exportName: externalExportName },
-        direction: "signal-host" as const,
-        reason: "Signals an owned server failure through the established rejecting host contract.",
-      })),
-      {
-        identity: { module: "src/server.ts", exportName: "classifyHttpOperationFailure" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic before classifying ordinary HTTP operation failures.",
-      },
-      {
-        identity: { module: "src/server.ts", exportName: "captureHttpOperation" },
-        category: "external-to-result",
-        externalApi: { package: "elysia", exportName: "request handler" },
-        direction: "capture-external",
-        reason: "Maps a request-handler rejection to the local HTTP Result envelope.",
-      },
-      ...["enqueueSseKeepAlive"].flatMap((exportName) => [
-        {
-          identity: { module: "src/server.ts", exportName },
-          category: "compatibility" as const,
-          externalApi: { package: "global", exportName: "ReadableStream controller.enqueue" },
-          direction: "capture-external" as const,
-          reason: "Contains a closed SSE controller enqueue failure during keep-alive cleanup.",
-        },
-        {
-          identity: { module: "src/server.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic from the SSE controller boundary.",
-        },
-      ]),
-    ],
-  ],
-  [
-    "apps/tool-bridge",
-    [
-      ...[
-        ["readFileText", "node:fs/promises.readFile"],
-        ["readFileBytes", "node:fs/promises.readFile"],
-        ["decodeJsonText", "JSON.parse"],
-        ["fetchRequest", "global fetch"],
-        ["readResponseText", "Response.text"],
-        ["isFile", "node:fs/promises.stat"],
-        ["openPromptInterface", "node:readline.createInterface"],
-        ["askPrompt", "node:readline.question"],
-        ["closePrompt", "node:readline.close"],
-        ["readStdinText", "process.stdin"],
-        ["normalizePathCandidate", "node:fs.realpathSync.native"],
-      ].flatMap(([exportName, externalExportName]) => [
-        {
-          identity: { module: "client.ts", exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "external", exportName: externalExportName },
-          direction: "capture-external" as const,
-          reason:
-            "Contains one immediate Tool Bridge filesystem, network, prompt, or JSON failure.",
-        },
-        {
-          identity: { module: "client.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity at the exact Tool Bridge adapter.",
-        },
-      ]),
-      {
-        identity: { module: "client.ts", exportName: "reportMainDefect" },
-        category: "defect-supervisor",
-        externalApi: { package: "global", exportName: "Promise.then rejection handler" },
-        direction: "observe-panic",
-        reason: "Routes top-level CLI rejection to the exact bounded process defect reporter.",
-      },
-    ],
-  ],
-  [
-    "packages/agent",
-    [
-      {
-        identity: { module: "failure-adapters.ts", exportName: "rethrowAgentPanic" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves exact Panic identity at narrow Agent exception boundaries.",
-      },
-      {
-        identity: {
-          module: "atomic-tool-execution.ts",
-          exportName: "cleanupFailedAtomicToolCall",
-        },
-        category: "external-to-result",
-        externalApi: { package: "@stanley2058/lilac-agent", exportName: "AgentEventHandler" },
-        direction: "capture-external",
-        reason:
-          "Maps a terminal tool-event callback failure to AtomicToolTerminalCleanupFailed before cleanup precedence is resolved.",
-      },
-      ...[
-        ["atomic-tool-execution.ts", "consumeAtomicToolResultStream", "async tool result stream"],
-        ["openai-server-compaction.ts", "compactWithOpenAIResponsesResult", "AI SDK streamText"],
-      ].map(([module, exportName, externalExportName]) => ({
-        identity: { module, exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "ai", exportName: externalExportName },
-        direction: "capture-external" as const,
-        reason: "Maps an immediate AI SDK or tool stream failure to an owned Result error.",
-      })),
-    ],
-  ],
-  [
-    "packages/bash-safety",
-    [
-      [
-        "src/analyze/analyze-command.ts",
-        "parseBashCommand.catch",
-        "just-bash",
-        "parse",
-        "Maps parser exceptions to BashCommandParseFailed.",
-      ],
-      [
-        "src/rules-filesystem.ts",
-        "readGitMetadataFile.catch",
-        "node:fs",
-        "readFileSync",
-        "Maps Git metadata file read exceptions to GitMetadataReadFailed.",
-      ],
-      [
-        "src/rules-rm.ts",
-        "resolveRmPaths.catch",
-        "node:fs",
-        "realpathSync",
-        "Maps path-resolution exceptions to RmPathResolutionFailed.",
-      ],
-    ].flatMap(([module, exportName, packageName, externalExportName, reason]) => [
-      {
-        identity: { module, exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: packageName, exportName: externalExportName },
-        direction: "capture-external" as const,
-        reason,
-      },
-      {
-        identity: { module, exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason: "Preserves Panic while the immediate Bash Safety adapter maps ordinary failure.",
-      },
-    ]),
-  ],
-  [
-    "apps/mini-lilac-tui",
-    [
-      ...[
-        ["src/cli.ts", "parseCliOptions", "node:util.parseArgs"],
-        ["src/clipboard.ts", "spawnClipboardCommand", "node:child_process.spawn"],
-        ["src/clipboard.ts", "openClipboardFile", "node:fs/promises.open"],
-        ["src/clipboard.ts", "statClipboardFile", "FileHandle.stat"],
-        ["src/clipboard.ts", "readClipboardFile", "FileHandle.read"],
-        ["src/clipboard.ts", "closeClipboardFile", "FileHandle.close"],
-        ["src/clipboard.ts", "runAppleScript", "node:child_process.execFile"],
-        ["src/clipboard.ts", "removeClipboardFile", "node:fs/promises.rm"],
-        ["src/preferences.ts", "decodeBindingPreferences", "JSON.parse"],
-        ["src/preferences.ts", "bindingPreferencesFileExists", "BunFile.exists"],
-        ["src/preferences.ts", "readBindingPreferencesFile", "BunFile.text"],
-        ["src/preferences.ts", "createBindingPreferencesDirectory", "node:fs/promises.mkdir"],
-        ["src/preferences.ts", "writeBindingPreferencesFile", "Bun.write"],
-        ["src/preferences.ts", "renameBindingPreferencesFile", "node:fs/promises.rename"],
-        ["src/preferences.ts", "removeTemporaryBindingPreferences", "node:fs/promises.rm"],
-        ["src/startup.ts", "verifySessionCwd", "node:fs.realpathSync.native"],
-        ["src/terminal-runtime-adapter.ts", "createTerminalRenderer", "createCliRenderer"],
-        ["src/terminal-runtime-adapter.ts", "readTerminalPalette", "renderer.getPalette"],
-        ["src/terminal-runtime-adapter.ts", "setTerminalBackground", "renderer.setBackgroundColor"],
-        ["src/terminal-runtime-adapter.ts", "renderTerminalApp", "@opentui/solid.render"],
-        ["src/terminal-runtime-adapter.ts", "destroyTerminalRenderer", "renderer.destroy"],
-        ["src/terminal-stream-adapter.ts", "readTerminalStream", "ReadableStream reader.read"],
-        ["src/terminal-stream-adapter.ts", "cancelTerminalStream", "ReadableStream.cancel"],
-        [
-          "src/terminal-stream-adapter.ts",
-          "releaseTerminalStreamLock",
-          "ReadableStream reader.releaseLock",
-        ],
-      ].flatMap(([module, exportName, externalExportName]) => [
-        {
-          identity: { module, exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "external", exportName: externalExportName },
-          direction: "capture-external" as const,
-          reason:
-            "Maps one immediate terminal, filesystem, parser, or stream failure to an owned Result.",
-        },
-        {
-          identity: { module, exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity at the exact TUI adapter boundary.",
-        },
-      ]),
-      {
-        identity: {
-          module: "src/terminal-runtime-adapter.ts",
-          exportName: "runTerminalEntrypoint",
-        },
-        category: "compatibility",
-        externalApi: { package: "@opentui/core", exportName: "terminal process entrypoint" },
-        direction: "capture-external",
-        reason: "Maps the top-level terminal failure to the process-owned Result contract.",
-      },
-      {
-        identity: {
-          module: "src/terminal-runtime-adapter.ts",
-          exportName: "runWithOwnedTerminalRenderer",
-        },
-        category: "external-to-result",
-        externalApi: { package: "@opentui/core", exportName: "OwnedTerminalRenderer.destroy" },
-        direction: "capture-external",
-        reason:
-          "Attempts owned renderer cleanup after work settles and preserves an ordinary cleanup failure as a Result.",
-      },
-      {
-        identity: {
-          module: "src/terminal-runtime-adapter.ts",
-          exportName: "requestTerminalRendererShutdown",
-        },
-        category: "compatibility",
-        externalApi: { package: "@opentui/core", exportName: "OwnedTerminalRenderer.destroy" },
-        direction: "capture-external",
-        reason:
-          "Retains a synchronous renderer-shutdown defect in a closed outcome until the owner wait is released.",
-      },
-      {
-        identity: {
-          module: "src/terminal-runtime-adapter.ts",
-          exportName: "resolveTerminalShutdownOutcome",
-        },
-        category: "compatibility",
-        externalApi: { package: "@opentui/core", exportName: "retained terminal shutdown defect" },
-        direction: "signal-host",
-        reason:
-          "Rethrows only the defect retained while synchronous renderer shutdown released the owner wait.",
-      },
-      {
-        identity: { module: "src/tool-observation-projection.ts", exportName: "parseInput" },
-        category: "external-to-result",
-        externalApi: { package: "zod", exportName: "ZodType.safeParse" },
-        direction: "capture-external",
-        reason:
-          "Contains hostile schema input access and maps ordinary parser failures to the projection-owned malformed Result while preserving Panic.",
-      },
-      {
-        identity: { module: "src/tool-observation-projection.ts", exportName: "parseInput" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic from hostile schema input access without converting it to an Err.",
-      },
-      {
-        identity: {
-          module: "src/tool-observation-projection.ts",
-          exportName: "decodeKnownToolObservation",
-        },
-        category: "external-to-result",
-        externalApi: {
-          package: "@stanley2058/mini-lilac-tui",
-          exportName: "toolObservationCodecRegistry",
-        },
-        direction: "capture-external",
-        reason:
-          "Contains one selected tool codec invocation and maps ordinary decoder failures to the projection-owned malformed Result while preserving Panic.",
-      },
-      {
-        identity: {
-          module: "src/tool-observation-projection.ts",
-          exportName: "decodeKnownToolObservation",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic from a selected tool decoder without converting it to an Err.",
-      },
-    ],
-  ],
-  [
-    "apps/core",
-    [
-      ...[
-        [
-          "src/tool-server/tools/programmatic-workflow.ts",
-          "adaptWorkflowInvocationResultToToolHost",
-          "programmatic workflow tool host",
-        ],
-        [
-          "src/workflow/workflow-subagent-dispatcher.ts",
-          "adaptWorkflowInvocationResultToSubagentHost",
-          "subagent delegation host",
-        ],
-        [
-          "src/workflow/durable-workflow-store.ts",
-          "adaptWorkflowMigrationResultToStartupHost",
-          "core startup",
-        ],
-        [
-          "src/workflow/durable-workflow-store.ts",
-          "adaptWorkflowTransactionResultToStoreHost",
-          "legacy synchronous workflow store callers",
-        ],
-        [
-          "src/transcript/transcript-store.ts",
-          "adaptTranscriptTransactionResultToStoreHost",
-          "legacy synchronous transcript transaction callers",
-        ],
-        [
-          "src/transcript/transcript-store.ts",
-          "adaptCoreOwnedBlobResultToStoreHost",
-          "legacy synchronous transcript blob callers",
-        ],
-      ].map(([module, exportName, host]) => ({
-        identity: { module, exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/lilac-core", exportName: host },
-        direction: "signal-host" as const,
-        reason: "Adapts an owned workflow persistence Result only at the existing host contract.",
-      })),
-      {
-        identity: {
-          module: "src/workflow/durable-workflow-store.ts",
-          exportName: "captureWorkflowRead",
-        },
-        category: "external-to-result",
-        externalApi: { package: "bun:sqlite", exportName: "Database query execution" },
-        direction: "capture-external",
-        reason:
-          "Contains synchronous Bun SQLite read failures, returning only recognized driver failures while preserving codec errors.",
-      },
-      {
-        identity: {
-          module: "src/workflow/durable-workflow-store.ts",
-          exportName: "captureWorkflowRead",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic identity across durable workflow reads.",
-      },
-      {
-        identity: {
-          module: "src/workflow/durable-workflow-store.ts",
-          exportName: "signalDurableWorkflowReadErrorToHost",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "workflow runtime and tool host contracts",
-        },
-        direction: "signal-host",
-        reason:
-          "Signals an explicitly branched durable read failure only where an existing synchronous or callback host contract cannot return Result.",
-      },
-      {
-        identity: {
-          module: "src/workflow/workflow-engine.ts",
-          exportName: "WorkflowEngine.runSandbox",
-        },
-        category: "compatibility",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "WorkflowSandboxRun.result",
-        },
-        direction: "capture-external",
-        reason:
-          "Maps sandbox rejection to the existing durable run terminalization host contract and preserves shutdown behavior.",
-      },
-      {
-        identity: {
-          module: "src/workflow/workflow-engine.ts",
-          exportName: "WorkflowEngine.dispatchAgentSafely",
-        },
-        category: "compatibility",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "workflow agent dispatch host",
-        },
-        direction: "capture-external",
-        reason:
-          "Maps agent dispatch rejection to the fenced durable operation terminalization contract before rethrowing to the sandbox host.",
-      },
-      {
-        identity: {
-          module: "src/transcript/transcript-store.ts",
-          exportName: "SqliteTranscriptStore.emitPersistenceDiagnosticsAfterTransaction",
-        },
-        category: "compatibility",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "TranscriptStorePersistenceDiagnostic callback",
-        },
-        direction: "capture-external",
-        reason:
-          "Contains an ordinary injected diagnostic observer failure after the SQLite transaction outcome is fixed.",
-      },
-      {
-        identity: {
-          module: "src/transcript/transcript-store.ts",
-          exportName: "SqliteTranscriptStore.emitPersistenceDiagnosticsAfterTransaction",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves diagnostic observer Panic identity after transaction finalization.",
-      },
-      {
-        identity: {
-          module: "src/transcript/transcript-store.ts",
-          exportName: "SqliteTranscriptStore.emitDeferredTranscriptEvents",
-        },
-        category: "compatibility",
-        externalApi: { package: "@stanley2058/lilac-utils", exportName: "Logger.info" },
-        direction: "capture-external",
-        reason:
-          "Contains ordinary deferred logging failure only after the SQLite transaction outcome is fixed.",
-      },
-      {
-        identity: {
-          module: "src/transcript/transcript-store.ts",
-          exportName: "SqliteTranscriptStore.emitDeferredTranscriptEvents",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves deferred logger Panic identity after transaction finalization.",
-      },
-      {
-        identity: {
-          module: "src/workflow/workflow-persistence-codec.ts",
-          exportName: "decodeJson",
-        },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "JSON.parse" },
-        direction: "capture-external",
-        reason: "Maps malformed persisted workflow JSON to an owned persistence Result error.",
-      },
-      {
-        identity: {
-          module: "src/workflow/workflow-persistence-codec.ts",
-          exportName: "decodeJson",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic identity at the persisted workflow JSON boundary.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-summarization-worker.ts",
-          exportName: "runThreadSummarizationWorkerOperation",
-        },
-        category: "compatibility",
-        externalApi: { package: "bun:sqlite", exportName: "Database.close" },
-        direction: "capture-external",
-        reason:
-          "Closes both isolate stores while projecting ordinary close failures to the worker's best-effort cleanup policy.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-summarization-worker.ts",
-          exportName: "runThreadSummarizationWorkerOperation",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Preserves the original operation Panic across independent cleanup and otherwise propagates the first cleanup Panic unchanged.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-worker.ts",
-          exportName: "createSummarizationWorkerTransport.onError.<callback>",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "node", exportName: "Worker.onerror" },
-        direction: "observe-panic",
-        reason:
-          "Normalizes the worker error event to a Panic while preserving an isolate Panic's identity.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-worker.ts",
-          exportName: "normalizeConversationThreadWorkerPanic",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Preserves genuine worker Panic identity while containing hostile worker error inspection.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-worker.ts",
-          exportName: "startConversationThreadSummarizationWorker.handleWorkerPanic",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "node", exportName: "Worker.onerror" },
-        direction: "observe-panic",
-        reason:
-          "Terminates the worker and immediately forwards its terminal Panic to the explicit fatal supervisor.",
-      },
-      ...[
-        [
-          "src/heartbeat/heartbeat-service.ts",
-          "adaptHeartbeatLifecycleStartResultToHost",
-          "startHeartbeatService",
-        ],
-        [
-          "src/heartbeat/heartbeat-service.ts",
-          "adaptHeartbeatLifecycleStopResultToHost",
-          "HeartbeatService.stop",
-        ],
-      ].map(([module, exportName, externalExportName]) => ({
-        identity: { module, exportName },
-        category: "result-to-framework" as const,
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: externalExportName,
-        },
-        direction: "signal-host" as const,
-        reason:
-          "Adapts one typed event-delivery lifecycle Result to the existing public rejecting host contract.",
-      })),
-      {
-        identity: {
-          module: "src/shared/event-bus-result.ts",
-          exportName: "adaptEventPublishResultToHost",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-event-bus",
-          exportName: "LilacBus.publish",
-        },
-        direction: "signal-host",
-        reason:
-          "Adapts the typed event-publish Result to existing Core callers' rejecting host contracts.",
-      },
-      ...[
-        ["captureCoreRedisConstruction", "Redis constructor"],
-        ["captureCoreWorkspacePreparation", "workspace mkdir/realpath"],
-        ["captureCoreRedisConnection", "Redis.ping"],
-        ["captureCoreRawBusConstruction", "createRedisStreamsBus"],
-        ["captureCoreLilacBusConstruction", "RedisEventDeadLetter/createLilacBus"],
-        ["captureCoreEventBusCleanup", "owned event-bus close"],
-      ].flatMap(([exportName, externalExportName]) => [
-        {
-          identity: { module: "src/runtime/create-core-runtime.ts", exportName },
-          category: "external-to-result" as const,
-          externalApi: {
-            package: "@stanley2058/lilac-core",
-            exportName: externalExportName,
-          },
-          direction: "capture-external" as const,
-          reason: "Captures one owned core event-bus setup or cleanup effect as a typed Result.",
-        },
-        {
-          identity: { module: "src/runtime/create-core-runtime.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity at the same owned external-effect boundary.",
-        },
-      ]),
-      {
-        identity: {
-          module: "src/runtime/create-core-runtime.ts",
-          exportName: "setupCoreEventBusResources",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Preserves the original event-bus setup Panic while supervising owned Redis cleanup to completion.",
-      },
-      ...[["adaptCoreEventBusCleanupResultToHost", "runtime host cleanup"]].map(
-        ([exportName, externalExportName]) => ({
-          identity: { module: "src/runtime/create-core-runtime.ts", exportName },
-          category: "result-to-framework" as const,
-          externalApi: { package: "@stanley2058/lilac-core", exportName: externalExportName },
-          direction: "signal-host" as const,
-          reason:
-            "Adapts an owned event-bus Result to the exact core runtime startup or cleanup exception contract.",
-        }),
-      ),
-      ...["createCoreRuntime.start", "createCoreRuntimeCleanupSupervisor.run"].map(
-        (exportName) => ({
-          identity: { module: "src/runtime/create-core-runtime.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason:
-            "Preserves startup Panic precedence while supervising every runtime cleanup operation.",
-        }),
-      ),
-      ...[
-        "createCoreRuntimeCleanupSupervisor.record",
-        "stopCoreResidualDiscordRequestRouter",
-        "superviseCoreResidualDiscordRequestRouterDone",
-      ].map((exportName) => ({
-        identity: { module: "src/runtime/create-core-runtime.ts", exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason:
-          "Preserves every residual router cleanup Panic by exact identity while Core retains cleanup ownership.",
-      })),
-      {
-        identity: {
-          module: "src/runtime/create-core-runtime.ts",
-          exportName: "createCoreRuntime.start.captureSummarizationRuntimeOperation",
-        },
-        category: "external-to-result",
-        externalApi: { package: "@stanley2058/lilac-core", exportName: "summarization runner" },
-        direction: "capture-external",
-        reason: "Maps in-process summarization rejection to the runtime-owned Result error.",
-      },
-      ...["importCustomCommandModule", "invokeCustomCommand", "settleCustomCommand"].flatMap(
-        (exportName) => [
-          {
-            identity: { module: "src/custom-commands/manager.ts", exportName },
-            category: "external-to-result" as const,
-            externalApi: { package: "plugin", exportName: "custom command" },
-            direction: "capture-external" as const,
-            reason:
-              "Maps immediate custom-command import or execution failure to an owned Result error.",
-          },
-          {
-            identity: { module: "src/custom-commands/manager.ts", exportName },
-            category: "defect-supervisor" as const,
-            externalApi: { package: "better-result", exportName: "Panic.is" },
-            direction: "observe-panic" as const,
-            reason: "Preserves Panic while ordinary custom-command failure is captured.",
-          },
-        ],
-      ),
-      ...["failPluginOperation", "failPluginInvariant"].map((exportName) => ({
-        identity: {
-          module: "src/plugins/manager.ts",
-          exportName: `createCoreToolPluginManager.${exportName}`,
-        },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/lilac-core", exportName: "buildLevel1Toolset" },
-        direction: "signal-host" as const,
-        reason: "Signals plugin failure through the existing rejected Core toolset host contract.",
-      })),
-      ...[
-        "adaptToolAuthenticationResultToElysia",
-        "adaptToolRequestHeadersResultToElysia",
-        "adaptToolPayloadResultToElysia",
-        "adaptSafetyModeResultToElysia",
-        "adaptToolRouteResultToElysia",
-        "adaptPluginListResultToElysia",
-      ].map((exportName) => ({
-        identity: { module: "src/tool-server/create-tool-server.ts", exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "elysia", exportName: "route handler" },
-        direction: "signal-host" as const,
-        reason: "Maps one exact typed Result failure to Elysia's route exception contract.",
-      })),
-      {
-        identity: {
-          module: "src/tool-server/create-tool-server.ts",
-          exportName: "adaptToolServerOptionsResultToHost",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "@stanley2058/lilac-core", exportName: "createToolServer" },
-        direction: "signal-host",
-        reason: "Maps invalid startup options to the existing createToolServer exception contract.",
-      },
-      {
-        identity: {
-          module: "src/tool-server/create-tool-server.ts",
-          exportName: "adaptPluginLifecycleResultToHost",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "@stanley2058/lilac-core", exportName: "tool server lifecycle" },
-        direction: "signal-host",
-        reason:
-          "Maps plugin lifecycle Result failures to the existing tool-server route/startup host contract.",
-      },
-      {
-        identity: {
-          module: "src/tool-server/create-tool-server.ts",
-          exportName: "createToolServer.captureAuthenticationOperation.catch",
-        },
-        category: "external-to-result",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "requestMessageCache/authorizeControlRequest",
-        },
-        direction: "capture-external",
-        reason:
-          "Maps an immediate request-cache or authorization callback failure to an owned authentication error.",
-      },
-      {
-        identity: {
-          module: "src/tool-server/create-tool-server.ts",
-          exportName: "createToolServer.captureSafetyModeProvider.catch",
-        },
-        category: "external-to-result",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "resolveServerSafetyMode/getConfig",
-        },
-        direction: "capture-external",
-        reason: "Maps a safety provider rejection to an owned safety-mode resolution error.",
-      },
-      {
-        identity: {
-          module: "src/tool-server/create-tool-server.ts",
-          exportName: "normalizeSuccessfulToolValue",
-        },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "JSON.stringify" },
-        direction: "capture-external",
-        reason:
-          "Normalizes plugin success values through HTTP JSON semantics and maps serialization failure to an opaque defect Result.",
-      },
-      {
-        identity: {
-          module: "src/tool-server/create-tool-server.ts",
-          exportName: "isToolInputValidationCause",
-        },
-        category: "compatibility",
-        externalApi: { package: "global", exportName: "instanceof" },
-        direction: "capture-external",
-        reason:
-          "Contains hostile external prototype inspection while retaining the validation compatibility response.",
-      },
-      {
-        identity: {
-          module: "src/tool-server/create-tool-server.ts",
-          exportName: "frameworkErrorLogProjection",
-        },
-        category: "compatibility",
-        externalApi: { package: "better-result", exportName: "TaggedError.is" },
-        direction: "capture-external",
-        reason:
-          "Projects hostile framework errors into a bounded plain logging record without leaking the original value.",
-      },
-      {
-        identity: {
-          module: "src/tool-server/create-tool-server.ts",
-          exportName: "observeToolCallRejection",
-        },
-        category: "defect-supervisor",
-        externalApi: {
-          package: "@stanley2058/lilac-plugin-runtime",
-          exportName: "isPluginPanic",
-        },
-        direction: "observe-panic",
-        reason:
-          "Forwards immediate plugin Panics and every projected post-timeout rejection to fatal supervision.",
-      },
-      {
-        identity: {
-          module: "src/tool-server/tools/conversation-thread.ts",
-          exportName: "resolveConversationThreadSummarizationToolOperation",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-plugin-runtime",
-          exportName: "ServerTool.call",
-        },
-        direction: "signal-host",
-        reason: "Maps a summarization Result error to the existing ServerTool rejection contract.",
-      },
-      {
-        identity: {
-          module: "src/tool-server/tools/conversation-thread.ts",
-          exportName: "ConversationThread.call",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-plugin-runtime",
-          exportName: "ServerTool.call",
-        },
-        direction: "signal-host",
-        reason:
-          "Maps a typed invalid callable Result to the existing ServerTool rejection contract at the exact host boundary.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-summarization-worker.ts",
-          exportName: "runJob",
-        },
-        category: "compatibility",
-        externalApi: { package: "node", exportName: "Worker.message" },
-        direction: "capture-external",
-        reason:
-          "Maps worker job failure to the existing response envelope at the isolate boundary.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-summarization-worker.ts",
-          exportName: "runJob",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while the worker boundary maps ordinary job failures.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-worker.ts",
-          exportName: "startConversationThreadSummarizationWorker.postRequest",
-        },
-        category: "external-to-result",
-        externalApi: { package: "node", exportName: "Worker.postMessage" },
-        direction: "capture-external",
-        reason: "Maps synchronous worker postMessage failure to a transport Result.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-worker.ts",
-          exportName: "startConversationThreadSummarizationWorker.postRequest",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while the worker client maps ordinary postMessage failure.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-worker.ts",
-          exportName: "startConversationThreadWorker.tick",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Periodic worker supervisor records ordinary failure and immediately reports Panic.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-worker.ts",
-          exportName: "startConversationThreadWorker.stop",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic" },
-        direction: "observe-panic",
-        reason: "Re-propagates a previously observed terminal Panic when the supervisor stops.",
-      },
-      {
-        identity: {
-          module: "src/conversation/thread-worker.ts",
-          exportName: "rethrowConversationThreadWorkerPanic",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Narrow helper preserves worker Panic identity without exempting worker orchestration.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "rethrowBusAgentRunnerPanic",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Narrow helper preserves agent-runner Panic identity without exempting bus orchestration.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "captureBusAgentRunnerOperation",
-        },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "Promise" },
-        direction: "capture-external",
-        reason:
-          "Captures one named runner dependency operation into an owned Result at its immediate rejection boundary.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "captureBusAgentRunnerOperation",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves exact Panic identity while capturing ordinary runner operation failure.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "signalBusAgentRunnerHostFailure",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "@stanley2058/lilac-agent", exportName: "agent callback" },
-        direction: "signal-host",
-        reason:
-          "Signals a typed runner failure through an exact agent or provider callback rejection contract.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "projectBusAgentRunnerError",
-        },
-        category: "compatibility",
-        externalApi: { package: "global", exportName: "opaque exception" },
-        direction: "capture-external",
-        reason: "Projects an opaque dependency exception into bounded safe runner logging fields.",
-      },
-      ...[
-        [
-          "startBusAgentRunner.drainSessionQueue.reportOutputPublisherError",
-          "createAgentOutputPublisher.onError",
-        ],
-        [
-          "startBusAgentRunner.drainSessionQueue.reportAgentActivityError",
-          "createAgentOutputActivityPublisher.onError",
-        ],
-      ].map(([exportName, externalExportName]) => ({
-        identity: { module: "src/surface/bridge/bus-agent-runner.ts", exportName: exportName! },
-        category: "compatibility" as const,
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: externalExportName!,
-        },
-        direction: "capture-external" as const,
-        reason:
-          "Normalizes one exact opaque runner callback failure immediately into a safe logging projection.",
-      })),
-      ...[
-        "captureRouterRouting",
-        "startDiscordRequestRouter.reloadCoreConfigIfNeeded",
-        "startDiscordRequestRouter.evaluateAdapterSuppression",
-        "startDiscordRequestRouter.evaluateDirectReplyRouterGate",
-      ].flatMap((exportName) => [
-        {
-          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
-          category: (exportName.startsWith("captureRouter")
-            ? "external-to-result"
-            : "compatibility") as "external-to-result" | "compatibility",
-          externalApi: {
-            package: "@stanley2058/lilac-core",
-            exportName: "request router dependency",
-          },
-          direction: "capture-external" as const,
-          reason:
-            "Captures an immediate router dependency rejection using its established typed Result or fail-open policy.",
-        },
-        {
-          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic while handling an immediate request-router dependency boundary.",
-        },
-      ]),
-      ...[
-        {
-          category: "compatibility" as const,
-          externalApi: { package: "global", exportName: "Object.getOwnPropertyDescriptor" },
-          direction: "capture-external" as const,
-          reason:
-            "Contains ordinary reflection failures while projecting untrusted Discord routing flags.",
-        },
-        {
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity at the Discord raw projection boundary.",
-        },
-      ].map(({ category, externalApi, direction, reason }) => ({
-        identity: {
-          module: "src/surface/discord/discord-request-router/common.ts",
-          exportName: "getDiscordFlags",
-        },
-        category,
-        externalApi,
-        direction,
-        reason,
-      })),
-      ...[
-        {
-          exportName: "captureRouterActiveBatchGate",
-          externalApi: {
-            package: "@stanley2058/lilac-core",
-            exportName: "RouterGate",
-          },
-          reason: "Maps active-batch gate rejection to the router's typed fail-closed policy.",
-        },
-        {
-          exportName: "captureRouterDebounceFlush",
-          externalApi: {
-            package: "global",
-            exportName: "setTimeout callback Promise",
-          },
-          reason:
-            "Supervises the detached debounce callback, mapping ordinary rejection to a typed Result while reporting Panic through router.done.",
-        },
-      ].flatMap(({ exportName, externalApi, reason }) => [
-        {
-          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
-          category: "external-to-result" as const,
-          externalApi,
-          direction: "capture-external" as const,
-          reason,
-        },
-        {
-          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity at the exact gate or detached timer boundary.",
-        },
-      ]),
-      ...["adaptDiscordRequestRouterStartOutcomeToHost", "adaptRouterSubscriptionsStop"].map(
-        (exportName) => ({
-          identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
-          category: "result-to-framework" as const,
-          externalApi: {
-            package: "@stanley2058/lilac-core",
-            exportName: "request router lifecycle",
-          },
-          direction: "signal-host" as const,
-          reason:
-            "Adapts the event-delivery lifecycle Result at the existing request-router host boundary.",
-        }),
-      ),
-      ...[
-        "adaptRouterSubscriptionStart",
-        "finishRouterSubscriptionStartFailure",
-        "stopRouterSubscriptionsAllSettled",
-      ].map((exportName) => ({
-        identity: { module: "src/surface/discord/discord-request-router.ts", exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason:
-          "Preserves exact startup or rollback Panic identity while retaining residual router ownership.",
-      })),
-      {
-        identity: {
-          module: "src/surface/discord/discord-request-router.ts",
-          exportName: "adaptRouterSelfLookup",
-        },
-        category: "external-to-result",
-        externalApi: { package: "@stanley2058/lilac-core", exportName: "SurfaceAdapter.getSelf" },
-        direction: "capture-external",
-        reason: "Captures adapter self-lookup rejection into the Discord router startup Result.",
-      },
-      {
-        identity: {
-          module: "src/surface/discord/discord-request-router.ts",
-          exportName: "adaptRouterSelfLookup",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves exact Panic identity while adapting Discord router self lookup.",
-      },
-      {
-        identity: {
-          module: "src/surface/discord/discord-request-router.ts",
-          exportName: "signalDiscordRequestRouterPlatformMismatch",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic" },
-        direction: "signal-host",
-        reason:
-          "Signals a hard startup invariant when the Discord router receives another platform's adapter.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/subscribe-from-bus.ts",
-          exportName: "captureBusToAdapterEffect",
-        },
-        category: "external-to-result",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "surface adapter and relay effect",
-        },
-        direction: "capture-external",
-        reason:
-          "Captures an immediate surface, relay, transcript, or event-publication rejection as the bridge-owned effect Result.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/subscribe-from-bus.ts",
-          exportName: "rethrowBusToAdapterPanic",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Preserves exact Panic identity while the bus-to-adapter effect boundary captures ordinary failures.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/subscribe-from-bus.ts",
-          exportName: "superviseBusToAdapterCleanup",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Runs every required relay cleanup and rethrows the original Panic ahead of ordinary cleanup defects.",
-      },
-      ...["adaptBusToAdapterSubscriptionStart", "adaptBusToAdapterSubscriptionStop"].map(
-        (exportName) => ({
-          identity: { module: "src/surface/bridge/subscribe-from-bus.ts", exportName },
-          category: "result-to-framework" as const,
-          externalApi: {
-            package: "@stanley2058/lilac-event-bus",
-            exportName: "subscription lifecycle",
-          },
-          direction: "signal-host" as const,
-          reason:
-            "Adapts the typed event-delivery lifecycle Result to the bridge's existing startup or shutdown host rejection contract.",
-        }),
-      ),
-      {
-        identity: {
-          module: "src/runtime/surface-runtime-lifecycle.ts",
-          exportName: "signalSurfaceRecoveryRollbackAtomicityUnknown",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic" },
-        direction: "signal-host",
-        reason:
-          "Escalates an incomplete paused-recovery rollback to the runtime host because recovery atomicity is unknown.",
-      },
-      {
-        identity: {
-          module: "src/runtime/graceful-restart-store.ts",
-          exportName: "signalMissingGracefulRestartDispositionToken",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic" },
-        direction: "signal-host",
-        reason:
-          "Signals the impossible invariant that a decoded persisted row reached disposition classification without its immutable token.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/subscribe-from-bus.ts",
-          exportName: "bridgeBusToAdapter.startRelay",
-        },
-        category: "compatibility",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "surface relay startup effects",
-        },
-        direction: "capture-external",
-        reason:
-          "Captures relay startup rejection at the smallest boundary so every partially created output, subscription, and typing resource is cleaned before propagation.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/subscribe-from-bus.ts",
-          exportName: "bridgeBusToAdapter.startRelay",
-        },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/lilac-core",
-          exportName: "surface relay startup host",
-        },
-        direction: "signal-host",
-        reason:
-          "Propagates the original startup rejection after complete cleanup, or the owned Panic when cleanup leaves atomicity unknown.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/subscribe-from-bus.ts",
-          exportName: "signalSurfaceRelayRecoveryAtomicityUnknown",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic" },
-        direction: "signal-host",
-        reason:
-          "Signals that reverse exhaustive relay recovery cleanup failed and left atomicity unknown.",
-      },
-      {
-        identity: {
-          module: "src/runtime/create-core-runtime.ts",
-          exportName: "normalizeRouterDoneDefect",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Preserves exact Panic identity while normalizing a non-Error router done rejection for fatal reporting.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "startBusAgentRunner.startSessionQueueDrain.superviseDetachedDrain",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "global", exportName: "Promise.catch" },
-        direction: "observe-panic",
-        reason:
-          "Supervises the detached session drain, preserving and explicitly reporting Panic while logging ordinary rejection.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "startBusAgentRunner.superviseAgentRunnerBackgroundFailure",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "global", exportName: "Promise.catch" },
-        direction: "observe-panic",
-        reason:
-          "Observes detached subscription and activation completion at the runner host boundary and reports rejected Panic without converting it to delivery error data.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "startBusAgentRunner.handleCmdRequestMessage",
-        },
-        category: "external-to-result",
-        externalApi: { package: "@stanley2058/lilac-event-bus", exportName: "event handler" },
-        direction: "capture-external",
-        reason:
-          "Captures ordinary request intake and lifecycle failures as the runner-owned delivery error union.",
-      },
-      {
-        identity: {
-          module: "src/surface/bridge/bus-agent-runner.ts",
-          exportName: "startBusAgentRunner.handleCmdRequestMessage",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Preserves exact Panic identity while ordinary request intake failure becomes an Err.",
-      },
-      {
-        identity: {
-          module: "src/ssh/remote-js/bundled-runner-failure.ts",
-          exportName: "rethrowBundledRemoteRunnerPanic",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic identity at the bundled remote-runner compatibility boundary.",
-      },
-      {
-        identity: {
-          module: "src/ssh/remote-js/remote-runner-entry.ts",
-          exportName: "main",
-        },
-        category: "compatibility",
-        externalApi: { package: "node", exportName: "bundled runner process" },
-        direction: "capture-external",
-        reason: "Maps ordinary bundled runner failures to the established wire error envelope.",
-      },
-      {
-        identity: {
-          module: "src/ssh/remote-js/bundled-runner-failure.ts",
-          exportName: "bundledRemoteRunnerErrorMessage",
-        },
-        category: "compatibility",
-        externalApi: { package: "global", exportName: "Error.message/String" },
-        direction: "capture-external",
-        reason:
-          "Contains hostile prototype, message, and coercion traps before projecting the bundled runner wire failure.",
-      },
-      {
-        identity: { module: "src/ssh/ssh-exec.ts", exportName: "rethrowSshPanic" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Narrow helper preserves Panic identity across immediate SSH adapters.",
-      },
-      ...[
-        ["acquireStreamReader.catch", "ReadableStream.getReader"],
-        ["readStreamChunk.catch", "ReadableStreamDefaultReader.read"],
-        ["releaseStreamReader.catch", "ReadableStreamDefaultReader.releaseLock"],
-        ["reportStreamActivity.catch", "activity callback"],
-        ["readResponseBody.catch", "Response.arrayBuffer"],
-        ["openOverflowSink.catch", "BufferedFileSink.open"],
-        ["writeOverflowSink.catch", "BufferedFileSink.write"],
-        ["closeOverflowSink.catch", "BufferedFileSink.close"],
-        ["abortOverflowSink.catch", "BufferedFileSink.abort"],
-        ["removeOverflowFile.catch", "fs.rm"],
-        ["signalSshProcess.catch", "process.kill"],
-        ["waitForSshExit.catch", "Subprocess.exited"],
-      ].map(([exportName, externalExport]) => ({
-        identity: { module: "src/ssh/ssh-exec.ts", exportName: exportName! },
-        category: "external-to-result" as const,
-        externalApi: { package: "node/bun", exportName: externalExport! },
-        direction: "capture-external" as const,
-        reason:
-          "Maps one immediate SSH stream, overflow, process, or callback failure to an owned Result error.",
-      })),
-      {
-        identity: {
-          module: "src/ssh/ssh-exec.ts",
-          exportName: "serializeRemoteRunnerRequestJson",
-        },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "JSON.stringify" },
-        direction: "capture-external",
-        reason: "Maps remote runner request serialization failure to an owned SSH error.",
-      },
-      {
-        identity: { module: "src/ssh/ssh-exec.ts", exportName: "sshExecScriptJson.catch" },
-        category: "external-to-result",
-        externalApi: { package: "@stanley2058/lilac-core", exportName: "sshExecBash" },
-        direction: "capture-external",
-        reason: "Maps SSH execution rejection and exact owned-signal cancellation to typed errors.",
-      },
-      {
-        identity: { module: "src/ssh/remote-js.ts", exportName: "getRemoteRunnerJsText.catch" },
-        category: "external-to-result",
-        externalApi: { package: "bun", exportName: "Bun.file.text" },
-        direction: "capture-external",
-        reason: "Maps bundled remote runner filesystem rejection to an owned source-read error.",
-      },
-      {
-        identity: {
-          module: "src/tools/fs/remote-fs.ts",
-          exportName: "sshExecRemoteFsRunnerJson.catch",
-        },
-        category: "external-to-result",
-        externalApi: { package: "@stanley2058/lilac-core", exportName: "sshExecBash" },
-        direction: "capture-external",
-        reason: "Maps remote filesystem runner transport rejection to an owned SSH error.",
-      },
-      {
-        identity: {
-          module: "src/tools/fs/remote-fs.ts",
-          exportName: "decodeRemoteFsRunnerPackageSpec",
-        },
-        category: "external-to-result",
-        externalApi: { package: "node:module", exportName: "require" },
-        direction: "capture-external",
-        reason: "Maps remote filesystem runner package loading failure to an owned setup error.",
-      },
-      ...[
-        ["src/ssh/remote-js.ts", "getRemoteRunnerJsText.catch"],
-        ["src/ssh/ssh-exec.ts", "serializeRemoteRunnerRequestJson"],
-        ["src/ssh/ssh-exec.ts", "sshExecScriptJson.catch"],
-        ["src/tools/fs/remote-fs.ts", "decodeRemoteFsRunnerPackageSpec"],
-        ["src/tools/fs/remote-fs.ts", "sshExecRemoteFsRunnerJson.catch"],
-      ].map(([module, exportName]) => ({
-        identity: { module: module!, exportName: exportName! },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason: "Preserves Panic while the immediate SSH adapter maps ordinary rejection.",
-      })),
-    ],
-  ],
-  [
-    "packages/fs",
-    [
-      ...[
-        ["src/fs-impl.ts", "compileEditRegex", "global", "RegExp"],
-        ["src/ripgrep.ts", "decodeRipgrepMatchLine", "global", "JSON.parse"],
-        ["src/ripgrep.ts", "ripgrep", "node:child_process", "spawn"],
-        ["src/search-backend.ts", "captureFffOperation", "@ff-labs/fff-node", "async operation"],
-        ["src/search-backend.ts", "captureFffSyncOperation", "@ff-labs/fff-node", "sync operation"],
-      ].flatMap(([module, exportName, packageName, externalExportName]) => [
-        {
-          identity: { module, exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: packageName, exportName: externalExportName },
-          direction: "capture-external" as const,
-          reason:
-            "Maps the immediate filesystem, parser, process, or FFF exception to an owned Result error.",
-        },
-        {
-          identity: { module, exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic while the immediate FS adapter maps ordinary external failure.",
-        },
-      ]),
-      ...[
-        ["captureFilesystemOperation", "node:fs/promises"],
-        ["captureFilesystemOperationSync", "node:fs"],
-      ].map(([exportName, packageName]) => ({
-        identity: { module: "src/filesystem-operation.ts", exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: packageName, exportName: "filesystem operation" },
-        direction: "capture-external" as const,
-        reason: "Maps an immediate filesystem exception to an owned Result error.",
-      })),
-      {
-        identity: { module: "src/filesystem-operation.ts", exportName: "decodeFilesystemFailure" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Projects exact Panic identity before classifying ordinary filesystem failures.",
-      },
-      {
-        identity: {
-          module: "src/remote-runner-protocol.ts",
-          exportName: "decodeJson",
-        },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "JSON.parse" },
-        direction: "capture-external",
-        reason: "Maps malformed remote runner JSON to the protocol-owned decode error.",
-      },
-      {
-        identity: {
-          module: "src/remote-runner-protocol.ts",
-          exportName: "decodeJson",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while malformed remote runner JSON is captured.",
-      },
-    ],
-  ],
-  [
-    "packages/plugin-runtime",
-    [
-      ...[
-        "decodeDynamicToolPluginModule",
-        "decodeToolPlugin",
-        "decodeToolPluginInstance",
-        "decodeLevel1ToolSpec",
-        "decodeServerTool",
-        "decodeVoidHookResult",
-        "decodeBooleanHookResult",
-        "decodeStringHookResult",
-        "decodeStringArrayHookResult",
-        "decodeServerToolListResult",
-        "decodeLevel1ToolFailureSummary",
-        "decodeLevel1ExecutableMetadata",
-        "decodeDisabledPluginIds",
-        "decodeLevel1RegistrationKey",
-        "mapHookResultInspectionException",
-      ].map((exportName) => ({
-        identity: { module: "capabilities.ts", exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason: "Preserves Panic while inspecting a plugin capability or hook result.",
-      })),
-      {
-        identity: { module: "discovery.ts", exportName: "captureFileOperation" },
-        category: "external-to-result",
-        externalApi: { package: "node:fs/promises", exportName: "filesystem operation" },
-        direction: "capture-external",
-        reason: "Maps the immediate plugin discovery filesystem rejection to an owned error.",
-      },
-      {
-        identity: { module: "discovery.ts", exportName: "captureFileOperation" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while plugin discovery maps ordinary filesystem rejection.",
-      },
-      {
-        identity: { module: "discovery.ts", exportName: "decodePluginPackageJsonText" },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "JSON.parse" },
-        direction: "capture-external",
-        reason: "Maps malformed plugin package JSON to the decoder's compatibility error.",
-      },
-      {
-        identity: { module: "discovery.ts", exportName: "decodePluginPackageJsonText" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while plugin package JSON parsing is captured.",
-      },
-      ...["captureSyncHook", "captureAsyncHook"].map((exportName) => ({
-        identity: { module: "hooks.ts", exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "plugin", exportName: "hook invocation" },
-        direction: "capture-external" as const,
-        reason: "Maps immediate third-party plugin hook failure to an owned invocation error.",
-      })),
-      ...["captureSyncHook", "captureAsyncHook"].map((exportName) => ({
-        identity: { module: "hooks.ts", exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason: "Preserves genuine Panic identity while mapping ordinary plugin hook failure.",
-      })),
-      {
-        identity: { module: "hooks.ts", exportName: "mapPluginHookException" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while normalizing ordinary plugin hook exceptions.",
-      },
-      {
-        identity: { module: "loader.ts", exportName: "loadToolPluginModuleCapability" },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "import" },
-        direction: "capture-external",
-        reason: "Maps plugin snapshot and dynamic-import rejection to an owned module-load error.",
-      },
-      {
-        identity: { module: "loader.ts", exportName: "loadToolPluginModuleCapability" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while plugin loading maps ordinary external rejection.",
-      },
-      {
-        identity: { module: "manager.ts", exportName: "captureManagerHook" },
-        category: "external-to-result",
-        externalApi: { package: "plugin", exportName: "manager hook" },
-        direction: "capture-external",
-        reason: "Maps an immediate host-supplied plugin manager hook failure to an owned error.",
-      },
-      {
-        identity: { module: "manager.ts", exportName: "captureManagerHook" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves genuine Panic identity while mapping ordinary manager hook failure.",
-      },
-      {
-        identity: { module: "manager.ts", exportName: "mapPluginManagerHookException" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while normalizing ordinary plugin manager hook exceptions.",
-      },
-      {
-        identity: { module: "capabilities.ts", exportName: "opaquePluginExceptionMessage" },
-        category: "compatibility",
-        externalApi: { package: "global", exportName: "Error.message/String" },
-        direction: "capture-external",
-        reason:
-          "Contains hostile exception getters and coercion while producing bounded compatibility text.",
-      },
-      {
-        identity: { module: "capabilities.ts", exportName: "isPluginPanic" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Recognizes genuine Panic while containing hostile proxy classification traps as ordinary external failure.",
-      },
-      {
-        identity: { module: "capabilities.ts", exportName: "safePluginExceptionCause" },
-        category: "compatibility",
-        externalApi: { package: "global", exportName: "Error.name" },
-        direction: "capture-external",
-        reason:
-          "Copies only bounded safe exception text and name while containing hostile prototype and property traps.",
-      },
-      {
-        identity: { module: "discovery.ts", exportName: "decodePluginFilesystemErrorCode" },
-        category: "compatibility",
-        externalApi: { package: "node:fs", exportName: "Error.code" },
-        direction: "capture-external",
-        reason: "Contains hostile filesystem error-code getters while projecting ENOENT state.",
-      },
-    ],
-  ],
-  [
-    "packages/remote-fs-runner",
-    [
-      ...["readStdinText"].map((exportName) => ({
-        identity: { module: "src/cli.ts", exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "node", exportName },
-        direction: "capture-external" as const,
-        reason: "Maps the immediate remote filesystem process or socket failure to an owned error.",
-      })),
-      ...["readStdinText"].map((exportName) => ({
-        identity: { module: "src/cli.ts", exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason: "Preserves Panic while the immediate process or socket adapter maps rejection.",
-      })),
-      ...["spawnDaemon", "releaseStartupLock"].map((exportName) => ({
-        identity: { module: "src/cli.ts", exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "node", exportName },
-        direction: "capture-external" as const,
-        reason:
-          "Maps the immediate daemon process or startup-lock exception to an owned Result error.",
-      })),
-      {
-        identity: { module: "src/cli.ts", exportName: "preservePanic" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Narrow helper preserves remote-runner Panic identity across immediate adapters.",
-      },
-      ...[
-        "captureStartupLockOperation",
-        "reportCleanupFailureWithoutMaskingOperation",
-        "superviseStartupLockCleanupAfterOperationDefect",
-        "runWithStartupLockCleanup",
-      ].map((exportName) => ({
-        identity: { module: "src/cli.ts", exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic" },
-        direction: "observe-panic" as const,
-        reason:
-          "Preserves the original operation defect while supervising startup-lock cleanup and reporting.",
-      })),
-      {
-        identity: {
-          module: "src/cli.ts",
-          exportName: "captureRuntimeOperation",
-        },
-        category: "external-to-result",
-        externalApi: { package: "node:fs/promises", exportName: "filesystem operation" },
-        direction: "capture-external",
-        reason: "Maps remote filesystem runtime setup rejection to an owned setup error.",
-      },
-      {
-        identity: {
-          module: "src/cli.ts",
-          exportName: "captureRuntimeOperation",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while runtime setup maps ordinary filesystem rejection.",
-      },
-      {
-        identity: {
-          module: "src/cli.ts",
-          exportName: "executeDaemonRequest",
-        },
-        category: "external-to-result",
-        externalApi: { package: "@stanley2058/lilac-fs", exportName: "FileSystem" },
-        direction: "capture-external",
-        reason:
-          "Maps daemon request execution rejection before writing the compatibility envelope.",
-      },
-      {
-        identity: { module: "src/cli.ts", exportName: "startMain" },
-        category: "compatibility",
-        externalApi: { package: "node", exportName: "CLI process" },
-        direction: "capture-external",
-        reason: "Maps an unexpected top-level CLI rejection to the established response envelope.",
-      },
-      {
-        identity: { module: "src/cli.ts", exportName: "reportMainFailure" },
-        category: "compatibility",
-        externalApi: { package: "node", exportName: "CLI process" },
-        direction: "capture-external",
-        reason: "Formats the top-level CLI rejection into the established response envelope.",
-      },
-      {
-        identity: { module: "src/cli.ts", exportName: "opaqueErrorMessage" },
-        category: "compatibility",
-        externalApi: { package: "global", exportName: "Error.message/String" },
-        direction: "capture-external",
-        reason:
-          "Contains hostile prototype, message, and coercion traps before projecting the remote runner wire failure.",
-      },
-      {
-        identity: { module: "src/cli.ts", exportName: "opaqueErrorCause" },
-        category: "compatibility",
-        externalApi: { package: "global", exportName: "Error instanceof" },
-        direction: "capture-external",
-        reason:
-          "Contains hostile prototype traps before carrying an exception into a remote runner owned error.",
-      },
-    ],
-  ],
-  [
-    "packages/coding-tools",
-    [
-      ...["persistBashArtifact", "executeLocalBash"].map((exportName) => ({
-        identity: { module: "src/bash.ts", exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason:
-          "Preserves Panic identity while applying Bash artifact-retention policy and cleanup.",
-      })),
-      {
-        identity: { module: "src/bash.ts", exportName: "persistBashArtifact" },
-        category: "compatibility",
-        externalApi: {
-          package: "@stanley2058/lilac-tool-results",
-          exportName: "ToolResultArtifactStore.createFromStream",
-        },
-        direction: "capture-external",
-        reason:
-          "Maps a non-Panic rejected artifact adapter to the established Bash retention-failure outcome.",
-      },
-      ...[
-        ["src/bash.ts", "ignoreBashFailure"],
-        ["src/bash.ts", "createBashSpool.activate"],
-        ["src/bash.ts", "createBashSpool.write"],
-        ["src/bash.ts", "createBashSpool.close"],
-        ["src/bash.ts", "killProcessGroup"],
-        ["src/buffered-file-sink.ts", "continueBufferedSinkQueue"],
-        ["src/batch.ts", "captureBatchBoundaryFailure"],
-      ].map(([module, exportName]) => ({
-        identity: { module, exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason: "Preserves Panic while applying the exact local cleanup or boundary policy.",
-      })),
-      ...[
-        ["src/apply-patch.ts", "parsePatch", "legacy patch parser"],
-        ["src/apply-patch.ts", "applyPatch", "legacy patch application"],
-        ["src/bash.ts", "normalizedNonnegativeInteger", "Bash option validation"],
-        ["src/bash.ts", "streamLocalBash", "AI SDK async tool stream"],
-        ["src/batch.ts", "collectApplyPatchTouchedPaths", "legacy batch preflight"],
-        ["src/batch.ts", "collectEditFileTouchedPaths", "legacy batch preflight"],
-        ["src/batch.ts", "createBatchToolResult.execute", "AI SDK tool execution"],
-        ["src/batch.ts", "createBatchTool", "legacy batch tool construction"],
-        ["src/guardrails.ts", "assertGuardrailBypassAllowed", "legacy guardrail assertion"],
-        ["src/guardrails.ts", "assertLocalCwd", "legacy cwd assertion"],
-        ["src/guardrails.ts", "canonicalizeAsFarAsExists", "legacy canonicalization"],
-        ["src/guardrails.ts", "assertCanonicalPathAllowed", "legacy path guardrail"],
-        ["src/index.ts", "createCodingToolset", "legacy coding toolset construction"],
-      ].map(([module, exportName, externalName]) => ({
-        identity: { module, exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/lilac-coding-tools", exportName: externalName },
-        direction: "signal-host" as const,
-        reason: "Adapts an owned Result or invariant failure to the established host contract.",
-      })),
-      ...["BufferedFileSink.write", "BufferedFileSink.open"].map((exportName) => ({
-        identity: { module: "src/buffered-file-sink.ts", exportName },
-        category: "compatibility" as const,
-        externalApi: { package: "@stanley2058/lilac-coding-tools", exportName: "BufferedFileSink" },
-        direction: "signal-host" as const,
-        reason: "Signals invalid sink use through the established asynchronous sink contract.",
-      })),
-    ],
-  ],
-  [
-    "packages/claude-code-bridge",
-    [
-      ...[
-        ["claude-attempt-runtime-owner.ts", "captureCandidateFactory", "candidate factory"],
-        ["claude-attempt-runtime-owner.ts", "disposeRun", "candidate cleanup"],
-        ["claude-code-run.ts", "captureExternalOperation", "Claude SDK operation"],
-        ["claude-code-run.ts", "captureExternalOperationSync", "Claude SDK operation"],
-        ["claude-code-tools.ts", "stringifyJson", "JSON.stringify"],
-        ["claude-code-tools.ts", "createClaudeCodeToolBridgeResult", "MCP bridge setup"],
-        ["claude-code-tools.ts", "createClaudeCodeToolBridgeResult.closeResult", "MCP close"],
-      ].flatMap(([module, exportName, externalName]) => [
-        {
-          identity: { module, exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "external", exportName: externalName },
-          direction: "capture-external" as const,
-          reason: "Maps the immediate external Claude or MCP failure to an owned Result outcome.",
-        },
-        {
-          identity: { module, exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity at the immediate Claude or MCP boundary.",
-        },
-      ]),
-      {
-        identity: { module: "claude-code-run.ts", exportName: "materializeClaudeCodeRunResult" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while combining materialization and cleanup Results.",
-      },
-      ...[
-        "settleQueryAndProcess",
-        "materializeClaudeCodeRunResult.waitForObservability",
-        "materializeClaudeCodeRunResult.drainQueryControllers",
-        "materializeClaudeCodeRunResult.clearResult.attempt",
-        "materializeClaudeCodeRunResult.clearResult",
-        "materializeClaudeCodeRunResult.disposeResult",
-        "materializeClaudeCodeRunResult.finalizeResult",
-      ].map((exportName) => ({
-        identity: { module: "claude-code-run.ts", exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason:
-          "Preserves the first Claude observability or cleanup Panic until all owned settlement work completes.",
-      })),
-      ...[
-        [
-          "claude-attempt-runtime-owner.ts",
-          "ClaudeAttemptRuntimeOwner.getNativeInputEstimateFloor",
-          "legacy input estimate",
-        ],
-        [
-          "claude-attempt-runtime-owner.ts",
-          "ClaudeAttemptRuntimeOwner.recordSuccessfulModelCall",
-          "legacy model-call completion",
-        ],
-        [
-          "claude-attempt-runtime-owner.ts",
-          "ClaudeAttemptRuntimeOwner.retireForRetry",
-          "legacy retry retirement",
-        ],
-        [
-          "claude-attempt-runtime-owner.ts",
-          "ClaudeAttemptRuntimeOwner.retireForCanonicalReplacement",
-          "legacy replacement retirement",
-        ],
-        [
-          "claude-attempt-runtime-owner.ts",
-          "ClaudeAttemptRuntimeOwner.adaptRunEndRetirementToHost",
-          "legacy run-end retirement",
-        ],
-        [
-          "claude-code-run.ts",
-          "materializeClaudeCodeRunResult.spawnTrackedProcess",
-          "Claude process host",
-        ],
-        ["claude-code-run.ts", "materializeClaudeCodeRunResult.clear", "Claude run control"],
-        [
-          "claude-code-run.ts",
-          "materializeClaudeCodeRunResult.createUtilityModel",
-          "legacy utility model construction",
-        ],
-        [
-          "claude-code-run.ts",
-          "materializeClaudeCodeRunResult.finalizeToHost",
-          "Claude native session lifecycle",
-        ],
-        ["claude-code-run.ts", "materializeClaudeCodeRun", "legacy Claude materialization"],
-        ["claude-code-tools.ts", "validateClaudeCodeBuiltInTools", "legacy built-in validation"],
-        ["claude-code-tools.ts", "mapToolResultOutputToMcp", "legacy MCP output mapping"],
-        [
-          "claude-code-tools.ts",
-          "createClaudeCodeToolBridgeResult.close",
-          "legacy MCP bridge cleanup",
-        ],
-        ["claude-code-tools.ts", "createClaudeCodeToolBridge", "legacy MCP bridge construction"],
-      ].map(([module, exportName, externalName]) => ({
-        identity: { module, exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/lilac-claude-code-bridge", exportName: externalName },
-        direction: "signal-host" as const,
-        reason:
-          "Adapts an owned Claude Result to the established framework or compatibility contract.",
-      })),
-    ],
-  ],
-  [
-    "packages/event-bus",
-    [
-      ...[
-        "createLilacBus.bus.publish",
-        "createLilacBus.bus.getTopicWatermark",
-        "createLilacBus.bus.trimTopicBeforeCheckpoint",
-        "createLilacBus.bus.retireTopicConsumerGroup",
-        "createLilacBus.bus.close",
-      ].flatMap((exportName) => [
-        {
-          identity: { module: "lilac-bus.ts", exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "@stanley2058/lilac-event-bus", exportName: "RawBus" },
-          direction: "capture-external" as const,
-          reason: "Maps an immediate raw event-bus rejection to the owned LilacBus Result.",
-        },
-        {
-          identity: { module: "lilac-bus.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity across the immediate raw event-bus adapter.",
-        },
-      ]),
-      ...[
-        ["redis-connection-pool.ts", "RedisConnectionPool.createConnection", "Redis duplicate"],
-        ["redis-streams-bus.ts", "ensureGroup", "Redis XGROUP"],
-      ].flatMap(([module, exportName, externalName]) => [
-        {
-          identity: { module, exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "ioredis", exportName: externalName },
-          direction: "capture-external" as const,
-          reason: "Maps the immediate Redis failure to an owned transport Result.",
-        },
-        {
-          identity: { module, exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity at the immediate Redis adapter.",
-        },
-      ]),
-      {
-        identity: {
-          module: "redis-streams-bus.ts",
-          exportName: "RedisStreamsBus.captureAcknowledgedTrim",
-        },
-        category: "compatibility",
-        externalApi: { package: "ioredis", exportName: "acknowledged trim" },
-        direction: "capture-external",
-        reason: "Contains a best-effort background trim failure at its logging boundary.",
-      },
-      ...["RedisStreamsBus.fetch", "RedisStreamsBus.watermark"].map((exportName) => ({
-        identity: { module: "redis-streams-bus.ts", exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/lilac-event-bus", exportName: "RawBus" },
-        direction: "signal-host" as const,
-        reason:
-          "Signals a strictly decoded Redis read failure through the raw transport's existing rejection contract.",
-      })),
-      {
-        identity: {
-          module: "redis-streams-bus.ts",
-          exportName: "RedisStreamsBus.retireConsumerGroup",
-        },
-        category: "compatibility",
-        externalApi: { package: "@stanley2058/lilac-event-bus", exportName: "RawBus" },
-        direction: "signal-host",
-        reason:
-          "Signals refused retirement through the raw transport's existing rejection contract.",
-      },
-    ],
-  ],
-  [
-    "packages/tool-results",
-    [
-      {
-        identity: {
-          module: "src/tool-result-artifact-metadata-codec.ts",
-          exportName: "decodeToolResultArtifactMetadata",
-        },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "JSON.parse" },
-        direction: "capture-external",
-        reason: "Maps malformed encrypted metadata plaintext to an owned codec Result error.",
-      },
-      {
-        identity: {
-          module: "src/tool-result-artifact-store.ts",
-          exportName: "adaptToolResultArtifactReadToAvailability",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "@stanley2058/lilac-tool-results", exportName: "read_file" },
-        direction: "signal-host",
-        reason:
-          "Preserves the established unavailable and invalid-page outward tool contracts at one explicit policy adapter.",
-      },
-      {
-        identity: {
-          module: "src/tool-result-artifact-store.ts",
-          exportName: "adaptToolResultArtifactStoreInitToHost",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "@stanley2058/lilac-tool-results", exportName: "runtime startup" },
-        direction: "signal-host",
-        reason:
-          "Signals an owned artifact initialization failure through the runtime startup contract.",
-      },
-      {
-        identity: { module: "src/tool-result-media.ts", exportName: "inlineDataUrl" },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "decodeURIComponent" },
-        direction: "capture-external",
-        reason: "Maps malformed inline data URL escaping to a bounded fallback.",
-      },
-      {
-        identity: {
-          module: "src/tool-result-output-normalizer.ts",
-          exportName: "serializeOutput",
-        },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "JSON.stringify" },
-        direction: "capture-external",
-        reason: "Maps non-serializable tool JSON output to the established text fallback.",
-      },
-      {
-        identity: {
-          module: "src/tool-result-output-normalizer.ts",
-          exportName: "serializeOutput",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic identity across the tool output serialization adapter.",
-      },
-      {
-        identity: {
-          module: "src/tool-result-artifact-store.ts",
-          exportName: "createToolResultArtifactStore.rethrowAfterCleanup",
-        },
-        category: "external-to-result",
-        externalApi: { package: "node", exportName: "artifact cleanup" },
-        direction: "capture-external",
-        reason:
-          "Combines an ordinary write failure with cleanup failure before the enclosing artifact Result capture.",
-      },
-      {
-        identity: {
-          module: "src/tool-result-artifact-store.ts",
-          exportName: "createToolResultArtifactStore.rethrowAfterCleanup",
-        },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Preserves primary Panic precedence and otherwise rethrows a cleanup Panic before combining ordinary failures.",
-      },
-      ...[
-        "createToolResultArtifactStore.captureOperation",
-        "createToolResultArtifactStore.readMetadata",
-        "createToolResultArtifactStore.listMetadata",
-        "createToolResultArtifactStore.writeAtomic",
-        "createToolResultArtifactStore.writeEncryptedStreamAtomic",
-        "createToolResultArtifactStore.createArtifact",
-        "createToolResultArtifactStore.readEncryptedWindow",
-        "createToolResultArtifactStore.readEncryptedContent",
-        "createToolResultArtifactStore.read",
-        "createToolResultArtifactStore.readWindow",
-        "createToolResultArtifactStore.removeInvalidArtifact",
-        "createToolResultArtifactStore.maintainArtifacts",
-        "createToolResultArtifactStore.maintain",
-      ].flatMap((exportName) => [
-        {
-          identity: { module: "src/tool-result-artifact-store.ts", exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "node", exportName: "artifact filesystem, stream, or AES-GCM" },
-          direction: "capture-external" as const,
-          reason:
-            "Maps this boundary's filesystem, stream, or AES-GCM exception into the owned artifact error flow, directly or through captureOperation.",
-        },
-        {
-          identity: { module: "src/tool-result-artifact-store.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason:
-            "Preserves Panic identity while applying this boundary's explicit owned-error classification.",
-        },
-      ]),
-    ],
-  ],
-  [
-    "packages/mini-lilac-runtime",
-    [
-      ...[
-        ["src/config.ts", "preserveRuntimeConfigPanic"],
-        ["src/providers.ts", "preserveProviderPanic"],
-        ["src/model-catalog.ts", "preserveModelCatalogPanic"],
-        ["src/skills.ts", "preserveSkillPanic"],
-        ["src/session-service.ts", "rethrowSessionPanic"],
-      ].map(([module, exportName]) => ({
-        identity: { module, exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason: "Preserves exact Panic identity at the immediate Mini Lilac runtime boundary.",
-      })),
-      ...[
-        ["src/session-service.ts", "SessionActor.buildAgent.decideTurnError"],
-        ["src/session-service.ts", "SessionActor.reportEventFailure"],
-        ["src/workspace-history-store.ts", "isMissingExecutable"],
-        ["src/workspace-history-store.ts", "describeError"],
-        ["src/workspace-history-store.ts", "captureWorkspaceHistoryFailure"],
-        [
-          "src/workspace-history-store.ts",
-          "WorkspaceHistoryStore.removeOwnedStore.catch.<callback@1>",
-        ],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.ensureStore.catch.<callback@1>"],
-        [
-          "src/workspace-history-store.ts",
-          "WorkspaceHistoryStore.applyPreparedRestore.catch.<callback@1>",
-        ],
-        [
-          "src/workspace-history-store.ts",
-          "WorkspaceHistoryStore.cleanupDestinationArtifacts.catch.<callback@1>",
-        ],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.emitVerificationFailure"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.withContext"],
-      ].map(([module, exportName]) => ({
-        identity: { module, exportName },
-        category: "compatibility" as const,
-        externalApi: { package: "external", exportName: "opaque runtime failure" },
-        direction: "capture-external" as const,
-        reason:
-          "Classifies or carries one opaque runtime failure at its exact retry, diagnostic, or cleanup boundary.",
-      })),
-      ...[
-        ["src/config.ts", "decodeRuntimeConfigYaml"],
-        ["src/config.ts", "loadRuntimeConfigResult"],
-        ["src/model-catalog.ts", "resolveLanguageModelResult"],
-        ["src/model-catalog.ts", "decodeModelsDevRegistry"],
-        ["src/model-catalog.ts", "decodeModelsDevCache"],
-        ["src/model-catalog.ts", "decodeV1ModelsResponse"],
-        ["src/providers.ts", "decodeProviderConfigYaml"],
-        ["src/providers.ts", "loadProviderConfigResult"],
-        ["src/providers.ts", "createAiProviderRegistryResult"],
-        ["src/providers.ts", "loadProviderRegistryResult"],
-        ["src/providers.ts", "loadProviderRegistryResult.codexTokensPromise.<callback>"],
-        ["src/skills.ts", "MiniLilacSkillCatalogSnapshot.resolvePath"],
-        ["src/skills.ts", "MiniLilacSkillCatalogSnapshot.readSkillFile"],
-        ["src/skills.ts", "MiniLilacSkillCatalogSnapshot.listResources"],
-        ["src/skills.ts", "MiniLilacSkillCatalog.discoverResult"],
-        ["src/sqlite-store.ts", "serializeStoreValueResult"],
-        ["src/sqlite-store.ts", "canonicalCommandPayloadResult"],
-        ["src/sqlite-store.ts", "canonicalizeStoredCwd"],
-        ["src/webfetch.ts", "captureWebfetchPromise"],
-        ["src/webfetch.ts", "captureWebfetchSync"],
-      ].map(([module, exportName]) => ({
-        identity: { module, exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "external", exportName: "runtime dependency" },
-        direction: "capture-external" as const,
-        reason:
-          "Maps one immediate parser, provider, filesystem, stream, or serialization failure to an owned runtime Result.",
-      })),
-      ...[
-        [
-          "ModelCatalog.readDiskCacheSource",
-          "node:fs/promises open, read, stat, or close",
-          "Maps cache read or handle-close failure to ModelCatalogCacheReadFailed while preserving Panic precedence.",
-        ],
-        [
-          "ModelCatalog.writeDiskCache",
-          "node:fs/promises temporary cache write",
-          "Preserves cache write and temporary-file cleanup failures in the owned cache error union.",
-        ],
-        [
-          "ModelCatalog.captureFetch",
-          "fetch",
-          "Projects a fetch rejection into the closed model-catalog capture without retaining provider details.",
-        ],
-        [
-          "ModelCatalog.acquireResponseReader",
-          "ReadableStream.getReader",
-          "Projects response-reader acquisition failure into the closed model-catalog capture.",
-        ],
-        [
-          "ModelCatalog.captureReaderRead",
-          "ReadableStreamDefaultReader.read",
-          "Projects response-reader rejection into the closed model-catalog capture.",
-        ],
-        [
-          "ModelCatalog.cancelResponseBody",
-          "ReadableStream.cancel",
-          "Retains response-body cancellation failure as an owned cleanup outcome.",
-        ],
-        [
-          "ModelCatalog.cancelResponseReader",
-          "ReadableStreamDefaultReader.cancel",
-          "Retains response-reader cancellation failure as an owned cleanup outcome.",
-        ],
-        [
-          "ModelCatalog.releaseReader",
-          "ReadableStreamDefaultReader.releaseLock",
-          "Retains response-reader lock release failure as an owned cleanup outcome.",
-        ],
-      ].map(([exportName, externalName, reason]) => ({
-        identity: { module: "src/model-catalog.ts", exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "external", exportName: externalName },
-        direction: "capture-external" as const,
-        reason,
-      })),
-      ...[
-        [
-          "loadProviderAuthResult",
-          "node:fs/promises stat, readFile, or JSON.parse",
-          "Maps provider-auth inspection, read, and parse failures to redacted owned errors without retaining credential-bearing causes.",
-        ],
-        [
-          "writeProviderAuthResult",
-          "node:fs/promises temporary auth write",
-          "Preserves write and temporary-file cleanup outcomes while omitting credential-bearing causes from owned errors.",
-        ],
-      ].map(([exportName, externalName, reason]) => ({
-        identity: { module: "src/providers.ts", exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "external", exportName: externalName },
-        direction: "capture-external" as const,
-        reason,
-      })),
-      ...[
-        ["src/config.ts", "loadRuntimeConfig"],
-        ["src/model-catalog.ts", "parseModelRef"],
-        ["src/model-catalog.ts", "resolveLanguageModel"],
-        ["src/model-catalog.ts", "ModelCatalog.constructor"],
-        ["src/model-catalog.ts", "ModelCatalog.get"],
-        ["src/providers.ts", "loadProviderConfig"],
-        ["src/providers.ts", "loadProviderAuth"],
-        ["src/providers.ts", "writeProviderAuth"],
-        ["src/providers.ts", "createAiProviderRegistry"],
-        ["src/providers.ts", "loadProviderRegistry"],
-        ["src/skills.ts", "MiniLilacSkillCatalogSnapshot.load"],
-        ["src/sqlite-store.ts", "serializeStoreValueResult"],
-        ["src/sqlite-store.ts", "storeResultToLegacy"],
-        ["src/sqlite-store.ts", "canonicalCommandPayloadResult"],
-        ["src/webfetch.ts", "inspectHtml.parsed.<callback>.onopentag"],
-        ["src/webfetch.ts", "webfetchResultToLegacyOutput"],
-        ["src/webfetch.ts", "executeWebfetch"],
-      ].map(([module, exportName]) => ({
-        identity: { module, exportName },
-        category: "result-to-framework" as const,
-        externalApi: {
-          package: "@stanley2058/mini-lilac-runtime",
-          exportName: "legacy host contract",
-        },
-        direction: "signal-host" as const,
-        reason:
-          "Adapts an owned runtime Result, parser callback, or constructor invariant to the established throwing host contract.",
-      })),
-      {
-        identity: { module: "src/webfetch.ts", exportName: "throwWebfetchPanic" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic" },
-        direction: "observe-panic",
-        reason: "Rethrows only the Panic retained by the webfetch external-capture adapter.",
-      },
-      {
-        identity: { module: "src/model-catalog.ts", exportName: "throwModelCatalogPanic" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic" },
-        direction: "observe-panic",
-        reason:
-          "Rethrows only the Panic retained while response cleanup was projected into a closed capture.",
-      },
-      ...[
-        "MiniLilacSqliteStore.close",
-        "MiniLilacSqliteStore.acquireCloseBlocker",
-        "MiniLilacSqliteStore.updateActiveRunInputTokens",
-        "MiniLilacSqliteStore.updateSessionBindings",
-        "MiniLilacSqliteStore.createRun",
-        "MiniLilacSqliteStore.finishRun",
-        "MiniLilacSqliteStore.reserveMiniMainClaudeSessionAttempt",
-        "MiniLilacSqliteStore.recordMiniMainClaudeSessionAttemptOutcome",
-        "MiniLilacSqliteStore.getMiniNamedClaudeState",
-        "MiniLilacSqliteStore.reserveMiniNamedClaudeSessionAttempt",
-        "MiniLilacSqliteStore.recordMiniNamedClaudeSessionAttemptOutcome",
-        "MiniLilacSqliteStore.admitRootPromptHistory",
-        "MiniLilacSqliteStore.commitHistoryCompaction",
-        "MiniLilacSqliteStore.appendHistoryTransition",
-        "MiniLilacSqliteStore.closeHistoryTransition",
-        "MiniLilacSqliteStore.setHistoryUndoFloor",
-        "MiniLilacSqliteStore.pushHistoryRedo",
-        "MiniLilacSqliteStore.reserveHistoryOperation",
-        "MiniLilacSqliteStore.skipPreparedHistoryRestore",
-        "MiniLilacSqliteStore.updateHistoryOperationPhase",
-        "MiniLilacSqliteStore.commitHistoryNavigation",
-        "MiniLilacSqliteStore.abandonHistoryNavigation",
-        "MiniLilacSqliteStore.commitPendingRunFinalization",
-        "MiniLilacSqliteStore.assertConservativeProviderTransition",
-        "MiniLilacSqliteStore.requireQuiescentHistorySession",
-        "MiniLilacSqliteStore.assertHeadsEqualState",
-        "MiniLilacSqliteStore.moveHistoryCursor",
-        "MiniLilacSqliteStore.parseHistoryNavigationResult",
-        "MiniLilacSqliteStore.saveHistoryCommandResult",
-        "MiniLilacSqliteStore.deleteHistoryOperationRow",
-        "MiniLilacSqliteStore.deletePendingRunFinalizationRow",
-        "MiniLilacSqliteStore.insertHistoryTransitionRow",
-        "MiniLilacSqliteStore.validateHistoryTransitionDestination",
-        "MiniLilacSqliteStore.assertStateConnectedToRoot",
-        "MiniLilacSqliteStore.internSerializedChain",
-      ].map((exportName) => ({
-        identity: { module: "src/sqlite-store.ts", exportName },
-        category: "rollback" as const,
-        externalApi: { package: "@stanley2058/lilac-utils", exportName: "runBunSqliteTransaction" },
-        direction: "signal-host" as const,
-        reason:
-          "Signals validation or invariant failure inside the exact SQLite transaction or synchronous compatibility boundary.",
-      })),
-      ...[
-        "assertWorkspaceHistoryAvailable",
-        "toolOutputErrorText",
-        "serializedUtf8Bytes",
-        "SessionActor.beginCommandSideEffect",
-        "SessionActor.startPrompt",
-        "SessionActor.createAgent",
-        "SessionActor.createAgent.materializeAttempt",
-        "SessionActor.createAgent.createCandidate",
-        "SessionActor.commitSteeringBoundary",
-        "SessionActor.commitSteeringBoundary.committed.<callback>",
-        "SessionActor.generateSessionTitle",
-        "SessionActor.delegate",
-        "SessionActor.executeTopLevelRun",
-        "SessionActor.finalizeTopLevelRun",
-        "SessionActor.commitRunFinalization",
-        "SessionActor.enqueueEvent",
-        "SessionActor.publishStoredChunk",
-        "SessionActor.closeSubscribers",
-        "SessionActor.queueControlChunks",
-        "SessionActor.queueSteeringChunk",
-        "SessionActor.queueSubagentStatus",
-        "SessionActor.queueAutomaticCompaction",
-        "SessionActor.broadcastCompaction",
-        "SessionActor.runCompaction",
-        "SessionActor.summarizeForCompaction",
-        "SessionService.constructor",
-        "SessionService.recoverPendingFinalization",
-        "SessionService.recoverHistory",
-        "SessionService.runWorkspaceHistoryMaintenance",
-        "SessionService.cleanupWorkspaceRestorePlans",
-        "SessionService.recoverHistoryNavigation",
-        "SessionService.promptDelegatedSession",
-        "SessionService.abandonHistoryNavigationInternal",
-      ].map((exportName) => ({
-        identity: { module: "src/session-service.ts", exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "external", exportName: "agent, persistence, or callback effect" },
-        direction: "capture-external" as const,
-        reason:
-          "Contains one immediate agent, persistence, queue, or callback failure at the actor-owned Result boundary.",
-      })),
-      ...[
-        "assertWorkspaceHistoryAvailable",
-        "SessionActor.withLock",
-        "SessionActor.beginCommandSideEffect",
-        "SessionActor.recordWorkspaceCapture",
-        "SessionActor.startPrompt",
-        "SessionActor.createAgent",
-        "SessionActor.createAgent.execute",
-        "SessionActor.createAgent.materializeAttempt.execute",
-        "SessionActor.createAgent.materializeAttempt",
-        "SessionActor.createAgent.createCandidate",
-        "SessionActor.commitSteeringBoundary",
-        "SessionActor.commitSteeringBoundary.entries.<callback>",
-        "SessionActor.commitSteeringBoundary.committed.<callback>",
-        "SessionActor.generateSessionTitle",
-        "SessionActor.replaceTodos",
-        "SessionActor.replaceTodos.operation.<callback>",
-        "SessionActor.delegate",
-        "SessionActor.executeTopLevelRun",
-        "SessionActor.commitRunFinalization",
-        "SessionActor.steer",
-        "SessionActor.interruptQueuedSteering",
-        "SessionActor.cancel",
-        "SessionActor.historyNavigationTarget",
-        "SessionActor.replayHistoryNavigation",
-        "SessionActor.assertHistoryNavigationQuiescent",
-        "SessionActor.compact",
-        "SessionActor.runCompaction",
-        "SessionActor.summarizeForCompaction",
-        "SessionActor.updateBindings",
-        "SessionService.constructor",
-        "SessionService.workspaceHistoryForWorkspace",
-        "SessionService.recordWorkspaceCaptureForSession",
-        "SessionService.recoverPendingFinalization",
-        "SessionService.recoverHistory",
-        "SessionService.createSessionInternal",
-        "SessionService.listSkills",
-        "SessionService.promptDelegatedSession",
-        "SessionService.withDelegatedSessionLock",
-        "SessionService.close",
-        "SessionService.shutdown",
-        "SessionService.assertAcceptingAdmissions",
-        "SessionService.trackOperation",
-        "SessionService.trackTask",
-        "SessionService.waitWithinGrace",
-      ].map((exportName) => ({
-        identity: { module: "src/session-service.ts", exportName },
-        category: "compatibility" as const,
-        externalApi: {
-          package: "@stanley2058/mini-lilac-runtime",
-          exportName: "actor host contract",
-        },
-        direction: "signal-host" as const,
-        reason:
-          "Signals cancellation, admission, invariant, or retained defect through the exact actor or legacy host contract.",
-      })),
-      ...[
-        "bytesToText",
-        "runWorkspaceHistoryCleanup",
-        "WorkspaceHistoryStore.capability",
-        "WorkspaceHistoryStore.verifySnapshot",
-        "WorkspaceHistoryStore.prepareRestoreLocked",
-        "WorkspaceHistoryStore.resumePreparedRestoreLocked",
-        "WorkspaceHistoryStore.objectExists",
-        "WorkspaceHistoryStore.reconcileExpectedSnapshotRefs",
-        "WorkspaceHistoryStore.cleanupOrphanSnapshotRefs",
-        "WorkspaceHistoryStore.getObjectAccounting",
-        "WorkspaceHistoryStore.runMaintenance",
-        "WorkspaceHistoryStore.writeAtomicPrivateFile",
-        "WorkspaceHistoryStore.ensureStore",
-        "WorkspaceHistoryStore.writeCaptureTree",
-        "WorkspaceHistoryStore.stageSnapshot",
-        "WorkspaceHistoryStore.stageDestinationEntries",
-        "WorkspaceHistoryStore.createIntendedDirectory",
-        "WorkspaceHistoryStore.validateSnapshotGraphs",
-        "WorkspaceHistoryStore.validateSourceGitDirectory",
-        "WorkspaceHistoryStore.runGit",
-        "WorkspaceHistoryStore.runPrivateGitToHandle",
-        "WorkspaceHistoryStore.emitMetric",
-      ].map((exportName) => ({
-        identity: { module: "src/workspace-history-store.ts", exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "node", exportName: "filesystem, Git, or observer operation" },
-        direction: "capture-external" as const,
-        reason:
-          "Contains one immediate filesystem, Git, decoder, or observer failure beneath the public workspace-history Result boundary.",
-      })),
-      ...[
-        "bytesToText",
-        "parseObjectAccounting",
-        "parseObjectAccounting.count",
-        "parseObjectAccounting.kibibytes",
-        "parseOid",
-        "splitNul",
-        "assertSafeRelativePath",
-        "runWorkspaceHistoryCleanup",
-        "lstatIfExists",
-        "WorkspaceHistoryStore.constructor",
-        "WorkspaceHistoryStore.capability",
-        "WorkspaceHistoryStore.withWorkspaceLock.assertActive",
-        "WorkspaceHistoryStore.resumeRestore",
-        "WorkspaceHistoryStore.cleanupRestorePlans",
-        "WorkspaceHistoryStore.verifySnapshot",
-        "WorkspaceHistoryStore.prepareRestoreLocked",
-        "WorkspaceHistoryStore.resumePreparedRestoreLocked",
-        "WorkspaceHistoryStore.objectExists",
-        "WorkspaceHistoryStore.reconcileExpectedSnapshotRefs",
-        "WorkspaceHistoryStore.cleanupOrphanSnapshotRefs",
-        "WorkspaceHistoryStore.getObjectAccounting",
-        "WorkspaceHistoryStore.runMaintenance",
-        "WorkspaceHistoryStore.validateExpectedRootTreeOids",
-        "WorkspaceHistoryStore.cleanupUnreferencedSnapshotMetadata",
-        "WorkspaceHistoryStore.removeOwnedStore",
-        "WorkspaceHistoryStore.verifyNoAlternates",
-        "WorkspaceHistoryStore.reconcileExpectedSnapshotRefsUnlocked",
-        "WorkspaceHistoryStore.verifyExistingStoreOwnership",
-        "WorkspaceHistoryStore.validateOperationId",
-        "WorkspaceHistoryStore.signatureMap",
-        "WorkspaceHistoryStore.writeRestorePlanManifest",
-        "WorkspaceHistoryStore.listSnapshotRefsUnlocked",
-        "WorkspaceHistoryStore.probeGit",
-        "WorkspaceHistoryStore.ensureStore",
-        "WorkspaceHistoryStore.assertNoSymlinkComponents",
-        "WorkspaceHistoryStore.classifyWorkspace",
-        "WorkspaceHistoryStore.discoverSourceRepository",
-        "WorkspaceHistoryStore.listSourceManagedPaths",
-        "WorkspaceHistoryStore.resolveEffectiveExcludesFile",
-        "WorkspaceHistoryStore.checkIgnoredPaths",
-        "WorkspaceHistoryStore.existingObjects",
-        "WorkspaceHistoryStore.writeCaptureTree",
-        "WorkspaceHistoryStore.parseLsTree",
-        "WorkspaceHistoryStore.preflightRestore",
-        "WorkspaceHistoryStore.preflightDestinationCapabilities",
-        "WorkspaceHistoryStore.objectSizes",
-        "WorkspaceHistoryStore.validateTargetPathSet",
-        "WorkspaceHistoryStore.stageSnapshot",
-        "WorkspaceHistoryStore.stageDestinationEntries",
-        "WorkspaceHistoryStore.createExclusiveTemporaryDirectory",
-        "WorkspaceHistoryStore.createIntendedDirectory",
-        "WorkspaceHistoryStore.createDestinationSibling",
-        "WorkspaceHistoryStore.parentIdentity",
-        "WorkspaceHistoryStore.applyPreparedRestore",
-        "WorkspaceHistoryStore.publishReplacementRoot",
-        "WorkspaceHistoryStore.validateDestinationStaging",
-        "WorkspaceHistoryStore.publishDestinationSibling",
-        "WorkspaceHistoryStore.syncPreparedOwnershipManifest.retainIdentity",
-        "WorkspaceHistoryStore.assertOwnedTemporary",
-        "WorkspaceHistoryStore.cleanupDestinationArtifacts",
-        "WorkspaceHistoryStore.cleanupStaleRestoreArtifactsLocked",
-        "WorkspaceHistoryStore.validatedOwnedRestoreArtifactPaths",
-        "WorkspaceHistoryStore.assertPreparedRestoreFresh",
-        "WorkspaceHistoryStore.assertFrozenRecoveryState",
-        "WorkspaceHistoryStore.assertFrozenSourceIntact",
-        "WorkspaceHistoryStore.verifyFrozenSignatures",
-        "WorkspaceHistoryStore.stripPreparedArtifacts",
-        "WorkspaceHistoryStore.assertLiveSignature",
-        "WorkspaceHistoryStore.workspaceIdentity",
-        "WorkspaceHistoryStore.assertSafeMutationAncestors",
-        "WorkspaceHistoryStore.verifyProtectedSignatures",
-        "WorkspaceHistoryStore.verifyFrozenRestoredSnapshot",
-        "WorkspaceHistoryStore.verifyTargetSnapshot",
-        "WorkspaceHistoryStore.validateSnapshotGraphs",
-        "WorkspaceHistoryStore.enumerateSnapshotGraph",
-        "WorkspaceHistoryStore.requireObject",
-        "WorkspaceHistoryStore.validateSourceGitDirectory",
-        "WorkspaceHistoryStore.runGit",
-        "WorkspaceHistoryStore.runPrivateGitToHandle",
-      ].map((exportName) => ({
-        identity: { module: "src/workspace-history-store.ts", exportName },
-        category: "compatibility" as const,
-        externalApi: {
-          package: "@stanley2058/mini-lilac-runtime",
-          exportName: "workspace-history private exception protocol",
-        },
-        direction: "signal-host" as const,
-        reason:
-          "Signals an owned validation, filesystem, or Git failure within the exception-native implementation captured by the public Result adapter.",
-      })),
-      ...[
-        "SessionService.capturePersistenceResult",
-        "SessionService.capturePersistencePromise",
-      ].flatMap((exportName) => [
-        {
-          identity: { module: "src/session-service.ts", exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "bun:sqlite", exportName: "Database operation" },
-          direction: "capture-external" as const,
-          reason:
-            "Maps owned persistence failures and recognized SQLite driver exceptions to the SessionService Result surface.",
-        },
-        {
-          identity: { module: "src/session-service.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason:
-            "Preserves Panic and unrecognized defects across the SessionService Result adapter.",
-        },
-      ]),
-      ...[
-        ["src/session-service.ts", "SessionActor.navigateHistory"],
-        ["src/sqlite-persistence-codec.ts", "decodePlainJson"],
-        ["src/sqlite-persistence-codec.ts", "decodeSuperJson"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.initializeSchemaResult"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.constructor"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.runHistoryReadResult"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.closeAfterInitializationFailure"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.restoreSchemaMigrationPragmas"],
-        ["src/sqlite-store.ts", "captureMiniLilacCleanup"],
-        ["src/sqlite-store.ts", "reportMiniLilacCleanupFailure"],
-        ["src/sqlite-store.ts", "readMiniLilacHistoryRecoveryStatusResult"],
-        ["src/sqlite-store.ts", "closeMiniLilacHistoryRecoveryDatabase"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.getModelMessagesResult"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.getUiMessagesResult"],
-        ["src/sqlite-todo-persistence-codec.ts", "decodeMiniLilacTodos"],
-        ["src/sqlite-todo-persistence-codec.ts", "readMiniLilacTodos"],
-        ["src/workspace-history-store.ts", "preserveWorkspaceHistoryFailureDuringCleanup"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.withWorkspaceLock"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.readCaptureCache"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.capturePublicResult"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.captureLockedResult"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.captureLocked"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.invalidateCaptureCacheResult"],
-      ].flatMap(([module, exportName]) => [
-        {
-          identity: { module, exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "external", exportName: "persistence dependency" },
-          direction: "capture-external" as const,
-          reason:
-            "Captures the immediate persistence, filesystem, parser, or lock exception at its owned adapter boundary.",
-        },
-        {
-          identity: { module, exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic or unrecognized defect" },
-          direction: "observe-panic" as const,
-          reason:
-            "Preserves Panic or an unrecognized defect while the adapter maps only its owned expected failures.",
-        },
-      ]),
-      ...[
-        ["src/workspace-history-persistence-codec.ts", "parseJson"],
-        ["src/workspace-history-store.ts", "lstatIfExists"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.removeOwnedStore"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.writeCaptureCache"],
-        [
-          "src/workspace-history-store.ts",
-          "WorkspaceHistoryStore.createExclusiveTemporaryDirectory",
-        ],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.createDestinationSibling"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.applyPreparedRestore"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.publishDestinationSibling"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.cleanupDestinationArtifacts"],
-        [
-          "src/workspace-history-store.ts",
-          "WorkspaceHistoryStore.cleanupStaleRestoreArtifactsLocked",
-        ],
-        [
-          "src/workspace-history-store.ts",
-          "WorkspaceHistoryStore.ensureSnapshotRefCreationMetadata",
-        ],
-      ].map(([module, exportName]) => ({
-        identity: { module, exportName },
-        category: "external-to-result" as const,
-        externalApi: { package: "node", exportName: "filesystem or process operation" },
-        direction: "capture-external" as const,
-        reason:
-          "Captures the immediate filesystem or process exception before the public workspace-history Result boundary.",
-      })),
-      ...[
-        ["src/session-service.ts", "mapMiniLilacPersistenceFailure"],
-        ["src/session-service.ts", "SessionActor.navigateHistory"],
-        ["src/session-service.ts", "SessionService.runWorkspaceHistoryMaintenance"],
-        ["src/session-service.ts", "SessionService.reconcileWorkspaceSnapshotRefs"],
-        ["src/session-service.ts", "SessionService.cleanupWorkspaceRestorePlans"],
-        ["src/session-service.ts", "SessionService.recoverHistoryNavigation"],
-        ["src/session-service.ts", "SessionService.abandonHistoryNavigationInternal"],
-        ["src/session-service.ts", "SessionService.captureWorkspaceWithCacheInvalidationPolicy"],
-        ["src/sqlite-persistence-codec.ts", "decodePlainJson"],
-        ["src/sqlite-persistence-codec.ts", "decodeSuperJson"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.initializeSchemaResult"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.constructor"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.runHistoryReadResult"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.closeAfterInitializationFailure"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.restoreSchemaMigrationPragmas"],
-        ["src/sqlite-store.ts", "throwPrimaryAfterCleanup"],
-        ["src/sqlite-store.ts", "readMiniLilacHistoryRecoveryStatusResult"],
-        ["src/sqlite-store.ts", "closeMiniLilacHistoryRecoveryDatabase"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.rehashTranscriptNodesForMigration"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.getModelMessagesResult"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.getUiMessagesResult"],
-        ["src/sqlite-store.ts", "MiniLilacSqliteStore.decodeTranscriptNodeValue"],
-        ["src/sqlite-todo-persistence-codec.ts", "decodeMiniLilacTodos"],
-        ["src/sqlite-todo-persistence-codec.ts", "readMiniLilacTodos"],
-        ["src/workspace-history-store.ts", "preserveWorkspaceHistoryFailureDuringCleanup"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.withWorkspaceLock"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.readRestorePlanManifest"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.verifyOwnershipMarker"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.readCaptureCache"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.writeAtomicPrivateFile"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.readSnapshot"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.readRestoreOwnershipManifest"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.readSnapshotRefCreationMetadata"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.objectTypesUnlocked"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.supportedPlatform"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.capturePublicResult"],
-        [
-          "src/workspace-history-store.ts",
-          "WorkspaceHistoryStore.withWorkspaceLock.lockedStore.capture",
-        ],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.captureLocked"],
-        ["src/workspace-history-store.ts", "WorkspaceHistoryStore.captureClassifiedWorkspace"],
-        [
-          "src/workspace-history-store.ts",
-          "WorkspaceHistoryStore.reconcileCaptureStateAfterRestore",
-        ],
-      ].map(([module, exportName]) => ({
-        identity: { module, exportName },
-        category: "compatibility" as const,
-        externalApi: { package: "internal", exportName: "enclosing Result or host boundary" },
-        direction: "signal-host" as const,
-        reason:
-          "Signals an unrecognized defect or compatibility failure to the enclosing registered Result or host adapter.",
-      })),
-      ...[
-        "readMiniLilacHistoryRecoveryStatus",
-        "toRun",
-        "MiniLilacSqliteStore.constructor",
-        "MiniLilacSqliteStore.initializeSchema",
-        "MiniLilacSqliteStore.getTodos",
-        "MiniLilacSqliteStore.runStoreTransaction",
-        "MiniLilacSqliteStore.getHistoryStoreMetadata",
-        "MiniLilacSqliteStore.getWorkspaceForSession",
-        "MiniLilacSqliteStore.listWorkspaces",
-        "MiniLilacSqliteStore.listWorkspaceSnapshots",
-        "MiniLilacSqliteStore.listWorkspaceSnapshotGroups",
-        "MiniLilacSqliteStore.getWorkspaceSnapshot",
-        "MiniLilacSqliteStore.getHistoryState",
-        "MiniLilacSqliteStore.getHistoryStateModelMessages",
-        "MiniLilacSqliteStore.getHistoryStateUiMessages",
-        "MiniLilacSqliteStore.getCurrentHistoryState",
-        "MiniLilacSqliteStore.getSessionHistory",
-        "MiniLilacSqliteStore.getHistoryNavigation",
-        "MiniLilacSqliteStore.findLatestUndoableUserTransition",
-        "MiniLilacSqliteStore.peekHistoryRedo",
-        "MiniLilacSqliteStore.listHistoryTopology",
-        "MiniLilacSqliteStore.getHistoryAccounting",
-        "MiniLilacSqliteStore.getHistoryOperation",
-        "MiniLilacSqliteStore.listHistoryOperations",
-        "MiniLilacSqliteStore.getPendingRunFinalization",
-        "MiniLilacSqliteStore.listPendingRunFinalizations",
-        "MiniLilacSqliteStore.listRecoverableOpenRootRuns",
-        "MiniLilacSqliteStore.getHistoryTransition",
-        "MiniLilacSqliteStore.getModelMessages",
-        "MiniLilacSqliteStore.getUiMessages",
-        "MiniLilacSqliteStore.createSession",
-        "MiniLilacSqliteStore.replaceTodosForRun",
-        "MiniLilacSqliteStore.createOrReuseWorkspaceSnapshot",
-        "MiniLilacSqliteStore.getMiniMainClaudeState",
-        "MiniLilacSqliteStore.commitSteeringHistoryBoundary",
-        "MiniLilacSqliteStore.commitEmptyHistoryNavigation",
-        "MiniLilacSqliteStore.reservePendingRunFinalization",
-        "MiniLilacSqliteStore.assertWorkspaceHistoryAvailableForOwner",
-        "MiniLilacSqliteStore.getIncomingHistoryTransition",
-        "MiniLilacSqliteStore.readSerializedChain",
-        "MiniLilacSqliteStore.getCommandResult",
-      ].map((exportName) => ({
-        identity: { module: "src/sqlite-store.ts", exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "internal", exportName: "legacy Mini Lilac store API" },
-        direction: "signal-host" as const,
-        reason:
-          "Adapts an owned persistence Result to the established synchronous Mini Lilac store contract.",
-      })),
-    ],
-  ],
-  [
-    "apps/mini-lilac-server",
-    [
-      ...["settleLifecycleResult", "settleCleanupEffect", "settleCleanupResult"].flatMap(
-        (exportName) => [
-          {
-            identity: { module: "src/main.ts", exportName },
-            category: "external-to-result" as const,
-            externalApi: { package: "external", exportName: "shutdown effect" },
-            direction: "capture-external" as const,
-            reason: "Settles one lifecycle or cleanup effect into an owned closed Result envelope.",
-          },
-          {
-            identity: { module: "src/main.ts", exportName },
-            category: "defect-supervisor" as const,
-            externalApi: { package: "better-result", exportName: "Panic.is" },
-            direction: "observe-panic" as const,
-            reason: "Retains exact Panic identity while shutdown cleanup continues.",
-          },
-        ],
-      ),
-      ...[
-        ["src/main.ts", "captureServerOperation", "server operation"],
-        ["src/main.ts", "captureServerCleanup", "server cleanup"],
-        ["src/main.ts", "captureNodeCliParsing", "node:util.parseArgs"],
-        ["src/server.ts", "captureSessionCreation", "session creation"],
-        ["src/server.ts", "canonicalDirectory", "node:fs/promises.realpath"],
-      ].flatMap(([module, exportName, externalExportName]) => [
-        {
-          identity: { module, exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "external", exportName: externalExportName },
-          direction: "capture-external" as const,
-          reason:
-            "Maps one immediate server, CLI, filesystem, or cleanup failure to an owned Result.",
-        },
-        {
-          identity: { module, exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity at the same Mini Lilac server boundary.",
-        },
-      ]),
-      {
-        identity: { module: "src/main.ts", exportName: "settleShutdownEffect" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Settles every shutdown effect while retaining the first observed Panic.",
-      },
-      ...[
-        ["src/main.ts", "adaptLifecycleResultToHost", "server lifecycle"],
-        ["src/main.ts", "acquireDatabaseLock", "database lock compatibility API"],
-        ["src/main.ts", "shutdownMiniLilacServer", "server shutdown compatibility API"],
-        ["src/server.ts", "invalidServerConfiguration", "Elysia server construction"],
-      ].map(([module, exportName, externalExportName]) => ({
-        identity: { module, exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/mini-lilac-server", exportName: externalExportName },
-        direction: "signal-host" as const,
-        reason: "Signals an owned server failure through the established rejecting host contract.",
-      })),
-      {
-        identity: { module: "src/server.ts", exportName: "classifyHttpOperationFailure" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic before classifying ordinary HTTP operation failures.",
-      },
-      {
-        identity: { module: "src/server.ts", exportName: "captureHttpOperation" },
-        category: "external-to-result",
-        externalApi: { package: "elysia", exportName: "request handler" },
-        direction: "capture-external",
-        reason: "Maps a request-handler rejection to the local HTTP Result envelope.",
-      },
-      ...["enqueueSseKeepAlive"].flatMap((exportName) => [
-        {
-          identity: { module: "src/server.ts", exportName },
-          category: "compatibility" as const,
-          externalApi: { package: "global", exportName: "ReadableStream controller.enqueue" },
-          direction: "capture-external" as const,
-          reason: "Contains a closed SSE controller enqueue failure during keep-alive cleanup.",
-        },
-        {
-          identity: { module: "src/server.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic from the SSE controller boundary.",
-        },
-      ]),
-      {
-        identity: {
-          module: "src/server.ts",
-          exportName: "adaptMiniLilacPersistenceResultToHost",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "elysia", exportName: "HTTP request handler" },
-        direction: "signal-host",
-        reason:
-          "Maps an owned Mini Lilac persistence Err to the established HTTP exception boundary.",
-      },
-    ],
-  ],
-  [
-    "packages/utils",
-    [
-      {
-        identity: { module: "persistence.ts", exportName: "runBunSqliteTransaction" },
-        category: "rollback",
-        externalApi: { package: "bun:sqlite", exportName: "Database.transaction.immediate" },
-        direction: "signal-host",
-        reason:
-          "Signals a logical Err through Bun's transaction callback using one private rollback sentinel.",
-      },
-      {
-        identity: {
-          module: "persistence.ts",
-          exportName: "runBunSqliteTransaction.value.<callback>",
-        },
-        category: "rollback",
-        externalApi: { package: "bun:sqlite", exportName: "Database.transaction.immediate" },
-        direction: "signal-host",
-        reason:
-          "Throws the private rollback sentinel only inside Bun's exact transaction callback.",
-      },
-      {
-        identity: { module: "persistence.ts", exportName: "runBunSqliteTransaction" },
-        category: "external-to-result",
-        externalApi: { package: "bun:sqlite", exportName: "Database.transaction.immediate" },
-        direction: "capture-external",
-        reason:
-          "Maps only caller-classified SQLite driver failures and rethrows unrecognized exceptions unchanged.",
-      },
-      {
-        identity: { module: "persistence.ts", exportName: "runBunSqliteTransaction" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Preserves exact Panic identity and escalates detectable transaction finalization uncertainty.",
-      },
-      {
-        identity: { module: "runtime-utils.ts", exportName: "isPanic" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason:
-          "Recognizes genuine Panic while containing hostile proxy classification traps as ordinary opaque failure.",
-      },
-      {
-        identity: { module: "runtime-utils.ts", exportName: "opaqueErrorMessage" },
-        category: "compatibility",
-        externalApi: { package: "global", exportName: "Error.message/String" },
-        direction: "capture-external",
-        reason:
-          "Contains hostile prototype, message, and coercion traps while projecting bounded caller-owned fallback text.",
-      },
-      {
-        identity: { module: "runtime-utils.ts", exportName: "opaqueErrorCause" },
-        category: "compatibility",
-        externalApi: { package: "global", exportName: "Error instanceof" },
-        direction: "capture-external",
-        reason:
-          "Contains hostile prototype traps while preserving inspectable causes and replacing opaque ones with a plain Error.",
-      },
-      ...["pathExists", "readCustomCommandDefinition", "discoverCustomCommands"].flatMap(
-        (exportName) => [
-          {
-            identity: { module: "custom-commands.ts", exportName },
-            category: "external-to-result" as const,
-            externalApi: { package: "node", exportName: "filesystem or JSON operation" },
-            direction: "capture-external" as const,
-            reason: "Maps immediate custom-command discovery failure to an owned Result error.",
-          },
-          {
-            identity: { module: "custom-commands.ts", exportName },
-            category: "defect-supervisor" as const,
-            externalApi: { package: "better-result", exportName: "Panic.is" },
-            direction: "observe-panic" as const,
-            reason: "Preserves Panic while mapping ordinary custom-command discovery failure.",
-          },
-        ],
-      ),
-      {
-        identity: { module: "custom-commands.ts", exportName: "decodeCustomCommandResult" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic while hostile custom-command result getters are decoded.",
-      },
-      ...[
-        ["find-root.ts", "hasWorkspacesFieldResult", "workspace manifest read"],
-        ["codex-oauth.ts", "decodeCodexTokens", "persisted token JSON parse"],
-        ["codex-oauth.ts", "writeSecretFileResult", "atomic secret write"],
-        ["codex-oauth.ts", "readCodexTokensResult", "persisted token read"],
-        ["codex-oauth.ts", "clearCodexTokensResult", "persisted token cleanup"],
-        ["codex-oauth.ts", "exchangeCodeForTokensResult", "OAuth exchange"],
-        ["codex-oauth.ts", "refreshAccessTokenResult", "OAuth refresh"],
-        ["codex-oauth.ts", "startCodexOAuthLogin.runExchangeResult", "OAuth login"],
-        ["core-config.ts", "decodeCoreConfigYaml", "YAML parse"],
-        ["model-capability.ts", "ModelCapability.loadRegistryResult", "model registry fetch"],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "decodeResponsesRequestBody.catch",
-          "request JSON parse",
-        ],
-        [
-          "server-compaction-request.ts",
-          "prepareServerCompactionRequestResult",
-          "compaction request boundary",
-        ],
-        ["skills.ts", "pathExists", "skill path access"],
-        ["skills.ts", "scanSkillPathsBounded", "skill directory scan"],
-        ["skills.ts", "readTextPrefixResult", "skill file read"],
-        ["skills.ts", "parseSkillMarkdownResult", "skill frontmatter parse"],
-      ].flatMap(([module, exportName, externalName]) => [
-        {
-          identity: { module, exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "external", exportName: externalName },
-          direction: "capture-external" as const,
-          reason: "Maps the immediate external failure to the utility's owned Result error.",
-        },
-        {
-          identity: { module, exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity while mapping the utility's owned external failure.",
-        },
-      ]),
-      ...[
-        ["agent-prompts.ts", "exists"],
-        ["agent-prompts.ts", "parsePromptTemplateState"],
-        ["agent-prompts.ts", "loadPromptTemplateState"],
-        ["agent-prompts.ts", "readTextIfExists"],
-        ["agent-prompts.ts", "promptWorkspaceSignature"],
-        ["build-info.ts", "findWorkspaceRootSafe"],
-        ["build-info.ts", "readBuildInfoFile"],
-        ["build-info.ts", "getBuildInfoFileCacheKey"],
-        ["build-info.ts", "readGitBuildInfo"],
-        ["codex-oauth.ts", "parseJwtClaims"],
-        ["codex-oauth.ts", "parseCodexOAuthCallback"],
-        ["llm-wire-debug.ts", "JsonlWriter.write"],
-        ["llm-wire-debug.ts", "createWriter"],
-        ["llm-wire-debug.ts", "captureNonStreamingResponse"],
-        ["llm-wire-debug.ts", "consumeSseDebugStream"],
-        ["llm-wire-debug.ts", "safeParseJson"],
-        ["llm-wire-debug.ts", "decodeRequestBody"],
-        ["logging.ts", "reportOpenObserveDiagnostics"],
-        ["logging.ts", "safeJsonStringify"],
-        ["logging.ts", "OpenObserveJsonlStream.write"],
-        ["model-provider.ts", "decodeCodexResponsesRequestBody.catch"],
-        ["openai-responses-websocket-fetch.ts", "createOpenAIResponsesWebSocketFetch.closeSocket"],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch.start.enqueueNormalizedEvent",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch.start.onMessage",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch.start.onClose",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch.start.onAbort",
-        ],
-      ].map(([module, exportName]) => ({
-        identity: { module, exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason: "Preserves Panic at the exact utility exception or callback boundary.",
-      })),
-      {
-        identity: { module: "codex-oauth.ts", exportName: "startCodexOAuthLogin.exchangeResult" },
-        category: "external-to-result",
-        externalApi: { package: "global", exportName: "Promise rejection" },
-        direction: "capture-external",
-        reason: "Captures an OAuth exchange rejection into the owned login Result.",
-      },
-      ...[
-        ["codex-oauth.ts", "startCodexOAuthLogin", "OAuth login startup"],
-        ["llm-wire-debug.ts", "withLlmWireDebugFetch", "debug fetch"],
-      ].map(([module, exportName, externalName]) => ({
-        identity: { module, exportName },
-        category: "compatibility" as const,
-        externalApi: { package: "@stanley2058/lilac-utils", exportName: externalName },
-        direction: "signal-host" as const,
-        reason: "Preserves the established host rejection contract after bounded interception.",
-      })),
-      ...[
-        ["agent-prompts.ts", "exists", "filesystem existence probe"],
-        ["agent-prompts.ts", "parsePromptTemplateState", "prompt-state JSON parse"],
-        ["agent-prompts.ts", "loadPromptTemplateState", "prompt-state load"],
-        ["agent-prompts.ts", "readTextIfExists", "prompt text read"],
-        ["agent-prompts.ts", "promptWorkspaceSignature", "workspace signature"],
-        ["ai-error.ts", "sanitizeRequestUrl", "URL"],
-        ["ai-error.ts", "parseResponseBody", "JSON.parse"],
-        ["build-info.ts", "findWorkspaceRootSafe", "workspace discovery"],
-        ["build-info.ts", "readBuildInfoFile", "build-info read"],
-        ["build-info.ts", "getBuildInfoFileCacheKey", "build-info stat"],
-        ["build-info.ts", "readGitBuildInfo", "git metadata read"],
-        ["codex-oauth.ts", "parseJwtClaims", "JWT JSON parse"],
-        ["codex-oauth.ts", "parseCodexOAuthCallback", "URL"],
-        ["codex-oauth.ts", "startCodexOAuthLogin", "OAuth callback server"],
-        ["codex-oauth.ts", "startCodexOAuthLogin.close", "OAuth callback server close"],
-        ["core-config.ts", "getCoreConfig", "configuration filesystem"],
-        ["llm-wire-debug.ts", "JsonlWriter.write", "wire-debug file write"],
-        ["llm-wire-debug.ts", "withLlmWireDebugFetch", "debug fetch"],
-        ["llm-wire-debug.ts", "createWriter", "wire-debug writer creation"],
-        ["llm-wire-debug.ts", "captureNonStreamingResponse", "response clone"],
-        ["llm-wire-debug.ts", "consumeSseDebugStream", "SSE debug stream"],
-        ["llm-wire-debug.ts", "safeParseJson", "JSON.parse"],
-        ["llm-wire-debug.ts", "decodeRequestBody", "request body decode"],
-        ["logging.ts", "reportOpenObserveDiagnostics", "OpenObserve reporting"],
-        ["logging.ts", "safeJsonStringify", "JSON.stringify"],
-        ["logging.ts", "OpenObserveJsonlStream.write", "OpenObserve stream write"],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.closeSocket",
-          "WebSocket close",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.connectWebSocket",
-          "WebSocket connect",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch",
-          "WebSocket request",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch.start.enqueueNormalizedEvent",
-          "Responses stream enqueue",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch.start.onMessage",
-          "WebSocket message",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch.start.onClose",
-          "WebSocket close event",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch.start.onAbort",
-          "WebSocket abort",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch.start",
-          "Responses stream start",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "maybeNormalizeResponsesSseResponse.start",
-          "SSE normalization",
-        ],
-        ["openai-responses-websocket-fetch.ts", "normalizeSseFrame", "SSE frame JSON parse"],
-        ["openai-responses-websocket-fetch.ts", "decodeRequestBody", "request body decode"],
-        ["tool-call-input-normalization.ts", "parsePlainObjectJson", "tool input JSON parse"],
-      ].map(([module, exportName, externalName]) => ({
-        identity: { module, exportName },
-        category: "compatibility" as const,
-        externalApi: { package: "external", exportName: externalName },
-        direction: "capture-external" as const,
-        reason: "Contains an immediate external exception at a bounded compatibility boundary.",
-      })),
-      ...[
-        ["codex-oauth.ts", "readCodexTokens", "legacy token read"],
-        ["codex-oauth.ts", "writeCodexTokens", "legacy token write"],
-        ["codex-oauth.ts", "clearCodexTokens", "legacy token cleanup"],
-        ["codex-oauth.ts", "exchangeCodeForTokens", "legacy OAuth exchange"],
-        ["codex-oauth.ts", "refreshAccessToken", "legacy OAuth refresh"],
-        ["codex-oauth.ts", "startCodexOAuthLogin.exchange", "legacy OAuth login"],
-        ["core-config.ts", "readCoreConfigVersion", "legacy config version"],
-        ["core-config.ts", "parseCoreConfig", "legacy config parse"],
-        ["core-config.ts", "getCoreConfig", "legacy config load"],
-        ["core-config.ts", "resolveDiscordToken", "legacy Discord token resolution"],
-        ["core-config/v1.ts", "parseCoreConfigV1ToUniversal", "legacy v1 config parse"],
-        ["core-config/v2.ts", "parseCoreConfigV2ToUniversal", "legacy v2 config parse"],
-        ["find-root.ts", "findWorkspaceRoot", "legacy workspace discovery"],
-        ["friendly-units.ts", "parseFriendlyByteSize", "legacy byte-size parse"],
-        ["friendly-units.ts", "parseFriendlyDurationMs", "legacy duration parse"],
-        ["model-capability.ts", "parseModelSpecifier", "legacy model specifier parse"],
-        ["model-capability.ts", "ModelCapability.resolve", "legacy model capability resolution"],
-        [
-          "model-provider.ts",
-          "normalizeCodexResponsesRequestRecord",
-          "legacy Codex request normalization",
-        ],
-        ["model-provider.ts", "createCodexOAuthProvider", "AI SDK OAuth provider"],
-        ["model-provider.ts", "createCodexOAuthProvider.refreshIfNeeded", "AI SDK OAuth refresh"],
-        ["model-slot.ts", "fromDurableResolvedModelRequest", "legacy durable model request"],
-        ["model-slot.ts", "fromDurableResolvedModelPlan", "legacy durable model plan"],
-        ["model-slot.ts", "resolveModelRef", "legacy model reference"],
-        ["model-slot.ts", "resolveModelChain", "legacy model chain"],
-        ["model-slot.ts", "resolveModelPlan", "legacy model plan"],
-        ["model-slot.ts", "resolveModelSlot", "legacy model slot"],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "signalResponsesStreamError",
-          "ReadableStream controller",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.connectWebSocket",
-          "WebSocket connection promise",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.connectWebSocket.onError",
-          "WebSocket connection promise",
-        ],
-        [
-          "openai-responses-websocket-fetch.ts",
-          "createOpenAIResponsesWebSocketFetch.websocketFetch",
-          "fetch response contract",
-        ],
-        [
-          "server-compaction-request.ts",
-          "withServerCompactionRequestFetch.wrappedFetch",
-          "fetch adapter",
-        ],
-        ["skills.ts", "parseSkillMarkdown", "legacy skill parser"],
-      ].map(([module, exportName, externalName]) => ({
-        identity: { module, exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "@stanley2058/lilac-utils", exportName: externalName },
-        direction: "signal-host" as const,
-        reason: "Adapts an owned Result or compatibility failure to the established host contract.",
-      })),
-      ...[
-        ["codex-oauth.ts", "readCodexTokens", "legacy token read"],
-        ["codex-oauth.ts", "clearCodexTokens", "legacy token cleanup"],
-        ["codex-oauth.ts", "legacyCodexTokenWriteError", "legacy token write errors"],
-        ["codex-oauth.ts", "legacyCodexOAuthError", "legacy OAuth errors"],
-        ["codex-oauth.ts", "legacyCodexOAuthLoginError", "legacy OAuth login errors"],
-        ["model-capability.ts", "ModelCapability.resolve", "legacy model capability errors"],
-        [
-          "server-compaction-request.ts",
-          "withServerCompactionRequestFetch.wrappedFetch",
-          "legacy compaction request errors",
-        ],
-      ].map(([module, exportName, externalName]) => ({
-        identity: { module, exportName },
-        category: "compatibility" as const,
-        externalApi: { package: "@stanley2058/lilac-utils", exportName: externalName },
-        direction: "capture-external" as const,
-        reason:
-          "Projects an owned unknown-bearing error cause only at the exact legacy compatibility boundary.",
-      })),
-    ],
-  ],
-  [
-    "packages/mini-lilac-client",
-    [
-      {
-        identity: { module: "mini-lilac-transport.ts", exportName: "normalizeStreamChunk" },
-        category: "result-to-framework",
-        externalApi: {
-          package: "@stanley2058/mini-lilac-client",
-          exportName: "miniLilacUnsupportedUIMessageChunkSchema",
-        },
-        direction: "signal-host",
-        reason:
-          "Rejects malformed reserved data-* sentinels and stream chunks through the existing stream host contract.",
-      },
-      {
-        identity: {
-          module: "mini-lilac-transport.ts",
-          exportName: "validateUnsupportedSentinel",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "ai", exportName: "Schema.validate" },
-        direction: "signal-host",
-        reason: "Rejects an invalid unsupported-chunk sentinel through the stream host contract.",
-      },
-      {
-        identity: {
-          module: "mini-lilac-transport.ts",
-          exportName: "parseMiniLilacStream.transform",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "global", exportName: "TransformStream.transform" },
-        direction: "signal-host",
-        reason: "Propagates malformed event-stream frames through the stream host contract.",
-      },
-      {
-        identity: { module: "mini-lilac-transport.ts", exportName: "externalOperationError" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves Panic from the owned operation or cancellation signal.",
-      },
-      {
-        identity: { module: "mini-lilac-transport.ts", exportName: "ownedRequestCancellation" },
-        category: "defect-supervisor",
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic",
-        reason: "Preserves a Panic used as the exact owned AbortSignal reason.",
-      },
-      {
-        identity: { module: "mini-lilac-transport.ts", exportName: "captureMiniLilacPromise" },
-        category: "external-to-result",
-        externalApi: { package: "external", exportName: "Mini Lilac async dependency" },
-        direction: "capture-external",
-        reason: "Maps an immediate client dependency rejection to an owned Result error.",
-      },
-      ...["captureMiniLilacSync"].flatMap((exportName) => [
-        {
-          identity: { module: "mini-lilac-transport.ts", exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "external", exportName: "Mini Lilac sync dependency" },
-          direction: "capture-external" as const,
-          reason: "Maps an immediate synchronous dependency failure to an owned Result error.",
-        },
-        {
-          identity: { module: "mini-lilac-transport.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves Panic identity across the synchronous client adapter.",
-        },
-      ]),
-      {
-        identity: {
-          module: "mini-lilac-transport.ts",
-          exportName: "resultToMiniLilacClientValue",
-        },
-        category: "result-to-framework",
-        externalApi: { package: "@stanley2058/mini-lilac-client", exportName: "legacy client API" },
-        direction: "signal-host",
-        reason: "Adapts owned client Results to the package's established throwing API contract.",
-      },
-      ...["cleanupMiniLilacStreamReader", "readMiniLilacStreamResult"].flatMap((exportName) => [
-        {
-          identity: { module: "mini-lilac-transport.ts", exportName },
-          category: "external-to-result" as const,
-          externalApi: { package: "global", exportName: "ReadableStream cleanup" },
-          direction: "capture-external" as const,
-          reason: "Maps an immediate stream cleanup rejection to an owned Result error.",
-        },
-        {
-          identity: { module: "mini-lilac-transport.ts", exportName },
-          category: "defect-supervisor" as const,
-          externalApi: { package: "better-result", exportName: "Panic.is" },
-          direction: "observe-panic" as const,
-          reason: "Preserves cleanup Panic precedence after all owned stream resources settle.",
-        },
-      ]),
-      ...[
-        "parseMiniLilacStream.pull",
-        "parseMiniLilacStream.cancel",
-        "parseMiniLilacStream.transform",
-        "resultStreamFromMiniLilacStream.cancel",
-        "resultStreamToLegacyStream.pull",
-      ].map((exportName) => ({
-        identity: { module: "mini-lilac-transport.ts", exportName },
-        category: "result-to-framework" as const,
-        externalApi: { package: "global", exportName: "ReadableStream controller" },
-        direction: "signal-host" as const,
-        reason:
-          "Signals a typed stream or cleanup failure through the ReadableStream host contract.",
-      })),
-      ...["parseMiniLilacStream.pull", "parseMiniLilacStream.transform"].map((exportName) => ({
-        identity: { module: "mini-lilac-transport.ts", exportName },
-        category: "compatibility" as const,
-        externalApi: { package: "global", exportName: "ReadableStream source" },
-        direction: "capture-external" as const,
-        reason: "Contains an immediate source or transform rejection at the stream host boundary.",
-      })),
-      ...["parseMiniLilacStream.transform"].map((exportName) => ({
-        identity: { module: "mini-lilac-transport.ts", exportName },
-        category: "defect-supervisor" as const,
-        externalApi: { package: "better-result", exportName: "Panic.is" },
-        direction: "observe-panic" as const,
-        reason: "Preserves Panic across stream transformation, result delivery, and cleanup.",
-      })),
-    ],
-  ],
-]);
-
 const EVENT_BUS_CODEC_REGISTRY: EventCodecRegistryRegistration = {
-  identity: { module: "lilac-codecs.ts", exportName: "lilacEventCodecRegistry" },
+  identity: {
+    module: "lilac-codecs.ts",
+    exportName: "lilacEventCodecRegistry",
+  },
   catalog: { module: "lilac-spec.ts", exportName: "LILAC_EVENTS" },
-  catalogHelper: { module: "define-lilac-events.ts", exportName: "defineLilacEvents" },
+  catalogHelper: {
+    module: "define-lilac-events.ts",
+    exportName: "defineLilacEvents",
+  },
   registryHelper: {
     module: "define-lilac-events.ts",
     exportName: "createLilacEventCodecRegistry",
@@ -6067,17 +3109,26 @@ const WAVE_2_RESULT_DECODERS = new Map<string, readonly ResultDecoderRegistratio
     "packages/claude-code-bridge",
     [
       {
-        identity: { module: "claude-code-run.ts", exportName: "decodeClaudeContextUsage" },
+        identity: {
+          module: "claude-code-run.ts",
+          exportName: "decodeClaudeContextUsage",
+        },
         category: "plugin",
         inputParameter: 0,
       },
       {
-        identity: { module: "claude-code-run.ts", exportName: "decodeClaudeStopHookInput" },
+        identity: {
+          module: "claude-code-run.ts",
+          exportName: "decodeClaudeStopHookInput",
+        },
         category: "plugin",
         inputParameter: 0,
       },
       {
-        identity: { module: "claude-code-run.ts", exportName: "decodeClaudeSessionInfo" },
+        identity: {
+          module: "claude-code-run.ts",
+          exportName: "decodeClaudeSessionInfo",
+        },
         category: "plugin",
         inputParameter: 0,
       },
@@ -6096,7 +3147,10 @@ const WAVE_2_RESULT_DECODERS = new Map<string, readonly ResultDecoderRegistratio
 const UTILS_CODEX_TOKENS_PERSISTED_CODEC = {
   identity: { module: "codex-oauth.ts", exportName: "decodeCodexTokens" },
   inputParameter: 0,
-  fixtureCatalog: { module: "codex-oauth.ts", exportName: "codexTokensCodecCases" },
+  fixtureCatalog: {
+    module: "codex-oauth.ts",
+    exportName: "codexTokensCodecCases",
+  },
   provenance: ["current", "migrated", "missing-defaulted"],
 } as const satisfies PersistedCodecRegistration;
 
@@ -6115,14 +3169,20 @@ const ACP_RUN_RECORD_PERSISTED_CODEC = {
 const ACP_RUN_CANCELLATION_PERSISTED_CODEC = {
   identity: { module: "run-store.ts", exportName: "decodeRunCancellation" },
   inputParameter: 0,
-  fixtureCatalog: { module: "run-store.ts", exportName: "runCancellationCodecCases" },
+  fixtureCatalog: {
+    module: "run-store.ts",
+    exportName: "runCancellationCodecCases",
+  },
   provenance: ["current", "migrated"],
 } as const satisfies PersistedCodecRegistration;
 
 const ACP_SESSION_INDEX_PERSISTED_CODEC = {
   identity: { module: "run-store.ts", exportName: "decodeSessionIndex" },
   inputParameter: 0,
-  fixtureCatalog: { module: "run-store.ts", exportName: "sessionIndexCodecCases" },
+  fixtureCatalog: {
+    module: "run-store.ts",
+    exportName: "sessionIndexCodecCases",
+  },
   provenance: ["current", "migrated", "missing-defaulted"],
 } as const satisfies PersistedCodecRegistration;
 
@@ -6142,14 +3202,23 @@ const ACP_PERSISTED_CONSUMERS = [
 ] as const satisfies readonly PersistedStoreConsumerRegistration[];
 
 const TUI_BINDING_PREFERENCES_PERSISTED_CODEC = {
-  identity: { module: "src/preferences.ts", exportName: "decodeBindingPreferences" },
+  identity: {
+    module: "src/preferences.ts",
+    exportName: "decodeBindingPreferences",
+  },
   inputParameter: 0,
-  fixtureCatalog: { module: "src/preferences.ts", exportName: "bindingPreferencesCodecCases" },
+  fixtureCatalog: {
+    module: "src/preferences.ts",
+    exportName: "bindingPreferencesCodecCases",
+  },
   provenance: ["current", "migrated", "missing-defaulted"],
 } as const satisfies PersistedCodecRegistration;
 
 const TUI_BINDING_PREFERENCES_PERSISTED_CONSUMER = {
-  identity: { module: "src/preferences.ts", exportName: "loadBindingPreferences" },
+  identity: {
+    module: "src/preferences.ts",
+    exportName: "loadBindingPreferences",
+  },
   codecs: [TUI_BINDING_PREFERENCES_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
 
@@ -6269,9 +3338,18 @@ const WAVE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[]
   [
     "packages/agent",
     [
-      { module: "atomic-tool-execution.ts", exportName: "consumeAtomicToolResultStream" },
-      { module: "atomic-tool-execution.ts", exportName: "cleanupFailedAtomicToolCall" },
-      { module: "openai-server-compaction.ts", exportName: "compactWithOpenAIResponsesResult" },
+      {
+        module: "atomic-tool-execution.ts",
+        exportName: "consumeAtomicToolResultStream",
+      },
+      {
+        module: "atomic-tool-execution.ts",
+        exportName: "cleanupFailedAtomicToolCall",
+      },
+      {
+        module: "openai-server-compaction.ts",
+        exportName: "compactWithOpenAIResponsesResult",
+      },
     ],
   ],
 ]);
@@ -6318,7 +3396,10 @@ const CORE_TRANSCRIPT_PERSISTED_CODECS = [
   ["decodeSurfaceMessageLinkRow", "surfaceMessageLinkRowCodecCases"],
 ].map(
   ([exportName, fixtureExportName]): PersistedCodecRegistration => ({
-    identity: { module: "src/transcript/transcript-persistence-codec.ts", exportName },
+    identity: {
+      module: "src/transcript/transcript-persistence-codec.ts",
+      exportName,
+    },
     inputParameter: 0,
     fixtureCatalog: {
       module: "src/transcript/transcript-persistence-codec.ts",
@@ -6333,9 +3414,30 @@ const CORE_TRANSCRIPT_PERSISTED_CODECS = [
   }),
 );
 
+const CORE_RESOURCE_PERSISTED_CODEC = {
+  identity: {
+    module: "src/transcript/transcript-persistence-codec.ts",
+    exportName: "decodeResourceRecordRow",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/transcript/transcript-persistence-codec.ts",
+    exportName: "resourceRecordRowCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_RESOURCE_PERSISTED_CONSUMER = {
+  identity: {
+    module: "src/transcript/transcript-store.ts",
+    exportName: "decodeResourceRecordRow",
+  },
+  codecs: [CORE_RESOURCE_PERSISTED_CODEC.identity],
+} as const satisfies PersistedStoreConsumerRegistration;
+
 const CORE_TRANSCRIPT_PERSISTED_CONSUMERS = [
   ["decodeTranscriptCompactionContext", [0]],
-  ["decodeTranscriptProviderState", [1]],
   ["decodeTranscriptRow", [2]],
   ["decodeCoreSurfaceProjectionRow", [3]],
   ["decodeCoreLineageManifestRow", [4]],
@@ -6344,7 +3446,10 @@ const CORE_TRANSCRIPT_PERSISTED_CONSUMERS = [
   ["decodeSurfaceMessageLinkRow", [7]],
 ].map(
   ([exportName, codecIndexes]): PersistedStoreConsumerRegistration => ({
-    identity: { module: "src/transcript/transcript-store.ts", exportName: String(exportName) },
+    identity: {
+      module: "src/transcript/transcript-store.ts",
+      exportName: String(exportName),
+    },
     codecs: (codecIndexes as number[]).map(
       (index) => CORE_TRANSCRIPT_PERSISTED_CODECS[index]!.identity,
     ),
@@ -6363,6 +3468,36 @@ const CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC = {
   },
   provenance: ["current", "migrated", "missing-defaulted"],
 } as const satisfies PersistedCodecRegistration;
+
+const CORE_LEGACY_WORKFLOW_BLOB_MIGRATION_PERSISTED_CONSUMER = {
+  identity: {
+    module: "scripts/legacy-workflow-blob-migration.ts",
+    exportName: "inspectLegacyWorkflowBlobMigration",
+  },
+  codecs: [CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC.identity],
+} as const satisfies PersistedStoreConsumerRegistration;
+
+const CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC = {
+  identity: {
+    module: "src/surface/bridge/bus-agent-runner/anthropic-fallback-cache-codec.ts",
+    exportName: "decodeAnthropicFallbackCacheRecord",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/surface/bridge/bus-agent-runner/anthropic-fallback-cache-codec.ts",
+    exportName: "anthropicFallbackCacheCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CONSUMER = {
+  identity: {
+    module: "src/surface/bridge/bus-agent-runner/anthropic-fallback-media.ts",
+    exportName: "readAnthropicFallbackCacheIndex",
+  },
+  codecs: [CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC.identity],
+} as const satisfies PersistedStoreConsumerRegistration;
 
 const CORE_WORKFLOW_ROW_PERSISTED_CODEC = {
   identity: {
@@ -6387,6 +3522,7 @@ const CORE_WORKFLOW_ROW_PERSISTED_CODEC = {
     receipt: "missing-rejected",
     outbox: "missing-rejected",
     "legacy-audit": "missing-rejected",
+    artifact: "missing-rejected",
   },
 } as const satisfies PersistedCodecRegistration;
 
@@ -6401,6 +3537,7 @@ const CORE_WORKFLOW_ROW_PERSISTED_CONSUMERS = [
   "decodeWorkflowRequestDispatchRow",
   "decodeWorkflowRequestTerminalReceiptRow",
   "decodeWorkflowActionOutboxRow",
+  "decodeWorkflowArtifactRow",
 ].map(
   (exportName): PersistedStoreConsumerRegistration => ({
     identity: { module: "src/workflow/durable-workflow-store.ts", exportName },
@@ -6439,7 +3576,10 @@ const CORE_WORKFLOW_STORE_READ_RESULT_APIS = [
   "DurableWorkflowStore.listSurfaceActions",
   "DurableWorkflowStore.listPendingActionOutboxEvents",
   "DurableWorkflowStore.listPendingActionOutboxProjections",
-].map((exportName) => ({ module: "src/workflow/durable-workflow-store.ts", exportName }));
+].map((exportName) => ({
+  module: "src/workflow/durable-workflow-store.ts",
+  exportName,
+}));
 
 const CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER = {
   identity: {
@@ -6470,31 +3610,139 @@ const TOOL_RESULT_ARTIFACT_METADATA_CONSUMER = {
   codecs: [TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
 
+const BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC = {
+  identity: {
+    module: "src/blob-tool-result-artifact-metadata-codec.ts",
+    exportName: "decodeBlobToolResultArtifactMetadata",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/blob-tool-result-artifact-metadata-codec.ts",
+    exportName: "blobToolResultArtifactMetadataCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const BLOB_TOOL_RESULT_ARTIFACT_METADATA_CONSUMER = {
+  identity: {
+    module: "src/blob-tool-result-artifact-store.ts",
+    exportName: "createBlobBackedToolResultArtifactStore.readMetadata",
+  },
+  codecs: [BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity],
+} as const satisfies PersistedStoreConsumerRegistration;
+
+const CORE_AGENT_RUN_OPENED_PERSISTED_CODEC = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "decodeAgentRunOpenedPayload",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "agentRunOpenedPayloadCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "decodeAgentRunCheckpointPayload",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "agentRunCheckpointPayloadCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "decodeAgentRunTerminalPayload",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "agentRunTerminalPayloadCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "SqliteAgentRunJournal.#decodeHead",
+  },
+  codecs: [
+    CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity,
+    CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity,
+  ],
+} as const satisfies PersistedStoreConsumerRegistration;
+
+const CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "SqliteAgentRunJournal.#validateHeadEvents",
+  },
+  codecs: [CORE_AGENT_RUN_OPENED_PERSISTED_CODEC.identity],
+} as const satisfies PersistedStoreConsumerRegistration;
+
+const CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER = {
+  identity: {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "SqliteAgentRunJournal.#decodePreviousCheckpoint",
+  },
+  codecs: [CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity],
+} as const satisfies PersistedStoreConsumerRegistration;
+
+const CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS = [
+  {
+    identity: {
+      module: "src/surface/bridge/agent-run-journal/index.ts",
+      exportName: "validatedOpenedPayload",
+    },
+    codecs: [CORE_AGENT_RUN_OPENED_PERSISTED_CODEC.identity],
+  },
+  {
+    identity: {
+      module: "src/surface/bridge/agent-run-journal/index.ts",
+      exportName: "validatedCheckpointPayload",
+    },
+    codecs: [CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity],
+  },
+  {
+    identity: {
+      module: "src/surface/bridge/agent-run-journal/index.ts",
+      exportName: "validatedTerminalPayload",
+    },
+    codecs: [CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity],
+  },
+] as const satisfies readonly PersistedStoreConsumerRegistration[];
+
 const CORE_GRACEFUL_RESTART_PERSISTED_CODEC = {
   identity: {
-    module: "src/runtime/graceful-restart-store.ts",
+    module: "src/migration/frozen-graceful-restart-store.ts",
     exportName: "decodeGracefulRestartSnapshot",
   },
   inputParameter: 0,
   fixtureCatalog: {
-    module: "src/runtime/graceful-restart-store.ts",
+    module: "src/migration/frozen-graceful-restart-store.ts",
     exportName: "gracefulRestartSnapshotCodecCases",
   },
-  provenance: ["current", "migrated", "missing-defaulted"],
+  provenance: ["current", "missing-defaulted"],
+  legacyOutcome: "rejected",
 } as const satisfies PersistedCodecRegistration;
 
-const CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER = {
+const CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER = {
   identity: {
-    module: "src/runtime/graceful-restart-store.ts",
-    exportName: "SqliteGracefulRestartStore.readCompletedSnapshot",
-  },
-  codecs: [CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity],
-} as const satisfies PersistedStoreConsumerRegistration;
-
-const CORE_GRACEFUL_RESTART_ENCODER_CONSUMER = {
-  identity: {
-    module: "src/runtime/graceful-restart-store.ts",
-    exportName: "encodeGracefulRestartSnapshot",
+    module: "scripts/legacy-graceful-restart-blob-migration.ts",
+    exportName: "classifyPersistedSnapshot",
   },
   codecs: [CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
@@ -6534,7 +3782,10 @@ const MINI_WORKSPACE_HISTORY_PERSISTED_CODECS = (
   ] as const
 ).map(
   ([exportName, fixtureExportName, provenance]): PersistedCodecRegistration => ({
-    identity: { module: "src/workspace-history-persistence-codec.ts", exportName },
+    identity: {
+      module: "src/workspace-history-persistence-codec.ts",
+      exportName,
+    },
     inputParameter: 0,
     fixtureCatalog: {
       module: "src/workspace-history-persistence-codec.ts",
@@ -6568,7 +3819,10 @@ const MINI_SQLITE_TRANSCRIPT_PERSISTED_CODECS = [
   ([exportName, fixtureExportName]): PersistedCodecRegistration => ({
     identity: { module: "src/sqlite-persistence-codec.ts", exportName },
     inputParameter: 0,
-    fixtureCatalog: { module: "src/sqlite-persistence-codec.ts", exportName: fixtureExportName },
+    fixtureCatalog: {
+      module: "src/sqlite-persistence-codec.ts",
+      exportName: fixtureExportName,
+    },
     provenance: ["current", "migrated", "missing-defaulted"],
   }),
 );
@@ -6595,7 +3849,10 @@ const MINI_SQLITE_TODO_PERSISTED_CONSUMER = {
 } as const satisfies PersistedStoreConsumerRegistration;
 
 const MINI_SQLITE_TODO_STORE_PERSISTED_CONSUMER = {
-  identity: { module: "src/sqlite-store.ts", exportName: "decodeMiniLilacTodos" },
+  identity: {
+    module: "src/sqlite-store.ts",
+    exportName: "decodeMiniLilacTodos",
+  },
   codecs: [MINI_SQLITE_TODO_PERSISTED_CODEC.identity],
 } as const satisfies PersistedStoreConsumerRegistration;
 
@@ -6680,7 +3937,10 @@ const MINI_SQLITE_BOUNDARY_DECODER_IDENTITIES = [
     "decodeMiniLilacSuperJsonPayload",
     "decodeMiniMainClaudeBindingPromotion",
     "decodeMiniNamedClaudeBindingPromotion",
-  ].map((exportName) => ({ module: "src/sqlite-persistence-codec.ts", exportName })),
+  ].map((exportName) => ({
+    module: "src/sqlite-persistence-codec.ts",
+    exportName,
+  })),
   {
     module: "src/sqlite-transcript-projection.ts",
     exportName: "validateMiniLilacPersistedSuperJsonValue",
@@ -6800,7 +4060,10 @@ const MINI_RUNTIME_OPERATIONAL_RESULT_APIS = [
     "WorkspaceHistoryStore.getObjectAccountingResult",
     "WorkspaceHistoryStore.runMaintenanceResult",
     "WorkspaceHistoryStore.cleanupStaleRestoreArtifactsResult",
-  ].map((exportName) => ({ module: "src/workspace-history-store.ts", exportName })),
+  ].map((exportName) => ({
+    module: "src/workspace-history-store.ts",
+    exportName,
+  })),
 ] as const satisfies readonly SymbolIdentity[];
 
 const UTILS_SQLITE_TRANSACTION_ADAPTER_IDENTITY = {
@@ -6813,6 +4076,14 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
   {
     module: "src/conversation/thread-store.ts",
     exportName: "ConversationThreadStore.upsertSummary",
+  },
+  {
+    module: "src/surface/bridge/request-delivery/sqlite-store.ts",
+    exportName: "transaction",
+  },
+  {
+    module: "src/surface/bridge/agent-run-journal/index.ts",
+    exportName: "transaction",
   },
   {
     module: "src/transcript/transcript-store.ts",
@@ -6831,6 +4102,12 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
     "SqliteTranscriptStore.recordCorePrimaryClaudeSessionAttemptOutcome",
     "SqliteTranscriptStore.publishCorePrimaryClaudeSuccess",
     "SqliteTranscriptStore.promoteCorePrimaryClaudeSessionBinding",
+    "SqliteTranscriptStore.registerOrGet",
+    "SqliteTranscriptStore.compareAndSwapCache",
+    "SqliteTranscriptStore.finalizeUnretained",
+    "SqliteTranscriptStore.retainAgentRunCheckpointBlobs",
+    "SqliteTranscriptStore.replaceAgentRunCheckpointBlobs",
+    "SqliteTranscriptStore.reconcileAgentRunCheckpointBlobs",
   ].map((exportName) => ({
     module: "src/transcript/transcript-store.ts",
     exportName,
@@ -6851,15 +4128,23 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
     module: "src/workflow/workflow-migrations.ts",
     exportName: "applyWorkflowSchemaMigrations",
   },
+  {
+    module: "src/workflow/workflow-migrations.ts",
+    exportName: "applyWorkflowBlobStorageSchema26Migration",
+  },
   ...[
-    "SqliteGracefulRestartStore.clear",
-    "SqliteGracefulRestartStore.consumeCompletedSnapshot",
-    "SqliteGracefulRestartStore.readCompletedSnapshot",
-    "SqliteGracefulRestartStore.saveCompletedSnapshot",
+    "SqliteQuestionStore.create",
+    "SqliteQuestionStore.replaceTokens",
+    "SqliteQuestionStore.applyAnswer",
+    "SqliteQuestionStore.interruptPending",
   ].map((exportName) => ({
-    module: "src/runtime/graceful-restart-store.ts",
+    module: "src/question/question-store.ts",
     exportName,
   })),
+  {
+    module: "scripts/legacy-graceful-restart-blob-migration.ts",
+    exportName: "commitLegacyGracefulRestartMigration",
+  },
 ].map(
   (identity): SqliteTransactionConsumerRegistration => ({
     identity,
@@ -6885,6 +4170,14 @@ const MINI_SQLITE_TRANSACTION_CONSUMERS = [
 ] as const satisfies readonly SqliteTransactionConsumerRegistration[];
 
 const CORE_EVENT_DELIVERY_CONSUMERS = [
+  {
+    identity: {
+      module: "src/surface/bridge/request-delivery/durable-request-bus.ts",
+      exportName: "createDurableCoreRequestBus",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic", "fetchTopic"],
+  },
   {
     identity: {
       module: "src/heartbeat/heartbeat-service.ts",
@@ -7003,7 +4296,11 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "apps/mini-lilac-tui"
         ? [{ include: "src/tool-observation-projection.ts" }]
         : root === "packages/mini-lilac-runtime"
-          ? [{ include: MINI_SQLITE_MIGRATION_RUN_RESULT_DECODER.identity.module }]
+          ? [
+              {
+                include: MINI_SQLITE_MIGRATION_RUN_RESULT_DECODER.identity.module,
+              },
+            ]
           : [
               ...new Set(
                 (WAVE_2_RESULT_DECODERS.get(root) ?? []).map(({ identity }) => identity.module),
@@ -7020,20 +4317,45 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ? [{ include: "src/preferences.ts" }]
           : root === "packages/tool-results"
             ? [
-                { include: TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.module },
-                { include: TOOL_RESULT_ARTIFACT_METADATA_CONSUMER.identity.module },
+                {
+                  include: TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.module,
+                },
+                {
+                  include: TOOL_RESULT_ARTIFACT_METADATA_CONSUMER.identity.module,
+                },
+                {
+                  include: BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.module,
+                },
+                {
+                  include: BLOB_TOOL_RESULT_ARTIFACT_METADATA_CONSUMER.identity.module,
+                },
               ]
             : root === "apps/core"
               ? [
-                  { include: "src/conversation/thread-summary-persistence-codec.ts" },
+                  {
+                    include: "src/conversation/thread-summary-persistence-codec.ts",
+                  },
                   { include: "src/conversation/thread-store.ts" },
                   { include: "src/transcript/transcript-persistence-codec.ts" },
                   { include: "src/transcript/transcript-store.ts" },
-                  { include: "src/runtime/graceful-restart-store.ts" },
-                  { include: "src/workflow/workflow-artifact-persistence-codec.ts" },
+                  { include: "src/surface/bridge/agent-run-journal/index.ts" },
+                  { include: "src/migration/frozen-graceful-restart-store.ts" },
+                  {
+                    include: "src/workflow/workflow-artifact-persistence-codec.ts",
+                  },
                   { include: "src/workflow/workflow-persistence-codec.ts" },
                   { include: "src/workflow/workflow-artifact-store.ts" },
                   { include: "src/workflow/durable-workflow-store.ts" },
+                  {
+                    include: "scripts/legacy-graceful-restart-blob-migration.ts",
+                  },
+                  { include: "scripts/legacy-workflow-blob-migration.ts" },
+                  {
+                    include: CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC.identity.module,
+                  },
+                  {
+                    include: CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CONSUMER.identity.module,
+                  },
                 ]
               : root === "packages/mini-lilac-runtime"
                 ? [
@@ -7046,8 +4368,12 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                   ]
                 : root === "packages/utils"
                   ? [
-                      { include: UTILS_CODEX_TOKENS_PERSISTED_CODEC.identity.module },
-                      { include: UTILS_CODEX_TOKENS_PERSISTED_CONSUMER.identity.module },
+                      {
+                        include: UTILS_CODEX_TOKENS_PERSISTED_CODEC.identity.module,
+                      },
+                      {
+                        include: UTILS_CODEX_TOKENS_PERSISTED_CONSUMER.identity.module,
+                      },
                     ]
                   : [],
     "architecture/persisted-codec-fixture-catalog":
@@ -7056,14 +4382,29 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : root === "apps/mini-lilac-tui"
           ? [{ include: "src/preferences.ts" }]
           : root === "packages/tool-results"
-            ? [{ include: TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.module }]
+            ? [
+                {
+                  include: TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.module,
+                },
+                {
+                  include: BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.module,
+                },
+              ]
             : root === "apps/core"
               ? [
-                  { include: "src/conversation/thread-summary-persistence-codec.ts" },
+                  {
+                    include: "src/conversation/thread-summary-persistence-codec.ts",
+                  },
                   { include: "src/transcript/transcript-persistence-codec.ts" },
-                  { include: "src/runtime/graceful-restart-store.ts" },
-                  { include: "src/workflow/workflow-artifact-persistence-codec.ts" },
+                  { include: "src/surface/bridge/agent-run-journal/index.ts" },
+                  { include: "src/migration/frozen-graceful-restart-store.ts" },
+                  {
+                    include: "src/workflow/workflow-artifact-persistence-codec.ts",
+                  },
                   { include: "src/workflow/workflow-persistence-codec.ts" },
+                  {
+                    include: CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC.identity.module,
+                  },
                 ]
               : root === "packages/mini-lilac-runtime"
                 ? [
@@ -7073,7 +4414,11 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                     { include: "src/sqlite-todo-persistence-codec.ts" },
                   ]
                 : root === "packages/utils"
-                  ? [{ include: UTILS_CODEX_TOKENS_PERSISTED_CODEC.identity.module }]
+                  ? [
+                      {
+                        include: UTILS_CODEX_TOKENS_PERSISTED_CODEC.identity.module,
+                      },
+                    ]
                   : [],
     "architecture/sqlite-transaction-adapter-contract":
       root === "packages/utils" ? [{ include: "persistence.ts" }] : [],
@@ -7091,7 +4436,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "apps/core"
         ? [
             { include: "src/conversation/thread-store.ts" },
-            { include: "src/runtime/graceful-restart-store.ts" },
+            { include: "src/question/question-store.ts" },
+            { include: "scripts/legacy-graceful-restart-blob-migration.ts" },
+            { include: "src/surface/bridge/agent-run-journal/index.ts" },
+            { include: "src/surface/bridge/request-delivery/sqlite-store.ts" },
             { include: "src/transcript/transcript-store.ts" },
             { include: "src/workflow/durable-workflow-store.ts" },
             { include: "src/workflow/workflow-migrations.ts" },
@@ -7132,16 +4480,21 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : root === "apps/mini-lilac-tui"
           ? [TUI_BINDING_PREFERENCES_PERSISTED_CODEC]
           : root === "packages/tool-results"
-            ? [TOOL_RESULT_ARTIFACT_METADATA_CODEC]
+            ? [TOOL_RESULT_ARTIFACT_METADATA_CODEC, BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC]
             : root === "packages/utils"
               ? [UTILS_CODEX_TOKENS_PERSISTED_CODEC]
               : root === "apps/core"
                 ? [
                     ...CORE_THREAD_PERSISTED_CODECS,
                     ...CORE_TRANSCRIPT_PERSISTED_CODECS,
+                    CORE_RESOURCE_PERSISTED_CODEC,
+                    CORE_AGENT_RUN_OPENED_PERSISTED_CODEC,
+                    CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC,
+                    CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC,
                     CORE_GRACEFUL_RESTART_PERSISTED_CODEC,
                     CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC,
                     CORE_WORKFLOW_ROW_PERSISTED_CODEC,
+                    CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC,
                   ]
                 : root === "packages/mini-lilac-runtime"
                   ? [
@@ -7157,16 +4510,22 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : root === "apps/mini-lilac-tui"
           ? [TUI_BINDING_PREFERENCES_PERSISTED_CONSUMER]
           : root === "packages/tool-results"
-            ? [TOOL_RESULT_ARTIFACT_METADATA_CONSUMER]
+            ? [TOOL_RESULT_ARTIFACT_METADATA_CONSUMER, BLOB_TOOL_RESULT_ARTIFACT_METADATA_CONSUMER]
             : root === "packages/utils"
               ? [UTILS_CODEX_TOKENS_PERSISTED_CONSUMER]
               : root === "apps/core"
                 ? [
                     ...CORE_THREAD_PERSISTED_CONSUMERS,
                     ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS,
-                    CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER,
-                    CORE_GRACEFUL_RESTART_ENCODER_CONSUMER,
+                    CORE_RESOURCE_PERSISTED_CONSUMER,
+                    CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER,
+                    CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER,
+                    CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER,
+                    ...CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS,
+                    CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER,
                     CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER,
+                    CORE_LEGACY_WORKFLOW_BLOB_MIGRATION_PERSISTED_CONSUMER,
+                    CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CONSUMER,
                     ...CORE_WORKFLOW_ROW_PERSISTED_CONSUMERS,
                   ]
                 : root === "packages/mini-lilac-runtime"
@@ -7184,14 +4543,20 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "packages/utils"
         ? [
             {
-              identity: { module: "persistence.ts", exportName: "runBunSqliteTransaction" },
+              identity: {
+                module: "persistence.ts",
+                exportName: "runBunSqliteTransaction",
+              },
               databaseParameter: 0,
               operationParameter: 1,
               rollbackSentinel: {
                 module: "persistence.ts",
                 exportName: "BunSqliteRollbackSentinel",
               },
-              panicClassifier: { package: "better-result", exportName: "Panic.is" },
+              panicClassifier: {
+                package: "better-result",
+                exportName: "Panic.is",
+              },
               driverErrorClassifier: {
                 module: "persistence.ts",
                 exportName: "classifyBunSqliteDriverFailure",
@@ -7209,7 +4574,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "packages/event-bus"
         ? [
             {
-              identity: { module: "raw-bus.ts", exportName: "RawBus.subscribe" },
+              identity: {
+                module: "raw-bus.ts",
+                exportName: "RawBus.subscribe",
+              },
               messageType: {
                 package: "@stanley2058/lilac-event-bus",
                 exportName: "Message",
@@ -7237,7 +4605,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       root === "packages/event-bus"
         ? [
             {
-              identity: { module: "lilac-bus.ts", exportName: "LilacBus.subscribeTopic" },
+              identity: {
+                module: "lilac-bus.ts",
+                exportName: "LilacBus.subscribeTopic",
+              },
               handlerParameter: 2,
               handlerMessageParameter: 0,
               handlerContextParameter: 1,
@@ -7266,6 +4637,29 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : [],
     boundaryDecoders: [
+      ...(root === "apps/core"
+        ? ([
+            ...["parseStoredAdapterEvent", "parseStoredTelegramRaw"].map((exportName) => ({
+              identity: {
+                module: "src/surface/telegram/telegram-ingress.ts",
+                exportName,
+              },
+              category: "persistence" as const,
+            })),
+            ...(
+              [
+                ["src/surface/telegram/telegram-raw.ts", "normalizeTelegramReplyReference"],
+                ["src/surface/telegram/telegram-error-projection.ts", "projectTelegramError"],
+                ["src/surface/telegram/telegram-error-projection.ts", "projectTelegramBotFailure"],
+                ["src/surface/telegram/telegram-request-router-composition.ts", "telegramFlags"],
+                ["src/surface/telegram/telegram-inbound-media.ts", "telegramInboundMediaFromRaw"],
+              ] as const
+            ).map(([module, exportName]) => ({
+              identity: { module, exportName },
+              category: "projection" as const,
+            })),
+          ] satisfies readonly BoundaryDecoder[])
+        : []),
       ...(root === "packages/plugin-runtime"
         ? ([
             ...[
@@ -7330,9 +4724,23 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             {
               identity: {
                 module: "core-primary-lineage.ts",
-                exportName: "decodeCorePrimaryLineageV1",
+                exportName: "decodeCorePrimaryLineageV2",
               },
               category: "projection" as const,
+            },
+            {
+              identity: {
+                module: "core-primary-lineage.ts",
+                exportName: "normalizeResolvedCanonicalMessages",
+              },
+              category: "projection" as const,
+            },
+            {
+              identity: {
+                module: "lilac-spec.ts",
+                exportName: "findManagedInlineData",
+              },
+              category: "wire" as const,
             },
           ] satisfies readonly BoundaryDecoder[])
         : []),
@@ -7342,12 +4750,19 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               identity: TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity,
               category: "persistence",
             },
+            {
+              identity: BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity,
+              category: "persistence",
+            },
           ] satisfies readonly BoundaryDecoder[])
         : []),
       ...(root === "packages/agent"
         ? ([
             {
-              identity: { module: "ai-sdk-pi-agent.ts", exportName: "repairLegacyBatchInput" },
+              identity: {
+                module: "ai-sdk-pi-agent.ts",
+                exportName: "repairLegacyBatchInput",
+              },
               category: "request",
             },
           ] satisfies readonly BoundaryDecoder[])
@@ -7388,26 +4803,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : []),
       ...(root === "apps/core"
         ? ([
-            ...["parseStoredAdapterEvent", "parseStoredTelegramRaw"].map((exportName) => ({
-              identity: {
-                module: "src/surface/telegram/telegram-ingress.ts",
-                exportName,
-              },
-              category: "persistence" as const,
-            })),
-            ...(
-              [
-                ["src/surface/telegram/telegram-raw.ts", "normalizeTelegramReplyReference"],
-                ["src/surface/telegram/telegram-error-projection.ts", "projectTelegramError"],
-                ["src/surface/telegram/telegram-error-projection.ts", "projectTelegramBotFailure"],
-                ["src/surface/telegram/telegram-request-router-composition.ts", "telegramFlags"],
-                ["src/surface/telegram/telegram-inbound-media.ts", "telegramInboundMediaFromRaw"],
-                ["src/tool-server/request-message-cache.ts", "estimateCachedMessageBytes"],
-              ] as const
-            ).map(([module, exportName]) => ({
-              identity: { module, exportName },
-              category: "projection" as const,
-            })),
             ...[
               "decodeConversationThreadStringArray",
               "decodeConversationThreadImportance",
@@ -7432,6 +4827,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "decodeRecentAgentWriteRow",
               "decodeDiscoveryRecordRow",
               "decodeSurfaceMessageLinkRow",
+              "normalizeResourceRecordV1",
+              "normalizeResourceCacheV1",
+              "normalizeResourceDetectedMediaType",
+              "decodeResourceRecordRow",
             ].map((exportName) => ({
               identity: {
                 module: "src/transcript/transcript-persistence-codec.ts",
@@ -7476,13 +4875,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               category: "persistence",
             },
             {
-              identity: {
-                module: "src/runtime/graceful-restart-store.ts",
-                exportName: "decodeOpaqueSuperJsonValue",
-              },
-              category: "persistence",
-            },
-            {
               identity: CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC.identity,
               category: "persistence",
             },
@@ -7499,6 +4891,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "decodeWorkflowRequestTerminalReceiptRow",
               "decodeWorkflowActionOutboxRow",
               "decodeWorkflowLegacyAuditRow",
+              "decodeWorkflowArtifactRow",
               "decodeWorkflowPersistenceRow",
             ].map((exportName) => ({
               identity: {
@@ -7509,13 +4902,16 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             })),
             {
               identity: {
-                module: "src/workflow/workflow-artifact-store.ts",
-                exportName: "projectFilesystemFailure",
+                module: "src/workflow/workflow-migrations.ts",
+                exportName: "decodeStagedWorkflowArtifactReference",
               },
               category: "persistence",
             },
             {
-              identity: { module: "src/mcp/config-file.ts", exportName: "isMissingFileError" },
+              identity: {
+                module: "src/mcp/config-file.ts",
+                exportName: "isMissingFileError",
+              },
               category: "projection",
             },
             {
@@ -7526,7 +4922,17 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               category: "projection",
             },
             {
-              identity: { module: "src/mcp/value-source.ts", exportName: "decodeJsonValue" },
+              identity: {
+                module: "src/mcp/value-source.ts",
+                exportName: "decodeJsonValue",
+              },
+              category: "projection",
+            },
+            {
+              identity: {
+                module: "src/mcp/registry.ts",
+                exportName: "decodeMcpServerInfo",
+              },
               category: "projection",
             },
             {
@@ -7587,6 +4993,42 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
           ] satisfies readonly BoundaryDecoder[])
         : []),
+      ...(root === "packages/blob-storage"
+        ? ([
+            {
+              identity: {
+                module: "src/local-backend.ts",
+                exportName: "classifyLocalFileCause",
+              },
+              category: "projection",
+            },
+            {
+              identity: {
+                module: "src/backend.ts",
+                exportName: "classifyAdapterErrorDetails",
+              },
+              category: "projection",
+            },
+            {
+              identity: {
+                module: "src/local-backend.ts",
+                exportName: "normalizeNodeFileReadableStream",
+              },
+              category: "projection",
+            },
+            ...[
+              "decodeReservation",
+              "referenceIssues",
+              "handleIssues",
+              "SupervisedBlobStore.startUpload",
+              "SupervisedBlobStore.open",
+              "SupervisedBlobStore.delete",
+            ].map((exportName) => ({
+              identity: { module: "src/store.ts", exportName },
+              category: "persistence" as const,
+            })),
+          ] satisfies readonly BoundaryDecoder[])
+        : []),
       ...(INTEGRATED_BOUNDARY_DECODERS.get(root) ?? []),
     ],
     openProtocolAdapters: INTEGRATED_OPEN_PROTOCOL_ADAPTERS.get(root) ?? [],
@@ -7627,36 +5069,40 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       ...(root === "apps/core"
         ? [
             {
-              identity: { module: "src/mcp/config-file.ts", exportName: "errorMessage" },
-              reason: "Formats an opaque external exception without inspecting domain structure.",
-            },
-            {
-              identity: { module: "src/mcp/value-source.ts", exportName: "errorMessage" },
-              reason: "Formats an opaque external exception without inspecting domain structure.",
-            },
-            {
               identity: {
-                module: "src/runtime/graceful-restart-store.ts",
-                exportName: "decodeOpaqueSuperJsonValue",
+                module: "src/mcp/config-file.ts",
+                exportName: "errorMessage",
               },
-              reason:
-                "Carries an opaque historical restart value through exact SuperJSON capability validation without inspecting domain content.",
+              reason: "Formats an opaque external exception without inspecting domain structure.",
             },
             {
               identity: {
-                module: "src/runtime/graceful-restart-store.ts",
+                module: "src/mcp/value-source.ts",
+                exportName: "errorMessage",
+              },
+              reason: "Formats an opaque external exception without inspecting domain structure.",
+            },
+            {
+              identity: {
+                module: "src/migration/frozen-graceful-restart-store.ts",
                 exportName: "isOpaqueSuperJsonValue",
               },
               reason:
                 "Checks only whether an opaque restart value has a SuperJSON-compatible outer JavaScript type before capability validation.",
             },
             {
-              identity: { module: "src/mcp/error-format.ts", exportName: "safeMcpErrorText" },
+              identity: {
+                module: "src/mcp/error-format.ts",
+                exportName: "safeMcpErrorText",
+              },
               reason:
                 "Redacts and bounds an opaque external exception for the compatibility response.",
             },
             {
-              identity: { module: "src/mcp/error-format.ts", exportName: "opaqueErrorMessage" },
+              identity: {
+                module: "src/mcp/error-format.ts",
+                exportName: "opaqueErrorMessage",
+              },
               reason: "Formats an opaque external exception without inspecting domain structure.",
             },
             ...[
@@ -7702,7 +5148,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       ...(root === "apps/core"
         ? [
             {
-              identity: { module: "src/shared/sqlite.ts", exportName: "isSqliteBusyError" },
+              identity: {
+                module: "src/shared/sqlite.ts",
+                exportName: "isSqliteBusyError",
+              },
               reason: "Checks only the SQLite busy/locked error-message capability.",
             },
             {
@@ -7727,724 +5176,60 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               },
               reason: "Checks only the exact better-result Panic brand in the isolated bundle.",
             },
+            ...["requiredString", "requiredTimestamp"].map((exportName) => ({
+              identity: {
+                module: "src/surface/bridge/request-delivery/sqlite-store.ts",
+                exportName,
+              },
+              reason:
+                "Checks one primitive SQLite field capability before constructing a typed request-delivery record.",
+            })),
+            {
+              identity: {
+                module: "scripts/legacy-transcript-blob-migration.ts",
+                exportName: "isDecodeFailure",
+              },
+              reason:
+                "Checks the exact migration-owned decode-failure discriminant before legacy blob inspection continues.",
+            },
+            {
+              identity: {
+                module: "scripts/legacy-graceful-restart-blob-migration.ts",
+                exportName: "isFormerOpaqueSuperJsonValue",
+              },
+              reason:
+                "Checks only whether a former restart value has a SuperJSON-compatible outer JavaScript type before migration validation.",
+            },
           ]
         : []),
       ...(INTEGRATED_CAPABILITY_PREDICATES.get(root) ?? []),
     ],
     exceptionAdapters: [
-      ...(root === "packages/event-bus"
-        ? ([
-            {
-              identity: {
-                module: "core-primary-lineage.ts",
-                exportName: "decodeCorePrimaryLineageV1",
-              },
-              category: "defect-supervisor",
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic",
-              reason:
-                "Maps ordinary lineage projection failures to an owned Result while preserving Panic at the exact boundary.",
-            },
-            {
-              identity: {
-                module: "redis-event-dead-letter.ts",
-                exportName: "RedisEventDeadLetter.constructor",
-              },
-              category: "compatibility",
-              externalApi: { package: "global", exportName: "constructor" },
-              direction: "signal-host",
-              reason:
-                "Converts typed Redis dead-letter configuration validation failure to the constructor host contract.",
-            },
-            ...[
-              [
-                "event-dead-letter.ts",
-                "captureDeadLetterAcceptance.catch",
-                "Preserves Panic while mapping a rejected dead-letter acceptance to its owned failure.",
-              ],
-              [
-                "lilac-bus.ts",
-                "checkedHandlerResult",
-                "Raises Panic when a handler returns a forged Result or embeds Panic as an expected error.",
-              ],
-              [
-                "lilac-bus.ts",
-                "createLilacBus.bus.fetchTopic",
-                "Preserves Panic while mapping an immediate raw fetch rejection to EventFetchTransportFailed.",
-              ],
-              [
-                "lilac-codecs.ts",
-                "decodeSchema",
-                "Preserves Panic while mapping schema decoder exceptions to contract issues.",
-              ],
-              [
-                "redis-streams-bus.ts",
-                "RedisStreamsBus.subscribe",
-                "Preserves Panic across subscription startup and delivery supervision.",
-              ],
-              [
-                "redis-streams-bus.ts",
-                "RedisStreamsBus.subscribe.running.<callback>",
-                "Preserves the running-loop defect while lease cleanup settles before rethrowing it unchanged.",
-              ],
-              [
-                "redis-streams-bus.ts",
-                "RedisStreamsBus.subscribe.stop",
-                "Rethrows the original delivery defect and preserves Panic from either cleanup operation.",
-              ],
-              [
-                "redis-streams-bus.ts",
-                "RedisStreamsBus.subscribe.stop.attempt.<callback>",
-                "Preserves the original delivery-loop defect and Panic identity at the exact stop-attempt boundary.",
-              ],
-            ].map(([module, exportName, reason]) => ({
-              identity: { module, exportName },
-              category: "defect-supervisor" as const,
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic" as const,
-              reason,
-            })),
-            ...[
-              [
-                "redis-streams-bus.ts",
-                "decodeSuperJson",
-                "superjson",
-                "SuperJSON.parse",
-                "Maps malformed Redis payload serialization to bounded wire evidence and a decode issue.",
-              ],
-              [
-                "redis-streams-bus.ts",
-                "RedisStreamsBus.subscribe.reportFatal",
-                "external",
-                "EventDeliveryFatalReporter.report",
-                "Contains a rejected fatal reporter at the logging-only defect reporting boundary.",
-              ],
-              [
-                "redis-streams-bus.ts",
-                "RedisStreamsBus.subscribe.cleanupGroup.attempt.<callback>",
-                "ioredis",
-                "Redis.xgroup or Redis.xpending",
-                "Captures consumer-group cleanup failure for the typed stop Result.",
-              ],
-              [
-                "redis-streams-bus.ts",
-                "captureRedisPendingSummary",
-                "ioredis",
-                "Redis.xpending",
-                "Maps a rejected payload-free pending-summary inspection to an owned observability failure.",
-              ],
-            ].map(([module, exportName, packageName, externalName, reason]) => ({
-              identity: { module, exportName },
-              category: "external-to-result" as const,
-              externalApi: { package: packageName, exportName: externalName },
-              direction: "capture-external" as const,
-              reason,
-            })),
-            ...[
-              "encryptRedisEventDeadLetterRecoveryValue",
-              "decryptRedisEventDeadLetterRecoveryValue",
-            ].flatMap((exportName) => [
-              {
-                identity: { module: "redis-event-dead-letter.ts", exportName },
-                category: "external-to-result" as const,
-                externalApi: { package: "node:crypto", exportName: "AES-256-GCM" },
-                direction: "capture-external" as const,
-                reason:
-                  "Maps an immediate authenticated-encryption operation failure to an owned recovery Result error.",
-              },
-              {
-                identity: { module: "redis-event-dead-letter.ts", exportName },
-                category: "defect-supervisor" as const,
-                externalApi: { package: "better-result", exportName: "Panic.is" },
-                direction: "observe-panic" as const,
-                reason:
-                  "Preserves Panic while capturing an immediate authenticated-encryption failure.",
-              },
-            ]),
-            ...[
-              ["decodeRedisEventDeadLetterCiphertextEnvelope", "global", "JSON.parse"],
-              ["decryptRedisEventDeadLetterRecord", "superjson", "SuperJSON.parse"],
-            ].map(([exportName, packageName, externalName]) => ({
-              identity: { module: "redis-event-dead-letter.ts", exportName },
-              category: "external-to-result" as const,
-              externalApi: { package: packageName, exportName: externalName },
-              direction: "capture-external" as const,
-              reason:
-                "Maps malformed persisted dead-letter serialization to an owned recovery Result error.",
-            })),
-          ] satisfies readonly ExceptionAdapter[])
-        : []),
+      ...(REVIEWED_EXCEPTION_ADAPTERS[root] ?? []),
       ...(root === "apps/core"
         ? ([
-            ...[
-              [
-                "src/runtime/graceful-restart-store.ts",
-                "parsePersistedPayload",
-                "superjson",
-                "SuperJSON.parse",
-                "Maps malformed restart snapshots to an owned persistence Result error.",
-              ],
-              [
-                "src/runtime/graceful-restart-store.ts",
-                "encodeGracefulRestartSnapshot",
-                "superjson",
-                "SuperJSON.stringify",
-                "Maps restart snapshot serialization failures to an owned persistence Result error.",
-              ],
-              [
-                "src/runtime/graceful-restart-store.ts",
-                "decodeOpaqueSuperJsonValue",
-                "superjson",
-                "SuperJSON round trip",
-                "Rejects unsupported opaque restart values through a content-blind exact round trip.",
-              ],
-              [
-                "src/transcript/transcript-store.ts",
-                "SqliteTranscriptStore.readFromSqlite",
-                "bun:sqlite",
-                "SqliteTranscriptStore read callback",
-                "Maps immediate SQLite read failures to an owned transcript store Result error.",
-              ],
-            ].map(([module, exportName, packageName, externalName, reason]) => ({
-              identity: { module, exportName },
-              category: "external-to-result" as const,
-              externalApi: { package: packageName, exportName: externalName },
-              direction: "capture-external" as const,
-              reason,
-            })),
-            ...[
-              ["src/runtime/graceful-restart-store.ts", "parsePersistedPayload"],
-              ["src/runtime/graceful-restart-store.ts", "encodeGracefulRestartSnapshot"],
-              ["src/runtime/graceful-restart-store.ts", "decodeOpaqueSuperJsonValue"],
-              ["src/transcript/transcript-store.ts", "SqliteTranscriptStore.readFromSqlite"],
-            ].map(([module, exportName]) => ({
-              identity: { module, exportName },
-              category: "defect-supervisor" as const,
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic" as const,
-              reason: "Preserves Panic identity at an immediate persistence adapter boundary.",
-            })),
             {
               identity: {
-                module: "src/workflow/workflow-artifact-persistence-codec.ts",
-                exportName: "decodeWorkflowValueArtifact",
-              },
-              category: "external-to-result",
-              externalApi: { package: "global", exportName: "JSON.parse" },
-              direction: "capture-external",
-              reason:
-                "Maps malformed persisted workflow artifact JSON to an owned persistence Result error.",
-            },
-            {
-              identity: {
-                module: "src/workflow/workflow-artifact-store.ts",
-                exportName: "lstatOrMissing",
-              },
-              category: "external-to-result",
-              externalApi: { package: "node:fs/promises", exportName: "lstat" },
-              direction: "capture-external",
-              reason: "Separates an absent workflow artifact from other filesystem failures.",
-            },
-            {
-              identity: {
-                module: "src/workflow/workflow-artifact-store.ts",
-                exportName: "artifactRoot.catch",
-              },
-              category: "external-to-result",
-              externalApi: { package: "global", exportName: "language exception capture" },
-              direction: "capture-external",
-              reason: "Separates an absent workflow artifact root from other filesystem failures.",
-            },
-            {
-              identity: {
-                module: "src/workflow/workflow-artifact-store.ts",
-                exportName: "rethrowWorkflowArtifactPanic",
-              },
-              category: "defect-supervisor",
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic",
-              reason: "Preserves Panic identity while workflow artifact I/O is mapped to Results.",
-            },
-            {
-              identity: {
-                module: "src/conversation/thread-summary-persistence-codec.ts",
-                exportName: "parseJson",
-              },
-              category: "external-to-result",
-              externalApi: { package: "global", exportName: "JSON.parse" },
-              direction: "capture-external",
-              reason: "Maps malformed persisted summary JSON to an owned persistence Result error.",
-            },
-            {
-              identity: {
-                module: "src/conversation/thread-service.ts",
-                exportName:
-                  "createConversationThreadToolService.resolvePersistenceOperation.err.<callback>",
-              },
-              category: "result-to-framework",
-              externalApi: {
-                package: "@stanley2058/lilac-core",
-                exportName: "ConversationThreadToolService",
-              },
-              direction: "signal-host",
-              reason:
-                "Signals a failed persisted-summary Result through the tool host exception contract.",
-            },
-            {
-              identity: {
-                module: "src/runtime/core-dead-letter-key.ts",
-                exportName: "loadOrCreateCoreDeadLetterKey",
-              },
-              category: "external-to-result",
-              externalApi: { package: "node:fs", exportName: "dead-letter key lifecycle" },
-              direction: "capture-external",
-              reason:
-                "Maps atomic persistent dead-letter key filesystem failures to owned typed Results.",
-            },
-            {
-              identity: {
-                module: "src/runtime/core-dead-letter-key.ts",
-                exportName: "loadOrCreateCoreDeadLetterKey",
-              },
-              category: "defect-supervisor",
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic",
-              reason:
-                "Preserves the original key lifecycle Panic while completing temporary-file cleanup.",
-            },
-            {
-              identity: {
-                module: "src/runtime/core-dead-letter-key.ts",
-                exportName: "readCoreDeadLetterKey",
-              },
-              category: "external-to-result",
-              externalApi: { package: "node:fs", exportName: "key file handle" },
-              direction: "capture-external",
-              reason:
-                "Contains file-handle read and close failures for the outer typed key lifecycle adapter.",
-            },
-            {
-              identity: {
-                module: "src/runtime/core-dead-letter-key.ts",
-                exportName: "readCoreDeadLetterKey",
-              },
-              category: "defect-supervisor",
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic",
-              reason: "Preserves the original key read Panic when file-handle cleanup also fails.",
-            },
-            ...["captureFileOperation", "readMcpConfigFile"].flatMap((exportName) => [
-              {
-                identity: { module: "src/mcp/config-file.ts", exportName },
-                category: "external-to-result" as const,
-                externalApi: { package: "node:fs/promises", exportName: "filesystem operation" },
-                direction: "capture-external" as const,
-                reason:
-                  "Maps an immediate MCP configuration filesystem failure to an owned Result error.",
-              },
-              {
-                identity: { module: "src/mcp/config-file.ts", exportName },
-                category: "defect-supervisor" as const,
-                externalApi: { package: "better-result", exportName: "Panic.is" },
-                direction: "observe-panic" as const,
-                reason:
-                  "Preserves exact Panic identity while mapping an immediate MCP configuration filesystem failure.",
-              },
-            ]),
-            {
-              identity: {
-                module: "src/mcp/config-file.ts",
-                exportName: "superviseMcpConfigFilePanicCleanup",
-              },
-              category: "defect-supervisor",
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic",
-              reason:
-                "Preserves the exact MCP configuration operation Panic while completing required temporary-file cleanup.",
-            },
-            {
-              identity: { module: "src/mcp/config-file.ts", exportName: "serializeConfig.catch" },
-              category: "defect-supervisor" as const,
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic" as const,
-              reason: "Preserves Panic while mapping the immediate serialization exception.",
-            },
-            {
-              identity: { module: "src/mcp/value-source.ts", exportName: "captureTextFileRead" },
-              category: "external-to-result" as const,
-              externalApi: { package: "filesystem", exportName: "text file read" },
-              direction: "capture-external" as const,
-              reason: "Maps an immediate MCP value file read failure to an owned Result error.",
-            },
-            {
-              identity: { module: "src/mcp/value-source.ts", exportName: "captureTextFileRead" },
-              category: "defect-supervisor" as const,
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic" as const,
-              reason:
-                "Preserves exact Panic identity while mapping an MCP value file read failure.",
-            },
-            {
-              identity: { module: "src/mcp/value-source.ts", exportName: "decodeJsonValue.catch" },
-              category: "defect-supervisor" as const,
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic" as const,
-              reason: "Preserves Panic while mapping the immediate JSON exception.",
-            },
-            ...["captureRunEvent", "captureChildActivity"].map((exportName) => ({
-              identity: {
-                module: "src/workflow/workflow-live-parent-bridge.ts",
-                exportName,
+                module: "src/surface/telegram/telegram-error-projection.ts",
+                exportName: "projectTelegramError",
               },
               category: "defect-supervisor" as const,
               externalApi: { package: "better-result", exportName: "Panic.is" },
               direction: "observe-panic" as const,
-              reason:
-                "Preserves Panic while mapping an immediate live-parent delivery failure to an owned Result error.",
-            })),
-            ...[
-              [
-                "WorkflowWaitResolver.captureWorkflowWaitResolverConsumerGroupRetirement",
-                "LilacBus.retireTopicConsumerGroup",
-              ],
-            ].flatMap(([exportName, externalExportName]) => [
-              {
-                identity: {
-                  module: "src/workflow/workflow-wait-resolver.ts",
-                  exportName,
-                },
-                category: "defect-supervisor" as const,
-                externalApi: { package: "better-result", exportName: "Panic.is" },
-                direction: "observe-panic" as const,
-                reason: "Preserves Panic identity at a workflow wait resolver bus boundary.",
-              },
-              {
-                identity: {
-                  module: "src/workflow/workflow-wait-resolver.ts",
-                  exportName,
-                },
-                category: "external-to-result" as const,
-                externalApi: {
-                  package: "@stanley2058/lilac-event-bus",
-                  exportName: externalExportName,
-                },
-                direction: "capture-external" as const,
-                reason: "Maps an event-bus rejection to an owned wait resolver Result error.",
-              },
-            ]),
-            {
-              identity: {
-                module: "src/workflow/workflow-engine.ts",
-                exportName: "runWorkflowTimerTick",
-              },
-              category: "defect-supervisor",
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic",
-              reason:
-                "Preserves Panic while mapping a supervised workflow timer rejection to an owned Result error.",
-            },
-            ...[
-              [
-                "captureWorkflowTerminalReceiptAdoption",
-                "@stanley2058/lilac-core",
-                "WorkflowEngine.adoptTerminalReceipt",
-                "terminal receipt adoption",
-              ],
-            ].flatMap(([exportName, packageName, externalExportName, operation]) => [
-              {
-                identity: { module: "src/workflow/workflow-engine.ts", exportName },
-                category: "defect-supervisor" as const,
-                externalApi: { package: "better-result", exportName: "Panic.is" },
-                direction: "observe-panic" as const,
-                reason: `Preserves Panic while capturing workflow ${operation}.`,
-              },
-              {
-                identity: { module: "src/workflow/workflow-engine.ts", exportName },
-                category: "external-to-result" as const,
-                externalApi: { package: packageName, exportName: externalExportName },
-                direction: "capture-external" as const,
-                reason: `Maps workflow ${operation} rejection to an owned Result error.`,
-              },
-            ]),
-            ...["WorkflowLiveParentBridge.registerParent"].map((exportName) => ({
-              identity: {
-                module: "src/workflow/workflow-live-parent-bridge.ts",
-                exportName,
-              },
-              category: "result-to-framework" as const,
-              externalApi: {
-                package: "@stanley2058/lilac-core",
-                exportName: "live-parent lifecycle host",
-              },
-              direction: "signal-host" as const,
-              reason:
-                "Adapts live-parent invariant or publication failure to the established lifecycle rejection contract.",
-            })),
-            {
-              identity: { module: "src/mcp/error-format.ts", exportName: "rethrowPanic" },
-              category: "defect-supervisor",
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic",
-              reason:
-                "Narrow helper propagates Panic without exempting its callers' ordinary throws.",
-            },
-            {
-              identity: { module: "src/mcp/error-format.ts", exportName: "opaqueErrorMessage" },
-              category: "compatibility",
-              externalApi: { package: "global", exportName: "Error.message" },
-              direction: "capture-external",
-              reason:
-                "Contains hostile Error.message getters while producing bounded compatibility text.",
-            },
-            {
-              identity: {
-                module: "src/mcp/oauth-provider.ts",
-                exportName: "McpOAuthProvider.clientInformationForSdkAttempt.err.<callback>",
-              },
-              category: "result-to-framework",
-              externalApi: {
-                package: "@ai-sdk/mcp",
-                exportName: "OAuthClientProvider.clientInformation",
-              },
-              direction: "signal-host",
-              reason:
-                "OAuthClientProvider requires credential failure through its rejection channel.",
-            },
-            ...[
-              [
-                "src/surface/telegram/telegram-error-projection.ts",
-                "projectTelegramError",
-                "Preserves exact Panic identity while projecting ordinary Telegram failures.",
-              ],
-              [
-                "src/surface/telegram/telegram-operation-result.ts",
-                "captureTelegramOperation",
-                "Preserves exact Panic identity while mapping ordinary Telegram operation failures to Results.",
-              ],
-              [
-                "src/surface/telegram/telegram-request-router.ts",
-                "startTelegramRequestRouter.subscribeTopic.<callback@3>",
-                "Preserves Panic identity at the event-bus consumer boundary.",
-              ],
-            ].map(([module, exportName, reason]) => ({
-              identity: { module, exportName },
-              category: "defect-supervisor" as const,
-              externalApi: { package: "better-result", exportName: "Panic.is" },
-              direction: "observe-panic" as const,
-              reason,
-            })),
-            ...[
-              [
-                "src/surface/telegram/telegram-adapter.ts",
-                "TelegramAdapter.connect.catch.<callback@1>",
-                "grammy",
-                "Bot.catch",
-                "Observes grammY update-handler failures at its required global error hook.",
-              ],
-              [
-                "src/surface/telegram/telegram-adapter.ts",
-                "TelegramAdapter.editMsg.ok.<callback>.captureTelegramOperation.<callback@2>",
-                "grammy",
-                "Api.editMessageText",
-                "Maps Telegram edit rejection and benign not-modified responses through the owned operation Result.",
-              ],
-              [
-                "src/surface/telegram/telegram-operation-result.ts",
-                "captureTelegramOperation",
-                "global",
-                "language exception capture",
-                "Maps an immediate Telegram API rejection to an owned SurfaceOperationResult.",
-              ],
-              [
-                "src/surface/telegram/output/telegram-output-stream.ts",
-                "TelegramOutputStream.withFallbacks",
-                "global",
-                "language exception capture",
-                "Captures Telegram API delivery rejection before applying rate-limit and entity fallbacks.",
-              ],
-              [
-                "src/surface/telegram/telegram-request-router.ts",
-                "startTelegramRequestRouter.subscribeTopic.<callback@3>",
-                "@stanley2058/lilac-event-bus",
-                "LilacBus.subscribeTopic handler",
-                "Maps request-routing callback failures to an owned event-delivery Result.",
-              ],
-            ].map(([module, exportName, packageName, externalName, reason]) => ({
-              identity: { module, exportName },
-              category: "external-to-result" as const,
-              externalApi: { package: packageName, exportName: externalName },
-              direction: "capture-external" as const,
-              reason,
-            })),
-            ...[
-              [
-                "src/surface/telegram/output/telegram-output-stream.ts",
-                "TelegramOutputStream.finishOutput",
-                "TelegramOutputStream finish Promise",
-                "Signals the impossible empty-finish Panic to the output-stream supervisor.",
-              ],
-              [
-                "src/surface/telegram/output/telegram-output-stream.ts",
-                "TelegramOutputStream.withFallbacks",
-                "TelegramOutputStream delivery promise",
-                "Signals the terminal retry/fallback failure through the established stream rejection contract.",
-              ],
-              [
-                "src/surface/telegram/telegram-adapter.ts",
-                "TelegramAdapter.whenReady",
-                "SurfaceAdapter.whenReady",
-                "Signals supervised polling failure through the established readiness Promise contract.",
-              ],
-              [
-                "src/surface/telegram/telegram-adapter.ts",
-                "TelegramAdapter.getSelf",
-                "SurfaceAdapter.getSelf",
-                "Signals adapter unavailability through the established SurfaceAdapter Promise contract.",
-              ],
-              [
-                "src/surface/telegram/telegram-adapter.ts",
-                "TelegramAdapter.editMsg.ok.<callback>.captureTelegramOperation.<callback@2>",
-                "captureTelegramOperation effect",
-                "Re-signals an unclassified edit failure to the exact operation Result adapter.",
-              ],
-              [
-                "src/surface/telegram/telegram-adapter.ts",
-                "TelegramAdapter.mustBot",
-                "captureTelegramOperation effect",
-                "Signals unavailable grammY state to the exact operation Result adapter.",
-              ],
-              [
-                "src/surface/telegram/telegram-adapter.ts",
-                "TelegramAdapter.mustStore",
-                "captureTelegramOperation effect",
-                "Signals unavailable Telegram persistence state to the exact operation Result adapter.",
-              ],
-              [
-                "src/surface/telegram/telegram-operation-result.ts",
-                "captureTelegramOperation",
-                "SurfaceAdapter operation Promise",
-                "Preserves rejection for unclassified external defects outside the owned surface-error union.",
-              ],
-              [
-                "src/surface/telegram/telegram-ids.ts",
-                "parseTelegramSessionId",
-                "strict Telegram reference parser",
-                "Preserves the strict parser rejection contract for already-branded Telegram references.",
-              ],
-              [
-                "src/surface/telegram/telegram-ids.ts",
-                "parseTelegramMessageId",
-                "strict Telegram reference parser",
-                "Preserves the strict parser rejection contract for already-branded Telegram message references.",
-              ],
-              [
-                "src/surface/telegram/telegram-request-router-composition.ts",
-                "readMessage.err",
-                "Telegram request composition",
-                "Signals a failed adapter read through the established request-composition Promise contract.",
-              ],
-              [
-                "src/surface/telegram/telegram-request-router.ts",
-                "configFromOverride.err",
-                "startTelegramRequestRouter",
-                "Signals invalid injected configuration through the router startup Promise contract.",
-              ],
-              [
-                "src/surface/telegram/telegram-request-router.ts",
-                "startTelegramRequestRouter.publishEvent",
-                "Telegram request-router consumer supervisor",
-                "Signals the Telegram-adapter platform invariant as a Panic.",
-              ],
-              [
-                "src/surface/telegram/telegram-request-router.ts",
-                "startTelegramRequestRouter.err",
-                "startTelegramRequestRouter",
-                "Signals subscription startup failure through the router startup Promise contract.",
-              ],
-              [
-                "src/surface/telegram/telegram-request-router.ts",
-                "startTelegramRequestRouter.ok.stop.err",
-                "TelegramRequestRouter.stop",
-                "Signals subscription shutdown failure through the router stop Promise contract.",
-              ],
-              [
-                "src/workflow/workflow-trigger-scheduler.ts",
-                "WorkflowTriggerScheduler.fire",
-                "WorkflowTriggerScheduler tick supervisor",
-                "Signals a lost trigger-claim ownership invariant to the scheduler supervisor.",
-              ],
-            ].map(([module, exportName, externalName, reason]) => ({
-              identity: { module, exportName },
-              category: "result-to-framework" as const,
-              externalApi: { package: "@stanley2058/lilac-core", exportName: externalName },
-              direction: "signal-host" as const,
-              reason,
-            })),
-          ] satisfies readonly ExceptionAdapter[])
-        : []),
-      ...(root === "packages/utils"
-        ? ([
-            {
-              identity: {
-                module: "persistence.ts",
-                exportName: "classifyBunSqliteError",
-              },
-              category: "compatibility",
-              externalApi: { package: "bun:sqlite", exportName: "SQLiteError" },
-              direction: "capture-external",
-              reason:
-                "Contains hostile SQLiteError brand and field inspection while returning only a bounded driver code.",
-            },
-            {
-              identity: {
-                module: "core-config.ts",
-                exportName: "adaptTelegramTokenResultToHost",
-              },
-              category: "result-to-framework",
-              externalApi: {
-                package: "@stanley2058/lilac-utils",
-                exportName: "resolveTelegramToken",
-              },
-              direction: "signal-host",
-              reason:
-                "Adapts a missing Telegram token Result to the established synchronous configuration host contract.",
+              reason: "Preserves exact Panic identity while projecting ordinary Telegram failures.",
             },
           ] satisfies readonly ExceptionAdapter[])
         : []),
-      ...(root === "apps/core" ? CORE_TOOL_SERVER_EXCEPTION_ADAPTERS : []),
-      ...(root === "apps/core" ? CORE_PARTITION_8_EXCEPTION_ADAPTERS : []),
-      ...(root === "apps/core" ? CORE_REVIEWED_PANIC_ADAPTERS : []),
-      ...(root === "apps/core" ? CORE_FATAL_SIGNAL_ADAPTERS : []),
-      ...(root === "apps/core" ? CORE_ADAPTER_EVENT_EXCEPTION_ADAPTERS : []),
-      ...(root === "packages/plugin-runtime"
-        ? ([
-            ...[
-              ["adaptToolInputResultToServerToolHost", "parseToolInput"],
-              ["adaptToolInputResultToZodHost", "parseToolInputPreservingZodError"],
-            ].map(([exportName, externalExportName]) => ({
-              identity: { module: "validation-error-message.ts", exportName },
-              category: "result-to-framework" as const,
-              externalApi: {
-                package: "@stanley2058/lilac-plugin-runtime",
-                exportName: externalExportName,
-              },
-              direction: "signal-host" as const,
-              reason: "Preserves the explicit compatibility parser's rejecting host contract.",
-            })),
-            {
-              identity: { module: "zod-cli.ts", exportName: "adaptZodCliResultToToolHost" },
-              category: "result-to-framework",
-              externalApi: {
-                package: "@stanley2058/lilac-plugin-runtime",
-                exportName: "ServerTool.list CLI projection",
-              },
-              direction: "signal-host",
-              reason: "Signals invalid internal CLI projection through the list host contract.",
-            },
-          ] satisfies readonly ExceptionAdapter[])
-        : []),
-      ...(root === "packages/mini-lilac-runtime" ? MINI_WORKSPACE_HISTORY_EXCEPTION_ADAPTERS : []),
-      ...preciseExceptionAdapters(PRECISE_EXCEPTION_IDENTITIES[root] ?? []),
+      ...(PRECISE_EXCEPTION_IDENTITIES[root] ?? []).map(([module, exportName]) => ({
+        identity: { module, exportName },
+        category: "compatibility" as const,
+        externalApi: {
+          package: "global",
+          exportName: "language host failure signal",
+        },
+        direction: "signal-host" as const,
+        reason: "Signals an owned failure through this exact callable's host contract.",
+      })),
     ],
     structuredLoggers:
       root === "apps/core"
@@ -8485,7 +5270,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "countGrepResult",
               "runCase",
               "runBenchmark",
-            ].map((exportName) => ({ module: "scripts/bench-fs-search.ts", exportName })),
+            ].map((exportName) => ({
+              module: "scripts/bench-fs-search.ts",
+              exportName,
+            })),
             ...[
               "parseRelativeDurationMs",
               "parseEpochMs",
@@ -8511,10 +5299,16 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               exportName: "decodeToolServerHeaders",
             },
             ...["resolveToolPathForRequestContextResult", "decodeDataUrlResult"].map(
-              (exportName) => ({ module: "src/shared/attachment-utils.ts", exportName }),
+              (exportName) => ({
+                module: "src/shared/attachment-utils.ts",
+                exportName,
+              }),
             ),
             ...["readConfiguredSshHostsResult", "requireConfiguredSshHostResult"].map(
-              (exportName) => ({ module: "src/ssh/ssh-config.ts", exportName }),
+              (exportName) => ({
+                module: "src/ssh/ssh-config.ts",
+                exportName,
+              }),
             ),
             {
               module: "src/tool-server/tools/programmatic-workflow.ts",
@@ -8556,7 +5350,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               exportName: "decodeGithubApiErrorResponse",
             },
             ...["decodeGithubUserTokenSecret", "readGithubUserTokenSecretResult"].map(
-              (exportName) => ({ module: "src/github/github-user-token.ts", exportName }),
+              (exportName) => ({
+                module: "src/github/github-user-token.ts",
+                exportName,
+              }),
             ),
             ...["captureGithubWebhookOperation", "superviseGithubWebhookHandler"].map(
               (exportName) => ({
@@ -8568,16 +5365,22 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             ...CORE_THREAD_PERSISTED_CONSUMERS.map(({ identity }) => identity),
             ...CORE_TRANSCRIPT_PERSISTED_CODECS.map(({ identity }) => identity),
             ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS.map(({ identity }) => identity),
+            CORE_RESOURCE_PERSISTED_CODEC.identity,
+            CORE_RESOURCE_PERSISTED_CONSUMER.identity,
+            CORE_AGENT_RUN_OPENED_PERSISTED_CODEC.identity,
+            CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC.identity,
+            CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC.identity,
+            CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER.identity,
+            CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER.identity,
+            CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER.identity,
+            ...CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS.map(({ identity }) => identity),
             CORE_GRACEFUL_RESTART_PERSISTED_CODEC.identity,
-            CORE_GRACEFUL_RESTART_PERSISTED_CONSUMER.identity,
-            CORE_GRACEFUL_RESTART_ENCODER_CONSUMER.identity,
-            {
-              module: "src/runtime/graceful-restart-store.ts",
-              exportName: "decodeOpaqueSuperJsonValue",
-            },
+            CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER.identity,
             CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC.identity,
             CORE_WORKFLOW_ROW_PERSISTED_CODEC.identity,
             CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER.identity,
+            CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC.identity,
+            CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CONSUMER.identity,
             ...CORE_WORKFLOW_ROW_PERSISTED_CONSUMERS.map(({ identity }) => identity),
             ...CORE_WORKFLOW_STORE_READ_RESULT_APIS,
             {
@@ -8612,6 +5415,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             },
             ...[
               ["src/tool-server/tools/attachment.ts", "Attachment.call"],
+              ["src/tool-server/tools/attachment.ts", "downloadLegacyBlobToBuffer"],
               ["src/tool-server/tools/codex.ts", "Codex.call"],
               ["src/tool-server/tools/content-inspect.ts", "ContentInspect.call"],
               ["src/tool-server/tools/conversation-thread.ts", "ConversationThread.call"],
@@ -8620,20 +5424,39 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               ["src/tool-server/tools/mcp.ts", "McpManagement.call"],
               ["src/tool-server/tools/onboarding.ts", "Onboarding.call"],
               ["src/tool-server/tools/programmatic-workflow.ts", "ProgrammaticWorkflow.call"],
+              ["src/tool-server/tools/resource.ts", "Resource.call"],
               ["src/tool-server/tools/skills.ts", "Skills.call"],
               ["src/tool-server/tools/ssh.ts", "SSH.call"],
               ["src/tool-server/tools/surface.ts", "Surface.call"],
               ["src/tool-server/tools/web.ts", "Web.call"],
-            ].map(([module, exportName]) => ({ module: module!, exportName: exportName! })),
+            ].map(([module, exportName]) => ({
+              module: module!,
+              exportName: exportName!,
+            })),
           ]
         : []),
       ...(root === "packages/plugin-runtime"
         ? [
-            { module: "validation-error-message.ts", exportName: "decodeToolInput" },
-            { module: "server-tool-result.ts", exportName: "decodeServerToolResult" },
-            { module: "define-server-tool.ts", exportName: "createCallable.<callback>.invoke" },
-            { module: "define-server-tool.ts", exportName: "lookupServerToolCallable" },
-            { module: "define-server-tool.ts", exportName: "defineServerTool.call" },
+            {
+              module: "validation-error-message.ts",
+              exportName: "decodeToolInput",
+            },
+            {
+              module: "server-tool-result.ts",
+              exportName: "decodeServerToolResult",
+            },
+            {
+              module: "define-server-tool.ts",
+              exportName: "createCallable.<callback>.invoke",
+            },
+            {
+              module: "define-server-tool.ts",
+              exportName: "lookupServerToolCallable",
+            },
+            {
+              module: "define-server-tool.ts",
+              exportName: "defineServerTool.call",
+            },
             { module: "hooks.ts", exportName: "invokeLevel2Call" },
             { module: "types.ts", exportName: "ServerTool.call" },
           ]
@@ -8642,6 +5465,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         ? [
             TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity,
             TOOL_RESULT_ARTIFACT_METADATA_CONSUMER.identity,
+            BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity,
+            BLOB_TOOL_RESULT_ARTIFACT_METADATA_CONSUMER.identity,
             ...[
               "init",
               "create",
@@ -8653,6 +5478,18 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             ].map((method) => ({
               module: "src/tool-result-artifact-store.ts",
               exportName: `createToolResultArtifactStore.${method}`,
+            })),
+            ...[
+              "init",
+              "create",
+              "createFromFile",
+              "createFromStream",
+              "read",
+              "readWindow",
+              "maintain",
+            ].map((method) => ({
+              module: "src/blob-tool-result-artifact-store.ts",
+              exportName: `createBlobBackedToolResultArtifactStore.${method}`,
             })),
           ]
         : []),
@@ -8692,26 +5529,53 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : []),
       ...(root === "apps/core"
         ? [
-            { module: "src/mcp/config-file.ts", exportName: "readMcpConfigFile" },
-            { module: "src/mcp/config-file.ts", exportName: "writeMcpConfigFileAtomic" },
-            { module: "src/mcp/config-file.ts", exportName: "mutateMcpConfigFile" },
+            {
+              module: "src/mcp/config-file.ts",
+              exportName: "readMcpConfigFile",
+            },
+            {
+              module: "src/mcp/config-file.ts",
+              exportName: "writeMcpConfigFileAtomic",
+            },
+            {
+              module: "src/mcp/config-file.ts",
+              exportName: "mutateMcpConfigFile",
+            },
             ...[
               "resolveMcpOAuthCredentialPathResult",
               "readMcpOAuthCredentialFileResult",
               "writeMcpOAuthCredentialFileAtomicResult",
               "updateMcpOAuthCredentialFileResult",
-            ].map((exportName) => ({ module: "src/mcp/credential-file.ts", exportName })),
+            ].map((exportName) => ({
+              module: "src/mcp/credential-file.ts",
+              exportName,
+            })),
             ...[
               "captureOAuthAttempt",
               "McpOAuthProvider.startAuthorizationResult",
               "McpOAuthProvider.completeAuthorizationResult",
               "McpOAuthProvider.createPendingAuthorization",
               "McpOAuthProviderService.startAuthorizationResult",
-            ].map((exportName) => ({ module: "src/mcp/oauth-provider.ts", exportName })),
-            { module: "src/mcp/value-source.ts", exportName: "resolveJsonPointer" },
-            { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSource" },
-            { module: "src/mcp/value-source.ts", exportName: "resolveMcpValueSourceMap" },
-            { module: "src/mcp/value-source.ts", exportName: "validateHttpHeaders" },
+            ].map((exportName) => ({
+              module: "src/mcp/oauth-provider.ts",
+              exportName,
+            })),
+            {
+              module: "src/mcp/value-source.ts",
+              exportName: "resolveJsonPointer",
+            },
+            {
+              module: "src/mcp/value-source.ts",
+              exportName: "resolveMcpValueSource",
+            },
+            {
+              module: "src/mcp/value-source.ts",
+              exportName: "resolveMcpValueSourceMap",
+            },
+            {
+              module: "src/mcp/value-source.ts",
+              exportName: "validateHttpHeaders",
+            },
             {
               module: "src/workflow/workflow-action-resolver.ts",
               exportName: "startWorkflowActionResolver.startWorkflowActionSubscriptionResult",
@@ -8754,7 +5618,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               module: "src/workflow/workflow-engine.ts",
               exportName: "WorkflowEngine.startWakeSubscription",
             },
-            { module: "src/workflow/workflow-engine.ts", exportName: "runWorkflowTimerTick" },
+            {
+              module: "src/workflow/workflow-engine.ts",
+              exportName: "runWorkflowTimerTick",
+            },
             {
               module: "src/workflow/workflow-engine.ts",
               exportName: "captureWorkflowTerminalReceiptAdoption",
@@ -8794,6 +5661,11 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               module: "src/surface/bridge/bus-agent-runner.ts",
               exportName: "formatClaudeLifecycleLogFields",
             },
+            {
+              kind: "local" as const,
+              module: "scripts/migrate-blob-storage.ts",
+              exportName: "formatBlobStorageMigrationFailureForLog",
+            },
           ]
         : []),
       ...(root === "packages/remote-fs-runner"
@@ -8822,76 +5694,19 @@ function preciseExceptionAdapterKey(
 
 const PRECISE_EXCEPTION_ADAPTER_KEYS = new Set(
   Object.entries(PRECISE_EXCEPTION_IDENTITIES).flatMap(([workspace, identities]) =>
-    identities.flatMap(([module, exportName, mode]) => {
+    identities.map(([module, exportName]) => {
       const signalDirection = exportName.startsWith("preserve")
         ? ("observe-panic" as const)
         : ("signal-host" as const);
-      switch (mode) {
-        case "capture":
-          return [preciseExceptionAdapterKey(workspace, module, exportName, "capture-external")];
-        case "signal":
-          return [preciseExceptionAdapterKey(workspace, module, exportName, signalDirection)];
-        case "both":
-          return [
-            preciseExceptionAdapterKey(workspace, module, exportName, "capture-external"),
-            preciseExceptionAdapterKey(workspace, module, exportName, signalDirection),
-          ];
-      }
+      return preciseExceptionAdapterKey(workspace, module, exportName, signalDirection);
     }),
   ),
 );
-
-const REVIEWED_INJECTED_EXTERNAL_EFFECT_KEYS = new Set([
-  preciseExceptionAdapterKey(
-    "apps/core",
-    "src/mcp/config-file.ts",
-    "captureFileOperation",
-    "capture-external",
-  ),
-  preciseExceptionAdapterKey(
-    "apps/core",
-    "src/mcp/value-source.ts",
-    "captureTextFileRead",
-    "capture-external",
-  ),
-  preciseExceptionAdapterKey(
-    "packages/event-bus",
-    "redis-streams-bus.ts",
-    "RedisStreamsBus.subscribe.reportFatal",
-    "capture-external",
-  ),
-  preciseExceptionAdapterKey(
-    "apps/core",
-    "src/transcript/transcript-store.ts",
-    "SqliteTranscriptStore.readFromSqlite",
-    "capture-external",
-  ),
-  preciseExceptionAdapterKey(
-    "apps/core",
-    "src/workflow/workflow-engine.ts",
-    "captureWorkflowTerminalReceiptAdoption",
-    "capture-external",
-  ),
-  preciseExceptionAdapterKey(
-    "apps/core",
-    "src/ssh/ssh-config.ts",
-    "readConfiguredSshHostsResult",
-    "capture-external",
-  ),
-  preciseExceptionAdapterKey(
-    "apps/core",
-    "src/surface/github/github-runtime-descriptor.ts",
-    "deleteGithubAcknowledgement",
-    "capture-external",
-  ),
-]);
 
 function exceptionAdapterSyntaxKinds(
   direction: ExceptionAdapter["direction"],
 ): readonly ExceptionAdapterSyntaxKind[] {
   switch (direction) {
-    case "capture-external":
-      return ["catch-clause", "rejection-callback"];
     case "signal-host":
       return ["throw-statement", "host-rejection-call", "registered-host-signal-call"];
     case "observe-panic":
@@ -8904,13 +5719,6 @@ function exceptionAdapterProvenance(
   adapter: ExceptionAdapter,
 ): ExceptionAdapterProvenance {
   const { module, exportName } = adapter.identity;
-  if (
-    REVIEWED_INJECTED_EXTERNAL_EFFECT_KEYS.has(
-      preciseExceptionAdapterKey(workspace, module, exportName, adapter.direction),
-    )
-  ) {
-    return "reviewed-injected-external-effect";
-  }
   if (
     PRECISE_EXCEPTION_ADAPTER_KEYS.has(
       preciseExceptionAdapterKey(workspace, module, exportName, adapter.direction),
@@ -8946,18 +5754,6 @@ function exceptionAdapterRelationship(
   packageName: string,
   adapter: ExceptionAdapter,
 ): ExceptionAdapterRelationship {
-  if (
-    REVIEWED_INJECTED_EXTERNAL_EFFECT_KEYS.has(
-      preciseExceptionAdapterKey(
-        workspace,
-        adapter.identity.module,
-        adapter.identity.exportName,
-        adapter.direction,
-      ),
-    )
-  ) {
-    return "injected-external-effect";
-  }
   if (adapter.externalApi.package === "global") return "language-runtime";
   if (adapter.externalApi.package === "Intl") return "language-runtime";
   if (
@@ -8968,16 +5764,11 @@ function exceptionAdapterRelationship(
   }
   if (
     adapter.direction === "signal-host" &&
-    (adapter.category === "result-to-framework" || adapter.category === "defect-supervisor")
+    (adapter.category === "result-to-framework" ||
+      adapter.category === "rollback" ||
+      adapter.category === "defect-supervisor")
   ) {
     return "host-contract";
-  }
-  if (
-    adapter.direction === "capture-external" &&
-    adapter.identity.exportName.includes(".catch") &&
-    adapter.externalApi.package !== packageName
-  ) {
-    return "external-rejection";
   }
   return "external-package";
 }
@@ -9024,7 +5815,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "2024d7a1ead9ed0c4e027cb81c0c5b6ed071a847f069261c3b6a2941ec96a557";
+  "9e91595a06da6dd2baaac20a344b15012ec2527d71a87758a2fb720afa9c2663";
 
 export const architectureManifest = {
   version: 1,
@@ -9179,7 +5970,56 @@ function requiredOperationalResultApis(
   ];
 }
 
+export function assertBlobStorageArchitecturePolicyIntegrity(
+  manifest: ArchitectureManifest,
+  policy: BlobStorageArchitecturePolicy = BLOB_STORAGE_ARCHITECTURE_POLICY,
+): void {
+  const storage = manifest.workspaces.find(
+    (workspace) => workspace.name === policy.storageWorkspace,
+  );
+  if (!storage) return;
+  if (storage.packageName !== policy.storagePackage) {
+    throw new Error(
+      `Blob storage workspace ${policy.storageWorkspace} must own package ${policy.storagePackage}.`,
+    );
+  }
+  if (!manifest.workspaces.some((workspace) => workspace.name === policy.coreWorkspace)) {
+    throw new Error(
+      `Blob storage policy references missing Core workspace ${policy.coreWorkspace}.`,
+    );
+  }
+  for (const registrations of [
+    policy.eventSchemaModules,
+    policy.adapterFactoryOwners,
+    policy.closeOwnerModules,
+    policy.materializationModules,
+    policy.migrationModules,
+  ]) {
+    const seen = new Set<string>();
+    for (const registration of registrations) {
+      requireNonempty(registration.workspace, "blob storage policy workspace");
+      requireNonempty(registration.module, "blob storage policy module");
+      if (!manifest.workspaces.some((workspace) => workspace.name === registration.workspace)) {
+        throw new Error(
+          `Blob storage policy module ${registration.workspace}/${registration.module} references an inactive workspace.`,
+        );
+      }
+      const key = `${registration.workspace}\0${registration.module}`;
+      if (seen.has(key)) {
+        throw new Error(
+          `Duplicate blob storage policy module ${registration.workspace}/${registration.module}.`,
+        );
+      }
+      seen.add(key);
+    }
+  }
+  requireUniqueValues(policy.adapterFactoryExports, "blob storage adapter factory exports");
+  requireUniqueValues(policy.allowedCoreBlobColumns, "allowed Core SQLite BLOB columns");
+  requireNonempty(policy.migrationEntrypoint, "blob storage migration entrypoint");
+}
+
 export function assertArchitectureManifestIntegrity(manifest: ArchitectureManifest): void {
+  assertBlobStorageArchitecturePolicyIntegrity(manifest);
   const workspacesByName = new Map(
     manifest.workspaces.map((workspace) => [workspace.name, workspace] as const),
   );
@@ -9365,10 +6205,19 @@ export function assertArchitectureManifestIntegrity(manifest: ArchitectureManife
       }
       persistedCodecIdentities.add(key);
       const provenance = requireUniqueValues(codec.provenance, `persisted codec ${key} provenance`);
-      for (const required of ["current", "migrated"] as const) {
-        if (!provenance.has(required)) {
-          throw new Error(`Persisted codec ${key} must declare '${required}' provenance.`);
-        }
+      if (!provenance.has("current")) {
+        throw new Error(`Persisted codec ${key} must declare 'current' provenance.`);
+      }
+      const legacyOutcome = codec.legacyOutcome ?? "migrated";
+      if (legacyOutcome === "migrated" && !provenance.has("migrated")) {
+        throw new Error(
+          `Persisted codec ${key} must declare 'migrated' provenance for a migrated legacy outcome.`,
+        );
+      }
+      if (legacyOutcome === "rejected" && provenance.has("migrated")) {
+        throw new Error(
+          `Persisted codec ${key} cannot declare 'migrated' provenance when legacy values are rejected.`,
+        );
       }
       if (codec.missingOutcomes !== undefined) {
         const families = Object.entries(codec.missingOutcomes);

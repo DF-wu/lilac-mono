@@ -176,26 +176,29 @@ export function startConversationThreadMaterializer(params: {
     pending.set(request.id, pendingRequest);
     const posted = Result.try({
       try: () => worker.postMessage(request),
-      catch: (cause) => cause,
+      catch: (cause) => ({ restoreCause: () => cause }),
     });
     posted.match({
       ok: () => () => undefined,
-      err: (error) => () => {
-        pending.delete(request.id);
-        if (Panic.is(error)) return adaptToolResultToHost(Result.err(error));
-        if (!(error instanceof Error)) {
-          return adaptToolResultToHost(
-            Result.err(
-              new Panic({
-                message: "Conversation thread materializer worker postMessage defect",
-                cause: error,
-              }),
-            ),
-          );
-        }
-        pendingRequest.reject(error);
-        scheduleRecovery();
-      },
+      err:
+        ({ restoreCause }) =>
+        () => {
+          const error = restoreCause();
+          pending.delete(request.id);
+          if (Panic.is(error)) return adaptToolResultToHost(Result.err(error));
+          if (!(error instanceof Error)) {
+            return adaptToolResultToHost(
+              Result.err(
+                new Panic({
+                  message: "Conversation thread materializer worker postMessage defect",
+                  cause: error,
+                }),
+              ),
+            );
+          }
+          pendingRequest.reject(error);
+          scheduleRecovery();
+        },
     })();
   };
 
@@ -263,23 +266,19 @@ export function startConversationThreadMaterializer(params: {
     flush: () => startedCoalescer.flush(),
     stop() {
       if (stopPromise) return stopPromise;
-      stopPromise = (async () => {
-        try {
-          await startedCoalescer.stop();
-        } finally {
-          stopped = true;
-          if (recoveryTimer) clearTimeout(recoveryTimer);
-          recoveryTimer = null;
-          worker.terminate();
-          rejectPending(
-            new ThreadMaterializerOperationFailed({
-              operation: "worker-stopped",
-              message: "conversation thread materializer worker stopped",
-            }),
-          );
-          logger.debug("conversation thread materializer worker stopped");
-        }
-      })();
+      stopPromise = startedCoalescer.stop().finally(() => {
+        stopped = true;
+        if (recoveryTimer) clearTimeout(recoveryTimer);
+        recoveryTimer = null;
+        worker.terminate();
+        rejectPending(
+          new ThreadMaterializerOperationFailed({
+            operation: "worker-stopped",
+            message: "conversation thread materializer worker stopped",
+          }),
+        );
+        logger.debug("conversation thread materializer worker stopped");
+      });
       return stopPromise;
     },
   };

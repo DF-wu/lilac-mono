@@ -5,8 +5,10 @@ import { defineRule } from "@oxlint/plugins";
 import ts from "typescript-codegen";
 
 import {
+  BLOB_STORAGE_ARCHITECTURE_POLICY,
   architectureManifest,
   type ArchitectureManifest,
+  type BlobStorageArchitecturePolicy,
   type ExceptionDirection,
 } from "../architecture/manifest.ts";
 import {
@@ -24,12 +26,23 @@ import {
 } from "./syntax-rule-utils.mts";
 
 export type LocalRecordGuardKind = "local-record-guard";
+export type ElseAfterTerminalKind = "else-after-terminal";
 export type PresentationDecoderImportKind = "presentation-decoder-import";
+export type PreferSwitchTrueChainKind = "prefer-switch-true-chain";
 export type ResultCallbackKind = "inline-async-result-callback";
 export type StoreInlineDecodingKind = "store-inline-json-decoding" | "store-inline-schema-decoding";
 export type DirectSqliteTransactionKind =
   | "direct-sqlite-transaction"
   | "manual-sqlite-transaction-control";
+export type BlobStorageSeamKind =
+  | "adapter-construction-import"
+  | "blob-domain-import"
+  | "blob-materialization-locality"
+  | "blob-store-close-ownership"
+  | "core-inline-blob-column"
+  | "current-inline-blob-value"
+  | "legacy-blob-decoder-import"
+  | "s3-storage-import";
 
 export function parseProductionSyntaxSource(sourceText: string, filePath: string): ts.SourceFile {
   return ts.createSourceFile(
@@ -565,10 +578,231 @@ function isExplicitHostErrorSignal(
 }
 
 const DIRECTION_KINDS = {
-  "capture-external": ["catch-clause", "promise-catch", "rejection-callback"],
-  "signal-host": ["promise-reject", "rejection-callback", "stream-error-signal", "throw"],
-  "observe-panic": ["catch-clause", "promise-catch", "rejection-callback", "throw"],
+  "signal-host": [
+    "promise-catch",
+    "promise-reject",
+    "rejection-callback",
+    "stream-error-signal",
+    "throw",
+  ],
+  "observe-panic": ["promise-catch", "rejection-callback", "throw"],
 } as const satisfies Readonly<Record<ExceptionDirection, readonly ExceptionFlowKind[]>>;
+
+function propertyStringName(name: ts.PropertyName): string | undefined {
+  return ts.isIdentifier(name) || ts.isStringLiteralLike(name) ? name.text : undefined;
+}
+
+interface BetterResultProvenance {
+  readonly captureFunctions: ReadonlyMap<string, number>;
+  readonly moduleNamespaces: ReadonlyMap<string, number>;
+  readonly resultNamespaces: ReadonlyMap<string, number>;
+}
+
+function mutationRootIdentifier(expression: ts.Expression): ts.Identifier | undefined {
+  let current = unwrappedExpression(expression);
+  while (ts.isPropertyAccessExpression(current) || ts.isElementAccessExpression(current)) {
+    current = unwrappedExpression(current.expression);
+  }
+  return ts.isIdentifier(current) ? current : undefined;
+}
+
+function collectMutatedBindings(sourceFile: ts.SourceFile): ReadonlySet<string> {
+  const mutated = new Set<string>();
+  const aliases: [string, string][] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      const source = mutationRootIdentifier(node.initializer);
+      if (source) aliases.push([node.name.text, source.text]);
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment
+    ) {
+      const root =
+        node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(node.left)
+          ? undefined
+          : mutationRootIdentifier(node.left);
+      if (root) mutated.add(root.text);
+    } else if (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) {
+      const root = mutationRootIdentifier(node.operand);
+      if (root) mutated.add(root.text);
+    } else if (ts.isCallExpression(node)) {
+      const parts = propertyAccessParts(node.expression);
+      const receiver = parts ? unwrappedExpression(parts[0]) : undefined;
+      const indirectMutation =
+        parts &&
+        receiver !== undefined &&
+        ts.isIdentifier(receiver) &&
+        ((receiver.text === "Object" && (parts[1] === "assign" || parts[1] === "defineProperty")) ||
+          (receiver.text === "Reflect" && (parts[1] === "set" || parts[1] === "defineProperty")));
+      const target = indirectMutation && node.arguments[0];
+      if (target && !ts.isSpreadElement(target)) {
+        const root = mutationRootIdentifier(target);
+        if (root) mutated.add(root.text);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [alias, source] of aliases) {
+      if (mutated.has(alias) === mutated.has(source)) continue;
+      mutated.add(alias);
+      mutated.add(source);
+      changed = true;
+    }
+  }
+  return mutated;
+}
+
+function collectBetterResultProvenance(sourceFile: ts.SourceFile): BetterResultProvenance {
+  const counts = collectBindingNameCounts(sourceFile);
+  const captureFunctions = new Map<string, number>();
+  const moduleNamespaces = new Map<string, number>();
+  const resultNamespaces = new Map<string, number>();
+  const declarations: ts.VariableDeclaration[] = [];
+  const mutated = collectMutatedBindings(sourceFile);
+  const visit = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node)) declarations.push(node);
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+
+  for (const statement of sourceFile.statements) {
+    if (
+      !ts.isImportDeclaration(statement) ||
+      !ts.isStringLiteral(statement.moduleSpecifier) ||
+      statement.moduleSpecifier.text !== "better-result" ||
+      statement.importClause?.isTypeOnly
+    ) {
+      continue;
+    }
+    const bindings = statement.importClause?.namedBindings;
+    if (!bindings) continue;
+    if (ts.isNamespaceImport(bindings)) {
+      if (!mutated.has(bindings.name.text)) {
+        setProvenance(moduleNamespaces, counts, bindings.name.text, statement.getStart(sourceFile));
+      }
+      continue;
+    }
+    for (const specifier of bindings.elements) {
+      if (
+        !specifier.isTypeOnly &&
+        (specifier.propertyName?.text ?? specifier.name.text) === "Result" &&
+        !mutated.has(specifier.name.text)
+      ) {
+        setProvenance(
+          resultNamespaces,
+          counts,
+          specifier.name.text,
+          statement.getStart(sourceFile),
+        );
+      }
+    }
+  }
+
+  const available = (values: ReadonlyMap<string, number>, name: string, at: number): boolean =>
+    !mutated.has(name) && (values.get(name) ?? Number.POSITIVE_INFINITY) <= at;
+  const isResultNamespace = (expression: ts.Expression, at: number): boolean => {
+    const value = unwrappedExpression(expression);
+    if (ts.isIdentifier(value)) return available(resultNamespaces, value.text, at);
+    const parts = propertyAccessParts(value);
+    if (!parts || parts[1] !== "Result") return false;
+    const receiver = unwrappedExpression(parts[0]);
+    return ts.isIdentifier(receiver) && available(moduleNamespaces, receiver.text, at);
+  };
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const declaration of declarations) {
+      if (
+        !ts.isIdentifier(declaration.name) ||
+        !declaration.initializer ||
+        mutated.has(declaration.name.text)
+      ) {
+        continue;
+      }
+      const position = declaration.getStart(sourceFile);
+      if (isResultNamespace(declaration.initializer, position)) {
+        changed =
+          setProvenance(resultNamespaces, counts, declaration.name.text, position) || changed;
+      }
+      const parts = propertyAccessParts(declaration.initializer);
+      if (
+        parts &&
+        (parts[1] === "try" || parts[1] === "tryPromise") &&
+        isResultNamespace(parts[0], position)
+      ) {
+        changed =
+          setProvenance(captureFunctions, counts, declaration.name.text, position) || changed;
+      }
+    }
+  }
+  return { captureFunctions, moduleNamespaces, resultNamespaces };
+}
+
+function isBetterResultCaptureCall(
+  call: ts.CallExpression,
+  provenance: BetterResultProvenance,
+): boolean {
+  const callee = unwrappedExpression(call.expression);
+  if (ts.isIdentifier(callee)) {
+    return (
+      (provenance.captureFunctions.get(callee.text) ?? Number.POSITIVE_INFINITY) <= call.getStart()
+    );
+  }
+  const parts = propertyAccessParts(callee);
+  if (!parts || (parts[1] !== "try" && parts[1] !== "tryPromise")) return false;
+  const receiver = unwrappedExpression(parts[0]);
+  if (ts.isIdentifier(receiver)) {
+    return (
+      (provenance.resultNamespaces.get(receiver.text) ?? Number.POSITIVE_INFINITY) <=
+      call.getStart()
+    );
+  }
+  const namespaceParts = propertyAccessParts(receiver);
+  if (!namespaceParts || namespaceParts[1] !== "Result") return false;
+  const namespace = unwrappedExpression(namespaceParts[0]);
+  return (
+    ts.isIdentifier(namespace) &&
+    (provenance.moduleNamespaces.get(namespace.text) ?? Number.POSITIVE_INFINITY) <= call.getStart()
+  );
+}
+
+function resultCaptureObjectForProperty(
+  property: ts.ObjectLiteralElementLike,
+  provenance: BetterResultProvenance,
+): ts.CallExpression | undefined {
+  if (!property.name || !ts.isObjectLiteralExpression(property.parent)) return undefined;
+  const object = property.parent;
+  let expression: ts.Expression = object;
+  while (ts.isParenthesizedExpression(expression.parent)) expression = expression.parent;
+  const call = expression.parent;
+  if (!ts.isCallExpression(call) || call.arguments[0] !== expression) return undefined;
+  return isBetterResultCaptureCall(call, provenance) ? call : undefined;
+}
+
+function throwIsCapturedByObjectResult(
+  node: ts.ThrowStatement,
+  provenance: BetterResultProvenance,
+): boolean {
+  for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+    if (!ts.isFunctionLike(current)) continue;
+    const property = current.parent;
+    if (
+      ts.isPropertyAssignment(property) &&
+      propertyStringName(property.name) === "try" &&
+      resultCaptureObjectForProperty(property, provenance)
+    ) {
+      return true;
+    }
+    break;
+  }
+  return false;
+}
 
 function normalizedAdapterModule(workspaceRoot: string, module: string): string {
   const normalizedRoot = normalizeFilePath(workspaceRoot).replace(/\/$/u, "");
@@ -613,6 +847,7 @@ export function findExceptionFlowViolationsInSourceFile(
   manifest: ArchitectureManifest = architectureManifest,
 ): SyntacticFinding<ExceptionFlowKind>[] {
   const provenance = collectPromiseProvenance(sourceFile);
+  const betterResultProvenance = collectBetterResultProvenance(sourceFile);
   const namedCallbackBodies = collectNamedCallbackBodies(sourceFile);
   const streamControllers = collectStreamControllers(sourceFile);
   const findings: SyntacticFinding<ExceptionFlowKind>[] = [];
@@ -626,18 +861,25 @@ export function findExceptionFlowViolationsInSourceFile(
     if (!adapterAllows(finding, manifest)) findings.push(finding);
   };
   const visit = (node: ts.Node): void => {
-    if (ts.isThrowStatement(node)) {
-      add(
-        node,
-        "throw",
-        "Return a typed Result error; throw only in an exactly registered adapter",
+    if (ts.isTryStatement(node)) {
+      findings.push(
+        createFinding(
+          sourceFile,
+          filePath,
+          node,
+          "try-statement",
+          "Use object-form Result.try or Result.tryPromise; production try statements are forbidden",
+          node,
+        ),
       );
-    } else if (ts.isCatchClause(node)) {
-      add(
-        node,
-        "catch-clause",
-        "Capture the external exception in an exactly registered adapter; try/finally remains allowed",
-      );
+    } else if (ts.isThrowStatement(node)) {
+      if (!throwIsCapturedByObjectResult(node, betterResultProvenance)) {
+        add(
+          node,
+          "throw",
+          "Return a typed Result error; throw only in an exactly registered adapter",
+        );
+      }
     } else if (ts.isNewExpression(node)) {
       for (const call of usedExecutorRejectCalls(node, provenance)) {
         add(
@@ -656,7 +898,7 @@ export function findExceptionFlowViolationsInSourceFile(
           add(
             node,
             "promise-catch",
-            "Capture rejection in an exactly registered external-to-result adapter instead of .catch",
+            "Use Result.tryPromise for ordinary rejection capture; reserve .catch for an exact host signal contract",
             callback && !ts.isSpreadElement(callback)
               ? rejectionCallbackOwner(callback, namedCallbackBodies)
               : node,
@@ -1019,6 +1261,366 @@ function importedWorkspaceModule(
   return { ...(suffix ? { module: moduleWithoutExtension(suffix) } : {}), workspace };
 }
 
+function staticPropertyName(name: ts.PropertyName | ts.BindingName): string | undefined {
+  return ts.isIdentifier(name) || ts.isStringLiteralLike(name) || ts.isNumericLiteral(name)
+    ? name.text
+    : undefined;
+}
+
+function registeredPackageModule(
+  workspace: string,
+  module: string,
+  registrations: readonly { readonly workspace: string; readonly module: string }[],
+): boolean {
+  return registrations.some(
+    (registration) =>
+      registration.workspace === workspace &&
+      moduleWithoutExtension(registration.module) === moduleWithoutExtension(module),
+  );
+}
+
+function importedNames(statement: ts.ImportDeclaration): readonly string[] {
+  const clause = statement.importClause;
+  if (!clause || clause.isTypeOnly) return [];
+  const bindings = clause.namedBindings;
+  if (!bindings || ts.isNamespaceImport(bindings)) return [];
+  return bindings.elements
+    .filter((specifier) => !specifier.isTypeOnly)
+    .map((specifier) => (specifier.propertyName ?? specifier.name).text);
+}
+
+function localImportedName(
+  statement: ts.ImportDeclaration,
+  importedName: string,
+): string | undefined {
+  const bindings = statement.importClause?.namedBindings;
+  if (!bindings || !ts.isNamedImports(bindings)) return undefined;
+  const specifier = bindings.elements.find(
+    (candidate) => (candidate.propertyName ?? candidate.name).text === importedName,
+  );
+  return specifier?.name.text;
+}
+
+function bindingNames(name: ts.BindingName): readonly string[] {
+  if (ts.isIdentifier(name)) return [name.text];
+  return name.elements.flatMap((element) =>
+    ts.isOmittedExpression(element) ? [] : bindingNames(element.name),
+  );
+}
+
+function expressionContainsOwnedName(
+  expression: ts.Expression,
+  ownedNames: ReadonlySet<string>,
+): boolean {
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isIdentifier(node) && ownedNames.has(node.text)) found = true;
+    if (!found) ts.forEachChild(node, visit);
+  };
+  visit(expression);
+  return found;
+}
+
+export function findBlobStorageSeamViolations(
+  sourceText: string,
+  filePath = "apps/example/src/blob-consumer.ts",
+  policy: SyntacticPolicy = SYNTACTIC_POLICY,
+  manifest: ArchitectureManifest = architectureManifest,
+  blobPolicy: BlobStorageArchitecturePolicy = BLOB_STORAGE_ARCHITECTURE_POLICY,
+): SyntacticFinding<BlobStorageSeamKind>[] {
+  if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
+  return findBlobStorageSeamViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+    manifest,
+    blobPolicy,
+  );
+}
+
+export function findBlobStorageSeamViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+  manifest: ArchitectureManifest = architectureManifest,
+  blobPolicy: BlobStorageArchitecturePolicy = BLOB_STORAGE_ARCHITECTURE_POLICY,
+): SyntacticFinding<BlobStorageSeamKind>[] {
+  if (!manifest.workspaces.some(({ name }) => name === blobPolicy.storageWorkspace)) return [];
+  const identity = sourceIdentity(filePath);
+  const normalizedFile = normalizeFilePath(filePath).replace(/\.(?:[cm]?[jt]sx?)$/iu, "");
+  const migrationEntrypoint = normalizeFilePath(blobPolicy.migrationEntrypoint);
+  const isMigrationEntrypoint =
+    normalizedFile === migrationEntrypoint || normalizedFile.endsWith(`/${migrationEntrypoint}`);
+  const isMigrationModule =
+    isMigrationEntrypoint ||
+    registeredPackageModule(identity.workspace, identity.module, blobPolicy.migrationModules);
+  const findings: SyntacticFinding<BlobStorageSeamKind>[] = [];
+  const add = (node: ts.Node, kind: BlobStorageSeamKind, message: string): void => {
+    findings.push(createFinding(sourceFile, filePath, node, kind, message));
+  };
+
+  const blobStoreTypeNames = new Set<string>();
+  const blobStoreValueNames = new Set<string>();
+  const s3ValueNames = new Set<string>();
+  const blobPackageNamespaces = new Set<string>();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier)) {
+      continue;
+    }
+    const specifier = statement.moduleSpecifier.text;
+    const names = importedNames(statement);
+    if (specifier === "bun") {
+      const s3Imports = names.filter((name) => name === "S3Client" || name === "S3File");
+      if (s3Imports.length > 0 && identity.workspace !== blobPolicy.storageWorkspace) {
+        add(
+          statement,
+          "s3-storage-import",
+          "Only the blob-storage package may import Bun S3 storage operations",
+        );
+      }
+      for (const name of s3Imports) {
+        s3ValueNames.add(localImportedName(statement, name) ?? name);
+      }
+    }
+
+    const target = importedWorkspaceModule(
+      `${identity.module}.ts`,
+      identity.workspace,
+      specifier,
+      manifest,
+    );
+    const relativeImportEscapesStorage =
+      identity.workspace === blobPolicy.storageWorkspace &&
+      specifier.startsWith(".") &&
+      path.posix
+        .normalize(path.posix.join(path.posix.dirname(identity.module), specifier))
+        .startsWith("../");
+    if (
+      identity.workspace === blobPolicy.storageWorkspace &&
+      ((target && target.workspace.name !== blobPolicy.storageWorkspace) ||
+        relativeImportEscapesStorage)
+    ) {
+      add(
+        statement,
+        "blob-domain-import",
+        "The blob-storage package cannot import another Lilac workspace domain",
+      );
+    }
+
+    if (specifier === blobPolicy.storagePackage) {
+      const bindings = statement.importClause?.namedBindings;
+      if (bindings && ts.isNamespaceImport(bindings) && !statement.importClause?.isTypeOnly) {
+        blobPackageNamespaces.add(bindings.name.text);
+      }
+      const typeBindings = statement.importClause?.namedBindings;
+      if (typeBindings && ts.isNamedImports(typeBindings)) {
+        for (const binding of typeBindings.elements) {
+          const imported = (binding.propertyName ?? binding.name).text;
+          if (imported === "BlobStore") blobStoreTypeNames.add(binding.name.text);
+        }
+      }
+      const importedFactories = names.filter((name) =>
+        blobPolicy.adapterFactoryExports.includes(name),
+      );
+      if (
+        importedFactories.length > 0 &&
+        !registeredPackageModule(
+          identity.workspace,
+          identity.module,
+          blobPolicy.adapterFactoryOwners,
+        ) &&
+        !isMigrationEntrypoint
+      ) {
+        add(
+          statement,
+          "adapter-construction-import",
+          "Construct blob adapters only in the registered Core composition module or offline migration task",
+        );
+      }
+    }
+
+    const legacyNames = names.filter((name) => name.startsWith("decodeLegacy"));
+    const legacyModule =
+      /legacy/iu.test(specifier) && /blob|attachment|artifact|binary|media/iu.test(specifier);
+    if (!isMigrationModule && (legacyNames.length > 0 || legacyModule)) {
+      add(
+        statement,
+        "legacy-blob-decoder-import",
+        "Legacy blob decoders may be imported only by apps/core/scripts/migrate-blob-storage.ts",
+      );
+    }
+  }
+
+  const typeMentionsBlobStore = (type: ts.TypeNode | undefined): boolean =>
+    !!type &&
+    [...blobStoreTypeNames].some((name) => new RegExp(`\\b${name}\\b`, "u").test(type.getText()));
+  const collectBlobStoreBindings = (node: ts.Node): void => {
+    if (
+      (ts.isParameter(node) || ts.isVariableDeclaration(node)) &&
+      typeMentionsBlobStore(node.type)
+    ) {
+      for (const name of bindingNames(node.name)) blobStoreValueNames.add(name);
+    } else if (ts.isPropertyDeclaration(node) && typeMentionsBlobStore(node.type)) {
+      const name = staticPropertyName(node.name);
+      if (name) blobStoreValueNames.add(name);
+    } else if (ts.isPropertySignature(node) && typeMentionsBlobStore(node.type)) {
+      const name = staticPropertyName(node.name);
+      if (name) blobStoreValueNames.add(name);
+    }
+    ts.forEachChild(node, collectBlobStoreBindings);
+  };
+  collectBlobStoreBindings(sourceFile);
+
+  const eventSchemaModule = registeredPackageModule(
+    identity.workspace,
+    identity.module,
+    blobPolicy.eventSchemaModules,
+  );
+  const allowedBlobColumns = new Set(blobPolicy.allowedCoreBlobColumns);
+  const managedFieldNames = new Set(["bytes", "content", "data", "payload"]);
+  const visit = (node: ts.Node): void => {
+    if (ts.isNewExpression(node)) {
+      const constructed = unwrappedExpression(node.expression);
+      const directS3 = ts.isIdentifier(constructed) && s3ValueNames.has(constructed.text);
+      const bunS3 =
+        ts.isPropertyAccessExpression(constructed) &&
+        ts.isIdentifier(constructed.expression) &&
+        constructed.expression.text === "Bun" &&
+        (constructed.name.text === "S3Client" || constructed.name.text === "S3File");
+      if ((directS3 || bunS3) && identity.workspace !== blobPolicy.storageWorkspace) {
+        add(
+          node,
+          "s3-storage-import",
+          "Only the blob-storage package may construct Bun S3 clients",
+        );
+      }
+    }
+
+    if (eventSchemaModule && ts.isPropertyAssignment(node)) {
+      const name = staticPropertyName(node.name);
+      const text = node.initializer.getText();
+      if (
+        name === "dataBase64" ||
+        (name && managedFieldNames.has(name) && /\b(?:ArrayBuffer|Buffer|Uint8Array)\b/u.test(text))
+      ) {
+        add(
+          node,
+          "current-inline-blob-value",
+          "Current event schemas must carry BlobHandleV1 or BlobRefV1 instead of managed inline bytes",
+        );
+      }
+    }
+    if (
+      eventSchemaModule &&
+      (ts.isStringLiteralLike(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+      /^data:[^,]*,/iu.test(node.text)
+    ) {
+      add(
+        node,
+        "current-inline-blob-value",
+        "Current event schemas cannot persist managed data URLs",
+      );
+    }
+
+    if (
+      identity.workspace === blobPolicy.coreWorkspace &&
+      !isMigrationModule &&
+      (ts.isStringLiteralLike(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+      /\b(?:ADD\s+COLUMN|ALTER\s+TABLE|CREATE\s+TABLE)\b/iu.test(node.text)
+    ) {
+      const columnPattern = /\b([A-Za-z_][A-Za-z0-9_]*)\s+BLOB\b/giu;
+      for (const match of node.text.matchAll(columnPattern)) {
+        const column = match[1];
+        if (column && !allowedBlobColumns.has(column)) {
+          add(
+            node,
+            "core-inline-blob-column",
+            `Core SQLite column '${column}' cannot store managed opaque bytes; persist a BlobRefV1 instead`,
+          );
+        }
+      }
+    }
+
+    if (
+      identity.workspace === blobPolicy.coreWorkspace &&
+      /(?:^|\/)(?:[^/]*persistence-codec|[^/]*store|migrations?)(?:$|\/)/u.test(identity.module) &&
+      ts.isPropertyAssignment(node)
+    ) {
+      const name = staticPropertyName(node.name);
+      const text = node.initializer.getText();
+      if (
+        name === "dataBase64" ||
+        (name &&
+          managedFieldNames.has(name) &&
+          /\b(?:ArrayBuffer|Buffer|Uint8Array)\b/u.test(text)) ||
+        /^data:[^,]*,/iu.test(text.replaceAll(/["'`]/gu, ""))
+      ) {
+        add(
+          node,
+          "current-inline-blob-value",
+          "Current Core persistence must store BlobRefV1 metadata instead of managed inline bytes",
+        );
+      }
+    }
+
+    if (ts.isCallExpression(node)) {
+      const called = propertyAccessParts(node.expression);
+      if (
+        called &&
+        ts.isIdentifier(called[0]) &&
+        blobPackageNamespaces.has(called[0].text) &&
+        blobPolicy.adapterFactoryExports.includes(called[1]) &&
+        !registeredPackageModule(
+          identity.workspace,
+          identity.module,
+          blobPolicy.adapterFactoryOwners,
+        ) &&
+        !isMigrationEntrypoint
+      ) {
+        add(
+          node,
+          "adapter-construction-import",
+          "Construct blob adapters only in the registered Core composition module or offline migration task",
+        );
+      }
+      if (called && (called[1] === "close" || called[1] === "open")) {
+        const receiver = called[0];
+        if (expressionContainsOwnedName(receiver, blobStoreValueNames)) {
+          if (
+            called[1] === "close" &&
+            !registeredPackageModule(
+              identity.workspace,
+              identity.module,
+              blobPolicy.closeOwnerModules,
+            )
+          ) {
+            add(
+              node,
+              "blob-store-close-ownership",
+              "Only the registered Core runtime owner may close the composed BlobStore",
+            );
+          }
+          if (
+            called[1] === "open" &&
+            !registeredPackageModule(
+              identity.workspace,
+              identity.module,
+              blobPolicy.materializationModules,
+            )
+          ) {
+            add(
+              node,
+              "blob-materialization-locality",
+              "Open BlobRefV1 content only in a registered hydration or materialization module",
+            );
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return findings;
+}
+
 export function findPresentationDecoderImportViolations(
   sourceText: string,
   filePath = "apps/example/src/render.ts",
@@ -1274,6 +1876,7 @@ function typeIsImportedResult(
 
 function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
   const counts = collectBindingNameCounts(sourceFile);
+  const mutated = collectMutatedBindings(sourceFile);
   const moduleNamespaces = new Set<string>();
   const importedResultTypeNames = new Set<string>();
   const resultFactories = new Map<string, number>();
@@ -1296,20 +1899,29 @@ function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
         : [statement.importClause.namedBindings]
       : []) {
       if (ts.isNamespaceImport(specifier)) {
-        moduleNamespaces.add(specifier.name.text);
+        if (!mutated.has(specifier.name.text)) moduleNamespaces.add(specifier.name.text);
         continue;
       }
       const importedName = (specifier.propertyName ?? specifier.name).text;
       if (importedName === "Result") {
-        setProvenance(
-          resultNamespaces,
-          counts,
-          specifier.name.text,
-          statement.getStart(sourceFile),
-        );
-        importedResultTypeNames.add(specifier.name.text);
+        if (!mutated.has(specifier.name.text)) {
+          setProvenance(
+            resultNamespaces,
+            counts,
+            specifier.name.text,
+            statement.getStart(sourceFile),
+          );
+          importedResultTypeNames.add(specifier.name.text);
+        }
       } else if (importedName === "ok" || importedName === "err") {
-        setProvenance(resultFactories, counts, specifier.name.text, statement.getStart(sourceFile));
+        if (!mutated.has(specifier.name.text)) {
+          setProvenance(
+            resultFactories,
+            counts,
+            specifier.name.text,
+            statement.getStart(sourceFile),
+          );
+        }
       }
     }
   }
@@ -1319,6 +1931,7 @@ function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
     if (
       ts.isVariableDeclaration(node) &&
       ts.isIdentifier(node.name) &&
+      !mutated.has(node.name.text) &&
       typeIsImportedResult(node.type, importedResultTypeNames)
     ) {
       setProvenance(resultValues, counts, node.name.text, node.getStart(sourceFile));
@@ -1326,6 +1939,7 @@ function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
     if (
       ts.isParameter(node) &&
       ts.isIdentifier(node.name) &&
+      !mutated.has(node.name.text) &&
       typeIsImportedResult(node.type, importedResultTypeNames)
     ) {
       setProvenance(resultValues, counts, node.name.text, node.getStart(sourceFile));
@@ -1353,6 +1967,7 @@ function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
     for (const declaration of declarations) {
       if (!declaration.initializer || !ts.isIdentifier(declaration.name)) continue;
       const name = declaration.name.text;
+      if (mutated.has(name)) continue;
       const position = declaration.getStart(sourceFile);
       if (isResultNamespaceExpression(declaration.initializer, current, position)) {
         changed = setProvenance(resultNamespaces, counts, name, position) || changed;
@@ -1363,6 +1978,7 @@ function collectResultProvenance(sourceFile: ts.SourceFile): ResultProvenance {
     }
     for (const assignment of assignments) {
       if (!ts.isIdentifier(assignment.left)) continue;
+      if (mutated.has(assignment.left.text)) continue;
       if (isKnownResultExpression(assignment.right, current, assignment.getStart(sourceFile))) {
         changed =
           setProvenance(
@@ -1705,6 +2321,134 @@ export function findDirectSqliteTransactionViolationsInSourceFile(
   return findings;
 }
 
+function isConditionalChainRoot(node: ts.IfStatement): boolean {
+  return !(ts.isIfStatement(node.parent) && node.parent.elseStatement === node);
+}
+
+function topLevelOrTermCount(expression: ts.Expression): number {
+  const unwrapped = unwrappedExpression(expression);
+  if (
+    !ts.isBinaryExpression(unwrapped) ||
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.BarBarToken
+  ) {
+    return 1;
+  }
+  return topLevelOrTermCount(unwrapped.left) + topLevelOrTermCount(unwrapped.right);
+}
+
+function conditionalChainExpressions(root: ts.IfStatement): readonly ts.Expression[] {
+  const expressions: ts.Expression[] = [];
+  let current: ts.IfStatement | undefined = root;
+  while (current) {
+    expressions.push(current.expression);
+    current =
+      current.elseStatement && ts.isIfStatement(current.elseStatement)
+        ? current.elseStatement
+        : undefined;
+  }
+  return expressions;
+}
+
+export function findPreferSwitchTrueChainViolations(
+  sourceText: string,
+  filePath = "apps/example/src/service.ts",
+  policy: SyntacticPolicy = SYNTACTIC_POLICY,
+): SyntacticFinding<PreferSwitchTrueChainKind>[] {
+  if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
+  return findPreferSwitchTrueChainViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+  );
+}
+
+export function findPreferSwitchTrueChainViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+): SyntacticFinding<PreferSwitchTrueChainKind>[] {
+  const findings: SyntacticFinding<PreferSwitchTrueChainKind>[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isIfStatement(node) && isConditionalChainRoot(node)) {
+      const expressions = conditionalChainExpressions(node);
+      const disjunctiveArms = expressions.filter(
+        (expression) => topLevelOrTermCount(expression) > 1,
+      ).length;
+      if (expressions.length >= 3 && disjunctiveArms >= 2) {
+        findings.push(
+          createFinding(
+            sourceFile,
+            filePath,
+            node,
+            "prefer-switch-true-chain",
+            "Use switch (true) with one ordered predicate group per case instead of this disjunctive if/else-if chain",
+          ),
+        );
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return findings;
+}
+
+function terminalBranchStatement(statement: ts.Statement): ts.Statement | undefined {
+  if (
+    ts.isReturnStatement(statement) ||
+    ts.isThrowStatement(statement) ||
+    ts.isContinueStatement(statement) ||
+    ts.isBreakStatement(statement)
+  ) {
+    return statement;
+  }
+  if (!ts.isBlock(statement)) return undefined;
+  const last = statement.statements.at(-1);
+  return last ? terminalBranchStatement(last) : undefined;
+}
+
+function terminalBranchKeyword(statement: ts.Statement): string {
+  if (ts.isReturnStatement(statement)) return "return";
+  if (ts.isThrowStatement(statement)) return "throw";
+  if (ts.isContinueStatement(statement)) return "continue";
+  return "break";
+}
+
+export function findElseAfterTerminalViolations(
+  sourceText: string,
+  filePath = "apps/example/src/service.ts",
+  policy: SyntacticPolicy = SYNTACTIC_POLICY,
+): SyntacticFinding<ElseAfterTerminalKind>[] {
+  if (isExcludedProductionFile(filePath, policy.productionExclusions)) return [];
+  return findElseAfterTerminalViolationsInSourceFile(
+    parseProductionSyntaxSource(sourceText, filePath),
+    filePath,
+  );
+}
+
+export function findElseAfterTerminalViolationsInSourceFile(
+  sourceFile: ts.SourceFile,
+  filePath: string,
+): SyntacticFinding<ElseAfterTerminalKind>[] {
+  const findings: SyntacticFinding<ElseAfterTerminalKind>[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isIfStatement(node) && node.elseStatement) {
+      const terminal = terminalBranchStatement(node.thenStatement);
+      if (terminal) {
+        findings.push(
+          createFinding(
+            sourceFile,
+            filePath,
+            node.elseStatement,
+            "else-after-terminal",
+            `Remove this else and continue the workflow after the terminal ${terminalBranchKeyword(terminal)}`,
+          ),
+        );
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return findings;
+}
+
 function ruleFromFinder<Kind extends string>(
   description: string,
   finder: (sourceText: string, filePath: string) => readonly SyntacticFinding<Kind>[],
@@ -1730,6 +2474,14 @@ export const noExceptionFlowRule = ruleFromFinder(
   "Disallow production exception flow outside exactly registered adapters",
   findExceptionFlowViolations,
 );
+export const noElseAfterTerminalRule = ruleFromFinder(
+  "Keep the workflow flat after terminal branches",
+  findElseAfterTerminalViolations,
+);
+export const blobStorageSeamRule = ruleFromFinder(
+  "Keep managed opaque bytes behind the unified blob-storage seam",
+  findBlobStorageSeamViolations,
+);
 export const noLocalIsRecordRule = ruleFromFinder(
   "Disallow local duplicates of canonical record guards",
   findLocalRecordGuardViolations,
@@ -1741,6 +2493,10 @@ export const noInlineAsyncResultCallbackRule = ruleFromFinder(
 export const noPresentationDecoderImportRule = ruleFromFinder(
   "Disallow Zod parser imports in activated unknown-free presentation modules",
   findPresentationDecoderImportViolations,
+);
+export const preferSwitchTrueChainRule = ruleFromFinder(
+  "Use switch (true) for ordered disjunctive branch chains",
+  findPreferSwitchTrueChainViolations,
 );
 export const noStoreInlineDecodingRule = ruleFromFinder(
   "Disallow inline JSON and schema decoding in exact registered store scopes",

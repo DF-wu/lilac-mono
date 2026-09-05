@@ -1,3 +1,4 @@
+import { captureError } from "./src/shared/error-capture.js";
 import { mkdir, rename, rm } from "node:fs/promises";
 import path from "node:path";
 
@@ -19,21 +20,40 @@ export class RemoteRunnerBuildError extends TaggedError("RemoteRunnerBuildError"
   readonly message: string;
 }> {}
 
-function captureBuildOperation<T>(
+async function captureBuildOperation<T>(
   operation: RemoteRunnerBuildError["operation"],
   effect: () => Promise<T>,
 ): Promise<ResultType<T, RemoteRunnerBuildError>> {
-  return Result.tryPromise({
-    try: effect,
-    catch: (caught) => {
-      if (isPanic(caught)) throw caught;
-      return new RemoteRunnerBuildError({
-        operation,
-        cause: opaqueErrorCause(caught, "Opaque remote runner build failure"),
-        message: `Remote runner ${operation} failed`,
-      });
-    },
+  const pending = Promise.resolve().then(effect);
+  const captured = await Result.tryPromise({
+    try: () => pending,
+    catch: (cause) => captureError(cause, "Remote runner build failed"),
   });
+  const outcome = captured.match<
+    | { readonly kind: "success"; readonly value: T }
+    | { readonly kind: "failure"; readonly cause: Error }
+  >({
+    ok: (value) => ({ kind: "success", value }),
+    err: ({ cause }) => ({ kind: "failure", cause }),
+  });
+  if (outcome.kind === "success") return Result.ok(outcome.value);
+  if (isPanic(outcome.cause)) {
+    await pending;
+    return Result.err(
+      new RemoteRunnerBuildError({
+        operation,
+        cause: opaqueErrorCause(outcome.cause, "Opaque remote runner build failure"),
+        message: `Remote runner ${operation} failed`,
+      }),
+    );
+  }
+  return Result.err(
+    new RemoteRunnerBuildError({
+      operation,
+      cause: opaqueErrorCause(outcome.cause, "Opaque remote runner build failure"),
+      message: `Remote runner ${operation} failed`,
+    }),
+  );
 }
 
 export async function buildRemoteRunner(): Promise<ResultType<void, RemoteRunnerBuildError>> {

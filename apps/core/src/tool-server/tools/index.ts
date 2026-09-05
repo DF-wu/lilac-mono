@@ -1,6 +1,7 @@
 export * from "./web";
 export * from "./content-inspect";
 export * from "./attachment";
+export * from "./resource";
 export * from "./programmatic-workflow";
 export * from "./discovery";
 export * from "./conversation-thread";

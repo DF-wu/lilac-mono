@@ -10,7 +10,6 @@ import {
   ToolPluginHookError,
   ToolPluginManager,
   type Level1ToolSpec,
-  type RequestContext,
 } from "@stanley2058/lilac-plugin-runtime";
 import { createLogger, parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError } from "better-result";
@@ -20,8 +19,9 @@ import {
   type ToolServerOptions,
   type ToolServerHealthSnapshot,
 } from "../src/tool-server/create-tool-server";
-import type { ServerTool } from "../src/tool-server/types";
+import type { RequestContext, ServerTool } from "../src/tool-server/types";
 import { RequestControlAuthority } from "../src/tool-server/request-control-authority";
+import { requestInvocationCwd } from "../src/tool-server/request-invocation-cwd";
 import { decodeToolInput } from "../src/tool-server/validation-error-message";
 import type { AuthenticatedRequestProjection } from "../src/surface/authenticated-request";
 
@@ -993,6 +993,7 @@ describe("createToolServer", () => {
       ).toMatchObject({ status: "ok", value: { ok: true } });
       expect(contexts).toHaveLength(1);
       expect(contexts[0]?.cwd).toBe("/workspace");
+      expect(contexts[0] && requestInvocationCwd(contexts[0])).toBe("/attacker-controlled");
       expect(
         (
           await server.app.handle(
@@ -1393,6 +1394,7 @@ describe("createToolServer", () => {
           operator: true,
         },
       ]);
+      expect(contexts.map(requestInvocationCwd)).toEqual([undefined, "/operator-selected-project"]);
     } finally {
       await server.stop();
     }
@@ -1527,6 +1529,7 @@ describe("createToolServer", () => {
       callableId: string;
       input: Record<string, unknown>;
       requestId?: string;
+      requestDeliveryId?: string;
       sessionId?: string;
       requestClient?: string;
       cwd?: string;
@@ -1554,6 +1557,7 @@ describe("createToolServer", () => {
           callableId,
           input,
           requestId: opts?.context?.requestId,
+          requestDeliveryId: opts?.context?.requestDeliveryId,
           sessionId: opts?.context?.sessionId,
           requestClient: opts?.context?.requestClient,
           cwd: opts?.context?.cwd,
@@ -1601,6 +1605,7 @@ describe("createToolServer", () => {
         headers: {
           "content-type": "application/json",
           "x-lilac-request-id": "req:1",
+          "x-lilac-request-delivery-id": "delivery-1",
           "x-lilac-session-id": "chan",
           "x-lilac-request-client": "discord",
           "x-lilac-cwd": "/tmp/work",
@@ -1620,6 +1625,7 @@ describe("createToolServer", () => {
     expect(captured.callableId).toBe("test.echo");
     expect(captured.input).toEqual({ hello: "world" });
     expect(captured.requestId).toBe("req:1");
+    expect(captured.requestDeliveryId).toBe("delivery-1");
     expect(captured.sessionId).toBe("chan");
     expect(captured.requestClient).toBe("discord");
     expect(captured.cwd).toBe("/tmp/work");
@@ -3554,6 +3560,7 @@ describe("createToolServer", () => {
 
   it("invokes the unhealthy watchdog after repeated live failures", async () => {
     const unhealthySnapshots: ToolServerHealthSnapshot[] = [];
+    const unhealthy = Promise.withResolvers<ToolServerHealthSnapshot>();
     const server = createToolServer({
       tools: [],
       healthProvider: () => ({
@@ -3568,6 +3575,7 @@ describe("createToolServer", () => {
       }),
       onUnhealthy: async (snapshot) => {
         unhealthySnapshots.push(snapshot);
+        unhealthy.resolve(snapshot);
       },
       healthConfig: {
         watchdogIntervalMs: 10,
@@ -3578,16 +3586,20 @@ describe("createToolServer", () => {
     await server.init();
     await server.start(0);
 
-    // test-wait-justification: allows two real watchdog intervals to trigger the configured unhealthy callback
-    await Bun.sleep(40);
+    const snapshot = await Promise.race([
+      unhealthy.promise,
+      Bun.sleep(1_000).then(() => {
+        throw new Error("Watchdog did not report the unhealthy runtime");
+      }),
+    ]).finally(async () => {
+      await server.stop();
+    });
 
     expect(unhealthySnapshots).toHaveLength(1);
     expect(
-      unhealthySnapshots[0]?.checks.find(
+      snapshot.checks.find(
         (check: ToolServerHealthSnapshot["checks"][number]) => check.name === "runtime.redis",
       )?.ok,
     ).toBe(false);
-
-    await server.stop();
   });
 });

@@ -1,7 +1,10 @@
-import type { ModelMessage } from "ai";
+import { captureError } from "../shared/error-capture.js";
+import type { BusMessageV2 } from "@stanley2058/lilac-event-bus";
 import { isPanic, resolveHeartbeatPromptPaths, type CoreConfig } from "@stanley2058/lilac-utils";
+import { Result } from "better-result";
 
 import { matchesMagicToken } from "../shared/magic-token";
+import { preserveToolPanic } from "../tools/tool-result-adapters";
 
 export const HEARTBEAT_SESSION_ID = "__heartbeat__";
 export const HEARTBEAT_OK_TOKEN = "HEARTBEAT_OK";
@@ -117,7 +120,7 @@ export function buildHeartbeatRequestMessages(params: {
   lastActivityAt?: number;
   heartbeat: CoreConfig["surface"]["heartbeat"];
   dataDir?: string;
-}): ModelMessage[] {
+}): BusMessageV2[] {
   const paths = resolveHeartbeatPromptPaths({ dataDir: params.dataDir });
   const quietState = getHeartbeatQuietState({
     nowMs: params.nowMs,
@@ -224,19 +227,27 @@ function resolveLocalHourMinute(
 }
 
 function createQuietHoursFormatter(timezone: string | undefined): Intl.DateTimeFormat {
-  try {
-    return new Intl.DateTimeFormat("en-GB", {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-      ...(timezone ? { timeZone: timezone } : {}),
-    });
-  } catch (cause) {
-    if (isPanic(cause)) throw cause;
-    return new Intl.DateTimeFormat("en-GB", {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-  }
+  const created = Result.try({
+    try: () =>
+      new Intl.DateTimeFormat("en-GB", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+        ...(timezone ? { timeZone: timezone } : {}),
+      }),
+    catch: captureError,
+  }).match<
+    | { readonly kind: "success"; readonly formatter: Intl.DateTimeFormat }
+    | { readonly kind: "failure"; readonly failure: Error }
+  >({
+    ok: (formatter) => ({ kind: "success", formatter }),
+    err: ({ cause }) => ({ kind: "failure", failure: cause }),
+  });
+  if (created.kind === "success") return created.formatter;
+  if (isPanic(created.failure)) preserveToolPanic(created.failure);
+  return new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }

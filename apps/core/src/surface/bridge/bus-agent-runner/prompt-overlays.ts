@@ -1,4 +1,4 @@
-import type { ModelMessage } from "ai";
+import { captureError } from "../../../shared/error-capture";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import {
   getDiscordSessionAliasValue,
@@ -9,13 +9,14 @@ import {
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { Result } from "better-result";
 
 import {
   buildHeartbeatSessionOverlay,
   buildOrdinaryHeartbeatOverlay,
   isHeartbeatSessionId,
 } from "../../../heartbeat/common";
-import { messagesContainSurfaceMetadata } from "../surface-metadata";
+import { messagesContainSurfaceMetadata, type SurfaceMetadataMessage } from "../surface-metadata";
 import type { AgentRunProfile } from "./raw";
 
 const DEFAULT_PROMPT_USER_ALIAS_LIMIT = 25;
@@ -153,34 +154,46 @@ export async function resolveSessionAdditionalPrompts(params: {
       continue;
     }
 
-    let filePath: string;
-    try {
-      const url = new URL(trimmed);
-      if (url.protocol !== "file:") {
-        throw new Error(`unsupported protocol '${url.protocol}'`);
-      }
-      filePath = fileURLToPath(url);
-    } catch (e) {
-      params.onWarn?.({
-        reason: "invalid_file_url",
-        value,
-        error: opaqueErrorMessage(e, "Unknown prompt file failure"),
+    const parsedPath = Result.try({
+      try: () => {
+        const url = new URL(trimmed);
+        if (url.protocol !== "file:") throw new Error(`unsupported protocol '${url.protocol}'`);
+        return fileURLToPath(url);
+      },
+      catch: captureError,
+    });
+    const filePath = parsedPath.match({ ok: (resolved) => resolved, err: () => null });
+    if (filePath === null) {
+      parsedPath.match({
+        ok: () => undefined,
+        err: (cause) =>
+          params.onWarn?.({
+            reason: "invalid_file_url",
+            value,
+            error: opaqueErrorMessage(cause, "Unknown prompt file failure"),
+          }),
       });
       continue;
     }
 
-    try {
-      const content = (await readFileText(filePath)).trim();
-      const filename = path.basename(filePath) || filePath;
-      out.push(`# ${filename} (${filePath})\n${content.length > 0 ? content : "(empty)"}`);
-    } catch (e) {
-      params.onWarn?.({
-        reason: "read_failed",
-        value,
-        filePath,
-        error: opaqueErrorMessage(e, "Unknown prompt path failure"),
-      });
-    }
+    const read = await Result.tryPromise({
+      try: () => readFileText(filePath),
+      catch: captureError,
+    });
+    read.match({
+      ok: (text) => {
+        const content = text.trim();
+        const filename = path.basename(filePath) || filePath;
+        out.push(`# ${filename} (${filePath})\n${content.length > 0 ? content : "(empty)"}`);
+      },
+      err: (cause) =>
+        params.onWarn?.({
+          reason: "read_failed",
+          value,
+          filePath,
+          error: opaqueErrorMessage(cause, "Unknown prompt path failure"),
+        }),
+    });
   }
 
   return out;
@@ -242,7 +255,9 @@ export function buildAutoInjectedThreadSearchOverlay(params: {
   ].join("\n");
 }
 
-export function buildSurfaceMetadataOverlay(messages: readonly ModelMessage[]): string | null {
+export function buildSurfaceMetadataOverlay(
+  messages: readonly SurfaceMetadataMessage[],
+): string | null {
   if (!messagesContainSurfaceMetadata(messages)) return null;
 
   return [

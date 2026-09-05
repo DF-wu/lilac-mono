@@ -39,6 +39,8 @@ import {
   type TestRawSubscriptionHost,
 } from "../../helpers/result-raw-bus";
 
+const UUID_V4_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
 function createInMemoryRawBus(): RawBus & TestRawSubscriptionHost {
   const topics = new Map<string, Array<Message<unknown>>>();
   const subs = new Set<{
@@ -278,16 +280,13 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       transcriptStore,
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.message.deleted",
       platform: "discord",
       ts: Date.now(),
       messageRef: { platform: "discord", channelId: "chan", messageId: "m1" },
       session: { platform: "discord", channelId: "chan" },
     });
-    // test-wait-justification: drains the adapter event listener and transcript unlink callback triggered above
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
     expect(unlinked).toEqual([{ platform: "discord", channelId: "chan", messageId: "m1" }]);
   });
 
@@ -331,16 +330,13 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       transcriptStore,
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.message.deleted",
       platform: "discord",
       ts: Date.now(),
       messageRef: { platform: "discord", channelId: "chan", messageId: "m1" },
       session: { platform: "discord", channelId: "chan" },
     });
-    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
     expect(publishedTypes).toContain(lilacEventTypes.EvtAdapterMessageDeleted);
     const stopped = await evtSub.stop();
     if (stopped.status === "error") throw stopped.error;
@@ -385,14 +381,14 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       raw: { discord: { mentionsBot: false } },
     };
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.message.created",
       platform: "discord",
       ts: Date.now(),
       message,
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.message.updated",
       platform: "discord",
       ts: Date.now(),
@@ -402,7 +398,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       },
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.message.deleted",
       platform: "discord",
       ts: Date.now(),
@@ -411,7 +407,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       raw: { reason: "deleted" },
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.reaction.added",
       platform: "discord",
       ts: Date.now(),
@@ -422,7 +418,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       userName: "bob",
     });
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.reaction.removed",
       platform: "discord",
       ts: Date.now(),
@@ -432,9 +428,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       userId: "u2",
       userName: "bob",
     });
-
-    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(published.map((m) => m.type)).toEqual([
       lilacEventTypes.EvtAdapterMessageCreated,
@@ -501,7 +494,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     if (subResult.status === "error") throw subResult.error;
     const sub = subResult.value;
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.request.cancel",
       platform: "discord",
       ts: Date.now(),
@@ -510,13 +503,11 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       cancelScope: "active_only",
     });
 
-    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
     expect(published.length).toBe(1);
     const msg = published[0]!;
     expect(msg.type).toBe(lilacEventTypes.CmdRequestMessage);
     expect(msg.data).toEqual({
+      requestDeliveryId: expect.stringMatching(UUID_V4_PATTERN),
       queue: "interrupt",
       messages: [],
       raw: {
@@ -559,7 +550,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     if (subResult.status === "error") throw subResult.error;
     const sub = subResult.value;
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.request.cancel",
       platform: "discord",
       ts: Date.now(),
@@ -570,13 +561,11 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       messageId: "m2",
     });
 
-    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
     expect(published.length).toBe(1);
     const msg = published[0]!;
     expect(msg.type).toBe(lilacEventTypes.CmdRequestMessage);
     expect(msg.data).toEqual({
+      requestDeliveryId: expect.stringMatching(UUID_V4_PATTERN),
       queue: "interrupt",
       messages: [],
       raw: {
@@ -621,7 +610,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
     if (subResult.status === "error") throw subResult.error;
     const sub = subResult.value;
 
-    adapter.emit({
+    await adapter.emitAndWait({
       type: "adapter.command.invoked",
       platform: "discord",
       ts: 1_234,
@@ -637,9 +626,6 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       sessionConfigId: "chan",
     });
 
-    // test-wait-justification: drains the adapter event listener and resulting in-memory bus publication
-    await new Promise((resolve) => setTimeout(resolve, 0));
-
     expect(published.length).toBe(1);
     const msg = published[0]!;
     expect(msg.type).toBe(lilacEventTypes.CmdRequestMessage);
@@ -649,6 +635,7 @@ describe("bridgeAdapterToBus cancel mapping", () => {
       request_client: "discord",
     });
     expect(msg.data).toEqual({
+      requestDeliveryId: expect.stringMatching(UUID_V4_PATTERN),
       queue: "prompt",
       messages: [
         {

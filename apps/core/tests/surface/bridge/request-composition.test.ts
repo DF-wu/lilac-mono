@@ -5,7 +5,13 @@ import {
   composeRequestMessages as composeRequestMessagesResult,
   composeSingleMessage as composeSingleMessageResult,
 } from "../../../src/surface/bridge/request-composition";
-import type { ModelMessage } from "ai";
+import type { StoredMessageV1 } from "@stanley2058/lilac-event-bus";
+import type {
+  BlobHandleV1,
+  BlobRefV1,
+  BlobStore,
+  BlobUpload,
+} from "@stanley2058/lilac-blob-storage";
 import { Panic, Result } from "better-result";
 import type {
   AdapterEventHandler,
@@ -20,7 +26,11 @@ import {
   SurfaceRateLimited,
   SurfaceUnavailable,
 } from "../../../src/surface/adapter";
-import type { TranscriptSnapshot, TranscriptStore } from "../../../src/transcript/transcript-store";
+import type {
+  AdmitCoreSurfaceProjection,
+  TranscriptSnapshot,
+  TranscriptStore,
+} from "../../../src/transcript/transcript-store";
 import type {
   ContentOpts,
   LimitOpts,
@@ -31,6 +41,10 @@ import type {
   SurfaceSelf,
   SurfaceSession,
 } from "../../../src/surface/types";
+import { getTestBlobStore } from "../../helpers/blob-store";
+import type { DiscordAttachmentCacheAccess } from "../../../src/surface/discord/discord-attachment";
+import type { RegisterResourceInput, ResourceDescriptor } from "../../../src/resource/contracts";
+import { ResourceStoreFailure } from "../../../src/resource/errors";
 import { SurfaceAdapterTestBase } from "../../helpers/surface-adapter-test-base";
 
 async function composeRecentChannelMessages(
@@ -96,7 +110,11 @@ class FakeAdapter extends SurfaceAdapterTestBase {
     return Result.ok({
       push: async () => Result.ok("visible" as const),
       finish: async () => {
-        const ref = { platform: "discord" as const, channelId: "unused", messageId: "unused" };
+        const ref = {
+          platform: "discord" as const,
+          channelId: "unused",
+          messageId: "unused",
+        };
         return Result.ok({ created: [ref], last: ref });
       },
       abort: async () => Result.ok(undefined),
@@ -104,7 +122,11 @@ class FakeAdapter extends SurfaceAdapterTestBase {
   }
 
   async sendMsg(_sessionRef: SessionRef, _content: ContentOpts, _opts?: SendOpts) {
-    return Result.ok({ platform: "discord", channelId: "unused", messageId: "unused" } as const);
+    return Result.ok({
+      platform: "discord",
+      channelId: "unused",
+      messageId: "unused",
+    } as const);
   }
 
   async readMsg(_msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
@@ -160,6 +182,105 @@ function formatExpectedSurfaceMetadataLine(meta: Record<string, unknown>): strin
 afterEach(() => {
   globalThis.fetch = originalFetch;
 });
+
+function controlledReservationBlobStore(): {
+  store: BlobStore;
+  uploads: Array<{
+    upload: BlobUpload;
+    complete: () => void;
+  }>;
+} {
+  const uploads: Array<{ upload: BlobUpload; complete: () => void }> = [];
+  let nextObject = 1;
+  const store: BlobStore = {
+    async startUpload() {
+      const index = nextObject++;
+      const objectId = `b1_${index.toString(16).padStart(32, "0")}`;
+      let complete!: () => void;
+      const completion = new Promise<ReturnType<typeof Result.ok<BlobRefV1>>>((resolve) => {
+        complete = () =>
+          resolve(
+            Result.ok({
+              version: 1,
+              objectId,
+              sha256: index.toString(16).padStart(64, "0"),
+              byteLength: 4,
+            }),
+          );
+      });
+      const upload = {
+        handle: { version: 1, objectId } satisfies BlobHandleV1,
+        completion,
+      };
+      uploads.push({ upload, complete });
+      return Result.ok(upload);
+    },
+    async resolve() {
+      return Result.err(new Error("not used") as never);
+    },
+    async open() {
+      return Result.err(new Error("not used") as never);
+    },
+    async delete() {
+      return Result.ok("deleted" as const);
+    },
+    async maintain() {
+      return Result.ok({ inspected: 0, deleted: 0, remaining: false });
+    },
+    async close() {
+      return Result.ok({ completedUploads: 0, interruptedUploads: 0 });
+    },
+  };
+  return { store, uploads };
+}
+
+const noOpAttachmentCache: DiscordAttachmentCacheAccess = {
+  get: () => null,
+  put: () => undefined,
+  clear: () => null,
+};
+
+function createRecordingResourceRegistry() {
+  const registrations: RegisterResourceInput[] = [];
+  return {
+    registrations,
+    registry: {
+      async register(input: RegisterResourceInput) {
+        registrations.push(input);
+        const descriptor: ResourceDescriptor = {
+          uri: `resource://r1_${registrations.length.toString(16).padStart(32, "0")}`,
+          ...(input.filename ? { filename: input.filename } : {}),
+          ...(input.declaredMediaType ? { declaredMediaType: input.declaredMediaType } : {}),
+          ...(input.reportedByteLength === undefined
+            ? {}
+            : { reportedByteLength: input.reportedByteLength }),
+        };
+        return Result.ok(descriptor);
+      },
+    },
+  };
+}
+
+function createProjectionCapturingStore(admitted: AdmitCoreSurfaceProjection[]): TranscriptStore {
+  return {
+    saveRequestTranscript: () => Result.ok(undefined),
+    linkSurfaceMessagesToRequest: () => undefined,
+    getTranscriptBySurfaceMessage: () => Result.ok(null),
+    putCoreOwnedBlob: () => {
+      throw new Error("unexpected blob ownership write");
+    },
+    getCoreOwnedBlob: () => {
+      throw new Error("unexpected blob ownership read");
+    },
+    deleteCoreOwnedBlobIfUnreferenced: () => null,
+    admitCoreSurfaceProjection(input) {
+      admitted.push(input);
+      return Result.ok({ ...input, createdAt: 0 });
+    },
+    getCoreSurfaceProjection: () => Result.ok(null),
+    close: () => undefined,
+  };
+}
 
 describe("request-composition attachments", () => {
   it("propagates message read failures instead of composing empty context", async () => {
@@ -314,30 +435,6 @@ describe("request-composition attachments", () => {
     expect(out!.content as string).toContain('"user_alias":"Stanley"');
   });
 
-  it("does not apply Discord user aliases to colliding Telegram user ids", async () => {
-    const msg: SurfaceMessage = {
-      ref: { platform: "telegram", channelId: "c", messageId: "m" },
-      session: { platform: "telegram", channelId: "c" },
-      userId: "u",
-      userName: "telegram-user",
-      text: "hi",
-      ts: 0,
-    };
-
-    const adapter = new FakeAdapter(msg, []);
-    const out = await composeSingleMessage(adapter, {
-      platform: "telegram",
-      botUserId: "bot",
-      botName: "lilac",
-      msgRef: msg.ref,
-      discordUserAliasById: new Map([["u", "Stanley"]]),
-    });
-
-    expect(out?.role).toBe("user");
-    expect(typeof out?.content).toBe("string");
-    expect(out!.content as string).not.toContain("user_alias");
-  });
-
   it("escapes metadata tags anywhere in user-authored text", async () => {
     const msg: SurfaceMessage = {
       ref: { platform: "discord", channelId: "c", messageId: "m" },
@@ -388,6 +485,59 @@ describe("request-composition attachments", () => {
     expect(typeof out?.content).toBe("string");
     expect(out!.content as string).toBe("assistant_output");
     expect(out!.content as string).not.toContain("[discord user_id=");
+  });
+
+  it("registers visible attachments on assistant surface messages", async () => {
+    const msg: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "m" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "bot",
+      userName: "lilac",
+      text: "assistant_output",
+      ts: 0,
+      raw: {
+        discord: {
+          attachments: [
+            {
+              id: "attachment-1",
+              url: "https://cdn.discordapp.com/attachments/1/2/report.pdf",
+              filename: "report.pdf",
+              mimeType: "application/pdf",
+              size: 4,
+            },
+          ],
+        },
+      },
+    };
+    const resources = createRecordingResourceRegistry();
+
+    const out = await composeSingleMessage(new FakeAdapter(msg), {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: msg.ref,
+      resourceRegistry: resources.registry,
+    });
+
+    expect(out?.role).toBe("assistant");
+    expect(out?.content).toEqual([
+      { type: "text", text: "assistant_output" },
+      {
+        type: "resource",
+        uri: "resource://r1_00000000000000000000000000000001",
+        filename: "report.pdf",
+        mediaType: "application/pdf",
+        size: 4,
+      },
+    ]);
+    expect(resources.registrations[0]?.origin).toEqual({
+      version: 1,
+      kind: "discord-attachment",
+      channelId: "c",
+      messageId: "m",
+      ordinal: 0,
+      attachmentId: "attachment-1",
+    });
   });
 
   it("keeps bot embed-only messages untagged", async () => {
@@ -494,7 +644,7 @@ describe("request-composition attachments", () => {
     expect(content).toContain("[discord_embed]");
   });
 
-  it("downloads discord attachment when mimeType is missing", async () => {
+  it("registers an unknown-size Discord attachment without fetching its bytes", async () => {
     let calls = 0;
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
@@ -524,11 +674,13 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
@@ -536,12 +688,110 @@ describe("request-composition attachments", () => {
     const content = out!.content as any[];
 
     expect(content.length).toBe(2);
-    expect(content[1].type).toBe("text");
-    expect(typeof content[1].text).toBe("string");
-    expect(content[1].text).toContain("[discord_attachment");
-    expect(content[1].text).toContain("file.txt");
-    expect(content[1].text).toContain("hello");
-    expect(calls).toBe(1);
+    expect(content[1]).toEqual({
+      type: "resource",
+      uri: "resource://r1_00000000000000000000000000000001",
+      filename: "file.txt",
+    });
+    expect(resources.registrations).toEqual([
+      {
+        origin: {
+          version: 1,
+          kind: "discord-attachment",
+          channelId: "c",
+          messageId: "m",
+          ordinal: 0,
+        },
+        filename: "file.txt",
+      },
+    ]);
+    expect(calls).toBe(0);
+  });
+
+  it("returns a closed registration failure when attachments have no registry", async () => {
+    const msg: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "m" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      userName: "user",
+      text: "hi",
+      ts: 0,
+      raw: {
+        discord: {
+          attachments: [
+            {
+              url: "https://cdn.discordapp.com/attachments/1/2/file.txt",
+              filename: "file.txt",
+            },
+          ],
+        },
+      },
+    };
+
+    const composed = await composeSingleMessageResult(new FakeAdapter(msg), {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: msg.ref,
+    });
+
+    expect(composed.status).toBe("error");
+    if (composed.status === "error") {
+      expect(composed.error).toBeInstanceOf(ResourceStoreFailure);
+    }
+  });
+
+  it("persists resource identity without signed URLs or attachment IDs in source facts", async () => {
+    const signedUrl = "https://cdn.discordapp.com/attachments/1/2/file.txt?sig=secret";
+    const attachmentId = "discord-attachment-id";
+    const msg: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "m" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      userName: "user",
+      text: "hi",
+      ts: 0,
+      raw: {
+        discord: {
+          attachments: [
+            {
+              id: attachmentId,
+              url: signedUrl,
+              filename: "file.txt",
+              mimeType: "text/plain",
+              size: 12,
+            },
+          ],
+        },
+      },
+    };
+    const admitted: AdmitCoreSurfaceProjection[] = [];
+    const resources = createRecordingResourceRegistry();
+
+    await composeSingleMessage(new FakeAdapter(msg), {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: msg.ref,
+      resourceRegistry: resources.registry,
+      transcriptStore: createProjectionCapturingStore(admitted),
+    });
+
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]?.canonicalMessages[0]?.content).toEqual([
+      expect.objectContaining({ type: "text" }),
+      {
+        type: "resource",
+        uri: "resource://r1_00000000000000000000000000000001",
+        filename: "file.txt",
+        mediaType: "text/plain",
+        size: 12,
+      },
+    ]);
+    const serializedFacts = JSON.stringify(admitted[0]?.sourceFacts);
+    expect(admitted[0]?.sourceFacts).not.toHaveProperty("attachments");
+    expect(serializedFacts).not.toContain(signedUrl);
+    expect(serializedFacts).not.toContain(attachmentId);
   });
 
   it("keeps labeled embed text before attachment-derived parts", async () => {
@@ -576,30 +826,35 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     expect(Array.isArray(out?.content)).toBe(true);
 
-    const content = out!.content as Array<{ type: string; text?: string }>;
+    const content = out!.content as Array<{ type: string; text?: string; filename?: string }>;
     expect(content[0]?.type).toBe("text");
     expect(content[0]?.text).toContain("look");
     expect(content[0]?.text).toContain("[discord_embed]");
-    expect(content[1]?.type).toBe("text");
-    expect(content[1]?.text).toContain("[discord_attachment");
-    expect(calls).toBe(1);
+    expect(content[1]?.type).toBe("resource");
+    expect(content[1]?.filename).toBe("file.txt");
+    expect(calls).toBe(0);
   });
 
-  it("does not download when mimeType is application/pdf", async () => {
-    // @ts-expect-error stub fetch
-    globalThis.fetch = async () => {
-      throw new Error("should not fetch");
-    };
+  it("emits PDF metadata as a structured resource part", async () => {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46]), {
+        headers: { "content-type": "application/pdf" },
+      });
+    }) as unknown as typeof fetch;
 
     const msg: SurfaceMessage = {
       ref: { platform: "discord", channelId: "c", messageId: "m" },
@@ -622,21 +877,71 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      blobStore: await getTestBlobStore(),
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     const content = out!.content as any[];
-    expect(content[1].type).toBe("file");
+    expect(content[1].type).toBe("resource");
+    expect(content[1].uri).toStartWith("resource://r1_");
     expect(content[1].mediaType).toBe("application/pdf");
-    expect(content[1].data).toBeInstanceOf(URL);
+    expect(content[1].filename).toBe("doc.pdf");
+    expect(calls).toBe(0);
   });
 
-  it("inlines plain text when mimeType is text/plain", async () => {
+  it("does not reserve request blobs for current Discord attachments", async () => {
+    globalThis.fetch = (async () =>
+      new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46]))) as unknown as typeof fetch;
+    const msg: SurfaceMessage = {
+      ref: { platform: "discord", channelId: "c", messageId: "m" },
+      session: { platform: "discord", channelId: "c" },
+      userId: "u",
+      userName: "user",
+      text: "hi",
+      ts: 0,
+      raw: {
+        discord: {
+          attachments: [
+            {
+              url: "https://cdn.discordapp.com/attachments/1/2/doc.pdf",
+              filename: "doc.pdf",
+              mimeType: "application/pdf",
+              size: 4,
+            },
+          ],
+        },
+      },
+    };
+    const blobs = controlledReservationBlobStore();
+    const resources = createRecordingResourceRegistry();
+    const composition = composeSingleMessageResult(new FakeAdapter(msg), {
+      platform: "discord",
+      botUserId: "bot",
+      botName: "lilac",
+      msgRef: msg.ref,
+      blobStore: blobs.store,
+      attachmentCache: noOpAttachmentCache,
+      resourceRegistry: resources.registry,
+    });
+
+    const composed = await composition;
+    expect(blobs.uploads).toHaveLength(0);
+    expect(composed.status).toBe("ok");
+    if (composed.status === "ok") {
+      const content = composed.value?.content;
+      expect(Array.isArray(content) ? content[1]?.type : null).toBe("resource");
+      expect(composed.value && "inputHandles" in composed.value).toBe(false);
+    }
+  });
+
+  it("keeps text/plain attachments resource-only", async () => {
     let calls = 0;
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
@@ -667,21 +972,23 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     const content = out!.content as any[];
-    expect(content[1].type).toBe("text");
-    expect(content[1].text).toContain("hello");
-    expect(calls).toBe(1);
+    expect(content[1].type).toBe("resource");
+    expect(JSON.stringify(content)).not.toContain("hello");
+    expect(calls).toBe(0);
   });
 
-  it("inlines text when mimeType is application/x-yaml", async () => {
+  it("keeps YAML attachments resource-only", async () => {
     let calls = 0;
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
@@ -712,21 +1019,23 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     const content = out!.content as any[];
-    expect(content[1].type).toBe("text");
-    expect(content[1].text).toContain("name: lilac");
-    expect(calls).toBe(1);
+    expect(content[1].type).toBe("resource");
+    expect(JSON.stringify(content)).not.toContain("name: lilac");
+    expect(calls).toBe(0);
   });
 
-  it("inlines text when mimeType ends with +json", async () => {
+  it("keeps vendor JSON attachments resource-only", async () => {
     let calls = 0;
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
@@ -757,21 +1066,23 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     const content = out!.content as any[];
-    expect(content[1].type).toBe("text");
-    expect(content[1].text).toContain('{"status":"ok"}');
-    expect(calls).toBe(1);
+    expect(content[1].type).toBe("resource");
+    expect(JSON.stringify(content)).not.toContain('{"status":"ok"}');
+    expect(calls).toBe(0);
   });
 
-  it("treats non-text binary as URL-only text", async () => {
+  it("keeps signed URLs out of binary resource parts", async () => {
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
       throw new Error("should not fetch");
@@ -798,21 +1109,23 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     const content = out!.content as any[];
-    expect(content[1].type).toBe("text");
-    expect(content[1].text).toContain("doc.rtf");
-    expect(content[1].text).toContain("https://cdn.discordapp.com/");
+    expect(content[1].type).toBe("resource");
+    expect(content[1].filename).toBe("doc.rtf");
+    expect(JSON.stringify(content)).not.toContain("cdn.discordapp.com");
   });
 
-  it("falls back to inferred mime type when download fails", async () => {
+  it("does not download attachment bytes during composition", async () => {
     // @ts-expect-error stub fetch
     globalThis.fetch = async () => {
       throw new Error("network down");
@@ -838,22 +1151,26 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
-    const out = await composeSingleMessage(adapter, {
+    const resources = createRecordingResourceRegistry();
+    const out = await composeSingleMessageResult(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      blobStore: await getTestBlobStore(),
+      resourceRegistry: resources.registry,
     });
 
-    expect(out?.role).toBe("user");
-    const content = out!.content as any[];
-    expect(content[1].type).toBe("text");
-    expect(content[1].text).toContain("note.txt");
-    expect(content[1].text).toContain("download failed");
-    expect(content[1].text).toContain("https://cdn.discordapp.com/");
+    expect(out.status).toBe("ok");
+    const content = out.match({ ok: (value) => value?.content, err: () => null });
+    expect(Array.isArray(content) ? content[1]?.type : null).toBe("resource");
   });
 
   it("uses forward snapshot content and visible attachments only", async () => {
+    globalThis.fetch = (async () =>
+      new Response(new Uint8Array([0xff, 0xd8, 0xff]), {
+        headers: { "content-type": "image/jpeg" },
+      })) as unknown as typeof fetch;
     const msg: SurfaceMessage = {
       ref: { platform: "discord", channelId: "c", messageId: "m" },
       session: { platform: "discord", channelId: "c" },
@@ -893,6 +1210,7 @@ describe("request-composition attachments", () => {
               content: "Forwarded snapshot text",
               attachments: [
                 {
+                  id: "visible-id",
                   url: "https://cdn.discordapp.com/attachments/fwd/1/IMG_VISIBLE.png",
                   filename: "IMG_VISIBLE.png",
                   mimeType: "image/jpeg",
@@ -906,11 +1224,14 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      blobStore: await getTestBlobStore(),
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
@@ -920,18 +1241,31 @@ describe("request-composition attachments", () => {
     expect(parts[0].type).toBe("text");
     expect(parts[0].text).toContain("Forwarded snapshot text");
 
-    const imageParts = parts.filter(
-      (p) =>
-        p &&
-        p.type === "file" &&
-        typeof p.mediaType === "string" &&
-        p.mediaType.startsWith("image/"),
-    );
-    expect(imageParts.length).toBe(1);
-    expect(String(imageParts[0].data)).toContain("IMG_VISIBLE.png");
+    const resourceParts = parts.filter((part) => part?.type === "resource");
+    expect(resourceParts).toHaveLength(1);
+    expect(resourceParts[0].filename).toBe("IMG_VISIBLE.png");
+    expect(resources.registrations).toEqual([
+      {
+        origin: {
+          version: 1,
+          kind: "discord-attachment",
+          channelId: "c",
+          messageId: "m",
+          ordinal: 0,
+          attachmentId: "visible-id",
+        },
+        filename: "IMG_VISIBLE.png",
+        declaredMediaType: "image/jpeg",
+        reportedByteLength: 10,
+      },
+    ]);
   });
 
   it("falls back to top-level attachments when forward snapshot attachments are empty", async () => {
+    globalThis.fetch = (async () =>
+      new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47]), {
+        headers: { "content-type": "image/png" },
+      })) as unknown as typeof fetch;
     const msg: SurfaceMessage = {
       ref: { platform: "discord", channelId: "c", messageId: "m" },
       session: { platform: "discord", channelId: "c" },
@@ -965,26 +1299,30 @@ describe("request-composition attachments", () => {
     };
 
     const adapter = new FakeAdapter(msg);
+    const resources = createRecordingResourceRegistry();
     const out = await composeSingleMessage(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       msgRef: msg.ref,
+      blobStore: await getTestBlobStore(),
+      resourceRegistry: resources.registry,
     });
 
     expect(out?.role).toBe("user");
     expect(Array.isArray(out?.content)).toBe(true);
 
     const parts = out!.content as any[];
-    const imageParts = parts.filter(
-      (p) =>
-        p &&
-        p.type === "file" &&
-        typeof p.mediaType === "string" &&
-        p.mediaType.startsWith("image/"),
-    );
-    expect(imageParts.length).toBe(1);
-    expect(String(imageParts[0].data)).toContain("IMG_TOP.png");
+    const resourceParts = parts.filter((part) => part?.type === "resource");
+    expect(resourceParts).toHaveLength(1);
+    expect(resourceParts[0].filename).toBe("IMG_TOP.png");
+    expect(resources.registrations[0]?.origin).toEqual({
+      version: 1,
+      kind: "discord-attachment",
+      channelId: "c",
+      messageId: "m",
+      ordinal: 0,
+    });
   });
 
   it("uses forward snapshot embed string description when content is empty", async () => {
@@ -1643,6 +1981,10 @@ describe("request-composition mention thread context", () => {
   });
 
   it("treats forwarded references as root and uses forwarded snapshot payload", async () => {
+    globalThis.fetch = (async () =>
+      new Response(new Uint8Array([0xff, 0xd8, 0xff]), {
+        headers: { "content-type": "image/jpeg" },
+      })) as unknown as typeof fetch;
     const sessionId = "c";
 
     const root: SurfaceMessage = {
@@ -1710,12 +2052,15 @@ describe("request-composition mention thread context", () => {
       [`${sessionId}:root`]: root,
       [`${sessionId}:fwd1`]: forwardMention,
     });
+    const resources = createRecordingResourceRegistry();
 
     const out = await composeRequestMessages(adapter, {
       platform: "discord",
       botUserId: "bot",
       botName: "lilac",
       trigger: { type: "mention", msgRef: forwardMention.ref },
+      blobStore: await getTestBlobStore(),
+      resourceRegistry: resources.registry,
     });
 
     expect(out.chainMessageIds).toEqual(["fwd1"]);
@@ -1728,15 +2073,16 @@ describe("request-composition mention thread context", () => {
     expect(parts[0].type).toBe("text");
     expect(parts[0].text).toContain("Forwarded snapshot text");
 
-    const imageParts = parts.filter(
-      (p) =>
-        p &&
-        p.type === "file" &&
-        typeof p.mediaType === "string" &&
-        p.mediaType.startsWith("image/"),
-    );
-    expect(imageParts.length).toBe(1);
-    expect(String(imageParts[0].data)).toContain("IMG_VISIBLE.png");
+    const resourceParts = parts.filter((part) => part?.type === "resource");
+    expect(resourceParts).toHaveLength(1);
+    expect(resourceParts[0].filename).toBe("IMG_VISIBLE.png");
+    expect(resources.registrations[0]?.origin).toEqual({
+      version: 1,
+      kind: "discord-attachment",
+      channelId: "c",
+      messageId: "fwd1",
+      ordinal: 0,
+    });
   });
 
   it("includes user alias in mention-thread attribution header when configured", async () => {
@@ -1925,7 +2271,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 8,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "40" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "40",
+      },
       triggerType: undefined,
     });
 
@@ -1948,7 +2298,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 20,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "40" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "40",
+      },
       triggerType: undefined,
     });
 
@@ -1984,7 +2338,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 40,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "80" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "80",
+      },
       triggerType: undefined,
     });
 
@@ -2008,7 +2366,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 100,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "160" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "160",
+      },
       triggerType: undefined,
     });
 
@@ -2037,7 +2399,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 8,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "220" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "220",
+      },
       triggerType: undefined,
     });
 
@@ -2067,7 +2433,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 40,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "80" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "80",
+      },
       triggerType: undefined,
     });
 
@@ -2094,7 +2464,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 8,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "220" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "220",
+      },
       triggerType: undefined,
     });
 
@@ -2130,7 +2504,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 8,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "220" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "220",
+      },
       triggerType: undefined,
     });
 
@@ -2169,7 +2547,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 20,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "10" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "10",
+      },
       triggerType: undefined,
     });
 
@@ -2350,7 +2732,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 20,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "10" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "10",
+      },
       triggerType: "mention",
     });
 
@@ -2385,7 +2771,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 20,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "10" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "10",
+      },
       triggerType: undefined,
     });
 
@@ -2420,7 +2810,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 20,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "10" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "10",
+      },
       triggerType: "mention",
     });
 
@@ -2456,7 +2850,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 2,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "4" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "4",
+      },
       triggerType: undefined,
     });
 
@@ -2493,7 +2891,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 8,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "5" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "5",
+      },
       triggerType: undefined,
     });
 
@@ -2504,53 +2906,6 @@ describe("request-composition active channel burst rules", () => {
       .join("\n");
     expect(combined).not.toContain("!cont=");
     expect(combined).toContain("current request");
-  });
-
-  it("does not expand Telegram reply history from a visible !continue directive", async () => {
-    const sessionId = "1001";
-    const anchorTs = 10_000_000;
-    const mk = (
-      id: string,
-      ts: number,
-      text: string,
-      raw: Record<string, unknown>,
-    ): SurfaceMessage => ({
-      ref: { platform: "telegram", channelId: sessionId, messageId: id },
-      session: { platform: "telegram", channelId: sessionId },
-      userId: id === "4" ? "bot" : "u",
-      userName: id === "4" ? "lilac" : "user",
-      text,
-      ts,
-      raw,
-    });
-    const telegramRaw = (messageId: string, replyToMessageId?: string) => ({
-      telegram: {
-        chatId: sessionId,
-        messageId,
-        ...(replyToMessageId === undefined ? {} : { replyToMessageId }),
-      },
-    });
-    const msgs = [
-      mk("1", anchorTs - 4 * 60 * 60 * 1000, "unrelated old one", telegramRaw("1")),
-      mk("2", anchorTs - 3 * 60 * 60 * 1000, "unrelated old two", telegramRaw("2")),
-      mk("3", anchorTs - 2_000, "recent", telegramRaw("3")),
-      mk("4", anchorTs - 1_000, "bot answer", telegramRaw("4")),
-      mk("5", anchorTs, "!continue reply only", telegramRaw("5", "4")),
-    ];
-    const adapter = new ListFakeAdapter(msgs);
-
-    const out = await composeRecentChannelMessages(adapter, {
-      platform: "telegram",
-      sessionId,
-      botUserId: "bot",
-      botName: "lilac",
-      limit: 3,
-      triggerMsgRef: { platform: "telegram", channelId: sessionId, messageId: "5" },
-      triggerType: "reply",
-    });
-
-    expect(out.chainMessageIds).toEqual(["3", "4", "5"]);
-    expect(JSON.stringify(out.messages)).not.toContain("unrelated old");
   });
 
   it("keeps visible !cont directives sticky and expands them recursively for later plain active messages", async () => {
@@ -2585,7 +2940,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 3,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "7" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "7",
+      },
       triggerType: undefined,
     });
 
@@ -2615,7 +2974,9 @@ describe("request-composition active channel burst rules", () => {
 
     const msgs = [
       mk("1", 1, "before"),
-      mk("2", 2, "!cont=2 reopen", { reference: { messageId: "1", channelId: sessionId } }),
+      mk("2", 2, "!cont=2 reopen", {
+        reference: { messageId: "1", channelId: sessionId },
+      }),
       mk("3", 3, "assistant", { reference: {} }, "bot", "lilac"),
       mk("4", 4, "plain follow-up"),
     ];
@@ -2628,7 +2989,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 3,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "4" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "4",
+      },
       triggerType: undefined,
     });
 
@@ -2672,7 +3037,11 @@ describe("request-composition active channel burst rules", () => {
       botUserId: "bot",
       botName: "lilac",
       limit: 8,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "6" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "6",
+      },
       triggerType: undefined,
     });
 
@@ -2712,7 +3081,7 @@ describe("request-composition active channel burst rules", () => {
     const lookupCounts = new Map<string, number>();
     const transcriptStore = transcriptStoreFor((input) => {
       lookupCounts.set(input.messageId, (lookupCounts.get(input.messageId) ?? 0) + 1);
-      const expanded = (content: string): ModelMessage[] => [{ role: "assistant", content }];
+      const expanded = (content: string): StoredMessageV1[] => [{ role: "assistant", content }];
       if (input.messageId === "8") {
         return {
           requestId: "r8",
@@ -2772,7 +3141,11 @@ describe("request-composition active channel burst rules", () => {
       botName: "lilac",
       limit: 20,
       transcriptStore,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "10" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "10",
+      },
       triggerType: undefined,
     });
 
@@ -2802,7 +3175,11 @@ describe("request-composition active channel burst rules", () => {
     const anchorTs = 10_000_000;
     const messages: SurfaceMessage[] = [
       {
-        ref: { platform: "discord", channelId: sessionId, messageId: "old-user" },
+        ref: {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: "old-user",
+        },
         session: { platform: "discord", channelId: sessionId },
         userId: "u",
         userName: "user",
@@ -2811,7 +3188,11 @@ describe("request-composition active channel burst rules", () => {
         raw: { reference: {} },
       },
       {
-        ref: { platform: "discord", channelId: sessionId, messageId: "checkpoint" },
+        ref: {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: "checkpoint",
+        },
         session: { platform: "discord", channelId: sessionId },
         userId: "bot",
         userName: "lilac",
@@ -2820,7 +3201,11 @@ describe("request-composition active channel burst rules", () => {
         raw: { reference: {} },
       },
       {
-        ref: { platform: "discord", channelId: sessionId, messageId: "descendant" },
+        ref: {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: "descendant",
+        },
         session: { platform: "discord", channelId: sessionId },
         userId: "u",
         userName: "user",
@@ -2829,7 +3214,11 @@ describe("request-composition active channel burst rules", () => {
         raw: { reference: {} },
       },
       {
-        ref: { platform: "discord", channelId: sessionId, messageId: "trigger" },
+        ref: {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: "trigger",
+        },
         session: { platform: "discord", channelId: sessionId },
         userId: "u",
         userName: "user",
@@ -2858,7 +3247,11 @@ describe("request-composition active channel burst rules", () => {
       botName: "lilac",
       limit: 8,
       transcriptStore,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "trigger" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "trigger",
+      },
     });
     const text = JSON.stringify(out.messages);
     expect(text).toContain("PERSISTED_CHECKPOINT");
@@ -2900,7 +3293,7 @@ describe("request-composition active channel burst rules", () => {
     ];
 
     const transcriptStore = transcriptStoreFor((input) => {
-      const expanded = (content: string): ModelMessage[] => [{ role: "assistant", content }];
+      const expanded = (content: string): StoredMessageV1[] => [{ role: "assistant", content }];
       if (input.messageId === "8") {
         return {
           requestId: "r8",
@@ -2960,7 +3353,11 @@ describe("request-composition active channel burst rules", () => {
       botName: "lilac",
       limit: 20,
       transcriptStore,
-      triggerMsgRef: { platform: "discord", channelId: sessionId, messageId: "10" },
+      triggerMsgRef: {
+        platform: "discord",
+        channelId: sessionId,
+        messageId: "10",
+      },
       triggerType: "mention",
     });
 
@@ -3601,7 +3998,11 @@ describe("request-composition session divider", () => {
         raw: { discord: { isChat: true } },
       },
       {
-        ref: { platform: "discord", channelId: sessionId, messageId: "d_other" },
+        ref: {
+          platform: "discord",
+          channelId: sessionId,
+          messageId: "d_other",
+        },
         session: { platform: "discord", channelId: sessionId },
         userId: "bot_other",
         userName: "lilac-other",

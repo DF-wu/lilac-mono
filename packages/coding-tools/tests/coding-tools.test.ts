@@ -228,7 +228,9 @@ describe("coding tools", () => {
       exitCode: -1,
       executionError: {
         type: "blocked",
+        code: "dynamic_recursive_delete",
         reason: expect.stringContaining("dynamic target"),
+        hint: expect.stringContaining("literal child paths"),
         segment: expect.stringContaining("rm -rf"),
       },
     });
@@ -956,7 +958,15 @@ describe("coding tools", () => {
         ],
       });
     }
-    expect(tools.read?.description).toContain("native visual or document analysis");
+    expect(tools.read?.description).toContain(
+      "Analyze supported images and PDFs already attached to context directly",
+    );
+    expect(tools.read?.description).toContain(
+      "Use read to attach supported images and PDFs available only through a local filesystem path",
+    );
+    expect(JSON.stringify(await asSchema(tools.read?.inputSchema).jsonSchema)).toContain(
+      "Local filesystem path or tool-result:// URI.",
+    );
   });
 
   it("read preserves attachment instructions and reports consumed attachment bytes", async () => {
@@ -1121,7 +1131,7 @@ describe("coding tools", () => {
   it("read enables media explicitly and enforces the decoded per-part byte limit", async () => {
     await writeFile(path.join(cwd, "large.webp"), Buffer.alloc(17));
     const textOnly = createCodingToolset({ cwd });
-    expect(textOnly.read?.description).not.toContain("native visual or document analysis");
+    expect(textOnly.read?.description).not.toContain("supported images and PDFs");
 
     const read = executable(
       createCodingToolset({
@@ -1993,11 +2003,31 @@ describe("coding tools", () => {
     const jsonSchema = await asSchema(batchTool.inputSchema).jsonSchema;
     const schemaShape = jsonSchema as {
       properties?: {
-        tool_calls?: { items?: { properties?: { tool?: { enum?: string[] } } } };
+        tool_calls?: {
+          items?: {
+            properties?: {
+              tool?: { enum?: string[] };
+              parameters?: unknown;
+            };
+          };
+        };
       };
     };
     const exposedNames = schemaShape.properties?.tool_calls?.items?.properties?.tool?.enum ?? [];
     expect(exposedNames.sort()).toEqual(["glob", "grep", "read"]);
+    expect(schemaShape.properties?.tool_calls?.items?.properties?.parameters).toEqual({});
+
+    const validateBatchInput = asSchema(batchTool.inputSchema).validate;
+    expect(validateBatchInput).toBeDefined();
+    expect(
+      await validateBatchInput?.({
+        tool_calls: [{ tool: "read", parameters: "not an object" }],
+      }),
+    ).toMatchObject({ success: false });
+    expect(await validateBatchInput?.({ tool_calls: [{ tool: "read" }] })).toEqual({
+      success: true,
+      value: { tool_calls: [{ tool: "read", parameters: {} }] },
+    });
 
     const expansion = await executable(tools, "batch").execute(
       {

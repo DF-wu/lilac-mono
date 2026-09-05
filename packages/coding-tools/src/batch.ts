@@ -6,7 +6,7 @@ import {
   type ExpandedToolCall,
 } from "@stanley2058/lilac-agent";
 import { expandTilde } from "@stanley2058/lilac-fs";
-import { asSchema, tool, type FlexibleSchema, type ToolSet } from "ai";
+import { asSchema, jsonSchema, tool, type FlexibleSchema, type ToolSet } from "ai";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
@@ -72,48 +72,48 @@ type CapturedBatchExternal<T> =
   | { readonly kind: "failure"; readonly message: string }
   | { readonly kind: "panic"; readonly panic: Panic };
 
-function projectBatchExternalCause(
-  cause: unknown,
-  fallbackMessage: string,
-): Exclude<CapturedBatchExternal<never>, { readonly kind: "completed" }> {
-  try {
-    if (Panic.is(cause)) return { kind: "panic", panic: cause };
-  } catch {
-    return { kind: "failure", message: fallbackMessage };
-  }
-  switch (typeof cause) {
-    case "string":
-      return { kind: "failure", message: cause };
-    case "bigint":
-    case "boolean":
-    case "number":
-    case "symbol":
-    case "undefined":
-      return { kind: "failure", message: String(cause) };
-    case "function":
-    case "object":
-      try {
-        if (cause instanceof Error) return { kind: "failure", message: cause.message };
-      } catch {
-        return { kind: "failure", message: fallbackMessage };
-      }
-      return { kind: "failure", message: fallbackMessage };
-  }
-}
-
 function captureBatchExternal<T>(
   effect: () => T | PromiseLike<T>,
   fallbackMessage: string,
 ): Promise<CapturedBatchExternal<T>> {
-  let pending: Promise<T>;
-  try {
-    pending = Promise.resolve(effect());
-  } catch (cause) {
-    return Promise.resolve(projectBatchExternalCause(cause, fallbackMessage));
-  }
-  return pending.then(
-    (value) => ({ kind: "completed", value }),
-    (cause) => projectBatchExternalCause(cause, fallbackMessage),
+  return Result.tryPromise({
+    try: async () => await effect(),
+    catch: (cause) => {
+      return () => {
+        const inspectedPanic = Result.try({
+          try: (): Panic | undefined => (Panic.is(cause) ? cause : undefined),
+          catch: () => undefined,
+        });
+        const panic = inspectedPanic.match({ ok: (value) => value, err: () => undefined });
+        if (panic) return { kind: "panic" as const, panic };
+        switch (typeof cause) {
+          case "string":
+            return { kind: "failure" as const, message: cause };
+          case "bigint":
+          case "boolean":
+          case "number":
+          case "symbol":
+          case "undefined":
+            return { kind: "failure" as const, message: String(cause) };
+          case "function":
+          case "object":
+            return Result.try({
+              try: () => (cause instanceof Error ? cause.message : fallbackMessage),
+              catch: () => fallbackMessage,
+            }).match({
+              ok: (message) => ({ kind: "failure" as const, message }),
+              err: () => ({ kind: "failure" as const, message: fallbackMessage }),
+            });
+        }
+      };
+    },
+  }).then((captured) =>
+    captured
+      .mapError((settle) => settle())
+      .match<CapturedBatchExternal<T>>({
+        ok: (value) => ({ kind: "completed", value }),
+        err: (failure) => failure,
+      }),
   );
 }
 
@@ -298,7 +298,7 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
           return name;
       }
     };
-    const inputSchema = z.object({
+    const runtimeInputSchema = z.object({
       tool_calls: z
         .array(
           z.object({
@@ -309,9 +309,35 @@ export function createBatchToolResult<TToolSpec extends BatchToolSpec = BatchToo
         .min(1)
         .max(maxCalls),
     });
+    const inputSchema = jsonSchema<z.output<typeof runtimeInputSchema>>(
+      {
+        type: "object",
+        properties: {
+          tool_calls: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                tool: { type: "string", enum: allowedNames },
+                parameters: {},
+              },
+              required: ["tool"],
+              additionalProperties: false,
+            },
+            minItems: 1,
+            maxItems: maxCalls,
+          },
+        },
+        required: ["tool_calls"],
+        additionalProperties: false,
+      },
+      {
+        validate: asSchema(runtimeInputSchema).validate,
+      },
+    );
 
     async function executeBatch(
-      input: z.output<typeof inputSchema>,
+      input: z.output<typeof runtimeInputSchema>,
       toolCallId: string,
     ): Promise<ResultType<ToolExpansion, BatchRejected>> {
       if (input.tool_calls.length > maxCalls) {

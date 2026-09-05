@@ -1,3 +1,5 @@
+import { captureError } from "../../../shared/error-capture";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import type { Logger } from "@stanley2058/simple-module-logger";
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
@@ -10,6 +12,7 @@ import {
   type PageContent,
   type PageContentResult,
 } from "./page-content";
+import { adaptToolResultToHost } from "../../../tools/tool-result-adapters";
 
 const MAX_FULL_DOM_PARSE_BYTES = 750 * 1024;
 
@@ -44,11 +47,21 @@ export class DefaultBrowserPageAcquisition implements BrowserPageAcquisition {
 
     this.logger.logDebug("Launching in new page...");
     const page = await context.newPage();
+    let closePending:
+      | Promise<ResultType<void, { readonly restoreCause: () => unknown }>>
+      | undefined;
     const onAbort = () => {
-      void page.close().catch(() => null);
+      void closePage();
+    };
+    const closePage = (): Promise<ResultType<void, { readonly restoreCause: () => unknown }>> => {
+      closePending ??= Result.tryPromise({
+        try: () => page.close(),
+        catch: (cause) => ({ restoreCause: () => cause }),
+      });
+      return closePending;
     };
     signal.addEventListener("abort", onAbort, { once: true });
-    try {
+    return await (async () => {
       checkPageSignal(signal);
       this.logger.logDebug("Navigating to page:", url);
       await page.goto(url, { waitUntil: "domcontentloaded", timeout });
@@ -62,19 +75,52 @@ export class DefaultBrowserPageAcquisition implements BrowserPageAcquisition {
         Buffer.byteLength(html, "utf8") > MAX_FULL_DOM_PARSE_BYTES
           ? buildSimpleHtmlContent(html, url)
           : this.pageContent.parse(html, url, { preprocessor, signal });
-      return { isError: false, content, rawHtml: html };
-    } finally {
+      return { isError: false, content, rawHtml: html } as const;
+    })().finally(async () => {
       signal.removeEventListener("abort", onAbort);
-      await page.close().catch(() => null);
-    }
+      const closed = await closePage();
+      const closeFailure = closed.match<Error | Panic | null>({
+        ok: () => null,
+        err: ({ restoreCause }) => {
+          const classified = Result.try({
+            try: () => {
+              const cause = restoreCause();
+              if (Panic.is(cause)) return { kind: "panic", panic: cause } as const;
+              if (cause instanceof Error) return { kind: "error", error: cause } as const;
+              return { kind: "opaque" } as const;
+            },
+            catch: () => ({ kind: "opaque" }) as const,
+          }).match<
+            | { readonly kind: "panic"; readonly panic: Panic }
+            | { readonly kind: "error"; readonly error: Error }
+            | { readonly kind: "opaque" }
+          >({
+            ok: (outcome) => outcome,
+            err: () => ({ kind: "opaque" }) as const,
+          });
+          if (classified.kind === "panic") return classified.panic;
+          if (classified.kind === "error") return classified.error;
+          return new Error("Unknown operation failure", { cause: restoreCause() });
+        },
+      });
+      if (closeFailure) adaptToolResultToHost(Result.err(closeFailure));
+    });
   }
 
   private async pathExecutable(path: string): Promise<boolean> {
-    try {
-      await fs.access(path, fsConstants.X_OK);
-      return true;
-    } catch {
-      return false;
+    {
+      const attempt = await Result.tryPromise({
+        try: async () => {
+          await fs.access(path, fsConstants.X_OK);
+          return true;
+        },
+        catch: captureError,
+      });
+
+      if (attempt.isErr()) {
+        return false;
+      }
+      return attempt.value;
     }
   }
 
