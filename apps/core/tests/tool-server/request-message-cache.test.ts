@@ -7,7 +7,6 @@ import {
 
 import {
   createRequestMessageCache,
-  projectCachedRequestMessageLineage,
   type AuthenticatedRequestOrigin,
 } from "../../src/tool-server/request-message-cache";
 import {
