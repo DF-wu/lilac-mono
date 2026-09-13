@@ -133,6 +133,104 @@ function withProgramFixture<T>(
 
 const fixtureProgram = createWorkspaceProgram(REPOSITORY_ROOT, BASE_WORKSPACE).program;
 
+describe("deprecated API references", () => {
+  test("rejects dependency aliases, deprecated overloads, types, and property references", () => {
+    const usage = [
+      'import { old as renamed, overloaded, type OldType, type Options } from "old-api";',
+      "renamed();",
+      'overloaded("legacy");',
+      "overloaded(1);",
+      "declare const options: Options;",
+      "options.old;",
+      'options["old"];',
+      "const { old: legacy } = options;",
+      "export type Alias = OldType;",
+      "options.current;",
+      "export const unrelated = { old: 1 }.old;",
+      "renamed();",
+    ].join("\n");
+    withProgramFixture(
+      {
+        "node_modules/old-api/package.json": JSON.stringify({ types: "index.d.ts" }),
+        "node_modules/old-api/index.d.ts": [
+          "/** @deprecated Use modern instead. */",
+          "export declare function old(): void;",
+          "/** @deprecated Pass a number instead. */",
+          "export declare function overloaded(value: string): void;",
+          "export declare function overloaded(value: number): void;",
+          "/** @deprecated Use NewType instead. */",
+          "export type OldType = string;",
+          "export interface Options {",
+          "  /** @deprecated Use current instead. */",
+          "  old: string;",
+          "  current: string;",
+          "}",
+        ].join("\n"),
+        "usage.ts": usage,
+        "ignored.test.ts": 'import { old } from "old-api"; old();',
+        "vendor/ignored.ts": 'import { old } from "old-api"; old();',
+        "declaration.ts": "/** @deprecated Use modern instead. */\nexport const old = 1;",
+      },
+      ({ repositoryRoot, workspaceRoot, workspace }) => {
+        const enabled = {
+          ...workspace,
+          ruleZones: { "architecture/no-deprecated": [{ include: "**" }] },
+        } satisfies WorkspaceArchitecture;
+        const { program } = createWorkspaceProgram(repositoryRoot, enabled);
+        const findings = analyzeWorkspace(
+          enabled,
+          workspaceRoot,
+          program,
+          undefined,
+          undefined,
+          undefined,
+          [],
+        );
+        const lines = findings.map((finding) => finding.location?.line);
+        expect(lines).toContain(2);
+        expect(lines).toContain(3);
+        expect(lines).toContain(6);
+        expect(lines).toContain(7);
+        expect(lines).toContain(8);
+        expect(lines).toContain(9);
+        expect(lines).toContain(12);
+        expect(lines).not.toContain(4);
+        expect(lines).not.toContain(10);
+        expect(lines).not.toContain(11);
+        expect(findings.every((finding) => finding.location?.file === "usage.ts")).toBe(true);
+        expect(findings.every((finding) => finding.severity === "error")).toBe(true);
+        expect(new Set(findings.map((finding) => finding.fingerprint)).size).toBe(findings.length);
+        expect(findings.find((finding) => finding.location?.line === 3)?.suggestion).toBe(
+          "Pass a number instead.",
+        );
+        expect(findings.find((finding) => finding.location?.line === 2)?.suggestion).toBe(
+          "Use modern instead.",
+        );
+        expect(
+          analyzeWorkspace(workspace, workspaceRoot, program, undefined, undefined, undefined, []),
+        ).toEqual([]);
+        const unsupportedProgram = new Proxy(program, {
+          get(target, property, receiver) {
+            if (property === "getSuggestionDiagnostics") return undefined;
+            return Reflect.get(target, property, receiver);
+          },
+        });
+        expect(() =>
+          analyzeWorkspace(
+            enabled,
+            workspaceRoot,
+            unsupportedProgram,
+            undefined,
+            undefined,
+            undefined,
+            [],
+          ),
+        ).toThrow("cannot provide architecture deprecation diagnostics");
+      },
+    );
+  });
+});
+
 interface WorkspaceRunnerResult {
   readonly exitCode: number;
   readonly stdout: string;

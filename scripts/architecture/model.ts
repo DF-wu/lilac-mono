@@ -1,4 +1,5 @@
 export const ARCHITECTURE_RULES = [
+  "architecture/no-deprecated",
   "architecture/no-unregistered-decoder",
   "architecture/no-domain-unknown",
   "architecture/no-unknown-assertion",

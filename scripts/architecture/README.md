@@ -62,6 +62,12 @@ catalog metadata, then update the digest and focused tests.
 
 ## Permanent Rules
 
+`architecture/no-deprecated` promotes TypeScript's deprecated-reference suggestions to errors in every
+production workspace. It includes dependency declarations, follows aliases, and checks the selected
+overload. Diagnostics include the declaration's deprecation guidance when present. It reuses the TS6
+Program's runtime suggestion API and fails closed if that API is unavailable after a compiler upgrade.
+The existing source exclusions apply; this is not a scan of dependency implementations or test files.
+
 Semantic rules enforce boundary decoding, domain-owned `unknown`, assertion and predicate safety, closed
 union exhaustiveness, declarative Result handling, Panic registration, compatibility serialization,
 redacted TaggedError logging, event delivery, persisted codecs, and SQLite transaction atomicity.

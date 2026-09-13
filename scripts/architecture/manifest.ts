@@ -302,6 +302,7 @@ export const EXACT_REGISTRATION_ARCHITECTURE_RULES = new Set<ArchitectureRule>([
 ]);
 
 export const FINAL_PACKAGE_WIDE_ARCHITECTURE_RULES = [
+  "architecture/no-deprecated",
   "architecture/no-unregistered-decoder",
   "architecture/no-domain-unknown",
   "architecture/no-unknown-assertion",
