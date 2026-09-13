@@ -226,11 +226,13 @@ surface:
 
     # Discord-only markdown output features.
     markdownTableRender:
-      # Convert markdown tables into fixed-width codeblock tables.
+      # Enable Markdown table rendering.
       enabled: true
-      # Rendering style for generated codeblock tables: unicode | ascii.
+      # Style: unicode | ascii | image.
+      # image: render top-level tables as PNG attachments in preview/plain/flat final output.
+      # In other output modes, previews, or on image failure, image falls back to unicode.
       style: unicode
-      # Max rendered table width (display cells, not bytes).
+      # Max text-rendered table width (display cells, not bytes); also used by image fallback.
       maxWidth: 50
       # Fallback when a table cannot fit maxWidth:
       # - list: render a wrapped row/key-value list in a text codeblock

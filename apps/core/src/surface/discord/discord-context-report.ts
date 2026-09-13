@@ -212,6 +212,7 @@ export function createDiscordContextReportProvider(params: {
     });
     const reportRequestId = request.requestId ?? `context:${crypto.randomUUID()}`;
     const system = buildAgentRunSystemPrompt({
+      requestClient: "discord",
       cfg: request.config,
       runProfile: "primary",
       resolved,

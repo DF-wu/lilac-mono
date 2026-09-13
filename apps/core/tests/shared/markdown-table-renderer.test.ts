@@ -15,6 +15,12 @@ function extractCodeBlockLines(text: string): string[] {
 }
 
 describe("markdown-table-renderer", () => {
+  it("uses Unicode text for image style when called as a text renderer", () => {
+    const input = "| Name | State |\n| --- | --- |\n| Alpha | Ready |";
+    expect(renderMarkdownTablesAsCodeBlocks(input, { style: "image" })).toBe(
+      renderMarkdownTablesAsCodeBlocks(input, { style: "unicode" }),
+    );
+  });
   it("renders markdown tables as unicode codeblock tables by default", () => {
     const input = ["| Name | Score |", "| --- | ---: |", "| Alice | 10 |", "| Bob | 200 |"].join(
       "\n",

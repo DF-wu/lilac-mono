@@ -268,6 +268,14 @@ export function buildSurfaceMetadataOverlay(
   ].join("\n");
 }
 
+export function buildDiscordOutputOverlay(): string {
+  return [
+    "Discord output formatting:",
+    "- Do not put links in Markdown tables. Use a list instead when entries need links.",
+    "- Keep Markdown tables at the top level, outside lists and blockquotes.",
+  ].join("\n");
+}
+
 export function buildRestrictedSessionOverlay(_params: { sessionId: string }): string {
   return [
     "Restricted public-session safety mode is active for this request.",

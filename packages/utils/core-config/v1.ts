@@ -162,7 +162,7 @@ export const routerSchema = z
 export const discordMarkdownTableRenderSchema = z
   .object({
     enabled: z.boolean().default(false),
-    style: z.enum(["unicode", "ascii"]).default("unicode"),
+    style: z.enum(["unicode", "ascii", "image"]).default("unicode"),
     maxWidth: z.number().int().min(40).max(240).default(80),
     fallbackMode: z.enum(["list", "passthrough"]).default("list"),
   })

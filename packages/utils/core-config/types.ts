@@ -250,7 +250,7 @@ export type UniversalCoreConfig = {
       };
       markdownTableRender: {
         enabled: boolean;
-        style: "unicode" | "ascii";
+        style: "unicode" | "ascii" | "image";
         maxWidth: number;
         fallbackMode: "list" | "passthrough";
       };

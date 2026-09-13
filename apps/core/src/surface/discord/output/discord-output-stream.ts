@@ -54,6 +54,8 @@ import {
 } from "./discord-markdown-math-renderer";
 import { renderMarkdownTablesAsCodeBlocks } from "../../../shared/markdown-table-renderer";
 import { buildCancelCustomId } from "../discord-cancel";
+import { renderDiscordTableImages } from "./discord-table-image-renderer";
+import { buildDiscordTableChunks, type DiscordPlainChunk } from "./discord-table-chunks";
 import { isTextSendableChannel, type SendableDiscordChannel } from "../discord-channel-guards";
 import { captureDiscordSurfaceError, classifyDiscordSurfaceError } from "../discord-adapter";
 
@@ -680,6 +682,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
       useSmartSplitting: boolean;
       rewriteText?: (text: string) => string;
       markdownTableRender?: MarkdownTableRenderOptions;
+      renderTableImages?: typeof renderDiscordTableImages;
       markdownMathRender?: DiscordMarkdownMathRenderOptions;
       outputMode: DiscordOutputMode;
       outputPreviewModeFinalStyle?: DiscordPreviewFinalOutputStyle;
@@ -759,9 +762,16 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   }
 
   private renderText(text: string, phase: DiscordMarkdownMathRenderPhase): string {
+    return this.renderPreparedText(this.prepareText(text), phase);
+  }
+
+  private prepareText(text: string): string {
     const rewrite = this.deps.rewriteText;
-    let rendered = rewrite ? rewrite(text) : text;
-    rendered = normalizeDiscordBlockquotes(rendered);
+    return normalizeDiscordBlockquotes(rewrite ? rewrite(text) : text);
+  }
+
+  private renderPreparedText(text: string, phase: DiscordMarkdownMathRenderPhase): string {
+    let rendered = text;
 
     const tableRender = this.deps.markdownTableRender;
     if (tableRender) {
@@ -1283,8 +1293,10 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     if (this.pendingAttachments.length === 0) return [];
 
     const MAX_FILES = 10;
-    const filesForFinal = this.pendingAttachments.slice(0, MAX_FILES);
-    const overflow = this.pendingAttachments.slice(MAX_FILES);
+    const available = MAX_FILES - target.attachments.size;
+    if (available <= 0) return this.flushPendingAttachments(target);
+    const filesForFinal = this.pendingAttachments.slice(0, available);
+    const overflow = this.pendingAttachments.slice(available);
 
     if (filesForFinal.length === 0) return [];
 
@@ -1390,13 +1402,7 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     };
   }
 
-  private async postFinalReplyPlain(): Promise<{ created: MsgRef[]; lastMsg: Message }> {
-    const { client, sessionRef } = this.deps;
-    const sessionResult = discordOutputSessionResult(sessionRef);
-    const discordSessionRef = adaptDiscordOutputResultToHost(sessionResult);
-
-    const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
-    const channel = adaptDiscordOutputResultToHost(channelResult);
+  private async buildFinalPlainChunks(): Promise<DiscordPlainChunk[]> {
     const { CLOSING_TAG_BUFFER } = getEmbedPusherConstants();
     const maxChunkLength =
       DISCORD_CONTENT_MAX_CHARS - (this.deps.useSmartSplitting ? CLOSING_TAG_BUFFER : 0);
@@ -1405,24 +1411,47 @@ export class DiscordOutputStream implements SurfaceOutputStream {
         ? this.finalTextSegments.slice(-1)
         : this.finalTextSegments;
     const finalTexts =
-      selectedFinalTexts && selectedFinalTexts.length > 0
-        ? selectedFinalTexts.map((segment) => this.renderText(segment, "terminal"))
-        : [this.getRenderedText("terminal")];
-    const chunks = finalTexts.flatMap((text) =>
-      chunkMarkdownForEmbeds(text.length > 0 ? text : "*<empty_string>*", {
+      selectedFinalTexts && selectedFinalTexts.length > 0 ? selectedFinalTexts : [this.textAcc];
+    const chunkText = (text: string): string[] =>
+      chunkMarkdownForEmbeds(text, {
         maxChunkLength,
         maxLastChunkLength: maxChunkLength,
         useSmartSplitting: this.deps.useSmartSplitting,
         hardMaxChunkLength: DISCORD_CONTENT_MAX_CHARS,
         completeLastChunk: true,
-      }),
-    );
+      });
+    const chunks: DiscordPlainChunk[] = [];
+    for (const text of finalTexts) {
+      if (this.usesFlatPreviewFinalText() && this.deps.markdownTableRender?.style === "image") {
+        chunks.push(
+          ...(await buildDiscordTableChunks(this.prepareText(text), {
+            renderText: (segment) => this.renderPreparedText(segment, "terminal"),
+            chunkText,
+            renderImages: this.deps.renderTableImages ?? renderDiscordTableImages,
+          })),
+        );
+        continue;
+      }
+      const rendered = this.renderText(text, "terminal");
+      chunks.push(...chunkText(rendered || "*<empty_string>*").map((chunk) => ({ text: chunk })));
+    }
+    if (chunks.length === 0) chunks.push({ text: "*<empty_string>*" });
+    if (chunks.at(-1)?.tableImage && this.pendingAttachments.length > 0) chunks.push({ text: "" });
+    return chunks;
+  }
+
+  private async postFinalReplyPlain(): Promise<{ created: MsgRef[]; lastMsg: Message }> {
+    const { client, sessionRef } = this.deps;
+    const sessionResult = discordOutputSessionResult(sessionRef);
+    const discordSessionRef = adaptDiscordOutputResultToHost(sessionResult);
+    const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
+    const channel = adaptDiscordOutputResultToHost(channelResult);
+    const displayChunks = await this.buildFinalPlainChunks();
 
     const MAX_FILES = 10;
     const filesForLastMessage = this.pendingAttachments.slice(0, MAX_FILES);
     const overflowAttachments = this.pendingAttachments.slice(MAX_FILES);
 
-    const displayChunks = chunks.length > 0 ? chunks : ["*<empty_string>*"];
     const createdMsgs: Message[] = [];
     let parent: Message | null = null;
 
@@ -1450,9 +1479,8 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     };
 
     for (let i = 0; i < displayChunks.length; i++) {
-      const chunk = displayChunks[i] ?? "";
+      const chunk = displayChunks[i]!;
       const isLast = i === displayChunks.length - 1;
-      const contentChunk = chunk || "*<empty_string>*";
       const embeds =
         isLast && this.statsForNerdsLine
           ? [
@@ -1464,10 +1492,20 @@ export class DiscordOutputStream implements SurfaceOutputStream {
             ]
           : undefined;
 
+      let files = isLast ? toDiscordFiles(filesForLastMessage) : undefined;
+      if (chunk.tableImage) {
+        files = [
+          {
+            attachment: Buffer.from(chunk.tableImage.bytes),
+            name: chunk.tableImage.filename,
+            description: chunk.tableImage.description,
+          },
+        ];
+      }
       const msg = await sendChunk({
-        content: contentChunk,
+        content: chunk.text.trim() ? chunk.text : undefined,
         embeds,
-        files: isLast ? toDiscordFiles(filesForLastMessage) : undefined,
+        files,
       });
 
       createdMsgs.push(msg);

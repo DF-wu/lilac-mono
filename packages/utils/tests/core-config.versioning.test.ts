@@ -13,6 +13,29 @@ import {
 import { deriveSubagentIdleTimeoutMs } from "../subagent-idle-timeout";
 
 describe("core config versioning", () => {
+  it("accepts opt-in image table style in both config versions without changing defaults", () => {
+    const v1 = parseCoreConfigV1ToUniversal({
+      surface: {
+        discord: {
+          botName: "lilac",
+          experimental: { markdownTableRender: { enabled: true, style: "image" } },
+        },
+      },
+    });
+    const v2 = parseCoreConfigV2ToUniversal({
+      surface: {
+        discord: { botName: "lilac", markdownTableRender: { enabled: true, style: "image" } },
+      },
+    });
+    expect(v1.surface.discord.markdownTableRender.style).toBe("image");
+    expect(v2.surface.discord.markdownTableRender.style).toBe("image");
+    expect(parseCoreConfigV1ToUniversal({}).surface.discord.markdownTableRender.style).toBe(
+      "unicode",
+    );
+    expect(parseCoreConfigV2ToUniversal({}).surface.discord.markdownTableRender.style).toBe(
+      "unicode",
+    );
+  });
   it("treats missing configVersion as v1", async () => {
     expect(readCoreConfigVersion({})).toBe(1);
 

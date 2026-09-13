@@ -5718,6 +5718,7 @@ export async function startBusAgentRunner(params: {
             buildAgentRunSystemPrompt({
               cfg,
               runProfile,
+              requestClient: next.requestClient,
               resolved,
               editingToolMode,
               skillsSection,

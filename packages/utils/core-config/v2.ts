@@ -304,7 +304,7 @@ const subagentsSchemaV2 = z.object({
 const discordMarkdownTableRenderSchema = z
   .object({
     enabled: z.boolean().default(true),
-    style: z.enum(["unicode", "ascii"]).default("unicode"),
+    style: z.enum(["unicode", "ascii", "image"]).default("unicode"),
     maxWidth: z.number().int().min(40).max(240).default(50),
     fallbackMode: z.enum(["list", "passthrough"]).default("list"),
   })

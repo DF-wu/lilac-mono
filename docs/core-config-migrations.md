@@ -17,6 +17,18 @@ application consumes only the universal shape.
 - If a newer field cannot be represented safely in an older version, that field requires the newer
   `configVersion`.
 
+## Image table style
+
+Table rendering now accepts `style: image`. The default remains `unicode`, so existing configurations
+keep their text rendering. In v2, set `surface.discord.markdownTableRender.enabled: true` and
+`surface.discord.markdownTableRender.style: image`, with `outputMode: preview`,
+`outputPreviewModeFinalStyle: plain`, and `outputPreviewModeFinalText: flat`, to send top-level tables as
+PNG attachments. The image style falls back to Unicode text in other modes and on rendering failure.
+
+The v1 parser also accepts `image` under `surface.discord.experimental.markdownTableRender.style`, but
+v1's reply-chain output uses the Unicode fallback. No config version bump or automatic rewrite is
+required. Older builds reject `image`; change the style to `unicode` or `ascii` before downgrading.
+
 ## v1
 
 `configVersion: 1` is the initial versioned config contract and matches the defaults used before config
