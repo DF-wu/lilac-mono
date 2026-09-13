@@ -71,5 +71,7 @@ describe("table PNG rendering", () => {
       expect(dimensions(code).height).toBe(160);
       expect(dimensions(code).width).toBeGreaterThan(dimensions(proportional).width * 2);
     },
+    // Chromium startup and five screenshots need headroom on shared CI runners.
+    30_000,
   );
 });
