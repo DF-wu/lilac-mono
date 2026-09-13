@@ -1,4 +1,4 @@
-import { ActionRowBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } from "discord.js";
+import { LabelBuilder, ModalBuilder, TextInputBuilder, TextInputStyle } from "discord.js";
 
 const QUESTION_ACTION_PREFIX = "question:v1:";
 const QUESTION_MODAL_PREFIX = "lilac_question_modal:v1:";
@@ -45,12 +45,11 @@ export function parseDiscordQuestionModalCustomId(customId: string): string | nu
 export function buildDiscordQuestionModal(token: string): ModalBuilder {
   const input = new TextInputBuilder()
     .setCustomId(DISCORD_QUESTION_CUSTOM_INPUT_ID)
-    .setLabel("Your answer")
     .setStyle(TextInputStyle.Paragraph)
     .setRequired(true)
     .setMaxLength(4_000);
   return new ModalBuilder()
     .setCustomId(buildDiscordQuestionModalCustomId(token))
     .setTitle("Other response")
-    .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+    .addLabelComponents(new LabelBuilder().setLabel("Your answer").setTextInputComponent(input));
 }

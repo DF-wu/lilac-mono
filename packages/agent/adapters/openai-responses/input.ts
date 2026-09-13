@@ -1,6 +1,6 @@
 import { readToolLoadingDefinitions, portableToolLoadingMessages } from "./tool-search";
 import type { AgentToolDefinition } from "../../agent-adapter";
-import type { FilePart, ImagePart, ModelMessage, ToolResultPart } from "ai";
+import type { FilePart, ModelMessage, ToolResultPart } from "ai";
 import { Result, type Result as ResultType } from "better-result";
 import { z } from "zod";
 import type {
@@ -136,12 +136,10 @@ function binaryFile(
   });
 }
 
-function resource(part: FilePart | ImagePart): Encoded<ResponseInputContent> {
+function resource(part: FilePart, isLegacyImage = false): Encoded<ResponseInputContent> {
   const options = metadata(part.providerOptions);
-  const mediaType = part.type === "image" ? (part.mediaType ?? "image") : part.mediaType;
-  const filename = part.type === "file" ? part.filename : undefined;
-  const image = part.type === "image" || mediaType === "image" || mediaType.startsWith("image/");
-  const data = part.type === "image" ? part.image : part.data;
+  const { mediaType, filename, data } = part;
+  const image = isLegacyImage || mediaType === "image" || mediaType.startsWith("image/");
   if (typeof data === "string" || data instanceof Uint8Array || data instanceof ArrayBuffer)
     return binaryFile(data, mediaType, filename, options);
   if (data instanceof URL)
@@ -174,7 +172,16 @@ function userContent(
       text: part.text,
       prompt_cache_breakpoint: cacheBreakpoint(part.providerOptions),
     });
-  return resource(part).andThen((item) => {
+  const file: FilePart =
+    part.type === "image"
+      ? {
+          type: "file",
+          data: part.image,
+          mediaType: part.mediaType ?? "image",
+          providerOptions: part.providerOptions,
+        }
+      : part;
+  return resource(file, part.type === "image").andThen((item) => {
     if (
       item.type === "input_file" &&
       item.file_data !== undefined &&

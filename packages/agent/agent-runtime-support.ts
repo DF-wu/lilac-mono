@@ -1011,13 +1011,12 @@ export function stripToolExecuteForModel<TOOLS extends ToolSet>(tools: TOOLS): T
   // but remove execution so we can run tools ourselves (enables steering).
   return Object.fromEntries(
     Object.entries(tools).map(([name, tool]) => {
-      const {
-        execute: _execute,
-        needsApproval: _needsApproval,
-        contextSchema: _contextSchema,
-        ...rest
-      } = tool;
-      return [name, rest];
+      const declaration = Object.fromEntries(
+        Object.entries(tool).filter(
+          ([key]) => key !== "execute" && key !== "needsApproval" && key !== "contextSchema",
+        ),
+      );
+      return [name, declaration];
     }),
   ) as ToolSet;
 }

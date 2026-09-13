@@ -40,7 +40,7 @@ const nativeSessionStartSchema = z.discriminatedUnion("mode", [
       mode: z.literal("fork"),
       baseSessionId: uuidSchema,
       sessionId: uuidSchema,
-      expectedSourceLastModified: z.number().finite().nonnegative(),
+      expectedSourceLastModified: z.number().nonnegative(),
     })
     .strict()
     .refine(({ baseSessionId, sessionId }) => baseSessionId !== sessionId, {
@@ -49,7 +49,7 @@ const nativeSessionStartSchema = z.discriminatedUnion("mode", [
     }),
 ]);
 
-const sdkMessageTypeSchema = z.object({ type: z.string() }).passthrough();
+const sdkMessageTypeSchema = z.object({ type: z.string() }).loose();
 const sdkInitMessageSchema = z
   .object({
     type: z.literal("system"),
@@ -57,15 +57,15 @@ const sdkInitMessageSchema = z
     session_id: z.string().min(1),
     model: z.string().min(1),
   })
-  .passthrough();
+  .loose();
 const sdkSuccessResultMessageSchema = z
   .object({
     type: z.literal("result"),
     subtype: z.literal("success"),
     session_id: z.string().min(1),
   })
-  .passthrough();
-const stopHookInputSchema = z.object({ hook_event_name: z.literal("Stop") }).passthrough();
+  .loose();
+const stopHookInputSchema = z.object({ hook_event_name: z.literal("Stop") }).loose();
 const contextUsageSchema = z
   .object({
     totalTokens: z.number().int().nonnegative(),
@@ -77,7 +77,7 @@ const contextUsageSchema = z
 const sessionInfoSchema = z.object({
   sessionId: z.string().min(1),
   cwd: z.string().min(1),
-  lastModified: z.number().finite().nonnegative(),
+  lastModified: z.number().nonnegative(),
 });
 
 type ClaudeCodeQueryControllerBoundary = {

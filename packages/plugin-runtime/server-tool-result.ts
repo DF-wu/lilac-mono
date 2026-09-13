@@ -9,7 +9,7 @@ const jsonValueSchema: z.ZodType<ServerToolJsonValue> = z.lazy(() =>
   z.union([
     z.null(),
     z.string(),
-    z.number().finite(),
+    z.number(),
     z.boolean(),
     z.array(jsonValueSchema),
     z.record(z.string(), jsonValueSchema),

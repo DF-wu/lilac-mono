@@ -198,7 +198,7 @@ const skillFrontmatterSchema = z
     name: z.string().trim().min(1),
     description: z.string().trim().min(1),
   })
-  .passthrough();
+  .loose();
 
 function splitFrontmatter(raw: string): {
   frontmatterText: string;

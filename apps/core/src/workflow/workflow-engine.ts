@@ -173,7 +173,7 @@ const pipelineInputSchema = z.strictObject({
   items: z.array(jsonValueSchema).max(10_000),
   options: workflowPipelineOptionsSchema,
 });
-const sleepInputSchema = z.union([z.number().finite().nonnegative(), z.string().min(1).max(100)]);
+const sleepInputSchema = z.union([z.number().nonnegative(), z.string().min(1).max(100)]);
 
 type AgentRequestResult = {
   state: "resolved" | "failed" | "cancelled" | "timed_out";

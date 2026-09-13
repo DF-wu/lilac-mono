@@ -38,11 +38,11 @@ const openAICompactionOutputPartSchema = z
             itemId: z.string().min(1),
             encryptedContent: z.string().min(1),
           })
-          .passthrough(),
+          .loose(),
       })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 
 export const openAIServerCompactionMetadataSchema = z
   .object({
@@ -66,16 +66,16 @@ const persistedOpenAICompactionPartSchema = z
             itemId: z.string().min(1),
             encryptedContent: z.string().min(1),
           })
-          .passthrough(),
+          .loose(),
         lilac: z
           .object({
             serverCompaction: openAIServerCompactionMetadataSchema,
           })
-          .passthrough(),
+          .loose(),
       })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 
 export type OpenAIServerCompactionMetadata = z.infer<typeof openAIServerCompactionMetadataSchema>;
 
@@ -285,14 +285,14 @@ export async function compactWithOpenAIResponsesResult(
       request.abortSignal?.throwIfAborted();
     }
 
-    const [response, usage] = await Promise.all([result.response, result.usage]);
-    return { response, usage };
+    const [finalStep, usage] = await Promise.all([result.finalStep, result.usage]);
+    return { response: finalStep.response, usage };
   });
   const attempt = attempted.match<
     | {
         readonly ok: true;
         readonly value: {
-          response: Awaited<ReturnType<typeof streamText>["response"]>;
+          response: Awaited<ReturnType<typeof streamText>["finalStep"]>["response"];
           usage: Awaited<ReturnType<typeof streamText>["usage"]>;
         };
       }

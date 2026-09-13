@@ -355,7 +355,7 @@ const LEGACY_TRANSCRIPT_SCHEMA5_OBJECT_CATALOG = [
 ] as const;
 
 const sha256HexSchema = z.string().regex(/^[0-9a-f]{64}$/u);
-const nonNegativeIntegerSchema = z.number().int().nonnegative().safe();
+const nonNegativeIntegerSchema = z.number().int().nonnegative();
 const adapterPlatformSchema = z.enum([
   "discord",
   "github",
@@ -457,8 +457,8 @@ const legacyLineageManifestSchema = z.strictObject({
           })
           .optional(),
         canonicalStart: nonNegativeIntegerSchema,
-        canonicalEnd: z.number().int().positive().safe(),
-        cumulativeAtomCount: z.number().int().positive().safe(),
+        canonicalEnd: z.number().int().positive(),
+        cumulativeAtomCount: z.number().int().positive(),
         cumulativePrefixDigest: sha256HexSchema,
       }),
     )
@@ -479,9 +479,9 @@ const claudeAttemptStateSchema = z.enum([
   "cancelled",
   "uncertain",
 ]);
-const nullablePositiveIntegerSchema = z.number().int().positive().safe().nullable();
+const nullablePositiveIntegerSchema = z.number().int().positive().nullable();
 const nullableNonNegativeIntegerSchema = nonNegativeIntegerSchema.nullable();
-const nullableNonNegativeFiniteSchema = z.number().finite().nonnegative().nullable();
+const nullableNonNegativeFiniteSchema = z.number().nonnegative().nullable();
 const nullableUuidSchema = z.uuid().nullable();
 
 const legacyNamedClaudeBindingRowSchema = z.strictObject({
@@ -498,12 +498,12 @@ const legacyNamedClaudeBindingRowSchema = z.strictObject({
   execution_scope_hash: z.string().min(1),
   claude_session_id: z.uuid(),
   native_cwd: z.string(),
-  native_last_modified: z.number().finite().nonnegative(),
+  native_last_modified: z.number().nonnegative(),
   native_context_tokens: nonNegativeIntegerSchema,
-  native_context_max_tokens: z.number().int().positive().safe(),
+  native_context_max_tokens: z.number().int().positive(),
   last_model_specifier: z.string(),
   last_reasoning: z.string(),
-  revision: z.number().int().positive().safe(),
+  revision: z.number().int().positive(),
   updated_ts: nonNegativeIntegerSchema,
 });
 
@@ -543,19 +543,19 @@ const legacyPrimaryClaudeBindingRowSchema = z.strictObject({
   binding_protocol_version: z.literal(1),
   provider_family: z.literal("claude-code"),
   lineage_version: z.literal(1),
-  atom_count: z.number().int().positive().safe(),
+  atom_count: z.number().int().positive(),
   prefix_digest: sha256HexSchema,
-  canonical_message_count: z.number().int().positive().safe(),
+  canonical_message_count: z.number().int().positive(),
   execution_scope_hash_version: z.literal(1),
   execution_scope_hash: z.string().min(1),
   claude_session_id: z.uuid(),
   native_cwd: z.string(),
-  native_last_modified: z.number().finite().nonnegative(),
+  native_last_modified: z.number().nonnegative(),
   native_context_tokens: nonNegativeIntegerSchema,
-  native_context_max_tokens: z.number().int().positive().safe(),
+  native_context_max_tokens: z.number().int().positive(),
   last_model_specifier: z.string(),
   last_reasoning: z.string(),
-  revision: z.number().int().positive().safe(),
+  revision: z.number().int().positive(),
   updated_ts: nonNegativeIntegerSchema,
   terminal_request_id: z.string().min(1).nullable(),
 });

@@ -557,10 +557,10 @@ export async function executeAiSdkModelCall(
 
   const responseAttempt = resultOutcome(
     await captureAgentPromise(async () => ({
-      response: await result.response,
+      response: (await result.finalStep).response,
       finishReason: await result.finishReason,
       usage: await result.usage,
-      totalUsage: await result.totalUsage,
+      totalUsage: await result.usage,
       warnings: await result.warnings,
     })),
   );

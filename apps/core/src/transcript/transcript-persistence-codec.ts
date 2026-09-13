@@ -88,7 +88,7 @@ const loadedCatalogIdsSchema = z.array(z.string().min(1)).superRefine((catalogId
 });
 const uuidSchema = z.uuid();
 const positiveIntegerSchema = z.number().int().positive();
-const nonNegativeFiniteSchema = z.number().finite().nonnegative();
+const nonNegativeFiniteSchema = z.number().nonnegative();
 const nullablePositiveIntegerSchema = positiveIntegerSchema.nullable();
 const nullableNonNegativeIntegerSchema = nonNegativeIntegerSchema.nullable();
 const nullableNonNegativeFiniteSchema = nonNegativeFiniteSchema.nullable();
@@ -122,7 +122,7 @@ const coreProjectionSourceFactSchema: z.ZodType<CoreProjectionSourceFact> = z.la
   z.union([
     z.null(),
     z.boolean(),
-    z.number().finite(),
+    z.number(),
     z.string(),
     z.array(coreProjectionSourceFactSchema),
     z.record(z.string(), coreProjectionSourceFactSchema),

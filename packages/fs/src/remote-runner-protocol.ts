@@ -1,7 +1,7 @@
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
-const finiteNumberSchema = z.number().finite();
+const finiteNumberSchema = z.number();
 const effectiveSearchBackendSchema = z.enum(["fff", "node-rg", "node-fs"]);
 const effectiveFuzzySearchBackendSchema = z.enum(["fff", "fzf"]);
 const readErrorCodeSchema = z.enum(["NOT_FOUND", "PERMISSION", "UNKNOWN"]);

@@ -3,6 +3,13 @@
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
 
+## Agent tool approval removal
+
+Lilac executes available tools without an approval step. Per-tool `needsApproval` callbacks are no
+longer evaluated, and agent options do not expose a `toolApproval` policy. Input validation, tool
+availability rules, and cancellation still apply. Existing persisted approval message formats remain
+readable; no stored-data or configuration version changes are needed.
+
 ## Image generation script interface
 
 `generate.image` now accepts only `{ code: string }`, with JavaScript executed by Bun in the calling

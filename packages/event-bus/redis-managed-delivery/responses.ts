@@ -22,7 +22,7 @@ const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const redisIntegerSchema = z
   .union([z.number(), z.string().regex(/^-?(?:0|[1-9]\d*)$/)])
   .transform(Number)
-  .pipe(z.number().int().safe());
+  .pipe(z.number().int());
 const nonnegativeIntegerSchema = redisIntegerSchema.pipe(z.number().nonnegative());
 const positiveIntegerSchema = redisIntegerSchema.pipe(z.number().positive());
 const attemptSchema = redisIntegerSchema
@@ -407,7 +407,7 @@ const stateCleanupScanResponseSchema = z
 const stateCleanupDeleteResponseSchema = z
   .number()
   .int()
-  .safe()
+
   .nonnegative()
   .transform((deletedCount) => ({ status: "deleted", deletedCount }) as const);
 

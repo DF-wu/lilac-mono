@@ -69,29 +69,29 @@ const retentionSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("durable") }),
   z.strictObject({
     kind: z.literal("expires"),
-    expiresAt: z.number().int().nonnegative().safe().max(8_640_000_000_000_000),
+    expiresAt: z.number().int().nonnegative().max(8_640_000_000_000_000),
   }),
 ]);
 
-const stagingExpiresAtSchema = z.number().int().nonnegative().safe().max(8_640_000_000_000_000);
+const stagingExpiresAtSchema = z.number().int().nonnegative().max(8_640_000_000_000_000);
 
 const pendingReservationSchema = z.strictObject({
   version: z.literal(1),
   objectId: z.string(),
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   state: z.literal("pending"),
   retention: retentionSchema,
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
   stagingExpiresAt: stagingExpiresAtSchema.optional(),
   pendingWrites: z.boolean().optional(),
 });
 const readyReservationSchema = z.strictObject({
   version: z.literal(1),
   objectId: z.string(),
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   state: z.literal("ready"),
   retention: retentionSchema,
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
   stagingExpiresAt: stagingExpiresAtSchema.optional(),
   pendingWrites: z.boolean().optional(),
   ref: blobRefV1Schema,
@@ -105,10 +105,10 @@ const stagedReservationSchema = readyReservationSchema.extend({
 const failedReservationSchema = z.strictObject({
   version: z.literal(1),
   objectId: z.string(),
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   state: z.literal("failed"),
   retention: retentionSchema,
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
   stagingExpiresAt: stagingExpiresAtSchema.optional(),
   pendingWrites: z.boolean().optional(),
   reason: z.enum(["source", "write", "expected_sha256", "expected_byte_length", "fenced"]),
@@ -116,20 +116,20 @@ const failedReservationSchema = z.strictObject({
 const interruptedReservationSchema = z.strictObject({
   version: z.literal(1),
   objectId: z.string(),
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   state: z.literal("interrupted"),
   retention: retentionSchema,
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
   stagingExpiresAt: stagingExpiresAtSchema.optional(),
   pendingWrites: z.boolean().optional(),
 });
 const deletedReservationSchema = z.strictObject({
   version: z.literal(1),
   objectId: z.string(),
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   state: z.literal("deleted"),
   retention: retentionSchema,
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
   stagingExpiresAt: stagingExpiresAtSchema.optional(),
   pendingWrites: z.boolean().optional(),
 });

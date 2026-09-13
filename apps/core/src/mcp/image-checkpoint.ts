@@ -11,10 +11,10 @@ import { materializeStoredMessagesV1 } from "../transcript/stored-message-materi
 
 export const mcpImageCheckpointReferenceSchema = z.strictObject({
   toolCallId: z.string().min(1),
-  outputIndex: z.number().int().nonnegative().safe(),
+  outputIndex: z.number().int().nonnegative(),
   localPath: z.string().regex(/^\/[^\0]+$/u),
   mediaType: z.string().startsWith("image/"),
-  byteLength: z.number().int().nonnegative().safe(),
+  byteLength: z.number().int().nonnegative(),
   sha256: z.string().regex(/^[0-9a-f]{64}$/u),
   filename: z.string().optional(),
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { TextInputStyle } from "discord.js";
+import { ComponentType, TextInputStyle } from "discord.js";
 
 import {
   buildDiscordQuestionCustomActionId,
@@ -34,12 +34,11 @@ describe("Discord question interactions", () => {
     expect(json.custom_id).toBe(buildDiscordQuestionModalCustomId(token));
     expect(parseDiscordQuestionModalCustomId(json.custom_id)).toBe(token);
     expect(json.title).toBe("Other response");
-    const row = json.components[0];
-    expect(row).toMatchObject({ type: 1 });
-    if (!row || !("components" in row)) throw new Error("Modal input row is missing");
-    expect(row.components[0]).toMatchObject({
+    const label = json.components[0];
+    expect(label).toMatchObject({ type: ComponentType.Label, label: "Your answer" });
+    if (!label || !("component" in label)) throw new Error("Modal input label is missing");
+    expect(label.component).toMatchObject({
       custom_id: DISCORD_QUESTION_CUSTOM_INPUT_ID,
-      label: "Your answer",
       style: TextInputStyle.Paragraph,
       required: true,
       max_length: 4_000,

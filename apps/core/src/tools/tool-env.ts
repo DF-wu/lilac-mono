@@ -39,7 +39,7 @@ const RESERVED_NAMES = new Set([
 
 const toolEnvFileSchema = z.record(z.string(), z.unknown());
 const expiresAtSchema = z
-  .union([z.string(), z.number().finite()])
+  .union([z.string(), z.number()])
   .refine((value) => Number.isFinite(new Date(value).getTime()), {
     message: "expiresAt must be a valid date string or epoch-millisecond number",
   });

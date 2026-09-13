@@ -91,7 +91,7 @@ export const customCommandDefSchema = z
         }
 
         ctx.addIssue({
-          code: z.ZodIssueCode.custom,
+          code: "custom",
           path: ["args", i, "choices", choiceIndex],
           message: `duplicate choice '${choice}'`,
         });

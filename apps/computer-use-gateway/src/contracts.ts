@@ -25,17 +25,17 @@ export const sessionSchema = z.string().regex(/^[a-f0-9]{64}$/);
 export const idleTimeoutSchema = z.number().int().min(1).max(86400);
 export const recordSchema = z.strictObject({
   session: sessionSchema,
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   containerId: z
     .string()
     .regex(/^[a-f0-9]{64}$/)
     .nullable(),
-  runtimeId: z.string().uuid().nullable(),
+  runtimeId: z.uuid().nullable(),
   port: z.number().int().min(1).max(65535),
   state: z.enum(["provisioning", "ready", "terminating"]),
   password: z.string().regex(/^[A-Za-z0-9_-]{8}$/),
   idleSeconds: idleTimeoutSchema,
-  expiresAt: z.number().int().nonnegative().safe(),
+  expiresAt: z.number().int().nonnegative(),
 });
 export type RunnerRecord = z.infer<typeof recordSchema>;
 
@@ -50,13 +50,13 @@ export const contentSchema = z.discriminatedUnion("type", [
 export const runnerReplySchema = z.discriminatedUnion("ok", [
   z.strictObject({
     ok: z.literal(true),
-    generation: z.string().uuid(),
+    generation: z.uuid(),
     content: z.array(contentSchema).max(10).optional(),
     isError: z.boolean().optional(),
   }),
   z.strictObject({
     ok: z.literal(false),
-    generation: z.string().uuid().optional(),
+    generation: z.uuid().optional(),
     error: z.string().max(4096),
   }),
 ]);

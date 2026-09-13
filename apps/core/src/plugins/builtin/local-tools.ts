@@ -82,7 +82,7 @@ const coreToolRequestMetadataSchema = z
     onSubagentDelegate: z.custom<DelegateHandler>(isDelegateHandler).optional(),
     onActivity: z.custom<AgentActivityHandler>(isAgentActivityHandler).optional(),
   })
-  .passthrough();
+  .loose();
 
 const editTargetInputSchema = z.object({
   path: z.string(),

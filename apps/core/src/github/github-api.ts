@@ -42,7 +42,7 @@ const githubIssueSchema = z.object({
   title: z.string(),
   body: z.string().nullable(),
   html_url: z.string().optional(),
-  pull_request: z.object({}).passthrough().optional(),
+  pull_request: z.object({}).loose().optional(),
   user: z.object({ login: z.string().optional(), id: z.number().int().optional() }).optional(),
   created_at: z.string().optional(),
   updated_at: z.string().optional(),

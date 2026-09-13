@@ -14,15 +14,15 @@ import {
 export const BLOB_TOOL_RESULT_ARTIFACT_METADATA_VERSION = 2 as const;
 
 const metadataSchema = z.strictObject({
-  id: z.string().uuid(),
-  storageKey: z.string().uuid(),
+  id: z.uuid(),
+  storageKey: z.uuid(),
   scopeId: z.string(),
   requestId: z.string(),
   toolCallId: z.string(),
   toolName: z.string(),
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
   expiresAt: z.number().int(),
-  bytes: z.number().int().nonnegative().safe(),
+  bytes: z.number().int().nonnegative(),
   blob: blobRefV1Schema,
 });
 
@@ -31,7 +31,7 @@ const envelopeSchema = z.strictObject({
   metadata: metadataSchema,
 });
 
-const envelopeVersionSchema = z.object({ version: z.number().int() }).passthrough();
+const envelopeVersionSchema = z.object({ version: z.number().int() }).loose();
 
 export type BlobToolResultArtifactMetadata = Omit<z.output<typeof metadataSchema>, "blob"> & {
   readonly blob: BlobRefV1;

@@ -115,6 +115,16 @@ describe("OpenAI Responses input", () => {
             mediaType: "image/png",
           },
           { type: "image", image: new URL("https://example.com/a.png") },
+          {
+            type: "image",
+            image: new URL("https://example.com/legacy-image"),
+            mediaType: "application/octet-stream",
+          },
+          {
+            type: "image",
+            image: { openai: "file-legacy-image" },
+            mediaType: "application/octet-stream",
+          },
         ],
       },
     ]);
@@ -124,6 +134,8 @@ describe("OpenAI Responses input", () => {
       { type: "input_file", filename: "notes.pdf", file_data: "data:application/pdf;base64,AQI=" },
       { type: "input_image", file_id: "file-image", detail: "auto" },
       { type: "input_image", image_url: "https://example.com/a.png", detail: "auto" },
+      { type: "input_image", image_url: "https://example.com/legacy-image", detail: "auto" },
+      { type: "input_image", file_id: "file-legacy-image", detail: "auto" },
     ]);
   });
 

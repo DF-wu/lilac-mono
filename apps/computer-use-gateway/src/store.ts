@@ -30,8 +30,8 @@ export class RunnerStore {
                 "Unsupported computer lifecycle database version",
               ),
             );
-          db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;");
-          db.exec(`CREATE TABLE IF NOT EXISTS runners (
+          db.run("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;");
+          db.run(`CREATE TABLE IF NOT EXISTS runners (
             session TEXT PRIMARY KEY, generation TEXT NOT NULL UNIQUE, containerId TEXT, runtimeId TEXT,
             port INTEGER NOT NULL UNIQUE, state TEXT NOT NULL, password TEXT NOT NULL,
             idleSeconds INTEGER NOT NULL, expiresAt INTEGER NOT NULL

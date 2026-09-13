@@ -19,7 +19,7 @@ import { panic as signalEventBusPanic } from "./redis-managed-delivery";
 import type { DecodedMessage, Message } from "./types";
 
 const nonemptyStringSchema = z.string().min(1);
-const finiteNumberSchema = z.number().finite();
+const finiteNumberSchema = z.number();
 
 type CapturedCodecFailure =
   | { readonly kind: "panic"; readonly panic: Panic }

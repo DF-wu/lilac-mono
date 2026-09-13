@@ -33,7 +33,7 @@ const codexOAuthTokensSchema = z
   })
   .strict();
 const legacyCodexOAuthTokensSchema = codexOAuthTokensSchema.omit({ type: true });
-const codexOAuthTokenTypeSchema = z.object({ type: z.string() }).passthrough();
+const codexOAuthTokenTypeSchema = z.object({ type: z.string() }).loose();
 const loggedOutCodexOAuthTokensSchema = z.object({}).strict();
 
 const authorizationCodeTokenResponseSchema = z.object({

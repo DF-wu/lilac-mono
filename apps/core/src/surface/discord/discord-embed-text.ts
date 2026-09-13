@@ -24,7 +24,7 @@ const discordEmbedFieldSchema = z
     name: optionalNonEmptyStringSchema,
     value: optionalNonEmptyStringSchema,
   })
-  .passthrough()
+  .loose()
   .transform((field): DiscordEmbedTextField | null => {
     if (!field.name && !field.value) return null;
     return {
@@ -33,8 +33,8 @@ const discordEmbedFieldSchema = z
     };
   });
 
-const discordEmbedImageSchema = z.object({ url: optionalNonEmptyStringSchema }).passthrough();
-const discordEmbedFooterSchema = z.object({ text: optionalNonEmptyStringSchema }).passthrough();
+const discordEmbedImageSchema = z.object({ url: optionalNonEmptyStringSchema }).loose();
+const discordEmbedFooterSchema = z.object({ text: optionalNonEmptyStringSchema }).loose();
 
 const discordEmbedSchema = z
   .object({
@@ -47,7 +47,7 @@ const discordEmbedSchema = z
     image: z.union([discordEmbedImageSchema, z.unknown().transform(() => ({ url: undefined }))]),
     footer: z.union([discordEmbedFooterSchema, z.unknown().transform(() => ({ text: undefined }))]),
   })
-  .passthrough()
+  .loose()
   .transform((embed): DiscordEmbedTextMeta | null => {
     const fields: DiscordEmbedTextField[] = [];
     for (const field of embed.fields) {

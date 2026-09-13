@@ -131,7 +131,7 @@ type AuthenticatedToolRequest = {
 const toolJsonValueSchema: z.ZodType<ToolJsonValue> = z.lazy(() =>
   z.union([
     z.string(),
-    z.number().finite(),
+    z.number(),
     z.boolean(),
     z.null(),
     z.array(toolJsonValueSchema),

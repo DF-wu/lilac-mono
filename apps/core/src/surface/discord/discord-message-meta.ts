@@ -163,9 +163,9 @@ function getSnapshotEmbeds(snapshot: MessageSnapshot): DiscordEmbedTextMeta[] {
 }
 
 const discordFlagsSchema = z.union([
-  z.number().finite(),
+  z.number(),
   z.bigint(),
-  z.object({ bitfield: z.union([z.number().finite(), z.bigint()]) }).passthrough(),
+  z.object({ bitfield: z.union([z.number(), z.bigint()]) }).loose(),
 ]);
 
 function normalizeFlagsNumber(input: unknown): number | undefined {

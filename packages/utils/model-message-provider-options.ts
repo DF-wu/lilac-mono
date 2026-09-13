@@ -6,7 +6,7 @@ export const openAICompactionPartSchema = z
     kind: z.literal("openai.compaction"),
     providerOptions: z.unknown().optional(),
   })
-  .passthrough();
+  .loose();
 
 export type OpenAICompactionPart = z.infer<typeof openAICompactionPartSchema>;
 

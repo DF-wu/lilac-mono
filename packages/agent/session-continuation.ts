@@ -186,8 +186,8 @@ export type TextReplayTarget = {
 export const textReplayTargetSchema: z.ZodType<TextReplayTarget> = z.strictObject({
   providerFamily: historyProviderFamilySchema,
   modelSpecifier: z.string().min(1),
-  maxToolInputChars: z.number().int().nonnegative().finite(),
-  maxToolResultChars: z.number().int().nonnegative().finite(),
+  maxToolInputChars: z.number().int().nonnegative(),
+  maxToolResultChars: z.number().int().nonnegative(),
 });
 
 export type HistoricalToolOutcome = "success" | "error" | "denied" | "unknown";
@@ -226,7 +226,7 @@ function utf16Compare(left: string, right: string): number {
   return 0;
 }
 
-const strictJsonPrimitiveSchema = z.union([z.null(), z.boolean(), z.number().finite(), z.string()]);
+const strictJsonPrimitiveSchema = z.union([z.null(), z.boolean(), z.number(), z.string()]);
 type StrictJsonValue =
   | z.infer<typeof strictJsonPrimitiveSchema>
   | StrictJsonValue[]

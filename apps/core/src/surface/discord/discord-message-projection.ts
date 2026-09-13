@@ -8,7 +8,7 @@ import { getDiscordSurfaceText } from "./discord-surface-display-text";
 
 const discordMessageTypeMetaSchema = z.object({
   discord: z.object({
-    type: z.number().finite().optional(),
+    type: z.number().optional(),
     typeName: z.string().optional(),
     system: z.boolean().optional(),
     isChat: z.boolean().optional(),

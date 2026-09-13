@@ -93,7 +93,7 @@ const routerRawSchema = z
     chainMessageIds: stringArraySchema,
     participantUserIds: stringArraySchema,
   })
-  .passthrough();
+  .loose();
 
 const requestControlRawSchema = z.strictObject({
   requiresActive: booleanTrueSchema,
@@ -112,7 +112,7 @@ const subagentRawSchema = z
       })
       .optional(),
   })
-  .passthrough();
+  .loose();
 
 const customCommandRawSchema = z
   .object({
@@ -127,7 +127,7 @@ const customCommandRawSchema = z
       })
       .optional(),
   })
-  .passthrough();
+  .loose();
 
 const workflowPolicyRawSchema = z
   .object({
@@ -139,7 +139,7 @@ const workflowPolicyRawSchema = z
       })
       .optional(),
   })
-  .passthrough();
+  .loose();
 
 export type WorkflowRequestHint = NonNullable<z.infer<typeof workflowPolicyRawSchema>["workflow"]>;
 
