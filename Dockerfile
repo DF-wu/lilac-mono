@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   ffmpeg \
   file \
   fonts-liberation \
+  fonts-noto-cjk \
   fonts-noto-color-emoji \
   git \
   golang-go \
