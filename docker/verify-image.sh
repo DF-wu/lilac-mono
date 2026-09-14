@@ -130,7 +130,7 @@ docker exec "$container_name" /bin/sh -c \
 resolved_tools=$(docker exec "$container_name" /bin/sh -c 'command -v tools')
 [[ $resolved_tools == /usr/local/bin/tools ]] || fail "root PATH does not select trusted tools CLI"
 docker exec "$container_name" /usr/local/bin/tools --help >/dev/null || fail "tools CLI smoke failed"
-docker exec --user lilac "$container_name" /usr/local/bin/tools --help >/dev/null ||
+docker exec --user "$runtime_user" "$container_name" /usr/local/bin/tools --help >/dev/null ||
   fail "unprivileged tools CLI smoke failed"
 operator_status=0
 operator_output=$(docker exec \

@@ -24,6 +24,7 @@ describe("Docker image identity variants", () => {
 
   it("drops privileges using the root-owned image identity", async () => {
     const entrypoint = await readRepoFile("docker/direct-entrypoint.sh");
+    const verifier = await readRepoFile("docker/verify-image.sh");
 
     expect(entrypoint).toContain("cat /etc/lilac-runtime-user");
     expect(entrypoint).toContain('id -u "$runtime_user"');
@@ -32,6 +33,8 @@ describe("Docker image identity variants", () => {
     expect(entrypoint).toContain('export LOGNAME="$runtime_user"');
     expect(entrypoint).not.toContain("id -u lilac");
     expect(entrypoint).not.toContain("id -g lilac");
+    expect(verifier).toContain('docker exec --user "$runtime_user"');
+    expect(verifier).not.toContain("docker exec --user lilac");
   });
 
   it("runs the automatic blob migration only for the exact Core image command", async () => {
