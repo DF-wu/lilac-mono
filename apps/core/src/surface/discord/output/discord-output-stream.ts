@@ -13,7 +13,11 @@ import {
   type MessageCreateOptions,
 } from "discord.js";
 
-import { createWorkingIndicatorQueue, formatWorkingStatus } from "@stanley2058/lilac-utils";
+import {
+  createLogger,
+  createWorkingIndicatorQueue,
+  formatWorkingStatus,
+} from "@stanley2058/lilac-utils";
 import { Panic, Result, TaggedError, type Result as ResultType } from "better-result";
 
 import type {
@@ -58,6 +62,8 @@ import { renderDiscordTableImages } from "./discord-table-image-renderer";
 import { buildDiscordTableChunks, type DiscordPlainChunk } from "./discord-table-chunks";
 import { isTextSendableChannel, type SendableDiscordChannel } from "../discord-channel-guards";
 import { captureDiscordSurfaceError, classifyDiscordSurfaceError } from "../discord-adapter";
+
+const tableOutputLogger = createLogger({ module: "surface:discord:output" });
 
 function asDiscordMsgRef(channelId: string, messageId: string): MsgRef {
   return { platform: "discord", channelId, messageId };
@@ -1427,7 +1433,11 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           ...(await buildDiscordTableChunks(this.prepareText(text), {
             renderText: (segment) => this.renderPreparedText(segment, "terminal"),
             chunkText,
-            renderImages: this.deps.renderTableImages ?? renderDiscordTableImages,
+            renderImages: (tables) =>
+              (this.deps.renderTableImages ?? renderDiscordTableImages)(tables, {
+                requestId: this.deps.opts?.requestId,
+                channelId: this.deps.sessionRef.channelId,
+              }),
           })),
         );
         continue;
@@ -1444,9 +1454,24 @@ export class DiscordOutputStream implements SurfaceOutputStream {
     const { client, sessionRef } = this.deps;
     const sessionResult = discordOutputSessionResult(sessionRef);
     const discordSessionRef = adaptDiscordOutputResultToHost(sessionResult);
+    const imageOutput = this.deps.markdownTableRender?.style === "image";
+    const logContext = {
+      requestId: this.deps.opts?.requestId,
+      channelId: discordSessionRef.channelId,
+    };
+    const preparationStartedAt = performance.now();
     const channelResult = await fetchTextChannelResult(client, discordSessionRef.channelId);
     const channel = adaptDiscordOutputResultToHost(channelResult);
+    const channelFetchedAt = performance.now();
     const displayChunks = await this.buildFinalPlainChunks();
+    if (imageOutput) {
+      tableOutputLogger.debug("table_image.output.prepared", {
+        ...logContext,
+        channelFetchMs: channelFetchedAt - preparationStartedAt,
+        buildChunksMs: performance.now() - channelFetchedAt,
+        chunkCount: displayChunks.length,
+      });
+    }
 
     const MAX_FILES = 10;
     const filesForLastMessage = this.pendingAttachments.slice(0, MAX_FILES);
@@ -1502,12 +1527,28 @@ export class DiscordOutputStream implements SurfaceOutputStream {
           },
         ];
       }
+      const sendStartedAt = performance.now();
+      if (imageOutput) {
+        tableOutputLogger.debug("table_image.output.send.start", {
+          ...logContext,
+          chunkIndex: i,
+          tableImageBytes: chunk.tableImage?.bytes.byteLength ?? 0,
+        });
+      }
       const msg = await sendChunk({
         content: chunk.text.trim() ? chunk.text : undefined,
         embeds,
         files,
       });
 
+      if (imageOutput) {
+        tableOutputLogger.debug("table_image.output.send.complete", {
+          ...logContext,
+          chunkIndex: i,
+          messageId: msg.id,
+          durationMs: performance.now() - sendStartedAt,
+        });
+      }
       createdMsgs.push(msg);
       const ref = asDiscordMsgRef(discordSessionRef.channelId, msg.id);
       this.created.push(ref);
@@ -1547,8 +1588,15 @@ export class DiscordOutputStream implements SurfaceOutputStream {
   private async finishOutput(): Promise<SurfaceOutputResult> {
     await this.ensureStarted();
 
+    const previewStartedAt = performance.now();
     this.done.resolve();
     await this.running;
+    if (this.deps.markdownTableRender?.style === "image") {
+      tableOutputLogger.debug("table_image.output.preview.settled", {
+        requestId: this.deps.opts?.requestId,
+        durationMs: performance.now() - previewStartedAt,
+      });
+    }
 
     if (this.isPreviewMode()) {
       const finalReplyPromise =

@@ -43,13 +43,15 @@ describe("plain flat table images", () => {
       ...defaults,
       client,
       opts: {
+        requestId: "table-request",
         replyTo: { platform: "discord", channelId: "chan", messageId: "source" },
         onMessageCreated: (ref) => {
           seen.push(ref.messageId);
         },
       },
       rewriteText: (text) => text.replaceAll("Alpha", "Rewritten"),
-      renderTableImages: async (tables) => {
+      renderTableImages: async (tables, context) => {
+        expect(context).toEqual({ requestId: "table-request", channelId: "chan" });
         renders++;
         expect(tables).toHaveLength(2);
         expect(tables[0]?.rows[1]?.[0]?.runs).toEqual([{ text: "Rewritten" }]);

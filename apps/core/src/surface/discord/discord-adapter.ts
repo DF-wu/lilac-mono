@@ -81,6 +81,7 @@ import { createDiscordEntityMapper, type EntityMapper } from "../../entity/entit
 import { DiscordSurfaceStore, type DbDiscordMessageRelation } from "../store/discord-surface-store";
 import { splitByDiscordWindowOldestToNewest } from "./merge-window";
 import { DiscordOutputStream, sendDiscordStyledMessage } from "./output/discord-output-stream";
+import { DiscordTableImageRenderer } from "./output/discord-table-image-renderer";
 import { parseCancelCustomId } from "./discord-cancel";
 import { buildDiscordActionComponentsResult, parseDiscordActionCustomId } from "./discord-actions";
 import {
@@ -706,6 +707,7 @@ function resolveDiscordSessionKind(
 }
 
 export class DiscordAdapter implements SurfaceAdapter {
+  private readonly tableImageRenderer = new DiscordTableImageRenderer();
   private client: Client | null = null;
   private store: DiscordSurfaceStore | null = null;
   private cfg: CoreConfig | null = null;
@@ -1049,6 +1051,9 @@ export class DiscordAdapter implements SurfaceAdapter {
     this.logger.debug("login ok");
 
     this.client = client;
+    await this.tableImageRenderer.setEnabled(
+      resolveMarkdownTableRenderOptions(cfg)?.style === "image",
+    );
   }
 
   async disconnect(): Promise<void> {
@@ -1064,7 +1069,10 @@ export class DiscordAdapter implements SurfaceAdapter {
     this.store = null;
     this.entityMapper = null;
 
-    const [destroyed] = await Promise.allSettled([Promise.resolve().then(() => c?.destroy())]);
+    const [destroyed, rendererClosed] = await Promise.allSettled([
+      Promise.resolve().then(() => c?.destroy()),
+      this.tableImageRenderer.close(),
+    ]);
     const [closed] = await Promise.allSettled([Promise.resolve().then(() => store?.close())]);
     this.healthState = {
       ...this.healthState,
@@ -1077,6 +1085,9 @@ export class DiscordAdapter implements SurfaceAdapter {
 
     if (destroyed?.status === "rejected" && Panic.is(destroyed.reason)) {
       throw destroyed.reason;
+    }
+    if (rendererClosed?.status === "rejected" && Panic.is(rendererClosed.reason)) {
+      throw rendererClosed.reason;
     }
     if (closed?.status === "rejected") {
       const failure =
@@ -1181,6 +1192,11 @@ export class DiscordAdapter implements SurfaceAdapter {
         this.lastCoreConfigReloadError = msg;
       },
     });
+    if (this.client) {
+      await this.tableImageRenderer.setEnabled(
+        resolveMarkdownTableRenderOptions(this.cfg)?.style === "image",
+      );
+    }
   }
 
   private async resolveCoreConfig(): Promise<CoreConfig> {
@@ -1352,6 +1368,7 @@ export class DiscordAdapter implements SurfaceAdapter {
         useSmartSplitting,
         rewriteText: this.entityMapper?.rewriteOutgoingText,
         markdownTableRender,
+        renderTableImages: this.tableImageRenderer.render,
         markdownMathRender,
         reasoningDisplayMode: cfg.agent.reasoningDisplay ?? "simple",
         outputMode: cfg.surface.discord.outputMode ?? "inline",
