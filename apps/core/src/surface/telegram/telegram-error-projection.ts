@@ -6,7 +6,7 @@ const telegramApiErrorSchema = z
   .object({
     error_code: z.number().optional(),
     description: z.string().optional(),
-    parameters: z.object({ retry_after: z.number().finite().nonnegative().optional() }).optional(),
+    parameters: z.object({ retry_after: z.number().nonnegative().optional() }).optional(),
   })
   .refine(
     (value) =>

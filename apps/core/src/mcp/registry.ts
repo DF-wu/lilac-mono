@@ -1,3 +1,4 @@
+import { withMcpSessionHeaders } from "./session-context";
 import { captureError } from "../shared/error-capture.js";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -18,6 +19,7 @@ import type { McpServerDefinition } from "./config-types";
 import { McpConfigError, readMcpConfigFile } from "./config-file";
 import { rethrowPanic, safeMcpErrorText } from "./error-format";
 import { enforceModernMcpResultContract, retainTransportPanic } from "./modern-result-validation";
+import { wrapMcpToolWithOutputValidation } from "./output-validation";
 import type {
   McpCatalogTool,
   McpCatalogServer,
@@ -306,11 +308,12 @@ function observeHttpSessionExpiration(
   };
 }
 
-function isOptionalHttpInboundSseError(
+function isNonTerminalInboundMcpError(
   definition: McpServerDefinition,
   sessionExpired: boolean,
   error: unknown,
 ): boolean {
+  if (mcpNonTerminalExecutionErrorSchema.safeParse(error).success) return true;
   if (definition.transportConfig.transport !== "http" || sessionExpired) return false;
   const parsed = optionalHttpInboundSseErrorSchema.safeParse(error);
   return parsed.success && parsed.data.url === new URL(definition.transportConfig.url).href;
@@ -721,9 +724,12 @@ export class McpRegistry implements McpRegistryApi {
             ok: (resolved) => async () => {
               sensitiveValues = resolved.sensitiveValues;
               const transport = enforceModernMcpResultContract(
-                observeHttpSessionExpiration(this.createTransport(resolved.input), () => {
-                  holder.sessionExpired = true;
-                }),
+                observeHttpSessionExpiration(
+                  withMcpSessionHeaders(this.createTransport(resolved.input)),
+                  () => {
+                    holder.sessionExpired = true;
+                  },
+                ),
               );
               phase = "connection";
 
@@ -737,7 +743,7 @@ export class McpRegistry implements McpRegistryApi {
                     protocolVersionDiscovery: true,
                     onUncaughtError: <TError>(error: TError) => {
                       if (
-                        isOptionalHttpInboundSseError(
+                        isNonTerminalInboundMcpError(
                           definition,
                           holder.sessionExpired === true,
                           error,
@@ -1071,7 +1077,10 @@ export class McpRegistry implements McpRegistryApi {
               : { description: toolDefinition.description }),
             identity,
             stableId: catalogToolStableId(identity),
-            tool: this.wrapToolExecution(definition.id, client, sdkTool),
+            tool: wrapMcpToolWithOutputValidation(
+              this.wrapToolExecution(definition.id, client, sdkTool),
+              toolDefinition.outputSchema,
+            ),
           } satisfies McpCatalogTool),
         );
       }
@@ -1104,7 +1113,10 @@ export class McpRegistry implements McpRegistryApi {
           if (outcome.kind === "success") return outcome.value;
           const cause = outcome.failure.cause;
           rethrowPanic(cause);
-          if (!mcpNonTerminalExecutionErrorSchema.safeParse(cause).success) {
+          if (
+            !args[1]?.abortSignal?.aborted &&
+            !mcpNonTerminalExecutionErrorSchema.safeParse(cause).success
+          ) {
             const current = this.entries.get(serverId);
             if (current?.client === client) {
               this.handleTerminalFailure(
@@ -1134,7 +1146,10 @@ export class McpRegistry implements McpRegistryApi {
           if (captured.isErr()) {
             const error = captured.error.cause;
             rethrowPanic(error);
-            if (!mcpNonTerminalExecutionErrorSchema.safeParse(error).success) {
+            if (
+              !args[1]?.abortSignal?.aborted &&
+              !mcpNonTerminalExecutionErrorSchema.safeParse(error).success
+            ) {
               const current = this.entries.get(serverId);
               if (current?.client === client) {
                 this.handleTerminalFailure(
@@ -1381,6 +1396,7 @@ export class McpRegistry implements McpRegistryApi {
         return [
           Object.freeze({
             serverId: entry.definition.id,
+            allowSubagents: entry.definition.allowSubagents,
             serverInfo: entry.serverInfo,
             ...(description === undefined ? {} : { description }),
           } satisfies McpCatalogServer),

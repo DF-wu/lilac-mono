@@ -28,9 +28,9 @@ const telegramFlagsSchema = z
         replyToMessageId: z.string().optional(),
         parentChannelId: z.string().optional(),
       })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 
 export type TelegramFlags = z.output<typeof telegramFlagsSchema>["telegram"];
 

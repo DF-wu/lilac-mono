@@ -1,14 +1,23 @@
+import { createHash } from "node:crypto";
+import { openAIResponseCodec } from "@stanley2058/lilac-agent/adapters/openai-responses/output";
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { createMemoryBlobStore, type BlobStore } from "@stanley2058/lilac-blob-storage";
-import { AiSdkPiAgent, type AiSdkPiAgentOptions } from "@stanley2058/lilac-agent";
+import {
+  AgentAdapterFailure,
+  AiSdkPiAgent,
+  type AiSdkPiAgentOptions,
+} from "@stanley2058/lilac-agent";
+import { OpenAIResponsesAgentAdapter } from "@stanley2058/lilac-agent/adapters/openai-responses/adapter";
+import type { OpenAIResponsesSocket } from "@stanley2058/lilac-agent/adapters/openai-responses/socket";
 import {
   createLilacBus,
   lilacEventTypes,
+  outReqTopic,
   type StoredMessageV1,
 } from "@stanley2058/lilac-event-bus";
 import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
@@ -32,12 +41,24 @@ import {
   type CoreAcceptedRequestWork,
 } from "../../../src/surface/bridge/request-delivery";
 import type { BuiltLevel1Toolset, CoreToolPluginManager } from "../../../src/plugins";
-import { projectStoredMessagesV1 } from "../../../src/transcript/stored-message-materialization";
+import {
+  createStoredMessageIdentityProjectionV1,
+  projectStoredMessagesV1,
+} from "../../../src/transcript/stored-message-materialization";
 import {
   joinAgentRunRecoveryHeads,
   removeFullyReconciledAgentRunTerminalHeads,
   selectAgentRunAcceptedRecovery,
 } from "../../../src/runtime/create-core-runtime";
+
+import {
+  SqliteTranscriptStore,
+  TranscriptStoreSqliteDriverFailure,
+  type TranscriptStore,
+} from "../../../src/transcript/transcript-store";
+
+import { McpImageCheckpointRegistry } from "../../../src/mcp/image-checkpoint";
+import { persistBlobBackedAgentRunCheckpoint } from "../../../src/surface/bridge/agent-run-checkpoint-persistence";
 
 const directories: string[] = [];
 
@@ -132,6 +153,7 @@ function testToolset(onEffect: () => void): BuiltLevel1Toolset {
     updateActiveBatchTools: () => undefined,
     genericOutputNormalizerBypassTools: new Set(["builtin"]),
     aggregateOutputBudgetExemptTools: new Set(),
+    release: async () => Result.ok(undefined),
   };
 }
 
@@ -271,6 +293,9 @@ async function reconstruct(input: {
   readonly dbPath: string;
   readonly blobStore: BlobStore;
   readonly onEffect?: () => void;
+  readonly transcriptStore?: TranscriptStore;
+  readonly beforeActivate?: (bus: ReturnType<typeof createLilacBus>) => Promise<void>;
+  readonly createAgent?: (options: AiSdkPiAgentOptions<ToolSet>) => AiSdkPiAgent<ToolSet>;
 }): Promise<RecoveredRun> {
   const store = new SqliteRequestDeliveryStore({
     dbPath: input.dbPath,
@@ -319,8 +344,11 @@ async function reconstruct(input: {
     blobStore: input.blobStore,
     requestDelivery: delivery,
     agentRunJournal: journalPort,
+    transcriptStore: input.transcriptStore,
     subscriptionId: `crash-recovery-${crypto.randomUUID()}`,
-    config: parseCoreConfigV2ToUniversal({}),
+    config: parseCoreConfigV2ToUniversal(
+      input.createAgent ? { agent: { retry: { enabled: false } } } : {},
+    ),
     pluginManager: manager,
     startPaused: true,
     issueControlCapability: () => ({
@@ -331,6 +359,7 @@ async function reconstruct(input: {
       throw panic;
     },
     createAgent: (options: AiSdkPiAgentOptions<ToolSet>) => {
+      if (input.createAgent) return input.createAgent(options);
       let call = 0;
       return new AiSdkPiAgent({
         ...options,
@@ -385,6 +414,7 @@ async function reconstruct(input: {
     requestDeliveryStore: store,
     journal,
   });
+  await input.beforeActivate?.(bus);
   runner.activate();
   return { prompts, order, runner, store, journal, bus, manager };
 }
@@ -402,7 +432,348 @@ function messagesFor(run: RecoveredRun, marker: string): string {
   return JSON.stringify(match?.[1] ?? []);
 }
 
+class RecoveryMailbox<T> {
+  private readonly values: T[] = [];
+  private readonly readers: Array<(value: IteratorResult<T>) => void> = [];
+  private closed = false;
+
+  push(value: T): void {
+    const reader = this.readers.shift();
+    if (reader) reader({ done: false, value });
+    else this.values.push(value);
+  }
+
+  close(): void {
+    this.closed = true;
+    for (const reader of this.readers.splice(0)) reader({ done: true, value: undefined });
+  }
+
+  async next(): Promise<IteratorResult<T>> {
+    const value = this.values.shift();
+    if (value !== undefined) return { done: false, value };
+    if (this.closed) return { done: true, value: undefined };
+    return await new Promise((resolve) => this.readers.push(resolve));
+  }
+
+  [Symbol.asyncIterator]() {
+    return this;
+  }
+}
+
+type OpenAIResponsesSocketEvent = Parameters<typeof openAIResponseCodec.decode>[0];
+
+class RecoverySocket implements OpenAIResponsesSocket {
+  readonly events = new RecoveryMailbox<
+    ResultType<OpenAIResponsesSocketEvent, AgentAdapterFailure>
+  >();
+  readonly outgoing = new RecoveryMailbox<Record<string, unknown>>();
+
+  send(payload: Parameters<OpenAIResponsesSocket["send"]>[0]) {
+    this.outgoing.push({ ...payload });
+    return Result.ok(undefined);
+  }
+
+  close(): void {
+    this.events.close();
+  }
+
+  emit(event: object): void {
+    this.events.push(Result.ok(event as OpenAIResponsesSocketEvent));
+  }
+
+  created(id: string, previousResponseId?: string): void {
+    this.emit({
+      type: "response.created",
+      response: {
+        id,
+        previous_response_id: previousResponseId,
+        status: "in_progress",
+        output: [],
+      },
+    });
+  }
+}
+
+async function waitForRecoveryState(predicate: () => boolean): Promise<void> {
+  for (let turn = 0; turn < 20_000; turn += 1) {
+    if (predicate()) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error("Native recovery state did not settle");
+}
+
 describe("agent run hard-crash recovery", () => {
+  it.each([true, false])(
+    "restores MCP image checkpoints through model binding when the file survives: %s",
+    async (survives) => {
+      const first = await fixture();
+      const accepted = acceptWork(first.store, { label: "MCP screenshot recovery" }, 1);
+      const bytes = Buffer.from("screenshot-image-bytes");
+      const localPath = join(first.directory, "screenshot.png");
+      await writeFile(localPath, bytes);
+      const registry = new McpImageCheckpointRegistry();
+      registry.remember({
+        toolCallId: "screenshot-call",
+        outputIndex: 0,
+        localPath,
+        mediaType: "image/png",
+        byteLength: bytes.byteLength,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      });
+      const messages: ModelMessage[] = [
+        { role: "user", content: "MCP screenshot recovery" },
+        {
+          role: "assistant",
+          content: [
+            { type: "tool-call", toolCallId: "screenshot-call", toolName: "builtin", input: {} },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "screenshot-call",
+              toolName: "builtin",
+              output: {
+                type: "content",
+                value: [
+                  {
+                    type: "file",
+                    mediaType: "image/png",
+                    data: { type: "data", data: bytes.toString("base64") },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ];
+      value(
+        await persistBlobBackedAgentRunCheckpoint({
+          journal: first.journal,
+          handle: value(first.journal.openRun(accepted.work)),
+          messages,
+          mcpImages: registry,
+          blobStore: first.blobStore,
+          identityProjection: createStoredMessageIdentityProjectionV1(),
+          retainedRequestDeliveries: [],
+        }),
+      );
+      first.journal.close();
+      first.store.close();
+      if (!survives) await rm(localPath);
+      let effects = 0;
+      const run = await reconstruct({
+        dbPath: first.dbPath,
+        blobStore: first.blobStore,
+        onEffect: () => {
+          effects += 1;
+        },
+      });
+      await waitForTerminal(run.store, [accepted.requestDeliveryId]);
+      const prompt = messagesFor(run, "MCP screenshot recovery");
+      if (survives) {
+        expect(prompt).toContain(bytes.toString("base64"));
+        expect(prompt).not.toContain("Image unavailable during recovery");
+      } else {
+        expect(prompt).toContain("Image unavailable during recovery");
+        expect(prompt).toContain(localPath);
+        expect(prompt).not.toContain(bytes.toString("base64"));
+      }
+      expect(effects).toBe(0);
+      await closeRecovered(run);
+      await resultValue(first.blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+    },
+  );
+
+  it.each(["result", "throw"] as const)(
+    "reports transcript save %s failures as failed durable outcomes",
+    async (failureMode) => {
+      const initial = await fixture();
+      const accepted = acceptWork(initial.store, { label: "transcript-save-failure" }, Date.now());
+      initial.store.close();
+      initial.journal.close();
+      const transcripts = new SqliteTranscriptStore(":memory:");
+      const error = new TranscriptStoreSqliteDriverFailure({
+        operation: "save-request-transcript",
+        code: "SQLITE_FULL",
+        message: "Transcript storage is full",
+      });
+      const save = spyOn(transcripts, "saveRequestTranscript").mockImplementation(() => {
+        if (failureMode === "throw") throw error;
+        return Result.err(error);
+      });
+      const states: string[] = [];
+      const finalTexts: string[] = [];
+      const run = await reconstruct({
+        dbPath: initial.dbPath,
+        blobStore: initial.blobStore,
+        transcriptStore: transcripts,
+        beforeActivate: async (bus) => {
+          value(
+            await bus.subscribeTopic(
+              "evt.request",
+              { mode: "tail", offset: { type: "now" } },
+              async (message) => {
+                if (message.type === lilacEventTypes.EvtRequestLifecycleChanged)
+                  states.push(message.data.state);
+                return Result.ok(undefined);
+              },
+              () => "dead-letter",
+            ),
+          );
+          value(
+            await bus.subscribeTopic(
+              outReqTopic(accepted.requestId),
+              { mode: "tail", offset: { type: "now" } },
+              async (message) => {
+                if (message.type === lilacEventTypes.EvtAgentOutputResponseText)
+                  finalTexts.push(message.data.finalText);
+                return Result.ok(undefined);
+              },
+              () => "dead-letter",
+            ),
+          );
+        },
+      });
+      try {
+        await waitForTerminal(run.store, [accepted.requestDeliveryId]);
+        expect(states).toContain("failed");
+        expect(states).not.toContain("resolved");
+        expect(finalTexts).toHaveLength(1);
+        expect(finalTexts[0]).toContain("Error:");
+        expect(finalTexts[0]).toContain("Transcript storage is full");
+        expect(value(run.store.load(accepted.requestDeliveryId))).toMatchObject({
+          state: "terminal",
+          outcome: { kind: "failed" },
+        });
+        expect(
+          value(transcripts.getRequestTranscript({ requestId: accepted.requestId })),
+        ).toBeNull();
+      } finally {
+        await closeRecovered(run);
+        save.mockRestore();
+        transcripts.close();
+      }
+    },
+  );
+
+  it("retains exhausted native steering and recovers only input absent from its checkpoint", async () => {
+    const initial = await fixture();
+    const owner = acceptWork(initial.store, { label: "native-recovery-owner" }, 1);
+    initial.journal.close();
+    initial.store.close();
+    const socket = new RecoverySocket();
+    let connectionCount = 0;
+    const failed = await reconstruct({
+      dbPath: initial.dbPath,
+      blobStore: initial.blobStore,
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          adapterFactory: () =>
+            new OpenAIResponsesAgentAdapter({
+              model: "gpt-6-astra",
+              transport: "websocket",
+              connect: async () => {
+                connectionCount += 1;
+                return Result.ok(socket);
+              },
+            }),
+        }),
+    });
+    expect((await socket.outgoing.next()).value).toMatchObject({ type: "response.create" });
+    socket.created("native-parent");
+    const publishControl = async (text: string): Promise<string> => {
+      const requestDeliveryId = crypto.randomUUID();
+      const data = {
+        requestDeliveryId,
+        queue: "steer" as const,
+        messages: [{ role: "user" as const, content: text }],
+        raw: { requiresActive: true },
+      };
+      value(
+        failed.store.prepare({
+          requestDeliveryId,
+          requestId: owner.requestId,
+          envelope: { headers: owner.work.headers, data },
+          inputHandles: [],
+          createdAt: Date.now(),
+        }),
+      );
+      await resultValue(
+        failed.bus.publish(lilacEventTypes.CmdRequestMessage, data, {
+          headers: owner.work.headers,
+        }),
+      );
+      return requestDeliveryId;
+    };
+    const committedId = await publishControl("native committed correction");
+    expect((await socket.outgoing.next()).value).toMatchObject({ type: "response.steer" });
+    socket.emit({
+      type: "response.steer.accepted",
+      steer: { id: "committed-steer", previous_response_id: "native-parent" },
+    });
+    socket.emit({
+      type: "response.incomplete",
+      response: {
+        id: "native-parent",
+        status: "incomplete",
+        incomplete_details: { reason: "steered" },
+        output: [],
+      },
+    });
+    socket.created("native-successor", "native-parent");
+    await waitForRecoveryState(() =>
+      value(failed.journal.loadRecoveryHeads()).heads.some((head) =>
+        head.checkpoint?.retainedRequestDeliveries.some(
+          (delivery) => delivery.requestDeliveryId === committedId,
+        ),
+      ),
+    );
+    const pendingId = await publishControl("native pending correction");
+    expect((await socket.outgoing.next()).value).toMatchObject({ type: "response.steer" });
+    socket.emit({
+      type: "response.steer.accepted",
+      steer: { id: "pending-steer", previous_response_id: "native-successor" },
+    });
+    socket.events.push(
+      Result.err(
+        new AgentAdapterFailure({
+          reason: "unavailable",
+          message: "WebSocket closed after steering acceptance",
+          replaySafety: "reconcile",
+        }),
+      ),
+    );
+    await waitForRecoveryState(() => failed.runner.getActiveLevel1Work().length === 0);
+    expect(connectionCount).toBe(1);
+    expect(failed.order).toContain(`surface:${owner.requestId}`);
+    expect(failed.order).not.toContain(`terminal:${owner.requestId}`);
+    for (const id of [owner.requestDeliveryId, committedId, pendingId]) {
+      expect(value(failed.store.load(id)).state).toBe("accepted");
+    }
+    const head = value(failed.journal.loadRecoveryHeads()).heads.find(
+      (entry) => entry.handle.runId === owner.requestDeliveryId,
+    );
+    expect(head?.state).not.toBe("terminal");
+    expect(
+      head?.checkpoint?.retainedRequestDeliveries.map((entry) => entry.requestDeliveryId),
+    ).toEqual([committedId]);
+    await closeRecovered(failed);
+
+    const recovered = await reconstruct({ dbPath: initial.dbPath, blobStore: initial.blobStore });
+    await waitForTerminal(recovered.store, [owner.requestDeliveryId, committedId, pendingId]);
+    const firstPrompt = [...recovered.prompts.values()][0]?.[0];
+    const text = JSON.stringify(firstPrompt);
+    expect(text.match(/native committed correction/g)).toHaveLength(1);
+    expect(text.match(/native pending correction/g)).toHaveLength(1);
+    expect(recovered.prompts.size).toBe(1);
+    await closeRecovered(recovered);
+    await resultValue(initial.blobStore.close({ deadlineAtMs: Date.now() + 1_000 }));
+  });
+
   it("reconstructs original, semantic, tool, subagent, and terminal boundaries", async () => {
     const first = await fixture();
     const records: AcceptedRequestDelivery<CoreAcceptedRequestWork>[] = [];

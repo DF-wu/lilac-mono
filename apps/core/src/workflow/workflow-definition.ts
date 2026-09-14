@@ -58,7 +58,7 @@ export const workflowDefinitionNameSchema = z
   .max(64)
   .regex(WORKFLOW_NAME_PATTERN, "workflow name must use strict lowercase kebab-case");
 
-const jsonPrimitiveSchema = z.union([z.null(), z.boolean(), z.number().finite(), z.string()]);
+const jsonPrimitiveSchema = z.union([z.null(), z.boolean(), z.number(), z.string()]);
 const sensitiveSchema = z.boolean().optional();
 
 type WorkflowJsonSchema =
@@ -135,8 +135,8 @@ const workflowJsonSchema: z.ZodType<WorkflowJsonSchema> = z.lazy(() =>
       type: z.enum(["number", "integer"]),
       enum: z.array(jsonPrimitiveSchema).max(MAX_SCHEMA_ENUM_VALUES).optional(),
       const: jsonPrimitiveSchema.optional(),
-      minimum: z.number().finite().optional(),
-      maximum: z.number().finite().optional(),
+      minimum: z.number().optional(),
+      maximum: z.number().optional(),
       description: z.string().max(MAX_SCHEMA_STRING_LENGTH).optional(),
       sensitive: sensitiveSchema,
     }),
@@ -983,7 +983,7 @@ function extractDefinitionObject(
   const clause = importStatement.importClause;
   if (
     !clause ||
-    clause.isTypeOnly ||
+    clause.phaseModifier === ts.SyntaxKind.TypeKeyword ||
     clause.name ||
     !clause.namedBindings ||
     !ts.isNamedImports(clause.namedBindings) ||

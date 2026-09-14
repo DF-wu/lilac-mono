@@ -110,6 +110,7 @@ function recordingPluginManager(
         updateActiveBatchTools: () => {},
         genericOutputNormalizerBypassTools: new Set<string>(),
         aggregateOutputBudgetExemptTools: new Set<string>(),
+        release: async () => Result.ok(undefined),
       });
     },
   };

@@ -402,7 +402,7 @@ const redisWireValueEvidenceSchema = z.discriminatedUnion("kind", [
       "structured",
       "text",
     ]),
-    charLength: z.number().int().nonnegative().safe(),
+    charLength: z.number().int().nonnegative(),
   }),
   z.strictObject({
     kind: z.literal("non-string"),
@@ -449,7 +449,7 @@ const eventTransportEvidenceSchema = z.strictObject({
       ]),
       preview: z.strictObject({
         fields: z.array(redisWireValueEvidenceSchema).max(32),
-        omittedValueCount: z.number().int().nonnegative().safe(),
+        omittedValueCount: z.number().int().nonnegative(),
       }),
     }),
   ]),

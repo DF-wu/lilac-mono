@@ -37,7 +37,7 @@ const questionRequestContextSchema = z.object({
         })
         .optional(),
     })
-    .passthrough()
+    .loose()
     .optional(),
 });
 

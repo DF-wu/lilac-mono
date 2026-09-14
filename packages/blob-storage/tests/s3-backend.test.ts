@@ -13,6 +13,12 @@ import {
   createS3BlobStore,
   materializeBlobRead,
 } from "../src";
+import {
+  reservationDecisionKey,
+  reservationFenceKey,
+  reservationKey,
+  reservationTransitionKey,
+} from "../src/backend";
 import { S3BlobBackend } from "../src/s3-backend";
 import { SupervisedBlobStore } from "../src/store";
 
@@ -39,6 +45,8 @@ class FakeS3Client {
   readonly writes: Array<{ readonly key: string; readonly acl?: string }> = [];
   readonly fetches: Array<{ readonly key: string; readonly method: string }> = [];
   failExists?: Error;
+  failList?: Error;
+  maxListKeys?: number;
   ambiguousContentWrite = false;
   ambiguousKeyIncludes?: string;
   failKeyIncludesBeforeWrite?: string;
@@ -213,11 +221,21 @@ class FakeS3Client {
     };
   }
 
-  async list(input?: { readonly prefix?: string; readonly maxKeys?: number }) {
+  async list(input?: {
+    readonly prefix?: string;
+    readonly maxKeys?: number;
+    readonly startAfter?: string;
+  }) {
+    if (this.failList !== undefined) {
+      const error = this.failList;
+      this.failList = undefined;
+      throw error;
+    }
     const keys = [...this.values.keys()]
       .filter((key) => key.startsWith(input?.prefix ?? ""))
+      .filter((key) => input?.startAfter === undefined || key > input.startAfter)
       .sort();
-    const limit = input?.maxKeys ?? 1_000;
+    const limit = Math.min(input?.maxKeys ?? 1_000, this.maxListKeys ?? 1_000);
     return {
       contents: keys.slice(0, limit).map((key) => ({
         key,
@@ -786,3 +804,138 @@ realS3Test("real S3-compatible lifecycle, privacy, and local-copy integration", 
     new TextEncoder().encode("real key copy"),
   );
 });
+
+test("S3 staged adoption and expiry use one conditional decision key", async () => {
+  const client = new FakeS3Client();
+  const first = backend(client);
+  const second = backend(client);
+  const objectId = `b1_${"d".repeat(32)}`;
+  const pending = '{"state":"pending"}\n';
+  const staged = '{"state":"staged"}\n';
+  const ready = '{"state":"ready"}\n';
+  const deleted = '{"state":"deleted"}\n';
+  success(await first.initialize({ createIfMissing: true }));
+  success(await first.createReservation(objectId, pending));
+  expect(success(await first.compareAndSwapReservation(objectId, pending, staged))).toBe(true);
+
+  const decisions = await Promise.all([
+    first.compareAndSwapReservation(objectId, staged, ready),
+    second.compareAndSwapReservation(objectId, staged, deleted),
+  ]);
+  expect(decisions.map(success).filter(Boolean)).toHaveLength(1);
+  const expected = success(decisions[0]!) ? ready : deleted;
+  expect(success(await first.readReservation(objectId))).toBe(expected);
+  expect(success(await second.readReservation(objectId))).toBe(expected);
+  expect(success(await second.compareAndSwapReservation(objectId, staged, ready))).toBe(false);
+  expect(success(await first.compareAndSwapReservation(objectId, staged, deleted))).toBe(false);
+  expect(client.values.has(`tenant/blobs/reservations/${objectId}.decision.json`)).toBe(true);
+});
+
+test("S3 adopted reservations retain their explicit deletion fence", async () => {
+  const client = new FakeS3Client();
+  const first = backend(client);
+  const objectId = `b1_${"e".repeat(32)}`;
+  const pending = '{"state":"pending"}\n';
+  const staged = '{"state":"staged"}\n';
+  const ready = '{"state":"ready"}\n';
+  const deleted = '{"state":"deleted"}\n';
+  success(await first.initialize({ createIfMissing: true }));
+  success(await first.createReservation(objectId, pending));
+  expect(success(await first.compareAndSwapReservation(objectId, pending, staged))).toBe(true);
+  expect(success(await first.compareAndSwapReservation(objectId, staged, ready))).toBe(true);
+  const reopened = backend(client);
+  expect(success(await reopened.readReservation(objectId))).toBe(ready);
+  expect(success(await reopened.compareAndSwapReservation(objectId, ready, deleted))).toBe(true);
+  expect(success(await first.readReservation(objectId))).toBe(deleted);
+  expect(client.values.has(`tenant/blobs/reservations/${objectId}.fence.json`)).toBe(true);
+  expect(success(await first.compareAndSwapReservation(objectId, staged, ready))).toBe(false);
+});
+
+test("S3 a delayed staged adopter cannot recreate a deleted reservation", async () => {
+  const client = new FakeS3Client();
+  const first = backend(client);
+  const second = backend(client);
+  const objectId = `b1_${"f".repeat(32)}`;
+  const pending = '{"state":"pending"}\n';
+  const staged = '{"state":"staged"}\n';
+  const ready = '{"state":"ready"}\n';
+  const deleted = '{"state":"deleted"}\n';
+  success(await first.initialize({ createIfMissing: true }));
+  success(await first.createReservation(objectId, pending));
+  expect(success(await first.compareAndSwapReservation(objectId, pending, staged))).toBe(true);
+  const observed = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const readReservation = first.readReservation.bind(first);
+  let pause = true;
+  first.readReservation = async (id) => {
+    const result = await readReservation(id);
+    if (pause) {
+      pause = false;
+      observed.resolve();
+      await resume.promise;
+    }
+    return result;
+  };
+
+  const adopting = first.compareAndSwapReservation(objectId, staged, ready);
+  await observed.promise;
+  expect(success(await second.compareAndSwapReservation(objectId, staged, deleted))).toBe(true);
+  success(
+    await second.deleteKeys([
+      reservationKey(objectId),
+      reservationFenceKey(objectId),
+      reservationDecisionKey(objectId),
+      reservationTransitionKey(objectId),
+    ]),
+  );
+  resume.resolve();
+
+  expect(success(await adopting)).toBe(false);
+  expect(success(await second.readReservation(objectId))).toBeNull();
+  expect(client.values.has(`tenant/blobs/${reservationDecisionKey(objectId)}`)).toBe(false);
+});
+
+for (const maxListKeys of [1, 1_000]) {
+  test(`S3 expiry pages advance past retained entries with provider page limit ${maxListKeys}`, async () => {
+    const client = new FakeS3Client();
+    client.maxListKeys = maxListKeys;
+    const adapter = backend(client);
+    const first = `b1_${"a".repeat(32)}`;
+    const second = `b1_${"b".repeat(32)}`;
+    const third = `b1_${"c".repeat(32)}`;
+    success(await adapter.initialize({ createIfMissing: true }));
+    success(await adapter.createReservation(second, '{"state":"deleted"}\n', 1));
+    success(await adapter.createReservation(third, '{"state":"deleted"}\n', 2));
+    success(await adapter.createReservation(first, '{"state":"deleted"}\n', 1));
+    for (let index = 0; index < 5; index += 1) {
+      success(
+        await adapter.createReservation(
+          `b1_${index.toString().padStart(32, "0")}`,
+          '{"state":"pending"}\n',
+          10,
+        ),
+      );
+    }
+
+    expect(success(await adapter.listExpiredReservationIds(2, 1))).toEqual({
+      ids: [first],
+      remaining: true,
+    });
+    client.failList = new Error("controlled list failure");
+    expect(failure(await adapter.listExpiredReservationIds(2, 1))).toBeInstanceOf(
+      BlobAdapterFailure,
+    );
+    expect(success(await adapter.listExpiredReservationIds(2, 1))).toEqual({
+      ids: [second],
+      remaining: true,
+    });
+    expect(success(await adapter.listExpiredReservationIds(2, 1))).toEqual({
+      ids: [third],
+      remaining: false,
+    });
+    expect(success(await adapter.listExpiredReservationIds(2, 1))).toEqual({
+      ids: [first],
+      remaining: true,
+    });
+  });
+}

@@ -133,8 +133,7 @@ const EXPLORE_PROFILE_DEFAULT: SubagentProfileConfig = {
       "fetch",
       "search",
       "skills.list",
-      "skills.brief",
-      "skills.full",
+      "skills.read",
       "content.inspect",
       "discovery.search",
       "conversation.thread.search",
@@ -310,6 +309,20 @@ const subagentsSchemaV2 = z.object({
 const discordMarkdownTableRenderSchema = z
   .object({
     enabled: z.boolean().default(true),
+    style: z.enum(["unicode", "ascii", "image"]).default("unicode"),
+    maxWidth: z.number().int().min(40).max(240).default(50),
+    fallbackMode: z.enum(["list", "passthrough"]).default("list"),
+  })
+  .default({
+    enabled: true,
+    style: "unicode",
+    maxWidth: 50,
+    fallbackMode: "list",
+  });
+
+const telegramMarkdownTableRenderSchema = z
+  .object({
+    enabled: z.boolean().default(true),
     style: z.enum(["unicode", "ascii"]).default("unicode"),
     maxWidth: z.number().int().min(40).max(240).default(50),
     fallbackMode: z.enum(["list", "passthrough"]).default("list"),
@@ -431,7 +444,7 @@ const telegramSurfaceSchema = z
     allowedChatIds: z.array(z.string().min(1)).default(() => []),
     allowedUserIds: z.array(z.string().min(1)).default(() => []),
     dbPath: z.string().min(1).optional(),
-    apiRoot: z.string().url().optional(),
+    apiRoot: z.url().optional(),
     outputMode: z.enum(["inline", "preview"]).default(TELEGRAM_SURFACE_DEFAULTS.outputMode),
     parseMode: z.enum(["html", "plain"]).default(TELEGRAM_SURFACE_DEFAULTS.parseMode),
     // Telegram throttles edits at roughly one per second per chat; going below
@@ -448,7 +461,7 @@ const telegramSurfaceSchema = z
       .min(1)
       .default(() => cloneDefaultWorkingIndicators()),
     commandMenu: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.commandMenu),
-    markdownTableRender: discordMarkdownTableRenderSchema,
+    markdownTableRender: telegramMarkdownTableRenderSchema,
     inboundMedia: z
       .object({
         enabled: z.boolean().default(TELEGRAM_SURFACE_DEFAULTS.inboundMedia.enabled),

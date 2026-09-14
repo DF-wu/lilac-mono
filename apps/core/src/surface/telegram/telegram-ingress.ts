@@ -16,7 +16,7 @@ import type { AdapterEvent } from "../events";
  */
 const surfaceRefSchema = z
   .object({ platform: z.literal("telegram"), channelId: z.string() })
-  .passthrough();
+  .loose();
 
 const storedTelegramEventSchema = z.union([
   z
@@ -24,9 +24,9 @@ const storedTelegramEventSchema = z.union([
       type: z.enum(["adapter.message.created", "adapter.message.updated"]),
       platform: z.literal("telegram"),
       ts: z.number(),
-      message: z.object({ ref: surfaceRefSchema, session: surfaceRefSchema }).passthrough(),
+      message: z.object({ ref: surfaceRefSchema, session: surfaceRefSchema }).loose(),
     })
-    .passthrough(),
+    .loose(),
   z
     .object({
       type: z.enum([
@@ -39,7 +39,7 @@ const storedTelegramEventSchema = z.union([
       messageRef: surfaceRefSchema,
       session: surfaceRefSchema,
     })
-    .passthrough(),
+    .loose(),
 ]);
 
 const storedTelegramRawSchema = z.json();

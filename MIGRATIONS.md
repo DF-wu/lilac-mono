@@ -5,23 +5,160 @@ documented separately in [`docs/core-config-migrations.md`](docs/core-config-mig
 
 ## Automatic Transcript And Workflow Blob Migration
 
-The production Docker entrypoint now coordinates the one-way Core transcript schema 5 and workflow
+The production Docker entrypoint coordinates the one-way Core transcript schema 5 and workflow
 schema 25 migration before starting the default Core command. When both databases are at those exact
 legacy versions, startup first writes an immutable backup to
-`DATA_DIR/.migration-backups/blob-storage-v5-v25`, then applies transcript schema 6 and workflow schema
-26. Fresh data directories and databases already at transcript schema 6 through the current supported
-version and workflow schema 26 continue without creating a backup. Mixed, partial, or unknown schema
-states fail closed before startup changes persisted data.
+`/data/migration-backups/blob-storage-v2/<timestamp>/`, then runs the blob-storage migration.
 
-The backup contains the SQLite databases and sidecars that exist, transcript and workflow blob
-directories that exist, and a manifest of the original paths. A successful backup is never overwritten
-by later starts. If migration fails, stop the deployment, preserve the failed data directory for
-diagnosis, and restore the backup contents into their manifest paths before rolling back to a build that
-expects schema 5/25.
+If either database is already newer, startup skips this compatibility migration. If either database is
+older or only one database is at the expected legacy version, startup fails closed and requires an
+operator to inspect and migrate the deployment explicitly. Rollback after a successful migration
+requires restoring the generated backup and running a pre-migration image that expects schema 5/25.
 
 Set `LILAC_AUTO_MIGRATE_BLOB_STORAGE=0` only as an operator-controlled temporary opt-out when the
 migration will be run manually with `bun run migrate:blob-storage`. The Docker gate applies only to the
 image's exact default Core command; maintenance and diagnostic commands do not trigger it.
+
+## Agent tool approval removal
+
+Lilac executes available tools without an approval step. Per-tool `needsApproval` callbacks are no
+longer evaluated, and agent options do not expose a `toolApproval` policy. Input validation, tool
+availability rules, and cancellation still apply. Existing persisted approval message formats remain
+readable; no stored-data or configuration version changes are needed.
+
+## Tool launcher build artifacts
+
+Built tool installations now include `tools-build-id` and `tools-build-info.json` beside
+`tools` and `tools-worker`. Install all four artifacts together. The launcher and worker
+read the shared ID at startup; a missing or malformed ID prevents startup. The ID remains
+part of the invocation protocol. Socket names hash the installation path and worker ID
+so separate installations cannot share a worker with different metadata.
+
+Docker writes version metadata only in `/app/build/build-info.json` and links the tool
+metadata file to it. Local tool builds write their metadata beside the executables.
+Metadata changes no longer change the worker ID or require recompiling either executable.
+
+## Skill read tool replacement
+
+`skills.read` replaces `skills.brief` and `skills.full`; both old callables are removed without aliases.
+Update scripts, prompt tool maps, and explicit callable allowlists to use `skills.read`. The generated
+config and both versioned parsers' default allowlists use the replacement callable. Existing explicit
+allowlists are not rewritten.
+
+The new tool accepts `name`, with no `maxChars` option. Its response fields are `path`, `length`,
+`metadata`, and `content`, in that order. `content` is the complete raw `SKILL.md`, including frontmatter;
+`length` counts its UTF-16 code units. The old body, truncation, and resource-listing fields are removed.
+Bash output limits continue to apply. See [skill authoring](docs/skill-authoring.md) for discovery and
+catalog behavior.
+
+## MCP subagent access defaults to disabled
+
+Each server in `mcp-config.yaml` now accepts `allowSubagents`, a boolean that defaults to `false`.
+The file remains `configVersion: 1`. Existing files still parse, but their MCP tools are no longer
+available to subagents, including `general` and `self` profiles with wildcard permissions.
+
+Add `allowSubagents: true` to each server whose subagent access should continue, then reload it with
+`mcp.reload` or restart Core. The server flag and the profile's Level 1 plugin/tool allowlists must all
+permit access. A profile wildcard cannot override `false`. Primary-agent access is unchanged.
+Leave computer-use disabled unless subagents should be able to operate their own desktops.
+
+The restriction applies when Core assembles a run's toolset, including resumed runs. Saved catalog
+selections cannot restore tools excluded from that toolset. Existing active toolsets retain their
+snapshot; finish or interrupt those runs before relying on a changed policy. A failed reload retains
+the previous server configuration, so check the reload outcome before starting new work.
+
+Older builds reject server entries containing `allowSubagents`. Remove the field before downgrading;
+the older build will again grant MCP access according to profile allowlists alone. This is a tool
+access policy, not OS isolation from MCP endpoints for subagents with native host execution.
+
+## Agent-run checkpoint local MCP images
+
+Version-1 agent-run checkpoints now accept an optional `mcpImages` array. Each entry identifies a tool
+result content position and records its absolute local path, MIME type, byte length, SHA-256, and
+optional filename. The corresponding stored message contains a text path marker, not inline bytes or
+a managed blob reference. Only MCP `image` results successfully written by Core's existing local
+materializer use this representation. Embedded MCP resources and ordinary binary `read` results keep
+their existing behavior. Final transcript persistence still uses managed blobs for inline images.
+
+Recovery reads each surviving local file and restores its inline image only when its length and hash
+match. Missing, unreadable, or changed files become text notices without discarding the checkpoint.
+The local files remain temporary and gain no new retention or cleanup policy.
+
+Existing checkpoints without `mcpImages` decode unchanged. No database schema migration or old-image
+migration runs. Older Core builds reject checkpoints containing the new field and can discard that run's
+journal progress, then recover its original accepted work. Drain active runs before downgrading to avoid
+that loss of progress and repeated work.
+
+## Computer-use gateway schema 1 and Core session header
+
+The optional gateway creates its own SQLite database, defaulting to `/data/computer-use.sqlite`, with
+`PRAGMA user_version=1`. This does not migrate Core's databases. The `runners` table stores session
+hash, desktop generation, Docker container ID, Python runtime ID, reserved port, provisioning/ready/
+terminating state, viewer password, idle timeout, and absolute expiry. Session, generation, and port
+are unique. Runtime IDs distinguish a surviving interpreter from a restarted process. The database
+uses WAL and full synchronous commits; its file permissions are 0600.
+
+Startup rejects unknown schema versions or invalid records before admitting MCP calls. It retains only
+unexpired ready records matched to usable owned Docker containers and removes owned outliers. It never
+restores a missing desktop from metadata. Failed inspection retains unresolved reservations and fails
+readiness. Keep the database volume and gateway ownership label together. Removing the volume alone
+loses credentials and intent, and does not remove sibling runner containers. There is no downgrade path
+for gateway schema 1; stop and explicitly terminate its runners before removing the integration.
+
+Core's MCP configuration remains version 1. HTTP tool calls now reserve `x-lilac-session-hash` for a
+SHA-256 digest of `lilac:mcp-session:v1`, a NUL separator, and the trusted UTF-8 canonical session ID.
+Static configuration cannot supply this header. Initialization and discovery omit it; stdio is unchanged.
+Existing HTTP servers may ignore the added header. An older Core build can discover this gateway but
+cannot use its runner tools because it does not supply the required routing identity. Disable this MCP
+server before rolling Core back. Bearer authentication still uses the existing static-header contract.
+
+The runner's local newline-JSON protocol carries `info`, `health`, and `execute` requests through Docker
+exec and a persistent Unix socket. It is private to the gateway/runner image pair. Deploy compatible
+images together; replacing a runner always creates a new desktop generation and password. Existing
+runners continue using their original image until termination or expiry.
+
+See [computer-use operation](docs/computer-use.md) for rollout, retention, and verification commands.
+
+## Workflow schema 27 and staged blob publication
+
+Schema 27 adds `workflow_artifact_publications` to the existing workflow database. Its columns are
+`object_id`, the primary key, `artifact_id`, `blob_ref_json`, and `created_at`. The JSON field retains the
+expected complete `BlobRefV1` before a staged upload becomes durable. Existing schema-26 workflow data
+and artifact references remain unchanged. Startup applies the additive migration automatically.
+Databases below the schema-26 blob baseline require the existing offline migration.
+
+BlobStore now supports staged reservations with finite cleanup deadlines. Adoption changes a completed
+staged reservation to durable ready through a fenced metadata decision. Existing BlobHandleV1 and
+BlobRefV1 formats and ordinary upload behavior stay unchanged. A new internal reservation decision file
+coordinates adoption and expiry cleanup.
+
+Core startup attempts a bounded batch of retained publication intents before starting workflow producers.
+It logs recovery failures and continues; the existing maintenance cycle retries bounded batches and
+duplicate-upload cleanup. Workflow staging has a ten-minute deadline. A failure before intent persistence
+leaves staging data for expiry cleanup. A failure after adoption leaves a publication row that can
+establish canonical ownership or finish deleting a duplicate.
+
+Expiry or deletion of a staged upload with unfinished byte writes retains its reservation and expiry
+index. Maintenance revisits that record to remove bytes from a delayed remote write. Only a producer
+that confirms its byte writes finished can retire this cleanup ownership. Process loss or an ambiguous
+network failure can therefore leave a small cleanup record indefinitely. Expiry scans advance through
+retained records so they cannot prevent other objects from being cleaned up.
+
+Older binaries reject workflow schema 27 and do not understand staged reservation fields or the adoption
+decision file. Adopted objects retain staging metadata, so finishing pending publication rows and clearing
+unfinished uploads does not make the current store backward-compatible. There is no automatic downgrade.
+Rollback requires a coordinated pre-upgrade backup of Core's databases and managed blob storage, or a
+separately reviewed downgrade. Stop producers before rollback and restore the backup's databases and
+managed blob storage together.
+
+Before any rollback that reuses current storage, resolve pending publications and outstanding backend
+writes. Retained unfinished-write records cannot be removed merely because their deadline passed;
+elapsed time alone does not prove a remote write has stopped. Existing untracked durable blobs from
+earlier versions cannot be identified safely by this migration and are not deleted automatically.
+
+A process interrupted immediately after a delayed backend decision write can leave an inert metadata
+file after deletion. It cannot resurrect readable content or a durable blob reference. Completed calls
+clean that file; removing every such interrupted marker would require a separate backend storage change.
 
 ## MCP 2026-07-28 client and OAuth credentials
 
@@ -147,8 +284,8 @@ Use `--dry-run` for a read-only preflight. The normal command preflights and the
 invocation. It accepts only supported legacy schemas, verifies every copied object's SHA-256 and byte
 length, rewrites each database only after its required objects exist, and removes replaced legacy byte
 columns and files. The offline command emits transcript schema 6 and workflow schema 26; current Core
-then applies the additive transcript schema 7 through 10 migrations during startup. Legacy or partially migrated
-versions stop startup with the migration command.
+then applies transcript schemas 7 through 10 and workflow schema 27 during startup. Databases below
+those blob baselines, including partially migrated legacy databases, stop startup with the migration command.
 
 The migration copies durable transcript, projection, lineage, and workflow artifact content. It discards
 rebuildable Discord downloads, Anthropic fallback media, and legacy tool-result artifacts. It does not
@@ -175,8 +312,7 @@ S3 credentials are names of environment variables in config; literal credentials
 Core now emits transient tool-result references as `resource://t1_<128-bit-id>`. Existing
 `tool-result://<uuid>` references remain readable by Core until their ordinary TTL or eviction removes
 them, so this URI change needs no persisted-data migration. Tool-result metadata, session scope,
-encryption, quota accounting, and expiry remain separate from retained `resource://r1_` records. Mini
-Lilac continues to emit and consume `tool-result://` references.
+encryption, quota accounting, and expiry remain separate from retained `resource://r1_` records.
 
 ## Redis Managed Event Delivery V2
 
@@ -195,149 +331,30 @@ Durable subscriptions no longer accept a start offset and always handle only ent
 physical group is created. Publisher-supplied approximate `MAXLEN` retention is removed. Expiring output
 streams remain tail-only, and supported trimming preserves all managed pending frontiers.
 
+<a id="core-transcript-database-schemas-1-9"></a>
+
 ## Downstream Core Config Extensions
 
 Manual v1-to-v2 upgrades follow [`docs/core-config-migrations.md`](docs/core-config-migrations.md). The
 DF-wu fork adds these downstream-only v2 contracts:
 
-- `surface.discord.outputPreviewPlainFinalStats` was removed. Discord preview plus plain final output now
+- `surface.discord.outputPreviewPlainFinalStats` was removed. Discord preview plus plain final output
   appends the stats footer whenever stats metadata is produced.
 - `surface.telegram` is disabled by default and requires `configVersion: 2` to enable or configure. Frozen
   v1 configs receive the disabled universal fallback. Existing v2 configs using `tokenEnv` are rejected;
   copy the secret to `token` in `core-config.yaml`. `allowedChatIds` fails closed, `streamEditIntervalMs`
-  defaults to `1500`, and `parseMode` defaults to `html`. The complete field reference is in
-  [`core-config.example.yaml`](packages/utils/config-templates/core-config.example.yaml) and operational
-  guidance is in [`docs/telegram-surface.md`](docs/telegram-surface.md).
+  defaults to `1500`, and `parseMode` defaults to `html`. See
+  [`docs/telegram-surface.md`](docs/telegram-surface.md).
 - `tools.generate.image.provider` selects `default` built-in routing or `openai-compatible` routing for all
-  image aliases. The v2-only `tools.generate.image.openaiCompatible.models` allowlist restricts which
-  aliases the compatible endpoint advertises and serves, and `tools.generate.image.openaiCompatible.modelIds`
-  overrides the upstream model ID per alias (unlisted aliases keep their canonical IDs). All of these
-  fields are v2-only; frozen v1 configs receive `provider: default` with the empty
-  `openaiCompatible: { modelIds: {} }` defaults. The compatible route has no automatic fallback. See
+  image aliases. `tools.generate.image.openaiCompatible.models` restricts advertised aliases and
+  `modelIds` overrides upstream model IDs. These fields are v2-only; frozen v1 configs retain the
+  built-in provider. The compatible route has no automatic fallback. See
   [`docs/generate-image-openai-compatible.md`](docs/generate-image-openai-compatible.md).
-- `surface.telegram.inboundMedia` delivers inbound Telegram photos and documents to the model, enabled by
-  default with `maxBytesPerAttachment: 5MiB` and `maxBytesPerRequest: 10MiB` decoded-byte budgets. It is
-  v2-only; frozen v1 configs receive the same defaults. Behavioral consequence relative to earlier builds:
-  an uncaptioned photo or document now starts a run (set `inboundMedia.enabled: false` to restore
-  caption-only routing). See [`docs/telegram-surface.md`](docs/telegram-surface.md).
+- `surface.telegram.inboundMedia` delivers inbound Telegram photos and documents to the model. It is
+  enabled by default with `maxBytesPerAttachment: 5MiB` and `maxBytesPerRequest: 10MiB`; set
+  `inboundMedia.enabled: false` to restore caption-only routing.
 
-## Historical Mini Lilac Database Schema 3
-
-The schema 2-to-3 step preserves sessions, runs, commands, and todos, and replaces mutable full
-transcript rows and full-prefix undo checkpoint blobs with immutable, hash-chained model/UI nodes.
-Session heads and undo checkpoints reference those chains, so common prefixes are shared while legacy
-divergent checkpoint branches remain usable. The step drops `run_chunks`, `model_transcript`, and
-`ui_messages` and does not run `VACUUM`. When schema 3 was current, the transaction set `user_version`
-to 3 only after migration succeeded and versions other than 0, 2, and 3 were rejected. The current
-schema 8 startup path described below supersedes that version acceptance and final-version behavior.
-
-Stream chunks are no longer durable SQLite state. An active session actor keeps a monotonic live log
-for replay, tail reconnect, resume projection, and final UI reconstruction. The log is discarded at
-run finalization. A process crash therefore retains no partial chunks and startup marks interrupted
-runs as errors; finalized canonical transcripts remain durable.
-
-## Historical Mini Lilac Database Schema 4
-
-The schema 3-to-4 step rebuilds the
-`sessions` table to widen its status `CHECK` with `compacting` and to add
-`input_tokens_estimated`. Every other table cascades from `sessions`, so the rebuild follows
-SQLite's documented recipe: `foreign_keys` off and `legacy_alter_table` on around the transaction,
-with `PRAGMA foreign_key_check` verified afterwards. No row content changes; existing sessions get
-`input_tokens_estimated = 0`. When schema 4 was current, versions other than 0, 2, 3, and 4 were
-rejected, and a schema 2 database migrated through 3 to 4 in one startup.
-
-Behaviour changes that accompany the schema:
-
-- Manual compaction sets the session status to `compacting` for its duration instead of leaving it
-  `idle`, and `commitCompaction` accepts `compacting` as a valid pre-commit state. An interrupted
-  compaction is recovered to `idle` at startup rather than to `error`, because compaction commits
-  only on success and therefore never leaves a partial transcript.
-- A committed manual compaction now writes the post-compaction token estimate to `input_tokens`
-  with `input_tokens_estimated = 1`, where it previously wrote `NULL`. The next turn's reported
-  usage clears the flag.
-
-## Historical Mini Lilac Database Schema 5
-
-The schema 4-to-5 step introduces workspace-owned durable history while preserving sessions, runs,
-commands, todos, and readable transcripts. It recomputes every transcript-node hash from its parent
-hash and serialized value, canonicalizes stored session working directories, creates one `workspaces`
-row per canonical directory, and rebuilds session/run ownership around that workspace identity.
-
-Legacy user checkpoints become immutable history states and prompt/steer transitions. Because schema
-4 had no workspace snapshots, every migrated state records `workspace_status = unavailable` and
-`workspace_unavailable_reason = legacy-migration`; migration does not claim that the filesystem can be
-restored. A linear active prompt remains an open transition and can recover. A readable quiescent
-history with no checkpoints, or with unusual checkpoint ordering, is preserved as one current
-migration state with undo disabled; unusual ordering while a run is active is rejected. Structural
-foreign-key, transcript-parent, active-run ownership, and unreadable persisted-data failures abort and
-roll back the migration. After successful conversion, `user_checkpoints` is dropped.
-
-The legacy migration codec also removes persisted `data-session` UI parts, converts the old
-`data-compaction.data.status` discriminant to `phase` (adding `outcome: compacted` for completed
-events), and removes non-user UI messages left empty by that normalization. This compatibility is
-specific to legacy database migration; it does not make the old protocol shape valid for current
-transcript writes or reads.
-
-## Historical Mini Lilac Database Schema 6
-
-The schema 5-to-6 step rebuilds `history_states` and `history_operations` without changing their rows.
-It widens the unavailable/skip reason `CHECK` constraints to admit `platform-unsupported`, preserving
-rowids, indexes, history topology, and all existing content. Fresh databases in the current startup
-path are created directly with the schema 6 table set before later migrations are applied.
-
-## Mini Lilac Protocol: compaction lifecycle
-
-`miniLilacCompactionEventSchema` replaces its terminal-only `status: "completed" | "failed"` field
-with a `phase` discriminant (`started`, `progress`, `completed`, `failed`, `cancelled`) plus
-`outcome`, `progress`, `summary`, `elapsedMs`, `durationMs`, and `modelCalls`. Persisted
-`data-compaction` UI parts written by older builds carry `status` and no longer parse; they are
-rejected at the current transcript boundary rather than silently dropped. The legacy database
-migration normalization described under schema 5 is the only compatibility exception.
-
-`POST /sessions/:id/compact` returns a UI message event stream instead of a JSON body. Admission
-still happens before the stream opens, so a non-quiescent session is still a 409.
-
-The response stream is a view of the compaction, not its owner. Abandoning the request only detaches
-the client: the compaction continues and still commits, and reattaching to it is not supported.
-Stopping it is `POST /sessions/:id/compact/cancel`, which answers `{"status":"cancelling"}` or
-`{"status":"inactive"}`; the terminal `cancelled` event then arrives on any stream still attached.
-Clients that previously cancelled by aborting the request will no longer stop anything.
-
-`compacting` is a session status, and every admission path — prompts included — now requires
-`idle`/`error`. A prompt sent during a compaction is rejected rather than raced.
-
-## Mini Lilac Database Schema 7
-
-Schema 7 adds provider-family metadata to history states and pending finalizations, plus
-exact-history-state Claude bindings and bounded attempt records for Mini main sessions. Existing
-history has unknown provider-family metadata and no native binding, so its next Claude turn starts a
-fresh persisted session rather than guessing that native state is synchronized.
-
-Successful Claude turns promote a binding only with their committed terminal history state. Main
-bindings remain attached to retained history states, allowing restart, undo, redo, and branch
-navigation to select an exact clean native base. Active attempts left by a crash become uncertain at
-startup and are never promoted.
-
-## Mini Lilac Database Schema 8
-
-Mini Lilac migrates schema 7 databases to schema 8 transactionally at startup. Schema 8 adds one
-current Claude binding and bounded attempt records for named delegated sessions, together
-with pending-finalization promotion metadata. Existing named sessions receive no inferred native
-binding and start fresh on their next eligible Claude turn. Both caller-supplied and generated names
-are eligible; callers continue an automatically named child by reusing the returned name.
-
-Main-session schema 7 behavior is unchanged. Startup recovery marks interrupted named attempts
-uncertain and can finish a canonically verified pending success. Foreign keys are checked before
-`user_version` becomes 8.
-
-The current startup path accepts a fresh version 0 database and persisted schemas 2 through 8;
-schema 1 and every other version are rejected. Fresh databases are created at
-the schema 6 table set, and every supported older database receives all applicable steps through 8
-in one transaction. Migration uses `foreign_keys = OFF` and `legacy_alter_table = ON` for the required
-table rebuilds, verifies foreign keys before setting `user_version = 8`, restores both pragmas, and
-does not expose an intermediate schema as the completed startup state.
-
-## Core Transcript Database Schemas 1-9
+## Core transcript database schemas 1-11
 
 Core's `agent-transcripts.db` has its own `transcript_schema_migrations` sequence. These are internal
 SQLite migrations and do not change `core-config.yaml`; its current config contract remains
@@ -385,6 +402,16 @@ SQLite migrations and do not change `core-config.yaml`; its current config contr
   removes the session-wide selection table. Historical rows have no snapshot. Descendants use the
   newest reachable prefix snapshot, or start empty when none exists.
 
+- Transcript schema 11 adds nullable `deleted_ts` to surface-message aliases. Existing rows remain
+  live. Surface deletion marks an alias deleted while transcript lookup and request-alias lineage
+  validation retain its request identity. Recovery targets, recent output links, discovery coverage,
+  and checkpoint live-output checks exclude deleted aliases. A database trigger removes every alias
+  when its request transcript is deleted, including age-based retention and checkpoint cleanup.
+  Deleted aliases without a transcript expire under the configured transcript age limit during
+  retention cleanup. Unlimited age retention keeps them.
+  Previously removed aliases cannot be reconstructed by this migration. Older binaries reject schema
+  11; rollback requires a pre-upgrade backup or a separately reviewed downgrade.
+
 Core applies missing versions in one immediate transaction, validates foreign keys, marks interrupted
 native attempts uncertain during startup recovery, and promotes recovered pending successes only
 after canonical transcript/lineage verification. Primary binding reads lazily reverify the identified
@@ -413,7 +440,7 @@ Pre-envelope revisions cannot be interpreted without changing their approval mea
 
 ## Workflow Runtime Clean Break
 
-The unified programmatic workflow runtime does not read or migrate legacy `WorkflowDefinitionV2`/`WorkflowDefinitionV3` records. Existing `workflows` and `workflow_tasks` SQLite tables may remain on disk but are inert. Recreate scheduled jobs as JavaScript definitions plus `workflow.trigger.create`; existing approvals do not carry forward because approval identity includes the immutable source, schema, capability profile, project path, and runtime version.
+This section records the historical unified runtime transition. It did not read or migrate legacy `WorkflowDefinitionV2`/`WorkflowDefinitionV3` records. Existing `workflows` and `workflow_tasks` SQLite tables remain inert. That transition required recreating scheduled jobs as JavaScript definitions plus `workflow.trigger.create`. Its approval identity included immutable source, schema, capability profile, project path, and runtime version, so old approvals did not carry forward. Schema 20 later removed this approval model, and schema 23 replaced the v3 execution identity with v4.
 
 Deferred subagents persist as generated unified workflow runs. Graceful-restart snapshots no longer contain runner-local deferred child handles, output cursors, timers, or buffered completions. Active generated runs and pending live-parent deliveries recover from the durable workflow database. At this clean break, terminal results fell back to a durable progress card when the parent could not be restored; Schema 24 supersedes that behavior by durably orphaning unreachable live-parent deliveries instead.
 
@@ -423,7 +450,7 @@ The Level-2 HTTP server remains an internal trusted-network service rather than 
 
 ## Workflow Schema 20
 
-Schema 20 and runtime `lilac-workflow-js-v3` are the profile-native trusted-auto-run clean break. Workflow definitions use `resources` for orchestration bounds, and the public durable hash is `resourcePolicySha256`. The former maximum capability envelope, exact grant identity, approval API/state/actions, `awaiting_review`, and shared-editor lease runtime are removed.
+Schema 20 introduced the profile-native trusted-auto-run clean break for runtime `lilac-workflow-js-v3`. This section records that transition; schema 21 removed its remaining approval tables, and schema 23 replaced v3 executable state. Workflow definitions use `resources` for orchestration bounds, and the public durable hash is `resourcePolicySha256`. The former maximum capability envelope, exact grant identity, approval API/state/actions, `awaiting_review`, and shared-editor lease runtime are removed.
 
 Migration from schema 19 does not translate old authority:
 
@@ -433,20 +460,20 @@ Migration from schema 19 does not translate old authority:
 - All old request dispatches are deactivated before dependent rows are deleted, so no old dispatch can be adopted or redispatched under current defaults.
 - Standalone v19 terminal receipts are archived as bounded `terminal_receipt` audit records and deleted with their old runs; no receipt can outlive the executable identity it referred to.
 - Old triggers and generated subagent revisions are deleted and must be recreated from current source by an authenticated trusted principal.
-- The historical approval tables/columns remain inert to avoid a disproportionate SQLite table-rebuild migration. No current store API, engine, scheduler, tool API, event, or progress action reads or writes approval records.
+- At schema 20, historical approval tables and columns remained inert to avoid a SQLite table rebuild. The v3 runtime did not read or write approval records. Schema 21 later dropped those tables and columns.
 - `workflow_shared_editor_leases` is dropped. Shared writers are intentionally concurrent.
 
-After migration, source files remain on disk and are statically revalidated into a new v3 snapshot on their first trusted invocation. Removed `capabilities` metadata fails validation with migration guidance; rename resource bounds to `resources` and use only profile-native `agent()` options.
+After migration 20, source files remained on disk and were statically revalidated into a new v3 snapshot on their first trusted invocation. Removed `capabilities` metadata fails validation with migration guidance; rename resource bounds to `resources` and use only profile-native `agent()` options.
 
 The unshipped workflow-only `plugins.workflowExternal`, plugin `workflowExposure`, and Level-1 effect metadata were removed rather than migrated. Config v2 now owns Level-1 tools/plugins, Level-2 callables/plugins, direct network, workspace writes, execution, and delegation under each `agent.subagents.profiles.*` entry. Config v1 remains frozen and receives the useful built-in profile defaults during universal parsing. These native profiles apply identically to direct and workflow-launched subagents and are not serialized into workflow revisions or operation guardrail envelopes.
 
 ## Workflow Schema 21
 
-Schema 21 is the workflow-runtime-simplification clean break. The guiding rule is that workflows orchestrate and profiles authorize: the workflow layer keeps durable operation identity, dispatch epochs, single-owner claims, terminal receipts, waits, triggers, replay, and progress, and drops every workflow-specific security concept. This is an atomic migration that shrinks the persisted dispatch policy while still reading persisted v20 dispatches.
+Schema 21 was the workflow-runtime-simplification clean break for the historical v3 runtime. The guiding rule is that workflows orchestrate and profiles authorize: the workflow layer keeps durable operation identity, dispatch epochs, single-owner claims, terminal receipts, waits, triggers, replay, and progress, and drops every workflow-specific security concept. This is an atomic migration that shrinks the persisted dispatch policy while still reading persisted v20 dispatches.
 
 Resolved `agent()` input is reduced to `profile`, `cwd`, `model`, `reasoning`, and `label`. `cwd` is free-form and no longer canonicalized against protected roots. Agent authority comes entirely from the selected native profile: profiles own tools, Bash, Level-2 callables, network, and delegation, identically for direct and workflow launches. The former `isolation`, `editing`, `tools`, `executables`, `level2Callables`, `surfaceOriginOperations`, and `delegation` agent options are removed and fail validation with migration guidance.
 
-The deterministic program child is spawned directly with `bun --smol workflow-sandbox-child.js`. The child keeps its determinism lockdown and NDJSON protocol, and the host retains wall-time, cancellation, output-size, and protocol limits with forced termination. `maxRuntimeMemoryBytes` is removed because a plain Bun subprocess does not enforce that contract; it is stripped from persisted revision limits. Workflow execution no longer requires systemd, Bubblewrap, cgroup v2, or user namespaces, and there is no plain-subprocess fallback to fail closed against.
+Schema 21 spawned the deterministic program child directly with `bun --smol workflow-sandbox-child.js`. The child kept its determinism lockdown and NDJSON protocol, and the host retained wall-time, cancellation, output-size, and protocol limits with forced termination. Schema 23 later removed the workflow-wide wall-time limit. `maxRuntimeMemoryBytes` is removed because a plain Bun subprocess does not enforce that contract; it is stripped from persisted revision limits. Workflow execution no longer requires systemd, Bubblewrap, cgroup v2, or user namespaces, and there is no plain-subprocess fallback to fail closed against.
 
 The persisted state migration is a clean break rather than a reinterpretation:
 
@@ -462,13 +489,15 @@ The persisted state migration is a clean break rather than a reinterpretation:
 
 The workflow-only security modules removed in this break (Level-1 boundary, path authority, protected-path, denied-root policy, network policy, descriptor path, scratch, and worktree artifact) are deleted rather than migrated. The dead tool-bridge `x-lilac-workflow-capability` header and plugin `workflowPathAuthority` guidance are removed. Level-2 `workflow.*` access follows native profile configuration and the generic profile-bound request capability; there is no workflow-specific active-request or principal gate.
 
+## Workflow schema 22
+
 Schema 22 adds durable materialization attempt/error state to live-parent completion deliveries. Deferred subagent results retry artifact loading and output normalization across process restarts before Core inserts an explicit failed synthetic result, preventing transient delivery failures from either losing successful child output or waiting forever.
 
 ## Workflow Schema 23
 
 Schema 23 and runtime `lilac-workflow-js-v4` remove the workflow-wide wall-time contract. Workflow programs, sleeps, reply waits, pauses, and recovery have no total elapsed-time limit. Individual child-agent operations retain `operationIdleTimeoutMs`, and explicit cancellation still forcibly terminates the workflow subprocess.
 
-The v4 API also removes the unused public `parallel(..., { concurrency })` option; `parallel(promises)` joins already-created promises, while `pipeline(..., { concurrency })` provides bounded fan-out. Reply waits are explicitly limited to the authenticated originating Discord or Telegram session and user. Matching replies are suppressed from ordinary surface routing so they resume only the waiting workflow. Telegram durable progress targets must use the originating Telegram session; scheduled fire and every progress-card send/edit/recreation recheck the current `allowedChatIds`, so removing a chat stops persisted schedules and projections without deleting their durable records. Literal host-call option objects receive static validation before a definition is saved or triggered.
+The v4 API also removes the unused public `parallel(..., { concurrency })` option; `parallel(promises)` joins already-created promises, while `pipeline(..., { concurrency })` provides bounded fan-out. Reply waits are explicitly limited to the authenticated originating Discord session. Literal host-call option objects receive static validation before a definition is saved or triggered.
 
 Terminal results, terminal detail, and requested result artifacts are returned without sensitivity gating. Sensitive input fields, argument hashes, and progress values remain redacted. The obsolete `includeSensitiveResult` run-inspection option is removed.
 

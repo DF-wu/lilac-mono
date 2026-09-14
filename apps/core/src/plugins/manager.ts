@@ -1,3 +1,4 @@
+import { bindMcpToolToSession } from "../mcp/session-context";
 import type { ToolSet } from "ai";
 import type { ClaudeCodeToolCatalogMetadataMap } from "@stanley2058/lilac-claude-code-bridge";
 import {
@@ -6,11 +7,14 @@ import {
   invokeLevel1CreateTool,
   invokeLevel1EditTargets,
   invokeLevel1IsEnabled,
+  isPluginPanic,
+  safePluginExceptionCause,
   type Level1ContributionInfo,
   type Level1ExecutionRequestContext,
   type Level1RunProfile,
   type Level1ToolSpecCapabilitySnapshot,
   type ServerTool,
+  type ToolPluginCleanupError,
 } from "@stanley2058/lilac-plugin-runtime";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
@@ -44,6 +48,7 @@ import {
 } from "../mcp/catalog-identity";
 import {
   createMcpBinaryResultMaterializer,
+  type McpBinaryResultMaterializerOptions,
   wrapMcpToolWithBinaryMaterialization,
 } from "../mcp/binary-result-materializer";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
@@ -74,12 +79,14 @@ function isStructurallyAllowed(
 
 function isMcpStructurallyAllowed(params: {
   serverId: string;
+  allowSubagents: boolean;
   rawName: string;
   modelName: string;
   runProfile: Level1RunProfile;
   config: CoreConfig;
 }): boolean {
   if (params.runProfile === "primary") return true;
+  if (!params.allowSubagents) return false;
   const profile = resolveNativeSubagentProfile(params.config, params.runProfile);
   const serverAllowed =
     profileIncludes(profile.level1.plugins, "mcp") ||
@@ -92,6 +99,7 @@ function isMcpStructurallyAllowed(params: {
 }
 
 export type BuildLevel1ToolsetParams = {
+  onMcpImageMaterialized?: McpBinaryResultMaterializerOptions["onImageMaterialized"];
   cwd: string;
   runProfile: Level1RunProfile;
   editingToolMode: "apply_patch" | "edit_file" | "none";
@@ -113,6 +121,7 @@ export type BuildLevel1ToolsetParams = {
 };
 
 export type BuiltLevel1Toolset = {
+  release(): Promise<ResultType<void, ToolPluginCleanupError>>;
   /** Every executable tool, including deferred plugin and MCP tools. */
   tools: ToolSet;
   specs: ReadonlyMap<string, CoreLevel1ToolSpec>;
@@ -163,8 +172,11 @@ function resultErrorOrNull<T, E>(result: ResultType<T, E>): E | null {
 }
 
 type CreatedCoreToolPluginManager = ReturnType<typeof createCoreToolPluginManager>;
-export type CoreToolPluginManager = Omit<CreatedCoreToolPluginManager, "getLevel2Capabilities"> &
-  Partial<Pick<CreatedCoreToolPluginManager, "getLevel2Capabilities">>;
+export type CoreToolPluginManager = Omit<
+  CreatedCoreToolPluginManager,
+  "getLevel2Capabilities" | "acquireGeneration"
+> &
+  Partial<Pick<CreatedCoreToolPluginManager, "getLevel2Capabilities" | "acquireGeneration">>;
 
 export function resolveOpaquePluginConfig(config: CoreConfig, pluginId: string): unknown {
   return config.plugins?.config?.[pluginId];
@@ -228,26 +240,58 @@ export function createCoreToolPluginManager(params: {
       Level1ToolsetBuildFailed | Level1ToolsetInvariantViolation | Level1ToolsetAssemblyFailed
     >
   > {
-    const fresh = await manager.ensureFresh();
-    const freshError = resultErrorOrNull(fresh);
-    if (freshError) {
-      if (freshError._tag !== "ToolPluginReloadCommittedCleanupError") {
-        return Result.err(pluginOperationFailure("ensureFresh", freshError));
-      }
-      logger.error("tool plugin refresh committed with cleanup failure", {
-        operation: "ensureFresh",
-        ...formatTaggedErrorForLog(freshError),
-      });
+    const initialized = await manager.init();
+    const initializationError = resultErrorOrNull(initialized);
+    if (initializationError) {
+      return Result.err(pluginOperationFailure("init", initializationError));
     }
+    const generation = manager.acquireGeneration();
+    const [built] = await Promise.allSettled([
+      assembleLevel1ToolsetResult(buildParams, generation),
+    ]);
+    if (built.status === "fulfilled") {
+      const toolset = built.value.match({ ok: (value) => value, err: () => null });
+      if (toolset) return Result.ok({ ...toolset, release: generation.release });
+    }
+    const [cleanup] = await Promise.allSettled([generation.release()]);
+    if (built.status === "rejected" && isPluginPanic(built.reason)) {
+      return adaptToolResultToHost(Result.err(built.reason));
+    }
+    if (cleanup.status === "rejected" && isPluginPanic(cleanup.reason)) {
+      return adaptToolResultToHost(Result.err(cleanup.reason));
+    }
+    if (built.status === "rejected") {
+      return adaptToolResultToHost(Result.err(safePluginExceptionCause(built.reason)));
+    }
+    if (cleanup.status === "rejected") {
+      return adaptToolResultToHost(Result.err(safePluginExceptionCause(cleanup.reason)));
+    }
+    cleanup.value.match({
+      ok: () => undefined,
+      err: (error) =>
+        logger.error("failed toolset generation cleanup", formatTaggedErrorForLog(error)),
+    });
+    return built.value.map((toolset) => ({ ...toolset, release: generation.release }));
+  }
+
+  async function assembleLevel1ToolsetResult(
+    buildParams: BuildLevel1ToolsetParams,
+    generation: ReturnType<typeof manager.acquireGeneration>,
+  ): Promise<
+    ResultType<
+      Omit<BuiltLevel1Toolset, "release">,
+      Level1ToolsetBuildFailed | Level1ToolsetInvariantViolation | Level1ToolsetAssemblyFailed
+    >
+  > {
     const resolvedConfig = await resolveConfig();
 
     const tools: ToolSet = {} as ToolSet;
     const batchTools: ToolSet = {} as ToolSet;
     const specs = new Map<string, CoreLevel1ToolSpec>();
     const directSpecs = new Map<string, CoreLevel1ToolSpec>();
-    const contributionInfo = manager.getLevel1ContributionInfo();
-    const level1Capabilities = manager.getLevel1Capabilities();
-    const level1Specs = manager.getLevel1Items();
+    const contributionInfo = generation.level1ContributionInfo;
+    const level1Capabilities = generation.level1Capabilities;
+    const level1Specs = generation.level1;
     for (const spec of level1Specs) {
       if (!level1Capabilities.has(spec)) {
         return Result.err(
@@ -321,7 +365,10 @@ export function createCoreToolPluginManager(params: {
     );
     const allMcpTools = params.runtime.mcpRegistry?.getTools() ?? [];
     const mcpBinaryMaterializer = buildParams.requestContext
-      ? createMcpBinaryResultMaterializer({ requestId: buildParams.requestContext.requestId })
+      ? createMcpBinaryResultMaterializer({
+          requestId: buildParams.requestContext.requestId,
+          onImageMaterialized: buildParams.onMcpImageMaterialized,
+        })
       : undefined;
     const identities = [
       ...externalSpecs.map((spec) => {
@@ -337,10 +384,7 @@ export function createCoreToolPluginManager(params: {
     ];
     const directToolNames = new Set(builtinSpecs.map(nameForSpec));
     const reservedNames = new Set(
-      manager
-        .getLevel1Items()
-        .filter((spec) => contributionForSpec(spec).source === "builtin")
-        .map(nameForSpec),
+      level1Specs.filter((spec) => contributionForSpec(spec).source === "builtin").map(nameForSpec),
     );
     reservedNames.add("find_tools");
     const nameAssignment = assignCatalogToolNames(identities, reservedNames);
@@ -358,6 +402,12 @@ export function createCoreToolPluginManager(params: {
         }),
       );
     }
+    const mcpCatalogServerById = new Map(
+      (params.runtime.mcpRegistry?.getCatalogServers() ?? []).map((server) => [
+        server.serverId,
+        server,
+      ]),
+    );
     const mcpTools: Array<(typeof allMcpTools)[number]> = [];
     for (const entry of allMcpTools) {
       const modelName = nameAssignment.byStableId.get(entry.stableId);
@@ -371,6 +421,7 @@ export function createCoreToolPluginManager(params: {
       if (
         isMcpStructurallyAllowed({
           serverId: entry.serverId,
+          allowSubagents: mcpCatalogServerById.get(entry.serverId)?.allowSubagents === true,
           rawName: entry.rawName,
           modelName,
           runProfile: buildParams.runProfile,
@@ -380,12 +431,6 @@ export function createCoreToolPluginManager(params: {
         mcpTools.push(entry);
       }
     }
-    const mcpCatalogServerById = new Map(
-      (params.runtime.mcpRegistry?.getCatalogServers() ?? []).map((server) => [
-        server.serverId,
-        server,
-      ]),
-    );
     const mcpToolCountsByServerId = new Map<string, number>();
     for (const entry of mcpTools) {
       mcpToolCountsByServerId.set(
@@ -515,14 +560,15 @@ export function createCoreToolPluginManager(params: {
     }
     for (const entry of mcpTools) {
       const namespaceSummary = mcpNamespaceSummaryByServerId.get(entry.serverId);
+      const scopedTool = bindMcpToolToSession(entry.tool, buildParams.requestContext?.sessionId);
       candidates.push({
         identity: entry.identity,
         ...(entry.title === undefined ? {} : { title: entry.title }),
         ...(entry.description === undefined ? {} : { description: entry.description }),
         ...(namespaceSummary === undefined ? {} : { namespaceSummary }),
         tool: mcpBinaryMaterializer
-          ? wrapMcpToolWithBinaryMaterialization(entry.tool, mcpBinaryMaterializer)
-          : entry.tool,
+          ? wrapMcpToolWithBinaryMaterialization(scopedTool, mcpBinaryMaterializer)
+          : scopedTool,
       });
     }
 
@@ -658,6 +704,7 @@ export function createCoreToolPluginManager(params: {
     getLevel2Tools: () => manager.getLevel2Items(),
     getLevel2ContributionInfo: () => manager.getLevel2ContributionInfo(),
     getLevel2Capabilities: () => manager.getLevel2Capabilities(),
+    acquireGeneration: () => manager.acquireGeneration(),
     buildLevel1ToolsetResult,
   };
 }

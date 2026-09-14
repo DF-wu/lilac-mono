@@ -25,6 +25,7 @@ import {
   contentKeyFor,
   expiryIndexKey,
   metadataKey,
+  reservationDecisionKey,
   reservationFenceKey,
   reservationKey,
   reservationTransitionKey,
@@ -68,56 +69,74 @@ const retentionSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("durable") }),
   z.strictObject({
     kind: z.literal("expires"),
-    expiresAt: z.number().int().nonnegative().safe().max(8_640_000_000_000_000),
+    expiresAt: z.number().int().nonnegative().max(8_640_000_000_000_000),
   }),
 ]);
+
+const stagingExpiresAtSchema = z.number().int().nonnegative().max(8_640_000_000_000_000);
 
 const pendingReservationSchema = z.strictObject({
   version: z.literal(1),
   objectId: z.string(),
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   state: z.literal("pending"),
   retention: retentionSchema,
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
+  stagingExpiresAt: stagingExpiresAtSchema.optional(),
+  pendingWrites: z.boolean().optional(),
 });
 const readyReservationSchema = z.strictObject({
   version: z.literal(1),
   objectId: z.string(),
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   state: z.literal("ready"),
   retention: retentionSchema,
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
+  stagingExpiresAt: stagingExpiresAtSchema.optional(),
+  pendingWrites: z.boolean().optional(),
   ref: blobRefV1Schema,
   contentKey: z.string(),
+});
+const stagedReservationSchema = readyReservationSchema.extend({
+  state: z.literal("staged"),
+  retention: z.strictObject({ kind: z.literal("durable") }),
+  stagingExpiresAt: stagingExpiresAtSchema,
 });
 const failedReservationSchema = z.strictObject({
   version: z.literal(1),
   objectId: z.string(),
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   state: z.literal("failed"),
   retention: retentionSchema,
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
+  stagingExpiresAt: stagingExpiresAtSchema.optional(),
+  pendingWrites: z.boolean().optional(),
   reason: z.enum(["source", "write", "expected_sha256", "expected_byte_length", "fenced"]),
 });
 const interruptedReservationSchema = z.strictObject({
   version: z.literal(1),
   objectId: z.string(),
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   state: z.literal("interrupted"),
   retention: retentionSchema,
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
+  stagingExpiresAt: stagingExpiresAtSchema.optional(),
+  pendingWrites: z.boolean().optional(),
 });
 const deletedReservationSchema = z.strictObject({
   version: z.literal(1),
   objectId: z.string(),
-  generation: z.string().uuid(),
+  generation: z.uuid(),
   state: z.literal("deleted"),
   retention: retentionSchema,
-  createdAt: z.number().int().nonnegative().safe(),
+  createdAt: z.number().int().nonnegative(),
+  stagingExpiresAt: stagingExpiresAtSchema.optional(),
+  pendingWrites: z.boolean().optional(),
 });
 const reservationSchema = z.discriminatedUnion("state", [
   pendingReservationSchema,
   readyReservationSchema,
+  stagedReservationSchema,
   failedReservationSchema,
   interruptedReservationSchema,
   deletedReservationSchema,
@@ -142,6 +161,7 @@ type ActiveUpload = {
   readonly reservationCreated: Promise<ResultType<void, BlobAdapterFailure>>;
   phase: "reserving" | "uploading" | "completed" | "interrupted" | "deleted";
   observedByteLength?: number;
+  contentWritesSettled?: boolean;
   sink?: BlobSink;
   readyPublication?: Promise<ResultType<boolean, BlobAdapterFailure>>;
 };
@@ -212,6 +232,13 @@ function terminalReservation(
     state,
     retention: reservation.retention,
     createdAt: reservation.createdAt,
+    ...(reservation.stagingExpiresAt === undefined
+      ? {}
+      : { stagingExpiresAt: reservation.stagingExpiresAt }),
+    ...(reservation.pendingWrites === true ||
+    (reservation.state === "pending" && reservation.stagingExpiresAt !== undefined)
+      ? { pendingWrites: true }
+      : {}),
   };
 }
 
@@ -255,7 +282,37 @@ export class SupervisedBlobStore implements BlobStore {
     this.#logger?.error(message, { adapter: this.#backend.kind, ...context });
   }
 
-  async startUpload(input: {
+  startStagedUpload(input: {
+    readonly source: BlobSource;
+    readonly stagingExpiresAt: number;
+    readonly expectedSha256?: string;
+    readonly expectedByteLength?: number;
+  }): Promise<ResultType<BlobUpload, BlobUploadStartError>> {
+    const deadline = stagingExpiresAtSchema.safeParse(input.stagingExpiresAt);
+    if (!deadline.success || deadline.data <= Date.now()) {
+      return Promise.resolve(
+        Result.err(
+          new BlobInvalidInput({
+            field: "stagingExpiresAt",
+            message: "Staging deadline must be a safe integer in the future",
+          }),
+        ),
+      );
+    }
+    return this.#startUpload({ ...input, retention: { kind: "durable" } });
+  }
+
+  startUpload(input: {
+    readonly source: BlobSource;
+    readonly retention: BlobRetention;
+    readonly expectedSha256?: string;
+    readonly expectedByteLength?: number;
+  }): Promise<ResultType<BlobUpload, BlobUploadStartError>> {
+    return this.#startUpload(input);
+  }
+
+  async #startUpload(input: {
+    readonly stagingExpiresAt?: number;
     readonly source: BlobSource;
     readonly retention: BlobRetention;
     readonly expectedSha256?: string;
@@ -311,12 +368,14 @@ export class SupervisedBlobStore implements BlobStore {
       state: "pending",
       retention: retention.data,
       createdAt: Date.now(),
+      ...(input.stagingExpiresAt === undefined ? {} : { stagingExpiresAt: input.stagingExpiresAt }),
     };
     const completion = deferred<ResultType<BlobRefV1, BlobWriteError>>();
     const reservationCreated = this.#backend.createReservation(
       objectId,
       serializeReservation(reservation),
-      reservation.retention.kind === "expires" ? reservation.retention.expiresAt : undefined,
+      reservation.stagingExpiresAt ??
+        (reservation.retention.kind === "expires" ? reservation.retention.expiresAt : undefined),
     );
     const active: ActiveUpload = {
       reservation,
@@ -382,6 +441,83 @@ export class SupervisedBlobStore implements BlobStore {
     });
   }
 
+  adopt(handle: BlobHandleV1): Promise<ResultType<BlobRefV1, BlobResolveError>> {
+    const issues = handleIssues(handle);
+    if (issues.length > 0) {
+      return Promise.resolve(
+        Result.err(new BlobInvalidReference({ issues, message: "Blob handle is invalid" })),
+      );
+    }
+    return Result.gen(async function* (this: SupervisedBlobStore) {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const reservation = yield* Result.await(this.#readReservation(handle.objectId));
+        if (reservation?.state === "ready") return Result.ok(reservation.ref);
+        if (reservation === null || reservation.state === "deleted") {
+          return Result.err(
+            new BlobObjectAbsent({
+              objectId: handle.objectId,
+              message: `Blob ${handle.objectId} is absent or its staging deadline passed`,
+            }),
+          );
+        }
+        if (reservation.state === "failed") {
+          return Result.err(
+            new BlobUploadFailed({
+              objectId: handle.objectId,
+              reason: reservation.reason,
+              message: `Blob upload ${handle.objectId} failed`,
+            }),
+          );
+        }
+        if (reservation.state === "interrupted") {
+          return Result.err(
+            new BlobUploadInterrupted({
+              objectId: handle.objectId,
+              message: `Blob upload ${handle.objectId} was interrupted`,
+            }),
+          );
+        }
+        if (
+          reservation.stagingExpiresAt !== undefined &&
+          reservation.stagingExpiresAt <= Date.now()
+        ) {
+          const expired = terminalReservation(reservation, "deleted");
+          const applied = yield* Result.await(
+            this.#backend.compareAndSwapReservation(
+              handle.objectId,
+              serializeReservation(reservation),
+              serializeReservation(expired),
+            ),
+          );
+          if (!applied) continue;
+          return Result.err(
+            new BlobObjectAbsent({
+              objectId: handle.objectId,
+              message: `Blob ${handle.objectId} expired before adoption`,
+            }),
+          );
+        }
+        if (reservation.state === "pending") break;
+        const adopted: Reservation = { ...reservation, state: "ready" };
+        const applied = yield* Result.await(
+          this.#backend.compareAndSwapReservation(
+            handle.objectId,
+            serializeReservation(reservation),
+            serializeReservation(adopted),
+          ),
+        );
+        if (applied) return Result.ok(reservation.ref);
+      }
+      return Result.err(
+        new BlobResolveTimeout({
+          objectId: handle.objectId,
+          timeoutMs: 0,
+          message: `Blob upload ${handle.objectId} is not ready for adoption`,
+        }),
+      );
+    }, this);
+  }
+
   async resolve(
     handle: BlobHandleV1,
     options: { readonly timeoutMs: number },
@@ -400,7 +536,7 @@ export class SupervisedBlobStore implements BlobStore {
     }
     const deadline = Date.now() + options.timeoutMs;
     const localUpload = this.#active.get(handle.objectId);
-    if (localUpload !== undefined) {
+    if (localUpload !== undefined && localUpload.reservation.stagingExpiresAt === undefined) {
       const remaining = Math.max(0, deadline - Date.now());
       let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
       const localDeadline = new Promise<{ readonly kind: "deadline" }>((resolve) => {
@@ -462,7 +598,8 @@ export class SupervisedBlobStore implements BlobStore {
             };
           }
           if (reservation.state === "ready") return { kind: "ready", ref: reservation.ref };
-          if (reservation.state === "pending") return { kind: "wait" };
+          if (reservation.state === "pending" || reservation.state === "staged")
+            return { kind: "wait" };
           if (reservation.state === "interrupted") {
             return {
               kind: "error",
@@ -609,7 +746,7 @@ export class SupervisedBlobStore implements BlobStore {
           if (reservation.state === "deleted") return this.#cleanupDeletedReservation(reservation);
           if (
             decodedRef.success &&
-            reservation.state === "ready" &&
+            (reservation.state === "ready" || reservation.state === "staged") &&
             JSON.stringify(reservation.ref) !== JSON.stringify(decodedRef.data)
           ) {
             return Result.err(
@@ -729,12 +866,20 @@ export class SupervisedBlobStore implements BlobStore {
       contentKey,
       metadataKey(contentKey),
       temporaryKey(reservation.objectId, reservation.generation),
-      ...(reservation.retention.kind === "expires"
-        ? [expiryIndexKey(reservation.retention.expiresAt, reservation.objectId)]
-        : []),
-      reservationFenceKey(reservation.objectId),
-      reservationTransitionKey(reservation.objectId),
-      reservationKey(reservation.objectId),
+      ...(reservation.pendingWrites === true
+        ? []
+        : [
+            ...(reservation.retention.kind === "expires"
+              ? [expiryIndexKey(reservation.retention.expiresAt, reservation.objectId)]
+              : []),
+            ...(reservation.stagingExpiresAt === undefined
+              ? []
+              : [expiryIndexKey(reservation.stagingExpiresAt, reservation.objectId)]),
+            reservationKey(reservation.objectId),
+            reservationFenceKey(reservation.objectId),
+            reservationDecisionKey(reservation.objectId),
+            reservationTransitionKey(reservation.objectId),
+          ]),
     ]);
     return removed.match<ResultType<"deleted", BlobDeleteError>>({
       ok: () => Result.ok("deleted"),
@@ -773,81 +918,109 @@ export class SupervisedBlobStore implements BlobStore {
         }),
       );
     }
-    const listed = await this.#backend.listExpiredReservationIds(now, limit);
-    return listed.match<Promise<ResultType<BlobMaintenanceSummary, BlobMaintenanceError>>>({
-      ok: async ({ ids, remaining }) => {
-        let inspected = 0;
-        let deleted = 0;
-        let firstFailure:
-          | {
-              readonly failure: BlobAdapterFailure | BlobIntegrityFailure;
-              readonly message: string;
-            }
-          | undefined;
-        for (const objectId of ids) {
-          inspected += 1;
-          const observed = await this.#readReservation(objectId);
-          const decision = observed.match<
-            | { readonly expired: boolean }
-            | { readonly error: BlobAdapterFailure | BlobIntegrityFailure }
-          >({
-            ok: (reservation) => ({
-              expired:
-                reservation?.retention.kind === "expires" && reservation.retention.expiresAt <= now,
-            }),
-            err: (error) => ({ error }),
-          });
-          if ("error" in decision) {
-            firstFailure ??= {
-              failure: decision.error,
-              message: "Blob maintenance could not inspect reservation metadata",
-            };
-            continue;
-          }
-          if (decision.expired) {
-            const removed = await this.delete({ version: 1, objectId });
-            const removal = removed.match<
-              { readonly deleted: boolean } | { readonly error: BlobDeleteError }
-            >({
-              ok: (status) => ({ deleted: status === "deleted" }),
-              err: (error) => ({ error }),
-            });
-            if ("error" in removal) {
-              const failure =
-                removal.error instanceof BlobDeleteFailed
-                  ? removal.error.failure
-                  : new BlobIntegrityFailure({
-                      objectId,
-                      reason: removal.error.message,
-                      message: `Blob maintenance could not delete ${objectId}`,
-                    });
-              firstFailure ??= {
+    return Result.gen(async function* (this: SupervisedBlobStore) {
+      const listed = yield* Result.await(
+        this.#backend.listExpiredReservationIds(now, limit).then((result) =>
+          result.mapError(
+            (failure) =>
+              new BlobMaintenanceFailed({
                 failure,
-                message: `Blob maintenance could not delete ${objectId}`,
-              };
-              continue;
-            }
-            if (removal.deleted) deleted += 1;
-          }
+                message: "Blob maintenance could not list reservations",
+              }),
+          ),
+        ),
+      );
+      let deleted = 0;
+      let firstFailure: BlobAdapterFailure | BlobIntegrityFailure | null = null;
+      for (const objectId of listed.ids) {
+        const maintained = await this.#withObjectLock(objectId, () =>
+          this.#maintainReservation(objectId, now),
+        );
+        const outcome = maintained.match<
+          | { readonly kind: "ok"; readonly deleted: boolean }
+          | { readonly kind: "error"; readonly error: BlobAdapterFailure | BlobIntegrityFailure }
+        >({
+          ok: (value) => ({ kind: "ok", deleted: value }),
+          err: (error) => ({ kind: "error", error }),
+        });
+        if (outcome.kind === "error") {
+          firstFailure ??= outcome.error;
+          continue;
         }
-        if (firstFailure !== undefined) {
-          return Result.err(
-            new BlobMaintenanceFailed({
-              failure: firstFailure.failure,
-              message: firstFailure.message,
-            }),
-          );
-        }
-        return Result.ok({ inspected, deleted, remaining });
-      },
-      err: async (failure) =>
-        Result.err(
+        if (outcome.deleted) deleted += 1;
+      }
+      if (firstFailure !== null)
+        return Result.err(
           new BlobMaintenanceFailed({
-            failure,
-            message: "Blob maintenance could not list reservations",
+            failure: firstFailure,
+            message: "Blob maintenance could not clean up an expired reservation",
+          }),
+        );
+      return Result.ok({ inspected: listed.ids.length, deleted, remaining: listed.remaining });
+    }, this);
+  }
+
+  #maintainReservation(
+    objectId: string,
+    now: number,
+  ): Promise<ResultType<boolean, BlobAdapterFailure | BlobIntegrityFailure>> {
+    return Result.gen(async function* (this: SupervisedBlobStore) {
+      const reservation = yield* Result.await(this.#readReservation(objectId));
+      if (reservation === null) return Result.ok(false);
+      if (reservation.state === "ready" && reservation.stagingExpiresAt !== undefined) {
+        yield* Result.await(
+          this.#backend.deleteKeys([expiryIndexKey(reservation.stagingExpiresAt, objectId)]),
+        );
+        return Result.ok(false);
+      }
+      const expiresAt =
+        reservation.stagingExpiresAt ??
+        (reservation.retention.kind === "expires" ? reservation.retention.expiresAt : undefined);
+      if (expiresAt === undefined || expiresAt > now) return Result.ok(false);
+      const deleted = terminalReservation(reservation, "deleted");
+      if (
+        reservation.state !== "deleted" &&
+        reservation.state !== "failed" &&
+        reservation.state !== "interrupted"
+      ) {
+        const applied = yield* Result.await(
+          this.#backend.compareAndSwapReservation(
+            objectId,
+            serializeReservation(reservation),
+            serializeReservation(deleted),
+          ),
+        );
+        if (!applied) return Result.ok(false);
+      }
+      const active = this.#active.get(objectId);
+      if (active !== undefined && active.phase !== "completed") {
+        active.phase = "deleted";
+        active.abortController.abort();
+        active.completion.resolve(
+          Result.err(
+            new BlobUploadFailed({
+              objectId,
+              reason: "fenced",
+              message: `Blob upload ${objectId} expired before publication`,
+            }),
+          ),
+        );
+      }
+      yield* Result.await(
+        this.#cleanupDeletedReservation(deleted).then((result) =>
+          result.mapError((error) => {
+            if (error instanceof BlobDeleteFailed) return error.failure;
+            if (error instanceof BlobIntegrityFailure) return error;
+            return new BlobIntegrityFailure({
+              objectId,
+              reason: error.message,
+              message: `Blob maintenance could not delete ${objectId}`,
+            });
           }),
         ),
-    });
+      );
+      return Result.ok(true);
+    }, this);
   }
 
   close(input: {
@@ -878,6 +1051,9 @@ export class SupervisedBlobStore implements BlobStore {
 
   async #runUpload(active: ActiveUpload): Promise<void> {
     const upload = await this.#transfer(active);
+    if (active.reservation.stagingExpiresAt !== undefined && active.contentWritesSettled === true) {
+      await this.#retireSettledCleanup(active.reservation.objectId);
+    }
     const settled = upload.match<
       | { readonly ok: true; readonly value: BlobRefV1 }
       | { readonly ok: false; readonly error: BlobWriteError }
@@ -924,6 +1100,40 @@ export class SupervisedBlobStore implements BlobStore {
     active.completion.resolve(settled.ok ? Result.ok(settled.value) : Result.err(settled.error));
     if (settled.ok) this.#completedUploads += 1;
     this.#active.delete(active.reservation.objectId);
+  }
+
+  async #retireSettledCleanup(objectId: string): Promise<void> {
+    const retired = await Result.gen(async function* (this: SupervisedBlobStore) {
+      const reservation = yield* Result.await(this.#readReservation(objectId));
+      if (reservation === null || reservation.pendingWrites !== true) return Result.ok(undefined);
+      if (
+        reservation.state !== "deleted" &&
+        reservation.state !== "failed" &&
+        reservation.state !== "interrupted"
+      ) {
+        return Result.ok(undefined);
+      }
+      const settled: Reservation = { ...reservation, pendingWrites: false };
+      const applied = yield* Result.await(
+        this.#backend.compareAndSwapReservation(
+          objectId,
+          serializeReservation(reservation),
+          serializeReservation(settled),
+        ),
+      );
+      if (!applied) return Result.ok(undefined);
+      yield* Result.await(this.#cleanupDeletedReservation(settled));
+      return Result.ok(undefined);
+    }, this);
+    retired.match({
+      ok: () => undefined,
+      err: (error) =>
+        this.#error("blob settled cleanup will retry during maintenance", {
+          objectId,
+          errorClass: error.name,
+          errorMessage: error.message,
+        }),
+    });
   }
 
   async #superviseUpload(active: ActiveUpload): Promise<void> {
@@ -1111,6 +1321,7 @@ export class SupervisedBlobStore implements BlobStore {
           );
     }
 
+    active.contentWritesSettled = true;
     const sha256 = hash.digest("hex");
     active.observedByteLength = byteLength;
     this.#debug("blob upload source consumed", {
@@ -1170,6 +1381,7 @@ export class SupervisedBlobStore implements BlobStore {
           : {}),
       };
       const contentKey = contentKeyFor(ref);
+      active.contentWritesSettled = false;
       const committed = await this.#backend.commitTemp(
         active.reservation.objectId,
         active.reservation.generation,
@@ -1211,6 +1423,7 @@ export class SupervisedBlobStore implements BlobStore {
               }),
             );
       }
+      active.contentWritesSettled = true;
       this.#debug("blob upload content committed", {
         objectId: active.reservation.objectId,
         byteLength,
@@ -1232,12 +1445,17 @@ export class SupervisedBlobStore implements BlobStore {
               }),
         );
       }
-      const ready: Reservation = {
-        ...active.reservation,
-        state: "ready",
-        ref,
-        contentKey,
-      };
+      const ready: Reservation =
+        active.reservation.stagingExpiresAt === undefined
+          ? { ...active.reservation, state: "ready", ref, contentKey }
+          : {
+              ...active.reservation,
+              state: "staged",
+              retention: { kind: "durable" },
+              stagingExpiresAt: active.reservation.stagingExpiresAt,
+              ref,
+              contentKey,
+            };
       const publication = this.#backend.compareAndSwapReservation(
         active.reservation.objectId,
         serializeReservation(active.reservation),
@@ -1369,6 +1587,9 @@ export class SupervisedBlobStore implements BlobStore {
       ...active.reservation,
       state: "failed",
       reason,
+      ...(active.reservation.stagingExpiresAt !== undefined && active.contentWritesSettled !== true
+        ? { pendingWrites: true }
+        : {}),
     };
     const persisted = await this.#backend.compareAndSwapReservation(
       active.reservation.objectId,
@@ -1506,7 +1727,7 @@ export class SupervisedBlobStore implements BlobStore {
             }),
           ),
         );
-        if (reservation.state === "ready") {
+        if (reservation.state === "ready" || reservation.state === "staged") {
           void this.#backend.deleteKeys([
             reservation.contentKey,
             metadataKey(reservation.contentKey),

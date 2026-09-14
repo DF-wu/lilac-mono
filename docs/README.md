@@ -32,10 +32,6 @@ Language: [`English (primary / canonical)`](../README.md) · [`Traditional Chine
 
 | Document | Contents |
 | --- | --- |
-| [`../apps/mini-lilac/README.md`](../apps/mini-lilac/README.md) | Mini Lilac installation and first run |
-| [`../apps/mini-lilac-server/README.md`](../apps/mini-lilac-server/README.md) | Mini server configuration, providers/auth, API, and history recovery |
-| [`../apps/mini-lilac-tui/README.md`](../apps/mini-lilac-tui/README.md) | Mini TUI options, keyboard model, and rendering |
-| [`../apps/acp-controller/README.md`](../apps/acp-controller/README.md) | `lilac-acp` build, session search, and detached prompts |
 
 ## Contributors
 

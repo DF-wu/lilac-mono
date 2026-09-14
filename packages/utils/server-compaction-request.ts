@@ -8,12 +8,12 @@ export const SERVER_COMPACTION_REQUEST_MARKER = "true";
 export const REMOTE_COMPACTION_BETA_FEATURE = "remote_compaction_v2";
 
 const CODEX_BETA_FEATURES_HEADER = "x-codex-beta-features";
-const compactionTriggerSchema = z.object({ type: z.literal("compaction_trigger") }).passthrough();
+const compactionTriggerSchema = z.object({ type: z.literal("compaction_trigger") }).loose();
 const responsesRequestSchema = z
   .object({
     input: z.array(z.unknown()),
   })
-  .passthrough();
+  .loose();
 
 type FetchInput = Parameters<typeof globalThis.fetch>[0];
 type FetchInit = Parameters<typeof globalThis.fetch>[1];

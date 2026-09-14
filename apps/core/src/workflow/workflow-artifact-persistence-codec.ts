@@ -13,13 +13,13 @@ const WORKFLOW_VALUE_ARTIFACT_ENCODING = "canonical-json";
 
 const artifactEnvelopeHeaderSchema = z
   .object({ format: z.literal(WORKFLOW_VALUE_ARTIFACT_FORMAT) })
-  .passthrough();
+  .loose();
 const artifactEnvelopeVersionSchema = z
   .object({
     format: z.literal(WORKFLOW_VALUE_ARTIFACT_FORMAT),
     version: z.number().int(),
   })
-  .passthrough();
+  .loose();
 const currentArtifactEnvelopeSchema = z.strictObject({
   format: z.literal(WORKFLOW_VALUE_ARTIFACT_FORMAT),
   version: z.literal(WORKFLOW_VALUE_ARTIFACT_FORMAT_VERSION),

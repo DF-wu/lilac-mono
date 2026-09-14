@@ -14,8 +14,8 @@ import type {
 
 const objectIdSchema = z.string().regex(/^b1_[0-9a-f]{32}$/u);
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/u);
-const byteLengthSchema = z.number().int().nonnegative().safe();
-const expiresAtSchema = z.number().int().nonnegative().safe().max(8_640_000_000_000_000);
+const byteLengthSchema = z.number().int().nonnegative();
+const expiresAtSchema = z.number().int().nonnegative().max(8_640_000_000_000_000);
 
 export const blobHandleV1Schema = z.strictObject({
   version: z.literal(1),
@@ -76,6 +76,15 @@ export type BlobCloseSummary = {
 };
 
 export type BlobStore = {
+  startStagedUpload(input: {
+    readonly source: BlobSource;
+    readonly stagingExpiresAt: number;
+    readonly expectedSha256?: string;
+    readonly expectedByteLength?: number;
+  }): Promise<Result<BlobUpload, BlobUploadStartError>>;
+
+  adopt(handle: BlobHandleV1): Promise<Result<BlobRefV1, BlobResolveError>>;
+
   startUpload(input: {
     readonly source: BlobSource;
     readonly retention: BlobRetention;

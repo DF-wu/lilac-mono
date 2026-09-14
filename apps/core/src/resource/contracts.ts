@@ -29,7 +29,7 @@ export const DEFAULT_RESOURCE_LIMITS: ResourceLimits = {
 
 const resourceIdPattern = /^r1_[0-9a-f]{32}$/u;
 const resourceUriPattern = /^resource:\/\/(r1_[0-9a-f]{32})$/u;
-const nonNegativeSafeIntegerSchema = z.number().int().nonnegative().safe();
+const nonNegativeSafeIntegerSchema = z.number().int().nonnegative();
 const normalizedMediaTypeSchema = z
   .string()
   .min(1)

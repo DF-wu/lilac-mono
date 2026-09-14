@@ -101,7 +101,7 @@ import type {
 
 const discordNotFoundErrorSchema = z
   .object({ code: z.union([z.literal(10_003), z.literal(10_008)]) })
-  .passthrough();
+  .loose();
 
 function discordNotFoundCode(error: unknown): 10_003 | 10_008 | null {
   const parsed = discordNotFoundErrorSchema.safeParse(error);
@@ -112,9 +112,9 @@ const discordOperationErrorSchema = z
   .object({
     code: z.number().int().optional(),
     status: z.number().int().optional(),
-    retry_after: z.number().finite().nonnegative().optional(),
+    retry_after: z.number().nonnegative().optional(),
   })
-  .passthrough();
+  .loose();
 
 class CapturedDiscordSurfaceError extends Error {
   readonly code?: number;

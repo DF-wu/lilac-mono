@@ -150,7 +150,7 @@ const pluginMetaShapeSchema = z
     name: z.string().optional(),
     version: z.string().optional(),
   })
-  .passthrough();
+  .loose();
 
 export function validateToolPluginMetaCapability(value: unknown): boolean {
   const parsed = pluginMetaShapeSchema.safeParse(value);
@@ -171,7 +171,7 @@ const level1ToolSpecShapeSchema = z
     formatArgs: level1FormatArgsFunctionSchema.optional(),
     summarizeFailure: level1SummarizeFailureFunctionSchema.optional(),
   })
-  .passthrough();
+  .loose();
 
 export function validateLevel1ToolSpecCapability(value: unknown): boolean {
   const parsed = level1ToolSpecShapeSchema.safeParse(value);
@@ -196,7 +196,7 @@ const level2ToolShapeSchema = z
     list: serverToolListFunctionSchema,
     call: serverToolCallFunctionSchema,
   })
-  .passthrough();
+  .loose();
 
 export function validateServerToolCapability(value: unknown): boolean {
   const parsed = level2ToolShapeSchema.safeParse(value);
@@ -220,7 +220,7 @@ const pluginInstanceShapeSchema = z
     init: pluginInstanceInitFunctionSchema.optional(),
     destroy: pluginInstanceDestroyFunctionSchema.optional(),
   })
-  .passthrough();
+  .loose();
 
 export function validateToolPluginInstanceCapability(value: unknown): boolean {
   const parsed = pluginInstanceShapeSchema.safeParse(value);
@@ -251,7 +251,7 @@ const toolPluginShapeSchema = z
     meta: toolPluginMetaSchema,
     create: functionSchema,
   })
-  .passthrough();
+  .loose();
 
 export function validateToolPluginCapability(value: unknown): boolean {
   const parsed = toolPluginShapeSchema.safeParse(value);
@@ -271,7 +271,7 @@ const dynamicModuleShapeSchema = z
       validateToolPluginCapability,
     ),
   })
-  .passthrough();
+  .loose();
 
 export function validateDynamicToolPluginModuleCapability(value: unknown): boolean {
   const parsed = dynamicModuleShapeSchema.safeParse(value);
@@ -321,7 +321,7 @@ const level1FailureSummaryShapeSchema = z.object({
     .regex(/^[a-z][a-z0-9_]*$/u)
     .optional(),
   retryable: z.boolean().optional(),
-  exitCode: z.number().int().finite().optional(),
+  exitCode: z.number().int().optional(),
   error: z.string().optional(),
 });
 

@@ -130,6 +130,8 @@ docker exec "$container_name" /bin/sh -c \
 resolved_tools=$(docker exec "$container_name" /bin/sh -c 'command -v tools')
 [[ $resolved_tools == /usr/local/bin/tools ]] || fail "root PATH does not select trusted tools CLI"
 docker exec "$container_name" /usr/local/bin/tools --help >/dev/null || fail "tools CLI smoke failed"
+docker exec --user lilac "$container_name" /usr/local/bin/tools --help >/dev/null ||
+  fail "unprivileged tools CLI smoke failed"
 operator_status=0
 operator_output=$(docker exec \
   --env TOOL_SERVER_BACKEND_URL=http://127.0.0.1:1 \
@@ -139,14 +141,19 @@ operator_output=$(docker exec \
 docker exec --user "$runtime_user" "$container_name" /usr/local/bin/bun --version >/dev/null ||
   fail "Bun smoke failed"
 
-for path in /app /usr/local/bin/bun /usr/local/libexec/lilac-tool-bridge; do
+for path in /app /usr/local/bin/bun /usr/local/bin/tools /usr/local/bin/tools-worker \
+  /usr/local/bin/tools-build-id /usr/local/bin/tools-build-info.json \
+  /usr/local/libexec/lilac-tool-bridge; do
   if docker exec --user "$runtime_user" "$container_name" /usr/bin/test -w "$path"; then
     fail "$path is writable by $runtime_user"
   fi
 done
 for path in \
   /app/build/build-info.json \
+  /usr/local/bin/tools-build-id \
+  /usr/local/bin/tools-build-info.json \
   /app/packages/utils/builtin-skills/customize-lilac/SKILL.md \
+  /app/packages/utils/builtin-skills/image-generation/SKILL.md \
   /app/packages/utils/builtin-skills/customize-lilac/references/self-debugging.md \
   /app/packages/utils/builtin-skills/customize-lilac/references/core-config.md \
   /app/packages/utils/config-templates/core-config.example.yaml \

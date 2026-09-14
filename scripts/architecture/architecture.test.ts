@@ -133,6 +133,104 @@ function withProgramFixture<T>(
 
 const fixtureProgram = createWorkspaceProgram(REPOSITORY_ROOT, BASE_WORKSPACE).program;
 
+describe("deprecated API references", () => {
+  test("rejects dependency aliases, deprecated overloads, types, and property references", () => {
+    const usage = [
+      'import { old as renamed, overloaded, type OldType, type Options } from "old-api";',
+      "renamed();",
+      'overloaded("legacy");',
+      "overloaded(1);",
+      "declare const options: Options;",
+      "options.old;",
+      'options["old"];',
+      "const { old: legacy } = options;",
+      "export type Alias = OldType;",
+      "options.current;",
+      "export const unrelated = { old: 1 }.old;",
+      "renamed();",
+    ].join("\n");
+    withProgramFixture(
+      {
+        "node_modules/old-api/package.json": JSON.stringify({ types: "index.d.ts" }),
+        "node_modules/old-api/index.d.ts": [
+          "/** @deprecated Use modern instead. */",
+          "export declare function old(): void;",
+          "/** @deprecated Pass a number instead. */",
+          "export declare function overloaded(value: string): void;",
+          "export declare function overloaded(value: number): void;",
+          "/** @deprecated Use NewType instead. */",
+          "export type OldType = string;",
+          "export interface Options {",
+          "  /** @deprecated Use current instead. */",
+          "  old: string;",
+          "  current: string;",
+          "}",
+        ].join("\n"),
+        "usage.ts": usage,
+        "ignored.test.ts": 'import { old } from "old-api"; old();',
+        "vendor/ignored.ts": 'import { old } from "old-api"; old();',
+        "declaration.ts": "/** @deprecated Use modern instead. */\nexport const old = 1;",
+      },
+      ({ repositoryRoot, workspaceRoot, workspace }) => {
+        const enabled = {
+          ...workspace,
+          ruleZones: { "architecture/no-deprecated": [{ include: "**" }] },
+        } satisfies WorkspaceArchitecture;
+        const { program } = createWorkspaceProgram(repositoryRoot, enabled);
+        const findings = analyzeWorkspace(
+          enabled,
+          workspaceRoot,
+          program,
+          undefined,
+          undefined,
+          undefined,
+          [],
+        );
+        const lines = findings.map((finding) => finding.location?.line);
+        expect(lines).toContain(2);
+        expect(lines).toContain(3);
+        expect(lines).toContain(6);
+        expect(lines).toContain(7);
+        expect(lines).toContain(8);
+        expect(lines).toContain(9);
+        expect(lines).toContain(12);
+        expect(lines).not.toContain(4);
+        expect(lines).not.toContain(10);
+        expect(lines).not.toContain(11);
+        expect(findings.every((finding) => finding.location?.file === "usage.ts")).toBe(true);
+        expect(findings.every((finding) => finding.severity === "error")).toBe(true);
+        expect(new Set(findings.map((finding) => finding.fingerprint)).size).toBe(findings.length);
+        expect(findings.find((finding) => finding.location?.line === 3)?.suggestion).toBe(
+          "Pass a number instead.",
+        );
+        expect(findings.find((finding) => finding.location?.line === 2)?.suggestion).toBe(
+          "Use modern instead.",
+        );
+        expect(
+          analyzeWorkspace(workspace, workspaceRoot, program, undefined, undefined, undefined, []),
+        ).toEqual([]);
+        const unsupportedProgram = new Proxy(program, {
+          get(target, property, receiver) {
+            if (property === "getSuggestionDiagnostics") return undefined;
+            return Reflect.get(target, property, receiver);
+          },
+        });
+        expect(() =>
+          analyzeWorkspace(
+            enabled,
+            workspaceRoot,
+            unsupportedProgram,
+            undefined,
+            undefined,
+            undefined,
+            [],
+          ),
+        ).toThrow("cannot provide architecture deprecation diagnostics");
+      },
+    );
+  });
+});
+
 interface WorkspaceRunnerResult {
   readonly exitCode: number;
   readonly stdout: string;
@@ -1272,7 +1370,8 @@ describe("Stage 2 union rules", () => {
     expect(isProductionFileName(path.join(root, "tests/support.ts"), root)).toBeFalse();
     expect(isProductionFileName(path.join(root, "__tests__/support.ts"), root)).toBeFalse();
     expect(isProductionFileName(path.join(root, "src/generated/output.ts"), root)).toBeFalse();
-    expect(isProductionFileName(path.join(root, "src/fixtures/production.ts"), root)).toBeFalse();
+    expect(isProductionFileName(path.join(root, "src/fixtures/production.ts"), root)).toBeTrue();
+    expect(isProductionFileName(path.join(root, "tests/fixtures/support.ts"), root)).toBeFalse();
     expect(isProductionFileName(path.join(root, "src/vendor/library.ts"), root)).toBeFalse();
   });
 });
@@ -2558,41 +2657,16 @@ describe("permanent architecture governance", () => {
     );
 
     for (const required of [
-      "apps/acp-controller:run-store.ts#decodeRunRecord->run-store.ts#runRecordCodecCases",
       "apps/core:src/migration/frozen-graceful-restart-store.ts#decodeGracefulRestartSnapshot->src/migration/frozen-graceful-restart-store.ts#gracefulRestartSnapshotCodecCases",
       "apps/core:src/workflow/workflow-persistence-codec.ts#decodeWorkflowPersistenceRow->src/workflow/workflow-persistence-codec.ts#workflowPersistenceRowCodecCases",
-      "apps/mini-lilac-tui:src/preferences.ts#decodeBindingPreferences->src/preferences.ts#bindingPreferencesCodecCases",
-      "packages/mini-lilac-runtime:src/workspace-history-persistence-codec.ts#decodeWorkspaceHistorySnapshotManifest->src/workspace-history-persistence-codec.ts#workspaceHistorySnapshotManifestCodecCases",
-      "packages/mini-lilac-runtime:src/sqlite-history-persistence-codec.ts#decodeMiniLilacStructuralHistoryRow->src/sqlite-history-persistence-codec.ts#miniLilacStructuralHistoryRowCodecCases",
-      "packages/tool-results:src/tool-result-artifact-metadata-codec.ts#decodeToolResultArtifactMetadata->src/tool-result-artifact-metadata-codec.ts#toolResultArtifactMetadataCodecCases",
+      "packages/tool-results:src/blob-tool-result-artifact-metadata-codec.ts#decodeBlobToolResultArtifactMetadata->src/blob-tool-result-artifact-metadata-codec.ts#blobToolResultArtifactMetadataCodecCases",
       "packages/utils:codex-oauth.ts#decodeCodexTokens->codex-oauth.ts#codexTokensCodecCases",
     ]) {
       expect(registrations).toContain(required);
     }
   });
 
-  test("retains the Mini TUI tool registry and representative boundary decoders", () => {
-    const tui = architectureManifest.workspaces.find(({ name }) => name === "apps/mini-lilac-tui");
-    if (!tui) throw new Error("Mini TUI architecture workspace missing");
-
-    expect(tui.toolCodecRegistries).toContainEqual({
-      identity: {
-        module: "src/tool-observation-projection.ts",
-        exportName: "toolObservationCodecRegistry",
-      },
-      aliases: [
-        {
-          module: "src/tool-observation-projection.ts",
-          exportName: "knownToolCodecRegistry",
-        },
-      ],
-      canonicalTools: {
-        package: "@stanley2058/mini-lilac-client",
-        module: "tool-catalog.ts",
-        exportName: "MINI_LILAC_TOOL_NAMES",
-      },
-    });
-
+  test("retains representative boundary decoders", () => {
     const decoders = new Set(
       architectureManifest.workspaces.flatMap((workspace) =>
         workspace.boundaryDecoders.map(
@@ -2606,7 +2680,6 @@ describe("permanent architecture governance", () => {
       "apps/core:src/surface/bridge/bus-agent-runner/raw.ts#parseRequestControlFromRaw:projection",
       "apps/core:src/workflow/workflow-action-resolver.ts#decodeWorkflowActionOutboxEvent:persistence",
       "apps/tool-bridge:client.ts#projectBridgeFailure:wire",
-      "apps/mini-lilac-server:src/server.ts#decodeMiniLilacHttpRequest:request",
       "packages/fs:src/remote-runner-protocol.ts#decodeJson:wire",
       "packages/plugin-runtime:server-tool-result.ts#decodeServerToolResult:plugin",
       "packages/plugin-runtime:server-tool-result.ts#transform.<callback@1>@2:plugin",
@@ -3086,6 +3159,31 @@ describe("real declaration integration", () => {
 });
 
 describe("architecture Program construction", () => {
+  test("checks production fixture modules while excluding test-owned fixture modules", () => {
+    withProgramFixture(
+      {
+        "src/fixtures/runtime.ts":
+          "export function project(value: unknown) { return value as { id: string }; }\n",
+        "tests/fixtures/support.ts":
+          "export function project(value: unknown) { return value as { id: string }; }\n",
+      },
+      ({ repositoryRoot, workspaceRoot, workspace }) => {
+        const program = createWorkspaceProgram(repositoryRoot, workspace).program;
+        const findings = analyzeWorkspace(
+          {
+            ...workspace,
+            ruleZones: { "architecture/no-unknown-assertion": [{ include: "**" }] },
+          },
+          workspaceRoot,
+          program,
+        );
+        expect(findings.map(({ rule, location }) => ({ rule, file: location?.file }))).toEqual([
+          { rule: "architecture/no-unknown-assertion", file: "src/fixtures/runtime.ts" },
+        ]);
+      },
+    );
+  });
+
   test("filters non-production roots, retains declarations, and resolves imported dependencies", () => {
     withProgramFixture(
       {

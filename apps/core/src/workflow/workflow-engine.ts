@@ -173,7 +173,7 @@ const pipelineInputSchema = z.strictObject({
   items: z.array(jsonValueSchema).max(10_000),
   options: workflowPipelineOptionsSchema,
 });
-const sleepInputSchema = z.union([z.number().finite().nonnegative(), z.string().min(1).max(100)]);
+const sleepInputSchema = z.union([z.number().nonnegative(), z.string().min(1).max(100)]);
 
 type AgentRequestResult = {
   state: "resolved" | "failed" | "cancelled" | "timed_out";
@@ -588,15 +588,6 @@ export class WorkflowEngine {
     this.wakeSubscription = requireWorkflowEngineSubscriptionStart(
       await this.startWakeSubscription(),
     );
-    const runningRuns = this.input.store.listRuns({ state: "running", limit: 1_000 });
-    const readRunningRuns = runningRuns.match({
-      ok: (value) => () => value,
-      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
-    });
-    const running = readRunningRuns();
-    for (const run of running) {
-      await this.claimAndLaunch(run, WORKFLOW_LEASE_STALE_MS);
-    }
     const blockedRuns = this.input.store.listRuns({ state: "blocked", limit: 1_000 });
     const readBlockedRuns = blockedRuns.match({
       ok: (value) => () => value,
@@ -759,6 +750,18 @@ export class WorkflowEngine {
         "Workflow cancellation reconciliation failed",
         formatWorkflowErrorForLog(error),
       );
+    }
+    const runningRuns = this.input.store.listRunsWithExpiredClaims({
+      staleBefore: this.now() - WORKFLOW_LEASE_STALE_MS,
+      limit: 1_000,
+    });
+    const readRunningRuns = runningRuns.match({
+      ok: (value) => () => value,
+      err: (error) => () => signalDurableWorkflowReadErrorToHost(error),
+    });
+    const running = readRunningRuns();
+    for (const run of running) {
+      await this.claimAndLaunch(run, WORKFLOW_LEASE_STALE_MS);
     }
     const queuedRuns = this.input.store.listRuns({ state: "queued", limit: 1_000 });
     const readQueuedRuns = queuedRuns.match({

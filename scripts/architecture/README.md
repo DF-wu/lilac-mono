@@ -62,6 +62,12 @@ catalog metadata, then update the digest and focused tests.
 
 ## Permanent Rules
 
+`architecture/no-deprecated` promotes TypeScript's deprecated-reference suggestions to errors in every
+production workspace. It includes dependency declarations, follows aliases, and checks the selected
+overload. Diagnostics include the declaration's deprecation guidance when present. It reuses the TS6
+Program's runtime suggestion API and fails closed if that API is unavailable after a compiler upgrade.
+The existing source exclusions apply; this is not a scan of dependency implementations or test files.
+
 Semantic rules enforce boundary decoding, domain-owned `unknown`, assertion and predicate safety, closed
 union exhaustiveness, declarative Result handling, Panic registration, compatibility serialization,
 redacted TaggedError logging, event delivery, persisted codecs, and SQLite transaction atomicity.
@@ -112,8 +118,10 @@ The Core BLOB-column check has one registered structured-data exception: convers
 embeddings. Migration modules are exact registrations because their job is to read and remove legacy byte
 formats; runtime modules receive no compatibility exemption.
 
-Production tests, generated output, and the generated Core remote-runner bundle are excluded by
-`source-policy.ts` and `syntax-policy.mts`; their TypeScript source remains enforced.
+Semantic and syntax checks share the exclusions in `source-policy.ts`. Test modules, test-support
+trees, vendored source, generated output, and the Core remote-runner bundle are excluded. Generated
+bundles are checked at their TypeScript source. A `fixtures` directory alone is not an exclusion:
+production `src/fixtures` is checked, while fixtures under test-support trees are excluded.
 
 ### Persisted Codecs
 

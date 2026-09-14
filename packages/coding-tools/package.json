@@ -41,15 +41,13 @@
   },
   "dependencies": {
     "@stanley2058/lilac-agent": "workspace:*",
-    "@stanley2058/lilac-bash-safety": "workspace:*",
     "@stanley2058/lilac-fs": "workspace:*",
-    "@stanley2058/lilac-tool-results": "workspace:*",
     "ai": "^7.0.22",
     "better-result": "catalog:",
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.0"
+    "@types/bun": "^1.4.1"
   },
   "peerDependencies": {
     "typescript": "^7.0.2"

@@ -6,7 +6,8 @@ import {
   type ToolSet,
 } from "ai";
 import { Result, TaggedError, type Panic, type Result as ResultType } from "better-result";
-import { createLogger, errorMessage } from "@stanley2058/lilac-utils";
+import { createLogger } from "@stanley2058/lilac-utils/logging";
+import { errorMessage } from "@stanley2058/lilac-utils/runtime-utils";
 
 import {
   captureAgentOperation,
@@ -455,25 +456,7 @@ async function settleAtomicToolCallImpl(
           const input = validatedInput.match({ ok: (value) => value, err: () => call.input });
           assertNotAborted();
 
-          const needsApproval =
-            typeof tool.needsApproval === "function"
-              ? await tool.needsApproval(input, {
-                  toolCallId: call.toolCallId,
-                  messages: options.messages,
-                  context: options.context,
-                })
-              : Boolean(tool.needsApproval);
-          assertNotAborted();
-
-          if (needsApproval) {
-            isError = true;
-            outcome = "denied";
-            result = { denied: true };
-            toolOutput = {
-              type: "execution-denied",
-              reason: "Tool requires approval.",
-            };
-          } else if (!tool.execute) {
+          if (!tool.execute) {
             const message = `Tool has no execute(): ${call.toolName}`;
             isError = true;
             outcome = "error";
@@ -549,6 +532,14 @@ async function settleAtomicToolCallImpl(
       }
 
       assertNotAborted();
+      if (
+        outcome === "success" &&
+        (toolOutput.type === "error-text" || toolOutput.type === "error-json")
+      ) {
+        isError = true;
+        outcome = "error";
+      }
+
       return {
         result,
         isError,

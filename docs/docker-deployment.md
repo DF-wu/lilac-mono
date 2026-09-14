@@ -1,5 +1,8 @@
 # Docker Deployment
 
+For a guided installation using published images, see [the installation guide](installation.md).
+The commands below describe source builds and manual container operation.
+
 Lilac runs `tini` as container PID 1 to reap orphaned children and forward signals. Its child is the root entrypoint, which performs startup setup and then replaces itself with Core as the unprivileged image user (`lilac` by default). The image does not run systemd, a user manager, or Bubblewrap, and it does not require writable cgroups, user namespaces, privileged mode, or unconfined security profiles. Core and its children write directly to the container's stdout and stderr.
 
 ## Start And Verify
@@ -79,3 +82,8 @@ docker compose exec -T lilac /usr/bin/id
 ```
 
 The service process and its subprocesses run as the configured image user (`lilac` by default); `docker compose exec` defaults to root so the operator CLI can read its token. Add `--user "${CONTAINER_USER:-lilac}"` when diagnosing the service user's filesystem access.
+
+## Optional computer use
+
+The desktop gateway and runner have separate image builds and an opt-in Compose file. See
+[computer-use deployment](computer-use.md). The standard Compose stack does not enable them.

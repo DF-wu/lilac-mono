@@ -154,7 +154,7 @@ const storedMediaEnvelopeSchema = z.object({
         audio: storedFileSchema.optional(),
         voice: storedFileSchema.optional(),
       })
-      .passthrough(),
+      .loose(),
   }),
 });
 

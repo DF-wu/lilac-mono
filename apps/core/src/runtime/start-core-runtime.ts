@@ -54,26 +54,27 @@ export async function startCoreRuntime(options: {
     }
     return operationResult.result;
   });
-  if (runtime.isErr()) return runtime;
-  const started = await Result.tryPromise({
-    try: () => runtime.value.start(),
-    catch: (cause) =>
-      new CoreRuntimeInvocationFailed({
-        operation: "start",
-        cause,
-        message: errorMessage(cause),
-      }),
-  });
-  return started.andThen((operationResult) => {
-    if (operationResult.kind === "panic") {
-      return Result.err(
+  return runtime.andThenAsync(async (runtimeValue) => {
+    const started = await Result.tryPromise({
+      try: () => runtimeValue.start(),
+      catch: (cause) =>
         new CoreRuntimeInvocationFailed({
           operation: "start",
-          cause: operationResult.panic,
-          message: errorMessage(operationResult.panic),
+          cause,
+          message: errorMessage(cause),
         }),
-      );
-    }
-    return operationResult.result.map(() => runtime.value);
+    });
+    return started.andThen((operationResult) => {
+      if (operationResult.kind === "panic") {
+        return Result.err(
+          new CoreRuntimeInvocationFailed({
+            operation: "start",
+            cause: operationResult.panic,
+            message: errorMessage(operationResult.panic),
+          }),
+        );
+      }
+      return operationResult.result.map(() => runtimeValue);
+    });
   });
 }

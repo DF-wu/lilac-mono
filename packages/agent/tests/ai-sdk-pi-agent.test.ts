@@ -3755,7 +3755,7 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
     });
   });
 
-  it("stops before approval when cancellation is requested by a tool start subscriber", async () => {
+  it("stops before execution when cancellation is requested by a tool start subscriber", async () => {
     const model = new MockLanguageModelV4({
       doStream: {
         stream: simulateReadableStream({
@@ -3771,7 +3771,6 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
       },
     });
     const terminalEvents: string[] = [];
-    let approvalChecks = 0;
     let executions = 0;
     let normalizations = 0;
     const agent = new AiSdkPiAgent({
@@ -3780,10 +3779,6 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
       tools: {
         lookup: tool({
           inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
-          needsApproval: () => {
-            approvalChecks += 1;
-            return false;
-          },
           execute: () => {
             executions += 1;
             return "unexpected";
@@ -3810,7 +3805,6 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
 
     await agent.prompt("cancel tool at start");
 
-    expect(approvalChecks).toBe(0);
     expect(executions).toBe(0);
     expect(normalizations).toBe(0);
     expect(terminalEvents).toEqual([
@@ -3820,82 +3814,6 @@ describe("AiSdkPiAgent queued steering and cancellation", () => {
       "agent_end",
     ]);
     expect(agent.state.messages).toEqual([{ role: "user", content: "cancel tool at start" }]);
-  });
-
-  it("stops before execution when cancellation occurs while approval is awaited", async () => {
-    const model = new MockLanguageModelV4({
-      doStream: {
-        stream: simulateReadableStream({
-          chunks: [
-            {
-              type: "tool-call",
-              toolCallId: "cancel-during-approval",
-              toolName: "lookup",
-              input: "{}",
-            },
-            {
-              type: "finish",
-              finishReason: { unified: "tool-calls", raw: "tool-calls" },
-              usage: zeroUsage(),
-            },
-          ],
-        }),
-      },
-    });
-    const approvalEntered = deferred();
-    const releaseApproval = deferred();
-    const terminalEvents: string[] = [];
-    let executions = 0;
-    let normalizations = 0;
-    const agent = new AiSdkPiAgent({
-      system: "test",
-      model,
-      tools: {
-        lookup: tool({
-          inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
-          needsApproval: async () => {
-            approvalEntered.resolve();
-            await releaseApproval.promise;
-            return false;
-          },
-          execute: () => {
-            executions += 1;
-            return "unexpected";
-          },
-        }),
-      },
-      normalizeToolResultOutput: (output) => {
-        normalizations += 1;
-        return output;
-      },
-    });
-    agent.subscribe((event) => {
-      if (event.type === "tool_execution_start") {
-        terminalEvents.push(event.type);
-      } else if (event.type === "turn_abort") {
-        terminalEvents.push(`${event.type}:${event.reason}`);
-      } else if (event.type === "messages_reset") {
-        terminalEvents.push(`${event.type}:${event.reason}`);
-      } else if (event.type === "agent_end") {
-        terminalEvents.push(event.type);
-      }
-    });
-
-    const run = agent.prompt("cancel during approval");
-    await approvalEntered.promise;
-    agent.cancel();
-    releaseApproval.resolve();
-    await run;
-
-    expect(executions).toBe(0);
-    expect(normalizations).toBe(0);
-    expect(terminalEvents).toEqual([
-      "tool_execution_start",
-      "turn_abort:cancel",
-      "messages_reset:cancel",
-      "agent_end",
-    ]);
-    expect(agent.state.messages).toEqual([{ role: "user", content: "cancel during approval" }]);
   });
 
   it("closes a streaming tool iterator when cancellation interrupts its output", async () => {
@@ -5184,7 +5102,7 @@ describe("AiSdkPiAgent tool-call expansion", () => {
         },
       ],
     });
-    let deniedExecuted = false;
+    let plainExecuted = false;
     const updates: string[] = [];
     const normalizedNames: string[] = [];
     const agent = new AiSdkPiAgent({
@@ -5198,11 +5116,11 @@ describe("AiSdkPiAgent tool-call expansion", () => {
               {
                 ok: true,
                 total: 3,
-                children: ["media-1", "denied-1", "stream-1"],
+                children: ["media-1", "plain-1", "stream-1"],
               },
               [
                 { toolCallId: "media-1", toolName: "media", input: {} },
-                { toolCallId: "denied-1", toolName: "denied", input: {} },
+                { toolCallId: "plain-1", toolName: "plain", input: {} },
                 { toolCallId: "stream-1", toolName: "streaming", input: {} },
               ],
             ),
@@ -5223,11 +5141,10 @@ describe("AiSdkPiAgent tool-call expansion", () => {
             ],
           }),
         }),
-        denied: tool({
+        plain: tool({
           inputSchema: jsonSchema({ type: "object", additionalProperties: false }),
-          needsApproval: true,
           execute: () => {
-            deniedExecuted = true;
+            plainExecuted = true;
             return { ok: true };
           },
         }),
@@ -5250,10 +5167,10 @@ describe("AiSdkPiAgent tool-call expansion", () => {
 
     await agent.prompt("expand");
 
-    expect(deniedExecuted).toBe(false);
+    expect(plainExecuted).toBe(true);
     expect(updates).toEqual(["streaming", "streaming"]);
     expect(normalizedNames[0]).toBe("batch");
-    expect(new Set(normalizedNames.slice(1))).toEqual(new Set(["media", "denied", "streaming"]));
+    expect(new Set(normalizedNames.slice(1))).toEqual(new Set(["media", "plain", "streaming"]));
 
     const roles = agent.state.messages.map((message) => message.role);
     expect(roles.slice(1, 7)).toEqual(["assistant", "tool", "assistant", "tool", "tool", "tool"]);
@@ -5273,7 +5190,7 @@ describe("AiSdkPiAgent tool-call expansion", () => {
     if (synthetic?.role !== "assistant" || !Array.isArray(synthetic.content)) return;
     expect(
       synthetic.content.filter((part) => part.type === "tool-call").map((part) => part.toolName),
-    ).toEqual(["media", "denied", "streaming"]);
+    ).toEqual(["media", "plain", "streaming"]);
 
     const mediaResult = agent.state.messages[4];
     expect(mediaResult?.role).toBe("tool");
@@ -5290,13 +5207,13 @@ describe("AiSdkPiAgent tool-call expansion", () => {
       },
     });
 
-    const deniedResult = agent.state.messages[5];
-    expect(deniedResult?.role).toBe("tool");
-    if (deniedResult?.role !== "tool") return;
-    expect(deniedResult.content[0]).toMatchObject({
+    const plainResult = agent.state.messages[5];
+    expect(plainResult?.role).toBe("tool");
+    if (plainResult?.role !== "tool") return;
+    expect(plainResult.content[0]).toMatchObject({
       type: "tool-result",
-      toolName: "denied",
-      output: { type: "execution-denied" },
+      toolName: "plain",
+      output: { type: "json", value: { ok: true } },
     });
   });
 

@@ -6,7 +6,7 @@ ARG CONTAINER_UID=1000
 ############################
 # Stage 1: runtime tools
 ############################
-FROM ${BASE_IMAGE} AS tools
+FROM ${BASE_IMAGE} AS toolchain
 ARG NODE_MAJOR
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -42,6 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   fonts-liberation \
   fonts-noto-color-emoji \
   git \
+  golang-go \
   gzip \
   imagemagick \
   iproute2 \
@@ -126,6 +127,8 @@ RUN if [ "$LILAC_USER" = "Catalina" ] && [ ! -e /home/Catalinna ]; then \
     fi
 ENV HOME=/home/${LILAC_USER}
 ENV DATA_DIR=/data
+ENV TOOL_SERVER_BACKEND_SOCKET=/run/lilac/tool-server/server.sock
+ENV LILAC_TOOL_WORKER_DIR=/run/lilac/tool-worker
 ENV LILAC_WORKSPACE_DIR=${DATA_DIR}/workspace
 ENV GIT_CONFIG_GLOBAL=${DATA_DIR}/.gitconfig
 ENV GNUPGHOME=${DATA_DIR}/secret/gnupg
@@ -139,6 +142,7 @@ ENV PATH=/usr/local/sbin:/usr/local/bin:${BUN_INSTALL_BIN}:${NPM_CONFIG_PREFIX}/
 RUN mkdir -p $DATA_DIR $DATA_DIR/secret
 RUN chown -R ${LILAC_USER}:$(id -gn "${LILAC_USER}") $DATA_DIR
 
+FROM toolchain AS tools
 USER ${LILAC_USER}
 
 # uv (user-level)
@@ -153,6 +157,15 @@ RUN install -o root -g root -m 0755 \
      /home/${LILAC_USER}/.bun/bin/bun \
      /usr/local/bin/bun
 
+# Isolate Go compilation from Bun, dependency manifests, and application metadata.
+FROM toolchain AS native-launcher
+WORKDIR /build
+COPY apps/tool-bridge/native-launcher.go ./
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    GOCACHE=/root/.cache/go-build CGO_ENABLED=0 go build \
+      -trimpath -buildvcs=false -buildmode=pie -ldflags "-s -w" \
+      -o /build/tools ./native-launcher.go
+
 ############################
 # Stage 2: deps
 ############################
@@ -163,10 +176,6 @@ WORKDIR /app
 COPY package.json bun.lock ./
 COPY apps/core/package.json apps/core/package.json
 COPY apps/tool-bridge/package.json apps/tool-bridge/package.json
-COPY apps/acp-controller/package.json apps/acp-controller/package.json
-COPY apps/mini-lilac/package.json apps/mini-lilac/package.json
-COPY apps/mini-lilac-server/package.json apps/mini-lilac-server/package.json
-COPY apps/mini-lilac-tui/package.json apps/mini-lilac-tui/package.json
 COPY packages/agent/package.json packages/agent/package.json
 COPY packages/bash-safety/package.json packages/bash-safety/package.json
 COPY packages/blob-storage/package.json packages/blob-storage/package.json
@@ -174,16 +183,13 @@ COPY packages/claude-code-bridge/package.json packages/claude-code-bridge/packag
 COPY packages/coding-tools/package.json packages/coding-tools/package.json
 COPY packages/event-bus/package.json packages/event-bus/package.json
 COPY packages/fs/package.json packages/fs/package.json
-COPY packages/mini-lilac-client/package.json packages/mini-lilac-client/package.json
-COPY packages/mini-lilac-runtime/package.json packages/mini-lilac-runtime/package.json
 COPY packages/plugin-runtime/package.json packages/plugin-runtime/package.json
 COPY packages/remote-fs-runner/package.json packages/remote-fs-runner/package.json
 COPY packages/tool-results/package.json packages/tool-results/package.json
 COPY packages/utils/package.json packages/utils/package.json
 COPY patches patches
 
-# Install only the main container's workspace graph. Other app sources remain
-# available in /app, but their dependencies are not included in the image.
+# Install only the main container's workspace graph.
 RUN bun install --frozen-lockfile \
       --filter '@stanley2058/lilac-tool-bridge' \
       --filter '@stanley2058/lilac-remote-fs-runner' \
@@ -193,26 +199,77 @@ RUN bun install --frozen-lockfile \
 # Stage 3: build + runtime entry
 ############################
 
-FROM deps AS build
+FROM deps AS tool-worker
 WORKDIR /app
-COPY bunfig.toml tsconfig.json ./
-COPY apps ./apps
-COPY packages ./packages
+COPY tsconfig.json ./
+COPY apps/tool-bridge/build.ts apps/tool-bridge/launcher.ts apps/tool-bridge/client.ts \
+     apps/tool-bridge/build-artifacts.ts apps/tool-bridge/invocation-runtime.ts \
+     apps/tool-bridge/wire-codecs.ts apps/tool-bridge/native-launcher.go \
+     apps/tool-bridge/tsconfig.json apps/tool-bridge/
+COPY apps/core/tsconfig.json apps/core/
+COPY apps/core/src/tool-server/client-arguments.ts apps/core/src/tool-server/client-protocol.ts \
+     apps/core/src/tool-server/
+COPY packages/plugin-runtime/types.ts packages/plugin-runtime/tsconfig.json packages/plugin-runtime/
+COPY packages/utils/build-info.ts packages/utils/find-root.ts packages/utils/runtime-utils.ts \
+     packages/utils/tsconfig.json packages/utils/
+RUN (cd apps/tool-bridge && bun build.ts --worker-only)
 
-# Build client bundles
-RUN (cd apps/tool-bridge && bun run build)
+FROM deps AS remote-runner
+WORKDIR /app
+COPY tsconfig.json ./
+COPY apps/core/build-remote-runner.ts apps/core/tsconfig.json apps/core/
+COPY apps/core/src/shared/error-capture.ts apps/core/src/shared/
+COPY apps/core/src/ssh/remote-js/*.ts apps/core/src/ssh/remote-js/
+COPY apps/core/src/tools/apply-patch/apply-patch-core.ts apps/core/src/tools/apply-patch/
+COPY apps/core/src/tools/tool-result-adapters.ts apps/core/src/tools/
+COPY packages/coding-tools/src/apply-patch.ts packages/coding-tools/src/
+COPY packages/coding-tools/tsconfig.json packages/coding-tools/
+COPY packages/fs/tsconfig.json packages/fs/
+COPY packages/fs/src packages/fs/src
+COPY packages/utils/*.ts packages/utils/tsconfig.json packages/utils/
+COPY packages/utils/core-config packages/utils/core-config
 RUN (cd apps/core && bun run build:remote-runner)
+
+FROM deps AS remote-fs-runner
+WORKDIR /app
+COPY tsconfig.json ./
+COPY packages/fs/tsconfig.json packages/fs/
+COPY packages/fs/src packages/fs/src
+COPY packages/remote-fs-runner/build.ts packages/remote-fs-runner/tsconfig.json packages/remote-fs-runner/
+COPY packages/remote-fs-runner/src packages/remote-fs-runner/src
 RUN (cd packages/remote-fs-runner && bun run build)
 
-# Keep the operator CLI outside the lilac-writable application build tree.
-RUN install -d -o root -g root -m 0755 /usr/local/libexec/lilac-tool-bridge \
-  && install -o root -g root -m 0755 \
-       /app/apps/tool-bridge/dist/index.js \
-       /usr/local/libexec/lilac-tool-bridge/index.js \
-  && install -o root -g root -m 0644 \
-       /app/apps/tool-bridge/dist/client.js \
-       /usr/local/libexec/lilac-tool-bridge/client.js \
-  && ln -s /usr/local/libexec/lilac-tool-bridge/index.js /usr/local/bin/tools
+############################
+# Stage 4: runtime
+############################
+
+FROM deps AS runtime
+WORKDIR /app
+COPY bunfig.toml tsconfig.json ./
+COPY apps/core apps/core
+COPY apps/tool-bridge apps/tool-bridge
+COPY packages/agent packages/agent
+COPY packages/bash-safety packages/bash-safety
+COPY packages/blob-storage packages/blob-storage
+COPY packages/claude-code-bridge packages/claude-code-bridge
+COPY packages/coding-tools packages/coding-tools
+COPY packages/event-bus packages/event-bus
+COPY packages/fs packages/fs
+COPY packages/plugin-runtime packages/plugin-runtime
+COPY packages/remote-fs-runner packages/remote-fs-runner
+COPY packages/tool-results packages/tool-results
+COPY packages/utils packages/utils
+COPY --from=native-launcher /build/tools /app/apps/tool-bridge/dist/tools
+COPY --from=tool-worker /app/apps/tool-bridge/dist/ /app/apps/tool-bridge/dist/
+COPY --from=remote-runner /app/apps/core/src/ssh/remote-js/remote-runner.cjs /app/apps/core/src/ssh/remote-js/
+COPY --from=remote-fs-runner /app/packages/remote-fs-runner/dist/ /app/packages/remote-fs-runner/dist/
+
+# Keep the launcher and resident worker outside the lilac-writable application build tree.
+COPY --from=native-launcher --chmod=0755 /build/tools /usr/local/bin/tools
+COPY --from=tool-worker --chmod=0755 /app/apps/tool-bridge/dist/tools-worker /usr/local/bin/tools-worker
+COPY --from=tool-worker --chmod=0644 /app/apps/tool-bridge/dist/tools-build-id /usr/local/bin/tools-build-id
+RUN ln -s /app/build/build-info.json /usr/local/bin/tools-build-info.json \
+  && ln -s /app/build/build-info.json /app/apps/tool-bridge/dist/tools-build-info.json
 
 COPY --chmod=0755 docker/direct-entrypoint.sh /usr/local/sbin/lilac-entrypoint
 COPY docker/create-operator-token.mjs /usr/local/libexec/create-operator-token.mjs
@@ -224,11 +281,11 @@ RUN writable_path="$(find /app ! -type l -perm /022 -print -quit)" \
        exit 1; \
      fi
 
+# Core and the tool client read the same image metadata without recompiling executables.
 ARG LILAC_BUILD_VERSION=dev
 ARG LILAC_BUILD_COMMIT=dev
 ARG LILAC_BUILD_DIRTY=false
 ARG LILAC_BUILD_AT=
-# Generate build metadata last so metadata-only changes create one tiny layer.
 RUN mkdir -p /app/build && BUILD_AT_FRAGMENT="" && if [ -n "$LILAC_BUILD_AT" ]; then BUILD_AT_FRAGMENT=$(printf ',\n  "builtAt": "%s"' "$LILAC_BUILD_AT"); fi && printf '{\n  "version": "%s",\n  "commit": "%s",\n  "dirty": %s%s\n}\n' "$LILAC_BUILD_VERSION" "$LILAC_BUILD_COMMIT" "$LILAC_BUILD_DIRTY" "$BUILD_AT_FRAGMENT" > /app/build/build-info.json
 
 STOPSIGNAL SIGTERM

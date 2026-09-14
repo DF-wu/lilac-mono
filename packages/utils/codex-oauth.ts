@@ -33,7 +33,7 @@ const codexOAuthTokensSchema = z
   })
   .strict();
 const legacyCodexOAuthTokensSchema = codexOAuthTokensSchema.omit({ type: true });
-const codexOAuthTokenTypeSchema = z.object({ type: z.string() }).passthrough();
+const codexOAuthTokenTypeSchema = z.object({ type: z.string() }).loose();
 const loggedOutCodexOAuthTokensSchema = z.object({}).strict();
 
 const authorizationCodeTokenResponseSchema = z.object({
@@ -577,27 +577,6 @@ export async function clearCodexTokensResult(
   const exists = inspectOutcome.value;
   if (!exists) return Result.ok(undefined);
   return writeSecretFileResult(storagePath, "{}\n");
-}
-
-export async function clearCodexTokens(storagePath: string = STORAGE_PATH): Promise<void> {
-  const result = await clearCodexTokensResult(storagePath);
-  const resolved = result.match<
-    | { readonly value: void }
-    | {
-        readonly error:
-          | CodexTokensReadFailed
-          | CodexTokensWriteFailed
-          | CodexTokensCleanupFailed
-          | CodexTokensWriteAndCleanupFailed;
-      }
-  >({
-    ok: (value) => ({ value }),
-    err: (error) => ({ error }),
-  });
-  if ("error" in resolved) {
-    if (resolved.error._tag === "CodexTokensReadFailed") throw resolved.error.cause;
-    throw projectLegacyCodexTokenWriteFailure(resolved.error);
-  }
 }
 
 function projectLegacyCodexTokenWriteFailure(

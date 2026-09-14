@@ -3,7 +3,7 @@ import { gfmFromMarkdown } from "mdast-util-gfm";
 import type { AlignType, PhrasingContent, Root, RootContent, Table, TableCell } from "mdast";
 import { gfm } from "micromark-extension-gfm";
 
-export type MarkdownTableRenderStyle = "unicode" | "ascii";
+export type MarkdownTableRenderStyle = "unicode" | "ascii" | "image";
 export type MarkdownTableFallbackMode = "list" | "passthrough";
 
 export type MarkdownTableRenderOptions = {
@@ -64,6 +64,119 @@ type TableRange = {
   node: Table;
 };
 
+export type MarkdownTableInlineStyle = {
+  bold?: boolean;
+  italic?: boolean;
+  code?: boolean;
+  strike?: boolean;
+  underline?: boolean;
+};
+
+export type MarkdownTableInlineRun = MarkdownTableInlineStyle & { text: string };
+
+export type MarkdownTableCellData = { runs: MarkdownTableInlineRun[] };
+
+export type MarkdownTableData = {
+  rows: MarkdownTableCellData[][];
+  align: AlignType[];
+};
+
+function tableInlineRuns(
+  nodes: readonly PhrasingContent[],
+  markdown: string,
+  style: MarkdownTableInlineStyle = {},
+): MarkdownTableInlineRun[] {
+  const runs: MarkdownTableInlineRun[] = [];
+  let underlineDepth = 0;
+  for (const node of nodes) {
+    if (node.type === "html" && /^<u\s*>$/iu.test(node.value)) {
+      underlineDepth++;
+      continue;
+    }
+    if (node.type === "html" && /^<\/u\s*>$/iu.test(node.value)) {
+      underlineDepth = Math.max(0, underlineDepth - 1);
+      continue;
+    }
+    const inherited = underlineDepth > 0 ? { ...style, underline: true } : style;
+    switch (node.type) {
+      case "strong": {
+        const start = node.position?.start.offset;
+        // Discord uses double underscores for underline rather than GFM strong emphasis.
+        const underline = start !== undefined && markdown.slice(start, start + 2) === "__";
+        const emphasis = underline ? { underline: true } : { bold: true };
+        runs.push(...tableInlineRuns(node.children, markdown, { ...inherited, ...emphasis }));
+        break;
+      }
+      case "emphasis":
+        runs.push(...tableInlineRuns(node.children, markdown, { ...inherited, italic: true }));
+        break;
+      case "delete":
+        runs.push(...tableInlineRuns(node.children, markdown, { ...inherited, strike: true }));
+        break;
+      case "link":
+      case "linkReference":
+        runs.push(...tableInlineRuns(node.children, markdown, inherited));
+        break;
+      case "inlineCode":
+        runs.push({ ...inherited, code: true, text: node.value });
+        break;
+      case "html":
+        runs.push({ ...inherited, text: /^<br\s*\/?>$/iu.test(node.value) ? "\n" : node.value });
+        break;
+      case "text":
+        runs.push({ ...inherited, text: node.value });
+        break;
+      case "break":
+        runs.push({ ...inherited, text: "\n" });
+        break;
+      case "image":
+        runs.push({ ...inherited, text: node.alt ?? "" });
+        break;
+      case "imageReference":
+      case "footnoteReference":
+        break;
+    }
+  }
+  return runs;
+}
+
+export type MarkdownTableSegment =
+  | { kind: "text"; text: string }
+  | { kind: "table"; source: string; table: MarkdownTableData };
+
+export function splitMarkdownTopLevelTables(markdown: string): MarkdownTableSegment[] {
+  const tree = fromMarkdown(markdown, {
+    extensions: [gfm()],
+    mdastExtensions: [gfmFromMarkdown()],
+  });
+  const segments: MarkdownTableSegment[] = [];
+  let cursor = 0;
+  for (const node of tree.children) {
+    if (node.type !== "table") continue;
+    const start = node.position?.start.offset;
+    const end = node.position?.end.offset;
+    if (start === undefined || end === undefined) continue;
+    if (start > cursor) segments.push({ kind: "text", text: markdown.slice(cursor, start) });
+    const headers = node.children[0]?.children ?? [];
+    segments.push({
+      kind: "table",
+      source: markdown.slice(start, end),
+      table: {
+        rows: node.children.map((row) =>
+          headers.map((_, index) => {
+            const cell = row.children[index];
+            return { runs: cell ? tableInlineRuns(cell.children, markdown) : [] };
+          }),
+        ),
+        align: node.align ?? [],
+      },
+    });
+    cursor = end;
+  }
+  if (cursor < markdown.length) segments.push({ kind: "text", text: markdown.slice(cursor) });
+  return segments;
+}
+
 type ResolvedOptions = {
   style: MarkdownTableRenderStyle;
   maxWidth: number;
@@ -72,7 +185,7 @@ type ResolvedOptions = {
 
 function resolveOptions(options: MarkdownTableRenderOptions): ResolvedOptions {
   return {
-    style: options.style ?? DEFAULT_STYLE,
+    style: options.style === "image" ? "unicode" : (options.style ?? DEFAULT_STYLE),
     maxWidth: Math.max(1, options.maxWidth ?? DEFAULT_MAX_WIDTH),
     fallbackMode: options.fallbackMode ?? DEFAULT_FALLBACK_MODE,
   };

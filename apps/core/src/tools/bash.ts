@@ -65,7 +65,7 @@ const bashExecutionErrorSchema = z.discriminatedUnion("type", [
 export const bashOutputSchema = z.object({
   stdout: z.string(),
   stderr: z.string(),
-  exitCode: z.number().int().finite(),
+  exitCode: z.number().int(),
   executionError: bashExecutionErrorSchema.optional(),
   truncation: z
     .object({

@@ -12,7 +12,7 @@ const toolMessageSchema = z
     role: z.literal("tool"),
     content: z.array(z.unknown()),
   })
-  .passthrough();
+  .loose();
 
 const readFileToolResultSchema = z
   .object({
@@ -20,7 +20,7 @@ const readFileToolResultSchema = z
     toolName: z.enum(["read", "read_file"]),
     output: z.unknown(),
   })
-  .passthrough();
+  .loose();
 
 const jsonToolOutputSchema = z
   .object({
@@ -30,23 +30,23 @@ const jsonToolOutputSchema = z
         loadedInstructions: z.array(z.string()).optional(),
         instructionsText: z.string().optional(),
       })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 
 const contentToolOutputSchema = z
   .object({
     type: z.literal("content"),
     value: z.array(z.unknown()),
   })
-  .passthrough();
+  .loose();
 
 const textContentPartSchema = z
   .object({
     type: z.literal("text"),
     text: z.string(),
   })
-  .passthrough();
+  .loose();
 
 export const READ_FILE_INSTRUCTION_HINT =
   "Successful local reads add newly applicable AGENTS.md instructions.";
@@ -58,11 +58,6 @@ export type LoadedInstructionContext = {
 
 export type ReadFileInstructionClaims = {
   forMessages(messages: readonly unknown[]): Set<string>;
-};
-
-export type InstructionLoadOptions = {
-  denyPaths?: readonly string[];
-  claimedInstructionPaths?: Set<string>;
 };
 
 export function createReadFileInstructionClaims(): ReadFileInstructionClaims {
@@ -237,21 +232,6 @@ async function loadInstructionsBetween(params: {
 
   if (loaded.length === 0) return null;
   return { loaded, text: snippets.join("\n\n") };
-}
-
-export async function loadWorkspaceInstructions(
-  cwd: string,
-  options: InstructionLoadOptions = {},
-): Promise<LoadedInstructionContext | null> {
-  const cwdAbsolute = await canonicalPath(cwd);
-  const boundaryDirectory = (await findGitRoot(cwdAbsolute)) ?? cwdAbsolute;
-  return loadInstructionsBetween({
-    startDirectory: cwdAbsolute,
-    boundaryDirectory,
-    alreadyLoaded: new Set(),
-    denyPaths: await canonicalPaths(options.denyPaths ?? []),
-    claimedInstructionPaths: options.claimedInstructionPaths,
-  });
 }
 
 export async function loadReadFileInstructions(params: {

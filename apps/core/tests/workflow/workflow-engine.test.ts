@@ -2069,6 +2069,124 @@ describe("WorkflowEngine", () => {
       rmSync(dbPath, { force: true });
     }
   });
+  it.each([false, true])(
+    "rechecks running leases after a fast restart, with live-owner refresh=%s",
+    async (refreshOwner) => {
+      const dbPath = join(tmpdir(), `workflow-fast-restart-${crypto.randomUUID()}.sqlite`);
+      const store = new HeartbeatTrackingWorkflowStore(dbPath);
+      const bus = createLilacBus(new LiveCapturingRawBus());
+      createApprovedRun(store);
+      store.tryClaimRun({ runId: "run-1", claimerId: "previous-owner", now: 100 });
+      let now = 200;
+      let dispatches = 0;
+      const engine = new WorkflowEngine({
+        bus,
+        store,
+        blobStore,
+        dataDir: dirname(dbPath),
+        subscriptionId: "fast-restart",
+        now: () => now,
+        pollMs: 1000000,
+        loadSnapshot: async () => agentWorkflowSource(),
+        compileSource: compileTestWorkflow,
+        dispatchAgentRequest: async () => {
+          dispatches += 1;
+          return { state: "resolved", output: "recovered", detail: null, usage: null };
+        },
+      });
+      const tick = async () => {
+        const scanned = store.observeNextQueuedScan();
+        await startResultForTest(
+          bus.publish(lilacEventTypes.EvtWorkflowProgressRequested, {
+            runId: "run-1",
+            revisionId: "revision-1",
+            reason: "operation_changed",
+            ts: now,
+          }),
+        );
+        await scanned;
+      };
+      try {
+        await engine.start();
+        expect(dispatches).toBe(0);
+        now = 60099;
+        await tick();
+        expect(workflowStoreValue(store.getRun("run-1"))?.claimedBy).toBe("previous-owner");
+        if (refreshOwner) {
+          expect(store.refreshRunClaim("run-1", "previous-owner", now)).toBe(true);
+          now = 60100;
+          await tick();
+          expect(dispatches).toBe(0);
+          expect(workflowStoreValue(store.getRun("run-1"))?.claimedBy).toBe("previous-owner");
+          now = 120099;
+        } else {
+          now = 60100;
+        }
+        await tick();
+        await waitFor(() => workflowStoreValue(store.getRun("run-1"))?.state === "succeeded");
+        await tick();
+        expect(dispatches).toBe(1);
+        expect(workflowStoreValue(store.getRun("run-1"))?.result).toBe("recovered");
+      } finally {
+        await engine.stop();
+        await bus.close();
+        store.close();
+        rmSync(dbPath, { force: true });
+      }
+    },
+  );
+  it("recovers an older expired claim behind a full page of newer live owners", async () => {
+    const dbPath = join(tmpdir(), `workflow-recovery-page-${crypto.randomUUID()}.sqlite`);
+    const store = new DurableWorkflowStore(dbPath);
+    const bus = createLilacBus(new CapturingRawBus());
+    createApprovedRun(store);
+    const expired = store.tryClaimRun({ runId: "run-1", claimerId: "dead-owner", now: 100 });
+    if (!expired) throw new Error("expired fixture run was not claimed");
+    const now = 60200;
+    for (let index = 0; index < 1000; index += 1) {
+      expect(
+        store.createRun({
+          ...expired,
+          runId: `live-${index}`,
+          claimedBy: "live-owner",
+          claimedAt: now,
+          createdAt: index + 2,
+          updatedAt: now,
+        }),
+      ).toBe(true);
+    }
+    const firstPage = workflowStoreValue(store.listRuns({ state: "running", limit: 1000 }));
+    expect(firstPage).toHaveLength(1000);
+    expect(firstPage.some((run) => run.runId === expired.runId)).toBe(false);
+    const dispatched: string[] = [];
+    const engine = new WorkflowEngine({
+      bus,
+      store,
+      blobStore,
+      dataDir: dirname(dbPath),
+      subscriptionId: "expired-claim-page",
+      now: () => now,
+      pollMs: 1000000,
+      loadSnapshot: async () => agentWorkflowSource(),
+      compileSource: compileTestWorkflow,
+      dispatchAgentRequest: async ({ run }) => {
+        dispatched.push(run.runId);
+        return { state: "resolved", output: "recovered", detail: null, usage: null };
+      },
+    });
+    try {
+      await engine.start();
+      await waitFor(() => workflowStoreValue(store.getRun(expired.runId))?.state === "succeeded");
+      expect(dispatched).toEqual([expired.runId]);
+      expect(workflowStoreValue(store.getRun("live-0"))?.claimedBy).toBe("live-owner");
+      expect(workflowStoreValue(store.getRun("live-999"))?.claimedBy).toBe("live-owner");
+    } finally {
+      await engine.stop();
+      await bus.close();
+      store.close();
+      rmSync(dbPath, { force: true });
+    }
+  }, 15_000);
   it("reclaims a crashed running run and replays completed operations without dispatch", async () => {
     const dbPath = join(tmpdir(), `workflow-engine-restart-${crypto.randomUUID()}.sqlite`);
     const store = new DurableWorkflowStore(dbPath);

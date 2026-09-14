@@ -20,37 +20,23 @@
 </p>
 
 <p align="center">
-  <a href="#choose-your-runtime">Choose your runtime</a> ·
   <a href="#fork-differences">Fork differences</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#core-surfaces">Surfaces</a> ·
   <a href="./docs/README.md">Full documentation</a> ·
   <a href="./PROJECT.md">Architecture details</a>
 </p>
-Lilac contains three related agent products built on shared Bun workspaces:
-
-- **Core** is the Redis-backed, event-driven runtime for Discord, Telegram, and optional GitHub ingress. It owns surface routing, agent execution, output relays, durable workflows, and the internal HTTP tool server.
-- **Mini Lilac** is a Redis-free local coding agent. A terminal client talks to an HTTP/SSE server with durable SQLite sessions and workspace history.
-- **ACP Controller** is the independent `lilac-acp` CLI for launching and continuing sessions through Agent Client Protocol harnesses. It is not a Core surface or a Mini client.
+Lilac Core is the Redis-backed, event-driven runtime for Discord, Telegram, and optional GitHub ingress.
+It owns surface routing, agent execution, output relays, durable workflows, and the internal HTTP tool
+server.
 
 Architecture and ownership are documented in [`PROJECT.md`](./PROJECT.md). Repository rules for coding agents are in [`AGENTS.md`](./AGENTS.md).
 
 > [!IMPORTANT]
 > This is a downstream fork that continuously tracks [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) through Git history and the `upstream` remote. It is not an official upstream release. This project regularly merges upstream updates while maintaining independent Telegram, OpenAI-compatible image routing, GitHub reply permalink, and deployment automation features.
 
-Lilac brings platform messaging, routing, model execution, tools, Skills, and recoverable workflows into one runtime. The monorepo provides both the full **Core** service and **Mini Lilac**, a local coding agent that does not require Redis.
-
-## Choose Your Runtime
-
-|                   | Core                                                                               | Mini Lilac                                           |
-| ----------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------- |
-| Best for          | Long-running bots, multi-platform collaboration, automation, and durable workflows | Using an interactive coding agent in a local project |
-| Entry points      | Discord, Telegram, GitHub webhook, HTTP tool server                                | Terminal TUI, HTTP/SSE API                           |
-| State             | Redis Streams + SQLite + `DATA_DIR`                                                | SQLite + `$XDG_STATE_HOME/mini-lilac`                |
-| Main dependencies | Bun, Redis; Docker Compose is recommended                                          | Bun and system `flock`; Redis is not required        |
-| Getting started   | Configure and start Core from this repo                                            | Build and run Mini Lilac directly from this repo     |
-
-Mini Lilac is a product under active upstream development, and this fork syncs with upstream. Choose Core to deploy a chat-platform bot or workflow service; choose Mini Lilac for the shortest path to operating a local project from the terminal.
+Lilac brings platform messaging, routing, model execution, tools, Skills, and recoverable workflows
+into one runtime.
 
 ## Fork Differences
 
@@ -58,11 +44,11 @@ The table below lists only behavior that still differs from upstream. For the fu
 
 | Area                            | Difference provided by this fork                                                                                                                       | Important limitations                                                                             |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| Telegram surface                | DMs, groups, forum topics, streaming HTML replies, cancellation, reactions, command menu, outbound attachments, workflow cards, and same-surface tools | Disabled by default; inbound attachment bytes are unavailable; long polling only                  |
+| Telegram surface                | DMs, groups, forum topics, streaming HTML replies, cancellation, reactions, command menu, inbound/outbound attachments, workflow cards, and same-surface tools | Disabled by default; long polling only                                                    |
 | OpenAI-compatible image routing | Routes the existing `generate.image` aliases through a single operator-specified OpenAI-compatible endpoint                                            | `configVersion: 2` only; no automatic fallback or custom alias mapping                            |
 | GitHub reply UX                 | `In reply to` can link directly to an issue/PR body or a specified comment's canonical permalink                                                       | GitHub comment self-loop protection has been accepted upstream and is no longer fork-only         |
 | Custom media plugin             | Deployable Level 2 image/video plugin example demonstrating strict configuration and file-safety handling                                              | The plugin is trusted in-process code; restricted callers currently cannot use external callables |
-| Operations and delivery         | Upstream checks every 6 hours, GHCR `catalina`/`claudia` tags, and ACP detached-run hardening                                                          | Automatic merges still require manual handling when conflicts occur                               |
+| Operations and delivery         | Upstream checks every 6 hours and GHCR publishes verified `catalina`/`claudia` tags                                                                    | Automatic merges still require manual handling when conflicts occur                               |
 
 ## Architecture Overview
 
@@ -102,37 +88,6 @@ flowchart LR
 ```
 
 ## Quick Start
-
-### Mini Lilac: Local Coding Agent
-
-Mini Lilac is the shortest path to interactive use. The package is not currently published to the public npm registry, so build it from a checkout and run it directly. The server listens on `127.0.0.1:8090` by default, and the TUI must run in a real terminal.
-
-```bash
-git clone https://github.com/DF-wu/lilac-mono.git
-cd lilac-mono
-bun install --frozen-lockfile
-cd apps/mini-lilac
-bun run build
-
-./dist/main.js server init
-./dist/main.js server auth codex
-./dist/main.js server
-```
-
-In another terminal, enter the project you want to operate on:
-
-```bash
-cd /path/to/your/project
-/path/to/lilac-mono/apps/mini-lilac/dist/main.js
-```
-
-Check the server:
-
-```bash
-curl -fsS http://127.0.0.1:8090/api/mini-lilac/healthz
-```
-
-See [`apps/mini-lilac/README.md`](./apps/mini-lilac/README.md) and [`apps/mini-lilac-server/README.md`](./apps/mini-lilac-server/README.md) for configuration, providers, API keys, Codex OAuth, remote listener authentication, and TUI usage.
 
 ### Core: Docker Compose
 
@@ -302,35 +257,17 @@ docker compose exec -T lilac /usr/local/bin/tools --operator --help custom-media
 
 See [`examples/plugins/custom-media/README.md`](./examples/plugins/custom-media/README.md) for the complete build, credential, model, and file-safety contract.
 
-## Operator CLI
-
-`lilac-acp` discovers local ACP harnesses, searches or snapshots sessions, and runs prompts through detached workers. Supported harnesses depend on local installation and discovery results.
-
-```bash
-cd apps/acp-controller
-bun run build
-./dist/index.js harnesses list
-./dist/index.js sessions list --directory /path/to/repo --search "failing tests"
-./dist/index.js prompt submit --directory /path/to/repo --harness opencode --text "Fix the failing tests"
-```
-
-See [`apps/acp-controller/README.md`](./apps/acp-controller/README.md) for status and cancellation commands.
-
 ## Repository Map
 
 | Path                           | Purpose                                                                                        |
 | ------------------------------ | ---------------------------------------------------------------------------------------------- |
 | `apps/core/`                   | Redis-backed Core runtime and all surface, workflow, and tool wiring                           |
-| `apps/mini-lilac/`             | Installable unified Mini Lilac command                                                         |
-| `apps/mini-lilac-server/`      | Redis-free HTTP/SSE coding-agent server                                                        |
-| `apps/mini-lilac-tui/`         | OpenTUI terminal client                                                                        |
 | `apps/tool-bridge/`            | `tools` CLI and standalone tool-server entrypoint                                              |
-| `apps/acp-controller/`         | `lilac-acp` multi-harness controller                                                           |
+| `apps/installer/`              | Guided Docker setup and reconfiguration CLI                                                    |
+| `apps/computer-use-gateway/`   | Optional authenticated desktop-session gateway                                                 |
 | `packages/event-bus/`          | Typed Redis Streams contract and transport                                                     |
 | `packages/agent/`              | AI SDK streaming, steering, follow-up, and interrupt control                                   |
 | `packages/plugin-runtime/`     | Level 1/Level 2 plugin contract                                                                |
-| `packages/mini-lilac-runtime/` | Mini sessions, transcripts, providers, and tools                                               |
-| `packages/mini-lilac-client/`  | Mini wire protocol and reconnectable transport                                                 |
 | `packages/utils/`              | Config, providers, prompts, and Skills                                                         |
 | `data/`                        | Core local runtime state; do not commit secrets                                                |
 | `ref/`                         | Vendored/reference repositories; subject to their respective licenses and treated as read-only |
@@ -350,7 +287,6 @@ bun run ci
 bun run check
 bun run ci
 bun run test:core
-bun run test:mini
 bun run test:all
 bun run typecheck
 bun run lint
@@ -377,12 +313,12 @@ See [`AGENTS.md`](./AGENTS.md) for each workspace's build, test, and typecheck c
 - [`plan/README.md`](./plan/README.md): active implementation plans
 - [`MIGRATIONS.md`](./MIGRATIONS.md): persisted-data, wire, and protocol migrations
 - [`docs/README.md`](./docs/README.md): deployment, surface, fork-feature, and extension index
+- [`docs/installation.md`](./docs/installation.md): guided installation, providers, and reconfiguration
 - [`docs/docker-deployment.md`](./docs/docker-deployment.md): container deployment and diagnostics
+- [`docs/computer-use.md`](./docs/computer-use.md): optional desktop gateway and runner deployment
 - [`docs/claude-code.md`](./docs/claude-code.md): Claude Code authentication, tools, continuation, and storage
 - [`docs/skill-authoring.md`](./docs/skill-authoring.md): skill format, discovery, and authoring guidance
 - [`PLUGIN_AUTHORING.md`](./PLUGIN_AUTHORING.md): Core tool plugin contract
-- [`apps/mini-lilac/README.md`](./apps/mini-lilac/README.md): Mini Lilac installation and first run
-- [`apps/acp-controller/README.md`](./apps/acp-controller/README.md): `lilac-acp` usage
 
 ## License and Acknowledgements
 

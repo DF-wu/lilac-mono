@@ -49,8 +49,8 @@ type FormerPersistedGracefulRestartRow = {
   readonly payload_json: string;
 };
 
-const finiteNonNegativeSchema = z.number().finite().nonnegative();
-const finitePositiveSchema = z.number().finite().positive();
+const finiteNonNegativeSchema = z.number().nonnegative();
+const finitePositiveSchema = z.number().positive();
 const nonemptyStringSchema = z.string().min(1);
 
 function isFormerOpaqueSuperJsonValue(value: unknown): value is FormerOpaqueSuperJsonValue {
@@ -86,7 +86,7 @@ const jsonValueSchema: z.ZodType<GracefulRestartJsonValue> = z.lazy(() =>
   z.union([
     z.null(),
     z.boolean(),
-    z.number().finite(),
+    z.number(),
     z.string(),
     z.array(jsonValueSchema),
     z.record(z.string(), jsonValueSchema.optional()),

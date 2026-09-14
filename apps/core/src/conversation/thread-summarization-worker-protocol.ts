@@ -2,7 +2,7 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { z } from "zod";
 
 const nonemptyStringSchema = z.string().min(1);
-const countSchema = z.number().finite().int().nonnegative();
+const countSchema = z.number().int().nonnegative();
 const discordMessageRefSchema = z.strictObject({
   channelId: nonemptyStringSchema,
   messageId: nonemptyStringSchema,
@@ -22,11 +22,11 @@ const threadSummarizationInputSchema = z.strictObject({
   wait: z.boolean().optional(),
   force: z.boolean().optional(),
   clear: z.boolean().optional(),
-  limit: z.number().finite().optional(),
+  limit: z.number().optional(),
   threadId: nonemptyStringSchema.optional(),
-  beforeTs: z.number().finite().optional(),
-  afterTs: z.number().finite().optional(),
-  now: z.number().finite().optional(),
+  beforeTs: z.number().optional(),
+  afterTs: z.number().optional(),
+  now: z.number().optional(),
 });
 
 const eligibilityReasonCountsSchema = z.strictObject({

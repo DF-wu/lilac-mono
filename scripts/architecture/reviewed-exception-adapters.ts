@@ -1,6 +1,32 @@
 import type { ExceptionAdapter } from "./manifest.ts";
 
 export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly ExceptionAdapter[]>> = {
+  "apps/installer": [
+    {
+      identity: { module: "src/prompt.ts", exportName: "resolvePromptValue" },
+      category: "compatibility",
+      externalApi: { package: "@clack/prompts", exportName: "isCancel" },
+      direction: "signal-host",
+      reason:
+        "Translates Clack's cancellation sentinel to AbortError so the installer unwinds through terminal and staging cleanup before returning exit status 130.",
+    },
+    {
+      identity: { module: "src/failure.ts", exportName: "withInstallerCleanup" },
+      category: "compatibility",
+      externalApi: { package: "global", exportName: "Promise rejection" },
+      direction: "signal-host",
+      reason:
+        "Preserves operation or cleanup failure identity after cleanup has settled, with Panic taking precedence over cancellation.",
+    },
+    {
+      identity: { module: "src/wizard.ts", exportName: "runWizard" },
+      category: "compatibility",
+      externalApi: { package: "global", exportName: "Promise rejection" },
+      direction: "signal-host",
+      reason:
+        "Forwards unexpected setup defects to the sanitized installer host after closing the terminal, while returning recognized cancellation as an exit result.",
+    },
+  ],
   "apps/core": [
     {
       identity: {
@@ -29,6 +55,34 @@ export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly Excep
       direction: "signal-host",
       reason:
         "Adapts live-parent invariant or publication failure to the established lifecycle rejection contract.",
+    },
+    {
+      identity: {
+        module: "src/workflow/workflow-live-parent-bridge.ts",
+        exportName: "WorkflowLiveParentBridge.registerParent.then.<callback@1>",
+      },
+      category: "result-to-framework",
+      externalApi: {
+        package: "@stanley2058/lilac-core",
+        exportName: "live-parent lifecycle host",
+      },
+      direction: "signal-host",
+      reason:
+        "Rejects readiness with the selected child preparation failure after every preparation settles.",
+    },
+    {
+      identity: {
+        module: "src/workflow/workflow-live-parent-bridge.ts",
+        exportName: "WorkflowLiveParentBridge.registerParent.catch.<callback@1>",
+      },
+      category: "result-to-framework",
+      externalApi: {
+        package: "@stanley2058/lilac-core",
+        exportName: "live-parent lifecycle host",
+      },
+      direction: "signal-host",
+      reason:
+        "Releases failed live-parent registration before preserving the original readiness rejection and Panic precedence.",
     },
     {
       identity: {

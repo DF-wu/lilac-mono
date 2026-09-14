@@ -1,3 +1,4 @@
+import { hashMcpSession, withMcpSessionHeaders } from "../../src/mcp/session-context";
 import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -15,6 +16,7 @@ import { createCoreToolPluginManager as createCoreToolPluginManagerResult } from
 import { decodeCoreToolRequestMetadata } from "../../src/plugins/builtin/local-tools";
 import { McpRegistry } from "../../src/mcp";
 import { catalogToolStableId } from "../../src/mcp/catalog-identity";
+import { selectedLevel1ToolNames } from "../../src/surface/bridge/bus-agent-runner";
 import type { ConversationThreadToolService } from "../../src/conversation/thread-service";
 import type { DiscoveryService } from "../../src/discovery/discovery-service";
 import { DurableWorkflowStore } from "../../src/workflow/durable-workflow-store";
@@ -146,8 +148,7 @@ const EXPECTED_STABLE_LEVEL2_CALLABLE_IDS = [
   "onboarding.vcs_env",
   "resource.materialize",
   "search",
-  "skills.brief",
-  "skills.full",
+  "skills.read",
   "skills.list",
   "ssh.hosts",
   "ssh.probe",
@@ -220,6 +221,82 @@ async function writeExternalPlugin(params: {
 }
 
 describe("core tool plugin manager", () => {
+  it("keeps active toolsets alive across reload and releases a failed concurrent build", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-generation-"));
+    const dataDir = path.join(tmpRoot, "data");
+    await writeExternalPlugin({
+      dataDir,
+      pluginId: "connection",
+      entryBody: `export default {
+        meta: { id: "connection" },
+        create() {
+          let closed = false;
+          return {
+            level1: [{
+              name: "read", isEnabled: () => true,
+              createTool: () => ({
+                description: "Read a shared connection",
+                inputSchema: { type: "object", properties: {} },
+                execute: () => ({ closed }),
+              }),
+            }],
+            destroy: async () => { closed = true; },
+          };
+        },
+      };`,
+    });
+    const cfg = testConfig({});
+    const configRead = Promise.withResolvers<CoreConfig>();
+    const configReadStarted = Promise.withResolvers<void>();
+    let blockNextConfigRead = false;
+    const manager = createCoreToolPluginManager({
+      runtime: {
+        getConfig: async () => {
+          if (!blockNextConfigRead) return cfg;
+          blockNextConfigRead = false;
+          configReadStarted.resolve();
+          return configRead.promise;
+        },
+      },
+      dataDir,
+    });
+    const toolset = await manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents,
+    });
+    const name = toolset.catalog.find((entry) => entry.sourceId === "connection")!.modelName;
+    const executable = getExecutableTool(
+      toolset.tools as Record<
+        string,
+        {
+          execute?: (...args: readonly unknown[]) => unknown;
+        }
+      >,
+      name,
+    );
+    expect(await executable.execute({})).toEqual({ closed: false });
+    blockNextConfigRead = true;
+    const failedBuild = manager.buildLevel1Toolset({
+      cwd: dataDir,
+      runProfile: "primary",
+      editingToolMode: "none",
+      subagentDepth: 0,
+      subagentConfig: cfg.agent.subagents,
+    });
+    await configReadStarted.promise;
+    expect((await manager.reload()).status).toBe("ok");
+    expect(await executable.execute({})).toEqual({ closed: false });
+    expect((await toolset.release()).status).toBe("ok");
+    expect(await executable.execute({})).toEqual({ closed: false });
+    configRead.reject(new Error("configuration unavailable"));
+    await expect(failedBuild).rejects.toThrow("configuration unavailable");
+    expect(await executable.execute({})).toEqual({ closed: true });
+    expect((await manager.destroy()).status).toBe("ok");
+  });
+
   let tmpRoot: string | null = null;
   let workflowStore: DurableWorkflowStore | null = null;
 
@@ -1226,11 +1303,13 @@ export default {
           getCatalogServers: () => [
             {
               serverId: "allowed",
+              allowSubagents: true,
               serverInfo: { name: "allowed", version: "1.0.0" },
               description: "Allowed server tools.",
             },
             {
               serverId: "blocked",
+              allowSubagents: true,
               serverInfo: { name: "blocked", version: "1.0.0" },
               description: "Blocked server tools.",
             },
@@ -1274,6 +1353,83 @@ export default {
     expect(general.directToolNames.has("find_tools")).toBe(true);
   });
 
+  it("requires server opt-in for every subagent profile, including saved tool selections", async () => {
+    tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
+    const dataDir = path.join(tmpRoot, "data");
+    const cfg = testConfig({});
+    const client = new FakeMcpClient({ first: { tools: [mcpToolDefinition("lookup")] } });
+    let config = mcpConfig([stdioDefinition("docs")]);
+    let createCount = 0;
+    const registry = new McpRegistry({
+      configPath: path.join(dataDir, "mcp-config.yaml"),
+      reportFatalError: (error) => {
+        throw error;
+      },
+      dependencies: {
+        readConfig: async () => configSnapshot(config),
+        createClient: async () => {
+          createCount += 1;
+          return client;
+        },
+      },
+    });
+    await registry.init();
+    const manager = createCoreToolPluginManager({
+      runtime: { config: cfg, mcpRegistry: registry },
+      dataDir,
+    });
+    await manager.init();
+    const build = (runProfile: "primary" | "general" | "self" | "explore") =>
+      manager.buildLevel1Toolset({
+        cwd: dataDir,
+        runProfile,
+        editingToolMode: "none",
+        subagentDepth: runProfile === "primary" ? 0 : 1,
+        subagentConfig: cfg.agent.subagents,
+      });
+    const expectMcpExecution = async (
+      toolset: Awaited<ReturnType<typeof build>>,
+      modelName: string,
+    ) => {
+      const tools = toolset.tools as Record<
+        string,
+        { execute?: (...args: readonly unknown[]) => unknown }
+      >;
+      const result = await getExecutableTool(tools, modelName).execute(
+        {},
+        { toolCallId: "lookup", messages: [] },
+      );
+      expect(result).toMatchObject({ content: [{ type: "text" }] });
+    };
+    try {
+      const primary = await build("primary");
+      const entry = primary.catalog.find((entry) => entry.source === "mcp");
+      if (!entry) throw new Error("missing primary MCP tool");
+      const selectedIds = [entry.stableId];
+      for (const allowSubagents of [false, true, false]) {
+        config = mcpConfig([{ ...stdioDefinition("docs"), allowSubagents }]);
+        expect((await registry.reload("docs")).status).toBe("ok");
+        expect(registry.getCatalogServers()[0]?.allowSubagents).toBe(allowSubagents);
+        for (const profile of ["primary", "general", "self", "explore"] as const) {
+          const toolset = await build(profile);
+          const allowed = profile === "primary" || (allowSubagents && profile !== "explore");
+          expect(toolset.catalog.some((tool) => tool.stableId === entry.stableId)).toBe(allowed);
+          expect(toolset.tools[entry.modelName] !== undefined).toBe(allowed);
+          expect(toolset.catalogMetadata[entry.modelName] !== undefined).toBe(allowed);
+          expect(selectedLevel1ToolNames(toolset, selectedIds).has(entry.modelName)).toBe(allowed);
+          expect(toolset.directToolNames.has("find_tools")).toBe(allowed);
+          if (allowed) await expectMcpExecution(toolset, entry.modelName);
+          await toolset.release();
+        }
+      }
+      expect(createCount).toBe(1);
+      await primary.release();
+    } finally {
+      await manager.destroy();
+      await registry.shutdown();
+    }
+  });
+
   it("reuses one registry client while creating run-scoped MCP model projections", async () => {
     tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-core-plugin-manager-"));
     const dataDir = path.join(tmpRoot, "data");
@@ -1294,6 +1450,25 @@ export default {
       },
     });
     await registry.init();
+    const observedHeaders: Array<string | null> = [];
+    const transport = withMcpSessionHeaders({
+      type: "http",
+      url: "http://example.test",
+      fetch: Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+        observedHeaders.push(new Request(input, init).headers.get("x-lilac-session-hash"));
+        return new Response("ok");
+      }, fetch),
+    });
+    if ("start" in transport || transport.type !== "http" || !transport.fetch)
+      throw new Error("Expected HTTP fetch");
+    const scopedFetch = transport.fetch;
+    client.executeTool = async () => {
+      await scopedFetch("http://example.test", {
+        method: "POST",
+        body: JSON.stringify({ method: "tools/call" }),
+      });
+      return { content: [{ type: "text", text: "ok" }] };
+    };
     const registryTool = registry.getTools()[0];
     if (!registryTool) throw new Error("missing shared MCP tool");
     registryTool.tool.toModelOutput = () => ({
@@ -1333,6 +1508,19 @@ export default {
     expect(Object.is(firstEntry.tool, secondEntry.tool)).toBe(false);
     expect(Object.is(first.tools[firstEntry.modelName], firstEntry.tool)).toBe(true);
     expect(Object.is(second.tools[secondEntry.modelName], secondEntry.tool)).toBe(true);
+    await Promise.all([
+      first.tools[firstEntry.modelName]!.execute!(
+        {},
+        { toolCallId: "first", messages: [], context: { sessionId: "forged" } },
+      ),
+      second.tools[secondEntry.modelName]!.execute!(
+        {},
+        { toolCallId: "second", messages: [], context: { sessionId: "forged" } },
+      ),
+    ]);
+    expect(observedHeaders.sort()).toEqual(
+      [hashMcpSession("first"), hashMcpSession("second")].sort(),
+    );
 
     await manager.destroy();
     await registry.shutdown();

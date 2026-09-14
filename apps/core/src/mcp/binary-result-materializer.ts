@@ -7,6 +7,7 @@ import type { CallToolResult } from "@ai-sdk/mcp";
 import { errorCode } from "@stanley2058/lilac-utils";
 import { Result } from "better-result";
 
+import type { McpImageCheckpointReference } from "./image-checkpoint";
 import type { McpConvertedTool } from "./registry-types";
 
 type McpToModelOutput = NonNullable<McpConvertedTool["toModelOutput"]>;
@@ -52,9 +53,10 @@ type ClaimedDirectory =
   | { readonly kind: "failure"; readonly cause: Error };
 
 type BinaryContent = {
+  readonly outputIndex: number;
   readonly data: string;
   readonly mediaType: string;
-  readonly source: "image" | "resource";
+  readonly source: "image" | "audio" | "resource";
 };
 
 type MaterializedBinary = {
@@ -74,6 +76,7 @@ export type McpBinaryResultMaterializer = {
 
 export type McpBinaryResultMaterializerOptions = {
   readonly requestId: string;
+  readonly onImageMaterialized?: (reference: McpImageCheckpointReference) => void;
   readonly rootDir?: string;
   readonly hashId?: (domain: "request" | "call", id: string) => string;
 };
@@ -100,15 +103,16 @@ function extensionFor(mediaType: string): string {
 
 function binaryContent(output: CallToolResult): BinaryContent[] {
   if (!("content" in output) || !Array.isArray(output.content)) return [];
-  return output.content.flatMap((part): BinaryContent[] => {
-    if (part.type === "image") {
-      return [{ data: part.data, mediaType: part.mimeType, source: "image" }];
+  return output.content.flatMap((part, outputIndex): BinaryContent[] => {
+    if (part.type === "image" || part.type === "audio") {
+      return [{ outputIndex, data: part.data, mediaType: part.mimeType, source: part.type }];
     }
     if (part.type === "resource") {
       const blob = part.resource.blob;
       if (typeof blob !== "string") return [];
       return [
         {
+          outputIndex,
           data: blob,
           mediaType: part.resource.mimeType ?? "application/octet-stream",
           source: "resource",
@@ -198,11 +202,14 @@ function appendMaterializationNotice(
   files: readonly MaterializedBinary[],
   failed: number,
 ): McpModelOutput {
-  if (modelOutput.type !== "content") return modelOutput;
   const notice = {
-    mcpBinaryFiles: files,
+    mcpBinaryFiles: files.map((file) => ({ ...file })),
     ...(failed === 0 ? {} : { materializationFailures: failed }),
   };
+  if (modelOutput.type === "error-json") {
+    return { type: "error-json", value: { error: modelOutput.value, ...notice } };
+  }
+  if (modelOutput.type !== "content") return modelOutput;
   return {
     ...modelOutput,
     value: [
@@ -275,6 +282,25 @@ export function createMcpBinaryResultMaterializer(
         if (written.kind === "failure") {
           failed += 1;
           continue;
+        }
+        const modelPart =
+          modelOutput.type === "content" ? modelOutput.value[item.outputIndex] : undefined;
+        if (
+          item.source === "image" &&
+          modelPart?.type === "file" &&
+          modelPart.data.type === "data" &&
+          modelPart.data.data === item.data &&
+          modelPart.mediaType === item.mediaType
+        ) {
+          options.onImageMaterialized?.({
+            toolCallId,
+            outputIndex: item.outputIndex,
+            localPath: written.value,
+            mediaType: item.mediaType,
+            byteLength: content.byteLength,
+            sha256: createHash("sha256").update(content).digest("hex"),
+            ...(modelPart.filename === undefined ? {} : { filename: modelPart.filename }),
+          });
         }
         files.push({
           bytes: content.byteLength,

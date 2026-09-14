@@ -6,10 +6,9 @@ import { z } from "zod";
 import {
   SERVER_COMPACTION_REQUEST_HEADER,
   SERVER_COMPACTION_REQUEST_MARKER,
-} from "@stanley2058/lilac-utils";
+} from "@stanley2058/lilac-utils/server-compaction-request";
 
 import {
-  compactWithOpenAIResponses,
   compactWithOpenAIResponsesResult,
   declarationOnlyServerCompactionTools,
   materializeOpenAIServerCompaction,
@@ -54,7 +53,12 @@ function artifactMessage(part: unknown): ModelMessage {
 describe("OpenAI server compaction artifacts", () => {
   it("keeps only non-executable function declarations", () => {
     const tools = declarationOnlyServerCompactionTools({
-      local: tool({ inputSchema: z.object({}), execute: () => "executed" }),
+      local: tool({
+        inputSchema: z.object({}),
+        execute: () => "executed",
+        needsApproval: true,
+        contextSchema: z.object({}),
+      }),
       hosted: Object.assign(tool({ inputSchema: z.object({}) }), {
         type: "provider" as const,
         id: "openai.web_search",
@@ -64,6 +68,8 @@ describe("OpenAI server compaction artifacts", () => {
 
     expect(Object.keys(tools)).toEqual(["local"]);
     expect(tools.local).not.toHaveProperty("execute");
+    expect(tools.local).not.toHaveProperty("needsApproval");
+    expect(tools.local).not.toHaveProperty("contextSchema");
   });
 
   it("creates a marked stateless artifact from exactly one provider compaction part", async () => {
@@ -102,7 +108,7 @@ describe("OpenAI server compaction artifacts", () => {
       },
     });
 
-    const artifact = await compactWithOpenAIResponses({
+    const result = await compactWithOpenAIResponsesResult({
       model,
       replayKey: "openai:openai/gpt-test",
       portableSummary: "Portable summary with enough text to estimate.",
@@ -119,6 +125,9 @@ describe("OpenAI server compaction artifacts", () => {
       },
       providerOptions: { openai: { store: true, include: ["file_search_call.results"] } },
     });
+
+    expect(result.isOk()).toBe(true);
+    const artifact = result.unwrap();
 
     expect(toolExecutions).toBe(0);
     expect(artifact.metadata.estimatedTokens).toBeGreaterThan(1);

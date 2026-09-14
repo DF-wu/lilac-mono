@@ -33,7 +33,7 @@ export function outReqTopic(requestId: string): OutReqTopic {
 }
 
 const nonemptyStringSchema = z.string().min(1);
-const finiteNumberSchema = z.number().finite();
+const finiteNumberSchema = z.number();
 
 export const requestLifecycleStateSchema = z.enum([
   "queued",

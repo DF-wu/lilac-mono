@@ -10,9 +10,11 @@ import {
   expiryIndexKey,
   LAYOUT_MARKER,
   metadataKey,
+  reservationDecisionKey,
   reservationFenceKey,
   reservationKey,
   reservationTransitionKey,
+  reservationUpdateKey,
   signalBlobAdapterFailure,
   signalRetainedBlobPanic,
   temporaryKey,
@@ -93,6 +95,7 @@ export class LocalBlobBackend implements BlobBackend {
   readonly #root: string;
   #rootDevice?: number;
   #rootInode?: number;
+  #expiryCursor?: string;
 
   constructor(root: string) {
     this.#root = path.resolve(root);
@@ -195,8 +198,10 @@ export class LocalBlobBackend implements BlobBackend {
   }
 
   async readReservation(objectId: string): Promise<ResultType<string | null, BlobAdapterFailure>> {
+    let effective: string | null = null;
     for (const key of [
       reservationFenceKey(objectId),
+      reservationDecisionKey(objectId),
       reservationTransitionKey(objectId),
       reservationKey(objectId),
     ]) {
@@ -209,7 +214,10 @@ export class LocalBlobBackend implements BlobBackend {
         err: (failure) => ({ kind: "failure", failure }),
       });
       if (outcome.kind === "failure") return Result.err(outcome.failure);
-      if (outcome.value !== null) return Result.ok(outcome.value);
+      if (key === reservationKey(objectId)) {
+        return Result.ok(outcome.value === null ? null : (effective ?? outcome.value));
+      }
+      effective ??= outcome.value;
     }
     return Result.ok(null);
   }
@@ -229,9 +237,7 @@ export class LocalBlobBackend implements BlobBackend {
     });
     if (state.kind === "failure") return Result.err(state.failure);
     if (state.value !== expectedSerialized) return Result.ok(false);
-    const key = expectedSerialized.includes('"state":"pending"')
-      ? reservationTransitionKey(objectId)
-      : reservationFenceKey(objectId);
+    const key = reservationUpdateKey(objectId, expectedSerialized);
     const published = await this.#writeTextExclusive(
       key,
       serialized,
@@ -253,6 +259,8 @@ export class LocalBlobBackend implements BlobBackend {
     }
     if (!publishState.published) return Result.ok(false);
     const effective = await this.readReservation(objectId);
+    const deleted = effective.match({ ok: (value) => value === null, err: () => false });
+    if (deleted) return (await this.deleteKeys([key])).map(() => false);
     return effective.map((value) => value === serialized);
   }
 
@@ -413,28 +421,40 @@ export class LocalBlobBackend implements BlobBackend {
         const partitions = await fs.readdir(this.#safePath("expiry"), {
           withFileTypes: true,
         });
+        const cursorPartition = this.#expiryCursor?.split("/")[1];
         const eligiblePartitions = partitions
           .filter(
             (entry) =>
               entry.isDirectory() && /^\d{16}$/u.test(entry.name) && Number(entry.name) <= now,
           )
           .map((entry) => entry.name)
+          .filter((partition) => cursorPartition === undefined || partition >= cursorPartition)
           .sort();
-        const ids: string[] = [];
+        const keys: string[] = [];
         for (const partition of eligiblePartitions) {
           await this.#assertSafeParent(`expiry/${partition}/item`);
           const entries = await fs.readdir(this.#safePath(`expiry/${partition}`), {
             withFileTypes: true,
           });
+          entries.sort((first, second) => first.name.localeCompare(second.name));
           for (const entry of entries) {
-            if (entry.isFile() && /^b1_[0-9a-f]{32}$/u.test(entry.name)) {
-              ids.push(entry.name);
-            }
-            if (ids.length > limit) break;
+            if (!entry.isFile() || !/^b1_[0-9a-f]{32}$/u.test(entry.name)) continue;
+            const key = `expiry/${partition}/${entry.name}`;
+            if (this.#expiryCursor !== undefined && key <= this.#expiryCursor) continue;
+            keys.push(key);
+            if (keys.length > limit) break;
           }
-          if (ids.length > limit) break;
+          if (keys.length > limit) break;
         }
-        return { ids: ids.slice(0, limit), remaining: ids.length > limit };
+        const page = keys.slice(0, limit);
+        const remaining = keys.length > limit;
+        this.#expiryCursor = remaining ? page.at(-1) : undefined;
+        return {
+          ids: page
+            .map((key) => key.split("/")[2])
+            .filter((objectId): objectId is string => objectId !== undefined),
+          remaining,
+        };
       },
     });
   }

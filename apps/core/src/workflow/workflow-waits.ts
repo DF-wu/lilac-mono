@@ -8,18 +8,18 @@ const replyMetadataSchema = z
     replyToMessageId: z.string().min(1).optional(),
     discord: z
       .object({ replyToMessageId: z.string().min(1).optional() })
-      .passthrough()
+      .loose()
       .optional(),
     github: z
       .object({ replyToMessageId: z.string().min(1).optional() })
-      .passthrough()
+      .loose()
       .optional(),
     telegram: z
       .object({ replyToMessageId: z.string().min(1).optional() })
-      .passthrough()
+      .loose()
       .optional(),
   })
-  .passthrough();
+  .loose();
 
 export function workflowReplyMatchKey(platform: string, channelId: string): string {
   return `${platform}:${channelId}`;

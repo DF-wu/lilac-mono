@@ -1,3 +1,4 @@
+import { CoreClaudeAttemptLifecycle } from "./claude-attempt-lifecycle";
 import { captureError } from "../shared/error-capture.js";
 import { Database } from "bun:sqlite";
 import { isDeepStrictEqual } from "node:util";
@@ -94,11 +95,6 @@ import {
 
 const logger = createLogger({ module: "transcript-store" });
 const TRANSCRIPT_SCHEMA_VERSION = TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION;
-const CORE_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT = 32;
-const CORE_NAMED_CLAUDE_ACTIVE_ATTEMPT_LIMIT = 8;
-const CORE_PRIMARY_CLAUDE_ATTEMPT_RETENTION_LIMIT = 32;
-const CORE_PRIMARY_CLAUDE_ACTIVE_ATTEMPT_LIMIT = 8;
-
 function surfaceRefPlatformPlaceholders(firstParamIndex: number): string {
   return SURFACE_REF_PLATFORMS.map((_, index) => `?${firstParamIndex + index}`).join(", ");
 }
@@ -1239,6 +1235,8 @@ export type TranscriptStore = {
 
 export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
   private readonly db: Database;
+  private readonly namedClaudeAttempts: CoreClaudeAttemptLifecycle;
+  private readonly primaryClaudeAttempts: CoreClaudeAttemptLifecycle;
   private readonly getRetention: () => {
     readonly maxAgeMs: RetentionLimit;
     readonly maxRequests: RetentionLimit;
@@ -1266,6 +1264,15 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     } = {},
   ) {
     this.db = new Database(dbPath);
+    this.namedClaudeAttempts = new CoreClaudeAttemptLifecycle(this.db, "named", (reason, message) =>
+      transactionConflict("publish-core-named-claude-success", reason, message),
+    );
+    this.primaryClaudeAttempts = new CoreClaudeAttemptLifecycle(
+      this.db,
+      "primary",
+      (reason, message) =>
+        transactionConflict("publish-core-primary-claude-success", reason, message),
+    );
     const retention = options.retention ?? {
       maxAgeMs: { kind: "bounded", value: DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS },
       maxRequests: { kind: "bounded", value: DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS },
@@ -1916,6 +1923,20 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         this.db.run(
           "INSERT INTO transcript_schema_migrations (version, applied_ts) VALUES (?, ?)",
           [10, Date.now()],
+        );
+      }
+      if (version < 11) {
+        this.db.run("ALTER TABLE surface_message_to_request ADD COLUMN deleted_ts INTEGER");
+        this.db.run(`
+          CREATE TRIGGER delete_transcript_surface_aliases
+          AFTER DELETE ON request_transcripts
+          BEGIN
+            DELETE FROM surface_message_to_request WHERE request_id = OLD.request_id;
+          END
+        `);
+        this.db.run(
+          "INSERT INTO transcript_schema_migrations (version, applied_ts) VALUES (?, ?)",
+          [11, Date.now()],
         );
       }
       const foreignKeyFailures = this.db
@@ -3626,7 +3647,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
             const linkedOutput = this.db
               .query(
                 `SELECT 1 FROM surface_message_to_request
-               WHERE request_id = ? AND platform = ? AND channel_id = ?
+               WHERE request_id = ? AND platform = ? AND channel_id = ? AND deleted_ts IS NULL
                LIMIT 1`,
               )
               .get(atom.requestId, input.requestClient, input.sessionId);
@@ -3936,18 +3957,20 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       () => {
         const mapping = this.db
           .query<{ request_id: string }, [AdapterPlatform, string, string]>(
-            "SELECT request_id FROM surface_message_to_request WHERE platform = ? AND channel_id = ? AND message_id = ?",
+            "SELECT request_id FROM surface_message_to_request WHERE platform = ? AND channel_id = ? AND message_id = ? AND deleted_ts IS NULL",
           )
           .get(input.platform, input.channelId, input.messageId);
         if (!mapping) return Result.ok({ checkpointDeleted: false });
 
         this.db.run(
-          "DELETE FROM surface_message_to_request WHERE platform = ? AND channel_id = ? AND message_id = ?",
-          [input.platform, input.channelId, input.messageId],
+          "UPDATE surface_message_to_request SET deleted_ts = ? WHERE platform = ? AND channel_id = ? AND message_id = ?",
+          [Date.now(), input.platform, input.channelId, input.messageId],
         );
 
         const remaining = this.db
-          .query("SELECT 1 FROM surface_message_to_request WHERE request_id = ? LIMIT 1")
+          .query(
+            "SELECT 1 FROM surface_message_to_request WHERE request_id = ? AND deleted_ts IS NULL LIMIT 1",
+          )
           .get(mapping.request_id);
         if (remaining)
           return Result.ok({ requestId: mapping.request_id, checkpointDeleted: false });
@@ -4019,7 +4042,9 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       this.db,
       () => {
         const linked = this.db
-          .query("SELECT 1 FROM surface_message_to_request WHERE request_id = ? LIMIT 1")
+          .query(
+            "SELECT 1 FROM surface_message_to_request WHERE request_id = ? AND deleted_ts IS NULL LIMIT 1",
+          )
           .get(input.requestId);
         if (linked) return Result.ok(false);
 
@@ -4256,245 +4281,61 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
   }
 
   reserveCoreNamedClaudeSessionAttempt(
-    inputValue: ReserveCoreNamedClaudeSessionAttempt,
+    input: ReserveCoreNamedClaudeSessionAttempt,
   ): ResultType<CoreNamedClaudeSessionAttempt, CoreClaudeAttemptMutationError> {
-    const input = inputValue;
-    const reserve = runBunSqliteTransaction<
-      CoreNamedClaudeSessionAttempt,
-      CoreClaudeAttemptMutationError,
-      TranscriptStoreSqliteDriverFailure
-    >(
+    return runBunSqliteTransaction(
       this.db,
-      () => {
-        const bindingHolder: { value: CoreNamedClaudeSessionBinding | null } = { value: null };
-        const bindingError = this.readCoreNamedClaudeSessionBinding({
-          providerId: input.providerId,
-          requestClient: input.requestClient,
-          lilacSessionId: input.lilacSessionId,
-        }).match({
-          err: (error) => error,
-          ok: (value) => {
-            bindingHolder.value = value;
-            return null;
-          },
-        });
-        if (bindingError) return Result.err(bindingError);
-        const binding = bindingHolder.value;
-        if (input.expectedBindingRevision === null) {
-          if (binding !== null) {
-            return Result.err(
-              transactionConflict(
-                "publish-core-named-claude-success",
-                "publication-fence-lost",
-                "Core named Claude binding changed before reservation",
-              ),
-            );
-          }
-        } else if (
-          binding === null ||
-          binding.revision !== input.expectedBindingRevision ||
-          (input.sourceSessionId !== null &&
-            (binding.claudeSessionId !== input.sourceSessionId ||
-              binding.executionScopeHashVersion !== input.executionScopeHashVersion ||
-              binding.executionScopeHash !== input.executionScopeHash))
-        ) {
-          return Result.err(
-            transactionConflict(
-              "publish-core-named-claude-success",
-              "publication-fence-lost",
-              "Core named Claude binding changed before reservation",
-            ),
-          );
-        }
-        let activeCount = 0;
-        const activeCountError = decodeTranscriptRow({
-          storeKind: "count",
-          row: this.db
-            .query<DecodedTranscriptCountRow, [AdapterPlatform, string, string]>(
-              `SELECT COUNT(*) AS count FROM core_named_claude_attempts
-               WHERE request_client = ? AND session_id = ? AND provider_id = ? AND state = 'active'`,
-            )
-            .get(input.requestClient, input.lilacSessionId, input.providerId),
-          schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
-          recordId: `named-active:${input.requestClient}:${input.lilacSessionId}:${input.providerId}`,
-        })
-          .mapError((error) =>
-            transactionConflict(
-              "publish-core-named-claude-success",
-              "publication-verification-failed",
-              error.message,
-            ),
-          )
-          .match({
-            err: (error) => error,
-            ok: (value) => {
-              activeCount = value.value.count;
-              return null;
-            },
-          });
-        if (activeCountError) return Result.err(activeCountError);
-        if (activeCount >= CORE_NAMED_CLAUDE_ACTIVE_ATTEMPT_LIMIT) {
-          return Result.err(
-            transactionConflict(
-              "publish-core-named-claude-success",
-              "attempt-not-retained",
-              "Too many active Core named Claude attempts are retained",
-            ),
-          );
-        }
-        const collidedAttempt = this.getCoreNamedClaudeSessionAttempt({
-          providerId: input.providerId,
-          requestClient: input.requestClient,
-          lilacSessionId: input.lilacSessionId,
-          requestId: input.requestId,
-          attemptIndex: input.attemptIndex,
-        });
-        let allocatedAttemptIndex = input.attemptIndex;
-        if (collidedAttempt !== null) {
-          const latestMatchingParity = this.db
-            .query<{ attempt_index: number }, [AdapterPlatform, string, string, string, number]>(
-              `SELECT attempt_index FROM core_named_claude_attempts
-               WHERE request_client = ? AND session_id = ? AND provider_id = ?
-                 AND request_id = ? AND attempt_index % 2 = ?
-               ORDER BY attempt_index DESC LIMIT 1`,
-            )
-            .get(
-              input.requestClient,
-              input.lilacSessionId,
-              input.providerId,
-              input.requestId,
-              input.attemptIndex % 2,
-            );
-          allocatedAttemptIndex = (latestMatchingParity?.attempt_index ?? input.attemptIndex) + 2;
-        }
-        const now = Date.now();
-        this.db.run(
-          `INSERT INTO core_named_claude_attempts (
+      () =>
+        this.namedClaudeAttempts.reserve(input, {
+          readBinding: () => this.readCoreNamedClaudeSessionBinding(input),
+          readAttempt: (attemptIndex) =>
+            this.getCoreNamedClaudeSessionAttempt({ ...input, attemptIndex }),
+          insert: (binding, allocatedAttemptIndex, now) => {
+            this.db.run(
+              `INSERT INTO core_named_claude_attempts (
            product, request_client, session_id, provider_id, source_terminal_request_id,
            source_canonical_head_hash, source_canonical_message_count,
            execution_scope_hash_version, execution_scope_hash, request_id, attempt_index,
            candidate_session_id, source_session_id, expected_binding_revision, state,
            created_ts, updated_ts
          ) VALUES ('core-named', ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
-          [
-            input.requestClient,
-            input.lilacSessionId,
-            input.providerId,
-            binding?.terminalRequestId ?? null,
-            binding?.canonicalHeadHash ?? null,
-            binding?.canonicalMessageCount ?? null,
-            input.executionScopeHash,
-            input.requestId,
-            allocatedAttemptIndex,
-            input.candidateSessionId,
-            input.sourceSessionId,
-            input.expectedBindingRevision,
-            now,
-            now,
-          ],
-        );
-        this.pruneCoreNamedClaudeAttempts(input);
-        const attempt = this.getCoreNamedClaudeSessionAttempt({
-          providerId: input.providerId,
-          requestClient: input.requestClient,
-          lilacSessionId: input.lilacSessionId,
-          requestId: input.requestId,
-          attemptIndex: allocatedAttemptIndex,
-        });
-        if (!attempt) {
-          return Result.err(
-            transactionConflict(
-              "publish-core-named-claude-success",
-              "attempt-not-retained",
-              "Reserved Core named Claude attempt was not retained",
-            ),
-          );
-        }
-        return Result.ok(attempt);
-      },
+              [
+                input.requestClient,
+                input.lilacSessionId,
+                input.providerId,
+                binding?.terminalRequestId ?? null,
+                binding?.canonicalHeadHash ?? null,
+                binding?.canonicalMessageCount ?? null,
+                input.executionScopeHash,
+                input.requestId,
+                allocatedAttemptIndex,
+                input.candidateSessionId,
+                input.sourceSessionId,
+                input.expectedBindingRevision,
+                now,
+                now,
+              ],
+            );
+          },
+          prune: () => this.pruneCoreNamedClaudeAttempts(input),
+        }),
       (cause) => classifyTranscriptSqliteDriverFailure("reserve-core-named-claude-attempt", cause),
     );
-    return reserve;
   }
 
   recordCoreNamedClaudeSessionAttemptOutcome(
-    inputValue: RecordCoreNamedClaudeSessionAttemptOutcome,
+    input: RecordCoreNamedClaudeSessionAttemptOutcome,
   ): ResultType<CoreNamedClaudeSessionAttempt, CoreClaudeAttemptMutationError> {
-    const input = inputValue;
-    const record = runBunSqliteTransaction<
-      CoreNamedClaudeSessionAttempt,
-      TranscriptTransactionConflict,
-      TranscriptStoreSqliteDriverFailure
-    >(
+    return runBunSqliteTransaction(
       this.db,
-      () => {
-        const attemptKey = {
-          providerId: input.providerId,
-          requestClient: input.requestClient,
-          lilacSessionId: input.lilacSessionId,
-          requestId: input.requestId,
-          attemptIndex: input.attemptIndex,
-        } as const;
-        const current = this.getCoreNamedClaudeSessionAttempt(attemptKey);
-        if (!current) {
-          return Result.err(
-            transactionConflict(
-              "publish-core-named-claude-success",
-              "attempt-not-found",
-              `Core named Claude attempt '${input.requestId}' was not found`,
-            ),
-          );
-        }
-        if (current.state !== "active") {
-          if (current.state === input.state) return Result.ok(current);
-          return Result.err(
-            transactionConflict(
-              "publish-core-named-claude-success",
-              "attempt-terminal",
-              `Core named Claude attempt is already terminal as '${current.state}'`,
-            ),
-          );
-        }
-        const now = Date.now();
-        const updated = this.db.run(
-          `UPDATE core_named_claude_attempts SET state = ?, updated_ts = ?
-         WHERE request_client = ? AND session_id = ? AND provider_id = ?
-           AND request_id = ? AND attempt_index = ? AND state = 'active'`,
-          [
-            input.state,
-            now,
-            input.requestClient,
-            input.lilacSessionId,
-            input.providerId,
-            input.requestId,
-            input.attemptIndex,
-          ],
-        );
-        if (updated.changes !== 1) {
-          return Result.err(
-            transactionConflict(
-              "publish-core-named-claude-success",
-              "publication-fence-lost",
-              "Core named Claude attempt lost its active fence",
-            ),
-          );
-        }
-        this.pruneCoreNamedClaudeAttempts(input);
-        const attempt = this.getCoreNamedClaudeSessionAttempt(attemptKey);
-        if (!attempt) {
-          return Result.err(
-            transactionConflict(
-              "publish-core-named-claude-success",
-              "attempt-not-retained",
-              "Updated Core named Claude attempt was not retained",
-            ),
-          );
-        }
-        return Result.ok(attempt);
-      },
+      () =>
+        this.namedClaudeAttempts.recordOutcome(
+          input,
+          () => this.getCoreNamedClaudeSessionAttempt(input),
+          () => this.pruneCoreNamedClaudeAttempts(input),
+        ),
       (cause) => classifyTranscriptSqliteDriverFailure("record-core-named-claude-outcome", cause),
     );
-    return record;
   }
 
   publishCoreNamedClaudeSuccess(
@@ -4905,246 +4746,63 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
   }
 
   reserveCorePrimaryClaudeSessionAttempt(
-    inputValue: ReserveCorePrimaryClaudeSessionAttempt,
+    input: ReserveCorePrimaryClaudeSessionAttempt,
   ): ResultType<CorePrimaryClaudeSessionAttempt, CoreClaudeAttemptMutationError> {
-    const input = inputValue;
-    const reserve = runBunSqliteTransaction<
-      CorePrimaryClaudeSessionAttempt,
-      CoreClaudeAttemptMutationError,
-      TranscriptStoreSqliteDriverFailure
-    >(
+    return runBunSqliteTransaction(
       this.db,
-      () => {
-        const bindingResult = this.readCorePrimaryClaudeSessionBinding({
-          providerId: input.providerId,
-          requestClient: input.requestClient,
-          lilacSessionId: input.lilacSessionId,
-        });
-        const continueReservation = bindingResult.match<
-          () => ResultType<CorePrimaryClaudeSessionAttempt, CoreClaudeAttemptMutationError>
-        >({
-          err: (error) => () => Result.err(error),
-          ok: (binding) => () => {
-            if (input.expectedBindingRevision === null) {
-              if (binding !== null) {
-                return Result.err(
-                  transactionConflict(
-                    "publish-core-primary-claude-success",
-                    "publication-fence-lost",
-                    "Core primary Claude binding changed before reservation",
-                  ),
-                );
-              }
-            } else if (
-              binding === null ||
-              binding.revision !== input.expectedBindingRevision ||
-              (input.sourceSessionId !== null &&
-                (binding.claudeSessionId !== input.sourceSessionId ||
-                  binding.executionScopeHashVersion !== input.executionScopeHashVersion ||
-                  binding.executionScopeHash !== input.executionScopeHash))
-            ) {
-              return Result.err(
-                transactionConflict(
-                  "publish-core-primary-claude-success",
-                  "publication-fence-lost",
-                  "Core primary Claude binding changed before reservation",
-                ),
-              );
-            }
-            const activeCountResult = decodeTranscriptRow({
-              storeKind: "count",
-              row: this.db
-                .query<DecodedTranscriptCountRow, ["discord", string, string]>(
-                  `SELECT COUNT(*) AS count FROM core_primary_claude_attempts
-             WHERE request_client = ? AND session_id = ? AND provider_id = ? AND state = 'active'`,
-                )
-                .get(input.requestClient, input.lilacSessionId, input.providerId),
-              schemaVersion: TRANSCRIPT_SCHEMA_VERSION,
-              recordId: `primary-active:${input.lilacSessionId}:${input.providerId}`,
-            })
-              .map((value) => value.value.count)
-              .mapError((error) =>
-                transactionConflict(
-                  "publish-core-primary-claude-success",
-                  "publication-verification-failed",
-                  error.message,
-                ),
-              );
-            const finishReservation = activeCountResult.match<
-              () => ResultType<CorePrimaryClaudeSessionAttempt, CoreClaudeAttemptMutationError>
-            >({
-              err: (error) => () => Result.err(error),
-              ok: (activeCount) => () => {
-                if (activeCount >= CORE_PRIMARY_CLAUDE_ACTIVE_ATTEMPT_LIMIT) {
-                  return Result.err(
-                    transactionConflict(
-                      "publish-core-primary-claude-success",
-                      "attempt-not-retained",
-                      "Too many active Core primary Claude attempts are retained",
-                    ),
-                  );
-                }
-                const collidedAttempt = this.getCorePrimaryClaudeSessionAttempt({
-                  providerId: input.providerId,
-                  requestClient: input.requestClient,
-                  lilacSessionId: input.lilacSessionId,
-                  requestId: input.requestId,
-                  attemptIndex: input.attemptIndex,
-                });
-                let allocatedAttemptIndex = input.attemptIndex;
-                if (collidedAttempt !== null) {
-                  const latestMatchingParity = this.db
-                    .query<{ attempt_index: number }, ["discord", string, string, string, number]>(
-                      `SELECT attempt_index FROM core_primary_claude_attempts
-                       WHERE request_client = ? AND session_id = ? AND provider_id = ?
-                         AND request_id = ? AND attempt_index % 2 = ?
-                       ORDER BY attempt_index DESC LIMIT 1`,
-                    )
-                    .get(
-                      input.requestClient,
-                      input.lilacSessionId,
-                      input.providerId,
-                      input.requestId,
-                      input.attemptIndex % 2,
-                    );
-                  allocatedAttemptIndex =
-                    (latestMatchingParity?.attempt_index ?? input.attemptIndex) + 2;
-                }
-                const now = Date.now();
-                this.db.run(
-                  `INSERT INTO core_primary_claude_attempts (
+      () =>
+        this.primaryClaudeAttempts.reserve(input, {
+          readBinding: () => this.readCorePrimaryClaudeSessionBinding(input),
+          readAttempt: (attemptIndex) =>
+            this.getCorePrimaryClaudeSessionAttempt({ ...input, attemptIndex }),
+          insert: (binding, allocatedAttemptIndex, now) => {
+            this.db.run(
+              `INSERT INTO core_primary_claude_attempts (
             product, request_client, session_id, provider_id, source_lineage_version,
             source_atom_count, source_prefix_digest, source_canonical_message_count,
             execution_scope_hash_version, execution_scope_hash, request_id, attempt_index,
             candidate_session_id, source_session_id, expected_binding_revision, state,
             created_ts, updated_ts
           ) VALUES ('core-primary', ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
-                  [
-                    input.requestClient,
-                    input.lilacSessionId,
-                    input.providerId,
-                    binding?.lineageVersion ?? null,
-                    binding?.atomCount ?? null,
-                    binding?.prefixDigest ?? null,
-                    binding?.canonicalMessageCount ?? null,
-                    input.executionScopeHash,
-                    input.requestId,
-                    allocatedAttemptIndex,
-                    input.candidateSessionId,
-                    input.sourceSessionId,
-                    input.expectedBindingRevision,
-                    now,
-                    now,
-                  ],
-                );
-                this.pruneCorePrimaryClaudeAttempts(input);
-                const attempt = this.getCorePrimaryClaudeSessionAttempt({
-                  providerId: input.providerId,
-                  requestClient: input.requestClient,
-                  lilacSessionId: input.lilacSessionId,
-                  requestId: input.requestId,
-                  attemptIndex: allocatedAttemptIndex,
-                });
-                if (!attempt) {
-                  return Result.err(
-                    transactionConflict(
-                      "publish-core-primary-claude-success",
-                      "attempt-not-retained",
-                      "Reserved Core primary Claude attempt was not retained",
-                    ),
-                  );
-                }
-                return Result.ok(attempt);
-              },
-            });
-            return finishReservation();
+              [
+                input.requestClient,
+                input.lilacSessionId,
+                input.providerId,
+                binding?.lineageVersion ?? null,
+                binding?.atomCount ?? null,
+                binding?.prefixDigest ?? null,
+                binding?.canonicalMessageCount ?? null,
+                input.executionScopeHash,
+                input.requestId,
+                allocatedAttemptIndex,
+                input.candidateSessionId,
+                input.sourceSessionId,
+                input.expectedBindingRevision,
+                now,
+                now,
+              ],
+            );
           },
-        });
-        return continueReservation();
-      },
+          prune: () => this.pruneCorePrimaryClaudeAttempts(input),
+        }),
       (cause) =>
         classifyTranscriptSqliteDriverFailure("reserve-core-primary-claude-attempt", cause),
     );
-    return reserve;
   }
 
   recordCorePrimaryClaudeSessionAttemptOutcome(
-    inputValue: RecordCorePrimaryClaudeSessionAttemptOutcome,
+    input: RecordCorePrimaryClaudeSessionAttemptOutcome,
   ): ResultType<CorePrimaryClaudeSessionAttempt, CoreClaudeAttemptMutationError> {
-    const input = inputValue;
-    const record = runBunSqliteTransaction<
-      CorePrimaryClaudeSessionAttempt,
-      TranscriptTransactionConflict,
-      TranscriptStoreSqliteDriverFailure
-    >(
+    return runBunSqliteTransaction(
       this.db,
-      () => {
-        const attemptKey = {
-          providerId: input.providerId,
-          requestClient: input.requestClient,
-          lilacSessionId: input.lilacSessionId,
-          requestId: input.requestId,
-          attemptIndex: input.attemptIndex,
-        } as const;
-        const current = this.getCorePrimaryClaudeSessionAttempt(attemptKey);
-        if (!current) {
-          return Result.err(
-            transactionConflict(
-              "publish-core-primary-claude-success",
-              "attempt-not-found",
-              `Core primary Claude attempt '${input.requestId}' was not found`,
-            ),
-          );
-        }
-        if (current.state !== "active") {
-          if (current.state === input.state) return Result.ok(current);
-          return Result.err(
-            transactionConflict(
-              "publish-core-primary-claude-success",
-              "attempt-terminal",
-              `Core primary Claude attempt is already terminal as '${current.state}'`,
-            ),
-          );
-        }
-        const updated = this.db.run(
-          `UPDATE core_primary_claude_attempts SET state = ?, updated_ts = ?
-         WHERE request_client = ? AND session_id = ? AND provider_id = ?
-           AND request_id = ? AND attempt_index = ? AND state = 'active'`,
-          [
-            input.state,
-            Date.now(),
-            input.requestClient,
-            input.lilacSessionId,
-            input.providerId,
-            input.requestId,
-            input.attemptIndex,
-          ],
-        );
-        if (updated.changes !== 1) {
-          return Result.err(
-            transactionConflict(
-              "publish-core-primary-claude-success",
-              "publication-fence-lost",
-              "Core primary Claude attempt lost its active fence",
-            ),
-          );
-        }
-        this.pruneCorePrimaryClaudeAttempts(input);
-        const attempt = this.getCorePrimaryClaudeSessionAttempt(attemptKey);
-        if (!attempt) {
-          return Result.err(
-            transactionConflict(
-              "publish-core-primary-claude-success",
-              "attempt-not-retained",
-              "Updated Core primary Claude attempt was not retained",
-            ),
-          );
-        }
-        return Result.ok(attempt);
-      },
+      () =>
+        this.primaryClaudeAttempts.recordOutcome(
+          input,
+          () => this.getCorePrimaryClaudeSessionAttempt(input),
+          () => this.pruneCorePrimaryClaudeAttempts(input),
+        ),
       (cause) => classifyTranscriptSqliteDriverFailure("record-core-primary-claude-outcome", cause),
     );
-    return record;
   }
 
   publishCorePrimaryClaudeSuccess(
@@ -5406,6 +5064,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         FROM surface_message_to_request
         WHERE request_id = ?1
           AND platform IN (${surfaceRefPlatformPlaceholders(2)})
+          AND deleted_ts IS NULL
         ORDER BY created_ts ASC, rowid ASC
         `,
       )
@@ -5458,13 +5117,14 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           rt.final_text
         FROM request_transcripts rt
         JOIN surface_message_to_request sm
-          ON sm.request_id = rt.request_id
+          ON sm.request_id = rt.request_id AND sm.deleted_ts IS NULL
         WHERE sm.rowid = (
           SELECT sm2.rowid
           FROM surface_message_to_request sm2
           WHERE sm2.request_id = sm.request_id
             AND sm2.platform = sm.platform
             AND sm2.channel_id = sm.channel_id
+            AND sm2.deleted_ts IS NULL
           ORDER BY sm2.created_ts DESC, sm2.rowid DESC
           LIMIT 1
         )
@@ -5529,6 +5189,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
         LEFT JOIN surface_message_to_request sm
           ON sm.request_id = rt.request_id
           AND sm.platform IN (${surfaceRefPlatformPlaceholders(1)})
+          AND sm.deleted_ts IS NULL
         ORDER BY rt.updated_ts DESC, rt.created_ts DESC, sm.created_ts ASC, sm.rowid ASC
         `,
       )
@@ -5803,10 +5464,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       )
       .all();
     const recoverActive = this.db.transaction(() => {
-      this.db.run(
-        "UPDATE core_named_claude_attempts SET state = 'uncertain', updated_ts = ? WHERE state = 'active'",
-        [Date.now()],
-      );
+      this.namedClaudeAttempts.markInterrupted(Date.now());
     });
     recoverActive.immediate();
     for (const row of interrupted) {
@@ -5913,21 +5571,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     lilacSessionId: string;
     providerId: string;
   }): DeferredTranscriptEvent | undefined {
-    const pruned = this.db.run(
-      `DELETE FROM core_named_claude_attempts
-       WHERE rowid IN (
-         SELECT rowid FROM core_named_claude_attempts
-         WHERE request_client = ? AND session_id = ? AND provider_id = ? AND state <> 'active'
-         ORDER BY updated_ts DESC, rowid DESC
-         LIMIT -1 OFFSET ?
-       )`,
-      [
-        input.requestClient,
-        input.lilacSessionId,
-        input.providerId,
-        CORE_NAMED_CLAUDE_ATTEMPT_RETENTION_LIMIT,
-      ],
-    ).changes;
+    const pruned = this.namedClaudeAttempts.prune(input);
     if (pruned > 0) {
       return {
         kind: "log",
@@ -6273,10 +5917,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
       )
       .all();
     const recoverActive = this.db.transaction(() => {
-      this.db.run(
-        "UPDATE core_primary_claude_attempts SET state = 'uncertain', updated_ts = ? WHERE state = 'active'",
-        [Date.now()],
-      );
+      this.primaryClaudeAttempts.markInterrupted(Date.now());
     });
     recoverActive.immediate();
     for (const row of interrupted) {
@@ -6385,21 +6026,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     lilacSessionId: string;
     providerId: string;
   }): DeferredTranscriptEvent | undefined {
-    const pruned = this.db.run(
-      `DELETE FROM core_primary_claude_attempts
-       WHERE rowid IN (
-         SELECT rowid FROM core_primary_claude_attempts
-         WHERE request_client = ? AND session_id = ? AND provider_id = ? AND state <> 'active'
-         ORDER BY updated_ts DESC, rowid DESC
-         LIMIT -1 OFFSET ?
-       )`,
-      [
-        input.requestClient,
-        input.lilacSessionId,
-        input.providerId,
-        CORE_PRIMARY_CLAUDE_ATTEMPT_RETENTION_LIMIT,
-      ],
-    ).changes;
+    const pruned = this.primaryClaudeAttempts.prune(input);
     if (pruned > 0) {
       return {
         kind: "log",
@@ -6460,7 +6087,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           AND context_meta_json IS NOT NULL
           AND NOT EXISTS (
             SELECT 1 FROM surface_message_to_request sm
-            WHERE sm.request_id = request_transcripts.request_id
+            WHERE sm.request_id = request_transcripts.request_id AND sm.deleted_ts IS NULL
           )
           AND NOT EXISTS (
             SELECT 1 FROM core_lineage_request_refs lineage_ref
@@ -6499,6 +6126,15 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     if (retention.maxAgeMs.kind === "bounded") {
       const cutoff = now - retention.maxAgeMs.value;
       this.db.run(
+        `DELETE FROM surface_message_to_request
+         WHERE deleted_ts < ?
+           AND NOT EXISTS (
+             SELECT 1 FROM request_transcripts transcript
+             WHERE transcript.request_id = surface_message_to_request.request_id
+           )`,
+        [cutoff],
+      );
+      this.db.run(
         `DELETE FROM request_transcripts
          WHERE updated_ts < ?
            AND NOT EXISTS (
@@ -6530,9 +6166,6 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
 
         for (const v of victims) {
           this.db.run("DELETE FROM request_transcripts WHERE request_id = ?", [v.request_id]);
-          this.db.run("DELETE FROM surface_message_to_request WHERE request_id = ?", [
-            v.request_id,
-          ]);
         }
       }
     }

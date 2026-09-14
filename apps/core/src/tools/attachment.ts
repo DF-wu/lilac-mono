@@ -1,4 +1,4 @@
-import { tool, type FilePart, type ImagePart, type ModelMessage } from "ai";
+import { tool, type FilePart, type ModelMessage } from "ai";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { lilacEventTypes, type LilacBus } from "@stanley2058/lilac-event-bus";
 import {
@@ -104,7 +104,7 @@ function normalizeAttachmentAddFilesInput(raw: unknown): unknown {
   };
 }
 
-type AttachmentData = ImagePart["image"] | FilePart["data"];
+type AttachmentData = FilePart["data"];
 
 function asBuffer(data: AttachmentData): Buffer {
   if (Buffer.isBuffer(data)) return data;
@@ -159,7 +159,7 @@ type DetectedAttachment =
       source: string;
       mediaTypeHint?: string;
       filenameHint?: string;
-      data: ImagePart["image"];
+      data: FilePart["data"];
     }
   | {
       kind: "file";

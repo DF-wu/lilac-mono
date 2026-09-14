@@ -32,10 +32,6 @@
 
 | 文件 | 內容 |
 | --- | --- |
-| [`../apps/mini-lilac/README.md`](../apps/mini-lilac/README.md) | Mini Lilac 安裝與 first run |
-| [`../apps/mini-lilac-server/README.md`](../apps/mini-lilac-server/README.md) | Mini server 設定、provider/auth、API 與 history recovery |
-| [`../apps/mini-lilac-tui/README.md`](../apps/mini-lilac-tui/README.md) | Mini TUI options、keyboard model 與 rendering |
-| [`../apps/acp-controller/README.md`](../apps/acp-controller/README.md) | `lilac-acp` build、session search 與 detached prompts |
 
 ## Contributors
 

@@ -1932,6 +1932,72 @@ function makeDiagnostic(
   };
 }
 
+interface SuggestionProgram extends ts.Program {
+  getSuggestionDiagnostics(sourceFile: ts.SourceFile): readonly ts.DiagnosticWithLocation[];
+}
+
+function hasSuggestionDiagnostics(program: ts.Program): program is SuggestionProgram {
+  return (
+    "getSuggestionDiagnostics" in program && typeof program.getSuggestionDiagnostics === "function"
+  );
+}
+
+function diagnosticNode(sourceFile: ts.SourceFile, start: number, length: number): ts.Node {
+  const end = start + length;
+  const find = (node: ts.Node): ts.Node => {
+    return (
+      ts.forEachChild(node, (child) => {
+        if (child.getStart(sourceFile) > start || child.end < end) return undefined;
+        return find(child);
+      }) ?? node
+    );
+  };
+  return find(sourceFile);
+}
+
+function analyzeDeprecatedReferences(
+  program: ts.Program,
+  sourceFile: ts.SourceFile,
+  workspace: WorkspaceArchitecture,
+  workspaceRoot: string,
+  diagnostics: ArchitectureDiagnostic[],
+): void {
+  // TS6 exposes editor suggestions on Program at runtime but omits this method from its public types.
+  // Reusing it preserves TypeScript's alias and overload handling without creating a second Program.
+  if (!hasSuggestionDiagnostics(program)) {
+    throw new Error(
+      `TypeScript ${ts.version} cannot provide architecture deprecation diagnostics.`,
+    );
+  }
+  for (const diagnostic of program.getSuggestionDiagnostics(sourceFile)) {
+    if (!diagnostic.reportsDeprecated) continue;
+    const guidance = diagnostic.relatedInformation
+      ?.flatMap((related) => {
+        if (!related.file || related.start === undefined || related.length === undefined) return [];
+        const text = related.file.text.slice(related.start, related.start + related.length);
+        if (!text.startsWith("@deprecated")) return [];
+        return [
+          text
+            .replace(/^@deprecated\s*/u, "")
+            .replace(/\n\s*\*\s?/gu, "\n")
+            .trim(),
+        ];
+      })
+      .filter(Boolean)
+      .join(" ");
+    diagnostics.push(
+      makeDiagnostic(
+        workspace,
+        workspaceRoot,
+        "architecture/no-deprecated",
+        diagnosticNode(sourceFile, diagnostic.start, diagnostic.length),
+        ts.flattenDiagnosticMessageText(diagnostic.messageText, " "),
+        guidance || "Replace this deprecated API.",
+      ),
+    );
+  }
+}
+
 function literalPropertyName(
   expression: ts.Expression | undefined,
   checker: ts.TypeChecker,
@@ -8489,6 +8555,9 @@ export function analyzeWorkspace(
     const activeRules = new Set(
       ARCHITECTURE_RULES.filter((rule) => ruleApplies(workspace, rule, module)),
     );
+    if (activeRules.has("architecture/no-deprecated")) {
+      analyzeDeprecatedReferences(program, sourceFile, workspace, workspaceRoot, diagnostics);
+    }
     const candidateNames = callCandidateNames(sourceFile, workspace, activeRules);
     const analyzeEveryCall = activeRules.has("architecture/no-manual-result-branching");
     const sourceExports = activeRules.has("architecture/no-unhandled-exception-contract")

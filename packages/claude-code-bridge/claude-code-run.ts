@@ -1,5 +1,6 @@
 import type { ExternalToolExecutionOutcome } from "@stanley2058/lilac-agent";
-import { claudeCodeExecutableSettings, opaqueErrorMessage } from "@stanley2058/lilac-utils";
+import { claudeCodeExecutableSettings } from "@stanley2058/lilac-utils/claude-code-executable";
+import { opaqueErrorMessage } from "@stanley2058/lilac-utils/runtime-utils";
 import type { LanguageModel, ToolSet } from "ai";
 import {
   createClaudeCode,
@@ -39,7 +40,7 @@ const nativeSessionStartSchema = z.discriminatedUnion("mode", [
       mode: z.literal("fork"),
       baseSessionId: uuidSchema,
       sessionId: uuidSchema,
-      expectedSourceLastModified: z.number().finite().nonnegative(),
+      expectedSourceLastModified: z.number().nonnegative(),
     })
     .strict()
     .refine(({ baseSessionId, sessionId }) => baseSessionId !== sessionId, {
@@ -48,7 +49,7 @@ const nativeSessionStartSchema = z.discriminatedUnion("mode", [
     }),
 ]);
 
-const sdkMessageTypeSchema = z.object({ type: z.string() }).passthrough();
+const sdkMessageTypeSchema = z.object({ type: z.string() }).loose();
 const sdkInitMessageSchema = z
   .object({
     type: z.literal("system"),
@@ -56,15 +57,15 @@ const sdkInitMessageSchema = z
     session_id: z.string().min(1),
     model: z.string().min(1),
   })
-  .passthrough();
+  .loose();
 const sdkSuccessResultMessageSchema = z
   .object({
     type: z.literal("result"),
     subtype: z.literal("success"),
     session_id: z.string().min(1),
   })
-  .passthrough();
-const stopHookInputSchema = z.object({ hook_event_name: z.literal("Stop") }).passthrough();
+  .loose();
+const stopHookInputSchema = z.object({ hook_event_name: z.literal("Stop") }).loose();
 const contextUsageSchema = z
   .object({
     totalTokens: z.number().int().nonnegative(),
@@ -76,7 +77,7 @@ const contextUsageSchema = z
 const sessionInfoSchema = z.object({
   sessionId: z.string().min(1),
   cwd: z.string().min(1),
-  lastModified: z.number().finite().nonnegative(),
+  lastModified: z.number().nonnegative(),
 });
 
 type ClaudeCodeQueryControllerBoundary = {
@@ -297,6 +298,7 @@ export type MaterializedClaudeCodeRun = {
   /** Present on bridge-created runs; optional for existing injected run implementations. */
   nativeSession?: ClaudeNativeSessionLifecycle;
   disposeResult(): Promise<ResultType<void, ClaudeCodeRunCleanupFailed>>;
+  settleExecutionResult?(): Promise<ResultType<void, ClaudeCodeRunCleanupFailed>>;
   dispose(): Promise<void>;
 };
 
@@ -1061,6 +1063,45 @@ export async function materializeClaudeCodeRunResult(options: {
     },
   };
 
+  const settleExecutionResult = async (): Promise<ResultType<void, ClaudeCodeRunCleanupFailed>> => {
+    const settlements = await Promise.allSettled([
+      Promise.resolve().then(clearResult),
+      drainQueryControllers(),
+    ]);
+    const failures: ClaudeCodeRunExternalFailure[] = [];
+    let firstPanic: Panic | undefined;
+    for (const settlement of settlements) {
+      const panic = deferredCleanupPanic(settlement);
+      if (panic) firstPanic ??= panic;
+      else if (settlement.status === "fulfilled") {
+        settlement.value.match({
+          ok: () => undefined,
+          err: (error) => failures.push(...error.failures),
+        });
+      }
+    }
+    if (unclaimedProcesses.length > 0) {
+      failures.push(
+        new ClaudeCodeRunExternalFailure({
+          operation: "Claude query-controller registration",
+          cause: new Error(
+            "Claude execution has subprocesses without query-controller registration",
+          ),
+          message: "Claude execution has subprocesses without query-controller registration",
+        }),
+      );
+    }
+    if (firstPanic) throw firstPanic;
+    return failures.length === 0
+      ? Result.ok(undefined)
+      : Result.err(
+          new ClaudeCodeRunCleanupFailed({
+            failures,
+            message: "Claude execution could not prove clean settlement",
+          }),
+        );
+  };
+
   let disposalResultPromise: Promise<ResultType<void, ClaudeCodeRunCleanupFailed>> | null = null;
   const disposeResult = (): Promise<ResultType<void, ClaudeCodeRunCleanupFailed>> => {
     if (disposalResultPromise) return disposalResultPromise;
@@ -1412,6 +1453,7 @@ export async function materializeClaudeCodeRunResult(options: {
           finalize,
         },
         disposeResult,
+        settleExecutionResult,
         dispose,
       });
     }),
@@ -1470,13 +1512,4 @@ export async function materializeClaudeCodeRunResult(options: {
       message: "Claude model construction and cleanup failed",
     }),
   );
-}
-
-/** Compatibility adapter for callers that consume materialization failures as rejections. */
-export async function materializeClaudeCodeRun(
-  options: Parameters<typeof materializeClaudeCodeRunResult>[0],
-): Promise<MaterializedClaudeCodeRun> {
-  const materialized = resultOutcome(await materializeClaudeCodeRunResult(options));
-  if (!materialized.ok) throw materialized.error;
-  return materialized.value;
 }

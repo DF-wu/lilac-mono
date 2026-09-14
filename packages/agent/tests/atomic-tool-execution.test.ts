@@ -17,7 +17,6 @@ describe("executeAtomicToolCall", () => {
     const abortController = new AbortController();
     const events: AtomicToolExecutionEvent[] = [];
     const seen: Array<{ input: unknown; options: unknown }> = [];
-    const approvalChecks: Array<{ input: unknown; options: unknown }> = [];
     const tools = {
       stream: tool({
         inputSchema: jsonSchema<{ count: number }>(
@@ -32,10 +31,6 @@ describe("executeAtomicToolCall", () => {
             },
           },
         ),
-        needsApproval: (input, options) => {
-          approvalChecks.push({ input, options });
-          return false;
-        },
         execute: async function* (input, options) {
           seen.push({ input, options });
           yield input.count;
@@ -66,12 +61,6 @@ describe("executeAtomicToolCall", () => {
     });
 
     expect(seen[0]?.input).toEqual({ count: 3 });
-    expect(approvalChecks).toEqual([
-      {
-        input: { count: 3 },
-        options: { toolCallId: "call-1", messages, context },
-      },
-    ]);
     expect(seen[0]?.options).toEqual({
       toolCallId: "call-1",
       messages,

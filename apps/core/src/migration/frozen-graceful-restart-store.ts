@@ -130,8 +130,8 @@ type DecodedGracefulRestartSnapshot = {
   readonly provenance: "current" | "missing-defaulted";
 };
 
-const finiteNonNegativeSchema = z.number().finite().nonnegative();
-const finitePositiveSchema = z.number().finite().positive();
+const finiteNonNegativeSchema = z.number().nonnegative();
+const finitePositiveSchema = z.number().positive();
 const nonemptyStringSchema = z.string().min(1);
 
 function isOpaqueSuperJsonValue(value: unknown): value is OpaqueSuperJsonValue {

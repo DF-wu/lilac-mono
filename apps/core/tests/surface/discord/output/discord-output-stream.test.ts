@@ -21,6 +21,194 @@ function resultValue<T, E>(result: ResultType<T, E>): T {
   return result.value;
 }
 
+describe("plain flat table images", () => {
+  const table = "| Name | State |\n| --- | --- |\n| Alpha | Ready |";
+  const png = new Uint8Array([137, 80, 78, 71]);
+  const defaults = {
+    sessionRef: { platform: "discord", channelId: "chan" } as const,
+    useSmartSplitting: true,
+    outputMode: "preview" as const,
+    outputPreviewModeFinalStyle: "plain" as const,
+    outputPreviewModeFinalText: "flat" as const,
+    markdownTableRender: { style: "image" as const, maxWidth: 50 },
+    reasoningDisplayMode: "none" as const,
+    workingIndicators: ["Working"],
+  };
+
+  it("renders only the final answer, uploads at table boundaries, and tracks every message", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    let renders = 0;
+    const seen: string[] = [];
+    const out = new DiscordOutputStream({
+      ...defaults,
+      client,
+      opts: {
+        replyTo: { platform: "discord", channelId: "chan", messageId: "source" },
+        onMessageCreated: (ref) => {
+          seen.push(ref.messageId);
+        },
+      },
+      rewriteText: (text) => text.replaceAll("Alpha", "Rewritten"),
+      renderTableImages: async (tables) => {
+        renders++;
+        expect(tables).toHaveLength(2);
+        expect(tables[0]?.rows[1]?.[0]?.runs).toEqual([{ text: "Rewritten" }]);
+        return [png, png];
+      },
+    });
+    const final = `Before\n\n${table}\n\nBetween\n\n${table}\n\nAfter`;
+    await out.push({ type: "text.delta", phase: "commentary", delta: table });
+    await out.push({
+      type: "text.set",
+      phase: "final_answer",
+      text: table + final,
+      finalSegments: [table, final],
+    });
+    expect(renders).toBe(0);
+    const result = resultValue(await out.finish());
+    expect(renders).toBe(1);
+    const ids = result.created.map((ref) => ref.messageId);
+    const sent = operations.filter((op) => ids.includes(op.messageId) && op.kind === "send");
+    expect(sent.map((op) => contentFromOptions(op.options)?.trim())).toEqual([
+      "Before",
+      "Between",
+      "After",
+    ]);
+    expect(sent.map((op) => uploadedFileNames(op.options))).toEqual([
+      ["table-1.png"],
+      ["table-2.png"],
+      [],
+    ]);
+    const first = sent[0]?.options as {
+      reply: { messageReference: string };
+      files: { description?: string }[];
+    };
+    expect(first.reply.messageReference).toBe("source");
+    expect(first.files[0]?.description).toBe(table.replaceAll("Alpha", "Rewritten"));
+    expect((sent[1]!.options as { reply?: unknown }).reply).toBeUndefined();
+    expect(ids.every((id) => seen.includes(id))).toBe(true);
+    expect(result.last.messageId).toBe(ids.at(-1)!);
+  });
+
+  it("sends table-only answers without placeholder content", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      ...defaults,
+      client,
+      renderTableImages: async () => [png],
+    });
+    await out.push({ type: "text.delta", delta: table });
+    const result = resultValue(await out.finish());
+    const sent = operations.find(
+      (op) => op.kind === "send" && op.messageId === result.last.messageId,
+    );
+    expect(contentFromOptions(sent?.options)).toBeUndefined();
+    expect(uploadedFileNames(sent?.options)).toEqual(["table-1.png"]);
+    expect(result.created).toHaveLength(1);
+  });
+
+  it("keeps ordinary attachments after a terminal table and respects the ten-file capacity", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      ...defaults,
+      client,
+      renderTableImages: async () => [png],
+    });
+    await out.push({ type: "text.delta", delta: table });
+    for (let i = 0; i < 11; i++)
+      await out.push({ type: "attachment.add", attachment: makeAttachment(i) });
+    const result = resultValue(await out.finish());
+    const sent = operations.filter(
+      (op) => result.created.some((ref) => ref.messageId === op.messageId) && op.kind !== "edit",
+    );
+    expect(sent.map((op) => filesCount(op.options))).toEqual([1, 10, 1]);
+    expect(allUploadedFileNames(sent)).toEqual([
+      "table-1.png",
+      ...Array.from({ length: 11 }, (_, i) => `image-${i}.png`),
+    ]);
+    expect(operations.filter((op) => op.kind === "edit" && hasFiles(op.options))).toHaveLength(0);
+  });
+
+  it("uses the text renderer when PNG rendering fails", async () => {
+    const { client, operations } = createFakeDiscordClient();
+    const out = new DiscordOutputStream({
+      ...defaults,
+      client,
+      renderTableImages: async () => [null],
+    });
+    await out.push({ type: "text.delta", delta: `Before\n\n${table}\n\nAfter` });
+    const result = resultValue(await out.finish());
+    const sent = operations.find(
+      (op) => op.kind === "send" && op.messageId === result.last.messageId,
+    );
+    expect(contentFromOptions(sent?.options)).toContain("```text");
+    expect(contentFromOptions(sent?.options)).toContain("┌");
+    expect(contentFromOptions(sent?.options)).toContain("After");
+    expect(uploadedFileNames(sent?.options)).toEqual([]);
+  });
+
+  it.each([
+    { outputMode: "inline" as const },
+    { outputPreviewModeFinalStyle: "embed" as const },
+    { outputPreviewModeFinalText: "reply-chain" as const },
+    { markdownTableRender: undefined },
+  ])("does not render images outside enabled plain flat output: %j", async (override) => {
+    const { client, operations } = createFakeDiscordClient();
+    let renders = 0;
+    const out = new DiscordOutputStream({
+      ...defaults,
+      ...override,
+      client,
+      renderTableImages: async () => {
+        renders++;
+        return [png];
+      },
+    });
+    await out.push({ type: "text.delta", delta: table });
+    const result = resultValue(await out.finish());
+    expect(renders).toBe(0);
+    if (override.markdownTableRender !== undefined || !("markdownTableRender" in override)) {
+      const output = operations
+        .filter((op) => result.created.some((ref) => ref.messageId === op.messageId))
+        .flatMap((op) => [
+          contentFromOptions(op.options) ?? "",
+          ...embedDescriptionsFromOptions(op.options),
+        ])
+        .join("\n");
+      expect(output).toContain("┌");
+    }
+  });
+
+  it.each(["unicode", "ascii", undefined] as const)(
+    "keeps style %s as text in plain flat mode",
+    async (style) => {
+      const { client, operations } = createFakeDiscordClient();
+      let renders = 0;
+      const out = new DiscordOutputStream({
+        ...defaults,
+        client,
+        markdownTableRender: { style, maxWidth: 50 },
+        renderTableImages: async () => {
+          renders++;
+          return [png];
+        },
+      });
+      await out.push({ type: "text.delta", delta: `Before\n\n${table}\n\nAfter` });
+      const result = resultValue(await out.finish());
+      expect(renders).toBe(0);
+      expect(result.created).toHaveLength(1);
+      const sent = operations.find(
+        (op) => op.kind === "send" && op.messageId === result.last.messageId,
+      );
+      const content = contentFromOptions(sent?.options);
+      expect(content).toContain("Before");
+      expect(content).toContain(style === "ascii" ? "+" : "┌");
+      expect(content).toContain("After");
+      expect(uploadedFileNames(sent?.options)).toEqual([]);
+    },
+  );
+});
+
 describe("escapeDiscordMarkdown", () => {
   it("escapes emphasis markers in glob-like patterns", () => {
     expect(escapeDiscordMarkdown("**/*")).toBe("\\*\\*/\\*");

@@ -8,6 +8,7 @@ import {
 } from "@stanley2058/lilac-utils";
 
 import type { AgentRunProfile } from "./raw";
+import type { AdapterPlatform } from "@stanley2058/lilac-event-bus";
 import type { SurfaceMetadataMessage } from "../surface-metadata";
 import type { SessionSafetyMode } from "../../session-policy";
 import {
@@ -16,6 +17,7 @@ import {
   buildAutoInjectedThreadSearchOverlay,
   buildRestrictedSessionOverlay,
   buildSurfaceMetadataOverlay,
+  buildDiscordOutputOverlay,
   maybeAppendResponseCommentaryPrompt,
 } from "./prompt-overlays";
 import { buildSystemPromptForProfile, selectWorkspaceSystemPrompt } from "./subagent-prompt";
@@ -23,6 +25,7 @@ import { buildSystemPromptForProfile, selectWorkspaceSystemPrompt } from "./suba
 export function buildAgentRunSystemPrompt(params: {
   cfg: CoreConfig;
   runProfile: AgentRunProfile;
+  requestClient: AdapterPlatform;
   resolved: ResolvedModelRef;
   editingToolMode: EditingToolMode;
   skillsSection: string | null;
@@ -79,6 +82,7 @@ export function buildAgentRunSystemPrompt(params: {
     params.heartbeatOverlay,
     autoInjectedThreadSearchOverlay,
     surfaceMetadataOverlay,
+    params.requestClient === "discord" ? buildDiscordOutputOverlay() : null,
     restrictedSessionOverlay,
   ]) {
     if (overlay?.trim()) prompt = `${prompt}\n\n${overlay}`;

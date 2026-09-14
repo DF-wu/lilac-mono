@@ -38,10 +38,7 @@ export type NormalizedDiscordRaw = {
 
 const recordSchema = z.record(z.string(), z.unknown());
 const maybeStringSchema = z.union([z.string().min(1), z.unknown().transform(() => undefined)]);
-const maybeFiniteNumberSchema = z.union([
-  z.number().finite(),
-  z.unknown().transform(() => undefined),
-]);
+const maybeFiniteNumberSchema = z.union([z.number(), z.unknown().transform(() => undefined)]);
 const discordReferenceSchema = z
   .object({
     messageId: maybeStringSchema,
@@ -49,7 +46,7 @@ const discordReferenceSchema = z
     guildId: maybeStringSchema,
     type: maybeFiniteNumberSchema,
   })
-  .passthrough();
+  .loose();
 const discordAttachmentSchema = z
   .object({
     id: maybeStringSchema,
@@ -60,7 +57,7 @@ const discordAttachmentSchema = z
     contentType: maybeStringSchema,
     size: maybeFiniteNumberSchema,
   })
-  .passthrough();
+  .loose();
 const discordEnvelopeSchema = z
   .object({
     content: maybeStringSchema,
@@ -73,7 +70,7 @@ const discordEnvelopeSchema = z
     guildId: maybeStringSchema,
     messageSnapshots: z.unknown().optional(),
   })
-  .passthrough();
+  .loose();
 const discordRawSchema = z
   .object({
     content: maybeStringSchema,
@@ -83,7 +80,7 @@ const discordRawSchema = z
     messageSnapshots: z.unknown().optional(),
     discord: z.unknown().optional(),
   })
-  .passthrough();
+  .loose();
 
 function normalizeReference(
   reference: z.infer<typeof discordReferenceSchema> | undefined,

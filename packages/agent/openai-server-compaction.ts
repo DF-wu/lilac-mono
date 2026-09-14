@@ -11,10 +11,12 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import {
   SERVER_COMPACTION_REQUEST_HEADER,
   SERVER_COMPACTION_REQUEST_MARKER,
-  isOpenAICompactionPart,
+} from "@stanley2058/lilac-utils/server-compaction-request";
+import { isOpenAICompactionPart } from "@stanley2058/lilac-utils/model-message-provider-options";
+import {
   type JSONObject,
   type ModelReasoningEffort,
-} from "@stanley2058/lilac-utils";
+} from "@stanley2058/lilac-utils/core-config/types";
 
 import { stripToolExecuteForModel, type SystemPrompt } from "./ai-sdk-pi-agent";
 import { captureAgentPromise, rethrowAgentPanic, type OpaqueAgentValue } from "./failure-adapters";
@@ -36,11 +38,11 @@ const openAICompactionOutputPartSchema = z
             itemId: z.string().min(1),
             encryptedContent: z.string().min(1),
           })
-          .passthrough(),
+          .loose(),
       })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 
 export const openAIServerCompactionMetadataSchema = z
   .object({
@@ -64,16 +66,16 @@ const persistedOpenAICompactionPartSchema = z
             itemId: z.string().min(1),
             encryptedContent: z.string().min(1),
           })
-          .passthrough(),
+          .loose(),
         lilac: z
           .object({
             serverCompaction: openAIServerCompactionMetadataSchema,
           })
-          .passthrough(),
+          .loose(),
       })
-      .passthrough(),
+      .loose(),
   })
-  .passthrough();
+  .loose();
 
 export type OpenAIServerCompactionMetadata = z.infer<typeof openAIServerCompactionMetadataSchema>;
 
@@ -283,14 +285,14 @@ export async function compactWithOpenAIResponsesResult(
       request.abortSignal?.throwIfAborted();
     }
 
-    const [response, usage] = await Promise.all([result.response, result.usage]);
-    return { response, usage };
+    const [finalStep, usage] = await Promise.all([result.finalStep, result.usage]);
+    return { response: finalStep.response, usage };
   });
   const attempt = attempted.match<
     | {
         readonly ok: true;
         readonly value: {
-          response: Awaited<ReturnType<typeof streamText>["response"]>;
+          response: Awaited<ReturnType<typeof streamText>["finalStep"]>["response"];
           usage: Awaited<ReturnType<typeof streamText>["usage"]>;
         };
       }
@@ -395,22 +397,4 @@ export async function compactWithOpenAIResponsesResult(
     );
   }
   return Result.ok(artifact);
-}
-
-/** Compatibility adapter for provider integrations that use rejection as their failure contract. */
-export async function compactWithOpenAIResponses(
-  request: OpenAIServerCompactionRequest,
-): Promise<OpenAIServerCompactionArtifact> {
-  const result = await compactWithOpenAIResponsesResult(request);
-  const outcome = result.match<
-    | { type: "ok"; value: OpenAIServerCompactionArtifact }
-    | { type: "error"; error: OpenAIServerCompactionError }
-  >({
-    ok: (value) => ({ type: "ok" as const, value }),
-    err: (error) => ({ type: "error" as const, error }),
-  });
-  if (outcome.type === "error") {
-    throw new Error(outcome.error.message, { cause: outcome.error });
-  }
-  return outcome.value;
 }

@@ -6,14 +6,14 @@
   "private": true,
   "license": "MIT",
   "bin": {
-    "tools": "dist/index.js"
+    "tools": "dist/tools"
   },
   "scripts": {
-    "build": "bun build.ts && chmod +x dist/index.js",
+    "build": "bun build.ts && chmod +x dist/tools dist/tools-worker",
     "test": "bun test"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.0"
+    "@types/bun": "^1.4.1"
   },
   "peerDependencies": {
     "typescript": "^7.0.2"

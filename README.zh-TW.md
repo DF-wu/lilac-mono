@@ -27,19 +27,7 @@
 > [!IMPORTANT]
 > 這是以 Git history 與 `upstream` remote 持續追蹤 [`stanley2058/lilac-mono`](https://github.com/stanley2058/lilac-mono) 的 downstream fork，不是上游官方發行版。本專案定期合併上游更新，同時維護 Telegram、相容式圖像路由、GitHub 回覆連結與部署自動化等獨立功能。
 
-Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工作流程放在同一套 runtime 中。Monorepo 內同時提供完整的 **Core** 服務，以及不需要 Redis 的本機 coding agent **Mini Lilac**。
-
-## 選擇執行方式
-
-| | Core | Mini Lilac |
-| --- | --- | --- |
-| 適合情境 | 長駐 bot、多平台協作、自動化與 durable workflows | 在本機專案中使用互動式 coding agent |
-| 入口 | Discord、Telegram、GitHub webhook、HTTP tool server | Terminal TUI、HTTP/SSE API |
-| 狀態儲存 | Redis Streams + SQLite + `DATA_DIR` | SQLite + `$XDG_STATE_HOME/mini-lilac` |
-| 主要依賴 | Bun、Redis；建議使用 Docker Compose | Bun 與系統 `flock`，不需要 Redis |
-| 開始方式 | 從本 repo 設定並啟動 Core | 從本 repo build 並直接執行 Mini Lilac |
-
-Mini Lilac 是上游持續發展的產品，本 fork 會隨上游同步。若你要部署聊天平台 bot 或工作流程服務，選 Core；若只要在終端操作本機專案，Mini Lilac 是較短的路徑。
+Lilac 把平台訊息、路由、模型執行、工具、Skills 與可恢復工作流程放在同一套 Core runtime 中。
 
 ## 本 Fork 的主要差異
 
@@ -47,11 +35,11 @@ Mini Lilac 是上游持續發展的產品，本 fork 會隨上游同步。若你
 
 | 領域 | 本 fork 提供的差異 | 重要限制 |
 | --- | --- | --- |
-| Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、outbound attachments、workflow cards 與同 surface tools | 預設停用；沒有 inbound attachment bytes；僅 long polling |
+| Telegram surface | DMs、群組、forum topics、串流 HTML 回覆、取消、reaction、command menu、inbound/outbound attachments、workflow cards 與同 surface tools | 預設停用；僅 long polling |
 | OpenAI-compatible 圖像路由 | 將既有 `generate.image` aliases 統一路由到 operator 指定的 OpenAI-compatible endpoint | 僅 `configVersion: 2`；無自動 fallback 或自訂 alias mapping |
 | GitHub 回覆 UX | `In reply to` 可直接連到 issue/PR body 或指定 comment 的 canonical permalink | GitHub comment self-loop 防護已被上游接收，不再列為 fork-only |
 | Custom media plugin | 可部署的 Level 2 image/video plugin 範例，示範嚴格設定與檔案安全處理 | Plugin 是 trusted in-process code；restricted caller 目前不能使用 external callables |
-| 維運與交付 | 每 6 小時檢查 upstream、GHCR `catalina`/`claudia` tags、ACP detached-run 強化 | 自動合併發生衝突時仍需人工處理 |
+| 維運與交付 | 每 6 小時檢查 upstream，並發布經驗證的 GHCR `catalina`/`claudia` tags | 自動合併發生衝突時仍需人工處理 |
 
 ## 架構概覽
 
@@ -91,37 +79,6 @@ flowchart LR
 ```
 
 ## 快速開始
-
-### Mini Lilac：本機 coding agent
-
-Mini Lilac 是最短的互動式使用路徑。套件目前尚未發布到 public npm registry，請從 checkout build 並直接執行；Server 預設只監聽 `127.0.0.1:8090`，TUI 必須在真正的 terminal 中執行。
-
-```bash
-git clone https://github.com/DF-wu/lilac-mono.git
-cd lilac-mono
-bun install --frozen-lockfile
-cd apps/mini-lilac
-bun run build
-
-./dist/main.js server init
-./dist/main.js server auth codex
-./dist/main.js server
-```
-
-在另一個 terminal 中，進入要操作的專案：
-
-```bash
-cd /path/to/your/project
-/path/to/lilac-mono/apps/mini-lilac/dist/main.js
-```
-
-確認 server：
-
-```bash
-curl -fsS http://127.0.0.1:8090/api/mini-lilac/healthz
-```
-
-設定檔、provider、API key、Codex OAuth、遠端 listener 認證與 TUI 操作見 [`apps/mini-lilac/README.md`](./apps/mini-lilac/README.md) 與 [`apps/mini-lilac-server/README.md`](./apps/mini-lilac-server/README.md)。
 
 ### Core：Docker Compose
 
@@ -291,35 +248,17 @@ docker compose exec -T lilac /usr/local/bin/tools --operator --help custom-media
 
 完整 build、credential、model 與 file-safety contract 見 [`examples/plugins/custom-media/README.md`](./examples/plugins/custom-media/README.md)。
 
-## Operator CLI
-
-`lilac-acp` 可探索本機 ACP harness、搜尋或 snapshot sessions，並以 detached worker 執行 prompt。支援的 harness 取決於本機安裝與 discovery 結果。
-
-```bash
-cd apps/acp-controller
-bun run build
-./dist/index.js harnesses list
-./dist/index.js sessions list --directory /path/to/repo --search "failing tests"
-./dist/index.js prompt submit --directory /path/to/repo --harness opencode --text "Fix the failing tests"
-```
-
-狀態與取消命令見 [`apps/acp-controller/README.md`](./apps/acp-controller/README.md)。
-
 ## Repository Map
 
 | Path | Purpose |
 | --- | --- |
 | `apps/core/` | Redis-backed Core runtime 與所有 surface、workflow、tool wiring |
-| `apps/mini-lilac/` | 可安裝的 unified Mini Lilac command |
-| `apps/mini-lilac-server/` | Redis-free HTTP/SSE coding-agent server |
-| `apps/mini-lilac-tui/` | OpenTUI terminal client |
 | `apps/tool-bridge/` | `tools` CLI 與 standalone tool-server entrypoint |
-| `apps/acp-controller/` | `lilac-acp` multi-harness controller |
+| `apps/installer/` | 引導式 Docker 安裝與重新設定 CLI |
+| `apps/computer-use-gateway/` | 選用的 authenticated desktop-session gateway |
 | `packages/event-bus/` | Typed Redis Streams contract 與 transport |
 | `packages/agent/` | AI SDK streaming、steering、follow-up 與 interrupt control |
 | `packages/plugin-runtime/` | Level 1/Level 2 plugin contract |
-| `packages/mini-lilac-runtime/` | Mini sessions、transcripts、providers 與 tools |
-| `packages/mini-lilac-client/` | Mini wire protocol 與 reconnectable transport |
 | `packages/utils/` | Config、providers、prompts 與 Skills |
 | `data/` | Core 的 local runtime state；不要提交 secrets |
 | `ref/` | Vendored/reference repositories；依各自 license，視為 read-only |
