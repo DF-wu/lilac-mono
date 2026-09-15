@@ -577,7 +577,7 @@ describe("web provider extraction", () => {
       expect(body).toMatchObject({
         url: "https://example.com/article",
         formats: ["html"],
-        timeout: 10_000,
+        timeout: 120_000,
       });
       return Response.json({
         success: true,
