@@ -185,7 +185,7 @@ export class DefaultProviderPageExtractor implements ProviderPageExtractor {
     input: PageAcquisitionInput,
     opts?: { signal?: AbortSignal },
   ): Promise<PageContentResult> {
-    const { url, format = "markdown", timeout = 10_000 } = input;
+    const { url, format = "markdown", timeout = 120_000 } = input;
     const environment = this.dependencies.getEnvironment().firecrawl;
     if (!environment.apiKey) {
       return { isError: true, error: "FIRECRAWL_API_KEY is not configured." };

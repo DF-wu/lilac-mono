@@ -89,7 +89,7 @@ const getPageSchema = z.object({
     .number()
     .optional()
     .describe(
-      "Timeout in ms. Timeout for initial connection if using browser. (default: 10000 = 10s)",
+      "Timeout in ms. Timeout for initial connection if using browser. Defaults to 120000 (120s) for Firecrawl extraction and 10000 (10s) otherwise.",
     ),
 });
 
@@ -789,13 +789,7 @@ export class Web implements ServerTool {
     input: GetPageInput,
     opts?: { signal?: AbortSignal },
   ): Promise<WebFetchResult> {
-    const {
-      url,
-      format = "markdown",
-      startOffset = 0,
-      maxCharacters = 200_000,
-      timeout = 10_000,
-    } = input;
+    const { url, format = "markdown", startOffset = 0, maxCharacters = 200_000, timeout } = input;
     const acquisitionInput = {
       url,
       format,
