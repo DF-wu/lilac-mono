@@ -32,8 +32,12 @@ const jsonPointerSchema = z.string().refine(
 
 export const mcpValueSourceSchema = z.union([
   z.string(),
-  z.strictObject({ env: z.string().min(1) }),
-  z.strictObject({ file: z.string().min(1), pointer: jsonPointerSchema.optional() }),
+  z.strictObject({ env: z.string().min(1), prefix: z.string().optional() }),
+  z.strictObject({
+    file: z.string().min(1),
+    pointer: jsonPointerSchema.optional(),
+    prefix: z.string().optional(),
+  }),
 ]);
 
 const staticOAuthClientSchema = z.strictObject({

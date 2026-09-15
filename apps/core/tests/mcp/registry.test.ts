@@ -310,14 +310,14 @@ describe("McpRegistry startup and discovery", () => {
         transportConfig: {
           transport: "http",
           url: "https://example.invalid/mcp",
-          headers: { Authorization: { env: "HTTP_TOKEN" } },
+          headers: { Authorization: { env: "HTTP_TOKEN", prefix: "Bearer " } },
         },
       },
     ]);
     const registry = new McpRegistry({
       configPath: "/data/mcp-config.yaml",
       reportFatalError: reportUnexpectedFatalError,
-      env: { STDIO_TOKEN: "stdio-secret", HTTP_TOKEN: "Bearer http-secret" },
+      env: { STDIO_TOKEN: "stdio-secret", HTTP_TOKEN: "http-secret" },
       dependencies: {
         readConfig: async () => configSnapshot(config),
         createClient: factory.create,

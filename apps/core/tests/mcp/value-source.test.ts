@@ -59,6 +59,53 @@ describe("MCP value sources", () => {
     ).toBe("selected");
   });
 
+  it("prepends prefixes after resolving values and preserves failures", async () => {
+    const context = {
+      baseDir: "/data",
+      env: { TOKEN: "env-token" },
+      readTextFile: async (file: string) =>
+        file.endsWith(".json") ? JSON.stringify({ token: " json-token " }) : " file-token\n",
+    };
+    const values = expectOk(
+      await resolveMcpValueSourceMap(
+        {
+          Authorization: { env: "TOKEN", prefix: "Bearer " },
+          "X-File": { file: "token.txt", prefix: "Token " },
+          "X-Json": { file: "auth.json", pointer: "/token", prefix: "Basic " },
+          "X-Empty": { env: "TOKEN", prefix: "" },
+        },
+        context,
+      ),
+    );
+    expect(values).toEqual({
+      Authorization: "Bearer env-token",
+      "X-File": "Token file-token",
+      "X-Json": "Basic  json-token ",
+      "X-Empty": "env-token",
+    });
+    expect(validateHttpHeaders(values).status).toBe("ok");
+    expect(
+      (await resolveMcpValueSource({ env: "MISSING", prefix: "Bearer " }, context)).status,
+    ).toBe("error");
+    expect(
+      (
+        await resolveMcpValueSource(
+          { file: "auth.json", pointer: "/missing", prefix: "Bearer " },
+          context,
+        )
+      ).status,
+    ).toBe("error");
+    const unsafe = expectOk(
+      await resolveMcpValueSourceMap(
+        {
+          Authorization: { env: "TOKEN", prefix: "Bearer\r\n" },
+        },
+        context,
+      ),
+    );
+    expect(validateHttpHeaders(unsafe).status).toBe("error");
+  });
+
   it("returns contextual failures without exposing other resolved values", async () => {
     const baseDir = await createTemporaryDirectory();
     const result = await resolveMcpValueSourceMap(
