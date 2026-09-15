@@ -1505,11 +1505,74 @@ describe("DiscordAdapter.listSessionParticipants", () => {
   });
 });
 
+describe("DiscordAdapter table image lifecycle", () => {
+  it("applies image enablement on config reload and retains it after a failed reload", async () => {
+    const base = testConfigWithStatusMessage();
+    const image: CoreConfig = {
+      ...base,
+      surface: {
+        ...base.surface,
+        discord: {
+          ...base.surface.discord,
+          markdownTableRender: {
+            enabled: true,
+            style: "image",
+            maxWidth: 80,
+            fallbackMode: "list",
+          },
+        },
+      },
+    };
+    let config = base;
+    let fail = false;
+    const adapter = createTestDiscordAdapter({
+      getConfig: async () => {
+        if (fail) throw new Error("invalid config");
+        return config;
+      },
+    });
+    const enabled: boolean[] = [];
+    const render = async () => [];
+    Object.assign(adapter, {
+      client: {},
+      tableImageRenderer: {
+        setEnabled: async (value: boolean) => {
+          enabled.push(value);
+        },
+        render,
+      },
+    });
+    const reload = Reflect.get(adapter, "reloadCoreConfigIfNeeded") as (options: {
+      applyPresence: boolean;
+    }) => Promise<void>;
+    await reload.call(adapter, { applyPresence: false });
+    config = image;
+    await reload.call(adapter, { applyPresence: false });
+    fail = true;
+    await reload.call(adapter, { applyPresence: false });
+    fail = false;
+    config = base;
+    await reload.call(adapter, { applyPresence: false });
+    expect(enabled).toEqual([false, true, true, false]);
+    const output = await adapter.startOutput({ platform: "discord", channelId: "channel" });
+    if (output.status === "error") throw output.error;
+    expect(Reflect.get(output.value, "deps").renderTableImages).toBe(render);
+  });
+});
+
 describe("DiscordAdapter.disconnect", () => {
   it("runs store cleanup before rethrowing the original client Panic", async () => {
     const adapter = createTestDiscordAdapter();
     const panic = new Panic({ message: "discord destroy invariant failed" });
     let storeClosed = false;
+    let rendererClosed = false;
+    Object.assign(adapter, {
+      tableImageRenderer: {
+        close: async () => {
+          rendererClosed = true;
+        },
+      },
+    });
     const state = adapter as unknown as {
       client: { destroy(): Promise<void> } | null;
       store: { close(): void } | null;
@@ -1527,6 +1590,7 @@ describe("DiscordAdapter.disconnect", () => {
 
     await expect(adapter.disconnect()).rejects.toBe(panic);
     expect(storeClosed).toBe(true);
+    expect(rendererClosed).toBe(true);
   });
 });
 
