@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { DiscordPresence } from "./discord-presence";
 
 import {
   ActivityType,
@@ -730,6 +731,10 @@ export class DiscordAdapter implements SurfaceAdapter {
 
   private self: SurfaceSelf | null = null;
   private presenceTimer: ReturnType<typeof setInterval> | null = null;
+  readonly presence = new DiscordPresence(() => {
+    this.superviseDiscordCallback("presence-activity", () => this.applyConfiguredPresence());
+  });
+  private appliedPresenceStatus: "online" | "idle" | undefined;
   private appliedStatusMessage: string | null | undefined;
   private healthState: Omit<DiscordAdapterHealthSnapshot, "cache"> = {
     connectionState: "idle",
@@ -847,6 +852,9 @@ export class DiscordAdapter implements SurfaceAdapter {
           }),
         );
 
+        this.presence.start();
+        this.applyConfiguredPresence({ client, force: true });
+
         // Register/refresh slash commands on boot.
         // Strategy:
         // 1) check existence
@@ -872,8 +880,6 @@ export class DiscordAdapter implements SurfaceAdapter {
             });
           },
         });
-
-        this.applyConfiguredPresence({ client, force: true });
 
         // Discord can clear custom presence over time; refresh periodically.
         this.presenceTimer = setInterval(
@@ -1058,6 +1064,7 @@ export class DiscordAdapter implements SurfaceAdapter {
 
   async disconnect(): Promise<void> {
     this.logger.info("disconnecting");
+    this.presence.stop();
 
     if (this.presenceTimer) {
       clearInterval(this.presenceTimer);
@@ -1209,7 +1216,13 @@ export class DiscordAdapter implements SurfaceAdapter {
     const user = client.user;
 
     const statusMessage = this.cfg.surface.discord.statusMessage?.trim() || null;
-    if (!input.force && this.appliedStatusMessage === statusMessage) return;
+    const status = this.presence.status;
+    if (
+      !input.force &&
+      this.appliedStatusMessage === statusMessage &&
+      this.appliedPresenceStatus === status
+    )
+      return;
 
     const applied = settleSurfaceFallback(
       Result.try({
@@ -1223,12 +1236,13 @@ export class DiscordAdapter implements SurfaceAdapter {
                   type: ActivityType.Custom,
                 },
               ],
-              status: "online",
+              status,
             });
           } else {
-            user.setPresence({ activities: [], status: "online" });
+            user.setPresence({ activities: [], status });
           }
           this.appliedStatusMessage = statusMessage;
+          this.appliedPresenceStatus = status;
         },
         catch: captureUndefinedSurfaceFallback,
       }),

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, jest } from "bun:test";
 import {
   ActivityType,
   ApplicationCommandOptionType,
@@ -1776,6 +1776,38 @@ describe("DiscordAdapter.refreshCoreConfig", () => {
       { activities: [], status: "online" },
     ]);
   });
+});
+
+it("preserves idle presence when the configured status message changes", async () => {
+  jest.useFakeTimers();
+  let cfg = testConfigWithStatusMessage("reading threads");
+  const calls: unknown[] = [];
+  const adapter = createTestDiscordAdapter({ getConfig: async () => cfg });
+  (adapter as unknown as { client: unknown }).client = {
+    user: { setPresence: (presence: unknown) => calls.push(presence) },
+  };
+  try {
+    await adapter.refreshCoreConfig();
+    adapter.presence.start();
+    jest.advanceTimersByTime(600_000);
+    await Promise.resolve();
+    expect(calls.at(-1)).toMatchObject({ status: "idle" });
+    cfg = testConfigWithStatusMessage("summarizing threads");
+    await adapter.refreshCoreConfig();
+    expect(calls.at(-1)).toMatchObject({
+      status: "idle",
+      activities: [{ state: "summarizing threads" }],
+    });
+    adapter.presence.requestStarted("delivery");
+    await Promise.resolve();
+    expect(calls.at(-1)).toMatchObject({
+      status: "online",
+      activities: [{ state: "summarizing threads" }],
+    });
+  } finally {
+    adapter.presence.stop();
+    jest.useRealTimers();
+  }
 });
 
 describe("DiscordAdapter.editMsg", () => {

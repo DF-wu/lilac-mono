@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
   BlobIntegrityFailure,
   BlobResolveTimeout,
@@ -24,6 +24,8 @@ import { Result, type Result as ResultType } from "better-result";
 import {
   REQUEST_DELIVERY_RESOLVE_TIMEOUT_MS,
   RequestDeliveryCoordinator,
+  RequestDeliveryAdmissionRejected,
+  RequestDeliverySqliteFailure,
   SqliteRequestDeliveryStore,
   collectCoreRequestInputHandles,
   coreRequestDeliveryCodecs,
@@ -103,6 +105,7 @@ function coordinator(input: {
   store: ReturnType<typeof createStore>;
   blobStore: Pick<BlobStore, "resolve" | "open" | "delete">;
   now?: () => number;
+  activity?: { requestStarted(id: string): void; requestSettled(id: string): void };
   logger?: {
     debug(message: string, context: Readonly<Record<string, string | number | boolean>>): void;
     error(message: string, context: Readonly<Record<string, string | number | boolean>>): void;
@@ -112,6 +115,7 @@ function coordinator(input: {
     store: input.store,
     blobStore: input.blobStore,
     admission: createCoreRequestDeliveryAdmission(input.blobStore),
+    activity: input.activity,
     ...(input.now ? { now: input.now } : {}),
     ...(input.logger ? { logger: input.logger } : {}),
   });
@@ -138,6 +142,136 @@ function publicationClaimMethods() {
 }
 
 describe("durable request delivery", () => {
+  test("tracks delivery activity before admission, across recovery, and through terminal outcomes", async () => {
+    const store = createStore();
+    const blobs = await memoryBlobStore();
+    const events: string[] = [];
+    const activity = {
+      requestStarted: (id: string) => {
+        events.push(`start:${id}`);
+      },
+      requestSettled: (id: string) => {
+        events.push(`settle:${id}`);
+      },
+    };
+    const ids = new Map<string, string>();
+    const delivery = coordinator({ store, blobStore: blobs, activity });
+    for (const kind of ["completed", "cancelled", "abandoned"] as const) {
+      const id = crypto.randomUUID();
+      ids.set(kind, id);
+      value(
+        store.prepare({
+          requestDeliveryId: id,
+          requestId: kind,
+          envelope: envelope({ requestDeliveryId: id, requestId: kind }),
+          inputHandles: [],
+          createdAt: 1,
+        }),
+      );
+      const pending = delivery.handleDelivery(id);
+      expect(events.at(-1)).toBe(`start:${id}`);
+      expect(value(await pending).disposition).toBe("accepted");
+      value(await delivery.handleDelivery(id));
+    }
+    events.length = 0;
+    const recovered = coordinator({ store, blobStore: blobs, activity });
+    value(
+      await recovered.recoverAccepted(async (record) => {
+        expect(events.at(-1)).toBe(`start:${record.requestDeliveryId}`);
+        return Result.ok(undefined);
+      }),
+    );
+    expect(events).toHaveLength(3);
+    for (const kind of ["completed", "cancelled", "abandoned"] as const) {
+      const id = ids.get(kind)!;
+      value(await recovered.terminalize({ requestDeliveryId: id, outcome: { kind } }));
+      expect(events.at(-1)).toBe(`settle:${id}`);
+      const count = events.length;
+      value(await recovered.handleDelivery(id));
+      expect(events).toHaveLength(count);
+    }
+    store.close();
+    await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
+  });
+
+  test("releases presence inhibition when admission parks or recovery fails", async () => {
+    const store = createStore();
+    const blobs = await memoryBlobStore();
+    const id = crypto.randomUUID();
+    const active = new Set<string>();
+    const activity = {
+      requestStarted: (id: string) => {
+        active.add(id);
+      },
+      requestSettled: (id: string) => {
+        active.delete(id);
+      },
+    };
+    value(
+      store.prepare({
+        requestDeliveryId: id,
+        requestId: "parked",
+        envelope: envelope({ requestDeliveryId: id, requestId: "parked" }),
+        inputHandles: [],
+        createdAt: 1,
+      }),
+    );
+    const parked = new RequestDeliveryCoordinator({
+      store,
+      blobStore: blobs,
+      activity,
+      admission: {
+        async validateAndBuildWork() {
+          expect(active.has(id)).toBe(true);
+          return Result.err(
+            new RequestDeliveryAdmissionRejected({
+              requestDeliveryId: id,
+              disposition: "park",
+              code: "test-park",
+              message: "Admission unavailable",
+            }),
+          );
+        },
+      },
+    });
+    expect(value(await parked.handleDelivery(id)).disposition).toBe("park");
+    expect(active.size).toBe(0);
+    const delivery = coordinator({ store, blobStore: blobs, activity });
+    expect(value(await delivery.handleDelivery(id)).disposition).toBe("accepted");
+    expect(active.has(id)).toBe(true);
+    active.clear();
+    value(await delivery.handleDelivery(id));
+    expect(active.size).toBe(0);
+    const recoveryError = new Error("Recovery unavailable");
+    const summary = value(
+      await delivery.recoverAccepted(async () => {
+        expect(active.has(id)).toBe(true);
+        return Result.err(recoveryError);
+      }),
+    );
+    expect(summary.failures).toEqual([recoveryError]);
+    expect(active.size).toBe(0);
+    value(await delivery.recoverAccepted(async () => Result.ok(undefined)));
+    expect(active.has(id)).toBe(true);
+    value(await delivery.terminalize({ requestDeliveryId: id, outcome: { kind: "completed" } }));
+    expect(active.size).toBe(0);
+    active.add(id);
+    const load = spyOn(store, "load").mockReturnValue(
+      Result.err(
+        new RequestDeliverySqliteFailure({
+          operation: "load",
+          code: "SQLITE_BUSY",
+          message: "Database busy",
+        }),
+      ),
+    );
+    expect(value(await delivery.handleDelivery(id)).disposition).toBe("park");
+    expect(active.has(id)).toBe(true);
+    load.mockRestore();
+    store.close();
+    await blobs.close({ deadlineAtMs: Date.now() + 1_000 });
+  });
+
   test("routes every cmd.request on the Core bus through a prepared record", async () => {
     const store = createStore();
     const blobs = await memoryBlobStore();

@@ -44,6 +44,11 @@ export type AcceptedRequestRecoverySummary = {
   readonly failures: readonly Error[];
 };
 
+export type RequestDeliveryActivity = {
+  requestStarted(requestDeliveryId: string): void;
+  requestSettled(requestDeliveryId: string): void;
+};
+
 export type RequestDeliveryCoordinatorOptions<TEnvelope, TWork, TOutputMetadata> = {
   readonly store: SqliteRequestDeliveryStore<TEnvelope, TWork, TOutputMetadata>;
   readonly blobStore: Pick<BlobStore, "resolve" | "delete">;
@@ -51,6 +56,7 @@ export type RequestDeliveryCoordinatorOptions<TEnvelope, TWork, TOutputMetadata>
   readonly now?: () => number;
   readonly isResolveTimeout?: (error: BlobResolveError) => boolean;
   readonly logger?: RequestDeliveryLogger;
+  readonly activity?: RequestDeliveryActivity;
 };
 
 export type RequestDeliveryLogger = {
@@ -77,6 +83,7 @@ export class RequestDeliveryCoordinator<
   readonly #now: () => number;
   readonly #isResolveTimeout: (error: BlobResolveError) => boolean;
   readonly #logger?: RequestDeliveryLogger;
+  readonly #activity?: RequestDeliveryActivity;
 
   constructor(options: RequestDeliveryCoordinatorOptions<TEnvelope, TWork, TOutputMetadata>) {
     this.#store = options.store;
@@ -85,6 +92,7 @@ export class RequestDeliveryCoordinator<
     this.#now = options.now ?? Date.now;
     this.#isResolveTimeout = options.isResolveTimeout ?? defaultIsResolveTimeout;
     this.#logger = options.logger;
+    this.#activity = options.activity;
   }
 
   async prepareAndPublish(
@@ -367,7 +375,14 @@ export class RequestDeliveryCoordinator<
               reason: "already-accepted",
             });
           }
-          return this.#handlePrepared(record);
+          this.#activity?.requestStarted(requestDeliveryId);
+          const handled = await this.#handlePrepared(record);
+          const parked = handled.match({
+            ok: (outcome) => outcome.disposition === "park",
+            err: () => false,
+          });
+          if (parked) this.#activity?.requestSettled(requestDeliveryId);
+          return handled;
         },
       })();
   }
@@ -429,6 +444,7 @@ export class RequestDeliveryCoordinator<
     >({
       err: (error) => async () => Result.err(error),
       ok: (value) => async () => {
+        this.#activity?.requestSettled(input.requestDeliveryId);
         await this.#deleteInputTargets(value.record);
         return Result.ok(value);
       },
@@ -557,13 +573,18 @@ export class RequestDeliveryCoordinator<
           else terminalized += 1;
           continue;
         }
+        this.#activity?.requestStarted(record.requestDeliveryId);
         const result = await resume(record);
-        result.match({
-          err: (error) => failures.push(error),
-          ok: () => {
-            resumed += 1;
-          },
+        const resumeError = result.match({
+          err: (error) => error,
+          ok: () => null,
         });
+        if (resumeError) {
+          this.#activity?.requestSettled(record.requestDeliveryId);
+          failures.push(resumeError);
+          continue;
+        }
+        resumed += 1;
       }
       const last = page.records.at(-1);
       if (!last || page.records.length < limit) break;
