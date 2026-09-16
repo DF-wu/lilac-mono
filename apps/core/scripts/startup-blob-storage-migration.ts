@@ -7,6 +7,7 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { runBlobStorageMigration } from "./migrate-blob-storage";
 import { ensureStartupBlobStorageBackup } from "./startup-blob-storage-backup";
 import { TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION } from "../src/transcript/transcript-persistence-codec";
+import { WORKFLOW_SCHEMA_VERSION } from "../src/workflow/workflow-migrations";
 
 export { startupBlobStorageBackupDir } from "./startup-blob-storage-backup";
 
@@ -14,7 +15,7 @@ const LEGACY_TRANSCRIPT_SCHEMA_VERSION = 5;
 const FIRST_BLOB_TRANSCRIPT_SCHEMA_VERSION = 6;
 const CURRENT_TRANSCRIPT_SCHEMA_VERSION = TRANSCRIPT_PERSISTENCE_SCHEMA_VERSION;
 const LEGACY_WORKFLOW_SCHEMA_VERSION = 25;
-const CURRENT_WORKFLOW_SCHEMA_VERSION = 26;
+const FIRST_BLOB_WORKFLOW_SCHEMA_VERSION = 26;
 
 export type StartupBlobStorageMigrationOptions = {
   readonly configPath: string;
@@ -88,8 +89,8 @@ export async function runStartupBlobStorageMigration(
             databasePath: options.workflowDbPath,
             table: "workflow_schema_migrations",
             legacyVersion: LEGACY_WORKFLOW_SCHEMA_VERSION,
-            firstCurrentVersion: CURRENT_WORKFLOW_SCHEMA_VERSION,
-            latestCurrentVersion: CURRENT_WORKFLOW_SCHEMA_VERSION,
+            firstCurrentVersion: FIRST_BLOB_WORKFLOW_SCHEMA_VERSION,
+            latestCurrentVersion: WORKFLOW_SCHEMA_VERSION,
           }),
         }),
         catch: (cause) =>

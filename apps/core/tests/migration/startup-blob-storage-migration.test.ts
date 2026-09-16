@@ -9,7 +9,10 @@ import {
   startupBlobStorageBackupDir,
 } from "../../scripts/startup-blob-storage-migration";
 import { runBlobStorageMigration } from "../../scripts/migrate-blob-storage";
-import { applyWorkflowSchemaMigrations } from "../../src/workflow/workflow-migrations";
+import {
+  applyWorkflowSchemaMigrations,
+  WORKFLOW_SCHEMA_VERSION,
+} from "../../src/workflow/workflow-migrations";
 import { createTranscriptSchemaMigrationFixture } from "../transcript/fixtures/transcript-schema-migration-fixtures";
 
 const temporaryDirectories: string[] = [];
@@ -41,7 +44,7 @@ function createLegacyTranscriptDatabase(databasePath: string): void {
   createTranscriptSchemaMigrationFixture(databasePath, 5);
 }
 
-function createWorkflowDatabase(databasePath: string, version: 25 | 26): void {
+function createWorkflowDatabase(databasePath: string, version: number): void {
   const database = new Database(databasePath, { create: true, strict: true });
   const migrated = applyWorkflowSchemaMigrations(database, () => 1, version);
   database.close(false);
@@ -77,6 +80,47 @@ function advanceTranscriptSchemaHistory(databasePath: string, throughVersion: nu
 }
 
 describe("runStartupBlobStorageMigration", () => {
+  it("accepts another startup after normal runtime workflow migrations", async () => {
+    const workspace = await createWorkspace();
+    const first = await runStartupBlobStorageMigration(workspace);
+    expect(first.isOk()).toBe(true);
+    createWorkflowDatabase(workspace.workflowDbPath, WORKFLOW_SCHEMA_VERSION);
+    const before = await Bun.file(workspace.workflowDbPath).bytes();
+
+    const second = await runStartupBlobStorageMigration(workspace);
+
+    expect(second.isOk()).toBe(true);
+    if (second.isOk()) expect(second.value).toEqual({ kind: "current" });
+    expect(await Bun.file(workspace.workflowDbPath).bytes()).toEqual(before);
+    expect(await Bun.file(startupBlobStorageBackupDir(workspace.dataDir)).exists()).toBe(false);
+  });
+
+  it.each(["future", "gap"] as const)(
+    "refuses a %s workflow ledger without writes",
+    async (kind) => {
+      const workspace = await createWorkspace();
+      createWorkflowDatabase(workspace.workflowDbPath, WORKFLOW_SCHEMA_VERSION);
+      const database = new Database(workspace.workflowDbPath, { strict: true });
+      if (kind === "future") {
+        database.run(
+          "INSERT INTO workflow_schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+          [WORKFLOW_SCHEMA_VERSION + 1, "future migration", 1],
+        );
+      } else {
+        database.run("DELETE FROM workflow_schema_migrations WHERE version = ?", [26]);
+      }
+      database.close(false);
+      const before = await Bun.file(workspace.workflowDbPath).bytes();
+
+      const result = await runStartupBlobStorageMigration(workspace);
+
+      expect(result.isErr()).toBe(true);
+      if (result.isErr()) expect(result.error.phase).toBe("inspect");
+      expect(await Bun.file(workspace.workflowDbPath).bytes()).toEqual(before);
+      expect(await Bun.file(startupBlobStorageBackupDir(workspace.dataDir)).exists()).toBe(false);
+    },
+  );
+
   it("backs up and migrates coordinated legacy schemas exactly once", async () => {
     const workspace = await createWorkspace();
     createLegacyTranscriptDatabase(workspace.transcriptDbPath);
