@@ -60,6 +60,7 @@ export const workflowRequestPolicySchema = z.strictObject({
       requestClient: z.enum([
         "discord",
         "github",
+        "native",
         "whatsapp",
         "slack",
         "telegram",

@@ -238,14 +238,14 @@ describe("surface runtime descriptor factories", () => {
 
   it("keys the closed registry platform set from the existing session refs", () => {
     expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<SessionRef["platform"]>();
-    expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<"discord" | "github">();
+    expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<"discord" | "github" | "native">();
   });
 
   it("keeps catalog keys exactly equal to session and message ref platforms", () => {
     expectTypeOf<BuiltinSurfaceProtocolKeysExactlyEqualRefPlatforms>().toEqualTypeOf<true>();
     expectTypeOf<keyof typeof BUILTIN_SURFACE_PROTOCOLS>().toEqualTypeOf<SessionRef["platform"]>();
     expectTypeOf<keyof typeof BUILTIN_SURFACE_PROTOCOLS>().toEqualTypeOf<MsgRef["platform"]>();
-    expect(Object.keys(BUILTIN_SURFACE_PROTOCOLS)).toEqual(["discord", "github"]);
+    expect(Object.keys(BUILTIN_SURFACE_PROTOCOLS)).toEqual(["discord", "github", "native"]);
   });
 
   it("keeps message-ref construction correlated to the selected protocol session ref", () => {

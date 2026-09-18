@@ -53,7 +53,19 @@ export const discordResourceOriginV1Schema = z.strictObject({
 });
 export type DiscordResourceOriginV1 = z.infer<typeof discordResourceOriginV1Schema>;
 
-export const resourceOriginV1Schema = z.discriminatedUnion("kind", [discordResourceOriginV1Schema]);
+export const nativeResourceOriginV1Schema = z.strictObject({
+  version: z.literal(1),
+  kind: z.literal("native-upload"),
+  threadId: z.string().min(1),
+  uploadId: z.string().min(1),
+  uploaderId: z.string().min(1),
+});
+export type NativeResourceOriginV1 = z.infer<typeof nativeResourceOriginV1Schema>;
+
+export const resourceOriginV1Schema = z.discriminatedUnion("kind", [
+  discordResourceOriginV1Schema,
+  nativeResourceOriginV1Schema,
+]);
 export type ResourceOriginV1 = z.infer<typeof resourceOriginV1Schema>;
 
 export const resourceCacheV1Schema = z.strictObject({

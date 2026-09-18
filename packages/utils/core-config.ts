@@ -88,6 +88,7 @@ export type {
   JSONArray,
   JSONObject,
   ModelReasoningEffort,
+  NativeSurfaceConfig,
   RouterSessionConfig,
   RouterSessionConfigScope,
   RetentionLimit,

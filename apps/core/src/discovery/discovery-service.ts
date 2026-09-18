@@ -451,7 +451,7 @@ function resolveLookbackDurationMs(
   return parseRelativeDurationMs(raw, "lookbackTime");
 }
 
-function resolveTimeWindow(
+export function resolveTimeWindow(
   input: DiscoverySearchInput,
   nowMs: number,
 ): ResultType<TimeWindow | undefined, DiscoveryTimeInputError> {
@@ -595,7 +595,7 @@ function compareCandidates(
   return left.row.doc_key.localeCompare(right.row.doc_key);
 }
 
-function compareGroups(
+export function compareGroups(
   left: DiscoveryResultGroup,
   right: DiscoveryResultGroup,
   orderBy: DiscoveryOrderBy,
@@ -740,7 +740,10 @@ function stripVerboseEntry(entry: DiscoveryResultEntry, verbose: boolean): Disco
   return rest;
 }
 
-function stripVerboseGroup(group: DiscoveryResultGroup, verbose: boolean): DiscoveryResultGroup {
+export function stripVerboseGroup(
+  group: DiscoveryResultGroup,
+  verbose: boolean,
+): DiscoveryResultGroup {
   if (verbose) return group;
   const { ts: _ts, score: _score, ...rest } = group;
   return {
@@ -1168,7 +1171,7 @@ export class DiscoveryService {
     for (const record of records) {
       const text = record.finalText?.trim();
       if (!text) continue;
-      if (hasIndexedSurfaceCoverage(record)) continue;
+      if (record.requestClient === "native" || hasIndexedSurfaceCoverage(record)) continue;
       documents.push({
         docKey: `conversation:transcript:${record.requestClient}:${record.sessionId}:${record.requestId}`,
         source: "conversation",

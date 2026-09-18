@@ -211,9 +211,9 @@ describe("subagent_delegate tool", () => {
           modelOverride?: string;
           reasoningOverride?: string;
           authenticatedOrigin?: {
-            platform: "discord" | "github";
+            platform: "discord" | "github" | "native";
             userId: string;
-            sessionRef: { platform: "discord" | "github"; channelId: string };
+            sessionRef: { platform: "discord" | "github" | "native"; channelId: string };
           };
         }
       | undefined;

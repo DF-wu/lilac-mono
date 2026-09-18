@@ -1,6 +1,32 @@
 import type { ExceptionAdapter } from "./manifest.ts";
 
 export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly ExceptionAdapter[]>> = {
+  "apps/web": [
+    {
+      identity: { module: "src/cache.ts", exportName: "signalWebCacheFailure" },
+      category: "result-to-framework",
+      externalApi: { package: "@stanley2058/lilac-client", exportName: "NativeCache" },
+      direction: "signal-host",
+      reason:
+        "Reports aborted IndexedDB commits through the shared cache Promise contract so the client cannot advance its checkpoint after a failed transaction.",
+    },
+    {
+      identity: { module: "src/cache.ts", exportName: "rejectWebCacheRequest" },
+      category: "compatibility",
+      externalApi: { package: "global", exportName: "IndexedDB request Promise rejection" },
+      direction: "signal-host",
+      reason:
+        "Adapts IndexedDB request error and blocked-open events to rejected Promises consumed by the local cache fallback capture boundary.",
+    },
+    {
+      identity: { module: "src/http.ts", exportName: "nativeWebHttpFailure" },
+      category: "result-to-framework",
+      externalApi: { package: "@orpc/client", exportName: "ORPCError" },
+      direction: "signal-host",
+      reason:
+        "Maps HTTP bootstrap and upload Result failures to the shared client's asynchronous transport error contract after Result policy is resolved.",
+    },
+  ],
   "apps/installer": [
     {
       identity: { module: "src/prompt.ts", exportName: "resolvePromptValue" },
@@ -28,6 +54,61 @@ export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly Excep
     },
   ],
   "apps/core": [
+    {
+      identity: {
+        module: "src/surface/native/gateway.ts",
+        exportName: "rethrowNativeGatewayFailure",
+      },
+      category: "defect-supervisor",
+      externalApi: { package: "@orpc/server", exportName: "AsyncIteratorClass" },
+      direction: "signal-host",
+      reason:
+        "Preserves the original streamed iterator failure after reporting it to the runtime supervisor, before oRPC serializes its terminal error event.",
+    },
+    {
+      identity: {
+        module: "src/surface/native/runtime.ts",
+        exportName: "nativeRuntimeFailureToHost",
+      },
+      category: "result-to-framework",
+      externalApi: {
+        package: "@stanley2058/lilac-core",
+        exportName: "native runtime lifecycle host",
+      },
+      direction: "signal-host",
+      reason:
+        "Signals failed durable output initialization or managed consumer shutdown through the existing runner and runtime lifecycle rejection contracts after Result policy is resolved.",
+    },
+    {
+      identity: { module: "src/surface/native/search.ts", exportName: "nativeSearchFailureToHost" },
+      category: "result-to-framework",
+      externalApi: {
+        package: "@stanley2058/lilac-core",
+        exportName: "ConversationThreadToolService",
+      },
+      direction: "signal-host",
+      reason:
+        "Signals a scoped native search Result failure through the existing conversation tool service rejection contract after Result policy is resolved.",
+    },
+    {
+      identity: {
+        module: "src/surface/native/resources.ts",
+        exportName: "signalNativeResourceStreamFailure",
+      },
+      category: "result-to-framework",
+      externalApi: { package: "global", exportName: "TransformStreamDefaultController.error" },
+      direction: "signal-host",
+      reason:
+        "Signals verified upload size failures and revoked resource access to the stream host so it stops transferring bytes.",
+    },
+    {
+      identity: { module: "src/surface/native/rpc.ts", exportName: "nativeRpcFailure" },
+      category: "result-to-framework",
+      externalApi: { package: "@orpc/server", exportName: "ORPCError" },
+      direction: "signal-host",
+      reason:
+        "Maps a native service Result failure to the oRPC host error contract after the Result callback returns, preserving expected failure classification.",
+    },
     {
       identity: {
         module: "src/conversation/thread-service.ts",

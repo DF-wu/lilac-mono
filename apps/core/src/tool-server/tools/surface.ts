@@ -14,7 +14,12 @@ import {
 import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
 import { isAdapterPlatform } from "../../shared/is-adapter-platform";
-import { hasCacheBurstProvider, type SurfaceOperationError } from "../../surface/adapter";
+import {
+  hasCacheBurstProvider,
+  type SurfaceAdapter,
+  type SurfaceOperationError,
+  type SurfaceOperationResult,
+} from "../../surface/adapter";
 import type {
   ResolvedSurfaceAdapter,
   SurfaceAdapterResolver,
@@ -204,7 +209,7 @@ function createSurfaceMessageRef<P extends RegisteredSurfacePlatform>(
 }
 
 const surfaceClientSchema = z
-  .enum(["discord", "github", "whatsapp", "slack", "telegram", "web"])
+  .enum(["discord", "github", "native", "whatsapp", "slack", "telegram", "web"])
   .describe(
     "Recognized surface wire client/platform. Execution requires a registered adapter and is selected from request context unless --client is needed.",
   );
@@ -537,9 +542,12 @@ function toAttachmentMeta(attachment: DiscordAttachmentMeta): SurfaceMessageAtta
 }
 
 function getMessageAttachmentMeta(msg: SurfaceMessage): SurfaceMessageAttachmentMeta[] {
-  return msg.session.platform === "discord"
-    ? projectDiscordMessage(msg).attachments.map(toAttachmentMeta)
-    : [];
+  if (msg.session.platform === "discord")
+    return projectDiscordMessage(msg).attachments.map(toAttachmentMeta);
+  return (msg.attachments ?? []).map((attachment) => ({
+    ...attachment,
+    kind: attachmentKindFromMimeType(attachment.mimeType),
+  }));
 }
 
 function buildAttachmentHints(
@@ -664,7 +672,7 @@ function toCompactMessage(
     }
   }
 
-  const attachments = discord?.attachments.map(toAttachmentMeta) ?? [];
+  const attachments = getMessageAttachmentMeta(msg);
   const mediaFiles = attachments.filter((a) => a.kind !== "file");
   const hints = buildAttachmentHints(attachments);
 
@@ -991,6 +999,7 @@ export class Surface implements ServerTool {
   constructor(
     private readonly params: {
       adapterResolver: SurfaceAdapterResolver;
+      nativeAdapterForContext?: (context: RequestContext) => SurfaceOperationResult<SurfaceAdapter>;
       config?: CoreConfig;
       getConfig?: () => Promise<CoreConfig>;
       discordSearch?: DiscordSearchService;
@@ -1014,7 +1023,7 @@ export class Surface implements ServerTool {
             "List recent visible writes produced by the agent, with session ids, message ids, and thin previews.",
           inputSchema: activitiesRecentAgentWritesInputSchema,
           validation: "zod",
-          run: (input) => this.callActivitiesRecentAgentWrites(input),
+          run: (input, opts) => this.callActivitiesRecentAgentWrites(input, opts?.context),
         }),
         "surface.sessions.list": callable({
           name: "Surface Sessions List",
@@ -1228,6 +1237,21 @@ export class Surface implements ServerTool {
       inputClient,
       ctx,
       resolver: this.params.adapterResolver,
+    }).andThen((resolved) => {
+      if (resolved.platform !== "native") return Result.ok(resolved);
+      if (
+        !ctx?.serverOwnedRequest ||
+        ctx.requestInitiator?.platform !== "native" ||
+        !this.params.nativeAdapterForContext
+      ) {
+        return Result.err(
+          surfaceFailure("denied", "Native surface tools require an authenticated native request"),
+        );
+      }
+      return surfaceOperationResult(this.params.nativeAdapterForContext(ctx)).map((adapter) => ({
+        ...resolved,
+        adapter,
+      }));
     });
   }
 
@@ -1355,6 +1379,7 @@ export class Surface implements ServerTool {
 
   private async callActivitiesRecentAgentWrites(
     input: z.output<typeof activitiesRecentAgentWritesInputSchema>,
+    ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
     const transcriptStore = this.params.transcriptStore;
     const listRecentAgentWrites = transcriptStore?.listRecentAgentWrites;
@@ -1397,6 +1422,25 @@ export class Surface implements ServerTool {
         offset += rows.length;
 
         for (const row of rows) {
+          if (ctx?.requestClient === "native" && row.client !== "native") continue;
+          let nativeText: string | undefined;
+          if (row.client === "native") {
+            const native = this.resolveAdapter("native", ctx).match({
+              ok: (value) => value,
+              err: () => null,
+            });
+            if (!native) continue;
+            const message = (
+              await native.adapter.readMsg(
+                createSurfaceMessageRef(
+                  native.protocol.refs.createSessionRef(row.sessionId),
+                  row.messageId,
+                ),
+              )
+            ).match({ ok: (value) => value, err: () => null });
+            if (!message) continue;
+            nativeText = message.text;
+          }
           if (row.client === "discord") {
             const discord = this.params.adapterResolver.resolve("discord");
             if (!discord) continue;
@@ -1416,17 +1460,19 @@ export class Surface implements ServerTool {
             }
           }
 
-          const text = (
-            await Result.tryPromise({
-              try: () => this.readRecentAgentWriteText(row),
-              catch: captureSurfaceFailure,
-            })
-          )
-            .mapError((failure) => surfaceExternalFailure(failure))
-            .match({
-              ok: (value) => value,
-              err: () => row.finalText ?? "",
-            });
+          const text =
+            nativeText ??
+            (
+              await Result.tryPromise({
+                try: () => this.readRecentAgentWriteText(row),
+                catch: captureSurfaceFailure,
+              })
+            )
+              .mapError((failure) => surfaceExternalFailure(failure))
+              .match({
+                ok: (value) => value,
+                err: () => row.finalText ?? "",
+              });
 
           const preview = toPreviewText(text);
 

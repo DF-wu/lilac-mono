@@ -1,0 +1,568 @@
+import { Result } from "better-result";
+import { z } from "zod";
+import {
+  cacheScopeKey,
+  MemoryNativeCache,
+  type CachePatch,
+  type CacheScope,
+  type CachedSlot,
+  type NativeCache,
+  type ThreadCheckpoint,
+} from "@stanley2058/lilac-client";
+import {
+  bootstrapReplySchema,
+  replayCheckpointSchema,
+  turnSlotSchema,
+  revisionSchema,
+  identitySchema,
+  type BootstrapReply,
+} from "@stanley2058/lilac-client-protocol";
+
+export type WebDraft = { text: string; skillIds: string[]; commandId?: string; savedText?: string };
+
+export type CachedBootstrap = { scope: CacheScope; bootstrap: BootstrapReply; savedAt: number };
+export type WebCacheOptions = {
+  indexedDB?: IDBFactory | null;
+  name?: string;
+  maxThreads?: number;
+  maxBytes?: number;
+};
+type ThreadRow = {
+  key: string;
+  scopeKey: string;
+  threadId: string;
+  checkpoint: ThreadCheckpoint["checkpoint"];
+  updatedAt: number;
+  bytes: number;
+};
+type SlotRow = {
+  key: string;
+  threadKey: string;
+  scopeKey: string;
+  data: CachedSlot;
+  bytes: number;
+};
+const encode = new TextEncoder();
+
+const cacheScopeSchema = z.strictObject({
+  installationId: z.string(),
+  principalId: z.string(),
+  protocolVersion: z.literal(1),
+  projectionVersion: z.literal(1),
+});
+const threadRowSchema = z.strictObject({
+  key: z.string(),
+  scopeKey: z.string(),
+  threadId: z.string(),
+  checkpoint: replayCheckpointSchema,
+  updatedAt: revisionSchema,
+  bytes: revisionSchema,
+});
+const slotRowSchema = z.strictObject({
+  key: z.string(),
+  threadKey: z.string(),
+  scopeKey: z.string(),
+  bytes: revisionSchema,
+  data: z.strictObject({ revision: revisionSchema, slot: turnSlotSchema }),
+});
+const bootstrapRowSchema = z.strictObject({
+  key: z.string(),
+  scope: cacheScopeSchema,
+  bootstrap: bootstrapReplySchema,
+  savedAt: revisionSchema,
+});
+const draftRowSchema = z.strictObject({
+  key: z.string(),
+  scopeKey: z.string(),
+  text: z.string().max(65_536),
+  skillIds: z.array(identitySchema).max(32).default([]),
+  commandId: identitySchema.optional(),
+  savedText: z.string().max(65_536).optional(),
+  updatedAt: revisionSchema,
+});
+function decodeThread(value: unknown): ThreadRow | undefined {
+  const parsed = threadRowSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+function decodeSlot(value: unknown): SlotRow | undefined {
+  const parsed = slotRowSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+function decodeBootstrap(value: unknown): CachedBootstrap | undefined {
+  const parsed = bootstrapRowSchema.safeParse(value);
+  if (!parsed.success) return undefined;
+  const { scope, bootstrap, savedAt } = parsed.data;
+  if (
+    bootstrap.installationId !== scope.installationId ||
+    bootstrap.viewer.id !== scope.principalId ||
+    parsed.data.key !== cacheScopeKey(scope)
+  )
+    return undefined;
+  return { scope, bootstrap, savedAt };
+}
+function decodeDraftRow(value: unknown): z.infer<typeof draftRowSchema> | undefined {
+  const parsed = draftRowSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
+function decodeDraft(value: unknown): WebDraft {
+  const parsed = draftRowSchema.safeParse(value);
+  if (!parsed.success) return { text: "", skillIds: [] };
+  return {
+    text: parsed.data.text,
+    skillIds: parsed.data.skillIds,
+    commandId: parsed.data.commandId,
+    savedText: parsed.data.savedText,
+  };
+}
+function rejectWebCacheRequest(reject: (cause: Error) => void, error: Error): void {
+  reject(error);
+}
+function idbRequest<T>(request: IDBRequest<T>): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () =>
+      rejectWebCacheRequest(reject, request.error ?? new Error("IndexedDB request failed"));
+  });
+}
+function completed(transaction: IDBTransaction): Promise<boolean> {
+  return new Promise((resolve) => {
+    transaction.oncomplete = () => resolve(true);
+    transaction.onabort = () => resolve(false);
+    transaction.onerror = () => resolve(false);
+  });
+}
+function signalWebCacheFailure(error: Error): never {
+  throw error;
+}
+async function assertCommitted(completion: Promise<boolean>): Promise<void> {
+  if (!(await completion)) signalWebCacheFailure(new Error("Cache transaction failed"));
+}
+function threadKey(scope: CacheScope, threadId: string): string {
+  return JSON.stringify([cacheScopeKey(scope), threadId]);
+}
+function slotKey(key: string, slotId: string): string {
+  return JSON.stringify([key, slotId]);
+}
+async function deleteIndex(store: IDBObjectStore, index: string, key: string): Promise<void> {
+  const keys = await idbRequest(store.index(index).getAllKeys(key));
+  if (!Array.isArray(keys)) return;
+  for (const entry of keys) {
+    if (typeof entry === "string") store.delete(entry);
+  }
+}
+
+function trimMap<T>(map: Map<string, T>, limit: number): void {
+  for (const key of map.keys()) {
+    if (map.size <= limit) return;
+    map.delete(key);
+  }
+}
+
+export class WebNativeCache implements NativeCache {
+  private readonly memory = new MemoryNativeCache();
+  private readonly snapshots = new Map<string, CachedBootstrap>();
+  private readonly drafts = new Map<string, WebDraft>();
+  private readonly factory: IDBFactory | null | undefined;
+  private readonly name: string;
+  private readonly maxThreads: number;
+  private readonly maxBytes: number;
+  private connection: Promise<IDBDatabase | undefined> | undefined;
+  private database: IDBDatabase | undefined;
+  private disabled = false;
+  private epoch = 0;
+  private readonly residentThreads = new Map<
+    string,
+    { scope: CacheScope; threadId: string; bytes: number }
+  >();
+
+  constructor(options: WebCacheOptions = {}) {
+    this.factory = options.indexedDB === undefined ? globalThis.indexedDB : options.indexedDB;
+    this.name = options.name ?? "lilac-native-v1";
+    this.maxThreads = Math.max(1, options.maxThreads ?? 24);
+    this.maxBytes = Math.max(1024, options.maxBytes ?? 64 * 1024 * 1024);
+  }
+  get persistent(): boolean {
+    return Boolean(this.factory) && !this.disabled;
+  }
+  private async open(): Promise<IDBDatabase | undefined> {
+    if (this.disabled || !this.factory) return undefined;
+    if (this.connection) return this.connection;
+    this.connection = this.openDatabase();
+    return this.connection;
+  }
+  private async openDatabase(): Promise<IDBDatabase | undefined> {
+    const result = await Result.tryPromise({
+      try: () =>
+        new Promise<IDBDatabase>((resolve, reject) => {
+          const request = this.factory!.open(this.name, 1);
+          request.onupgradeneeded = () => {
+            const db = request.result;
+            const threads = db.createObjectStore("threads", { keyPath: "key" });
+            threads.createIndex("scope", "scopeKey");
+            const slots = db.createObjectStore("slots", { keyPath: "key" });
+            slots.createIndex("thread", "threadKey");
+            slots.createIndex("scope", "scopeKey");
+            db.createObjectStore("snapshots", { keyPath: "key" });
+            const drafts = db.createObjectStore("drafts", { keyPath: "key" });
+            drafts.createIndex("scope", "scopeKey");
+          };
+          request.onsuccess = () => {
+            if (this.disabled) {
+              request.result.close();
+              rejectWebCacheRequest(reject, new Error("Cache closed during open"));
+              return;
+            }
+            resolve(request.result);
+          };
+          request.onerror = () =>
+            rejectWebCacheRequest(reject, request.error ?? new Error("IndexedDB request failed"));
+          request.onblocked = () =>
+            rejectWebCacheRequest(reject, new Error("Cache upgrade blocked"));
+        }),
+      catch: () => undefined,
+    });
+    const db = result.match({ ok: (value) => value, err: () => undefined });
+    if (!db) {
+      this.disabled = true;
+      return undefined;
+    }
+    this.database = db;
+    db.onversionchange = () => {
+      db.close();
+      this.database = undefined;
+      this.connection = undefined;
+    };
+    return db;
+  }
+  private async attempt<T>(
+    operation: (database: IDBDatabase) => Promise<T>,
+  ): Promise<T | undefined> {
+    const db = await this.open();
+    if (!db) return undefined;
+    const result = await Result.tryPromise({ try: () => operation(db), catch: () => undefined });
+    const outcome = result.match<{ value: T } | { failed: true }>({
+      ok: (value) => ({ value }),
+      err: () => ({ failed: true }),
+    });
+    if ("value" in outcome) return outcome.value;
+    this.disabled = true;
+    this.database?.close();
+    this.database = undefined;
+    this.connection = undefined;
+    const factory = this.factory;
+    if (factory) {
+      const cleanup = await Result.tryPromise({
+        try: () =>
+          new Promise<void>((resolve) => {
+            const request = factory.deleteDatabase(this.name);
+            request.onsuccess = () => resolve();
+            request.onerror = () => resolve();
+            request.onblocked = () => resolve();
+          }),
+        catch: () => undefined,
+      });
+      cleanup.match({ ok: () => {}, err: () => {} });
+    }
+    return undefined;
+  }
+  async read(scope: CacheScope, threadId: string): Promise<ThreadCheckpoint | undefined> {
+    const epoch = this.epoch;
+    const cached = await this.memory.read(scope, threadId);
+    if (cached) {
+      const resident = this.residentThreads.get(threadKey(scope, threadId));
+      if (resident) this.touch(scope, threadId, resident.bytes);
+      return cached;
+    }
+    const key = threadKey(scope, threadId);
+    const loaded = await this.attempt(async (db) => {
+      const tx = db.transaction(["threads", "slots"], "readwrite");
+      const done = completed(tx);
+      const row = decodeThread(await idbRequest(tx.objectStore("threads").get(key)));
+      if (!row || row.scopeKey !== cacheScopeKey(scope) || row.threadId !== threadId) {
+        await assertCommitted(done);
+        return undefined;
+      }
+      const values = await idbRequest(tx.objectStore("slots").index("thread").getAll(key));
+      if (!Array.isArray(values)) {
+        await assertCommitted(done);
+        return undefined;
+      }
+      const slots: CachedSlot[] = [];
+      for (const value of values) {
+        const slot = decodeSlot(value);
+        if (!slot || slot.threadKey !== key || slot.scopeKey !== cacheScopeKey(scope)) {
+          await assertCommitted(done);
+          return undefined;
+        }
+        slots.push(slot.data);
+      }
+      tx.objectStore("threads").put({ ...row, updatedAt: Date.now() });
+      await assertCommitted(done);
+      return {
+        checkpoint: row.checkpoint,
+        slots: slots.sort((a, b) => a.slot.position - b.slot.position),
+      };
+    });
+    if (!loaded || epoch !== this.epoch) return undefined;
+    await this.memory.commit(scope, threadId, {
+      checkpoint: loaded.checkpoint,
+      replace: true,
+      put: loaded.slots,
+      remove: [],
+    });
+    this.touch(scope, threadId, encode.encode(JSON.stringify(loaded)).byteLength);
+    await this.evictMemory();
+    return loaded;
+  }
+  private touch(scope: CacheScope, threadId: string, bytes: number): void {
+    const key = threadKey(scope, threadId);
+    this.residentThreads.delete(key);
+    this.residentThreads.set(key, { scope, threadId, bytes });
+  }
+  private async evictMemory(): Promise<void> {
+    let bytes = 0;
+    for (const value of this.residentThreads.values()) bytes += value.bytes;
+    for (const [key, value] of this.residentThreads) {
+      if (this.residentThreads.size <= this.maxThreads && bytes <= this.maxBytes) return;
+      this.residentThreads.delete(key);
+      bytes -= value.bytes;
+      await this.memory.remove(value.scope, value.threadId);
+    }
+  }
+  async commit(scope: CacheScope, threadId: string, patch: CachePatch): Promise<void> {
+    await this.memory.commit(scope, threadId, patch);
+    const key = threadKey(scope, threadId);
+    const scopeKey = cacheScopeKey(scope);
+    const rows: SlotRow[] = patch.put.map((data) => ({
+      key: slotKey(key, data.slot.slotId),
+      threadKey: key,
+      scopeKey,
+      data,
+      bytes: encode.encode(JSON.stringify(data)).byteLength,
+    }));
+    const bytes = await this.attempt(async (db) => {
+      const tx = db.transaction(["threads", "slots"], "readwrite");
+      const done = completed(tx);
+      const threads = tx.objectStore("threads");
+      const slots = tx.objectStore("slots");
+      const previous = decodeThread(await idbRequest(threads.get(key)));
+      if (!previous && !patch.replace) {
+        await assertCommitted(done);
+        return 0;
+      }
+      let total = patch.replace ? 0 : (previous?.bytes ?? 0);
+      if (patch.replace) await deleteIndex(slots, "thread", key);
+      for (const id of new Set([...patch.remove, ...patch.put.map((value) => value.slot.slotId)])) {
+        const old = decodeSlot(await idbRequest(slots.get(slotKey(key, id))));
+        if (old) total -= old.bytes;
+        slots.delete(slotKey(key, id));
+      }
+      for (const row of rows) {
+        slots.put(row);
+        total += row.bytes;
+      }
+      threads.put({
+        key,
+        scopeKey,
+        threadId,
+        checkpoint: patch.checkpoint,
+        updatedAt: Date.now(),
+        bytes: total,
+      });
+      const all = await idbRequest(threads.getAll());
+      const metadata = Array.isArray(all)
+        ? all
+            .map(decodeThread)
+            .filter((row) => row !== undefined)
+            .sort((a, b) => a.updatedAt - b.updatedAt)
+        : [];
+      let retainedBytes = metadata.reduce((sum, row) => sum + row.bytes, 0);
+      let retainedCount = metadata.length;
+      for (const row of metadata) {
+        if (retainedCount <= this.maxThreads && retainedBytes <= this.maxBytes) break;
+        threads.delete(row.key);
+        await deleteIndex(slots, "thread", row.key);
+        retainedCount--;
+        retainedBytes -= row.bytes;
+      }
+      await assertCommitted(done);
+      return total;
+    });
+    const previousBytes = patch.replace ? 0 : (this.residentThreads.get(key)?.bytes ?? 0);
+    this.touch(
+      scope,
+      threadId,
+      bytes ?? previousBytes + rows.reduce((sum, row) => sum + row.bytes, 0),
+    );
+    await this.evictMemory();
+  }
+  async remove(scope: CacheScope, threadId: string): Promise<void> {
+    this.epoch++;
+    await this.memory.remove(scope, threadId);
+    const key = threadKey(scope, threadId);
+    this.residentThreads.delete(key);
+    await this.attempt(async (db) => {
+      const tx = db.transaction(["threads", "slots", "drafts"], "readwrite");
+      const done = completed(tx);
+      tx.objectStore("threads").delete(key);
+      tx.objectStore("drafts").delete(key);
+      await deleteIndex(tx.objectStore("slots"), "thread", key);
+      await assertCommitted(done);
+    });
+    this.drafts.delete(key);
+  }
+  async purge(scope: CacheScope): Promise<void> {
+    this.epoch++;
+    await this.memory.purge(scope);
+    const key = cacheScopeKey(scope);
+    this.snapshots.delete(key);
+    for (const [id, value] of this.residentThreads) {
+      if (cacheScopeKey(value.scope) === key) {
+        this.residentThreads.delete(id);
+        this.drafts.delete(id);
+      }
+    }
+    for (const id of this.drafts.keys()) {
+      if (id.startsWith(JSON.stringify([key]).slice(0, -1))) this.drafts.delete(id);
+    }
+    await this.attempt(async (db) => {
+      const tx = db.transaction(["threads", "slots", "snapshots", "drafts"], "readwrite");
+      const done = completed(tx);
+      tx.objectStore("snapshots").delete(key);
+      await deleteIndex(tx.objectStore("threads"), "scope", key);
+      await deleteIndex(tx.objectStore("slots"), "scope", key);
+      await deleteIndex(tx.objectStore("drafts"), "scope", key);
+      await assertCommitted(done);
+    });
+  }
+  async saveBootstrap(scope: CacheScope, bootstrap: BootstrapReply): Promise<void> {
+    if (
+      bootstrap.installationId !== scope.installationId ||
+      bootstrap.viewer.id !== scope.principalId
+    )
+      return;
+    const key = cacheScopeKey(scope);
+    const previous = this.snapshots.get(key);
+    const catalog =
+      bootstrap.catalog.kind === "unchanged" &&
+      previous?.bootstrap.catalog.kind === "catalog" &&
+      previous.bootstrap.catalog.catalog.revision === bootstrap.catalog.revision
+        ? previous.bootstrap.catalog
+        : bootstrap.catalog;
+    const value: CachedBootstrap = {
+      scope,
+      bootstrap: {
+        ...bootstrap,
+        selectedThread: undefined,
+        selectedThreadUnavailable: undefined,
+        catalog,
+      },
+      savedAt: Date.now(),
+    };
+    this.snapshots.set(key, value);
+    trimMap(this.snapshots, this.maxThreads);
+    await this.attempt(async (db) => {
+      const tx = db.transaction("snapshots", "readwrite");
+      const done = completed(tx);
+      const store = tx.objectStore("snapshots");
+      store.put({ key, ...value });
+      const all = await idbRequest(store.getAll());
+      const rows = Array.isArray(all)
+        ? all
+            .map(decodeBootstrap)
+            .filter((item) => item !== undefined)
+            .sort((a, b) => b.savedAt - a.savedAt)
+        : [];
+      for (const row of rows.slice(this.maxThreads)) store.delete(cacheScopeKey(row.scope));
+      await assertCommitted(done);
+    });
+  }
+  async readBootstrap(scope: CacheScope): Promise<CachedBootstrap | undefined> {
+    const epoch = this.epoch;
+    const key = cacheScopeKey(scope);
+    const existing = this.snapshots.get(key);
+    if (existing) return existing;
+    const value = await this.attempt(async (db) => {
+      const tx = db.transaction("snapshots", "readonly");
+      const done = completed(tx);
+      const result = decodeBootstrap(await idbRequest(tx.objectStore("snapshots").get(key)));
+      await assertCommitted(done);
+      return result;
+    });
+    if (epoch !== this.epoch) return undefined;
+    if (value) this.snapshots.set(key, value);
+    return value;
+  }
+  async readLatestBootstrap(): Promise<CachedBootstrap | undefined> {
+    const epoch = this.epoch;
+    const values = await this.attempt(async (db) => {
+      const tx = db.transaction("snapshots", "readonly");
+      const done = completed(tx);
+      const result = await idbRequest(tx.objectStore("snapshots").getAll());
+      await assertCommitted(done);
+      return Array.isArray(result)
+        ? result.map(decodeBootstrap).filter((value) => value !== undefined)
+        : [];
+    });
+    if (epoch !== this.epoch) return undefined;
+    for (const value of values ?? []) this.snapshots.set(cacheScopeKey(value.scope), value);
+    return [...this.snapshots.values()].sort((a, b) => b.savedAt - a.savedAt)[0];
+  }
+  async saveDraft(scope: CacheScope, threadId: string, draft: WebDraft): Promise<void> {
+    const value: WebDraft = {
+      text: draft.text.slice(0, 65_536),
+      skillIds: [...new Set(draft.skillIds)].slice(0, 32),
+      commandId: draft.commandId,
+      savedText: draft.savedText?.slice(0, 65_536),
+    };
+    const key = threadKey(scope, threadId);
+    this.drafts.delete(key);
+    this.drafts.set(key, value);
+    trimMap(this.drafts, this.maxThreads);
+    await this.attempt(async (db) => {
+      const tx = db.transaction("drafts", "readwrite");
+      const done = completed(tx);
+      const store = tx.objectStore("drafts");
+      store.put({
+        key,
+        scopeKey: cacheScopeKey(scope),
+        ...value,
+        updatedAt: Date.now(),
+      });
+      const all = await idbRequest(store.getAll());
+      const rows = Array.isArray(all)
+        ? all
+            .map(decodeDraftRow)
+            .filter((row) => row !== undefined)
+            .sort((a, b) => b.updatedAt - a.updatedAt)
+        : [];
+      for (const row of rows.slice(this.maxThreads)) store.delete(row.key);
+      await assertCommitted(done);
+    });
+  }
+  async readDraft(scope: CacheScope, threadId: string): Promise<WebDraft> {
+    const epoch = this.epoch;
+    const key = threadKey(scope, threadId);
+    const known = this.drafts.get(key);
+    if (known !== undefined) return structuredClone(known);
+    const value = await this.attempt(async (db) => {
+      const tx = db.transaction("drafts", "readonly");
+      const done = completed(tx);
+      const row = await idbRequest(tx.objectStore("drafts").get(key));
+      await assertCommitted(done);
+      return decodeDraft(row);
+    });
+    if (epoch !== this.epoch) return { text: "", skillIds: [] };
+    if (value !== undefined) this.drafts.set(key, value);
+    return value ? structuredClone(value) : { text: "", skillIds: [] };
+  }
+  close(): void {
+    this.database?.close();
+    this.database = undefined;
+    this.connection = undefined;
+  }
+}
+
+export function createWebNativeCache(options: WebCacheOptions = {}): WebNativeCache {
+  return new WebNativeCache(options);
+}

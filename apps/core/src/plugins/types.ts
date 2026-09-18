@@ -1,3 +1,5 @@
+import type { SurfaceAdapter, SurfaceOperationResult } from "../surface/adapter";
+import type { RequestContext } from "../tool-server/types";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
@@ -8,6 +10,7 @@ import type {
 } from "@stanley2058/lilac-plugin-runtime";
 
 import type { SurfaceAdapterResolver } from "../surface/runtime-descriptor";
+import type { NativeSearchService } from "../surface/native/search";
 import type { DiscoveryService } from "../discovery/discovery-service";
 import type { ConversationThreadToolService } from "../conversation/thread-service";
 import type { DiscordSearchService } from "../surface/store/discord-search-store";
@@ -29,10 +32,13 @@ export type CoreToolPluginRuntime = {
   blobStore?: BlobStore;
   attachmentOutputLifecycle?: AttachmentOutputLifecycle;
   resourceAccess?: ResourceAccess;
+  resourceAccessForContext?: (context: RequestContext | undefined) => ResourceAccess | undefined;
   surfaceAdapterResolver?: SurfaceAdapterResolver;
+  nativeAdapterForContext?: (context: RequestContext) => SurfaceOperationResult<SurfaceAdapter>;
   config?: CoreConfig;
   getConfig?: () => Promise<CoreConfig>;
   discovery?: DiscoveryService;
+  nativeSearch?: NativeSearchService;
   conversationThreads?: ConversationThreadToolService;
   discordSearch?: DiscordSearchService;
   transcriptStore?: TranscriptStore;

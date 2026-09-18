@@ -131,6 +131,41 @@ export type BlobStorageConfig =
       forcePathStyle: boolean;
     };
 
+export type NativeSurfaceConfig = {
+  enabled: boolean;
+  host: string;
+  port: number;
+  publicUrl: string;
+  installationId?: string;
+  allowedOrigins: string[];
+  auth: {
+    provider: "local" | "clerk";
+    ownerId: string;
+    ownerProviderUserId?: string;
+    clerkIssuer?: string;
+    clerkOAuthClientId?: string;
+  };
+  outputStreaming: "paragraph" | "complete";
+  oldMessageSelectionMaxAgeMs: number | null;
+  storageRetentionMaxAgeMs: number | null;
+  crossThreadSend: { triggerRun: boolean };
+};
+
+export function defaultNativeSurfaceConfig(): NativeSurfaceConfig {
+  return {
+    enabled: false,
+    host: "127.0.0.1",
+    port: 8787,
+    publicUrl: "http://localhost:8787",
+    allowedOrigins: ["http://localhost:8787"],
+    auth: { provider: "local", ownerId: "owner" },
+    outputStreaming: "paragraph",
+    oldMessageSelectionMaxAgeMs: null,
+    storageRetentionMaxAgeMs: null,
+    crossThreadSend: { triggerRun: true },
+  };
+}
+
 export type UniversalCoreConfig = {
   configVersion: CoreConfigVersion;
 
@@ -213,6 +248,7 @@ export type UniversalCoreConfig = {
   };
 
   surface: {
+    native: NativeSurfaceConfig;
     router: {
       defaultMode: "mention" | "active";
       sessionModes: Record<

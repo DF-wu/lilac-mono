@@ -20,7 +20,7 @@ import {
   webFetchModeSchema,
 } from "./v1";
 import { collectUnknownConfigKeyPaths } from "./unknown-keys";
-import { MODEL_REASONING_EFFORTS } from "./types";
+import { defaultNativeSurfaceConfig, MODEL_REASONING_EFFORTS } from "./types";
 
 import type {
   ConfigParser,
@@ -698,6 +698,68 @@ const modelsSchemaV2 = z
     },
   });
 
+const nativeHttpUrlSchema = z.url().refine((value) => {
+  const url = new URL(value);
+  return url.protocol === "http:" || url.protocol === "https:";
+}, "Expected an HTTP or HTTPS URL");
+const nativeOriginSchema = nativeHttpUrlSchema.refine(
+  (value) => new URL(value).origin === value,
+  "Expected an origin without a path or trailing slash",
+);
+
+const nativeSurfaceSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    host: z.string().trim().min(1).default("127.0.0.1"),
+    port: z.number().int().min(1).max(65535).default(8787),
+    publicUrl: nativeHttpUrlSchema.default("http://localhost:8787"),
+    installationId: z.string().trim().min(1).max(256).optional(),
+    allowedOrigins: z.array(nativeOriginSchema).min(1).default(["http://localhost:8787"]),
+    auth: z
+      .object({
+        provider: z.enum(["local", "clerk"]).default("local"),
+        ownerId: z
+          .string()
+          .trim()
+          .min(1)
+          .max(256)
+          .refine(
+            (value) => value !== "lilac",
+            "The lilac identity is reserved for the service user",
+          )
+          .default("owner"),
+        ownerProviderUserId: z.string().trim().min(1).optional(),
+        clerkIssuer: z.url().optional(),
+        clerkOAuthClientId: z.string().trim().min(1).optional(),
+      })
+      .default({ provider: "local", ownerId: "owner" }),
+    outputStreaming: z.enum(["paragraph", "complete"]).default("paragraph"),
+    oldMessageSelectionMaxAgeMs: positiveDurationMsSchema.nullable().default(null),
+    storageRetentionMaxAgeMs: positiveDurationMsSchema.nullable().default(null),
+    crossThreadSend: z
+      .object({ triggerRun: z.boolean().default(true) })
+      .default({ triggerRun: true }),
+  })
+  .superRefine((value, ctx) => {
+    if (!value.enabled) return;
+    if (!value.installationId)
+      ctx.addIssue({
+        code: "custom",
+        path: ["installationId"],
+        message: "Required when the native surface is enabled",
+      });
+    if (value.auth.provider !== "clerk") return;
+    for (const key of ["ownerProviderUserId", "clerkIssuer"] as const) {
+      if (value.auth[key]) continue;
+      ctx.addIssue({
+        code: "custom",
+        path: ["auth", key],
+        message: "Required when Clerk authentication is enabled",
+      });
+    }
+  })
+  .default(defaultNativeSurfaceConfig());
+
 export const coreConfigInputSchemaV2 = z.object({
   configVersion: configVersionSchema,
 
@@ -710,11 +772,13 @@ export const coreConfigInputSchemaV2 = z.object({
 
   surface: z
     .object({
+      native: nativeSurfaceSchema,
       router: routerSchema,
       discord: discordSurfaceSchema,
       heartbeat: heartbeatSchema,
     })
     .default({
+      native: defaultNativeSurfaceConfig(),
       router: {
         defaultMode: "mention",
         sessionModes: {},

@@ -49,11 +49,13 @@ import type { RequestContext as CoreRequestContext } from "../../src/tool-server
 const SESSION_REF_FIXTURES = {
   discord: { platform: "discord", channelId: "discord-channel" },
   github: { platform: "github", channelId: "owner/repo#1" },
+  native: { platform: "native", channelId: "thread-1" },
 } as const satisfies Record<SessionRef["platform"], SessionRef>;
 
 const MESSAGE_REF_FIXTURES = {
   discord: { platform: "discord", channelId: "discord-channel", messageId: "discord-message" },
   github: { platform: "github", channelId: "owner/repo#1", messageId: "101" },
+  native: { platform: "native", channelId: "thread-1", messageId: "message-1" },
 } as const satisfies Record<MsgRef["platform"], MsgRef>;
 
 type SurfaceOperationEntrypoint =
@@ -223,7 +225,7 @@ interface SurfaceAdapterSignatureFixture {
 describe("surface operation contract", () => {
   it("keeps session and message platform sets exactly equal", () => {
     expectTypeOf<SessionRef["platform"]>().toEqualTypeOf<MsgRef["platform"]>();
-    expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<"discord" | "github">();
+    expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<"discord" | "github" | "native">();
     expectTypeOf<
       NonNullable<PluginRequestContext["requestInitiator"]>["platform"]
     >().toEqualTypeOf<string>();

@@ -76,7 +76,15 @@ The fail-closed workspace inventory is `ACTIVE_WORKSPACES` in `scripts/architect
   supervised uploads, verified reads, expiry, maintenance, and local and S3-compatible adapters.
 - `packages/claude-code-bridge`: Claude agent adapter, runtime integration, in-process MCP tool bridge,
   native input delivery, attempt settlement, and continuation metadata.
-- `packages/client-protocol`: pre-release native display/replay schemas and typed oRPC synchronization contracts. Stage 0 tests exercise Bun WebSocket transport and a test-only replay reducer; Core does not expose a native gateway yet.
+- `packages/client-protocol`: versioned native display/replay schemas and typed oRPC contracts.
+- `packages/client`: framework-independent native socket, replay, receipt and cache coordination.
+- `apps/web`: React/Vite native chat UI. Core serves its built assets from the native gateway.
+
+Native surface ownership is in `apps/core/src/surface/native`: `store.ts` owns native SQLite state,
+`execution.ts` bridges accepted input to existing request delivery, and `runtime.ts` composes auth,
+resources, search, semantic output projection and the HTTP/WebSocket gateway. The surface uses
+starter-owned authority and a separate user directory, with `lilac` as its service user. The web app
+uses the shared client and a principal-scoped IndexedDB cache. See [native setup](docs/native-surface.md).
 - `packages/coding-tools`: shared coding-tool schemas and implementations, patch/edit behavior, batching, instruction discovery, and tool guardrails.
 - `packages/computer-use-runner`: pinned CUA desktop image, Chromium seccomp profile, persistent Python runtime, and runner checks.
 - `packages/event-bus`: event catalog, codecs, typed bus, delivery policy, dead letters, and Redis Streams transport.
@@ -127,7 +135,7 @@ Only the exact live token can create or observe the `requestDeliveryId` to strea
 records that stream ID, one Redis operation confirms the exact marker and removes it with the claim. An
 expired or superseded producer token cannot append a request.
 
-Durable consumers need stable `subscriptionId` values. The transport maps them to versioned physical groups created at the current stream end, leases each invocation, heartbeats live attempts, and reclaims expired attempts with token fencing. Delivery is at-least-once: handlers that perform external effects own their idempotency. The fixed policy allows five attempts before Redis-only dead-letter exhaustion. Managed dead-letter persistence, source acknowledgement, and delivery-metadata cleanup are atomic; ordinary commit atomically acknowledges and removes metadata. `consumerId` identifies one process within a group, and the Redis stream entry ID is the cursor/checkpoint. Tail delivery retains its cursor behavior and no lease.
+Durable consumers need stable `subscriptionId` values. The transport maps them to versioned physical groups created at the current stream end by default. `startFrom: "beginning"` replays retained events when a group is first created; it never resets an existing group's durable frontier. The transport leases each invocation, heartbeats live attempts, and reclaims expired attempts with token fencing. Delivery is at-least-once: handlers that perform external effects own their idempotency. The fixed policy allows five attempts before Redis-only dead-letter exhaustion. Managed dead-letter persistence, source acknowledgement, and delivery-metadata cleanup are atomic; ordinary commit atomically acknowledges and removes metadata. `consumerId` identifies one process within a group, and the Redis stream entry ID is the cursor/checkpoint. Tail delivery retains its cursor behavior and no lease.
 
 ## Tools, Plugins, And Skills
 

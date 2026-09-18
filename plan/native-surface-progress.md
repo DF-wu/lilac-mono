@@ -2,68 +2,113 @@
 
 Active plan: [native-surface.md](native-surface.md). Product scope and stage exit gates are unchanged.
 
-## Stage 0, in progress
+## Implementation status
 
-The initial slice establishes a registered `packages/client-protocol` workspace, strict pre-release
-replay schemas, typed oRPC sync contracts, a test-only reducer and real Bun WebSocket proofs. It does
-not expose a gateway, change existing surfaces or persist native data.
+The backend, shared client and web SPA are implemented. Final Stage 2 browser validation and review
+are in progress. Stage 3 has not started. No stage is closed while its required verification remains
+outstanding.
 
-Measured on Linux x86_64, AMD Ryzen 9 5950X, Bun 1.4.2, loopback with no injected latency:
+The initial protocol proof was committed as `61485a63`. Subsequent implementation adds:
 
-| Proof | Result |
+- A separate versioned SQLite native store, immutable turns, command receipts, owner-managed sharing,
+  starter authority, replay checkpoints, deferred history and bounded detail pagination.
+- Local fixed-owner sessions and Clerk verification, authenticated bootstrap and one typed oRPC
+  socket, HTTP uploads and origin-thread-authorized resources.
+- Existing execution admission, pinned model selection, steering/follow-up/cancel, upload gating,
+  rewind/delete recovery, canonical history selection, semantic durable output and compaction events.
+- Native surface tools, search and summaries, read-only external views, static skill/command catalogs,
+  owner config Save and MCP Reload. Structured native questions remain unsupported.
+- A framework-independent client with persistent replay/cache interfaces, revision fences, reconnect,
+  incremental updates, scoped IndexedDB storage and bounded inactive state.
+- React/Vite UI with virtualized lists, local autocomplete, resource previews, persistent text/skill
+  drafts, activity folds, rich Markdown and explicit service-worker updates.
+
+## Performance fixture and limits
+
+Reference environment: Linux x86_64, AMD Ryzen 9 5950X, Bun 1.4.2, Chrome 151 headless, loopback with
+no injected latency. The executable fixture is
+`apps/core/tests/surface/native/browser-fixture.ts`. It uses production native services and runner
+with a deterministic model, synthetic credentials, 600 historical turns, 60 sidebar threads, rich
+content and a huge paged turn. It does not use the operator's real conversations or credentials.
+
+Selected implementation bounds:
+
+| Item | Bound |
 | --- | --- |
-| Unchanged sync, representative IDs | 355 bytes including masked client and server WebSocket framing. |
-| Unchanged sync, maximum schema identifier lengths and revisions | 753 bytes with framing. |
-| Browser transport-only bundle | 24,647 bytes minified, 8,842 bytes gzip. No Core/server/schema/AI runtime imports. This excludes the future cache/reducer and UI. |
-| Transport behavior | Runtime input/output validation, concurrent RPC during subscription, cancellation and socket-close subscription cleanup pass. |
-| Replay model | Latest-first window, turn/range hydration, stale generation/revision fencing, independent unresolved coverage and retry are covered by executable fixtures. |
+| Initial recent window | Five turns, 224 KiB projection budget. |
+| Replay retention | Seven days and 128 MiB across retained native changes. |
+| Persisted browser thread cache | 24 threads, 64 MiB, with eviction. |
+| Inactive shared-client stores | Eight; active or observed stores remain pinned. |
+| Deferred hydration | Bounded turn/range and within-turn pages, independent of committed replay cursor. |
 
-The transport byte proof excludes authentication/connection establishment and unrelated traffic, as
-required by the plan. It does not yet prove server-side cursor expiry handling or real storage replay.
-The proof server is test-only and binds loopback on an ephemeral port. Tests synchronize on promises
-and socket events, with no fixed sleeps.
+Measured unchanged rich-thread navigation transfers 702–708 bytes including masked client/server
+WebSocket framing, subscription replacement and the queue request. Authentication and connection
+establishment are excluded. The browser renders cached content before waiting for these requests.
+Earlier protocol-only fixtures measured 355 bytes with representative IDs and 753 bytes at maximum
+schema identifier lengths; those results do not include the web UI's queue traffic.
 
-Production contracts currently contain only the display text subset needed by these proofs. Full
-message/tool/resource parts, command receipts, authority, bootstrap catalogs, admission and cache
-persistence remain unfinished. The reducer stays under test support until the shared client owns its
-production implementation. The 256 KiB prototype frame budget and 128-slot batch bound are not new
-Core configuration options.
+The browser fixture records frame sizes and request paths without recording credentials or message
+payloads. Twenty cached rich-thread clicks measured 43.7 ms p95 and 44.5 ms maximum through two animation
+frames, within the 50 ms reference target. Twenty uncached 600-turn bootstrap requests measured
+5.1 ms p95 and 23.3 ms maximum including loopback transfer and JSON parsing. The response was
+20,942 bytes and contained a bounded recent window rather than the full history.
 
-Research evidence:
+A cold production shell transferred 609,049 bytes on the fixture's uncompressed HTTP endpoint,
+including headers for its three asset requests. The build reports approximately 175 KiB gzip for
+main JavaScript. The rich fixture fetched 5.72 MB of lazy renderer assets in total. A subsequent
+service-worker-controlled reload transferred zero asset bytes. On that warm reload the socket opened
+at 47 ms and bootstrap began at 60.9 ms; neither waited for the auth-info response or a thread-list
+request. The rich fixture measured 30.8 MB JavaScript heap, 0.007 layout shift and a longest renderer
+long task of 135 ms. Rich libraries remain an observable lazy-load cost, separate from cached
+thread navigation.
 
-- [Admission, durable output, publication boundaries and rewind](native-stage0-handoffs.md).
-- [Authentication and terminal dependencies/limits](native-stage0-auth-terminal.md).
+## Review and fixes
 
-The existing output stream cannot provide native durability unchanged. It expires and accepts only
-tail subscriptions. The handoff audit identifies a durable native event path and WAL publication
-ordering that require executable crash tests. Pending uploads must remain outside execution admission
-until resources are ready, because its existing materialization timeout is 60 seconds.
+Independent standards and specification reviews run against `61485a63` plus the implementation.
+Confirmed fixes include:
 
-## Remaining Stage 0 gates
+- Snapshot/live ordering, stale generation fences, sparse hydration and missing-target cursor safety.
+- Duplicate initial selected-thread transfer, duplicate queue reads and stale cached-store replacement.
+- Durable model-plan pinning and input acknowledgement before model execution.
+- Repeated TTL trimming with explicit canonical-history provenance, including identical user turns.
+- Shutdown drainage for RPC mutations and HTTP transfers, original defect supervision, and persistence
+  errors preserved during failed upload settlement.
+- Native summaries moved into the existing scheduler, outside critical delivery maintenance.
+- Config editor save/tab races, external transcript ordering, draft restoration and logout races.
 
-- Complete versioned contracts and enumerate native store/config/event migration scope. Add bounded
-  paging within huge single turns and wire hydration/live-update events into typed subscriptions.
-- Prove authenticated bootstrap/socket/resource operation and principal normalization, local sessions,
-  Clerk refresh and TUI PKCE. Real Clerk sign-in needs a configured test installation.
-- Prove durable input/output handoffs, upload-ready/control races and rewind recovery at the identified
-  owners. Confirm late steering disposition before freezing that contract.
-- Exercise semantic text/step/phase/compaction publication, including abnormal termination and retry.
-- Complete bootstrap/live ordering and persistent cache crash proofs.
-- Verify OpenTUI clipboard and terminal behavior in Ghostty/Kitty and define the release fixture's
-  latency/history windows and replay retention byte cap.
-- Review the complete stage, fix blockers and repeat review before closing it.
+Independent re-review cleared the web upload lifecycle, rich accessibility, config, auth/logout and
+client memory fixes. Actual browser tests cover two users, immediate access revocation, two-tab
+logout, automatic 60-second expiry with private-cache purge, latest-turn positioning and bounded
+history hydration, malformed rich content, drafts, file retry/preview, non-blocking send and rewind.
+An explicit service-worker upgrade from build `980c627937d74d1f3297` to `2e86b19823697da5995a`
+preserved the draft. The remaining review item is custom-command activity visibility. Incremental commits do not imply stage completion.
 
-## Initial slice review
+## Authentication evidence
 
-Independent review found missing-target cursor advancement and a stale-generation resync race. The
-proof reducer now preserves the committed checkpoint, requires resync for unsupported changes, and
-retains the highest observed generation/revision while waiting for a valid replacement window.
-Canonical ASCII identifiers make the maximum-length byte fixture cover permitted identifier values.
-The reviewer repeated the review after fixes and reported no blockers for this slice. The empty
-architecture exception-registry entry for the new workspace grants no exemptions.
+Local sessions, expiry, origin checks, resource access and principal isolation have executable tests.
+A real native-only Core process starts against disposable Redis without Discord credentials, serves
+an authenticated bootstrap and exits naturally after shutdown. Production-service integration tests
+exercise streaming, replay, rewind, upload gating, steering, follow-ups, cancellation and shared-reader
+permissions.
 
-Validation: all 20 package tests and the package typecheck passed. Full `bun run check` passed after
-the workspace registration fix, including architecture, lint, formatting, repository typechecks and
-tests.
+Clerk CLI initialization links the development app `app_3JVlP4sHyXZsQVtvzO819Lswzaq`. CLI doctor passes
+its integration checks. The local credential files are ignored `apps/web/.env.local` and the Clerk
+CLI's `/home/stanley/.config/clerk-cli/config.json`; their contents are not included in this document.
+The CLI administrator login is separate from a Clerk application user. Live application sign-in is
+pending an owner account in that development app. No registration flow was added to Lilac.
 
-No stage has been closed. Incremental commits do not imply stage completion.
+The hosted application entry is `https://thorough-lamb-9546.accounts.dev/sign-in`.
+
+OpenTUI runtime/clipboard research is in
+[native-stage0-auth-terminal.md](native-stage0-auth-terminal.md). Actual Ghostty/Kitty and terminal
+OAuth interaction have not been claimed as tested. No TUI implementation is included in this stage.
+
+## Verification record
+
+Focused protocol, store, execution, gateway, resource, runtime, client, cache, web and architecture
+tests have passed as their review fixes landed. Full `bun run check` passed, including 3,269 Core
+tests, all other workspace tests, architecture checks, lint, formatting and repository typechecks.
+The production web build also passed. A final check is repeated before each incremental commit.
+
+See [operator setup and rollback](../docs/native-surface.md) and
+[MIGRATIONS.md](../MIGRATIONS.md) for deployment and persistence details.

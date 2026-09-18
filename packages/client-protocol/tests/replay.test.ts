@@ -377,3 +377,46 @@ describe("native replay contracts", () => {
     expect(initial.slots[0]?.slot.kind).toBe("deferred");
   });
 });
+
+test("delta replay applies multiple revisions atomically and rejects the wrong base", () => {
+  const initial = state([ready(0, "start")]);
+  const delta = replayReplySchema.parse({
+    kind: "delta",
+    fromRevision: 1,
+    checkpoint: checkpoint(4),
+    changes: [
+      {
+        kind: "append-text",
+        turnId: "turn-0",
+        position: 0,
+        messageId: "message-0",
+        partIndex: 0,
+        text: " end",
+      },
+      {
+        kind: "set-part",
+        turnId: "turn-0",
+        position: 0,
+        messageId: "message-0",
+        partIndex: 1,
+        part: {
+          type: "data-activity",
+          id: "tool",
+          data: { kind: "tool", label: "Read", state: "complete" },
+        },
+      },
+      { kind: "turn-state", turnId: "turn-0", position: 0, state: "complete", settledAt: 100 },
+    ],
+  });
+  const result = applyReplayReply(initial, delta);
+  expect(result?.checkpoint.projectionRevision).toBe(4);
+  expect(result?.slots[0]?.slot).toMatchObject({
+    state: "complete",
+    messages: [{ parts: [{ text: "start end" }, { type: "data-activity" }] }],
+  });
+  if (delta.kind !== "delta") throw new Error("Expected delta fixture");
+  const rejected = applyReplayReply(initial, { ...delta, fromRevision: 2 });
+  expect(rejected?.resyncRequired).toBe(true);
+  expect(rejected?.checkpoint.projectionRevision).toBe(1);
+  expect(rejected?.slots).toEqual(initial.slots);
+});

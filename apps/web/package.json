@@ -1,0 +1,45 @@
+{
+  "name": "@stanley2058/lilac-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@base-ui/react": "^1.8.0",
+    "@clerk/react": "^6.16.1",
+    "@clerk/ui": "^1.33.1",
+    "@orpc/client": "1.15.1",
+    "@stanley2058/lilac-client": "workspace:*",
+    "@stanley2058/lilac-client-protocol": "workspace:*",
+    "@tailwindcss/vite": "^4.3.3",
+    "@tanstack/react-virtual": "^3.14.13",
+    "better-result": "catalog:",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "dompurify": "^3.4.15",
+    "lucide-react": "^1.47.0",
+    "mermaid": "^12.0.0",
+    "react": "19",
+    "react-dom": "19",
+    "react-markdown": "^10.1.0",
+    "rehype-mathjax": "^7.1.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
+    "shiki": "^4.4.3",
+    "tailwind-merge": "^3.7.0",
+    "tailwindcss": "^4.3.3",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "fake-indexeddb": "^6.2.5",
+    "vite": "^8.3.0"
+  }
+}

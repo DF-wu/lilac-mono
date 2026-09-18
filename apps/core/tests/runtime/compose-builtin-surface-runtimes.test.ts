@@ -10,13 +10,19 @@ import type {
   SurfaceAdapterEventSource,
 } from "../../src/surface/adapter";
 import { createDescriptorBoundSurfaceEventSource } from "../../src/surface/produced-ref-guard";
-import type { SurfaceRuntimeHealthPort } from "../../src/surface/runtime-descriptor";
+import { nativeSurfaceProtocol } from "../../src/surface/native/native-protocol";
+import type {
+  SurfaceRuntimeDescriptor,
+  SurfaceRuntimeHealthPort,
+} from "../../src/surface/runtime-descriptor";
 import { createInMemoryDeliveryBus } from "../helpers/in-memory-delivery-bus";
 
 function createComposition(input: {
   readonly webhookSecret?: string;
   readonly githubAppCredentialsAvailable: boolean;
   readonly discordHealth?: SurfaceRuntimeHealthPort;
+  readonly discordEnabled?: boolean;
+  readonly nativeDescriptor?: SurfaceRuntimeDescriptor<"native">;
 }) {
   const logs: Array<{
     readonly level: "debug" | "info" | "warn";
@@ -35,6 +41,8 @@ function createComposition(input: {
   };
   const created = composeBuiltinSurfaceRuntimes({
     discordAdapter,
+    discordEnabled: input.discordEnabled,
+    nativeDescriptor: input.nativeDescriptor,
     githubAdapter,
     descriptorBoundDiscordEventSource: createDescriptorBoundSurfaceEventSource(
       "discord",
@@ -69,6 +77,22 @@ function createComposition(input: {
 }
 
 describe("built-in surface runtime composition", () => {
+  it("runs native without registering Discord ingress, relay or questions", () => {
+    const composition = createComposition({
+      githubAppCredentialsAvailable: false,
+      discordEnabled: false,
+      nativeDescriptor: { protocol: nativeSurfaceProtocol, adapter: {} as SurfaceAdapter },
+    });
+    expect(composition.registry.entries().map((entry) => entry.platform)).toEqual([
+      "native",
+      "github",
+    ]);
+    expect(composition.registry.adapterResolver().resolve("discord")).toBeNull();
+    expect(composition.registry.questionResolver().entries()).toHaveLength(0);
+    const native = composition.registry.entries()[0]!;
+    expect(native.relay).toBeUndefined();
+    expect(native.adapterIngress).toBeUndefined();
+  });
   it("registers optional Discord health without adding it to other descriptors", () => {
     const health: SurfaceRuntimeHealthPort = {
       getContribution: () => ({ checks: [], info: { ready: true } }),

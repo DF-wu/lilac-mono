@@ -37,6 +37,12 @@ export function applyReplayReply(
   state: ReplayState | undefined,
   reply: ReplayReply,
 ): ReplayState | undefined {
+  if (reply.kind === "delta") {
+    if (!state) return state;
+    if (state.checkpoint.projectionRevision !== reply.fromRevision)
+      return requireResync(state, reply.checkpoint);
+    return applyChanges(state, reply);
+  }
   if (reply.kind === "unchanged") {
     if (!state || state.resyncRequired) return state;
     const sameGeneration =
@@ -124,10 +130,95 @@ function applyChange(
     return { kind: "applied", slots: slots.with(targetIndex, { ...target, revision }) };
   }
   if (target.slot.turnId !== change.turnId) return { kind: "resync" };
+  if (change.kind === "turn-state") {
+    const { kind: _kind, turnId: _turnId, position: _position, ...status } = change;
+    return {
+      kind: "applied",
+      slots: slots.with(targetIndex, {
+        revision,
+        slot: { ...target.slot, ...status },
+      }),
+    };
+  }
+  if (change.kind === "append-message") {
+    if (target.slot.messages.some((message) => message.id === change.message.id))
+      return { kind: "resync" };
+    const before =
+      change.beforeMessageId === undefined
+        ? target.slot.messages.length
+        : target.slot.messages.findIndex((message) => message.id === change.beforeMessageId);
+    if (before === -1) return { kind: "resync" };
+    return {
+      kind: "applied",
+      slots: slots.with(targetIndex, {
+        revision,
+        slot: {
+          ...target.slot,
+          messages: target.slot.messages.toSpliced(before, 0, change.message),
+        },
+      }),
+    };
+  }
   const messageIndex = target.slot.messages.findIndex((message) => message.id === change.messageId);
+  if (change.kind === "remove-message") {
+    if (messageIndex === -1) return { kind: "resync" };
+    return {
+      kind: "applied",
+      slots: slots.with(targetIndex, {
+        revision,
+        slot: { ...target.slot, messages: target.slot.messages.toSpliced(messageIndex, 1) },
+      }),
+    };
+  }
   const message = target.slot.messages[messageIndex];
+  if (change.kind === "truncate-parts") {
+    if (!message || message.parts.length < change.length) return { kind: "resync" };
+    return {
+      kind: "applied",
+      slots: slots.with(targetIndex, {
+        revision,
+        slot: {
+          ...target.slot,
+          messages: target.slot.messages.with(messageIndex, {
+            ...message,
+            parts: message.parts.slice(0, change.length),
+          }),
+        },
+      }),
+    };
+  }
+  if (change.kind === "message-meta") {
+    if (!message) return { kind: "resync" };
+    return {
+      kind: "applied",
+      slots: slots.with(targetIndex, {
+        revision,
+        slot: {
+          ...target.slot,
+          messages: target.slot.messages.with(messageIndex, {
+            ...message,
+            metadata: { ...message.metadata, ...change.metadata },
+          }),
+        },
+      }),
+    };
+  }
   const part = message?.parts[change.partIndex];
-  if (!message || !part) return { kind: "resync" };
+  if (!message) return { kind: "resync" };
+  if (change.kind === "set-part") {
+    if (change.partIndex > message.parts.length) return { kind: "resync" };
+    const parts = [...message.parts];
+    parts[change.partIndex] = change.part;
+    const messages = target.slot.messages.with(messageIndex, { ...message, parts });
+    return {
+      kind: "applied",
+      slots: slots.with(targetIndex, {
+        revision,
+        slot: { ...target.slot, messages },
+      }),
+    };
+  }
+  if (!part || part.type !== "text") return { kind: "resync" };
   const messages = target.slot.messages.with(messageIndex, {
     ...message,
     parts: message.parts.with(change.partIndex, { ...part, text: part.text + change.text }),
@@ -159,6 +250,14 @@ export function applyLiveUpdate(state: ReplayState, update: LiveUpdate): ReplayS
   if (update.checkpoint.projectionRevision <= state.checkpoint.projectionRevision) return state;
   if (update.checkpoint.projectionRevision !== state.checkpoint.projectionRevision + 1)
     return requireResync(state, update.checkpoint);
+  return applyChanges(state, update);
+}
+
+function applyChanges(state: ReplayState, update: LiveUpdate): ReplayState {
+  if (state.resyncRequired) return requireResync(state, update.checkpoint);
+  if (update.checkpoint.historyGeneration !== state.checkpoint.historyGeneration)
+    return requireResync(state, update.checkpoint);
+  if (update.checkpoint.projectionRevision <= state.checkpoint.projectionRevision) return state;
   let slots = state.slots;
   for (const change of update.changes) {
     const outcome = applyChange(slots, change, update.checkpoint.projectionRevision);

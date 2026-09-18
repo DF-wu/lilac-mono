@@ -4,6 +4,7 @@ node_modules
 # output
 out
 apps/installer/dist/
+apps/web/dist/
 *.tgz
 packages/remote-fs-runner/dist/cli.js
 

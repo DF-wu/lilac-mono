@@ -13,3 +13,5 @@ export * from "./define-lilac-events";
 export * from "./lilac-spec";
 export * from "./lilac-codecs";
 export * from "./lilac-bus";
+
+export * from "./native-output";

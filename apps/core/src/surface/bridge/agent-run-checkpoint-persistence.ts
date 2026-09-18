@@ -4,7 +4,11 @@ import { Result, TaggedError, type Result as ResultType } from "better-result";
 import { isDeepStrictEqual } from "node:util";
 
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
-import type { CorePrimaryLineageV2, StoredMessageV1 } from "@stanley2058/lilac-event-bus";
+import type {
+  CorePrimaryLineageV2,
+  NativeOutputFrontier,
+  StoredMessageV1,
+} from "@stanley2058/lilac-event-bus";
 
 import {
   StoredMessageProjectionError,
@@ -207,6 +211,7 @@ export async function persistBlobBackedAgentRunCheckpoint(input: {
   readonly transcriptStore?: TranscriptStore;
   readonly shouldAbandon?: () => boolean;
   readonly corePrimaryLineage?: CorePrimaryLineageV2;
+  readonly nativeOutput?: NativeOutputFrontier;
   readonly loadedCatalogIds?: readonly string[];
   readonly currentTurnUserId?: string;
   readonly retainedRequestDeliveries: readonly {
@@ -283,6 +288,7 @@ export async function persistBlobBackedAgentRunCheckpoint(input: {
     messages,
     mcpImages: imageProjection?.references,
     ...(input.corePrimaryLineage ? { corePrimaryLineage: input.corePrimaryLineage } : {}),
+    ...(input.nativeOutput ? { nativeOutput: input.nativeOutput } : {}),
     ...(input.loadedCatalogIds ? { loadedCatalogIds: input.loadedCatalogIds } : {}),
     ...(input.currentTurnUserId ? { currentTurnUserId: input.currentTurnUserId } : {}),
     retainedRequestDeliveries: input.retainedRequestDeliveries,

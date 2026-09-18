@@ -7,6 +7,10 @@ export interface ProductionExclusion {
 
 export const PRODUCTION_FILE_EXCLUSIONS = [
   {
+    pattern: "(?:^|/)node_modules(?:/|$)",
+    reason: "Installed dependencies and their generated caches are not workspace production source",
+  },
+  {
     pattern: "(?:^|/)(?:tests?|__tests__)(?:/|$)",
     reason: "Production policy does not apply to test support trees",
   },

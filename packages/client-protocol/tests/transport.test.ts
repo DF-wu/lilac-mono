@@ -24,7 +24,9 @@ function framedBytes(message: string, masked: boolean): number {
   return bytes + 2 + lengthBytes + (masked ? 4 : 0);
 }
 
-function connect(options: { invalidOutput?: boolean; checkpoint?: typeof checkpoint } = {}) {
+function connect(
+  options: { invalidOutput?: boolean; unavailable?: boolean; checkpoint?: typeof checkpoint } = {},
+) {
   const reply = { kind: "unchanged" as const, checkpoint: options.checkpoint ?? checkpoint };
   const received: string[] = [];
   const sent: string[] = [];
@@ -33,7 +35,9 @@ function connect(options: { invalidOutput?: boolean; checkpoint?: typeof checkpo
   const api = implement(nativeSyncContract);
   const router = api.router({
     threads: {
-      sync: api.threads.sync.handler(() => {
+      sync: api.threads.sync.handler(({ errors }) => {
+        if (options.unavailable)
+          throw errors.NOT_READY({ data: { message: "Native recovery pending" } });
         if (options.invalidOutput)
           return { ...reply, checkpoint: { ...reply.checkpoint, cursor: "" } };
         return reply;
@@ -122,6 +126,15 @@ describe("Bun oRPC transport proof", () => {
     console.info(
       `native max-length unchanged reconciliation: ${bytes} bytes including WebSocket framing`,
     );
+  });
+
+  test("preserves declared domain failures without converting them to a signed-out response", async () => {
+    const connection = connect({ unavailable: true });
+    await expect(connection.client.threads.sync({ threadId: "thread-1" })).rejects.toMatchObject({
+      code: "NOT_READY",
+      status: 503,
+      data: { message: "Native recovery pending" },
+    });
   });
 
   test("validates inputs and outputs at runtime", async () => {

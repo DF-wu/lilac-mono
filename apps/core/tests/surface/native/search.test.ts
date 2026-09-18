@@ -1,0 +1,233 @@
+import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { NativeStore } from "../../../src/surface/native/store";
+import { NativeSearchStore } from "../../../src/surface/native/store-search";
+import { NativeSummaryStore } from "../../../src/surface/native/store-search-summary";
+import { normalizeNativeSummary } from "../../../src/surface/native/search-summary-codec";
+import type { ConversationThreadToolService } from "../../../src/conversation/thread-service";
+import { NativeSearchService } from "../../../src/surface/native/search";
+import {
+  NativeExternalThreads,
+  externalThreadId,
+} from "../../../src/surface/native/search-external";
+import { nativeSearchTool } from "../../../src/surface/native/search-tools";
+import { Discovery } from "../../../src/tool-server/tools/discovery";
+import type { DiscoveryService } from "../../../src/discovery/discovery-service";
+import type { SurfaceAdapterResolver } from "../../../src/surface/runtime-descriptor";
+
+let db: Database;
+let store: NativeStore;
+let search: NativeSearchService;
+let messages: NativeSearchStore;
+beforeEach(() => {
+  db = new Database(":memory:");
+  store = new NativeStore(db, () => 1000);
+  store.initialize().unwrap();
+  for (const id of ["owner", "alice", "bob"])
+    store
+      .upsertUser({
+        id,
+        providerId: id,
+        displayName: id,
+        role: id === "owner" ? "owner" : "participant",
+        toolMode: "full",
+      })
+      .unwrap();
+  messages = new NativeSearchStore({ db, store });
+  search = new NativeSearchService({ store, searchStore: messages });
+});
+afterEach(() => db.close());
+function thread(userId: string, title: string, text: string) {
+  const created = store.createThread(userId, { commandId: `create_${title}`, title }).unwrap();
+  const input = store
+    .acceptInput(userId, {
+      threadId: created.id,
+      commandId: `input_${title}`,
+      text,
+      historyGeneration: 0,
+      mode: "prompt",
+      attachmentIds: [],
+      skillIds: [],
+    })
+    .unwrap();
+  return { id: created.id, turnId: input.turnId! };
+}
+
+describe("native search authority", () => {
+  test("filters thread content before limit, pagination, and snippets", () => {
+    thread("alice", "secret", "Private needle secret");
+    const allowed = thread("bob", "visible", "Visible needle");
+    const result = search.query("bob", { query: "needle", limit: 1 }).unwrap();
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]!.threadId).toBe(allowed.id);
+    expect(result.nextCursor).toBeUndefined();
+    expect(search.query("owner", { query: "needle" }).unwrap().items).toHaveLength(2);
+  });
+  test("share removal revokes content, metadata, and reads immediately", () => {
+    const hidden = thread("alice", "secret", "needle");
+    store.shareThread("owner", { threadId: hidden.id, userId: "bob", grant: "read" }).unwrap();
+    expect(
+      search.conversationMetadata("bob", { threadIds: [hidden.id] }).unwrap().threads,
+    ).toHaveLength(1);
+    store.shareThread("owner", { threadId: hidden.id, userId: "bob", grant: null }).unwrap();
+    expect(search.conversationRead("bob", { threadId: hidden.id }).isErr()).toBe(true);
+    expect(search.conversationMetadata("bob", { threadIds: [hidden.id] }).isErr()).toBe(true);
+    expect(search.query("bob", { query: "needle" }).unwrap().items).toEqual([]);
+  });
+  test("agent data principal remains starter when owner edits", () => {
+    const origin = thread("alice", "origin", "hello");
+    thread("owner", "private", "ownerneedle");
+    const context = {
+      serverOwnedRequest: true,
+      requestInitiator: { platform: "native" as const, userId: "owner" },
+      requestInitiatorSessionId: origin.id,
+    };
+    const result = nativeSearchTool(search, context, (service, userId) =>
+      service.query(userId, { query: "ownerneedle" }),
+    ).unwrap();
+    expect(result.items).toEqual([]);
+    expect(
+      nativeSearchTool(search, { ...context, serverOwnedRequest: false }, (service, userId) =>
+        service.query(userId, { query: "hello" }),
+      ).isErr(),
+    ).toBe(true);
+  });
+  test("search uses current turn projection and excludes removed turns", () => {
+    const origin = thread("alice", "origin", "needle");
+    expect(messages.readThread("alice", origin.id).unwrap().total).toBe(1);
+    db.query("DELETE FROM native_records WHERE kind='turn' AND thread_id=?").run(origin.id);
+    expect(search.query("alice", { query: "needle" }).unwrap().items).toEqual([]);
+  });
+  test("scope binding rechecks starter authority on every auto-inject call", async () => {
+    const origin = thread("alice", "origin", "needle");
+    thread("owner", "secret", "secretneedle");
+    const scoped = search.forThread(origin.id);
+    const result = await scoped.search({ query: "secretneedle" });
+    expect(result.results).toEqual([]);
+    expect((await scoped.read({ threadId: origin.id })).thread.session.platform).toBe("native");
+  });
+  test("native discovery surrounds only visible matches and validates time windows", () => {
+    thread("owner", "secret", "needle private");
+    const origin = thread("alice", "origin", "needle visible");
+    const result = search.discovery("alice", { query: "needle", surrounding: 2 }).unwrap();
+    expect(result.groups).toHaveLength(1);
+    expect(result.groups[0]!.origin).toEqual({
+      kind: "session",
+      platform: "native",
+      sessionId: origin.id,
+      label: "origin",
+    });
+    expect(result.groups[0]!.entries.flat()[0]!.text).toBe("needle visible");
+    expect(search.discovery("alice", { query: "needle", offsetTime: "1d" }).isErr()).toBe(true);
+  });
+  test("participant discovery never consults global files or external threads", async () => {
+    thread("alice", "origin", "needle");
+    const result = await search.discoveryWithExternal(
+      "alice",
+      { query: "needle" },
+      {
+        searchResult: () => {
+          throw new Error("Unauthorized global source");
+        },
+      },
+    );
+    expect(result.unwrap().groups).toHaveLength(1);
+  });
+  test("thread search and metadata use the whole-thread summary", () => {
+    const origin = thread("alice", "origin", "literal text");
+    const summaries = new NativeSummaryStore({ db, store });
+    summaries.initialize().unwrap();
+    summaries
+      .put({
+        threadId: origin.id,
+        historyGeneration: 0,
+        contentRevision: store.getThreadRecord(origin.id).unwrap().revision,
+        generatedAt: 1000,
+        messageCount: 1,
+        summary: normalizeNativeSummary({
+          title: "Database design",
+          brief: "An architectural discussion",
+          topics: ["architecture"],
+        }),
+      })
+      .unwrap();
+    const withSummaries = new NativeSearchService({ store, searchStore: messages, summaries });
+    expect(
+      withSummaries.conversationSearch("alice", { query: "architecture" }).unwrap().results[0]!
+        .brief,
+    ).toBe("An architectural discussion");
+    expect(
+      withSummaries.conversationMetadata("alice", { threadIds: [origin.id] }).unwrap().threads[0]!
+        .title,
+    ).toBe("Database design");
+    expect(
+      withSummaries.conversationSearch("bob", { query: "architecture" }).unwrap().results,
+    ).toEqual([]);
+  });
+  test("only an owner starter aggregates external conversation search", async () => {
+    const alice = thread("alice", "alice", "needle");
+    const owner = thread("owner", "owner", "needle");
+    let calls = 0;
+    const externalThreads = {
+      search: async () => {
+        calls++;
+        return {
+          meta: {
+            query: "needle",
+            limit: 5,
+            mode: "lexical",
+            minScore: 0,
+            count: 1,
+            vectorAvailable: false,
+          },
+          results: [{ threadId: "discord_thread", title: "External", brief: "needle" }],
+        };
+      },
+    } as unknown as ConversationThreadToolService;
+    const service = new NativeSearchService({ store, searchStore: messages, externalThreads });
+    expect((await service.forThread(alice.id).search({ query: "needle" })).results).toHaveLength(1);
+    expect(calls).toBe(0);
+    expect((await service.forThread(owner.id).search({ query: "needle" })).results).toHaveLength(3);
+    expect(calls).toBe(1);
+  });
+  test("native tool context never falls back to global discovery", async () => {
+    const tool = new Discovery({
+      discovery: {
+        searchResult: () => {
+          throw new Error("Global search must not run");
+        },
+      } as unknown as DiscoveryService,
+    });
+    const result = await tool.call(
+      "discovery.search",
+      { query: "needle" },
+      { context: { requestInitiator: { platform: "native", userId: "alice" } } },
+    );
+    expect(result.isErr()).toBe(true);
+  });
+});
+
+describe("external reads", () => {
+  test("authorizes owner before consulting any adapter", async () => {
+    const adapters: SurfaceAdapterResolver = {
+      registeredPlatforms: () => [],
+      resolve: () => {
+        throw new Error("Must not consult external sources");
+      },
+    };
+    const service = new NativeExternalThreads({ getUser: (id) => store.getUser(id), adapters });
+    expect((await service.list("alice", {})).isErr()).toBe(true);
+    expect(
+      (await service.read("alice", { threadId: externalThreadId("discord", "123") })).isErr(),
+    ).toBe(true);
+  });
+  test("unavailable and malformed sources return explicit failures", async () => {
+    const adapters: SurfaceAdapterResolver = { registeredPlatforms: () => [], resolve: () => null };
+    const service = new NativeExternalThreads({ getUser: (id) => store.getUser(id), adapters });
+    expect((await service.list("owner", {})).unwrap().items).toEqual([]);
+    expect(
+      (await service.read("owner", { threadId: externalThreadId("discord", "123") })).isErr(),
+    ).toBe(true);
+    expect((await service.read("owner", { threadId: "invalid" })).isErr()).toBe(true);
+  });
+});

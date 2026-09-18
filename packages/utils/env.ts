@@ -51,6 +51,14 @@ export function parseEnv() {
     redisUrl: env.REDIS_URL,
     sqliteUrl: env.SQLITE_URL || path.join(dataDir, "data.sqlite3"),
     dataDir,
+    native: {
+      localUsername: env.LILAC_NATIVE_LOCAL_USERNAME,
+      localPasswordHash: env.LILAC_NATIVE_LOCAL_PASSWORD_HASH,
+      sessionSecret: env.LILAC_NATIVE_SESSION_SECRET,
+      clerkSecretKey: env.CLERK_SECRET_KEY,
+      clerkPublishableKey: env.CLERK_PUBLISHABLE_KEY,
+      clerkJwtKey: env.CLERK_JWT_KEY,
+    },
     toolServer: {
       port: env.LL_TOOL_SERVER_PORT,
     },

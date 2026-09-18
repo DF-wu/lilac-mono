@@ -77,7 +77,7 @@ class FakeOutputStream {
   constructor(
     private readonly onFirstPush?: () => void,
     private readonly finalTextMode: SurfaceFinalTextMode = "continuation",
-    private readonly platform: "discord" | "github" = "discord",
+    private readonly platform: "discord" | "github" | "native" = "discord",
     private readonly terminalPartTypes: ReadonlySet<SurfaceOutputPart["type"]> = new Set(),
   ) {}
 

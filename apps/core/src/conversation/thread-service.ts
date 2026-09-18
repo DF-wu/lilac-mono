@@ -284,7 +284,7 @@ export type ConversationThreadSearchResult = {
     queryAttribution?: ConversationThreadQueryAttribution[];
     aboutnessCoverage?: ConversationThreadAboutnessCoverage;
     session?: {
-      platform: "discord";
+      platform: "discord" | "native";
       channelId: string;
       guildId?: string;
       parentChannelId?: string;
@@ -350,7 +350,7 @@ export type ConversationThreadReadOutput = {
     importance?: "low" | "medium" | "high";
     importanceReasons?: string[];
     session: {
-      platform: "discord";
+      platform: "discord" | "native";
       channelId: string;
       guildId?: string;
       parentChannelId?: string;
@@ -1495,7 +1495,7 @@ function countSummarizationEligibility(
   return counts;
 }
 
-async function defaultSummarizer(input: {
+export async function defaultSummarizer(input: {
   cfg: CoreConfig;
   jobId?: string;
   threadId: string;
@@ -1504,6 +1504,7 @@ async function defaultSummarizer(input: {
   promptContext: ConversationThreadPromptContext | null;
   messages: readonly ConversationThreadSummaryMessage[];
   omittedMessages?: number;
+  abortSignal?: AbortSignal;
 }): Promise<ResultType<ConversationThreadSummaryInput, ConversationThreadGenerationError>> {
   const resolvedResult = resolveSummarizationModel(input.cfg);
   const resolvedError = resultErrorOrNull(resolvedResult);
@@ -1561,6 +1562,7 @@ async function defaultSummarizer(input: {
   if (resolved.provider === "codex") {
     const result = streamText({
       model: resolved.model,
+      abortSignal: input.abortSignal,
       instructions,
       messages,
       reasoning: resolved.reasoning,
@@ -1580,6 +1582,7 @@ async function defaultSummarizer(input: {
     () =>
       generateText({
         model: resolved.model,
+        abortSignal: input.abortSignal,
         output: Output.object({ schema: threadSummarySchema }),
         instructions,
         messages,

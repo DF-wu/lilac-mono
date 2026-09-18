@@ -118,6 +118,25 @@ conversation:
       filterCurrentParticipants: false
 
 surface:
+  native:
+    enabled: false
+    host: 127.0.0.1
+    port: 8787
+    publicUrl: http://localhost:8787
+    # Set a unique installationId before enabling.
+    # installationId: your-installation-id
+    allowedOrigins: [http://localhost:8787]
+    auth:
+      provider: local
+      ownerId: owner
+      # Clerk: set ownerProviderUserId and clerkIssuer; clerkOAuthClientId enables TUI login.
+      # Local credentials: LILAC_NATIVE_LOCAL_USERNAME, LILAC_NATIVE_LOCAL_PASSWORD_HASH.
+      # Session signing: LILAC_NATIVE_SESSION_SECRET (at least 32 bytes).
+    outputStreaming: paragraph
+    oldMessageSelectionMaxAgeMs: null
+    storageRetentionMaxAgeMs: null
+    crossThreadSend:
+      triggerRun: true
   # Router behavior is surface-wide (not per-adapter).
   router:
     # Routing modes:

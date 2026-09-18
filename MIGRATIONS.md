@@ -3,12 +3,50 @@
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
 
-## Native protocol Stage 0
+## Native surface version 1
 
-The new `packages/client-protocol` workspace contains pre-release version-1 display/replay schemas and
-oRPC synchronization proofs. Core does not expose these procedures. No existing installation, Core
-configuration, event-bus contract or stored data changes in this slice. The full native protocol and
-store migrations remain part of the active native-surface plan.
+The optional native surface adds version-1 JSON/oRPC client contracts, native session/message refs,
+and `native-surface.db`. Existing installations keep native disabled. The new store owns users,
+memberships, threads, turns, command receipts, upload handles, read/reaction state and bounded replay
+changes. It uses its own SQLite schema version and strict per-record codecs. It does not import or
+replace Discord's store. Native private projection provenance never enters display payloads.
+
+Version-2 core config accepts optional `surface.native`. Version-1 config normalization leaves native
+disabled. Old-message selection and storage retention both default to disabled. Existing v2 config
+without this section behaves unchanged. Remove the section before using a strict older parser.
+
+The transcript/resource database advances to schema 13. Schema 12 adds native resource ownership
+references, and schema 13 retains canonical native transcripts while native history refers to them.
+Global transcript age/count pruning cannot remove native conversation history behind the surface.
+Rewind, deletion and explicit native retention release those references through the existing recovery
+path. Resource records accept immutable native upload origins; their origin thread controls access.
+
+Native refs are additive to current surface/workflow event schemas. Frozen legacy snapshot validators
+still reject native values. Restore a consistent backup before downgrading a database to an older
+build, and drain native work before removing the gateway. Keep native state together with existing
+request-delivery, WAL, transcript/resource, event-bus and managed blob data.
+
+Browser projection caches are scoped by installation, principal, protocol and projection version.
+They are disposable: unsupported versions or invalid coverage require a fresh recent window, while
+server conversation history remains authoritative. Never copy one user's cache into another scope.
+
+## Native output recovery frontier
+
+Native runs add an optional `nativeOutput` field to version-1 agent-run WAL checkpoints. It stores
+`ordinal`, the last native output publication covered by that checkpoint, and `position`, the display
+ordering boundary. Existing checkpoints without this field remain valid. Non-native runs omit it.
+The checkpoint writer waits for the captured durable publication barrier before writing the field with
+canonical history. A failed publication retains the earlier checkpoint or accepted input.
+
+The new fixed `evt.native.output` topic uses nonexpiring managed durable delivery. Its internal events
+carry a publication ordinal separate from their original display position. Native recovery publishes a
+reset through the saved ordinal, retaining the checkpointed projection prefix and removing abandoned
+output. Recovery from accepted work without a checkpoint retains no prior output. Private native
+projection provenance supports this rollback and never enters client payloads.
+
+Drain native runs before downgrading to a build without this contract. Older strict WAL readers may
+reject native checkpoints containing the new field and restart from accepted input. At-least-once
+model/tool execution remains unchanged; the frontier does not make external effects exactly once.
 
 ## MCP value source prefixes
 

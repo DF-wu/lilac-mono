@@ -1,0 +1,374 @@
+import {
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ClipboardEvent,
+  type DragEvent,
+} from "react";
+import { ArrowUp, Paperclip, Square, X, FileText, CornerDownRight } from "lucide-react";
+import type { Completion } from "@stanley2058/lilac-client";
+import type { ChatCommon, ComposerSubmission, Attachment } from "../types";
+import { IconButton, VirtualList, ErrorNotice } from "./ui";
+
+export type ComposerProps = Pick<ChatCommon, "client" | "scope" | "catalog"> & {
+  text: string;
+  skillIds: string[];
+  onSkills: (ids: string[]) => void;
+  commandId?: string;
+  onCommand: (id: string | undefined) => void;
+  onText: (text: string) => void;
+  attachments: readonly Attachment[];
+  onAttach: (files: File[]) => void;
+  onRemoveAttachment: (key: string) => void;
+  onRetryAttachment: (key: string) => void;
+  active: boolean;
+  canCancel: boolean;
+  disabled: boolean;
+  modelId?: string;
+  onModelChange: (modelId: string) => void;
+  onSubmit: (value: ComposerSubmission) => void;
+  onCancel: () => void;
+};
+
+export function Composer(props: ComposerProps) {
+  const { text, onText, attachments, active, disabled, catalog } = props;
+  const input = useRef<HTMLTextAreaElement>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [mode, setMode] = useState<"steer" | "followup">("steer");
+  const [modelId, setModelId] = useState<string>();
+  const commandId = props.commandId;
+  const setCommandId = props.onCommand;
+  const [error, setError] = useState<string>();
+  const skillIds = props.skillIds;
+  const setSkills = props.onSkills;
+  const [cursor, setCursor] = useState(text.length);
+  const [selected, setSelected] = useState(0);
+  const [menuHidden, setMenuHidden] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const prefix = text.slice(0, cursor);
+  const match = /(?:^|\s)([$/])([^\n]*)$/.exec(prefix);
+  const trigger = match?.[1] === "$" ? "$" : "/";
+  const query = match?.[2]?.replace(/^skill:/, "") ?? "";
+  const completions = useMemo(
+    () =>
+      match && !menuHidden
+        ? props.client.catalogs
+            .complete(props.scope, trigger, query, 100)
+            .filter((item) => !match[2]?.startsWith("skill:") || item.kind === "skill")
+        : [],
+    [props.client, props.scope, trigger, query, !!match, menuHidden, catalog],
+  );
+  const highlighted = Math.min(selected, Math.max(0, completions.length - 1));
+
+  function choose(item: Completion) {
+    const start = cursor - (match?.[2]?.length ?? 0) - 1;
+    const inserted = `${text.slice(0, start)}${item.insertText} ${text.slice(cursor)}`;
+    onText(inserted);
+    if (item.kind === "skill") setSkills([...new Set([...skillIds, item.id])].slice(0, 32));
+    if (item.kind !== "skill") setCommandId(item.id);
+    setError(undefined);
+    setMenuHidden(true);
+    setCursor(start + item.insertText.length + 1);
+    input.current?.focus();
+  }
+
+  function submit() {
+    if (disabled || (!text.trim() && attachments.length === 0)) return;
+    const matching =
+      catalog?.commands.filter(
+        (entry) => text.trim() === `/${entry.name}` || text.startsWith(`/${entry.name} `),
+      ) ?? [];
+    if (!commandId && matching.length > 1) {
+      setError("Choose the command from the menu to resolve its name.");
+      return;
+    }
+    const command = commandId ? matching.find((entry) => entry.id === commandId) : matching[0];
+    if (commandId && !command) {
+      setCommandId(undefined);
+      setError("The selected command changed. Choose it again.");
+      return;
+    }
+    if (command?.kind === "builtin" && command.id === "cancel") {
+      props.onCancel();
+      onText("");
+      setCommandId(undefined);
+      return;
+    }
+    if (command?.kind === "builtin" && command.id === "model") {
+      document.getElementById("composer-model")?.focus();
+      onText("");
+      setCommandId(undefined);
+      return;
+    }
+    const custom = command?.kind === "custom" ? command : undefined;
+    props.onSubmit({
+      text,
+      skillIds,
+      mode,
+      modelId: modelId ?? props.modelId,
+      command: custom
+        ? { id: custom.id, arguments: text.slice(custom.name.length + 2) }
+        : undefined,
+      attachments: [...attachments],
+    });
+    setSkills([]);
+    setCommandId(undefined);
+    setError(undefined);
+    setMenuHidden(true);
+  }
+
+  function keydown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.nativeEvent.isComposing) return;
+    if (
+      completions.length &&
+      ["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"].includes(event.key)
+    ) {
+      event.preventDefault();
+      if (event.key === "Escape") {
+        setMenuHidden(true);
+        return;
+      }
+      if (event.key === "ArrowDown") {
+        setSelected((value) => (value + 1) % completions.length);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        setSelected((value) => (value + completions.length - 1) % completions.length);
+        return;
+      }
+      const completion = completions[highlighted];
+      if (completion) choose(completion);
+      return;
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      submit();
+    }
+  }
+  function paste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const files = [...event.clipboardData.files];
+    if (files.length) {
+      event.preventDefault();
+      props.onAttach(files);
+    }
+  }
+  function drop(event: DragEvent) {
+    event.preventDefault();
+    setDragging(false);
+    props.onAttach([...event.dataTransfer.files]);
+  }
+
+  return (
+    <div
+      className={`composer-wrap ${dragging ? "is-dragging" : ""}`}
+      onDragOver={(event) => {
+        event.preventDefault();
+        setDragging(true);
+      }}
+      onDragLeave={() => setDragging(false)}
+      onDrop={drop}
+    >
+      {completions.length ? (
+        <div
+          className="completion-popover"
+          id="composer-completions"
+          role="listbox"
+          aria-label={trigger === "$" ? "Skills" : "Commands and skills"}
+        >
+          <VirtualList
+            items={completions}
+            itemKey={(item) => `${item.kind}:${item.id}`}
+            label="Suggestions"
+            presentation
+            activeIndex={highlighted}
+            estimate={44}
+            render={(item, index) => (
+              <button
+                type="button"
+                role="option"
+                aria-selected={index === highlighted}
+                id={`completion-${index}`}
+                className={`completion ${index === highlighted ? "selected" : ""}`}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => choose(item)}
+              >
+                <span className="completion-name">
+                  {trigger === "/" ? item.insertText : item.name}
+                </span>
+                <span className="completion-description">{item.description}</span>
+                {item.source ? <span className="badge">{item.source}</span> : null}
+              </button>
+            )}
+          />
+        </div>
+      ) : null}
+      <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+      <div className="composer">
+        {attachments.length ? (
+          <div className="attachment-list">
+            {attachments.map((attachment) => (
+              <div className="attachment" key={attachment.key}>
+                {attachment.preview ? (
+                  <img src={attachment.preview} alt={attachment.file.name} />
+                ) : (
+                  <FileText />
+                )}
+                <span className="attachment-info">
+                  <span>{attachment.file.name}</span>
+                  <small>
+                    {attachment.state === "failed"
+                      ? attachment.error
+                      : `${Math.round(attachment.file.size / 1024)} KB`}
+                  </small>
+                  {attachment.state === "uploading" ? (
+                    <progress
+                      value={attachment.progress}
+                      max={1}
+                      aria-label={`Uploading ${attachment.file.name}`}
+                    />
+                  ) : null}
+                  {attachment.state === "failed" ? (
+                    <button type="button" onClick={() => props.onRetryAttachment(attachment.key)}>
+                      Retry
+                    </button>
+                  ) : null}
+                </span>
+                <IconButton
+                  label={`Remove ${attachment.file.name}`}
+                  onClick={() => props.onRemoveAttachment(attachment.key)}
+                >
+                  <X />
+                </IconButton>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {skillIds.length ? (
+          <div className="skill-chips">
+            {skillIds.map((id) => (
+              <button
+                type="button"
+                className="badge"
+                key={id}
+                onClick={() => setSkills(skillIds.filter((item) => item !== id))}
+              >
+                {catalog?.skills.find((skill) => skill.id === id)?.name ?? id}
+                <X />
+              </button>
+            ))}
+          </div>
+        ) : null}
+        <textarea
+          ref={input}
+          value={text}
+          onChange={(event) => {
+            const value = event.target.value;
+            const chosen = catalog?.commands.find((entry) => entry.id === commandId);
+            if (
+              chosen &&
+              value.trim() !== `/${chosen.name}` &&
+              !value.startsWith(`/${chosen.name} `)
+            )
+              setCommandId(undefined);
+            setSkills(
+              skillIds.filter((id) => {
+                const skill = catalog?.skills.find((item) => item.id === id);
+                return !!skill && hasSkillMention(value, skill.name);
+              }),
+            );
+            onText(value);
+            setCursor(event.target.selectionStart);
+            setMenuHidden(false);
+            setSelected(0);
+          }}
+          onSelect={(event) => setCursor(event.currentTarget.selectionStart)}
+          onKeyDown={keydown}
+          onPaste={paste}
+          placeholder={active ? "Steer Lilac, or queue a follow-up…" : "Message Lilac…"}
+          role="combobox"
+          aria-autocomplete="list"
+          aria-haspopup="listbox"
+          aria-label="Message"
+          aria-controls={completions.length ? "composer-completions" : undefined}
+          aria-expanded={completions.length > 0}
+          aria-activedescendant={completions.length ? `completion-${highlighted}` : undefined}
+          disabled={disabled}
+          maxLength={65_536}
+          rows={2}
+        />
+        <footer className="composer-toolbar">
+          <select
+            id="composer-model"
+            aria-label="Response model"
+            value={modelId ?? props.modelId ?? catalog?.models[0]?.id ?? ""}
+            disabled={disabled || (active && mode === "steer")}
+            onChange={(event) => {
+              setModelId(event.target.value);
+              props.onModelChange(event.target.value);
+            }}
+          >
+            {catalog?.models.map((model) => (
+              <option key={model.id} value={model.id}>
+                {model.label}
+              </option>
+            ))}
+          </select>
+          <span className="toolbar-spacer" />
+          {active ? (
+            <label className="queue-mode">
+              <CornerDownRight />
+              <select
+                aria-label="When sent during an active run"
+                value={mode}
+                onChange={(event) =>
+                  setMode(event.target.value === "followup" ? "followup" : "steer")
+                }
+              >
+                <option value="steer">Steering</option>
+                <option value="followup">Follow-up</option>
+              </select>
+            </label>
+          ) : null}
+          <input
+            ref={fileInput}
+            type="file"
+            aria-label="Attach files"
+            multiple
+            className="sr-only"
+            tabIndex={-1}
+            onChange={(event) => {
+              props.onAttach([...(event.target.files ?? [])]);
+              event.target.value = "";
+            }}
+          />
+          <IconButton
+            label="Attach files"
+            disabled={disabled}
+            onClick={() => fileInput.current?.click()}
+          >
+            <Paperclip />
+          </IconButton>
+          {props.canCancel ? (
+            <IconButton label="Cancel run" className="cancel-button" onClick={props.onCancel}>
+              <Square />
+            </IconButton>
+          ) : null}
+          <IconButton
+            label="Send message"
+            className="send-button"
+            disabled={disabled || (!text.trim() && !attachments.length)}
+            onClick={submit}
+          >
+            <ArrowUp />
+          </IconButton>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+export function hasSkillMention(text: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|\\s)(?:\\$|/skill:)${escaped}(?=$|[^\\p{L}\\p{N}_-])`, "u").test(text);
+}
