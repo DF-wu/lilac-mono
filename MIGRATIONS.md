@@ -3,6 +3,18 @@
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
 
+## MCP value source prefixes
+
+Environment and file references in `mcp-config.yaml` accept an optional string `prefix`.
+For example, `Authorization: { env: MCP_TOKEN, prefix: "Bearer " }` adds the authentication
+scheme without storing it in the token. Prefixes are prepended verbatim after resolution,
+including after whole-file trimming or JSON Pointer selection. The shared value-source format
+also supports prefixes in stdio environment values and static OAuth client values.
+
+The file remains `configVersion: 1`; existing configurations keep their behavior. Reload with
+`mcp.reload` or restart Core after editing. Older builds reject references containing `prefix`;
+remove the field and include the prefix in the referenced value before downgrading.
+
 ## Automatic Transcript And Workflow Blob Migration
 
 The production Docker entrypoint coordinates the one-way Core transcript schema 5 and workflow

@@ -3,7 +3,10 @@ export const MCP_CONFIG_FILE_NAME = "mcp-config.yaml";
 export const MCP_MAX_SERVER_ID_LENGTH = 64;
 
 /** A literal value, environment lookup, or UTF-8 file lookup. */
-export type McpValueSource = string | { env: string } | { file: string; pointer?: string };
+export type McpValueSource =
+  | string
+  | { env: string; prefix?: string }
+  | { file: string; pointer?: string; prefix?: string };
 
 export type McpStaticOAuthClient = {
   type: "static";

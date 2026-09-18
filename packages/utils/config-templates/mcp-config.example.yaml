@@ -16,7 +16,10 @@ servers: {}
 #     url: https://mcp.example.com/mcp
 #     headers:
 #       Authorization:
-#         env: DOCS_MCP_AUTHORIZATION
+#         env: DOCS_MCP_TOKEN
+#         prefix: "Bearer "
+#         # Or use file: secret/token.txt, optionally with pointer: /access_token.
+#         # Prefix is prepended verbatim after resolving an env or file value.
 #
 #   linear:
 #     transport: http

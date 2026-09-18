@@ -2101,6 +2101,10 @@ export async function createCoreRuntime(
           dbPath: path.join(env.dataDir, "request-delivery.db"),
           blobStore: blobStoreCreation.store,
           logger: requestDeliveryLogger,
+          activity: {
+            requestStarted: (id) => adapter.presence.requestStarted(id),
+            requestSettled: (id) => adapter.presence.requestSettled(id),
+          },
         });
       },
       catch: captureRuntimeError,
@@ -3843,6 +3847,7 @@ export async function createCoreRuntime(
             bus: durableBus,
             blobStore: activeBlobStore,
             requestDelivery: requestDeliveryCoordinator,
+            onRequestSettled: (id) => adapter.presence.requestSettled(id),
             ...(agentRunJournal ? { agentRunJournal } : {}),
             subscriptionId: subId(subscriptionPrefix, "agent-runner"),
             reportFatalPanic: reportFatalError,

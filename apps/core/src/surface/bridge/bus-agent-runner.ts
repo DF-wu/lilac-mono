@@ -2625,6 +2625,7 @@ export async function startBusAgentRunner(params: {
   blobStore: AnthropicFallbackBlobStore;
   resourceAccess?: Pick<ResourceAccess, "describe" | "open">;
   requestDelivery?: BusAgentRunnerRequestDelivery;
+  onRequestSettled?: (requestDeliveryId: string) => void;
   agentRunJournal?: Pick<
     AgentRunJournal,
     "openRun" | "writeCheckpoint" | "markTerminal" | "resetRun" | "removeReconciled"
@@ -8533,6 +8534,10 @@ export async function startBusAgentRunner(params: {
             sessionId: next.sessionId,
           });
         }
+      }
+      if (next.requestDeliveryId) params.onRequestSettled?.(next.requestDeliveryId);
+      for (const requestDeliveryId of state.activeRun?.retainedRequestDeliveries.keys() ?? []) {
+        params.onRequestSettled?.(requestDeliveryId);
       }
       state.agent = null;
       state.activeRequestId = null;

@@ -2972,7 +2972,7 @@ describe("durable accepted runner recovery", () => {
       }
     },
   );
-  it.each(["register", "ready"] as const)(
+  it.each(["register", "ready", "terminalize"] as const)(
     "settles preparation failure at parent %s and starts the next session request",
     async (failureStage) => {
       const bus = createLilacBus(createInMemoryRawBus());
@@ -2980,10 +2980,11 @@ describe("durable accepted runner recovery", () => {
       let registrations = 0;
       let closes = 0;
       const terminalized: string[] = [];
+      const settled: string[] = [];
       const workflowLiveParentBridge = {
         registerParent: () => {
           registrations += 1;
-          if (failureStage === "register") throw new Error("parent registration unavailable");
+          if (failureStage !== "ready") throw new Error("parent registration unavailable");
           return {
             ready: Promise.reject(new Error("child subscription unavailable")),
             close: async () => {
@@ -3000,9 +3001,15 @@ describe("durable accepted runner recovery", () => {
         config: parseCoreConfigV2ToUniversal({}),
         pluginManager,
         workflowLiveParentBridge,
+        onRequestSettled: (id) => {
+          settled.push(id);
+        },
         requestDelivery: {
           terminalize: async ({ requestDeliveryId }: { requestDeliveryId: string }) => {
             terminalized.push(requestDeliveryId);
+            if (failureStage === "terminalize") {
+              return Result.err(new Error("terminal write unavailable"));
+            }
             return Result.ok(undefined);
           },
         } as unknown as BusAgentRunnerRequestDelivery,
@@ -3026,6 +3033,7 @@ describe("durable accepted runner recovery", () => {
           );
           await runner.getActiveDrainOperation();
           expect(terminalized).toContain(requestDeliveryId);
+          expect(settled).toContain(requestDeliveryId);
         }
         expect(registrations).toBe(2);
         expect(closes).toBe(failureStage === "ready" ? 2 : 0);

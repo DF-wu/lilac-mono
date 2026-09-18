@@ -297,7 +297,7 @@ export async function resolveMcpValueSource(
             message: `environment variable ${source.env} is not set`,
           }),
         )
-      : Result.ok(value);
+      : Result.ok(`${source.prefix ?? ""}${value}`);
   }
 
   const filePath = path.isAbsolute(source.file)
@@ -307,7 +307,7 @@ export async function resolveMcpValueSource(
   return read.match<() => Promise<McpValueResolution>>({
     err: (error) => async () => Result.err(error),
     ok: (text) => async () => {
-      if (source.pointer === undefined) return Result.ok(text.trim());
+      if (source.pointer === undefined) return Result.ok(`${source.prefix ?? ""}${text.trim()}`);
       const pointer = source.pointer;
       return decodeJsonValue(source.file, text).andThen((document) =>
         resolveJsonPointer(document, pointer)
@@ -322,7 +322,7 @@ export async function resolveMcpValueSource(
           )
           .andThen((resolved) =>
             typeof resolved === "string"
-              ? Result.ok(resolved)
+              ? Result.ok(`${source.prefix ?? ""}${resolved}`)
               : Result.err(
                   new McpValueNotStringError({
                     source: source.file,

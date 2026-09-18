@@ -115,6 +115,33 @@ servers:
     expect(reparsed).toEqual(parsed);
   });
 
+  it("round-trips prefixed header sources and rejects non-string prefixes", () => {
+    const source = `
+configVersion: 1
+servers:
+  remote:
+    transport: http
+    url: https://example.invalid/mcp
+    headers:
+      Authorization: { env: TOKEN, prefix: "Bearer " }
+      X-File: { file: secret/token.txt, prefix: "Token " }
+      X-Json: { file: secret/auth.json, pointer: /token, prefix: "Basic " }
+`;
+    const parsed = parseMcpConfigYaml(source);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.config.servers.remote?.transportConfig).toMatchObject({
+      headers: {
+        Authorization: { env: "TOKEN", prefix: "Bearer " },
+        "X-File": { file: "secret/token.txt", prefix: "Token " },
+        "X-Json": { file: "secret/auth.json", pointer: "/token", prefix: "Basic " },
+      },
+    });
+    expect(parseMcpConfigYaml(serializeMcpConfigYaml(parsed.config))).toEqual(parsed);
+    expect(parseMcpConfigYaml(source.replace('prefix: "Bearer "', "prefix: 123")).ok).toBe(false);
+    expect(parseMcpConfigYaml(source.replace('prefix: "Token "', "prefix: false")).ok).toBe(false);
+  });
+
   it("strictly rejects unknown policy fields and malformed value sources", () => {
     const unknown = parseMcpConfigYaml(`
 configVersion: 1
