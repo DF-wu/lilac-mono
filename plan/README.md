@@ -7,7 +7,7 @@ facts are incorporated into those documents and remain available in Git history.
 
 ## Active
 
-No active repository-wide implementation plans.
+- [Native Lilac surface and first-party clients](native-surface.md): active, Stage 0 contracts and technical proofs.
 
 Only plans listed under **Active** are repository-wide implementation plans. A task-specific plan is
 authoritative only when the user explicitly approves it for that task.
