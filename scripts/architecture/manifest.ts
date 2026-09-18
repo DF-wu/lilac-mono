@@ -364,6 +364,7 @@ export const ACTIVE_WORKSPACES = [
   ["packages/blob-storage", "@stanley2058/lilac-blob-storage"],
   ["packages/claude-code-bridge", "@stanley2058/lilac-claude-code-bridge"],
   ["packages/coding-tools", "@stanley2058/lilac-coding-tools"],
+  ["packages/client-protocol", "@stanley2058/lilac-client-protocol"],
   ["packages/event-bus", "@stanley2058/lilac-event-bus"],
   ["packages/fs", "@stanley2058/lilac-fs"],
   ["packages/plugin-runtime", "@stanley2058/lilac-plugin-runtime"],

@@ -76,6 +76,7 @@ The fail-closed workspace inventory is `ACTIVE_WORKSPACES` in `scripts/architect
   supervised uploads, verified reads, expiry, maintenance, and local and S3-compatible adapters.
 - `packages/claude-code-bridge`: Claude agent adapter, runtime integration, in-process MCP tool bridge,
   native input delivery, attempt settlement, and continuation metadata.
+- `packages/client-protocol`: pre-release native display/replay schemas and typed oRPC synchronization contracts. Stage 0 tests exercise Bun WebSocket transport and a test-only replay reducer; Core does not expose a native gateway yet.
 - `packages/coding-tools`: shared coding-tool schemas and implementations, patch/edit behavior, batching, instruction discovery, and tool guardrails.
 - `packages/computer-use-runner`: pinned CUA desktop image, Chromium seccomp profile, persistent Python runtime, and runner checks.
 - `packages/event-bus`: event catalog, codecs, typed bus, delivery policy, dead letters, and Redis Streams transport.

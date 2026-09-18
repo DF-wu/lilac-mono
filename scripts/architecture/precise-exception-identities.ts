@@ -20,6 +20,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
   "apps/computer-use-gateway": [],
   "apps/installer": [],
   "packages/computer-use-runner": [],
+  "packages/client-protocol": [],
   "apps/core": [
     ["src/agent/claude-composition.ts", "canonicalClaudeExecutionCwd", "signal"],
     ["src/surface/bridge/subscribe-from-bus.ts", "bridgeBusToAdapter.startRelay", "signal"],

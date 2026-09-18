@@ -3,6 +3,13 @@
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
 
+## Native protocol Stage 0
+
+The new `packages/client-protocol` workspace contains pre-release version-1 display/replay schemas and
+oRPC synchronization proofs. Core does not expose these procedures. No existing installation, Core
+configuration, event-bus contract or stored data changes in this slice. The full native protocol and
+store migrations remain part of the active native-surface plan.
+
 ## MCP value source prefixes
 
 Environment and file references in `mcp-config.yaml` accept an optional string `prefix`.
