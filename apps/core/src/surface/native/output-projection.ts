@@ -34,6 +34,20 @@ function messageIdentity(event: NativeOutputEvent, payload: PositionedPayload): 
   return `${attemptPrefix(event.requestId, event.attemptId)}${digest(stepIdentity(payload))}_${String(payload.position).padStart(16, "0")}_${digest(payload.type)}`;
 }
 
+function existingActivityMessage(
+  slot: ReadyTurnSlot,
+  payload: PositionedPayload,
+): string | undefined {
+  if (payload.type !== "activity") return undefined;
+  const activityId = digest(payload.activityId);
+  return slot.messages.find((message) =>
+    message.parts.some(
+      (part) =>
+        part.type === "data-activity" && part.id === activityId && part.data.kind === payload.kind,
+    ),
+  )?.id;
+}
+
 function messagePosition(message: DisplayMessage): number | undefined {
   const match = /^np_[a-f0-9]{24}_[a-f0-9]{24}_(\d{16})_[a-f0-9]{24}$/.exec(message.id);
   return match?.[1] === undefined ? undefined : Number(match[1]);
@@ -212,7 +226,7 @@ function projectEvent(slot: ReadyTurnSlot, event: NativeOutputEvent): ProjectedT
   if (payload.type === "reset") return resetAttempt(slot, event, payload);
   if (payload.type === "terminal") return settleTurn(slot, event, payload.state);
   let projection: ProjectedTurn = { slot, changes: [] };
-  const messageId = messageIdentity(event, payload);
+  const messageId = existingActivityMessage(slot, payload) ?? messageIdentity(event, payload);
   if (!slot.messages.some((message) => message.id === messageId))
     projection = insertMessage(projection, event, payload);
   switch (payload.type) {

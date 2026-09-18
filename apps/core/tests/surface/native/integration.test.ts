@@ -1,5 +1,8 @@
 import { MockLanguageModelV4 } from "ai/test";
 import { describe, expect, test } from "bun:test";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   createNativeIntegrationFixture,
   integrationValue,
@@ -405,3 +408,103 @@ test("shared reader sees only shared threads and cannot mutate their owner histo
     await fixture.close();
   }
 });
+
+test.each(["success", "error", "cancel"] as const)(
+  "custom command publishes durable running and settled activity on %s",
+  async (outcome) => {
+    let commandModule: { release: { resolve: () => void } } | undefined;
+    const modelPrompts: string[] = [];
+    const fixture = await createNativeIntegrationFixture({
+      prepare: async ({ dataDir }) => {
+        const directory = path.join(dataDir, "cmds", "activity-fixture");
+        await mkdir(directory, { recursive: true });
+        await writeFile(
+          path.join(directory, "def.json"),
+          JSON.stringify({
+            name: "activity-fixture",
+            description: "Controlled integration command",
+            args: [],
+          }),
+        );
+        const entrypoint = path.join(directory, "index.ts");
+        await writeFile(
+          entrypoint,
+          `
+export const release = Promise.withResolvers();
+export async function execute(_args, context) {
+  await Promise.race([release.promise, new Promise(resolve => {
+    if (context.abortSignal.aborted) return resolve();
+    context.abortSignal.addEventListener("abort", resolve, { once: true });
+  })]);
+  ${outcome === "error" ? 'throw new Error("Controlled command failure");' : 'return { type: "text", value: "Controlled command result" };'}
+}
+`,
+        );
+        commandModule = await import(pathToFileURL(entrypoint).href);
+      },
+      model: new MockLanguageModelV4({
+        doStream: async ({ prompt }) => {
+          modelPrompts.push(JSON.stringify(prompt));
+          return nativeFixtureTextResponse("Command handled.");
+        },
+      }),
+    });
+    try {
+      const client = fixture.connect().client;
+      const thread = await client.threads.create({
+        commandId: crypto.randomUUID(),
+        title: "Command activity",
+      });
+      const events = await client.threads.watch({ threadId: thread.id });
+      await events.next();
+      const running = Promise.withResolvers<void>();
+      const activityStates: string[] = [];
+      let terminalSeen = false;
+      const observe = (async () => {
+        for await (const event of events) {
+          const changes =
+            event.kind === "update"
+              ? event.update.changes
+              : event.kind === "replay" && event.reply.kind === "delta"
+                ? event.reply.changes
+                : [];
+          for (const change of changes) {
+            if (change.kind !== "set-part" || change.part.type !== "data-activity") continue;
+            expect(change.part.data.label).toContain("activity-fixture");
+            activityStates.push(change.part.data.state);
+            if (change.part.data.state === "running") running.resolve();
+          }
+          terminalSeen ||= changes.some(
+            (change) => change.kind === "turn-state" && change.state !== "running",
+          );
+          if (terminalSeen && activityStates.some((state) => state !== "running")) return;
+        }
+      })();
+      const receipt = await client.inputs.submit({
+        ...nativePrompt(thread.id, "Handle the command result"),
+        command: { id: "custom:activity-fixture", arguments: "" },
+      });
+      await running.promise;
+      const active = await client.threads.sync({ threadId: thread.id });
+      expect(JSON.stringify(active)).toContain('"state":"running"');
+      if (outcome === "cancel")
+        await client.runs.cancel({
+          threadId: thread.id,
+          commandId: crypto.randomUUID(),
+          historyGeneration: 0,
+        });
+      else commandModule?.release.resolve();
+      await observe;
+      if (outcome !== "cancel") await completed(fixture.store, receipt.inputId);
+      expect(activityStates).toEqual(["running", outcome === "success" ? "complete" : "failed"]);
+      const replay = await fixture.connect().client.threads.sync({ threadId: thread.id });
+      expect(JSON.stringify(replay)).toContain("activity-fixture");
+      expect(modelPrompts).toHaveLength(outcome === "success" ? 1 : 0);
+      if (outcome === "success") expect(modelPrompts[0]).toContain("Controlled command result");
+      expect(fixture.fatalErrors).toEqual([]);
+    } finally {
+      commandModule?.release.resolve();
+      await fixture.close();
+    }
+  },
+);

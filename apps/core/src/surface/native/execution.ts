@@ -211,7 +211,7 @@ export function createNativeExecution(options: {
           customCommand: {
             name,
             args: invocation.args,
-            prompt: invocation.prompt,
+            prompt: invocation.prompt ?? undefined,
             text: invocation.text,
             source: "text",
           },

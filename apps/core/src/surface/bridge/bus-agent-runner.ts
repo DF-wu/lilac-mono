@@ -5002,6 +5002,30 @@ export async function startBusAgentRunner(params: {
       onError: reportOutputPublisherError,
       reportFatalPanic,
     });
+    const nativeToolSteps = new Map<string, string>();
+    const publishNativeToolActivity = (
+      toolCallId: string,
+      status: "start" | "update" | "end",
+      label: string,
+      ok?: boolean,
+    ): void => {
+      const stepId = nativeToolSteps.get(toolCallId) ?? nativeStepId();
+      nativeToolSteps.set(toolCallId, stepId);
+      const terminalState = ok === false ? "failed" : "complete";
+      nativeOutput?.activity({
+        activityId: toolCallId,
+        stepId,
+        kind: "tool",
+        state: status === "end" ? terminalState : "start",
+        label,
+      });
+    };
+    const publishNonAgentToolStatus = async (
+      update: Parameters<typeof outputPublisher.publishToolCall>[0],
+    ): Promise<void> => {
+      publishNativeToolActivity(update.toolCallId, update.status, update.display, update.ok);
+      await outputPublisher.publishToolCall(update);
+    };
     const publishAuxiliaryOutput = async (
       operation: string,
       publish: () => Promise<void>,
@@ -5409,9 +5433,7 @@ export async function startBusAgentRunner(params: {
           liveParentSession = params.workflowLiveParentBridge?.registerParent({
             parentRequestId: next.requestId,
             onActivity: () => markRunActivity("subagent"),
-            publishToolStatus: async (update) => {
-              await outputPublisher.publishToolCall(update);
-            },
+            publishToolStatus: publishNonAgentToolStatus,
             recoverSynchronousDeliveries: next.recovery !== undefined,
           });
           await liveParentSession?.ready;
@@ -5579,7 +5601,7 @@ export async function startBusAgentRunner(params: {
             const display = `${CUSTOM_COMMAND_TOOL_NAME} ${parsedCustomCommand.text}`;
             activeCustomCommandTool = { toolCallId, display };
 
-            await outputPublisher.publishToolCall({
+            await publishNonAgentToolStatus({
               toolCallId,
               status: "start",
               display,
@@ -5640,7 +5662,7 @@ export async function startBusAgentRunner(params: {
             if (customCancelled) {
               requestTerminalKind = "cancelled";
               const finalText = "Cancelled.";
-              await outputPublisher.publishToolCall({
+              await publishNonAgentToolStatus({
                 toolCallId,
                 status: "end",
                 display,
@@ -5680,7 +5702,7 @@ export async function startBusAgentRunner(params: {
               output,
             });
 
-            await outputPublisher.publishToolCall({
+            await publishNonAgentToolStatus({
               toolCallId,
               status: "end",
               display,
@@ -7505,13 +7527,7 @@ export async function startBusAgentRunner(params: {
             }
 
             if (event.type === "tool_execution_start") {
-              nativeOutput?.activity({
-                activityId: event.toolCallId,
-                stepId: nativeStepId(),
-                kind: "tool",
-                state: "start",
-                label: event.toolName,
-              });
+              publishNativeToolActivity(event.toolCallId, "start", event.toolName);
               const startedAt = Date.now();
               toolStartMs.set(event.toolCallId, startedAt);
               currentTurnToolCallIds.add(event.toolCallId);
@@ -7557,13 +7573,7 @@ export async function startBusAgentRunner(params: {
                   ok = toolFailure.ok;
                   break;
               }
-              nativeOutput?.activity({
-                activityId: event.toolCallId,
-                stepId: nativeStepId(),
-                kind: "tool",
-                state: ok ? "complete" : "failed",
-                label: event.toolName,
-              });
+              publishNativeToolActivity(event.toolCallId, "end", event.toolName, ok);
               const interruptedForShutdown = shutdownAbortRequestIds.has(headers.request_id);
               const toolFailureError = toolFailure.error ?? "tool failed";
 
@@ -7747,9 +7757,7 @@ export async function startBusAgentRunner(params: {
                       raw: next.raw,
                       previousMessages: agent.state.messages,
                       userMessages: mergedInitial,
-                      publishToolStatus: async (update) => {
-                        await outputPublisher.publishToolCall(update);
-                      },
+                      publishToolStatus: publishNonAgentToolStatus,
                       onError: reportAutoInjectedThreadSearchError,
                       onInjected: (event) => {
                         logger.info("conversation.thread.auto_inject.appended", {
@@ -8331,7 +8339,7 @@ export async function startBusAgentRunner(params: {
             customCommandError = failure.displayMessage;
           }
           await captureBusAgentRunnerOperation("custom command failure status publish", () =>
-            outputPublisher.publishToolCall({
+            publishNonAgentToolStatus({
               toolCallId,
               status: "end",
               display,

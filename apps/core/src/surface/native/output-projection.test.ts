@@ -55,6 +55,70 @@ function outputText(value: ReadyTurnSlot): string {
     .join("");
 }
 
+test("live activity keeps its identity across another step retry and recovery rollback", () => {
+  const activity: NativeOutputPayload = {
+    type: "activity",
+    activityId: "workflow",
+    stepId: "step-1",
+    position: 1,
+    kind: "tool",
+    state: "start",
+    label: "Workflow running",
+  };
+  const started = projectNativeOutput(slot(), event(activity, "first", 1));
+  const messageId = started.slot.messages[1]!.id;
+  const retry = projectNativeOutput(
+    started.slot,
+    event({ type: "reset", previousAttemptId: "first", stepId: "step-2" }, "retry", 2),
+    started.projection,
+  );
+  const completed = projectNativeOutput(
+    retry.slot,
+    event({ ...activity, position: 2, state: "complete", label: "Workflow complete" }, "retry", 3),
+    retry.projection,
+  );
+  expect(completed.slot.messages).toHaveLength(2);
+  expect(completed.slot.messages[1]!.id).toBe(messageId);
+  expect(completed.changes.map((change) => change.kind)).toEqual(["set-part"]);
+  const recovered = projectNativeOutput(
+    completed.slot,
+    event({ type: "reset", previousAttemptId: "retry", retainThroughOrdinal: 1 }, "recovered", 2),
+    completed.projection,
+  );
+  expect(recovered.slot.messages[1]!.parts[0]).toMatchObject({ data: { state: "running" } });
+  const settled = projectNativeOutput(
+    recovered.slot,
+    event({ ...activity, stepId: "step-0", position: 2, state: "failed" }, "recovered", 3),
+    recovered.projection,
+  );
+  expect(settled.slot.messages).toHaveLength(2);
+  expect(settled.slot.messages[1]!.id).toBe(messageId);
+  expect(settled.slot.messages[1]!.parts[0]).toMatchObject({ data: { state: "failed" } });
+  expect(settled.changes.map((change) => change.kind)).toEqual(["set-part"]);
+});
+
+test("activity in the reset step is removed before a reused tool identifier starts again", () => {
+  const activity: NativeOutputPayload = {
+    type: "activity",
+    activityId: "tool",
+    stepId: "step",
+    position: 1,
+    kind: "tool",
+    state: "start",
+    label: "Tool",
+  };
+  const started = projectNativeOutput(slot(), event(activity, "first", 1));
+  const reset = projectNativeOutput(
+    started.slot,
+    event({ type: "reset", previousAttemptId: "first", stepId: "step" }, "retry", 2),
+    started.projection,
+  );
+  expect(reset.slot.messages).toHaveLength(1);
+  const restarted = projectNativeOutput(reset.slot, event(activity, "retry", 3), reset.projection);
+  expect(restarted.slot.messages).toHaveLength(2);
+  expect(restarted.slot.messages[1]!.id).not.toBe(started.slot.messages[1]!.id);
+});
+
 describe("native output projection", () => {
   test("paragraph publications append bounded parts and keep stable phase/identity", () => {
     const first = projectNativeOutput(slot(), event(text(1, "First\n\n")));

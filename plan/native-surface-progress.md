@@ -8,7 +8,8 @@ The backend, shared client and web SPA are implemented. Final Stage 2 browser va
 are in progress. Stage 3 has not started. No stage is closed while its required verification remains
 outstanding.
 
-The initial protocol proof was committed as `61485a63`. Subsequent implementation adds:
+The initial protocol proof was committed as `61485a63`; backend and web implementation were committed
+as `8ed38ff7`. Subsequent implementation adds:
 
 - A separate versioned SQLite native store, immutable turns, command receipts, owner-managed sharing,
   starter authority, replay checkpoints, deferred history and bounded detail pagination.
@@ -81,7 +82,15 @@ client memory fixes. Actual browser tests cover two users, immediate access revo
 logout, automatic 60-second expiry with private-cache purge, latest-turn positioning and bounded
 history hydration, malformed rich content, drafts, file retry/preview, non-blocking send and rewind.
 An explicit service-worker upgrade from build `980c627937d74d1f3297` to `2e86b19823697da5995a`
-preserved the draft. The remaining review item is custom-command activity visibility. Incremental commits do not imply stage completion.
+preserved the draft. The late command review fixed omitted optional prompt metadata, custom-command
+activity and stable workflow activity identity across retry/recovery. Success, failure and cancellation
+have real-runtime integration coverage, and the fix passed independent review.
+
+Active-run custom commands still need a queue-policy decision. The existing command runner executes
+commands at the start of a full turn; active steering only appends a user message. It cannot silently
+accept and discard a command invocation. The user has been asked whether to automatically queue
+custom commands as follow-ups or require explicit Follow-up mode. This remains an implementation
+blocker until that choice is made and enforced by the backend and UI. Incremental commits do not imply stage completion.
 
 ## Authentication evidence
 
