@@ -19,6 +19,12 @@ describe("attachment viewer", () => {
     expect(html).toContain("Download notes.pdf");
     expect(html).not.toContain("Loading preview");
   });
+  test("PDF filenames remain previewable when upload metadata has no specific media type", () => {
+    expect(attachmentKind("", "notes.pdf")).toBe("pdf");
+    expect(attachmentKind("application/octet-stream", "NOTES.PDF")).toBe("pdf");
+    expect(attachmentKind("application/octet-stream", "archive.bin")).toBe("text");
+    expect(attachmentKind("image/png", "notes.pdf")).toBe("image");
+  });
   test("Markdown and MDX have raw/rendered controls without executing MDX", () => {
     for (const name of ["notes.md", "README.MARKDOWN", "demo.mdx"])
       expect(isMarkdownAttachment(name)).toBe(true);

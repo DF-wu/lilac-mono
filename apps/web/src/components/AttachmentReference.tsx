@@ -44,7 +44,7 @@ export function AttachmentReference({
         <ResourcePreview
           name={resource.name}
           href={href}
-          kind={attachmentKind(resource.mediaType)}
+          kind={attachmentKind(resource.mediaType, resource.name)}
           onClose={() => setOpen(false)}
         />
       ) : null}

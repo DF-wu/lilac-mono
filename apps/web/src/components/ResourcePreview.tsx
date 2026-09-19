@@ -30,8 +30,9 @@ import "./resource-preview.css";
 
 type ResourceData = Extract<DisplayPart, { type: "data-resource" }>["data"];
 export type AttachmentKind = "image" | "video" | "audio" | "text" | "pdf";
-export function attachmentKind(mediaType: string): AttachmentKind {
-  if (mediaType === "application/pdf") return "pdf";
+export function attachmentKind(mediaType: string, name = ""): AttachmentKind {
+  const genericType = mediaType === "" || mediaType === "application/octet-stream";
+  if (mediaType === "application/pdf" || (genericType && /\.pdf$/iu.test(name))) return "pdf";
   if (mediaType.startsWith("image/")) return "image";
   if (mediaType.startsWith("video/")) return "video";
   if (mediaType.startsWith("audio/")) return "audio";
@@ -46,7 +47,7 @@ export function formatFileSize(bytes: number): string {
 export function ReadyAttachment({ data, href }: { data: ResourceData; href: string }) {
   const [failed, setFailed] = useState(false);
   const [preview, setPreview] = useState(false);
-  const kind = attachmentKind(data.mediaType);
+  const kind = attachmentKind(data.mediaType, data.name);
   let icon = <FileText />;
   if (kind === "video") icon = <Film />;
   if (kind === "audio") icon = <Music />;

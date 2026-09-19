@@ -564,8 +564,8 @@ export const Message = memo(function Message(props: MessageProps) {
             </TooltipTrigger>
             <TooltipContent
               className="message-author-details"
-              side="top"
-              align={self ? "end" : "start"}
+              side={self ? "left" : "right"}
+              align="center"
             >
               <span className="message-author-name">{author.displayName}</span>
               <span>{authorRole}</span>
