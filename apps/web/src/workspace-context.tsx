@@ -41,7 +41,7 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
     () =>
       client.subscribe((event) => {
         if (event.kind === "connection" && event.state === "online")
-          void queries.invalidateQueries();
+          void queries.invalidateQueries({ refetchType: "none" });
       }),
     [client, queries],
   );

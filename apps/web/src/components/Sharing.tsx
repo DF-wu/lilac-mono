@@ -1,16 +1,13 @@
-import { useEffect, useState } from "react";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { participantOptions, userOptions, useNativeOnline } from "../queries";
+import { useState } from "react";
 import { X, UserPlus } from "lucide-react";
 import type { NativeClient } from "@stanley2058/lilac-client";
-import type {
-  NativeRpcOutputs,
-  NativeThread,
-  NativeUser,
-} from "@stanley2058/lilac-client-protocol";
-import { attempt, ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
+import type { NativeThread } from "@stanley2058/lilac-client-protocol";
+import { ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
 import { Button } from "./ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 
-type Participant = NativeRpcOutputs["participants"]["list"]["items"][number];
 export function Sharing({
   client,
   thread,
@@ -20,46 +17,42 @@ export function Sharing({
   thread: NativeThread;
   onClose: () => void;
 }) {
-  const [participants, setParticipants] = useState<Participant[]>([]);
-  const [users, setUsers] = useState<NativeUser[]>([]);
-  const [nextCursor, setNextCursor] = useState<string>();
+  const online = useNativeOnline(client);
+  const queries = useQueryClient();
+  const participantQuery = useQuery({ ...participantOptions(client, thread.id), enabled: online });
+  const userQuery = useInfiniteQuery({ ...userOptions(client), enabled: online });
+  const participants = participantQuery.data?.items ?? [];
+  const users = userQuery.data?.pages.flatMap((page) => page.items) ?? [];
+  const participantIds = new Set(participants.map((entry) => entry.user.id));
   const [userId, setUserId] = useState("");
   const [role, setRole] = useState<"read" | "edit">("read");
-  const [error, setError] = useState<string>();
-  async function loadUsers(cursor?: string) {
-    if (!client.rpc) return;
-    const page = await attempt(() => client.rpc!.users.list({ limit: 100, cursor }), setError);
-    if (page) {
-      setUsers((items) => (cursor ? [...items, ...page.items] : page.items));
-      setNextCursor(page.nextCursor);
-    }
-  }
-  async function refresh() {
-    if (!client.rpc) return;
-    const result = await attempt(
-      () => client.rpc!.participants.list({ threadId: thread.id }),
-      setError,
-    );
-    if (result) setParticipants(result.items);
-  }
-  useEffect(() => {
-    void refresh();
-    void loadUsers();
-  }, [client, thread.id]);
-  async function grant(id: string, value: "read" | "edit") {
-    if (!client.rpc || !id) return;
-    const result = await attempt(
-      () => client.rpc!.participants.set({ threadId: thread.id, userId: id, role: value }),
-      setError,
-    );
-    if (result) {
+  const change = useMutation({
+    mutationFn: (input: { userId: string; role?: "read" | "edit" }) => {
+      const rpc = client.rpc;
+      if (!rpc) return Promise.resolve(undefined);
+      if (input.role)
+        return rpc.participants.set({
+          threadId: thread.id,
+          userId: input.userId,
+          role: input.role,
+        });
+      return rpc.participants.remove({ threadId: thread.id, userId: input.userId });
+    },
+    onSuccess: async (result) => {
+      if (!result) return;
       setUserId("");
-      await refresh();
-    }
-  }
+      await queries.invalidateQueries({ queryKey: ["participants", thread.id] });
+    },
+  });
+  const mutating = change.isPending;
   return (
     <Modal title="Share conversation" onClose={onClose}>
-      <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+      <ErrorNotice
+        message={
+          change.error?.message ?? participantQuery.error?.message ?? userQuery.error?.message
+        }
+        onDismiss={change.error ? () => change.reset() : undefined}
+      />
       <div className="inline-form">
         <Select
           items={users.map((user) => ({ value: user.id, label: user.displayName }))}
@@ -71,11 +64,7 @@ export function Sharing({
           </SelectTrigger>
           <SelectContent>
             {users
-              .filter(
-                (user) =>
-                  user.role === "participant" &&
-                  !participants.some((entry) => entry.user.id === user.id),
-              )
+              .filter((user) => user.role === "participant" && !participantIds.has(user.id))
               .map((user) => (
                 <SelectItem key={user.id} value={user.id}>
                   {user.displayName}
@@ -101,18 +90,21 @@ export function Sharing({
         </Select>
         <IconButton
           label="Share with selected person"
-          disabled={!userId}
-          onClick={() => void grant(userId, role)}
+          disabled={!userId || !online || mutating}
+          onClick={() => change.mutate({ userId, role })}
         >
           <UserPlus />
         </IconButton>
       </div>
-      {nextCursor ? (
+      {userQuery.hasNextPage ? (
         <Button
           type="button"
           variant="ghost"
           className="text-button"
-          onClick={() => void loadUsers(nextCursor)}
+          disabled={userQuery.isFetching}
+          onClick={() => {
+            if (!userQuery.isFetching) void userQuery.fetchNextPage({ cancelRefetch: false });
+          }}
         >
           Load more people
         </Button>
@@ -136,9 +128,14 @@ export function Sharing({
                 { value: "edit", label: "Can edit" },
               ]}
               value={entry.role}
-              disabled={entry.user.id === thread.starterId || entry.user.role === "owner"}
+              disabled={
+                !online ||
+                mutating ||
+                entry.user.id === thread.starterId ||
+                entry.user.role === "owner"
+              }
               onValueChange={(value) =>
-                void grant(entry.user.id, value === "edit" ? "edit" : "read")
+                change.mutate({ userId: entry.user.id, role: value === "edit" ? "edit" : "read" })
               }
             >
               <SelectTrigger aria-label={`Access for ${entry.user.displayName}`}>
@@ -153,15 +150,13 @@ export function Sharing({
             </Select>
             <IconButton
               label={`Remove ${entry.user.displayName}`}
-              disabled={entry.user.id === thread.starterId || entry.user.role === "owner"}
-              onClick={() => {
-                if (!client.rpc) return;
-                void attempt(
-                  () =>
-                    client.rpc!.participants.remove({ threadId: thread.id, userId: entry.user.id }),
-                  setError,
-                ).then(refresh);
-              }}
+              disabled={
+                !online ||
+                mutating ||
+                entry.user.id === thread.starterId ||
+                entry.user.role === "owner"
+              }
+              onClick={() => change.mutate({ userId: entry.user.id })}
             >
               <X />
             </IconButton>

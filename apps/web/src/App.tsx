@@ -1,6 +1,8 @@
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
+import { participantOptions, searchOptions, useNativeOnline } from "./queries";
 import { useStore } from "zustand";
 import { WorkspaceProvider, useWorkspace } from "./workspace-context";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Result } from "better-result";
 import { Tooltip } from "@base-ui/react/tooltip";
 import {
@@ -18,22 +20,23 @@ import {
   MoreHorizontal,
   Palette,
 } from "lucide-react";
-import type {
-  DisplayCatalog,
-  NativeThread,
-  NativeRpcOutputs,
-} from "@stanley2058/lilac-client-protocol";
+import type { DisplayCatalog, NativeThread } from "@stanley2058/lilac-client-protocol";
 import type { AppProps, ComposerSubmission } from "./types";
 import { resolveAttachmentIds } from "./uploads";
 import { Chat, type Draft, type PendingInput } from "./components/Chat";
-import { Settings } from "./components/Settings";
+const Settings = lazy(() =>
+  import("./components/Settings").then((module) => ({ default: module.Settings })),
+);
 import { SidebarSearch } from "./components/SidebarSearch";
-import { Sharing } from "./components/Sharing";
-import { External } from "./components/External";
+const Sharing = lazy(() =>
+  import("./components/Sharing").then((module) => ({ default: module.Sharing })),
+);
+const External = lazy(() =>
+  import("./components/External").then((module) => ({ default: module.External })),
+);
 import { attempt, IconButton, Modal, VirtualList } from "./components/ui";
 import { DraftChat } from "./components/DraftChat";
 import { MessageIdentityContext } from "./components/message-identity";
-import type { ActorIdentity } from "./components/ActorAvatar";
 import { toast } from "./components/ui/toast";
 import { ThreadSelect, ThreadCard } from "./components/ThreadSelect";
 import {
@@ -93,9 +96,6 @@ function Workspace(props: AppProps) {
   const [catalog, setCatalog] = useState<DisplayCatalog | undefined>(() =>
     initial.catalog.kind === "catalog" ? initial.catalog.catalog : client.catalogs.get(props.scope),
   );
-  const [participants, setParticipants] = useState(
-    () => new Map<string, Map<string, ActorIdentity>>(),
-  );
   const [unknownAuthor, setUnknownAuthor] = useState<{ threadId: string; authorId: string }>();
   const onUnknownAuthor = useCallback(
     (authorId: string) => {
@@ -116,9 +116,23 @@ function Workspace(props: AppProps) {
   const [external, setExternal] = useState(false);
   const [externalId, setExternalId] = useState<string>();
   const [sidebar, setSidebar] = useState(true);
-  const searchQuery = useRef("");
-  const [results, setResults] = useState<NativeRpcOutputs["search"]["query"]>();
-  const [searching, setSearching] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const online = useNativeOnline(client);
+  const queries = useQueryClient();
+  const searchResults = useInfiniteQuery({
+    ...searchOptions(client, searchQuery),
+    enabled: online && !!searchQuery,
+  });
+  const results = searchQuery
+    ? {
+        items: searchResults.data?.pages.flatMap((page) => page.items) ?? [],
+        nextCursor: searchResults.hasNextPage,
+      }
+    : undefined;
+  const searching = searchResults.isFetching;
+  useEffect(() => {
+    if (searchResults.error) setError(searchResults.error.message);
+  }, [searchResults.error]);
   const [rename, setRename] = useState<{ id: string; title: string }>();
   const [confirmDelete, setConfirmDelete] = useState<string>();
   const [theme, setTheme] = useState(() => readTheme());
@@ -146,42 +160,26 @@ function Workspace(props: AppProps) {
   const archivedRef = useRef(archived);
   archivedRef.current = archived;
 
+  const participantQuery = useQuery({
+    ...participantOptions(client, selected?.id ?? ""),
+    enabled: online && !!selected && !external,
+  });
   useEffect(() => {
-    const rpc = client.rpc;
-    if (!rpc || !selected || external) return;
-    const known = participants.get(selected.id);
-    if (known && (unknownAuthor?.threadId !== selected.id || known.has(unknownAuthor.authorId)))
-      return;
-    let canceled = false;
-    void attempt(
-      () => rpc.participants.list({ threadId: selected.id }),
-      () => {},
-    ).then((result) => {
-      if (!result || canceled) return;
-      setParticipants((current) => {
-        const changed = new Map(current);
-        changed.set(
-          selected.id,
-          new Map(result.items.map(({ user }) => [user.id, { displayName: user.displayName }])),
-        );
-        if (changed.size > 100) changed.delete(changed.keys().next().value!);
-        return changed;
-      });
-    });
-    return () => {
-      canceled = true;
-    };
-  }, [client, selected?.id, selected?.capabilities.read, external, connection, unknownAuthor]);
+    if (!unknownAuthor || unknownAuthor.threadId !== selected?.id) return;
+    void queries.invalidateQueries({ queryKey: ["participants", unknownAuthor.threadId] });
+  }, [queries, unknownAuthor, selected?.id]);
   const identities = useMemo(() => {
-    const users = new Map(selectedId ? participants.get(selectedId) : []);
+    const users = new Map(
+      participantQuery.data?.items.map(({ user }) => [user.id, { displayName: user.displayName }]),
+    );
     users.set(initial.viewer.id, { displayName: initial.viewer.displayName });
     return {
       agent: catalog?.agent ?? { displayName: "Lilac" },
       viewerId: initial.viewer.id,
       users,
-      onUnknownAuthor: selectedId && participants.has(selectedId) ? onUnknownAuthor : undefined,
+      onUnknownAuthor: participantQuery.data ? onUnknownAuthor : undefined,
     };
-  }, [catalog?.agent, participants, selectedId, initial.viewer, onUnknownAuthor]);
+  }, [catalog?.agent, participantQuery.data, initial.viewer, onUnknownAuthor]);
   useEffect(() => {
     const cache = props.draftCache;
     if (!cache) return;
@@ -254,11 +252,7 @@ function Workspace(props: AppProps) {
             return;
           case "removed":
             setThreads((items) => items.filter((thread) => thread.id !== event.threadId));
-            setParticipants((current) => {
-              const changed = new Map(current);
-              changed.delete(event.threadId);
-              return changed;
-            });
+            queries.removeQueries({ queryKey: ["participants", event.threadId] });
             drafts.current.delete(event.threadId);
             pending.current.delete(event.threadId);
             readTurns.current.delete(event.threadId);
@@ -518,31 +512,12 @@ function Workspace(props: AppProps) {
       setThreadListError(true);
       return;
     }
-    setThreads((current) =>
-      cursor
-        ? [
-            ...current,
-            ...page.items.filter((thread) => !current.some((item) => item.id === thread.id)),
-          ]
-        : page.items,
-    );
+    setThreads((current) => {
+      if (!cursor) return page.items;
+      const ids = new Set(current.map((thread) => thread.id));
+      return [...current, ...page.items.filter((thread) => !ids.has(thread.id))];
+    });
     setNextCursor(page.nextCursor);
-  }
-  async function search(cursor?: string) {
-    if (!client.rpc || !searchQuery.current.trim()) {
-      setResults(undefined);
-      return;
-    }
-    setSearching(true);
-    const result = await attempt(
-      () => client.rpc!.search.query({ query: searchQuery.current.trim(), limit: 100, cursor }),
-      setError,
-    );
-    setSearching(false);
-    if (result)
-      setResults((current) =>
-        cursor && current ? { ...result, items: [...current.items, ...result.items] } : result,
-      );
   }
   async function update(id: string, change: { title?: string; archived?: boolean }) {
     if (draftStore.getState().localDrafts.has(id)) {
@@ -700,13 +675,11 @@ function Workspace(props: AppProps) {
                 <div className="sidebar-search-row">
                   <SidebarSearch
                     onSearch={(query) => {
-                      searchQuery.current = query;
-                      void search();
+                      const next = query.trim();
+                      if (next && next === searchQuery) void searchResults.refetch();
+                      setSearchQuery(next);
                     }}
-                    onClear={() => {
-                      searchQuery.current = "";
-                      setResults(undefined);
-                    }}
+                    onClear={() => setSearchQuery("")}
                   />
                   <nav className="sidebar-tabs" aria-label="Conversation filters and actions">
                     <IconButton
@@ -771,7 +744,11 @@ function Workspace(props: AppProps) {
                       <Button
                         variant="ghost"
                         className="text-button"
-                        onClick={() => void search(results.nextCursor)}
+                        disabled={searching}
+                        onClick={() => {
+                          if (!searching)
+                            void searchResults.fetchNextPage({ cancelRefetch: false });
+                        }}
                       >
                         More results
                       </Button>
@@ -896,11 +873,14 @@ function Workspace(props: AppProps) {
             <ResizablePanel id="chat" minSize="40%" className="chat-panel">
               <div className="main-panel">
                 {external && owner ? (
-                  <External
-                    client={client}
-                    resourceUrl={props.resourceUrl}
-                    initialThreadId={externalId}
-                  />
+                  <Suspense fallback={<p role="status">Loading conversations…</p>}>
+                    <External
+                      key={externalId ?? "list"}
+                      client={client}
+                      resourceUrl={props.resourceUrl}
+                      initialThreadId={externalId}
+                    />
+                  </Suspense>
                 ) : null}
                 {!external && selected ? (
                   <Chat
@@ -992,18 +972,39 @@ function Workspace(props: AppProps) {
             </ResizablePanel>
           </ResizablePanelGroup>
           {settings && owner ? (
-            <Settings
-              viewer={initial.viewer}
-              onLogout={props.onLogout}
-              client={client}
-              onClose={() => setSettings(false)}
-              agent={identities.agent}
-              theme={theme}
-              onTheme={setTheme}
-            />
+            <Suspense
+              fallback={
+                <Modal title="Settings" onClose={() => setSettings(false)}>
+                  <p role="status">Loading settings…</p>
+                </Modal>
+              }
+            >
+              <Settings
+                viewer={initial.viewer}
+                onLogout={props.onLogout}
+                client={client}
+                onClose={() => setSettings(false)}
+                agent={identities.agent}
+                theme={theme}
+                onTheme={setTheme}
+              />
+            </Suspense>
           ) : null}
           {sharing && owner && selected ? (
-            <Sharing client={client} thread={selected} onClose={() => setSharing(false)} />
+            <Suspense
+              fallback={
+                <Modal title="Share conversation" onClose={() => setSharing(false)}>
+                  <p role="status">Loading people…</p>
+                </Modal>
+              }
+            >
+              <Sharing
+                key={selected.id}
+                client={client}
+                thread={selected}
+                onClose={() => setSharing(false)}
+              />
+            </Suspense>
           ) : null}
           {rename !== undefined ? (
             <Modal title="Rename conversation" onClose={() => setRename(undefined)}>

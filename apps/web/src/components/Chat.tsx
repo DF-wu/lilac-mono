@@ -1,3 +1,5 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { queueOptions, refreshQueue as refreshQueueQuery, useNativeOnline } from "../queries";
 import { useWorkspace } from "../workspace-context";
 import {
   useCallback,
@@ -10,7 +12,7 @@ import {
 } from "react";
 import { X, RotateCcw } from "lucide-react";
 import type { NativeInput, DisplayPart } from "@stanley2058/lilac-client-protocol";
-import type { ChatCommon, ComposerSubmission, QueueEntry } from "../types";
+import type { ChatCommon, ComposerSubmission } from "../types";
 import { resolveAttachmentIds } from "../uploads";
 import { inputDeliveryOptions } from "../input-mode";
 import { Button } from "./ui/button";
@@ -108,10 +110,16 @@ export function Chat(props: ChatProps) {
   const active = !!thread.activeRunId;
   const previousActive = useRef(active);
   const [latestVisible, setLatestVisible] = useState(false);
-  const [queue, setQueue] = useState<QueueEntry[]>([]);
-  const queueRequest = useRef(0);
   const canEdit = useRef(thread.capabilities.edit);
   canEdit.current = thread.capabilities.edit;
+  const online = useNativeOnline(client);
+  const queries = useQueryClient();
+  const queueQuery = useQuery({
+    ...queueOptions(client, thread.id),
+    enabled: online && thread.capabilities.edit,
+  });
+  const queue = thread.capabilities.edit ? (queueQuery.data?.items ?? []) : [];
+
   const [error, setError] = useState<string>();
   const [rewindTarget, setRewindTarget] = useState<string>();
   const [rewinding, setRewinding] = useState(false);
@@ -131,31 +139,20 @@ export function Chat(props: ChatProps) {
     [upload, pool],
   );
   const attachments = uploads.filter((attachment) => draft.attachments.includes(attachment.key));
-  const refreshQueue = useCallback(async () => {
-    const request = ++queueRequest.current;
-    const rpc = client.rpc;
-    if (!rpc || !canEdit.current) {
-      setQueue([]);
-      return;
-    }
-    const result = await attempt(
-      () => rpc.runs.queue({ threadId: thread.id }),
-      (message) => {
-        if (request === queueRequest.current && canEdit.current) setError(message);
-      },
-    );
-    if (result && request === queueRequest.current && canEdit.current) setQueue(result.items);
-  }, [client, thread.id, thread.capabilities.edit]);
+  const refreshQueue = useCallback(
+    () => refreshQueueQuery(queries, thread.id),
+    [queries, thread.id],
+  );
   useEffect(() => {
-    void refreshQueue();
-    const unsubscribe = client.subscribe((event) => {
-      if (event.kind === "input" && event.threadId === thread.id) void refreshQueue();
-    });
-    return () => {
-      queueRequest.current++;
-      unsubscribe();
-    };
-  }, [client, thread.id, refreshQueue]);
+    if (queueQuery.error) setError(queueQuery.error.message);
+  }, [queueQuery.error]);
+  useEffect(
+    () =>
+      client.subscribe((event) => {
+        if (event.kind === "input" && event.threadId === thread.id) void refreshQueue();
+      }),
+    [client, thread.id, refreshQueue],
+  );
   useEffect(() => {
     const changed = previousActive.current !== active;
     previousActive.current = active;

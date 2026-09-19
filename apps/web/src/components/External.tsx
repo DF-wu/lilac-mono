@@ -1,13 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
+import { useInfiniteQuery } from "@tanstack/react-query";
+import { externalListOptions, externalReadOptions, useNativeOnline } from "../queries";
 import { RefreshCw, ArrowLeft } from "lucide-react";
 import type { NativeClient } from "@stanley2058/lilac-client";
-import type { NativeRpcOutputs } from "@stanley2058/lilac-client-protocol";
-import { attempt, ErrorNotice, IconButton, VirtualList } from "./ui";
-import { mergeExternalPage } from "../external-pages";
+import { ErrorNotice, IconButton, VirtualList } from "./ui";
+import { mergeExternalPage, type ExternalPage } from "../external-pages";
 import { Message } from "./Timeline";
 import { Button } from "./ui/button";
 
-type ExternalThread = NativeRpcOutputs["external"]["list"]["items"][number];
 export function External({
   client,
   resourceUrl,
@@ -17,56 +17,24 @@ export function External({
   resourceUrl: (id: string) => string;
   initialThreadId?: string;
 }) {
-  const [threads, setThreads] = useState<ExternalThread[]>([]);
-  const [nextCursor, setNextCursor] = useState<string>();
-  const [view, setView] = useState<NativeRpcOutputs["external"]["read"]>();
-  const [error, setError] = useState<string>();
-  const readSequence = useRef(0);
-  async function list(cursor?: string) {
-    if (!client.rpc) return;
-    const result = await attempt(() => client.rpc!.external.list({ limit: 100, cursor }), setError);
-    if (result) {
-      setThreads((items) => (cursor ? [...items, ...result.items] : result.items));
-      setNextCursor(result.nextCursor);
-    }
-  }
-  async function read(threadId: string, cursor?: string) {
-    if (!client.rpc) return;
-    const sequence = ++readSequence.current;
-    const result = await attempt(
-      () => client.rpc!.external.read({ threadId, cursor }),
-      (message) => {
-        if (readSequence.current === sequence) setError(message);
-      },
-    );
-    if (result && readSequence.current === sequence)
-      setView((previous) => mergeExternalPage(previous, result, !!cursor));
-  }
-  useEffect(
-    () => () => {
-      readSequence.current++;
-    },
-    [],
+  const [threadId, setThreadId] = useState(initialThreadId);
+  const online = useNativeOnline(client);
+  const list = useInfiniteQuery({ ...externalListOptions(client), enabled: online && !threadId });
+  const read = useInfiniteQuery({
+    ...externalReadOptions(client, threadId),
+    enabled: online && !!threadId,
+  });
+  const threads = list.data?.pages.flatMap((page) => page.items) ?? [];
+  const view = read.data?.pages.reduce<ExternalPage | undefined>(
+    (previous, page) => mergeExternalPage(previous, page, true),
+    undefined,
   );
-  useEffect(() => {
-    if (initialThreadId) {
-      void read(initialThreadId);
-      return;
-    }
-    void list();
-  }, [client, initialThreadId]);
+  const error = threadId ? read.error : list.error;
   return (
     <section className="external-view">
       <header className="thread-header">
-        {view ? (
-          <IconButton
-            label="Back to external conversations"
-            onClick={() => {
-              readSequence.current++;
-              setView(undefined);
-              void list();
-            }}
-          >
+        {threadId ? (
+          <IconButton label="Back to external conversations" onClick={() => setThreadId(undefined)}>
             <ArrowLeft />
           </IconButton>
         ) : null}
@@ -84,14 +52,19 @@ export function External({
         <IconButton
           label="Refresh external conversation"
           onClick={() => {
-            if (view) void read(view.thread.id);
-            else void list();
+            if (threadId) void read.refetch();
+            else void list.refetch();
           }}
         >
           <RefreshCw />
         </IconButton>
       </header>
-      <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+      <ErrorNotice message={error?.message} />
+      {threadId && !view ? (
+        <p role="status">
+          {read.isFetching ? "Loading conversation…" : "Conversation unavailable"}
+        </p>
+      ) : null}
       {view ? (
         <>
           <VirtualList
@@ -110,17 +83,21 @@ export function External({
               />
             )}
           />
-          {view.nextCursor ? (
+          {read.hasNextPage ? (
             <Button
               variant="ghost"
               className="text-button"
-              onClick={() => void read(view.thread.id, view.nextCursor)}
+              disabled={read.isFetching}
+              onClick={() => {
+                if (!read.isFetching) void read.fetchNextPage({ cancelRefetch: false });
+              }}
             >
               {view.thread.surface === "discord" ? "Load older messages" : "Load more messages"}
             </Button>
           ) : null}
         </>
-      ) : (
+      ) : null}
+      {!threadId ? (
         <>
           <VirtualList
             items={threads}
@@ -132,20 +109,27 @@ export function External({
                 type="button"
                 variant="ghost"
                 className="external-thread h-auto"
-                onClick={() => void read(thread.id)}
+                onClick={() => setThreadId(thread.id)}
               >
                 <span>{thread.title}</span>
                 <span className="badge">{thread.surface}</span>
               </Button>
             )}
           />
-          {nextCursor ? (
-            <Button variant="ghost" className="text-button" onClick={() => void list(nextCursor)}>
+          {list.hasNextPage ? (
+            <Button
+              variant="ghost"
+              className="text-button"
+              disabled={list.isFetching}
+              onClick={() => {
+                if (!list.isFetching) void list.fetchNextPage({ cancelRefetch: false });
+              }}
+            >
               Load more conversations
             </Button>
           ) : null}
         </>
-      )}
+      ) : null}
     </section>
   );
 }

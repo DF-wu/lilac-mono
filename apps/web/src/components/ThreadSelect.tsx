@@ -1,4 +1,6 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { participantOptions, useNativeOnline } from "../queries";
+import { useState, type ReactNode } from "react";
 import {
   Clock3,
   Cpu,
@@ -12,9 +14,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import type { NativeClient } from "@stanley2058/lilac-client";
-import type { NativeThread, NativeUser, Participant } from "@stanley2058/lilac-client-protocol";
+import type { NativeThread, NativeUser } from "@stanley2058/lilac-client-protocol";
 import { relativeThreadTime } from "../thread-metadata";
-import { attempt } from "./ui";
 import { Button } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { ActorAvatar } from "./ActorAvatar";
@@ -104,26 +105,12 @@ export function ThreadSelect({
   selected?: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  const [participants, setParticipants] = useState<Participant[]>();
-  const [error, setError] = useState<string>();
-  useEffect(() => {
-    const rpc = client.rpc;
-    if (!open || !rpc || participantNames || participants) return;
-    let canceled = false;
-    setError(undefined);
-    void attempt(
-      () => rpc.participants.list({ threadId: thread.id }),
-      (message) => {
-        if (!canceled) setError(message);
-      },
-    ).then((reply) => {
-      if (!canceled && reply) setParticipants(reply.items);
-    });
-    return () => {
-      canceled = true;
-    };
-  }, [open, client, thread.id]);
-  const names = participantNames ?? participants?.map(({ user }) => user.displayName);
+  const online = useNativeOnline(client);
+  const { data, error } = useQuery({
+    ...participantOptions(client, thread.id),
+    enabled: online && open && !participantNames,
+  });
+  const names = participantNames ?? data?.items.map(({ user }) => user.displayName);
   const starter =
     thread.starterDisplayName ??
     (thread.starterId === viewer.id ? viewer.displayName : "Participant");

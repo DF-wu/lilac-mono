@@ -1,3 +1,5 @@
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { configOptions, userOptions, useNativeOnline } from "../queries";
 import { AgentIdentity } from "./AgentIdentity";
 import type { ActorIdentity } from "./ActorAvatar";
 import { useEffect, useRef, useState } from "react";
@@ -51,29 +53,22 @@ export function Settings({
   const document = editor?.document;
   const text = editor?.text ?? "";
   const status = editor?.status ?? "";
+  const online = useNativeOnline(client);
+  const queries = useQueryClient();
+  const configKind = tab === "mcp" ? "mcp" : "core";
+  const config = useQuery({
+    ...configOptions(client, configKind),
+    enabled: online && (tab === "core" || tab === "mcp") && !editors[configKind],
+  });
   useEffect(() => {
-    if (tab !== "core" && tab !== "mcp") return;
-    const rpc = client.rpc;
-    if (!rpc || editors[tab]) return;
-    let canceled = false;
-    setError(undefined);
-    void attempt(
-      () => rpc.config.read({ kind: tab }),
-      (message) => {
-        if (tabRef.current === tab) setError(message);
-      },
-    ).then((value) => {
-      if (!value || canceled) return;
-      setEditors((current) =>
-        current[tab]
-          ? current
-          : { ...current, [tab]: { document: value, text: value.text, editRevision: 0 } },
-      );
-    });
-    return () => {
-      canceled = true;
-    };
-  }, [client, tab]);
+    const value = config.data;
+    if (!value) return;
+    setEditors((current) =>
+      current[value.kind]
+        ? current
+        : { ...current, [value.kind]: { document: value, text: value.text, editRevision: 0 } },
+    );
+  }, [config.data]);
   async function save() {
     const rpc = client.rpc;
     if (!rpc || !document || !editor || savingKinds.current.has(document.kind)) return;
@@ -92,6 +87,7 @@ export function Settings({
     savingKinds.current.delete(request.kind);
     setSaving((current) => ({ ...current, [request.kind]: false }));
     if (!saved) return;
+    void queries.invalidateQueries({ queryKey: ["config", request.kind] });
     setEditors((current) => completeConfigSave(current, request, saved));
   }
   async function reload() {
@@ -145,7 +141,12 @@ export function Settings({
             </div>
           </TabsList>
           <div className="settings-options">
-            <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+            <ErrorNotice
+              message={
+                error ?? (tab === "core" || tab === "mcp" ? config.error?.message : undefined)
+              }
+              onDismiss={error ? () => setError(undefined) : undefined}
+            />
             <TabsContent value="account" className="settings-section">
               <h2>Account</h2>
               <dl className="settings-account">
@@ -255,36 +256,39 @@ export function Settings({
 }
 
 export function People({ client }: { client: NativeClient }) {
-  const [users, setUsers] = useState<NativeUser[]>([]);
-  const [nextCursor, setNextCursor] = useState<string>();
+  const online = useNativeOnline(client);
+  const queries = useQueryClient();
+  const userQuery = useInfiniteQuery({ ...userOptions(client), enabled: online });
+  const users = userQuery.data?.pages.flatMap((page) => page.items) ?? [];
   const [providerId, setProviderId] = useState("");
-  const [error, setError] = useState<string>();
   const [mode, setMode] = useState<"restricted" | "full">("restricted");
-  async function load(cursor?: string) {
-    if (!client.rpc) return;
-    const result = await attempt(() => client.rpc!.users.list({ limit: 100, cursor }), setError);
-    if (result) {
-      setUsers((current) => (cursor ? [...current, ...result.items] : result.items));
-      setNextCursor(result.nextCursor);
-    }
-  }
-  useEffect(() => {
-    void load();
-  }, [client]);
-  async function add() {
-    if (!client.rpc || !providerId.trim()) return;
-    const user = await attempt(
-      () => client.rpc!.users.add({ providerUserId: providerId.trim(), toolMode: mode }),
-      setError,
-    );
-    if (user) {
-      setUsers((current) => [...current.filter((item) => item.id !== user.id), user]);
-      setProviderId("");
-    }
-  }
+  const change = useMutation({
+    mutationFn: (
+      input:
+        | { providerUserId: string; toolMode: "full" | "restricted" }
+        | { userId: string; toolMode: "full" | "restricted" },
+    ) => {
+      const rpc = client.rpc;
+      if (!rpc) return Promise.resolve(undefined);
+      if ("providerUserId" in input) return rpc.users.add(input);
+      return rpc.users.setToolMode(input);
+    },
+    onSuccess: async (user, input) => {
+      if (!user) return;
+      if ("providerUserId" in input) setProviderId("");
+      await Promise.all([
+        queries.invalidateQueries({ queryKey: ["participants"] }),
+        queries.invalidateQueries({ queryKey: ["users"] }),
+      ]);
+    },
+  });
+  const mutating = change.isPending;
   return (
     <section className="people">
-      <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+      <ErrorNotice
+        message={change.error?.message ?? userQuery.error?.message}
+        onDismiss={change.error ? () => change.reset() : undefined}
+      />
       <div className="inline-form">
         <Input
           aria-label="Existing Clerk user ID"
@@ -308,7 +312,11 @@ export function People({ client }: { client: NativeClient }) {
             <SelectItem value="full">Full access</SelectItem>
           </SelectContent>
         </Select>
-        <IconButton label="Add existing user" onClick={() => void add()}>
+        <IconButton
+          label="Add existing user"
+          disabled={!online || mutating || !providerId.trim()}
+          onClick={() => change.mutate({ providerUserId: providerId.trim(), toolMode: mode })}
+        >
           <UserPlus />
         </IconButton>
       </div>
@@ -326,21 +334,14 @@ export function People({ client }: { client: NativeClient }) {
                 { value: "restricted", label: "Restricted" },
                 { value: "full", label: "Full access" },
               ]}
-              disabled={user.role !== "participant"}
+              disabled={!online || mutating || user.role !== "participant"}
               value={user.toolMode}
-              onValueChange={(value) => {
-                const toolMode = value === "full" ? "full" : "restricted";
-                if (!client.rpc) return;
-                void attempt(
-                  () => client.rpc!.users.setToolMode({ userId: user.id, toolMode }),
-                  setError,
-                ).then((updated) => {
-                  if (updated)
-                    setUsers((current) =>
-                      current.map((item) => (item.id === updated.id ? updated : item)),
-                    );
-                });
-              }}
+              onValueChange={(value) =>
+                change.mutate({
+                  userId: user.id,
+                  toolMode: value === "full" ? "full" : "restricted",
+                })
+              }
             >
               <SelectTrigger aria-label={`Tool access for ${user.displayName}`}>
                 <SelectValue />
@@ -353,12 +354,15 @@ export function People({ client }: { client: NativeClient }) {
           </div>
         )}
       />
-      {nextCursor ? (
+      {userQuery.hasNextPage ? (
         <Button
           type="button"
           variant="ghost"
           className="text-button"
-          onClick={() => void load(nextCursor)}
+          disabled={userQuery.isFetching}
+          onClick={() => {
+            if (!userQuery.isFetching) void userQuery.fetchNextPage({ cancelRefetch: false });
+          }}
         >
           Load more people
         </Button>

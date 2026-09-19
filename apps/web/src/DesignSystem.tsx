@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect, useState, type ReactNode } from "react";
 import {
   Archive,
@@ -955,6 +956,9 @@ function Layout() {
   );
 }
 export default function DesignSystem() {
+  const [queries] = useState(
+    () => new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  );
   const [theme, setTheme] = useState("dark");
   useEffect(() => {
     const previous = document.documentElement.dataset.theme;
@@ -967,66 +971,68 @@ export default function DesignSystem() {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
   return (
-    <TooltipProvider>
-      <div className="ds-page">
-        <header className="ds-header">
-          <a href="/" className="ds-back">
-            <ArrowLeft />
-            Back to chat
-          </a>
-          <div className="ds-header-main">
-            <div>
-              <span className="ds-eyebrow">Lilac</span>
-              <h1>Design system</h1>
-              <p>Components, states, and patterns used in the native app.</p>
-            </div>
-            <Select
-              value={theme}
-              items={[
-                { value: "dark", label: "Dark" },
-                { value: "light", label: "Light" },
-                { value: "system", label: "System" },
-              ]}
-              onValueChange={(value) => {
-                if (value) setTheme(value);
-              }}
-            >
-              <SelectTrigger aria-label="Preview theme">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="dark">Dark</SelectItem>
-                <SelectItem value="light">Light</SelectItem>
-                <SelectItem value="system">System</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </header>
-        <div className="ds-body">
-          <nav className="ds-nav" aria-label="Component sections">
-            {sections.map(([id, title]) => (
-              <a key={id} href={`#${id}`}>
-                {title}
-              </a>
-            ))}
-          </nav>
-          <main className="ds-main">
-            <Foundations />
-            <Threads />
-            <Messages />
-            <ComposerSpecimen />
-            <Attachments />
-            <Section id="content" title="Rich content">
-              <div className="ds-content">
-                <Markdown text={richText} />
+    <QueryClientProvider client={queries}>
+      <TooltipProvider>
+        <div className="ds-page">
+          <header className="ds-header">
+            <a href="/" className="ds-back">
+              <ArrowLeft />
+              Back to chat
+            </a>
+            <div className="ds-header-main">
+              <div>
+                <span className="ds-eyebrow">Lilac</span>
+                <h1>Design system</h1>
+                <p>Components, states, and patterns used in the native app.</p>
               </div>
-            </Section>
-            <Controls />
-            <Overlays />
-            <Layout />
-          </main>
+              <Select
+                value={theme}
+                items={[
+                  { value: "dark", label: "Dark" },
+                  { value: "light", label: "Light" },
+                  { value: "system", label: "System" },
+                ]}
+                onValueChange={(value) => {
+                  if (value) setTheme(value);
+                }}
+              >
+                <SelectTrigger aria-label="Preview theme">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="dark">Dark</SelectItem>
+                  <SelectItem value="light">Light</SelectItem>
+                  <SelectItem value="system">System</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </header>
+          <div className="ds-body">
+            <nav className="ds-nav" aria-label="Component sections">
+              {sections.map(([id, title]) => (
+                <a key={id} href={`#${id}`}>
+                  {title}
+                </a>
+              ))}
+            </nav>
+            <main className="ds-main">
+              <Foundations />
+              <Threads />
+              <Messages />
+              <ComposerSpecimen />
+              <Attachments />
+              <Section id="content" title="Rich content">
+                <div className="ds-content">
+                  <Markdown text={richText} />
+                </div>
+              </Section>
+              <Controls />
+              <Overlays />
+              <Layout />
+            </main>
+          </div>
         </div>
-      </div>
-    </TooltipProvider>
+      </TooltipProvider>
+    </QueryClientProvider>
   );
 }
