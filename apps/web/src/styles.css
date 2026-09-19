@@ -1427,7 +1427,7 @@ progress {
 
 .thread-header { height: 2rem; min-height: 0; padding-block: calc(var(--space-1) / 2); }
 .thread-header .icon-button { width: var(--control-compact); height: var(--control-compact); }
-.sidebar-hidden .sidebar-toggle { height: 2rem; }
-.sidebar-hidden .sidebar-toggle .icon-button { width: var(--control-compact); height: var(--control-compact); }
+.sidebar-toggle { height: 2rem; }
+.sidebar-toggle .icon-button { width: var(--control-compact); height: var(--control-compact); }
 .scroll-to-end { position: absolute; bottom: 100%; left: 0; right: 0; display: flex; justify-content: center; padding-bottom: var(--space-2); pointer-events: none; }
 .scroll-to-end > button { pointer-events: auto; height: var(--control-compact); border-radius: 999px; gap: var(--space-1); font-size: var(--text-xs); box-shadow: 0 2px 8px var(--overlay); }
