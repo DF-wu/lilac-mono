@@ -28,3 +28,5 @@
 @keyframes thread-working-spin { to { transform:rotate(360deg); } }
 @media(prefers-reduced-motion:reduce) { .thread-card[data-state=working] .thread-state-icon svg { animation:none; } }
 @media(hover:none) { .thread-card-actions { opacity:1; pointer-events:auto; } .thread-card:has(.thread-card-actions) .thread-card-meta { visibility:hidden; } .thread-card:has(.thread-card-actions) .thread-starter { max-width:calc(100% - var(--control-compact) * 3); } }
+
+.thread-card .thread-card-select, .thread-card .thread-card-select:hover, .thread-card .thread-card-select:focus-visible { background: transparent; }

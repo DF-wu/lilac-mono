@@ -581,29 +581,31 @@ export function Chat(props: ChatProps) {
           />
         </UploadProgressContext.Provider>
 
-        {thread.capabilities.edit && rewindTarget ? (
-          <Modal title="Rewind this conversation?" onClose={() => setRewindTarget(undefined)}>
-            <p>
-              The selected turn and everything after it will leave the conversation. Its text
-              returns to your composer. File changes and other tool effects remain.
-            </p>
-            {active ? <p>The active run will be canceled and queued messages dropped.</p> : null}
-            <div className="dialog-actions">
-              <Button className="button" onClick={() => setRewindTarget(undefined)}>
-                Keep conversation
-              </Button>
-              <Button
-                variant="destructive"
-                className="button danger"
-                disabled={rewinding}
-                onClick={() => void rewind()}
-              >
-                <RotateCcw />
-                Rewind
-              </Button>
-            </div>
-          </Modal>
-        ) : null}
+        <Modal
+          open={thread.capabilities.edit && !!rewindTarget}
+          title="Rewind this conversation?"
+          onClose={() => setRewindTarget(undefined)}
+        >
+          <p>
+            The selected turn and everything after it will leave the conversation. Its text returns
+            to your composer. File changes and other tool effects remain.
+          </p>
+          {active ? <p>The active run will be canceled and queued messages dropped.</p> : null}
+          <div className="dialog-actions">
+            <Button className="button" onClick={() => setRewindTarget(undefined)}>
+              Keep conversation
+            </Button>
+            <Button
+              variant="destructive"
+              className="button danger"
+              disabled={rewinding}
+              onClick={() => void rewind()}
+            >
+              <RotateCcw />
+              Rewind
+            </Button>
+          </div>
+        </Modal>
       </div>
     </MessageIdentityContext>
   );

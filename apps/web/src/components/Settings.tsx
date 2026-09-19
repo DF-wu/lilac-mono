@@ -37,6 +37,7 @@ export function Settings({
   agent: ActorIdentity;
   onTheme: (value: string) => void;
 }) {
+  const [open, setOpen] = useState(true);
   const { client, preferences } = useWorkspace();
   const animation = useStore(preferences, (state) => state.animation);
   const [tab, setTab] = useState<"account" | "theme" | "core" | "mcp" | "agent" | "users">(
@@ -56,20 +57,29 @@ export function Settings({
   const status = editor?.status ?? "";
   const online = useNativeOnline(client);
   const queries = useQueryClient();
-  const configKind = tab === "mcp" ? "mcp" : "core";
-  const config = useQuery({
-    ...configOptions(client, configKind),
-    enabled: online && (tab === "core" || tab === "mcp") && !editors[configKind],
+  const loadConfig = open && online && viewer.role === "owner";
+  const coreConfig = useQuery({
+    ...configOptions(client, "core"),
+    enabled: loadConfig && !editors.core,
   });
+  const mcpConfig = useQuery({
+    ...configOptions(client, "mcp"),
+    enabled: loadConfig && !editors.mcp,
+  });
+  const config = tab === "mcp" ? mcpConfig : coreConfig;
   useEffect(() => {
-    const value = config.data;
-    if (!value) return;
-    setEditors((current) =>
-      current[value.kind]
-        ? current
-        : { ...current, [value.kind]: { document: value, text: value.text, editRevision: 0 } },
-    );
-  }, [config.data]);
+    for (const value of [coreConfig.data, mcpConfig.data]) {
+      if (!value) continue;
+      setEditors((current) =>
+        current[value.kind]
+          ? current
+          : {
+              ...current,
+              [value.kind]: { document: value, text: value.text, editRevision: 0 },
+            },
+      );
+    }
+  }, [coreConfig.data, mcpConfig.data]);
   async function save() {
     const rpc = client.rpc;
     if (!rpc || !document || !editor || savingKinds.current.has(document.kind)) return;
@@ -98,8 +108,9 @@ export function Settings({
   }
   return (
     <Dialog
-      open
-      onOpenChange={(open) => {
+      open={open}
+      onOpenChange={setOpen}
+      onOpenChangeComplete={(open) => {
         if (!open) onClose();
       }}
     >

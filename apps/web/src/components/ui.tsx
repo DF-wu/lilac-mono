@@ -3,6 +3,7 @@ import {
   useEffect,
   useEffectEvent,
   useRef,
+  useState,
   type ButtonHTMLAttributes,
   type ReactNode,
 } from "react";
@@ -45,17 +46,27 @@ export function Modal({
   children,
   onClose,
   wide = false,
+  open: controlledOpen,
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
   wide?: boolean;
+  open?: boolean;
 }) {
+  const [localOpen, setLocalOpen] = useState(true);
+  const close = () => {
+    if (controlledOpen !== undefined) onClose();
+    else setLocalOpen(false);
+  };
   return (
     <Dialog
-      open
+      open={controlledOpen ?? localOpen}
       onOpenChange={(open) => {
-        if (!open) onClose();
+        if (!open) close();
+      }}
+      onOpenChangeComplete={(open) => {
+        if (!open && controlledOpen === undefined) onClose();
       }}
     >
       <DialogContent
@@ -64,7 +75,7 @@ export function Modal({
       >
         <DialogHeader className="modal-header flex-row items-center justify-between">
           <DialogTitle>{title}</DialogTitle>
-          <IconButton label="Close" onClick={onClose}>
+          <IconButton label="Close" onClick={close}>
             <X />
           </IconButton>
         </DialogHeader>

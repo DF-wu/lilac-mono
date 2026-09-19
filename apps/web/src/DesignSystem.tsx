@@ -894,27 +894,25 @@ function Overlays() {
           </Button>
         </div>
       </Specimen>
-      {dialog ? (
-        <Modal title="Rename conversation" onClose={() => setDialog(false)}>
-          <label className="ds-field">
-            Title
-            <Input defaultValue="A quiet weekend" />
-          </label>
-          <div className="dialog-actions">
-            <Button variant="ghost" onClick={() => setDialog(false)}>
-              Cancel
-            </Button>
-            <Button
-              onClick={() => {
-                setDialog(false);
-                setAction("Preview title saved");
-              }}
-            >
-              Save
-            </Button>
-          </div>
-        </Modal>
-      ) : null}
+      <Modal open={dialog} title="Rename conversation" onClose={() => setDialog(false)}>
+        <label className="ds-field">
+          Title
+          <Input defaultValue="A quiet weekend" />
+        </label>
+        <div className="dialog-actions">
+          <Button variant="ghost" onClick={() => setDialog(false)}>
+            Cancel
+          </Button>
+          <Button
+            onClick={() => {
+              setDialog(false);
+              setAction("Preview title saved");
+            }}
+          >
+            Save
+          </Button>
+        </div>
+      </Modal>
     </Section>
   );
 }

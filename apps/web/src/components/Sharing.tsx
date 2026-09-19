@@ -4,11 +4,11 @@ import { participantOptions, userOptions, useNativeOnline } from "../queries";
 import { useState } from "react";
 import { X, UserPlus } from "lucide-react";
 import type { NativeThread } from "@stanley2058/lilac-client-protocol";
-import { ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
+import { ErrorNotice, IconButton, VirtualList } from "./ui";
 import { Button } from "./ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 
-export function Sharing({ thread, onClose }: { thread: NativeThread; onClose: () => void }) {
+export function Sharing({ thread }: { thread: NativeThread }) {
   const { client } = useWorkspace();
   const online = useNativeOnline(client);
   const queries = useQueryClient();
@@ -39,7 +39,7 @@ export function Sharing({ thread, onClose }: { thread: NativeThread; onClose: ()
   });
   const mutating = change.isPending;
   return (
-    <Modal title="Share conversation" onClose={onClose}>
+    <>
       <ErrorNotice
         message={
           change.error?.message ?? participantQuery.error?.message ?? userQuery.error?.message
@@ -156,6 +156,6 @@ export function Sharing({ thread, onClose }: { thread: NativeThread; onClose: ()
           </div>
         )}
       />
-    </Modal>
+    </>
   );
 }

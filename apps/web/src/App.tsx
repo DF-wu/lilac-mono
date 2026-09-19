@@ -34,9 +34,7 @@ import type { AppProps, ComposerSubmission } from "./types";
 import { resolveAttachmentIds } from "./uploads";
 import { ChatPanels, ChatLoadState } from "./components/ChatPanels";
 import { Chat, type Draft, type PendingInput } from "./components/Chat";
-const Settings = lazy(() =>
-  import("./components/Settings").then((module) => ({ default: module.Settings })),
-);
+import { Settings } from "./components/Settings";
 import { SidebarSearch } from "./components/SidebarSearch";
 const Sharing = lazy(() =>
   import("./components/Sharing").then((module) => ({ default: module.Sharing })),
@@ -922,78 +920,68 @@ function Workspace(props: AppProps) {
             </ResizablePanel>
           </ResizablePanelGroup>
           {settings ? (
-            <Suspense
-              fallback={
-                <Modal title="Settings" onClose={() => setSettings(false)}>
-                  <p role="status">Loading settings…</p>
-                </Modal>
-              }
-            >
-              <Settings
-                viewer={initial.viewer}
-                onLogout={props.onLogout}
-                onClose={() => setSettings(false)}
-                agent={identities.agent}
-                theme={theme}
-                onTheme={setTheme}
-              />
-            </Suspense>
+            <Settings
+              viewer={initial.viewer}
+              onLogout={props.onLogout}
+              onClose={() => setSettings(false)}
+              agent={identities.agent}
+              theme={theme}
+              onTheme={setTheme}
+            />
           ) : null}
           {sharing && owner && selected ? (
-            <Suspense
-              fallback={
-                <Modal title="Share conversation" onClose={() => setSharing(false)}>
-                  <p role="status">Loading people…</p>
-                </Modal>
-              }
-            >
-              <Sharing key={selected.id} thread={selected} onClose={() => setSharing(false)} />
-            </Suspense>
-          ) : null}
-          {rename !== undefined ? (
-            <Modal title="Rename conversation" onClose={() => setRename(undefined)}>
-              <form
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  void update(rename.id, { title: rename.title });
-                }}
-              >
-                <Input
-                  className="wide-input"
-                  autoFocus
-                  aria-label="Conversation name"
-                  value={rename.title}
-                  onChange={(event) => setRename({ ...rename, title: event.target.value })}
-                  maxLength={512}
-                />
-                <div className="dialog-actions">
-                  <Button className="button primary" type="submit">
-                    Rename
-                  </Button>
-                </div>
-              </form>
+            <Modal title="Share conversation" onClose={() => setSharing(false)}>
+              <Suspense fallback={<p role="status">Loading people…</p>}>
+                <Sharing key={selected.id} thread={selected} />
+              </Suspense>
             </Modal>
           ) : null}
-          {confirmDelete ? (
-            <Modal title="Delete conversation?" onClose={() => setConfirmDelete(undefined)}>
-              <p>
-                This removes the conversation and makes its files unavailable. Any active run will
-                be canceled.
-              </p>
+          <Modal open={!!rename} title="Rename conversation" onClose={() => setRename(undefined)}>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (rename) void update(rename.id, { title: rename.title });
+              }}
+            >
+              <Input
+                className="wide-input"
+                autoFocus
+                aria-label="Conversation name"
+                value={rename?.title ?? ""}
+                onChange={(event) => {
+                  if (rename) setRename({ ...rename, title: event.target.value });
+                }}
+                maxLength={512}
+              />
               <div className="dialog-actions">
-                <Button className="button" onClick={() => setConfirmDelete(undefined)}>
-                  Keep conversation
-                </Button>
-                <Button
-                  variant="destructive"
-                  className="button danger"
-                  onClick={() => void deleteThread()}
-                >
-                  Delete
+                <Button className="button primary" type="submit">
+                  Rename
                 </Button>
               </div>
-            </Modal>
-          ) : null}
+            </form>
+          </Modal>
+          <Modal
+            open={!!confirmDelete}
+            title="Delete conversation?"
+            onClose={() => setConfirmDelete(undefined)}
+          >
+            <p>
+              This removes the conversation and makes its files unavailable. Any active run will be
+              canceled.
+            </p>
+            <div className="dialog-actions">
+              <Button className="button" onClick={() => setConfirmDelete(undefined)}>
+                Keep conversation
+              </Button>
+              <Button
+                variant="destructive"
+                className="button danger"
+                onClick={() => void deleteThread()}
+              >
+                Delete
+              </Button>
+            </div>
+          </Modal>
         </main>
       </Tooltip.Provider>
     </MessageIdentityContext.Provider>

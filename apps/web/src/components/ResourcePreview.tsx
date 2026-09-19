@@ -564,6 +564,7 @@ export function ResourcePreview({
     }),
     err: (error): TextPreviewState => ({ status: "error", message: error.message }),
   }) ?? { status: "loading" };
+  const [open, setOpen] = useState(true);
   const backdropPress = useRef<{ id: number; x: number; y: number; moved: boolean } | null>(null);
   function beginBackdropPress(event: PointerEvent<HTMLDivElement>) {
     backdropPress.current = null;
@@ -587,8 +588,9 @@ export function ResourcePreview({
   }
   return (
     <Dialog
-      open
-      onOpenChange={(open) => {
+      open={open}
+      onOpenChange={setOpen}
+      onOpenChangeComplete={(open) => {
         if (!open) onClose();
       }}
     >
@@ -609,14 +611,18 @@ export function ResourcePreview({
             !isPreviewBackdrop(event.target, event.clientX, event.clientY)
           )
             return;
-          onClose();
+          setOpen(false);
         }}
       >
         <header className="resource-preview-header">
           <DialogTitle className="resource-preview-title" title={name}>
             {name}
           </DialogTitle>
-          <IconButton label="Close preview" className="resource-preview-close" onClick={onClose}>
+          <IconButton
+            label="Close preview"
+            className="resource-preview-close"
+            onClick={() => setOpen(false)}
+          >
             <X />
           </IconButton>
         </header>
