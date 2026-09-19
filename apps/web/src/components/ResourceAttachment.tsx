@@ -1,3 +1,4 @@
+import { useMessageServices } from "./message-services";
 import { useRef, useState } from "react";
 import type { DisplayPart } from "@stanley2058/lilac-client-protocol";
 import { FileText } from "lucide-react";
@@ -7,22 +8,12 @@ import { attempt } from "./ui";
 import { ReadyAttachment } from "./ResourcePreview";
 import "./message-presentation.css";
 
-type ResourceAttachmentProps = {
-  part: Extract<DisplayPart, { type: "data-resource" }>;
-  resourceUrl: (id: string) => string;
-  canEdit: boolean;
-  upload?: (
-    resourceId: string,
-    file: File,
-    onProgress: (fraction: number) => void,
-  ) => Promise<void>;
-};
 export function ResourceAttachment({
   part,
-  resourceUrl,
-  upload,
-  canEdit,
-}: ResourceAttachmentProps) {
+}: {
+  part: Extract<DisplayPart, { type: "data-resource" }>;
+}) {
+  const { resourceUrl, upload, canEdit } = useMessageServices();
   const [recovery, setRecovery] = useState<{ progress: number; active: boolean; error?: string }>({
     progress: 0,
     active: false,

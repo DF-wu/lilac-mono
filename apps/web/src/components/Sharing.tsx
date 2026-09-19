@@ -1,22 +1,15 @@
+import { useWorkspace } from "../workspace-context";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { participantOptions, userOptions, useNativeOnline } from "../queries";
 import { useState } from "react";
 import { X, UserPlus } from "lucide-react";
-import type { NativeClient } from "@stanley2058/lilac-client";
 import type { NativeThread } from "@stanley2058/lilac-client-protocol";
 import { ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
 import { Button } from "./ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 
-export function Sharing({
-  client,
-  thread,
-  onClose,
-}: {
-  client: NativeClient;
-  thread: NativeThread;
-  onClose: () => void;
-}) {
+export function Sharing({ thread, onClose }: { thread: NativeThread; onClose: () => void }) {
+  const { client } = useWorkspace();
   const online = useNativeOnline(client);
   const queries = useQueryClient();
   const participantQuery = useQuery({ ...participantOptions(client, thread.id), enabled: online });

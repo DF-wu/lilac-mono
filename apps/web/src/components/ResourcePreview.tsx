@@ -1,3 +1,4 @@
+import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type ReactNode, type PointerEvent } from "react";
 import type { DisplayPart } from "@stanley2058/lilac-client-protocol";
 import {
@@ -548,7 +549,21 @@ export function ResourcePreview({
   kind: AttachmentKind;
   onClose: () => void;
 }) {
-  const [text, setText] = useState<TextPreviewState>({ status: "loading" });
+  const preview = useQuery({
+    queryKey: ["resource-preview", href],
+    queryFn: ({ signal }) => loadResourcePreview(href, signal),
+    enabled: kind === "text",
+    staleTime: 0,
+    gcTime: 60_000,
+  });
+  const text: TextPreviewState = preview.data?.match({
+    ok: (value): TextPreviewState => ({
+      status: "ready",
+      text: value.text,
+      truncated: value.truncated,
+    }),
+    err: (error): TextPreviewState => ({ status: "error", message: error.message }),
+  }) ?? { status: "loading" };
   const backdropPress = useRef<{ id: number; x: number; y: number; moved: boolean } | null>(null);
   function beginBackdropPress(event: PointerEvent<HTMLDivElement>) {
     backdropPress.current = null;
@@ -570,20 +585,6 @@ export function ResourcePreview({
     if (!press || press.id !== event.pointerId) return;
     if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > 4) press.moved = true;
   }
-  useEffect(() => {
-    if (kind !== "text") return;
-    const controller = new AbortController();
-    async function load() {
-      const result = await loadResourcePreview(href, controller.signal);
-      if (controller.signal.aborted) return;
-      result.match({
-        ok: (value) => setText({ status: "ready", text: value.text, truncated: value.truncated }),
-        err: (error) => setText({ status: "error", message: error.message }),
-      });
-    }
-    void load();
-    return () => controller.abort();
-  }, [href, kind]);
   return (
     <Dialog
       open

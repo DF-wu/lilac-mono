@@ -38,7 +38,7 @@ import { attempt, IconButton, Modal, VirtualList } from "./components/ui";
 import { DraftChat } from "./components/DraftChat";
 import { MessageIdentityContext } from "./components/message-identity";
 import { toast } from "./components/ui/toast";
-import { ThreadSelect, ThreadCard } from "./components/ThreadSelect";
+import { SidebarThread } from "./components/SidebarThread";
 import {
   newDraftThread,
   restoreDraftThread,
@@ -48,12 +48,6 @@ import {
   type DraftThread,
 } from "./draft-thread";
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "./components/ui/resizable";
-import {
-  ContextMenu,
-  ContextMenuTrigger,
-  ContextMenuContent,
-  ContextMenuItem,
-} from "./components/ui/context-menu";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -74,15 +68,10 @@ export function App(props: AppProps) {
 }
 function Workspace(props: AppProps) {
   const { pool, drafts: draftStore } = useWorkspace();
-  const draftSummaries = useStore(draftStore, (state) => state.summaries);
+  const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
   const [threads, setThreads] = useState(initial.threads.items);
-  const [now, setNow] = useState(Date.now);
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
-    return () => window.clearInterval(timer);
-  }, []);
   const [nextCursor, setNextCursor] = useState(initial.threads.nextCursor);
   const [loadingThreads, setLoadingThreads] = useState(false);
   const [threadListError, setThreadListError] = useState(false);
@@ -569,16 +558,7 @@ function Workspace(props: AppProps) {
     if (selectedRef.current === id) createThread();
   }
   const sidebarThreads = [
-    ...(!archived
-      ? draftSummaries.map((thread) => ({
-          id: thread.id,
-          title: thread.title,
-          draft: true,
-          editable: thread.editable,
-          archived: false,
-          source: undefined,
-        }))
-      : []),
+    ...(!archived ? draftIds.map((id) => ({ id, source: undefined })) : []),
     ...threads
       .filter((thread) => thread.archived === archived)
       .map((thread) => ({
@@ -611,35 +591,6 @@ function Workspace(props: AppProps) {
     });
     return () => toast.close("connection");
   }, [connection]);
-  const rowActions = (thread: (typeof sidebarThreads)[number]) =>
-    thread.editable ? (
-      <>
-        <IconButton
-          label={`Rename ${thread.title || "conversation"}`}
-          tooltip="Rename"
-          onClick={() => setRename({ id: thread.id, title: thread.title })}
-        >
-          <Pencil />
-        </IconButton>
-        {!thread.draft ? (
-          <IconButton
-            label={`${thread.archived ? "Unarchive" : "Archive"} ${thread.title || "conversation"}`}
-            tooltip={thread.archived ? "Unarchive" : "Archive"}
-            onClick={() => void update(thread.id, { archived: !thread.archived })}
-          >
-            {thread.archived ? <ArchiveRestore /> : <Archive />}
-          </IconButton>
-        ) : null}
-        <IconButton
-          className="destructive-action"
-          label={`Delete ${thread.title || "conversation"}`}
-          tooltip="Delete"
-          onClick={() => setConfirmDelete(thread.id)}
-        >
-          <Trash2 />
-        </IconButton>
-      </>
-    ) : undefined;
   return (
     <MessageIdentityContext.Provider value={identities}>
       <Tooltip.Provider delay={350}>
@@ -769,64 +720,20 @@ function Workspace(props: AppProps) {
                       className="thread-list"
                       estimate={64}
                       render={(thread) => (
-                        <ContextMenu>
-                          <ContextMenuTrigger className="thread-row-card">
-                            {thread.source ? (
-                              <ThreadSelect
-                                thread={thread.source}
-                                viewer={initial.viewer}
-                                client={client}
-                                modelLabel={
-                                  catalog?.models.find(
-                                    (model) => model.id === thread.source.modelId,
-                                  )?.label
-                                }
-                                now={now}
-                                selected={selectedId === thread.id && !external}
-                                actions={rowActions(thread)}
-                                onSelect={() => select(thread.id)}
-                              />
-                            ) : (
-                              <ThreadCard
-                                title={thread.title}
-                                starterName={`${initial.viewer.displayName} · Draft`}
-                                state="idle"
-                                updatedAt={now}
-                                now={now}
-                                selected={selectedId === thread.id && !external}
-                                actions={rowActions(thread)}
-                                onSelect={() => select(thread.id)}
-                              />
-                            )}
-                          </ContextMenuTrigger>
-                          {thread.editable ? (
-                            <ContextMenuContent>
-                              <ContextMenuItem
-                                onClick={() => setRename({ id: thread.id, title: thread.title })}
-                              >
-                                <Pencil />
-                                Rename
-                              </ContextMenuItem>
-                              {!thread.draft ? (
-                                <ContextMenuItem
-                                  onClick={() =>
-                                    void update(thread.id, { archived: !thread.archived })
-                                  }
-                                >
-                                  {thread.archived ? <ArchiveRestore /> : <Archive />}
-                                  {thread.archived ? "Unarchive" : "Archive"}
-                                </ContextMenuItem>
-                              ) : null}
-                              <ContextMenuItem
-                                variant="destructive"
-                                onClick={() => setConfirmDelete(thread.id)}
-                              >
-                                <Trash2 />
-                                Delete
-                              </ContextMenuItem>
-                            </ContextMenuContent>
-                          ) : null}
-                        </ContextMenu>
+                        <SidebarThread
+                          id={thread.id}
+                          thread={thread.source}
+                          viewer={initial.viewer}
+                          modelLabel={
+                            catalog?.models.find((model) => model.id === thread.source?.modelId)
+                              ?.label
+                          }
+                          selected={selectedId === thread.id && !external}
+                          onSelect={select}
+                          onRename={(id, title) => setRename({ id, title })}
+                          onArchive={(id, archived) => void update(id, { archived })}
+                          onDelete={setConfirmDelete}
+                        />
                       )}
                     />
                     {threadListError ? (
@@ -874,12 +781,7 @@ function Workspace(props: AppProps) {
               <div className="main-panel">
                 {external && owner ? (
                   <Suspense fallback={<p role="status">Loading conversations…</p>}>
-                    <External
-                      key={externalId ?? "list"}
-                      client={client}
-                      resourceUrl={props.resourceUrl}
-                      initialThreadId={externalId}
-                    />
+                    <External key={externalId ?? "list"} initialThreadId={externalId} />
                   </Suspense>
                 ) : null}
                 {!external && selected ? (
@@ -982,7 +884,6 @@ function Workspace(props: AppProps) {
               <Settings
                 viewer={initial.viewer}
                 onLogout={props.onLogout}
-                client={client}
                 onClose={() => setSettings(false)}
                 agent={identities.agent}
                 theme={theme}
@@ -998,12 +899,7 @@ function Workspace(props: AppProps) {
                 </Modal>
               }
             >
-              <Sharing
-                key={selected.id}
-                client={client}
-                thread={selected}
-                onClose={() => setSharing(false)}
-              />
+              <Sharing key={selected.id} thread={selected} onClose={() => setSharing(false)} />
             </Suspense>
           ) : null}
           {rename !== undefined ? (

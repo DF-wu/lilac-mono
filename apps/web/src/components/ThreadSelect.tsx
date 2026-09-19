@@ -1,6 +1,7 @@
+import { useWorkspace } from "../workspace-context";
 import { useQuery } from "@tanstack/react-query";
 import { participantOptions, useNativeOnline } from "../queries";
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   Clock3,
   Cpu,
@@ -13,7 +14,6 @@ import {
   MessageCircleQuestion,
   type LucideIcon,
 } from "lucide-react";
-import type { NativeClient } from "@stanley2058/lilac-client";
 import type { NativeThread, NativeUser } from "@stanley2058/lilac-client-protocol";
 import { relativeThreadTime } from "../thread-metadata";
 import { Button } from "./ui/button";
@@ -43,7 +43,7 @@ export function ThreadCard({
   title: string;
   starterName: string;
   updatedAt: number;
-  now: number;
+  now?: number;
   state: ThreadDisplayState;
   selected?: boolean;
   actions?: ReactNode;
@@ -70,9 +70,7 @@ export function ThreadCard({
                   <StatusIcon />
                 </span>
               ) : null}
-              <time dateTime={new Date(updatedAt).toISOString()}>
-                {relativeThreadTime(updatedAt, now)}
-              </time>
+              <ThreadTime updatedAt={updatedAt} now={now} />
             </span>
           </span>
           <span className="thread-card-title">{title || "Untitled"}</span>
@@ -83,10 +81,23 @@ export function ThreadCard({
   );
 }
 
+function ThreadTime({ updatedAt, now }: { updatedAt: number; now?: number }) {
+  const [clock, setClock] = useState(Date.now);
+  useEffect(() => {
+    if (now !== undefined) return;
+    const timer = window.setInterval(() => setClock(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, [now]);
+  return (
+    <time dateTime={new Date(updatedAt).toISOString()}>
+      {relativeThreadTime(updatedAt, now ?? clock)}
+    </time>
+  );
+}
+
 export function ThreadSelect({
   thread,
   viewer,
-  client,
   modelLabel,
   now,
   onSelect,
@@ -97,13 +108,13 @@ export function ThreadSelect({
   participantNames?: string[];
   thread: NativeThread;
   viewer: NativeUser;
-  client: NativeClient;
   modelLabel?: string;
-  now: number;
+  now?: number;
   onSelect: () => void;
   actions?: ReactNode;
   selected?: boolean;
 }) {
+  const { client } = useWorkspace();
   const [open, setOpen] = useState(false);
   const online = useNativeOnline(client);
   const { data, error } = useQuery({

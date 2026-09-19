@@ -15,6 +15,7 @@ test("draft edits retain sidebar snapshots when the visible summary is unchanged
     ]),
   );
   const summaries = store.getState().summaries;
+  const ids = store.getState().ids;
   const edited = { ...first, draft: { ...first.draft, text: first.draft.text + " more typing" } };
   store.getState().setLocalDrafts(
     new Map([
@@ -32,6 +33,7 @@ test("draft edits retain sidebar snapshots when the visible summary is unchanged
     ]),
   );
   expect(store.getState().summaries[0]?.title).toBe("Renamed");
+  expect(store.getState().ids).toBe(ids);
   expect(store.getState().summaries[1]).toBe(summaries[1]);
 });
 

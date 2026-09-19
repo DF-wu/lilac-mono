@@ -334,3 +334,19 @@ test("local draft discovery ignores malformed keys and forged scope indexes", as
     "draft:valid",
   ]);
 });
+
+test("draft writes avoid reading all draft bodies until the storage cap requires eviction", async () => {
+  const factory = new IDBFactory();
+  const first = cache(factory, { maxThreads: 2 });
+  const getAll = spyOn(IDBObjectStore.prototype, "getAll");
+  await first.saveDraft(scope, "draft:first", { text: "First", skillIds: [] });
+  await first.saveDraft(scope, "draft:second", { text: "Second", skillIds: [] });
+  await first.saveDraft(scope, "draft:first", { text: "First edited", skillIds: [] });
+  expect(getAll).not.toHaveBeenCalled();
+  await first.saveDraft(scope, "draft:third", { text: "Third", skillIds: [] });
+  expect(getAll).toHaveBeenCalledTimes(1);
+  getAll.mockRestore();
+  first.close();
+  const reopened = cache(factory, { maxThreads: 2 });
+  expect((await reopened.listLocalDrafts(scope)).length).toBe(2);
+});

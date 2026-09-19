@@ -1,22 +1,15 @@
+import { useWorkspace } from "../workspace-context";
 import { useState } from "react";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { externalListOptions, externalReadOptions, useNativeOnline } from "../queries";
 import { RefreshCw, ArrowLeft } from "lucide-react";
-import type { NativeClient } from "@stanley2058/lilac-client";
 import { ErrorNotice, IconButton, VirtualList } from "./ui";
 import { mergeExternalPage, type ExternalPage } from "../external-pages";
 import { Message } from "./Timeline";
 import { Button } from "./ui/button";
 
-export function External({
-  client,
-  resourceUrl,
-  initialThreadId,
-}: {
-  client: NativeClient;
-  resourceUrl: (id: string) => string;
-  initialThreadId?: string;
-}) {
+export function External({ initialThreadId }: { initialThreadId?: string }) {
+  const { client, resourceUrl } = useWorkspace();
   const [threadId, setThreadId] = useState(initialThreadId);
   const online = useNativeOnline(client);
   const list = useInfiniteQuery({ ...externalListOptions(client), enabled: online && !threadId });

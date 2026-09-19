@@ -1,5 +1,11 @@
 import {
+  MessageServicesContext,
+  useMessageServices,
+  type MessageServices,
+} from "./message-services";
+import {
   memo,
+  createContext,
   useContext,
   useId,
   type ReactNode,
@@ -62,37 +68,27 @@ export function useSlotIds(store: NativeThreadStore) {
   return useSyncExternalStore(subscribe, snapshot, snapshot);
 }
 
-export type TimelineProps = {
+export type TimelineProps = MessageServices & {
   header?: ReactNode;
   footer?: ReactNode;
   client: NativeClient;
   threadId: string;
-  canEdit: boolean;
-  resourceUrl: (id: string) => string;
-  upload?: (
-    resourceId: string,
-    file: File,
-    onProgress: (fraction: number) => void,
-  ) => Promise<void>;
   onRewind: (turnId: string) => void;
-  onAction: (
-    messageId: string,
-    part: Extract<DisplayPart, { type: "data-actions" }>,
-    actionId: string,
-  ) => void;
-  onReaction: (messageId: string, emoji: string, active: boolean) => void;
   onLatestVisibleChange?: (visible: boolean) => void;
 };
-
-type TurnProps = Omit<TimelineProps, "header" | "footer" | "onLatestVisibleChange">;
-function messageProps(props: TurnProps): Omit<MessageProps, "message" | "controls"> {
-  return {
-    canEdit: props.canEdit,
-    resourceUrl: props.resourceUrl,
-    upload: props.upload,
-    onAction: props.onAction,
-    onReaction: props.onReaction,
-  };
+type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind">;
+const TimelineContext = createContext<TimelineServices | undefined>(undefined);
+function useMessageServicesValue({
+  canEdit,
+  resourceUrl,
+  upload,
+  onAction,
+  onReaction,
+}: MessageServices) {
+  return useMemo(
+    () => ({ canEdit, resourceUrl, upload, onAction, onReaction }),
+    [canEdit, resourceUrl, upload, onAction, onReaction],
+  );
 }
 
 export function useLatestReadableTurn(store: NativeThreadStore) {
@@ -108,6 +104,11 @@ export function useLatestReadableTurn(store: NativeThreadStore) {
 }
 
 export const Timeline = memo(function Timeline(props: TimelineProps) {
+  const services = useMessageServicesValue(props);
+  const timeline = useMemo(
+    () => ({ client: props.client, threadId: props.threadId, onRewind: props.onRewind }),
+    [props.client, props.threadId, props.onRewind],
+  );
   const store = props.client.thread(props.threadId);
   const ids = useSlotIds(store);
   const parent = useRef<HTMLDivElement>(null);
@@ -230,131 +231,126 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     }
   };
   return (
-    <div
-      className="timeline chat-scroll"
-      ref={parent}
-      onScroll={rememberScroll}
-      onClickCapture={(event) => {
-        if (
-          event.target instanceof Element &&
-          event.target.closest("[data-slot=collapsible-trigger], .message-expand")
-        )
-          atTail.current = false;
-      }}
-      onFocusCapture={(event) => {
-        if (
-          event.target instanceof Element &&
-          event.target.closest('.message-card-preview[data-collapsed="true"]')
-        )
-          atTail.current = false;
-      }}
-      onWheel={(event) => {
-        const editor =
-          event.target instanceof Element ? event.target.closest(".composer-editor") : null;
-        if (
-          editor &&
-          ((event.deltaY < 0 && editor.scrollTop > 0) ||
-            (event.deltaY > 0 && editor.scrollTop + editor.clientHeight < editor.scrollHeight))
-        )
-          return;
-        userScroll.current = true;
-        if (event.deltaY < 0) atTail.current = false;
-      }}
-      onTouchStart={(event) => {
-        touchY.current = event.touches[0]?.clientY;
-      }}
-      onTouchMove={(event) => {
-        userScroll.current = true;
-        const next = event.touches[0]?.clientY;
-        if (next !== undefined && touchY.current !== undefined && next > touchY.current)
-          atTail.current = false;
-        touchY.current = next;
-      }}
-      onKeyDown={(event) => {
-        if (event.target instanceof Element && event.target.closest(".chat-sticky-footer")) return;
-        if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key))
-          userScroll.current = true;
-        if (["ArrowUp", "PageUp", "Home"].includes(event.key)) atTail.current = false;
-      }}
-      onPointerDown={(event) => {
-        if (event.nativeEvent.offsetX >= event.currentTarget.clientWidth) {
-          userScroll.current = true;
-          atTail.current = false;
-        }
-      }}
-      role="region"
-      aria-label="Conversation"
-      tabIndex={0}
-    >
-      {props.header ? (
-        <div ref={headerRef} className="chat-sticky-header">
-          {props.header}
-        </div>
-      ) : null}
-      <div
-        ref={canvasRef}
-        className="virtual-canvas timeline-canvas"
-        style={{
-          height: virtual.getTotalSize(),
-          minHeight: `calc(100% - ${insets.top + insets.bottom}px)`,
-        }}
-      >
-        {rows.map((row) => (
-          <div
-            key={row.key}
-            data-index={row.index}
-            ref={virtual.measureElement}
-            className="virtual-row"
-            style={{ transform: `translateY(${row.start - insets.top}px)` }}
-          >
-            <SlotRow
-              client={props.client}
-              threadId={props.threadId}
-              canEdit={props.canEdit}
-              resourceUrl={props.resourceUrl}
-              upload={props.upload}
-              onAction={props.onAction}
-              onReaction={props.onReaction}
-              onRewind={props.onRewind}
-              slotId={ids[row.index]!}
-              store={store}
-            />
-          </div>
-        ))}
-        {ids.length === 0 ? <div className="empty-chat">Start a conversation.</div> : null}
-      </div>
-      {props.footer ? (
-        <div ref={footerRef} className="chat-sticky-footer">
-          {awayFromEnd ? (
-            <div className="scroll-to-end">
-              <Button
-                variant="secondary"
-                onClick={() => {
-                  atTail.current = true;
-                  userScroll.current = false;
-                  if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
-                  updateEndVisibility();
-                }}
-              >
-                <ChevronDown />
-                Scroll to end
-              </Button>
+    <TimelineContext value={timeline}>
+      <MessageServicesContext value={services}>
+        <div
+          className="timeline chat-scroll"
+          ref={parent}
+          onScroll={rememberScroll}
+          onClickCapture={(event) => {
+            if (
+              event.target instanceof Element &&
+              event.target.closest("[data-slot=collapsible-trigger], .message-expand")
+            )
+              atTail.current = false;
+          }}
+          onFocusCapture={(event) => {
+            if (
+              event.target instanceof Element &&
+              event.target.closest('.message-card-preview[data-collapsed="true"]')
+            )
+              atTail.current = false;
+          }}
+          onWheel={(event) => {
+            const editor =
+              event.target instanceof Element ? event.target.closest(".composer-editor") : null;
+            if (
+              editor &&
+              ((event.deltaY < 0 && editor.scrollTop > 0) ||
+                (event.deltaY > 0 && editor.scrollTop + editor.clientHeight < editor.scrollHeight))
+            )
+              return;
+            userScroll.current = true;
+            if (event.deltaY < 0) atTail.current = false;
+          }}
+          onTouchStart={(event) => {
+            touchY.current = event.touches[0]?.clientY;
+          }}
+          onTouchMove={(event) => {
+            userScroll.current = true;
+            const next = event.touches[0]?.clientY;
+            if (next !== undefined && touchY.current !== undefined && next > touchY.current)
+              atTail.current = false;
+            touchY.current = next;
+          }}
+          onKeyDown={(event) => {
+            if (event.target instanceof Element && event.target.closest(".chat-sticky-footer"))
+              return;
+            if (
+              ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)
+            )
+              userScroll.current = true;
+            if (["ArrowUp", "PageUp", "Home"].includes(event.key)) atTail.current = false;
+          }}
+          onPointerDown={(event) => {
+            if (event.nativeEvent.offsetX >= event.currentTarget.clientWidth) {
+              userScroll.current = true;
+              atTail.current = false;
+            }
+          }}
+          role="region"
+          aria-label="Conversation"
+          tabIndex={0}
+        >
+          {props.header ? (
+            <div ref={headerRef} className="chat-sticky-header">
+              {props.header}
             </div>
           ) : null}
-          {props.footer}
+          <div
+            ref={canvasRef}
+            className="virtual-canvas timeline-canvas"
+            style={{
+              height: virtual.getTotalSize(),
+              minHeight: `calc(100% - ${insets.top + insets.bottom}px)`,
+            }}
+          >
+            {rows.map((row) => (
+              <div
+                key={row.key}
+                data-index={row.index}
+                ref={virtual.measureElement}
+                className="virtual-row"
+                style={{ transform: `translateY(${row.start - insets.top}px)` }}
+              >
+                <SlotRow slotId={ids[row.index]!} store={store} />
+              </div>
+            ))}
+            {ids.length === 0 ? <div className="empty-chat">Start a conversation.</div> : null}
+          </div>
+          {props.footer ? (
+            <div ref={footerRef} className="chat-sticky-footer">
+              {awayFromEnd ? (
+                <div className="scroll-to-end">
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      atTail.current = true;
+                      userScroll.current = false;
+                      if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
+                      updateEndVisibility();
+                    }}
+                  >
+                    <ChevronDown />
+                    Scroll to end
+                  </Button>
+                </div>
+              ) : null}
+              {props.footer}
+            </div>
+          ) : null}
         </div>
-      ) : null}
-    </div>
+      </MessageServicesContext>
+    </TimelineContext>
   );
 });
 
-const SlotRow = memo(function SlotRow(
-  props: TurnProps & { store: NativeThreadStore; slotId: string },
-) {
+const SlotRow = memo(function SlotRow(props: { store: NativeThreadStore; slotId: string }) {
+  const { client, threadId } = useContext(TimelineContext)!;
   const slot = useSlot(props.store, props.slotId);
   useEffect(() => {
-    if (slot?.kind === "deferred") void props.client.hydrate(props.threadId, props.slotId);
-  }, [slot?.kind, props.client, props.threadId, props.slotId]);
+    if (slot?.kind === "deferred") void client.hydrate(threadId, props.slotId);
+  }, [slot?.kind, client, threadId, props.slotId]);
   if (!slot) return null;
   if (slot.kind !== "ready")
     return (
@@ -362,10 +358,7 @@ const SlotRow = memo(function SlotRow(
         {slot.kind === "failed" ? (
           <>
             <span>{slot.message}</span>
-            <Button
-              type="button"
-              onClick={() => void props.client.hydrate(props.threadId, slot.slotId)}
-            >
+            <Button type="button" onClick={() => void client.hydrate(threadId, slot.slotId)}>
               Retry history
             </Button>
           </>
@@ -374,18 +367,12 @@ const SlotRow = memo(function SlotRow(
         )}
       </div>
     );
-  return (
-    <Turn
-      {...messageProps(props)}
-      client={props.client}
-      threadId={props.threadId}
-      onRewind={props.onRewind}
-      slot={slot}
-    />
-  );
+  return <Turn slot={slot} />;
 });
 
-export const Turn = memo(function Turn(props: TurnProps & { slot: ReadyTurnSlot }) {
+const Turn = memo(function Turn(props: { slot: ReadyTurnSlot }) {
+  const { client, threadId, onRewind } = useContext(TimelineContext)!;
+  const { canEdit } = useMessageServices();
   const { slot } = props;
   const [expanded, setExpanded] = useState(false);
   const firstUser = slot.messages.find(
@@ -413,16 +400,12 @@ export const Turn = memo(function Turn(props: TurnProps & { slot: ReadyTurnSlot 
     <article className="turn" data-turn-id={slot.turnId}>
       {firstUser ? (
         <div className="user-turn">
-          <Message
-            {...messageProps(props)}
+          <MessageBody
             message={firstUser}
             controls={
               <>
-                {props.canEdit ? (
-                  <IconButton
-                    label="Rewind to this turn"
-                    onClick={() => props.onRewind(slot.turnId)}
-                  >
+                {canEdit ? (
+                  <IconButton label="Rewind to this turn" onClick={() => onRewind(slot.turnId)}>
                     <RotateCcw />
                   </IconButton>
                 ) : null}
@@ -453,17 +436,15 @@ export const Turn = memo(function Turn(props: TurnProps & { slot: ReadyTurnSlot 
           </CollapsibleTrigger>
           <CollapsibleContent className="expanded-work">
             {intermediate.map((message) => (
-              <Message key={message.id} {...messageProps(props)} message={message} />
+              <MessageBody key={message.id} message={message} />
             ))}
           </CollapsibleContent>
         </Collapsible>
       ) : (
-        intermediate.map((message) => (
-          <Message key={message.id} {...messageProps(props)} message={message} />
-        ))
+        intermediate.map((message) => <MessageBody key={message.id} message={message} />)
       )}
       {finals.map((message) => (
-        <Message key={message.id} {...messageProps(props)} message={message} />
+        <MessageBody key={message.id} message={message} />
       ))}
       {settled && !intermediate.length && slot.state !== "complete" ? (
         <Marker className="turn-status">
@@ -475,7 +456,7 @@ export const Turn = memo(function Turn(props: TurnProps & { slot: ReadyTurnSlot 
           variant="ghost"
           className="text-button"
           type="button"
-          onClick={() => void props.client.loadTurnPage(props.threadId, slot.slotId)}
+          onClick={() => void client.loadTurnPage(threadId, slot.slotId)}
         >
           Load more of this turn
         </Button>
@@ -585,10 +566,7 @@ function MessageCard({
   content,
   self,
   collapsible,
-  resourceUrl,
-  canEdit,
-  upload,
-}: Pick<MessageProps, "resourceUrl" | "canEdit" | "upload"> & {
+}: {
   content: MessageCardGroup;
   self: boolean;
   collapsible: boolean;
@@ -628,13 +606,7 @@ function MessageCard({
             {images.length > 0 ? (
               <div className="message-attachments message-image-attachments">
                 {images.map((part) => (
-                  <ResourceAttachment
-                    key={part.id}
-                    part={part}
-                    resourceUrl={resourceUrl}
-                    canEdit={canEdit}
-                    upload={upload}
-                  />
+                  <ResourceAttachment key={part.id} part={part} />
                 ))}
               </div>
             ) : null}
@@ -644,13 +616,7 @@ function MessageCard({
             {files.length > 0 ? (
               <div className="message-attachments">
                 {files.map((part) => (
-                  <ResourceAttachment
-                    key={part.id}
-                    part={part}
-                    resourceUrl={resourceUrl}
-                    canEdit={canEdit}
-                    upload={upload}
-                  />
+                  <ResourceAttachment key={part.id} part={part} />
                 ))}
               </div>
             ) : null}
@@ -673,6 +639,16 @@ function MessageCard({
 }
 
 export const Message = memo(function Message(props: MessageProps) {
+  const services = useMessageServicesValue(props);
+  return (
+    <MessageServicesContext value={services}>
+      <MessageBody message={props.message} controls={props.controls} />
+    </MessageServicesContext>
+  );
+});
+
+const MessageBody = memo(function MessageBody(props: Pick<MessageProps, "message" | "controls">) {
+  const { resourceUrl, canEdit, onAction, onReaction } = useMessageServices();
   const { message } = props;
   const [copyError, setCopyError] = useState<string>();
   const groups = useMemo(() => groupParts(message.parts), [message.parts]);
@@ -707,10 +683,10 @@ export const Message = memo(function Message(props: MessageProps) {
       new Map(
         attachments.map((part) => [
           `/api/resources/${encodeURIComponent(part.data.resourceId)}`,
-          { resource: part.data, href: props.resourceUrl(part.data.resourceId) },
+          { resource: part.data, href: resourceUrl(part.data.resourceId) },
         ]),
       ),
-    [attachments, props.resourceUrl],
+    [attachments, resourceUrl],
   );
   return (
     <ChatMessage
@@ -759,9 +735,6 @@ export const Message = memo(function Message(props: MessageProps) {
                   content={group}
                   self={self}
                   collapsible={message.role === "user"}
-                  resourceUrl={props.resourceUrl}
-                  canEdit={props.canEdit}
-                  upload={props.upload}
                 />
               );
             if (group.kind === "activity")
@@ -794,9 +767,9 @@ export const Message = memo(function Message(props: MessageProps) {
                       <Button
                         key={action.actionId}
                         type="button"
-                        disabled={!props.canEdit || action.disabled}
+                        disabled={!canEdit || action.disabled}
                         variant={action.style === "danger" ? "destructive" : "secondary"}
-                        onClick={() => props.onAction(message.id, part, action.actionId)}
+                        onClick={() => onAction(message.id, part, action.actionId)}
                       >
                         {action.label}
                       </Button>
@@ -810,13 +783,11 @@ export const Message = memo(function Message(props: MessageProps) {
                       <Button
                         key={reaction.emoji}
                         type="button"
-                        disabled={!props.canEdit}
+                        disabled={!canEdit}
                         aria-pressed={reaction.reacted}
                         variant="secondary"
                         className="badge"
-                        onClick={() =>
-                          props.onReaction(message.id, reaction.emoji, !reaction.reacted)
-                        }
+                        onClick={() => onReaction(message.id, reaction.emoji, !reaction.reacted)}
                       >
                         {reaction.emoji} {reaction.count}
                       </Button>

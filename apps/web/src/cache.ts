@@ -550,6 +550,11 @@ export class WebNativeCache implements NativeCache {
         ...value,
         updatedAt: Date.now(),
       });
+      const count = await idbRequest(store.count());
+      if (typeof count === "number" && count <= this.maxThreads) {
+        await assertCommitted(done);
+        return;
+      }
       const all = await idbRequest(store.getAll());
       const rows = Array.isArray(all)
         ? all

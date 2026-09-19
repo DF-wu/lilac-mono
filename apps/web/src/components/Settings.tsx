@@ -1,10 +1,10 @@
+import { useWorkspace } from "../workspace-context";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { configOptions, userOptions, useNativeOnline } from "../queries";
 import { AgentIdentity } from "./AgentIdentity";
 import type { ActorIdentity } from "./ActorAvatar";
 import { useEffect, useRef, useState } from "react";
 import { LogOut, RefreshCw, Save, UserPlus } from "lucide-react";
-import type { NativeClient } from "@stanley2058/lilac-client";
 import type { NativeRpcOutputs, NativeUser } from "@stanley2058/lilac-client-protocol";
 import { attempt, ErrorNotice, IconButton, VirtualList } from "./ui";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
@@ -22,7 +22,6 @@ import {
   type ConfigKind,
 } from "../config-editor";
 export function Settings({
-  client,
   onClose,
   theme,
   onTheme,
@@ -30,7 +29,6 @@ export function Settings({
   viewer,
   onLogout,
 }: {
-  client: NativeClient;
   viewer: NativeUser;
   onLogout: () => Promise<void>;
   onClose: () => void;
@@ -38,6 +36,7 @@ export function Settings({
   agent: ActorIdentity;
   onTheme: (value: string) => void;
 }) {
+  const { client } = useWorkspace();
   const [tab, setTab] = useState<"account" | "theme" | "core" | "mcp" | "agent" | "users">(
     "account",
   );
@@ -199,7 +198,7 @@ export function Settings({
             </TabsContent>
             <TabsContent value="users" className="settings-section">
               <h2>User</h2>
-              <People client={client} />
+              <People />
             </TabsContent>
             {tab === "core" || tab === "mcp" ? (
               <TabsContent value={tab} className="settings-section settings-config">
@@ -255,7 +254,8 @@ export function Settings({
   );
 }
 
-export function People({ client }: { client: NativeClient }) {
+export function People() {
+  const { client } = useWorkspace();
   const online = useNativeOnline(client);
   const queries = useQueryClient();
   const userQuery = useInfiniteQuery({ ...userOptions(client), enabled: online });

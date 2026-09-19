@@ -35,10 +35,12 @@ export function draftThreadTitle(thread: DraftThread): string {
 }
 
 function draftPreviewLine(text: string): string {
-  const line = text.trim().split("\n")[0] ?? "";
+  const trimmed = text.trim();
+  const newline = trimmed.indexOf("\n");
+  const line = newline < 0 ? trimmed : trimmed.slice(0, newline);
   let preview = "";
   let offset = 0;
-  while (offset < line.length) {
+  while (offset < line.length && preview.length < 80) {
     const remaining = line.slice(offset);
     if (remaining.startsWith("\\")) {
       preview += remaining.slice(0, 2);
@@ -49,7 +51,7 @@ function draftPreviewLine(text: string): string {
     if (code) {
       const closing = line.indexOf(code, offset + code.length);
       const end = closing < 0 ? line.length : closing + code.length;
-      preview += line.slice(offset, end);
+      preview += line.slice(offset, Math.min(end, offset + 80 - preview.length));
       offset = end;
       continue;
     }
