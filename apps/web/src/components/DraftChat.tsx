@@ -1,4 +1,5 @@
 import { useStore } from "zustand";
+import { useLayoutEffect, useState } from "react";
 import { useWorkspace } from "../workspace-context";
 import type { DisplayCatalog } from "@stanley2058/lilac-client-protocol";
 import type { ComposerSubmission } from "../types";
@@ -10,11 +11,20 @@ import { ErrorNotice } from "./ui";
 export function DraftChat(props: {
   catalog?: DisplayCatalog;
   threadId: string;
+  foreground: boolean;
+  displayRevision: number;
+  onPrepare: () => void;
+  onReady: () => void;
   onChange: (update: (thread: DraftThread) => DraftThread) => void;
   onSubmit: (submission: ComposerSubmission) => void;
 }) {
   const { drafts } = useWorkspace();
-  const thread = useStore(drafts, (state) => state.localDrafts.get(props.threadId));
+  useLayoutEffect(props.onPrepare, [props.onPrepare]);
+  const liveThread = useStore(drafts, (state) => state.localDrafts.get(props.threadId));
+  // The draft leaves the store when its first send creates a native thread. Keep the outgoing panel until handoff.
+  const [lastThread, setLastThread] = useState(liveThread);
+  if (liveThread && liveThread !== lastThread) setLastThread(liveThread);
+  const thread = liveThread ?? lastThread;
   const { onChange } = props;
   if (!thread) return null;
   const draft = thread.draft;
@@ -48,7 +58,10 @@ export function DraftChat(props: {
           </div>
         ) : null}
         <Composer
-          windowDrop
+          windowDrop={props.foreground}
+          onReadyChange={(ready) => {
+            if (ready && props.displayRevision >= 0) props.onReady();
+          }}
           catalog={props.catalog}
           text={draft.text}
           skillIds={draft.skillIds}

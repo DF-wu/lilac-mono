@@ -1,8 +1,16 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { queueOptions, refreshQueue as refreshQueueQuery, useNativeOnline } from "../queries";
+import {
+  participantOptions,
+  queueOptions,
+  refreshQueue as refreshQueueQuery,
+  useNativeOnline,
+} from "../queries";
+import { MessageIdentityContext } from "./message-identity";
 import { useWorkspace } from "../workspace-context";
 import {
   useCallback,
+  useContext,
+  useLayoutEffect,
   useEffect,
   useMemo,
   useRef,
@@ -44,11 +52,20 @@ export type ChatProps = Pick<ChatCommon, "thread" | "catalog" | "onError"> & {
   readTurns: Map<string, string>;
   pending: PendingInput[];
   onPending: (update: (pending: PendingInput[]) => PendingInput[]) => void;
+  foreground: boolean;
+  displayRevision: number;
+  onPrepare: () => void;
+  cacheLoaded: boolean;
+  onReady: () => void;
 };
 
 export function Chat(props: ChatProps) {
   const { client, pool, scope, upload, resourceUrl, draftCache } = useWorkspace();
   const { thread } = props;
+  useLayoutEffect(props.onPrepare, [props.onPrepare]);
+  const identity = useContext(MessageIdentityContext);
+  const [draftLoaded, setDraftLoaded] = useState(false);
+  const [editorReady, setEditorReady] = useState(false);
   const [draft, setDraft] = useState(props.draft);
   const draftVersion = useRef(0);
   const draftRef = useRef(draft);
@@ -84,12 +101,16 @@ export function Chat(props: ChatProps) {
       draftRef.current.text ||
       draftRef.current.skillIds.length ||
       draftRef.current.attachments.length
-    )
+    ) {
+      setDraftLoaded(true);
       return;
+    }
     let canceled = false;
     const revision = draftVersion.current;
     void attempt(() => cache.readDraft(scope, thread.id), setError).then((restored) => {
-      if (!restored || canceled || draftVersion.current !== revision) return;
+      if (canceled) return;
+      setDraftLoaded(true);
+      if (!restored || draftVersion.current !== revision) return;
       const value = { ...restored, attachments: [] };
       draftRef.current = value;
       setDraft(value);
@@ -106,6 +127,12 @@ export function Chat(props: ChatProps) {
     props.onPending(() => value);
   };
   const store = client.thread(thread.id);
+  const subscribeHistory = useCallback(
+    (listener: () => void) => store.subscribe(listener),
+    [store],
+  );
+  const historySnapshot = useCallback(() => !!store.checkpoint, [store]);
+  const historyLoaded = useSyncExternalStore(subscribeHistory, historySnapshot, historySnapshot);
   const readableTurnId = useLatestReadableTurn(store);
   const active = !!thread.activeRunId;
   const previousActive = useRef(active);
@@ -114,6 +141,37 @@ export function Chat(props: ChatProps) {
   canEdit.current = thread.capabilities.edit;
   const online = useNativeOnline(client);
   const queries = useQueryClient();
+  const participants = useQuery({ ...participantOptions(client, thread.id), enabled: online });
+  const [unknownAuthor, setUnknownAuthor] = useState<string>();
+  useEffect(() => {
+    if (unknownAuthor) void queries.invalidateQueries({ queryKey: ["participants", thread.id] });
+  }, [queries, thread.id, unknownAuthor]);
+  const identities = useMemo(() => {
+    const users = new Map(
+      participants.data?.items.map(({ user }) => [user.id, { displayName: user.displayName }]),
+    );
+    const viewer = identity.viewerId ? identity.users.get(identity.viewerId) : undefined;
+    if (identity.viewerId && viewer) users.set(identity.viewerId, viewer);
+    return {
+      agent: identity.agent,
+      viewerId: identity.viewerId,
+      users,
+      onUnknownAuthor: participants.data ? setUnknownAuthor : undefined,
+    };
+  }, [identity, participants.data]);
+  const [historyError, setHistoryError] = useState<string>();
+  useEffect(
+    () =>
+      client.subscribe((event) => {
+        if (event.kind === "error" && !store.checkpoint) setHistoryError(event.error.message);
+      }),
+    [client, store],
+  );
+  const readyForDisplay =
+    draftLoaded &&
+    (!thread.capabilities.edit || editorReady) &&
+    (historyLoaded || (props.cacheLoaded && (!online || !!historyError))) &&
+    (!online || !participants.isPending);
   const queueQuery = useQuery({
     ...queueOptions(client, thread.id),
     enabled: online && thread.capabilities.edit,
@@ -159,7 +217,7 @@ export function Chat(props: ChatProps) {
     if (changed) void refreshQueue();
   }, [active, refreshQueue]);
   useEffect(() => {
-    if (!readableTurnId || !latestVisible || active) return;
+    if (!props.foreground || !readableTurnId || !latestVisible || active) return;
     const turnId = readableTurnId;
     let pending = false;
     function markVisibleTurnRead() {
@@ -182,7 +240,7 @@ export function Chat(props: ChatProps) {
     markVisibleTurnRead();
     document.addEventListener("visibilitychange", markVisibleTurnRead);
     return () => document.removeEventListener("visibilitychange", markVisibleTurnRead);
-  }, [client, thread.id, active, latestVisible, readableTurnId, props.readTurns]);
+  }, [client, thread.id, active, latestVisible, readableTurnId, props.readTurns, props.foreground]);
 
   const setPending = (commandId: string, patch: Partial<PendingInput> | null) => {
     commitPending((entries) =>
@@ -345,7 +403,13 @@ export function Chat(props: ChatProps) {
   );
   const composer = (
     <div className="chat-bottom">
-      <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+      <ErrorNotice
+        message={error ?? historyError}
+        onDismiss={() => {
+          setError(undefined);
+          setHistoryError(undefined);
+        }}
+      />
       {pendingEntries.length ? (
         <VirtualList
           className="pending-inputs"
@@ -437,7 +501,8 @@ export function Chat(props: ChatProps) {
       ) : null}
       {thread.capabilities.edit ? (
         <Composer
-          windowDrop
+          windowDrop={props.foreground}
+          onReadyChange={setEditorReady}
           catalog={props.catalog}
           text={draft.text}
           skillIds={draft.skillIds}
@@ -489,46 +554,57 @@ export function Chat(props: ChatProps) {
     </div>
   );
   return (
-    <div className="chat-workspace">
-      <UploadProgressContext.Provider value={uploadProgress}>
-        <Timeline
-          header={props.header}
-          footer={composer}
-          onLatestVisibleChange={setLatestVisible}
-          client={client}
-          threadId={thread.id}
-          canEdit={thread.capabilities.edit}
-          resourceUrl={resourceUrl}
-          upload={recoveryUpload}
-          onRewind={setRewindTarget}
-          onAction={onAction}
-          onReaction={onReaction}
-        />
-      </UploadProgressContext.Provider>
+    <MessageIdentityContext value={identities}>
+      <div className="chat-workspace">
+        <UploadProgressContext.Provider value={uploadProgress}>
+          <Timeline
+            waitForHydration={online && !historyError}
+            readyForDisplay={readyForDisplay && props.displayRevision >= 0}
+            displayRevision={props.displayRevision}
+            onReady={props.onReady}
+            emptyMessage={
+              !historyLoaded
+                ? "Conversation history is unavailable. Reconnect to load it."
+                : undefined
+            }
+            header={props.header}
+            footer={composer}
+            onLatestVisibleChange={setLatestVisible}
+            client={client}
+            threadId={thread.id}
+            canEdit={thread.capabilities.edit}
+            resourceUrl={resourceUrl}
+            upload={recoveryUpload}
+            onRewind={setRewindTarget}
+            onAction={onAction}
+            onReaction={onReaction}
+          />
+        </UploadProgressContext.Provider>
 
-      {thread.capabilities.edit && rewindTarget ? (
-        <Modal title="Rewind this conversation?" onClose={() => setRewindTarget(undefined)}>
-          <p>
-            The selected turn and everything after it will leave the conversation. Its text returns
-            to your composer. File changes and other tool effects remain.
-          </p>
-          {active ? <p>The active run will be canceled and queued messages dropped.</p> : null}
-          <div className="dialog-actions">
-            <Button className="button" onClick={() => setRewindTarget(undefined)}>
-              Keep conversation
-            </Button>
-            <Button
-              variant="destructive"
-              className="button danger"
-              disabled={rewinding}
-              onClick={() => void rewind()}
-            >
-              <RotateCcw />
-              Rewind
-            </Button>
-          </div>
-        </Modal>
-      ) : null}
-    </div>
+        {thread.capabilities.edit && rewindTarget ? (
+          <Modal title="Rewind this conversation?" onClose={() => setRewindTarget(undefined)}>
+            <p>
+              The selected turn and everything after it will leave the conversation. Its text
+              returns to your composer. File changes and other tool effects remain.
+            </p>
+            {active ? <p>The active run will be canceled and queued messages dropped.</p> : null}
+            <div className="dialog-actions">
+              <Button className="button" onClick={() => setRewindTarget(undefined)}>
+                Keep conversation
+              </Button>
+              <Button
+                variant="destructive"
+                className="button danger"
+                disabled={rewinding}
+                onClick={() => void rewind()}
+              >
+                <RotateCcw />
+                Rewind
+              </Button>
+            </div>
+          </Modal>
+        ) : null}
+      </div>
+    </MessageIdentityContext>
   );
 }

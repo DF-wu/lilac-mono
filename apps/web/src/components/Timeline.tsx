@@ -75,6 +75,11 @@ export type TimelineProps = MessageServices & {
   threadId: string;
   onRewind: (turnId: string) => void;
   onLatestVisibleChange?: (visible: boolean) => void;
+  readyForDisplay?: boolean;
+  displayRevision?: number;
+  onReady?: () => void;
+  emptyMessage?: string;
+  waitForHydration?: boolean;
 };
 type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind">;
 const TimelineContext = createContext<TimelineServices | undefined>(undefined);
@@ -111,6 +116,9 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   );
   const store = props.client.thread(props.threadId);
   const ids = useSlotIds(store);
+  const subscribeTail = useCallback((listener: () => void) => store.subscribe(listener), [store]);
+  const tailSnapshot = useCallback(() => store.at(store.size - 1)?.kind !== "deferred", [store]);
+  const tailHydrated = useSyncExternalStore(subscribeTail, tailSnapshot, tailSnapshot);
   const parent = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
@@ -211,6 +219,46 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     previousCount.current = ids.length;
   }, [ids.length, virtual]);
   const rows = virtual.getVirtualItems();
+  const revealed = useRef<number | undefined>(undefined);
+  useLayoutEffect(() => {
+    if (
+      !props.readyForDisplay ||
+      !props.onReady ||
+      revealed.current === props.displayRevision ||
+      (props.waitForHydration && !tailHydrated)
+    )
+      return;
+    atTail.current = true;
+    let frame = 0;
+    let previousHeight = -1;
+    let stableFrames = 0;
+    const settle = () => {
+      const viewport = parent.current;
+      if (!viewport) return;
+      if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
+      viewport.scrollTop = viewport.scrollHeight;
+      const height = viewport.scrollHeight;
+      stableFrames = height === previousHeight ? stableFrames + 1 : 0;
+      previousHeight = height;
+      if (stableFrames >= 2) {
+        revealed.current = props.displayRevision;
+        setAwayFromEnd(false);
+        props.onReady?.();
+        return;
+      }
+      frame = requestAnimationFrame(settle);
+    };
+    frame = requestAnimationFrame(settle);
+    return () => cancelAnimationFrame(frame);
+  }, [
+    props.readyForDisplay,
+    props.displayRevision,
+    props.onReady,
+    props.waitForHydration,
+    tailHydrated,
+    ids,
+    virtual,
+  ]);
   useLayoutEffect(() => {
     const viewport = parent.current;
     const latest = rows.find((row) => row.index === ids.length - 1);
@@ -316,7 +364,9 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
                 <SlotRow slotId={ids[row.index]!} store={store} />
               </div>
             ))}
-            {ids.length === 0 ? <div className="empty-chat">Start a conversation.</div> : null}
+            {ids.length === 0 ? (
+              <div className="empty-chat">{props.emptyMessage ?? "Start a conversation."}</div>
+            ) : null}
           </div>
           {props.footer ? (
             <div ref={footerRef} className="chat-sticky-footer">

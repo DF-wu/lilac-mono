@@ -1,11 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import {
+  onlineManager,
   infiniteQueryOptions,
   queryOptions,
   skipToken,
   type QueryClient,
 } from "@tanstack/react-query";
 import type { NativeClient } from "@stanley2058/lilac-client";
+
+const subscribeBrowserOnline = onlineManager.subscribe.bind(onlineManager);
+const browserOnlineSnapshot = () => onlineManager.isOnline();
 
 export function useNativeOnline(client: NativeClient) {
   const [online, setOnline] = useState(() => !!client.rpc);
@@ -16,7 +20,12 @@ export function useNativeOnline(client: NativeClient) {
       }),
     [client],
   );
-  return online;
+  const browserOnline = useSyncExternalStore(
+    subscribeBrowserOnline,
+    browserOnlineSnapshot,
+    browserOnlineSnapshot,
+  );
+  return online && browserOnline;
 }
 
 export function participantOptions(client: NativeClient, threadId: string) {
@@ -25,6 +34,15 @@ export function participantOptions(client: NativeClient, threadId: string) {
     queryKey: ["participants", threadId],
     queryFn:
       rpc && threadId ? ({ signal }) => rpc.participants.list({ threadId }, { signal }) : skipToken,
+  });
+}
+
+export function threadOptions(client: NativeClient, threadId: string) {
+  const rpc = client.rpc;
+  return queryOptions({
+    queryKey: ["thread", threadId],
+    queryFn:
+      rpc && threadId ? ({ signal }) => rpc.threads.get({ threadId }, { signal }) : skipToken,
   });
 }
 

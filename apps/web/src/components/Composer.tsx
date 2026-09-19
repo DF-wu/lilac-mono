@@ -45,6 +45,7 @@ export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catal
   canCancel: boolean;
   disabled: boolean;
   windowDrop?: boolean;
+  onReadyChange?: (ready: boolean) => void;
   submitting?: boolean;
   modelId?: string;
   onModelChange: (modelId: string) => void;
@@ -70,6 +71,9 @@ export function Composer(props: ComposerProps) {
   const [editorValue, setEditorValue] = useState<{ text: string; plainText: string }>();
   const plainText = editorValue?.plainText ?? "";
   const editorReady = editorValue?.text === text;
+  useEffect(() => {
+    props.onReadyChange?.(editorReady);
+  }, [editorReady, props.onReadyChange]);
   const updatePlainText = useCallback(
     (plainText: string, text: string) => setEditorValue({ text, plainText }),
     [],
