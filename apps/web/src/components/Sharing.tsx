@@ -7,6 +7,8 @@ import type {
   NativeUser,
 } from "@stanley2058/lilac-client-protocol";
 import { attempt, ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
+import { Button } from "./ui/button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 
 type Participant = NativeRpcOutputs["participants"]["list"]["items"][number];
 export function Sharing({
@@ -59,32 +61,44 @@ export function Sharing({
     <Modal title="Share conversation" onClose={onClose}>
       <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
       <div className="inline-form">
-        <select
-          aria-label="Person to add"
-          value={userId}
-          onChange={(event) => setUserId(event.target.value)}
+        <Select
+          items={users.map((user) => ({ value: user.id, label: user.displayName }))}
+          value={userId || null}
+          onValueChange={(value) => setUserId(value ?? "")}
         >
-          <option value="">Choose a person</option>
-          {users
-            .filter(
-              (user) =>
-                user.role === "participant" &&
-                !participants.some((entry) => entry.user.id === user.id),
-            )
-            .map((user) => (
-              <option key={user.id} value={user.id}>
-                {user.displayName}
-              </option>
-            ))}
-        </select>
-        <select
-          aria-label="Access to conversation"
+          <SelectTrigger className="grow min-w-0" aria-label="Person to add">
+            <SelectValue placeholder="Choose a person" />
+          </SelectTrigger>
+          <SelectContent>
+            {users
+              .filter(
+                (user) =>
+                  user.role === "participant" &&
+                  !participants.some((entry) => entry.user.id === user.id),
+              )
+              .map((user) => (
+                <SelectItem key={user.id} value={user.id}>
+                  {user.displayName}
+                </SelectItem>
+              ))}
+          </SelectContent>
+        </Select>
+        <Select
+          items={[
+            { value: "read", label: "Can read" },
+            { value: "edit", label: "Can edit" },
+          ]}
           value={role}
-          onChange={(event) => setRole(event.target.value === "edit" ? "edit" : "read")}
+          onValueChange={(value) => setRole(value === "edit" ? "edit" : "read")}
         >
-          <option value="read">Can read</option>
-          <option value="edit">Can edit</option>
-        </select>
+          <SelectTrigger aria-label="Access to conversation">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="read">Can read</SelectItem>
+            <SelectItem value="edit">Can edit</SelectItem>
+          </SelectContent>
+        </Select>
         <IconButton
           label="Share with selected person"
           disabled={!userId}
@@ -94,9 +108,14 @@ export function Sharing({
         </IconButton>
       </div>
       {nextCursor ? (
-        <button type="button" className="text-button" onClick={() => void loadUsers(nextCursor)}>
+        <Button
+          type="button"
+          variant="ghost"
+          className="text-button"
+          onClick={() => void loadUsers(nextCursor)}
+        >
           Load more people
-        </button>
+        </Button>
       ) : null}
       <VirtualList
         items={participants}
@@ -111,19 +130,27 @@ export function Sharing({
                 {entry.user.id === thread.starterId ? "Restricted" : "Restricted · read-only"}
               </small>
             ) : null}
-            <select
-              aria-label={`Access for ${entry.user.displayName}`}
+            <Select
+              items={[
+                { value: "read", label: "Can read" },
+                { value: "edit", label: "Can edit" },
+              ]}
               value={entry.role}
               disabled={entry.user.id === thread.starterId || entry.user.role === "owner"}
-              onChange={(event) =>
-                void grant(entry.user.id, event.target.value === "edit" ? "edit" : "read")
+              onValueChange={(value) =>
+                void grant(entry.user.id, value === "edit" ? "edit" : "read")
               }
             >
-              <option value="read">Can read</option>
-              <option value="edit" disabled={entry.user.toolMode === "restricted"}>
-                Can edit
-              </option>
-            </select>
+              <SelectTrigger aria-label={`Access for ${entry.user.displayName}`}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="read">Can read</SelectItem>
+                <SelectItem value="edit" disabled={entry.user.toolMode === "restricted"}>
+                  Can edit
+                </SelectItem>
+              </SelectContent>
+            </Select>
             <IconButton
               label={`Remove ${entry.user.displayName}`}
               disabled={entry.user.id === thread.starterId || entry.user.role === "owner"}

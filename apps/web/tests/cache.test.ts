@@ -253,3 +253,84 @@ test("legacy text-only draft rows retain text with empty selected skills", async
     skillIds: [],
   });
 });
+
+test("local draft discovery survives reload and excludes server drafts and other principals", async () => {
+  const factory = new IDBFactory();
+  const first = cache(factory);
+  const draft = {
+    text: "**Unsent review**",
+    skillIds: ["repo_review"],
+    commandId: "review",
+    savedText: "**Unsent review**",
+    title: "Review notes",
+    modelId: "fast-model",
+  };
+  await first.saveDraft(scope, "draft:local", draft);
+  await first.saveDraft(scope, "server-thread", { text: "Existing chat draft", skillIds: [] });
+  await first.saveDraft(scope, "draft:empty", { text: "  ", skillIds: [], title: "Empty draft" });
+  await first.saveDraft({ ...scope, principalId: "other" }, "draft:private", {
+    text: "Other person's draft",
+    skillIds: [],
+  });
+  first.close();
+  const second = cache(factory);
+  expect(await second.listLocalDrafts(scope)).toEqual([{ threadId: "draft:local", draft }]);
+  expect(await second.readDraft(scope, "draft:local")).toEqual(draft);
+  await second.deleteDraft(scope, "draft:local");
+  second.close();
+  const third = cache(factory);
+  expect(await third.listLocalDrafts(scope)).toEqual([]);
+  expect((await third.readDraft(scope, "server-thread")).text).toBe("Existing chat draft");
+  expect(await third.listLocalDrafts({ ...scope, principalId: "other" })).toHaveLength(1);
+});
+
+test("local drafts remain scoped and cloned when IndexedDB is unavailable", async () => {
+  const first = cache(null);
+  await first.saveDraft(scope, "draft:local", { text: "Unsent", skillIds: ["skill"] });
+  await first.saveDraft(scope, "server-thread", { text: "Existing chat draft", skillIds: [] });
+  const discovered = await first.listLocalDrafts(scope);
+  discovered[0]!.draft.skillIds.push("mutated");
+  expect((await first.listLocalDrafts(scope))[0]?.draft.skillIds).toEqual(["skill"]);
+  expect(await first.listLocalDrafts({ ...scope, principalId: "other" })).toEqual([]);
+  await first.deleteDraft(scope, "draft:local");
+  expect(await first.listLocalDrafts(scope)).toEqual([]);
+});
+
+test("logout purges persisted local drafts and fences a discovery already in flight", async () => {
+  const factory = new IDBFactory();
+  const first = cache(factory);
+  await first.saveDraft(scope, "draft:local", { text: "Unsent", skillIds: [] });
+  first.close();
+  const second = cache(factory);
+  const discovery = second.listLocalDrafts(scope);
+  await second.purge(scope);
+  expect(await discovery).toEqual([]);
+  second.close();
+  expect(await cache(factory).listLocalDrafts(scope)).toEqual([]);
+});
+
+test("local draft discovery ignores malformed keys and forged scope indexes", async () => {
+  const factory = new IDBFactory();
+  const first = cache(factory);
+  await first.saveDraft(scope, "draft:valid", { text: "Valid", skillIds: [] });
+  first.close();
+  const raw = await openRaw(factory);
+  const tx = raw.transaction("drafts", "readwrite");
+  const complete = new Promise<void>((resolve) => {
+    tx.oncomplete = () => resolve();
+  });
+  const store = tx.objectStore("drafts");
+  const scopeKey = JSON.stringify(["install", "owner", 1, 1]);
+  const row = { scopeKey, text: "Unexpected draft", skillIds: [], updatedAt: 1 };
+  store.put({ ...row, key: "malformed" });
+  store.put({
+    ...row,
+    key: JSON.stringify([JSON.stringify(["install", "other", 1, 1]), "draft:private"]),
+  });
+  store.put({ ...row, key: JSON.stringify([scopeKey, "draft:corrupt"]), title: 42 });
+  await complete;
+  raw.close();
+  expect((await cache(factory).listLocalDrafts(scope)).map((entry) => entry.threadId)).toEqual([
+    "draft:valid",
+  ]);
+});

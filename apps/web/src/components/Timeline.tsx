@@ -20,6 +20,10 @@ import type {
 import { IconButton, VirtualList, Modal, attempt } from "./ui";
 import { UploadProgressContext } from "../upload-context";
 import { Markdown } from "./Markdown";
+import { Button } from "./ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
+import { Message as ChatMessage, MessageContent, MessageHeader } from "./ui/message";
+import { Marker, MarkerContent, MarkerIcon } from "./ui/marker";
 
 export function useSlot(store: NativeThreadStore, slotId: string | undefined) {
   const subscribe = useCallback(
@@ -202,12 +206,12 @@ const SlotRow = memo(function SlotRow(
         {slot.kind === "failed" ? (
           <>
             <span>{slot.message}</span>
-            <button
+            <Button
               type="button"
               onClick={() => void props.client.hydrate(props.threadId, slot.slotId)}
             >
               Retry history
-            </button>
+            </Button>
           </>
         ) : (
           <span>Earlier messages</span>
@@ -279,20 +283,26 @@ export const Turn = memo(function Turn(
         </div>
       ) : null}
       {settled && intermediate.length ? (
-        <>
-          <button
-            type="button"
-            className="work-summary"
-            aria-expanded={expanded}
-            onClick={() => setExpanded((value) => !value)}
+        <Collapsible open={expanded} onOpenChange={setExpanded}>
+          <CollapsibleTrigger
+            render={
+              <Button
+                variant="ghost"
+                className="work-summary h-auto justify-start rounded-none px-0 aria-expanded:bg-transparent hover:bg-transparent"
+              />
+            }
           >
-            <ChevronRight className={expanded ? "rotated" : ""} />
-            <span>
-              {duration === undefined ? "Work" : `Worked for ${formatDuration(duration)}`}
-            </span>
-            {slot.state !== "complete" ? <span className="badge">{slot.state}</span> : null}
-          </button>
-          {expanded ? (
+            <Marker render={<span />}>
+              <MarkerIcon>
+                <ChevronRight className={expanded ? "rotated" : ""} />
+              </MarkerIcon>
+              <MarkerContent>
+                {duration === undefined ? "Work" : `Worked for ${formatDuration(duration)}`}
+              </MarkerContent>
+              {slot.state !== "complete" ? <span className="badge">{slot.state}</span> : null}
+            </Marker>
+          </CollapsibleTrigger>
+          <CollapsibleContent>
             <VirtualList
               items={intermediate}
               itemKey={(message) => message.id}
@@ -301,8 +311,8 @@ export const Turn = memo(function Turn(
               estimate={96}
               render={(message) => <Message {...props} message={message} />}
             />
-          ) : null}
-        </>
+          </CollapsibleContent>
+        </Collapsible>
       ) : (
         intermediate.map((message) => <Message key={message.id} {...props} message={message} />)
       )}
@@ -310,16 +320,19 @@ export const Turn = memo(function Turn(
         <Message key={message.id} {...props} message={message} />
       ))}
       {settled && !intermediate.length && slot.state !== "complete" ? (
-        <div className="turn-status">{slot.state}</div>
+        <Marker className="turn-status">
+          <MarkerContent>{slot.state}</MarkerContent>
+        </Marker>
       ) : null}
       {slot.partsCursor ? (
-        <button
+        <Button
+          variant="ghost"
           className="text-button"
           type="button"
           onClick={() => void props.client.loadTurnPage(props.threadId, slot.slotId)}
         >
           Load more of this turn
-        </button>
+        </Button>
       ) : null}
     </article>
   );
@@ -385,79 +398,90 @@ export const Message = memo(function Message(props: MessageProps) {
   const { message } = props;
   const groups = useMemo(() => groupParts(message.parts), [message.parts]);
   return (
-    <div className={`message message-${message.role}`} data-message-id={message.id}>
-      {message.role === "user" && message.metadata?.authorId ? (
-        <span className="message-author">
-          {message.metadata.authorId}
-          {message.metadata.inputMode === "steer" ? " · Steering" : ""}
-        </span>
-      ) : null}
-      {groups.map((group, index) => {
-        if (group.kind === "text") return <Markdown key={index} text={group.text} />;
-        if (group.kind === "activity") return <Activity key={index} parts={group.parts} />;
-        const part = group.part;
-        switch (part.type) {
-          case "data-resource":
-            return (
-              <Resource
-                key={part.id}
-                part={part}
-                resourceUrl={props.resourceUrl}
-                canEdit={props.canEdit}
-                upload={props.upload}
-              />
-            );
-          case "data-compaction":
-            return (
-              <div className="compaction" key={part.id}>
-                Context compaction {part.data.state}
-                {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
-                  ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
-                  : ""}
-              </div>
-            );
-          case "data-input-state":
-            return part.data.state === "admitted" ? null : (
-              <div className="input-state" key={part.id}>
-                {part.data.reason ?? part.data.state}
-              </div>
-            );
-          case "data-actions":
-            return (
-              <div className="action-list" key={part.id}>
-                {part.data.actions.map((action) => (
-                  <button
-                    key={action.actionId}
-                    type="button"
-                    disabled={!props.canEdit || action.disabled}
-                    className={`button ${action.style === "danger" ? "danger" : ""}`}
-                    onClick={() => props.onAction(message.id, part, action.actionId)}
-                  >
-                    {action.label}
-                  </button>
-                ))}
-              </div>
-            );
-          case "data-reactions":
-            return (
-              <div className="reaction-list" key={part.id}>
-                {part.data.items.map((reaction) => (
-                  <button
-                    key={reaction.emoji}
-                    type="button"
-                    disabled={!props.canEdit}
-                    aria-pressed={reaction.reacted}
-                    className="badge"
-                    onClick={() => props.onReaction(message.id, reaction.emoji, !reaction.reacted)}
-                  >
-                    {reaction.emoji} {reaction.count}
-                  </button>
-                ))}
-              </div>
-            );
-        }
-      })}
-    </div>
+    <ChatMessage
+      align={message.role === "user" ? "end" : "start"}
+      className={`message message-${message.role} text-base`}
+      data-message-id={message.id}
+    >
+      <MessageContent>
+        {message.role === "user" && message.metadata?.authorId ? (
+          <MessageHeader className="message-author px-0">
+            {message.metadata.authorId}
+            {message.metadata.inputMode === "steer" ? " · Steering" : ""}
+          </MessageHeader>
+        ) : null}
+        {groups.map((group, index) => {
+          if (group.kind === "text") return <Markdown key={index} text={group.text} />;
+          if (group.kind === "activity") return <Activity key={index} parts={group.parts} />;
+          const part = group.part;
+          switch (part.type) {
+            case "data-resource":
+              return (
+                <Resource
+                  key={part.id}
+                  part={part}
+                  resourceUrl={props.resourceUrl}
+                  canEdit={props.canEdit}
+                  upload={props.upload}
+                />
+              );
+            case "data-compaction":
+              return (
+                <Marker variant="separator" className="compaction" key={part.id}>
+                  <MarkerContent>
+                    Context compaction {part.data.state}
+                    {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
+                      ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
+                      : ""}
+                  </MarkerContent>
+                </Marker>
+              );
+            case "data-input-state":
+              return part.data.state === "admitted" ? null : (
+                <Marker className="input-state" key={part.id}>
+                  <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
+                </Marker>
+              );
+            case "data-actions":
+              return (
+                <div className="action-list" key={part.id}>
+                  {part.data.actions.map((action) => (
+                    <Button
+                      key={action.actionId}
+                      type="button"
+                      disabled={!props.canEdit || action.disabled}
+                      variant={action.style === "danger" ? "destructive" : "secondary"}
+                      onClick={() => props.onAction(message.id, part, action.actionId)}
+                    >
+                      {action.label}
+                    </Button>
+                  ))}
+                </div>
+              );
+            case "data-reactions":
+              return (
+                <div className="reaction-list" key={part.id}>
+                  {part.data.items.map((reaction) => (
+                    <Button
+                      key={reaction.emoji}
+                      type="button"
+                      disabled={!props.canEdit}
+                      aria-pressed={reaction.reacted}
+                      variant="secondary"
+                      className="badge"
+                      onClick={() =>
+                        props.onReaction(message.id, reaction.emoji, !reaction.reacted)
+                      }
+                    >
+                      {reaction.emoji} {reaction.count}
+                    </Button>
+                  ))}
+                </div>
+              );
+          }
+        })}
+      </MessageContent>
+    </ChatMessage>
   );
 });
 
@@ -465,21 +489,27 @@ function Activity({ parts }: { parts: Extract<DisplayPart, { type: "data-activit
   const [open, setOpen] = useState(false);
   const running = parts.some((part) => part.data.state === "running");
   return (
-    <div className="activity-block">
-      <button
-        type="button"
-        className="work-summary"
-        onClick={() => setOpen((value) => !value)}
-        aria-expanded={open}
+    <Collapsible className="activity-block" open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger
+        render={
+          <Button
+            variant="ghost"
+            className="work-summary h-auto justify-start rounded-none px-0 aria-expanded:bg-transparent hover:bg-transparent"
+          />
+        }
       >
-        <ChevronRight className={open ? "rotated" : ""} />
-        <span>
-          {running
-            ? parts.find((part) => part.data.state === "running")?.data.label
-            : `${parts.length} ${parts.length === 1 ? "activity" : "activities"}`}
-        </span>
-      </button>
-      {open ? (
+        <Marker render={<span />}>
+          <MarkerIcon>
+            <ChevronRight className={open ? "rotated" : ""} />
+          </MarkerIcon>
+          <MarkerContent>
+            {running
+              ? parts.find((part) => part.data.state === "running")?.data.label
+              : `${parts.length} ${parts.length === 1 ? "activity" : "activities"}`}
+          </MarkerContent>
+        </Marker>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
         <VirtualList
           items={parts}
           itemKey={(part) => part.id}
@@ -494,8 +524,8 @@ function Activity({ parts }: { parts: Extract<DisplayPart, { type: "data-activit
             </div>
           )}
         />
-      ) : null}
-    </div>
+      </CollapsibleContent>
+    </Collapsible>
   );
 }
 
@@ -526,9 +556,9 @@ function Resource({
         <span>{data.name}</span>
         <span>{recovery.error ?? local?.error ?? data.error ?? data.state}</span>
         {canEdit && local?.state === "failed" && local.retry ? (
-          <button type="button" className="text-button" onClick={local.retry}>
+          <Button type="button" variant="ghost" className="text-button" onClick={local.retry}>
             Retry upload
-          </button>
+          </Button>
         ) : null}
         {canEdit && upload && !local && data.state !== "canceled" ? (
           <>
@@ -567,14 +597,15 @@ function Resource({
                 );
               }}
             />
-            <button
+            <Button
               type="button"
+              variant="ghost"
               className="text-button"
               disabled={recovery.active}
               onClick={() => fileInput.current?.click()}
             >
               Resume upload
-            </button>
+            </Button>
           </>
         ) : null}
         {data.state === "pending" || recovery.active ? (
@@ -601,9 +632,14 @@ function Resource({
       </a>
       {data.mediaType.startsWith("text/") ||
       /\.(md|txt|json|csv|yaml|yml|ts|tsx|js|py|sh|log)$/i.test(data.name) ? (
-        <button type="button" className="text-button" onClick={() => setPreview(true)}>
+        <Button
+          type="button"
+          variant="ghost"
+          className="text-button"
+          onClick={() => setPreview(true)}
+        >
           Preview
-        </button>
+        </Button>
       ) : null}
       {failed ? <span className="error-text">This file is unavailable.</span> : null}
       {preview ? (

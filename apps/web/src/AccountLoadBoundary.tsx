@@ -1,3 +1,4 @@
+import { Button } from "./components/ui/button";
 import { Component, type ReactNode } from "react";
 
 export class AccountLoadBoundary extends Component<
@@ -15,9 +16,9 @@ export class AccountLoadBoundary extends Component<
     return (
       <div role="alert">
         <p>{this.props.message}</p>
-        <button type="button" onClick={this.props.onReload}>
+        <Button type="button" onClick={this.props.onReload}>
           Reload
-        </button>
+        </Button>
       </div>
     );
   }

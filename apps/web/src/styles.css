@@ -1,7 +1,42 @@
 @import "tailwindcss";
 
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--surface);
+  --color-card-foreground: var(--foreground);
+  --color-popover: var(--surface-raised);
+  --color-popover-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--surface-hover);
+  --color-secondary-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--surface-hover);
+  --color-accent-foreground: var(--foreground);
+  --color-destructive: var(--danger);
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-ring: var(--focus);
+}
+
+@layer base {
+
 :root {
+  --secondary: var(--surface-hover);
+  --secondary-foreground: var(--foreground);
+  --popover: var(--surface-raised);
+  --popover-foreground: var(--foreground);
+  --accent: var(--surface-hover);
+  --accent-foreground: var(--foreground);
+  --destructive: var(--danger);
+  --ring: var(--focus);
+  --input: var(--border);
   color-scheme: dark;
+  --border: color-mix(in srgb, var(--foreground) 12%, transparent);
   --background: #17161a;
   --surface: #211f25;
   --surface-hover: #2c2932;
@@ -1158,3 +1193,90 @@ progress {
 }
 .file-preview { max-height:60dvh; overflow:auto; background:var(--background); padding:var(--space-4); border-radius:var(--radius-md); white-space:pre-wrap; font-size:var(--text-sm); }
 .retrieved-time { font-size:var(--text-xs); color:var(--muted-foreground); white-space:nowrap; }
+
+}
+
+@layer components {
+  .app-shell {
+    position: relative;
+    display: flex;
+  }
+  .workspace-panels,
+  .sidebar,
+  .main-panel {
+    height: 100%;
+  }
+  .sidebar-toggle {
+    position: fixed;
+    top: var(--space-3);
+    left: var(--space-3);
+    z-index: 40;
+  }
+  .sidebar-header {
+    padding-left: var(--space-7);
+    min-height: calc(var(--control-size) + var(--space-4));
+  }
+  .sidebar-hidden .thread-header {
+    padding-left: calc(var(--space-7) + var(--space-3));
+  }
+  .thread-row {
+    gap: 0;
+    padding: var(--space-1);
+    min-height: var(--row-size);
+  }
+  .thread-select > span:first-of-type {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: left;
+    flex: 1;
+  }
+  .thread-actions {
+    display: none;
+    align-items: center;
+    flex: none;
+  }
+  .thread-row:hover .thread-actions,
+  .thread-row:focus-within .thread-actions {
+    display: flex;
+  }
+  .thread-actions .icon-button {
+    width: var(--control-compact);
+    height: var(--control-compact);
+  }
+  .sidebar-resize-handle {
+    background: transparent;
+  }
+  .sidebar-resize-handle:hover,
+  .sidebar-resize-handle:focus-visible {
+    background: var(--primary);
+  }
+  .draft-chat {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+    justify-content: flex-end;
+  }
+  @media (hover: none) {
+    .thread-actions { display: flex; }
+  }
+  @media (max-width: 760px) {
+    .sidebar-panel {
+      position: absolute !important;
+      inset: 0 auto 0 0;
+      width: min(85vw, var(--sidebar-width)) !important;
+      z-index: 30;
+      box-shadow: var(--shadow-overlay);
+    }
+    .sidebar-panel .sidebar {
+      position: static;
+      width: 100%;
+    }
+    .sidebar-resize-handle { display: none; }
+    .chat-panel { flex: 1 !important; }
+    .thread-header {
+      padding-left: calc(var(--space-7) + var(--space-3));
+    }
+  }
+}

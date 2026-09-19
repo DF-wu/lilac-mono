@@ -5,6 +5,7 @@ import type { NativeRpcOutputs } from "@stanley2058/lilac-client-protocol";
 import { attempt, ErrorNotice, IconButton, VirtualList } from "./ui";
 import { mergeExternalPage } from "../external-pages";
 import { Message } from "./Timeline";
+import { Button } from "./ui/button";
 
 type ExternalThread = NativeRpcOutputs["external"]["list"]["items"][number];
 export function External({
@@ -110,12 +111,13 @@ export function External({
             )}
           />
           {view.nextCursor ? (
-            <button
+            <Button
+              variant="ghost"
               className="text-button"
               onClick={() => void read(view.thread.id, view.nextCursor)}
             >
               {view.thread.surface === "discord" ? "Load older messages" : "Load more messages"}
-            </button>
+            </Button>
           ) : null}
         </>
       ) : (
@@ -126,20 +128,21 @@ export function External({
             label="External conversations"
             className="external-thread-list"
             render={(thread) => (
-              <button
+              <Button
                 type="button"
-                className="external-thread"
+                variant="ghost"
+                className="external-thread h-auto"
                 onClick={() => void read(thread.id)}
               >
                 <span>{thread.title}</span>
                 <span className="badge">{thread.surface}</span>
-              </button>
+              </Button>
             )}
           />
           {nextCursor ? (
-            <button className="text-button" onClick={() => void list(nextCursor)}>
+            <Button variant="ghost" className="text-button" onClick={() => void list(nextCursor)}>
               Load more conversations
-            </button>
+            </Button>
           ) : null}
         </>
       )}

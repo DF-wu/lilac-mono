@@ -1,5 +1,8 @@
 import {
+  lazy,
+  Suspense,
   useMemo,
+  useCallback,
   useRef,
   useState,
   type KeyboardEvent,
@@ -10,6 +13,12 @@ import { ArrowUp, Paperclip, Square, X, FileText, CornerDownRight } from "lucide
 import type { Completion } from "@stanley2058/lilac-client";
 import type { ChatCommon, ComposerSubmission, Attachment } from "../types";
 import { IconButton, VirtualList, ErrorNotice } from "./ui";
+import type { ComposerEditorHandle } from "./composer-editor";
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "./ui/select";
+import { Popover, PopoverTrigger, PopoverContent } from "./ui/popover";
+
+const ComposerEditor = lazy(() => import("./composer-editor"));
+
 import { inputDeliveryOptions } from "../input-mode";
 
 export type ComposerProps = Pick<ChatCommon, "client" | "scope" | "catalog"> & {
@@ -26,6 +35,7 @@ export type ComposerProps = Pick<ChatCommon, "client" | "scope" | "catalog"> & {
   active: boolean;
   canCancel: boolean;
   disabled: boolean;
+  submitting?: boolean;
   modelId?: string;
   onModelChange: (modelId: string) => void;
   onSubmit: (value: ComposerSubmission) => void;
@@ -34,8 +44,9 @@ export type ComposerProps = Pick<ChatCommon, "client" | "scope" | "catalog"> & {
 
 export function Composer(props: ComposerProps) {
   const { text, onText, attachments, active, disabled, catalog } = props;
-  const input = useRef<HTMLTextAreaElement>(null);
+  const input = useRef<ComposerEditorHandle>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const insertingCompletion = useRef(false);
   const [mode, setMode] = useState<"steer" | "followup">("steer");
   const [modelId, setModelId] = useState<string>();
   const commandId = props.commandId;
@@ -43,12 +54,18 @@ export function Composer(props: ComposerProps) {
   const [error, setError] = useState<string>();
   const skillIds = props.skillIds;
   const setSkills = props.onSkills;
-  const [cursor, setCursor] = useState(text.length);
+  const [editorValue, setEditorValue] = useState<{ text: string; plainText: string }>();
+  const plainText = editorValue?.plainText ?? "";
+  const editorReady = editorValue?.text === text;
+  const updatePlainText = useCallback(
+    (plainText: string, text: string) => setEditorValue({ text, plainText }),
+    [],
+  );
+  const [prefix, setPrefix] = useState("");
   const [selected, setSelected] = useState(0);
   const [menuHidden, setMenuHidden] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const prefix = text.slice(0, cursor);
-  const match = /(?:^|\s)([$/])([^\n]*)$/.exec(prefix);
+  const match = /(?:^|\s)([$/])([^$/\n]*)$/.exec(prefix);
   const trigger = match?.[1] === "$" ? "$" : "/";
   const query = match?.[2]?.replace(/^skill:/, "") ?? "";
   const completions = useMemo(
@@ -63,7 +80,7 @@ export function Composer(props: ComposerProps) {
   const highlighted = Math.min(selected, Math.max(0, completions.length - 1));
   const matching =
     catalog?.commands.filter(
-      (entry) => text.trim() === `/${entry.name}` || text.startsWith(`/${entry.name} `),
+      (entry) => plainText.trim() === `/${entry.name}` || plainText.startsWith(`/${entry.name} `),
     ) ?? [];
   const unambiguous = matching.length === 1 ? matching[0] : undefined;
   const command = commandId ? matching.find((entry) => entry.id === commandId) : unambiguous;
@@ -71,19 +88,21 @@ export function Composer(props: ComposerProps) {
   const delivery = inputDeliveryOptions(active, mode, modelId ?? props.modelId, !!custom);
 
   function choose(item: Completion) {
-    const start = cursor - (match?.[2]?.length ?? 0) - 1;
-    const inserted = `${text.slice(0, start)}${item.insertText} ${text.slice(cursor)}`;
-    onText(inserted);
+    insertingCompletion.current = true;
+    input.current?.complete(item.insertText, (match?.[2]?.length ?? 0) + 1);
     if (item.kind === "skill") setSkills([...new Set([...skillIds, item.id])].slice(0, 32));
     if (item.kind !== "skill") setCommandId(item.id);
     setError(undefined);
     setMenuHidden(true);
-    setCursor(start + item.insertText.length + 1);
-    input.current?.focus();
   }
 
   function submit() {
-    if (disabled || (!text.trim() && attachments.length === 0)) return;
+    if (disabled || !editorReady || props.submitting || (!text.trim() && attachments.length === 0))
+      return;
+    if (text.length > 65_536) {
+      setError("Messages can contain up to 65,536 characters.");
+      return;
+    }
     if (!commandId && matching.length > 1) {
       setError("Choose the command from the menu to resolve its name.");
       return;
@@ -111,7 +130,7 @@ export function Composer(props: ComposerProps) {
       mode: delivery.mode === "prompt" ? mode : delivery.mode,
       modelId: delivery.modelId,
       command: custom
-        ? { id: custom.id, arguments: text.slice(custom.name.length + 2) }
+        ? { id: custom.id, arguments: plainText.slice(custom.name.length + 2) }
         : undefined,
       attachments: [...attachments],
     });
@@ -121,7 +140,7 @@ export function Composer(props: ComposerProps) {
     setMenuHidden(true);
   }
 
-  function keydown(event: KeyboardEvent<HTMLTextAreaElement>) {
+  function keydown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.nativeEvent.isComposing) return;
     if (
       completions.length &&
@@ -149,7 +168,7 @@ export function Composer(props: ComposerProps) {
       submit();
     }
   }
-  function paste(event: ClipboardEvent<HTMLTextAreaElement>) {
+  function paste(event: ClipboardEvent<HTMLDivElement>) {
     const files = [...event.clipboardData.files];
     if (files.length) {
       event.preventDefault();
@@ -172,8 +191,22 @@ export function Composer(props: ComposerProps) {
       onDragLeave={() => setDragging(false)}
       onDrop={drop}
     >
-      {completions.length ? (
-        <div
+      <Popover
+        open={completions.length > 0}
+        onOpenChange={(open) => {
+          if (!open) setMenuHidden(true);
+        }}
+      >
+        <PopoverTrigger
+          render={<span className="composer-completion-anchor" />}
+          tabIndex={-1}
+          aria-hidden
+        />
+        <PopoverContent
+          side="top"
+          align="start"
+          initialFocus={false}
+          finalFocus={false}
           className="completion-popover"
           id="composer-completions"
           role="listbox"
@@ -204,8 +237,8 @@ export function Composer(props: ComposerProps) {
               </button>
             )}
           />
-        </div>
-      ) : null}
+        </PopoverContent>
+      </Popover>
       <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
       <div className="composer">
         {attachments.length ? (
@@ -262,80 +295,99 @@ export function Composer(props: ComposerProps) {
             ))}
           </div>
         ) : null}
-        <textarea
-          ref={input}
-          value={text}
-          onChange={(event) => {
-            const value = event.target.value;
-            const chosen = catalog?.commands.find((entry) => entry.id === commandId);
-            if (
-              chosen &&
-              value.trim() !== `/${chosen.name}` &&
-              !value.startsWith(`/${chosen.name} `)
-            )
-              setCommandId(undefined);
-            setSkills(
-              skillIds.filter((id) => {
-                const skill = catalog?.skills.find((item) => item.id === id);
-                return !!skill && hasSkillMention(value, skill.name);
-              }),
-            );
-            onText(value);
-            setCursor(event.target.selectionStart);
-            setMenuHidden(false);
-            setSelected(0);
-          }}
-          onSelect={(event) => setCursor(event.currentTarget.selectionStart)}
-          onKeyDown={keydown}
-          onPaste={paste}
-          placeholder={active ? "Steer Lilac, or queue a follow-up…" : "Message Lilac…"}
-          role="combobox"
-          aria-autocomplete="list"
-          aria-haspopup="listbox"
-          aria-label="Message"
-          aria-controls={completions.length ? "composer-completions" : undefined}
-          aria-expanded={completions.length > 0}
-          aria-activedescendant={completions.length ? `completion-${highlighted}` : undefined}
-          disabled={disabled}
-          maxLength={65_536}
-          rows={2}
-        />
+        <Suspense fallback={<div className="composer-editor" aria-label="Loading editor" />}>
+          <ComposerEditor
+            ref={input}
+            text={text}
+            onText={(value, visibleText) => {
+              setEditorValue({ text: value, plainText: visibleText });
+              if (insertingCompletion.current) {
+                insertingCompletion.current = false;
+                onText(value);
+                setMenuHidden(true);
+                return;
+              }
+              const chosen = catalog?.commands.find((entry) => entry.id === commandId);
+              if (
+                chosen &&
+                visibleText.trim() !== `/${chosen.name}` &&
+                !visibleText.startsWith(`/${chosen.name} `)
+              )
+                setCommandId(undefined);
+              setSkills(
+                skillIds.filter((id) => {
+                  const skill = catalog?.skills.find((item) => item.id === id);
+                  return !!skill && hasSkillMention(visibleText, skill.name);
+                }),
+              );
+              onText(value);
+              setMenuHidden(false);
+              setSelected(0);
+            }}
+            onPlainText={updatePlainText}
+            onPrefix={setPrefix}
+            onKeyDown={keydown}
+            onPaste={paste}
+            placeholder={active ? "Steer Lilac, or queue a follow-up…" : "Message Lilac…"}
+            expanded={completions.length > 0}
+            activeDescendant={completions.length ? `completion-${highlighted}` : undefined}
+            disabled={disabled}
+          />
+        </Suspense>
         <footer className="composer-toolbar">
-          <select
-            id="composer-model"
-            aria-label="Response model"
+          <Select
+            items={catalog?.models.map((model) => ({ value: model.id, label: model.label }))}
             value={modelId ?? props.modelId ?? catalog?.models[0]?.id ?? ""}
             disabled={disabled || delivery.mode === "steer"}
-            onChange={(event) => {
-              setModelId(event.target.value);
-              props.onModelChange(event.target.value);
+            onValueChange={(value) => {
+              if (!value) return;
+              setModelId(value);
+              props.onModelChange(value);
             }}
           >
-            {catalog?.models.map((model) => (
-              <option key={model.id} value={model.id}>
-                {model.label}
-              </option>
-            ))}
-          </select>
+            <SelectTrigger id="composer-model" aria-label="Response model">
+              <SelectValue>
+                {
+                  catalog?.models.find(
+                    (entry) => entry.id === (modelId ?? props.modelId ?? catalog.models[0]?.id),
+                  )?.label
+                }
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {catalog?.models.map((model) => (
+                <SelectItem key={model.id} value={model.id}>
+                  {model.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <span className="toolbar-spacer" />
           {active ? (
-            <label className="queue-mode">
+            <div className="queue-mode">
               <CornerDownRight />
-              <select
-                aria-label={
-                  custom ? "Custom commands queue as follow-ups" : "When sent during an active run"
-                }
-                title={custom ? "Custom commands queue as follow-ups" : undefined}
+              <Select
                 disabled={!!custom}
                 value={delivery.mode}
-                onChange={(event) =>
-                  setMode(event.target.value === "followup" ? "followup" : "steer")
-                }
+                onValueChange={(value) => setMode(value === "followup" ? "followup" : "steer")}
               >
-                <option value="steer">Steering</option>
-                <option value="followup">Follow-up</option>
-              </select>
-            </label>
+                <SelectTrigger
+                  aria-label={
+                    custom
+                      ? "Custom commands queue as follow-ups"
+                      : "When sent during an active run"
+                  }
+                >
+                  <SelectValue>
+                    {delivery.mode === "followup" ? "Follow-up" : "Steering"}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="steer">Steering</SelectItem>
+                  <SelectItem value="followup">Follow-up</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           ) : null}
           <input
             ref={fileInput}
@@ -364,7 +416,9 @@ export function Composer(props: ComposerProps) {
           <IconButton
             label={active && custom ? "Queue command as follow-up" : "Send message"}
             className="send-button"
-            disabled={disabled || (!text.trim() && !attachments.length)}
+            disabled={
+              disabled || !editorReady || props.submitting || (!text.trim() && !attachments.length)
+            }
             onClick={submit}
           >
             <ArrowUp />

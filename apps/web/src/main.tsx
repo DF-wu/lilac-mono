@@ -1,3 +1,4 @@
+import { Button } from "./components/ui/button";
 import { lazy, Suspense, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { Result } from "better-result";
@@ -66,7 +67,7 @@ function Root() {
       {update ? (
         <div className="app-update" role="status">
           <span>Update available</span>
-          <button onClick={update.activate}>Reload</button>
+          <Button onClick={update.activate}>Reload</Button>
         </div>
       ) : null}
     </>
@@ -83,7 +84,7 @@ function Root() {
       <main className="login-shell">
         <h1>Lilac</h1>
         <p role="status">{state.message}</p>
-        <button onClick={start}>Reconnect</button>
+        <Button onClick={start}>Reconnect</Button>
       </main>,
     );
   if (state.kind === "login")

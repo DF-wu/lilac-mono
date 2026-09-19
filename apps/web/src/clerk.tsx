@@ -1,3 +1,4 @@
+import { Button } from "./components/ui/button";
 import { ClerkProvider, SignIn, UserButton, useAuth, useClerk } from "@clerk/react";
 import { shadcn } from "@clerk/ui/themes";
 import { useEffect, useRef, useState, type ReactNode } from "react";
@@ -61,10 +62,10 @@ function SignInView({ onSignedIn }: { onSignedIn: () => void }) {
   if (isSignedIn)
     return (
       <div className="login-form">
-        <button type="button" onClick={onSignedIn}>
+        <Button type="button" onClick={onSignedIn}>
           Retry connection
-        </button>
-        <button
+        </Button>
+        <Button
           type="button"
           disabled={busy}
           onClick={() => {
@@ -72,7 +73,7 @@ function SignInView({ onSignedIn }: { onSignedIn: () => void }) {
           }}
         >
           Use another account
-        </button>
+        </Button>
         {error ? <p role="alert">{error}</p> : null}
       </div>
     );

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Tooltip } from "@base-ui/react/tooltip";
-import { Dialog } from "@base-ui/react/dialog";
+import { Button } from "./ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
 import { X } from "lucide-react";
 import { Result } from "better-result";
 
@@ -11,11 +12,13 @@ export function IconButton({
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
   return (
-    <Tooltip.Root>
-      <Tooltip.Trigger
+    <Tooltip>
+      <TooltipTrigger
         render={
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="icon"
             {...props}
             className={`icon-button ${props.className ?? ""}`}
             aria-label={label}
@@ -23,13 +26,9 @@ export function IconButton({
         }
       >
         {children}
-      </Tooltip.Trigger>
-      <Tooltip.Portal>
-        <Tooltip.Positioner sideOffset={6}>
-          <Tooltip.Popup className="tooltip">{label}</Tooltip.Popup>
-        </Tooltip.Positioner>
-      </Tooltip.Portal>
-    </Tooltip.Root>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }
 
@@ -45,25 +44,25 @@ export function Modal({
   wide?: boolean;
 }) {
   return (
-    <Dialog.Root
+    <Dialog
       open
       onOpenChange={(open) => {
         if (!open) onClose();
       }}
     >
-      <Dialog.Portal>
-        <Dialog.Backdrop className="modal-backdrop" />
-        <Dialog.Popup className={`modal ${wide ? "modal-wide" : ""}`}>
-          <header className="modal-header">
-            <Dialog.Title>{title}</Dialog.Title>
-            <IconButton label="Close" onClick={onClose}>
-              <X />
-            </IconButton>
-          </header>
-          {children}
-        </Dialog.Popup>
-      </Dialog.Portal>
-    </Dialog.Root>
+      <DialogContent
+        className={`block max-h-[calc(100dvh-var(--space-6))] overflow-y-auto p-5 ${wide ? "sm:max-w-4xl" : "sm:max-w-lg"}`}
+        showCloseButton={false}
+      >
+        <DialogHeader className="modal-header flex-row items-center justify-between">
+          <DialogTitle>{title}</DialogTitle>
+          <IconButton label="Close" onClick={onClose}>
+            <X />
+          </IconButton>
+        </DialogHeader>
+        {children}
+      </DialogContent>
+    </Dialog>
   );
 }
 

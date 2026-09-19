@@ -30,6 +30,13 @@ Browser projection caches are scoped by installation, principal, protocol and pr
 They are disposable: unsupported versions or invalid coverage require a fresh recent window, while
 server conversation history remains authoritative. Never copy one user's cache into another scope.
 
+## Native web local drafts
+
+The existing scoped browser draft cache also holds unsent new conversations under `draft:` IDs.
+Draft rows accept optional title and model selection metadata. Existing rows remain readable; no
+IndexedDB version or backend schema changes. An older web build may ignore rows with the new optional
+metadata. File selections remain in memory and must be reattached after a browser reload.
+
 ## Native output recovery frontier
 
 Native runs add an optional `nativeOutput` field to version-1 agent-run WAL checkpoints. It stores

@@ -3821,12 +3821,25 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : []),
       ...(root === "apps/web"
-        ? ["decodeThread", "decodeSlot", "decodeBootstrap", "decodeDraft", "decodeDraftRow"].map(
-            (exportName) => ({
-              identity: { module: "src/cache.ts", exportName },
+        ? [
+            "decodeThread",
+            "decodeSlot",
+            "decodeBootstrap",
+            "decodeDraft",
+            "decodeDraftRow",
+            "localDraftId",
+          ].map((exportName) => ({
+            identity: { module: "src/cache.ts", exportName },
+            category: "persistence" as const,
+          }))
+        : []),
+      ...(root === "apps/web"
+        ? [
+            {
+              identity: { module: "src/draft-thread.ts", exportName: "restoreDraftThread" },
               category: "persistence" as const,
-            }),
-          )
+            },
+          ]
         : []),
       ...(root === "apps/web"
         ? ["decodeWebBootstrap", "decodeWebAuthInfo"].map((exportName) => ({

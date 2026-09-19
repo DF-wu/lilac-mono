@@ -59,6 +59,11 @@ and data authority. Human author attribution remains separate.
 
 ## Conversation behavior
 
+New conversation opens a local draft. Typing or attaching files adds it to the sidebar; the server
+thread is created on the first Send. Draft text survives reloads, while unsent files must be reattached.
+The composer supports basic Markdown formatting through Plate. Enter sends; Shift+Enter continues
+writing. Sidebar rows offer rename and delete on hover or focus, with more actions in the context menu.
+
 The thread's model selection applies to new full turns. Active runs retain their selected model.
 Sending while a run is active steers by default; follow-up mode queues a full turn. Cancel drops
 queued follow-ups. Users can remove queued entries but cannot reorder or edit them.

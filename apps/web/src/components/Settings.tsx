@@ -3,6 +3,11 @@ import { RefreshCw, Save, UserPlus } from "lucide-react";
 import type { NativeClient } from "@stanley2058/lilac-client";
 import type { NativeRpcOutputs, NativeUser } from "@stanley2058/lilac-client-protocol";
 import { attempt, ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
+import { Button } from "./ui/button";
+import { Input } from "./ui/input";
+import { Textarea } from "./ui/textarea";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "./ui/tabs";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
 
 import {
   completeConfigSave,
@@ -84,76 +89,97 @@ export function Settings({
   }
   return (
     <Modal title="Settings" onClose={onClose} wide>
-      <nav className="tabs" aria-label="Settings sections">
-        {(["core", "mcp", "users", "appearance"] as const).map((key) => (
-          <button
-            type="button"
-            key={key}
-            className={tab === key ? "selected" : ""}
-            onClick={() => setTab(key)}
-          >
-            {{ core: "Core", mcp: "MCP", users: "People", appearance: "Appearance" }[key]}
-          </button>
-        ))}
-      </nav>
-      <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
-      {tab === "appearance" ? (
-        <label className="field">
-          Theme
-          <select value={theme} onChange={(event) => onTheme(event.target.value)}>
-            <option value="system">System</option>
-            <option value="dark">Dark</option>
-            <option value="light">Light</option>
-          </select>
-        </label>
-      ) : null}
-      {tab === "users" ? <People client={client} /> : null}
-      {tab === "core" || tab === "mcp" ? (
-        <>
-          <textarea
-            className="config-editor"
-            spellCheck={false}
-            aria-label={`${tab === "core" ? "Core" : "MCP"} configuration YAML`}
-            value={document ? text : ""}
-            disabled={!document}
-            onChange={(event) => {
-              setEditors((current) => editConfig(current, tab, event.target.value));
-            }}
-          />
-          <footer className="config-footer">
-            <span role="status">
-              {status}
-              {tab === "mcp" && status === "Saved" ? ". Reload to apply changes." : ""}
-            </span>
-            <span className="toolbar-spacer" />
-            {tab === "mcp" ? (
-              <button className="button" onClick={() => void reload()}>
-                <RefreshCw />
-                Reload MCP
-              </button>
-            ) : null}
-            <button
-              className="button primary"
-              disabled={!document || !!saving[document.kind] || text === document.text}
-              onClick={() => void save()}
+      <Tabs
+        className="flex-col"
+        value={tab}
+        onValueChange={(value) => {
+          if (value === "core" || value === "mcp" || value === "users" || value === "appearance")
+            setTab(value);
+        }}
+      >
+        <TabsList aria-label="Settings sections">
+          {(["core", "mcp", "users", "appearance"] as const).map((key) => (
+            <TabsTrigger key={key} value={key}>
+              {{ core: "Core", mcp: "MCP", users: "People", appearance: "Appearance" }[key]}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+        <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+        <TabsContent value="appearance">
+          <label className="field">
+            Theme
+            <Select
+              items={[
+                { value: "system", label: "System" },
+                { value: "dark", label: "Dark" },
+                { value: "light", label: "Light" },
+              ]}
+              value={theme}
+              onValueChange={(value) => {
+                if (value) onTheme(value);
+              }}
             >
-              <Save />
-              Save
-            </button>
-          </footer>
-          {reloads ? (
-            <div className="reload-results">
-              {reloads.servers.map((server) => (
-                <div key={server.name}>
-                  <strong>{server.name}</strong>
-                  <span>{server.state}</span>
-                  {server.error ? <p className="error-text">{server.error}</p> : null}
-                </div>
-              ))}
-            </div>
-          ) : null}
-        </>
-      ) : null}
+              <SelectTrigger aria-label="Theme">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="system">System</SelectItem>
+                <SelectItem value="dark">Dark</SelectItem>
+                <SelectItem value="light">Light</SelectItem>
+              </SelectContent>
+            </Select>
+          </label>
+        </TabsContent>
+        <TabsContent value="users">
+          <People client={client} />
+        </TabsContent>
+        {tab === "core" || tab === "mcp" ? (
+          <TabsContent value={tab}>
+            <Textarea
+              className="config-editor"
+              spellCheck={false}
+              aria-label={`${tab === "core" ? "Core" : "MCP"} configuration YAML`}
+              value={document ? text : ""}
+              disabled={!document}
+              onChange={(event) => {
+                setEditors((current) => editConfig(current, tab, event.target.value));
+              }}
+            />
+            <footer className="config-footer">
+              <span role="status">
+                {status}
+                {tab === "mcp" && status === "Saved" ? ". Reload to apply changes." : ""}
+              </span>
+              <span className="toolbar-spacer" />
+              {tab === "mcp" ? (
+                <Button variant="secondary" className="button" onClick={() => void reload()}>
+                  <RefreshCw />
+                  Reload MCP
+                </Button>
+              ) : null}
+              <Button
+                className="button primary"
+                disabled={!document || !!saving[document.kind] || text === document.text}
+                onClick={() => void save()}
+              >
+                <Save />
+                Save
+              </Button>
+            </footer>
+            {reloads ? (
+              <div className="reload-results">
+                {reloads.servers.map((server) => (
+                  <div key={server.name}>
+                    <strong>{server.name}</strong>
+                    <span>{server.state}</span>
+                    {server.error ? <p className="error-text">{server.error}</p> : null}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </TabsContent>
+        ) : null}
+      </Tabs>
     </Modal>
   );
 }
@@ -190,20 +216,28 @@ export function People({ client }: { client: NativeClient }) {
     <section className="people">
       <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
       <div className="inline-form">
-        <input
+        <Input
           aria-label="Existing Clerk user ID"
           placeholder="Clerk user ID"
           value={providerId}
           onChange={(event) => setProviderId(event.target.value)}
         />
-        <select
-          aria-label="Tool access for added user"
+        <Select
+          items={[
+            { value: "restricted", label: "Restricted" },
+            { value: "full", label: "Full access" },
+          ]}
           value={mode}
-          onChange={(event) => setMode(event.target.value === "full" ? "full" : "restricted")}
+          onValueChange={(value) => setMode(value === "full" ? "full" : "restricted")}
         >
-          <option value="restricted">Restricted</option>
-          <option value="full">Full access</option>
-        </select>
+          <SelectTrigger aria-label="Tool access for added user">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="restricted">Restricted</SelectItem>
+            <SelectItem value="full">Full access</SelectItem>
+          </SelectContent>
+        </Select>
         <IconButton label="Add existing user" onClick={() => void add()}>
           <UserPlus />
         </IconButton>
@@ -217,12 +251,15 @@ export function People({ client }: { client: NativeClient }) {
           <div className="person-row">
             <span>{user.displayName}</span>
             <small>{user.role}</small>
-            <select
-              aria-label={`Tool access for ${user.displayName}`}
+            <Select
+              items={[
+                { value: "restricted", label: "Restricted" },
+                { value: "full", label: "Full access" },
+              ]}
               disabled={user.role !== "participant"}
               value={user.toolMode}
-              onChange={(event) => {
-                const toolMode = event.target.value === "full" ? "full" : "restricted";
+              onValueChange={(value) => {
+                const toolMode = value === "full" ? "full" : "restricted";
                 if (!client.rpc) return;
                 void attempt(
                   () => client.rpc!.users.setToolMode({ userId: user.id, toolMode }),
@@ -235,16 +272,26 @@ export function People({ client }: { client: NativeClient }) {
                 });
               }}
             >
-              <option value="restricted">Restricted</option>
-              <option value="full">Full access</option>
-            </select>
+              <SelectTrigger aria-label={`Tool access for ${user.displayName}`}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="restricted">Restricted</SelectItem>
+                <SelectItem value="full">Full access</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
         )}
       />
       {nextCursor ? (
-        <button type="button" className="text-button" onClick={() => void load(nextCursor)}>
+        <Button
+          type="button"
+          variant="ghost"
+          className="text-button"
+          onClick={() => void load(nextCursor)}
+        >
           Load more people
-        </button>
+        </Button>
       ) : null}
     </section>
   );

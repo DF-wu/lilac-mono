@@ -5,6 +5,7 @@ import type { AppProps, ChatCommon, ComposerSubmission, QueueEntry } from "../ty
 import { resolveAttachmentIds } from "../uploads";
 import { inputDeliveryOptions } from "../input-mode";
 import type { UploadPool } from "../uploads";
+import { Button } from "./ui/button";
 import { Composer } from "./Composer";
 import { Timeline, useSlot, useSlotIds } from "./Timeline";
 import { attempt, ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
@@ -44,6 +45,10 @@ export function Chat(props: ChatProps) {
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const [pendingEntries, setPendingEntries] = useState(props.pending);
+  useEffect(() => {
+    pendingRef.current = props.pending;
+    setPendingEntries(props.pending);
+  }, [props.pending]);
   const pendingRef = useRef(pendingEntries);
   pendingRef.current = pendingEntries;
   const commitDraft = (value: Draft) => {
@@ -329,7 +334,7 @@ export function Chat(props: ChatProps) {
                 <span>{entry.text}</span>
                 <small>{entry.error ?? "Sending…"}</small>
                 {entry.state !== "preparing" ? (
-                  <button
+                  <Button
                     type="button"
                     onClick={() =>
                       void deliver(
@@ -349,7 +354,7 @@ export function Chat(props: ChatProps) {
                     }
                   >
                     Retry message
-                  </button>
+                  </Button>
                 ) : null}
               </div>
             )}
@@ -391,8 +396,9 @@ export function Chat(props: ChatProps) {
           </div>
         ) : null}
         {draft.savedText ? (
-          <button
+          <Button
             type="button"
+            variant="ghost"
             className="text-button"
             onClick={() =>
               commitDraft({
@@ -403,7 +409,7 @@ export function Chat(props: ChatProps) {
             }
           >
             Restore previous draft
-          </button>
+          </Button>
         ) : null}
         {thread.capabilities.edit ? (
           <Composer
@@ -466,13 +472,18 @@ export function Chat(props: ChatProps) {
           </p>
           {active ? <p>The active run will be canceled and queued messages dropped.</p> : null}
           <div className="dialog-actions">
-            <button className="button" onClick={() => setRewindTarget(undefined)}>
+            <Button className="button" onClick={() => setRewindTarget(undefined)}>
               Keep conversation
-            </button>
-            <button className="button danger" disabled={rewinding} onClick={() => void rewind()}>
+            </Button>
+            <Button
+              variant="destructive"
+              className="button danger"
+              disabled={rewinding}
+              onClick={() => void rewind()}
+            >
               <RotateCcw />
               Rewind
-            </button>
+            </Button>
           </div>
         </Modal>
       ) : null}

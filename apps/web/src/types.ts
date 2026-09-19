@@ -22,7 +22,7 @@ export type AppProps = {
   resourceUrl: (resourceId: string) => string;
   onLogout: () => Promise<void>;
   userControl?: ReactNode;
-  draftCache?: Pick<WebNativeCache, "readDraft" | "saveDraft">;
+  draftCache?: Pick<WebNativeCache, "readDraft" | "saveDraft" | "listLocalDrafts" | "deleteDraft">;
 };
 export type Attachment = {
   key: string;

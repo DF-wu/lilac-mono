@@ -1,3 +1,5 @@
+import { Input } from "./components/ui/input";
+import { Button } from "./components/ui/button";
 import { useEffect, useState, type ComponentProps } from "react";
 import { localLogin } from "./http";
 
@@ -27,16 +29,16 @@ export function LocalLogin({ onSignedIn }: { onSignedIn: () => void }) {
     <form className="login-form" onSubmit={submit}>
       <label>
         Username
-        <input name="username" autoComplete="username" required autoFocus />
+        <Input name="username" autoComplete="username" required autoFocus />
       </label>
       <label>
         Password
-        <input name="password" type="password" autoComplete="current-password" required />
+        <Input name="password" type="password" autoComplete="current-password" required />
       </label>
       {error ? <p role="alert">{error}</p> : null}
-      <button type="submit" disabled={busy}>
+      <Button type="submit" disabled={busy}>
         {busy ? "Signing in…" : "Sign in"}
-      </button>
+      </Button>
     </form>
   );
 }

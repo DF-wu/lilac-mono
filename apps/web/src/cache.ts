@@ -18,7 +18,14 @@ import {
   type BootstrapReply,
 } from "@stanley2058/lilac-client-protocol";
 
-export type WebDraft = { text: string; skillIds: string[]; commandId?: string; savedText?: string };
+export type WebDraft = {
+  text: string;
+  skillIds: string[];
+  commandId?: string;
+  savedText?: string;
+  title?: string;
+  modelId?: string;
+};
 
 export type CachedBootstrap = { scope: CacheScope; bootstrap: BootstrapReply; savedAt: number };
 export type WebCacheOptions = {
@@ -78,6 +85,8 @@ const draftRowSchema = z.strictObject({
   skillIds: z.array(identitySchema).max(32).default([]),
   commandId: identitySchema.optional(),
   savedText: z.string().max(65_536).optional(),
+  title: z.string().max(512).optional(),
+  modelId: identitySchema.optional(),
   updatedAt: revisionSchema,
 });
 function decodeThread(value: unknown): ThreadRow | undefined {
@@ -112,6 +121,8 @@ function decodeDraft(value: unknown): WebDraft {
     skillIds: parsed.data.skillIds,
     commandId: parsed.data.commandId,
     savedText: parsed.data.savedText,
+    ...(parsed.data.title === undefined ? {} : { title: parsed.data.title }),
+    ...(parsed.data.modelId === undefined ? {} : { modelId: parsed.data.modelId }),
   };
 }
 function rejectWebCacheRequest(reject: (cause: Error) => void, error: Error): void {
@@ -142,6 +153,14 @@ function threadKey(scope: CacheScope, threadId: string): string {
 }
 function slotKey(key: string, slotId: string): string {
   return JSON.stringify([key, slotId]);
+}
+const draftKeySchema = z.tuple([z.string(), z.string().startsWith("draft:")]);
+function localDraftId(key: string, scopeKey: string): string | undefined {
+  const decoded = Result.try({ try: () => JSON.parse(key), catch: () => undefined });
+  const value = decoded.match({ ok: (value) => value, err: () => undefined });
+  const parsed = draftKeySchema.safeParse(value);
+  if (!parsed.success || parsed.data[0] !== scopeKey) return undefined;
+  return parsed.data[1];
 }
 async function deleteIndex(store: IDBObjectStore, index: string, key: string): Promise<void> {
   const keys = await idbRequest(store.index(index).getAllKeys(key));
@@ -514,6 +533,8 @@ export class WebNativeCache implements NativeCache {
       skillIds: [...new Set(draft.skillIds)].slice(0, 32),
       commandId: draft.commandId,
       savedText: draft.savedText?.slice(0, 65_536),
+      ...(draft.title === undefined ? {} : { title: draft.title.slice(0, 512) }),
+      ...(draft.modelId === undefined ? {} : { modelId: draft.modelId }),
     };
     const key = threadKey(scope, threadId);
     this.drafts.delete(key);
@@ -555,6 +576,46 @@ export class WebNativeCache implements NativeCache {
     if (epoch !== this.epoch) return { text: "", skillIds: [] };
     if (value !== undefined) this.drafts.set(key, value);
     return value ? structuredClone(value) : { text: "", skillIds: [] };
+  }
+  async listLocalDrafts(scope: CacheScope): Promise<{ threadId: string; draft: WebDraft }[]> {
+    const epoch = this.epoch;
+    const scopeKey = cacheScopeKey(scope);
+    const rows = await this.attempt(async (db) => {
+      const tx = db.transaction("drafts", "readonly");
+      const done = completed(tx);
+      const values = await idbRequest(tx.objectStore("drafts").index("scope").getAll(scopeKey));
+      await assertCommitted(done);
+      if (!Array.isArray(values)) return [];
+      return values
+        .map(decodeDraftRow)
+        .filter((row) => row !== undefined)
+        .filter((row) => row.scopeKey === scopeKey)
+        .sort((a, b) => b.updatedAt - a.updatedAt);
+    });
+    if (epoch !== this.epoch) return [];
+    const drafts = new Map<string, WebDraft>();
+    for (const row of rows ?? []) {
+      const threadId = localDraftId(row.key, scopeKey);
+      if (threadId) drafts.set(threadId, decodeDraft(row));
+    }
+    for (const [key, draft] of this.drafts) {
+      const threadId = localDraftId(key, scopeKey);
+      if (threadId) drafts.set(threadId, draft);
+    }
+    return [...drafts]
+      .filter(([, draft]) => draft.text.trim() || draft.skillIds.length || draft.commandId)
+      .map(([threadId, draft]) => ({ threadId, draft: structuredClone(draft) }));
+  }
+  async deleteDraft(scope: CacheScope, threadId: string): Promise<void> {
+    this.epoch++;
+    const key = threadKey(scope, threadId);
+    this.drafts.delete(key);
+    await this.attempt(async (db) => {
+      const tx = db.transaction("drafts", "readwrite");
+      const done = completed(tx);
+      tx.objectStore("drafts").delete(key);
+      await assertCommitted(done);
+    });
   }
   close(): void {
     this.database?.close();

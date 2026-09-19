@@ -140,3 +140,23 @@ The production web build also passed. A final check is repeated before each incr
 
 See [operator setup and rollback](../docs/native-surface.md) and
 [MIGRATIONS.md](../MIGRATIONS.md) for deployment and persistence details.
+
+## Web component and draft follow-up
+
+The web UI now uses the official shadcn Base UI registry components for split panes, messages,
+markers, selectors, popovers, dropdown/context menus, dialogs, buttons, inputs and activity folds.
+The existing virtualized history scroller retains ownership of deferred hydration and saved offsets;
+MessageScroller was evaluated but would introduce competing scroll anchoring for those virtual rows.
+The project logo is the bundled favicon. Sidebar toggle coordinates stay fixed across collapse, and
+keyboard resizing works. Mobile verification at 390 pixels found no horizontal page overflow.
+
+Plate supplies rich Markdown editing and keeps the existing Markdown wire payload. The editor is a
+separate lazy chunk. Browser checks cover formatting, skill completion, multiple list items, heading
+to paragraph editing, selectors, focus handling, dialogs and activity expansion. Plain-text editor
+identity drives command/skill matching so Markdown escapes cannot change invocation names.
+
+New conversations remain local until first Send. Dirty draft rows support rename/delete and persist
+text and selection metadata in the existing scoped draft cache. Files remain in memory until Send.
+Browser checks cover first-send creation/upload delays, editing and navigation during those delays,
+unopened-thread actions, local draft restoration and Back navigation. No backend or wire changes
+were required.
