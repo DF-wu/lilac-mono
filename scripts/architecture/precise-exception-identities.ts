@@ -20,6 +20,7 @@ export const PRECISE_EXCEPTION_IDENTITIES = {
   "apps/computer-use-gateway": [],
   "apps/installer": [],
   "apps/web": [],
+  "apps/tui": [],
   "packages/computer-use-runner": [],
   "packages/client": [],
   "packages/client-protocol": [],

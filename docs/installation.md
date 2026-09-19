@@ -2,7 +2,8 @@
 
 Lilac's installer downloads a standalone CLI and runs an interactive setup before starting the
 published containers. You need Docker, a model-provider account or an OpenAI-compatible endpoint, and
-a Discord application with a bot token. Bun, Node.js, Git, and a source checkout are not required.
+an interactive terminal. The native web and terminal interfaces are the default; Discord is optional.
+Bun, Node.js, Git, and a source checkout are not required.
 
 ## System requirements
 
@@ -37,16 +38,20 @@ Setup follows this sequence:
 1. Check Docker and Compose.
 2. Choose the installation directory. The default is your current directory.
 3. Configure at least one model provider, then select main and fast models.
-4. Enter the Discord bot token, open the invite and application-settings links, and choose channel rules.
+4. Choose Web and terminal, the default, or Discord. Native setup creates a local owner account or
+   connects an existing Clerk application. Discord can also be added alongside native.
 5. Configure any optional integrations, or skip them.
 6. Review the proposed configuration with secrets masked and confirm the write.
 7. Pull container images, start Core and Redis, and wait for container health checks.
 
-Once setup finishes, mention the bot in an allowed Discord channel to try it. Container health means
-the services started successfully; your first Discord request also exercises model generation.
+Once setup finishes, open `http://localhost:8787` and sign in with the local owner credentials chosen
+in setup. For a terminal demo, run `./bin/lilac-tui --url http://localhost:8787`. Both use the normal
+authenticated backend and your configured model. No Clerk account is needed with local auth.
+Container health means the services started successfully; your first prompt exercises model generation.
+Discord-only installations start by mentioning the bot in an allowed channel.
 
 Next, [personalize Lilac's prompt files](../README.md#after-installation-make-lilac-your-own).
-Edit them yourself or ask Lilac on Discord to walk you through your preferences and update the files.
+Edit them yourself or ask Lilac to walk you through your preferences and update the files.
 
 ### Model providers
 
@@ -71,6 +76,22 @@ localhost callback URL shown in the browser. The installer does not offer the `c
 An OpenAI-compatible base URL must be reachable both from the installer and from the Core container.
 For a service on the Docker host, use an address with that reachability rather than container-local
 `localhost`.
+
+### Native authentication
+
+Local auth has one owner and no user registration. Setup hashes the chosen password with Argon2id and
+generates a session secret. The username, password hash and secret go in `secrets.env`, never in
+`core-config.yaml`. The native gateway listens inside the container and is published only on host
+`127.0.0.1:8787`. Use an SSH tunnel for access from another machine, or place an HTTPS reverse proxy
+in front of that port and supply its origin as the Native web URL.
+
+Clerk setup takes an existing application's owner user ID, issuer, secret key and publishable key.
+The optional public OAuth client ID enables terminal login. Configure its loopback callback according
+to [native setup](native-surface.md). The installer does not enroll users or create a Clerk application.
+
+Existing installations retain their current enabled surfaces and port bindings during update or
+reinstall. Enabling native on an existing Discord installation is an explicit manual configuration
+change described in [native setup](native-surface.md).
 
 ### Discord
 
@@ -107,6 +128,7 @@ The selected installation directory contains:
 | Path | Purpose |
 | --- | --- |
 | `bin/lilac` | Standalone setup CLI |
+| `bin/lilac-tui` | Native terminal client |
 | `compose.yaml` | Container services and resolved image references |
 | `secrets.env` | Environment credentials passed to the containers |
 | `data/core-config.yaml` | Your Core configuration |
@@ -172,7 +194,8 @@ For a private registry, authenticate Docker before starting setup.
 
 The default published CLI embeds immutable image digests from its own release. It does not depend on
 the registry's mutable `latest` tags. `LILAC_RELEASE_BASE_URL` must contain assets named
-`lilac-linux-x64`, `lilac-linux-arm64`, `lilac-darwin-x64`, and `lilac-darwin-arm64`, plus `SHA256SUMS` with
+`lilac-<target>` and `lilac-tui-<target>` for each supported target (`linux-x64`, `linux-arm64`,
+`darwin-x64`, `darwin-arm64`), plus `SHA256SUMS` with
 standard `sha256sum` output using those basenames. A custom source can provide only the platforms it
 supports. Its URL must identify one coherent artifact set.
 

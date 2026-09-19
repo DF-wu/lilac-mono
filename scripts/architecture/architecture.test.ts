@@ -2656,6 +2656,8 @@ describe("permanent architecture governance", () => {
     );
 
     for (const required of [
+      "apps/tui:src/persistence-codec.ts#decodeTuiCache->src/persistence-codec.ts#tuiCacheCodecCases",
+      "apps/tui:src/persistence-codec.ts#decodeTuiCredential->src/persistence-codec.ts#tuiCredentialCodecCases",
       "apps/core:src/migration/frozen-graceful-restart-store.ts#decodeGracefulRestartSnapshot->src/migration/frozen-graceful-restart-store.ts#gracefulRestartSnapshotCodecCases",
       "apps/core:src/workflow/workflow-persistence-codec.ts#decodeWorkflowPersistenceRow->src/workflow/workflow-persistence-codec.ts#workflowPersistenceRowCodecCases",
       "packages/tool-results:src/blob-tool-result-artifact-metadata-codec.ts#decodeBlobToolResultArtifactMetadata->src/blob-tool-result-artifact-metadata-codec.ts#blobToolResultArtifactMetadataCodecCases",
@@ -2675,6 +2677,8 @@ describe("permanent architecture governance", () => {
       ),
     );
     for (const required of [
+      "apps/tui:src/session.ts#decodeTuiBootstrap:wire",
+      "apps/tui:src/persistence-codec.ts#decode:persistence",
       "apps/core:src/tool-server/create-tool-server.ts#normalizeSuccessfulToolValue:plugin",
       "apps/core:src/surface/bridge/bus-agent-runner/raw.ts#parseRequestControlFromRaw:projection",
       "apps/core:src/workflow/workflow-action-resolver.ts#decodeWorkflowActionOutboxEvent:persistence",

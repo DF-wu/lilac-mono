@@ -28,6 +28,9 @@ export async function startNativeClerkBrowserFixture() {
         ownerId: "owner",
         ownerProviderUserId,
         clerkIssuer: `https://${frontendHost}`,
+        ...(process.env.TEST_NATIVE_CLERK_OAUTH_CLIENT_ID
+          ? { clerkOAuthClientId: process.env.TEST_NATIVE_CLERK_OAUTH_CLIENT_ID }
+          : {}),
       };
     },
     seed: (store) => {

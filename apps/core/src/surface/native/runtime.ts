@@ -26,6 +26,7 @@ import { NativeConfigService } from "./config-service";
 import { createNativeExecution, type NativeRunnerControl } from "./execution";
 import { nativeFailure } from "./errors";
 import { createNativeGateway } from "./gateway";
+import { createNativeMetrics } from "./metrics";
 import type { NativeInstallation } from "./installation";
 import { nativeThreadId } from "./native-protocol";
 import { createNativeOutputPublisher, createNativeBusOutputSink } from "./output";
@@ -84,6 +85,7 @@ export type NativeRuntimeOptions = {
 
 export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const { store, database, auth, clerk, login } = options.installation;
+  const metrics = createNativeMetrics();
   let skills: readonly DiscoveredSkill[] = (
     await discoverSkills({ workspaceRoot: options.workspaceRoot, dataDir: options.dataDir })
   ).skills;
@@ -105,6 +107,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     remoteDenyPaths: options.denyPaths,
   });
   const execution = createNativeExecution({
+    metrics,
     store,
     bus: options.bus,
     transcriptStore: options.transcript,
@@ -235,12 +238,19 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     ...(clerk ? { lookupUser: clerk.lookupUser } : {}),
   });
   const gateway = createNativeGateway({
+    metrics,
     reportFatalError: options.reportFatalError,
     hostname: nativeConfig.host,
     port: nativeConfig.port,
     auth,
     publicAuth: {
       provider: nativeConfig.auth.provider,
+      ...(nativeConfig.auth.provider === "clerk"
+        ? {
+            issuer: nativeConfig.auth.clerkIssuer,
+            oauthClientId: nativeConfig.auth.clerkOAuthClientId,
+          }
+        : {}),
       ...(options.publishableKey ? { publishableKey: options.publishableKey } : {}),
     },
     ...(login ? { login } : {}),
@@ -307,8 +317,8 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
         subscriptionId: `${options.subscriptionPrefix}:native-output`,
         consumerId: `${options.subscriptionPrefix}:native-output:${process.pid}`,
       },
-      async (message) =>
-        store.projectTurn(
+      async (message) => {
+        const projected = store.projectTurn(
           message.data.threadId,
           message.data.generation,
           message.data.eventId,
@@ -335,7 +345,26 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
                 ),
               );
             }),
-        ),
+        );
+        const committedAt = performance.now();
+        const committed = projected.match({ ok: () => true, err: () => false });
+        if (!committed) {
+          metrics.handoffFailure("projection", message.data.threadId, message.data.requestId);
+          return projected;
+        }
+        const thread = store
+          .getThreadRecord(message.data.threadId)
+          .match({ ok: (value) => value, err: () => undefined });
+        if (thread)
+          metrics.committed(
+            thread.id,
+            thread.revision,
+            thread.historyGeneration,
+            message.data.requestId,
+            committedAt,
+          );
+        return projected;
+      },
       (error) =>
         error._tag === "NativeStoreFailure" && error.code === "stale" ? "commit" : "retry",
     );

@@ -14,6 +14,8 @@ export class WebRequestFailed extends TaggedError("WebRequestFailed")<{
 export const authInfoSchema = z.strictObject({
   provider: z.enum(["local", "clerk"]),
   publishableKey: z.string().optional(),
+  issuer: z.string().optional(),
+  oauthClientId: z.string().optional(),
 });
 export type AuthInfo = z.infer<typeof authInfoSchema>;
 

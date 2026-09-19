@@ -14,6 +14,7 @@ import { createNativeLocalAuthenticator } from "./auth-local";
 import { createNativeGateway, type NativeGatewayOptions } from "./gateway";
 import { nativeRpcValue, type NativeRpcServices } from "./rpc";
 import { nativeFailure } from "./errors";
+import { createNativeMetrics, type NativeMetricSink } from "./metrics";
 
 const cleanup: (() => void | Promise<void>)[] = [];
 afterEach(async () => {
@@ -33,6 +34,8 @@ const checkpoint = {
 };
 
 async function fixture(webRoot?: string, resources?: NativeGatewayOptions["resources"]) {
+  const measurements: { event: string; fields: Parameters<NativeMetricSink>[1] }[] = [];
+  const metrics = createNativeMetrics((event, fields) => measurements.push({ event, fields }));
   const fatalErrors: Error[] = [];
   const fatal = Promise.withResolvers<Error>();
   const auth = createNativeLocalAuthenticator({
@@ -102,6 +105,7 @@ async function fixture(webRoot?: string, resources?: NativeGatewayOptions["resou
     },
   } as unknown as NativeRpcServices;
   const gateway = createNativeGateway({
+    metrics,
     hostname: "127.0.0.1",
     port: 0,
     webRoot,
@@ -123,7 +127,16 @@ async function fixture(webRoot?: string, resources?: NativeGatewayOptions["resou
     headers: { authorization: `Basic ${btoa("operator:test-password")}` },
   });
   const { token } = (await login.json()) as { token: string };
-  return { url, token, gateway, services, fatalErrors, fatal: fatal.promise };
+  return {
+    url,
+    token,
+    gateway,
+    services,
+    fatalErrors,
+    fatal: fatal.promise,
+    metrics,
+    measurements,
+  };
 }
 
 function connect(url: string, token: string) {
@@ -423,7 +436,7 @@ describe("native gateway", () => {
       hostname: "127.0.0.1",
       port: 0,
       auth,
-      publicAuth: { provider: "clerk" },
+      publicAuth: { provider: "clerk", issuer, oauthClientId: "client_fixture" },
       services,
       getViewer: (id) => Result.ok({ ...user, id }),
       reportFatalError: (error) => {
@@ -432,6 +445,13 @@ describe("native gateway", () => {
     });
     const { url } = gateway.start().unwrap();
     cleanup.push(gateway.stop);
+    const publicInfo = await fetch(new URL("api/auth/info", url));
+    expect(publicInfo.headers.get("cache-control")).toContain("no-store");
+    expect(await publicInfo.json()).toEqual({
+      provider: "clerk",
+      issuer,
+      oauthClientId: "client_fixture",
+    });
     const aliceToken = await sign("alice");
     const bobToken = await sign("bob");
     const alice = connect(url, aliceToken).client;
@@ -517,4 +537,28 @@ describe("native gateway", () => {
       ).status,
     ).toBe(422);
   });
+});
+
+test("real oRPC frames produce redacted replay and bootstrap measurements", async () => {
+  const { url, token, metrics, measurements } = await fixture();
+  metrics.committed("thread", 1, 0, "request");
+  const bootstrap = await fetch(new URL("api/bootstrap", url), {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  expect(bootstrap.status).toBe(200);
+  const { client } = connect(url, token);
+  const stream = await client.threads.watch({ threadId: "thread" });
+  expect((await stream.next()).value).toMatchObject({ kind: "replay" });
+  await stream.return?.();
+  expect(measurements.find((item) => item.event === "bootstrap.complete")?.fields.status).toBe(200);
+  const replay = measurements.find((item) => item.event === "replay.enqueue")?.fields;
+  expect(replay).toMatchObject({
+    threadId: "thread",
+    requestId: "request",
+    kind: "window",
+    cacheReset: false,
+  });
+  expect(replay?.commitToSocketEnqueueMs).toBeGreaterThanOrEqual(0);
+  expect(replay?.bytes).toBeGreaterThan(0);
+  expect(JSON.stringify(measurements)).not.toContain(token);
 });

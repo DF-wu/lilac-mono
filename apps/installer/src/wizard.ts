@@ -4,6 +4,7 @@ import type { JSONValue } from "../../../packages/utils/core-config/types";
 import { createPrompt } from "./prompt";
 import { configureProviders } from "./providers";
 import { configureDiscord } from "./discord";
+import { configureNative } from "./native";
 import { configureOptional } from "./optional";
 import {
   createConfigDocument,
@@ -173,7 +174,18 @@ async function configureInstallation(
       if (!reinstall) await configureExisting(prompt, draft);
     } else {
       await configureProviders(prompt, draft);
-      await configureDiscord(prompt, draft);
+      const surface = await prompt.select(
+        "Primary interface",
+        [
+          { value: "native", label: "Web and terminal" },
+          { value: "discord", label: "Discord" },
+        ],
+        "native",
+      );
+      if (surface === "native") await configureNative(prompt, draft);
+      if (surface === "discord" || (await prompt.confirm("Also connect Discord?", false))) {
+        await configureDiscord(prompt, draft);
+      }
       await configureOptional(prompt, draft);
     }
 
@@ -228,8 +240,16 @@ async function configureInstallation(
     prompt.note("Pulling images and starting containers…");
     yield* Result.await(startDeployment(root, images, draft.computerEnabled));
     const quotedRoot = "'" + root.replaceAll("'", "'\"'\"'") + "'";
+    const nativeUrl = String(
+      draft.get(["surface", "native", "publicUrl"]) ?? "http://localhost:8787",
+    );
+    const quotedNativeUrl = "'" + nativeUrl.replaceAll("'", "'\"'\"'") + "'";
+    const nextStep =
+      draft.get(["surface", "native", "enabled"]) === true
+        ? `Open ${nativeUrl} and sign in. For the terminal demo, run:\n  cd ${quotedRoot}\n  ./bin/lilac-tui --url ${quotedNativeUrl}\nThe demo uses your configured model.`
+        : "Mention your bot in an allowed Discord channel to try it.";
     prompt.note(
-      `Lilac is healthy. Mention your bot in an allowed Discord channel to try it.\n\nTo update this installation, run:\n  cd ${quotedRoot}\n  ./bin/lilac\n\nFor logs, run docker compose logs -f from:\n  ${root}`,
+      `Lilac is healthy. ${nextStep}\n\nTo update this installation, run:\n  cd ${quotedRoot}\n  ./bin/lilac\n\nFor logs, run docker compose logs -f from:\n  ${root}`,
     );
     return Result.ok({ installed: true, root });
   });

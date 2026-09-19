@@ -54,7 +54,11 @@
     "test:computer-use:docker": "LILAC_COMPUTER_DOCKER_TEST=1 bun run --filter='@stanley2058/lilac-computer-use-gateway' test",
     "build:installer": "bun apps/installer/build.ts",
     "test:installer": "bun run --filter=@stanley2058/lilac-installer test",
-    "typecheck:installer": "bunx tsc -p apps/installer/tsconfig.json --noEmit"
+    "typecheck:installer": "bunx tsc -p apps/installer/tsconfig.json --noEmit",
+    "dev:tui": "bun --cwd=apps/tui run dev",
+    "build:tui": "bun apps/tui/build.ts",
+    "test:tui": "bun run --filter=@stanley2058/lilac-tui test",
+    "typecheck:tui": "bun run --filter=@stanley2058/lilac-tui typecheck"
   },
   "devDependencies": {
     "@oxlint/plugins": "1.75.0",

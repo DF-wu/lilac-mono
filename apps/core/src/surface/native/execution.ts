@@ -10,12 +10,14 @@ import type { NativeInputRecord } from "./codec";
 import { nativeFailure, NativeStoreFailure } from "./errors";
 import { nativeSessionId } from "./native-protocol";
 import type { NativeStore } from "./store";
+import type { NativeMetrics } from "./metrics";
 
 export type NativeRunnerControl = {
   cancelNativeSession(sessionId: string): Promise<ResultType<void, Error>>;
 };
 
 export function createNativeExecution(options: {
+  metrics?: NativeMetrics;
   store: NativeStore;
   bus: Pick<LilacBus, "publish">;
   transcriptStore: TranscriptStore;
@@ -279,6 +281,12 @@ export function createNativeExecution(options: {
     if (cancelingThreads.has(threadId)) return Result.ok(undefined);
     return Result.gen(async function* () {
       const pending = yield* store.listPendingInputs(threadId);
+      options.metrics?.queue(
+        threadId,
+        pending.filter((input) => input.state === "uploading").length,
+        pending.filter((input) => input.state === "queued").length,
+        pending.filter((input) => input.state === "admitted").length,
+      );
       for (const candidate of pending) {
         const thread = yield* store.getThreadRecord(threadId);
         if (thread.mutationPending || thread.deleted) return Result.ok(undefined);
@@ -302,6 +310,7 @@ export function createNativeExecution(options: {
         const published = await publishInput(admitted);
         const failure = published.match({ ok: () => null, err: (error) => error });
         if (!failure) continue;
+        options.metrics?.handoffFailure("admission", admitted.threadId, admitted.requestId);
         if (
           failure instanceof NativeStoreFailure &&
           (failure.code === "invalid" || failure.code === "forbidden")

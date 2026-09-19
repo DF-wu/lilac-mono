@@ -5,6 +5,7 @@ node_modules
 out
 apps/installer/dist/
 apps/web/dist/
+apps/tui/dist/
 *.tgz
 packages/remote-fs-runner/dist/cli.js
 

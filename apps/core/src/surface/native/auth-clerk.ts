@@ -32,6 +32,7 @@ const tokenClaims = z.object({
   exp: z.number().int().positive(),
   iss: z.string(),
   sub: z.string().min(1),
+  azp: z.string().optional(),
 });
 
 export function decodeNativeClerkClaims(
@@ -126,7 +127,6 @@ export async function createNativeClerkAuthenticator(
                 acceptsToken: config.oauthClientId
                   ? ["session_token", "oauth_token"]
                   : ["session_token"],
-                authorizedParties: [...config.allowedOrigins],
                 jwtKey: config.jwtKey,
                 clockSkewInMs: 0,
               }),
@@ -156,6 +156,12 @@ export async function createNativeClerkAuthenticator(
         const now = Math.floor(Date.now() / 1000);
         if (claims.iss !== config.issuer || claims.exp <= now || claims.sub !== identity.userId) {
           return Result.err(authFailure("unauthorized", "Token identity or expiry is invalid"));
+        }
+        if (
+          identity.tokenType === "session_token" &&
+          (!claims.azp || !config.allowedOrigins.includes(claims.azp))
+        ) {
+          return Result.err(authFailure("forbidden", "Session authorized party is not allowed"));
         }
         if (
           identity.tokenType === "oauth_token" &&

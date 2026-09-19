@@ -423,6 +423,9 @@ export function createDeployment(
             XDG_CONFIG_HOME: "/data/.config",
           },
           volumes: ["./data:/data"],
+          ...(draft.get(["surface", "native", "enabled"]) === true
+            ? { ports: ["127.0.0.1:8787:8787"] }
+            : {}),
           extra_hosts: ["host.docker.internal:host-gateway"],
           tmpfs: [
             "/run:rw,nosuid,nodev,mode=755,size=64m",
@@ -538,7 +541,7 @@ export async function writeInstallation(
   },
   writeData: DataFileWriter = writeDataFiles,
 ) {
-  const files: { filename: string; content?: string; mode: number }[] = [
+  const files: { filename: string; content?: string; source?: string; mode: number }[] = [
     {
       filename: path.join(options.root, "secrets.env"),
       content:
@@ -550,6 +553,15 @@ export async function writeInstallation(
   const executable = path.join(options.root, "bin", "lilac");
   if (options.installExecutable && process.execPath !== executable)
     files.push({ filename: executable, mode: 0o755 });
+  const terminalSource = path.join(path.dirname(process.execPath), "lilac-tui");
+  const terminalTarget = path.join(options.root, "bin", "lilac-tui");
+  if (
+    options.installExecutable &&
+    terminalSource !== terminalTarget &&
+    (await Bun.file(terminalSource).exists())
+  ) {
+    files.push({ filename: terminalTarget, source: terminalSource, mode: 0o755 });
+  }
   const staged = files.map((file) => ({
     ...file,
     temporary: `${file.filename}.${crypto.randomUUID()}.tmp`,
@@ -590,7 +602,8 @@ export async function writeInstallation(
             try: async () => {
               for (const file of staged) {
                 temporaryFiles.push(file.temporary);
-                if (file.content === undefined) await copyFile(process.execPath, file.temporary);
+                if (file.content === undefined)
+                  await copyFile(file.source ?? process.execPath, file.temporary);
                 else await Bun.write(file.temporary, file.content, { mode: file.mode });
                 await chmod(file.temporary, file.mode);
               }

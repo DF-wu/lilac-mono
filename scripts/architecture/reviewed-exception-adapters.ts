@@ -1,6 +1,32 @@
 import type { ExceptionAdapter } from "./manifest.ts";
 
 export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly ExceptionAdapter[]>> = {
+  "apps/tui": [
+    {
+      identity: { module: "src/fatal.ts", exportName: "rethrowTuiDefect" },
+      category: "defect-supervisor",
+      externalApi: { package: "@opentui/core", exportName: "terminal application host" },
+      direction: "signal-host",
+      reason:
+        "Preserves a captured terminal application defect after controller failure or application cleanup policy is resolved.",
+    },
+    {
+      identity: { module: "src/cache.ts", exportName: "nativeTuiCacheFailure" },
+      category: "result-to-framework",
+      externalApi: { package: "@stanley2058/lilac-client", exportName: "NativeCache" },
+      direction: "signal-host",
+      reason:
+        "Reports failed disk cache commits through the shared cache Promise contract so the client cannot advance its checkpoint after a failed write.",
+    },
+    {
+      identity: { module: "src/session.ts", exportName: "nativeTuiHttpFailure" },
+      category: "result-to-framework",
+      externalApi: { package: "@orpc/client", exportName: "ORPCError" },
+      direction: "signal-host",
+      reason:
+        "Maps terminal bootstrap and upload Result failures to the shared client's asynchronous transport error contract after Result policy is resolved.",
+    },
+  ],
   "apps/web": [
     {
       identity: { module: "src/cache.ts", exportName: "signalWebCacheFailure" },

@@ -242,7 +242,12 @@ jobs:
           LILAC_DEFAULT_COMPUTER_RUNNER_IMAGE: ${{ needs.image-manifests.outputs.runner }}
         run: bun run build:installer --target ${{ matrix.target }}
 
-      - name: Run standalone binary outside the source checkout
+      - name: Build standalone terminal client
+        env:
+          LILAC_TUI_VERSION: ${{ needs.release-info.outputs.version }}
+        run: bun run build:tui --target ${{ matrix.target }}
+
+      - name: Run standalone binaries outside the source checkout
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.release-info.outputs.version }}
@@ -254,12 +259,22 @@ jobs:
           cd "$smoke_dir"
           "$binary" --version | grep -F "$VERSION"
           "$binary" --help
+          tui="$GITHUB_WORKSPACE/apps/tui/dist/lilac-tui-$TARGET"
+          "$tui" --version | grep -F "$VERSION"
+          "$tui" --help
 
-      - name: Upload standalone installer
+      - name: Stage standalone release assets
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p release-cli
+          cp "apps/installer/dist/lilac-$TARGET" "apps/tui/dist/lilac-tui-$TARGET" release-cli/
+
+      - name: Upload standalone clients
         uses: actions/upload-artifact@v6
         with:
           name: cli-${{ matrix.target }}
-          path: apps/installer/dist/lilac-${{ matrix.target }}
+          path: release-cli/*
           if-no-files-found: error
           retention-days: 2
 
@@ -290,7 +305,7 @@ jobs:
         run: |
           cp install.sh release/install.sh
           cd release
-          sha256sum lilac-linux-x64 lilac-linux-arm64 lilac-darwin-x64 lilac-darwin-arm64 install.sh > SHA256SUMS
+          sha256sum lilac-linux-x64 lilac-linux-arm64 lilac-darwin-x64 lilac-darwin-arm64 lilac-tui-linux-x64 lilac-tui-linux-arm64 lilac-tui-darwin-x64 lilac-tui-darwin-arm64 install.sh > SHA256SUMS
           printf 'Scheduled build from commit %s.\n\nThe standalone installers use these image digests:\n\n- Core: %s\n- Computer-use gateway: %s\n- Computer-use runner: %s\n\nSee the installation guide in the repository for setup instructions.\n' "$GITHUB_SHA" "$CORE" "$GATEWAY" "$RUNNER" > notes.md
 
       - name: Publish complete release

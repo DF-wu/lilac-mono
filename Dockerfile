@@ -163,6 +163,7 @@ COPY packages/agent/package.json packages/agent/package.json
 COPY packages/bash-safety/package.json packages/bash-safety/package.json
 COPY packages/blob-storage/package.json packages/blob-storage/package.json
 COPY packages/claude-code-bridge/package.json packages/claude-code-bridge/package.json
+COPY packages/client-protocol/package.json packages/client-protocol/package.json
 COPY packages/coding-tools/package.json packages/coding-tools/package.json
 COPY packages/event-bus/package.json packages/event-bus/package.json
 COPY packages/fs/package.json packages/fs/package.json
@@ -222,6 +223,18 @@ COPY packages/remote-fs-runner/build.ts packages/remote-fs-runner/tsconfig.json 
 COPY packages/remote-fs-runner/src packages/remote-fs-runner/src
 RUN (cd packages/remote-fs-runner && bun run build)
 
+FROM deps AS web
+WORKDIR /app
+COPY apps/web/package.json apps/web/package.json
+COPY packages/client/package.json packages/client/package.json
+RUN bun install --frozen-lockfile --filter '@stanley2058/lilac-web'
+COPY tsconfig.json ./
+COPY apps/web apps/web
+COPY packages/client packages/client
+COPY packages/client-protocol packages/client-protocol
+RUN bun run build:web \
+  && find /app/apps/web/dist ! -type l -perm /022 -exec chmod go-w {} +
+
 ############################
 # Stage 4: runtime
 ############################
@@ -235,6 +248,7 @@ COPY packages/agent packages/agent
 COPY packages/bash-safety packages/bash-safety
 COPY packages/blob-storage packages/blob-storage
 COPY packages/claude-code-bridge packages/claude-code-bridge
+COPY packages/client-protocol packages/client-protocol
 COPY packages/coding-tools packages/coding-tools
 COPY packages/event-bus packages/event-bus
 COPY packages/fs packages/fs
@@ -242,6 +256,7 @@ COPY packages/plugin-runtime packages/plugin-runtime
 COPY packages/remote-fs-runner packages/remote-fs-runner
 COPY packages/tool-results packages/tool-results
 COPY packages/utils packages/utils
+COPY --from=web /app/apps/web/dist /app/apps/web/dist
 COPY --from=native-launcher /build/tools /app/apps/tool-bridge/dist/tools
 COPY --from=tool-worker /app/apps/tool-bridge/dist/ /app/apps/tool-bridge/dist/
 COPY --from=remote-runner /app/apps/core/src/ssh/remote-js/remote-runner.cjs /app/apps/core/src/ssh/remote-js/

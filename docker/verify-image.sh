@@ -91,6 +91,9 @@ operator_output=$(docker exec \
   fail "operator CLI did not load its token before the expected connection failure"
 docker exec --user lilac "$container_name" /usr/local/bin/bun --version >/dev/null ||
   fail "Bun smoke failed"
+docker exec --user lilac "$container_name" /usr/local/bin/bun -e \
+  'await import("./apps/core/src/surface/native/runtime.ts")' >/dev/null || \
+  fail "native runtime dependencies are incomplete"
 
 for path in /app /usr/local/bin/bun /usr/local/bin/tools /usr/local/bin/tools-worker \
   /usr/local/bin/tools-build-id /usr/local/bin/tools-build-info.json; do
@@ -99,6 +102,9 @@ for path in /app /usr/local/bin/bun /usr/local/bin/tools /usr/local/bin/tools-wo
   fi
 done
 for path in \
+  /app/apps/web/dist/index.html \
+  /app/apps/web/dist/sw.js \
+  /app/packages/client-protocol/src/index.ts \
   /app/build/build-info.json \
   /usr/local/bin/tools-build-id \
   /usr/local/bin/tools-build-info.json \

@@ -8,6 +8,7 @@ import {
 } from "@stanley2058/lilac-client-protocol";
 import { Result, TaggedError } from "better-result";
 import { z } from "zod";
+import { createNativeMetrics, type NativeMetrics } from "./metrics";
 import { captureError } from "../../shared/error-capture";
 import type { NativeAuthenticator, NativeAuthError, NativeLogin, NativePrincipal } from "./auth";
 import {
@@ -19,10 +20,16 @@ import {
 
 export class NativeGatewayError extends TaggedError("NativeGatewayError")<{ message: string }> {}
 export type NativeGatewayOptions = {
+  metrics?: NativeMetrics;
   hostname: string;
   port: number;
   auth: NativeAuthenticator;
-  publicAuth: { provider: "local" | "clerk"; publishableKey?: string };
+  publicAuth: {
+    provider: "local" | "clerk";
+    publishableKey?: string;
+    issuer?: string;
+    oauthClientId?: string;
+  };
   login?: (request: Request, clientKey: string) => Promise<Result<NativeLogin, NativeAuthError>>;
   services: NativeRpcServices;
   getViewer: (userId: string) => Result<NativeUser, NativeServiceError>;
@@ -32,6 +39,7 @@ export type NativeGatewayOptions = {
 };
 type Peer = { send: (message: string | ArrayBufferLike | Uint8Array) => number };
 type SocketData = {
+  metrics: ReturnType<NativeMetrics["connection"]>;
   context: NativeRpcContext;
   peer?: Peer;
   expiry?: ReturnType<typeof setTimeout>;
@@ -225,6 +233,7 @@ async function staticResponse(request: Request, webRoot: string | undefined): Pr
 }
 
 export function createNativeGateway(options: NativeGatewayOptions) {
+  const metrics = options.metrics ?? createNativeMetrics();
   const handler = new RPCHandler(createNativeRouter(options.services, options.getViewer), {
     clientInterceptors: [
       onError((error) => observeNativeGatewayFailure(error, options.reportFatalError)),
@@ -288,7 +297,13 @@ export function createNativeGateway(options: NativeGatewayOptions) {
       };
       if (
         running.upgrade(original, {
-          data: { context, inflight: 0, budget: 120, refill: Date.now() },
+          data: {
+            context,
+            metrics: metrics.connection(),
+            inflight: 0,
+            budget: 120,
+            refill: Date.now(),
+          },
         })
       )
         return;
@@ -369,6 +384,7 @@ export function createNativeGateway(options: NativeGatewayOptions) {
     running: Bun.Server<SocketData>,
     original: Request,
   ): Promise<Response | undefined> {
+    const started = performance.now();
     const captured = await Result.tryPromise({
       try: () => routeRequest(request, running, original),
       catch: captureError,
@@ -377,7 +393,10 @@ export function createNativeGateway(options: NativeGatewayOptions) {
       options.reportFatalError(captured.error.cause);
       return privateJson({ error: "Native service is unavailable" }, 503);
     }
-    return captured.match({ ok: (response) => response, err: () => undefined });
+    const response = captured.match({ ok: (value) => value, err: () => undefined });
+    if (new URL(request.url).pathname === "/api/bootstrap")
+      metrics.bootstrap(performance.now() - started, response?.status ?? 503);
+    return response;
   }
 
   async function deliverSocketMessage(
@@ -393,9 +412,11 @@ export function createNativeGateway(options: NativeGatewayOptions) {
     data.budget = Math.min(120, data.budget + (time - data.refill) * 0.12) - 1;
     data.refill = time;
     if (typeof message !== "string" || data.budget < 0 || data.inflight >= 64 || !data.peer) {
+      data.metrics.pressure(data.inflight);
       socket.close(4408, "Connection limit exceeded");
       return;
     }
+    data.metrics.received(message, data.inflight);
     const valid = validateNativeFrame(message).match({ ok: () => true, err: () => false });
     if (!valid) {
       socket.close(4400, "Socket protocol failed");
@@ -436,6 +457,7 @@ export function createNativeGateway(options: NativeGatewayOptions) {
                 return;
               }
               sockets.add(socket);
+              socket.data.metrics.opened();
               socket.data.context.refreshed = () => scheduleExpiry(socket);
               socket.data.context.loggedOut = () => {
                 socket.data.ending = true;
@@ -460,6 +482,7 @@ export function createNativeGateway(options: NativeGatewayOptions) {
                     }
                   }
                   const sent = socket.send(message);
+                  socket.data.metrics.sent(message, sent, socket.getBufferedAmount());
                   if (socket.data.ending) {
                     socket.data.ending = false;
                     setImmediate(() => socket.close(4401, "Session ended"));
@@ -475,7 +498,8 @@ export function createNativeGateway(options: NativeGatewayOptions) {
               void operation.then(() => rpcOperations.delete(operation));
               return operation;
             },
-            close(socket) {
+            close(socket, code) {
+              socket.data.metrics.closed(code);
               sockets.delete(socket);
               clearTimeout(socket.data.expiry);
               if (socket.data.peer) handler.close(socket.data.peer);

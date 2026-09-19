@@ -181,8 +181,8 @@ describe("native Clerk authentication with real SDK and signed fixtures", () => 
             : Result.err(authFailure("forbidden", "User is not registered")),
       })
     ).unwrap();
-    const sign = (claims: Record<string, string | number> = {}, oauth = false) =>
-      new SignJWT({ sid: "sess_fixture", azp: origin, ...claims })
+    const sign = (claims: Record<string, string | number | undefined> = {}, oauth = false) =>
+      new SignJWT({ ...(oauth ? {} : { sid: "sess_fixture", azp: origin }), ...claims })
         .setProtectedHeader({ alg: "RS256", kid: "fixture", typ: oauth ? "at+jwt" : "JWT" })
         .setIssuer(typeof claims.iss === "string" ? claims.iss : issuer)
         .setSubject(typeof claims.sub === "string" ? claims.sub : "user_fixture")
@@ -237,6 +237,51 @@ describe("native Clerk authentication with real SDK and signed fixtures", () => 
     expect((await auth.authenticate(request(`${token.slice(0, -10)}aaaaaaaaaa`))).isErr()).toBe(
       true,
     );
+  });
+
+  test("session authorized party is required independently of OAuth client authority", async () => {
+    const { auth, sign } = await setup();
+    for (const azp of [undefined, "https://foreign.example"]) {
+      const token = await sign({ azp });
+      expect(
+        (await auth.authenticate(request(token))).match({
+          ok: () => "accepted",
+          err: (error) => error.code,
+        }),
+      ).toBe("forbidden");
+    }
+    const current = (
+      await auth.authenticate(
+        request(await sign({ client_id: "client_fixture", jti: "oat_first" }, true)),
+      )
+    ).unwrap();
+    const rotated = await auth.reauthenticate(
+      current,
+      request(await sign({ client_id: "client_fixture", jti: "oat_rotated" }, true)),
+    );
+    expect(rotated.unwrap().sessionId).toBe("oat_rotated");
+    expect(rotated.unwrap().userId).toBe(current.userId);
+    expect(
+      (
+        await auth.reauthenticate(
+          current,
+          request(await sign({ client_id: "wrong", jti: "oat_wrong" }, true)),
+        )
+      ).isErr(),
+    ).toBe(true);
+    expect(
+      (
+        await auth.reauthenticate(
+          current,
+          request(
+            await sign(
+              { client_id: "client_fixture", sub: "user_unknown", jti: "oat_other" },
+              true,
+            ),
+          ),
+        )
+      ).isErr(),
+    ).toBe(true);
   });
 
   test("preserves Clerk handshake instead of declaring logout", async () => {
