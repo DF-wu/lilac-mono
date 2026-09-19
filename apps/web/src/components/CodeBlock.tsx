@@ -1,7 +1,8 @@
-import { useState, type ReactNode } from "react";
+import { useContext, useState, type ReactNode } from "react";
 import { Check, Code, Copy, FileCode, FileJson, Terminal, WrapText } from "lucide-react";
 import { IconButton, attempt } from "./ui";
 import "./message-presentation.css";
+import { MarkdownWrapContext } from "./markdown-layout";
 
 export function CodeLanguageIcon({ language }: { language: string }) {
   if (/^(bash|sh|shell|zsh|powershell|console)$/iu.test(language)) return <Terminal />;
@@ -19,20 +20,23 @@ export function CodeBlock({
   language: string;
   children?: ReactNode;
 }) {
+  const forceWrap = useContext(MarkdownWrapContext);
   const [wrap, setWrap] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState<string>();
   return (
-    <div className="code-block" data-wrap={wrap}>
+    <div className="code-block" data-wrap={forceWrap || wrap}>
       <div className="code-toolbar">
         <span className="code-language" title={language}>
           <CodeLanguageIcon language={language} />
           <span>{language}</span>
         </span>
         <div className="code-actions">
-          <IconButton label="Wrap code" aria-pressed={wrap} onClick={() => setWrap(!wrap)}>
-            <WrapText />
-          </IconButton>
+          {!forceWrap ? (
+            <IconButton label="Wrap code" aria-pressed={wrap} onClick={() => setWrap(!wrap)}>
+              <WrapText />
+            </IconButton>
+          ) : null}
           <IconButton
             label={copied ? "Copied code" : "Copy code"}
             onClick={() => {

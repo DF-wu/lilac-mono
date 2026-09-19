@@ -1400,3 +1400,16 @@ progress {
   .agent-name-form { display:flex; align-items:flex-end; gap:var(--space-3); }
   .agent-name-form .field { flex:1; margin:0; min-width:0; }
 }
+
+.markdown[data-wrap="true"] {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.markdown[data-wrap="true"] pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.markdown[data-wrap="true"] table {
+  table-layout: fixed;
+}

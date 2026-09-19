@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { AttachmentPreviewBody } from "../src/components/ResourcePreview";
+import { MarkdownWrapContext } from "../src/components/markdown-layout";
 import { CodeBlock } from "../src/components/CodeBlock";
 import { faviconUrl } from "../src/components/LinkWithFavicon";
 import { initials } from "../src/components/ActorAvatar";
@@ -259,4 +260,17 @@ describe("message presentation", () => {
     expect(error).toContain('role="status"');
     expect(error).toContain("binary file");
   });
+});
+
+test("file preview code stays wrapped while chat code retains its wrap control", () => {
+  const wrapped = renderToStaticMarkup(
+    <MarkdownWrapContext value={true}>
+      <CodeBlock source="const longLine = 'content';" language="typescript" />
+    </MarkdownWrapContext>,
+  );
+  expect(wrapped).toContain('data-wrap="true"');
+  expect(wrapped).not.toContain('aria-label="Wrap code"');
+  expect(wrapped).toContain('aria-label="Copy code"');
+  const chat = renderToStaticMarkup(<CodeBlock source="code" language="text" />);
+  expect(chat).toContain('aria-label="Wrap code"');
 });

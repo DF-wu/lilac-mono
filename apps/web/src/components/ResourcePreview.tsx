@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode, type PointerEvent } from "react";
 import type { DisplayPart } from "@stanley2058/lilac-client-protocol";
 import {
   Check,
@@ -12,6 +12,7 @@ import {
   RotateCcw,
   ZoomIn,
   ZoomOut,
+  X,
 } from "lucide-react";
 import { copyPreviewImage } from "../image-clipboard";
 import { Markdown } from "./Markdown";
@@ -24,7 +25,8 @@ import {
   AttachmentTitle,
   AttachmentDescription,
 } from "./ui/attachment";
-import { IconButton, Modal } from "./ui";
+import { IconButton } from "./ui";
+import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
 import "./message-presentation.css";
 import "./resource-preview.css";
 
@@ -164,22 +166,62 @@ function PreviewDownload({ name, href }: { name: string; href: string }) {
   );
 }
 
+function PreviewFrame({
+  children,
+  toolbar,
+  note,
+  fill = false,
+}: {
+  children: ReactNode;
+  toolbar: ReactNode;
+  note?: ReactNode;
+  fill?: boolean;
+}) {
+  return (
+    <div className="attachment-preview-body" data-fill={fill}>
+      <div className="attachment-preview-stage">{children}</div>
+      <div className="attachment-preview-footer">
+        {note}
+        <div className="media-preview-toolbar">{toolbar}</div>
+      </div>
+    </div>
+  );
+}
+
+function PreviewStatus({ children }: { children: ReactNode }) {
+  return (
+    <div className="attachment-preview-empty" role="status">
+      {children}
+    </div>
+  );
+}
+
 function TextAttachmentPreview({
   name,
   href,
   text,
+  fill = false,
 }: {
   name: string;
   href: string;
   text?: TextPreviewState;
+  fill?: boolean;
 }) {
+  const download = <PreviewDownload name={name} href={href} />;
   if (text?.status === "error")
     return (
-      <p className="error-text" role="status">
-        {text.message}
-      </p>
+      <PreviewFrame fill={fill} toolbar={download}>
+        <PreviewStatus>
+          <p className="error-text">{text.message}</p>
+        </PreviewStatus>
+      </PreviewFrame>
     );
-  if (text?.status !== "ready") return <p role="status">Loading preview…</p>;
+  if (text?.status !== "ready")
+    return (
+      <PreviewFrame fill={fill} toolbar={download}>
+        <PreviewStatus>Loading preview…</PreviewStatus>
+      </PreviewFrame>
+    );
   const raw = (
     <pre
       className="attachment-text-preview"
@@ -190,46 +232,50 @@ function TextAttachmentPreview({
       {text.text}
     </pre>
   );
+  const note = text.truncated ? (
+    <p className="attachment-preview-note">
+      Preview limited to 64 KB.{" "}
+      <a href={href} download={name}>
+        Download full file
+      </a>
+    </p>
+  ) : null;
+  if (!isMarkdownAttachment(name))
+    return (
+      <PreviewFrame fill={fill} toolbar={download} note={note}>
+        {raw}
+      </PreviewFrame>
+    );
   return (
-    <>
-      {isMarkdownAttachment(name) ? (
-        <Tabs defaultValue="rendered" className="attachment-preview-tabs">
-          <div className="media-preview-toolbar">
-            <TabsList>
-              <TabsTrigger value="rendered">Rendered</TabsTrigger>
-              <TabsTrigger value="raw">Raw</TabsTrigger>
-            </TabsList>
-            <PreviewDownload name={name} href={href} />
-          </div>
-          <TabsContent value="rendered">
-            <div
-              className="attachment-rendered-preview"
-              tabIndex={0}
-              role="region"
-              aria-label={`${name} rendered contents`}
-            >
-              <Markdown text={text.text} />
-            </div>
-          </TabsContent>
-          <TabsContent value="raw">{raw}</TabsContent>
-        </Tabs>
-      ) : (
-        <>
-          <div className="media-preview-toolbar">
-            <PreviewDownload name={name} href={href} />
-          </div>
-          {raw}
-        </>
-      )}
-      {text.truncated ? (
-        <p className="attachment-preview-note">
-          Preview limited to 64 KB.{" "}
-          <a href={href} download={name}>
-            Download full file
-          </a>
-        </p>
-      ) : null}
-    </>
+    <Tabs
+      defaultValue="rendered"
+      className="attachment-preview-body attachment-preview-tabs"
+      data-fill={fill}
+    >
+      <TabsContent value="rendered" className="attachment-preview-stage">
+        <div
+          className="attachment-rendered-preview"
+          tabIndex={0}
+          role="region"
+          aria-label={`${name} rendered contents`}
+        >
+          <Markdown text={text.text} wrap />
+        </div>
+      </TabsContent>
+      <TabsContent value="raw" className="attachment-preview-stage">
+        {raw}
+      </TabsContent>
+      <div className="attachment-preview-footer">
+        {note}
+        <div className="media-preview-toolbar">
+          <TabsList>
+            <TabsTrigger value="rendered">Rendered</TabsTrigger>
+            <TabsTrigger value="raw">Raw</TabsTrigger>
+          </TabsList>
+          {download}
+        </div>
+      </div>
+    </Tabs>
   );
 }
 
@@ -238,11 +284,13 @@ export function AttachmentPreviewBody({
   href,
   kind,
   text,
+  fill = false,
 }: {
   name: string;
   href: string;
   kind: AttachmentKind;
   text?: TextPreviewState;
+  fill?: boolean;
 }) {
   const [zoom, setZoom] = useState(1);
   const [failed, setFailed] = useState(false);
@@ -250,6 +298,42 @@ export function AttachmentPreviewBody({
   const [copyState, setCopyState] = useState<"idle" | "copying" | "copied">("idle");
   const [copyError, setCopyError] = useState<string>();
   const viewport = useRef<HTMLDivElement>(null);
+  const pan = useRef<{ id: number; x: number; y: number; left: number; top: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
+  function startPan(event: PointerEvent<HTMLDivElement>) {
+    const element = event.currentTarget;
+    if (
+      pan.current ||
+      kind !== "image" ||
+      event.button !== 0 ||
+      (element.scrollWidth <= element.clientWidth && element.scrollHeight <= element.clientHeight)
+    )
+      return;
+    event.preventDefault();
+    pan.current = {
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      left: element.scrollLeft,
+      top: element.scrollTop,
+    };
+    element.setPointerCapture(event.pointerId);
+    setDragging(true);
+  }
+  function movePan(event: PointerEvent<HTMLDivElement>) {
+    const origin = pan.current;
+    if (!origin || origin.id !== event.pointerId) return;
+    event.preventDefault();
+    event.currentTarget.scrollLeft = origin.left + origin.x - event.clientX;
+    event.currentTarget.scrollTop = origin.top + origin.y - event.clientY;
+  }
+  function stopPan(event: PointerEvent<HTMLDivElement>) {
+    if (pan.current?.id !== event.pointerId) return;
+    pan.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId))
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    setDragging(false);
+  }
   const previewImage = useRef<HTMLImageElement>(null);
   useEffect(() => {
     const element = viewport.current;
@@ -277,99 +361,123 @@ export function AttachmentPreviewBody({
       },
     });
   }
-  if (kind === "text") return <TextAttachmentPreview name={name} href={href} text={text} />;
+  const download = <PreviewDownload name={name} href={href} />;
+  if (kind === "text")
+    return <TextAttachmentPreview name={name} href={href} text={text} fill={fill} />;
   if (failed)
     return (
-      <p className="error-text" role="status">
-        This file is unavailable.
-      </p>
+      <PreviewFrame fill={fill} toolbar={download}>
+        <PreviewStatus>
+          <p className="error-text">This file is unavailable.</p>
+        </PreviewStatus>
+      </PreviewFrame>
     );
   if (kind === "pdf")
     return (
-      <>
-        <div className="media-preview-toolbar">
-          <Button
-            variant="ghost"
-            size="icon"
-            nativeButton={false}
-            render={<a href={href} target="_blank" rel="noreferrer" />}
-            aria-label="Open PDF in new tab"
-            title="Open PDF in new tab"
-          >
-            <ExternalLink />
-          </Button>
-          <PreviewDownload name={name} href={href} />
-        </div>
+      <PreviewFrame
+        fill={fill}
+        toolbar={
+          <>
+            <Button
+              variant="ghost"
+              size="icon"
+              nativeButton={false}
+              render={<a href={href} target="_blank" rel="noreferrer" />}
+              aria-label="Open PDF in new tab"
+              title="Open PDF in new tab"
+            >
+              <ExternalLink />
+            </Button>
+            {download}
+          </>
+        }
+      >
         <object
           className="attachment-pdf-preview"
           data={href}
           type="application/pdf"
           aria-label={`${name} PDF preview`}
         >
-          <p>
+          <PreviewStatus>
             Your browser cannot display this PDF.{" "}
             <a href={href} download={name}>
               Download {name}
             </a>
-          </p>
+          </PreviewStatus>
         </object>
-      </>
+      </PreviewFrame>
     );
   if (kind === "audio")
     return (
-      <>
-        <div className="media-preview-toolbar">
-          <PreviewDownload name={name} href={href} />
+      <PreviewFrame fill={fill} toolbar={download}>
+        <div className="attachment-audio-preview">
+          <audio
+            src={href}
+            controls
+            autoPlay={false}
+            preload="metadata"
+            aria-label={name}
+            onError={() => setFailed(true)}
+          />
         </div>
-        <audio
-          src={href}
-          controls
-          autoPlay={false}
-          preload="metadata"
-          aria-label={name}
-          onError={() => setFailed(true)}
-        />
-      </>
+      </PreviewFrame>
     );
   return (
-    <>
-      <div className="media-preview-toolbar">
-        {kind === "image" ? (
-          <>
-            <IconButton label="Zoom out" disabled={zoom <= 0.25} onClick={() => changeZoom(-0.25)}>
-              <ZoomOut />
-            </IconButton>
-            <span aria-live="polite">{Math.round(zoom * 100)}%</span>
-            <IconButton label="Zoom in" disabled={zoom >= 4} onClick={() => changeZoom(0.25)}>
-              <ZoomIn />
-            </IconButton>
-            <IconButton label="Reset zoom" onClick={() => setZoom(1)}>
-              <RotateCcw />
-            </IconButton>
-            <IconButton
-              label={copyState === "copied" ? "Image copied" : "Copy image"}
-              disabled={!loaded || copyState === "copying"}
-              onClick={() => {
-                void copyImage();
-              }}
-            >
-              {copyState === "copied" ? <Check /> : <Copy />}
-            </IconButton>
-          </>
-        ) : null}
-        <PreviewDownload name={name} href={href} />
-      </div>
-      {copyError ? (
-        <p className="error-text" role="status">
-          {copyError}
-        </p>
-      ) : null}
+    <PreviewFrame
+      fill={fill}
+      note={
+        copyError ? (
+          <p className="error-text" role="status">
+            {copyError}
+          </p>
+        ) : null
+      }
+      toolbar={
+        <>
+          {kind === "image" ? (
+            <>
+              <IconButton
+                label="Zoom out"
+                disabled={zoom <= 0.25}
+                onClick={() => changeZoom(-0.25)}
+              >
+                <ZoomOut />
+              </IconButton>
+              <span aria-live="polite">{Math.round(zoom * 100)}%</span>
+              <IconButton label="Zoom in" disabled={zoom >= 4} onClick={() => changeZoom(0.25)}>
+                <ZoomIn />
+              </IconButton>
+              <IconButton label="Reset zoom" onClick={() => setZoom(1)}>
+                <RotateCcw />
+              </IconButton>
+              <IconButton
+                label={copyState === "copied" ? "Image copied" : "Copy image"}
+                disabled={!loaded || copyState === "copying"}
+                onClick={() => {
+                  void copyImage();
+                }}
+              >
+                {copyState === "copied" ? <Check /> : <Copy />}
+              </IconButton>
+            </>
+          ) : null}
+          {download}
+        </>
+      }
+    >
       <div
         ref={viewport}
         className="media-preview-viewport"
         tabIndex={0}
         role="region"
         aria-label={`${name} preview`}
+        data-pan-enabled={kind === "image" && zoom > 1}
+        data-dragging={dragging}
+        onPointerDown={startPan}
+        onPointerMove={movePan}
+        onPointerUp={stopPan}
+        onPointerCancel={stopPan}
+        onLostPointerCapture={stopPan}
       >
         <div
           className="media-preview-content"
@@ -380,6 +488,7 @@ export function AttachmentPreviewBody({
               ref={previewImage}
               src={href}
               alt={name}
+              draggable={false}
               onLoad={() => setLoaded(true)}
               onError={() => setFailed(true)}
             />
@@ -394,7 +503,7 @@ export function AttachmentPreviewBody({
           )}
         </div>
       </div>
-    </>
+    </PreviewFrame>
   );
 }
 
@@ -425,8 +534,23 @@ export function ResourcePreview({
     return () => controller.abort();
   }, [href, kind]);
   return (
-    <Modal title={name} onClose={onClose} wide>
-      <AttachmentPreviewBody key={href} name={name} href={href} kind={kind} text={text} />
-    </Modal>
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DialogContent className="resource-preview-dialog" showCloseButton={false}>
+        <header className="resource-preview-header">
+          <DialogTitle className="resource-preview-title" title={name}>
+            {name}
+          </DialogTitle>
+          <IconButton label="Close preview" className="resource-preview-close" onClick={onClose}>
+            <X />
+          </IconButton>
+        </header>
+        <AttachmentPreviewBody key={href} name={name} href={href} kind={kind} text={text} fill />
+      </DialogContent>
+    </Dialog>
   );
 }

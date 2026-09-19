@@ -56,6 +56,10 @@ describe("attachment viewer", () => {
     expect(html).toContain("Download image.png");
     expect(html).toContain('class="media-preview-viewport"');
     expect(html).toContain("Reset zoom");
+    expect(html).toContain('draggable="false"');
+    expect(html.indexOf('class="media-preview-viewport"')).toBeLessThan(
+      html.indexOf('class="media-preview-toolbar"'),
+    );
   });
 });
 
@@ -77,4 +81,27 @@ test("image attachments use a thumbnail without a filename footer or default act
   expect(html).not.toContain("attachment-file-row");
   expect(html).not.toContain("Download image.png");
   expect(html).not.toContain("1 KB");
+});
+
+test("full-window previews keep the download footer available during loading and errors", () => {
+  for (const text of [
+    { status: "loading" } as const,
+    { status: "error", message: "Text preview unavailable for this binary file." } as const,
+  ]) {
+    const html = renderToStaticMarkup(
+      <AttachmentPreviewBody
+        name="file.bin"
+        href="/api/resources/file"
+        kind="text"
+        text={text}
+        fill
+      />,
+    );
+    expect(html).toContain('data-fill="true"');
+    expect(html).toContain('role="status"');
+    expect(html).toContain('aria-label="Download file.bin"');
+    expect(html.indexOf('role="status"')).toBeLessThan(
+      html.indexOf('class="attachment-preview-footer"'),
+    );
+  }
 });

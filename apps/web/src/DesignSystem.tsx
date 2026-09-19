@@ -101,8 +101,14 @@ const swatches = [
 ] as const;
 const spacings = [1, 2, 3, 4, 5, 6, 7];
 const noop = () => {};
-const markdownAttachment =
-  "#### A quiet weekend\n\nStart with **coffee by the river**, then browse the bookstore.\n\n- Bring a book to swap\n- Leave the afternoon free";
+const markdownAttachment = [
+  "#### A quiet weekend",
+  "Start with **coffee by the river**, then browse the bookstore. Leave enough time to explore the neighborhood and find somewhere to read before heading home.",
+  "- Bring a book to swap\n- Leave the afternoon free",
+  "https://example.com/" + "a-long-path-without-breaks".repeat(8),
+  "```text\n" + "A long code line should wrap within the preview. ".repeat(8) + "\n```",
+  "| Plan | Details |\n| --- | --- |\n| Morning | " + "CoffeeAndBooks".repeat(12) + " |",
+].join("\n\n");
 const identities = {
   viewerId: "alex",
   agent: { displayName: "Lilac", avatarUrl: logo },

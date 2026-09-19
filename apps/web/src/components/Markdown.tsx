@@ -1,5 +1,7 @@
 import { Component, lazy, memo, Suspense, type ReactNode } from "react";
 
+import { MarkdownWrapContext } from "./markdown-layout";
+
 const MarkdownContent = lazy(() => import("./MarkdownContent"));
 
 export class RichRenderBoundary extends Component<
@@ -15,15 +17,23 @@ export class RichRenderBoundary extends Component<
   }
 }
 
-export const Markdown = memo(function Markdown({ text }: { text: string }) {
+export const Markdown = memo(function Markdown({
+  text,
+  wrap = false,
+}: {
+  text: string;
+  wrap?: boolean;
+}) {
   const fallback = <div className="markdown-source">{text}</div>;
   return (
-    <div className="markdown">
-      <RichRenderBoundary key={text} fallback={fallback}>
-        <Suspense fallback={fallback}>
-          <MarkdownContent text={text} />
-        </Suspense>
-      </RichRenderBoundary>
+    <div className="markdown" data-wrap={wrap}>
+      <MarkdownWrapContext value={wrap}>
+        <RichRenderBoundary key={text} fallback={fallback}>
+          <Suspense fallback={fallback}>
+            <MarkdownContent text={text} />
+          </Suspense>
+        </RichRenderBoundary>
+      </MarkdownWrapContext>
     </div>
   );
 });
