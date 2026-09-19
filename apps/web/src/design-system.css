@@ -48,6 +48,11 @@
   .ds-thread-list { display: flex; flex-direction: column; gap: var(--space-5); padding: var(--space-3); background: var(--surface); border-radius: var(--radius-lg); }
   .ds-feedback { min-height: var(--space-5); font-size: var(--text-sm); color: var(--muted-foreground); }
   .ds-conversation { display: flex; flex-direction: column; gap: var(--space-5); padding-block: var(--space-3); }
+  .ds-agent-demo { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+  .ds-agent-controls { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: var(--space-3); }
+  .ds-agent-caption .ds-state-label { display: block; margin-bottom: var(--space-1); }
+  .ds-agent-preview { height: 36rem; max-height: 70dvh; overflow: auto; padding: var(--space-4); border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--background); }
+  .ds-agent-preview .turn { padding: 0; }
   .ds-composer { margin-block: var(--space-4); }
   .ds-source { padding: var(--space-4); background: var(--surface); border-radius: var(--radius-md); white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-sm); }
   .ds-field { display: flex; flex-direction: column; gap: var(--space-2); font-size: var(--text-sm); }

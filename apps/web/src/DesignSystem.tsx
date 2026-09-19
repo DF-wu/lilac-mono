@@ -66,6 +66,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { Markdown } from "./components/Markdown";
 import ComposerEditor from "./components/composer-editor";
 import { Message } from "./components/Timeline";
+import { AgentWorkDemo } from "./components/AgentWorkDemo";
 import { SidebarSearch } from "./components/SidebarSearch";
 import { ThreadCard } from "./components/ThreadSelect";
 import "./design-system.css";
@@ -74,6 +75,7 @@ const sections = [
   ["foundations", "Foundations"],
   ["threads", "Threads"],
   ["messages", "Messages"],
+  ["agent-work", "Agent work"],
   ["composer", "Composer"],
   ["attachments", "Attachments"],
   ["content", "Rich content"],
@@ -1023,6 +1025,13 @@ export default function DesignSystem() {
               <Foundations />
               <Threads />
               <Messages />
+              <Section
+                id="agent-work"
+                title="Agent work"
+                description="Choose a stage to inspect, or play through the examples. Expand work summaries and tool details. These use the conversation renderer with local sample data."
+              >
+                <AgentWorkDemo />
+              </Section>
               <ComposerSpecimen />
               <Attachments />
               <Section id="content" title="Rich content">

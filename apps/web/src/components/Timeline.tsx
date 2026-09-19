@@ -346,7 +346,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
 });
 
 const SlotRow = memo(function SlotRow(props: { store: NativeThreadStore; slotId: string }) {
-  const { client, threadId } = useContext(TimelineContext)!;
+  const { client, threadId, onRewind } = useContext(TimelineContext)!;
   const slot = useSlot(props.store, props.slotId);
   useEffect(() => {
     if (slot?.kind === "deferred") void client.hydrate(threadId, props.slotId);
@@ -367,11 +367,21 @@ const SlotRow = memo(function SlotRow(props: { store: NativeThreadStore; slotId:
         )}
       </div>
     );
-  return <Turn slot={slot} />;
+  return (
+    <Turn
+      slot={slot}
+      onRewind={onRewind}
+      onLoadMore={() => void client.loadTurnPage(threadId, slot.slotId)}
+    />
+  );
 });
 
-const Turn = memo(function Turn(props: { slot: ReadyTurnSlot }) {
-  const { client, threadId, onRewind } = useContext(TimelineContext)!;
+export const Turn = memo(function Turn(props: {
+  slot: ReadyTurnSlot;
+  onRewind: (turnId: string) => void;
+  onLoadMore: () => void;
+}) {
+  const { onRewind, onLoadMore } = props;
   const { canEdit } = useMessageServices();
   const { slot } = props;
   const [expanded, setExpanded] = useState(false);
@@ -452,12 +462,7 @@ const Turn = memo(function Turn(props: { slot: ReadyTurnSlot }) {
         </Marker>
       ) : null}
       {slot.partsCursor ? (
-        <Button
-          variant="ghost"
-          className="text-button"
-          type="button"
-          onClick={() => void client.loadTurnPage(threadId, slot.slotId)}
-        >
+        <Button variant="ghost" className="text-button" type="button" onClick={onLoadMore}>
           Load more of this turn
         </Button>
       ) : null}
