@@ -660,6 +660,7 @@ small {
   resize: vertical;
 }
 .composer-toolbar {
+  padding-left: var(--space-2);
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-1);
@@ -1063,10 +1064,9 @@ progress {
 }
 .markdown blockquote {
   margin: var(--space-3) 0;
-  padding: var(--space-3) var(--space-4);
-  background: var(--surface);
+  padding-inline-start: var(--space-4);
+  border-inline-start: var(--space-1) solid var(--muted-foreground);
   color: var(--muted-foreground);
-  border-radius: var(--radius-sm);
 }
 .markdown code {
   font-family: ui-monospace, SFMono-Regular, monospace;

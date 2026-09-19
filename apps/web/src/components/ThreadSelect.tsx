@@ -57,12 +57,12 @@ export function ThreadCard({
         onClick={onSelect}
         aria-label={`${title || "Untitled"}, ${states[state].label}`}
       >
-        <span className="thread-state-icon" aria-label={states[state].label}>
-          <StatusIcon />
-        </span>
         <span className="thread-card-copy">
           <span className="thread-card-top">
             <span className="thread-starter">
+              <span className="thread-state-icon" aria-label={states[state].label}>
+                <StatusIcon />
+              </span>
               <ActorAvatar displayName={starterName} />
               <span>{starterName}</span>
             </span>
