@@ -1,6 +1,8 @@
 import { expect, it } from "bun:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { KEYS, NodeApi } from "platejs";
-import {
+import ComposerEditor, {
   createComposerEditor,
   composerMarkdown,
   composerPrefix,
@@ -70,4 +72,32 @@ it("keeps an empty or cleared editor empty on the wire", () => {
   editor.tf.select({ anchor: editor.api.start([])!, focus: editor.api.end([])! });
   editor.tf.delete();
   expect(composerMarkdown(editor)).toBe("");
+});
+
+it("keeps multiline editor semantics while announcing completion options", () => {
+  const noop = () => {};
+  const render = (expanded: boolean) =>
+    renderToStaticMarkup(
+      createElement(ComposerEditor, {
+        text: "$review",
+        disabled: false,
+        placeholder: "Message",
+        onText: noop,
+        onPlainText: noop,
+        onPrefix: noop,
+        onKeyDown: noop,
+        onPaste: noop,
+        expanded,
+        activeDescendant: expanded ? "completion-0" : undefined,
+      }),
+    );
+  const expanded = render(true);
+  expect(expanded).toContain('role="textbox" aria-multiline="true"');
+  expect(expanded).toContain('aria-autocomplete="list"');
+  expect(expanded).toContain('aria-controls="composer-completions"');
+  expect(expanded).toContain('aria-activedescendant="completion-0"');
+  expect(expanded).not.toContain('aria-expanded="true"');
+  const closed = render(false);
+  expect(closed).not.toContain('aria-controls="composer-completions"');
+  expect(closed).not.toContain('aria-activedescendant="completion-0"');
 });

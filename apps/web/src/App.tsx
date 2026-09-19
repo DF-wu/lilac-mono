@@ -519,6 +519,19 @@ export function App(props: AppProps) {
   const draft = selectedId
     ? (drafts.current.get(selectedId) ?? { text: "", skillIds: [], attachments: [] })
     : { text: "", skillIds: [], attachments: [] };
+  const notices = (
+    <>
+      {connection !== "online" ? (
+        <div className="connection-notice" role="status">
+          <WifiOff />
+          {connection === "connecting"
+            ? "Connecting…"
+            : "Offline. Cached conversations remain available."}
+        </div>
+      ) : null}
+      <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+    </>
+  );
   return (
     <Tooltip.Provider delay={350}>
       <div className={`app-shell ${sidebar ? "" : "sidebar-hidden"}`}>
@@ -771,15 +784,7 @@ export function App(props: AppProps) {
           ) : null}
           <ResizablePanel id="chat" minSize="40%" className="chat-panel">
             <main className="main-panel">
-              {connection !== "online" ? (
-                <div className="connection-notice" role="status">
-                  <WifiOff />
-                  {connection === "connecting"
-                    ? "Connecting…"
-                    : "Offline. Cached conversations remain available."}
-                </div>
-              ) : null}
-              <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+              {!selected || external ? notices : null}
               {external && owner ? (
                 <External
                   client={client}
@@ -833,6 +838,7 @@ export function App(props: AppProps) {
                       </DropdownMenu>
                     ) : null}
                   </header>
+                  {notices}
                   <Chat
                     key={selected.id}
                     {...props}

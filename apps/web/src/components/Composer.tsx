@@ -48,7 +48,6 @@ export function Composer(props: ComposerProps) {
   const fileInput = useRef<HTMLInputElement>(null);
   const insertingCompletion = useRef(false);
   const [mode, setMode] = useState<"steer" | "followup">("steer");
-  const [modelId, setModelId] = useState<string>();
   const commandId = props.commandId;
   const setCommandId = props.onCommand;
   const [error, setError] = useState<string>();
@@ -85,7 +84,7 @@ export function Composer(props: ComposerProps) {
   const unambiguous = matching.length === 1 ? matching[0] : undefined;
   const command = commandId ? matching.find((entry) => entry.id === commandId) : unambiguous;
   const custom = command?.kind === "custom" ? command : undefined;
-  const delivery = inputDeliveryOptions(active, mode, modelId ?? props.modelId, !!custom);
+  const delivery = inputDeliveryOptions(active, mode, props.modelId, !!custom);
 
   function choose(item: Completion) {
     insertingCompletion.current = true;
@@ -337,21 +336,26 @@ export function Composer(props: ComposerProps) {
         <footer className="composer-toolbar">
           <Select
             items={catalog?.models.map((model) => ({ value: model.id, label: model.label }))}
-            value={modelId ?? props.modelId ?? catalog?.models[0]?.id ?? ""}
+            value={props.modelId ?? catalog?.models[0]?.id ?? ""}
             disabled={disabled || delivery.mode === "steer"}
             onValueChange={(value) => {
               if (!value) return;
-              setModelId(value);
               props.onModelChange(value);
             }}
           >
-            <SelectTrigger id="composer-model" aria-label="Response model">
-              <SelectValue>
-                {
-                  catalog?.models.find(
-                    (entry) => entry.id === (modelId ?? props.modelId ?? catalog.models[0]?.id),
-                  )?.label
-                }
+            <SelectTrigger
+              id="composer-model"
+              aria-label="Response model"
+              className="composer-model min-w-0 max-w-full"
+            >
+              <SelectValue className="min-w-0">
+                <span className="truncate">
+                  {
+                    catalog?.models.find(
+                      (entry) => entry.id === (props.modelId ?? catalog.models[0]?.id),
+                    )?.label
+                  }
+                </span>
               </SelectValue>
             </SelectTrigger>
             <SelectContent>

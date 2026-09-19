@@ -300,7 +300,10 @@ export default function ComposerEditor(props: ComposerEditorProps) {
         <IconButton
           label="Code block"
           disabled={props.disabled}
-          onClick={() => editor.getTransforms(CodeBlockPlugin).code_block.toggle()}
+          onClick={() => {
+            editor.getTransforms(CodeBlockPlugin).code_block.toggle();
+            editor.tf.focus();
+          }}
         >
           <SquareCode />
         </IconButton>
@@ -308,10 +311,10 @@ export default function ComposerEditor(props: ComposerEditorProps) {
       <PlateContent
         className="composer-editor"
         aria-label="Message"
-        role="combobox"
+        role="textbox"
+        aria-multiline="true"
         aria-autocomplete="list"
         aria-haspopup="listbox"
-        aria-expanded={props.expanded}
         aria-controls={props.expanded ? "composer-completions" : undefined}
         aria-activedescendant={props.activeDescendant}
         placeholder={props.placeholder}

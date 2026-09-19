@@ -102,9 +102,15 @@ export function Chat(props: ChatProps) {
   const active = !!thread.activeRunId;
   const previousActive = useRef(active);
   const [queue, setQueue] = useState<QueueEntry[]>([]);
+  const queueRequest = useRef(0);
+  const canEdit = useRef(thread.capabilities.edit);
+  canEdit.current = thread.capabilities.edit;
   const [error, setError] = useState<string>();
   const [rewindTarget, setRewindTarget] = useState<string>();
   const [rewinding, setRewinding] = useState(false);
+  useEffect(() => {
+    if (!thread.capabilities.edit) setRewindTarget(undefined);
+  }, [thread.capabilities.edit]);
   const subscribe = useCallback(
     (listener: () => void) => pool.subscribe(thread.id, listener),
     [pool, thread.id],
@@ -135,16 +141,29 @@ export function Chat(props: ChatProps) {
   );
   const attachments = uploads.filter((attachment) => draft.attachments.includes(attachment.key));
   const refreshQueue = useCallback(async () => {
+    const request = ++queueRequest.current;
     const rpc = client.rpc;
-    if (!rpc || !thread.capabilities.edit) return;
-    const result = await attempt(() => rpc.runs.queue({ threadId: thread.id }), setError);
-    if (result) setQueue(result.items);
+    if (!rpc || !canEdit.current) {
+      setQueue([]);
+      return;
+    }
+    const result = await attempt(
+      () => rpc.runs.queue({ threadId: thread.id }),
+      (message) => {
+        if (request === queueRequest.current && canEdit.current) setError(message);
+      },
+    );
+    if (result && request === queueRequest.current && canEdit.current) setQueue(result.items);
   }, [client, thread.id, thread.capabilities.edit]);
   useEffect(() => {
     void refreshQueue();
-    return client.subscribe((event) => {
+    const unsubscribe = client.subscribe((event) => {
       if (event.kind === "input" && event.threadId === thread.id) void refreshQueue();
     });
+    return () => {
+      queueRequest.current++;
+      unsubscribe();
+    };
   }, [client, thread.id, refreshQueue]);
   useEffect(() => {
     const changed = previousActive.current !== active;
@@ -170,12 +189,20 @@ export function Chat(props: ChatProps) {
     );
   };
   async function deliver(entry: PendingInput, retryFailed = false) {
+    if (!canEdit.current) return;
     const ids = await resolveAttachmentIds(
       pool,
       thread.id,
       entry.submission.attachments,
       retryFailed,
     );
+    if (!canEdit.current) {
+      setPending(entry.commandId, {
+        state: "rejected",
+        error: "You no longer have permission to send to this conversation.",
+      });
+      return;
+    }
     if (ids.some((id) => !id)) {
       setPending(entry.commandId, {
         state: "rejected",
@@ -252,7 +279,7 @@ export function Chat(props: ChatProps) {
   async function rewind() {
     const rpc = client.rpc,
       checkpoint = store.checkpoint;
-    if (!rpc || !checkpoint || !rewindTarget || rewinding) return;
+    if (!canEdit.current || !rpc || !checkpoint || !rewindTarget || rewinding) return;
     setRewinding(true);
     const reply = await attempt(
       () =>
@@ -266,7 +293,7 @@ export function Chat(props: ChatProps) {
       setError,
     );
     setRewinding(false);
-    if (!reply) return;
+    if (!reply || !canEdit.current) return;
     const current = draftRef.current;
     commitDraft({
       text: reply.text,
@@ -333,7 +360,7 @@ export function Chat(props: ChatProps) {
               <div className="pending-input" key={entry.commandId}>
                 <span>{entry.text}</span>
                 <small>{entry.error ?? "Sending…"}</small>
-                {entry.state !== "preparing" ? (
+                {thread.capabilities.edit && entry.state !== "preparing" ? (
                   <Button
                     type="button"
                     onClick={() =>
@@ -360,7 +387,7 @@ export function Chat(props: ChatProps) {
             )}
           />
         ) : null}
-        {queue.length ? (
+        {thread.capabilities.edit && queue.length ? (
           <div className="queue">
             <VirtualList
               items={queue}
@@ -464,7 +491,7 @@ export function Chat(props: ChatProps) {
           <div className="read-only">Read-only</div>
         )}
       </div>
-      {rewindTarget ? (
+      {thread.capabilities.edit && rewindTarget ? (
         <Modal title="Rewind this conversation?" onClose={() => setRewindTarget(undefined)}>
           <p>
             The selected turn and everything after it will leave the conversation. Its text returns

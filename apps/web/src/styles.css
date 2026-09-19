@@ -661,19 +661,18 @@ small {
 }
 .composer-toolbar {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-1);
   align-items: center;
   padding-top: var(--space-2);
 }
-.composer-toolbar select {
-  background: transparent;
-  max-width: 15rem;
-  font-size: var(--text-sm);
-  padding: var(--space-1);
-  color: var(--muted-foreground);
+.composer-model {
+  flex: 0 1 auto;
+  max-width: min(100%, var(--sidebar-width));
 }
 .queue-mode {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   color: var(--muted-foreground);
 }
@@ -733,6 +732,10 @@ small {
 .skill-chips svg {
   width: var(--text-xs);
   height: var(--text-xs);
+}
+.attachment-list {
+  max-height: min(25dvh, calc(var(--space-7) * 4));
+  overflow-y: auto;
 }
 .attachment {
   display: flex;
@@ -1191,9 +1194,6 @@ progress {
   }
   .chat-bottom {
     padding: var(--space-2) var(--space-3) var(--space-3);
-  }
-  .composer-toolbar select {
-    max-width: 10rem;
   }
   .queue-mode svg {
     display: none;
