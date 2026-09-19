@@ -1417,3 +1417,10 @@ progress {
 .virtual-list.scroll-fade {
   mask-image: linear-gradient(to bottom, black calc(100% - var(--space-6)), transparent);
 }
+
+.chat-scroll { position: relative; overflow-y: auto; overflow-x: hidden; }
+.chat-sticky-header { position: sticky; top: 0; z-index: 3; background: color-mix(in srgb, var(--background) 75%, transparent); backdrop-filter: blur(16px); }
+.chat-sticky-footer { position: sticky; bottom: 0; z-index: 3; }
+.chat-sticky-footer .composer, .draft-workspace .composer { background: color-mix(in srgb, var(--surface) 75%, transparent); backdrop-filter: blur(16px); }
+.draft-workspace > .chat-bottom { position: sticky; bottom: 0; z-index: 3; }
+.composer-wrap, .composer { min-width: 0; max-width: 100%; }

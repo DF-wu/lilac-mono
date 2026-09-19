@@ -1,6 +1,8 @@
 import {
   memo,
   useContext,
+  useId,
+  type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -52,6 +54,8 @@ export function useSlotIds(store: NativeThreadStore) {
 }
 
 export type TimelineProps = {
+  header?: ReactNode;
+  footer?: ReactNode;
   client: NativeClient;
   threadId: string;
   canEdit: boolean;
@@ -76,6 +80,24 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   const store = props.client.thread(props.threadId);
   const ids = useSlotIds(store);
   const parent = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLDivElement>(null);
+  const footerRef = useRef<HTMLDivElement>(null);
+  const [insets, setInsets] = useState({ top: 0, bottom: 0 });
+  useLayoutEffect(() => {
+    const measure = () => {
+      const top = headerRef.current?.offsetHeight ?? 0;
+      const bottom = footerRef.current?.offsetHeight ?? 0;
+      setInsets((current) =>
+        current.top === top && current.bottom === bottom ? current : { top, bottom },
+      );
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (headerRef.current) observer.observe(headerRef.current);
+    if (footerRef.current) observer.observe(footerRef.current);
+    return () => observer.disconnect();
+  }, []);
   const atTail = useRef(!props.positions.has(props.threadId));
   const userScroll = useRef(false);
   const touchY = useRef<number | undefined>(undefined);
@@ -84,6 +106,9 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   const getItemKey = useCallback((index: number) => ids[index]!, [ids]);
   const virtual = useVirtualizer({
     count: ids.length,
+    scrollMargin: insets.top,
+    scrollPaddingStart: insets.top,
+    scrollPaddingEnd: insets.bottom,
     getScrollElement: () => parent.current,
     estimateSize: () => 240,
     getItemKey,
@@ -96,11 +121,17 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
         const offset = parent.current.scrollTop;
         const anchor = virtual
           .getVirtualItems()
-          .find((row) => row.end >= offset && store.get(ids[row.index] ?? "")?.kind === "ready");
+          .find(
+            (row) =>
+              row.end >= offset + insets.top && store.get(ids[row.index] ?? "")?.kind === "ready",
+          );
         if (anchor)
-          pendingAnchor.current = { id: ids[anchor.index]!, delta: offset - anchor.start };
+          pendingAnchor.current = {
+            id: ids[anchor.index]!,
+            delta: offset - anchor.start + insets.top,
+          };
       }),
-    [store, ids, virtual],
+    [store, ids, virtual, insets.top],
   );
   useLayoutEffect(() => {
     const anchor = pendingAnchor.current;
@@ -112,7 +143,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     if (offset) virtual.scrollToOffset(offset[0] + anchor.delta);
   }, [ids, virtual]);
   useEffect(() => {
-    const canvas = parent.current?.firstElementChild;
+    const canvas = canvasRef.current;
     if (!canvas) return;
     let scheduled = 0;
     const observer = new ResizeObserver(() => {
@@ -123,6 +154,8 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       });
     });
     observer.observe(canvas);
+    if (parent.current) observer.observe(parent.current);
+    if (footerRef.current) observer.observe(footerRef.current);
     return () => {
       observer.disconnect();
       cancelAnimationFrame(scheduled);
@@ -145,10 +178,10 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     const visible =
       !!viewport &&
       !!latest &&
-      latest.end > viewport.scrollTop &&
-      latest.start < viewport.scrollTop + viewport.clientHeight;
+      latest.end > viewport.scrollTop + insets.top &&
+      latest.start < viewport.scrollTop + viewport.clientHeight - insets.bottom;
     props.onLatestVisibleChange?.(visible);
-  }, [rows, ids.length, props.onLatestVisibleChange]);
+  }, [rows, ids.length, insets, props.onLatestVisibleChange]);
   const rememberScroll = () => {
     const element = parent.current;
     if (!element) return;
@@ -160,17 +193,32 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   };
   return (
     <div
-      className="timeline"
+      className="timeline chat-scroll"
       ref={parent}
       onScroll={rememberScroll}
       onClickCapture={(event) => {
         if (
           event.target instanceof Element &&
-          event.target.closest("[data-slot=collapsible-trigger]")
+          event.target.closest("[data-slot=collapsible-trigger], .message-expand")
+        )
+          atTail.current = false;
+      }}
+      onFocusCapture={(event) => {
+        if (
+          event.target instanceof Element &&
+          event.target.closest('.message-card-preview[data-collapsed="true"]')
         )
           atTail.current = false;
       }}
       onWheel={(event) => {
+        const editor =
+          event.target instanceof Element ? event.target.closest(".composer-editor") : null;
+        if (
+          editor &&
+          ((event.deltaY < 0 && editor.scrollTop > 0) ||
+            (event.deltaY > 0 && editor.scrollTop + editor.clientHeight < editor.scrollHeight))
+        )
+          return;
         userScroll.current = true;
         if (event.deltaY < 0) atTail.current = false;
       }}
@@ -185,6 +233,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
         touchY.current = next;
       }}
       onKeyDown={(event) => {
+        if (event.target instanceof Element && event.target.closest(".chat-sticky-footer")) return;
         if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key))
           userScroll.current = true;
         if (["ArrowUp", "PageUp", "Home"].includes(event.key)) atTail.current = false;
@@ -199,20 +248,37 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       aria-label="Conversation"
       tabIndex={0}
     >
-      <div className="virtual-canvas timeline-canvas" style={{ height: virtual.getTotalSize() }}>
+      {props.header ? (
+        <div ref={headerRef} className="chat-sticky-header">
+          {props.header}
+        </div>
+      ) : null}
+      <div
+        ref={canvasRef}
+        className="virtual-canvas timeline-canvas"
+        style={{
+          height: virtual.getTotalSize(),
+          minHeight: `calc(100% - ${insets.top + insets.bottom}px)`,
+        }}
+      >
         {rows.map((row) => (
           <div
             key={row.key}
             data-index={row.index}
             ref={virtual.measureElement}
             className="virtual-row"
-            style={{ transform: `translateY(${row.start}px)` }}
+            style={{ transform: `translateY(${row.start - insets.top}px)` }}
           >
             <SlotRow {...props} slotId={ids[row.index]!} store={store} />
           </div>
         ))}
+        {ids.length === 0 ? <div className="empty-chat">Start a conversation.</div> : null}
       </div>
-      {ids.length === 0 ? <div className="empty-chat">Start a conversation.</div> : null}
+      {props.footer ? (
+        <div ref={footerRef} className="chat-sticky-footer">
+          {props.footer}
+        </div>
+      ) : null}
     </div>
   );
 });
@@ -251,7 +317,6 @@ export const Turn = memo(function Turn(
 ) {
   const { slot } = props;
   const [expanded, setExpanded] = useState(false);
-  const [copyError, setCopyError] = useState<string>();
   const firstUser = slot.messages.find(
     (message) => message.role === "user" && message.metadata?.inputMode !== "steer",
   );
@@ -277,34 +342,30 @@ export const Turn = memo(function Turn(
     <article className="turn" data-turn-id={slot.turnId}>
       {firstUser ? (
         <div className="user-turn">
-          <Message {...props} message={firstUser} />
-          <div className="message-controls">
-            {firstUser.metadata?.createdAt ? (
-              <time dateTime={new Date(firstUser.metadata.createdAt).toISOString()}>
-                {new Date(firstUser.metadata.createdAt).toLocaleTimeString([], {
-                  hour: "numeric",
-                  minute: "2-digit",
-                })}
-              </time>
-            ) : null}
-            <IconButton
-              label="Copy message"
-              onClick={() =>
-                void attempt(
-                  () => navigator.clipboard.writeText(messageText(firstUser)),
-                  () => setCopyError("Copy unavailable"),
-                )
-              }
-            >
-              <Copy />
-            </IconButton>
-            {copyError ? <span role="status">{copyError}</span> : null}
-            {props.canEdit ? (
-              <IconButton label="Rewind to this turn" onClick={() => props.onRewind(slot.turnId)}>
-                <RotateCcw />
-              </IconButton>
-            ) : null}
-          </div>
+          <Message
+            {...props}
+            message={firstUser}
+            controls={
+              <>
+                {firstUser.metadata?.createdAt ? (
+                  <time dateTime={new Date(firstUser.metadata.createdAt).toISOString()}>
+                    {new Date(firstUser.metadata.createdAt).toLocaleTimeString([], {
+                      hour: "numeric",
+                      minute: "2-digit",
+                    })}
+                  </time>
+                ) : null}
+                {props.canEdit ? (
+                  <IconButton
+                    label="Rewind to this turn"
+                    onClick={() => props.onRewind(slot.turnId)}
+                  >
+                    <RotateCcw />
+                  </IconButton>
+                ) : null}
+              </>
+            }
+          />
         </div>
       ) : null}
       {settled && intermediate.length ? (
@@ -390,6 +451,7 @@ type MessageProps = Pick<
   "canEdit" | "resourceUrl" | "upload" | "onAction" | "onReaction"
 > & {
   message: DisplayMessage;
+  controls?: ReactNode;
 };
 type Group =
   | { kind: "text"; text: string }
@@ -457,46 +519,88 @@ function groupMessageCards(groups: readonly Group[]): CardGroup[] {
 function MessageCard({
   content,
   self,
+  collapsible,
   resourceUrl,
   canEdit,
   upload,
 }: Pick<MessageProps, "resourceUrl" | "canEdit" | "upload"> & {
   content: MessageCardGroup;
   self: boolean;
+  collapsible: boolean;
 }) {
+  const contentRef = useRef<HTMLDivElement>(null);
+  const previewId = useId();
+  const [expanded, setExpanded] = useState(false);
+  const [long, setLong] = useState(false);
+  useLayoutEffect(() => {
+    const element = contentRef.current;
+    if (!collapsible || !element) return;
+    const measure = () =>
+      setLong(
+        element.getBoundingClientRect().height >
+          24 * parseFloat(getComputedStyle(document.documentElement).fontSize),
+      );
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [collapsible]);
+  const collapsed = collapsible && long && !expanded;
   const images = content.attachments.filter((part) => part.data.mediaType.startsWith("image/"));
   const files = content.attachments.filter((part) => !part.data.mediaType.startsWith("image/"));
   return (
     <Bubble variant={self ? "tinted" : "muted"} className="message-bubble">
       <BubbleContent>
-        {images.length > 0 ? (
-          <div className="message-attachments message-image-attachments">
-            {images.map((part) => (
-              <ResourceAttachment
-                key={part.id}
-                part={part}
-                resourceUrl={resourceUrl}
-                canEdit={canEdit}
-                upload={upload}
-              />
+        <div
+          id={previewId}
+          className="message-card-preview"
+          data-collapsed={collapsed}
+          onFocusCapture={() => {
+            if (collapsed) setExpanded(true);
+          }}
+        >
+          <div ref={contentRef} className="message-card-body">
+            {images.length > 0 ? (
+              <div className="message-attachments message-image-attachments">
+                {images.map((part) => (
+                  <ResourceAttachment
+                    key={part.id}
+                    part={part}
+                    resourceUrl={resourceUrl}
+                    canEdit={canEdit}
+                    upload={upload}
+                  />
+                ))}
+              </div>
+            ) : null}
+            {content.texts.map((text, index) => (
+              <Markdown key={index} text={text} />
             ))}
+            {files.length > 0 ? (
+              <div className="message-attachments">
+                {files.map((part) => (
+                  <ResourceAttachment
+                    key={part.id}
+                    part={part}
+                    resourceUrl={resourceUrl}
+                    canEdit={canEdit}
+                    upload={upload}
+                  />
+                ))}
+              </div>
+            ) : null}
           </div>
-        ) : null}
-        {content.texts.map((text, index) => (
-          <Markdown key={index} text={text} />
-        ))}
-        {files.length > 0 ? (
-          <div className="message-attachments">
-            {files.map((part) => (
-              <ResourceAttachment
-                key={part.id}
-                part={part}
-                resourceUrl={resourceUrl}
-                canEdit={canEdit}
-                upload={upload}
-              />
-            ))}
-          </div>
+        </div>
+        {collapsible && long ? (
+          <Button
+            variant="ghost"
+            className="message-expand"
+            aria-expanded={expanded}
+            aria-controls={previewId}
+            onClick={() => setExpanded((value) => !value)}
+          >
+            {expanded ? "Show less" : "Show full message"}
+          </Button>
         ) : null}
       </BubbleContent>
     </Bubble>
@@ -505,6 +609,7 @@ function MessageCard({
 
 export const Message = memo(function Message(props: MessageProps) {
   const { message } = props;
+  const [copyError, setCopyError] = useState<string>();
   const groups = useMemo(() => groupParts(message.parts), [message.parts]);
   const cards = useMemo(() => groupMessageCards(groups), [groups]);
   const identities = useContext(MessageIdentityContext);
@@ -588,6 +693,7 @@ export const Message = memo(function Message(props: MessageProps) {
                   key={index}
                   content={group}
                   self={self}
+                  collapsible={message.role === "user"}
                   resourceUrl={props.resourceUrl}
                   canEdit={props.canEdit}
                   upload={props.upload}
@@ -656,6 +762,25 @@ export const Message = memo(function Message(props: MessageProps) {
           })}
         </MessageContent>
       </MessageResourcesContext>
+      {conversational ? (
+        <div className="message-controls">
+          {messageText(message) ? (
+            <IconButton
+              label="Copy message"
+              onClick={() =>
+                void attempt(
+                  () => navigator.clipboard.writeText(messageText(message)),
+                  () => setCopyError("Copy unavailable"),
+                )
+              }
+            >
+              <Copy />
+            </IconButton>
+          ) : null}
+          {copyError ? <span role="status">{copyError}</span> : null}
+          {props.controls}
+        </div>
+      ) : null}
     </ChatMessage>
   );
 });

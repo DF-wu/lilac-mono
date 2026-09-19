@@ -68,3 +68,9 @@
 
 .native-message[data-align="end"] .message-bubble [data-slot="bubble-content"] { background: color-mix(in srgb, var(--primary) 14%, var(--surface)); color: var(--foreground); }
 .markdown-link { text-decoration: underline; text-underline-offset: 0.15em; }
+
+.message-card-preview { min-width: 0; }
+.message-card-preview[data-collapsed="true"] { max-height: 24rem; overflow: hidden; mask-image: linear-gradient(to bottom, black calc(100% - 3rem), transparent); }
+.message-card-body { display: flow-root; min-width: 0; }
+.message-expand { display: flex; margin-left: auto; margin-top: var(--space-2); }
+.native-message[data-align="start"] > .message-controls { justify-content: flex-start; }

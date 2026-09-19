@@ -932,74 +932,76 @@ export function App(props: AppProps) {
                   />
                 ) : null}
                 {!external && selected ? (
-                  <>
-                    <header className="thread-header">
-                      <h1>{selected.title || "Untitled"}</h1>
-                      {selected.archived ? <span className="badge">Archived</span> : null}
-                      <span className="toolbar-spacer" />
-                      {owner ? (
-                        <IconButton
-                          label="Share conversation"
-                          tooltip="Share"
-                          onClick={() => setSharing(true)}
-                        >
-                          <Users />
-                        </IconButton>
-                      ) : null}
-                      {selected.capabilities.edit ? (
-                        <DropdownMenu>
-                          <DropdownMenuTrigger
-                            render={
-                              <IconButton label="Conversation actions" tooltip="Options">
-                                <MoreHorizontal />
-                              </IconButton>
-                            }
-                          />
-                          <DropdownMenuContent align="end">
-                            <DropdownMenuItem
-                              onClick={() => setRename({ id: selected.id, title: selected.title })}
-                            >
-                              <Pencil />
-                              Rename
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              onClick={() =>
-                                void update(selected.id, { archived: !selected.archived })
+                  <Chat
+                    header={
+                      <header className="thread-header">
+                        <h1>{selected.title || "Untitled"}</h1>
+                        {selected.archived ? <span className="badge">Archived</span> : null}
+                        <span className="toolbar-spacer" />
+                        {owner ? (
+                          <IconButton
+                            label="Share conversation"
+                            tooltip="Share"
+                            onClick={() => setSharing(true)}
+                          >
+                            <Users />
+                          </IconButton>
+                        ) : null}
+                        {selected.capabilities.edit ? (
+                          <DropdownMenu>
+                            <DropdownMenuTrigger
+                              render={
+                                <IconButton label="Conversation actions" tooltip="Options">
+                                  <MoreHorizontal />
+                                </IconButton>
                               }
-                            >
-                              {selected.archived ? <ArchiveRestore /> : <Archive />}
-                              {selected.archived ? "Unarchive" : "Archive"}
-                            </DropdownMenuItem>
-                            <DropdownMenuItem
-                              variant="destructive"
-                              onClick={() => setConfirmDelete(selected.id)}
-                            >
-                              <Trash2 />
-                              Delete
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      ) : null}
-                    </header>
-                    <Chat
-                      key={selected.id}
-                      {...props}
-                      thread={selected}
-                      catalog={catalog}
-                      onError={setError}
-                      pool={pool}
-                      positions={positions.current}
-                      readTurns={readTurns.current}
-                      draft={draft}
-                      onDraft={(value) => {
-                        drafts.current.set(selected.id, value);
-                      }}
-                      pending={pending.current.get(selected.id) ?? []}
-                      onPending={(change) => {
-                        patchPending(selected.id, change);
-                      }}
-                    />
-                  </>
+                            />
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  setRename({ id: selected.id, title: selected.title })
+                                }
+                              >
+                                <Pencil />
+                                Rename
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                onClick={() =>
+                                  void update(selected.id, { archived: !selected.archived })
+                                }
+                              >
+                                {selected.archived ? <ArchiveRestore /> : <Archive />}
+                                {selected.archived ? "Unarchive" : "Archive"}
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                variant="destructive"
+                                onClick={() => setConfirmDelete(selected.id)}
+                              >
+                                <Trash2 />
+                                Delete
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        ) : null}
+                      </header>
+                    }
+                    key={selected.id}
+                    {...props}
+                    thread={selected}
+                    catalog={catalog}
+                    onError={setError}
+                    pool={pool}
+                    positions={positions.current}
+                    readTurns={readTurns.current}
+                    draft={draft}
+                    onDraft={(value) => {
+                      drafts.current.set(selected.id, value);
+                    }}
+                    pending={pending.current.get(selected.id) ?? []}
+                    onPending={(change) => {
+                      patchPending(selected.id, change);
+                    }}
+                  />
                 ) : null}
                 {!external && selectedDraft ? (
                   <DraftChat

@@ -191,6 +191,21 @@ const messageFixtures: DisplayMessage[] = [
     ],
   },
   {
+    id: "gallery-long-user",
+    role: "user",
+    metadata: { authorId: "alex", createdAt: now - 10_000 },
+    parts: [
+      {
+        type: "text",
+        text: Array.from(
+          { length: 14 },
+          () =>
+            `Leave room for a riverside walk, a bookstore visit, and an unhurried coffee. Keep the afternoon flexible so everyone can choose their own pace.`,
+        ).join("\n\n"),
+      },
+    ],
+  },
+  {
     id: "gallery-agent",
     role: "assistant",
     metadata: { authorId: "lilac", createdAt: now },

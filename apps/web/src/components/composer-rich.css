@@ -1,5 +1,7 @@
 .composer-editor {
-  min-height: calc(var(--space-6) * 2);
+  min-width: 0;
+  min-height: calc(1lh + var(--space-3) * 2);
+  overflow-x: hidden;
   max-height: min(35vh, 20rem);
   overflow-y: auto;
   padding: var(--space-3);
@@ -14,7 +16,8 @@
 .composer-editor h3 { font-size: var(--text-base); }
 .composer-editor blockquote { padding-inline-start: var(--space-3); border-inline-start: var(--space-1) solid var(--muted-foreground); color: var(--muted-foreground); }
 .composer-editor pre, .composer-editor code { background: var(--muted); border-radius: var(--radius-sm); }
-.composer-editor pre { padding: var(--space-2); }
+.composer-editor pre { padding: var(--space-2); max-width: 100%; }
+.composer-editor pre, .composer-editor pre *, .composer-editor code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .composer-editor ul, .composer-editor ol { padding-inline-start: var(--space-6); margin: 0; }
 .composer-editor ul { list-style-type: disc; }
 .composer-editor ol { list-style-type: decimal; }
@@ -85,3 +88,6 @@
 .composer-attachment-chip[data-state="missing"] {
   color: var(--danger);
 }
+
+.composer .skill-chips .badge { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.composer .skill-chips .badge svg { flex: none; }

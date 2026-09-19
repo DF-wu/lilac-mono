@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { X, RotateCcw } from "lucide-react";
 import type { NativeInput, DisplayPart } from "@stanley2058/lilac-client-protocol";
 import type { AppProps, ChatCommon, ComposerSubmission, QueueEntry } from "../types";
@@ -28,6 +36,7 @@ export type PendingInput = {
   state: "preparing" | "uncertain" | "rejected";
 };
 export type ChatProps = ChatCommon & {
+  header: ReactNode;
   draft: Draft;
   draftCache?: AppProps["draftCache"];
   onDraft: (draft: Draft) => void;
@@ -371,10 +380,159 @@ export function Chat(props: ChatProps) {
     },
     [client, thread.id],
   );
+  const composer = (
+    <div className="chat-bottom">
+      <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+      {pendingEntries.length ? (
+        <VirtualList
+          className="pending-inputs"
+          items={pendingEntries}
+          itemKey={(entry) => entry.commandId}
+          label="Pending messages"
+          estimate={88}
+          render={(entry) => (
+            <div className="pending-input" key={entry.commandId}>
+              <span>{entry.text}</span>
+              <small>{entry.error ?? "Sending…"}</small>
+              {thread.capabilities.edit && entry.state !== "preparing" ? (
+                <Button
+                  type="button"
+                  onClick={() =>
+                    void deliver(
+                      {
+                        ...entry,
+                        submission: {
+                          ...entry.submission,
+                          attachments: entry.submission.attachments.map(
+                            (attachment) =>
+                              uploads.find((candidate) => candidate.key === attachment.key) ??
+                              attachment,
+                          ),
+                        },
+                      },
+                      true,
+                    )
+                  }
+                >
+                  Retry message
+                </Button>
+              ) : null}
+            </div>
+          )}
+        />
+      ) : null}
+      {thread.capabilities.edit && queue.length ? (
+        <div className="queue">
+          <VirtualList
+            items={queue}
+            itemKey={(entry) => entry.inputId}
+            label="Queued messages"
+            estimate={48}
+            render={(entry) => (
+              <div className="queue-entry">
+                <span className="badge">{queueLabels[entry.mode]}</span>
+                <span>{entry.text}</span>
+                <IconButton
+                  label="Remove queued message"
+                  onClick={() => {
+                    const checkpoint = store.checkpoint;
+                    if (!client.rpc || !checkpoint) return;
+                    void attempt(
+                      () =>
+                        client.rpc!.runs.removeQueued({
+                          threadId: thread.id,
+                          commandId: crypto.randomUUID(),
+                          historyGeneration: checkpoint.historyGeneration,
+                          inputId: entry.inputId,
+                        }),
+                      setError,
+                    ).then(refreshQueue);
+                  }}
+                >
+                  <X />
+                </IconButton>
+              </div>
+            )}
+          />
+        </div>
+      ) : null}
+      {draft.savedText ? (
+        <Button
+          type="button"
+          variant="ghost"
+          className="text-button"
+          onClick={() =>
+            commitDraft({
+              ...draft,
+              text: draft.savedText ?? "",
+              savedText: draft.text || undefined,
+            })
+          }
+        >
+          Restore previous draft
+        </Button>
+      ) : null}
+      {thread.capabilities.edit ? (
+        <Composer
+          windowDrop
+          client={client}
+          scope={props.scope}
+          catalog={props.catalog}
+          text={draft.text}
+          skillIds={draft.skillIds}
+          onSkills={(skillIds) => commitDraft({ ...draftRef.current, skillIds })}
+          commandId={draft.commandId}
+          onCommand={(commandId) => commitDraft({ ...draftRef.current, commandId })}
+          onText={(text) => commitDraft({ ...draftRef.current, text })}
+          attachments={attachments}
+          onAttach={(files) =>
+            commitDraft({
+              ...draft,
+              attachments: [
+                ...draft.attachments,
+                ...files
+                  .slice(0, 32 - draft.attachments.length)
+                  .map((file) => pool.add(thread.id, file)),
+              ],
+            })
+          }
+          onRemoveAttachment={(key) => {
+            pool.remove(thread.id, key);
+            commitDraft({ ...draft, attachments: draft.attachments.filter((id) => id !== key) });
+          }}
+          onRetryAttachment={(key) => pool.retry(thread.id, key)}
+          active={active}
+          canCancel={active || queue.length > 0}
+          disabled={false}
+          modelId={thread.modelId}
+          onModelChange={(modelId) => {
+            const rpc = client.rpc,
+              checkpoint = store.checkpoint;
+            if (!rpc || !checkpoint) return;
+            void attempt(
+              () =>
+                rpc.threads.update({
+                  threadId: thread.id,
+                  expectedRevision: checkpoint.projectionRevision,
+                  modelId,
+                }),
+              setError,
+            );
+          }}
+          onSubmit={submit}
+          onCancel={() => void cancel()}
+        />
+      ) : (
+        <div className="read-only">Read-only</div>
+      )}
+    </div>
+  );
   return (
     <div className="chat-workspace">
       <UploadProgressContext.Provider value={uploadProgress}>
         <Timeline
+          header={props.header}
+          footer={composer}
           onLatestVisibleChange={setLatestVisible}
           client={client}
           threadId={thread.id}
@@ -387,151 +545,7 @@ export function Chat(props: ChatProps) {
           positions={props.positions}
         />
       </UploadProgressContext.Provider>
-      <div className="chat-bottom">
-        <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
-        {pendingEntries.length ? (
-          <VirtualList
-            className="pending-inputs"
-            items={pendingEntries}
-            itemKey={(entry) => entry.commandId}
-            label="Pending messages"
-            estimate={88}
-            render={(entry) => (
-              <div className="pending-input" key={entry.commandId}>
-                <span>{entry.text}</span>
-                <small>{entry.error ?? "Sending…"}</small>
-                {thread.capabilities.edit && entry.state !== "preparing" ? (
-                  <Button
-                    type="button"
-                    onClick={() =>
-                      void deliver(
-                        {
-                          ...entry,
-                          submission: {
-                            ...entry.submission,
-                            attachments: entry.submission.attachments.map(
-                              (attachment) =>
-                                uploads.find((candidate) => candidate.key === attachment.key) ??
-                                attachment,
-                            ),
-                          },
-                        },
-                        true,
-                      )
-                    }
-                  >
-                    Retry message
-                  </Button>
-                ) : null}
-              </div>
-            )}
-          />
-        ) : null}
-        {thread.capabilities.edit && queue.length ? (
-          <div className="queue">
-            <VirtualList
-              items={queue}
-              itemKey={(entry) => entry.inputId}
-              label="Queued messages"
-              estimate={48}
-              render={(entry) => (
-                <div className="queue-entry">
-                  <span className="badge">{queueLabels[entry.mode]}</span>
-                  <span>{entry.text}</span>
-                  <IconButton
-                    label="Remove queued message"
-                    onClick={() => {
-                      const checkpoint = store.checkpoint;
-                      if (!client.rpc || !checkpoint) return;
-                      void attempt(
-                        () =>
-                          client.rpc!.runs.removeQueued({
-                            threadId: thread.id,
-                            commandId: crypto.randomUUID(),
-                            historyGeneration: checkpoint.historyGeneration,
-                            inputId: entry.inputId,
-                          }),
-                        setError,
-                      ).then(refreshQueue);
-                    }}
-                  >
-                    <X />
-                  </IconButton>
-                </div>
-              )}
-            />
-          </div>
-        ) : null}
-        {draft.savedText ? (
-          <Button
-            type="button"
-            variant="ghost"
-            className="text-button"
-            onClick={() =>
-              commitDraft({
-                ...draft,
-                text: draft.savedText ?? "",
-                savedText: draft.text || undefined,
-              })
-            }
-          >
-            Restore previous draft
-          </Button>
-        ) : null}
-        {thread.capabilities.edit ? (
-          <Composer
-            windowDrop
-            client={client}
-            scope={props.scope}
-            catalog={props.catalog}
-            text={draft.text}
-            skillIds={draft.skillIds}
-            onSkills={(skillIds) => commitDraft({ ...draftRef.current, skillIds })}
-            commandId={draft.commandId}
-            onCommand={(commandId) => commitDraft({ ...draftRef.current, commandId })}
-            onText={(text) => commitDraft({ ...draftRef.current, text })}
-            attachments={attachments}
-            onAttach={(files) =>
-              commitDraft({
-                ...draft,
-                attachments: [
-                  ...draft.attachments,
-                  ...files
-                    .slice(0, 32 - draft.attachments.length)
-                    .map((file) => pool.add(thread.id, file)),
-                ],
-              })
-            }
-            onRemoveAttachment={(key) => {
-              pool.remove(thread.id, key);
-              commitDraft({ ...draft, attachments: draft.attachments.filter((id) => id !== key) });
-            }}
-            onRetryAttachment={(key) => pool.retry(thread.id, key)}
-            active={active}
-            canCancel={active || queue.length > 0}
-            disabled={false}
-            modelId={thread.modelId}
-            onModelChange={(modelId) => {
-              const rpc = client.rpc,
-                checkpoint = store.checkpoint;
-              if (!rpc || !checkpoint) return;
-              void attempt(
-                () =>
-                  rpc.threads.update({
-                    threadId: thread.id,
-                    expectedRevision: checkpoint.projectionRevision,
-                    modelId,
-                  }),
-                setError,
-              );
-            }}
-            onSubmit={submit}
-            onCancel={() => void cancel()}
-          />
-        ) : (
-          <div className="read-only">Read-only</div>
-        )}
-      </div>
+
       {thread.capabilities.edit && rewindTarget ? (
         <Modal title="Rewind this conversation?" onClose={() => setRewindTarget(undefined)}>
           <p>

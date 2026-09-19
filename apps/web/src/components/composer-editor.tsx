@@ -75,7 +75,6 @@ import {
 import { IconButton } from "./ui";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import type { Attachment } from "../types";
-import "./composer-rich.css";
 
 function Paragraph(props: PlateElementProps) {
   return <PlateElement {...props} as="p" />;
@@ -595,6 +594,7 @@ export default function ComposerEditor(props: ComposerEditorProps) {
         </div>
         <PlateContent
           className="composer-editor"
+          style={{ minHeight: "calc(1lh + var(--space-3) * 2)", overflowWrap: "anywhere" }}
           aria-label="Message"
           role="textbox"
           aria-multiline="true"

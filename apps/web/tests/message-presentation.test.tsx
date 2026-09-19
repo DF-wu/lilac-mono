@@ -68,6 +68,7 @@ describe("message presentation", () => {
       );
       expect(html).toContain(`data-slot="message" data-align="${self ? "end" : "start"}"`);
       expect(html).toContain('data-slot="bubble"');
+      expect(html).toContain('aria-label="Copy message"');
       expect(html.indexOf('data-slot="message-avatar"')).toBeLessThan(
         html.indexOf('data-slot="message-content"'),
       );

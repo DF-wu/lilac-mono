@@ -1,3 +1,5 @@
+import "./composer-rich.css";
+import { Button } from "./ui/button";
 import {
   lazy,
   Suspense,
@@ -296,7 +298,22 @@ export function Composer(props: ComposerProps) {
           </div>
         ) : null}
         <Suspense
-          fallback={<div className="composer-editor" role="status" aria-label="Loading editor" />}
+          fallback={
+            <div role="status" aria-label="Loading editor">
+              <div className="composer-formatting" aria-hidden="true">
+                {[0, 1, 2, 3, 4, 5, 6, 7, 8].map((index) => (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="icon-button"
+                    disabled
+                    key={index}
+                  />
+                ))}
+              </div>
+              <div className="composer-editor" />
+            </div>
+          }
         >
           <ComposerEditor
             ref={input}

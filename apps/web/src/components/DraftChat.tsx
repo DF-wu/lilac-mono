@@ -16,7 +16,7 @@ export function DraftChat(props: {
   const { thread, onChange } = props;
   const draft = thread.draft;
   return (
-    <div className="chat-workspace draft-workspace">
+    <div className="chat-workspace draft-workspace chat-scroll">
       <div className="welcome">
         <span className="brand">
           lilac
