@@ -1,4 +1,5 @@
 import { useWorkspace } from "../workspace-context";
+import { useStore } from "zustand";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { configOptions, userOptions, useNativeOnline } from "../queries";
 import { AgentIdentity } from "./AgentIdentity";
@@ -36,7 +37,8 @@ export function Settings({
   agent: ActorIdentity;
   onTheme: (value: string) => void;
 }) {
-  const { client } = useWorkspace();
+  const { client, preferences } = useWorkspace();
+  const animation = useStore(preferences, (state) => state.animation);
   const [tab, setTab] = useState<"account" | "theme" | "core" | "mcp" | "agent" | "users">(
     "account",
   );
@@ -129,15 +131,17 @@ export function Settings({
               <TabsTrigger value="account">Account</TabsTrigger>
               <TabsTrigger value="theme">Theme</TabsTrigger>
             </div>
-            <div className="settings-navigation-group">
-              <span className="settings-navigation-label" aria-hidden="true">
-                Runtime
-              </span>
-              <TabsTrigger value="core">Core</TabsTrigger>
-              <TabsTrigger value="mcp">MCP</TabsTrigger>
-              <TabsTrigger value="agent">Agent</TabsTrigger>
-              <TabsTrigger value="users">User</TabsTrigger>
-            </div>
+            {viewer.role === "owner" ? (
+              <div className="settings-navigation-group">
+                <span className="settings-navigation-label" aria-hidden="true">
+                  Runtime
+                </span>
+                <TabsTrigger value="core">Core</TabsTrigger>
+                <TabsTrigger value="mcp">MCP</TabsTrigger>
+                <TabsTrigger value="agent">Agent</TabsTrigger>
+                <TabsTrigger value="users">User</TabsTrigger>
+              </div>
+            ) : null}
           </TabsList>
           <div className="settings-options">
             <ErrorNotice
@@ -195,6 +199,34 @@ export function Settings({
                   </SelectContent>
                 </Select>
               </label>
+              <label className="field">
+                Animation speed
+                <Select
+                  items={[
+                    { value: "off", label: "Off" },
+                    { value: "fast", label: "Fast" },
+                    { value: "slow", label: "Slow" },
+                  ]}
+                  value={animation}
+                  onValueChange={(value) => {
+                    if (value === "off" || value === "fast" || value === "slow")
+                      preferences.getState().setAnimation(value);
+                  }}
+                >
+                  <SelectTrigger aria-label="Animation speed">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="off">Off</SelectItem>
+                    <SelectItem value="fast">Fast</SelectItem>
+                    <SelectItem value="slow">Slow</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+              <p className="muted">
+                Animation speed is saved for your account on this device. Reduced motion follows
+                your system preference.
+              </p>
             </TabsContent>
             <TabsContent value="users" className="settings-section">
               <h2>User</h2>

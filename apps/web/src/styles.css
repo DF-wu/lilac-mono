@@ -565,7 +565,7 @@ small {
   color: var(--foreground);
 }
 .work-summary svg {
-  transition: transform 0.15s ease;
+  transition: transform var(--motion-duration) ease;
 }
 .rotated {
   transform: rotate(90deg);
@@ -1343,10 +1343,6 @@ progress {
   .sidebar-resize-handle {
     background: transparent;
   }
-  .workspace-panels > [data-panel][hidden],
-  .sidebar-resize-handle[hidden] {
-    display: none !important;
-  }
   .sidebar-resize-handle:hover,
   .sidebar-resize-handle:focus-visible {
     background: var(--primary);
@@ -1448,3 +1444,55 @@ progress {
 .sidebar-search-row .sidebar-tabs { flex: none; gap: var(--space-1); padding: 0; }
 .sidebar-search-row .sidebar-tabs .icon-button { width: var(--control-compact); height: var(--control-compact); }
 .sidebar-search-row:has(.search-box:focus-within) .sidebar-tabs { display: none; }
+
+:root { --motion-duration: 150ms; --motion-spin-duration: 1s; }
+:root[data-animation="slow"] { --motion-duration: 350ms; --motion-spin-duration: 2s; }
+:root[data-animation] *, :root[data-animation] *::before, :root[data-animation] *::after {
+  animation-duration: var(--motion-duration) !important;
+}
+:root[data-animation] :where([class*="transition"], [class*="duration"], .workspace-panels, .sidebar-panel, .work-summary svg) {
+  transition-duration: var(--motion-duration) !important;
+}
+:root[data-animation] .animate-spin,
+:root[data-animation] .thread-card[data-state="working"] .thread-state-icon svg {
+  animation-duration: var(--motion-spin-duration) !important;
+}
+:root[data-animation="off"] *, :root[data-animation="off"] *::before, :root[data-animation="off"] *::after {
+  transition-duration: 0s !important;
+  animation: none !important;
+  scroll-behavior: auto !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root[data-animation] *, :root[data-animation] *::before, :root[data-animation] *::after {
+    transition-duration: 0s !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+.workspace-panels {
+  flex: none;
+  transition: width var(--motion-duration) ease, transform var(--motion-duration) ease;
+}
+.sidebar-hidden .workspace-panels {
+  --workspace-width: calc(100% + var(--sidebar-offset));
+  transform: translateX(calc(-1 * var(--sidebar-offset)));
+}
+@media (max-width: 760px) {
+  .sidebar-hidden .workspace-panels { --workspace-width: 100%; transform: none; }
+  .workspace-panels > #sidebar[data-panel] {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: min(85vw, var(--sidebar-width)) !important;
+    height: 100%;
+    flex: none !important;
+    overflow: visible !important;
+    z-index: 30;
+  }
+  .sidebar-panel {
+    position: relative !important;
+    width: 100% !important;
+    transition: transform var(--motion-duration) ease;
+  }
+  .sidebar-hidden .sidebar-panel { transform: translateX(-100%); }
+  .sidebar-resize-handle { display: none !important; }
+}

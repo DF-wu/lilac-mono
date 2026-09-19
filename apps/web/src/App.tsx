@@ -2,7 +2,16 @@ import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-quer
 import { participantOptions, searchOptions, useNativeOnline } from "./queries";
 import { useStore } from "zustand";
 import { WorkspaceProvider, useWorkspace } from "./workspace-context";
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import { Result } from "better-result";
 import { Tooltip } from "@base-ui/react/tooltip";
 import {
@@ -105,6 +114,7 @@ function Workspace(props: AppProps) {
   const [external, setExternal] = useState(false);
   const [externalId, setExternalId] = useState<string>();
   const [sidebar, setSidebar] = useState(true);
+  const [sidebarPixels, setSidebarPixels] = useState(288);
   const [searchQuery, setSearchQuery] = useState("");
   const online = useNativeOnline(client);
   const queries = useQueryClient();
@@ -596,6 +606,7 @@ function Workspace(props: AppProps) {
       <Tooltip.Provider delay={350}>
         <main
           className={`app-shell ${sidebar ? "" : "sidebar-hidden"}`}
+          style={{ "--sidebar-offset": `${sidebarPixels + 1}px` } as CSSProperties}
           aria-label="Chat workspace"
         >
           <div className="sidebar-toggle">
@@ -606,9 +617,17 @@ function Workspace(props: AppProps) {
               {sidebar ? <PanelLeftClose /> : <PanelLeftOpen />}
             </IconButton>
           </div>
-          <ResizablePanelGroup orientation="horizontal" className="workspace-panels">
+          <ResizablePanelGroup
+            orientation="horizontal"
+            className="workspace-panels"
+            style={{ width: "var(--workspace-width, 100%)" }}
+          >
             <ResizablePanel
-              hidden={!sidebar}
+              inert={!sidebar}
+              aria-hidden={!sidebar}
+              onResize={(size) => {
+                if (size.inPixels > 0) setSidebarPixels(size.inPixels);
+              }}
               id="sidebar"
               groupResizeBehavior="preserve-pixel-size"
               defaultSize="18rem"
@@ -757,11 +776,9 @@ function Workspace(props: AppProps) {
                   >
                     <Palette />
                   </IconButton>
-                  {owner ? (
-                    <IconButton label="Settings" onClick={() => setSettings(true)}>
-                      <SettingsIcon />
-                    </IconButton>
-                  ) : null}
+                  <IconButton label="Settings" onClick={() => setSettings(true)}>
+                    <SettingsIcon />
+                  </IconButton>
                   <IconButton
                     label="Sign out"
                     onClick={() => void attempt(props.onLogout, setError)}
@@ -772,7 +789,6 @@ function Workspace(props: AppProps) {
               </aside>
             </ResizablePanel>
             <ResizableHandle
-              hidden={!sidebar}
               disabled={!sidebar}
               aria-label="Sidebar width"
               className="sidebar-resize-handle"
@@ -873,7 +889,7 @@ function Workspace(props: AppProps) {
               </div>
             </ResizablePanel>
           </ResizablePanelGroup>
-          {settings && owner ? (
+          {settings ? (
             <Suspense
               fallback={
                 <Modal title="Settings" onClose={() => setSettings(false)}>
