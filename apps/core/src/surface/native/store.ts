@@ -785,6 +785,7 @@ export class NativeStore {
             Result.gen(function* () {
               if (thread.historyGeneration !== input.historyGeneration || thread.mutationPending)
                 return Result.err(nativeFailure("stale", "Thread history is changing"));
+              const effectiveMode = input.command && thread.activeRunId ? "followup" : input.mode;
               const pendingCount =
                 store.db
                   .query<{ count: number }, [string]>(
@@ -795,9 +796,9 @@ export class NativeStore {
                 return Result.err(
                   nativeFailure("conflict", "Thread already has 128 pending inputs"),
                 );
-              if (input.mode !== "prompt" && !thread.activeRunId)
+              if (effectiveMode !== "prompt" && !thread.activeRunId)
                 return Result.err(nativeFailure("stale", "There is no active run for this input"));
-              if (input.mode === "prompt" && thread.activeRunId)
+              if (effectiveMode === "prompt" && thread.activeRunId)
                 return Result.err(
                   nativeFailure("conflict", "Choose steering or follow-up while a run is active"),
                 );
@@ -833,7 +834,7 @@ export class NativeStore {
                 position: thread.nextPosition,
                 historyGeneration: thread.historyGeneration,
                 text: input.text,
-                mode: input.mode,
+                mode: effectiveMode,
                 runId: thread.activeRunId,
                 state: uploads.some((upload) => upload.state !== "ready") ? "uploading" : "queued",
                 attachmentIds: [...input.attachmentIds],
@@ -848,9 +849,9 @@ export class NativeStore {
                   "SELECT 1 FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.mode')!='steer' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL LIMIT 1",
                 )
                 .get(thread.id);
-              if (input.mode === "prompt" && !earlierFull)
+              if (effectiveMode === "prompt" && !earlierFull)
                 accepted = store.createInputTurn(thread, accepted, uploads);
-              if (input.mode === "steer") {
+              if (effectiveMode === "steer") {
                 const activeInput = yield* store.getInputByRequestId(thread.activeRunId ?? "");
                 accepted = {
                   ...accepted,

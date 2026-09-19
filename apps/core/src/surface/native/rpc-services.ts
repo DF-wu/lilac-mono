@@ -648,7 +648,7 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           yield* inputSelections(principal, input);
           const thread = yield* store.authorizeThread(principal.userId, input.threadId, true);
           const resolvedModelRequest =
-            input.mode === "steer"
+            input.mode === "steer" && !input.command
               ? undefined
               : yield* options.resolveModel(input.modelId ?? thread.modelId);
           const receipt = yield* store.acceptInput(principal.userId, input, {

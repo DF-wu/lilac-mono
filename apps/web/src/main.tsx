@@ -1,9 +1,11 @@
-import { lazy, Suspense, useEffect, useState, useSyncExternalStore } from "react";
+import { lazy, Suspense, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import { Result } from "better-result";
 import { WebSessionController, webCache } from "./bootstrap";
 import { LocalLogin } from "./auth";
 import { readAuthInfo, resourceUrl, uploadResource, type AuthInfo } from "./http";
 import { watchAppUpdates, type AppUpdate } from "./updates";
+import { AccountLoadBoundary } from "./AccountLoadBoundary";
 import App from "./App";
 import "./styles.css";
 
@@ -23,8 +25,15 @@ const logout = async () => {
     await sessions.logout();
     return;
   }
-  const clerk = await import("./clerk");
-  await sessions.logout(clerk.signOutActiveClerk);
+  const loadedProvider = await Result.tryPromise({
+    try: async () => (await import("./clerk")).signOutActiveClerk,
+    catch: () =>
+      new Error("Could not load account controls. Reload to finish signing out of Clerk."),
+  });
+  await loadedProvider.match({
+    ok: (signOut) => sessions.logout(signOut),
+    err: (error) => sessions.logout(async () => Result.err(error)),
+  });
 };
 start();
 
@@ -51,22 +60,34 @@ function Root() {
       stop?.();
     };
   }, []);
+  const withUpdate = (content: ReactNode) => (
+    <>
+      {content}
+      {update ? (
+        <div className="app-update" role="status">
+          <span>Update available</span>
+          <button onClick={update.activate}>Reload</button>
+        </div>
+      ) : null}
+    </>
+  );
+  const reload = update?.activate ?? (() => location.reload());
   if (state.kind === "starting")
-    return (
+    return withUpdate(
       <div className="login-shell">
         <span className="brand">Lilac</span>
-      </div>
+      </div>,
     );
   if (state.kind === "offline")
-    return (
+    return withUpdate(
       <main className="login-shell">
         <h1>Lilac</h1>
         <p role="status">{state.message}</p>
         <button onClick={start}>Reconnect</button>
-      </main>
+      </main>,
     );
   if (state.kind === "login")
-    return (
+    return withUpdate(
       <main className="login-shell">
         <h1>Lilac</h1>
         {state.message ? <p role="status">{state.message}</p> : null}
@@ -78,40 +99,36 @@ function Root() {
           </fieldset>
         ) : null}
         {!state.signingOut && auth?.provider === "clerk" && auth.publishableKey ? (
-          <Suspense fallback={<p>Loading sign-in…</p>}>
-            <ClerkLogin publishableKey={auth.publishableKey} onSignedIn={start} />
-          </Suspense>
+          <AccountLoadBoundary onReload={reload} message="Unable to load sign-in.">
+            <Suspense fallback={<p>Loading sign-in…</p>}>
+              <ClerkLogin publishableKey={auth.publishableKey} onSignedIn={start} />
+            </Suspense>
+          </AccountLoadBoundary>
         ) : null}
-      </main>
+      </main>,
     );
   const { session } = state;
   const userControl =
     auth?.provider === "clerk" && auth.publishableKey ? (
-      <Suspense fallback={null}>
-        <ClerkUserControl
-          publishableKey={auth.publishableKey}
-          client={session.client}
-          onLogout={logout}
-        />
-      </Suspense>
+      <AccountLoadBoundary onReload={reload} message="Unable to load account controls.">
+        <Suspense fallback={null}>
+          <ClerkUserControl
+            publishableKey={auth.publishableKey}
+            client={session.client}
+            onLogout={logout}
+          />
+        </Suspense>
+      </AccountLoadBoundary>
     ) : undefined;
-  return (
-    <>
-      <App
-        {...session}
-        draftCache={webCache}
-        upload={uploadResource}
-        resourceUrl={resourceUrl}
-        onLogout={logout}
-        userControl={userControl}
-      />
-      {update ? (
-        <div className="app-update" role="status">
-          <span>Update available</span>
-          <button onClick={update.activate}>Reload</button>
-        </div>
-      ) : null}
-    </>
+  return withUpdate(
+    <App
+      {...session}
+      draftCache={webCache}
+      upload={uploadResource}
+      resourceUrl={resourceUrl}
+      onLogout={logout}
+      userControl={userControl}
+    />,
   );
 }
 

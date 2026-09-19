@@ -86,3 +86,10 @@ There is no architectural blocker to starting the backend. These checks remain b
 3. Confirm the selected OAuth JWT verification exposes the user and configured client identity needed by the native normalization boundary. Keep user tokens distinct from organization or service principals.
 4. Run OpenTUI clipboard/input smoke checks in actual Ghostty/Kitty desktop sessions and the packaged executable. This subtask checked documentation and exact peer requirements, not an interactive renderer.
 5. Document the supported remote-terminal limits. If seamless Clerk login or local image clipboard reads from an arbitrary SSH session become mandatory, they require a supported provider/device or terminal transport beyond the proven baseline.
+
+## Stage 2 implementation evidence
+
+Backend auth boundary tests and browser Clerk session checks are now recorded in
+[native-surface-progress.md](native-surface-progress.md). The live development installation passed
+owner sign-in through a single-use ticket, session refresh, authenticated resources and logout.
+Public-client PKCE and actual Ghostty/Kitty checks belong to the unstarted TUI stage and remain unverified.

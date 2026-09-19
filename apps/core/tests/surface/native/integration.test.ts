@@ -508,3 +508,78 @@ export async function execute(_args, context) {
     }
   },
 );
+
+test("a custom command submitted as steering queues and executes in its own full turn", async () => {
+  const firstStarted = Promise.withResolvers<void>();
+  const releaseFirst = Promise.withResolvers<void>();
+  const modelPrompts: string[] = [];
+  let commandModule: { calls: number } | undefined;
+  const fixture = await createNativeIntegrationFixture({
+    prepare: async ({ dataDir }) => {
+      const directory = path.join(dataDir, "cmds", "queued-fixture");
+      await mkdir(directory, { recursive: true });
+      await writeFile(
+        path.join(directory, "def.json"),
+        JSON.stringify({
+          name: "queued-fixture",
+          description: "Queued integration command",
+          args: [],
+        }),
+      );
+      const entrypoint = path.join(directory, "index.ts");
+      await writeFile(
+        entrypoint,
+        'export let calls = 0; export function execute() { calls += 1; return { type: "text", value: "Queued command result" }; }\n',
+      );
+      commandModule = await import(pathToFileURL(entrypoint).href);
+    },
+    model: new MockLanguageModelV4({
+      doStream: async ({ prompt }) => {
+        modelPrompts.push(JSON.stringify(prompt));
+        if (modelPrompts.length === 1) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        }
+        return nativeFixtureTextResponse(`Finished full turn ${modelPrompts.length}`);
+      },
+    }),
+  });
+  try {
+    const client = fixture.connect().client;
+    const thread = await client.threads.create({
+      commandId: crypto.randomUUID(),
+      title: "Queued command",
+    });
+    const first = await client.inputs.submit(
+      nativePrompt(thread.id, "Keep the first turn running"),
+    );
+    await firstStarted.promise;
+    const command = await client.inputs.submit({
+      ...nativePrompt(thread.id, "Use the queued command result", "steer"),
+      command: { id: "custom:queued-fixture", arguments: "" },
+    });
+    expect(command.state).toBe("queued");
+    expect(commandModule?.calls).toBe(0);
+    const queue = await client.runs.queue({ threadId: thread.id });
+    expect(queue.items).toHaveLength(1);
+    expect(queue.items[0]?.mode).toBe("followup");
+    expect(queue.items[0]?.inputId).toBe(command.inputId);
+    releaseFirst.resolve();
+    await completed(fixture.store, command.inputId);
+    const accepted = integrationValue(fixture.store.getInput(command.inputId));
+    expect(accepted.mode).toBe("followup");
+    expect(accepted.turnId).toBeDefined();
+    expect(accepted.turnId).not.toBe(first.turnId);
+    expect(commandModule?.calls).toBe(1);
+    expect(modelPrompts).toHaveLength(2);
+    expect(modelPrompts[0]).not.toContain("Use the queued command result");
+    expect(modelPrompts[1]).toContain("Finished full turn 1");
+    expect(modelPrompts[1]).toContain("Use the queued command result");
+    expect(modelPrompts[1]).toContain("Queued command result");
+    expect((await client.runs.queue({ threadId: thread.id })).items).toEqual([]);
+    expect(fixture.fatalErrors).toEqual([]);
+  } finally {
+    releaseFirst.resolve();
+    await fixture.close();
+  }
+});

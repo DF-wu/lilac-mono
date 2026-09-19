@@ -94,7 +94,9 @@ function fixture() {
               catalog: {
                 revision: catalogRevision,
                 models: modelAvailable ? [{ id: "configured", label: "Configured" }] : [],
-                commands: [],
+                commands: [
+                  { id: "custom:review", name: "review", description: "Review", kind: "custom" },
+                ],
                 skills: [],
               },
             },
@@ -336,6 +338,63 @@ describe("native RPC service projection", () => {
     ).toBe(true);
     expect(state.store.listPendingInputs(state.thread.id).unwrap()).toHaveLength(1);
   });
+
+  test.each(["steer", "prompt"] as const)(
+    "active custom %s queues a full follow-up with a fresh model and unchanged retry fingerprint",
+    async (mode) => {
+      using state = fixture();
+      const initial = state.store
+        .acceptInput(
+          "owner",
+          {
+            threadId: state.thread.id,
+            commandId: "initial",
+            historyGeneration: 0,
+            text: "initial",
+            mode: "prompt",
+            attachmentIds: [],
+            skillIds: [],
+          },
+          {
+            resolvedModelRequest: {
+              spec: "openai/old-model",
+              provider: "openai",
+              modelId: "old-model",
+              reasoningDisplay: "detailed",
+            },
+          },
+        )
+        .unwrap();
+      const active = state.store.prepareInput(initial.inputId).unwrap()!;
+      state.store.settleInput(active.id, "admitted").unwrap();
+      state.store.setActiveRun(state.thread.id, 0, active.requestId).unwrap();
+      const input: NativeRpcInputs["inputs"]["submit"] = {
+        threadId: state.thread.id,
+        commandId: "custom-steer",
+        historyGeneration: 0,
+        text: "/review changes",
+        mode,
+        command: { id: "custom:review", arguments: "changes" },
+        attachmentIds: [],
+        skillIds: [],
+      };
+      const receipt = (await state.services.inputs.submit(principal, input)).unwrap();
+      const stored = state.store.getInput(receipt.inputId).unwrap();
+      expect(stored.mode).toBe("followup");
+      expect(stored.turnId).toBeUndefined();
+      expect(stored.requestId).not.toBe(active.requestId);
+      expect(stored.resolvedModelRequest?.spec).toBe("openai/gpt-5");
+      expect(state.store.prepareInput(stored.id).unwrap()).toBeNull();
+      state.removeModel();
+      expect((await state.services.inputs.submit(principal, input)).unwrap()).toEqual(receipt);
+      expect(state.modelResolutions()).toBe(1);
+      expect(
+        (await state.services.inputs.submit(principal, { ...input, mode: "followup" })).isErr(),
+      ).toBe(true);
+      state.store.cancelRun("owner", state.thread.id, active.requestId).unwrap();
+      expect(state.store.getInput(receipt.inputId).unwrap().state).toBe("canceled");
+    },
+  );
 
   test("model validation happens before creating persistent input", async () => {
     using state = fixture();

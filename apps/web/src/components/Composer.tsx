@@ -10,6 +10,7 @@ import { ArrowUp, Paperclip, Square, X, FileText, CornerDownRight } from "lucide
 import type { Completion } from "@stanley2058/lilac-client";
 import type { ChatCommon, ComposerSubmission, Attachment } from "../types";
 import { IconButton, VirtualList, ErrorNotice } from "./ui";
+import { inputDeliveryOptions } from "../input-mode";
 
 export type ComposerProps = Pick<ChatCommon, "client" | "scope" | "catalog"> & {
   text: string;
@@ -60,6 +61,14 @@ export function Composer(props: ComposerProps) {
     [props.client, props.scope, trigger, query, !!match, menuHidden, catalog],
   );
   const highlighted = Math.min(selected, Math.max(0, completions.length - 1));
+  const matching =
+    catalog?.commands.filter(
+      (entry) => text.trim() === `/${entry.name}` || text.startsWith(`/${entry.name} `),
+    ) ?? [];
+  const unambiguous = matching.length === 1 ? matching[0] : undefined;
+  const command = commandId ? matching.find((entry) => entry.id === commandId) : unambiguous;
+  const custom = command?.kind === "custom" ? command : undefined;
+  const delivery = inputDeliveryOptions(active, mode, modelId ?? props.modelId, !!custom);
 
   function choose(item: Completion) {
     const start = cursor - (match?.[2]?.length ?? 0) - 1;
@@ -75,15 +84,10 @@ export function Composer(props: ComposerProps) {
 
   function submit() {
     if (disabled || (!text.trim() && attachments.length === 0)) return;
-    const matching =
-      catalog?.commands.filter(
-        (entry) => text.trim() === `/${entry.name}` || text.startsWith(`/${entry.name} `),
-      ) ?? [];
     if (!commandId && matching.length > 1) {
       setError("Choose the command from the menu to resolve its name.");
       return;
     }
-    const command = commandId ? matching.find((entry) => entry.id === commandId) : matching[0];
     if (commandId && !command) {
       setCommandId(undefined);
       setError("The selected command changed. Choose it again.");
@@ -101,12 +105,11 @@ export function Composer(props: ComposerProps) {
       setCommandId(undefined);
       return;
     }
-    const custom = command?.kind === "custom" ? command : undefined;
     props.onSubmit({
       text,
       skillIds,
-      mode,
-      modelId: modelId ?? props.modelId,
+      mode: delivery.mode === "prompt" ? mode : delivery.mode,
+      modelId: delivery.modelId,
       command: custom
         ? { id: custom.id, arguments: text.slice(custom.name.length + 2) }
         : undefined,
@@ -302,7 +305,7 @@ export function Composer(props: ComposerProps) {
             id="composer-model"
             aria-label="Response model"
             value={modelId ?? props.modelId ?? catalog?.models[0]?.id ?? ""}
-            disabled={disabled || (active && mode === "steer")}
+            disabled={disabled || delivery.mode === "steer"}
             onChange={(event) => {
               setModelId(event.target.value);
               props.onModelChange(event.target.value);
@@ -319,8 +322,12 @@ export function Composer(props: ComposerProps) {
             <label className="queue-mode">
               <CornerDownRight />
               <select
-                aria-label="When sent during an active run"
-                value={mode}
+                aria-label={
+                  custom ? "Custom commands queue as follow-ups" : "When sent during an active run"
+                }
+                title={custom ? "Custom commands queue as follow-ups" : undefined}
+                disabled={!!custom}
+                value={delivery.mode}
                 onChange={(event) =>
                   setMode(event.target.value === "followup" ? "followup" : "steer")
                 }
@@ -355,7 +362,7 @@ export function Composer(props: ComposerProps) {
             </IconButton>
           ) : null}
           <IconButton
-            label="Send message"
+            label={active && custom ? "Queue command as follow-up" : "Send message"}
             className="send-button"
             disabled={disabled || (!text.trim() && !attachments.length)}
             onClick={submit}

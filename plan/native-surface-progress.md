@@ -4,9 +4,9 @@ Active plan: [native-surface.md](native-surface.md). Product scope and stage exi
 
 ## Implementation status
 
-The backend, shared client and web SPA are implemented. Final Stage 2 browser validation and review
-are in progress. Stage 3 has not started. No stage is closed while its required verification remains
-outstanding.
+The backend, shared client and web SPA are complete through Stage 2. Independent standards and
+specification reviews found no remaining blockers after the final fixes. Repository checks, the
+production build and browser verification passed. Stage 3 has not started.
 
 The initial protocol proof was committed as `61485a63`; backend and web implementation were committed
 as `8ed38ff7`. Subsequent implementation adds:
@@ -86,11 +86,21 @@ preserved the draft. The late command review fixed omitted optional prompt metad
 activity and stable workflow activity identity across retry/recovery. Success, failure and cancellation
 have real-runtime integration coverage, and the fix passed independent review.
 
-Active-run custom commands still need a queue-policy decision. The existing command runner executes
-commands at the start of a full turn; active steering only appends a user message. It cannot silently
-accept and discard a command invocation. The user has been asked whether to automatically queue
-custom commands as follow-ups or require explicit Follow-up mode. This remains an implementation
-blocker until that choice is made and enforced by the backend and UI. Incremental commits do not imply stage completion.
+The user selected automatic follow-ups for active-run custom commands. Backend admission normalizes
+commands to follow-ups even when a client sends steering, pins the selected next-run model, and keeps
+retry receipts stable. The composer reflects the effective mode. A real-runner integration test proves
+the command waits for the current run and executes once in the next full turn.
+
+The update notice now appears during sign-in, startup and offline states as well as an open session.
+A browser check triggered the preload-error path while signed out, verified Reload was visible, and
+used it to reload the sign-in page. A subsequent review found that a failed Clerk lazy import could
+unmount that notice. Account controls now have an error boundary with a Reload fallback. Logout
+catches account-module loading failures and routes them through the existing logout operation,
+which clears private client state and reports the provider failure. A successful load invokes Clerk
+sign-out before unmounting its provider. Controller regressions cover provider rejection and the
+invoke-before-unmount ordering. An actual blocked Clerk chunk browser test confirmed that the shell
+and Reload survive, repeated failures remain recoverable, and Reload restores sign-in after the
+request block is removed.
 
 ## Authentication evidence
 
@@ -103,8 +113,17 @@ permissions.
 Clerk CLI initialization links the development app `app_3JVlP4sHyXZsQVtvzO819Lswzaq`. CLI doctor passes
 its integration checks. The local credential files are ignored `apps/web/.env.local` and the Clerk
 CLI's `/home/stanley/.config/clerk-cli/config.json`; their contents are not included in this document.
-The CLI administrator login is separate from a Clerk application user. Live application sign-in is
-pending an owner account in that development app. No registration flow was added to Lilac.
+The supplied Clerk application user was configured as the owner in an isolated live fixture. A
+short-lived, single-use Clerk sign-in ticket exercised the real Clerk SDK and backend verification.
+Owner bootstrap, socket prompts, file upload/preview, automatic token refresh, authenticated reload,
+and sign-out passed. Bootstrap and the previously accessible resource returned 401 after sign-out.
+This verifies application sessions, not an interactive password or GitHub OAuth login. No registration
+flow was added to Lilac; the embedded sign-in card hides signup and disables signup transfer.
+
+`apps/core/tests/surface/native/clerk-browser-fixture.ts` loads the existing ignored environment
+configuration at runtime and takes `TEST_NATIVE_CLERK_OWNER_ID`. It uses a disposable native store and
+deterministic model without changing the operator's normal Core configuration. No credentials or
+sign-in tickets were recorded in source or test artifacts.
 
 The hosted application entry is `https://thorough-lamb-9546.accounts.dev/sign-in`.
 
@@ -115,7 +134,7 @@ OAuth interaction have not been claimed as tested. No TUI implementation is incl
 ## Verification record
 
 Focused protocol, store, execution, gateway, resource, runtime, client, cache, web and architecture
-tests have passed as their review fixes landed. Full `bun run check` passed, including 3,269 Core
+tests have passed as their review fixes landed. Full `bun run check` passed, including Core
 tests, all other workspace tests, architecture checks, lint, formatting and repository typechecks.
 The production web build also passed. A final check is repeated before each incremental commit.
 

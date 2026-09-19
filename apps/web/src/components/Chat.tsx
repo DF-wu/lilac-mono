@@ -3,6 +3,7 @@ import { X, RotateCcw } from "lucide-react";
 import type { NativeInput, DisplayPart } from "@stanley2058/lilac-client-protocol";
 import type { AppProps, ChatCommon, ComposerSubmission, QueueEntry } from "../types";
 import { resolveAttachmentIds } from "../uploads";
+import { inputDeliveryOptions } from "../input-mode";
 import type { UploadPool } from "../uploads";
 import { Composer } from "./Composer";
 import { Timeline, useSlot, useSlotIds } from "./Timeline";
@@ -190,10 +191,14 @@ export function Chat(props: ChatProps) {
       commandId: entry.commandId,
       historyGeneration: checkpoint.historyGeneration,
       text: entry.text,
-      mode: active ? entry.submission.mode : "prompt",
+      ...inputDeliveryOptions(
+        active,
+        entry.submission.mode,
+        entry.submission.modelId,
+        !!entry.submission.command,
+      ),
       attachmentIds: ids.filter((id): id is string => !!id),
       skillIds: entry.submission.skillIds,
-      modelId: active && entry.submission.mode === "steer" ? undefined : entry.submission.modelId,
       command: entry.submission.command,
     };
     setPending(entry.commandId, { input });

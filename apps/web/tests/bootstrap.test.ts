@@ -301,3 +301,15 @@ test("provider logout failure remains visible after private state is purged", as
   });
   expect(await test.cache.readLatestBootstrap()).toBeUndefined();
 });
+
+test("a rejected provider loader still clears the session and private cache", async () => {
+  const test = setup();
+  await test.controller.start();
+  await test.controller.logout(() => Promise.reject(new Error("Failed to fetch account module")));
+  expect(test.controller.getSnapshot()).toMatchObject({
+    kind: "login",
+    signingOut: false,
+    message: "Could not sign out of the authentication provider. Try again.",
+  });
+  expect(await test.cache.readLatestBootstrap()).toBeUndefined();
+});

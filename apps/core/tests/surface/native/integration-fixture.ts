@@ -40,7 +40,10 @@ import {
   type NativeLogin,
   type NativeAuthError,
 } from "../../../src/surface/native/auth";
-import { openNativeInstallation } from "../../../src/surface/native/installation";
+import {
+  openNativeInstallation,
+  type NativeInstallationSecrets,
+} from "../../../src/surface/native/installation";
 import { createNativeRuntime } from "../../../src/surface/native/runtime";
 import type { CoreToolPluginManager, BuiltLevel1Toolset } from "../../../src/plugins";
 
@@ -103,6 +106,8 @@ export async function createNativeIntegrationFixture(
     port?: number;
     password?: string;
     allowedOrigins?: string[];
+    installationSecrets?: NativeInstallationSecrets;
+    publishableKey?: string;
     model?: MockLanguageModelV4;
     seed?: (
       store: import("../../../src/surface/native/store").NativeStore,
@@ -147,7 +152,7 @@ export async function createNativeIntegrationFixture(
     await openNativeInstallation({
       config: config.surface.native,
       dataDir,
-      secrets: {
+      secrets: options.installationSecrets ?? {
         localUsername: username,
         localPasswordHash: await Bun.password.hash(password, {
           algorithm: "argon2id",
@@ -160,6 +165,8 @@ export async function createNativeIntegrationFixture(
   );
   const store = installation.store;
   if (options.additionalLocalUsers?.length) {
+    if (config.surface.native.auth.provider !== "local")
+      throw new Error("Additional fixture accounts require the local provider");
     const originalAuth = installation.auth;
     const originalLogin = installation.login;
     if (!originalLogin) throw new Error("Local fixture login is unavailable");
@@ -290,6 +297,7 @@ export async function createNativeIntegrationFixture(
   const runtime = integrationValue(
     await createNativeRuntime({
       installation,
+      publishableKey: options.publishableKey,
       bus,
       blobs,
       transcript,
@@ -370,12 +378,15 @@ export async function createNativeIntegrationFixture(
   runner.activate();
   const address = integrationValue(runtime.startIngress());
   const url = address.url;
-  const login = await fetch(new URL("api/auth/login", url), {
-    method: "POST",
-    headers: { authorization: `Basic ${btoa(`${username}:${password}`)}` },
-  });
-  if (!login.ok) throw new Error(`Native fixture login failed: ${login.status}`);
-  const loginData = (await login.json()) as { token: string };
+  let loginData = { token: "" };
+  if (config.surface.native.auth.provider === "local") {
+    const login = await fetch(new URL("api/auth/login", url), {
+      method: "POST",
+      headers: { authorization: `Basic ${btoa(`${username}:${password}`)}` },
+    });
+    if (!login.ok) throw new Error(`Native fixture login failed: ${login.status}`);
+    loginData = (await login.json()) as { token: string };
+  }
   const sockets = new Set<WebSocket>();
   async function loginAs(loginUsername: string, loginPassword: string): Promise<string> {
     const response = await fetch(new URL("api/auth/login", url), {

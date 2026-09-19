@@ -62,6 +62,9 @@ and data authority. Human author attribution remains separate.
 The thread's model selection applies to new full turns. Active runs retain their selected model.
 Sending while a run is active steers by default; follow-up mode queues a full turn. Cancel drops
 queued follow-ups. Users can remove queued entries but cannot reorder or edit them.
+Custom commands sent during an active run automatically queue as follow-ups, including when the
+composer was set to steering. They use the selected next-run model and execute at the start of that
+new full turn.
 
 Rewind targets a full user turn. It cancels active work, removes that turn and later history, and puts
 the original text into the composer. Steering messages are not rewind targets. Rewind does not undo

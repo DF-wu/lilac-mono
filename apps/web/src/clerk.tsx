@@ -80,6 +80,8 @@ function SignInView({ onSignedIn }: { onSignedIn: () => void }) {
     <SignIn
       routing="hash"
       withSignUp={false}
+      transferable={false}
+      appearance={{ elements: { footerAction__signIn: { display: "none" } } }}
       forceRedirectUrl={location.pathname + location.search}
     />
   );
