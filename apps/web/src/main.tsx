@@ -1,5 +1,5 @@
 import { Button } from "./components/ui/button";
-import { lazy, Suspense, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { Result } from "better-result";
 import { WebSessionController, webCache } from "./bootstrap";
@@ -9,18 +9,22 @@ import { watchAppUpdates, type AppUpdate } from "./updates";
 import { AccountLoadBoundary } from "./AccountLoadBoundary";
 import App from "./App";
 import "./styles.css";
+import { Toaster, toast } from "./components/ui/toast";
+const DesignSystem = lazy(() => import("./DesignSystem"));
+const designSystemPage = location.pathname === "/design-system";
 
 const ClerkLogin = lazy(() => import("./clerk").then((module) => ({ default: module.ClerkLogin })));
 const ClerkUserControl = lazy(() =>
   import("./clerk").then((module) => ({ default: module.ClerkUserControl })),
 );
 const sessions = new WebSessionController();
-const authInfo = readAuthInfo();
+const authInfo = designSystemPage ? undefined : readAuthInfo();
 const start = () => {
   void sessions.start();
 };
 const logout = async () => {
   const auth = await authInfo;
+  if (!auth) return;
   const provider = auth.match({ ok: (value) => value.provider, err: () => "local" });
   if (provider !== "clerk") {
     await sessions.logout();
@@ -36,7 +40,7 @@ const logout = async () => {
     err: (error) => sessions.logout(async () => Result.err(error)),
   });
 };
-start();
+if (!designSystemPage) start();
 
 function Root() {
   const state = useSyncExternalStore(sessions.subscribe, sessions.getSnapshot);
@@ -44,7 +48,7 @@ function Root() {
   const [authError, setAuthError] = useState("");
   const [update, setUpdate] = useState<AppUpdate>();
   useEffect(() => {
-    void authInfo.then((result) =>
+    void authInfo?.then((result) =>
       result.match({ ok: setAuth, err: (error) => setAuthError(error.message) }),
     );
     let stop: (() => void) | undefined;
@@ -61,38 +65,45 @@ function Root() {
       stop?.();
     };
   }, []);
-  const withUpdate = (content: ReactNode) => (
-    <>
-      {content}
-      {update ? (
-        <div className="app-update" role="status">
-          <span>Update available</span>
-          <Button onClick={update.activate}>Reload</Button>
-        </div>
-      ) : null}
-    </>
-  );
+  useEffect(() => {
+    if (!update) return;
+    toast.add({
+      id: "app-update",
+      title: "Update available",
+      timeout: 0,
+      actionProps: { children: "Reload", onClick: update.activate },
+    });
+    return () => toast.close("app-update");
+  }, [update]);
+  const stateMessage =
+    state.kind === "offline" || state.kind === "login" ? state.message : undefined;
+  useEffect(() => {
+    const message = stateMessage === "Sign in to continue" ? authError : stateMessage || authError;
+    if (!message) {
+      toast.close("session-status");
+      return;
+    }
+    toast.add({ id: "session-status", title: message, type: "error", timeout: 0 });
+    return () => toast.close("session-status");
+  }, [stateMessage, authError]);
   const reload = update?.activate ?? (() => location.reload());
   if (state.kind === "starting")
-    return withUpdate(
+    return (
       <div className="login-shell">
         <span className="brand">Lilac</span>
-      </div>,
+      </div>
     );
   if (state.kind === "offline")
-    return withUpdate(
+    return (
       <main className="login-shell">
         <h1>Lilac</h1>
-        <p role="status">{state.message}</p>
         <Button onClick={start}>Reconnect</Button>
-      </main>,
+      </main>
     );
   if (state.kind === "login")
-    return withUpdate(
+    return (
       <main className="login-shell">
         <h1>Lilac</h1>
-        {state.message ? <p role="status">{state.message}</p> : null}
-        {authError ? <p role="alert">{authError}</p> : null}
         {state.signingOut ? <p role="status">Signing out…</p> : null}
         {auth?.provider === "local" ? (
           <fieldset disabled={state.signingOut}>
@@ -106,7 +117,7 @@ function Root() {
             </Suspense>
           </AccountLoadBoundary>
         ) : null}
-      </main>,
+      </main>
     );
   const { session } = state;
   const userControl =
@@ -121,7 +132,7 @@ function Root() {
         </Suspense>
       </AccountLoadBoundary>
     ) : undefined;
-  return withUpdate(
+  return (
     <App
       {...session}
       draftCache={webCache}
@@ -129,9 +140,20 @@ function Root() {
       resourceUrl={resourceUrl}
       onLogout={logout}
       userControl={userControl}
-    />,
+    />
   );
 }
 
 const root = document.getElementById("root");
-if (root) createRoot(root).render(<Root />);
+if (root)
+  createRoot(root).render(
+    <Toaster>
+      {designSystemPage ? (
+        <Suspense fallback={null}>
+          <DesignSystem />
+        </Suspense>
+      ) : (
+        <Root />
+      )}
+    </Toaster>,
+  );

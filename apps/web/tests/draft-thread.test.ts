@@ -72,3 +72,27 @@ test("history restores the exact local draft and creates a fresh empty draft for
   expect(hasDraftContent(fallback)).toBe(false);
   expect(hasDraftContent(restoreDraftThread(drafts, null))).toBe(false);
 });
+
+test("draft titles show inline file names without leaking local attachment handles", () => {
+  const draft = newDraftThread();
+  const withText = (text: string) => ({ ...draft, draft: { ...draft.draft, text } });
+  expect(
+    draftThreadTitle(withText("Review [my\\_\\[draft\\].png](attachment:local-id) next")),
+  ).toBe("Review my_[draft].png next");
+  expect(draftThreadTitle(withText("Literal `[image.png](attachment:local-id)` next"))).toBe(
+    "Literal `[image.png](attachment:local-id)` next",
+  );
+  expect(draftThreadTitle(withText("Literal ``[image.png](attachment:local-id)` code``"))).toBe(
+    "Literal ``[image.png](attachment:local-id)` code``",
+  );
+  expect(draftThreadTitle(withText("[website](https://example.com)"))).toBe(
+    "[website](https://example.com)",
+  );
+  const prepared = prepareDraftSend(withText("Review [image.png](attachment:local-id)"), {
+    text: "Review image.png",
+    skillIds: [],
+    mode: "steer",
+    attachments: [],
+  });
+  expect(prepared.title).toBe("Review image.png");
+});

@@ -8,6 +8,10 @@ import ComposerEditor, {
   composerPrefix,
   composerPlainText,
   insertComposerCompletion,
+  insertComposerAttachment,
+  composerSubmissionMarkdown,
+  remapComposerAttachments,
+  attachmentSize,
 } from "../src/components/composer-editor";
 
 it("round trips basic rich Markdown through draft text", () => {
@@ -100,4 +104,88 @@ it("keeps multiline editor semantics while announcing completion options", () =>
   const closed = render(false);
   expect(closed).not.toContain('aria-controls="composer-completions"');
   expect(closed).not.toContain('aria-activedescendant="completion-0"');
+});
+
+it("inserts a file reference at the caret and restores its position without flattening Markdown", () => {
+  const editor = createComposerEditor("**Compare**  with the earlier image");
+  editor.tf.select({ path: [0, 1], offset: 1 });
+  insertComposerAttachment(editor, {
+    key: "image-one",
+    file: new File(["image"], "screen.png", { type: "image/png" }),
+  });
+  expect(composerMarkdown(editor)).toBe(
+    "**Compare** [screen.png](attachment:image-one)  with the earlier image",
+  );
+  const restored = createComposerEditor(composerMarkdown(editor));
+  expect(composerMarkdown(restored)).toBe(composerMarkdown(editor));
+  expect(composerPlainText(restored)).toBe("Compare screen.png  with the earlier image");
+  expect(composerSubmissionMarkdown(restored)).toBe(
+    "**Compare** screen.png  with the earlier image",
+  );
+});
+
+it("remaps only file references when a local draft moves to a server thread", () => {
+  const markdown =
+    "See [notes.txt](attachment:old-key) and `attachment:old-key`.\n\n```md\n[notes.txt](attachment:old-key)\n```";
+  const remapped = remapComposerAttachments(markdown, new Map([["old-key", "new-key"]]));
+  expect(remapped).toBe(
+    "See [notes.txt](attachment:new-key) and `attachment:old-key`.\n\n```md\n[notes.txt](attachment:old-key)\n```",
+  );
+  expect(composerSubmissionMarkdown(createComposerEditor(remapped))).toBe(
+    "See notes.txt and `attachment:old-key`.\n\n```md\n[notes.txt](attachment:old-key)\n```",
+  );
+});
+
+it("keeps attachment-only drafts sendable and handles Markdown characters in filenames", () => {
+  const editor = createComposerEditor();
+  insertComposerAttachment(editor, { key: "special-file", file: new File([""], "my_[draft].txt") });
+  const markdown = composerMarkdown(editor);
+  const restored = createComposerEditor(markdown);
+  expect(composerPlainText(restored)).toBe("my_[draft].txt ");
+  expect(composerSubmissionMarkdown(restored)).not.toContain("attachment:");
+  expect(markdown).not.toContain("\u200b");
+  expect(composerSubmissionMarkdown(restored)).not.toContain("\u200b");
+  expect(composerMarkdown(restored)).toBe(markdown);
+});
+
+it("renders inline thumbnails, file size and accessible remove and retry controls", () => {
+  const noop = () => {};
+  const html = renderToStaticMarkup(
+    createElement(ComposerEditor, {
+      text: "Review [image.png](attachment:image)",
+      attachments: [
+        {
+          key: "image",
+          file: new File([new Uint8Array(1536)], "image.png", { type: "image/png" }),
+          preview: "blob:preview",
+          reservation: Promise.resolve(undefined),
+          progress: 0,
+          state: "failed",
+          error: "Upload failed",
+        },
+      ],
+      disabled: false,
+      placeholder: "Message",
+      onText: noop,
+      onPlainText: noop,
+      onPrefix: noop,
+      onKeyDown: noop,
+      onPaste: noop,
+      expanded: false,
+    }),
+  );
+  expect(html).toContain('class="composer-attachment-chip"');
+  expect(html).toContain('src="blob:preview"');
+  expect(html).toContain("2 KB");
+  expect(html).toContain('aria-label="Remove image.png"');
+  expect(html).toContain('aria-label="Retry image.png"');
+  expect(attachmentSize(512)).toBe("512 B");
+  expect(attachmentSize(1572864)).toBe("1.5 MB");
+});
+
+it("separates an inserted file name from adjacent prose", () => {
+  const editor = createComposerEditor("Review");
+  editor.tf.select(editor.api.end([])!);
+  insertComposerAttachment(editor, { key: "file", file: new File(["text"], "notes.txt") });
+  expect(composerSubmissionMarkdown(editor)).toBe("Review notes.txt ");
 });

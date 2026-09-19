@@ -3836,6 +3836,17 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : [],
     boundaryDecoders: [
+      ...(root === "apps/web"
+        ? [
+            {
+              identity: {
+                module: "src/components/composer-editor.tsx",
+                exportName: "projectComposerNode",
+              },
+              category: "projection" as const,
+            },
+          ]
+        : []),
       ...(root === "apps/tui"
         ? [
             ...["decodeTuiAuthInfo", "decodeTuiLocalToken"].map((exportName) => ({
@@ -3898,6 +3909,14 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             {
               identity: { module: "src/draft-thread.ts", exportName: "restoreDraftThread" },
               category: "persistence" as const,
+            },
+          ]
+        : []),
+      ...(root === "apps/web"
+        ? [
+            {
+              identity: { module: "src/resource-preview.ts", exportName: "decodeResourcePreview" },
+              category: "wire" as const,
             },
           ]
         : []),
@@ -4604,6 +4623,12 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             { module: "src/components/rich-code.tsx", exportName: "loadCodeTokens" },
             { module: "src/components/rich-diagram.tsx", exportName: "renderDiagram" },
           ]
+        : []),
+      ...(root === "apps/web"
+        ? ["decodeResourcePreview", "loadResourcePreview"].map((exportName) => ({
+            module: "src/resource-preview.ts",
+            exportName,
+          }))
         : []),
       ...(root === "apps/web"
         ? [

@@ -10,29 +10,23 @@ import {
   useSyncExternalStore,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import {
-  ChevronRight,
-  RotateCcw,
-  FileText,
-  ExternalLink,
-  Copy,
-  Brain,
-  Wrench,
-  Workflow,
-  LoaderCircle,
-} from "lucide-react";
+import { ChevronRight, RotateCcw, Copy, Brain, Wrench, Workflow, LoaderCircle } from "lucide-react";
 import type { NativeClient, NativeThreadStore } from "@stanley2058/lilac-client";
 import type {
   DisplayMessage,
   ReadyTurnSlot,
   DisplayPart,
 } from "@stanley2058/lilac-client-protocol";
-import { IconButton, Modal, attempt } from "./ui";
-import { UploadProgressContext } from "../upload-context";
+import { IconButton, attempt } from "./ui";
+import { ResourceAttachment } from "./ResourceAttachment";
+import { ActorAvatar } from "./ActorAvatar";
+import { MessageIdentityContext } from "./message-identity";
+import { Bubble, BubbleContent } from "./ui/bubble";
+import "./message-presentation.css";
 import { Markdown } from "./Markdown";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
-import { Message as ChatMessage, MessageContent, MessageHeader } from "./ui/message";
+import { Message as ChatMessage, MessageContent, MessageHeader, MessageAvatar } from "./ui/message";
 import { Marker, MarkerContent, MarkerIcon } from "./ui/marker";
 
 export function useSlot(store: NativeThreadStore, slotId: string | undefined) {
@@ -73,6 +67,7 @@ export type TimelineProps = {
   ) => void;
   onReaction: (messageId: string, emoji: string, active: boolean) => void;
   positions: Map<string, number>;
+  onLatestVisibleChange?: (visible: boolean) => void;
 };
 
 export const Timeline = memo(function Timeline(props: TimelineProps) {
@@ -141,6 +136,17 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       virtual.scrollToIndex(ids.length - 1, { align: "end" });
     previousCount.current = ids.length;
   }, [ids.length, virtual]);
+  const rows = virtual.getVirtualItems();
+  useLayoutEffect(() => {
+    const viewport = parent.current;
+    const latest = rows.find((row) => row.index === ids.length - 1);
+    const visible =
+      !!viewport &&
+      !!latest &&
+      latest.end > viewport.scrollTop &&
+      latest.start < viewport.scrollTop + viewport.clientHeight;
+    props.onLatestVisibleChange?.(visible);
+  }, [rows, ids.length, props.onLatestVisibleChange]);
   const rememberScroll = () => {
     const element = parent.current;
     if (!element) return;
@@ -192,7 +198,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       tabIndex={0}
     >
       <div className="virtual-canvas timeline-canvas" style={{ height: virtual.getTotalSize() }}>
-        {virtual.getVirtualItems().map((row) => (
+        {rows.map((row) => (
           <div
             key={row.key}
             data-index={row.index}
@@ -409,21 +415,53 @@ export function groupParts(parts: readonly DisplayPart[]): Group[] {
 export const Message = memo(function Message(props: MessageProps) {
   const { message } = props;
   const groups = useMemo(() => groupParts(message.parts), [message.parts]);
+  const identities = useContext(MessageIdentityContext);
+  const authorId = message.role === "user" ? message.metadata?.authorId : undefined;
+  const authorResolved = authorId !== undefined && identities.users.has(authorId);
+  const onUnknownAuthor = identities.onUnknownAuthor;
+  useEffect(() => {
+    if (authorId === undefined || authorResolved) return;
+    onUnknownAuthor?.(authorId);
+  }, [authorId, authorResolved, onUnknownAuthor]);
+  const author =
+    message.role === "assistant"
+      ? identities.agent
+      : (identities.users.get(message.metadata?.authorId ?? "") ?? { displayName: "Participant" });
+  const conversational = groups.some(
+    (group) =>
+      group.kind === "text" || (group.kind === "part" && group.part.type === "data-resource"),
+  );
   return (
     <ChatMessage
       align={message.role === "user" ? "end" : "start"}
-      className={`message message-${message.role} text-base`}
+      className={`message message-${message.role} native-message text-base`}
       data-message-id={message.id}
     >
+      {conversational ? (
+        <MessageAvatar>
+          <ActorAvatar {...author} />
+        </MessageAvatar>
+      ) : null}
       <MessageContent>
-        {message.role === "user" && message.metadata?.authorId ? (
+        {conversational ? (
           <MessageHeader className="message-author px-0">
-            {message.metadata.authorId}
-            {message.metadata.inputMode === "steer" ? " · Steering" : ""}
+            {author.displayName}
+            {message.metadata?.inputMode === "steer" ? " · Steering" : ""}
           </MessageHeader>
         ) : null}
         {groups.map((group, index) => {
-          if (group.kind === "text") return <Markdown key={index} text={group.text} />;
+          if (group.kind === "text")
+            return (
+              <Bubble
+                key={index}
+                variant={message.role === "user" ? "tinted" : "muted"}
+                className="message-bubble"
+              >
+                <BubbleContent>
+                  <Markdown text={group.text} />
+                </BubbleContent>
+              </Bubble>
+            );
           if (group.kind === "activity")
             return (
               <Activity key={index} parts={group.parts} createdAt={message.metadata?.createdAt} />
@@ -432,7 +470,7 @@ export const Message = memo(function Message(props: MessageProps) {
           switch (part.type) {
             case "data-resource":
               return (
-                <Resource
+                <ResourceAttachment
                   key={part.id}
                   part={part}
                   resourceUrl={props.resourceUrl}
@@ -595,181 +633,5 @@ export function ActivityItem({ part }: { part: ActivityPart }) {
         <pre className="activity-detail">{part.data.detail}</pre>
       </CollapsibleContent>
     </Collapsible>
-  );
-}
-
-function Resource({
-  part,
-  resourceUrl,
-  upload,
-  canEdit,
-}: {
-  part: Extract<DisplayPart, { type: "data-resource" }>;
-  resourceUrl: (id: string) => string;
-  upload?: TimelineProps["upload"];
-  canEdit: boolean;
-}) {
-  const [failed, setFailed] = useState(false);
-  const [preview, setPreview] = useState(false);
-  const [recovery, setRecovery] = useState<{ progress: number; active: boolean; error?: string }>({
-    progress: 0,
-    active: false,
-  });
-  const fileInput = useRef<HTMLInputElement>(null);
-  const { data } = part;
-  const local = useContext(UploadProgressContext).get(data.resourceId);
-  if (data.state !== "ready")
-    return (
-      <div className="resource">
-        <FileText />
-        <span>{data.name}</span>
-        <span>{recovery.error ?? local?.error ?? data.error ?? data.state}</span>
-        {canEdit && local?.state === "failed" && local.retry ? (
-          <Button type="button" variant="ghost" className="text-button" onClick={local.retry}>
-            Retry upload
-          </Button>
-        ) : null}
-        {canEdit && upload && !local && data.state !== "canceled" ? (
-          <>
-            <input
-              type="file"
-              ref={fileInput}
-              className="sr-only"
-              tabIndex={-1}
-              aria-label={`Resume upload of ${data.name}`}
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                event.target.value = "";
-                if (!file) return;
-                if (file.name !== data.name || file.size !== data.size) {
-                  setRecovery({
-                    active: false,
-                    progress: 0,
-                    error: "Choose the original file with the same name and size.",
-                  });
-                  return;
-                }
-                setRecovery({ active: true, progress: 0 });
-                void attempt(
-                  async () => {
-                    await upload(data.resourceId, file, (progress) =>
-                      setRecovery({ active: true, progress }),
-                    );
-                    setRecovery({ active: false, progress: 1 });
-                  },
-                  () =>
-                    setRecovery({
-                      active: false,
-                      progress: 0,
-                      error: "Upload failed. Select the file to retry.",
-                    }),
-                );
-              }}
-            />
-            <Button
-              type="button"
-              variant="ghost"
-              className="text-button"
-              disabled={recovery.active}
-              onClick={() => fileInput.current?.click()}
-            >
-              Resume upload
-            </Button>
-          </>
-        ) : null}
-        {data.state === "pending" || recovery.active ? (
-          <progress
-            value={recovery.active ? recovery.progress : (local?.progress ?? data.progress)}
-            max={1}
-            aria-label={`Uploading ${data.name}`}
-          />
-        ) : null}
-      </div>
-    );
-  const href = resourceUrl(data.resourceId);
-  return (
-    <div className="resource-ready">
-      {data.mediaType.startsWith("image/") && !failed ? (
-        <a href={href} target="_blank" rel="noreferrer">
-          <img src={href} loading="lazy" alt={data.name} onError={() => setFailed(true)} />
-        </a>
-      ) : null}
-      <a className="resource-link" href={href} target="_blank" rel="noreferrer">
-        <FileText />
-        <span>{data.name}</span>
-        <ExternalLink />
-      </a>
-      {data.mediaType.startsWith("text/") ||
-      /\.(md|txt|json|csv|yaml|yml|ts|tsx|js|py|sh|log)$/i.test(data.name) ? (
-        <Button
-          type="button"
-          variant="ghost"
-          className="text-button"
-          onClick={() => setPreview(true)}
-        >
-          Preview
-        </Button>
-      ) : null}
-      {failed ? <span className="error-text">This file is unavailable.</span> : null}
-      {preview ? (
-        <FilePreview name={data.name} href={href} onClose={() => setPreview(false)} />
-      ) : null}
-    </div>
-  );
-}
-
-function FilePreview({ name, href, onClose }: { name: string; href: string; onClose: () => void }) {
-  const [text, setText] = useState<string>();
-  const [error, setError] = useState<string>();
-  const [truncated, setTruncated] = useState(false);
-  useEffect(() => {
-    const controller = new AbortController();
-    void attempt(
-      async () => {
-        const response = await fetch(href, { signal: controller.signal });
-        if (!response.ok || !response.body) {
-          setError("This file is unavailable.");
-          return;
-        }
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let source = "",
-          bytes = 0;
-        while (bytes < 65_536) {
-          const chunk = await reader.read();
-          if (chunk.done) {
-            source += decoder.decode();
-            setText(source);
-            return;
-          }
-          const remaining = 65_536 - bytes;
-          source += decoder.decode(chunk.value.subarray(0, remaining), { stream: true });
-          bytes += chunk.value.byteLength;
-        }
-        await reader.cancel();
-        if (!controller.signal.aborted) {
-          setText(source);
-          setTruncated(true);
-        }
-      },
-      () => {
-        if (!controller.signal.aborted) setError("This file is unavailable.");
-      },
-    );
-    return () => controller.abort();
-  }, [href]);
-  return (
-    <Modal title={name} onClose={onClose} wide>
-      {error ? (
-        <p className="error-text">{error}</p>
-      ) : (
-        <pre className="file-preview">{text ?? "Loading file…"}</pre>
-      )}
-      {truncated ? (
-        <a href={href} target="_blank" rel="noreferrer">
-          Open full file
-        </a>
-      ) : null}
-    </Modal>
   );
 }

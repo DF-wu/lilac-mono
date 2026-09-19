@@ -41,6 +41,14 @@ For frontend development, run `bun run dev:web`. Vite proxies `/api` and WebSock
 `http://127.0.0.1:8787`; `LILAC_WEB_BACKEND_URL` overrides that development target. Add the development
 origin, normally `http://localhost:5173`, to `allowedOrigins`.
 
+## Design system
+
+Open `/design-system`, or use the palette button in the sidebar, to inspect the real UI components
+with synthetic examples. The page requires no login and makes no requests for conversations or
+configuration. It includes dark/light themes, thread states, messages, composer, attachment previews,
+code blocks, controls, overlays and layout. The input-required thread state is a visual specimen;
+the native question capability remains unimplemented.
+
 ## Clerk
 
 Choose Clerk per installation with `surface.native.auth.provider: clerk`. Configure the owner's native
@@ -62,7 +70,10 @@ and data authority. Human author attribution remains separate.
 New conversation opens a local draft. Typing or attaching files adds it to the sidebar; the server
 thread is created on the first Send. Draft text survives reloads, while unsent files must be reattached.
 The composer supports basic Markdown formatting through Plate. Enter sends; Shift+Enter continues
-writing. Sidebar rows offer rename and delete on hover or focus, with more actions in the context menu.
+writing. Attachments appear as inline file chips. Drafts restored after reload require missing files
+to be reattached or removed before sending. Sidebar rows show the starter and activity time; rename,
+archive and delete replace the timestamp on hover or focus. A completed indicator remains until the
+latest settled turn is visible in the foreground tab. Working and failed runs have separate states.
 
 The thread's model selection applies to new full turns. Active runs retain their selected model.
 Sending while a run is active steers by default; follow-up mode queues a full turn. Cancel drops
@@ -77,7 +88,9 @@ external tool effects.
 
 Attachments upload over HTTP. Sending accepts the message while upload continues; execution waits
 for all file resources. Resource access follows the file's original thread, including when another
-thread references it. Filepath previews read the latest file and show an error when it is gone.
+thread references it. Text previews return at most 64 KiB, with a truncation indicator for larger
+files and an error for binary data. Local and SSH filepath previews read only that prefix of the
+latest file and show an error when it is gone.
 
 `outputStreaming: paragraph` publishes text at blank-line boundaries. `complete` publishes the
 buffered text at model-step completion or tool handoff. Clients never receive token-by-token text.
@@ -95,8 +108,13 @@ config, using revisions to reject concurrent edits. Core keeps its existing relo
 Save writes the document; Reload applies it through the existing MCP registry. The UI does not edit
 `.env` or credential files. Listener and authentication settings take effect when Core restarts.
 
+The owner can change the agent's display name and upload a PNG, JPEG, WebP or GIF avatar up to 2 MiB.
+These settings persist in the native service-user record; the service identity remains `lilac`.
+Authenticated participants see the same identity across threads. Avatar URLs include a content
+revision and use the browser's private cache; changing the avatar changes its URL.
+
 The browser caches versioned app assets and scoped conversation projections separately. Private
-API responses never enter the service worker cache. Logout clears private cached data. An app update
+API responses never enter the service worker cache. Logout clears cached conversation data. An app update
 offers a Reload button; drafts remain on the device until sent or cleared.
 
 ## Terminal client

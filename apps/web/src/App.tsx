@@ -12,12 +12,11 @@ import {
   Trash2,
   Users,
   Globe,
-  MessageSquare,
   PanelLeftClose,
   PanelLeftOpen,
-  WifiOff,
   X,
   MoreHorizontal,
+  Palette,
 } from "lucide-react";
 import type {
   DisplayCatalog,
@@ -30,9 +29,12 @@ import { Chat, type Draft, type PendingInput } from "./components/Chat";
 import { Settings } from "./components/Settings";
 import { Sharing } from "./components/Sharing";
 import { External } from "./components/External";
-import { attempt, ErrorNotice, IconButton, Modal, VirtualList } from "./components/ui";
+import { attempt, IconButton, Modal, VirtualList } from "./components/ui";
 import { DraftChat } from "./components/DraftChat";
-import { ThreadSelect } from "./components/ThreadSelect";
+import { MessageIdentityContext } from "./components/message-identity";
+import type { ActorIdentity } from "./components/ActorAvatar";
+import { toast } from "./components/ui/toast";
+import { ThreadSelect, ThreadCard } from "./components/ThreadSelect";
 import {
   newDraftThread,
   restoreDraftThread,
@@ -81,6 +83,21 @@ export function App(props: AppProps) {
   const [catalog, setCatalog] = useState<DisplayCatalog | undefined>(() =>
     initial.catalog.kind === "catalog" ? initial.catalog.catalog : client.catalogs.get(props.scope),
   );
+  const [participants, setParticipants] = useState(
+    () => new Map<string, Map<string, ActorIdentity>>(),
+  );
+  const [unknownAuthor, setUnknownAuthor] = useState<{ threadId: string; authorId: string }>();
+  const onUnknownAuthor = useCallback(
+    (authorId: string) => {
+      if (selectedId)
+        setUnknownAuthor((current) =>
+          current?.threadId === selectedId && current.authorId === authorId
+            ? current
+            : { threadId: selectedId, authorId },
+        );
+    },
+    [selectedId],
+  );
   const [connection, setConnection] = useState("online");
   const [error, setError] = useState<string>();
   const [settings, setSettings] = useState(false);
@@ -119,6 +136,41 @@ export function App(props: AppProps) {
   const archivedRef = useRef(archived);
   archivedRef.current = archived;
 
+  useEffect(() => {
+    const rpc = client.rpc;
+    if (!rpc || !selected || external) return;
+    const known = participants.get(selected.id);
+    if (known && (unknownAuthor?.threadId !== selected.id || known.has(unknownAuthor.authorId)))
+      return;
+    let canceled = false;
+    void attempt(
+      () => rpc.participants.list({ threadId: selected.id }),
+      () => {},
+    ).then((result) => {
+      if (!result || canceled) return;
+      setParticipants((current) => {
+        const changed = new Map(current);
+        changed.set(
+          selected.id,
+          new Map(result.items.map(({ user }) => [user.id, { displayName: user.displayName }])),
+        );
+        if (changed.size > 100) changed.delete(changed.keys().next().value!);
+        return changed;
+      });
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [client, selected?.id, selected?.capabilities.read, external, connection, unknownAuthor]);
+  const identities = useMemo(() => {
+    const users = new Map(selectedId ? participants.get(selectedId) : []);
+    users.set(initial.viewer.id, { displayName: initial.viewer.displayName });
+    return {
+      agent: catalog?.agent ?? { displayName: "Lilac" },
+      users,
+      onUnknownAuthor: selectedId && participants.has(selectedId) ? onUnknownAuthor : undefined,
+    };
+  }, [catalog?.agent, participants, selectedId, initial.viewer, onUnknownAuthor]);
   useEffect(() => {
     const cache = props.draftCache;
     if (!cache) return;
@@ -195,6 +247,11 @@ export function App(props: AppProps) {
             return;
           case "removed":
             setThreads((items) => items.filter((thread) => thread.id !== event.threadId));
+            setParticipants((current) => {
+              const changed = new Map(current);
+              changed.delete(event.threadId);
+              return changed;
+            });
             drafts.current.delete(event.threadId);
             pending.current.delete(event.threadId);
             readTurns.current.delete(event.threadId);
@@ -335,6 +392,7 @@ export function App(props: AppProps) {
     );
     if (!created || pool.signal.aborted) return;
     upsert(created);
+    const { remapComposerAttachments } = await import("./components/composer-editor");
     const latest = localDraftsRef.current.get(id);
     const moveAttachments = (files: ComposerSubmission["attachments"]) =>
       files.map((item) => {
@@ -349,13 +407,18 @@ export function App(props: AppProps) {
     patchPending(created.id, (entries) => [...entries, entry]);
     if (latest) {
       const unsent = moveAttachments(latest.attachments);
-      drafts.current.set(created.id, {
+      const transferredDraft = {
         ...latest.draft,
+        text: remapComposerAttachments(
+          latest.draft.text,
+          new Map(latest.attachments.map((item, index) => [item.key, unsent[index]!.key])),
+        ),
         attachments: unsent.map((file) => file.key),
-      });
+      };
+      drafts.current.set(created.id, transferredDraft);
       if (props.draftCache)
         void attempt(
-          () => props.draftCache!.saveDraft(props.scope, created.id, latest.draft),
+          () => props.draftCache!.saveDraft(props.scope, created.id, transferredDraft),
           setError,
         );
     }
@@ -519,425 +582,450 @@ export function App(props: AppProps) {
   const draft = selectedId
     ? (drafts.current.get(selectedId) ?? { text: "", skillIds: [], attachments: [] })
     : { text: "", skillIds: [], attachments: [] };
-  const notices = (
-    <>
-      {connection !== "online" ? (
-        <div className="connection-notice" role="status">
-          <WifiOff />
-          {connection === "connecting"
-            ? "Connecting…"
-            : "Offline. Cached conversations remain available."}
-        </div>
-      ) : null}
-      <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
-    </>
-  );
-  return (
-    <Tooltip.Provider delay={350}>
-      <div className={`app-shell ${sidebar ? "" : "sidebar-hidden"}`}>
-        <div className="sidebar-toggle">
+  useEffect(() => {
+    if (!error) return;
+    toast.add({ id: "app-error", title: error, type: "error", onClose: () => setError(undefined) });
+  }, [error]);
+  useEffect(() => {
+    if (connection === "online") {
+      toast.close("connection");
+      return;
+    }
+    toast.add({
+      id: "connection",
+      title: connection === "connecting" ? "Connecting…" : "You're offline",
+      description: "Cached conversations remain available.",
+      type: "info",
+      timeout: 0,
+    });
+    return () => toast.close("connection");
+  }, [connection]);
+  const rowActions = (thread: (typeof sidebarThreads)[number]) =>
+    thread.editable ? (
+      <>
+        <IconButton
+          label={`Rename ${thread.title || "conversation"}`}
+          onClick={() => setRename({ id: thread.id, title: thread.title })}
+        >
+          <Pencil />
+        </IconButton>
+        {!thread.draft ? (
           <IconButton
-            label={sidebar ? "Hide sidebar" : "Show sidebar"}
-            onClick={() => setSidebar((value) => !value)}
+            label={`${thread.archived ? "Unarchive" : "Archive"} ${thread.title || "conversation"}`}
+            onClick={() => void update(thread.id, { archived: !thread.archived })}
           >
-            {sidebar ? <PanelLeftClose /> : <PanelLeftOpen />}
+            {thread.archived ? <ArchiveRestore /> : <Archive />}
           </IconButton>
-        </div>
-        <ResizablePanelGroup orientation="horizontal" className="workspace-panels">
-          {sidebar ? (
-            <ResizablePanel
-              id="sidebar"
-              defaultSize="18rem"
-              minSize="12rem"
-              maxSize="40%"
-              className="sidebar-panel"
+        ) : null}
+        <IconButton
+          className="destructive-action"
+          label={`Delete ${thread.title || "conversation"}`}
+          onClick={() => setConfirmDelete(thread.id)}
+        >
+          <Trash2 />
+        </IconButton>
+      </>
+    ) : undefined;
+  return (
+    <MessageIdentityContext.Provider value={identities}>
+      <Tooltip.Provider delay={350}>
+        <main
+          className={`app-shell ${sidebar ? "" : "sidebar-hidden"}`}
+          aria-label="Chat workspace"
+        >
+          <div className="sidebar-toggle">
+            <IconButton
+              label={sidebar ? "Hide sidebar" : "Show sidebar"}
+              onClick={() => setSidebar((value) => !value)}
             >
-              <aside className="sidebar">
-                <header className="sidebar-header">
-                  <span className="brand">
-                    lilac
-                    <span />
-                  </span>
-                  <span className="toolbar-spacer" />
-                  <IconButton label="New conversation" onClick={() => void createThread()}>
-                    <Plus />
-                  </IconButton>
-                </header>
-                <form
-                  className="search-box"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    void search();
-                  }}
-                >
-                  <Search />
-                  <Input
-                    className="pl-9 pr-9"
-                    value={searchQuery}
-                    onChange={(event) => {
-                      setSearchQuery(event.target.value);
-                      if (!event.target.value) setResults(undefined);
-                    }}
-                    aria-label="Search conversations"
-                    placeholder="Search conversations"
-                  />
-                  <Button type="submit" className="sr-only">
-                    Search
-                  </Button>
-                  {searchQuery ? (
-                    <IconButton
-                      label="Clear search"
-                      onClick={() => {
-                        setSearchQuery("");
-                        setResults(undefined);
-                      }}
-                    >
-                      <X />
+              {sidebar ? <PanelLeftClose /> : <PanelLeftOpen />}
+            </IconButton>
+          </div>
+          <ResizablePanelGroup orientation="horizontal" className="workspace-panels">
+            {sidebar ? (
+              <ResizablePanel
+                id="sidebar"
+                defaultSize="18rem"
+                minSize="12rem"
+                maxSize="40%"
+                className="sidebar-panel"
+              >
+                <aside className="sidebar">
+                  <header className="sidebar-header">
+                    <span className="brand">
+                      lilac
+                      <span />
+                    </span>
+                    <span className="toolbar-spacer" />
+                    <IconButton label="New conversation" onClick={() => void createThread()}>
+                      <Plus />
                     </IconButton>
-                  ) : null}
-                </form>
-                <nav className="sidebar-tabs">
-                  <IconButton
-                    label={archived ? "Show active conversations" : "Show archived conversations"}
-                    aria-pressed={archived}
-                    onClick={() => {
-                      const value = !archived;
-                      setArchived(value);
-                      setExternal(false);
-                      void listThreads(value);
+                  </header>
+                  <form
+                    className="search-box"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void search();
                     }}
                   >
-                    <Archive />
-                  </IconButton>
-                  {owner ? (
+                    <Search />
+                    <Input
+                      className="pl-9 pr-9"
+                      value={searchQuery}
+                      onChange={(event) => {
+                        setSearchQuery(event.target.value);
+                        if (!event.target.value) setResults(undefined);
+                      }}
+                      aria-label="Search conversations"
+                      placeholder="Search conversations"
+                    />
+                    <Button type="submit" className="sr-only">
+                      Search
+                    </Button>
+                    {searchQuery ? (
+                      <IconButton
+                        label="Clear search"
+                        onClick={() => {
+                          setSearchQuery("");
+                          setResults(undefined);
+                        }}
+                      >
+                        <X />
+                      </IconButton>
+                    ) : null}
+                  </form>
+                  <nav className="sidebar-tabs">
                     <IconButton
-                      label="Read other surfaces"
-                      aria-pressed={external}
+                      label={archived ? "Show active conversations" : "Show archived conversations"}
+                      aria-pressed={archived}
                       onClick={() => {
-                        setExternalId(undefined);
-                        setExternal((value) => !value);
+                        const value = !archived;
+                        setArchived(value);
+                        setExternal(false);
+                        void listThreads(value);
                       }}
                     >
-                      <Globe />
+                      <Archive />
                     </IconButton>
-                  ) : null}
-                  <span className="toolbar-spacer" />
-                  {archived ? <small>Archived</small> : null}
-                </nav>
-                {results ? (
-                  <>
-                    <VirtualList
-                      items={results.items}
-                      itemKey={(hit) => `${hit.threadId}:${hit.turnId ?? hit.excerpt}`}
-                      label="Search results"
-                      className="thread-list"
-                      estimate={92}
-                      render={(hit) => (
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          className="search-result h-auto flex-col items-start whitespace-normal"
-                          onClick={() => {
-                            if (hit.surface === "native") select(hit.threadId);
-                            else {
-                              setExternalId(hit.threadId);
-                              setExternal(true);
-                            }
-                          }}
-                        >
-                          <strong>{hit.title}</strong>
-                          <span>{hit.excerpt}</span>
-                        </Button>
-                      )}
-                    />
-                    {results.items.length === 0 && !searching ? (
-                      <p className="muted empty-list">No results</p>
-                    ) : null}
-                    {results.nextCursor ? (
-                      <Button
-                        variant="ghost"
-                        className="text-button"
-                        onClick={() => void search(results.nextCursor)}
+                    {owner ? (
+                      <IconButton
+                        label="Read other surfaces"
+                        aria-pressed={external}
+                        onClick={() => {
+                          setExternalId(undefined);
+                          setExternal((value) => !value);
+                        }}
                       >
-                        More results
-                      </Button>
+                        <Globe />
+                      </IconButton>
                     ) : null}
-                  </>
-                ) : (
-                  <>
-                    <VirtualList
-                      items={sidebarThreads}
-                      itemKey={(thread) => thread.id}
-                      label="Conversations"
-                      className="thread-list"
-                      estimate={64}
-                      render={(thread) => (
-                        <ContextMenu>
-                          <ContextMenuTrigger
-                            className={`thread-row ${selectedId === thread.id && !external ? "selected" : ""}`}
+                    <span className="toolbar-spacer" />
+                    {archived ? <small>Archived</small> : null}
+                  </nav>
+                  {results ? (
+                    <>
+                      <VirtualList
+                        items={results.items}
+                        itemKey={(hit) => `${hit.threadId}:${hit.turnId ?? hit.excerpt}`}
+                        label="Search results"
+                        className="thread-list"
+                        estimate={92}
+                        render={(hit) => (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            className="search-result h-auto flex-col items-start whitespace-normal"
+                            onClick={() => {
+                              if (hit.surface === "native") select(hit.threadId);
+                              else {
+                                setExternalId(hit.threadId);
+                                setExternal(true);
+                              }
+                            }}
                           >
-                            {thread.source ? (
-                              <ThreadSelect
-                                thread={thread.source}
-                                viewer={initial.viewer}
-                                client={client}
-                                modelLabel={
-                                  catalog?.models.find(
-                                    (model) => model.id === thread.source.modelId,
-                                  )?.label
-                                }
-                                now={now}
-                                onSelect={() => select(thread.id)}
-                              />
-                            ) : (
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                className="thread-select flex-1 min-w-0 shrink justify-start"
-                                onClick={() => select(thread.id)}
-                              >
-                                <MessageSquare />
-                                <span>{thread.title || "Untitled"}</span>
-                                <span className="badge">Draft</span>
-                              </Button>
-                            )}
+                            <strong>{hit.title}</strong>
+                            <span>{hit.excerpt}</span>
+                          </Button>
+                        )}
+                      />
+                      {results.items.length === 0 && !searching ? (
+                        <p className="muted empty-list">No results</p>
+                      ) : null}
+                      {results.nextCursor ? (
+                        <Button
+                          variant="ghost"
+                          className="text-button"
+                          onClick={() => void search(results.nextCursor)}
+                        >
+                          More results
+                        </Button>
+                      ) : null}
+                    </>
+                  ) : (
+                    <>
+                      <VirtualList
+                        items={sidebarThreads}
+                        itemKey={(thread) => thread.id}
+                        label="Conversations"
+                        className="thread-list"
+                        estimate={64}
+                        render={(thread) => (
+                          <ContextMenu>
+                            <ContextMenuTrigger className="thread-row-card">
+                              {thread.source ? (
+                                <ThreadSelect
+                                  thread={thread.source}
+                                  viewer={initial.viewer}
+                                  client={client}
+                                  modelLabel={
+                                    catalog?.models.find(
+                                      (model) => model.id === thread.source.modelId,
+                                    )?.label
+                                  }
+                                  now={now}
+                                  selected={selectedId === thread.id && !external}
+                                  actions={rowActions(thread)}
+                                  onSelect={() => select(thread.id)}
+                                />
+                              ) : (
+                                <ThreadCard
+                                  title={thread.title}
+                                  starterName={`${initial.viewer.displayName} · Draft`}
+                                  state="idle"
+                                  updatedAt={now}
+                                  now={now}
+                                  selected={selectedId === thread.id && !external}
+                                  actions={rowActions(thread)}
+                                  onSelect={() => select(thread.id)}
+                                />
+                              )}
+                            </ContextMenuTrigger>
                             {thread.editable ? (
-                              <span className="thread-actions">
-                                <IconButton
-                                  label={`Rename ${thread.title || "conversation"}`}
+                              <ContextMenuContent>
+                                <ContextMenuItem
                                   onClick={() => setRename({ id: thread.id, title: thread.title })}
                                 >
                                   <Pencil />
-                                </IconButton>
-                                <IconButton
-                                  label={`Delete ${thread.title || "conversation"}`}
+                                  Rename
+                                </ContextMenuItem>
+                                {!thread.draft ? (
+                                  <ContextMenuItem
+                                    onClick={() =>
+                                      void update(thread.id, { archived: !thread.archived })
+                                    }
+                                  >
+                                    {thread.archived ? <ArchiveRestore /> : <Archive />}
+                                    {thread.archived ? "Unarchive" : "Archive"}
+                                  </ContextMenuItem>
+                                ) : null}
+                                <ContextMenuItem
+                                  variant="destructive"
                                   onClick={() => setConfirmDelete(thread.id)}
                                 >
                                   <Trash2 />
-                                </IconButton>
-                              </span>
-                            ) : null}
-                          </ContextMenuTrigger>
-                          {thread.editable ? (
-                            <ContextMenuContent>
-                              <ContextMenuItem
-                                onClick={() => setRename({ id: thread.id, title: thread.title })}
-                              >
-                                <Pencil />
-                                Rename
-                              </ContextMenuItem>
-                              {!thread.draft ? (
-                                <ContextMenuItem
-                                  onClick={() =>
-                                    void update(thread.id, { archived: !thread.archived })
-                                  }
-                                >
-                                  {thread.archived ? <ArchiveRestore /> : <Archive />}
-                                  {thread.archived ? "Unarchive" : "Archive"}
+                                  Delete
                                 </ContextMenuItem>
-                              ) : null}
-                              <ContextMenuItem
-                                variant="destructive"
-                                onClick={() => setConfirmDelete(thread.id)}
-                              >
-                                <Trash2 />
-                                Delete
-                              </ContextMenuItem>
-                            </ContextMenuContent>
-                          ) : null}
-                        </ContextMenu>
-                      )}
-                    />
-                    {nextCursor ? (
-                      <Button
-                        variant="ghost"
-                        className="text-button"
-                        onClick={() => void listThreads(archived, nextCursor)}
-                      >
-                        More conversations
-                      </Button>
-                    ) : null}
-                  </>
-                )}
-                <footer className="sidebar-footer">
-                  {props.userControl ?? (
-                    <span className="viewer-name">{initial.viewer.displayName}</span>
+                              </ContextMenuContent>
+                            ) : null}
+                          </ContextMenu>
+                        )}
+                      />
+                      {nextCursor ? (
+                        <Button
+                          variant="ghost"
+                          className="text-button"
+                          onClick={() => void listThreads(archived, nextCursor)}
+                        >
+                          More conversations
+                        </Button>
+                      ) : null}
+                    </>
                   )}
-                  <span className="toolbar-spacer" />
-                  {owner ? (
-                    <IconButton label="Settings" onClick={() => setSettings(true)}>
-                      <SettingsIcon />
-                    </IconButton>
-                  ) : null}
-                  <IconButton
-                    label="Sign out"
-                    onClick={() => void attempt(props.onLogout, setError)}
-                  >
-                    <LogOut />
-                  </IconButton>
-                </footer>
-              </aside>
-            </ResizablePanel>
-          ) : null}
-          {sidebar ? (
-            <ResizableHandle aria-label="Sidebar width" className="sidebar-resize-handle" />
-          ) : null}
-          <ResizablePanel id="chat" minSize="40%" className="chat-panel">
-            <main className="main-panel">
-              {!selected || external ? notices : null}
-              {external && owner ? (
-                <External
-                  client={client}
-                  resourceUrl={props.resourceUrl}
-                  initialThreadId={externalId}
-                />
-              ) : null}
-              {!external && selected ? (
-                <>
-                  <header className="thread-header">
-                    <h1>{selected.title || "Untitled"}</h1>
-                    {selected.archived ? <span className="badge">Archived</span> : null}
+                  <footer className="sidebar-footer">
+                    {props.userControl ?? (
+                      <span className="viewer-name">{initial.viewer.displayName}</span>
+                    )}
                     <span className="toolbar-spacer" />
+                    <IconButton
+                      label="Design system"
+                      onClick={() => location.assign("/design-system")}
+                    >
+                      <Palette />
+                    </IconButton>
                     {owner ? (
-                      <IconButton label="Share conversation" onClick={() => setSharing(true)}>
-                        <Users />
+                      <IconButton label="Settings" onClick={() => setSettings(true)}>
+                        <SettingsIcon />
                       </IconButton>
                     ) : null}
-                    {selected.capabilities.edit ? (
-                      <DropdownMenu>
-                        <DropdownMenuTrigger
-                          render={
-                            <IconButton label="Conversation actions">
-                              <MoreHorizontal />
-                            </IconButton>
-                          }
-                        />
-                        <DropdownMenuContent align="end">
-                          <DropdownMenuItem
-                            onClick={() => setRename({ id: selected.id, title: selected.title })}
-                          >
-                            <Pencil />
-                            Rename
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            onClick={() =>
-                              void update(selected.id, { archived: !selected.archived })
-                            }
-                          >
-                            {selected.archived ? <ArchiveRestore /> : <Archive />}
-                            {selected.archived ? "Unarchive" : "Archive"}
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            variant="destructive"
-                            onClick={() => setConfirmDelete(selected.id)}
-                          >
-                            <Trash2 />
-                            Delete
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    ) : null}
-                  </header>
-                  {notices}
-                  <Chat
-                    key={selected.id}
-                    {...props}
-                    thread={selected}
-                    catalog={catalog}
-                    onError={setError}
-                    pool={pool}
-                    positions={positions.current}
-                    readTurns={readTurns.current}
-                    draft={draft}
-                    onDraft={(value) => {
-                      drafts.current.set(selected.id, value);
-                    }}
-                    pending={pending.current.get(selected.id) ?? []}
-                    onPending={(change) => {
-                      patchPending(selected.id, change);
-                    }}
+                    <IconButton
+                      label="Sign out"
+                      onClick={() => void attempt(props.onLogout, setError)}
+                    >
+                      <LogOut />
+                    </IconButton>
+                  </footer>
+                </aside>
+              </ResizablePanel>
+            ) : null}
+            {sidebar ? (
+              <ResizableHandle aria-label="Sidebar width" className="sidebar-resize-handle" />
+            ) : null}
+            <ResizablePanel id="chat" minSize="40%" className="chat-panel">
+              <div className="main-panel">
+                {external && owner ? (
+                  <External
+                    client={client}
+                    resourceUrl={props.resourceUrl}
+                    initialThreadId={externalId}
                   />
-                </>
-              ) : null}
-              {!external && selectedDraft ? (
-                <DraftChat
-                  key={selectedDraft.id}
-                  client={client}
-                  scope={props.scope}
-                  catalog={catalog}
-                  thread={selectedDraft}
-                  onChange={(change) => changeLocalDraft(selectedDraft.id, change)}
-                  onSubmit={(submission) => void submitDraft(selectedDraft.id, submission)}
+                ) : null}
+                {!external && selected ? (
+                  <>
+                    <header className="thread-header">
+                      <h1>{selected.title || "Untitled"}</h1>
+                      {selected.archived ? <span className="badge">Archived</span> : null}
+                      <span className="toolbar-spacer" />
+                      {owner ? (
+                        <IconButton label="Share conversation" onClick={() => setSharing(true)}>
+                          <Users />
+                        </IconButton>
+                      ) : null}
+                      {selected.capabilities.edit ? (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger
+                            render={
+                              <IconButton label="Conversation actions">
+                                <MoreHorizontal />
+                              </IconButton>
+                            }
+                          />
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem
+                              onClick={() => setRename({ id: selected.id, title: selected.title })}
+                            >
+                              <Pencil />
+                              Rename
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={() =>
+                                void update(selected.id, { archived: !selected.archived })
+                              }
+                            >
+                              {selected.archived ? <ArchiveRestore /> : <Archive />}
+                              {selected.archived ? "Unarchive" : "Archive"}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              variant="destructive"
+                              onClick={() => setConfirmDelete(selected.id)}
+                            >
+                              <Trash2 />
+                              Delete
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      ) : null}
+                    </header>
+                    <Chat
+                      key={selected.id}
+                      {...props}
+                      thread={selected}
+                      catalog={catalog}
+                      onError={setError}
+                      pool={pool}
+                      positions={positions.current}
+                      readTurns={readTurns.current}
+                      draft={draft}
+                      onDraft={(value) => {
+                        drafts.current.set(selected.id, value);
+                      }}
+                      pending={pending.current.get(selected.id) ?? []}
+                      onPending={(change) => {
+                        patchPending(selected.id, change);
+                      }}
+                    />
+                  </>
+                ) : null}
+                {!external && selectedDraft ? (
+                  <DraftChat
+                    key={selectedDraft.id}
+                    client={client}
+                    scope={props.scope}
+                    catalog={catalog}
+                    thread={selectedDraft}
+                    onChange={(change) => changeLocalDraft(selectedDraft.id, change)}
+                    onSubmit={(submission) => void submitDraft(selectedDraft.id, submission)}
+                  />
+                ) : null}
+                {!external && !selected && !selectedDraft ? (
+                  <div className="welcome">
+                    <Button onClick={createThread}>
+                      <Plus />
+                      New conversation
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
+            </ResizablePanel>
+          </ResizablePanelGroup>
+          {settings && owner ? (
+            <Settings
+              client={client}
+              onClose={() => setSettings(false)}
+              agent={identities.agent}
+              theme={theme}
+              onTheme={setTheme}
+            />
+          ) : null}
+          {sharing && owner && selected ? (
+            <Sharing client={client} thread={selected} onClose={() => setSharing(false)} />
+          ) : null}
+          {rename !== undefined ? (
+            <Modal title="Rename conversation" onClose={() => setRename(undefined)}>
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void update(rename.id, { title: rename.title });
+                }}
+              >
+                <Input
+                  className="wide-input"
+                  autoFocus
+                  aria-label="Conversation name"
+                  value={rename.title}
+                  onChange={(event) => setRename({ ...rename, title: event.target.value })}
+                  maxLength={512}
                 />
-              ) : null}
-              {!external && !selected && !selectedDraft ? (
-                <div className="welcome">
-                  <Button onClick={createThread}>
-                    <Plus />
-                    New conversation
+                <div className="dialog-actions">
+                  <Button className="button primary" type="submit">
+                    Rename
                   </Button>
                 </div>
-              ) : null}
-            </main>
-          </ResizablePanel>
-        </ResizablePanelGroup>
-        {settings && owner ? (
-          <Settings
-            client={client}
-            onClose={() => setSettings(false)}
-            theme={theme}
-            onTheme={setTheme}
-          />
-        ) : null}
-        {sharing && owner && selected ? (
-          <Sharing client={client} thread={selected} onClose={() => setSharing(false)} />
-        ) : null}
-        {rename !== undefined ? (
-          <Modal title="Rename conversation" onClose={() => setRename(undefined)}>
-            <form
-              onSubmit={(event) => {
-                event.preventDefault();
-                void update(rename.id, { title: rename.title });
-              }}
-            >
-              <Input
-                className="wide-input"
-                autoFocus
-                aria-label="Conversation name"
-                value={rename.title}
-                onChange={(event) => setRename({ ...rename, title: event.target.value })}
-                maxLength={512}
-              />
+              </form>
+            </Modal>
+          ) : null}
+          {confirmDelete ? (
+            <Modal title="Delete conversation?" onClose={() => setConfirmDelete(undefined)}>
+              <p>
+                This removes the conversation and makes its files unavailable. Any active run will
+                be canceled.
+              </p>
               <div className="dialog-actions">
-                <Button className="button primary" type="submit">
-                  Rename
+                <Button className="button" onClick={() => setConfirmDelete(undefined)}>
+                  Keep conversation
+                </Button>
+                <Button
+                  variant="destructive"
+                  className="button danger"
+                  onClick={() => void deleteThread()}
+                >
+                  Delete
                 </Button>
               </div>
-            </form>
-          </Modal>
-        ) : null}
-        {confirmDelete ? (
-          <Modal title="Delete conversation?" onClose={() => setConfirmDelete(undefined)}>
-            <p>
-              This removes the conversation and makes its files unavailable. Any active run will be
-              canceled.
-            </p>
-            <div className="dialog-actions">
-              <Button className="button" onClick={() => setConfirmDelete(undefined)}>
-                Keep conversation
-              </Button>
-              <Button
-                variant="destructive"
-                className="button danger"
-                onClick={() => void deleteThread()}
-              >
-                Delete
-              </Button>
-            </div>
-          </Modal>
-        ) : null}
-      </div>
-    </Tooltip.Provider>
+            </Modal>
+          ) : null}
+        </main>
+      </Tooltip.Provider>
+    </MessageIdentityContext.Provider>
   );
 }
 export default App;

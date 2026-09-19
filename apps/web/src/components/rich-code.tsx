@@ -1,3 +1,4 @@
+import { CodeBlock } from "./CodeBlock";
 import { Result, type Result as ResultType } from "better-result";
 import { RichRenderFailed } from "./rich-render-error";
 import { memo, useEffect, useState } from "react";
@@ -108,33 +109,27 @@ export default memo(function HighlightedCode({
     };
   }, [source, language]);
   if (rendered?.source !== source || rendered.language !== language)
-    return (
-      <pre className="markdown-code">
-        <code>{source}</code>
-      </pre>
-    );
+    return <CodeBlock source={source} language={language} />;
   return (
-    <pre className="markdown-code">
-      <code>
-        {rendered.tokens.map((line, lineIndex) => (
-          <span key={lineIndex}>
-            {line.map((token, tokenIndex) => (
-              <span
-                key={tokenIndex}
-                style={{
-                  color: token.color,
-                  fontStyle: token.fontStyle && token.fontStyle & 1 ? "italic" : undefined,
-                  fontWeight: token.fontStyle && token.fontStyle & 2 ? "bold" : undefined,
-                  textDecoration: token.fontStyle && token.fontStyle & 4 ? "underline" : undefined,
-                }}
-              >
-                {token.content}
-              </span>
-            ))}
-            {lineIndex < rendered.tokens.length - 1 ? "\n" : null}
-          </span>
-        ))}
-      </code>
-    </pre>
+    <CodeBlock source={source} language={language}>
+      {rendered.tokens.map((line, lineIndex) => (
+        <span key={lineIndex}>
+          {line.map((token, tokenIndex) => (
+            <span
+              key={tokenIndex}
+              style={{
+                color: token.color,
+                fontStyle: token.fontStyle && token.fontStyle & 1 ? "italic" : undefined,
+                fontWeight: token.fontStyle && token.fontStyle & 2 ? "bold" : undefined,
+                textDecoration: token.fontStyle && token.fontStyle & 4 ? "underline" : undefined,
+              }}
+            >
+              {token.content}
+            </span>
+          ))}
+          {lineIndex < rendered.tokens.length - 1 ? "\n" : null}
+        </span>
+      ))}
+    </CodeBlock>
   );
 });

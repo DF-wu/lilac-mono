@@ -28,10 +28,41 @@ export function newDraftThread(): DraftThread {
 
 export function draftThreadTitle(thread: DraftThread): string {
   return (
-    (thread.title ?? thread.draft.text.trim().split("\n")[0]?.slice(0, 80) ?? "") ||
+    (thread.title ?? draftPreviewLine(thread.draft.text).slice(0, 80) ?? "") ||
     thread.attachments[0]?.file.name ||
     "New conversation"
   );
+}
+
+function draftPreviewLine(text: string): string {
+  const line = text.trim().split("\n")[0] ?? "";
+  let preview = "";
+  let offset = 0;
+  while (offset < line.length) {
+    const remaining = line.slice(offset);
+    if (remaining.startsWith("\\")) {
+      preview += remaining.slice(0, 2);
+      offset += 2;
+      continue;
+    }
+    const code = /^`+/.exec(remaining)?.[0];
+    if (code) {
+      const closing = line.indexOf(code, offset + code.length);
+      const end = closing < 0 ? line.length : closing + code.length;
+      preview += line.slice(offset, end);
+      offset = end;
+      continue;
+    }
+    const attachment = /^\[((?:\\.|[^\\\]])*)\]\(attachment:[^\s)]+\)/.exec(remaining);
+    if (attachment) {
+      preview += attachment[1]!.replace(/\\([\\`*{}\[\]()#+\-.!_>~|])/g, "$1");
+      offset += attachment[0].length;
+      continue;
+    }
+    preview += line[offset];
+    offset++;
+  }
+  return preview;
 }
 
 export function hasDraftContent(thread: DraftThread): boolean {
@@ -62,7 +93,7 @@ export function prepareDraftSend(
   if (thread.creation) return thread.creation;
   return {
     commandId: crypto.randomUUID(),
-    title: draftThreadTitle(thread),
+    title: draftThreadTitle({ ...thread, draft: { ...thread.draft, text: submission.text } }),
     modelId: submission.modelId,
     entry: {
       commandId: crypto.randomUUID(),

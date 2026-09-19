@@ -1372,3 +1372,29 @@ progress {
     }
   }
 }
+
+@layer components {
+  .login-shell {
+    width: min(100% - var(--space-6), 24rem);
+    min-height: 100dvh;
+    margin-inline: auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: var(--space-5);
+    padding-block: var(--space-7);
+  }
+  .login-shell h1, .login-shell > .brand { font-size: var(--text-2xl); font-weight: 650; text-align: center; }
+  .login-shell fieldset { border: 0; padding: 0; min-width: 0; }
+  .login-form { display: grid; gap: var(--space-4); }
+  .login-form label { display: grid; gap: var(--space-2); font-size: var(--text-sm); }
+  .login-form > button { width: 100%; margin-top: var(--space-2); }
+  .thread-row-card { display: block; padding-block: var(--space-1); }
+}
+@layer components {
+  .agent-identity-settings { display:grid; gap:var(--space-4); margin-block:var(--space-4) var(--space-6); }
+  .agent-identity-settings h2 { font-size:var(--text-base); font-weight:600; }
+  .agent-avatar-editor { display:flex; align-items:center; gap:var(--space-3); flex-wrap:wrap; }
+  .agent-name-form { display:flex; align-items:flex-end; gap:var(--space-3); }
+  .agent-name-form .field { flex:1; margin:0; min-width:0; }
+}

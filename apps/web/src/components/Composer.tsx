@@ -2,6 +2,7 @@ import {
   lazy,
   Suspense,
   useMemo,
+  useContext,
   useCallback,
   useRef,
   useState,
@@ -9,7 +10,7 @@ import {
   type ClipboardEvent,
   type DragEvent,
 } from "react";
-import { ArrowUp, Paperclip, Square, X, FileText, CornerDownRight } from "lucide-react";
+import { ArrowUp, Paperclip, Square, X, CornerDownRight } from "lucide-react";
 import type { Completion } from "@stanley2058/lilac-client";
 import type { ChatCommon, ComposerSubmission, Attachment } from "../types";
 import { IconButton, VirtualList, ErrorNotice } from "./ui";
@@ -19,6 +20,7 @@ import { Popover, PopoverTrigger, PopoverContent } from "./ui/popover";
 
 const ComposerEditor = lazy(() => import("./composer-editor"));
 
+import { MessageIdentityContext } from "./message-identity";
 import { inputDeliveryOptions } from "../input-mode";
 
 export type ComposerProps = Pick<ChatCommon, "client" | "scope" | "catalog"> & {
@@ -43,6 +45,7 @@ export type ComposerProps = Pick<ChatCommon, "client" | "scope" | "catalog"> & {
 };
 
 export function Composer(props: ComposerProps) {
+  const { agent } = useContext(MessageIdentityContext);
   const { text, onText, attachments, active, disabled, catalog } = props;
   const input = useRef<ComposerEditorHandle>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -98,6 +101,10 @@ export function Composer(props: ComposerProps) {
   function submit() {
     if (disabled || !editorReady || props.submitting || (!text.trim() && attachments.length === 0))
       return;
+    if (input.current?.hasMissingAttachments()) {
+      setError("Reattach or remove the missing files before sending.");
+      return;
+    }
     if (text.length > 65_536) {
       setError("Messages can contain up to 65,536 characters.");
       return;
@@ -124,7 +131,7 @@ export function Composer(props: ComposerProps) {
       return;
     }
     props.onSubmit({
-      text,
+      text: input.current?.submissionText() ?? text,
       skillIds,
       mode: delivery.mode === "prompt" ? mode : delivery.mode,
       modelId: delivery.modelId,
@@ -197,6 +204,7 @@ export function Composer(props: ComposerProps) {
         }}
       >
         <PopoverTrigger
+          nativeButton={false}
           render={<span className="composer-completion-anchor" />}
           tabIndex={-1}
           aria-hidden
@@ -240,45 +248,6 @@ export function Composer(props: ComposerProps) {
       </Popover>
       <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
       <div className="composer">
-        {attachments.length ? (
-          <div className="attachment-list">
-            {attachments.map((attachment) => (
-              <div className="attachment" key={attachment.key}>
-                {attachment.preview ? (
-                  <img src={attachment.preview} alt={attachment.file.name} />
-                ) : (
-                  <FileText />
-                )}
-                <span className="attachment-info">
-                  <span>{attachment.file.name}</span>
-                  <small>
-                    {attachment.state === "failed"
-                      ? attachment.error
-                      : `${Math.round(attachment.file.size / 1024)} KB`}
-                  </small>
-                  {attachment.state === "uploading" ? (
-                    <progress
-                      value={attachment.progress}
-                      max={1}
-                      aria-label={`Uploading ${attachment.file.name}`}
-                    />
-                  ) : null}
-                  {attachment.state === "failed" ? (
-                    <button type="button" onClick={() => props.onRetryAttachment(attachment.key)}>
-                      Retry
-                    </button>
-                  ) : null}
-                </span>
-                <IconButton
-                  label={`Remove ${attachment.file.name}`}
-                  onClick={() => props.onRemoveAttachment(attachment.key)}
-                >
-                  <X />
-                </IconButton>
-              </div>
-            ))}
-          </div>
-        ) : null}
         {skillIds.length ? (
           <div className="skill-chips">
             {skillIds.map((id) => (
@@ -294,10 +263,15 @@ export function Composer(props: ComposerProps) {
             ))}
           </div>
         ) : null}
-        <Suspense fallback={<div className="composer-editor" aria-label="Loading editor" />}>
+        <Suspense
+          fallback={<div className="composer-editor" role="status" aria-label="Loading editor" />}
+        >
           <ComposerEditor
             ref={input}
             text={text}
+            attachments={attachments}
+            onRemoveAttachment={props.onRemoveAttachment}
+            onRetryAttachment={props.onRetryAttachment}
             onText={(value, visibleText) => {
               setEditorValue({ text: value, plainText: visibleText });
               if (insertingCompletion.current) {
@@ -327,7 +301,11 @@ export function Composer(props: ComposerProps) {
             onPrefix={setPrefix}
             onKeyDown={keydown}
             onPaste={paste}
-            placeholder={active ? "Steer Lilac, or queue a follow-up…" : "Message Lilac…"}
+            placeholder={
+              active
+                ? `Steer ${agent.displayName}, or queue a follow-up…`
+                : `Message ${agent.displayName}…`
+            }
             expanded={completions.length > 0}
             activeDescendant={completions.length ? `completion-${highlighted}` : undefined}
             disabled={disabled}

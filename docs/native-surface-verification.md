@@ -42,7 +42,24 @@ menu spacing and a fixed sidebar-toggle position. Expanding settled work preserv
 scroll position; activity groups and tool details remain closed until opened. Participant details
 load on hover or keyboard focus through the existing authorized endpoint.
 
-## Current production web performance
+## Design-system and UI follow-up
+
+The `/design-system` gallery uses real app components and synthetic fixtures. Browser verification
+covered 1280-pixel desktop and 390-pixel mobile layouts in dark/light themes, component menus and
+dialogs, media playback/zoom, inline file-chip editing, draft navigation and reload recovery.
+Accessibility audits reported no violations in the gallery or the settled chat screen.
+
+Live local-auth checks covered owner name/avatar changes, the People list after avatar upload,
+service-worker update/reload toasts, and offline status without a layout banner. Toasts sit above
+the conversation rather than over the send control. A warmed cached-thread switch transferred 702
+WebSocket bytes including framing, with no HTTP requests; this is a single transfer check, not a
+new timing benchmark. Identity data is reused on revisits and refreshed for unknown visible authors.
+
+Boundary tests cover owner-only identity changes, public-user projections, avatar caching,
+per-user unread completion, and binary/missing/unauthorized preview responses. A 1 GiB sparse file
+produced a 64 KiB local/remote preview while full reads retained their previous size limit.
+
+## Stage 5 production web performance baseline
 
 Measured on 2026-09-19 after the shadcn/Plate changes and Stage 5 polish, including deferred Mermaid
 layout. The production main asset was `index-ChO3H5WL.js`. Core served the build on loopback using the
@@ -56,7 +73,7 @@ styling and intersected the timeline viewport. The run also retained the previou
 measurement for comparison. The 95th percentile is the nineteenth sorted sample. Animation-frame
 callbacks measure browser scheduling and laid-out content, not compositor presentation timestamps.
 
-| Measurement | Current result |
+| Measurement | Recorded result |
 | --- | --- |
 | Cached rich-thread click to first frame with visible content | 39.8 ms p95; 44.0 ms maximum; viewport checks passed in all 20 samples. |
 | Same clicks measured through two animation frames | 50.5 ms p95; 50.6 ms maximum. This conservative proxy remains 0.5 ms above the 50 ms content target. |

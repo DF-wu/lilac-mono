@@ -101,6 +101,7 @@ export function Chat(props: ChatProps) {
   const last = useSlot(store, ids.at(-1));
   const active = !!thread.activeRunId;
   const previousActive = useRef(active);
+  const [latestVisible, setLatestVisible] = useState(false);
   const [queue, setQueue] = useState<QueueEntry[]>([]);
   const queueRequest = useRef(0);
   const canEdit = useRef(thread.capabilities.edit);
@@ -171,15 +172,45 @@ export function Chat(props: ChatProps) {
     if (changed) void refreshQueue();
   }, [active, refreshQueue]);
   useEffect(() => {
-    if (last?.kind !== "ready" || !client.rpc || props.readTurns.get(thread.id) === last.turnId)
+    if (
+      last?.kind !== "ready" ||
+      !latestVisible ||
+      active ||
+      last.state === "pending" ||
+      last.state === "running"
+    )
       return;
-    void attempt(
-      () => client.rpc!.threads.markRead({ threadId: thread.id, turnId: last.turnId }),
-      setError,
-    ).then((result) => {
-      if (result) props.readTurns.set(thread.id, last.turnId);
-    });
-  }, [client, thread.id, last?.kind === "ready" ? last.turnId : undefined]);
+    const turnId = last.turnId;
+    let pending = false;
+    function markVisibleTurnRead() {
+      const rpc = client.rpc;
+      if (
+        document.visibilityState !== "visible" ||
+        !rpc ||
+        pending ||
+        props.readTurns.get(thread.id) === turnId
+      )
+        return;
+      pending = true;
+      void attempt(() => rpc.threads.markRead({ threadId: thread.id, turnId }), setError).then(
+        (result) => {
+          pending = false;
+          if (result) props.readTurns.set(thread.id, turnId);
+        },
+      );
+    }
+    markVisibleTurnRead();
+    document.addEventListener("visibilitychange", markVisibleTurnRead);
+    return () => document.removeEventListener("visibilitychange", markVisibleTurnRead);
+  }, [
+    client,
+    thread.id,
+    active,
+    latestVisible,
+    last?.kind === "ready" ? last.turnId : undefined,
+    last?.kind === "ready" ? last.state : undefined,
+    props.readTurns,
+  ]);
 
   const setPending = (commandId: string, patch: Partial<PendingInput> | null) => {
     commitPending((entries) =>
@@ -336,6 +367,7 @@ export function Chat(props: ChatProps) {
     <div className="chat-workspace">
       <UploadProgressContext.Provider value={uploadProgress}>
         <Timeline
+          onLatestVisibleChange={setLatestVisible}
           client={client}
           threadId={thread.id}
           canEdit={thread.capabilities.edit}

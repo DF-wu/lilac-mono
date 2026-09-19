@@ -29,3 +29,59 @@
   height: min(20rem, var(--available-height));
 }
 .composer-editor [data-slate-placeholder] { opacity: 1 !important; }
+.composer-attachment-node {
+  display: inline;
+}
+.composer-attachment-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  padding-inline: var(--space-1);
+  border-radius: var(--radius-sm);
+  background: var(--muted);
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  vertical-align: middle;
+  white-space: nowrap;
+  line-height: 1.5;
+}
+.composer-attachment-chip > img,
+.composer-attachment-chip > svg {
+  width: var(--space-4);
+  height: var(--space-4);
+  flex-shrink: 0;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+}
+.composer-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.composer-attachment-chip small {
+  color: var(--muted-foreground);
+  font-size: var(--text-xs);
+  flex-shrink: 0;
+}
+.composer-attachment-chip .icon-button {
+  width: var(--space-5);
+  height: var(--space-5);
+  flex-shrink: 0;
+}
+.composer-attachment-chip .icon-button svg {
+  width: var(--space-3);
+  height: var(--space-3);
+}
+.composer-attachment-chip progress {
+  position: absolute;
+  bottom: 0;
+  inset-inline: var(--space-1);
+  width: calc(100% - var(--space-2));
+  height: calc(var(--space-1) / 2);
+  accent-color: var(--primary);
+}
+.composer-attachment-chip[data-state="failed"],
+.composer-attachment-chip[data-state="missing"] {
+  color: var(--danger);
+}

@@ -3,6 +3,8 @@ import ReactMarkdown, { type Components, type ExtraProps } from "react-markdown"
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { RichRenderBoundary } from "./Markdown";
+import { LinkWithFavicon } from "./LinkWithFavicon";
+import { CodeBlock } from "./CodeBlock";
 import { markdownUrl } from "./markdown-policy";
 
 const HighlightedCode = lazy(() => import("./rich-code"));
@@ -11,11 +13,7 @@ const MathExpression = lazy(() => import("./rich-math"));
 const plugins = [remarkGfm, remarkMath];
 
 function RichBlock({ source, language }: { source: string; language: string }) {
-  const fallback = (
-    <pre className="markdown-code">
-      <code>{source}</code>
-    </pre>
-  );
+  const fallback = <CodeBlock source={source} language={language} />;
   let content = <HighlightedCode source={source} language={language} />;
   if (language === "mermaid") content = <Diagram source={source} />;
   if (language === "math") content = <MathExpression source={source} display />;
@@ -80,11 +78,7 @@ const components: Components = {
       </RichRenderBoundary>
     );
   },
-  a: ({ children, href }) => (
-    <a href={href} target="_blank" rel="noopener noreferrer">
-      {children}
-    </a>
-  ),
+  a: ({ children, href }) => <LinkWithFavicon href={href}>{children}</LinkWithFavicon>,
   img: ({ src, alt }) => (
     <img src={src} alt={alt ?? ""} loading="lazy" decoding="async" referrerPolicy="no-referrer" />
   ),

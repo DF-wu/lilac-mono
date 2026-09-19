@@ -1,3 +1,5 @@
+import { AgentIdentity } from "./AgentIdentity";
+import type { ActorIdentity } from "./ActorAvatar";
 import { useEffect, useRef, useState } from "react";
 import { RefreshCw, Save, UserPlus } from "lucide-react";
 import type { NativeClient } from "@stanley2058/lilac-client";
@@ -20,10 +22,12 @@ export function Settings({
   onClose,
   theme,
   onTheme,
+  agent,
 }: {
   client: NativeClient;
   onClose: () => void;
   theme: string;
+  agent: ActorIdentity;
   onTheme: (value: string) => void;
 }) {
   const [tab, setTab] = useState<"core" | "mcp" | "users" | "appearance">("core");
@@ -106,6 +110,7 @@ export function Settings({
         </TabsList>
         <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
         <TabsContent value="appearance">
+          <AgentIdentity client={client} identity={agent} />
           <label className="field">
             Theme
             <Select
