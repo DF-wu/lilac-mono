@@ -376,6 +376,8 @@ small {
   overflow: auto;
   position: relative;
   min-height: 0;
+  padding-right: var(--space-1);
+  margin-right: calc(-1 * var(--space-1));
 }
 .virtual-canvas {
   position: relative;
@@ -1340,6 +1342,10 @@ progress {
   }
   .sidebar-resize-handle {
     background: transparent;
+  }
+  .workspace-panels > [data-panel][hidden],
+  .sidebar-resize-handle[hidden] {
+    display: none !important;
   }
   .sidebar-resize-handle:hover,
   .sidebar-resize-handle:focus-visible {

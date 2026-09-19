@@ -688,240 +688,240 @@ export function App(props: AppProps) {
             </IconButton>
           </div>
           <ResizablePanelGroup orientation="horizontal" className="workspace-panels">
-            {sidebar ? (
-              <ResizablePanel
-                id="sidebar"
-                defaultSize="18rem"
-                minSize="12rem"
-                maxSize="40%"
-                className="sidebar-panel"
-              >
-                <aside className="sidebar">
-                  <header className="sidebar-header">
-                    <span className="brand">
-                      lilac
-                      <span />
-                    </span>
-                  </header>
-                  <div className="sidebar-search-row">
-                    <form
-                      className="search-box"
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        void search();
+            <ResizablePanel
+              hidden={!sidebar}
+              id="sidebar"
+              defaultSize="18rem"
+              minSize="12rem"
+              maxSize="40%"
+              className="sidebar-panel"
+            >
+              <aside className="sidebar">
+                <header className="sidebar-header">
+                  <span className="brand">
+                    lilac
+                    <span />
+                  </span>
+                </header>
+                <div className="sidebar-search-row">
+                  <form
+                    className="search-box"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void search();
+                    }}
+                  >
+                    <Search />
+                    <Input
+                      className="pl-9 pr-9"
+                      value={searchQuery}
+                      onChange={(event) => {
+                        setSearchQuery(event.target.value);
+                        if (!event.target.value) setResults(undefined);
                       }}
-                    >
-                      <Search />
-                      <Input
-                        className="pl-9 pr-9"
-                        value={searchQuery}
-                        onChange={(event) => {
-                          setSearchQuery(event.target.value);
-                          if (!event.target.value) setResults(undefined);
-                        }}
-                        aria-label="Search conversations"
-                        placeholder="Search"
-                      />
-                      <Button type="submit" className="sr-only">
-                        Search
-                      </Button>
-                      {searchQuery ? (
-                        <IconButton
-                          label="Clear search"
-                          onClick={() => {
-                            setSearchQuery("");
-                            setResults(undefined);
-                          }}
-                        >
-                          <X />
-                        </IconButton>
-                      ) : null}
-                    </form>
-                    <nav className="sidebar-tabs" aria-label="Conversation filters and actions">
+                      aria-label="Search conversations"
+                      placeholder="Search"
+                    />
+                    <Button type="submit" className="sr-only">
+                      Search
+                    </Button>
+                    {searchQuery ? (
                       <IconButton
-                        label={
-                          archived ? "Show active conversations" : "Show archived conversations"
-                        }
-                        aria-pressed={archived}
+                        label="Clear search"
                         onClick={() => {
-                          const value = !archived;
-                          setArchived(value);
-                          setExternal(false);
-                          void listThreads(value);
+                          setSearchQuery("");
+                          setResults(undefined);
                         }}
                       >
-                        <Archive />
-                      </IconButton>
-                      {owner ? (
-                        <IconButton
-                          label="Read other surfaces"
-                          aria-pressed={external}
-                          onClick={() => {
-                            setExternalId(undefined);
-                            setExternal((value) => !value);
-                          }}
-                        >
-                          <Globe />
-                        </IconButton>
-                      ) : null}
-                      <IconButton label="New conversation" onClick={() => void createThread()}>
-                        <Plus />
-                      </IconButton>
-                    </nav>
-                  </div>
-                  {results ? (
-                    <>
-                      <VirtualList
-                        items={results.items}
-                        itemKey={(hit) => `${hit.threadId}:${hit.turnId ?? hit.excerpt}`}
-                        label="Search results"
-                        className="thread-list"
-                        estimate={92}
-                        render={(hit) => (
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            className="search-result h-auto flex-col items-start whitespace-normal"
-                            onClick={() => {
-                              if (hit.surface === "native") select(hit.threadId);
-                              else {
-                                setExternalId(hit.threadId);
-                                setExternal(true);
-                              }
-                            }}
-                          >
-                            <strong>{hit.title}</strong>
-                            <span>{hit.excerpt}</span>
-                          </Button>
-                        )}
-                      />
-                      {results.items.length === 0 && !searching ? (
-                        <p className="muted empty-list">No results</p>
-                      ) : null}
-                      {results.nextCursor ? (
-                        <Button
-                          variant="ghost"
-                          className="text-button"
-                          onClick={() => void search(results.nextCursor)}
-                        >
-                          More results
-                        </Button>
-                      ) : null}
-                    </>
-                  ) : (
-                    <>
-                      <VirtualList
-                        items={sidebarThreads}
-                        itemKey={(thread) => thread.id}
-                        label="Conversations"
-                        scrollFade
-                        hasMore={!!nextCursor && !threadListError}
-                        loading={loadingThreads}
-                        onEndReached={() => {
-                          if (nextCursor) void listThreads(archived, nextCursor);
-                        }}
-                        className="thread-list"
-                        estimate={64}
-                        render={(thread) => (
-                          <ContextMenu>
-                            <ContextMenuTrigger className="thread-row-card">
-                              {thread.source ? (
-                                <ThreadSelect
-                                  thread={thread.source}
-                                  viewer={initial.viewer}
-                                  client={client}
-                                  modelLabel={
-                                    catalog?.models.find(
-                                      (model) => model.id === thread.source.modelId,
-                                    )?.label
-                                  }
-                                  now={now}
-                                  selected={selectedId === thread.id && !external}
-                                  actions={rowActions(thread)}
-                                  onSelect={() => select(thread.id)}
-                                />
-                              ) : (
-                                <ThreadCard
-                                  title={thread.title}
-                                  starterName={`${initial.viewer.displayName} · Draft`}
-                                  state="idle"
-                                  updatedAt={now}
-                                  now={now}
-                                  selected={selectedId === thread.id && !external}
-                                  actions={rowActions(thread)}
-                                  onSelect={() => select(thread.id)}
-                                />
-                              )}
-                            </ContextMenuTrigger>
-                            {thread.editable ? (
-                              <ContextMenuContent>
-                                <ContextMenuItem
-                                  onClick={() => setRename({ id: thread.id, title: thread.title })}
-                                >
-                                  <Pencil />
-                                  Rename
-                                </ContextMenuItem>
-                                {!thread.draft ? (
-                                  <ContextMenuItem
-                                    onClick={() =>
-                                      void update(thread.id, { archived: !thread.archived })
-                                    }
-                                  >
-                                    {thread.archived ? <ArchiveRestore /> : <Archive />}
-                                    {thread.archived ? "Unarchive" : "Archive"}
-                                  </ContextMenuItem>
-                                ) : null}
-                                <ContextMenuItem
-                                  variant="destructive"
-                                  onClick={() => setConfirmDelete(thread.id)}
-                                >
-                                  <Trash2 />
-                                  Delete
-                                </ContextMenuItem>
-                              </ContextMenuContent>
-                            ) : null}
-                          </ContextMenu>
-                        )}
-                      />
-                      {threadListError ? (
-                        <Button
-                          variant="ghost"
-                          onClick={() => void listThreads(archived, nextCursor)}
-                        >
-                          Retry loading conversations
-                        </Button>
-                      ) : null}
-                    </>
-                  )}
-                  <footer className="sidebar-footer">
-                    {props.userControl ?? (
-                      <span className="viewer-name">{initial.viewer.displayName}</span>
-                    )}
-                    <span className="toolbar-spacer" />
-                    <IconButton
-                      label="Design system"
-                      onClick={() => location.assign("/design-system")}
-                    >
-                      <Palette />
-                    </IconButton>
-                    {owner ? (
-                      <IconButton label="Settings" onClick={() => setSettings(true)}>
-                        <SettingsIcon />
+                        <X />
                       </IconButton>
                     ) : null}
+                  </form>
+                  <nav className="sidebar-tabs" aria-label="Conversation filters and actions">
                     <IconButton
-                      label="Sign out"
-                      onClick={() => void attempt(props.onLogout, setError)}
+                      label={archived ? "Show active conversations" : "Show archived conversations"}
+                      aria-pressed={archived}
+                      onClick={() => {
+                        const value = !archived;
+                        setArchived(value);
+                        setExternal(false);
+                        void listThreads(value);
+                      }}
                     >
-                      <LogOut />
+                      <Archive />
                     </IconButton>
-                  </footer>
-                </aside>
-              </ResizablePanel>
-            ) : null}
-            {sidebar ? (
-              <ResizableHandle aria-label="Sidebar width" className="sidebar-resize-handle" />
-            ) : null}
+                    {owner ? (
+                      <IconButton
+                        label="Read other surfaces"
+                        aria-pressed={external}
+                        onClick={() => {
+                          setExternalId(undefined);
+                          setExternal((value) => !value);
+                        }}
+                      >
+                        <Globe />
+                      </IconButton>
+                    ) : null}
+                    <IconButton label="New conversation" onClick={() => void createThread()}>
+                      <Plus />
+                    </IconButton>
+                  </nav>
+                </div>
+                {results ? (
+                  <>
+                    <VirtualList
+                      items={results.items}
+                      itemKey={(hit) => `${hit.threadId}:${hit.turnId ?? hit.excerpt}`}
+                      label="Search results"
+                      className="thread-list"
+                      estimate={92}
+                      render={(hit) => (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          className="search-result h-auto flex-col items-start whitespace-normal"
+                          onClick={() => {
+                            if (hit.surface === "native") select(hit.threadId);
+                            else {
+                              setExternalId(hit.threadId);
+                              setExternal(true);
+                            }
+                          }}
+                        >
+                          <strong>{hit.title}</strong>
+                          <span>{hit.excerpt}</span>
+                        </Button>
+                      )}
+                    />
+                    {results.items.length === 0 && !searching ? (
+                      <p className="muted empty-list">No results</p>
+                    ) : null}
+                    {results.nextCursor ? (
+                      <Button
+                        variant="ghost"
+                        className="text-button"
+                        onClick={() => void search(results.nextCursor)}
+                      >
+                        More results
+                      </Button>
+                    ) : null}
+                  </>
+                ) : (
+                  <>
+                    <VirtualList
+                      items={sidebarThreads}
+                      itemKey={(thread) => thread.id}
+                      label="Conversations"
+                      scrollFade
+                      hasMore={!!nextCursor && !threadListError}
+                      loading={loadingThreads}
+                      onEndReached={() => {
+                        if (nextCursor) void listThreads(archived, nextCursor);
+                      }}
+                      className="thread-list"
+                      estimate={64}
+                      render={(thread) => (
+                        <ContextMenu>
+                          <ContextMenuTrigger className="thread-row-card">
+                            {thread.source ? (
+                              <ThreadSelect
+                                thread={thread.source}
+                                viewer={initial.viewer}
+                                client={client}
+                                modelLabel={
+                                  catalog?.models.find(
+                                    (model) => model.id === thread.source.modelId,
+                                  )?.label
+                                }
+                                now={now}
+                                selected={selectedId === thread.id && !external}
+                                actions={rowActions(thread)}
+                                onSelect={() => select(thread.id)}
+                              />
+                            ) : (
+                              <ThreadCard
+                                title={thread.title}
+                                starterName={`${initial.viewer.displayName} · Draft`}
+                                state="idle"
+                                updatedAt={now}
+                                now={now}
+                                selected={selectedId === thread.id && !external}
+                                actions={rowActions(thread)}
+                                onSelect={() => select(thread.id)}
+                              />
+                            )}
+                          </ContextMenuTrigger>
+                          {thread.editable ? (
+                            <ContextMenuContent>
+                              <ContextMenuItem
+                                onClick={() => setRename({ id: thread.id, title: thread.title })}
+                              >
+                                <Pencil />
+                                Rename
+                              </ContextMenuItem>
+                              {!thread.draft ? (
+                                <ContextMenuItem
+                                  onClick={() =>
+                                    void update(thread.id, { archived: !thread.archived })
+                                  }
+                                >
+                                  {thread.archived ? <ArchiveRestore /> : <Archive />}
+                                  {thread.archived ? "Unarchive" : "Archive"}
+                                </ContextMenuItem>
+                              ) : null}
+                              <ContextMenuItem
+                                variant="destructive"
+                                onClick={() => setConfirmDelete(thread.id)}
+                              >
+                                <Trash2 />
+                                Delete
+                              </ContextMenuItem>
+                            </ContextMenuContent>
+                          ) : null}
+                        </ContextMenu>
+                      )}
+                    />
+                    {threadListError ? (
+                      <Button
+                        variant="ghost"
+                        onClick={() => void listThreads(archived, nextCursor)}
+                      >
+                        Retry loading conversations
+                      </Button>
+                    ) : null}
+                  </>
+                )}
+                <footer className="sidebar-footer">
+                  {props.userControl ?? (
+                    <span className="viewer-name">{initial.viewer.displayName}</span>
+                  )}
+                  <span className="toolbar-spacer" />
+                  <IconButton
+                    label="Design system"
+                    onClick={() => location.assign("/design-system")}
+                  >
+                    <Palette />
+                  </IconButton>
+                  {owner ? (
+                    <IconButton label="Settings" onClick={() => setSettings(true)}>
+                      <SettingsIcon />
+                    </IconButton>
+                  ) : null}
+                  <IconButton
+                    label="Sign out"
+                    onClick={() => void attempt(props.onLogout, setError)}
+                  >
+                    <LogOut />
+                  </IconButton>
+                </footer>
+              </aside>
+            </ResizablePanel>
+            <ResizableHandle
+              hidden={!sidebar}
+              disabled={!sidebar}
+              aria-label="Sidebar width"
+              className="sidebar-resize-handle"
+            />
             <ResizablePanel id="chat" minSize="40%" className="chat-panel">
               <div className="main-panel">
                 {external && owner ? (
