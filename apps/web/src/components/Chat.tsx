@@ -1,3 +1,4 @@
+import { useWorkspace } from "../workspace-context";
 import {
   useCallback,
   useEffect,
@@ -9,10 +10,9 @@ import {
 } from "react";
 import { X, RotateCcw } from "lucide-react";
 import type { NativeInput, DisplayPart } from "@stanley2058/lilac-client-protocol";
-import type { AppProps, ChatCommon, ComposerSubmission, QueueEntry } from "../types";
+import type { ChatCommon, ComposerSubmission, QueueEntry } from "../types";
 import { resolveAttachmentIds } from "../uploads";
 import { inputDeliveryOptions } from "../input-mode";
-import type { UploadPool } from "../uploads";
 import { Button } from "./ui/button";
 import { Composer } from "./Composer";
 import { Timeline, useLatestReadableTurn } from "./Timeline";
@@ -35,19 +35,18 @@ export type PendingInput = {
   error?: string;
   state: "preparing" | "uncertain" | "rejected";
 };
-export type ChatProps = ChatCommon & {
+export type ChatProps = Pick<ChatCommon, "thread" | "catalog" | "onError"> & {
   header: ReactNode;
   draft: Draft;
-  draftCache?: AppProps["draftCache"];
   onDraft: (draft: Draft) => void;
-  pool: UploadPool;
   readTurns: Map<string, string>;
   pending: PendingInput[];
   onPending: (update: (pending: PendingInput[]) => PendingInput[]) => void;
 };
 
 export function Chat(props: ChatProps) {
-  const { client, thread, pool } = props;
+  const { client, pool, scope, upload, resourceUrl, draftCache } = useWorkspace();
+  const { thread } = props;
   const [draft, setDraft] = useState(props.draft);
   const draftVersion = useRef(0);
   const draftRef = useRef(draft);
@@ -64,10 +63,10 @@ export function Chat(props: ChatProps) {
     draftRef.current = value;
     setDraft(value);
     props.onDraft(value);
-    if (props.draftCache)
+    if (draftCache)
       void attempt(
         () =>
-          props.draftCache!.saveDraft(props.scope, thread.id, {
+          draftCache!.saveDraft(scope, thread.id, {
             text: value.text,
             skillIds: value.skillIds,
             commandId: value.commandId,
@@ -77,7 +76,7 @@ export function Chat(props: ChatProps) {
       );
   };
   useEffect(() => {
-    const cache = props.draftCache;
+    const cache = draftCache;
     if (
       !cache ||
       draftRef.current.text ||
@@ -87,7 +86,7 @@ export function Chat(props: ChatProps) {
       return;
     let canceled = false;
     const revision = draftVersion.current;
-    void attempt(() => cache.readDraft(props.scope, thread.id), setError).then((restored) => {
+    void attempt(() => cache.readDraft(scope, thread.id), setError).then((restored) => {
       if (!restored || canceled || draftVersion.current !== revision) return;
       const value = { ...restored, attachments: [] };
       draftRef.current = value;
@@ -97,7 +96,7 @@ export function Chat(props: ChatProps) {
     return () => {
       canceled = true;
     };
-  }, [props.draftCache, props.scope, thread.id]);
+  }, [draftCache, scope, thread.id]);
   const commitPending = (update: (entries: PendingInput[]) => PendingInput[]) => {
     const value = update(pendingRef.current);
     pendingRef.current = value;
@@ -125,27 +124,11 @@ export function Chat(props: ChatProps) {
   );
   const snapshot = useCallback(() => pool.get(thread.id), [pool, thread.id]);
   const uploads = useSyncExternalStore(subscribe, snapshot, snapshot);
-  const uploadProgress = useMemo(
-    () =>
-      new Map(
-        uploads
-          .filter((item) => item.resourceId)
-          .map((item) => [
-            item.resourceId!,
-            {
-              progress: item.progress,
-              state: item.state,
-              error: item.error,
-              retry: () => pool.retry(thread.id, item.key),
-            },
-          ]),
-      ),
-    [uploads, pool, thread.id],
-  );
+  const uploadProgress = useMemo(() => ({ pool, threadId: thread.id }), [pool, thread.id]);
   const recoveryUpload = useCallback(
     (resourceId: string, file: File, onProgress: (fraction: number) => void) =>
-      props.upload(resourceId, file, onProgress, pool.signal),
-    [props.upload, pool],
+      upload(resourceId, file, onProgress, pool.signal),
+    [upload, pool],
   );
   const attachments = uploads.filter((attachment) => draft.attachments.includes(attachment.key));
   const refreshQueue = useCallback(async () => {
@@ -458,8 +441,6 @@ export function Chat(props: ChatProps) {
       {thread.capabilities.edit ? (
         <Composer
           windowDrop
-          client={client}
-          scope={props.scope}
           catalog={props.catalog}
           text={draft.text}
           skillIds={draft.skillIds}
@@ -520,7 +501,7 @@ export function Chat(props: ChatProps) {
           client={client}
           threadId={thread.id}
           canEdit={thread.capabilities.edit}
-          resourceUrl={props.resourceUrl}
+          resourceUrl={resourceUrl}
           upload={recoveryUpload}
           onRewind={setRewindTarget}
           onAction={onAction}

@@ -1,3 +1,4 @@
+import { useOptionalWorkspace } from "../workspace-context";
 import "./composer-rich.css";
 import { Button } from "./ui/button";
 import {
@@ -29,7 +30,7 @@ const ComposerEditor = lazy(() => import("./composer-editor"));
 import { MessageIdentityContext } from "./message-identity";
 import { inputDeliveryOptions } from "../input-mode";
 
-export type ComposerProps = Pick<ChatCommon, "client" | "scope" | "catalog"> & {
+export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catalog">> & {
   text: string;
   skillIds: string[];
   onSkills: (ids: string[]) => void;
@@ -52,6 +53,9 @@ export type ComposerProps = Pick<ChatCommon, "client" | "scope" | "catalog"> & {
 };
 
 export function Composer(props: ComposerProps) {
+  const workspace = useOptionalWorkspace();
+  const client = props.client ?? workspace?.client;
+  const scope = props.scope ?? workspace?.scope;
   const { agent } = useContext(MessageIdentityContext);
   const { text, onText, attachments, active, disabled, catalog } = props;
   const input = useRef<ComposerEditorHandle>(null);
@@ -89,12 +93,12 @@ export function Composer(props: ComposerProps) {
   const query = match?.[2]?.replace(/^skill:/, "") ?? "";
   const completions = useMemo(
     () =>
-      match && !menuHidden
-        ? props.client.catalogs
-            .complete(props.scope, trigger, query, 100)
+      match && !menuHidden && client && scope
+        ? client.catalogs
+            .complete(scope, trigger, query, 100)
             .filter((item) => !match[2]?.startsWith("skill:") || item.kind === "skill")
         : [],
-    [props.client, props.scope, trigger, query, !!match, menuHidden, catalog],
+    [client, scope, trigger, query, !!match, menuHidden, catalog],
   );
   const highlighted = Math.min(selected, Math.max(0, completions.length - 1));
   const matching =

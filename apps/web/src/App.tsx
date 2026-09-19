@@ -1,3 +1,5 @@
+import { useStore } from "zustand";
+import { WorkspaceProvider, useWorkspace } from "./workspace-context";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Result } from "better-result";
 import { Tooltip } from "@base-ui/react/tooltip";
@@ -22,7 +24,7 @@ import type {
   NativeRpcOutputs,
 } from "@stanley2058/lilac-client-protocol";
 import type { AppProps, ComposerSubmission } from "./types";
-import { UploadPool, resolveAttachmentIds } from "./uploads";
+import { resolveAttachmentIds } from "./uploads";
 import { Chat, type Draft, type PendingInput } from "./components/Chat";
 import { Settings } from "./components/Settings";
 import { SidebarSearch } from "./components/SidebarSearch";
@@ -37,7 +39,6 @@ import { ThreadSelect, ThreadCard } from "./components/ThreadSelect";
 import {
   newDraftThread,
   restoreDraftThread,
-  draftThreadTitle,
   hasDraftContent,
   prepareDraftSend,
   releaseDraftAttachments,
@@ -62,6 +63,16 @@ import "./styles.css";
 
 export type { AppProps } from "./types";
 export function App(props: AppProps) {
+  return (
+    <WorkspaceProvider {...props}>
+      <Workspace {...props} />
+    </WorkspaceProvider>
+  );
+}
+function Workspace(props: AppProps) {
+  const { pool, drafts: draftStore } = useWorkspace();
+  const draftSummaries = useStore(draftStore, (state) => state.summaries);
+  const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
   const [threads, setThreads] = useState(initial.threads.items);
   const [now, setNow] = useState(Date.now);
@@ -73,12 +84,9 @@ export function App(props: AppProps) {
   const [loadingThreads, setLoadingThreads] = useState(false);
   const [threadListError, setThreadListError] = useState(false);
   const threadListRequest = useRef({ loading: false });
-  const [firstDraft] = useState(newDraftThread);
-  const [localDrafts, setLocalDrafts] = useState(() => new Map([[firstDraft.id, firstDraft]]));
+  const [firstDraft] = useState(() => draftStore.getState().localDrafts.values().next().value!);
   const removedDrafts = useRef(new Set<string>());
   const selectionVersion = useRef(0);
-  const localDraftsRef = useRef(localDrafts);
-  localDraftsRef.current = localDrafts;
   const [selectedId, setSelectedId] = useState<string | undefined>(
     props.initialThreadId ?? initial.threads.items[0]?.id ?? firstDraft.id,
   );
@@ -128,8 +136,9 @@ export function App(props: AppProps) {
     [],
   );
   const readTurns = useRef(new Map<string, string>());
-  const pool = useMemo(() => new UploadPool(client, props.upload), [client, props.upload]);
-  const selectedDraft = selectedId ? localDrafts.get(selectedId) : undefined;
+  const selectedDraft = useStore(draftStore, (state) =>
+    selectedId && state.localDrafts.has(selectedId) ? selectedId : undefined,
+  );
   const selected = threads.find((thread) => thread.id === selectedId);
   const owner = initial.viewer.role === "owner";
   const selectedRef = useRef(selectedId);
@@ -181,7 +190,7 @@ export function App(props: AppProps) {
     const state: unknown = history.state;
     void attempt(() => cache.listLocalDrafts(props.scope), setError).then((saved) => {
       if (!saved || canceled) return;
-      const changed = new Map(localDraftsRef.current);
+      const changed = new Map(draftStore.getState().localDrafts);
       for (const { threadId, draft } of saved) {
         if (changed.has(threadId) || removedDrafts.current.has(threadId)) continue;
         changed.set(threadId, {
@@ -192,7 +201,6 @@ export function App(props: AppProps) {
           modelId: draft.modelId,
         });
       }
-      localDraftsRef.current = changed;
       setLocalDrafts(changed);
       if (selectionVersion.current !== version || new URL(location.href).searchParams.has("thread"))
         return;
@@ -213,16 +221,6 @@ export function App(props: AppProps) {
     });
     saved.match({ ok: () => {}, err: () => {} });
   }, [theme]);
-  useEffect(
-    () => () => {
-      pool.dispose();
-      for (const thread of localDraftsRef.current.values()) {
-        releaseDraftAttachments(thread.attachments);
-        releaseDraftAttachments(thread.creation?.entry.submission.attachments ?? []);
-      }
-    },
-    [pool],
-  );
   const upsert = useCallback(
     (thread: NativeThread) =>
       setThreads((current) => {
@@ -309,10 +307,9 @@ export function App(props: AppProps) {
         setSelectedId(id);
         return;
       }
-      const draft = restoreDraftThread(localDraftsRef.current, event.state);
-      const changed = new Map(localDraftsRef.current);
+      const draft = restoreDraftThread(draftStore.getState().localDrafts, event.state);
+      const changed = new Map(draftStore.getState().localDrafts);
       changed.set(draft.id, draft);
-      localDraftsRef.current = changed;
       setLocalDrafts(changed);
       setSelectedId(draft.id);
       history.replaceState({ draftThreadId: draft.id }, "", location.href);
@@ -321,12 +318,11 @@ export function App(props: AppProps) {
     return () => window.removeEventListener("popstate", pop);
   }, []);
   function changeLocalDraft(id: string, update: (thread: DraftThread) => DraftThread) {
-    const current = localDraftsRef.current.get(id);
+    const current = draftStore.getState().localDrafts.get(id);
     if (!current) return;
-    const changed = new Map(localDraftsRef.current);
+    const changed = new Map(draftStore.getState().localDrafts);
     const next = update(current);
     changed.set(id, next);
-    localDraftsRef.current = changed;
     setLocalDrafts(changed);
     const cache = props.draftCache;
     if (!cache) return;
@@ -344,13 +340,12 @@ export function App(props: AppProps) {
     removedDrafts.current.add(id);
     if (props.draftCache)
       void attempt(() => props.draftCache!.deleteDraft(props.scope, id), setError);
-    const current = localDraftsRef.current.get(id);
+    const current = draftStore.getState().localDrafts.get(id);
     if (!current) return;
     releaseDraftAttachments(current.attachments);
     releaseDraftAttachments(current.creation?.entry.submission.attachments ?? []);
-    const changed = new Map(localDraftsRef.current);
+    const changed = new Map(draftStore.getState().localDrafts);
     changed.delete(id);
-    localDraftsRef.current = changed;
     setLocalDrafts(changed);
   }
   function select(id: string) {
@@ -364,17 +359,16 @@ export function App(props: AppProps) {
   }
   function createThread() {
     const draft = newDraftThread();
-    const changed = new Map(localDraftsRef.current);
+    const changed = new Map(draftStore.getState().localDrafts);
     for (const [id, existing] of changed) if (!hasDraftContent(existing)) changed.delete(id);
     changed.set(draft.id, draft);
-    localDraftsRef.current = changed;
     setLocalDrafts(changed);
     setArchived(false);
     if (archived) void listThreads(false);
     select(draft.id);
   }
   async function submitDraft(id: string, submission: ComposerSubmission) {
-    const current = localDraftsRef.current.get(id);
+    const current = draftStore.getState().localDrafts.get(id);
     const rpc = client.rpc;
     if (!current || current.sending) return;
     if (!rpc) {
@@ -404,7 +398,7 @@ export function App(props: AppProps) {
     upsert(created);
     const { remapComposerAttachments, resolveComposerAttachments } =
       await import("./components/composer-editor");
-    const latest = localDraftsRef.current.get(id);
+    const latest = draftStore.getState().localDrafts.get(id);
     const moveAttachments = (files: ComposerSubmission["attachments"]) =>
       files.map((item) => {
         const key = pool.add(created.id, item.file);
@@ -551,7 +545,7 @@ export function App(props: AppProps) {
       );
   }
   async function update(id: string, change: { title?: string; archived?: boolean }) {
-    if (localDraftsRef.current.has(id)) {
+    if (draftStore.getState().localDrafts.has(id)) {
       changeLocalDraft(id, (draft) => ({ ...draft, title: change.title ?? draft.title }));
       setRename(undefined);
       return;
@@ -571,7 +565,7 @@ export function App(props: AppProps) {
   async function deleteThread() {
     const id = confirmDelete;
     if (!id) return;
-    if (localDraftsRef.current.has(id)) {
+    if (draftStore.getState().localDrafts.has(id)) {
       removeLocalDraft(id);
       setConfirmDelete(undefined);
       if (selectedRef.current === id) createThread();
@@ -601,11 +595,11 @@ export function App(props: AppProps) {
   }
   const sidebarThreads = [
     ...(!archived
-      ? [...localDrafts.values()].filter(hasDraftContent).map((thread) => ({
+      ? draftSummaries.map((thread) => ({
           id: thread.id,
-          title: draftThreadTitle(thread),
+          title: thread.title,
           draft: true,
-          editable: !thread.creation,
+          editable: thread.editable,
           archived: false,
           source: undefined,
         }))
@@ -963,11 +957,9 @@ export function App(props: AppProps) {
                       </header>
                     }
                     key={selected.id}
-                    {...props}
                     thread={selected}
                     catalog={catalog}
                     onError={setError}
-                    pool={pool}
                     readTurns={readTurns.current}
                     draft={draft}
                     onDraft={(value) => {
@@ -981,13 +973,11 @@ export function App(props: AppProps) {
                 ) : null}
                 {!external && selectedDraft ? (
                   <DraftChat
-                    key={selectedDraft.id}
-                    client={client}
-                    scope={props.scope}
+                    key={selectedDraft}
                     catalog={catalog}
-                    thread={selectedDraft}
-                    onChange={(change) => changeLocalDraft(selectedDraft.id, change)}
-                    onSubmit={(submission) => void submitDraft(selectedDraft.id, submission)}
+                    threadId={selectedDraft}
+                    onChange={(change) => changeLocalDraft(selectedDraft, change)}
+                    onSubmit={(submission) => void submitDraft(selectedDraft, submission)}
                   />
                 ) : null}
                 {!external && !selected && !selectedDraft ? (

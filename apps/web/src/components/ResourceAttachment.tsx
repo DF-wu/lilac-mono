@@ -1,7 +1,7 @@
-import { useContext, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import type { DisplayPart } from "@stanley2058/lilac-client-protocol";
 import { FileText } from "lucide-react";
-import { UploadProgressContext } from "../upload-context";
+import { useUploadProgress } from "../upload-context";
 import { Button } from "./ui/button";
 import { attempt } from "./ui";
 import { ReadyAttachment } from "./ResourcePreview";
@@ -29,7 +29,7 @@ export function ResourceAttachment({
   });
   const fileInput = useRef<HTMLInputElement>(null);
   const { data } = part;
-  const local = useContext(UploadProgressContext).get(data.resourceId);
+  const local = useUploadProgress(data.resourceId);
   if (data.state !== "ready")
     return (
       <div className="resource">

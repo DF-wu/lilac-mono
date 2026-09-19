@@ -1,19 +1,22 @@
+import { useStore } from "zustand";
+import { useWorkspace } from "../workspace-context";
 import type { DisplayCatalog } from "@stanley2058/lilac-client-protocol";
-import type { AppProps, ComposerSubmission } from "../types";
+import type { ComposerSubmission } from "../types";
 import { draftAttachment, releaseDraftAttachments, type DraftThread } from "../draft-thread";
 import { Composer } from "./Composer";
 import { Button } from "./ui/button";
 import { ErrorNotice } from "./ui";
 
 export function DraftChat(props: {
-  client: AppProps["client"];
-  scope: AppProps["scope"];
   catalog?: DisplayCatalog;
-  thread: DraftThread;
+  threadId: string;
   onChange: (update: (thread: DraftThread) => DraftThread) => void;
   onSubmit: (submission: ComposerSubmission) => void;
 }) {
-  const { thread, onChange } = props;
+  const { drafts } = useWorkspace();
+  const thread = useStore(drafts, (state) => state.localDrafts.get(props.threadId));
+  const { onChange } = props;
+  if (!thread) return null;
   const draft = thread.draft;
   return (
     <div className="chat-workspace draft-workspace chat-scroll">
@@ -46,8 +49,6 @@ export function DraftChat(props: {
         ) : null}
         <Composer
           windowDrop
-          client={props.client}
-          scope={props.scope}
           catalog={props.catalog}
           text={draft.text}
           skillIds={draft.skillIds}
