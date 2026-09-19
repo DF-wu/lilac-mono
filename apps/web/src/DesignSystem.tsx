@@ -12,7 +12,6 @@ import {
   LoaderCircle,
   Pencil,
   Plus,
-  Search,
   Trash2,
 } from "lucide-react";
 import type { DisplayMessage } from "@stanley2058/lilac-client-protocol";
@@ -67,6 +66,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { Markdown } from "./components/Markdown";
 import ComposerEditor from "./components/composer-editor";
 import { Message } from "./components/Timeline";
+import { SidebarSearch } from "./components/SidebarSearch";
 import { ThreadCard } from "./components/ThreadSelect";
 import "./design-system.css";
 
@@ -679,6 +679,7 @@ function Attachments() {
   );
 }
 function Controls() {
+  const [search, setSearch] = useState("");
   const [model, setModel] = useState<string | null>("balanced");
   return (
     <Section id="controls" title="Controls">
@@ -710,13 +711,16 @@ function Controls() {
             Conversation title
             <Input placeholder="Untitled conversation" />
           </label>
-          <label className="ds-field">
-            Search
-            <div className="search-box">
-              <Search aria-hidden />
-              <Input placeholder="Search conversations" />
-            </div>
-          </label>
+          <div className="ds-field">
+            <span>Search</span>
+            <SidebarSearch
+              onSearch={(query) => setSearch(query.trim())}
+              onClear={() => setSearch("")}
+            />
+            <span className="ds-muted" role="status">
+              {search ? `Submitted search: ${search}` : ""}
+            </span>
+          </div>
           <label className="ds-field">
             Disabled
             <Input disabled value="Unavailable" readOnly />
