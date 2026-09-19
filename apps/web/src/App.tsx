@@ -691,9 +691,10 @@ export function App(props: AppProps) {
             <ResizablePanel
               hidden={!sidebar}
               id="sidebar"
+              groupResizeBehavior="preserve-pixel-size"
               defaultSize="18rem"
               minSize="12rem"
-              maxSize="40%"
+              maxSize="32rem"
               className="sidebar-panel"
             >
               <aside className="sidebar">
