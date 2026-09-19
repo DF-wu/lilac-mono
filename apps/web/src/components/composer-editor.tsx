@@ -73,6 +73,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { IconButton } from "./ui";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import type { Attachment } from "../types";
 import "./composer-rich.css";
 
@@ -138,42 +139,48 @@ function AttachmentElement(props: PlateElementProps) {
   const name = attachment?.file.name ?? metadata.name;
   return (
     <PlateElement {...props} as="span" className="composer-attachment-node">
-      <span
-        className="composer-attachment-chip"
-        contentEditable={false}
-        data-state={attachment?.state ?? "missing"}
-        title={attachment?.error ?? name}
-      >
-        {attachment?.preview ? <img src={attachment.preview} alt="" /> : <FileText />}
-        <span className="composer-attachment-name">{name}</span>
-        <small>{attachment ? attachmentSize(attachment.file.size) : "Reattach file"}</small>
-        {attachment?.state === "reserving" ? (
-          <span className="sr-only">Preparing upload</span>
-        ) : null}
-        {attachment?.state === "uploading" ? (
-          <progress value={attachment.progress} max={1} aria-label={`Uploading ${name}`} />
-        ) : null}
-        {attachment?.state === "failed" ? (
-          <IconButton
-            label={`Retry ${name}`}
-            disabled={context.disabled}
-            onClick={() => context.retry?.(key)}
-          >
-            <RotateCcw />
-          </IconButton>
-        ) : null}
-        <IconButton
-          label={`Remove ${name}`}
-          disabled={context.disabled}
-          onClick={() => {
-            const path = props.editor.api.findPath(props.element);
-            if (path) props.editor.tf.removeNodes({ at: path });
-            props.editor.tf.focus();
-          }}
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <span
+              className="composer-attachment-chip"
+              contentEditable={false}
+              data-state={attachment?.state ?? "missing"}
+            />
+          }
         >
-          <X />
-        </IconButton>
-      </span>
+          {attachment?.preview ? <img src={attachment.preview} alt="" /> : <FileText />}
+          <span className="composer-attachment-name">{name}</span>
+          <small>{attachment ? attachmentSize(attachment.file.size) : "Reattach file"}</small>
+          {attachment?.state === "reserving" ? (
+            <span className="sr-only">Preparing upload</span>
+          ) : null}
+          {attachment?.state === "uploading" ? (
+            <progress value={attachment.progress} max={1} aria-label={`Uploading ${name}`} />
+          ) : null}
+          {attachment?.state === "failed" ? (
+            <IconButton
+              label={`Retry ${name}`}
+              disabled={context.disabled}
+              onClick={() => context.retry?.(key)}
+            >
+              <RotateCcw />
+            </IconButton>
+          ) : null}
+          <IconButton
+            label={`Remove ${name}`}
+            disabled={context.disabled}
+            onClick={() => {
+              const path = props.editor.api.findPath(props.element);
+              if (path) props.editor.tf.removeNodes({ at: path });
+              props.editor.tf.focus();
+            }}
+          >
+            <X />
+          </IconButton>
+        </TooltipTrigger>
+        <TooltipContent>{attachment?.error ?? name}</TooltipContent>
+      </Tooltip>
       {props.children}
     </PlateElement>
   );
@@ -363,6 +370,25 @@ export function composerMarkdown(editor: PlateEditor): string {
 
 export function composerSubmissionMarkdown(editor: PlateEditor): string {
   return serializeComposer(editor, false);
+}
+
+export function resolveComposerAttachments(
+  text: string,
+  resourceIds: ReadonlyMap<string, string>,
+): string {
+  const editor = createComposerEditor(text);
+  editor.children = mapComposerValue(editor.children, (node) => {
+    const metadata = projectComposerNode(node);
+    if (!metadata.attachment) return node;
+    const id = metadata.key ? resourceIds.get(metadata.key) : undefined;
+    if (!id) return { text: metadata.name };
+    return {
+      type: KEYS.a,
+      url: `/api/resources/${encodeURIComponent(id)}`,
+      children: [{ text: metadata.name }],
+    };
+  });
+  return composerMarkdown(editor);
 }
 
 export function remapComposerAttachments(text: string, keys: ReadonlyMap<string, string>): string {

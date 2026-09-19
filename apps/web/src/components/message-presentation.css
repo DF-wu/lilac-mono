@@ -3,11 +3,17 @@
   background: transparent;
   border-radius: 0;
 }
-.native-message [data-slot="message-avatar"] { align-self: flex-start; margin-top: var(--space-6); }
+.native-message { flex-direction: column; align-items: flex-start; gap: var(--space-2); }
+.native-message[data-align="end"] { flex-direction: column; align-items: flex-end; }
+.native-message [data-slot="message-avatar"] { align-self: auto; margin: 0; overflow: visible; background: transparent; }
 .native-message [data-slot="message-content"] { align-items: flex-start; }
 .native-message[data-align="end"] [data-slot="message-content"] { align-items: flex-end; }
-.native-message .message-author { margin: 0; padding: 0 var(--space-2); }
-.native-message .message-bubble { max-width: 100%; }
+.native-message.message-assistant .message-bubble { max-width: 100%; }
+.message-avatar-trigger { display: flex; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: default; }
+.message-avatar-trigger:focus-visible { outline: 2px solid var(--focus); outline-offset: var(--space-1); }
+.message-author-details { flex-direction: column; align-items: flex-start; gap: var(--space-1); }
+.message-author-name { font-weight: 600; }
+.native-message .message-bubble { max-width: 90%; }
 .native-message .message-bubble [data-slot="bubble-content"] {
   padding: var(--space-3) var(--space-4);
   border: 0;
@@ -16,6 +22,15 @@
 }
 .native-message .message-bubble .markdown > :first-child { margin-top: 0; }
 .native-message .message-bubble .markdown > :last-child { margin-bottom: 0; }
+.message-attachments { display: flex; flex-wrap: wrap; align-items: flex-start; gap: var(--space-2); }
+.message-bubble .markdown + .message-attachments { margin-top: var(--space-3); }
+.message-bubble .message-image-attachments + .markdown { margin-top: var(--space-3); }
+.user-turn:has(.native-message) { margin-left: 0; }
+.user-turn:has(.native-message[data-align="start"]) .message-controls { justify-content: flex-start; }
+.sent-attachment-reference { display: inline; }
+.sent-attachment-chip { display: inline-flex; max-width: 100%; height: auto; gap: var(--space-1); vertical-align: baseline; padding: 0 var(--space-2); border-radius: var(--radius-sm); font-size: inherit; font-weight: inherit; line-height: inherit; }
+.sent-attachment-chip > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sent-attachment-chip > img, .sent-attachment-chip > svg { width: 1em; height: 1em; margin: 0; border-radius: var(--radius-sm); object-fit: cover; flex-shrink: 0; }
 .code-block {
   margin: var(--space-3) 0;
   background: var(--background);
@@ -45,12 +60,6 @@
 .attachment-download:hover { background: var(--surface-hover); }
 .attachment-download svg { width: var(--icon-size); height: var(--icon-size); }
 .attachment-audio { max-width: 100%; padding: var(--space-2); }
-.media-preview-toolbar { display: flex; justify-content: center; align-items: center; gap: var(--space-2); padding: var(--space-2); font-size: var(--text-sm); }
-.media-preview-viewport { overflow: auto; max-height: 65dvh; overscroll-behavior: contain; background: var(--background); border-radius: var(--radius-md); }
-.media-preview-content { margin: auto; }
-.media-preview-content img, .media-preview-content video { display: block; width: 100%; max-width: none; height: auto; }
-.attachment-text-preview { max-height: 65dvh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--space-4); border-radius: var(--radius-md); background: var(--background); font-size: var(--text-sm); }
-.attachment-preview-note { color: var(--muted-foreground); font-size: var(--text-xs); }
 @media (max-width: 40rem) {
   .native-message { gap: var(--space-1); }
   .native-message .message-bubble [data-slot="bubble-content"] { padding: var(--space-2) var(--space-3); }
@@ -58,4 +67,4 @@
 }
 
 .native-message[data-align="end"] .message-bubble [data-slot="bubble-content"] { background: color-mix(in srgb, var(--primary) 14%, var(--surface)); color: var(--foreground); }
-.markdown-link, .attachment-preview-note a { text-decoration: underline; text-underline-offset: 0.15em; }
+.markdown-link { text-decoration: underline; text-underline-offset: 0.15em; }

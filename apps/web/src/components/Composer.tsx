@@ -2,6 +2,7 @@ import {
   lazy,
   Suspense,
   useMemo,
+  useEffect,
   useContext,
   useCallback,
   useRef,
@@ -10,7 +11,10 @@ import {
   type ClipboardEvent,
   type DragEvent,
 } from "react";
-import { ArrowUp, Paperclip, Square, X, CornerDownRight } from "lucide-react";
+import { ArrowUp, Paperclip, Square, X, CornerDownRight, Upload } from "lucide-react";
+import { createPortal } from "react-dom";
+import { hasFileDrag, installWindowFileDrop } from "../window-file-drop";
+import "./composer-drop.css";
 import type { Completion } from "@stanley2058/lilac-client";
 import type { ChatCommon, ComposerSubmission, Attachment } from "../types";
 import { IconButton, VirtualList, ErrorNotice } from "./ui";
@@ -37,6 +41,7 @@ export type ComposerProps = Pick<ChatCommon, "client" | "scope" | "catalog"> & {
   active: boolean;
   canCancel: boolean;
   disabled: boolean;
+  windowDrop?: boolean;
   submitting?: boolean;
   modelId?: string;
   onModelChange: (modelId: string) => void;
@@ -67,6 +72,16 @@ export function Composer(props: ComposerProps) {
   const [selected, setSelected] = useState(0);
   const [menuHidden, setMenuHidden] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const dropProps = useRef(props);
+  dropProps.current = props;
+  useEffect(() => {
+    if (!props.windowDrop) return;
+    return installWindowFileDrop(window, {
+      canAttach: () => !dropProps.current.disabled,
+      show: setDragging,
+      attach: (files) => dropProps.current.onAttach(files),
+    });
+  }, [props.windowDrop]);
   const match = /(?:^|\s)([$/])([^$/\n]*)$/.exec(prefix);
   const trigger = match?.[1] === "$" ? "$" : "/";
   const query = match?.[2]?.replace(/^skill:/, "") ?? "";
@@ -132,6 +147,7 @@ export function Composer(props: ComposerProps) {
     }
     props.onSubmit({
       text: input.current?.submissionText() ?? text,
+      ...(attachments.length ? { attachmentText: text } : {}),
       skillIds,
       mode: delivery.mode === "prompt" ? mode : delivery.mode,
       modelId: delivery.modelId,
@@ -182,21 +198,37 @@ export function Composer(props: ComposerProps) {
     }
   }
   function drop(event: DragEvent) {
+    if (!hasFileDrag(event.dataTransfer)) return;
     event.preventDefault();
     setDragging(false);
+    if (disabled) return;
     props.onAttach([...event.dataTransfer.files]);
   }
 
   return (
     <div
       className={`composer-wrap ${dragging ? "is-dragging" : ""}`}
-      onDragOver={(event) => {
-        event.preventDefault();
-        setDragging(true);
-      }}
-      onDragLeave={() => setDragging(false)}
-      onDrop={drop}
+      onDragOver={
+        props.windowDrop
+          ? undefined
+          : (event) => {
+              if (!hasFileDrag(event.dataTransfer)) return;
+              event.preventDefault();
+              setDragging(!disabled);
+            }
+      }
+      onDragLeave={props.windowDrop ? undefined : () => setDragging(false)}
+      onDrop={props.windowDrop ? undefined : drop}
     >
+      {props.windowDrop && dragging && !disabled
+        ? createPortal(
+            <div className="composer-window-drop" role="status">
+              <Upload aria-hidden="true" />
+              <span>Add photos &amp; files</span>
+            </div>,
+            document.body,
+          )
+        : null}
       <Popover
         open={completions.length > 0}
         onOpenChange={(open) => {

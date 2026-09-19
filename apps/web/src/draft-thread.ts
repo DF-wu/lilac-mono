@@ -93,7 +93,10 @@ export function prepareDraftSend(
   if (thread.creation) return thread.creation;
   return {
     commandId: crypto.randomUUID(),
-    title: draftThreadTitle({ ...thread, draft: { ...thread.draft, text: submission.text } }),
+    title: draftThreadTitle({
+      ...thread,
+      draft: { ...thread.draft, text: submission.attachmentText ?? submission.text },
+    }),
     modelId: submission.modelId,
     entry: {
       commandId: crypto.randomUUID(),

@@ -45,6 +45,7 @@ export function DraftChat(props: {
           </div>
         ) : null}
         <Composer
+          windowDrop
           client={props.client}
           scope={props.scope}
           catalog={props.catalog}

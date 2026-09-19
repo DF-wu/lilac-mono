@@ -167,6 +167,7 @@ export function App(props: AppProps) {
     users.set(initial.viewer.id, { displayName: initial.viewer.displayName });
     return {
       agent: catalog?.agent ?? { displayName: "Lilac" },
+      viewerId: initial.viewer.id,
       users,
       onUnknownAuthor: selectedId && participants.has(selectedId) ? onUnknownAuthor : undefined,
     };
@@ -392,7 +393,8 @@ export function App(props: AppProps) {
     );
     if (!created || pool.signal.aborted) return;
     upsert(created);
-    const { remapComposerAttachments } = await import("./components/composer-editor");
+    const { remapComposerAttachments, resolveComposerAttachments } =
+      await import("./components/composer-editor");
     const latest = localDraftsRef.current.get(id);
     const moveAttachments = (files: ComposerSubmission["attachments"]) =>
       files.map((item) => {
@@ -402,7 +404,21 @@ export function App(props: AppProps) {
     const files = moveAttachments(creation.entry.submission.attachments);
     const entry: PendingInput = {
       ...creation.entry,
-      submission: { ...creation.entry.submission, attachments: files },
+      submission: {
+        ...creation.entry.submission,
+        attachmentText: creation.entry.submission.attachmentText
+          ? remapComposerAttachments(
+              creation.entry.submission.attachmentText,
+              new Map(
+                creation.entry.submission.attachments.map((attachment, index) => [
+                  attachment.key,
+                  files[index]!.key,
+                ]),
+              ),
+            )
+          : undefined,
+        attachments: files,
+      },
     };
     patchPending(created.id, (entries) => [...entries, entry]);
     if (latest) {
@@ -449,7 +465,12 @@ export function App(props: AppProps) {
           threadId: created.id,
           commandId: entry.commandId,
           historyGeneration: replay.checkpoint.historyGeneration,
-          text: entry.text,
+          text: entry.submission.attachmentText
+            ? resolveComposerAttachments(
+                entry.submission.attachmentText,
+                new Map(files.map((file, index) => [file.key, attachmentIds[index]!])),
+              )
+            : entry.text,
           mode: "prompt" as const,
           modelId: entry.submission.modelId,
           attachmentIds: attachmentIds.filter((resourceId): resourceId is string => !!resourceId),

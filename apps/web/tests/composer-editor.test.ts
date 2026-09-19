@@ -11,6 +11,7 @@ import ComposerEditor, {
   insertComposerAttachment,
   composerSubmissionMarkdown,
   remapComposerAttachments,
+  resolveComposerAttachments,
   attachmentSize,
 } from "../src/components/composer-editor";
 
@@ -179,6 +180,8 @@ it("renders inline thumbnails, file size and accessible remove and retry control
   expect(html).toContain("2 KB");
   expect(html).toContain('aria-label="Remove image.png"');
   expect(html).toContain('aria-label="Retry image.png"');
+  expect(html).not.toContain('title="Upload failed"');
+  expect(html).toContain('data-slot="tooltip-trigger"');
   expect(attachmentSize(512)).toBe("512 B");
   expect(attachmentSize(1572864)).toBe("1.5 MB");
 });
@@ -188,4 +191,36 @@ it("separates an inserted file name from adjacent prose", () => {
   editor.tf.select(editor.api.end([])!);
   insertComposerAttachment(editor, { key: "file", file: new File(["text"], "notes.txt") });
   expect(composerSubmissionMarkdown(editor)).toBe("Review notes.txt ");
+});
+
+it("resolves duplicate file names by their attachment identities and leaves code literal", () => {
+  const source =
+    "First [same.png](attachment:first), then [same.png](attachment:second). `literal [same.png](attachment:first)`";
+  const sent = resolveComposerAttachments(
+    source,
+    new Map([
+      ["first", "upload-one"],
+      ["second", "upload-two"],
+    ]),
+  );
+  expect(sent).toBe(
+    "First [same.png](/api/resources/upload-one), then [same.png](/api/resources/upload-two). `literal [same.png](attachment:first)`",
+  );
+  expect(resolveComposerAttachments("[missing.txt](attachment:missing)", new Map())).toBe(
+    "missing.txt",
+  );
+  expect(
+    resolveComposerAttachments(
+      "[safe.txt](attachment:known)",
+      new Map([["known", "id/with space"]]),
+    ),
+  ).toBe("[safe.txt](/api/resources/id%2Fwith%20space)");
+});
+
+it("preserves file references through local draft remapping before resource reservation", () => {
+  const local = "Compare [image.png](attachment:local-key)";
+  const moved = remapComposerAttachments(local, new Map([["local-key", "upload-key"]]));
+  expect(resolveComposerAttachments(moved, new Map([["upload-key", "reserved-id"]]))).toBe(
+    "Compare [image.png](/api/resources/reserved-id)",
+  );
 });

@@ -21,13 +21,15 @@ import { IconButton, attempt } from "./ui";
 import { ResourceAttachment } from "./ResourceAttachment";
 import { ActorAvatar } from "./ActorAvatar";
 import { MessageIdentityContext } from "./message-identity";
+import { MessageResourcesContext } from "./message-resources";
 import { Bubble, BubbleContent } from "./ui/bubble";
 import "./message-presentation.css";
 import { Markdown } from "./Markdown";
 import { Button } from "./ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
-import { Message as ChatMessage, MessageContent, MessageHeader, MessageAvatar } from "./ui/message";
+import { Message as ChatMessage, MessageContent, MessageAvatar } from "./ui/message";
 import { Marker, MarkerContent, MarkerIcon } from "./ui/marker";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
 export function useSlot(store: NativeThreadStore, slotId: string | undefined) {
   const subscribe = useCallback(
@@ -412,9 +414,99 @@ export function groupParts(parts: readonly DisplayPart[]): Group[] {
   return groups;
 }
 
+type MessageCardGroup = {
+  kind: "content";
+  texts: string[];
+  attachments: Extract<DisplayPart, { type: "data-resource" }>[];
+};
+type CardGroup =
+  | MessageCardGroup
+  | Extract<Group, { kind: "activity" }>
+  | {
+      kind: "part";
+      part: Exclude<DisplayPart, { type: "text" | "data-activity" | "data-resource" }>;
+    };
+
+function groupMessageCards(groups: readonly Group[]): CardGroup[] {
+  const cards: CardGroup[] = [];
+  let content: MessageCardGroup | undefined;
+  for (const group of groups) {
+    if (group.kind === "activity") {
+      content = undefined;
+      cards.push(group);
+      continue;
+    }
+    if (group.kind === "part" && group.part.type !== "data-resource") {
+      content = undefined;
+      cards.push({ kind: "part", part: group.part });
+      continue;
+    }
+    if (!content) {
+      content = { kind: "content", texts: [], attachments: [] };
+      cards.push(content);
+    }
+    if (group.kind === "text") {
+      content.texts.push(group.text);
+      continue;
+    }
+    if (group.part.type === "data-resource") content.attachments.push(group.part);
+  }
+  return cards;
+}
+
+function MessageCard({
+  content,
+  self,
+  resourceUrl,
+  canEdit,
+  upload,
+}: Pick<MessageProps, "resourceUrl" | "canEdit" | "upload"> & {
+  content: MessageCardGroup;
+  self: boolean;
+}) {
+  const images = content.attachments.filter((part) => part.data.mediaType.startsWith("image/"));
+  const files = content.attachments.filter((part) => !part.data.mediaType.startsWith("image/"));
+  return (
+    <Bubble variant={self ? "tinted" : "muted"} className="message-bubble">
+      <BubbleContent>
+        {images.length > 0 ? (
+          <div className="message-attachments message-image-attachments">
+            {images.map((part) => (
+              <ResourceAttachment
+                key={part.id}
+                part={part}
+                resourceUrl={resourceUrl}
+                canEdit={canEdit}
+                upload={upload}
+              />
+            ))}
+          </div>
+        ) : null}
+        {content.texts.map((text, index) => (
+          <Markdown key={index} text={text} />
+        ))}
+        {files.length > 0 ? (
+          <div className="message-attachments">
+            {files.map((part) => (
+              <ResourceAttachment
+                key={part.id}
+                part={part}
+                resourceUrl={resourceUrl}
+                canEdit={canEdit}
+                upload={upload}
+              />
+            ))}
+          </div>
+        ) : null}
+      </BubbleContent>
+    </Bubble>
+  );
+}
+
 export const Message = memo(function Message(props: MessageProps) {
   const { message } = props;
   const groups = useMemo(() => groupParts(message.parts), [message.parts]);
+  const cards = useMemo(() => groupMessageCards(groups), [groups]);
   const identities = useContext(MessageIdentityContext);
   const authorId = message.role === "user" ? message.metadata?.authorId : undefined;
   const authorResolved = authorId !== undefined && identities.users.has(authorId);
@@ -431,109 +523,139 @@ export const Message = memo(function Message(props: MessageProps) {
     (group) =>
       group.kind === "text" || (group.kind === "part" && group.part.type === "data-resource"),
   );
+  let authorRole = "Participant";
+  if (message.role === "assistant") authorRole = "Agent";
+  else if (authorId !== undefined && authorId === identities.viewerId) authorRole = "You";
+  const self =
+    message.role === "user" && authorId !== undefined && authorId === identities.viewerId;
+  const attachments = useMemo(
+    () => message.parts.filter((part) => part.type === "data-resource"),
+    [message.parts],
+  );
+  const resources = useMemo(
+    () =>
+      new Map(
+        attachments.map((part) => [
+          `/api/resources/${encodeURIComponent(part.data.resourceId)}`,
+          { resource: part.data, href: props.resourceUrl(part.data.resourceId) },
+        ]),
+      ),
+    [attachments, props.resourceUrl],
+  );
   return (
     <ChatMessage
-      align={message.role === "user" ? "end" : "start"}
+      align={self ? "end" : "start"}
       className={`message message-${message.role} native-message text-base`}
       data-message-id={message.id}
     >
       {conversational ? (
         <MessageAvatar>
-          <ActorAvatar {...author} />
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  className="message-avatar-trigger"
+                  aria-label={`About ${author.displayName}`}
+                />
+              }
+            >
+              <ActorAvatar {...author} />
+            </TooltipTrigger>
+            <TooltipContent
+              className="message-author-details"
+              side="top"
+              align={self ? "end" : "start"}
+            >
+              <span className="message-author-name">{author.displayName}</span>
+              <span>{authorRole}</span>
+              {message.metadata?.inputMode === "steer" ? <span>Steering</span> : null}
+              {message.metadata?.createdAt !== undefined ? (
+                <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
+                  {new Date(message.metadata.createdAt).toLocaleString()}
+                </time>
+              ) : null}
+            </TooltipContent>
+          </Tooltip>
         </MessageAvatar>
       ) : null}
-      <MessageContent>
-        {conversational ? (
-          <MessageHeader className="message-author px-0">
-            {author.displayName}
-            {message.metadata?.inputMode === "steer" ? " · Steering" : ""}
-          </MessageHeader>
-        ) : null}
-        {groups.map((group, index) => {
-          if (group.kind === "text")
-            return (
-              <Bubble
-                key={index}
-                variant={message.role === "user" ? "tinted" : "muted"}
-                className="message-bubble"
-              >
-                <BubbleContent>
-                  <Markdown text={group.text} />
-                </BubbleContent>
-              </Bubble>
-            );
-          if (group.kind === "activity")
-            return (
-              <Activity key={index} parts={group.parts} createdAt={message.metadata?.createdAt} />
-            );
-          const part = group.part;
-          switch (part.type) {
-            case "data-resource":
+      <MessageResourcesContext value={resources}>
+        <MessageContent>
+          {cards.map((group, index) => {
+            if (group.kind === "content")
               return (
-                <ResourceAttachment
-                  key={part.id}
-                  part={part}
+                <MessageCard
+                  key={index}
+                  content={group}
+                  self={self}
                   resourceUrl={props.resourceUrl}
                   canEdit={props.canEdit}
                   upload={props.upload}
                 />
               );
-            case "data-compaction":
+            if (group.kind === "activity")
               return (
-                <Marker variant="separator" className="compaction" key={part.id}>
-                  <MarkerContent>
-                    Context compaction {part.data.state}
-                    {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
-                      ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
-                      : ""}
-                  </MarkerContent>
-                </Marker>
+                <Activity key={index} parts={group.parts} createdAt={message.metadata?.createdAt} />
               );
-            case "data-input-state":
-              return part.data.state === "admitted" ? null : (
-                <Marker className="input-state" key={part.id}>
-                  <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
-                </Marker>
-              );
-            case "data-actions":
-              return (
-                <div className="action-list" key={part.id}>
-                  {part.data.actions.map((action) => (
-                    <Button
-                      key={action.actionId}
-                      type="button"
-                      disabled={!props.canEdit || action.disabled}
-                      variant={action.style === "danger" ? "destructive" : "secondary"}
-                      onClick={() => props.onAction(message.id, part, action.actionId)}
-                    >
-                      {action.label}
-                    </Button>
-                  ))}
-                </div>
-              );
-            case "data-reactions":
-              return (
-                <div className="reaction-list" key={part.id}>
-                  {part.data.items.map((reaction) => (
-                    <Button
-                      key={reaction.emoji}
-                      type="button"
-                      disabled={!props.canEdit}
-                      aria-pressed={reaction.reacted}
-                      variant="secondary"
-                      className="badge"
-                      onClick={() =>
-                        props.onReaction(message.id, reaction.emoji, !reaction.reacted)
-                      }
-                    >
-                      {reaction.emoji} {reaction.count}
-                    </Button>
-                  ))}
-                </div>
-              );
-          }
-        })}
-      </MessageContent>
+            const part = group.part;
+            switch (part.type) {
+              case "data-compaction":
+                return (
+                  <Marker variant="separator" className="compaction" key={part.id}>
+                    <MarkerContent>
+                      Context compaction {part.data.state}
+                      {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
+                        ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
+                        : ""}
+                    </MarkerContent>
+                  </Marker>
+                );
+              case "data-input-state":
+                return part.data.state === "admitted" ? null : (
+                  <Marker className="input-state" key={part.id}>
+                    <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
+                  </Marker>
+                );
+              case "data-actions":
+                return (
+                  <div className="action-list" key={part.id}>
+                    {part.data.actions.map((action) => (
+                      <Button
+                        key={action.actionId}
+                        type="button"
+                        disabled={!props.canEdit || action.disabled}
+                        variant={action.style === "danger" ? "destructive" : "secondary"}
+                        onClick={() => props.onAction(message.id, part, action.actionId)}
+                      >
+                        {action.label}
+                      </Button>
+                    ))}
+                  </div>
+                );
+              case "data-reactions":
+                return (
+                  <div className="reaction-list" key={part.id}>
+                    {part.data.items.map((reaction) => (
+                      <Button
+                        key={reaction.emoji}
+                        type="button"
+                        disabled={!props.canEdit}
+                        aria-pressed={reaction.reacted}
+                        variant="secondary"
+                        className="badge"
+                        onClick={() =>
+                          props.onReaction(message.id, reaction.emoji, !reaction.reacted)
+                        }
+                      >
+                        {reaction.emoji} {reaction.count}
+                      </Button>
+                    ))}
+                  </div>
+                );
+            }
+          })}
+        </MessageContent>
+      </MessageResourcesContext>
     </ChatMessage>
   );
 });

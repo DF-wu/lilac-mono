@@ -96,3 +96,15 @@ test("draft titles show inline file names without leaking local attachment handl
   });
   expect(prepared.title).toBe("Review image.png");
 });
+
+test("first-send titles use attachment labels without Markdown escapes", () => {
+  const thread = newDraftThread();
+  const creation = prepareDraftSend(thread, {
+    text: "polish-preview\\.md ",
+    attachmentText: "[polish-preview.md](attachment:file-key) ",
+    skillIds: [],
+    mode: "steer",
+    attachments: [],
+  });
+  expect(creation.title).toBe("polish-preview.md");
+});

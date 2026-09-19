@@ -36,6 +36,7 @@ export type Attachment = {
 };
 export type ComposerSubmission = {
   text: string;
+  attachmentText?: string;
   skillIds: string[];
   mode: "steer" | "followup";
   modelId?: string;

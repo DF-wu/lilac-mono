@@ -4,6 +4,8 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { RichRenderBoundary } from "./Markdown";
 import { LinkWithFavicon } from "./LinkWithFavicon";
+import { AttachmentReference } from "./AttachmentReference";
+import { MessageResourcesContext } from "./message-resources";
 import { CodeBlock } from "./CodeBlock";
 import { markdownUrl } from "./markdown-policy";
 
@@ -62,6 +64,18 @@ function TaskCheckbox({ checked }: ComponentProps<"input">) {
   return <input type="checkbox" checked={checked} disabled aria-label={label} />;
 }
 
+function MessageLink({ children, href }: ComponentProps<"a">) {
+  const resources = useContext(MessageResourcesContext);
+  const resource = href === undefined ? undefined : resources.get(href);
+  if (resource && href)
+    return (
+      <AttachmentReference href={resource.href} resource={resource.resource}>
+        {children}
+      </AttachmentReference>
+    );
+  return <LinkWithFavicon href={href}>{children}</LinkWithFavicon>;
+}
+
 const components: Components = {
   pre: Pre,
   li: ListItem,
@@ -78,7 +92,7 @@ const components: Components = {
       </RichRenderBoundary>
     );
   },
-  a: ({ children, href }) => <LinkWithFavicon href={href}>{children}</LinkWithFavicon>,
+  a: MessageLink,
   img: ({ src, alt }) => (
     <img src={src} alt={alt ?? ""} loading="lazy" decoding="async" referrerPolicy="no-referrer" />
   ),

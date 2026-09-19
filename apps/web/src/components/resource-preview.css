@@ -1,0 +1,96 @@
+.resource-preview,
+.media-preview-viewport,
+.attachment-text-preview,
+.attachment-rendered-preview,
+.attachment-pdf-preview {
+  --preview-height: min(65dvh, 40rem);
+}
+.media-preview-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding-block: var(--space-2);
+  font-size: var(--text-sm);
+}
+.media-preview-viewport {
+  height: var(--preview-height);
+  display: flex;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--background);
+  border-radius: var(--radius-md);
+}
+.media-preview-content {
+  min-width: 0;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: auto;
+}
+.media-preview-content img,
+.media-preview-content video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  object-fit: contain;
+}
+.attachment-text-preview,
+.attachment-rendered-preview,
+.attachment-pdf-preview {
+  height: var(--preview-height);
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-radius: var(--radius-md);
+  background: var(--background);
+  font-size: var(--text-sm);
+}
+.attachment-text-preview,
+.attachment-rendered-preview { padding: var(--space-4); }
+.attachment-text-preview { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.attachment-rendered-preview .markdown > :first-child { margin-top: 0; }
+.attachment-pdf-preview { display: block; width: 100%; }
+.attachment-preview-note { color: var(--muted-foreground); font-size: var(--text-xs); margin-top: var(--space-2); }
+.attachment-preview-note a { text-decoration: underline; text-underline-offset: 0.15em; }
+
+.attachment-image-card {
+  --attachment-thumbnail-width: calc(var(--space-7) * 3 + var(--space-2));
+  --attachment-thumbnail-height: calc(var(--space-7) * 2 + var(--space-4));
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: var(--attachment-thumbnail-width);
+  min-width: 0;
+  height: var(--attachment-thumbnail-height);
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+.attachment-image-thumbnail {
+  border: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border-radius: inherit;
+  cursor: zoom-in;
+}
+.attachment-image-thumbnail img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.attachment-image-unavailable {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  white-space: normal;
+  color: var(--muted-foreground);
+  font-size: var(--text-xs);
+}

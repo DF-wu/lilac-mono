@@ -221,12 +221,10 @@ export function Chat(props: ChatProps) {
   };
   async function deliver(entry: PendingInput, retryFailed = false) {
     if (!canEdit.current) return;
-    const ids = await resolveAttachmentIds(
-      pool,
-      thread.id,
-      entry.submission.attachments,
-      retryFailed,
-    );
+    const [ids, { resolveComposerAttachments }] = await Promise.all([
+      resolveAttachmentIds(pool, thread.id, entry.submission.attachments, retryFailed),
+      import("./composer-editor"),
+    ]);
     if (!canEdit.current) {
       setPending(entry.commandId, {
         state: "rejected",
@@ -253,7 +251,17 @@ export function Chat(props: ChatProps) {
       threadId: thread.id,
       commandId: entry.commandId,
       historyGeneration: checkpoint.historyGeneration,
-      text: entry.text,
+      text: entry.submission.attachmentText
+        ? resolveComposerAttachments(
+            entry.submission.attachmentText,
+            new Map(
+              entry.submission.attachments.map((attachment, index) => [
+                attachment.key,
+                ids[index]!,
+              ]),
+            ),
+          )
+        : entry.text,
       ...inputDeliveryOptions(
         active,
         entry.submission.mode,
@@ -472,6 +480,7 @@ export function Chat(props: ChatProps) {
         ) : null}
         {thread.capabilities.edit ? (
           <Composer
+            windowDrop
             client={client}
             scope={props.scope}
             catalog={props.catalog}

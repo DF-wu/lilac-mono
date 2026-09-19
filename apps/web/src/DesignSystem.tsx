@@ -18,6 +18,7 @@ import type { DisplayMessage } from "@stanley2058/lilac-client-protocol";
 import logo from "./assets/logo.svg";
 import motion from "./assets/design-system/motion.mp4";
 import tone from "./assets/design-system/tone.wav";
+import weekendPdf from "./assets/design-system/weekend.pdf";
 import type { Attachment } from "./types";
 import { AttachmentPreviewBody, ReadyAttachment } from "./components/ResourcePreview";
 import { MessageIdentityContext } from "./components/message-identity";
@@ -100,9 +101,15 @@ const swatches = [
 ] as const;
 const spacings = [1, 2, 3, 4, 5, 6, 7];
 const noop = () => {};
+const markdownAttachment =
+  "#### A quiet weekend\n\nStart with **coffee by the river**, then browse the bookstore.\n\n- Bring a book to swap\n- Leave the afternoon free";
 const identities = {
+  viewerId: "alex",
   agent: { displayName: "Lilac", avatarUrl: logo },
-  users: new Map([["alex", { displayName: "Alex Chen" }]]),
+  users: new Map([
+    ["alex", { displayName: "Alex Chen" }],
+    ["morgan", { displayName: "Morgan Lee" }],
+  ]),
 };
 const messageFixtures: DisplayMessage[] = [
   {
@@ -113,6 +120,67 @@ const messageFixtures: DisplayMessage[] = [
       {
         type: "text",
         text: "Can you help me plan a quiet weekend? Somewhere with good coffee and a bookstore.",
+      },
+    ],
+  },
+  {
+    id: "gallery-participant",
+    role: "user",
+    metadata: { authorId: "morgan", createdAt: now - 30_000 },
+    parts: [{ type: "text", text: "The riverside sounds good. I'll bring a book to swap." }],
+  },
+  {
+    id: "gallery-user-attachment",
+    role: "user",
+    metadata: { authorId: "alex", createdAt: now - 15_000 },
+    parts: [
+      {
+        type: "text",
+        text: "Use [lilac.svg](/api/resources/gallery-shared-image) for the cover. Keep the plan short enough to share.",
+      },
+      {
+        type: "data-resource",
+        id: "gallery-shared-image",
+        data: {
+          resourceId: "gallery-shared-image",
+          name: "lilac.svg",
+          mediaType: "image/svg+xml",
+          size: 2400,
+          state: "ready",
+        },
+      },
+      {
+        type: "data-resource",
+        id: "gallery-cover-image",
+        data: {
+          resourceId: "gallery-cover-image",
+          name: "cover-option.svg",
+          mediaType: "image/svg+xml",
+          size: 2400,
+          state: "ready",
+        },
+      },
+      {
+        type: "data-resource",
+        id: "gallery-detail-image",
+        data: {
+          resourceId: "gallery-detail-image",
+          name: "detail.svg",
+          mediaType: "image/svg+xml",
+          size: 2400,
+          state: "ready",
+        },
+      },
+      {
+        type: "data-resource",
+        id: "gallery-shared-pdf",
+        data: {
+          resourceId: "gallery-shared-pdf",
+          name: "weekend.pdf",
+          mediaType: "application/pdf",
+          size: 728,
+          state: "ready",
+        },
       },
     ],
   },
@@ -203,7 +271,7 @@ const messageFixtures: DisplayMessage[] = [
   },
 ];
 const richText =
-  '### A small plan\n\nUse **bold**, *italic*, ~~strikethrough~~, and `inline code`. Links include a favicon: [GitHub](https://github.com).\n\n> Leave enough room to change your mind.\n\n- [x] Pick a place\n- [ ] Check the weather\n\n| Time | Plan |\n| --- | --- |\n| Morning | Coffee and a walk |\n| Afternoon | Bookstore |\n\n```typescript\nconst weekend = { pace: "slow", reservations: false };\nconsole.log("There is time to stop and explore", weekend);\n```\n\n```bash\nbun run dev:web\n```\n\nInline math: $a^2 + b^2 = c^2$.\n\n```mermaid\nflowchart LR\n  Coffee --> Walk --> Bookstore\n```';
+  '### A small plan\n\nUse **bold**, *italic*, ~~strikethrough~~, and `inline code`. Links include a favicon: [GitHub](https://github.com).\n\n> Leave enough room to change your mind.\n\n- [x] Pick a place\n- [ ] Check the weather\n\n| Time | Plan |\n| --- | --- |\n| Morning | Coffee and a walk |\n| Afternoon | Bookstore |\n\n```typescript\nconst weekend = { pace: "slow", reservations: false };\nconsole.log("There is time to stop and explore", weekend);\n```\n\n```bash\nbun run dev:web\n```\n\nInline math: $a^2 + b^2 = c^2$.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\n```mermaid\nflowchart LR\n  Coffee --> Walk --> Bookstore\n```';
 
 function Section({
   id,
@@ -353,7 +421,7 @@ function Messages() {
             <Message
               key={message.id}
               message={message}
-              resourceUrl={() => logo}
+              resourceUrl={(id) => (id === "gallery-shared-pdf" ? weekendPdf : logo)}
               canEdit={false}
               onAction={noop}
               onReaction={noop}
@@ -532,6 +600,26 @@ function Attachments() {
               status: "ready",
               text: "A quiet weekend\n\n1. Coffee by the river\n2. Browse the bookstore\n3. Leave the afternoon free",
               truncated: false,
+            }}
+          />
+        </Specimen>
+        <Specimen title="Markdown preview">
+          <AttachmentPreviewBody
+            name="notes.md"
+            href={`data:text/markdown,${encodeURIComponent(markdownAttachment)}`}
+            kind="text"
+            text={{ status: "ready", text: markdownAttachment, truncated: false }}
+          />
+        </Specimen>
+        <Specimen title="PDF">
+          <ReadyAttachment
+            href={weekendPdf}
+            data={{
+              resourceId: "gallery-pdf",
+              name: "weekend.pdf",
+              mediaType: "application/pdf",
+              size: 728,
+              state: "ready",
             }}
           />
         </Specimen>
