@@ -319,13 +319,26 @@ function Specimen({
 function DemoThreadActions({ onAction }: { onAction: (label: string) => void }) {
   return (
     <>
-      <IconButton label="Rename conversation" onClick={() => onAction("Rename selected")}>
+      <IconButton
+        label="Rename conversation"
+        tooltip="Rename"
+        onClick={() => onAction("Rename selected")}
+      >
         <Pencil />
       </IconButton>
-      <IconButton label="Archive conversation" onClick={() => onAction("Archive selected")}>
+      <IconButton
+        label="Archive conversation"
+        tooltip="Archive"
+        onClick={() => onAction("Archive selected")}
+      >
         <Archive />
       </IconButton>
-      <IconButton label="Delete conversation" onClick={() => onAction("Delete selected")}>
+      <IconButton
+        label="Delete conversation"
+        tooltip="Delete"
+        className="destructive-action"
+        onClick={() => onAction("Delete selected")}
+      >
         <Trash2 />
       </IconButton>
     </>

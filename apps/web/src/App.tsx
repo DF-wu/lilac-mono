@@ -71,6 +71,9 @@ export function App(props: AppProps) {
     return () => window.clearInterval(timer);
   }, []);
   const [nextCursor, setNextCursor] = useState(initial.threads.nextCursor);
+  const [loadingThreads, setLoadingThreads] = useState(false);
+  const [threadListError, setThreadListError] = useState(false);
+  const threadListRequest = useRef({ loading: false });
   const [firstDraft] = useState(newDraftThread);
   const [localDrafts, setLocalDrafts] = useState(() => new Map([[firstDraft.id, firstDraft]]));
   const removedDrafts = useRef(new Set<string>());
@@ -239,9 +242,16 @@ export function App(props: AppProps) {
       client.subscribe((event) => {
         switch (event.kind) {
           case "bootstrap":
+            threadListRequest.current = { loading: false };
+            setLoadingThreads(false);
+            setThreadListError(false);
+            setCatalog(client.catalogs.get(props.scope));
+            if (archivedRef.current) {
+              void listThreads(true);
+              return;
+            }
             setThreads(event.bootstrap.threads.items);
             setNextCursor(event.bootstrap.threads.nextCursor);
-            setCatalog(client.catalogs.get(props.scope));
             return;
           case "thread":
             upsert(event.thread);
@@ -362,6 +372,7 @@ export function App(props: AppProps) {
     localDraftsRef.current = changed;
     setLocalDrafts(changed);
     setArchived(false);
+    if (archived) void listThreads(false);
     select(draft.id);
   }
   async function submitDraft(id: string, submission: ComposerSubmission) {
@@ -496,22 +507,34 @@ export function App(props: AppProps) {
     );
   }
   async function listThreads(showArchived: boolean, cursor?: string) {
-    if (!client.rpc) return;
+    if (!client.rpc || (cursor && threadListRequest.current.loading)) return;
+    const request = { loading: true };
+    threadListRequest.current = request;
+    setLoadingThreads(true);
+    setThreadListError(false);
+    if (!cursor) setNextCursor(undefined);
     const page = await attempt(
       () => client.rpc!.threads.list({ archived: showArchived, limit: 100, cursor }),
-      setError,
+      (message) => {
+        if (threadListRequest.current === request) setError(message);
+      },
     );
-    if (page) {
-      setThreads((current) =>
-        cursor
-          ? [
-              ...current,
-              ...page.items.filter((thread) => !current.some((item) => item.id === thread.id)),
-            ]
-          : page.items,
-      );
-      setNextCursor(page.nextCursor);
+    if (threadListRequest.current !== request) return;
+    request.loading = false;
+    setLoadingThreads(false);
+    if (!page) {
+      setThreadListError(true);
+      return;
     }
+    setThreads((current) =>
+      cursor
+        ? [
+            ...current,
+            ...page.items.filter((thread) => !current.some((item) => item.id === thread.id)),
+          ]
+        : page.items,
+    );
+    setNextCursor(page.nextCursor);
   }
   async function search(cursor?: string) {
     if (!client.rpc || !searchQuery.trim()) {
@@ -626,6 +649,7 @@ export function App(props: AppProps) {
       <>
         <IconButton
           label={`Rename ${thread.title || "conversation"}`}
+          tooltip="Rename"
           onClick={() => setRename({ id: thread.id, title: thread.title })}
         >
           <Pencil />
@@ -633,6 +657,7 @@ export function App(props: AppProps) {
         {!thread.draft ? (
           <IconButton
             label={`${thread.archived ? "Unarchive" : "Archive"} ${thread.title || "conversation"}`}
+            tooltip={thread.archived ? "Unarchive" : "Archive"}
             onClick={() => void update(thread.id, { archived: !thread.archived })}
           >
             {thread.archived ? <ArchiveRestore /> : <Archive />}
@@ -641,6 +666,7 @@ export function App(props: AppProps) {
         <IconButton
           className="destructive-action"
           label={`Delete ${thread.title || "conversation"}`}
+          tooltip="Delete"
           onClick={() => setConfirmDelete(thread.id)}
         >
           <Trash2 />
@@ -788,6 +814,12 @@ export function App(props: AppProps) {
                         items={sidebarThreads}
                         itemKey={(thread) => thread.id}
                         label="Conversations"
+                        scrollFade
+                        hasMore={!!nextCursor && !threadListError}
+                        loading={loadingThreads}
+                        onEndReached={() => {
+                          if (nextCursor) void listThreads(archived, nextCursor);
+                        }}
                         className="thread-list"
                         estimate={64}
                         render={(thread) => (
@@ -851,13 +883,12 @@ export function App(props: AppProps) {
                           </ContextMenu>
                         )}
                       />
-                      {nextCursor ? (
+                      {threadListError ? (
                         <Button
                           variant="ghost"
-                          className="text-button"
                           onClick={() => void listThreads(archived, nextCursor)}
                         >
-                          More conversations
+                          Retry loading conversations
                         </Button>
                       ) : null}
                     </>
@@ -907,7 +938,11 @@ export function App(props: AppProps) {
                       {selected.archived ? <span className="badge">Archived</span> : null}
                       <span className="toolbar-spacer" />
                       {owner ? (
-                        <IconButton label="Share conversation" onClick={() => setSharing(true)}>
+                        <IconButton
+                          label="Share conversation"
+                          tooltip="Share"
+                          onClick={() => setSharing(true)}
+                        >
                           <Users />
                         </IconButton>
                       ) : null}
@@ -915,7 +950,7 @@ export function App(props: AppProps) {
                         <DropdownMenu>
                           <DropdownMenuTrigger
                             render={
-                              <IconButton label="Conversation actions">
+                              <IconButton label="Conversation actions" tooltip="Options">
                                 <MoreHorizontal />
                               </IconButton>
                             }

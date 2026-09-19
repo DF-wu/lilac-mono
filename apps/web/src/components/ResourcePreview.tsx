@@ -191,7 +191,7 @@ function PreviewFrame({
 function PreviewStatus({ children }: { children: ReactNode }) {
   return (
     <div className="attachment-preview-empty" role="status">
-      {children}
+      <div>{children}</div>
     </div>
   );
 }
@@ -507,6 +507,36 @@ export function AttachmentPreviewBody({
   );
 }
 
+export function isWithinContainedImage(
+  point: { x: number; y: number },
+  bounds: { left: number; top: number; width: number; height: number },
+  image: { width: number; height: number },
+): boolean {
+  if (image.width <= 0 || image.height <= 0) return false;
+  const scale = Math.min(bounds.width / image.width, bounds.height / image.height);
+  const width = image.width * scale;
+  const height = image.height * scale;
+  const left = bounds.left + (bounds.width - width) / 2;
+  const top = bounds.top + (bounds.height - height) / 2;
+  return point.x >= left && point.x <= left + width && point.y >= top && point.y <= top + height;
+}
+
+function isPreviewBackdrop(target: EventTarget, x: number, y: number): boolean {
+  if (!(target instanceof Element)) return false;
+  if (
+    target.closest(
+      "button, a, audio, video, object, .attachment-text-preview, .attachment-rendered-preview, .media-preview-toolbar, .attachment-preview-note, .resource-preview-title, .attachment-preview-empty > *",
+    )
+  )
+    return false;
+  const image = target.closest(".media-preview-viewport")?.querySelector("img");
+  if (!image) return true;
+  return !isWithinContainedImage({ x, y }, image.getBoundingClientRect(), {
+    width: image.naturalWidth,
+    height: image.naturalHeight,
+  });
+}
+
 export function ResourcePreview({
   name,
   href,
@@ -519,6 +549,27 @@ export function ResourcePreview({
   onClose: () => void;
 }) {
   const [text, setText] = useState<TextPreviewState>({ status: "loading" });
+  const backdropPress = useRef<{ id: number; x: number; y: number; moved: boolean } | null>(null);
+  function beginBackdropPress(event: PointerEvent<HTMLDivElement>) {
+    backdropPress.current = null;
+    if (
+      !event.isPrimary ||
+      event.button !== 0 ||
+      !isPreviewBackdrop(event.target, event.clientX, event.clientY)
+    )
+      return;
+    backdropPress.current = {
+      id: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      moved: false,
+    };
+  }
+  function moveBackdropPress(event: PointerEvent<HTMLDivElement>) {
+    const press = backdropPress.current;
+    if (!press || press.id !== event.pointerId) return;
+    if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > 4) press.moved = true;
+  }
   useEffect(() => {
     if (kind !== "text") return;
     const controller = new AbortController();
@@ -540,7 +591,26 @@ export function ResourcePreview({
         if (!open) onClose();
       }}
     >
-      <DialogContent className="resource-preview-dialog" showCloseButton={false}>
+      <DialogContent
+        className="resource-preview-dialog"
+        showCloseButton={false}
+        onPointerDownCapture={beginBackdropPress}
+        onPointerMoveCapture={moveBackdropPress}
+        onPointerCancelCapture={() => {
+          backdropPress.current = null;
+        }}
+        onClickCapture={(event) => {
+          const press = backdropPress.current;
+          backdropPress.current = null;
+          if (
+            !press ||
+            press.moved ||
+            !isPreviewBackdrop(event.target, event.clientX, event.clientY)
+          )
+            return;
+          onClose();
+        }}
+      >
         <header className="resource-preview-header">
           <DialogTitle className="resource-preview-title" title={name}>
             {name}

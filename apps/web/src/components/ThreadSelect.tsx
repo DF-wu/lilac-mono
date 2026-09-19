@@ -60,15 +60,19 @@ export function ThreadCard({
         <span className="thread-card-copy">
           <span className="thread-card-top">
             <span className="thread-starter">
-              <span className="thread-state-icon" aria-label={states[state].label}>
-                <StatusIcon />
-              </span>
               <ActorAvatar displayName={starterName} />
               <span>{starterName}</span>
             </span>
-            <time dateTime={new Date(updatedAt).toISOString()}>
-              {relativeThreadTime(updatedAt, now)}
-            </time>
+            <span className="thread-card-meta">
+              {state !== "idle" ? (
+                <span className="thread-state-icon" aria-label={states[state].label}>
+                  <StatusIcon />
+                </span>
+              ) : null}
+              <time dateTime={new Date(updatedAt).toISOString()}>
+                {relativeThreadTime(updatedAt, now)}
+              </time>
+            </span>
           </span>
           <span className="thread-card-title">{title || "Untitled"}</span>
         </span>

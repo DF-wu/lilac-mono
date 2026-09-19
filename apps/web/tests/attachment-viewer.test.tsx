@@ -5,6 +5,7 @@ import {
   ReadyAttachment,
   attachmentKind,
   isMarkdownAttachment,
+  isWithinContainedImage,
 } from "../src/components/ResourcePreview";
 
 describe("attachment viewer", () => {
@@ -104,4 +105,28 @@ test("full-window previews keep the download footer available during loading and
       html.indexOf('class="attachment-preview-footer"'),
     );
   }
+});
+
+test("image hit testing excludes object-fit letterboxing and respects zoomed bounds", () => {
+  const bounds = { left: 10, top: 20, width: 400, height: 400 };
+  expect(isWithinContainedImage({ x: 210, y: 30 }, bounds, { width: 800, height: 400 })).toBe(
+    false,
+  );
+  expect(isWithinContainedImage({ x: 210, y: 220 }, bounds, { width: 800, height: 400 })).toBe(
+    true,
+  );
+  expect(isWithinContainedImage({ x: 20, y: 220 }, bounds, { width: 400, height: 800 })).toBe(
+    false,
+  );
+  expect(isWithinContainedImage({ x: 210, y: 220 }, bounds, { width: 400, height: 800 })).toBe(
+    true,
+  );
+  expect(isWithinContainedImage({ x: 210, y: 220 }, bounds, { width: 0, height: 0 })).toBe(false);
+  expect(
+    isWithinContainedImage(
+      { x: 210, y: 220 },
+      { left: -100, top: -100, width: 800, height: 800 },
+      { width: 800, height: 400 },
+    ),
+  ).toBe(true);
 });

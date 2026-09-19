@@ -1413,3 +1413,7 @@ progress {
 .markdown[data-wrap="true"] table {
   table-layout: fixed;
 }
+
+.virtual-list.scroll-fade {
+  mask-image: linear-gradient(to bottom, black calc(100% - var(--space-6)), transparent);
+}

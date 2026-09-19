@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, type ButtonHTMLAttributes, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useEffectEvent,
+  useRef,
+  type ButtonHTMLAttributes,
+  type ReactNode,
+} from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Button } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
@@ -8,9 +15,10 @@ import { Result } from "better-result";
 
 export function IconButton({
   label,
+  tooltip = label,
   children,
   ...props
-}: ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
+}: ButtonHTMLAttributes<HTMLButtonElement> & { label: string; tooltip?: string }) {
   return (
     <Tooltip>
       <TooltipTrigger
@@ -27,7 +35,7 @@ export function IconButton({
       >
         {children}
       </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
+      <TooltipContent>{tooltip}</TooltipContent>
     </Tooltip>
   );
 }
@@ -75,6 +83,10 @@ export function VirtualList<T>({
   estimate = 52,
   activeIndex,
   presentation = false,
+  onEndReached,
+  hasMore = false,
+  loading = false,
+  scrollFade = false,
 }: {
   items: readonly T[];
   itemKey: (item: T) => string;
@@ -84,6 +96,10 @@ export function VirtualList<T>({
   estimate?: number;
   activeIndex?: number;
   presentation?: boolean;
+  onEndReached?: () => void;
+  hasMore?: boolean;
+  loading?: boolean;
+  scrollFade?: boolean;
 }) {
   const parent = useRef<HTMLDivElement>(null);
   const getItemKey = useCallback((index: number) => itemKey(items[index]!), [items, itemKey]);
@@ -94,13 +110,21 @@ export function VirtualList<T>({
     getItemKey,
     overscan: 5,
   });
+  const remaining =
+    virtual.getTotalSize() - (virtual.scrollOffset ?? 0) - (virtual.scrollRect?.height ?? 0);
+  const nearEnd = remaining < estimate * 3;
+  const reachEnd = useEffectEvent(() => onEndReached?.());
+  useEffect(() => {
+    if (nearEnd && hasMore && !loading) reachEnd();
+  }, [nearEnd, hasMore, loading, items.length]);
   useEffect(() => {
     if (activeIndex !== undefined) virtual.scrollToIndex(activeIndex, { align: "auto" });
   }, [activeIndex, virtual]);
   return (
     <div
       ref={parent}
-      className={`virtual-list ${className}`}
+      className={`virtual-list ${className} ${scrollFade && (remaining > 1 || hasMore) ? "scroll-fade" : ""}`}
+      aria-busy={loading || undefined}
       aria-label={presentation ? undefined : label}
       role={presentation ? "presentation" : "list"}
     >
