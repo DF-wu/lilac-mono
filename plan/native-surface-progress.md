@@ -1,12 +1,13 @@
 # Native surface implementation progress
 
-Active plan: [native-surface.md](native-surface.md). Product scope and stage exit gates are unchanged.
+Active plan: [native-surface.md](native-surface.md). Stanley added Stage 5 for UI/UX polish and authorized continuation through plan completion.
 
 ## Implementation status
 
 The backend, shared client and web SPA are complete through Stage 2. Independent standards and
 specification reviews found no remaining blockers after the final fixes. Repository checks, the
-production build and browser verification passed. Stage 3 has not started.
+production build and browser verification passed. Stage 3 is in progress. Stage 4 release integration
+and Stage 5 UI/UX polish follow, each with an independent review/fix loop before closure.
 
 The initial protocol proof was committed as `61485a63`; backend and web implementation were committed
 as `8ed38ff7`. Subsequent implementation adds:

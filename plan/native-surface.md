@@ -1,6 +1,6 @@
 # Native Lilac surface and first-party clients
 
-Status: active, 2026-09-19. Approved for implementation by Stanley. Stage 0 is in progress. Product scope and stage exit gates below remain authoritative. Incremental commits are authorized; every stage requires review and fixes until no blockers remain before closure.
+Status: active, 2026-09-19. Approved for implementation by Stanley. Stages 0–2 are complete; implementation continues through Stages 3–5. Stanley added Stage 5 for UI/UX polish. Product scope and stage exit gates below remain authoritative. Incremental commits are authorized; every stage requires review and fixes until no blockers remain before closure.
 
 ## Objective and sequence
 
@@ -416,6 +416,14 @@ Measure redacted connection/replay bytes, bootstrap latency, cache resets, queue
 Run focused workspace tests/typechecks, required architecture/codec checks, complete `bun run check` on final implementation changes, and browser/terminal integration checks. Use event/state synchronization, not fixed test waits. Incremental implementation commits are authorized. Publishing still requires a separate user request.
 
 Release gate: install using local or Clerk auth, start work without Discord, attach files, leave/reconnect, inspect results, search, rewind and continue. Native then becomes the default entrypoint, with Discord optional.
+
+### Stage 5: UI/UX polish
+
+Review the implemented web and terminal daily-use flows against the UI design and performance guidelines. Polish conversation navigation, drafts and first send, composer completion, attachments and local progress/error states, active and settled activity disclosure, queue/cancel/rewind controls, and sign-in/reconnect/reload recovery. Reuse the existing shadcn components and Plate composer in web and OpenTUI facilities in the terminal. Preserve the established product scope and wire semantics.
+
+Verify desktop and narrow web layouts, keyboard navigation and focus, accessible icon controls, token-based spacing/type, sidebar alignment, scroll anchoring and bounded lists. Keep text visible while rich renderers or older history load. Fix observed defects and inconsistent interactions; do not add unrelated features or a new visual system.
+
+Exit: the owner and participant flows work through the supported clients, browser and terminal checks cover the polished interactions, performance budgets remain satisfied, and independent standards/spec reviews have no blockers after the review/fix loop. Run the full repository checks against the final changes. Record verification limits explicitly and transfer durable setup, compatibility and operation facts into the maintained documentation before closing the plan. Publishing remains outside this task.
 
 ## Required failure and conformance coverage
 
