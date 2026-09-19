@@ -15,7 +15,7 @@ import { inputDeliveryOptions } from "../input-mode";
 import type { UploadPool } from "../uploads";
 import { Button } from "./ui/button";
 import { Composer } from "./Composer";
-import { Timeline, useSlot, useSlotIds } from "./Timeline";
+import { Timeline, useLatestReadableTurn } from "./Timeline";
 import { attempt, ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
 
 import { UploadProgressContext } from "../upload-context";
@@ -105,8 +105,7 @@ export function Chat(props: ChatProps) {
     props.onPending(() => value);
   };
   const store = client.thread(thread.id);
-  const ids = useSlotIds(store);
-  const last = useSlot(store, ids.at(-1));
+  const readableTurnId = useLatestReadableTurn(store);
   const active = !!thread.activeRunId;
   const previousActive = useRef(active);
   const [latestVisible, setLatestVisible] = useState(false);
@@ -180,15 +179,8 @@ export function Chat(props: ChatProps) {
     if (changed) void refreshQueue();
   }, [active, refreshQueue]);
   useEffect(() => {
-    if (
-      last?.kind !== "ready" ||
-      !latestVisible ||
-      active ||
-      last.state === "pending" ||
-      last.state === "running"
-    )
-      return;
-    const turnId = last.turnId;
+    if (!readableTurnId || !latestVisible || active) return;
+    const turnId = readableTurnId;
     let pending = false;
     function markVisibleTurnRead() {
       const rpc = client.rpc;
@@ -210,15 +202,7 @@ export function Chat(props: ChatProps) {
     markVisibleTurnRead();
     document.addEventListener("visibilitychange", markVisibleTurnRead);
     return () => document.removeEventListener("visibilitychange", markVisibleTurnRead);
-  }, [
-    client,
-    thread.id,
-    active,
-    latestVisible,
-    last?.kind === "ready" ? last.turnId : undefined,
-    last?.kind === "ready" ? last.state : undefined,
-    props.readTurns,
-  ]);
+  }, [client, thread.id, active, latestVisible, readableTurnId, props.readTurns]);
 
   const setPending = (commandId: string, patch: Partial<PendingInput> | null) => {
     commitPending((entries) =>

@@ -5,10 +5,14 @@ import { MarkdownWrapContext } from "./markdown-layout";
 const MarkdownContent = lazy(() => import("./MarkdownContent"));
 
 export class RichRenderBoundary extends Component<
-  { children: ReactNode; fallback: ReactNode },
-  { failed: boolean }
+  { children: ReactNode; fallback: ReactNode; resetKey?: string },
+  { failed: boolean; resetKey?: string }
 > {
   override state = { failed: false };
+  static getDerivedStateFromProps(props: { resetKey?: string }, state: { resetKey?: string }) {
+    if (props.resetKey !== state.resetKey) return { failed: false, resetKey: props.resetKey };
+    return null;
+  }
   static getDerivedStateFromError() {
     return { failed: true };
   }
@@ -28,7 +32,7 @@ export const Markdown = memo(function Markdown({
   return (
     <div className="markdown" data-wrap={wrap}>
       <MarkdownWrapContext value={wrap}>
-        <RichRenderBoundary key={text} fallback={fallback}>
+        <RichRenderBoundary resetKey={text} fallback={fallback}>
           <Suspense fallback={fallback}>
             <MarkdownContent text={text} />
           </Suspense>

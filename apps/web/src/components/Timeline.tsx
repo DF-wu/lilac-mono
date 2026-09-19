@@ -84,6 +84,29 @@ export type TimelineProps = {
   onLatestVisibleChange?: (visible: boolean) => void;
 };
 
+type TurnProps = Omit<TimelineProps, "header" | "footer" | "onLatestVisibleChange">;
+function messageProps(props: TurnProps): Omit<MessageProps, "message" | "controls"> {
+  return {
+    canEdit: props.canEdit,
+    resourceUrl: props.resourceUrl,
+    upload: props.upload,
+    onAction: props.onAction,
+    onReaction: props.onReaction,
+  };
+}
+
+export function useLatestReadableTurn(store: NativeThreadStore) {
+  const subscribe = useCallback((listener: () => void) => store.subscribe(listener), [store]);
+  const snapshot = useCallback(() => {
+    const id = store.slotIds.at(-1);
+    const slot = id ? store.get(id) : undefined;
+    if (slot?.kind !== "ready" || slot.state === "pending" || slot.state === "running")
+      return undefined;
+    return slot.turnId;
+  }, [store]);
+  return useSyncExternalStore(subscribe, snapshot, snapshot);
+}
+
 export const Timeline = memo(function Timeline(props: TimelineProps) {
   const store = props.client.thread(props.threadId);
   const ids = useSlotIds(store);
@@ -284,7 +307,18 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
             className="virtual-row"
             style={{ transform: `translateY(${row.start - insets.top}px)` }}
           >
-            <SlotRow {...props} slotId={ids[row.index]!} store={store} />
+            <SlotRow
+              client={props.client}
+              threadId={props.threadId}
+              canEdit={props.canEdit}
+              resourceUrl={props.resourceUrl}
+              upload={props.upload}
+              onAction={props.onAction}
+              onReaction={props.onReaction}
+              onRewind={props.onRewind}
+              slotId={ids[row.index]!}
+              store={store}
+            />
           </div>
         ))}
         {ids.length === 0 ? <div className="empty-chat">Start a conversation.</div> : null}
@@ -315,7 +349,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
 });
 
 const SlotRow = memo(function SlotRow(
-  props: TimelineProps & { store: NativeThreadStore; slotId: string },
+  props: TurnProps & { store: NativeThreadStore; slotId: string },
 ) {
   const slot = useSlot(props.store, props.slotId);
   useEffect(() => {
@@ -340,10 +374,18 @@ const SlotRow = memo(function SlotRow(
         )}
       </div>
     );
-  return <Turn {...props} slot={slot} />;
+  return (
+    <Turn
+      {...messageProps(props)}
+      client={props.client}
+      threadId={props.threadId}
+      onRewind={props.onRewind}
+      slot={slot}
+    />
+  );
 });
 
-export const Turn = memo(function Turn(props: TimelineProps & { slot: ReadyTurnSlot }) {
+export const Turn = memo(function Turn(props: TurnProps & { slot: ReadyTurnSlot }) {
   const { slot } = props;
   const [expanded, setExpanded] = useState(false);
   const firstUser = slot.messages.find(
@@ -372,7 +414,7 @@ export const Turn = memo(function Turn(props: TimelineProps & { slot: ReadyTurnS
       {firstUser ? (
         <div className="user-turn">
           <Message
-            {...props}
+            {...messageProps(props)}
             message={firstUser}
             controls={
               <>
@@ -411,15 +453,17 @@ export const Turn = memo(function Turn(props: TimelineProps & { slot: ReadyTurnS
           </CollapsibleTrigger>
           <CollapsibleContent className="expanded-work">
             {intermediate.map((message) => (
-              <Message key={message.id} {...props} message={message} />
+              <Message key={message.id} {...messageProps(props)} message={message} />
             ))}
           </CollapsibleContent>
         </Collapsible>
       ) : (
-        intermediate.map((message) => <Message key={message.id} {...props} message={message} />)
+        intermediate.map((message) => (
+          <Message key={message.id} {...messageProps(props)} message={message} />
+        ))
       )}
       {finals.map((message) => (
-        <Message key={message.id} {...props} message={message} />
+        <Message key={message.id} {...messageProps(props)} message={message} />
       ))}
       {settled && !intermediate.length && slot.state !== "complete" ? (
         <Marker className="turn-status">
