@@ -1,5 +1,6 @@
 "use client";
 
+import { useSurfaceOpen } from "./surface-visibility";
 import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip";
 import { cn } from "cn";
 
@@ -8,7 +9,8 @@ function TooltipProvider({ delay = 0, ...props }: TooltipPrimitive.Provider.Prop
 }
 
 function Tooltip({ ...props }: TooltipPrimitive.Root.Props) {
-  return <TooltipPrimitive.Root data-slot="tooltip" {...props} />;
+  const open = useSurfaceOpen(props);
+  return <TooltipPrimitive.Root data-slot="tooltip" {...props} {...open} />;
 }
 
 function TooltipTrigger({ ...props }: TooltipPrimitive.Trigger.Props) {

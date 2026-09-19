@@ -1,3 +1,4 @@
+import { threadIdFromUrl } from "./thread-location";
 import { NativeClient, type CacheScope } from "@stanley2058/lilac-client";
 import type { BootstrapReply } from "@stanley2058/lilac-client-protocol";
 import { ORPCError } from "@orpc/client";
@@ -142,7 +143,7 @@ export class WebSessionController {
     await active?.dispose();
   }
   private async startSession(epoch: number, signal: AbortSignal): Promise<void> {
-    const threadId = this.currentUrl().searchParams.get("thread") ?? undefined;
+    const threadId = threadIdFromUrl(this.currentUrl());
     const cached = await this.cache.readLatestBootstrap();
     if (epoch !== this.epoch) return;
     if (cached) {

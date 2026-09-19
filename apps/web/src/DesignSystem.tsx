@@ -1,3 +1,4 @@
+import { Link, useLocation } from "@tanstack/react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect, useState, type ReactNode } from "react";
 import {
@@ -960,6 +961,9 @@ function Layout() {
   );
 }
 export default function DesignSystem() {
+  const returnThreadId = useLocation({ select: (location) => location.state.chatThreadId });
+  const returnDraftId = useLocation({ select: (location) => location.state.draftThreadId });
+
   const [queries] = useState(
     () => new QueryClient({ defaultOptions: { queries: { retry: false } } }),
   );
@@ -979,10 +983,15 @@ export default function DesignSystem() {
       <TooltipProvider>
         <div className="ds-page">
           <header className="ds-header">
-            <a href="/" className="ds-back">
+            <Link
+              to={returnThreadId ? "/threads/$threadId" : "/"}
+              params={returnThreadId ? { threadId: returnThreadId } : {}}
+              state={{ draftThreadId: returnDraftId }}
+              className="ds-back"
+            >
               <ArrowLeft />
               Back to chat
-            </a>
+            </Link>
             <div className="ds-header-main">
               <div>
                 <span className="ds-eyebrow">Lilac</span>

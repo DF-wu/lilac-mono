@@ -1,3 +1,6 @@
+import { SurfaceVisibilityContext } from "./components/ui/surface-visibility";
+import { Outlet, RouterProvider, useMatch } from "@tanstack/react-router";
+import { createAppRouter } from "./router";
 import { Button } from "./components/ui/button";
 import { lazy, Suspense, useEffect, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
@@ -10,15 +13,20 @@ import { AccountLoadBoundary } from "./AccountLoadBoundary";
 import App from "./App";
 import "./styles.css";
 import { Toaster, toast } from "./components/ui/toast";
-const DesignSystem = lazy(() => import("./DesignSystem"));
-const designSystemPage = location.pathname === "/design-system";
 
 const ClerkLogin = lazy(() => import("./clerk").then((module) => ({ default: module.ClerkLogin })));
 const ClerkUserControl = lazy(() =>
   import("./clerk").then((module) => ({ default: module.ClerkUserControl })),
 );
 const sessions = new WebSessionController();
-const authInfo = designSystemPage ? undefined : readAuthInfo();
+let authInfo: ReturnType<typeof readAuthInfo> | undefined;
+let sessionStarted = false;
+function enterChat() {
+  authInfo ??= readAuthInfo();
+  if (sessionStarted) return;
+  sessionStarted = true;
+  start();
+}
 const start = () => {
   void sessions.start();
 };
@@ -40,7 +48,6 @@ const logout = async () => {
     err: (error) => sessions.logout(async () => Result.err(error)),
   });
 };
-if (!designSystemPage) start();
 
 function Root() {
   const state = useSyncExternalStore(sessions.subscribe, sessions.getSnapshot);
@@ -144,16 +151,29 @@ function Root() {
   );
 }
 
+function RouteShell() {
+  const chat = useMatch({ from: "/chat", shouldThrow: false, select: () => true }) ?? false;
+  const [visitedChat, setVisitedChat] = useState(chat);
+  if (chat && !visitedChat) setVisitedChat(true);
+  return (
+    <>
+      {visitedChat ? (
+        <div hidden={!chat} style={{ height: "100%" }}>
+          <SurfaceVisibilityContext value={chat}>
+            <Root />
+          </SurfaceVisibilityContext>
+        </div>
+      ) : null}
+      <Outlet />
+    </>
+  );
+}
+
+const router = createAppRouter({ shellComponent: RouteShell, onChatEnter: enterChat });
 const root = document.getElementById("root");
 if (root)
   createRoot(root).render(
     <Toaster>
-      {designSystemPage ? (
-        <Suspense fallback={null}>
-          <DesignSystem />
-        </Suspense>
-      ) : (
-        <Root />
-      )}
+      <RouterProvider router={router} />
     </Toaster>,
   );

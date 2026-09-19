@@ -58,7 +58,7 @@ function setup(options: WebSessionOptions = {}) {
     },
     bootstrap: async () => bootstrap,
     logout: async () => undefined,
-    currentUrl: () => new URL("http://localhost/?thread=selected"),
+    currentUrl: () => new URL("http://localhost/threads/selected"),
     channel: null,
     ...options,
   });

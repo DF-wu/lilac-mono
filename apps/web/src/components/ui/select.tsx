@@ -1,11 +1,17 @@
 "use client";
 
+import { useSurfaceOpen } from "./surface-visibility";
 import * as React from "react";
 import { Select as SelectPrimitive } from "@base-ui/react/select";
 import { cn } from "cn";
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react";
 
-const Select = SelectPrimitive.Root;
+function Select<Value, Multiple extends boolean | undefined = false>(
+  props: SelectPrimitive.Root.Props<Value, Multiple>,
+) {
+  const open = useSurfaceOpen(props);
+  return <SelectPrimitive.Root {...props} {...open} />;
+}
 
 function SelectGroup({ className, ...props }: SelectPrimitive.Group.Props) {
   return (

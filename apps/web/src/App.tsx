@@ -1,3 +1,4 @@
+import { useLocation, useNavigate, useMatch, useRouter } from "@tanstack/react-router";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { searchOptions, threadOptions, useNativeOnline } from "./queries";
 import { useStore } from "zustand";
@@ -75,6 +76,15 @@ export function App(props: AppProps) {
   );
 }
 function Workspace(props: AppProps) {
+  const navigate = useNavigate();
+  const router = useRouter();
+  const active = useMatch({ from: "/chat", shouldThrow: false, select: () => true }) ?? false;
+  const routeThreadId = useMatch({
+    from: "/chat/threads/$threadId",
+    shouldThrow: false,
+    select: (match) => match.params.threadId,
+  });
+  const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
   const { pool, drafts: draftStore } = useWorkspace();
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
@@ -86,10 +96,19 @@ function Workspace(props: AppProps) {
   const threadListRequest = useRef({ loading: false });
   const [firstDraft] = useState(() => draftStore.getState().localDrafts.values().next().value!);
   const removedDrafts = useRef(new Set<string>());
-  const selectionVersion = useRef(0);
-  const [selectedId, setSelectedId] = useState<string | undefined>(
-    props.initialThreadId ?? initial.threads.items[0]?.id ?? firstDraft.id,
-  );
+  const routeSelection =
+    routeThreadId ?? routeDraftId ?? initial.threads.items[0]?.id ?? firstDraft.id;
+  const [lastSelectedId, setLastSelectedId] = useState(routeSelection);
+  if (active && lastSelectedId !== routeSelection) setLastSelectedId(routeSelection);
+  const selectedId = active ? routeSelection : lastSelectedId;
+  useEffect(() => {
+    if (!active || routeThreadId || routeDraftId) return;
+    if (selectedId.startsWith("draft:")) {
+      void navigate({ to: "/", state: { draftThreadId: selectedId }, replace: true });
+      return;
+    }
+    void navigate({ to: "/threads/$threadId", params: { threadId: selectedId }, replace: true });
+  }, [active, routeThreadId, routeDraftId, selectedId, navigate]);
   const [catalog, setCatalog] = useState<DisplayCatalog | undefined>(() =>
     initial.catalog.kind === "catalog" ? initial.catalog.catalog : client.catalogs.get(props.scope),
   );
@@ -134,6 +153,13 @@ function Workspace(props: AppProps) {
   }, [searchResults.error]);
   const [rename, setRename] = useState<{ id: string; title: string }>();
   const [confirmDelete, setConfirmDelete] = useState<string>();
+  useEffect(() => {
+    if (active) return;
+    setSettings(false);
+    setSharing(false);
+    setRename(undefined);
+    setConfirmDelete(undefined);
+  }, [active]);
   const [theme, setTheme] = useState(() => readTheme());
   const drafts = useRef(new Map<string, Draft>());
   const [pendingInputs, setPendingInputs] = useState(new Map<string, PendingInput[]>());
@@ -151,6 +177,8 @@ function Workspace(props: AppProps) {
   const readTurns = useRef(new Map<string, string>());
   const selected = threads.find((thread) => thread.id === selectedId);
   const owner = initial.viewer.role === "owner";
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
   const archivedRef = useRef(archived);
@@ -164,15 +192,23 @@ function Workspace(props: AppProps) {
     }),
     [catalog?.agent, initial.viewer],
   );
+  useEffect(() => {
+    setExternal(false);
+  }, [selectedId]);
   const [loadedThreadId, setLoadedThreadId] = useState<string>();
+  const [draftsHydrated, setDraftsHydrated] = useState(!props.draftCache);
+  const routeDraftExists = useStore(
+    draftStore,
+    (state) => !routeDraftId || state.localDrafts.has(routeDraftId),
+  );
   useEffect(() => {
     const cache = props.draftCache;
     if (!cache) return;
     let canceled = false;
-    const version = selectionVersion.current;
-    const state: unknown = history.state;
     void attempt(() => cache.listLocalDrafts(props.scope), setError).then((saved) => {
-      if (!saved || canceled) return;
+      if (canceled) return;
+      setDraftsHydrated(true);
+      if (!saved) return;
       const changed = new Map(draftStore.getState().localDrafts);
       for (const { threadId, draft } of saved) {
         if (changed.has(threadId) || removedDrafts.current.has(threadId)) continue;
@@ -185,17 +221,28 @@ function Workspace(props: AppProps) {
         });
       }
       setLocalDrafts(changed);
-      if (selectionVersion.current !== version || new URL(location.href).searchParams.has("thread"))
-        return;
-      const restored = restoreDraftThread(changed, state);
-      if (!changed.has(restored.id)) return;
-      setSelectedId(restored.id);
-      history.replaceState({ draftThreadId: restored.id }, "", location.href);
     });
     return () => {
       canceled = true;
     };
   }, [props.draftCache, props.scope]);
+  useEffect(() => {
+    if (!active || !draftsHydrated || !routeDraftId || routeDraftExists) return;
+    const changed = new Map(draftStore.getState().localDrafts);
+    const draft = restoreDraftThread(changed, { draftThreadId: routeDraftId });
+    changed.set(draft.id, draft);
+    setLocalDrafts(changed);
+    void navigate({ to: "/", state: { draftThreadId: draft.id }, replace: true });
+  }, [
+    active,
+    draftsHydrated,
+    routeDraftId,
+    routeDraftExists,
+    draftStore,
+    setLocalDrafts,
+    navigate,
+  ]);
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     const saved = Result.try({
@@ -241,7 +288,7 @@ function Workspace(props: AppProps) {
             drafts.current.delete(event.threadId);
             pending.current.delete(event.threadId);
             readTurns.current.delete(event.threadId);
-            if (selectedRef.current === event.threadId) setSelectedId(undefined);
+            if (activeRef.current && selectedRef.current === event.threadId) createThread();
             return;
           case "catalog":
             setCatalog(client.catalogs.get(props.scope));
@@ -277,28 +324,6 @@ function Workspace(props: AppProps) {
   useEffect(() => {
     if (selectedMetadata.data && !selected) upsert(selectedMetadata.data);
   }, [selectedMetadata.data, !!selected, upsert]);
-  useEffect(() => {
-    if (selectedRef.current?.startsWith("draft:")) {
-      history.replaceState({ draftThreadId: selectedRef.current }, "", location.href);
-    }
-    const pop = (event: PopStateEvent) => {
-      selectionVersion.current++;
-      setExternal(false);
-      const id = new URL(window.location.href).searchParams.get("thread");
-      if (id) {
-        setSelectedId(id);
-        return;
-      }
-      const draft = restoreDraftThread(draftStore.getState().localDrafts, event.state);
-      const changed = new Map(draftStore.getState().localDrafts);
-      changed.set(draft.id, draft);
-      setLocalDrafts(changed);
-      setSelectedId(draft.id);
-      history.replaceState({ draftThreadId: draft.id }, "", location.href);
-    };
-    window.addEventListener("popstate", pop);
-    return () => window.removeEventListener("popstate", pop);
-  }, []);
   function changeLocalDraft(id: string, update: (thread: DraftThread) => DraftThread) {
     const current = draftStore.getState().localDrafts.get(id);
     if (!current) return;
@@ -331,14 +356,14 @@ function Workspace(props: AppProps) {
     setLocalDrafts(changed);
   }
   function select(id: string) {
-    selectionVersion.current++;
-    setSelectedId(id);
     setExternal(false);
-    const url = new URL(window.location.href);
-    if (id.startsWith("draft:")) url.searchParams.delete("thread");
-    else url.searchParams.set("thread", id);
-    history.pushState(id.startsWith("draft:") ? { draftThreadId: id } : {}, "", url);
+    if (id.startsWith("draft:")) {
+      void navigate({ to: "/", state: { draftThreadId: id } });
+      return;
+    }
+    void navigate({ to: "/threads/$threadId", params: { threadId: id } });
   }
+
   function createThread() {
     const draft = newDraftThread();
     const changed = new Map(draftStore.getState().localDrafts);
@@ -348,6 +373,16 @@ function Workspace(props: AppProps) {
     setArchived(false);
     if (archived) void listThreads(false);
     select(draft.id);
+  }
+  function finishDraftNavigation(draftId: string, threadId: string) {
+    if (selectedRef.current !== draftId) return;
+    if (activeRef.current) {
+      select(threadId);
+      return;
+    }
+    const location = router.state.location;
+    if (location.pathname !== "/design-system" || location.state.draftThreadId !== draftId) return;
+    void navigate({ to: "/design-system", state: { chatThreadId: threadId }, replace: true });
   }
   async function submitDraft(id: string, submission: ComposerSubmission) {
     const current = draftStore.getState().localDrafts.get(id);
@@ -424,7 +459,7 @@ function Workspace(props: AppProps) {
         );
     }
     removeLocalDraft(id);
-    if (selectedRef.current === id) select(created.id);
+    finishDraftNavigation(id, created.id);
     const patch = (change: Partial<PendingInput> | null) =>
       patchPending(created.id, (entries) =>
         change
@@ -531,7 +566,7 @@ function Workspace(props: AppProps) {
     if (id.startsWith("draft:")) {
       removeLocalDraft(id);
       setConfirmDelete(undefined);
-      if (selectedRef.current === id) createThread();
+      if (activeRef.current && selectedRef.current === id) createThread();
       return;
     }
     const rpc = client.rpc;
@@ -554,7 +589,7 @@ function Workspace(props: AppProps) {
     drafts.current.delete(id);
     patchPending(id, () => []);
     setConfirmDelete(undefined);
-    if (selectedRef.current === id) createThread();
+    if (activeRef.current && selectedRef.current === id) createThread();
   }
   const sidebarThreads = [
     ...(!archived ? draftIds.map((id) => ({ id, source: undefined })) : []),
@@ -769,7 +804,14 @@ function Workspace(props: AppProps) {
                   <span className="toolbar-spacer" />
                   <IconButton
                     label="Design system"
-                    onClick={() => location.assign("/design-system")}
+                    onClick={() =>
+                      void navigate({
+                        to: "/design-system",
+                        state: selectedId.startsWith("draft:")
+                          ? { draftThreadId: selectedId }
+                          : { chatThreadId: selectedId },
+                      })
+                    }
                   >
                     <Palette />
                   </IconButton>
@@ -804,7 +846,7 @@ function Workspace(props: AppProps) {
                         return (
                           <DraftChat
                             threadId={id}
-                            foreground={foreground}
+                            foreground={foreground && active}
                             displayRevision={revision}
                             onPrepare={onPrepare}
                             onReady={onReady}
@@ -831,7 +873,7 @@ function Workspace(props: AppProps) {
                         );
                       return (
                         <Chat
-                          foreground={foreground}
+                          foreground={foreground && active}
                           displayRevision={revision}
                           onPrepare={onPrepare}
                           onReady={onReady}
