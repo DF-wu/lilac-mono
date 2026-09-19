@@ -72,7 +72,7 @@
   --line-normal: 1.6;
   --shadow-overlay: 0 1rem 4rem #0006;
   --sidebar-width: 18rem;
-  --chat-width: 54rem;
+  --chat-width: calc(54rem + var(--space-4) * 2);
   --icon-size: 1.125rem;
   --control-size: 2.25rem;
   --row-size: 2.75rem;
@@ -692,8 +692,8 @@ small {
   right: 0;
   bottom: calc(100% + var(--space-2));
   height: 20rem;
-  padding: var(--space-2);
-  border-radius: var(--radius-md);
+  padding: calc(var(--space-1) * 1.5);
+  border-radius: var(--radius-lg);
   background: var(--surface-raised);
   box-shadow: var(--shadow-overlay);
   z-index: 20;
@@ -1091,6 +1091,7 @@ progress {
   overflow-wrap: anywhere;
 }
 .markdown-table {
+  border-radius: var(--radius-md);
   overflow: auto;
   max-width: 100%;
   margin: var(--space-3) 0;
@@ -1129,6 +1130,7 @@ progress {
 }
 .markdown-math-display {
   display: block;
+  text-align: center;
   overflow: auto;
   margin: var(--space-3) 0;
 }
