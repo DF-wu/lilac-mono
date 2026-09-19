@@ -1003,6 +1003,8 @@ export function App(props: AppProps) {
           </ResizablePanelGroup>
           {settings && owner ? (
             <Settings
+              viewer={initial.viewer}
+              onLogout={props.onLogout}
               client={client}
               onClose={() => setSettings(false)}
               agent={identities.agent}

@@ -1,10 +1,12 @@
 import { AgentIdentity } from "./AgentIdentity";
 import type { ActorIdentity } from "./ActorAvatar";
 import { useEffect, useRef, useState } from "react";
-import { RefreshCw, Save, UserPlus } from "lucide-react";
+import { LogOut, RefreshCw, Save, UserPlus } from "lucide-react";
 import type { NativeClient } from "@stanley2058/lilac-client";
 import type { NativeRpcOutputs, NativeUser } from "@stanley2058/lilac-client-protocol";
-import { attempt, ErrorNotice, IconButton, Modal, VirtualList } from "./ui";
+import { attempt, ErrorNotice, IconButton, VirtualList } from "./ui";
+import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
+import "./settings.css";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { Textarea } from "./ui/textarea";
@@ -23,14 +25,20 @@ export function Settings({
   theme,
   onTheme,
   agent,
+  viewer,
+  onLogout,
 }: {
   client: NativeClient;
+  viewer: NativeUser;
+  onLogout: () => Promise<void>;
   onClose: () => void;
   theme: string;
   agent: ActorIdentity;
   onTheme: (value: string) => void;
 }) {
-  const [tab, setTab] = useState<"core" | "mcp" | "users" | "appearance">("core");
+  const [tab, setTab] = useState<"account" | "theme" | "core" | "mcp" | "agent" | "users">(
+    "account",
+  );
   const [editors, setEditors] = useState<ConfigEditors>({});
   const [error, setError] = useState<string>();
   const [reloads, setReloads] = useState<NativeRpcOutputs["config"]["reloadMcp"]>();
@@ -92,100 +100,157 @@ export function Settings({
     if (result) setReloads(result);
   }
   return (
-    <Modal title="Settings" onClose={onClose} wide>
-      <Tabs
-        className="flex-col"
-        value={tab}
-        onValueChange={(value) => {
-          if (value === "core" || value === "mcp" || value === "users" || value === "appearance")
-            setTab(value);
-        }}
-      >
-        <TabsList aria-label="Settings sections">
-          {(["core", "mcp", "users", "appearance"] as const).map((key) => (
-            <TabsTrigger key={key} value={key}>
-              {{ core: "Core", mcp: "MCP", users: "People", appearance: "Appearance" }[key]}
-            </TabsTrigger>
-          ))}
-        </TabsList>
-        <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
-        <TabsContent value="appearance">
-          <AgentIdentity client={client} identity={agent} />
-          <label className="field">
-            Theme
-            <Select
-              items={[
-                { value: "system", label: "System" },
-                { value: "dark", label: "Dark" },
-                { value: "light", label: "Light" },
-              ]}
-              value={theme}
-              onValueChange={(value) => {
-                if (value) onTheme(value);
-              }}
-            >
-              <SelectTrigger aria-label="Theme">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="system">System</SelectItem>
-                <SelectItem value="dark">Dark</SelectItem>
-                <SelectItem value="light">Light</SelectItem>
-              </SelectContent>
-            </Select>
-          </label>
-        </TabsContent>
-        <TabsContent value="users">
-          <People client={client} />
-        </TabsContent>
-        {tab === "core" || tab === "mcp" ? (
-          <TabsContent value={tab}>
-            <Textarea
-              className="config-editor"
-              spellCheck={false}
-              aria-label={`${tab === "core" ? "Core" : "MCP"} configuration YAML`}
-              value={document ? text : ""}
-              disabled={!document}
-              onChange={(event) => {
-                setEditors((current) => editConfig(current, tab, event.target.value));
-              }}
-            />
-            <footer className="config-footer">
-              <span role="status">
-                {status}
-                {tab === "mcp" && status === "Saved" ? ". Reload to apply changes." : ""}
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DialogContent className="settings-dialog">
+        <DialogTitle className="sr-only">Settings</DialogTitle>
+        <Tabs
+          className="settings-layout"
+          orientation="vertical"
+          value={tab}
+          onValueChange={(value) => {
+            if (
+              value === "account" ||
+              value === "theme" ||
+              value === "core" ||
+              value === "mcp" ||
+              value === "agent" ||
+              value === "users"
+            ) {
+              setTab(value);
+              setError(undefined);
+            }
+          }}
+        >
+          <TabsList className="settings-navigation" aria-label="Settings sections">
+            <div className="settings-navigation-group">
+              <span className="settings-navigation-label" aria-hidden="true">
+                Preferences
               </span>
-              <span className="toolbar-spacer" />
-              {tab === "mcp" ? (
-                <Button variant="secondary" className="button" onClick={() => void reload()}>
-                  <RefreshCw />
-                  Reload MCP
-                </Button>
-              ) : null}
-              <Button
-                className="button primary"
-                disabled={!document || !!saving[document.kind] || text === document.text}
-                onClick={() => void save()}
-              >
-                <Save />
-                Save
+              <TabsTrigger value="account">Account</TabsTrigger>
+              <TabsTrigger value="theme">Theme</TabsTrigger>
+            </div>
+            <div className="settings-navigation-group">
+              <span className="settings-navigation-label" aria-hidden="true">
+                Runtime
+              </span>
+              <TabsTrigger value="core">Core</TabsTrigger>
+              <TabsTrigger value="mcp">MCP</TabsTrigger>
+              <TabsTrigger value="agent">Agent</TabsTrigger>
+              <TabsTrigger value="users">User</TabsTrigger>
+            </div>
+          </TabsList>
+          <div className="settings-options">
+            <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
+            <TabsContent value="account" className="settings-section">
+              <h2>Account</h2>
+              <dl className="settings-account">
+                <div>
+                  <dt>Name</dt>
+                  <dd>{viewer.displayName}</dd>
+                </div>
+                <div>
+                  <dt>Role</dt>
+                  <dd>{viewer.role}</dd>
+                </div>
+                <div>
+                  <dt>Tool access</dt>
+                  <dd>{viewer.toolMode === "full" ? "Full access" : "Restricted"}</dd>
+                </div>
+              </dl>
+              <Button variant="secondary" onClick={() => void attempt(onLogout, setError)}>
+                <LogOut />
+                Sign out
               </Button>
-            </footer>
-            {reloads ? (
-              <div className="reload-results">
-                {reloads.servers.map((server) => (
-                  <div key={server.name}>
-                    <strong>{server.name}</strong>
-                    <span>{server.state}</span>
-                    {server.error ? <p className="error-text">{server.error}</p> : null}
+            </TabsContent>
+            <TabsContent value="agent" className="settings-section">
+              <AgentIdentity client={client} identity={agent} />
+            </TabsContent>
+            <TabsContent value="theme" className="settings-section">
+              <h2>Theme</h2>
+              <label className="field">
+                Theme
+                <Select
+                  items={[
+                    { value: "system", label: "System" },
+                    { value: "dark", label: "Dark" },
+                    { value: "light", label: "Light" },
+                  ]}
+                  value={theme}
+                  onValueChange={(value) => {
+                    if (value) onTheme(value);
+                  }}
+                >
+                  <SelectTrigger aria-label="Theme">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="system">System</SelectItem>
+                    <SelectItem value="dark">Dark</SelectItem>
+                    <SelectItem value="light">Light</SelectItem>
+                  </SelectContent>
+                </Select>
+              </label>
+            </TabsContent>
+            <TabsContent value="users" className="settings-section">
+              <h2>User</h2>
+              <People client={client} />
+            </TabsContent>
+            {tab === "core" || tab === "mcp" ? (
+              <TabsContent value={tab} className="settings-section settings-config">
+                <h2>{tab === "core" ? "Core" : "MCP"}</h2>
+                <Textarea
+                  className="config-editor"
+                  spellCheck={false}
+                  aria-label={`${tab === "core" ? "Core" : "MCP"} configuration YAML`}
+                  value={document ? text : ""}
+                  disabled={!document}
+                  onChange={(event) => {
+                    setEditors((current) => editConfig(current, tab, event.target.value));
+                  }}
+                />
+                <footer className="config-footer">
+                  <span role="status">
+                    {status}
+                    {tab === "mcp" && status === "Saved" ? ". Reload to apply changes." : ""}
+                  </span>
+                  <span className="toolbar-spacer" />
+                  {tab === "mcp" ? (
+                    <Button variant="secondary" className="button" onClick={() => void reload()}>
+                      <RefreshCw />
+                      Reload MCP
+                    </Button>
+                  ) : null}
+                  <Button
+                    className="button primary"
+                    disabled={!document || !!saving[document.kind] || text === document.text}
+                    onClick={() => void save()}
+                  >
+                    <Save />
+                    Save
+                  </Button>
+                </footer>
+                {tab === "mcp" && reloads ? (
+                  <div className="reload-results">
+                    {reloads.servers.map((server) => (
+                      <div key={server.name}>
+                        <strong>{server.name}</strong>
+                        <span>{server.state}</span>
+                        {server.error ? <p className="error-text">{server.error}</p> : null}
+                      </div>
+                    ))}
                   </div>
-                ))}
-              </div>
+                ) : null}
+              </TabsContent>
             ) : null}
-          </TabsContent>
-        ) : null}
-      </Tabs>
-    </Modal>
+          </div>
+        </Tabs>
+      </DialogContent>
+    </Dialog>
   );
 }
 
