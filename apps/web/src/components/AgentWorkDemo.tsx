@@ -1,9 +1,12 @@
+import { MessageArrivals } from "../message-arrivals";
+import { MessageArrivalsContext } from "./message-arrivals";
 import { useEffect, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, Pause, Play, RotateCcw } from "lucide-react";
 import { agentWorkStages } from "../agent-work-fixtures";
 import { MessageIdentityContext } from "./message-identity";
 import { MessageServicesContext, type MessageServices } from "./message-services";
 import { Turn } from "./Timeline";
+import type { ReadyTurnSlot } from "@stanley2058/lilac-client-protocol";
 import { Button } from "./ui/button";
 import { IconButton } from "./ui";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
@@ -131,13 +134,12 @@ export function AgentWorkDemo() {
       <div className="ds-agent-preview" aria-label="Agent work preview" tabIndex={0}>
         <MessageIdentityContext value={identities}>
           <MessageServicesContext value={services}>
-            <Turn
+            <DemoTurn
               key={stage.id}
               slot={slot}
               onRewind={() =>
                 setFeedback("Rewind selected. This demo does not change any conversation.")
               }
-              onLoadMore={() => {}}
             />
           </MessageServicesContext>
         </MessageIdentityContext>
@@ -146,5 +148,18 @@ export function AgentWorkDemo() {
         {feedback}
       </p>
     </div>
+  );
+}
+
+function DemoTurn({ slot, onRewind }: { slot: ReadyTurnSlot; onRewind: () => void }) {
+  const [arrivals] = useState(() => {
+    const arrivals = new MessageArrivals();
+    arrivals.activate([]);
+    return arrivals;
+  });
+  return (
+    <MessageArrivalsContext value={arrivals}>
+      <Turn slot={slot} onRewind={onRewind} onLoadMore={() => {}} />
+    </MessageArrivalsContext>
   );
 }

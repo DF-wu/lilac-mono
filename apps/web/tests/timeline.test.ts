@@ -8,6 +8,7 @@ import {
   activitySummary,
   groupActivityMessages,
   groupParts,
+  messageArrivalIds,
 } from "../src/components/Timeline";
 
 function activity(id: string): DisplayMessage {
@@ -107,5 +108,45 @@ describe("native turn activity disclosure", () => {
     const html = renderToStaticMarkup(createElement(ActivityItem, { part: failed }));
     expect(html).toContain("Failed");
     expect(html).not.toContain("<button");
+  });
+});
+
+describe("streaming block arrivals", () => {
+  it("does not consume an empty placeholder before its first streamed text", () => {
+    const message: DisplayMessage = {
+      id: "stream",
+      role: "assistant",
+      parts: [{ type: "text", text: "" }],
+    };
+    expect(messageArrivalIds(message)).toEqual([]);
+    message.parts[0] = { type: "text", text: "First token" };
+    expect(messageArrivalIds(message)).toEqual(["stream:content:0"]);
+  });
+  it("keeps text tokens stable while identifying appended blocks", () => {
+    const message: DisplayMessage = {
+      id: "stream",
+      role: "assistant",
+      parts: [{ type: "text", text: "First" }],
+    };
+    const original = messageArrivalIds(message);
+    message.parts[0] = { type: "text", text: "First block with more tokens" };
+    expect(messageArrivalIds(message)).toEqual(original);
+    message.parts.push(...activity("tool").parts, { type: "text", text: "Second block" });
+    expect(messageArrivalIds(message)).toEqual([
+      "stream:content:0",
+      "activity:tool",
+      "activity-item:tool",
+      "stream:content:2",
+    ]);
+  });
+
+  it("retains unique tool identities when adjacent work messages are grouped", () => {
+    const grouped = groupActivityMessages([activity("first"), activity("second")]);
+    expect(grouped.flatMap(messageArrivalIds)).toEqual([
+      "activity:first",
+      "activity-item:first",
+      "activity:second",
+      "activity-item:second",
+    ]);
   });
 });

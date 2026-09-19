@@ -1,3 +1,5 @@
+import { MessageArrivals } from "../message-arrivals";
+import { MessageArrivalsContext, LiveMessageContext, useMessageArrival } from "./message-arrivals";
 import {
   MessageServicesContext,
   useMessageServices,
@@ -116,6 +118,10 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   );
   const store = props.client.thread(props.threadId);
   const ids = useSlotIds(store);
+  const arrivals = useMemo(() => new MessageArrivals(), [store]);
+  useLayoutEffect(() => {
+    arrivals.deactivate();
+  }, [arrivals, props.displayRevision]);
   const subscribeTail = useCallback((listener: () => void) => store.subscribe(listener), [store]);
   const tailSnapshot = useCallback(() => store.at(store.size - 1)?.kind !== "deferred", [store]);
   const tailHydrated = useSyncExternalStore(subscribeTail, tailSnapshot, tailSnapshot);
@@ -241,6 +247,12 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       stableFrames = height === previousHeight ? stableFrames + 1 : 0;
       previousHeight = height;
       if (stableFrames >= 2) {
+        arrivals.activate(
+          store.slotIds.flatMap((id) => {
+            const slot = store.get(id);
+            return slot?.kind === "ready" ? slot.messages.flatMap(messageArrivalIds) : [];
+          }),
+        );
         revealed.current = props.displayRevision;
         setAwayFromEnd(false);
         props.onReady?.();
@@ -251,6 +263,8 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     frame = requestAnimationFrame(settle);
     return () => cancelAnimationFrame(frame);
   }, [
+    arrivals,
+    store,
     props.readyForDisplay,
     props.displayRevision,
     props.onReady,
@@ -279,119 +293,124 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     }
   };
   return (
-    <TimelineContext value={timeline}>
-      <MessageServicesContext value={services}>
-        <div
-          className="timeline chat-scroll"
-          ref={parent}
-          onScroll={rememberScroll}
-          onClickCapture={(event) => {
-            if (
-              event.target instanceof Element &&
-              event.target.closest("[data-slot=collapsible-trigger], .message-expand")
-            )
-              atTail.current = false;
-          }}
-          onFocusCapture={(event) => {
-            if (
-              event.target instanceof Element &&
-              event.target.closest('.message-card-preview[data-collapsed="true"]')
-            )
-              atTail.current = false;
-          }}
-          onWheel={(event) => {
-            const editor =
-              event.target instanceof Element ? event.target.closest(".composer-editor") : null;
-            if (
-              editor &&
-              ((event.deltaY < 0 && editor.scrollTop > 0) ||
-                (event.deltaY > 0 && editor.scrollTop + editor.clientHeight < editor.scrollHeight))
-            )
-              return;
-            userScroll.current = true;
-            if (event.deltaY < 0) atTail.current = false;
-          }}
-          onTouchStart={(event) => {
-            touchY.current = event.touches[0]?.clientY;
-          }}
-          onTouchMove={(event) => {
-            userScroll.current = true;
-            const next = event.touches[0]?.clientY;
-            if (next !== undefined && touchY.current !== undefined && next > touchY.current)
-              atTail.current = false;
-            touchY.current = next;
-          }}
-          onKeyDown={(event) => {
-            if (event.target instanceof Element && event.target.closest(".chat-sticky-footer"))
-              return;
-            if (
-              ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)
-            )
-              userScroll.current = true;
-            if (["ArrowUp", "PageUp", "Home"].includes(event.key)) atTail.current = false;
-          }}
-          onPointerDown={(event) => {
-            if (event.nativeEvent.offsetX >= event.currentTarget.clientWidth) {
-              userScroll.current = true;
-              atTail.current = false;
-            }
-          }}
-          role="region"
-          aria-label="Conversation"
-          tabIndex={0}
-        >
-          {props.header ? (
-            <div ref={headerRef} className="chat-sticky-header">
-              {props.header}
-            </div>
-          ) : null}
+    <MessageArrivalsContext value={arrivals}>
+      <TimelineContext value={timeline}>
+        <MessageServicesContext value={services}>
           <div
-            ref={canvasRef}
-            className="virtual-canvas timeline-canvas"
-            style={{
-              height: virtual.getTotalSize(),
-              minHeight: `calc(100% - ${insets.top + insets.bottom}px)`,
+            className="timeline chat-scroll"
+            ref={parent}
+            onScroll={rememberScroll}
+            onClickCapture={(event) => {
+              if (
+                event.target instanceof Element &&
+                event.target.closest("[data-slot=collapsible-trigger], .message-expand")
+              )
+                atTail.current = false;
             }}
+            onFocusCapture={(event) => {
+              if (
+                event.target instanceof Element &&
+                event.target.closest('.message-card-preview[data-collapsed="true"]')
+              )
+                atTail.current = false;
+            }}
+            onWheel={(event) => {
+              const editor =
+                event.target instanceof Element ? event.target.closest(".composer-editor") : null;
+              if (
+                editor &&
+                ((event.deltaY < 0 && editor.scrollTop > 0) ||
+                  (event.deltaY > 0 &&
+                    editor.scrollTop + editor.clientHeight < editor.scrollHeight))
+              )
+                return;
+              userScroll.current = true;
+              if (event.deltaY < 0) atTail.current = false;
+            }}
+            onTouchStart={(event) => {
+              touchY.current = event.touches[0]?.clientY;
+            }}
+            onTouchMove={(event) => {
+              userScroll.current = true;
+              const next = event.touches[0]?.clientY;
+              if (next !== undefined && touchY.current !== undefined && next > touchY.current)
+                atTail.current = false;
+              touchY.current = next;
+            }}
+            onKeyDown={(event) => {
+              if (event.target instanceof Element && event.target.closest(".chat-sticky-footer"))
+                return;
+              if (
+                ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(
+                  event.key,
+                )
+              )
+                userScroll.current = true;
+              if (["ArrowUp", "PageUp", "Home"].includes(event.key)) atTail.current = false;
+            }}
+            onPointerDown={(event) => {
+              if (event.nativeEvent.offsetX >= event.currentTarget.clientWidth) {
+                userScroll.current = true;
+                atTail.current = false;
+              }
+            }}
+            role="region"
+            aria-label="Conversation"
+            tabIndex={0}
           >
-            {rows.map((row) => (
-              <div
-                key={row.key}
-                data-index={row.index}
-                ref={virtual.measureElement}
-                className="virtual-row"
-                style={{ transform: `translateY(${row.start - insets.top}px)` }}
-              >
-                <SlotRow slotId={ids[row.index]!} store={store} />
+            {props.header ? (
+              <div ref={headerRef} className="chat-sticky-header">
+                {props.header}
               </div>
-            ))}
-            {ids.length === 0 ? (
-              <div className="empty-chat">{props.emptyMessage ?? "Start a conversation."}</div>
+            ) : null}
+            <div
+              ref={canvasRef}
+              className="virtual-canvas timeline-canvas"
+              style={{
+                height: virtual.getTotalSize(),
+                minHeight: `calc(100% - ${insets.top + insets.bottom}px)`,
+              }}
+            >
+              {rows.map((row) => (
+                <div
+                  key={row.key}
+                  data-index={row.index}
+                  ref={virtual.measureElement}
+                  className="virtual-row"
+                  style={{ transform: `translateY(${row.start - insets.top}px)` }}
+                >
+                  <SlotRow slotId={ids[row.index]!} store={store} />
+                </div>
+              ))}
+              {ids.length === 0 ? (
+                <div className="empty-chat">{props.emptyMessage ?? "Start a conversation."}</div>
+              ) : null}
+            </div>
+            {props.footer ? (
+              <div ref={footerRef} className="chat-sticky-footer">
+                {awayFromEnd ? (
+                  <div className="scroll-to-end">
+                    <Button
+                      variant="secondary"
+                      onClick={() => {
+                        atTail.current = true;
+                        userScroll.current = false;
+                        if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
+                        updateEndVisibility();
+                      }}
+                    >
+                      <ChevronDown />
+                      Scroll to end
+                    </Button>
+                  </div>
+                ) : null}
+                {props.footer}
+              </div>
             ) : null}
           </div>
-          {props.footer ? (
-            <div ref={footerRef} className="chat-sticky-footer">
-              {awayFromEnd ? (
-                <div className="scroll-to-end">
-                  <Button
-                    variant="secondary"
-                    onClick={() => {
-                      atTail.current = true;
-                      userScroll.current = false;
-                      if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
-                      updateEndVisibility();
-                    }}
-                  >
-                    <ChevronDown />
-                    Scroll to end
-                  </Button>
-                </div>
-              ) : null}
-              {props.footer}
-            </div>
-          ) : null}
-        </div>
-      </MessageServicesContext>
-    </TimelineContext>
+        </MessageServicesContext>
+      </TimelineContext>
+    </MessageArrivalsContext>
   );
 });
 
@@ -461,6 +480,7 @@ export const Turn = memo(function Turn(props: {
       {firstUser ? (
         <div className="user-turn">
           <MessageBody
+            live={!settled}
             message={firstUser}
             controls={
               <>
@@ -496,15 +516,17 @@ export const Turn = memo(function Turn(props: {
           </CollapsibleTrigger>
           <CollapsibleContent className="expanded-work">
             {intermediate.map((message) => (
-              <MessageBody key={message.id} message={message} />
+              <MessageBody key={message.id} message={message} live={!settled} />
             ))}
           </CollapsibleContent>
         </Collapsible>
       ) : (
-        intermediate.map((message) => <MessageBody key={message.id} message={message} />)
+        intermediate.map((message) => (
+          <MessageBody key={message.id} message={message} live={!settled} />
+        ))
       )}
       {finals.map((message) => (
-        <MessageBody key={message.id} message={message} />
+        <MessageBody key={message.id} message={message} live={!settled} />
       ))}
       {settled && !intermediate.length && slot.state !== "complete" ? (
         <Marker className="turn-status">
@@ -617,15 +639,33 @@ function groupMessageCards(groups: readonly Group[]): CardGroup[] {
   return cards;
 }
 
+export function messageArrivalIds(message: DisplayMessage): string[] {
+  return groupMessageCards(groupParts(message.parts)).flatMap((group, index) => {
+    if (group.kind === "content")
+      return group.texts.some(Boolean) || group.attachments.length > 0
+        ? [`${message.id}:content:${index}`]
+        : [];
+    if (group.kind === "activity")
+      return group.parts.flatMap((part) => [`activity:${part.id}`, `activity-item:${part.id}`]);
+    return [];
+  });
+}
+
 function MessageCard({
   content,
   self,
   collapsible,
+  arrivalId,
 }: {
+  arrivalId: string;
   content: MessageCardGroup;
   self: boolean;
   collapsible: boolean;
 }) {
+  const arrivalRef = useMessageArrival(
+    arrivalId,
+    content.texts.some(Boolean) || content.attachments.length > 0,
+  );
   const contentRef = useRef<HTMLDivElement>(null);
   const previewId = useId();
   const [expanded, setExpanded] = useState(false);
@@ -647,7 +687,7 @@ function MessageCard({
   const images = content.attachments.filter((part) => part.data.mediaType.startsWith("image/"));
   const files = content.attachments.filter((part) => !part.data.mediaType.startsWith("image/"));
   return (
-    <Bubble variant={self ? "tinted" : "muted"} className="message-bubble">
+    <Bubble ref={arrivalRef} variant={self ? "tinted" : "muted"} className="message-bubble">
       <BubbleContent>
         <div
           id={previewId}
@@ -702,7 +742,9 @@ export const Message = memo(function Message(props: MessageProps) {
   );
 });
 
-const MessageBody = memo(function MessageBody(props: Pick<MessageProps, "message" | "controls">) {
+const MessageBody = memo(function MessageBody(
+  props: Pick<MessageProps, "message" | "controls"> & { live?: boolean },
+) {
   const { resourceUrl, canEdit, onAction, onReaction } = useMessageServices();
   const { message } = props;
   const [copyError, setCopyError] = useState<string>();
@@ -744,143 +786,150 @@ const MessageBody = memo(function MessageBody(props: Pick<MessageProps, "message
     [attachments, resourceUrl],
   );
   return (
-    <ChatMessage
-      align={self ? "end" : "start"}
-      className={`message message-${message.role} native-message text-base`}
-      data-message-id={message.id}
-    >
-      {conversational ? (
-        <MessageAvatar>
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <button
-                  type="button"
-                  className="message-avatar-trigger"
-                  aria-label={`About ${author.displayName}`}
-                />
+    <LiveMessageContext value={props.live ?? false}>
+      <ChatMessage
+        align={self ? "end" : "start"}
+        className={`message message-${message.role} native-message text-base`}
+        data-message-id={message.id}
+      >
+        {conversational ? (
+          <MessageAvatar>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <button
+                    type="button"
+                    className="message-avatar-trigger"
+                    aria-label={`About ${author.displayName}`}
+                  />
+                }
+              >
+                <ActorAvatar {...author} />
+              </TooltipTrigger>
+              <TooltipContent
+                className="message-author-details"
+                side={self ? "left" : "right"}
+                align="center"
+              >
+                <span className="message-author-name">{author.displayName}</span>
+                <span>{authorRole}</span>
+                {message.metadata?.inputMode === "steer" ? <span>Steering</span> : null}
+                {message.metadata?.createdAt !== undefined ? (
+                  <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
+                    {new Date(message.metadata.createdAt).toLocaleString()}
+                  </time>
+                ) : null}
+              </TooltipContent>
+            </Tooltip>
+          </MessageAvatar>
+        ) : null}
+        <MessageResourcesContext value={resources}>
+          <MessageContent>
+            {cards.map((group, index) => {
+              if (group.kind === "content")
+                return (
+                  <MessageCard
+                    key={index}
+                    arrivalId={`${message.id}:content:${index}`}
+                    content={group}
+                    self={self}
+                    collapsible={message.role === "user"}
+                  />
+                );
+              if (group.kind === "activity")
+                return (
+                  <Activity
+                    key={index}
+                    parts={group.parts}
+                    createdAt={message.metadata?.createdAt}
+                  />
+                );
+              const part = group.part;
+              switch (part.type) {
+                case "data-compaction":
+                  return (
+                    <Marker variant="separator" className="compaction" key={part.id}>
+                      <MarkerContent>
+                        Context compaction {part.data.state}
+                        {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
+                          ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
+                          : ""}
+                      </MarkerContent>
+                    </Marker>
+                  );
+                case "data-input-state":
+                  return part.data.state === "admitted" ? null : (
+                    <Marker className="input-state" key={part.id}>
+                      <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
+                    </Marker>
+                  );
+                case "data-actions":
+                  return (
+                    <div className="action-list" key={part.id}>
+                      {part.data.actions.map((action) => (
+                        <Button
+                          key={action.actionId}
+                          type="button"
+                          disabled={!canEdit || action.disabled}
+                          variant={action.style === "danger" ? "destructive" : "secondary"}
+                          onClick={() => onAction(message.id, part, action.actionId)}
+                        >
+                          {action.label}
+                        </Button>
+                      ))}
+                    </div>
+                  );
+                case "data-reactions":
+                  return (
+                    <div className="reaction-list" key={part.id}>
+                      {part.data.items.map((reaction) => (
+                        <Button
+                          key={reaction.emoji}
+                          type="button"
+                          disabled={!canEdit}
+                          aria-pressed={reaction.reacted}
+                          variant="secondary"
+                          className="badge"
+                          onClick={() => onReaction(message.id, reaction.emoji, !reaction.reacted)}
+                        >
+                          {reaction.emoji} {reaction.count}
+                        </Button>
+                      ))}
+                    </div>
+                  );
               }
-            >
-              <ActorAvatar {...author} />
-            </TooltipTrigger>
-            <TooltipContent
-              className="message-author-details"
-              side={self ? "left" : "right"}
-              align="center"
-            >
-              <span className="message-author-name">{author.displayName}</span>
-              <span>{authorRole}</span>
-              {message.metadata?.inputMode === "steer" ? <span>Steering</span> : null}
-              {message.metadata?.createdAt !== undefined ? (
-                <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
-                  {new Date(message.metadata.createdAt).toLocaleString()}
-                </time>
-              ) : null}
-            </TooltipContent>
-          </Tooltip>
-        </MessageAvatar>
-      ) : null}
-      <MessageResourcesContext value={resources}>
-        <MessageContent>
-          {cards.map((group, index) => {
-            if (group.kind === "content")
-              return (
-                <MessageCard
-                  key={index}
-                  content={group}
-                  self={self}
-                  collapsible={message.role === "user"}
-                />
-              );
-            if (group.kind === "activity")
-              return (
-                <Activity key={index} parts={group.parts} createdAt={message.metadata?.createdAt} />
-              );
-            const part = group.part;
-            switch (part.type) {
-              case "data-compaction":
-                return (
-                  <Marker variant="separator" className="compaction" key={part.id}>
-                    <MarkerContent>
-                      Context compaction {part.data.state}
-                      {part.data.beforeCount !== undefined && part.data.afterCount !== undefined
-                        ? ` · ${part.data.beforeCount} → ${part.data.afterCount}`
-                        : ""}
-                    </MarkerContent>
-                  </Marker>
-                );
-              case "data-input-state":
-                return part.data.state === "admitted" ? null : (
-                  <Marker className="input-state" key={part.id}>
-                    <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
-                  </Marker>
-                );
-              case "data-actions":
-                return (
-                  <div className="action-list" key={part.id}>
-                    {part.data.actions.map((action) => (
-                      <Button
-                        key={action.actionId}
-                        type="button"
-                        disabled={!canEdit || action.disabled}
-                        variant={action.style === "danger" ? "destructive" : "secondary"}
-                        onClick={() => onAction(message.id, part, action.actionId)}
-                      >
-                        {action.label}
-                      </Button>
-                    ))}
-                  </div>
-                );
-              case "data-reactions":
-                return (
-                  <div className="reaction-list" key={part.id}>
-                    {part.data.items.map((reaction) => (
-                      <Button
-                        key={reaction.emoji}
-                        type="button"
-                        disabled={!canEdit}
-                        aria-pressed={reaction.reacted}
-                        variant="secondary"
-                        className="badge"
-                        onClick={() => onReaction(message.id, reaction.emoji, !reaction.reacted)}
-                      >
-                        {reaction.emoji} {reaction.count}
-                      </Button>
-                    ))}
-                  </div>
-                );
-            }
-          })}
-        </MessageContent>
-      </MessageResourcesContext>
-      {conversational ? (
-        <div className="message-controls">
-          {message.metadata?.createdAt !== undefined ? (
-            <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
-              {new Date(message.metadata.createdAt).toLocaleTimeString([], {
-                hour: "numeric",
-                minute: "2-digit",
-              })}
-            </time>
-          ) : null}
-          {messageText(message) ? (
-            <IconButton
-              label="Copy message"
-              onClick={() =>
-                void attempt(
-                  () => navigator.clipboard.writeText(messageText(message)),
-                  () => setCopyError("Copy unavailable"),
-                )
-              }
-            >
-              <Copy />
-            </IconButton>
-          ) : null}
-          {copyError ? <span role="status">{copyError}</span> : null}
-          {props.controls}
-        </div>
-      ) : null}
-    </ChatMessage>
+            })}
+          </MessageContent>
+        </MessageResourcesContext>
+        {conversational ? (
+          <div className="message-controls">
+            {message.metadata?.createdAt !== undefined ? (
+              <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
+                {new Date(message.metadata.createdAt).toLocaleTimeString([], {
+                  hour: "numeric",
+                  minute: "2-digit",
+                })}
+              </time>
+            ) : null}
+            {messageText(message) ? (
+              <IconButton
+                label="Copy message"
+                onClick={() =>
+                  void attempt(
+                    () => navigator.clipboard.writeText(messageText(message)),
+                    () => setCopyError("Copy unavailable"),
+                  )
+                }
+              >
+                <Copy />
+              </IconButton>
+            ) : null}
+            {copyError ? <span role="status">{copyError}</span> : null}
+            {props.controls}
+          </div>
+        ) : null}
+      </ChatMessage>
+    </LiveMessageContext>
   );
 });
 
@@ -912,6 +961,7 @@ function ActivityIcon({ part }: { part: ActivityPart }) {
 }
 
 export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdAt?: number }) {
+  const arrivalRef = useMessageArrival(`activity:${parts[0]?.id}`);
   const [open, setOpen] = useState(false);
   const representative =
     parts.find((part) => part.data.state === "running") ??
@@ -919,7 +969,7 @@ export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdA
     parts[0];
   if (!representative) return null;
   return (
-    <Collapsible className="activity-block" open={open} onOpenChange={setOpen}>
+    <Collapsible ref={arrivalRef} className="activity-block" open={open} onOpenChange={setOpen}>
       <CollapsibleTrigger
         render={
           <Button variant="ghost" className="activity-summary h-auto justify-start px-2 py-1" />
@@ -948,6 +998,7 @@ export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdA
 }
 
 export function ActivityItem({ part }: { part: ActivityPart }) {
+  const arrivalRef = useMessageArrival(`activity-item:${part.id}`);
   const [open, setOpen] = useState(false);
   const row = (
     <Marker render={<span />}>
@@ -962,9 +1013,14 @@ export function ActivityItem({ part }: { part: ActivityPart }) {
       {part.data.detail ? <ChevronRight className={open ? "rotated" : ""} /> : null}
     </Marker>
   );
-  if (!part.data.detail) return <div className="activity-item activity-item-trigger">{row}</div>;
+  if (!part.data.detail)
+    return (
+      <div ref={arrivalRef} className="activity-item activity-item-trigger">
+        {row}
+      </div>
+    );
   return (
-    <Collapsible className="activity-item" open={open} onOpenChange={setOpen}>
+    <Collapsible ref={arrivalRef} className="activity-item" open={open} onOpenChange={setOpen}>
       <CollapsibleTrigger
         render={
           <Button

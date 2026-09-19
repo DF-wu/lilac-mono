@@ -78,3 +78,10 @@
 .native-message > .message-controls { opacity: 0; pointer-events: none; }
 .native-message:hover > .message-controls, .native-message:focus-within > .message-controls { opacity: 1; pointer-events: auto; }
 @media (hover: none) { .native-message > .message-controls { opacity: 1; pointer-events: auto; } }
+
+[data-message-arrival] { opacity: 1; transition: opacity var(--motion-duration, 150ms) ease; }
+[data-message-arrival="pending"] { opacity: 0; transition: none; }
+:root[data-animation="off"] [data-message-arrival] { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  [data-message-arrival] { opacity: 1; transition: none; }
+}
