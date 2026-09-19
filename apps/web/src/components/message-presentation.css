@@ -74,3 +74,7 @@
 .message-card-body { display: flow-root; min-width: 0; }
 .message-expand { display: flex; margin-left: auto; margin-top: var(--space-2); }
 .native-message[data-align="start"] > .message-controls { justify-content: flex-start; }
+
+.native-message > .message-controls { opacity: 0; pointer-events: none; }
+.native-message:hover > .message-controls, .native-message:focus-within > .message-controls { opacity: 1; pointer-events: auto; }
+@media (hover: none) { .native-message > .message-controls { opacity: 1; pointer-events: auto; } }

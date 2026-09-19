@@ -128,7 +128,6 @@ export function App(props: AppProps) {
     },
     [],
   );
-  const positions = useRef(new Map<string, number>());
   const readTurns = useRef(new Map<string, string>());
   const pool = useMemo(() => new UploadPool(client, props.upload), [client, props.upload]);
   const selectedDraft = selectedId ? localDrafts.get(selectedId) : undefined;
@@ -991,7 +990,6 @@ export function App(props: AppProps) {
                     catalog={catalog}
                     onError={setError}
                     pool={pool}
-                    positions={positions.current}
                     readTurns={readTurns.current}
                     draft={draft}
                     onDraft={(value) => {

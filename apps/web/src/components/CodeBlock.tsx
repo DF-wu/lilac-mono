@@ -21,7 +21,7 @@ export function CodeBlock({
   children?: ReactNode;
 }) {
   const forceWrap = useContext(MarkdownWrapContext);
-  const [wrap, setWrap] = useState(false);
+  const [wrap, setWrap] = useState(true);
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState<string>();
   return (

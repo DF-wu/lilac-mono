@@ -50,7 +50,7 @@ describe("message presentation", () => {
       const message: DisplayMessage = {
         id: "message",
         role,
-        metadata: { authorId },
+        metadata: { authorId, createdAt: 1_700_000_000_000 },
         parts: [{ type: "text", text: "Visible content" }],
       };
       const html = renderToStaticMarkup(
@@ -69,6 +69,8 @@ describe("message presentation", () => {
       expect(html).toContain(`data-slot="message" data-align="${self ? "end" : "start"}"`);
       expect(html).toContain('data-slot="bubble"');
       expect(html).toContain('aria-label="Copy message"');
+      const controls = html.slice(html.indexOf('class="message-controls"'));
+      expect(controls.indexOf("<time")).toBeLessThan(controls.indexOf('aria-label="Copy message"'));
       expect(html.indexOf('data-slot="message-avatar"')).toBeLessThan(
         html.indexOf('data-slot="message-content"'),
       );
@@ -221,7 +223,7 @@ describe("message presentation", () => {
     const html = renderToStaticMarkup(<CodeBlock source={'echo "<script>"'} language="bash" />);
     expect(html).toContain('aria-label="Copy code"');
     expect(html).toContain('aria-label="Wrap code"');
-    expect(html).toContain('aria-pressed="false"');
+    expect(html).toContain('aria-pressed="true"');
     expect(html).toContain("&lt;script&gt;");
     expect(html).not.toContain("<script>");
   });

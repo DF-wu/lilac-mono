@@ -41,7 +41,6 @@ export type ChatProps = ChatCommon & {
   draftCache?: AppProps["draftCache"];
   onDraft: (draft: Draft) => void;
   pool: UploadPool;
-  positions: Map<string, number>;
   readTurns: Map<string, string>;
   pending: PendingInput[];
   onPending: (update: (pending: PendingInput[]) => PendingInput[]) => void;
@@ -542,7 +541,6 @@ export function Chat(props: ChatProps) {
           onRewind={setRewindTarget}
           onAction={onAction}
           onReaction={onReaction}
-          positions={props.positions}
         />
       </UploadProgressContext.Provider>
 

@@ -12,7 +12,16 @@ import {
   useSyncExternalStore,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ChevronRight, RotateCcw, Copy, Brain, Wrench, Workflow, LoaderCircle } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  RotateCcw,
+  Copy,
+  Brain,
+  Wrench,
+  Workflow,
+  LoaderCircle,
+} from "lucide-react";
 import type { NativeClient, NativeThreadStore } from "@stanley2058/lilac-client";
 import type {
   DisplayMessage,
@@ -72,7 +81,6 @@ export type TimelineProps = {
     actionId: string,
   ) => void;
   onReaction: (messageId: string, emoji: string, active: boolean) => void;
-  positions: Map<string, number>;
   onLatestVisibleChange?: (visible: boolean) => void;
 };
 
@@ -98,7 +106,13 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     if (footerRef.current) observer.observe(footerRef.current);
     return () => observer.disconnect();
   }, []);
-  const atTail = useRef(!props.positions.has(props.threadId));
+  const atTail = useRef(true);
+  const [awayFromEnd, setAwayFromEnd] = useState(false);
+  const updateEndVisibility = useCallback(() => {
+    const element = parent.current;
+    if (element)
+      setAwayFromEnd(element.scrollHeight - element.scrollTop - element.clientHeight > 8);
+  }, []);
   const userScroll = useRef(false);
   const touchY = useRef<number | undefined>(undefined);
   const previousCount = useRef(ids.length);
@@ -147,10 +161,12 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     if (!canvas) return;
     let scheduled = 0;
     const observer = new ResizeObserver(() => {
+      updateEndVisibility();
       if (!atTail.current || !ids.length) return;
       cancelAnimationFrame(scheduled);
       scheduled = requestAnimationFrame(() => {
         if (atTail.current) virtual.scrollToIndex(ids.length - 1, { align: "end" });
+        updateEndVisibility();
       });
     });
     observer.observe(canvas);
@@ -160,11 +176,10 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       observer.disconnect();
       cancelAnimationFrame(scheduled);
     };
-  }, [ids, virtual]);
+  }, [ids, virtual, updateEndVisibility]);
   useLayoutEffect(() => {
-    const saved = props.positions.get(props.threadId);
-    if (saved !== undefined) virtual.scrollToOffset(saved);
-    else if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
+    atTail.current = true;
+    if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
   }, [props.threadId]);
   useLayoutEffect(() => {
     if (ids.length > previousCount.current && atTail.current)
@@ -185,9 +200,9 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   const rememberScroll = () => {
     const element = parent.current;
     if (!element) return;
-    props.positions.set(props.threadId, element.scrollTop);
+    updateEndVisibility();
     if (userScroll.current) {
-      atTail.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
+      atTail.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 8;
       userScroll.current = false;
     }
   };
@@ -276,6 +291,22 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       </div>
       {props.footer ? (
         <div ref={footerRef} className="chat-sticky-footer">
+          {awayFromEnd ? (
+            <div className="scroll-to-end">
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  atTail.current = true;
+                  userScroll.current = false;
+                  if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
+                  updateEndVisibility();
+                }}
+              >
+                <ChevronDown />
+                Scroll to end
+              </Button>
+            </div>
+          ) : null}
           {props.footer}
         </div>
       ) : null}
@@ -312,9 +343,7 @@ const SlotRow = memo(function SlotRow(
   return <Turn {...props} slot={slot} />;
 });
 
-export const Turn = memo(function Turn(
-  props: Omit<TimelineProps, "positions"> & { slot: ReadyTurnSlot },
-) {
+export const Turn = memo(function Turn(props: TimelineProps & { slot: ReadyTurnSlot }) {
   const { slot } = props;
   const [expanded, setExpanded] = useState(false);
   const firstUser = slot.messages.find(
@@ -347,14 +376,6 @@ export const Turn = memo(function Turn(
             message={firstUser}
             controls={
               <>
-                {firstUser.metadata?.createdAt ? (
-                  <time dateTime={new Date(firstUser.metadata.createdAt).toISOString()}>
-                    {new Date(firstUser.metadata.createdAt).toLocaleTimeString([], {
-                      hour: "numeric",
-                      minute: "2-digit",
-                    })}
-                  </time>
-                ) : null}
                 {props.canEdit ? (
                   <IconButton
                     label="Rewind to this turn"
@@ -764,6 +785,14 @@ export const Message = memo(function Message(props: MessageProps) {
       </MessageResourcesContext>
       {conversational ? (
         <div className="message-controls">
+          {message.metadata?.createdAt !== undefined ? (
+            <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
+              {new Date(message.metadata.createdAt).toLocaleTimeString([], {
+                hour: "numeric",
+                minute: "2-digit",
+              })}
+            </time>
+          ) : null}
           {messageText(message) ? (
             <IconButton
               label="Copy message"

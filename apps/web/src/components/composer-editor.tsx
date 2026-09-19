@@ -292,7 +292,23 @@ export const composerPlugins = [
     node: { component: LinkElement },
   }),
   IndentPlugin.configure({
-    inject: { targetPlugins: [KEYS.p, ...KEYS.heading, KEYS.blockquote, KEYS.codeBlock] },
+    inject: {
+      targetPlugins: [KEYS.p, ...KEYS.heading, KEYS.blockquote, KEYS.codeBlock],
+      nodeProps: {
+        transformNodeValue: ({
+          element,
+          getOptions,
+        }: {
+          element?: TElement & Partial<TListProps>;
+          getOptions: () => { offset?: number; unit?: string };
+        }) => {
+          const indent = typeof element?.indent === "number" ? element.indent : 0;
+          const depth = element?.listStyleType ? Math.max(0, indent - 1) : indent;
+          const { offset = 24, unit = "px" } = getOptions();
+          return `${depth * offset}${unit}`;
+        },
+      },
+    },
   }),
   ListPlugin.configure({
     inputRules: [
