@@ -3,7 +3,6 @@ import { Result } from "better-result";
 import { Tooltip } from "@base-ui/react/tooltip";
 import {
   Plus,
-  Search,
   Settings as SettingsIcon,
   LogOut,
   Archive,
@@ -14,7 +13,6 @@ import {
   Globe,
   PanelLeftClose,
   PanelLeftOpen,
-  X,
   MoreHorizontal,
   Palette,
 } from "lucide-react";
@@ -27,6 +25,7 @@ import type { AppProps, ComposerSubmission } from "./types";
 import { UploadPool, resolveAttachmentIds } from "./uploads";
 import { Chat, type Draft, type PendingInput } from "./components/Chat";
 import { Settings } from "./components/Settings";
+import { SidebarSearch } from "./components/SidebarSearch";
 import { Sharing } from "./components/Sharing";
 import { External } from "./components/External";
 import { attempt, IconButton, Modal, VirtualList } from "./components/ui";
@@ -109,7 +108,7 @@ export function App(props: AppProps) {
   const [external, setExternal] = useState(false);
   const [externalId, setExternalId] = useState<string>();
   const [sidebar, setSidebar] = useState(true);
-  const [searchQuery, setSearchQuery] = useState("");
+  const searchQuery = useRef("");
   const [results, setResults] = useState<NativeRpcOutputs["search"]["query"]>();
   const [searching, setSearching] = useState(false);
   const [rename, setRename] = useState<{ id: string; title: string }>();
@@ -536,13 +535,13 @@ export function App(props: AppProps) {
     setNextCursor(page.nextCursor);
   }
   async function search(cursor?: string) {
-    if (!client.rpc || !searchQuery.trim()) {
+    if (!client.rpc || !searchQuery.current.trim()) {
       setResults(undefined);
       return;
     }
     setSearching(true);
     const result = await attempt(
-      () => client.rpc!.search.query({ query: searchQuery.trim(), limit: 100, cursor }),
+      () => client.rpc!.search.query({ query: searchQuery.current.trim(), limit: 100, cursor }),
       setError,
     );
     setSearching(false);
@@ -705,39 +704,16 @@ export function App(props: AppProps) {
                   </span>
                 </header>
                 <div className="sidebar-search-row">
-                  <form
-                    className="search-box"
-                    onSubmit={(event) => {
-                      event.preventDefault();
+                  <SidebarSearch
+                    onSearch={(query) => {
+                      searchQuery.current = query;
                       void search();
                     }}
-                  >
-                    <Search />
-                    <Input
-                      className="pl-9 pr-9"
-                      value={searchQuery}
-                      onChange={(event) => {
-                        setSearchQuery(event.target.value);
-                        if (!event.target.value) setResults(undefined);
-                      }}
-                      aria-label="Search conversations"
-                      placeholder="Search"
-                    />
-                    <Button type="submit" className="sr-only">
-                      Search
-                    </Button>
-                    {searchQuery ? (
-                      <IconButton
-                        label="Clear search"
-                        onClick={() => {
-                          setSearchQuery("");
-                          setResults(undefined);
-                        }}
-                      >
-                        <X />
-                      </IconButton>
-                    ) : null}
-                  </form>
+                    onClear={() => {
+                      searchQuery.current = "";
+                      setResults(undefined);
+                    }}
+                  />
                   <nav className="sidebar-tabs" aria-label="Conversation filters and actions">
                     <IconButton
                       label={archived ? "Show active conversations" : "Show archived conversations"}
