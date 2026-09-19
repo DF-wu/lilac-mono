@@ -160,3 +160,18 @@ text and selection metadata in the existing scoped draft cache. Files remain in 
 Browser checks cover first-send creation/upload delays, editing and navigation during those delays,
 unopened-thread actions, local draft restoration and Back navigation. No backend or wire changes
 were required.
+
+## Web layout and activity follow-up
+
+Select menus now pad their item lists, the search icon sits inside the input, and the sidebar toggle
+shares the header's vertical center while retaining its coordinates across collapse. Settled work
+expands inline through the main timeline. Activity groups and individual tool details remain
+independently collapsed until opened; expanding them suspends tail-following so the view stays put.
+The sidebar shows relative activity times and offers thread details on hover or keyboard focus,
+including the starter, model when selected, status and people with access. Participant names use the
+existing authorized RPC only when details open. No wire or storage changes were needed.
+
+Browser verification covers menu spacing, search placement, both toggle states, desktop/mobile
+layout, inline expansion, individual tool detail disclosure, participant details and long-turn
+paging. Focused tests cover default activity disclosure and relative timestamps. Standards and spec
+reviews found no blockers.

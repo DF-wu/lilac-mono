@@ -10,14 +10,24 @@ import {
   useSyncExternalStore,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ChevronRight, RotateCcw, FileText, ExternalLink, Copy } from "lucide-react";
+import {
+  ChevronRight,
+  RotateCcw,
+  FileText,
+  ExternalLink,
+  Copy,
+  Brain,
+  Wrench,
+  Workflow,
+  LoaderCircle,
+} from "lucide-react";
 import type { NativeClient, NativeThreadStore } from "@stanley2058/lilac-client";
 import type {
   DisplayMessage,
   ReadyTurnSlot,
   DisplayPart,
 } from "@stanley2058/lilac-client-protocol";
-import { IconButton, VirtualList, Modal, attempt } from "./ui";
+import { IconButton, Modal, attempt } from "./ui";
 import { UploadProgressContext } from "../upload-context";
 import { Markdown } from "./Markdown";
 import { Button } from "./ui/button";
@@ -111,9 +121,9 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     const observer = new ResizeObserver(() => {
       if (!atTail.current || !ids.length) return;
       cancelAnimationFrame(scheduled);
-      scheduled = requestAnimationFrame(() =>
-        virtual.scrollToIndex(ids.length - 1, { align: "end" }),
-      );
+      scheduled = requestAnimationFrame(() => {
+        if (atTail.current) virtual.scrollToIndex(ids.length - 1, { align: "end" });
+      });
     });
     observer.observe(canvas);
     return () => {
@@ -145,6 +155,13 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       className="timeline"
       ref={parent}
       onScroll={rememberScroll}
+      onClickCapture={(event) => {
+        if (
+          event.target instanceof Element &&
+          event.target.closest("[data-slot=collapsible-trigger]")
+        )
+          atTail.current = false;
+      }}
       onWheel={(event) => {
         userScroll.current = true;
         if (event.deltaY < 0) atTail.current = false;
@@ -302,15 +319,10 @@ export const Turn = memo(function Turn(
               {slot.state !== "complete" ? <span className="badge">{slot.state}</span> : null}
             </Marker>
           </CollapsibleTrigger>
-          <CollapsibleContent>
-            <VirtualList
-              items={intermediate}
-              itemKey={(message) => message.id}
-              label="Turn activity"
-              className="expanded-work"
-              estimate={96}
-              render={(message) => <Message {...props} message={message} />}
-            />
+          <CollapsibleContent className="expanded-work">
+            {intermediate.map((message) => (
+              <Message key={message.id} {...props} message={message} />
+            ))}
           </CollapsibleContent>
         </Collapsible>
       ) : (
@@ -412,7 +424,10 @@ export const Message = memo(function Message(props: MessageProps) {
         ) : null}
         {groups.map((group, index) => {
           if (group.kind === "text") return <Markdown key={index} text={group.text} />;
-          if (group.kind === "activity") return <Activity key={index} parts={group.parts} />;
+          if (group.kind === "activity")
+            return (
+              <Activity key={index} parts={group.parts} createdAt={message.metadata?.createdAt} />
+            );
           const part = group.part;
           switch (part.type) {
             case "data-resource":
@@ -485,45 +500,99 @@ export const Message = memo(function Message(props: MessageProps) {
   );
 });
 
-function Activity({ parts }: { parts: Extract<DisplayPart, { type: "data-activity" }>[] }) {
+type ActivityPart = Extract<DisplayPart, { type: "data-activity" }>;
+
+export function activitySummary(parts: readonly ActivityPart[]): string {
+  const running = parts.find((part) => part.data.state === "running");
+  if (running) return running.data.label;
+  if (parts.length === 1) return parts[0]!.data.label;
+  const tools = parts.filter((part) => part.data.kind === "tool").length;
+  const workflows = parts.filter((part) => part.data.kind === "workflow").length;
+  const thinking = parts.some((part) => part.data.kind === "thinking");
+  const labels = [];
+  if (thinking) labels.push("Thought");
+  if (tools)
+    labels.push(`${thinking ? "used" : "Used"} ${tools} ${tools === 1 ? "tool" : "tools"}`);
+  if (workflows)
+    labels.push(
+      `${labels.length ? "ran" : "Ran"} ${workflows} ${workflows === 1 ? "workflow" : "workflows"}`,
+    );
+  return labels.join(" and ");
+}
+
+function ActivityIcon({ part }: { part: ActivityPart }) {
+  if (part.data.state === "running") return <LoaderCircle className="animate-spin" />;
+  if (part.data.kind === "thinking") return <Brain />;
+  if (part.data.kind === "workflow") return <Workflow />;
+  return <Wrench />;
+}
+
+export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdAt?: number }) {
   const [open, setOpen] = useState(false);
-  const running = parts.some((part) => part.data.state === "running");
+  const representative =
+    parts.find((part) => part.data.state === "running") ??
+    parts.find((part) => part.data.kind === "tool") ??
+    parts[0];
+  if (!representative) return null;
   return (
     <Collapsible className="activity-block" open={open} onOpenChange={setOpen}>
       <CollapsibleTrigger
         render={
-          <Button
-            variant="ghost"
-            className="work-summary h-auto justify-start rounded-none px-0 aria-expanded:bg-transparent hover:bg-transparent"
-          />
+          <Button variant="ghost" className="activity-summary h-auto justify-start px-2 py-1" />
         }
       >
         <Marker render={<span />}>
           <MarkerIcon>
-            <ChevronRight className={open ? "rotated" : ""} />
+            <ActivityIcon part={representative} />
           </MarkerIcon>
-          <MarkerContent>
-            {running
-              ? parts.find((part) => part.data.state === "running")?.data.label
-              : `${parts.length} ${parts.length === 1 ? "activity" : "activities"}`}
-          </MarkerContent>
+          <MarkerContent className="activity-label">{activitySummary(parts)}</MarkerContent>
+          {createdAt !== undefined ? (
+            <time className="activity-time" dateTime={new Date(createdAt).toISOString()}>
+              {new Date(createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+            </time>
+          ) : null}
+          <ChevronRight className={open ? "rotated" : ""} />
         </Marker>
       </CollapsibleTrigger>
+      <CollapsibleContent className="activity-details">
+        {parts.map((part) => (
+          <ActivityItem key={part.id} part={part} />
+        ))}
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+export function ActivityItem({ part }: { part: ActivityPart }) {
+  const [open, setOpen] = useState(false);
+  const row = (
+    <Marker render={<span />}>
+      <MarkerIcon>
+        <ActivityIcon part={part} />
+      </MarkerIcon>
+      <MarkerContent className="activity-label">{part.data.label}</MarkerContent>
+      {part.data.state === "failed" ? <span className="activity-state">Failed</span> : null}
+      {part.data.durationMs !== undefined ? (
+        <span className="activity-time">{formatDuration(part.data.durationMs)}</span>
+      ) : null}
+      {part.data.detail ? <ChevronRight className={open ? "rotated" : ""} /> : null}
+    </Marker>
+  );
+  if (!part.data.detail) return <div className="activity-item activity-item-trigger">{row}</div>;
+  return (
+    <Collapsible className="activity-item" open={open} onOpenChange={setOpen}>
+      <CollapsibleTrigger
+        render={
+          <Button
+            variant="ghost"
+            className="activity-item-trigger h-auto justify-start px-2 py-1"
+          />
+        }
+      >
+        {row}
+      </CollapsibleTrigger>
       <CollapsibleContent>
-        <VirtualList
-          items={parts}
-          itemKey={(part) => part.id}
-          label="Activity details"
-          className="activity-details"
-          estimate={72}
-          render={(part) => (
-            <div className="activity-item">
-              <span>{part.data.label}</span>
-              <span className="badge">{part.data.state}</span>
-              {part.data.detail ? <pre>{part.data.detail}</pre> : null}
-            </div>
-          )}
-        />
+        <pre className="activity-detail">{part.data.detail}</pre>
       </CollapsibleContent>
     </Collapsible>
   );

@@ -104,6 +104,7 @@ function completedTurn(
           data: {
             kind: "tool",
             label: "Searched the workspace",
+            detail: "Found the transport, replay cache, and resource resolver modules.",
             state: "complete",
             durationMs: 180,
           },
@@ -118,6 +119,7 @@ function completedTurn(
           data: {
             kind: "tool",
             label: "Read the protocol definition",
+            detail: "Reviewed display messages, turn slots, and replay cursors.",
             state: "complete",
             durationMs: 120,
           },

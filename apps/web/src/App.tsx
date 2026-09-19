@@ -32,6 +32,7 @@ import { Sharing } from "./components/Sharing";
 import { External } from "./components/External";
 import { attempt, ErrorNotice, IconButton, Modal, VirtualList } from "./components/ui";
 import { DraftChat } from "./components/DraftChat";
+import { ThreadSelect } from "./components/ThreadSelect";
 import {
   newDraftThread,
   restoreDraftThread,
@@ -62,6 +63,11 @@ export type { AppProps } from "./types";
 export function App(props: AppProps) {
   const { client, initial } = props;
   const [threads, setThreads] = useState(initial.threads.items);
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const [nextCursor, setNextCursor] = useState(initial.threads.nextCursor);
   const [firstDraft] = useState(newDraftThread);
   const [localDrafts, setLocalDrafts] = useState(() => new Map([[firstDraft.id, firstDraft]]));
@@ -496,6 +502,7 @@ export function App(props: AppProps) {
           draft: true,
           editable: !thread.creation,
           archived: false,
+          source: undefined,
         }))
       : []),
     ...threads
@@ -506,6 +513,7 @@ export function App(props: AppProps) {
         draft: false,
         editable: thread.capabilities.edit,
         archived: thread.archived,
+        source: thread,
       })),
   ];
   const draft = selectedId
@@ -551,6 +559,7 @@ export function App(props: AppProps) {
                 >
                   <Search />
                   <Input
+                    className="pl-9 pr-9"
                     value={searchQuery}
                     onChange={(event) => {
                       setSearchQuery(event.target.value);
@@ -648,24 +657,37 @@ export function App(props: AppProps) {
                       itemKey={(thread) => thread.id}
                       label="Conversations"
                       className="thread-list"
+                      estimate={64}
                       render={(thread) => (
                         <ContextMenu>
                           <ContextMenuTrigger
                             className={`thread-row ${selectedId === thread.id && !external ? "selected" : ""}`}
                           >
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              className="thread-select flex-1 min-w-0 shrink justify-start"
-                              onClick={() => select(thread.id)}
-                            >
-                              <MessageSquare />
-                              <span>{thread.title || "Untitled"}</span>
-                              {thread.draft ? <span className="badge">Draft</span> : null}
-                              {!thread.draft && !thread.editable ? (
-                                <span className="badge">Read</span>
-                              ) : null}
-                            </Button>
+                            {thread.source ? (
+                              <ThreadSelect
+                                thread={thread.source}
+                                viewer={initial.viewer}
+                                client={client}
+                                modelLabel={
+                                  catalog?.models.find(
+                                    (model) => model.id === thread.source.modelId,
+                                  )?.label
+                                }
+                                now={now}
+                                onSelect={() => select(thread.id)}
+                              />
+                            ) : (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                className="thread-select flex-1 min-w-0 shrink justify-start"
+                                onClick={() => select(thread.id)}
+                              >
+                                <MessageSquare />
+                                <span>{thread.title || "Untitled"}</span>
+                                <span className="badge">Draft</span>
+                              </Button>
+                            )}
                             {thread.editable ? (
                               <span className="thread-actions">
                                 <IconButton
