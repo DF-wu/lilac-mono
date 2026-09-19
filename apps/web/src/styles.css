@@ -1431,3 +1431,14 @@ progress {
 .sidebar-toggle .icon-button { width: var(--control-compact); height: var(--control-compact); }
 .scroll-to-end { position: absolute; bottom: 100%; left: 0; right: 0; display: flex; justify-content: center; padding-bottom: var(--space-2); pointer-events: none; }
 .scroll-to-end > button { pointer-events: auto; height: var(--control-compact); border-radius: 999px; gap: var(--space-1); font-size: var(--text-xs); box-shadow: 0 2px 8px var(--overlay); }
+
+.sidebar { padding-top: 0; }
+.sidebar-header { height: 2rem; min-height: 2rem; flex: none; padding: 0 0 0 calc(var(--control-compact) + var(--space-3)); margin-bottom: var(--space-3); }
+.sidebar-header .brand { line-height: 1; }
+.sidebar-search-row { display: flex; align-items: center; gap: var(--space-1); min-width: 0; margin-bottom: var(--space-2); }
+.sidebar-search-row .search-box { flex: 1; min-width: 0; }
+.sidebar-search-row .search-box input { height: 2rem; min-width: 0; padding-block: 0; padding-right: var(--space-3); }
+.sidebar-search-row .search-box:has(.icon-button) input { padding-right: var(--space-6); }
+.sidebar-search-row .sidebar-tabs { flex: none; gap: var(--space-1); padding: 0; }
+.sidebar-search-row .sidebar-tabs .icon-button { width: var(--control-compact); height: var(--control-compact); }
+.sidebar-search-row:has(.search-box:focus-within) .sidebar-tabs { display: none; }

@@ -702,72 +702,73 @@ export function App(props: AppProps) {
                       lilac
                       <span />
                     </span>
-                    <span className="toolbar-spacer" />
-                    <IconButton label="New conversation" onClick={() => void createThread()}>
-                      <Plus />
-                    </IconButton>
                   </header>
-                  <form
-                    className="search-box"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      void search();
-                    }}
-                  >
-                    <Search />
-                    <Input
-                      className="pl-9 pr-9"
-                      value={searchQuery}
-                      onChange={(event) => {
-                        setSearchQuery(event.target.value);
-                        if (!event.target.value) setResults(undefined);
-                      }}
-                      aria-label="Search conversations"
-                      placeholder="Search conversations"
-                    />
-                    <Button type="submit" className="sr-only">
-                      Search
-                    </Button>
-                    {searchQuery ? (
-                      <IconButton
-                        label="Clear search"
-                        onClick={() => {
-                          setSearchQuery("");
-                          setResults(undefined);
-                        }}
-                      >
-                        <X />
-                      </IconButton>
-                    ) : null}
-                  </form>
-                  <nav className="sidebar-tabs">
-                    <IconButton
-                      label={archived ? "Show active conversations" : "Show archived conversations"}
-                      aria-pressed={archived}
-                      onClick={() => {
-                        const value = !archived;
-                        setArchived(value);
-                        setExternal(false);
-                        void listThreads(value);
+                  <div className="sidebar-search-row">
+                    <form
+                      className="search-box"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void search();
                       }}
                     >
-                      <Archive />
-                    </IconButton>
-                    {owner ? (
+                      <Search />
+                      <Input
+                        className="pl-9 pr-9"
+                        value={searchQuery}
+                        onChange={(event) => {
+                          setSearchQuery(event.target.value);
+                          if (!event.target.value) setResults(undefined);
+                        }}
+                        aria-label="Search conversations"
+                        placeholder="Search"
+                      />
+                      <Button type="submit" className="sr-only">
+                        Search
+                      </Button>
+                      {searchQuery ? (
+                        <IconButton
+                          label="Clear search"
+                          onClick={() => {
+                            setSearchQuery("");
+                            setResults(undefined);
+                          }}
+                        >
+                          <X />
+                        </IconButton>
+                      ) : null}
+                    </form>
+                    <nav className="sidebar-tabs" aria-label="Conversation filters and actions">
                       <IconButton
-                        label="Read other surfaces"
-                        aria-pressed={external}
+                        label={
+                          archived ? "Show active conversations" : "Show archived conversations"
+                        }
+                        aria-pressed={archived}
                         onClick={() => {
-                          setExternalId(undefined);
-                          setExternal((value) => !value);
+                          const value = !archived;
+                          setArchived(value);
+                          setExternal(false);
+                          void listThreads(value);
                         }}
                       >
-                        <Globe />
+                        <Archive />
                       </IconButton>
-                    ) : null}
-                    <span className="toolbar-spacer" />
-                    {archived ? <small>Archived</small> : null}
-                  </nav>
+                      {owner ? (
+                        <IconButton
+                          label="Read other surfaces"
+                          aria-pressed={external}
+                          onClick={() => {
+                            setExternalId(undefined);
+                            setExternal((value) => !value);
+                          }}
+                        >
+                          <Globe />
+                        </IconButton>
+                      ) : null}
+                      <IconButton label="New conversation" onClick={() => void createThread()}>
+                        <Plus />
+                      </IconButton>
+                    </nav>
+                  </div>
                   {results ? (
                     <>
                       <VirtualList
