@@ -65,6 +65,7 @@ The fail-closed workspace inventory is `ACTIVE_WORKSPACES` in `scripts/architect
 - `apps/computer-use-gateway`: optional authenticated MCP desktop gateway, Docker lifecycle, and session/port SQLite bookkeeping.
 - `apps/core`: Core composition, surfaces, routing, tool adapters/server, workflows, recovery, and Core-owned persistence.
 - `apps/installer`: standalone setup CLI, provider and Discord onboarding, configuration updates, and published-image Compose deployment. See `docs/installation.md` for installation and release operations.
+- `apps/tui`: OpenTUI/Solid native client, terminal login, private disk replay cache, plaintext presentation and standalone packaging. It reuses `packages/client`; Core owns execution and server history.
 - `apps/tool-bridge`: the native `tools` launcher, its resident Bun HTTP client, and the reduced dev-mode Core tool server entry.
 
 ### Packages
@@ -85,6 +86,16 @@ Native surface ownership is in `apps/core/src/surface/native`: `store.ts` owns n
 resources, search, semantic output projection and the HTTP/WebSocket gateway. The surface uses
 starter-owned authority and a separate user directory, with `lilac` as its service user. The web app
 uses the shared client and a principal-scoped IndexedDB cache. See [native setup](docs/native-surface.md).
+
+Native input receipts and upload readiness commit before the existing request-delivery coordinator
+admits execution. Stable delivery identities bridge these stores; the native surface does not own a
+second model-execution queue. Starter authority and history generation are rechecked at admission.
+Semantic output uses the nonexpiring `evt.native.output` topic. Projection and deduplication receipts
+commit before bus acknowledgement; WAL checkpoints wait for the output publication frontier they
+cover. Rewind fences the discarded generation, waits for runner cancellation, reconciles canonical
+transcript references and finishes its persisted mutation before admitting new work. Startup resumes
+unfinished mutations before recovering native requests. See [native migrations](MIGRATIONS.md#native-output-recovery-frontier).
+
 - `packages/coding-tools`: shared coding-tool schemas and implementations, patch/edit behavior, batching, instruction discovery, and tool guardrails.
 - `packages/computer-use-runner`: pinned CUA desktop image, Chromium seccomp profile, persistent Python runtime, and runner checks.
 - `packages/event-bus`: event catalog, codecs, typed bus, delivery policy, dead letters, and Redis Streams transport.
@@ -99,7 +110,7 @@ uses the shared client and a principal-scoped IndexedDB cache. See [native setup
 Three concepts must remain distinct:
 
 - The event bus `AdapterPlatform` is a compatibility wire enum and includes values that Core does not implement.
-- `BUILTIN_SURFACE_PROTOCOLS` in `apps/core/src/surface/builtin-surface-protocols.ts` is the exhaustive static catalog for the closed `SessionRef`/`MsgRef` platforms, currently Discord and GitHub. It owns protocol-specific ref construction, request-ID interpretation, and tool target projection. Catalog membership does not enable a surface or grant trust.
+- `BUILTIN_SURFACE_PROTOCOLS` in `apps/core/src/surface/builtin-surface-protocols.ts` is the exhaustive static catalog for the closed `SessionRef`/`MsgRef` platforms, currently Discord, GitHub and native. It owns protocol-specific ref construction, request-ID interpretation, and tool target projection. Catalog membership does not enable a surface or grant trust.
 - `SurfaceRuntimeRegistry` in `apps/core/src/surface/runtime-descriptor.ts` contains the executable descriptors installed in one Core process. A descriptor explicitly contributes an adapter and optional adapter ingress, request ingress, relay, workflow-progress, and health ports. Resolution is exact; it is not inferred from the wire enum or static catalog.
 
 The registry binds one produced-ref-guarded adapter facade and passes that facade to descriptor ports. Caller refs and adapter-produced refs are checked before shared publication, persistence, or workflow progress. Workflow progress additionally gates exact target, binding, and ref correlation and persists permanent-versus-retryable operation policy. The registry is internal composition, not a dynamic surface plugin API.
@@ -118,7 +129,7 @@ modes and streaming previews. Image cells support bold, italic, inline code, str
 `__underline__`, and nested combinations. Links display their labels. The default style remains
 `unicode`; `ascii` also stays text-only.
 
-Trust admission starts at authenticated Discord ingress or verified GitHub webhook ingress. A `SurfacePrincipal` is created only from correlated normalized identity carried through the trusted request path. Protocol catalog membership, descriptor registration, a request header, or a claimed platform cannot create authority; conflicting or missing correlation falls back to restricted behavior.
+Trust admission starts at authenticated Discord or native ingress, or verified GitHub webhook ingress. A `SurfacePrincipal` is created only from correlated normalized identity carried through the trusted request path. Protocol catalog membership, descriptor registration, a request header, or a claimed platform cannot create authority; conflicting or missing correlation falls back to restricted behavior.
 
 ## Event Delivery
 
@@ -251,7 +262,8 @@ resource module refreshes an origin URL in memory, streams at most 512 MiB into 
 result, and attaches the cache reference with compare-and-swap semantics. Images and PDFs no larger
 than 25 MiB may become verified byte-backed provider parts. Claude Code receives images only.
 
-Possession of an exact retained resource URI grants access without a session or principal comparison.
+Legacy resource resolution treats an exact retained resource URI as a capability. Native resource
+access also requires current visibility of the origin thread, including cross-thread references.
 Plain text containing a URI does not add retention or create a provider file part. When the final
 structured transcript or projection reference is deleted, the URI stops resolving. Maintenance first
 deletes any resource-owned cached blob, then removes the unretained resource row. Failed blob deletion

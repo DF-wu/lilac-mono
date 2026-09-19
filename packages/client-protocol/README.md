@@ -1,7 +1,7 @@
 # Native client protocol
 
-Version 1 contracts for the active [native surface plan](../../plan/native-surface.md). These
-pre-release schemas describe display state and commands. Core owns authorization, durable admission,
+Version 1 contracts for the [native surface](../../docs/native-surface.md). These
+schemas describe display state and commands. Core owns authorization, durable admission,
 resource resolution and execution; importing this package does not start a backend.
 
 `src/rpc.ts` exports `nativeContract`, a contract-first oRPC router. It covers authenticated bootstrap,

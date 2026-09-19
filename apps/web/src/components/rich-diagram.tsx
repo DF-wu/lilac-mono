@@ -60,9 +60,13 @@ export default memo(function Diagram({ source }: { source: string }) {
       if (!active) return;
       result.match({ ok: (svg) => setRendered({ source, svg }), err: () => setFailed(source) });
     }
-    void render();
+    // Leave a paint for conversation text before Mermaid performs synchronous layout work.
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => void render());
+    });
     return () => {
       active = false;
+      cancelAnimationFrame(frame);
     };
   }, [id, source]);
   if (rendered?.source === source)

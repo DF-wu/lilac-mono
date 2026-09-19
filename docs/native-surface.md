@@ -45,7 +45,7 @@ origin, normally `http://localhost:5173`, to `allowedOrigins`.
 
 Choose Clerk per installation with `surface.native.auth.provider: clerk`. Configure the owner's native
 `ownerId`, Clerk `ownerProviderUserId` and `clerkIssuer`. A registered public `clerkOAuthClientId` is
-only needed for OAuth clients such as the later TUI; browser sessions work without one. Set
+only needed for OAuth clients such as the TUI; browser sessions work without one. Set
 `CLERK_SECRET_KEY` and `CLERK_PUBLISHABLE_KEY` in the server environment. `CLERK_JWT_KEY` is optional.
 Only the publishable key reaches the browser. The web build does not embed installation credentials.
 
@@ -98,6 +98,61 @@ Save writes the document; Reload applies it through the existing MCP registry. T
 The browser caches versioned app assets and scoped conversation projections separately. Private
 API responses never enter the service worker cache. Logout clears private cached data. An app update
 offers a Reload button; drafts remain on the device until sent or cleared.
+
+## Terminal client
+
+The installer includes `bin/lilac-tui`. Run it against the same native server as the web app:
+
+```sh
+./bin/lilac-tui --url http://127.0.0.1:8787
+```
+
+From a source checkout, use `bun run dev:tui -- --url http://127.0.0.1:8787`.
+`bun run build:tui` creates a standalone binary in `apps/tui/dist` for the current platform.
+Use `--thread ID` to open a thread, `--no-cache` to disable transcript caching, or `--login`
+to sign in again. Release artifacts pair the server and clients from the same commit.
+
+The TUI uses OpenTUI/Solid and renders plain text. Markdown, tables, math and diagrams remain source
+text; images are accepted as input and listed as attachments. Enter sends, Shift+Enter adds a line,
+Ctrl+C cancels the run, and Ctrl+Q exits. Ctrl+T opens conversations, Ctrl+M opens models and Ctrl+K
+shows the queue. Use `$` or `/skill:` for skills and `/` for commands. Tab inserts the selected
+completion. `:help` lists commands for search, older history, queue removal, upload retry and rewind.
+New conversations stay local until Send.
+
+Use `:attach /path/to/file` for file and image input. Ctrl+V reads the host clipboard through OpenTUI
+when supported. Over SSH that is the remote host's clipboard; use file paths or run the client locally
+against the remote server. Sent attachments show progress while the composer remains usable.
+The server waits for resources before starting work. Output strips terminal control sequences.
+
+Local auth prompts for the fixed username and password. The password is never saved. Clerk opens a
+browser using Authorization Code with PKCE and a temporary loopback callback. Register a public OAuth
+client with required PKCE, redirect URI `http://127.0.0.1/callback`, and scopes
+`openid profile offline_access`; set its ID in `surface.native.auth.clerkOAuthClientId`.
+Enable JWT OAuth access tokens in Clerk. For SSH, run the client locally or arrange forwarding for
+the callback port. This version does not implement a device-code fallback.
+
+Credentials live under `$XDG_CONFIG_HOME/lilac/tui`, defaulting to `~/.config/lilac/tui`.
+Conversation cache lives separately under `$XDG_CACHE_HOME/lilac/tui`, defaulting to
+`~/.cache/lilac/tui`. Directories use mode 0700 and files use mode 0600. Atomic cache writes retain
+at most 64 threads within 32 MiB. Corrupt or incompatible cache files reset from the server.
+`:logout` invalidates the current token at the native server, revokes the Clerk refresh token when
+applicable, and clears local credentials and the principal's cache. Clerk JWT access tokens remain
+valid upstream until expiry; native logout blocks the current token for the running server process.
+
+## Diagnostics and compatibility
+
+See [verification evidence and limits](native-surface-verification.md) for deployment, authentication,
+terminal/browser checks and the previous performance baseline.
+
+Backend, shared clients and display projection use native protocol version 1. Update the server and
+clients together. Older web tabs retain assets until reload; terminal clients report an incompatible
+response instead of interpreting another protocol version.
+
+Debug logging under `surface:native:metrics` records connection IDs, application-frame byte counts,
+bootstrap duration, replay kind/resets, queue pressure and handoff failures. Request and thread IDs
+correlate output commits with socket enqueue timing. This timing ends at the server's socket send,
+not at client rendering. Byte counters exclude TLS and WebSocket framing overhead. Metric fields
+omit credentials and conversation bodies.
 
 ## Persistence and rollback
 

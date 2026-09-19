@@ -37,6 +37,20 @@ Draft rows accept optional title and model selection metadata. Existing rows rem
 IndexedDB version or backend schema changes. An older web build may ignore rows with the new optional
 metadata. File selections remain in memory and must be reattached after a browser reload.
 
+## Native terminal cache version 1
+
+The terminal client writes versioned private credential and transcript files separately. Its
+`cache-v1.json` atomically commits replay checkpoints and hydrated/deferred slots, bounded to 64 threads
+and 32 MiB. Cache entries are scoped by installation, principal, protocol and projection version.
+Unsupported or corrupt cache files reset from the server; they never migrate canonical history.
+Credential files are keyed by the server origin hash and contain session or OAuth refresh credentials,
+never the local Basic password. Logout removes the credential and purges the principal's cache.
+See [native setup](docs/native-surface.md) for locations and permissions.
+
+Fresh installer deployments default to native web/terminal with authentication. Updating or reinstalling
+an existing deployment retains its configured surfaces and port bindings. Existing Core configurations
+without `surface.native` remain disabled; no configuration-version bump enables a listener implicitly.
+
 ## Native output recovery frontier
 
 Native runs add an optional `nativeOutput` field to version-1 agent-run WAL checkpoints. It stores
