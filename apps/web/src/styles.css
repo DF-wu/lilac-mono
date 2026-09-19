@@ -1477,6 +1477,12 @@ progress {
   --workspace-width: calc(100% + var(--sidebar-offset));
   transform: translateX(calc(-1 * var(--sidebar-offset)));
 }
+@media (min-width: 761px) {
+  /* Group resizing must not feed a changing sidebar measurement back into the slide distance. */
+  .workspace-panels[data-sidebar-fixed="true"] > #sidebar[data-panel] {
+    flex: 0 0 var(--sidebar-panel-width) !important;
+  }
+}
 @media (max-width: 760px) {
   .sidebar-hidden .workspace-panels { --workspace-width: 100%; transform: none; }
   .workspace-panels > #sidebar[data-panel] {

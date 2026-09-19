@@ -104,6 +104,19 @@ function Workspace(props: AppProps) {
   const [externalId, setExternalId] = useState<string>();
   const [sidebar, setSidebar] = useState(true);
   const [sidebarPixels, setSidebarPixels] = useState(288);
+  const [sidebarSliding, setSidebarSliding] = useState(false);
+  const panelGroup = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!sidebarSliding) return;
+    let canceled = false;
+    const animations = panelGroup.current?.getAnimations() ?? [];
+    void Promise.allSettled(animations.map((animation) => animation.finished)).then(() => {
+      if (!canceled) setSidebarSliding(false);
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [sidebar, sidebarSliding]);
   const [searchQuery, setSearchQuery] = useState("");
   const online = useNativeOnline(client);
   const queries = useQueryClient();
@@ -581,13 +594,21 @@ function Workspace(props: AppProps) {
       <Tooltip.Provider delay={350}>
         <main
           className={`app-shell ${sidebar ? "" : "sidebar-hidden"}`}
-          style={{ "--sidebar-offset": `${sidebarPixels + 1}px` } as CSSProperties}
+          style={
+            {
+              "--sidebar-panel-width": `${sidebarPixels}px`,
+              "--sidebar-offset": `${sidebarPixels + 1}px`,
+            } as CSSProperties
+          }
           aria-label="Chat workspace"
         >
           <div className="sidebar-toggle">
             <IconButton
               label={sidebar ? "Hide sidebar" : "Show sidebar"}
-              onClick={() => setSidebar((value) => !value)}
+              onClick={() => {
+                setSidebarSliding(true);
+                setSidebar((value) => !value);
+              }}
             >
               {sidebar ? <PanelLeftClose /> : <PanelLeftOpen />}
             </IconButton>
@@ -595,13 +616,16 @@ function Workspace(props: AppProps) {
           <ResizablePanelGroup
             orientation="horizontal"
             className="workspace-panels"
+            elementRef={panelGroup}
+            data-sidebar-fixed={!sidebar || sidebarSliding}
             style={{ width: "var(--workspace-width, 100%)" }}
           >
             <ResizablePanel
               inert={!sidebar}
               aria-hidden={!sidebar}
               onResize={(size) => {
-                if (size.inPixels > 0) setSidebarPixels(size.inPixels);
+                if (sidebar && !sidebarSliding && size.inPixels > 0)
+                  setSidebarPixels(size.inPixels);
               }}
               id="sidebar"
               groupResizeBehavior="preserve-pixel-size"
@@ -764,7 +788,7 @@ function Workspace(props: AppProps) {
               </aside>
             </ResizablePanel>
             <ResizableHandle
-              disabled={!sidebar}
+              disabled={!sidebar || sidebarSliding}
               aria-label="Sidebar width"
               className="sidebar-resize-handle"
             />
