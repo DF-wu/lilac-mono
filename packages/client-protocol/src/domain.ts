@@ -20,6 +20,8 @@ export const nativeThreadSchema = z.strictObject({
   id: identitySchema,
   title: z.string().max(512),
   starterId: identitySchema,
+  starterDisplayName: z.string().max(256).optional(),
+  displayStatus: z.enum(["idle", "completed", "working", "error"]).optional(),
   activeRunId: runIdentitySchema.optional(),
   archived: z.boolean(),
   updatedAt: revisionSchema,
@@ -57,8 +59,16 @@ export const commandChoiceSchema = z.strictObject({
   kind: z.enum(["builtin", "custom"]),
   argumentHint: z.string().max(256).optional(),
 });
+export const agentIdentitySchema = z.strictObject({
+  id: z.literal("lilac"),
+  displayName: z.string().min(1).max(256),
+  avatarUrl: z.string().max(512).optional(),
+});
+export type AgentIdentity = z.infer<typeof agentIdentitySchema>;
+
 export const displayCatalogSchema = z.strictObject({
   revision: identitySchema,
+  agent: agentIdentitySchema.optional(),
   models: z.array(modelChoiceSchema).max(256),
   skills: z.array(skillChoiceSchema).max(512),
   commands: z.array(commandChoiceSchema).max(512),
@@ -192,3 +202,10 @@ export const mcpReloadReplySchema = z.strictObject({
 });
 export type McpReloadReply = z.infer<typeof mcpReloadReplySchema>;
 export type ConfigDocument = z.infer<typeof configDocumentSchema>;
+
+export const resourcePreviewSchema = z.strictObject({
+  text: z.string().max(65_536),
+  truncated: z.boolean(),
+  byteLength: z.number().int().nonnegative(),
+});
+export type ResourcePreview = z.infer<typeof resourcePreviewSchema>;

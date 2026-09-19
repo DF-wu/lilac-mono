@@ -30,6 +30,30 @@ Browser projection caches are scoped by installation, principal, protocol and pr
 They are disposable: unsupported versions or invalid coverage require a fresh recent window, while
 server conversation history remains authoritative. Never copy one user's cache into another scope.
 
+## Native display identity and previews
+
+Native v1 user records now accept an optional `avatar` containing a managed blob reference and a
+validated raster image media type. Existing records omit it and retain their initials fallback.
+The stable `lilac` service-user ID and authority are unchanged; startup preserves its display name
+and avatar. Only the owner can change either. Avatar reads require native authentication and are
+installation-wide, independent of private thread attachment grants.
+
+Display catalogs optionally carry `agent` identity. Existing disposable client caches without it
+remain readable and use the default identity until catalog reconciliation. Thread summaries add
+optional `starterDisplayName` and `displayStatus` display fields; the server emits these using existing
+thread/read state. The existing `native_surface_read` table is initialized by `NativeStore`, with no
+schema or read-state migration.
+
+The filesystem `fs.read_bytes` request accepts optional `prefixBytes` from 1 through 65,536.
+Without it, reads retain their whole-file limit and result shape. Prefix reads return at most that
+many bytes and add `totalBytes`, the original size reported by the opened file. `bytesLength` remains
+the returned prefix length and `fileHash` hashes those returned bytes; prefix reads do not establish
+a full-file edit hash. Both local and SSH paths retain their existing denied-path checks.
+
+Text preview endpoints cap returned UTF-8 prefixes at 64 KiB and preserve the originating thread's
+resource authorization. Binary data returns a displayable error. Published file previews read a bounded prefix of the
+latest file, as before. The new preview endpoints do not create file snapshots.
+
 ## Native web local drafts
 
 The existing scoped browser draft cache also holds unsent new conversations under `draft:` IDs.

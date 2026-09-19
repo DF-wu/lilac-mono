@@ -12,6 +12,7 @@ import {
 } from "@stanley2058/lilac-utils";
 import { Result, type Result as ResultType } from "better-result";
 import { z } from "zod";
+import { blobRefV1Schema } from "@stanley2058/lilac-blob-storage";
 import { workflowResolvedModelRequestSchema } from "../../workflow/workflow-request-authority";
 import { nativeOutputProjectionStateSchema } from "./output-projection-codec";
 
@@ -21,6 +22,12 @@ export const nativeUserSchema = z.strictObject({
   id,
   providerId: id,
   displayName: z.string().max(256),
+  avatar: z
+    .strictObject({
+      blob: blobRefV1Schema,
+      mediaType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+    })
+    .optional(),
   role: z.enum(["owner", "participant", "service"]),
   toolMode: z.enum(["restricted", "full"]),
 });

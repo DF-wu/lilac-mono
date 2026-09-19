@@ -15,6 +15,7 @@ import {
 } from "./replay.ts";
 import {
   catalogReplySchema,
+  agentIdentitySchema,
   catalogIdentifierSchema,
   configDocumentSchema,
   externalThreadSchema,
@@ -214,6 +215,11 @@ export const nativeContract = {
       .input(threadIdInput.extend({ userId: identitySchema, role: participantRoleSchema }))
       .output(successSchema),
     remove: procedure.input(threadIdInput.extend({ userId: identitySchema })).output(successSchema),
+  },
+  identity: {
+    update: procedure
+      .input(z.strictObject({ displayName: z.string().trim().min(1).max(256) }))
+      .output(agentIdentitySchema),
   },
   users: {
     list: procedure.input(pageInputSchema).output(

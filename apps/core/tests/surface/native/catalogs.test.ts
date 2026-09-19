@@ -38,3 +38,38 @@ it("projects display data without provider options or skill paths and reuses rev
   expect(restricted.catalog.skills).toEqual([]);
   expect(restricted.catalog.revision).not.toBe(reply.catalog.revision);
 });
+
+it("identity changes invalidate the catalog once and survive model catalog reloads", () => {
+  const source = {
+    config: parseCoreConfigV2ToUniversal({ models: { main: { model: "openai/demo" } } }),
+    commands: [],
+    skills: [],
+  };
+  const service = new NativeCatalogService(source);
+  let notifications = 0;
+  service.subscribe(() => notifications++);
+  service.setAgent({
+    id: "lilac",
+    displayName: "Garden",
+    avatarUrl: "/api/identity/avatar?revision=one",
+  });
+  const first = service.get({ key: "owner" });
+  if (first.kind !== "catalog") throw new Error("Expected catalog");
+  expect(first.catalog.agent?.displayName).toBe("Garden");
+  service.setAgent({
+    id: "lilac",
+    displayName: "Garden",
+    avatarUrl: "/api/identity/avatar?revision=one",
+  });
+  expect(notifications).toBe(1);
+  service.setAgent({
+    id: "lilac",
+    displayName: "Garden",
+    avatarUrl: "/api/identity/avatar?revision=two",
+  });
+  expect(service.get({ key: "owner" }, first.catalog.revision).kind).toBe("catalog");
+  service.update(source);
+  const reloaded = service.get({ key: "participant" });
+  if (reloaded.kind !== "catalog") throw new Error("Expected catalog");
+  expect(reloaded.catalog.agent?.avatarUrl).toContain("revision=two");
+});

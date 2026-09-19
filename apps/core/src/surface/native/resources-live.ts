@@ -12,6 +12,7 @@ import {
 import { parseSshCwdTarget } from "../../ssh/ssh-cwd";
 import { remoteReadFileBytes } from "../../tools/fs/remote-fs";
 import type { NativeThreadRecord, NativeUser } from "./codec";
+import { NATIVE_TEXT_PREVIEW_BYTES, textPreview } from "./resource-preview";
 import { nativeFailure, type NativeStoreFailure } from "./errors";
 
 type NativeFileError = NativeStoreFailure | PersistedDataError;
@@ -36,7 +37,10 @@ export class NativeLiveFileService {
     actorId: string,
     pathId: string,
     signal?: AbortSignal,
-  ): Promise<NativeFileResult<{ bytes: Uint8Array; filename: string; mediaType: string }>> {
+    preview = false,
+  ): Promise<
+    NativeFileResult<{ bytes: Uint8Array; filename: string; mediaType: string; byteLength: number }>
+  > {
     const service = this;
     return Result.gen(async function* () {
       const reference = yield* service.dependencies.native.readPublishedPath(actorId, pathId);
@@ -54,7 +58,8 @@ export class NativeLiveFileService {
             cwd: target.cwd,
             filePath: reference.path,
             denyPaths: service.dependencies.remoteDenyPaths,
-            maxBytes: RESOURCE_MAX_BYTES,
+            maxBytes: preview ? NATIVE_TEXT_PREVIEW_BYTES : RESOURCE_MAX_BYTES,
+            ...(preview ? { prefixBytes: NATIVE_TEXT_PREVIEW_BYTES } : {}),
             ...(signal ? { signal } : {}),
           }).then((result) =>
             result.mapError(() => nativeFailure("not-found", "File is missing or unreadable")),
@@ -68,6 +73,7 @@ export class NativeLiveFileService {
         yield* service.dependencies.native.readPublishedPath(actorId, pathId);
         return Result.ok({
           bytes,
+          byteLength: read.totalBytes ?? bytes.byteLength,
           filename: basename(reference.path),
           mediaType: inferMimeTypeFromFilename(reference.path),
         });
@@ -82,7 +88,8 @@ export class NativeLiveFileService {
       }).mapError(() => nativeFailure("forbidden", "File path is outside this thread's access"));
       const read = await service.dependencies.filesystem.readFileBytes({
         path,
-        maxBytes: RESOURCE_MAX_BYTES,
+        maxBytes: preview ? NATIVE_TEXT_PREVIEW_BYTES : RESOURCE_MAX_BYTES,
+        ...(preview ? { prefixBytes: NATIVE_TEXT_PREVIEW_BYTES } : {}),
       });
       if (!read.success)
         return Result.err(nativeFailure("not-found", "File is missing or unreadable"));
@@ -91,6 +98,7 @@ export class NativeLiveFileService {
       yield* service.dependencies.native.readPublishedPath(actorId, pathId);
       return Result.ok({
         bytes: read.bytes,
+        byteLength: read.totalBytes ?? read.bytes.byteLength,
         filename: basename(reference.path),
         mediaType: inferMimeTypeFromFilename(reference.path),
       });
@@ -98,9 +106,30 @@ export class NativeLiveFileService {
   }
 
   async handle(request: Request, actorId: string): Promise<Response | undefined> {
-    const pathId = /^\/api\/files\/([^/]+)$/u.exec(new URL(request.url).pathname)?.[1];
+    const match = /^\/api\/files\/([^/]+)(\/preview)?$/u.exec(new URL(request.url).pathname);
+    const pathId = match?.[1];
     if (pathId === undefined || request.method !== "GET") return undefined;
-    const result = await this.read(actorId, pathId, request.signal);
+    const result = await this.read(actorId, pathId, request.signal, !!match?.[2]);
+    if (match?.[2])
+      return result
+        .andThen((file) => textPreview(file.bytes, file.byteLength))
+        .match({
+          ok: (preview) =>
+            Response.json(preview, {
+              headers: {
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+              },
+            }),
+          err: (error) =>
+            Response.json(
+              { error: error.message },
+              {
+                status: previewErrorStatus(error),
+                headers: { "Cache-Control": "no-store" },
+              },
+            ),
+        });
     return result.match({
       ok: (file) =>
         new Response(new Blob([Uint8Array.from(file.bytes)]), {
@@ -169,4 +198,20 @@ function publishedFilesystemPath(url: string): string | null {
   if (parsed.hostname && parsed.hostname !== "localhost") return null;
   const decoded = Result.try({ try: () => decodeURIComponent(parsed.pathname), catch: () => null });
   return decoded.match({ ok: (path) => path, err: () => null });
+}
+
+function previewErrorStatus(error: NativeFileError): number {
+  if (error._tag !== "NativeStoreFailure") return 503;
+  switch (error.code) {
+    case "forbidden":
+      return 403;
+    case "invalid":
+      return 422;
+    case "not-found":
+      return 404;
+    case "sqlite":
+    case "conflict":
+    case "stale":
+      return 503;
+  }
 }

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type { DisplayCatalog } from "@stanley2058/lilac-client-protocol";
+import type { AgentIdentity, DisplayCatalog } from "@stanley2058/lilac-client-protocol";
 import type { CoreConfig } from "@stanley2058/lilac-utils/core-config";
 import type { DiscoveredSkill } from "@stanley2058/lilac-utils/skills";
 import type { CustomCommandDef } from "@stanley2058/lilac-utils/custom-commands";
@@ -31,7 +31,17 @@ export class NativeCatalogService {
   }
 
   update(source: NativeCatalogSource): void {
-    this.source = projectCatalog(source);
+    this.source = {
+      ...projectCatalog(source),
+      ...(this.source.agent ? { agent: this.source.agent } : {}),
+    };
+    this.scopes.clear();
+    for (const listener of this.listeners) listener();
+  }
+
+  setAgent(agent: AgentIdentity): void {
+    if (JSON.stringify(this.source.agent) === JSON.stringify(agent)) return;
+    this.source = { ...this.source, agent };
     this.scopes.clear();
     for (const listener of this.listeners) listener();
   }
@@ -61,7 +71,12 @@ export class NativeCatalogService {
           (command) => command.kind === "builtin" || scope.commandNames?.has(command.name),
         )
       : source.commands;
-    const display = { models: source.models, skills, commands };
+    const display = {
+      models: source.models,
+      skills,
+      commands,
+      ...(source.agent ? { agent: source.agent } : {}),
+    };
     const nextRevision = createHash("sha256")
       .update(scope.key)
       .update("\0")

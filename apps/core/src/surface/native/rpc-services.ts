@@ -17,6 +17,7 @@ import type { NativeAuthenticator, NativePrincipal } from "./auth";
 import type { NativeClerkAuthenticator } from "./auth-clerk";
 import type { NativeCatalogService } from "./catalogs";
 import type { NativeUploadRecord, NativeUser as StoredUser } from "./codec";
+import { agentIdentity, nativeUserDisplay } from "./identity";
 import type { NativeConfigService } from "./config-service";
 import { NativeStoreFailure, nativeFailure } from "./errors";
 import type { NativeExecution } from "./execution";
@@ -46,7 +47,7 @@ export type NativeRpcServiceOptions = {
 };
 
 export function nativeViewer(user: StoredUser): NativeUser {
-  return { id: user.id, displayName: user.displayName, role: user.role, toolMode: user.toolMode };
+  return nativeUserDisplay(user);
 }
 
 function displayResource(upload: NativeUploadRecord): ResourceDisplay {
@@ -66,6 +67,8 @@ function summarySignature(thread: NativeThread): string {
     thread.modelId,
     thread.archived,
     thread.capabilities,
+    thread.starterDisplayName,
+    thread.displayStatus,
   ]);
 }
 
@@ -610,6 +613,13 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
       },
       remove(principal, input) {
         return store.shareThread(principal.userId, { ...input, grant: null }).map(success);
+      },
+    },
+    identity: {
+      update(principal, input) {
+        return store
+          .setAgentIdentity(principal.userId, { displayName: input.displayName })
+          .map(agentIdentity);
       },
     },
     users: {

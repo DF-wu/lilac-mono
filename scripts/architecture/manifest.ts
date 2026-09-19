@@ -2914,7 +2914,12 @@ const CORE_NATIVE_RECORD_PERSISTED_CODEC = {
 } as const satisfies PersistedCodecRegistration;
 
 const CORE_NATIVE_RECORD_PERSISTED_CONSUMERS = [
-  ...["NativeStore.readRecord", "NativeStore.readRows", "NativeStore.sync"].map((exportName) => ({
+  ...[
+    "NativeStore.readRecord",
+    "NativeStore.readRows",
+    "NativeStore.sync",
+    "NativeStore.displayStatus",
+  ].map((exportName) => ({
     module: "src/surface/native/store.ts",
     exportName,
   })),
@@ -4806,6 +4811,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "NativeStore.findUserByProviderId",
               "NativeStore.upsertUser",
               "NativeStore.setToolMode",
+              "NativeStore.setAgentIdentity",
               "NativeStore.requireOwner",
               "NativeStore.getThreadRecord",
               "NativeStore.authorizeThread",

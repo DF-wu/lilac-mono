@@ -43,7 +43,6 @@ export class NativeSurfaceStore {
     return nativeStoreTransaction(this.db, () => {
       this.db
         .run(`CREATE TABLE IF NOT EXISTS native_surface_reactions (thread_id TEXT NOT NULL,message_id TEXT NOT NULL,actor_id TEXT NOT NULL,emoji TEXT NOT NULL,PRIMARY KEY(thread_id,message_id,actor_id,emoji));
-        CREATE TABLE IF NOT EXISTS native_surface_read (thread_id TEXT NOT NULL,reader_id TEXT NOT NULL,position INTEGER NOT NULL,message_index INTEGER NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(thread_id,reader_id));
         CREATE TABLE IF NOT EXISTS native_surface_actions (actor_id TEXT NOT NULL,command_id TEXT NOT NULL,fingerprint TEXT NOT NULL,PRIMARY KEY(actor_id,command_id));`);
       return Result.ok(undefined);
     });
@@ -246,11 +245,12 @@ export class NativeSurfaceStore {
         if (messageId && !message)
           return Result.err(nativeFailure("not-found", "Message is unavailable"));
         if (!message) return Result.ok(undefined);
-        surface.db
+        const changed = surface.db
           .query(
-            "INSERT INTO native_surface_read(thread_id,reader_id,position,message_index,generation) VALUES(?,?,?,?,?) ON CONFLICT(thread_id,reader_id) DO UPDATE SET position=excluded.position,message_index=excluded.message_index,generation=excluded.generation",
+            "INSERT INTO native_surface_read(thread_id,reader_id,position,message_index,generation) VALUES(?,?,?,?,?) ON CONFLICT(thread_id,reader_id) DO UPDATE SET position=excluded.position,message_index=excluded.message_index,generation=excluded.generation WHERE generation != excluded.generation OR (position,message_index) < (excluded.position,excluded.message_index)",
           )
           .run(threadId, readerId, message.position, message.index, thread.historyGeneration);
+        if (changed.changes > 0) surface.store.notifyDisplayChanged(threadId);
         return Result.ok(undefined);
       }),
     );

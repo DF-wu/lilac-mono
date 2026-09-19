@@ -296,3 +296,153 @@ describe("native resources", () => {
     expect(value(await f.access.maintain({ limit: 10 })).deleted).toBe(1);
   });
 });
+
+describe("native identity and text previews", () => {
+  test("owner identity survives persisted reads and avatar is readable outside origin threads", async () => {
+    const f = await fixture();
+    value(
+      f.native.upsertUser({
+        id: "lilac",
+        providerId: "service:lilac",
+        displayName: "Lilac",
+        role: "service",
+        toolMode: "full",
+      }),
+    );
+    expect(f.native.setAgentIdentity("alice", { displayName: "Forged" }).status).toBe("error");
+    value(f.native.setAgentIdentity("owner", { displayName: "Garden" }));
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=",
+      "base64",
+    );
+    const request = () =>
+      new Request("http://native/api/identity/avatar", {
+        method: "PUT",
+        headers: { "content-type": "image/png" },
+        body: png,
+      });
+    expect((await f.service.handle(request(), "alice"))?.status).toBe(403);
+    const uploaded = await f.service.handle(request(), "owner");
+    expect(uploaded?.status).toBe(200);
+    expect(await uploaded?.json()).toMatchObject({
+      id: "lilac",
+      displayName: "Garden",
+      avatarUrl: expect.stringContaining("/api/identity/avatar?revision="),
+    });
+    const read = await f.service.handle(new Request("http://native/api/identity/avatar"), "bob");
+    expect(read?.headers.get("content-type")).toBe("image/png");
+    expect(Buffer.from(await read!.arrayBuffer())).toEqual(png);
+    const avatar = value(f.native.getUser("lilac")).avatar!;
+    const cached = await f.service.handle(
+      new Request(`http://native/api/identity/avatar?revision=${avatar.blob.sha256}`),
+      "bob",
+    );
+    expect(cached?.headers.get("cache-control")).toBe("private, max-age=86400, immutable");
+    const unchanged = await f.service.handle(
+      new Request("http://native/api/identity/avatar", {
+        headers: { "if-none-match": `"${avatar.blob.sha256}"` },
+      }),
+      "bob",
+    );
+    expect(unchanged?.status).toBe(304);
+    expect(
+      (
+        await f.service.handle(
+          new Request("http://native/api/identity/avatar", {
+            headers: { "if-none-match": `"${avatar.blob.sha256}"` },
+          }),
+          "unknown",
+        )
+      )?.status,
+    ).toBe(404);
+    expect(value(f.native.getUser("lilac")).avatar?.blob.byteLength).toBe(png.length);
+    expect(
+      (
+        await f.service.handle(
+          new Request("http://native/api/identity/avatar", { method: "DELETE" }),
+          "bob",
+        )
+      )?.status,
+    ).toBe(403);
+    expect(
+      (
+        await f.service.handle(
+          new Request("http://native/api/identity/avatar", { method: "DELETE" }),
+          "owner",
+        )
+      )?.status,
+    ).toBe(200);
+    expect(
+      (await f.service.handle(new Request("http://native/api/identity/avatar"), "bob"))?.status,
+    ).toBe(404);
+  });
+
+  test("avatar size and bytes are validated instead of trusting the content type", async () => {
+    const f = await fixture();
+    value(
+      f.native.upsertUser({
+        id: "lilac",
+        providerId: "service:lilac",
+        displayName: "Lilac",
+        role: "service",
+        toolMode: "full",
+      }),
+    );
+    for (const body of ["<svg></svg>", new Uint8Array(2_097_153)]) {
+      const response = await f.service.handle(
+        new Request("http://native/api/identity/avatar", {
+          method: "PUT",
+          headers: { "content-type": "image/png" },
+          body,
+        }),
+        "owner",
+      );
+      expect(response?.status).toBe(400);
+    }
+    expect(value(f.native.getUser("lilac")).avatar).toBeUndefined();
+  });
+
+  test("text preview caps bytes, preserves UTF-8 and applies the origin thread ACL", async () => {
+    const f = await fixture();
+    const text = "a".repeat(65_535) + "🙂";
+    const ready = value(
+      await f.service.ingest("alice", f.thread.id, {
+        filename: "long.txt",
+        mediaType: "text/plain",
+        bytes: new TextEncoder().encode(text),
+      }),
+    );
+    f.publish(ready.id);
+    const request = () =>
+      new Request(`http://native/api/resources/${ready.id}/preview?limit=9999999`);
+    const response = await f.service.handle(request(), "bob");
+    expect(response?.status).toBe(200);
+    expect(await response?.json()).toEqual({
+      text: "a".repeat(65_535),
+      truncated: true,
+      byteLength: 65_539,
+    });
+    value(f.native.shareThread("owner", { threadId: f.thread.id, userId: "bob", grant: null }));
+    expect((await f.service.handle(request(), "bob"))?.status).toBe(403);
+  });
+
+  test("binary preview returns a displayable error", async () => {
+    const f = await fixture();
+    const ready = value(
+      await f.service.ingest("alice", f.thread.id, {
+        filename: "data.bin",
+        mediaType: "application/octet-stream",
+        bytes: new Uint8Array([0, 1, 2]),
+      }),
+    );
+    f.publish(ready.id);
+    const response = await f.service.handle(
+      new Request(`http://native/api/resources/${ready.id}/preview`),
+      "bob",
+    );
+    expect(response?.status).toBe(422);
+    expect(await response?.json()).toEqual({
+      error: "Text preview is unavailable for this binary file",
+    });
+  });
+});

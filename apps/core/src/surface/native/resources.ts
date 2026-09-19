@@ -1,3 +1,6 @@
+import { agentIdentity } from "./identity";
+import { readPreviewPrefix, textPreview } from "./resource-preview";
+import { classifyResourcePrefix } from "../../resource/resource-mime";
 import type { PersistedDataError } from "@stanley2058/lilac-utils";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
@@ -34,6 +37,10 @@ type NativeResult<T> = ResultType<T, NativeResourceError>;
 type NativeStateResult<T> = ResultType<T, NativeResourceStateError>;
 
 export interface NativeUploadStore {
+  setAgentIdentity?(
+    actorId: string,
+    input: { displayName?: string; avatar?: NativeUser["avatar"] | null },
+  ): NativeStateResult<NativeUser>;
   getUser(actorId: string): NativeStateResult<NativeUser>;
   getThreadRecord(threadId: string): NativeStateResult<NativeThreadRecord>;
   authorizeThread(
@@ -514,8 +521,142 @@ export class NativeResourceService {
     });
   }
 
+  async handleAvatar(request: Request, actorId: string): Promise<Response> {
+    const service = this;
+    const result = await Result.gen(async function* () {
+      const actor = yield* service.dependencies.native.getUser(actorId);
+      const identity = yield* service.dependencies.native.getUser("lilac");
+      if (request.method === "GET") {
+        if (!identity.avatar)
+          return Result.err(nativeFailure("not-found", "Avatar is unavailable"));
+        const avatar = identity.avatar;
+        const etag = `"${avatar.blob.sha256}"`;
+        const currentRevision =
+          new URL(request.url).searchParams.get("revision") === avatar.blob.sha256;
+        const headers = {
+          "Content-Type": avatar.mediaType,
+          "Cache-Control": currentRevision
+            ? "private, max-age=86400, immutable"
+            : "private, no-cache",
+          ETag: etag,
+          "X-Content-Type-Options": "nosniff",
+          "Content-Security-Policy": "sandbox; default-src 'none'",
+        };
+        if (request.headers.get("if-none-match") === etag)
+          return Result.ok(new Response(null, { status: 304, headers }));
+        const opened = yield* Result.await(
+          service.dependencies.blobs
+            .open(avatar.blob)
+            .then((value) =>
+              value.mapError(() => nativeFailure("not-found", "Avatar is unavailable")),
+            ),
+        );
+        const bytes = yield* Result.await(
+          Result.tryPromise({
+            try: () => new Response(opened.stream).arrayBuffer(),
+            catch: () => nativeFailure("not-found", "Avatar is unavailable"),
+          }),
+        );
+        yield* Result.await(
+          opened.completion.then((value) =>
+            value.mapError(() => nativeFailure("invalid", "Avatar verification failed")),
+          ),
+        );
+        return Result.ok(new Response(bytes, { headers }));
+      }
+      if (actor.role !== "owner")
+        return Result.err(nativeFailure("forbidden", "Only the owner can change agent identity"));
+      const update = service.dependencies.native.setAgentIdentity?.bind(
+        service.dependencies.native,
+      );
+      if (!update) return Result.err(nativeFailure("invalid", "Agent identity is unavailable"));
+      if (request.method === "DELETE") {
+        const changed = yield* update(actorId, { avatar: null });
+        if (identity.avatar)
+          yield* Result.await(
+            service.dependencies.blobs
+              .delete(identity.avatar.blob)
+              .then((value) =>
+                value.mapError(() =>
+                  nativeFailure("sqlite", "Previous avatar could not be removed"),
+                ),
+              ),
+          );
+        return Result.ok(
+          Response.json(agentIdentity(changed), { headers: { "Cache-Control": "no-store" } }),
+        );
+      }
+      if (request.method !== "PUT") return Result.ok(new Response(null, { status: 405 }));
+      const size = Number(request.headers.get("content-length"));
+      if (size > 2_097_152) return Result.err(nativeFailure("invalid", "Avatar exceeds 2 MiB"));
+      if (!request.body) return Result.err(nativeFailure("invalid", "Avatar bytes are required"));
+      const bytes = yield* Result.await(readAvatarBytes(request.body));
+      const classification = yield* Result.await(
+        Result.tryPromise({
+          try: () =>
+            classifyResourcePrefix({
+              prefix: bytes,
+              filename: "avatar",
+              declaredMediaType: request.headers.get("content-type") ?? undefined,
+            }),
+          catch: () => nativeFailure("invalid", "Avatar could not be read"),
+        }),
+      );
+      const mediaType = classification.mediaType;
+      if (
+        mediaType !== "image/png" &&
+        mediaType !== "image/jpeg" &&
+        mediaType !== "image/webp" &&
+        mediaType !== "image/gif"
+      )
+        return Result.err(nativeFailure("invalid", "Choose a PNG, JPEG, WebP or GIF image"));
+      const transfer = yield* Result.await(
+        service.dependencies.blobs
+          .startUpload({ source: bytes, retention: { kind: "durable" } })
+          .then((value) =>
+            value.mapError(() => nativeFailure("invalid", "Avatar upload could not start")),
+          ),
+      );
+      const blob = yield* Result.await(
+        transfer.completion.then((value) =>
+          value.mapError(() => nativeFailure("invalid", "Avatar upload failed")),
+        ),
+      );
+      const persisted = Result.gen(function* () {
+        const previous = yield* service.dependencies.native.getUser("lilac");
+        const changed = yield* update(actorId, { avatar: { blob, mediaType } });
+        return Result.ok({ previous, changed });
+      });
+      const failure = persisted.match({ ok: () => null, err: (error) => error });
+      if (failure) {
+        yield* Result.await(
+          service.dependencies.blobs
+            .delete(blob)
+            .then((value) =>
+              value.mapError(() => nativeFailure("sqlite", "Unused avatar could not be removed")),
+            ),
+        );
+        return Result.err(failure);
+      }
+      const { previous, changed } = yield* persisted;
+      if (previous.avatar)
+        yield* Result.await(
+          service.dependencies.blobs
+            .delete(previous.avatar.blob)
+            .then((value) =>
+              value.mapError(() => nativeFailure("sqlite", "Previous avatar could not be removed")),
+            ),
+        );
+      return Result.ok(
+        Response.json(agentIdentity(changed), { headers: { "Cache-Control": "no-store" } }),
+      );
+    });
+    return result.match({ ok: (response) => response, err: resourceFailureResponse });
+  }
+
   async handle(request: Request, actorId: string): Promise<Response | undefined> {
     const url = new URL(request.url);
+    if (url.pathname === "/api/identity/avatar") return this.handleAvatar(request, actorId);
     const uploadId = /^\/api\/uploads\/([^/]+)$/u.exec(url.pathname)?.[1];
     if (uploadId !== undefined && request.method === "PUT") {
       if (!request.body) return Response.json({ error: "Missing upload bytes" }, { status: 400 });
@@ -525,7 +666,8 @@ export class NativeResourceService {
         err: resourceFailureResponse,
       });
     }
-    const resourceId = /^\/api\/resources\/([^/]+)$/u.exec(url.pathname)?.[1];
+    const resourceMatch = /^\/api\/resources\/([^/]+)(\/preview)?$/u.exec(url.pathname);
+    const resourceId = resourceMatch?.[1];
     if (resourceId === undefined || (request.method !== "GET" && request.method !== "HEAD"))
       return undefined;
     const reference = this.dependencies.native.readUpload(actorId, resourceId);
@@ -543,6 +685,28 @@ export class NativeResourceService {
         ok: () => new Response(null, { status: 404 }),
         err: resourceFailureResponse,
       });
+    if (resourceMatch?.[2]) {
+      const preview = await readPreviewPrefix(read.stream);
+      return preview
+        .andThen((bytes) => textPreview(bytes, read.blob.byteLength))
+        .match({
+          ok: (value) =>
+            Response.json(value, {
+              headers: {
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+              },
+            }),
+          err: (error) =>
+            Response.json(
+              { error: error.message },
+              {
+                status: error.code === "invalid" ? 422 : 404,
+                headers: { "Cache-Control": "no-store" },
+              },
+            ),
+        });
+    }
     const size = read.blob.byteLength;
     const range = parseByteRange(request.headers.get("range"), size);
     if (range === "invalid") {
@@ -678,4 +842,35 @@ export function signalNativeResourceStreamFailure(
   error: NativeStoreFailure,
 ): void {
   controller.error(error);
+}
+
+async function readAvatarBytes(
+  stream: ReadableStream<Uint8Array>,
+): Promise<NativeStateResult<Uint8Array>> {
+  const reader = stream.getReader();
+  const result = await Result.tryPromise({
+    try: async () => {
+      const bytes = new Uint8Array(2_097_153);
+      let size = 0;
+      while (size < bytes.byteLength) {
+        const next = await reader.read();
+        if (next.done) break;
+        const part = next.value.subarray(0, bytes.byteLength - size);
+        bytes.set(part, size);
+        size += part.byteLength;
+      }
+      return bytes.subarray(0, size);
+    },
+    catch: () => nativeFailure("invalid", "Avatar upload failed"),
+  });
+  const cleanup = await Result.tryPromise({
+    try: () => reader.cancel(),
+    catch: () => nativeFailure("invalid", "Avatar upload failed"),
+  });
+  reader.releaseLock();
+  return Result.all([result, cleanup]).andThen(([bytes]) =>
+    bytes.byteLength > 2_097_152
+      ? Result.err(nativeFailure("invalid", "Avatar exceeds 2 MiB"))
+      : Result.ok(bytes),
+  );
 }

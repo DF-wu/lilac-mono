@@ -155,10 +155,12 @@ async function initializeNativeInstallation(
       role: "owner",
       toolMode: "full",
     });
+    const serviceUser = yield* store.findUserByProviderId("service:lilac");
     yield* store.upsertUser({
+      ...serviceUser,
       id: "lilac",
       providerId: "service:lilac",
-      displayName: "Lilac",
+      displayName: serviceUser?.displayName ?? "Lilac",
       role: "service",
       toolMode: "full",
     });

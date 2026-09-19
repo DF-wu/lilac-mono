@@ -21,6 +21,7 @@ import type { SurfaceAdapterResolver } from "../runtime-descriptor";
 import { resolveAgentRunModelResult, type NativeRunnerRequest } from "../bridge/bus-agent-runner";
 import { parseNativeRequestEnvelope } from "../authenticated-request";
 import { NativeSurfaceAdapter, nativeSurfaceError } from "./adapter";
+import { agentIdentity } from "./identity";
 import { NativeCatalogService } from "./catalogs";
 import { NativeConfigService } from "./config-service";
 import { createNativeExecution, type NativeRunnerControl } from "./execution";
@@ -93,6 +94,16 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     config: options.getConfig(),
     skills,
     commands: options.customCommands.list().map((entry) => entry.def),
+  });
+  const refreshAgentIdentity = () => {
+    store
+      .getUser("lilac")
+      .map(agentIdentity)
+      .match({ ok: (identity) => catalogs.setAgent(identity), err: options.reportFatalError });
+  };
+  refreshAgentIdentity();
+  const stopAgentIdentity = store.subscribe((threadId) => {
+    if (!threadId) refreshAgentIdentity();
   });
   const resources = new NativeResourceService({
     native: store,
@@ -415,6 +426,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
 
   async function stopIngress() {
     summaryAbort.abort();
+    stopAgentIdentity();
     unsubscribe?.();
     unsubscribe = undefined;
     await gateway.stop();

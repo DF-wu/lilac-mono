@@ -161,6 +161,11 @@ export function createNativeRouter(
         nativeRpcValue(await services.participants.remove(context.principal, input, signal)),
       ),
     },
+    identity: {
+      update: secured.identity.update.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.identity.update(context.principal, input, signal)),
+      ),
+    },
     users: {
       list: secured.users.list.handler(async ({ input, context, signal }) =>
         nativeRpcValue(await services.users.list(context.principal, input, signal)),

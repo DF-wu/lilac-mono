@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { Result } from "better-result";
 import {
   bootstrapReplySchema,
+  nativeUserSchema,
   threadEventSchema,
   type NativeRpcInputs,
 } from "@stanley2058/lilac-client-protocol";
@@ -591,4 +592,45 @@ describe("native RPC service projection", () => {
     controller.abort();
     expect((await completed).done).toBe(true);
   });
+});
+
+test("user and participant RPC projections never expose stored avatar blobs", async () => {
+  using state = fixture();
+  state.store
+    .upsertUser({
+      id: "lilac",
+      providerId: "service:lilac",
+      displayName: "Garden",
+      role: "service",
+      toolMode: "full",
+      avatar: {
+        mediaType: "image/png",
+        blob: {
+          version: 1,
+          objectId: `b1_${"a".repeat(32)}`,
+          sha256: "b".repeat(64),
+          byteLength: 42,
+        },
+      },
+    })
+    .unwrap();
+  const directory = (await state.services.users.list(principal, { limit: 30 })).unwrap();
+  const participants = (
+    await state.services.participants.list(principal, { threadId: state.thread.id })
+  ).unwrap();
+  for (const user of [...directory.items, ...participants.items.map((entry) => entry.user)]) {
+    expect(nativeUserSchema.safeParse(user).success).toBe(true);
+    expect(user).not.toHaveProperty("avatar");
+    expect(user).not.toHaveProperty("providerId");
+  }
+  expect(
+    (await state.services.identity.update(principal, { displayName: "Lily" })).unwrap(),
+  ).toMatchObject({
+    id: "lilac",
+    displayName: "Lily",
+    avatarUrl: expect.stringContaining("/api/identity/avatar"),
+  });
+  expect((await state.services.identity.update(reader, { displayName: "Changed" })).isErr()).toBe(
+    true,
+  );
 });

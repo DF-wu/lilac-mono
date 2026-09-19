@@ -405,6 +405,7 @@ export async function remoteReadFileBytes(params: {
   filePath: string;
   denyPaths: readonly string[];
   maxBytes: number;
+  prefixBytes?: number;
   timeoutMs?: number;
   signal?: AbortSignal;
 }): Promise<ResultType<RemoteReadBytesResult, RemoteFsExecutionError>> {
@@ -421,7 +422,11 @@ export async function remoteReadFileBytes(params: {
     input: {
       op: "fs.read_bytes",
       denyPaths: [...params.denyPaths],
-      input: { path: params.filePath, maxBytes: params.maxBytes },
+      input: {
+        path: params.filePath,
+        maxBytes: params.maxBytes,
+        ...(params.prefixBytes === undefined ? {} : { prefixBytes: params.prefixBytes }),
+      },
     },
     timeoutMs: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     signal: params.signal,
