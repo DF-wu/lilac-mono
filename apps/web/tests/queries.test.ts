@@ -243,3 +243,29 @@ test("empty drafts stay cached when revisiting a thread", async () => {
   expect(queries.getQueryData(options.queryKey)?.text).toBe("");
   queries.clear();
 });
+
+test("draft handoff replaces sidebar hydration and retains live attachments when reopening", async () => {
+  const queries = cache();
+  const options = composerDraftOptions(
+    { installationId: "fixture", principalId: "owner", protocolVersion: 1, projectionVersion: 1 },
+    "created",
+    {
+      readDraft: async () => ({ text: "", skillIds: [] }),
+      saveDraft: async () => {},
+      listLocalDrafts: async () => [],
+      deleteDraft: async () => {},
+    },
+  );
+  await queries.ensureQueryData(options);
+  const followUp = { text: "Also check this file", skillIds: [], attachments: ["live-upload"] };
+  updateComposerDraft(queries, "created", followUp);
+  const composer = new QueryObserver(queries, options);
+  const stop = composer.subscribe(() => {});
+  expect(composer.getCurrentResult().data).toEqual(followUp);
+  stop();
+  const reopened = new QueryObserver(queries, options);
+  const stopReopened = reopened.subscribe(() => {});
+  expect(reopened.getCurrentResult().data).toEqual(followUp);
+  stopReopened();
+  queries.clear();
+});

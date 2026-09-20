@@ -58,6 +58,7 @@
   --primary-foreground: #211629;
   --danger: #e991a0;
   --success: #8ebeae;
+  --draft: #dfb65a;
   --focus: #cfb8e2;
   --radius-sm: 0.375rem;
   --radius-md: 0.75rem;
@@ -111,6 +112,7 @@
   --primary-foreground: #fff;
   --danger: #b83250;
   --success: #346e5a;
+  --draft: #946900;
   --focus: #754593;
   --shadow-overlay: 0 1rem 4rem #30203826;
 }
@@ -128,6 +130,7 @@
     --primary-foreground: #fff;
     --danger: #b83250;
     --success: #346e5a;
+    --draft: #946900;
     --focus: #754593;
     --shadow-overlay: 0 1rem 4rem #30203826;
   }

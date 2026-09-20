@@ -33,3 +33,9 @@
 
 .thread-pin { display:grid; place-items:center; flex:none; }
 .thread-pin svg { width:var(--icon-size); height:var(--icon-size); }
+
+.thread-card[data-draft] { background: color-mix(in srgb, var(--draft) 7%, transparent); }
+.thread-card[data-draft]:hover, .thread-card[data-draft]:focus-within { background: color-mix(in srgb, var(--draft) 10%, var(--surface-hover)); }
+.thread-card[data-draft].selected { background: color-mix(in srgb, var(--draft) 10%, var(--surface-raised)); }
+.thread-draft-icon { color: var(--draft); flex: none; display: grid; place-items: center; }
+.thread-draft-icon svg { width: var(--icon-size); height: var(--icon-size); }

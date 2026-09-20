@@ -1,5 +1,8 @@
 import { useState } from "react";
 import { useStore } from "zustand";
+import { useQuery } from "@tanstack/react-query";
+import { composerDraftOptions } from "../queries";
+import type { Draft } from "./Chat";
 import {
   Archive,
   ArchiveRestore,
@@ -20,6 +23,15 @@ import {
   ContextMenuTrigger,
 } from "./ui/context-menu";
 import { ThreadCard, ThreadSelect } from "./ThreadSelect";
+
+function hasUnsentDraft(draft: Draft) {
+  return !!(
+    draft.text.trim() ||
+    draft.attachments.length ||
+    draft.skillIds.length ||
+    draft.commandId
+  );
+}
 
 export function SidebarThread({
   id,
@@ -50,7 +62,12 @@ export function SidebarThread({
   onArchive: (id: string, archived: boolean) => void;
   onDelete: (id: string) => void;
 }) {
-  const { drafts } = useWorkspace();
+  const { drafts, scope, draftCache } = useWorkspace();
+  const { data: hasReplyDraft } = useQuery({
+    ...composerDraftOptions(scope, id, draftCache),
+    enabled: !!thread,
+    select: hasUnsentDraft,
+  });
   const draft = useStore(drafts, (state) =>
     thread ? undefined : state.summaries.find((item) => item.id === id),
   );
@@ -89,6 +106,7 @@ export function SidebarThread({
         {thread ? (
           <ThreadSelect
             thread={thread}
+            draft={hasReplyDraft ? "reply" : undefined}
             viewer={viewer}
             modelLabel={modelLabel}
             selected={selected}
@@ -99,7 +117,8 @@ export function SidebarThread({
         ) : (
           <ThreadCard
             title={title}
-            starterName={`${viewer.displayName} · Draft`}
+            starterName={viewer.displayName}
+            draft="new"
             starterAvatarUrl={viewer.avatarUrl}
             state="idle"
             updatedAt={now}

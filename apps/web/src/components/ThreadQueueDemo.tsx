@@ -5,6 +5,10 @@ import { moveInQueues, type ThreadQueues } from "../sidebar-order";
 import { ThreadQueue } from "./ThreadQueue";
 import { ThreadCard } from "./ThreadSelect";
 import { IconButton } from "./ui";
+const draftTitles: Record<string, string> = {
+  "draft:weekend": "Plan a weekend by the river",
+  "draft:notes": "Turn these notes into a proposal",
+};
 const titles = [
   "Plan the next release",
   "Compare the two proposals",
@@ -12,6 +16,9 @@ const titles = [
   "Review the weekend itinerary",
   "Write up the meeting notes",
 ];
+function replyDraft(id: string) {
+  return id === "queue-demo-0" ? "reply" : undefined;
+}
 function initialQueues(): ThreadQueues {
   const entries = titles.map((title, index) => {
     const source: NativeThread = {
@@ -27,7 +34,11 @@ function initialQueues(): ThreadQueues {
     };
     return { id: source.id, source };
   });
-  return { pinned: entries.slice(0, 1), active: entries.slice(1, 4), settled: entries.slice(4) };
+  return {
+    pinned: entries.slice(0, 1),
+    active: [...Object.keys(draftTitles).map((id) => ({ id })), ...entries.slice(1, 4)],
+    settled: entries.slice(4),
+  };
 }
 export function ThreadQueueDemo() {
   const [queues, setQueues] = useState(initialQueues);
@@ -39,7 +50,7 @@ export function ThreadQueueDemo() {
         queues={queues}
         totals={{
           pinned: queues.pinned.length,
-          active: queues.active.length,
+          active: queues.active.filter((entry) => entry.source).length,
           settled: queues.settled.length,
         }}
         onMove={(move) => setQueues((current) => moveInQueues(current, move))}
@@ -47,29 +58,32 @@ export function ThreadQueueDemo() {
         onSettledOpen={setOpen}
         renderThread={(entry, section) => (
           <ThreadCard
-            title={entry.source!.title}
-            starterName={entry.source!.starterDisplayName!}
-            updatedAt={entry.source!.updatedAt}
-            state={entry.source!.displayStatus ?? "idle"}
+            title={entry.source?.title ?? draftTitles[entry.id]!}
+            draft={entry.source ? replyDraft(entry.id) : "new"}
+            starterName={entry.source?.starterDisplayName ?? "Alex Chen"}
+            updatedAt={entry.source?.updatedAt ?? 0}
+            state={entry.source?.displayStatus ?? "idle"}
             selected={selected === entry.id}
             pinned={section === "pinned"}
             onSelect={() => setSelected(entry.id)}
             actions={
               <>
-                <IconButton
-                  label={section === "settled" ? "Unsettle" : "Settle"}
-                  onClick={() =>
-                    setQueues((current) =>
-                      moveInQueues(current, {
-                        threadId: entry.id,
-                        section: section === "settled" ? "active" : "settled",
-                        atStart: true,
-                      }),
-                    )
-                  }
-                >
-                  {section === "settled" ? <Undo2 /> : <CircleCheck />}
-                </IconButton>
+                {entry.source ? (
+                  <IconButton
+                    label={section === "settled" ? "Unsettle" : "Settle"}
+                    onClick={() =>
+                      setQueues((current) =>
+                        moveInQueues(current, {
+                          threadId: entry.id,
+                          section: section === "settled" ? "active" : "settled",
+                          atStart: true,
+                        }),
+                      )
+                    }
+                  >
+                    {section === "settled" ? <Undo2 /> : <CircleCheck />}
+                  </IconButton>
+                ) : null}
                 <IconButton label="Rename" onClick={() => setSelected(entry.id)}>
                   <Pencil />
                 </IconButton>

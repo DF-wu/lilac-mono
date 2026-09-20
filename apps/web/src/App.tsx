@@ -8,7 +8,13 @@ import {
 } from "./components/SubagentPanel";
 import { useLocation, useNavigate, useMatch, useRouter } from "@tanstack/react-router";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import { profileOptions, searchOptions, threadOptions, useNativeOnline } from "./queries";
+import {
+  updateComposerDraft,
+  profileOptions,
+  searchOptions,
+  threadOptions,
+  useNativeOnline,
+} from "./queries";
 import { useStore } from "zustand";
 import { WorkspaceProvider, useWorkspace } from "./workspace-context";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -450,6 +456,7 @@ function Workspace(props: AppProps) {
         attachments: unsent.map((file) => file.key),
       };
       drafts.current.set(created.id, transferredDraft);
+      updateComposerDraft(queries, created.id, transferredDraft);
       if (props.draftCache)
         void attempt(
           () => props.draftCache!.saveDraft(props.scope, created.id, transferredDraft),

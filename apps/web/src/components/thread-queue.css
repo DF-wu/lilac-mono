@@ -17,3 +17,7 @@
 .thread-queue.is-dragging .thread-card-actions { display:none; }
 
 .queue-section-end { height:12px; }
+
+.queue-draft-divider { height: 1px; margin: var(--space-3); background: var(--border); }
+
+.queue-draft { padding-bottom: var(--space-2); }

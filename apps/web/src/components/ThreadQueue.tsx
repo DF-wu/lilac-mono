@@ -34,7 +34,7 @@ import { Button } from "./ui/button";
 import "./thread-queue.css";
 
 type QueueRow =
-  | { id: string; section: SidebarSection; kind: "heading" | "end" }
+  | { id: string; section: SidebarSection; kind: "heading" | "end" | "draft-divider" }
   | { id: string; section: SidebarSection; kind: "thread"; thread: QueueThread };
 const keyboardCoordinates: KeyboardCoordinateGetter = (event, { currentCoordinates, context }) => {
   if (event.code !== "ArrowDown" && event.code !== "ArrowUp") return;
@@ -106,38 +106,52 @@ export function ThreadQueue({
     [queues, drag?.move],
   );
   const dragging = !!drag;
-  const rows = useMemo<QueueRow[]>(
-    () =>
-      sidebarSections.flatMap((section) => [
+  const rows = useMemo<QueueRow[]>(() => {
+    const drafts = visible.active.filter((thread) => !thread.source);
+    return [
+      ...drafts.map((thread) => ({
+        id: thread.id,
+        section: "active" as const,
+        kind: "thread" as const,
+        thread,
+      })),
+      ...(drafts.length
+        ? [{ id: "draft-divider", section: "active" as const, kind: "draft-divider" as const }]
+        : []),
+      ...sidebarSections.flatMap((section) => [
         ...(dragging || section === "settled"
           ? [{ id: `heading:${section}`, section, kind: "heading" as const }]
           : []),
         ...(section !== "settled" || settledOpen
-          ? visible[section].map((thread) => ({
-              id: thread.id,
-              section,
-              kind: "thread" as const,
-              thread,
-            }))
+          ? visible[section]
+              .filter((thread) => !!thread.source)
+              .map((thread) => ({
+                id: thread.id,
+                section,
+                kind: "thread" as const,
+                thread,
+              }))
           : []),
         ...(dragging && (section !== "settled" || settledOpen)
           ? [{ id: `end:${section}`, section, kind: "end" as const }]
           : []),
       ]),
-    [visible, settledOpen, dragging],
-  );
+    ];
+  }, [visible, settledOpen, dragging]);
   const rowsById = useMemo(() => new Map(rows.map((row) => [row.id, row])), [rows]);
   function over(event: DragOverEvent) {
     const current = dragRef.current;
     if (!current || !event.over || event.over.id === current.id) return;
     const target = rowsById.get(String(event.over.id));
-    if (!target) return;
+    if (!target || target.kind === "draft-divider") return;
     let move: ThreadMove = { threadId: current.id, section: target.section };
     if (target.kind === "heading") move = { ...move, atStart: true };
     if (target.kind === "end")
       move = {
         ...move,
-        afterId: visible[target.section].filter((thread) => thread.id !== current.id).at(-1)?.id,
+        afterId: visible[target.section]
+          .filter((thread) => thread.source && thread.id !== current.id)
+          .at(-1)?.id,
       };
     if (target.kind === "thread") {
       if (!target.thread.source) return;
@@ -213,26 +227,32 @@ export function ThreadQueue({
         hasMore={hasMore}
         loading={loading}
         onEndReached={onEndReached}
-        render={(row) =>
-          row.kind === "thread" ? (
-            <QueueItem
-              id={row.id}
-              disabled={disabled || !row.thread.source}
-              title={row.thread.source?.title ?? "Draft"}
-            >
+        render={(row) => {
+          if (row.kind === "draft-divider")
+            return <div className="queue-draft-divider" role="separator" aria-label="Drafts" />;
+          if (row.kind !== "thread")
+            return (
+              <QueueTarget
+                row={row}
+                highlighted={drag?.move?.section === row.section}
+                count={totals[row.section]}
+                open={settledOpen}
+                toggle={() => onSettledOpen(!settledOpen)}
+                dragging={!!drag}
+              />
+            );
+          if (!row.thread.source)
+            return (
+              <div className="queue-draft">
+                <QueueCard thread={row.thread} section={row.section} renderThread={renderThread} />
+              </div>
+            );
+          return (
+            <QueueItem id={row.id} disabled={disabled} title={row.thread.source.title}>
               <QueueCard thread={row.thread} section={row.section} renderThread={renderThread} />
             </QueueItem>
-          ) : (
-            <QueueTarget
-              row={row}
-              highlighted={drag?.move?.section === row.section}
-              count={totals[row.section]}
-              open={settledOpen}
-              toggle={() => onSettledOpen(!settledOpen)}
-              dragging={!!drag}
-            />
-          )
-        }
+          );
+        }}
       />
       {createPortal(
         <DragOverlay dropAnimation={{ duration: dropDuration, easing: "ease" }}>

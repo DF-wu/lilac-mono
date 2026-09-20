@@ -24,6 +24,8 @@ export function composerDraftOptions(
       return { text: "", skillIds: [], ...saved, attachments: [] };
     },
     staleTime: "static",
+    // Live attachment keys must survive sidebar unmounts and thread switches.
+    gcTime: Infinity,
   });
 }
 

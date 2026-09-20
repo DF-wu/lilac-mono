@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { participantOptions, useNativeOnline } from "../queries";
 import { useEffect, useState, type ReactNode } from "react";
 import {
+  SquarePen,
   Clock3,
   Cpu,
   MessageSquare,
@@ -40,6 +41,7 @@ export function ThreadCard({
   state,
   selected,
   pinned,
+  draft,
   actions,
   onSelect,
 }: {
@@ -51,21 +53,31 @@ export function ThreadCard({
   state: ThreadDisplayState;
   selected?: boolean;
   pinned?: boolean;
+  draft?: "new" | "reply";
   actions?: ReactNode;
   onSelect: () => void;
 }) {
   const StatusIcon = states[state].icon;
   return (
-    <div className={`thread-card ${selected ? "selected" : ""}`} data-state={state}>
+    <div
+      className={`thread-card ${selected ? "selected" : ""}`}
+      data-state={state}
+      data-draft={selected ? undefined : draft}
+    >
       <Button
         variant="ghost"
         className="thread-card-select"
         onClick={onSelect}
-        aria-label={`${title || "Untitled"}, ${states[state].label}`}
+        aria-label={`${title || "Untitled"}, ${states[state].label}${draft && !selected ? ", Draft" : ""}`}
       >
         <span className="thread-card-copy">
           <span className="thread-card-top">
             <span className="thread-starter">
+              {draft && !selected ? (
+                <span className="thread-draft-icon" aria-label="Draft">
+                  <SquarePen />
+                </span>
+              ) : null}
               <ActorAvatar displayName={starterName} avatarUrl={starterAvatarUrl} />
               <span>{starterName}</span>
             </span>
@@ -80,7 +92,7 @@ export function ThreadCard({
                   <StatusIcon />
                 </span>
               ) : null}
-              <ThreadTime updatedAt={updatedAt} now={now} />
+              {draft !== "new" ? <ThreadTime updatedAt={updatedAt} now={now} /> : null}
             </span>
           </span>
           <span className="thread-card-title">{title || "Untitled"}</span>
@@ -114,6 +126,7 @@ export function ThreadSelect({
   actions,
   selected,
   pinned,
+  draft,
   participantNames,
 }: {
   participantNames?: string[];
@@ -125,6 +138,7 @@ export function ThreadSelect({
   actions?: ReactNode;
   selected?: boolean;
   pinned?: boolean;
+  draft?: "new" | "reply";
 }) {
   const { client } = useWorkspace();
   const [open, setOpen] = useState(false);
@@ -153,6 +167,7 @@ export function ThreadSelect({
           state={state}
           selected={selected}
           pinned={pinned}
+          draft={draft}
           actions={actions}
           onSelect={onSelect}
         />
@@ -176,6 +191,12 @@ export function ThreadSelect({
             <span>
               <Cpu />
               {modelLabel ?? thread.modelId}
+            </span>
+          ) : null}
+          {draft && !selected ? (
+            <span>
+              <SquarePen />
+              Unsent draft
             </span>
           ) : null}
           <span>
