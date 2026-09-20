@@ -114,6 +114,49 @@ test("streaming answers have no action row until the turn settles", () => {
   expect(renderStage("complete").match(/class="message-controls"/gu)).toHaveLength(2);
 });
 
+test("subagents retain activity identity as results arrive and settle under the parent", () => {
+  const stages = ["subagents-working", "subagents-results", "subagents-complete"];
+  const expectedStates: ("running" | "complete")[][] = [
+    ["running", "running"],
+    ["complete", "running"],
+    ["complete", "complete"],
+  ];
+  let previousIds: string[] = [];
+  for (const [index, id] of stages.entries()) {
+    const slot = agentWorkStages.find((stage) => stage.id === id)!.frames[0]!;
+    const ids = slot.messages.map((message) => message.id);
+    expect(ids.slice(0, previousIds.length)).toEqual(previousIds);
+    previousIds = ids;
+    const activities = slot.messages
+      .filter((message) => ["demo_subagent_weather", "demo_subagent_museum"].includes(message.id))
+      .flatMap((message) => message.parts)
+      .filter((part) => part.type === "data-activity");
+    expect(activities.map((part) => part.id)).toEqual([
+      "demo_subagent_weather",
+      "demo_subagent_museum",
+    ]);
+    expect(activities.map((part) => part.data.state)).toEqual(expectedStates[index]!);
+    for (const part of activities) {
+      expect(part.data.kind).toBe("tool");
+      expect(part.data.detail).toBeUndefined();
+      expect(part.data.label.length).toBeLessThanOrEqual(256);
+    }
+    const html = renderStage(id);
+    expect(html.match(/aria-label="About Lilac"/gu)).toHaveLength(1);
+    expect(html).not.toContain('class="work-participation"');
+    if (slot.state === "complete") {
+      expect(html).toContain("Worked for 1m");
+      expect(html).toContain('data-message-id="demo_final"');
+      expect(html).not.toContain('data-message-id="demo_subagent_weather"');
+      expect(html.match(/class="message-controls"/gu)).toHaveLength(2);
+      continue;
+    }
+    expect(html).toContain(index === 0 ? "subagent (explore;" : "subagent (general;");
+    expect(html).not.toContain('data-message-id="demo_final"');
+    expect(html.match(/class="message-controls"/gu)).toHaveLength(1);
+  }
+});
+
 test("an earlier final answer becomes intermediate when steering continues the turn", () => {
   const original = agentWorkStages.find((stage) => stage.id === "steering-complete")!.frames[0]!;
   const messages = [...original.messages];

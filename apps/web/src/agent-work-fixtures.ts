@@ -225,6 +225,53 @@ const finalSteering = {
   settledAt: demoTime + 240_000,
 };
 
+const delegation = message("demo_delegation", [
+  {
+    type: "text",
+    text: "I'll ask one subagent to check the weather and another to check the museum. Meanwhile, I'll compare travel times.",
+  },
+]);
+// Native projection exposes subagent progress as tool labels, without a child transcript or detail.
+function subagent(id: string, label: string, state: Activity["data"]["state"]) {
+  return message(id, [{ type: "data-activity", id, data: { kind: "tool", label, state } }]);
+}
+const weatherSubagent = subagent(
+  "demo_subagent_weather",
+  "subagent (explore; 1/2 done)\n|- + Check Saturday's forecast\n`- > Check riverside conditions",
+  "running",
+);
+const museumSubagent = subagent(
+  "demo_subagent_museum",
+  "subagent (general; 0/2 done)\n|- > Check opening hours\n`- > Check ticket availability",
+  "running",
+);
+const weatherSubagentDone = subagent(
+  "demo_subagent_weather",
+  "subagent (explore; 2/2 done)\n|- + Check Saturday's forecast\n`- + Check riverside conditions",
+  "complete",
+);
+const museumSubagentDone = subagent(
+  "demo_subagent_museum",
+  "subagent (general; 2/2 done)\n|- + Check opening hours\n`- + Check ticket availability",
+  "complete",
+);
+const subagentUpdate = message("demo_subagent_update", [
+  {
+    type: "text",
+    text: "The weather check is back: mild and dry, with the riverside path open. The museum check is still running.",
+  },
+]);
+const parentRouteDone = message("demo_parent_work", [
+  activity(
+    "demo_parent_route",
+    "tool",
+    "Checked travel times",
+    "complete",
+    "The riverside path starts at Sanjo Station. The museum is a 15-minute bus ride away.",
+    8000,
+  ),
+]);
+
 export const agentWorkStages: AgentWorkStage[] = [
   {
     id: "queued",
@@ -319,6 +366,56 @@ export const agentWorkStages: AgentWorkStage[] = [
     label: "Multiple blocks",
     description: "Reasoning, commentary, tools, a table, and another tool call interleaved.",
     frames: [turn(multiple)],
+  },
+  {
+    id: "subagents-working",
+    label: "Subagents · working",
+    description: "Two subagents work in parallel while the parent checks travel times.",
+    frames: [
+      turn([
+        delegation,
+        weatherSubagent,
+        museumSubagent,
+        message("demo_parent_work", [
+          activity(
+            "demo_parent_route",
+            "tool",
+            "Checking travel times…",
+            "running",
+            "Compare the walk from Sanjo Station with the trip to the museum.",
+          ),
+        ]),
+      ]),
+    ],
+  },
+  {
+    id: "subagents-results",
+    label: "Subagents · partial results",
+    description: "One subagent finishes; the parent shares an update while the other continues.",
+    frames: [
+      turn([delegation, weatherSubagentDone, museumSubagent, parentRouteDone, subagentUpdate]),
+    ],
+  },
+  {
+    id: "subagents-complete",
+    label: "Subagents · complete",
+    description: "Both subagents finish. Expand the work summary to inspect their progress.",
+    frames: [
+      {
+        ...turn(
+          [
+            delegation,
+            weatherSubagentDone,
+            museumSubagentDone,
+            parentRouteDone,
+            subagentUpdate,
+            final,
+          ],
+          "complete",
+        ),
+        settledAt: demoTime + 60_000,
+      },
+    ],
   },
   {
     id: "workflow",
