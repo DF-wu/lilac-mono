@@ -1,3 +1,5 @@
+import { useSubagents, subagentProfileName } from "./subagent-context";
+import type { SubagentSummary } from "@stanley2058/lilac-client-protocol";
 import { copyMessage, messageClipboard } from "../message-clipboard";
 import { MessageArrivals } from "../message-arrivals";
 import { MessageArrivalsContext, LiveMessageContext, useMessageArrival } from "./message-arrivals";
@@ -27,6 +29,7 @@ import {
   RotateCcw,
   Copy,
   CopyCheck,
+  Bot,
   Brain,
   Wrench,
   Workflow,
@@ -986,7 +989,22 @@ const MessageBody = memo(function MessageBody(
 
 type ActivityPart = Extract<DisplayPart, { type: "data-activity" }>;
 
-export function activitySummary(parts: readonly ActivityPart[]): string {
+export function activitySummary(
+  parts: readonly ActivityPart[],
+  agents: ReadonlyMap<string, SubagentSummary> = new Map(),
+): string {
+  const spawned = parts.filter((part) => subagentActivity(part, agents)).length;
+  if (spawned) {
+    const tools = parts.filter(
+      (part) => part.data.kind === "tool" && !subagentActivity(part, agents),
+    ).length;
+    const labels = [];
+    if (tools) labels.push(`Used ${tools} ${tools === 1 ? "tool" : "tools"}`);
+    labels.push(
+      `${tools ? "spawned" : "Spawned"} ${spawned} ${spawned === 1 ? "agent" : "agents"}`,
+    );
+    return labels.join(" and ");
+  }
   const running = parts.find((part) => part.data.state === "running");
   if (running) return running.data.label;
   const only = parts.length === 1 ? parts[0] : undefined;
@@ -1015,6 +1033,8 @@ function ActivityIcon({ part }: { part: ActivityPart }) {
 }
 
 export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdAt?: number }) {
+  const { agents } = useSubagents();
+  const spawned = parts.some((part) => subagentActivity(part, agents));
   const arrivalRef = useMessageArrival(`activity:${parts[0]?.id}`);
   const [open, setOpen] = useState(false);
   const representative =
@@ -1030,12 +1050,14 @@ export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdA
         }
       >
         <Marker render={<span />}>
-          <MarkerIcon>
-            <ActivityIcon part={representative} />
-          </MarkerIcon>
+          <MarkerIcon>{spawned ? <Bot /> : <ActivityIcon part={representative} />}</MarkerIcon>
           <MarkerContent className="activity-label">
-            <span className={representative.data.state === "running" ? "working-text" : undefined}>
-              {activitySummary(parts)}
+            <span
+              className={
+                !spawned && representative.data.state === "running" ? "working-text" : undefined
+              }
+            >
+              {activitySummary(parts, agents)}
             </span>
           </MarkerContent>
           {createdAt !== undefined ? (
@@ -1055,9 +1077,52 @@ export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdA
   );
 }
 
+function subagentActivity(
+  part: ActivityPart,
+  agents: ReadonlyMap<string, SubagentSummary>,
+): (Pick<SubagentSummary, "profile" | "title" | "state"> & { id?: string }) | undefined {
+  const agent = agents.get(part.id);
+  if (agent) return agent;
+  const profile = /^subagent(?:_delegate)? \((explore|general|self)(?:;|\))/.exec(
+    part.data.label,
+  )?.[1];
+  if (profile !== "explore" && profile !== "general" && profile !== "self") return;
+  const current = part.data.label
+    .split("\n")
+    .findLast((line) => line.includes("> "))
+    ?.split("> ")[1];
+  return {
+    profile,
+    title: current ?? (part.data.state === "running" ? "Thinking…" : "Completed"),
+    state: part.data.state,
+    id: undefined,
+  };
+}
+
 export function ActivityItem({ part }: { part: ActivityPart }) {
+  const { agents, open: openAgent } = useSubagents();
+  const agent = subagentActivity(part, agents);
   const arrivalRef = useMessageArrival(`activity-item:${part.id}`);
   const [open, setOpen] = useState(false);
+  if (agent)
+    return (
+      <div ref={arrivalRef}>
+        <Button
+          variant="ghost"
+          className="subagent-activity"
+          onClick={() => openAgent(agent.id ?? part.id)}
+        >
+          <Bot />
+          <span>
+            {subagentProfileName(agent.profile)} -{" "}
+            <span className={agent.state === "running" ? "working-text" : undefined}>
+              {agent.title}
+            </span>
+          </span>
+          <ChevronRight />
+        </Button>
+      </div>
+    );
   const row = (
     <Marker render={<span />}>
       <MarkerIcon>

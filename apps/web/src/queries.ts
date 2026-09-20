@@ -157,3 +157,80 @@ export function profileOptions(client: NativeClient) {
     refetchOnWindowFocus: true,
   });
 }
+
+export function subagentsOptions(client: NativeClient, threadId: string) {
+  const rpc = client.rpc;
+  return infiniteQueryOptions({
+    queryKey: ["subagents", threadId],
+    initialPageParam: undefined as string | undefined,
+    queryFn:
+      rpc && threadId && !threadId.startsWith("draft:")
+        ? ({ signal, pageParam }) => rpc.subagents.list({ threadId, cursor: pageParam }, { signal })
+        : skipToken,
+    getNextPageParam: (page) => page.nextCursor,
+    staleTime: 1000,
+  });
+}
+
+export type SubagentTranscriptPage = Awaited<
+  ReturnType<NonNullable<NativeClient["rpc"]>["subagents"]["read"]>
+>;
+
+export function mergeSubagentTranscript(
+  previous: SubagentTranscriptPage | undefined,
+  page: SubagentTranscriptPage,
+): SubagentTranscriptPage {
+  if (!previous || page.offset < previous.offset) return page;
+  const prefix = previous.messages.slice(0, page.offset - previous.offset);
+  return {
+    ...page,
+    offset: previous.offset,
+    nextBefore: previous.nextBefore,
+    messages: [...prefix, ...page.messages],
+  };
+}
+
+export function subagentTranscriptOptions(
+  client: NativeClient,
+  queries: QueryClient,
+  threadId: string,
+  agentId: string,
+) {
+  const rpc = client.rpc;
+  const queryKey = ["subagent-transcript", threadId, agentId];
+  return queryOptions({
+    queryKey,
+    queryFn:
+      rpc && agentId
+        ? async ({ signal }) => {
+            const previous = queries.getQueryData<SubagentTranscriptPage>(queryKey);
+            const from = previous
+              ? previous.offset + Math.max(0, previous.messages.length - 20)
+              : undefined;
+            const page = await rpc.subagents.read({ threadId, agentId, from }, { signal });
+            return mergeSubagentTranscript(previous, page);
+          }
+        : skipToken,
+    staleTime: 1000,
+  });
+}
+
+export function subagentHistoryOptions(
+  client: NativeClient,
+  threadId: string,
+  agentId: string,
+  before?: number,
+) {
+  const rpc = client.rpc;
+  return infiniteQueryOptions({
+    queryKey: ["subagent-history", threadId, agentId],
+    initialPageParam: before,
+    queryFn:
+      rpc && agentId
+        ? ({ signal, pageParam }) =>
+            rpc.subagents.read({ threadId, agentId, before: pageParam }, { signal })
+        : skipToken,
+    getNextPageParam: (page) => page.nextBefore,
+    staleTime: Infinity,
+  });
+}

@@ -1,3 +1,5 @@
+import { NativeSubagentPanel, NativeSubagentProvider } from "./components/SubagentPanel";
+import { PanelRightOpen, PanelRightClose } from "lucide-react";
 import { useLocation, useNavigate, useMatch, useRouter } from "@tanstack/react-router";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { profileOptions, searchOptions, threadOptions, useNativeOnline } from "./queries";
@@ -86,7 +88,15 @@ function Workspace(props: AppProps) {
   });
   const routePathname = useLocation({ select: (location) => location.pathname });
   const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
-  const { pool, drafts: draftStore } = useWorkspace();
+  const { pool, drafts: draftStore, subagentPanel } = useWorkspace();
+  const rightOpen = useStore(subagentPanel, (state) => state.open);
+  const [rightPixels, setRightPixels] = useState(360);
+  const [rightSliding, setRightSliding] = useState(false);
+  const [lastRightOpen, setLastRightOpen] = useState(rightOpen);
+  if (lastRightOpen !== rightOpen) {
+    setLastRightOpen(rightOpen);
+    setRightSliding(true);
+  }
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
@@ -128,16 +138,19 @@ function Workspace(props: AppProps) {
   const [sidebarSliding, setSidebarSliding] = useState(false);
   const panelGroup = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (!sidebarSliding) return;
+    if (!sidebarSliding && !rightSliding) return;
     let canceled = false;
     const animations = panelGroup.current?.getAnimations() ?? [];
     void Promise.allSettled(animations.map((animation) => animation.finished)).then(() => {
-      if (!canceled) setSidebarSliding(false);
+      if (!canceled) {
+        setSidebarSliding(false);
+        setRightSliding(false);
+      }
     });
     return () => {
       canceled = true;
     };
-  }, [sidebar, sidebarSliding]);
+  }, [sidebar, sidebarSliding, rightOpen, rightSliding]);
   const [searchQuery, setSearchQuery] = useState("");
   const queries = useQueryClient();
   const searchResults = useInfiniteQuery({
@@ -630,395 +643,436 @@ function Workspace(props: AppProps) {
   }, [connection]);
   return (
     <MessageIdentityContext.Provider value={identities}>
-      <Tooltip.Provider delay={350}>
-        <main
-          className={`app-shell ${sidebar ? "" : "sidebar-hidden"}`}
-          style={
-            {
-              "--sidebar-panel-width": `${sidebarPixels}px`,
-              "--sidebar-offset": `${sidebarPixels + 1}px`,
-            } as CSSProperties
-          }
-          aria-label="Chat workspace"
-        >
-          <div className="sidebar-toggle">
-            <IconButton
-              label={sidebar ? "Hide sidebar" : "Show sidebar"}
-              onClick={() => {
-                setSidebarSliding(true);
-                setSidebar((value) => !value);
-              }}
-            >
-              {sidebar ? <PanelLeftClose /> : <PanelLeftOpen />}
-            </IconButton>
-          </div>
-          <ResizablePanelGroup
-            orientation="horizontal"
-            className="workspace-panels"
-            elementRef={panelGroup}
-            data-sidebar-fixed={!sidebar || sidebarSliding}
-            style={{ width: "var(--workspace-width, 100%)" }}
+      <NativeSubagentProvider
+        threadId={selectedId ?? ""}
+        running={selected?.displayStatus === "working"}
+        foreground={active && !external}
+      >
+        <Tooltip.Provider delay={350}>
+          <main
+            className={`app-shell ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
+            style={
+              {
+                "--sidebar-panel-width": `${sidebarPixels}px`,
+                "--sidebar-offset": `${sidebarPixels + 1}px`,
+                "--right-panel-width": `${rightPixels}px`,
+                "--right-panel-offset": `${rightPixels + 1}px`,
+              } as CSSProperties
+            }
+            aria-label="Chat workspace"
           >
-            <ResizablePanel
-              inert={!sidebar}
-              aria-hidden={!sidebar}
-              onResize={(size) => {
-                if (sidebar && !sidebarSliding && size.inPixels > 0)
-                  setSidebarPixels(size.inPixels);
-              }}
-              id="sidebar"
-              groupResizeBehavior="preserve-pixel-size"
-              defaultSize="18rem"
-              minSize="12rem"
-              maxSize="32rem"
-              className="sidebar-panel"
+            <div className="sidebar-toggle">
+              <IconButton
+                label={sidebar ? "Hide sidebar" : "Show sidebar"}
+                onClick={() => {
+                  setSidebarSliding(true);
+                  setSidebar((value) => !value);
+                }}
+              >
+                {sidebar ? <PanelLeftClose /> : <PanelLeftOpen />}
+              </IconButton>
+            </div>
+            <ResizablePanelGroup
+              orientation="horizontal"
+              className="workspace-panels"
+              elementRef={panelGroup}
+              data-sidebar-fixed={!sidebar || sidebarSliding || rightSliding}
+              data-right-fixed={!rightOpen || sidebarSliding || rightSliding}
+              style={{ width: "var(--workspace-width, 100%)" }}
             >
-              <aside className="sidebar">
-                <header className="sidebar-header">
-                  <span className="brand">
-                    lilac
-                    <span />
-                  </span>
-                </header>
-                <div className="sidebar-search-row">
-                  <SidebarSearch
-                    onSearch={(query) => {
-                      const next = query.trim();
-                      if (next && next === searchQuery) void searchResults.refetch();
-                      setSearchQuery(next);
-                    }}
-                    onClear={() => setSearchQuery("")}
-                  />
-                  <nav className="sidebar-tabs" aria-label="Conversation filters and actions">
-                    <IconButton
-                      label={archived ? "Show active conversations" : "Show archived conversations"}
-                      aria-pressed={archived}
-                      onClick={() => {
-                        const value = !archived;
-                        setArchived(value);
-                        setExternal(false);
-                        void listThreads(value);
+              <ResizablePanel
+                inert={!sidebar}
+                aria-hidden={!sidebar}
+                onResize={(size) => {
+                  if (sidebar && !sidebarSliding && !rightSliding && size.inPixels > 0)
+                    setSidebarPixels(size.inPixels);
+                }}
+                id="sidebar"
+                groupResizeBehavior="preserve-pixel-size"
+                defaultSize="18rem"
+                minSize="12rem"
+                maxSize="32rem"
+                className="sidebar-panel"
+              >
+                <aside className="sidebar">
+                  <header className="sidebar-header">
+                    <span className="brand">
+                      lilac
+                      <span />
+                    </span>
+                  </header>
+                  <div className="sidebar-search-row">
+                    <SidebarSearch
+                      onSearch={(query) => {
+                        const next = query.trim();
+                        if (next && next === searchQuery) void searchResults.refetch();
+                        setSearchQuery(next);
                       }}
-                    >
-                      <Archive />
-                    </IconButton>
-                    {owner ? (
+                      onClear={() => setSearchQuery("")}
+                    />
+                    <nav className="sidebar-tabs" aria-label="Conversation filters and actions">
                       <IconButton
-                        label="Read other surfaces"
-                        aria-pressed={external}
+                        label={
+                          archived ? "Show active conversations" : "Show archived conversations"
+                        }
+                        aria-pressed={archived}
                         onClick={() => {
-                          setExternalId(undefined);
-                          setExternal((value) => !value);
+                          const value = !archived;
+                          setArchived(value);
+                          setExternal(false);
+                          void listThreads(value);
                         }}
                       >
-                        <Globe />
+                        <Archive />
                       </IconButton>
-                    ) : null}
-                    <IconButton label="New conversation" onClick={() => void createThread()}>
-                      <Plus />
-                    </IconButton>
-                  </nav>
-                </div>
-                {results ? (
-                  <>
-                    <VirtualList
-                      items={results.items}
-                      itemKey={(hit) => `${hit.threadId}:${hit.turnId ?? hit.excerpt}`}
-                      label="Search results"
-                      className="thread-list"
-                      estimate={92}
-                      render={(hit) => (
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          className="search-result h-auto flex-col items-start whitespace-normal"
+                      {owner ? (
+                        <IconButton
+                          label="Read other surfaces"
+                          aria-pressed={external}
                           onClick={() => {
-                            if (hit.surface === "native") select(hit.threadId);
-                            else {
-                              setExternalId(hit.threadId);
-                              setExternal(true);
-                            }
+                            setExternalId(undefined);
+                            setExternal((value) => !value);
                           }}
                         >
-                          <strong>{hit.title}</strong>
-                          <span>{hit.excerpt}</span>
-                        </Button>
-                      )}
-                    />
-                    {results.items.length === 0 && !searching ? (
-                      <p className="muted empty-list">No results</p>
-                    ) : null}
-                    {results.nextCursor ? (
-                      <Button
-                        variant="ghost"
-                        className="text-button"
-                        disabled={searching}
-                        onClick={() => {
-                          if (!searching)
-                            void searchResults.fetchNextPage({ cancelRefetch: false });
-                        }}
-                      >
-                        More results
-                      </Button>
-                    ) : null}
-                  </>
-                ) : (
-                  <>
-                    {!archived ? (
-                      <SidebarQueue
-                        fallbackThreads={threads}
-                        draftIds={draftIds}
-                        viewer={viewer}
-                        selectedId={external ? undefined : selectedId}
-                        models={catalog?.models}
-                        onThread={upsert}
-                        onSelect={select}
-                        onRename={(id, title) => setRename({ id, title })}
-                        onArchive={(id, archived) => void update(id, { archived })}
-                        onDelete={setConfirmDelete}
-                      />
-                    ) : (
+                          <Globe />
+                        </IconButton>
+                      ) : null}
+                      <IconButton label="New conversation" onClick={() => void createThread()}>
+                        <Plus />
+                      </IconButton>
+                    </nav>
+                  </div>
+                  {results ? (
+                    <>
                       <VirtualList
-                        items={sidebarThreads}
-                        itemKey={(thread) => thread.id}
-                        label="Conversations"
-                        scrollFade
-                        hasMore={!!nextCursor && !threadListError}
-                        loading={loadingThreads}
-                        onEndReached={() => {
-                          if (nextCursor) void listThreads(archived, nextCursor);
-                        }}
+                        items={results.items}
+                        itemKey={(hit) => `${hit.threadId}:${hit.turnId ?? hit.excerpt}`}
+                        label="Search results"
                         className="thread-list"
-                        estimate={64}
-                        render={(thread) => (
-                          <SidebarThread
-                            id={thread.id}
-                            thread={thread.source}
-                            viewer={viewer}
-                            modelLabel={
-                              catalog?.models.find((model) => model.id === thread.source?.modelId)
-                                ?.label
-                            }
-                            selected={selectedId === thread.id && !external}
-                            onSelect={select}
-                            onRename={(id, title) => setRename({ id, title })}
-                            onArchive={(id, archived) => void update(id, { archived })}
-                            onDelete={setConfirmDelete}
-                          />
+                        estimate={92}
+                        render={(hit) => (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            className="search-result h-auto flex-col items-start whitespace-normal"
+                            onClick={() => {
+                              if (hit.surface === "native") select(hit.threadId);
+                              else {
+                                setExternalId(hit.threadId);
+                                setExternal(true);
+                              }
+                            }}
+                          >
+                            <strong>{hit.title}</strong>
+                            <span>{hit.excerpt}</span>
+                          </Button>
                         )}
                       />
-                    )}
-                    {threadListError ? (
-                      <Button
-                        variant="ghost"
-                        onClick={() => void listThreads(archived, nextCursor)}
-                      >
-                        Retry loading conversations
-                      </Button>
-                    ) : null}
-                  </>
-                )}
-                <footer className="sidebar-footer">
-                  {props.userControl ?? <span className="viewer-name">{viewer.displayName}</span>}
-                  <span className="toolbar-spacer" />
-                  <IconButton
-                    label="Design system"
-                    onClick={() =>
-                      void navigate({
-                        to: "/design-system",
-                        state: selectedId.startsWith("draft:")
-                          ? { draftThreadId: selectedId }
-                          : { chatThreadId: selectedId },
-                      })
-                    }
-                  >
-                    <Palette />
-                  </IconButton>
-                  <IconButton label="Settings" onClick={() => setSettings(true)}>
-                    <SettingsIcon />
-                  </IconButton>
-                  <IconButton
-                    label="Sign out"
-                    onClick={() => void attempt(props.onLogout, setError)}
-                  >
-                    <LogOut />
-                  </IconButton>
-                </footer>
-              </aside>
-            </ResizablePanel>
-            <ResizableHandle
-              disabled={!sidebar || sidebarSliding}
-              aria-label="Sidebar width"
-              className="sidebar-resize-handle"
-            />
-            <ResizablePanel id="chat" minSize="40%" className="chat-panel">
-              <div className="main-panel">
-                {external && owner ? (
-                  <Suspense fallback={<p role="status">Loading conversations…</p>}>
-                    <External key={externalId ?? "list"} initialThreadId={externalId} />
-                  </Suspense>
-                ) : null}
-                {!external && selectedId
-                  ? (() => {
-                      const thread = selected ?? selectedMetadata.data;
-                      return (
-                        <Chat
-                          threadId={selectedId}
-                          thread={thread}
-                          foreground={active}
-                          catalog={catalog}
-                          onError={setError}
-                          readTurns={readTurns.current}
-                          draft={drafts.current.get(selectedId)}
-                          onDraft={(id, value) => drafts.current.set(id, value)}
-                          pending={pendingInputs.get(selectedId) ?? []}
-                          onPending={patchPending}
-                          onLocalChange={changeLocalDraft}
-                          onLocalSubmit={(id, submission) => void submitDraft(id, submission)}
-                          onRetryLoad={() => {
-                            void selectedMetadata.refetch();
-                            void client.selectThread(selectedId);
+                      {results.items.length === 0 && !searching ? (
+                        <p className="muted empty-list">No results</p>
+                      ) : null}
+                      {results.nextCursor ? (
+                        <Button
+                          variant="ghost"
+                          className="text-button"
+                          disabled={searching}
+                          onClick={() => {
+                            if (!searching)
+                              void searchResults.fetchNextPage({ cancelRefetch: false });
                           }}
-                          loadingMessage={
-                            selectedMetadata.error?.message ??
-                            (!online && !thread
-                              ? "This conversation is unavailable while offline."
-                              : undefined)
-                          }
-                          header={
-                            thread ? (
-                              <header className="thread-header">
-                                <h1>{thread.title || "Untitled"}</h1>
-                                {thread.archived ? <span className="badge">Archived</span> : null}
-                                <span className="toolbar-spacer" />
-                                {owner ? (
-                                  <IconButton
-                                    label="Share conversation"
-                                    tooltip="Share"
-                                    onClick={() => setSharing(true)}
-                                  >
-                                    <Users />
-                                  </IconButton>
-                                ) : null}
-                                {thread.capabilities.edit ? (
-                                  <DropdownMenu>
-                                    <DropdownMenuTrigger
-                                      render={
-                                        <IconButton label="Conversation actions" tooltip="Options">
-                                          <MoreHorizontal />
-                                        </IconButton>
-                                      }
-                                    />
-                                    <DropdownMenuContent align="end">
-                                      <DropdownMenuItem
-                                        onClick={() =>
-                                          setRename({ id: thread.id, title: thread.title })
-                                        }
-                                      >
-                                        <Pencil />
-                                        Rename
-                                      </DropdownMenuItem>
-                                      <DropdownMenuItem
-                                        onClick={() =>
-                                          void update(thread.id, { archived: !thread.archived })
-                                        }
-                                      >
-                                        {thread.archived ? <ArchiveRestore /> : <Archive />}
-                                        {thread.archived ? "Unarchive" : "Archive"}
-                                      </DropdownMenuItem>
-                                      <DropdownMenuItem
-                                        variant="destructive"
-                                        onClick={() => setConfirmDelete(thread.id)}
-                                      >
-                                        <Trash2 />
-                                        Delete
-                                      </DropdownMenuItem>
-                                    </DropdownMenuContent>
-                                  </DropdownMenu>
-                                ) : null}
-                              </header>
-                            ) : undefined
-                          }
+                        >
+                          More results
+                        </Button>
+                      ) : null}
+                    </>
+                  ) : (
+                    <>
+                      {!archived ? (
+                        <SidebarQueue
+                          fallbackThreads={threads}
+                          draftIds={draftIds}
+                          viewer={viewer}
+                          selectedId={external ? undefined : selectedId}
+                          models={catalog?.models}
+                          onThread={upsert}
+                          onSelect={select}
+                          onRename={(id, title) => setRename({ id, title })}
+                          onArchive={(id, archived) => void update(id, { archived })}
+                          onDelete={setConfirmDelete}
                         />
-                      );
-                    })()
-                  : null}
-                {!external && !selectedId ? (
-                  <div className="welcome">
-                    <Button onClick={createThread}>
-                      <Plus />
-                      New conversation
-                    </Button>
-                  </div>
-                ) : null}
-              </div>
-            </ResizablePanel>
-          </ResizablePanelGroup>
-          {settings ? (
-            <Settings
-              viewer={viewer}
-              onLogout={props.onLogout}
-              onClose={() => setSettings(false)}
-              agent={identities.agent}
-              theme={theme}
-              onTheme={setTheme}
-            />
-          ) : null}
-          {sharing && owner && selected ? (
-            <Modal title="Share conversation" onClose={() => setSharing(false)}>
-              <Suspense fallback={<p role="status">Loading people…</p>}>
-                <Sharing key={selected.id} thread={selected} />
-              </Suspense>
-            </Modal>
-          ) : null}
-          <Modal open={!!rename} title="Rename conversation" onClose={() => setRename(undefined)}>
-            <form
-              onSubmit={(event) => {
-                event.preventDefault();
-                if (rename) void update(rename.id, { title: rename.title });
-              }}
-            >
-              <Input
-                className="wide-input"
-                autoFocus
-                aria-label="Conversation name"
-                value={rename?.title ?? ""}
-                onChange={(event) => {
-                  if (rename) setRename({ ...rename, title: event.target.value });
-                }}
-                maxLength={512}
+                      ) : (
+                        <VirtualList
+                          items={sidebarThreads}
+                          itemKey={(thread) => thread.id}
+                          label="Conversations"
+                          scrollFade
+                          hasMore={!!nextCursor && !threadListError}
+                          loading={loadingThreads}
+                          onEndReached={() => {
+                            if (nextCursor) void listThreads(archived, nextCursor);
+                          }}
+                          className="thread-list"
+                          estimate={64}
+                          render={(thread) => (
+                            <SidebarThread
+                              id={thread.id}
+                              thread={thread.source}
+                              viewer={viewer}
+                              modelLabel={
+                                catalog?.models.find((model) => model.id === thread.source?.modelId)
+                                  ?.label
+                              }
+                              selected={selectedId === thread.id && !external}
+                              onSelect={select}
+                              onRename={(id, title) => setRename({ id, title })}
+                              onArchive={(id, archived) => void update(id, { archived })}
+                              onDelete={setConfirmDelete}
+                            />
+                          )}
+                        />
+                      )}
+                      {threadListError ? (
+                        <Button
+                          variant="ghost"
+                          onClick={() => void listThreads(archived, nextCursor)}
+                        >
+                          Retry loading conversations
+                        </Button>
+                      ) : null}
+                    </>
+                  )}
+                  <footer className="sidebar-footer">
+                    {props.userControl ?? <span className="viewer-name">{viewer.displayName}</span>}
+                    <span className="toolbar-spacer" />
+                    <IconButton
+                      label="Design system"
+                      onClick={() =>
+                        void navigate({
+                          to: "/design-system",
+                          state: selectedId.startsWith("draft:")
+                            ? { draftThreadId: selectedId }
+                            : { chatThreadId: selectedId },
+                        })
+                      }
+                    >
+                      <Palette />
+                    </IconButton>
+                    <IconButton label="Settings" onClick={() => setSettings(true)}>
+                      <SettingsIcon />
+                    </IconButton>
+                    <IconButton
+                      label="Sign out"
+                      onClick={() => void attempt(props.onLogout, setError)}
+                    >
+                      <LogOut />
+                    </IconButton>
+                  </footer>
+                </aside>
+              </ResizablePanel>
+              <ResizableHandle
+                disabled={!sidebar || sidebarSliding || rightSliding}
+                aria-label="Sidebar width"
+                className="sidebar-resize-handle"
               />
+              <ResizablePanel id="chat" minSize="10%" className="chat-panel">
+                <div className="main-panel">
+                  {external && owner ? (
+                    <Suspense fallback={<p role="status">Loading conversations…</p>}>
+                      <External key={externalId ?? "list"} initialThreadId={externalId} />
+                    </Suspense>
+                  ) : null}
+                  {!external && selectedId
+                    ? (() => {
+                        const thread = selected ?? selectedMetadata.data;
+                        return (
+                          <Chat
+                            threadId={selectedId}
+                            thread={thread}
+                            foreground={active}
+                            catalog={catalog}
+                            onError={setError}
+                            readTurns={readTurns.current}
+                            draft={drafts.current.get(selectedId)}
+                            onDraft={(id, value) => drafts.current.set(id, value)}
+                            pending={pendingInputs.get(selectedId) ?? []}
+                            onPending={patchPending}
+                            onLocalChange={changeLocalDraft}
+                            onLocalSubmit={(id, submission) => void submitDraft(id, submission)}
+                            onRetryLoad={() => {
+                              void selectedMetadata.refetch();
+                              void client.selectThread(selectedId);
+                            }}
+                            loadingMessage={
+                              selectedMetadata.error?.message ??
+                              (!online && !thread
+                                ? "This conversation is unavailable while offline."
+                                : undefined)
+                            }
+                            header={
+                              thread ? (
+                                <header className="thread-header">
+                                  <h1>{thread.title || "Untitled"}</h1>
+                                  {thread.archived ? <span className="badge">Archived</span> : null}
+                                  <span className="toolbar-spacer" />
+                                  {owner ? (
+                                    <IconButton
+                                      label="Share conversation"
+                                      tooltip="Share"
+                                      onClick={() => setSharing(true)}
+                                    >
+                                      <Users />
+                                    </IconButton>
+                                  ) : null}
+                                  {thread.capabilities.edit ? (
+                                    <DropdownMenu>
+                                      <DropdownMenuTrigger
+                                        render={
+                                          <IconButton
+                                            label="Conversation actions"
+                                            tooltip="Options"
+                                          >
+                                            <MoreHorizontal />
+                                          </IconButton>
+                                        }
+                                      />
+                                      <DropdownMenuContent align="end">
+                                        <DropdownMenuItem
+                                          onClick={() =>
+                                            setRename({ id: thread.id, title: thread.title })
+                                          }
+                                        >
+                                          <Pencil />
+                                          Rename
+                                        </DropdownMenuItem>
+                                        <DropdownMenuItem
+                                          onClick={() =>
+                                            void update(thread.id, { archived: !thread.archived })
+                                          }
+                                        >
+                                          {thread.archived ? <ArchiveRestore /> : <Archive />}
+                                          {thread.archived ? "Unarchive" : "Archive"}
+                                        </DropdownMenuItem>
+                                        <DropdownMenuItem
+                                          variant="destructive"
+                                          onClick={() => setConfirmDelete(thread.id)}
+                                        >
+                                          <Trash2 />
+                                          Delete
+                                        </DropdownMenuItem>
+                                      </DropdownMenuContent>
+                                    </DropdownMenu>
+                                  ) : null}
+                                  <IconButton
+                                    label={rightOpen ? "Hide right panel" : "Show right panel"}
+                                    onClick={subagentPanel.getState().toggle}
+                                  >
+                                    {rightOpen ? <PanelRightClose /> : <PanelRightOpen />}
+                                  </IconButton>
+                                </header>
+                              ) : undefined
+                            }
+                          />
+                        );
+                      })()
+                    : null}
+                  {!external && !selectedId ? (
+                    <div className="welcome">
+                      <Button onClick={createThread}>
+                        <Plus />
+                        New conversation
+                      </Button>
+                    </div>
+                  ) : null}
+                </div>
+              </ResizablePanel>
+              <ResizableHandle
+                disabled={!rightOpen || sidebarSliding || rightSliding}
+                aria-label="Right panel width"
+                className="right-panel-resize-handle"
+              />
+              <ResizablePanel
+                id="right-panel"
+                className="right-panel"
+                inert={!rightOpen}
+                aria-hidden={!rightOpen}
+                defaultSize="360px"
+                minSize="240px"
+                maxSize="45%"
+                groupResizeBehavior="preserve-pixel-size"
+                onResize={(size) => {
+                  if (rightOpen && !rightSliding && !sidebarSliding && size.inPixels > 0)
+                    setRightPixels(size.inPixels);
+                }}
+              >
+                <NativeSubagentPanel threadId={selectedId ?? ""} foreground={active && !external} />
+              </ResizablePanel>
+            </ResizablePanelGroup>
+            {settings ? (
+              <Settings
+                viewer={viewer}
+                onLogout={props.onLogout}
+                onClose={() => setSettings(false)}
+                agent={identities.agent}
+                theme={theme}
+                onTheme={setTheme}
+              />
+            ) : null}
+            {sharing && owner && selected ? (
+              <Modal title="Share conversation" onClose={() => setSharing(false)}>
+                <Suspense fallback={<p role="status">Loading people…</p>}>
+                  <Sharing key={selected.id} thread={selected} />
+                </Suspense>
+              </Modal>
+            ) : null}
+            <Modal open={!!rename} title="Rename conversation" onClose={() => setRename(undefined)}>
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (rename) void update(rename.id, { title: rename.title });
+                }}
+              >
+                <Input
+                  className="wide-input"
+                  autoFocus
+                  aria-label="Conversation name"
+                  value={rename?.title ?? ""}
+                  onChange={(event) => {
+                    if (rename) setRename({ ...rename, title: event.target.value });
+                  }}
+                  maxLength={512}
+                />
+                <div className="dialog-actions">
+                  <Button className="button primary" type="submit">
+                    Rename
+                  </Button>
+                </div>
+              </form>
+            </Modal>
+            <Modal
+              open={!!confirmDelete}
+              title="Delete conversation?"
+              onClose={() => setConfirmDelete(undefined)}
+            >
+              <p>
+                This removes the conversation and makes its files unavailable. Any active run will
+                be canceled.
+              </p>
               <div className="dialog-actions">
-                <Button className="button primary" type="submit">
-                  Rename
+                <Button className="button" onClick={() => setConfirmDelete(undefined)}>
+                  Keep conversation
+                </Button>
+                <Button
+                  variant="destructive"
+                  className="button danger"
+                  onClick={() => void deleteThread()}
+                >
+                  Delete
                 </Button>
               </div>
-            </form>
-          </Modal>
-          <Modal
-            open={!!confirmDelete}
-            title="Delete conversation?"
-            onClose={() => setConfirmDelete(undefined)}
-          >
-            <p>
-              This removes the conversation and makes its files unavailable. Any active run will be
-              canceled.
-            </p>
-            <div className="dialog-actions">
-              <Button className="button" onClick={() => setConfirmDelete(undefined)}>
-                Keep conversation
-              </Button>
-              <Button
-                variant="destructive"
-                className="button danger"
-                onClick={() => void deleteThread()}
-              >
-                Delete
-              </Button>
-            </div>
-          </Modal>
-        </main>
-      </Tooltip.Provider>
+            </Modal>
+          </main>
+        </Tooltip.Provider>
+      </NativeSubagentProvider>
     </MessageIdentityContext.Provider>
   );
 }

@@ -1567,3 +1567,31 @@ progress {
     animation: none;
   }
 }
+
+@media (min-width: 761px) {
+  .workspace-panels {
+    --hidden-left: 0px;
+    --hidden-right: 0px;
+    --workspace-width: calc(100% + var(--hidden-left) + var(--hidden-right));
+  }
+  .sidebar-hidden .workspace-panels {
+    --hidden-left: var(--sidebar-offset);
+    --workspace-width: calc(100% + var(--hidden-left) + var(--hidden-right));
+  }
+  .right-panel-hidden .workspace-panels { --hidden-right: var(--right-panel-offset); }
+  .workspace-panels[data-right-fixed="true"] > .right-panel[data-panel] {
+    flex: 0 0 var(--right-panel-width) !important;
+  }
+}
+@media (max-width: 760px) {
+  .right-panel {
+    position: absolute !important;
+    inset: 0 0 0 auto;
+    width: min(90vw, var(--right-panel-width)) !important;
+    z-index: 35;
+    transition: transform var(--motion-duration) ease;
+    box-shadow: var(--shadow-overlay);
+  }
+  .right-panel-hidden .right-panel { transform: translateX(100%); }
+  .right-panel-resize-handle { display: none; }
+}

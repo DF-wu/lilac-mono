@@ -151,7 +151,7 @@ test("subagents retain activity identity as results arrive and settle under the 
       expect(html.match(/class="message-controls"/gu)).toHaveLength(2);
       continue;
     }
-    expect(html).toContain(index === 0 ? "subagent (explore;" : "subagent (general;");
+    expect(html).toContain("Used 1 tool and spawned 2 agents");
     expect(html).not.toContain('data-message-id="demo_final"');
     expect(html.match(/class="message-controls"/gu)).toHaveLength(1);
   }

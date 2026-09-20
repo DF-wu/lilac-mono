@@ -2,6 +2,7 @@ import type {
   DisplayMessage,
   DisplayPart,
   ReadyTurnSlot,
+  SubagentSummary,
 } from "@stanley2058/lilac-client-protocol";
 
 type Activity = Extract<DisplayPart, { type: "data-activity" }>;
@@ -606,3 +607,86 @@ export const agentWorkStages: AgentWorkStage[] = [
     frames: [turn([work, commentary], "canceled")],
   },
 ];
+
+export function demoSubagents(slot: ReadyTurnSlot): SubagentSummary[] {
+  return slot.messages.flatMap((message) =>
+    message.parts.flatMap((part) => {
+      if (part.type !== "data-activity") return [];
+      const profiles = {
+        demo_subagent_weather: "explore",
+        demo_subagent_museum: "general",
+      } as const;
+      const profile = profiles[part.id as keyof typeof profiles];
+      if (!profile) return [];
+      const titles = {
+        explore: "Checking riverside conditions…",
+        general: "Checking opening hours…",
+      };
+      return [
+        {
+          id: part.id,
+          activityId: part.id,
+          turnId: slot.turnId,
+          profile,
+          name: profile === "explore" ? "Weather and riverside" : "Museum visit",
+          state: part.data.state,
+          title: part.data.state === "running" ? titles[profile] : "Completed",
+          startedAt: demoTime + 3000,
+        },
+      ];
+    }),
+  );
+}
+
+export function demoSubagentTranscript(agent: SubagentSummary): DisplayMessage[] {
+  const weather = agent.profile === "explore";
+  const transcript: DisplayMessage[] = [
+    {
+      id: "child_prompt",
+      role: "user",
+      parts: [
+        {
+          type: "text",
+          text: weather
+            ? "Check Saturday's weather and the riverside walking conditions."
+            : "Check the museum's opening hours and ticket availability.",
+        },
+      ],
+    },
+    message("child_commentary", [
+      {
+        type: "text",
+        text: weather
+          ? "I'll check the forecast, then look for path closures."
+          : "I'll check the museum's own schedule and booking page.",
+      },
+    ]),
+    message("child_work", [
+      activity(
+        "child_tool",
+        "tool",
+        agent.title,
+        agent.state === "running" ? "running" : "complete",
+        weather
+          ? "Forecast: 18°C with light cloud. No path closures reported."
+          : "Saturday hours: 10:00–18:00. Tickets available at the door.",
+      ),
+    ]),
+  ];
+  if (agent.state === "complete")
+    transcript.push(
+      message(
+        "child_final",
+        [
+          {
+            type: "text",
+            text: weather
+              ? "Mild and dry on Saturday. The riverside path is open; bring a light jacket."
+              : "The museum is open 10:00–18:00, with last admission at 17:30. No advance booking is needed.",
+          },
+        ],
+        "final",
+      ),
+    );
+  return transcript;
+}

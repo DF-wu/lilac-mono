@@ -1,3 +1,11 @@
+import { useMemo } from "react";
+import { useStore } from "zustand";
+import { PanelRightOpen } from "lucide-react";
+import { demoSubagents, demoSubagentTranscript } from "../agent-work-fixtures";
+import { createSubagentPanelStore } from "../subagent-panel-store";
+import { SubagentContext } from "./subagent-context";
+import { SubagentPanelView } from "./SubagentPanel";
+import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "./ui/resizable";
 import { MessageArrivals } from "../message-arrivals";
 import { MessageArrivalsContext } from "./message-arrivals";
 import { useEffect, useRef, useState } from "react";
@@ -21,11 +29,42 @@ const identities = {
 };
 
 export function AgentWorkDemo() {
+  const [panel] = useState(createSubagentPanelStore);
+  const panelOpen = useStore(panel, (state) => state.open);
+  const panelSelection = useStore(panel, (state) => state.selection);
+  const [panelWidth, setPanelWidth] = useState(360);
+  const [panelSliding, setPanelSliding] = useState(false);
+  const [previousOpen, setPreviousOpen] = useState(panelOpen);
+  const panelGroup = useRef<HTMLDivElement>(null);
+  if (previousOpen !== panelOpen) {
+    setPreviousOpen(panelOpen);
+    setPanelSliding(true);
+  }
+  useEffect(() => {
+    if (!panelSliding) return;
+    let canceled = false;
+    const animations = panelGroup.current?.getAnimations() ?? [];
+    void Promise.allSettled(animations.map((animation) => animation.finished)).then(() => {
+      if (!canceled) setPanelSliding(false);
+    });
+    return () => {
+      canceled = true;
+    };
+  }, [panelOpen, panelSliding]);
   const [playhead, setPlayhead] = useState({ stage: 1, frame: 0, playing: false });
   const [feedback, setFeedback] = useState("");
   const container = useRef<HTMLDivElement>(null);
   const stage = agentWorkStages[playhead.stage]!;
   const slot = stage.frames[playhead.frame]!;
+  const agents = useMemo(() => demoSubagents(slot), [slot]);
+  const selectedAgent = agents.find((agent) => agent.id === panelSelection?.agentId);
+  const agentContext = useMemo(
+    () => ({
+      agents: new Map(agents.map((agent) => [agent.activityId, agent])),
+      open: (id: string) => panel.getState().select("demo", id),
+    }),
+    [agents, panel],
+  );
   useEffect(() => {
     if (!playhead.playing) return;
     const timer = window.setTimeout(
@@ -123,6 +162,9 @@ export function AgentWorkDemo() {
           >
             <ChevronRight />
           </IconButton>
+          <IconButton label="Toggle agents panel" onClick={panel.getState().toggle}>
+            <PanelRightOpen />
+          </IconButton>
           <IconButton label="Restart demo" onClick={() => select(0)}>
             <RotateCcw />
           </IconButton>
@@ -134,19 +176,67 @@ export function AgentWorkDemo() {
         </span>
         <p className="ds-muted">{stage.description}</p>
       </div>
-      <div className="ds-agent-preview" aria-label="Agent work preview" tabIndex={0}>
-        <MessageIdentityContext value={identities}>
-          <MessageServicesContext value={services}>
-            <DemoTurn
-              key={stage.id}
-              slot={slot}
-              onRewind={() =>
-                setFeedback("Rewind selected. This demo does not change any conversation.")
-              }
+      <SubagentContext value={agentContext}>
+        <div
+          className={`ds-agent-workspace ${panelOpen ? "" : "right-panel-hidden"}`}
+          style={
+            {
+              "--right-panel-width": `${panelWidth}px`,
+              "--right-panel-offset": `${panelWidth + 1}px`,
+            } as React.CSSProperties
+          }
+        >
+          <ResizablePanelGroup
+            orientation="horizontal"
+            className="workspace-panels"
+            elementRef={panelGroup}
+            data-right-fixed={!panelOpen || panelSliding}
+            style={{ width: "var(--workspace-width, 100%)" }}
+          >
+            <ResizablePanel minSize="10%">
+              <div className="ds-agent-preview" aria-label="Agent work preview" tabIndex={0}>
+                <MessageIdentityContext value={identities}>
+                  <MessageServicesContext value={services}>
+                    <DemoTurn
+                      key={stage.id}
+                      slot={slot}
+                      onRewind={() =>
+                        setFeedback("Rewind selected. This demo does not change any conversation.")
+                      }
+                    />
+                  </MessageServicesContext>
+                </MessageIdentityContext>
+              </div>
+            </ResizablePanel>
+            <ResizableHandle
+              disabled={!panelOpen || panelSliding}
+              aria-label="Demo agents panel width"
             />
-          </MessageServicesContext>
-        </MessageIdentityContext>
-      </div>
+            <ResizablePanel
+              id="demo-agents-panel"
+              className="right-panel"
+              defaultSize="360px"
+              minSize="200px"
+              maxSize="65%"
+              groupResizeBehavior="preserve-pixel-size"
+              inert={!panelOpen}
+              aria-hidden={!panelOpen}
+              onResize={(size) => {
+                if (panelOpen && !panelSliding && size.inPixels > 0) setPanelWidth(size.inPixels);
+              }}
+            >
+              <SubagentPanelView
+                items={agents}
+                selected={selectedAgent}
+                messages={selectedAgent ? demoSubagentTranscript(selectedAgent) : []}
+                onSelect={agentContext.open}
+                onBack={panel.getState().back}
+                onClose={panel.getState().close}
+              />
+            </ResizablePanel>
+          </ResizablePanelGroup>
+        </div>
+      </SubagentContext>
       <p className="ds-feedback" role="status">
         {feedback}
       </p>
