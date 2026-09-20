@@ -967,7 +967,7 @@ export default function DesignSystem() {
   const [queries] = useState(
     () => new QueryClient({ defaultOptions: { queries: { retry: false } } }),
   );
-  const [theme, setTheme] = useState("dark");
+  const [theme, setTheme] = useState(() => document.documentElement.dataset.theme ?? "system");
   useEffect(() => {
     const previous = document.documentElement.dataset.theme;
     return () => {
