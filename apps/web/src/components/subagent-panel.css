@@ -23,8 +23,6 @@
 .subagent-transcript [data-slot="bubble"] { max-width: 100%; }
 .subagent-activity { width: 100%; height: auto; text-align: left; justify-content: flex-start; color: var(--muted-foreground); padding: var(--space-1) var(--space-2); }
 .subagent-activity > span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.right-panel { min-width: 0; overflow: hidden; }
-.right-panel-resize-handle { flex: none; }
 :root[data-animation] .subagent-status .animate-spin { animation-duration: var(--motion-spin-duration) !important; }
 
 .right-panel-toggle { position: absolute; top: 0; right: var(--space-3); z-index: 40; height: 2rem; display: flex; align-items: center; }

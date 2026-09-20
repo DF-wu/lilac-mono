@@ -76,11 +76,8 @@
 
 .ds-queue-preview { height:32rem; display:flex; flex-direction:column; min-width:0; background:var(--surface); border-radius:var(--radius-lg); padding:var(--space-2); }
 
-.ds-agent-workspace { --right-panel-width: 360px; --right-panel-offset: 361px; height: 36rem; max-height: 70dvh; overflow: hidden; position: relative; border: 1px solid var(--border); border-radius: var(--radius-lg); }
+.ds-agent-workspace { height: 36rem; max-height: 70dvh; overflow: hidden; position: relative; border: 1px solid var(--border); border-radius: var(--radius-lg); }
 .ds-agent-workspace .ds-agent-preview { height: 100%; max-height: none; border: 0; border-radius: 0; }
-@media (max-width: 760px) {
-  .ds-agent-workspace .workspace-panels { --workspace-width: 100%; }
-  .ds-agent-workspace .right-panel { width: min(90%, var(--right-panel-width)) !important; }
-}
+
 
 .ds-agent-preview { padding-top: calc(2rem + var(--space-3)); }

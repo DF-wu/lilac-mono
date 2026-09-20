@@ -1,11 +1,10 @@
-import { updatePanelWidth } from "./panel-width";
+import { WorkspacePanels, WorkspaceSidePanel } from "./WorkspacePanels";
 import { useMemo } from "react";
 import { useStore } from "zustand";
 import { demoSubagents, demoSubagentTranscript } from "../agent-work-fixtures";
 import { createSubagentPanelStore } from "../subagent-panel-store";
 import { SubagentContext } from "./subagent-context";
 import { SubagentPanelView, RightPanelToggle } from "./SubagentPanel";
-import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "./ui/resizable";
 import { MessageArrivals } from "../message-arrivals";
 import { MessageArrivalsContext } from "./message-arrivals";
 import { useEffect, useRef, useState } from "react";
@@ -32,25 +31,6 @@ export function AgentWorkDemo() {
   const [panel] = useState(createSubagentPanelStore);
   const panelOpen = useStore(panel, (state) => state.open);
   const panelSelection = useStore(panel, (state) => state.selection);
-  const workspaceElement = useRef<HTMLDivElement>(null);
-  const [panelSliding, setPanelSliding] = useState(false);
-  const [previousOpen, setPreviousOpen] = useState(panelOpen);
-  const panelGroup = useRef<HTMLDivElement>(null);
-  if (previousOpen !== panelOpen) {
-    setPreviousOpen(panelOpen);
-    setPanelSliding(true);
-  }
-  useEffect(() => {
-    if (!panelSliding) return;
-    let canceled = false;
-    const animations = panelGroup.current?.getAnimations() ?? [];
-    void Promise.allSettled(animations.map((animation) => animation.finished)).then(() => {
-      if (!canceled) setPanelSliding(false);
-    });
-    return () => {
-      canceled = true;
-    };
-  }, [panelOpen, panelSliding]);
   const [playhead, setPlayhead] = useState({ stage: 1, frame: 0, playing: false });
   const [feedback, setFeedback] = useState("");
   const container = useRef<HTMLDivElement>(null);
@@ -174,19 +154,10 @@ export function AgentWorkDemo() {
         <p className="ds-muted">{stage.description}</p>
       </div>
       <SubagentContext value={agentContext}>
-        <div
-          className={`ds-agent-workspace ${panelOpen ? "" : "right-panel-hidden"}`}
-          ref={workspaceElement}
-        >
+        <div className={`ds-agent-workspace ${panelOpen ? "" : "right-panel-hidden"}`}>
           <RightPanelToggle open={panelOpen} onToggle={panel.getState().toggle} />
-          <ResizablePanelGroup
-            orientation="horizontal"
-            className="workspace-panels"
-            elementRef={panelGroup}
-            data-right-fixed={!panelOpen || panelSliding}
-            style={{ width: "var(--workspace-width, 100%)" }}
-          >
-            <ResizablePanel minSize="10%">
+          <WorkspacePanels rightOpen={panelOpen}>
+            <div className="chat-panel">
               <div className="ds-agent-preview" aria-label="Agent work preview" tabIndex={0}>
                 <MessageIdentityContext value={identities}>
                   <MessageServicesContext value={services}>
@@ -200,25 +171,12 @@ export function AgentWorkDemo() {
                   </MessageServicesContext>
                 </MessageIdentityContext>
               </div>
-            </ResizablePanel>
-            <ResizableHandle
-              disabled={!panelOpen || panelSliding}
-              aria-label="Demo agents panel width"
-            />
-            <ResizablePanel
+            </div>
+            <WorkspaceSidePanel
+              side="right"
+              open={panelOpen}
               id="demo-agents-panel"
-              data-panel-side="right"
-              className="right-panel"
-              defaultSize="360px"
-              minSize="200px"
-              maxSize="65%"
-              groupResizeBehavior="preserve-pixel-size"
-              inert={!panelOpen}
-              aria-hidden={!panelOpen}
-              onResize={(size) => {
-                if (panelOpen && !panelSliding && size.inPixels > 0)
-                  updatePanelWidth(workspaceElement.current, "right", size.inPixels);
-              }}
+              label="Demo agents panel width"
             >
               <SubagentPanelView
                 items={agents}
@@ -227,8 +185,8 @@ export function AgentWorkDemo() {
                 onSelect={agentContext.open}
                 onBack={panel.getState().back}
               />
-            </ResizablePanel>
-          </ResizablePanelGroup>
+            </WorkspaceSidePanel>
+          </WorkspacePanels>
         </div>
       </SubagentContext>
       <p className="ds-feedback" role="status">

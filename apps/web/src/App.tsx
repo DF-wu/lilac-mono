@@ -1,4 +1,4 @@
-import { updatePanelWidth } from "./components/panel-width";
+import { WorkspacePanels, WorkspaceSidePanel } from "./components/WorkspacePanels";
 import {
   NativeSubagentPanel,
   NativeSubagentProvider,
@@ -53,7 +53,6 @@ import {
   releaseDraftAttachments,
   type DraftThread,
 } from "./draft-thread";
-import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "./components/ui/resizable";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -85,13 +84,6 @@ function Workspace(props: AppProps) {
   const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
   const { pool, drafts: draftStore, subagentPanel } = useWorkspace();
   const rightOpen = useStore(subagentPanel, (state) => state.open);
-  const workspaceElement = useRef<HTMLElement>(null);
-  const [rightSliding, setRightSliding] = useState(false);
-  const [lastRightOpen, setLastRightOpen] = useState(rightOpen);
-  if (lastRightOpen !== rightOpen) {
-    setLastRightOpen(rightOpen);
-    setRightSliding(true);
-  }
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
@@ -129,22 +121,6 @@ function Workspace(props: AppProps) {
   const [external, setExternal] = useState(false);
   const [externalId, setExternalId] = useState<string>();
   const [sidebar, setSidebar] = useState(true);
-  const [sidebarSliding, setSidebarSliding] = useState(false);
-  const panelGroup = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!sidebarSliding && !rightSliding) return;
-    let canceled = false;
-    const animations = panelGroup.current?.getAnimations() ?? [];
-    void Promise.allSettled(animations.map((animation) => animation.finished)).then(() => {
-      if (!canceled) {
-        setSidebarSliding(false);
-        setRightSliding(false);
-      }
-    });
-    return () => {
-      canceled = true;
-    };
-  }, [sidebar, sidebarSliding, rightOpen, rightSliding]);
   const [searchQuery, setSearchQuery] = useState("");
   const queries = useQueryClient();
   const searchResults = useInfiniteQuery({
@@ -645,14 +621,12 @@ function Workspace(props: AppProps) {
         <Tooltip.Provider delay={350}>
           <main
             className={`app-shell ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
-            ref={workspaceElement}
             aria-label="Chat workspace"
           >
             <div className="sidebar-toggle">
               <IconButton
                 label={sidebar ? "Hide sidebar" : "Show sidebar"}
                 onClick={() => {
-                  setSidebarSliding(true);
                   setSidebar((value) => !value);
                 }}
               >
@@ -660,28 +634,8 @@ function Workspace(props: AppProps) {
               </IconButton>
             </div>
             <RightPanelToggle open={rightOpen} onToggle={subagentPanel.getState().toggle} />
-            <ResizablePanelGroup
-              orientation="horizontal"
-              className="workspace-panels"
-              elementRef={panelGroup}
-              data-sidebar-fixed={!sidebar || sidebarSliding || rightSliding}
-              data-right-fixed={!rightOpen || sidebarSliding || rightSliding}
-              style={{ width: "var(--workspace-width, 100%)" }}
-            >
-              <ResizablePanel
-                inert={!sidebar}
-                aria-hidden={!sidebar}
-                onResize={(size) => {
-                  if (sidebar && !sidebarSliding && !rightSliding && size.inPixels > 0)
-                    updatePanelWidth(workspaceElement.current, "sidebar", size.inPixels);
-                }}
-                id="sidebar"
-                groupResizeBehavior="preserve-pixel-size"
-                defaultSize="18rem"
-                minSize="12rem"
-                maxSize="32rem"
-                className="sidebar-panel"
-              >
+            <WorkspacePanels leftOpen={sidebar} rightOpen={rightOpen}>
+              <WorkspaceSidePanel side="left" open={sidebar} id="sidebar" label="Sidebar width">
                 <aside className="sidebar">
                   <header className="sidebar-header">
                     <span className="brand">
@@ -856,13 +810,8 @@ function Workspace(props: AppProps) {
                     </IconButton>
                   </footer>
                 </aside>
-              </ResizablePanel>
-              <ResizableHandle
-                disabled={!sidebar || sidebarSliding || rightSliding}
-                aria-label="Sidebar width"
-                className="sidebar-resize-handle"
-              />
-              <ResizablePanel id="chat" minSize="10%" className="chat-panel">
+              </WorkspaceSidePanel>
+              <div id="chat" className="chat-panel">
                 <div className="main-panel">
                   {external && owner ? (
                     <Suspense fallback={<p role="status">Loading conversations…</p>}>
@@ -966,30 +915,16 @@ function Workspace(props: AppProps) {
                     </div>
                   ) : null}
                 </div>
-              </ResizablePanel>
-              <ResizableHandle
-                disabled={!rightOpen || sidebarSliding || rightSliding}
-                aria-label="Right panel width"
-                className="right-panel-resize-handle"
-              />
-              <ResizablePanel
+              </div>
+              <WorkspaceSidePanel
+                side="right"
+                open={rightOpen}
                 id="right-panel"
-                data-panel-side="right"
-                className="right-panel"
-                inert={!rightOpen}
-                aria-hidden={!rightOpen}
-                defaultSize="360px"
-                minSize="240px"
-                maxSize="45%"
-                groupResizeBehavior="preserve-pixel-size"
-                onResize={(size) => {
-                  if (rightOpen && !rightSliding && !sidebarSliding && size.inPixels > 0)
-                    updatePanelWidth(workspaceElement.current, "right", size.inPixels);
-                }}
+                label="Right panel width"
               >
                 <NativeSubagentPanel threadId={selectedId ?? ""} foreground={active && !external} />
-              </ResizablePanel>
-            </ResizablePanelGroup>
+              </WorkspaceSidePanel>
+            </WorkspacePanels>
             {settings ? (
               <Settings
                 viewer={viewer}
