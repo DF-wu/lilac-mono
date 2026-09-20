@@ -15,8 +15,8 @@ import "./styles.css";
 import { Toaster, toast } from "./components/ui/toast";
 
 const ClerkLogin = lazy(() => import("./clerk").then((module) => ({ default: module.ClerkLogin })));
-const ClerkUserControl = lazy(() =>
-  import("./clerk").then((module) => ({ default: module.ClerkUserControl })),
+const ClerkSession = lazy(() =>
+  import("./clerk").then((module) => ({ default: module.ClerkSession })),
 );
 const sessions = new WebSessionController();
 let authInfo: ReturnType<typeof readAuthInfo> | undefined;
@@ -127,11 +127,11 @@ function Root() {
       </main>
     );
   const { session } = state;
-  const userControl =
+  const sessionControl =
     auth?.provider === "clerk" && auth.publishableKey ? (
       <AccountLoadBoundary onReload={reload} message="Unable to load account controls.">
         <Suspense fallback={null}>
-          <ClerkUserControl
+          <ClerkSession
             publishableKey={auth.publishableKey}
             client={session.client}
             onLogout={logout}
@@ -146,7 +146,7 @@ function Root() {
       upload={uploadResource}
       resourceUrl={resourceUrl}
       onLogout={logout}
-      userControl={userControl}
+      sessionControl={sessionControl}
     />
   );
 }

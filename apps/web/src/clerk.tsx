@@ -1,5 +1,5 @@
 import { Button } from "./components/ui/button";
-import { ClerkProvider, SignIn, UserButton, useAuth, useClerk } from "@clerk/react";
+import { ClerkProvider, SignIn, useAuth, useClerk } from "@clerk/react";
 import { shadcn } from "@clerk/ui/themes";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { NativeClient } from "@stanley2058/lilac-client";
@@ -102,7 +102,7 @@ export function ClerkLogin({
   );
 }
 
-function SessionControls({
+function SessionStatus({
   client,
   onLogout,
 }: {
@@ -170,15 +170,10 @@ function SessionControls({
       window.removeEventListener("online", retry);
     };
   }, [client, getToken, isLoaded, isSignedIn, onLogout]);
-  return (
-    <>
-      <UserButton />
-      {error ? <span role="status">{error}</span> : null}
-    </>
-  );
+  return error ? <span role="status">{error}</span> : null;
 }
 
-export function ClerkUserControl({
+export function ClerkSession({
   publishableKey,
   client,
   onLogout,
@@ -189,7 +184,7 @@ export function ClerkUserControl({
 }) {
   return (
     <Provider publishableKey={publishableKey}>
-      <SessionControls client={client} onLogout={onLogout} />
+      <SessionStatus client={client} onLogout={onLogout} />
     </Provider>
   );
 }

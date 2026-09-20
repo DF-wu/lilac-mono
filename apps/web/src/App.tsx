@@ -1,3 +1,4 @@
+import { ActorAvatar } from "./components/ActorAvatar";
 import { defaultRightPanel } from "./panel-store";
 import { WorkspacePanels, WorkspaceSidePanel } from "./components/WorkspacePanels";
 import {
@@ -15,6 +16,7 @@ import { Result } from "better-result";
 import { Tooltip } from "@base-ui/react/tooltip";
 import {
   Plus,
+  MessageCirclePlus,
   Settings as SettingsIcon,
   LogOut,
   Archive,
@@ -677,6 +679,7 @@ function Workspace(props: AppProps) {
                         label={
                           archived ? "Show active conversations" : "Show archived conversations"
                         }
+                        tooltip="Archived"
                         aria-pressed={archived}
                         onClick={() => {
                           const value = !archived;
@@ -690,6 +693,7 @@ function Workspace(props: AppProps) {
                       {owner ? (
                         <IconButton
                           label="Read other surfaces"
+                          tooltip="Others"
                           aria-pressed={external}
                           onClick={() => {
                             setExternalId(undefined);
@@ -699,8 +703,12 @@ function Workspace(props: AppProps) {
                           <Globe />
                         </IconButton>
                       ) : null}
-                      <IconButton label="New conversation" onClick={() => void createThread()}>
-                        <Plus />
+                      <IconButton
+                        label="New conversation"
+                        tooltip="New"
+                        onClick={() => void createThread()}
+                      >
+                        <MessageCirclePlus />
                       </IconButton>
                     </nav>
                   </div>
@@ -804,30 +812,39 @@ function Workspace(props: AppProps) {
                     </>
                   )}
                   <footer className="sidebar-footer">
-                    {props.userControl ?? <span className="viewer-name">{viewer.displayName}</span>}
+                    <ActorAvatar displayName={viewer.displayName} avatarUrl={viewer.avatarUrl} />
+                    <span className="viewer-name">{viewer.displayName}</span>
+                    {props.sessionControl}
                     <span className="toolbar-spacer" />
-                    <IconButton
-                      label="Design system"
-                      onClick={() =>
-                        void navigate({
-                          to: "/design-system",
-                          state: selectedId.startsWith("draft:")
-                            ? { draftThreadId: selectedId }
-                            : { chatThreadId: selectedId },
-                        })
-                      }
-                    >
-                      <Palette />
-                    </IconButton>
-                    <IconButton label="Settings" onClick={() => setSettings(true)}>
-                      <SettingsIcon />
-                    </IconButton>
-                    <IconButton
-                      label="Sign out"
-                      onClick={() => void attempt(props.onLogout, setError)}
-                    >
-                      <LogOut />
-                    </IconButton>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        render={
+                          <IconButton label="Settings">
+                            <SettingsIcon />
+                          </IconButton>
+                        }
+                      />
+                      <DropdownMenuContent side="top" align="end">
+                        <DropdownMenuItem onClick={() => setSettings(true)}>
+                          <SettingsIcon /> Settings
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() =>
+                            void navigate({
+                              to: "/design-system",
+                              state: selectedId.startsWith("draft:")
+                                ? { draftThreadId: selectedId }
+                                : { chatThreadId: selectedId },
+                            })
+                          }
+                        >
+                          <Palette /> Design
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => void attempt(props.onLogout, setError)}>
+                          <LogOut /> Logout
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </footer>
                 </aside>
               </WorkspaceSidePanel>

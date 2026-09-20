@@ -348,7 +348,6 @@ small {
   padding-top: var(--space-3);
 }
 .viewer-name {
-  padding-left: var(--space-2);
   font-size: var(--text-sm);
   white-space: nowrap;
   overflow: hidden;
@@ -1480,7 +1479,7 @@ progress {
 .activity-summary:focus-visible .activity-time,
 .activity-item-trigger:hover .activity-time,
 .activity-item-trigger:focus-visible .activity-time { opacity: 1; }
-.agent-response > [data-slot="message-avatar"] { margin-bottom: var(--space-2); align-self: flex-start; background: transparent; overflow: visible; }
+.agent-response > [data-slot="message-avatar"] { align-self: flex-start; background: transparent; overflow: visible; }
 
 .working-text {
   color: transparent;
