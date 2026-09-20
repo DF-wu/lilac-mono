@@ -22,6 +22,74 @@ describe("markdown", () => {
     expect(html).not.toContain('href="javascript:');
     expect(html).toContain('rel="noopener noreferrer"');
   });
+  test("renders all five GitHub alerts with labeled icons and rich content", () => {
+    for (const [kind, title] of [
+      ["NOTE", "Note"],
+      ["TIP", "Tip"],
+      ["IMPORTANT", "Important"],
+      ["WARNING", "Warning"],
+      ["CAUTION", "Caution"],
+    ]) {
+      const html = renderToStaticMarkup(
+        <MarkdownContent
+          text={`> [!${kind}]\n> Keep **this** and [the guide](https://example.com).\n>\n> - First step\n> - Second step`}
+        />,
+      );
+      expect(html).toContain(`data-alert="${kind!.toLowerCase()}"`);
+      expect(html).toContain(`${title}</p>`);
+      expect(html).toContain("<svg");
+      expect(html).toContain('aria-hidden="true"');
+      expect(html).toContain("<strong>this</strong>");
+      expect(html).toContain("<ul>");
+      expect(html).toContain("First step");
+      expect(html).not.toContain(`[!${kind}]`);
+    }
+  });
+  test("preserves alert body paragraphs and hard breaks", () => {
+    for (const text of [
+      "> [!NOTE]\n> First line  \n> Second line\n>\n> Another paragraph",
+      "> [!NOTE]  \n> First line\n> Second line\n>\n> Another paragraph",
+      "> [!note]\n>\n> First line\n> Second line\n>\n> Another paragraph",
+    ]) {
+      const html = renderToStaticMarkup(<MarkdownContent text={text} />);
+      expect(html).toContain('data-alert="note"');
+      expect(html).toContain("First line");
+      expect(html).toContain("Second line");
+      expect(html).toContain("<p>Another paragraph</p>");
+    }
+    const empty = renderToStaticMarkup(<MarkdownContent text="> [!TIP]" />);
+    expect(empty).toContain('data-alert="tip"');
+    expect(empty).not.toContain("<p></p>");
+  });
+  test("leaves quotes, code, unsupported markers, and inline or nested markers unchanged", () => {
+    for (const text of [
+      "> Ordinary quote",
+      "> [!UNKNOWN]\n> Keep this",
+      "> [!NOTE] same line",
+      "> [!NOTE]**same line**",
+      "> `[!NOTE]`\n> Code marker",
+      "[!NOTE]\nPlain paragraph",
+      "> Outer\n>\n> > [!NOTE]\n> > Nested quote",
+      "- Item\n\n  > [!TIP]\n  > Nested in a list",
+      "```md\n> [!NOTE]\n> Example\n```",
+    ]) {
+      const html = renderToStaticMarkup(<MarkdownContent text={text} />);
+      expect(html).not.toContain("data-alert=");
+    }
+  });
+  test("alerts preserve Markdown safety filtering", () => {
+    const html = renderToStaticMarkup(
+      <MarkdownContent
+        text={
+          "> [!WARNING]\n> <script>alert(1)</script>\n>\n> [bad](javascript:alert) **Safe text**"
+        }
+      />,
+    );
+    expect(html).toContain('data-alert="warning"');
+    expect(html).toContain("<strong>Safe text</strong>");
+    expect(html).not.toContain("<script>");
+    expect(html).not.toContain('href="javascript:');
+  });
   test("malformed and unfinished fences keep source visible", () => {
     const html = renderToStaticMarkup(
       <MarkdownContent text={'```typescript\nconst value = "<script>";\n'} />,

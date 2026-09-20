@@ -299,6 +299,14 @@ const messageFixtures: DisplayMessage[] = [
 const richText =
   '### A small plan\n\nUse **bold**, *italic*, ~~strikethrough~~, and `inline code`. Links include a favicon: [GitHub](https://github.com).\n\n> Leave enough room to change your mind.\n\n- [x] Pick a place\n- [ ] Check the weather\n\n| Time | Plan |\n| --- | --- |\n| Morning | Coffee and a walk |\n| Afternoon | Bookstore |\n\n```typescript\nconst weekend = { pace: "slow", reservations: false };\nconsole.log("There is time to stop and explore", weekend);\n```\n\n```bash\nbun run dev:web\n```\n\nInline math: $a^2 + b^2 = c^2$.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\n```mermaid\nflowchart LR\n  Coffee --> Walk --> Bookstore\n```';
 
+const alertExamples = [
+  "> [!NOTE]\n> Keep useful context close to the conversation.",
+  "> [!TIP]\n> Use **Shift + Enter** to add a new line.",
+  "> [!IMPORTANT]\n> Save your work before starting the next step.",
+  "> [!WARNING]\n> Check the destination before moving files.",
+  "> [!CAUTION]\n> Deleting this file cannot be undone.",
+].join("\n\n");
+
 function Section({
   id,
   title,
@@ -1043,6 +1051,9 @@ export default function DesignSystem() {
               <Section id="content" title="Rich content">
                 <div className="ds-content">
                   <Markdown text={richText} />
+                  <Specimen title="GitHub alerts">
+                    <Markdown text={alertExamples} />
+                  </Specimen>
                 </div>
               </Section>
               <Controls />

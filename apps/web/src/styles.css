@@ -1097,6 +1097,30 @@ progress {
   border-inline-start: var(--space-1) solid var(--muted-foreground);
   color: var(--muted-foreground);
 }
+.markdown-alert {
+  --alert-color: light-dark(#0969da, #58a6ff);
+  margin: var(--space-4) 0;
+  padding: var(--space-2) var(--space-4);
+  border-inline-start: var(--space-1) solid var(--alert-color);
+  color: var(--foreground);
+}
+.markdown-alert[data-alert="tip"] { --alert-color: var(--success); }
+.markdown-alert[data-alert="important"] { --alert-color: var(--primary); }
+.markdown-alert[data-alert="warning"] { --alert-color: var(--draft); }
+.markdown-alert[data-alert="caution"] { --alert-color: var(--danger); }
+.markdown .markdown-alert-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: 0;
+  color: var(--alert-color);
+  font-weight: 600;
+}
+.markdown-alert-title svg {
+  width: var(--icon-size);
+  height: var(--icon-size);
+  flex-shrink: 0;
+}
 .markdown code {
   font-family: ui-monospace, SFMono-Regular, monospace;
   font-size: 0.9em;

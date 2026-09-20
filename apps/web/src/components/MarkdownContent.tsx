@@ -1,3 +1,4 @@
+import { githubAlerts, MarkdownBlockquote } from "./markdown-alerts";
 import { createContext, useContext, lazy, memo, Suspense, type ComponentProps } from "react";
 import ReactMarkdown, { type Components, type ExtraProps } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -13,6 +14,7 @@ const HighlightedCode = lazy(() => import("./rich-code"));
 const Diagram = lazy(() => import("./rich-diagram"));
 const MathExpression = lazy(() => import("./rich-math"));
 const plugins = [remarkGfm, remarkMath];
+const rehypePlugins = [githubAlerts];
 
 function RichBlock({ source, language }: { source: string; language: string }) {
   const fallback = <CodeBlock source={source} language={language} />;
@@ -78,6 +80,7 @@ function MessageLink({ children, href }: ComponentProps<"a">) {
 
 const components: Components = {
   pre: Pre,
+  blockquote: MarkdownBlockquote,
   li: ListItem,
   input: TaskCheckbox,
   code: ({ className, children }) => {
@@ -107,6 +110,7 @@ export default memo(function MarkdownContent({ text }: { text: string }) {
   return (
     <ReactMarkdown
       remarkPlugins={plugins}
+      rehypePlugins={rehypePlugins}
       components={components}
       urlTransform={markdownUrl}
       skipHtml
