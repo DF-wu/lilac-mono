@@ -214,27 +214,24 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     const offset = virtual.getOffsetForIndex(index, "start");
     if (offset) virtual.scrollToOffset(offset[0] + anchor.delta);
   }, [ids, virtual]);
-  useEffect(() => {
+  const pinToEnd = useCallback(() => {
+    const viewport = parent.current;
+    if (!atTail.current || !viewport) return;
+    viewport.scrollTop = viewport.scrollHeight;
+    previousScrollTop.current = viewport.scrollTop;
+  }, []);
+  useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    let scheduled = 0;
     const observer = new ResizeObserver(() => {
+      pinToEnd();
       updateEndVisibility();
-      if (!atTail.current || !ids.length) return;
-      cancelAnimationFrame(scheduled);
-      scheduled = requestAnimationFrame(() => {
-        if (atTail.current) virtual.scrollToIndex(ids.length - 1, { align: "end" });
-        updateEndVisibility();
-      });
     });
     observer.observe(canvas);
     if (parent.current) observer.observe(parent.current);
     if (footerRef.current) observer.observe(footerRef.current);
-    return () => {
-      observer.disconnect();
-      cancelAnimationFrame(scheduled);
-    };
-  }, [ids, virtual, updateEndVisibility]);
+    return () => observer.disconnect();
+  }, [pinToEnd, updateEndVisibility]);
   useLayoutEffect(() => {
     atTail.current = true;
     userScroll.current = false;
@@ -254,6 +251,8 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       virtual.scrollToIndex(ids.length - 1, { align: "end" });
     previousCount.current = ids.length;
   }, [ids.length, virtual]);
+  // Hydration can change existing turn heights without changing their IDs.
+  useLayoutEffect(pinToEnd);
   const rows = virtual.getVirtualItems();
   const activatedArrivals = useRef<MessageArrivals>(undefined);
   useLayoutEffect(() => {
