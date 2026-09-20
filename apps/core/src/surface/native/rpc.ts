@@ -244,6 +244,14 @@ export function createNativeRouter(
         nativeRpcValue(await services.search.query(context.principal, input, signal)),
       ),
     },
+    subagents: {
+      list: secured.subagents.list.handler(async ({ context, input }) =>
+        nativeRpcValue(await services.subagents.list(context.principal, input)),
+      ),
+      read: secured.subagents.read.handler(async ({ context, input }) =>
+        nativeRpcValue(await services.subagents.read(context.principal, input)),
+      ),
+    },
     external: {
       list: secured.external.list.handler(async ({ input, context, signal }) =>
         nativeRpcValue(await services.external.list(context.principal, input, signal)),

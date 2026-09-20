@@ -3165,6 +3165,7 @@ const CORE_WORKFLOW_STORE_READ_RESULT_APIS = [
   "DurableWorkflowStore.listRevisions",
   "DurableWorkflowStore.getRun",
   "DurableWorkflowStore.listRuns",
+  "DurableWorkflowStore.listSubagentRuns",
   "DurableWorkflowStore.listRunsWithExpiredClaims",
   "DurableWorkflowStore.listActiveRuns",
   "DurableWorkflowStore.listRunsNeedingProjectionReconciliation",

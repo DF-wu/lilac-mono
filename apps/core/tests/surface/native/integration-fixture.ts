@@ -1,3 +1,4 @@
+import { DurableWorkflowStore } from "../../../src/workflow/durable-workflow-store";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -291,6 +292,7 @@ export async function createNativeIntegrationFixture(
   const journal = new SqliteAgentRunJournal({ dbPath: requestDb });
   const customCommands = new CustomCommandManager(dataDir);
   integrationValue(await customCommands.init());
+  const subagentWorkflows = new DurableWorkflowStore(":memory:");
   let runner: Awaited<ReturnType<typeof startBusAgentRunner>> | undefined;
   const fatalErrors: Error[] = [];
   const warnings: { message: string; error: Error }[] = [];
@@ -312,6 +314,7 @@ export async function createNativeIntegrationFixture(
       adapters: { registeredPlatforms: () => [], resolve: () => null },
       conversationThreads: () => undefined,
       runner: () => runner,
+      workflows: subagentWorkflows,
       deliveryState: (id) =>
         deliveryStore.load(id).map((record) => {
           if (!record) return "missing" as const;
@@ -435,6 +438,7 @@ export async function createNativeIntegrationFixture(
     for (const socket of sockets) socket.close();
     await runtime.stopIngress();
     await runner?.stop();
+    subagentWorkflows.close();
     await runtime.stopOutput();
     await pluginManager.destroy();
     await resourceAccess.close();

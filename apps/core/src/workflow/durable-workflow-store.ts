@@ -1132,6 +1132,21 @@ export class DurableWorkflowStore {
     );
   }
 
+  listSubagentRuns(
+    parentSessionId: string,
+    offset = 0,
+  ): ResultType<WorkflowRun[], DurableWorkflowReadError> {
+    return captureWorkflowRead("list-subagent-runs", () => {
+      const rows = this.persistedRows(
+        `SELECT * FROM workflow_runs
+         WHERE json_extract(completion_target_json, '$.kind') = 'live_parent'
+           AND json_extract(completion_target_json, '$.parentSessionId') = ?
+         ORDER BY created_at DESC, run_id DESC LIMIT 101 OFFSET ?`,
+      ).all(parentSessionId, offset);
+      return this.decodeRows(rows, decodeWorkflowRunRow);
+    });
+  }
+
   listActiveLiveParentRuns(
     parentRequestId: string,
     limit = 1_000,

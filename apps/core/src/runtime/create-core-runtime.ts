@@ -3146,6 +3146,7 @@ export async function createCoreRuntime(
                 },
                 conversationThreads: () => nativeConversationPlanner,
                 runner: () => stopAgentRunner ?? undefined,
+                workflows: activeDurableWorkflowStore,
                 deliveryState: (id) =>
                   requestDeliveryStore!
                     .load(id)

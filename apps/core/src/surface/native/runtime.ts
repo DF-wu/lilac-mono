@@ -1,3 +1,5 @@
+import { NativeSubagents, type SubagentReader } from "./subagents";
+import type { DurableWorkflowStore } from "../../workflow/durable-workflow-store";
 import path from "node:path";
 import { Result, type Result as ResultType } from "better-result";
 import { FileSystem } from "@stanley2058/lilac-fs";
@@ -75,7 +77,8 @@ export type NativeRuntimeOptions = {
   mcpRegistry: Pick<McpRegistryApi, "reload">;
   adapters: SurfaceAdapterResolver;
   conversationThreads: () => ConversationThreadToolService | undefined;
-  runner: () => NativeRunnerControl | undefined;
+  runner: () => (NativeRunnerControl & SubagentReader) | undefined;
+  workflows: DurableWorkflowStore;
   deliveryState: (
     id: string,
   ) => ResultType<"missing" | "owned" | "completed" | "failed" | "cancelled", Error>;
@@ -236,6 +239,12 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   });
   const nativeConfig = options.getConfig().surface.native;
   const services = createNativeRpcServices({
+    subagents: new NativeSubagents({
+      native: store,
+      workflows: options.workflows,
+      transcripts: options.transcript,
+      live: options.runner,
+    }),
     store,
     auth,
     installationId: nativeConfig.installationId!,

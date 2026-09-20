@@ -9289,6 +9289,31 @@ export async function startBusAgentRunner(params: {
     resumeAcceptedDelivery,
     discardPausedRecoveredDelivery,
     cancelNativeSession,
+    readSubagentSnapshot(sessionId: string, requestId: string, includeMessages = false) {
+      const state = bySession.get(sessionId);
+      const run = state?.activeRun;
+      if (!run || run.requestId !== requestId || run.runProfile === "primary") return undefined;
+      const tool = [...run.activeTools.values()].at(-1);
+      const stream = state.agent?.state.streamMessage;
+      const responding =
+        typeof stream?.content === "string"
+          ? stream.content.length > 0
+          : stream?.content.at(-1)?.type === "text";
+      return {
+        messages: includeMessages
+          ? [
+              ...(state.agent?.state.messages ?? []),
+              ...(state.agent?.state.streamMessage ? [state.agent.state.streamMessage] : []),
+            ]
+          : [],
+        streaming: !!state.agent?.state.streamMessage,
+        activeTools: [...run.activeTools].map(([toolCallId, tool]) => ({
+          toolCallId,
+          toolName: tool.toolName,
+        })),
+        title: tool?.toolName ?? (responding ? "Responding…" : "Thinking…"),
+      };
+    },
     getActiveDrainOperation: () => activeDrainOperation,
     getTerminalCleanupOperations: () => terminalCleanupOperations,
     stop: async () => {

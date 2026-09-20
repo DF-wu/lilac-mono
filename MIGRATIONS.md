@@ -645,3 +645,14 @@ retry time and revokes active controls, and startup reconciliation does not repe
 failure while the target and configuration revision still match. A changed target or progress-port
 configuration clears the stale gate and allows projection to be attempted again; retryable failures
 continue to use the existing durable backoff state.
+
+## Native subagent inspection
+
+The native v1 RPC contract adds `subagents.list` and `subagents.read`. Both require read access to the
+parent thread and exclude runs whose parent request is no longer in canonical history. Workflow run
+IDs remain opaque, including their existing colon-separated prefixes. The new panel reads existing
+workflow and transcript stores; there is no stored-data migration. Update clients and servers together.
+
+Transcript responses contain bounded pages of display text and activity labels. They omit system
+prompts, raw reasoning, tool arguments, and provider state. Older runs without retained transcripts
+show an unavailable state. Panel visibility and pixel width are local to the current workspace session.

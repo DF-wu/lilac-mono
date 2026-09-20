@@ -218,3 +218,15 @@ export const resourcePreviewSchema = z.strictObject({
   byteLength: z.number().int().nonnegative(),
 });
 export type ResourcePreview = z.infer<typeof resourcePreviewSchema>;
+
+export const subagentSummarySchema = z.strictObject({
+  id: runIdentitySchema,
+  activityId: identitySchema,
+  turnId: identitySchema,
+  profile: z.enum(["explore", "general", "self"]),
+  name: z.string().max(256),
+  title: z.string().max(256),
+  state: z.enum(["running", "complete", "failed", "canceled"]),
+  startedAt: revisionSchema,
+});
+export type SubagentSummary = z.infer<typeof subagentSummarySchema>;

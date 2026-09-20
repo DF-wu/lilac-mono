@@ -14,6 +14,7 @@ import {
   MAX_REPLAY_BATCH_BYTES,
 } from "./replay.ts";
 import {
+  subagentSummarySchema,
   catalogReplySchema,
   agentIdentitySchema,
   catalogIdentifierSchema,
@@ -324,6 +325,32 @@ export const nativeContract = {
         z.strictObject({
           items: z.array(searchHitSchema).max(100),
           nextCursor: identitySchema.optional(),
+        }),
+      ),
+  },
+  subagents: {
+    list: procedure.input(threadIdInput.extend({ cursor: identitySchema.optional() })).output(
+      z.strictObject({
+        items: z.array(subagentSummarySchema).max(100),
+        nextCursor: identitySchema.optional(),
+      }),
+    ),
+    read: procedure
+      .input(
+        threadIdInput.extend({
+          agentId: runIdentitySchema,
+          before: z.number().int().nonnegative().optional(),
+          from: z.number().int().nonnegative().optional(),
+        }),
+      )
+      .output(
+        z.strictObject({
+          agent: subagentSummarySchema,
+          messages: z.array(displayMessageSchema).max(40),
+          nextBefore: z.number().int().nonnegative().optional(),
+          unavailable: z.boolean(),
+          offset: z.number().int().nonnegative(),
+          total: z.number().int().nonnegative(),
         }),
       ),
   },

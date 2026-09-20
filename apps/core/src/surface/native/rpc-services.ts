@@ -1,3 +1,4 @@
+import type { NativeSubagents } from "./subagents";
 import { randomUUID } from "node:crypto";
 import type {
   BootstrapReply,
@@ -29,6 +30,7 @@ import type { NativeSearchStore } from "./store-search";
 import type { NativeSurfaceStore } from "./store-surface";
 
 export type NativeRpcServiceOptions = {
+  subagents?: Pick<NativeSubagents, "list" | "read">;
   store: NativeStore;
   auth: NativeAuthenticator;
   installationId: string;
@@ -810,6 +812,13 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           });
         });
       },
+    },
+    subagents: {
+      list: (principal, input) =>
+        options.subagents?.list(principal.userId, input) ?? Result.ok({ items: [] }),
+      read: (principal, input) =>
+        options.subagents?.read(principal.userId, input) ??
+        Result.err(nativeFailure("not-found", "Subagent not found")),
     },
     external: {
       list(principal, input) {
