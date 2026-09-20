@@ -119,7 +119,6 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   const tailSnapshot = useCallback(() => store.at(store.size - 1)?.kind !== "deferred", [store]);
   const tailHydrated = useSyncExternalStore(subscribeTail, tailSnapshot, tailSnapshot);
   const parent = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLDivElement>(null);
   const headerRef = useRef<HTMLDivElement>(null);
   const footerRef = useRef<HTMLDivElement>(null);
   const [insets, setInsets] = useState({ top: 0, bottom: 0 });
@@ -138,42 +137,49 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     return () => observer.disconnect();
   }, []);
   const [positionedThread, setPositionedThread] = useState<string>();
+  const [tailRenderedThread, setTailRenderedThread] = useState<string>();
   const switching = positionedThread !== props.threadId;
-  const atTail = useRef(true);
   const [awayFromEnd, setAwayFromEnd] = useState(false);
-  const updateEndVisibility = useCallback(() => {
-    const element = parent.current;
-    if (element)
-      setAwayFromEnd(
-        !atTail.current && element.scrollHeight - element.scrollTop - element.clientHeight > 8,
-      );
-  }, []);
-  const userScroll = useRef(false);
-  const previousScrollTop = useRef(0);
-  const touchY = useRef<number | undefined>(undefined);
-  const previousCount = useRef(ids.length);
-  const pendingAnchor = useRef<{ id: string; delta: number } | undefined>(undefined);
-  const getItemKey = useCallback((index: number) => ids[index]!, [ids]);
-  const virtual = useVirtualizer({
-    count: ids.length,
-    scrollMargin: insets.top,
+  const [readingDisclosure, setReadingDisclosure] = useState<string>();
+  const getItemKey = useCallback(
+    (index: number) => {
+      if (index === 0) return `${props.threadId}:header`;
+      // The last key must change on append so followOnAppend sees the new turn.
+      if (index === ids.length + 1) return `${props.threadId}:footer:${ids.at(-1) ?? "empty"}`;
+      return ids[index - 1]!;
+    },
+    [ids, props.threadId],
+  );
+  const virtual = useVirtualizer<HTMLDivElement, HTMLDivElement>({
+    // Sticky chrome participates in measurements so the virtual and native scroll extents agree.
+    count: ids.length + 2,
+    anchorTo: readingDisclosure === props.threadId ? "start" : "end",
+    followOnAppend: readingDisclosure !== props.threadId,
+    scrollEndThreshold: 8,
     scrollPaddingStart: insets.top,
     scrollPaddingEnd: insets.bottom,
     getScrollElement: () => parent.current,
-    estimateSize: () => 240,
+    estimateSize: (index) => {
+      if (index === 0) return headerRef.current?.offsetHeight ?? 32;
+      if (index === ids.length + 1) return footerRef.current?.offsetHeight ?? 0;
+      return 240;
+    },
     getItemKey,
+    // Disclosures are measured during layout, before ResizeObserver delivers their new size.
+    measureElement: (element, entry) =>
+      Math.round(entry?.borderBoxSize?.[0]?.blockSize ?? element.offsetHeight),
     overscan: 3,
     rangeExtractor: (range) => {
-      if (!switching) return defaultRangeExtractor(range);
+      if (tailRenderedThread === props.threadId) return defaultRangeExtractor(range);
       const tail: number[] = [];
-      for (let index = Math.max(0, range.count - 4); index < range.count; index++) tail.push(index);
+      for (let index = Math.max(0, range.count - 5); index < range.count; index++) tail.push(index);
       return tail;
     },
   });
   const measureTurn = useCallback(
     (content: HTMLElement) => {
       const row = content.closest<HTMLDivElement>(".virtual-row");
-      if (row) virtual.resizeItem(virtual.indexFromElement(row), row.offsetHeight);
+      if (row) virtual.measureElement(row);
     },
     [virtual],
   );
@@ -186,74 +192,40 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     }),
     [props.client, props.threadId, props.onRewind, measureTurn],
   );
-  useEffect(
-    () =>
-      store.subscribe((change) => {
-        if (!change.structure || atTail.current || !parent.current) return;
-        const offset = parent.current.scrollTop;
-        const anchor = virtual
-          .getVirtualItems()
-          .find(
-            (row) =>
-              row.end >= offset + insets.top && store.get(ids[row.index] ?? "")?.kind === "ready",
-          );
-        if (anchor)
-          pendingAnchor.current = {
-            id: ids[anchor.index]!,
-            delta: offset - anchor.start + insets.top,
-          };
-      }),
-    [store, ids, virtual, insets.top],
+  const measureHeader = useCallback(
+    (element: HTMLDivElement | null) => {
+      headerRef.current = element;
+      virtual.measureElement(element);
+    },
+    [virtual, props.threadId],
   );
+  const measureFooter = useCallback(
+    (element: HTMLDivElement | null) => {
+      footerRef.current = element;
+      virtual.measureElement(element);
+    },
+    [virtual, getItemKey],
+  );
+  const totalSize = virtual.getTotalSize();
+  const headerSize = virtual.measurementsCache[0]?.size ?? 0;
+  const footerSize = virtual.measurementsCache[ids.length + 1]?.size ?? 0;
   useLayoutEffect(() => {
-    const anchor = pendingAnchor.current;
-    if (!anchor) return;
-    pendingAnchor.current = undefined;
-    const index = ids.indexOf(anchor.id);
-    if (index < 0) return;
-    const offset = virtual.getOffsetForIndex(index, "start");
-    if (offset) virtual.scrollToOffset(offset[0] + anchor.delta);
-  }, [ids, virtual]);
-  const pinToEnd = useCallback(() => {
-    const viewport = parent.current;
-    if (!atTail.current || !viewport) return;
-    viewport.scrollTop = viewport.scrollHeight;
-    previousScrollTop.current = viewport.scrollTop;
-  }, []);
-  useLayoutEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const observer = new ResizeObserver(() => {
-      pinToEnd();
-      updateEndVisibility();
-    });
-    observer.observe(canvas);
-    if (parent.current) observer.observe(parent.current);
-    if (footerRef.current) observer.observe(footerRef.current);
-    return () => observer.disconnect();
-  }, [pinToEnd, updateEndVisibility]);
-  useLayoutEffect(() => {
-    atTail.current = true;
-    userScroll.current = false;
-    pendingAnchor.current = undefined;
-    previousCount.current = ids.length;
+    if (!switching) return;
+    setReadingDisclosure(undefined);
+    virtual.scrollToEnd();
     setAwayFromEnd(false);
-    virtual.measure();
-    if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
-    if (parent.current) {
-      parent.current.scrollTop = parent.current.scrollHeight;
-      previousScrollTop.current = parent.current.scrollTop;
+    if (!store.checkpoint || !tailHydrated || totalSize !== virtual.getTotalSize()) return;
+    // Measure the normal overscan before completing the initial thread position.
+    if (tailRenderedThread !== props.threadId) {
+      setTailRenderedThread(props.threadId);
+      return;
     }
     setPositionedThread(props.threadId);
-  }, [props.threadId]);
+  });
   useLayoutEffect(() => {
-    if (ids.length > previousCount.current && atTail.current)
-      virtual.scrollToIndex(ids.length - 1, { align: "end" });
-    previousCount.current = ids.length;
-  }, [ids.length, virtual]);
-  // Hydration can change existing turn heights without changing their IDs.
-  useLayoutEffect(pinToEnd);
-  const rows = virtual.getVirtualItems();
+    setAwayFromEnd(!virtual.isAtEnd());
+  }, [virtual, totalSize, insets]);
+  const rows = virtual.getVirtualItems().filter((row) => row.index > 0 && row.index <= ids.length);
   const activatedArrivals = useRef<MessageArrivals>(undefined);
   useLayoutEffect(() => {
     if (activatedArrivals.current === arrivals || !tailHydrated || !store.checkpoint) return;
@@ -267,7 +239,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   }, [arrivals, store, tailHydrated, ids]);
   useLayoutEffect(() => {
     const viewport = parent.current;
-    const latest = rows.find((row) => row.index === ids.length - 1);
+    const latest = rows.find((row) => row.index === ids.length);
     const visible =
       !!viewport &&
       !!latest &&
@@ -275,16 +247,6 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       latest.start < viewport.scrollTop + viewport.clientHeight - insets.bottom;
     props.onLatestVisibleChange?.(visible);
   }, [rows, ids.length, insets, props.onLatestVisibleChange]);
-  const rememberScroll = () => {
-    const element = parent.current;
-    if (!element) return;
-    const nearEnd = element.scrollHeight - element.scrollTop - element.clientHeight <= 8;
-    if (userScroll.current && !nearEnd) atTail.current = false;
-    if (nearEnd && element.scrollTop >= previousScrollTop.current) atTail.current = true;
-    previousScrollTop.current = element.scrollTop;
-    userScroll.current = false;
-    updateEndVisibility();
-  };
   return (
     <MessageArrivalsContext value={arrivals}>
       <TimelineContext value={timeline}>
@@ -292,73 +254,39 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
           <div
             className="timeline chat-scroll"
             ref={parent}
-            onScroll={rememberScroll}
+            onScroll={(event) => {
+              setReadingDisclosure(undefined);
+              const viewport = event.currentTarget;
+              setAwayFromEnd(
+                viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > 8,
+              );
+            }}
             onClickCapture={(event) => {
-              if (
-                event.target instanceof Element &&
-                event.target.closest("[data-slot=collapsible-trigger], .message-expand")
-              )
-                atTail.current = false;
+              if (!(event.target instanceof Element)) return;
+              const trigger = event.target.closest(
+                '[data-slot="collapsible-trigger"], .message-expand',
+              );
+              if (trigger?.getAttribute("aria-expanded") === "false")
+                setReadingDisclosure(props.threadId);
             }}
             onFocusCapture={(event) => {
               if (
                 event.target instanceof Element &&
                 event.target.closest('.message-card-preview[data-collapsed="true"]')
               )
-                atTail.current = false;
-            }}
-            onWheel={(event) => {
-              const editor =
-                event.target instanceof Element ? event.target.closest(".composer-editor") : null;
-              if (
-                editor &&
-                ((event.deltaY < 0 && editor.scrollTop > 0) ||
-                  (event.deltaY > 0 &&
-                    editor.scrollTop + editor.clientHeight < editor.scrollHeight))
-              )
-                return;
-              userScroll.current = true;
-              if (event.deltaY < 0) atTail.current = false;
-            }}
-            onTouchStart={(event) => {
-              touchY.current = event.touches[0]?.clientY;
-            }}
-            onTouchMove={(event) => {
-              userScroll.current = true;
-              const next = event.touches[0]?.clientY;
-              if (next !== undefined && touchY.current !== undefined && next > touchY.current)
-                atTail.current = false;
-              touchY.current = next;
-            }}
-            onKeyDown={(event) => {
-              if (event.target instanceof Element && event.target.closest(".chat-sticky-footer"))
-                return;
-              if (
-                ["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(
-                  event.key,
-                )
-              )
-                userScroll.current = true;
-              if (["ArrowUp", "PageUp", "Home"].includes(event.key)) atTail.current = false;
-            }}
-            onPointerDown={(event) => {
-              if (event.nativeEvent.offsetX >= event.currentTarget.clientWidth) {
-                userScroll.current = true;
-                atTail.current = false;
-              }
+                setReadingDisclosure(props.threadId);
             }}
             role="region"
             aria-label="Conversation"
             tabIndex={0}
           >
-            <div ref={headerRef} className="chat-sticky-header">
+            <div ref={measureHeader} data-index={0} className="chat-sticky-header">
               {props.header}
             </div>
             <div
-              ref={canvasRef}
               className="virtual-canvas timeline-canvas"
               style={{
-                height: virtual.getTotalSize(),
+                height: Math.max(0, totalSize - headerSize - footerSize),
                 minHeight: `calc(100% - ${insets.top + insets.bottom}px)`,
               }}
             >
@@ -368,9 +296,9 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
                   data-index={row.index}
                   ref={virtual.measureElement}
                   className="virtual-row"
-                  style={{ transform: `translateY(${row.start - insets.top}px)` }}
+                  style={{ transform: `translateY(${row.start - headerSize}px)` }}
                 >
-                  <SlotRow slotId={ids[row.index]!} store={store} />
+                  <SlotRow slotId={ids[row.index - 1]!} store={store} />
                 </div>
               ))}
               {ids.length === 0
@@ -382,18 +310,10 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
                 : null}
             </div>
             {props.footer ? (
-              <div ref={footerRef} className="chat-sticky-footer">
+              <div ref={measureFooter} data-index={ids.length + 1} className="chat-sticky-footer">
                 {awayFromEnd && !switching ? (
                   <div className="scroll-to-end">
-                    <Button
-                      variant="secondary"
-                      onClick={() => {
-                        atTail.current = true;
-                        userScroll.current = false;
-                        if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
-                        updateEndVisibility();
-                      }}
-                    >
+                    <Button variant="secondary" onClick={() => virtual.scrollToEnd()}>
                       <ChevronDown />
                       Scroll to end
                     </Button>
