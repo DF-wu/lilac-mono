@@ -157,3 +157,36 @@ test("one participant is omitted even when they steer repeatedly", () => {
   expect(html).toContain("Worked for 4m");
   expect(renderStage("complete")).not.toContain('class="work-participation"');
 });
+
+test("rewind stays between time and copy and is disabled for an active agent", () => {
+  const slot = agentWorkStages.find((stage) => stage.id === "complete")!.frames[0]!;
+  for (const rewindDisabled of [false, true]) {
+    const html = renderToStaticMarkup(
+      <MessageIdentityContext
+        value={{ viewerId: "demo_user", agent: { displayName: "Lilac" }, users: new Map() }}
+      >
+        <MessageServicesContext
+          value={{
+            canEdit: true,
+            rewindDisabled,
+            resourceUrl: () => "",
+            onAction: () => {},
+            onReaction: () => {},
+          }}
+        >
+          <Turn slot={slot} onRewind={() => {}} onLoadMore={() => {}} />
+        </MessageServicesContext>
+      </MessageIdentityContext>,
+    );
+    const controls = html.slice(html.indexOf('class="message-controls"'));
+    expect(controls.indexOf("<time")).toBeLessThan(
+      controls.indexOf('aria-label="Rewind to this turn"'),
+    );
+    expect(controls.indexOf('aria-label="Rewind to this turn"')).toBeLessThan(
+      controls.indexOf('aria-label="Copy message"'),
+    );
+    const rewind = controls.match(/<button[^>]*aria-label="Rewind to this turn"[^>]*>/)?.[0];
+    expect(rewind).toBeDefined();
+    expect(/\sdisabled(?:=|\s|>)/.test(rewind!)).toBe(rewindDisabled);
+  }
+});

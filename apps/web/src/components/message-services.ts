@@ -4,6 +4,7 @@ import type { AppProps } from "../types";
 
 export type MessageServices = Pick<AppProps, "resourceUrl"> & {
   canEdit: boolean;
+  rewindDisabled?: boolean;
   upload?: AppProps["upload"];
   onAction: (
     messageId: string,

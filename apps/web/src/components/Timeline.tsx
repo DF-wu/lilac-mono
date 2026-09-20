@@ -1,3 +1,4 @@
+import { copyMessage, messageClipboard } from "../message-clipboard";
 import { MessageArrivals } from "../message-arrivals";
 import { MessageArrivalsContext, LiveMessageContext, useMessageArrival } from "./message-arrivals";
 import {
@@ -25,6 +26,7 @@ import {
   ChevronRight,
   RotateCcw,
   Copy,
+  CopyCheck,
   Brain,
   Wrench,
   Workflow,
@@ -86,14 +88,15 @@ type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind"> 
 const TimelineContext = createContext<TimelineServices | undefined>(undefined);
 function useMessageServicesValue({
   canEdit,
+  rewindDisabled,
   resourceUrl,
   upload,
   onAction,
   onReaction,
 }: MessageServices) {
   return useMemo(
-    () => ({ canEdit, resourceUrl, upload, onAction, onReaction }),
-    [canEdit, resourceUrl, upload, onAction, onReaction],
+    () => ({ canEdit, rewindDisabled, resourceUrl, upload, onAction, onReaction }),
+    [canEdit, rewindDisabled, resourceUrl, upload, onAction, onReaction],
   );
 }
 
@@ -366,7 +369,7 @@ export const Turn = memo(function Turn(props: {
   onLoadMore: () => void;
 }) {
   const { onRewind, onLoadMore } = props;
-  const { canEdit } = useMessageServices();
+  const { canEdit, rewindDisabled } = useMessageServices();
   const { slot } = props;
   const [expanded, setExpanded] = useState(false);
   const firstUser = slot.messages.find(
@@ -396,8 +399,12 @@ export const Turn = memo(function Turn(props: {
             message={firstUser}
             controls={
               <>
-                {canEdit ? (
-                  <IconButton label="Rewind to this turn" onClick={() => onRewind(slot.turnId)}>
+                {canEdit && firstUser.metadata?.authorId === identities.viewerId ? (
+                  <IconButton
+                    disabled={rewindDisabled}
+                    label="Rewind to this turn"
+                    onClick={() => onRewind(slot.turnId)}
+                  >
                     <RotateCcw />
                   </IconButton>
                 ) : null}
@@ -522,6 +529,9 @@ function TurnMessages({
         showAvatar={showAvatar}
         showControls={message.role === "user" || message.id === finalMessageId}
         copyText={message.id === finalMessageId ? finalText : undefined}
+        copyParts={
+          message.id === finalMessageId ? messages.flatMap((item) => item.parts) : undefined
+        }
       />
     );
   });
@@ -784,11 +794,18 @@ const MessageBody = memo(function MessageBody(
     showAvatar?: boolean;
     showControls?: boolean;
     copyText?: string;
+    copyParts?: readonly DisplayPart[];
   },
 ) {
   const { resourceUrl, canEdit, onAction, onReaction } = useMessageServices();
   const { message } = props;
   const [copyError, setCopyError] = useState<string>();
+  const [copiedAt, setCopiedAt] = useState(0);
+  useEffect(() => {
+    if (!copiedAt) return;
+    const timer = setTimeout(() => setCopiedAt(0), 2000);
+    return () => clearTimeout(timer);
+  }, [copiedAt]);
   const copyText = props.copyText ?? messageText(message);
   const groups = useMemo(() => groupParts(message.parts), [message.parts]);
   const cards = useMemo(() => groupMessageCards(groups), [groups]);
@@ -827,6 +844,34 @@ const MessageBody = memo(function MessageBody(
       ),
     [attachments, resourceUrl],
   );
+  const time =
+    message.metadata?.createdAt !== undefined ? (
+      <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
+        {new Date(message.metadata.createdAt).toLocaleTimeString([], {
+          hour: "numeric",
+          minute: "2-digit",
+        })}
+      </time>
+    ) : null;
+  const copy =
+    copyText || attachments.length ? (
+      <IconButton
+        label="Copy message"
+        tooltip={copiedAt ? "Copied!" : "Copy message"}
+        onClick={() =>
+          void attempt(
+            async () => {
+              setCopyError(undefined);
+              await copyMessage(messageClipboard(copyText, props.copyParts ?? message.parts));
+              setCopiedAt(Date.now());
+            },
+            () => setCopyError("Copy unavailable"),
+          )
+        }
+      >
+        {copiedAt ? <CopyCheck /> : <Copy />}
+      </IconButton>
+    ) : null;
   return (
     <LiveMessageContext value={props.live ?? false}>
       <ChatMessage
@@ -919,29 +964,19 @@ const MessageBody = memo(function MessageBody(
         (props.showControls ??
           (message.metadata?.phase !== "commentary" && !message.metadata?.incomplete)) ? (
           <div className="message-controls">
-            {message.metadata?.createdAt !== undefined ? (
-              <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
-                {new Date(message.metadata.createdAt).toLocaleTimeString([], {
-                  hour: "numeric",
-                  minute: "2-digit",
-                })}
-              </time>
-            ) : null}
-            {copyText ? (
-              <IconButton
-                label="Copy message"
-                onClick={() =>
-                  void attempt(
-                    () => navigator.clipboard.writeText(copyText),
-                    () => setCopyError("Copy unavailable"),
-                  )
-                }
-              >
-                <Copy />
-              </IconButton>
-            ) : null}
+            {self ? (
+              <>
+                {time}
+                {props.controls}
+                {copy}
+              </>
+            ) : (
+              <>
+                {copy}
+                {time}
+              </>
+            )}
             {copyError ? <span role="status">{copyError}</span> : null}
-            {props.controls}
           </div>
         ) : null}
       </ChatMessage>

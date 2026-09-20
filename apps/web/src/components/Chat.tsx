@@ -372,7 +372,15 @@ export function Chat(props: ChatProps) {
   async function rewind() {
     const rpc = client.rpc,
       checkpoint = store.checkpoint;
-    if (!draftLoaded || !canEdit.current || !rpc || !checkpoint || !rewindTarget || rewinding)
+    if (
+      !draftLoaded ||
+      !canEdit.current ||
+      !rpc ||
+      !checkpoint ||
+      !rewindTarget ||
+      rewinding ||
+      active
+    )
       return;
     setRewinding(true);
     const reply = await attempt(
@@ -553,9 +561,13 @@ export function Chat(props: ChatProps) {
           onCommand={(commandId) => commitDraft({ ...getDraft(), commandId })}
           onText={(text) => commitDraft({ ...getDraft(), text })}
           attachments={attachments}
-          onAttach={(files) => {
+          onAttach={(files, requireAll) => {
             if (local) {
-              const added = files.slice(0, 32 - attachments.length).map(draftAttachment);
+              const current = draftStore.getState().localDrafts.get(threadId);
+              if (!current) return [];
+              const available = 32 - current.attachments.length;
+              if (requireAll && files.length > available) return [];
+              const added = files.slice(0, available).map(draftAttachment);
               props.onLocalChange(threadId, (current) => ({
                 ...current,
                 attachments: [...current.attachments, ...added],
@@ -564,17 +576,16 @@ export function Chat(props: ChatProps) {
                   attachments: [...current.draft.attachments, ...added.map((item) => item.key)],
                 },
               }));
-              return;
+              return added;
             }
-            commitDraft({
-              ...draft,
-              attachments: [
-                ...draft.attachments,
-                ...files
-                  .slice(0, 32 - draft.attachments.length)
-                  .map((file) => pool.add(threadId, file)),
-              ],
-            });
+            const current = getDraft();
+            const available = 32 - current.attachments.length;
+            if (requireAll && files.length > available) return [];
+            const keys = files.slice(0, available).map((file) => pool.add(threadId, file));
+            commitDraft({ ...current, attachments: [...current.attachments, ...keys] });
+            return keys.map(
+              (key) => pool.get(threadId).find((attachment) => attachment.key === key)!,
+            );
           }}
           onRemoveAttachment={(key) => {
             if (local) {
@@ -668,6 +679,7 @@ export function Chat(props: ChatProps) {
             resourceUrl={resourceUrl}
             upload={recoveryUpload}
             onRewind={setRewindTarget}
+            rewindDisabled={active}
             onAction={onAction}
             onReaction={onReaction}
           />
@@ -682,7 +694,7 @@ export function Chat(props: ChatProps) {
             The selected turn and everything after it will leave the conversation. Its text returns
             to your composer. File changes and other tool effects remain.
           </p>
-          {active ? <p>The active run will be canceled and queued messages dropped.</p> : null}
+          {active ? <p>Wait for the agent to finish before rewinding.</p> : null}
           <div className="dialog-actions">
             <Button className="button" onClick={() => setRewindTarget(undefined)}>
               Keep conversation
@@ -690,7 +702,7 @@ export function Chat(props: ChatProps) {
             <Button
               variant="destructive"
               className="button danger"
-              disabled={rewinding}
+              disabled={rewinding || active}
               onClick={() => void rewind()}
             >
               <RotateCcw />

@@ -14,6 +14,8 @@ import ComposerEditor, {
   remapComposerAttachments,
   resolveComposerAttachments,
   attachmentSize,
+  restoreMessageAttachments,
+  captureComposerPaste,
 } from "../src/components/composer-editor";
 
 it("round trips basic rich Markdown through draft text", () => {
@@ -263,4 +265,48 @@ it("keeps the empty document nodes when switching between empty drafts", () => {
   replaceComposerDocument(editor, "");
   expect(editor.children[0]).toBe(paragraph);
   expect(composerMarkdown(editor)).toBe("");
+});
+
+it("restores copied resources inline and keeps unrelated links and code intact", () => {
+  const file = new File(["notes"], "notes.md", { type: "text/markdown" });
+  const attachment = {
+    key: "new-key",
+    file,
+    state: "ready" as const,
+    progress: 1,
+    reservation: Promise.resolve("new-resource"),
+  };
+  const text = restoreMessageAttachments(
+    "Before [notes.md](/api/resources/original) after [site](https://example.com).\n\n`/api/resources/original`",
+    new Map([["original", attachment]]),
+  );
+  expect(text).toContain(
+    "Before [notes.md](attachment:new-key) after [site](https://example.com).",
+  );
+  expect(text).toContain("`/api/resources/original`");
+  const image = restoreMessageAttachments(
+    "Before ![notes](/api/resources/original) after",
+    new Map([["original", attachment]]),
+  );
+  expect(image).toBe("Before [notes.md](attachment:new-key) after");
+  const submitted = resolveComposerAttachments(text, new Map([["new-key", "new-resource"]]));
+  expect(submitted).toContain("[notes.md](/api/resources/new-resource)");
+  expect(restoreMessageAttachments("", new Map([["original", attachment]]))).toContain(
+    "[notes.md](attachment:new-key)",
+  );
+});
+
+it("keeps an asynchronous paste range current and releases it on insertion or cancellation", () => {
+  const editor = createComposerEditor("before after");
+  editor.tf.select({ path: [0, 0], offset: 7 });
+  const target = captureComposerPaste(editor);
+  editor.tf.insertText("prefix ", { at: { path: [0, 0], offset: 0 } });
+  target.insert("**pasted** ");
+  expect(composerMarkdown(editor)).toBe("prefix before **pasted** after");
+  expect(editor.api.rangeRefs().size).toBe(0);
+  const canceled = captureComposerPaste(editor);
+  canceled.cancel();
+  canceled.insert("must not appear");
+  expect(composerMarkdown(editor)).not.toContain("must not appear");
+  expect(editor.api.rangeRefs().size).toBe(0);
 });

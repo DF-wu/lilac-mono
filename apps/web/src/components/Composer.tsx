@@ -1,3 +1,4 @@
+import { Result } from "better-result";
 import { useOptionalWorkspace } from "../workspace-context";
 import "./composer-rich.css";
 import { Button } from "./ui/button";
@@ -20,7 +21,8 @@ import { hasFileDrag, installWindowFileDrop } from "../window-file-drop";
 import "./composer-drop.css";
 import type { Completion } from "@stanley2058/lilac-client";
 import type { ChatCommon, ComposerSubmission, Attachment } from "../types";
-import { IconButton, VirtualList, ErrorNotice } from "./ui";
+import { readMessageClipboard, type MessageClipboard } from "../message-clipboard";
+import { IconButton, VirtualList, ErrorNotice, attempt } from "./ui";
 import type { ComposerEditorHandle } from "./composer-editor";
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from "./ui/select";
 import { Popover, PopoverTrigger, PopoverContent } from "./ui/popover";
@@ -40,7 +42,7 @@ export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catal
   onCommand: (id: string | undefined) => void;
   onText: (text: string) => void;
   attachments: readonly Attachment[];
-  onAttach: (files: File[]) => void;
+  onAttach: (files: File[], requireAll?: boolean) => Attachment[] | void;
   onRemoveAttachment: (key: string) => void;
   onRetryAttachment: (key: string) => void;
   active: boolean;
@@ -216,7 +218,92 @@ export function Composer(props: ComposerProps) {
       submit();
     }
   }
+  const pastes = useRef(new Set<{ controller: AbortController; cancel: () => void }>());
+  useEffect(
+    () => () => {
+      for (const paste of pastes.current) {
+        paste.controller.abort();
+        paste.cancel();
+      }
+      pastes.current.clear();
+    },
+    [props.documentKey],
+  );
+
+  async function pasteMessage(message: MessageClipboard) {
+    const editor = input.current;
+    const resourceUrl = workspace?.resourceUrl;
+    if (!editor || !resourceUrl) return;
+    const documentKey = props.documentKey;
+    const target = editor.capturePaste();
+    const controller = new AbortController();
+    const paste = { controller, cancel: target.cancel };
+    pastes.current.add(paste);
+    await attempt(
+      async () => {
+        const downloads = await Promise.all(
+          message.resources.map(async (resource) => {
+            const response = await fetch(resourceUrl(resource.resourceId), {
+              signal: controller.signal,
+            });
+            if (!response.ok) return Result.err(`Could not copy attachment ${resource.name}`);
+            return Result.ok(
+              new File([await response.blob()], resource.name, { type: resource.mediaType }),
+            );
+          }),
+        );
+        const files = Result.all(downloads).match({
+          ok: (files) => files,
+          err: (message) => {
+            if (!controller.signal.aborted && dropProps.current.documentKey === documentKey)
+              setError(message);
+            return undefined;
+          },
+        });
+        if (!files) return;
+        const { restoreMessageAttachments } = await import("./composer-editor");
+        if (
+          controller.signal.aborted ||
+          dropProps.current.documentKey !== documentKey ||
+          dropProps.current.disabled
+        )
+          return;
+        if (dropProps.current.attachments.length + files.length > 32) {
+          setError("A message can contain at most 32 attachments.");
+          return;
+        }
+        const added = dropProps.current.onAttach(files, true);
+        if (!added || added.length !== files.length) {
+          setError("A message can contain at most 32 attachments.");
+          return;
+        }
+        target.insert(
+          restoreMessageAttachments(
+            message.text,
+            new Map(
+              message.resources.map((resource, index) => [resource.resourceId, added[index]!]),
+            ),
+          ),
+        );
+      },
+      (message) => {
+        if (!controller.signal.aborted && dropProps.current.documentKey === documentKey)
+          setError(message);
+      },
+    );
+    controller.abort();
+    target.cancel();
+    pastes.current.delete(paste);
+  }
+
   function paste(event: ClipboardEvent<HTMLDivElement>) {
+    if (disabled) return;
+    const message = readMessageClipboard(event.clipboardData.getData("text/html"));
+    if (message && workspace) {
+      event.preventDefault();
+      void pasteMessage(message);
+      return;
+    }
     const files = [...event.clipboardData.files];
     if (files.length) {
       event.preventDefault();

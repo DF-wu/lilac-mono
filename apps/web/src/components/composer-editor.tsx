@@ -57,7 +57,7 @@ import { LinkPlugin } from "@platejs/link/react";
 import { BulletedListRules, OrderedListRules, toggleList } from "@platejs/list";
 import { ListPlugin } from "@platejs/list/react";
 import { IndentPlugin } from "@platejs/indent/react";
-import { MarkdownPlugin } from "@platejs/markdown";
+import { MarkdownPlugin, defaultRules } from "@platejs/markdown";
 import remarkGfm from "remark-gfm";
 import {
   Bold,
@@ -416,6 +416,63 @@ export function resolveComposerAttachments(
   return composerMarkdown(editor);
 }
 
+export function restoreMessageAttachments(
+  text: string,
+  attachments: ReadonlyMap<string, Attachment>,
+): string {
+  const editor = createComposerEditor(text);
+  const byUrl = new Map(
+    [...attachments].map(([id, attachment]) => [
+      `/api/resources/${encodeURIComponent(id)}`,
+      attachment,
+    ]),
+  );
+  const value = editor.getApi(MarkdownPlugin).markdown.deserialize(text, {
+    rules: {
+      img: {
+        deserialize: (node, decoration, options) => {
+          const attachment = byUrl.get(node.url);
+          if (!attachment) return defaultRules.img!.deserialize!(node, decoration, options);
+          return { type: KEYS.a, url: node.url, children: [{ text: attachment.file.name }] };
+        },
+      },
+    },
+  });
+  if (value.length) editor.children = value;
+  const used = new Set<string>();
+  editor.children = mapComposerValue(editor.children, (node) => {
+    const attachment = byUrl.get(projectComposerNode(node).url ?? "");
+    if (!attachment) return node;
+    used.add(attachment.key);
+    return {
+      type: attachmentType,
+      attachmentKey: attachment.key,
+      name: attachment.file.name,
+      children: [{ text: "" }],
+    };
+  });
+  for (const attachment of attachments.values()) {
+    if (!used.has(attachment.key)) insertComposerAttachment(editor, attachment);
+  }
+  return composerMarkdown(editor);
+}
+
+export function captureComposerPaste(editor: PlateEditor) {
+  const end = editor.api.end([])!;
+  const range = editor.api.rangeRef(editor.selection ?? { anchor: end, focus: end });
+  return {
+    cancel: () => {
+      range.unref();
+    },
+    insert(text: string) {
+      const at = range.unref();
+      if (!at) return;
+      editor.tf.select(at);
+      editor.tf.insertFragment(deserializeComposer(editor, text));
+    },
+  };
+}
+
 export function remapComposerAttachments(text: string, keys: ReadonlyMap<string, string>): string {
   const editor = createComposerEditor(text);
   editor.children = mapComposerValue(editor.children, (node) => {
@@ -458,6 +515,7 @@ export function insertComposerCompletion(editor: PlateEditor, text: string, repl
 }
 
 export type ComposerEditorHandle = {
+  capturePaste: () => ReturnType<typeof captureComposerPaste>;
   complete: (text: string, replaceLength: number) => void;
   submissionText: () => string;
   hasMissingAttachments: () => boolean;
@@ -529,6 +587,7 @@ export default function ComposerEditor(props: ComposerEditorProps) {
   useImperativeHandle(
     props.ref,
     () => ({
+      capturePaste: () => captureComposerPaste(editor),
       submissionText: () => composerSubmissionMarkdown(editor),
       hasMissingAttachments: () =>
         [...attachmentKeys(editor)].some(

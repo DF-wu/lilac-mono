@@ -70,7 +70,9 @@ describe("message presentation", () => {
       expect(html).toContain('data-slot="bubble"');
       expect(html).toContain('aria-label="Copy message"');
       const controls = html.slice(html.indexOf('class="message-controls"'));
-      expect(controls.indexOf("<time")).toBeLessThan(controls.indexOf('aria-label="Copy message"'));
+      const timeIndex = controls.indexOf("<time");
+      const copyIndex = controls.indexOf('aria-label="Copy message"');
+      expect(self ? timeIndex < copyIndex : copyIndex < timeIndex).toBe(true);
       expect(html.indexOf('data-slot="message-avatar"')).toBeLessThan(
         html.indexOf('data-slot="message-content"'),
       );
