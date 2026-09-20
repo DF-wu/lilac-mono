@@ -1,14 +1,11 @@
-import { useRef, useState, type ChangeEvent } from "react";
+import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Result } from "better-result";
 import type { NativeUser } from "@stanley2058/lilac-client-protocol";
-import { ImagePlus, Trash2 } from "lucide-react";
 import { useWorkspace } from "../workspace-context";
 import { useNativeOnline } from "../queries";
-import { ActorAvatar } from "./ActorAvatar";
-import { ErrorNotice, IconButton } from "./ui";
-import { Button } from "./ui/button";
-import { Input } from "./ui/input";
+import { ErrorNotice } from "./ui";
+import { ProfileEditor } from "./ProfileEditor";
 
 export function AccountProfile({ viewer }: { viewer: NativeUser }) {
   const { client } = useWorkspace();
@@ -16,7 +13,6 @@ export function AccountProfile({ viewer }: { viewer: NativeUser }) {
   const queries = useQueryClient();
   const [draftName, setDraftName] = useState<string>();
   const [error, setError] = useState<string>();
-  const fileInput = useRef<HTMLInputElement>(null);
   const name = draftName ?? viewer.displayName;
   const save = useMutation({
     mutationFn: (displayName: string) => client.rpc!.profile.update({ displayName }),
@@ -65,71 +61,23 @@ export function AccountProfile({ viewer }: { viewer: NativeUser }) {
     onError: (failure) => setError(failure.message),
   });
   const busy = save.isPending || avatar.isPending;
-  function choose(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) return;
-    setError(undefined);
-    avatar.mutate(file);
-  }
   return (
-    <section className="agent-identity-settings account-profile" aria-label="Your profile">
-      <div className="agent-avatar-editor">
-        <ActorAvatar {...viewer} size="lg" />
-        <Button
-          variant="secondary"
-          disabled={busy || !online}
-          onClick={() => fileInput.current?.click()}
-        >
-          <ImagePlus /> Upload avatar
-        </Button>
-        {viewer.avatarUrl ? (
-          <IconButton
-            label="Remove avatar"
-            disabled={busy || !online}
-            onClick={() => {
-              setError(undefined);
-              avatar.mutate(null);
-            }}
-          >
-            <Trash2 />
-          </IconButton>
-        ) : null}
-        <input
-          ref={fileInput}
-          type="file"
-          className="sr-only"
-          aria-label="Your avatar"
-          accept="image/png,image/jpeg,image/webp,image/gif"
-          onChange={choose}
-        />
-      </div>
-      <form
-        className="agent-name-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (!online || busy || !name.trim() || name.trim() === viewer.displayName) return;
+    <section aria-label="Your profile">
+      <ProfileEditor
+        identity={viewer}
+        name={name}
+        onNameChange={setDraftName}
+        disabled={busy || !online}
+        saving={save.isPending}
+        onSave={() => {
           setError(undefined);
           save.mutate(name.trim());
         }}
-      >
-        <label className="field">
-          Display name
-          <Input
-            maxLength={256}
-            value={name}
-            disabled={busy}
-            onChange={(event) => setDraftName(event.target.value)}
-          />
-        </label>
-        <Button
-          type="submit"
-          disabled={busy || !online || !name.trim() || name.trim() === viewer.displayName}
-        >
-          {save.isPending ? "Saving…" : "Save"}
-        </Button>
-      </form>
-      <p className="muted">Your name and avatar appear in conversations.</p>
+        onAvatarChange={(file) => {
+          setError(undefined);
+          avatar.mutate(file);
+        }}
+      />
       <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
     </section>
   );

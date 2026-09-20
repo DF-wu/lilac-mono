@@ -34,8 +34,14 @@ export function SidebarPreferences() {
     : (preferences.data?.autoSettleDays ?? 3);
   return (
     <>
-      <label className="field">
-        Auto-settle inactive conversations
+      <div className="settings-row">
+        <div className="settings-row-description">
+          <span>Auto-settle inactive conversations</span>
+          <p className="muted">
+            Pinned conversations stay pinned. New activity moves settled conversations back to
+            Active. Saved to your account across devices.
+          </p>
+        </div>
         <Select
           items={intervals}
           value={current}
@@ -56,11 +62,8 @@ export function SidebarPreferences() {
             ))}
           </SelectContent>
         </Select>
-      </label>
-      <p className="muted">
-        Pinned conversations stay pinned. New activity moves settled conversations back to Active.
-        Saved to your account across devices.
-      </p>
+      </div>
+
       <ErrorNotice message={(update.error ?? preferences.error)?.message} />
     </>
   );

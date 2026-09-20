@@ -62,6 +62,12 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "./components/ui/dropdown-menu";
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+} from "./components/ui/context-menu";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import "./styles.css";
@@ -816,19 +822,19 @@ function Workspace(props: AppProps) {
                     <span className="viewer-name">{viewer.displayName}</span>
                     {props.sessionControl}
                     <span className="toolbar-spacer" />
-                    <DropdownMenu>
-                      <DropdownMenuTrigger
+                    <ContextMenu>
+                      <ContextMenuTrigger
                         render={
-                          <IconButton label="Settings">
+                          <IconButton label="Settings" onClick={() => setSettings(true)}>
                             <SettingsIcon />
                           </IconButton>
                         }
                       />
-                      <DropdownMenuContent side="top" align="end">
-                        <DropdownMenuItem onClick={() => setSettings(true)}>
+                      <ContextMenuContent side="top" align="end">
+                        <ContextMenuItem onClick={() => setSettings(true)}>
                           <SettingsIcon /> Settings
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
+                        </ContextMenuItem>
+                        <ContextMenuItem
                           onClick={() =>
                             void navigate({
                               to: "/design-system",
@@ -839,12 +845,15 @@ function Workspace(props: AppProps) {
                           }
                         >
                           <Palette /> Design
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => void attempt(props.onLogout, setError)}>
+                        </ContextMenuItem>
+                        <ContextMenuItem
+                          variant="destructive"
+                          onClick={() => void attempt(props.onLogout, setError)}
+                        >
                           <LogOut /> Logout
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
+                        </ContextMenuItem>
+                      </ContextMenuContent>
+                    </ContextMenu>
                   </footer>
                 </aside>
               </WorkspaceSidePanel>
@@ -967,7 +976,6 @@ function Workspace(props: AppProps) {
             {settings ? (
               <Settings
                 viewer={viewer}
-                onLogout={props.onLogout}
                 onClose={() => setSettings(false)}
                 agent={identities.agent}
                 theme={theme}

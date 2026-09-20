@@ -7,7 +7,7 @@ import { AccountProfile } from "./AccountProfile";
 import { AgentIdentity } from "./AgentIdentity";
 import type { ActorIdentity } from "./ActorAvatar";
 import { useEffect, useRef, useState } from "react";
-import { LogOut, RefreshCw, Save, UserPlus } from "lucide-react";
+import { RefreshCw, Save, UserPlus } from "lucide-react";
 import type { NativeRpcOutputs, NativeUser } from "@stanley2058/lilac-client-protocol";
 import { attempt, ErrorNotice, IconButton, VirtualList } from "./ui";
 import { Dialog, DialogContent, DialogTitle } from "./ui/dialog";
@@ -30,10 +30,8 @@ export function Settings({
   onTheme,
   agent,
   viewer,
-  onLogout,
 }: {
   viewer: NativeUser;
-  onLogout: () => Promise<void>;
   onClose: () => void;
   theme: string;
   agent: ActorIdentity;
@@ -142,7 +140,7 @@ export function Settings({
                 Preferences
               </span>
               <TabsTrigger value="account">Account</TabsTrigger>
-              <TabsTrigger value="theme">Theme</TabsTrigger>
+              <TabsTrigger value="theme">Appearance</TabsTrigger>
             </div>
             {viewer.role === "owner" ? (
               <div className="settings-navigation-group">
@@ -166,7 +164,9 @@ export function Settings({
             <TabsContent value="account" className="settings-section">
               <h2>Account</h2>
               <AccountProfile viewer={viewer} />
+              <h2>Thread</h2>
               <SidebarPreferences />
+              <h2>Access</h2>
               <dl className="settings-account">
                 <div>
                   <dt>Role</dt>
@@ -177,18 +177,15 @@ export function Settings({
                   <dd>{viewer.toolMode === "full" ? "Full access" : "Restricted"}</dd>
                 </div>
               </dl>
-              <Button variant="secondary" onClick={() => void attempt(onLogout, setError)}>
-                <LogOut />
-                Sign out
-              </Button>
             </TabsContent>
             <TabsContent value="agent" className="settings-section">
+              <h2>Agent</h2>
               <AgentIdentity client={client} identity={agent} />
             </TabsContent>
             <TabsContent value="theme" className="settings-section">
-              <h2>Theme</h2>
-              <label className="field">
-                Theme
+              <h2>Appearance</h2>
+              <div className="settings-row">
+                <span>Theme</span>
                 <Select
                   items={[
                     { value: "system", label: "System" },
@@ -209,9 +206,15 @@ export function Settings({
                     <SelectItem value="light">Light</SelectItem>
                   </SelectContent>
                 </Select>
-              </label>
-              <label className="field">
-                Animation speed
+              </div>
+              <div className="settings-row">
+                <div className="settings-row-description">
+                  <span>Animation speed</span>
+                  <p className="muted">
+                    Animation speed is saved for your account on this device. Reduced motion follows
+                    your system preference.
+                  </p>
+                </div>
                 <Select
                   items={[
                     { value: "off", label: "Off" },
@@ -233,11 +236,7 @@ export function Settings({
                     <SelectItem value="slow">Slow</SelectItem>
                   </SelectContent>
                 </Select>
-              </label>
-              <p className="muted">
-                Animation speed is saved for your account on this device. Reduced motion follows
-                your system preference.
-              </p>
+              </div>
             </TabsContent>
             <TabsContent value="users" className="settings-section">
               <h2>User</h2>

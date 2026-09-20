@@ -1400,11 +1400,6 @@ progress {
   .thread-row-card { display: block; padding-block: var(--space-1); }
 }
 @layer components {
-  .agent-identity-settings { display:grid; gap:var(--space-4); margin-block:var(--space-4) var(--space-6); }
-  .agent-identity-settings h2 { font-size:var(--text-base); font-weight:600; }
-  .agent-avatar-editor { display:flex; align-items:center; gap:var(--space-3); flex-wrap:wrap; }
-  .agent-name-form { display:flex; align-items:flex-end; gap:var(--space-3); }
-  .agent-name-form .field { flex:1; margin:0; min-width:0; }
 }
 
 .markdown[data-wrap="true"] {
