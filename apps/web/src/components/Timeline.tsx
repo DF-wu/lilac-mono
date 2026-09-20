@@ -1033,7 +1033,11 @@ export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdA
           <MarkerIcon>
             <ActivityIcon part={representative} />
           </MarkerIcon>
-          <MarkerContent className="activity-label">{activitySummary(parts)}</MarkerContent>
+          <MarkerContent className="activity-label">
+            <span className={representative.data.state === "running" ? "working-text" : undefined}>
+              {activitySummary(parts)}
+            </span>
+          </MarkerContent>
           {createdAt !== undefined ? (
             <time className="activity-time" dateTime={new Date(createdAt).toISOString()}>
               {new Date(createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
@@ -1059,7 +1063,11 @@ export function ActivityItem({ part }: { part: ActivityPart }) {
       <MarkerIcon>
         <ActivityIcon part={part} />
       </MarkerIcon>
-      <MarkerContent className="activity-label">{part.data.label}</MarkerContent>
+      <MarkerContent className="activity-label">
+        <span className={part.data.state === "running" ? "working-text" : undefined}>
+          {part.data.label}
+        </span>
+      </MarkerContent>
       {part.data.state === "failed" ? <span className="activity-state">Failed</span> : null}
       {part.data.durationMs !== undefined ? (
         <span className="activity-time">{formatDuration(part.data.durationMs)}</span>

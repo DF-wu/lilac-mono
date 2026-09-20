@@ -1470,8 +1470,8 @@ progress {
 .sidebar-search-row .sidebar-tabs .icon-button { width: var(--control-compact); height: var(--control-compact); }
 .sidebar-search-row:has(.search-box:focus-within) .sidebar-tabs { display: none; }
 
-:root { --motion-duration: 150ms; --motion-spin-duration: 1s; }
-:root[data-animation="slow"] { --motion-duration: 350ms; --motion-spin-duration: 2s; }
+:root { --motion-duration: 150ms; --motion-spin-duration: 1s; --motion-shine-duration: 2s; }
+:root[data-animation="slow"] { --motion-duration: 350ms; --motion-spin-duration: 2s; --motion-shine-duration: 4s; }
 :root[data-animation] *, :root[data-animation] *::before, :root[data-animation] *::after {
   animation-duration: var(--motion-duration) !important;
 }
@@ -1534,3 +1534,36 @@ progress {
 .activity-item-trigger:hover .activity-time,
 .activity-item-trigger:focus-visible .activity-time { opacity: 1; }
 .agent-response > [data-slot="message-avatar"] { margin-bottom: var(--space-2); align-self: flex-start; background: transparent; overflow: visible; }
+
+.working-text {
+  color: transparent;
+  background-image: linear-gradient(
+    90deg,
+    var(--muted-foreground) 35%,
+    color-mix(in srgb, var(--muted-foreground) 80%, var(--foreground)) 43%,
+    var(--foreground) 50%,
+    color-mix(in srgb, var(--muted-foreground) 80%, var(--foreground)) 57%,
+    var(--muted-foreground) 65%
+  );
+  background-size: 300% 100%;
+  background-clip: text;
+  animation: working-text-shine var(--motion-shine-duration) linear infinite;
+}
+:root[data-animation] .working-text {
+  animation-duration: var(--motion-shine-duration) !important;
+}
+@keyframes working-text-shine {
+  from { background-position: 100% 0; }
+  to { background-position: 0% 0; }
+}
+:root[data-animation="off"] .working-text {
+  color: var(--muted-foreground);
+  background-image: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .working-text {
+    color: var(--muted-foreground);
+    background-image: none;
+    animation: none;
+  }
+}
