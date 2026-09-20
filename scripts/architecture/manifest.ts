@@ -3840,6 +3840,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       ...(root === "apps/web"
         ? [
             {
+              identity: { module: "src/panel-store.ts", exportName: "decodePanelLayouts" },
+              category: "persistence" as const,
+            },
+            {
               identity: {
                 module: "src/components/composer-editor.tsx",
                 exportName: "projectComposerNode",

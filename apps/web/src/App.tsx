@@ -1,3 +1,4 @@
+import { defaultRightPanel } from "./panel-store";
 import { WorkspacePanels, WorkspaceSidePanel } from "./components/WorkspacePanels";
 import {
   NativeSubagentPanel,
@@ -82,8 +83,7 @@ function Workspace(props: AppProps) {
   });
   const routePathname = useLocation({ select: (location) => location.pathname });
   const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
-  const { pool, drafts: draftStore, subagentPanel } = useWorkspace();
-  const rightOpen = useStore(subagentPanel, (state) => state.open);
+  const { pool, drafts: draftStore, panels } = useWorkspace();
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
@@ -120,7 +120,13 @@ function Workspace(props: AppProps) {
   const [archived, setArchived] = useState(false);
   const [external, setExternal] = useState(false);
   const [externalId, setExternalId] = useState<string>();
-  const [sidebar, setSidebar] = useState(true);
+  const sidebarLayout = useStore(panels, (state) => state.sidebar);
+  const rightLayout = useStore(
+    panels,
+    (state) => state.threads.get(selectedId) ?? defaultRightPanel,
+  );
+  const sidebar = sidebarLayout.open;
+  const rightOpen = rightLayout.open;
   const [searchQuery, setSearchQuery] = useState("");
   const queries = useQueryClient();
   const searchResults = useInfiniteQuery({
@@ -442,6 +448,7 @@ function Workspace(props: AppProps) {
           setError,
         );
     }
+    panels.getState().moveThread(id, created.id);
     removeLocalDraft(id);
     finishDraftNavigation(id, created.id);
     const patch = (change: Partial<PendingInput> | null) =>
@@ -626,16 +633,29 @@ function Workspace(props: AppProps) {
             <div className="sidebar-toggle">
               <IconButton
                 label={sidebar ? "Hide sidebar" : "Show sidebar"}
-                onClick={() => {
-                  setSidebar((value) => !value);
-                }}
+                onClick={panels.getState().toggleSidebar}
               >
                 {sidebar ? <PanelLeftClose /> : <PanelLeftOpen />}
               </IconButton>
             </div>
-            <RightPanelToggle open={rightOpen} onToggle={subagentPanel.getState().toggle} />
-            <WorkspacePanels leftOpen={sidebar} rightOpen={rightOpen}>
-              <WorkspaceSidePanel side="left" open={sidebar} id="sidebar" label="Sidebar width">
+            <RightPanelToggle
+              open={rightOpen}
+              onToggle={() => panels.getState().toggle(selectedId)}
+            />
+            <WorkspacePanels
+              leftOpen={sidebar}
+              rightOpen={rightOpen}
+              leftWidth={sidebarLayout.width}
+              rightWidth={rightLayout.width}
+              layoutKey={selectedId}
+            >
+              <WorkspaceSidePanel
+                side="left"
+                open={sidebar}
+                id="sidebar"
+                label="Sidebar width"
+                onWidthChange={panels.getState().resizeSidebar}
+              >
                 <aside className="sidebar">
                   <header className="sidebar-header">
                     <span className="brand">
@@ -920,6 +940,8 @@ function Workspace(props: AppProps) {
                 side="right"
                 open={rightOpen}
                 id="right-panel"
+                resizeKey={selectedId}
+                onWidthChange={(width) => panels.getState().resize(selectedId, width)}
                 label="Right panel width"
               >
                 <NativeSubagentPanel threadId={selectedId ?? ""} foreground={active && !external} />

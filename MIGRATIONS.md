@@ -30,6 +30,13 @@ Browser projection caches are scoped by installation, principal, protocol and pr
 They are disposable: unsupported versions or invalid coverage require a fresh recent window, while
 server conversation history remains authoritative. Never copy one user's cache into another scope.
 
+## Native web local panel layouts
+
+The web app stores device-local panel preferences under `lilac-panels-v1`, scoped by installation and
+principal. The JSON value contains the global sidebar width/open state and right-panel width/open
+state pairs keyed by thread ID. Missing, invalid, or unavailable storage uses the existing defaults.
+Older clients ignore the new key. No backend data or existing browser preferences require migration.
+
 ## Native personal sidebar queues
 
 The native store adds `native_user_preferences` and `native_thread_preferences`. These additive

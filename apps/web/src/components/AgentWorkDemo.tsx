@@ -2,7 +2,7 @@ import { WorkspacePanels, WorkspaceSidePanel } from "./WorkspacePanels";
 import { useMemo } from "react";
 import { useStore } from "zustand";
 import { demoSubagents, demoSubagentTranscript } from "../agent-work-fixtures";
-import { createSubagentPanelStore } from "../subagent-panel-store";
+import { createPanelStore, defaultRightPanel } from "../panel-store";
 import { SubagentContext } from "./subagent-context";
 import { SubagentPanelView, RightPanelToggle } from "./SubagentPanel";
 import { MessageArrivals } from "../message-arrivals";
@@ -28,8 +28,9 @@ const identities = {
 };
 
 export function AgentWorkDemo() {
-  const [panel] = useState(createSubagentPanelStore);
-  const panelOpen = useStore(panel, (state) => state.open);
+  const [panel] = useState(createPanelStore);
+  const panelLayout = useStore(panel, (state) => state.threads.get("demo") ?? defaultRightPanel);
+  const panelOpen = panelLayout.open;
   const panelSelection = useStore(panel, (state) => state.selection);
   const [playhead, setPlayhead] = useState({ stage: 1, frame: 0, playing: false });
   const [feedback, setFeedback] = useState("");
@@ -155,8 +156,8 @@ export function AgentWorkDemo() {
       </div>
       <SubagentContext value={agentContext}>
         <div className={`ds-agent-workspace ${panelOpen ? "" : "right-panel-hidden"}`}>
-          <RightPanelToggle open={panelOpen} onToggle={panel.getState().toggle} />
-          <WorkspacePanels rightOpen={panelOpen}>
+          <RightPanelToggle open={panelOpen} onToggle={() => panel.getState().toggle("demo")} />
+          <WorkspacePanels rightOpen={panelOpen} rightWidth={panelLayout.width}>
             <div className="chat-panel">
               <div className="ds-agent-preview" aria-label="Agent work preview" tabIndex={0}>
                 <MessageIdentityContext value={identities}>
@@ -176,6 +177,7 @@ export function AgentWorkDemo() {
               side="right"
               open={panelOpen}
               id="demo-agents-panel"
+              onWidthChange={(width) => panel.getState().resize("demo", width)}
               label="Demo agents panel width"
             >
               <SubagentPanelView

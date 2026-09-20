@@ -1,4 +1,4 @@
-import { createSubagentPanelStore } from "./subagent-panel-store";
+import { createPanelStore } from "./panel-store";
 import { createContext, useContext, useEffect, useMemo, type ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { AppProps } from "./types";
@@ -11,7 +11,7 @@ type WorkspaceServices = Pick<
   AppProps,
   "client" | "scope" | "upload" | "resourceUrl" | "draftCache"
 > & {
-  subagentPanel: ReturnType<typeof createSubagentPanelStore>;
+  panels: ReturnType<typeof createPanelStore>;
   pool: UploadPool;
   drafts: ReturnType<typeof createDraftStore>;
   preferences: ReturnType<typeof createPreferences>;
@@ -26,7 +26,7 @@ export function useWorkspace() {
 
 export function WorkspaceProvider({ children, ...props }: AppProps & { children: ReactNode }) {
   const { client, scope, upload, resourceUrl, draftCache } = props;
-  const subagentPanel = useMemo(() => createSubagentPanelStore(), [client]);
+  const panels = useMemo(() => createPanelStore(scope), [scope.installationId, scope.principalId]);
   const pool = useMemo(() => new UploadPool(client, upload), [client, upload]);
   const drafts = useMemo(() => createDraftStore(), [client]);
   const preferences = useMemo(
@@ -54,9 +54,9 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
       pool,
       drafts,
       preferences,
-      subagentPanel,
+      panels,
     }),
-    [client, scope, upload, resourceUrl, draftCache, pool, drafts, preferences, subagentPanel],
+    [client, scope, upload, resourceUrl, draftCache, pool, drafts, preferences, panels],
   );
   const queries = useMemo(
     () =>

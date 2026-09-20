@@ -1,17 +1,43 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { panelSizes } from "../panel-store";
+import { useEffect, useLayoutEffect, useRef, type CSSProperties, type ReactNode } from "react";
 import "./workspace-panels.css";
 
 export function WorkspacePanels({
   leftOpen,
   rightOpen,
+  leftWidth,
+  rightWidth,
+  layoutKey,
   children,
 }: {
   leftOpen?: boolean;
   rightOpen: boolean;
+  leftWidth?: number;
+  rightWidth?: number;
+  layoutKey?: string;
   children: ReactNode;
 }) {
+  const grid = useRef<HTMLDivElement>(null);
+  const previousLayoutKey = useRef(layoutKey);
+  useLayoutEffect(() => {
+    if (!grid.current || previousLayoutKey.current === layoutKey) return;
+    previousLayoutKey.current = layoutKey;
+    // A thread switch restores its layout before paint instead of animating the previous thread's widths.
+    grid.current.dataset.resizing = "true";
+    if (leftWidth !== undefined)
+      grid.current.style.setProperty("--left-panel-width", `${leftWidth}px`);
+    if (rightWidth !== undefined)
+      grid.current.style.setProperty("--right-panel-width", `${rightWidth}px`);
+    restorePanelTransition(grid.current);
+  }, [layoutKey, leftWidth, rightWidth]);
+  const widths: CSSProperties & { "--left-panel-width"?: string; "--right-panel-width"?: string } =
+    {};
+  if (leftWidth !== undefined) widths["--left-panel-width"] = `${leftWidth}px`;
+  if (rightWidth !== undefined) widths["--right-panel-width"] = `${rightWidth}px`;
   return (
     <div
+      ref={grid}
+      style={widths}
       className="workspace-panels"
       data-has-left={leftOpen !== undefined}
       data-left-open={leftOpen ?? false}
@@ -30,22 +56,21 @@ function restorePanelTransition(grid: HTMLElement) {
 
 const minimumChatWidth = 160;
 
-const panelSizes = {
-  left: { initial: 288, min: 192, max: 512 },
-  right: { initial: 360, min: 240, max: 640 },
-};
-
 export function WorkspaceSidePanel({
   side,
   open,
   id,
   label,
+  resizeKey,
+  onWidthChange,
   children,
 }: {
   side: "left" | "right";
   open: boolean;
   id: string;
   label: string;
+  resizeKey?: string;
+  onWidthChange?: (width: number) => void;
   children: ReactNode;
 }) {
   const handle = useRef<HTMLDivElement>(null);
@@ -55,6 +80,8 @@ export function WorkspaceSidePanel({
     width: number;
     max: number;
     grid: HTMLElement;
+    resizedWidth?: number;
+    commit?: (width: number) => void;
   } | null>(null);
   const sizes = panelSizes[side];
   const direction = side === "left" ? 1 : -1;
@@ -64,15 +91,16 @@ export function WorkspaceSidePanel({
     if (!current) return;
     drag.current = null;
     restorePanelTransition(current.grid);
+    if (current.resizedWidth !== undefined) current.commit?.(current.resizedWidth);
     if (handle.current?.hasPointerCapture(current.pointerId)) {
       handle.current.releasePointerCapture(current.pointerId);
     }
   }
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) finishResize();
     return finishResize;
-  }, [open]);
+  }, [open, resizeKey]);
 
   function resizeBounds() {
     const panel = handle.current?.parentElement;
@@ -104,6 +132,7 @@ export function WorkspaceSidePanel({
     const pixels = Math.round(Math.max(sizes.min, Math.min(max, width)));
     grid.style.setProperty(`--${side}-panel-width`, `${pixels}px`);
     handle.current?.setAttribute("aria-valuenow", String(pixels));
+    return pixels;
   }
 
   return (
@@ -136,12 +165,17 @@ export function WorkspaceSidePanel({
           event.currentTarget.focus();
           event.currentTarget.setPointerCapture(event.pointerId);
           bounds.grid.dataset.resizing = "true";
-          drag.current = { ...bounds, pointerId: event.pointerId, startX: event.clientX };
+          drag.current = {
+            ...bounds,
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            commit: onWidthChange,
+          };
         }}
         onPointerMove={(event) => {
           const current = drag.current;
           if (!current || current.pointerId !== event.pointerId) return;
-          resize(
+          current.resizedWidth = resize(
             current.grid,
             current.width + direction * (event.clientX - current.startX),
             current.max,
@@ -160,8 +194,9 @@ export function WorkspaceSidePanel({
           if (event.key === "Home") width = sizes.min;
           if (event.key === "End") width = bounds.max;
           bounds.grid.dataset.resizing = "true";
-          resize(bounds.grid, width, bounds.max);
+          const pixels = resize(bounds.grid, width, bounds.max);
           restorePanelTransition(bounds.grid);
+          onWidthChange?.(pixels);
         }}
       />
     </div>

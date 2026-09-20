@@ -1,3 +1,4 @@
+import { defaultRightPanel } from "../panel-store";
 import { useContext, useMemo, useEffect, type ReactNode } from "react";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useStore } from "zustand";
@@ -36,7 +37,7 @@ export function NativeSubagentProvider({
   foreground: boolean;
   children: ReactNode;
 }) {
-  const { client, subagentPanel } = useWorkspace();
+  const { client, panels } = useWorkspace();
   const online = useNativeOnline(client);
   const query = useInfiniteQuery({
     ...subagentsOptions(client, threadId),
@@ -58,8 +59,8 @@ export function NativeSubagentProvider({
     [query.data],
   );
   const value = useMemo(
-    () => ({ agents, open: (id: string) => subagentPanel.getState().select(threadId, id) }),
-    [agents, subagentPanel, threadId],
+    () => ({ agents, open: (id: string) => panels.getState().select(threadId, id) }),
+    [agents, panels, threadId],
   );
   return <SubagentContext value={value}>{children}</SubagentContext>;
 }
@@ -71,9 +72,9 @@ export function NativeSubagentPanel({
   threadId: string;
   foreground: boolean;
 }) {
-  const { client, subagentPanel } = useWorkspace();
-  const open = useStore(subagentPanel, (state) => state.open);
-  const selection = useStore(subagentPanel, (state) => state.selection);
+  const { client, panels } = useWorkspace();
+  const open = useStore(panels, (state) => (state.threads.get(threadId) ?? defaultRightPanel).open);
+  const selection = useStore(panels, (state) => state.selection);
   const queries = useQueryClient();
   const targetId = selection?.threadId === threadId ? selection.agentId : "";
   const online = useNativeOnline(client);
@@ -137,7 +138,7 @@ export function NativeSubagentPanel({
   const error =
     list.error?.message ?? transcript.error?.message ?? history.error?.message ?? missing;
   const moreHistory = history.data ? history.hasNextPage : page?.nextBefore !== undefined;
-  const actions = subagentPanel.getState();
+  const actions = panels.getState();
   return (
     <SubagentPanelView
       items={items}

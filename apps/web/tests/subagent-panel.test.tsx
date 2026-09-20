@@ -5,21 +5,21 @@ import { agentWorkStages, demoSubagents, demoSubagentTranscript } from "../src/a
 import { SubagentPanelView } from "../src/components/SubagentPanel";
 import { SubagentContext } from "../src/components/subagent-context";
 import { ActivityItem } from "../src/components/Timeline";
-import { createSubagentPanelStore } from "../src/subagent-panel-store";
+import { createPanelStore, defaultRightPanel } from "../src/panel-store";
 
 const actions = { onSelect: () => {}, onBack: () => {} };
 const slot = agentWorkStages.find((stage) => stage.id === "subagents-working")!.frames[0]!;
 const agents = demoSubagents(slot);
 
 test("agents panel starts closed and retains its selected transcript across close and reopen", () => {
-  const store = createSubagentPanelStore();
-  expect(store.getState().open).toBe(false);
+  const store = createPanelStore();
+  expect((store.getState().threads.get("thread") ?? defaultRightPanel).open).toBe(false);
   store.getState().select("thread", agents[0]!.id);
-  expect(store.getState().open).toBe(true);
-  store.getState().close();
+  expect((store.getState().threads.get("thread") ?? defaultRightPanel).open).toBe(true);
+  store.getState().toggle("thread");
   expect(store.getState().selection).toEqual({ threadId: "thread", agentId: agents[0]!.id });
-  store.getState().toggle();
-  expect(store.getState().open).toBe(true);
+  store.getState().toggle("thread");
+  expect((store.getState().threads.get("thread") ?? defaultRightPanel).open).toBe(true);
   store.getState().back();
   expect(store.getState().selection).toBeUndefined();
 });
