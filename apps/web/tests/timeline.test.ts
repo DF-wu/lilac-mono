@@ -4,6 +4,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   Activity,
+  Message,
   ActivityItem,
   activitySummary,
   groupActivityMessages,
@@ -149,4 +150,23 @@ describe("streaming block arrivals", () => {
       "activity-item:second",
     ]);
   });
+});
+
+it("caps user message previews before layout measurement without clamping assistant responses", () => {
+  const render = (role: "user" | "assistant") =>
+    renderToStaticMarkup(
+      createElement(Message, {
+        message: {
+          id: "long",
+          role,
+          parts: [{ type: "text", text: "A long paragraph.\n\n".repeat(100) }],
+        },
+        canEdit: false,
+        resourceUrl: (id) => id,
+        onAction: () => {},
+        onReaction: () => {},
+      }),
+    );
+  expect(render("user")).toContain('data-collapsed="true"');
+  expect(render("assistant")).toContain('data-collapsed="false"');
 });

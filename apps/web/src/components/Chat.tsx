@@ -543,6 +543,7 @@ export function Chat(props: ChatProps) {
       <div hidden={!editable}>
         <Composer
           documentKey={threadId}
+          loadingDraft={!draftLoaded}
           windowDrop={props.foreground}
           catalog={props.catalog}
           text={draft.text}

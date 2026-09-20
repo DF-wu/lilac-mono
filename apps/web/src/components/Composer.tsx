@@ -33,6 +33,7 @@ import { inputDeliveryOptions } from "../input-mode";
 export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catalog">> & {
   text: string;
   documentKey?: string;
+  loadingDraft?: boolean;
   skillIds: string[];
   onSkills: (ids: string[]) => void;
   commandId?: string;
@@ -340,6 +341,7 @@ export function Composer(props: ComposerProps) {
         >
           <ComposerEditor
             documentKey={props.documentKey}
+            loadingDraft={props.loadingDraft}
             ref={input}
             text={text}
             attachments={attachments}
@@ -378,7 +380,7 @@ export function Composer(props: ComposerProps) {
             onPrefix={setPrefix}
             onKeyDown={keydown}
             onPaste={paste}
-            placeholder={disabled ? "" : placeholder}
+            placeholder={placeholder}
             expanded={completions.length > 0}
             activeDescendant={completions.length ? `completion-${highlighted}` : undefined}
             disabled={disabled}

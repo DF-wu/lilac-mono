@@ -80,7 +80,9 @@ export type TimelineProps = MessageServices & {
   emptyMessage?: string;
   emptyContent?: ReactNode;
 };
-type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind">;
+type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind"> & {
+  measureTurn: (content: HTMLElement) => void;
+};
 const TimelineContext = createContext<TimelineServices | undefined>(undefined);
 function useMessageServicesValue({
   canEdit,
@@ -109,10 +111,6 @@ export function useLatestReadableTurn(store: NativeThreadStore) {
 
 export const Timeline = memo(function Timeline(props: TimelineProps) {
   const services = useMessageServicesValue(props);
-  const timeline = useMemo(
-    () => ({ client: props.client, threadId: props.threadId, onRewind: props.onRewind }),
-    [props.client, props.threadId, props.onRewind],
-  );
   const store = props.client.thread(props.threadId);
   const ids = useSlotIds(store);
   const arrivals = useMemo(() => new MessageArrivals(), [store]);
@@ -172,6 +170,22 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       return tail;
     },
   });
+  const measureTurn = useCallback(
+    (content: HTMLElement) => {
+      const row = content.closest<HTMLDivElement>(".virtual-row");
+      if (row) virtual.resizeItem(virtual.indexFromElement(row), row.offsetHeight);
+    },
+    [virtual],
+  );
+  const timeline = useMemo(
+    () => ({
+      client: props.client,
+      threadId: props.threadId,
+      onRewind: props.onRewind,
+      measureTurn,
+    }),
+    [props.client, props.threadId, props.onRewind, measureTurn],
+  );
   useEffect(
     () =>
       store.subscribe((change) => {
@@ -781,7 +795,11 @@ function MessageCard({
     observer.observe(element);
     return () => observer.disconnect();
   }, [collapsible]);
-  const collapsed = collapsible && long && !expanded;
+  const timeline = useContext(TimelineContext);
+  useLayoutEffect(() => {
+    if (contentRef.current) timeline?.measureTurn(contentRef.current);
+  }, [expanded, long, timeline]);
+  const collapsed = collapsible && !expanded;
   const images = content.attachments.filter((part) => part.data.mediaType.startsWith("image/"));
   const files = content.attachments.filter((part) => !part.data.mediaType.startsWith("image/"));
   return (
@@ -791,6 +809,7 @@ function MessageCard({
           id={previewId}
           className="message-card-preview"
           data-collapsed={collapsed}
+          data-overflow={long}
           onFocusCapture={() => {
             if (collapsed) setExpanded(true);
           }}

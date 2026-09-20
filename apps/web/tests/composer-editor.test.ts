@@ -249,8 +249,18 @@ it("resets history even when two threads have identical draft text", () => {
   const editor = createComposerEditor("Shared text");
   editor.tf.select(editor.api.end([])!);
   editor.tf.insertText("!");
+  const document = editor.children;
   replaceComposerDocument(editor, "Shared text!");
+  expect(editor.children).toBe(document);
   editor.tf.undo();
   expect(composerMarkdown(editor)).toBe("Shared text!");
   expect(editor.history.undos).toHaveLength(0);
+});
+
+it("keeps the empty document nodes when switching between empty drafts", () => {
+  const editor = createComposerEditor();
+  const paragraph = editor.children[0];
+  replaceComposerDocument(editor, "");
+  expect(editor.children[0]).toBe(paragraph);
+  expect(composerMarkdown(editor)).toBe("");
 });

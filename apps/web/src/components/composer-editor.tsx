@@ -350,7 +350,7 @@ function deserializeComposer(editor: PlateEditor, text: string) {
 export function replaceComposerDocument(editor: PlateEditor, text: string) {
   editor.tf.withoutSaving(() => {
     editor.tf.deselect();
-    editor.tf.setValue(deserializeComposer(editor, text));
+    if (composerMarkdown(editor) !== text) editor.tf.setValue(deserializeComposer(editor, text));
   });
   editor.history = { undos: [], redos: [] };
   editor.marks = null;
@@ -466,6 +466,7 @@ export type ComposerEditorProps = {
   ref?: Ref<ComposerEditorHandle>;
   text: string;
   documentKey?: string;
+  loadingDraft?: boolean;
   attachments?: readonly Attachment[];
   onRemoveAttachment?: (key: string) => void;
   onRetryAttachment?: (key: string) => void;
@@ -491,6 +492,7 @@ export default function ComposerEditor(props: ComposerEditorProps) {
     value: (editor) => deserializeComposer(editor, props.text),
   });
   useLayoutEffect(() => {
+    if (props.loadingDraft) return;
     const switched = documentKey.current !== props.documentKey;
     if (switched) {
       documentKey.current = props.documentKey;
@@ -502,8 +504,9 @@ export default function ComposerEditor(props: ComposerEditorProps) {
     }
     lastText.current = props.text;
     props.onPlainText(composerPlainText(editor), props.text);
-  }, [editor, props.documentKey, props.text, props.onPlainText]);
+  }, [editor, props.documentKey, props.loadingDraft, props.text, props.onPlainText]);
   useEffect(() => {
+    if (props.loadingDraft) return;
     const currentKeys = new Set(attachments.map((attachment) => attachment.key));
     const references = attachmentKeys(editor);
     for (const key of seenAttachments.current) {
@@ -522,7 +525,7 @@ export default function ComposerEditor(props: ComposerEditorProps) {
     }
     seenAttachments.current = currentKeys;
     referencedAttachments.current = attachmentKeys(editor);
-  }, [editor, attachments]);
+  }, [editor, attachments, props.loadingDraft]);
   useImperativeHandle(
     props.ref,
     () => ({
@@ -539,6 +542,7 @@ export default function ComposerEditor(props: ComposerEditorProps) {
     [editor, attachments],
   );
   function change() {
+    if (props.loadingDraft) return;
     const references = attachmentKeys(editor);
     for (const key of referencedAttachments.current) {
       if (!references.has(key) && attachments.some((attachment) => attachment.key === key))
