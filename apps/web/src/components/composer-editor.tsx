@@ -1,4 +1,5 @@
 import {
+  memo,
   createContext,
   useContext,
   useEffect,
@@ -539,7 +540,7 @@ export type ComposerEditorProps = {
   activeDescendant?: string;
 };
 
-export default function ComposerEditor(props: ComposerEditorProps) {
+const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) {
   const lastText = useRef(props.text);
   const documentKey = useRef(props.documentKey);
   const attachments = props.attachments ?? emptyAttachments;
@@ -614,18 +615,6 @@ export default function ComposerEditor(props: ComposerEditorProps) {
     props.onPlainText(composerPlainText(editor), text);
     props.onPrefix(composerPrefix(editor));
   }
-  function mark(key: string) {
-    editor.tf.toggleMark(key);
-    editor.tf.focus();
-  }
-  function block(type: string) {
-    editor.tf.toggleBlock(type);
-    editor.tf.focus();
-  }
-  function list(listStyleType: string) {
-    toggleList(editor, { listStyleType });
-    editor.tf.focus();
-  }
   return (
     <AttachmentContext
       value={{ attachments, disabled: props.disabled, retry: props.onRetryAttachment }}
@@ -636,59 +625,7 @@ export default function ComposerEditor(props: ComposerEditorProps) {
         onValueChange={change}
         onSelectionChange={() => props.onPrefix(composerPrefix(editor))}
       >
-        <div
-          className="composer-formatting"
-          role="toolbar"
-          aria-label="Text formatting"
-          onMouseDown={(event) => event.preventDefault()}
-        >
-          <IconButton label="Bold" disabled={props.disabled} onClick={() => mark(KEYS.bold)}>
-            <Bold />
-          </IconButton>
-          <IconButton label="Italic" disabled={props.disabled} onClick={() => mark(KEYS.italic)}>
-            <Italic />
-          </IconButton>
-          <IconButton
-            label="Strikethrough"
-            disabled={props.disabled}
-            onClick={() => mark(KEYS.strikethrough)}
-          >
-            <Strikethrough />
-          </IconButton>
-          <IconButton label="Inline code" disabled={props.disabled} onClick={() => mark(KEYS.code)}>
-            <Code />
-          </IconButton>
-          <IconButton label="Heading" disabled={props.disabled} onClick={() => block(KEYS.h2)}>
-            <Heading2 />
-          </IconButton>
-          <IconButton
-            label="Quote"
-            disabled={props.disabled}
-            onClick={() => block(KEYS.blockquote)}
-          >
-            <Quote />
-          </IconButton>
-          <IconButton label="Bulleted list" disabled={props.disabled} onClick={() => list("disc")}>
-            <List />
-          </IconButton>
-          <IconButton
-            label="Numbered list"
-            disabled={props.disabled}
-            onClick={() => list("decimal")}
-          >
-            <ListOrdered />
-          </IconButton>
-          <IconButton
-            label="Code block"
-            disabled={props.disabled}
-            onClick={() => {
-              editor.getTransforms(CodeBlockPlugin).code_block.toggle();
-              editor.tf.focus();
-            }}
-          >
-            <SquareCode />
-          </IconButton>
-        </div>
+        <ComposerFormatting editor={editor} disabled={props.disabled} />
         <PlateContent
           className="composer-editor"
           style={{ minHeight: "calc(1lh + var(--space-3) * 2)", overflowWrap: "anywhere" }}
@@ -713,4 +650,74 @@ export default function ComposerEditor(props: ComposerEditorProps) {
       </Plate>
     </AttachmentContext>
   );
-}
+});
+
+export default ComposerEditor;
+
+const ComposerFormatting = memo(function ComposerFormatting({
+  editor,
+  disabled,
+}: {
+  editor: PlateEditor;
+  disabled: boolean;
+}) {
+  function mark(key: string) {
+    editor.tf.toggleMark(key);
+    editor.tf.focus();
+  }
+  function block(type: string) {
+    editor.tf.toggleBlock(type);
+    editor.tf.focus();
+  }
+  function list(listStyleType: string) {
+    toggleList(editor, { listStyleType });
+    editor.tf.focus();
+  }
+  return (
+    <div
+      className="composer-formatting"
+      role="toolbar"
+      aria-label="Text formatting"
+      onMouseDown={(event) => event.preventDefault()}
+    >
+      <IconButton label="Bold" disabled={disabled} onClick={() => mark(KEYS.bold)}>
+        <Bold />
+      </IconButton>
+      <IconButton label="Italic" disabled={disabled} onClick={() => mark(KEYS.italic)}>
+        <Italic />
+      </IconButton>
+      <IconButton
+        label="Strikethrough"
+        disabled={disabled}
+        onClick={() => mark(KEYS.strikethrough)}
+      >
+        <Strikethrough />
+      </IconButton>
+      <IconButton label="Inline code" disabled={disabled} onClick={() => mark(KEYS.code)}>
+        <Code />
+      </IconButton>
+      <IconButton label="Heading" disabled={disabled} onClick={() => block(KEYS.h2)}>
+        <Heading2 />
+      </IconButton>
+      <IconButton label="Quote" disabled={disabled} onClick={() => block(KEYS.blockquote)}>
+        <Quote />
+      </IconButton>
+      <IconButton label="Bulleted list" disabled={disabled} onClick={() => list("disc")}>
+        <List />
+      </IconButton>
+      <IconButton label="Numbered list" disabled={disabled} onClick={() => list("decimal")}>
+        <ListOrdered />
+      </IconButton>
+      <IconButton
+        label="Code block"
+        disabled={disabled}
+        onClick={() => {
+          editor.getTransforms(CodeBlockPlugin).code_block.toggle();
+          editor.tf.focus();
+        }}
+      >
+        <SquareCode />
+      </IconButton>
+    </div>
+  );
+});

@@ -1,3 +1,4 @@
+import { useEventCallback } from "./use-event-callback";
 import { ActorAvatar } from "./components/ActorAvatar";
 import { defaultRightPanel } from "./panel-store";
 import { WorkspacePanels, WorkspaceSidePanel } from "./components/WorkspacePanels";
@@ -261,6 +262,7 @@ function Workspace(props: AppProps) {
   const upsert = useCallback(
     (thread: NativeThread) =>
       setThreads((current) => {
+        if (current.some((entry) => entry === thread)) return current;
         const found = current.some((entry) => entry.id === thread.id);
         if (!found && thread.archived !== archivedRef.current && thread.id !== selectedRef.current)
           return current;
@@ -366,7 +368,7 @@ function Workspace(props: AppProps) {
     changed.delete(id);
     setLocalDrafts(changed);
   }
-  function discardDraft(id: string) {
+  const discardDraft = useEventCallback(function discardDraft(id: string) {
     if (id.startsWith("draft:")) {
       if (draftStore.getState().localDrafts.get(id)?.creation) return;
       // Clearing avoids invalidating concurrent cache reads for other threads.
@@ -380,17 +382,17 @@ function Workspace(props: AppProps) {
     for (const key of draft?.attachments ?? []) pool.remove(id, key);
     if (props.draftCache)
       void attempt(() => props.draftCache!.saveDraft(props.scope, id, empty), setError);
-  }
-  function select(id: string) {
+  });
+  const select = useEventCallback(function select(id: string) {
     setExternal(false);
     if (id.startsWith("draft:")) {
       void navigate({ to: "/", state: { draftThreadId: id } });
       return;
     }
     void navigate({ to: "/threads/$threadId", params: { threadId: id } });
-  }
+  });
 
-  function createThread() {
+  const createThread = useEventCallback(function createThread() {
     const draft = newDraftThread();
     const changed = new Map(draftStore.getState().localDrafts);
     for (const [id, existing] of changed) if (!hasDraftContent(existing)) changed.delete(id);
@@ -399,7 +401,7 @@ function Workspace(props: AppProps) {
     setArchived(false);
     if (archived) void listThreads(false);
     select(draft.id);
-  }
+  });
   function finishDraftNavigation(draftId: string, threadId: string) {
     if (selectedRef.current !== draftId) return;
     if (activeRef.current) {
@@ -655,6 +657,110 @@ function Workspace(props: AppProps) {
     });
     return () => toast.close("connection");
   }, [connection]);
+  const renameSidebarThread = useEventCallback((id: string, title: string) =>
+    setRename({ id, title }),
+  );
+  const archiveSidebarThread = useEventCallback(
+    (id: string, archived: boolean) => void update(id, { archived }),
+  );
+  const searchSidebar = useEventCallback((query: string) => {
+    const next = query.trim();
+    if (next && next === searchQuery) void searchResults.refetch();
+    setSearchQuery(next);
+  });
+  const clearSidebarSearch = useCallback(() => setSearchQuery(""), []);
+  const toggleArchived = useEventCallback(() => {
+    const value = !archived;
+    setArchived(value);
+    setExternal(false);
+    void listThreads(value);
+  });
+  const toggleExternal = useCallback(() => {
+    setExternalId(undefined);
+    setExternal((value) => !value);
+  }, []);
+  const openSettings = useCallback(() => setSettings(true), []);
+  const openDesign = useEventCallback(
+    () =>
+      void navigate({
+        to: "/design-system",
+        state: selectedId.startsWith("draft:")
+          ? { draftThreadId: selectedId }
+          : { chatThreadId: selectedId },
+      }),
+  );
+  const logout = useEventCallback(() => void attempt(props.onLogout, setError));
+  const sidebarToolbar = useMemo(
+    () => (
+      <div className="sidebar-search-row">
+        <SidebarSearch onSearch={searchSidebar} onClear={clearSidebarSearch} />
+        <nav className="sidebar-tabs" aria-label="Conversation filters and actions">
+          <IconButton
+            label={archived ? "Show active conversations" : "Show archived conversations"}
+            tooltip="Archived"
+            aria-pressed={archived}
+            onClick={toggleArchived}
+          >
+            <Archive />
+          </IconButton>
+          {owner ? (
+            <IconButton
+              label="Read other surfaces"
+              tooltip="Others"
+              aria-pressed={external}
+              onClick={toggleExternal}
+            >
+              <Globe />
+            </IconButton>
+          ) : null}
+          <IconButton label="New conversation" tooltip="New" onClick={createThread}>
+            <MessageCirclePlus />
+          </IconButton>
+        </nav>
+      </div>
+    ),
+    [
+      archived,
+      external,
+      owner,
+      searchSidebar,
+      clearSidebarSearch,
+      toggleArchived,
+      toggleExternal,
+      createThread,
+    ],
+  );
+  const sidebarFooter = useMemo(
+    () => (
+      <footer className="sidebar-footer">
+        <ActorAvatar displayName={viewer.displayName} avatarUrl={viewer.avatarUrl} />
+        <span className="viewer-name">{viewer.displayName}</span>
+        {props.sessionControl}
+        <span className="toolbar-spacer" />
+        <ContextMenu>
+          <ContextMenuTrigger
+            render={
+              <IconButton label="Settings" onClick={openSettings}>
+                <SettingsIcon />
+              </IconButton>
+            }
+          />
+          <ContextMenuContent side="top" align="end">
+            <ContextMenuItem onClick={openSettings}>
+              <SettingsIcon /> Settings
+            </ContextMenuItem>
+            <ContextMenuItem onClick={openDesign}>
+              <Palette /> Design
+            </ContextMenuItem>
+            <ContextMenuItem variant="destructive" onClick={logout}>
+              <LogOut /> Logout
+            </ContextMenuItem>
+          </ContextMenuContent>
+        </ContextMenu>
+      </footer>
+    ),
+    [viewer, props.sessionControl, openSettings, openDesign, logout],
+  );
   return (
     <MessageIdentityContext.Provider value={identities}>
       <NativeSubagentProvider
@@ -700,53 +806,7 @@ function Workspace(props: AppProps) {
                       <span />
                     </span>
                   </header>
-                  <div className="sidebar-search-row">
-                    <SidebarSearch
-                      onSearch={(query) => {
-                        const next = query.trim();
-                        if (next && next === searchQuery) void searchResults.refetch();
-                        setSearchQuery(next);
-                      }}
-                      onClear={() => setSearchQuery("")}
-                    />
-                    <nav className="sidebar-tabs" aria-label="Conversation filters and actions">
-                      <IconButton
-                        label={
-                          archived ? "Show active conversations" : "Show archived conversations"
-                        }
-                        tooltip="Archived"
-                        aria-pressed={archived}
-                        onClick={() => {
-                          const value = !archived;
-                          setArchived(value);
-                          setExternal(false);
-                          void listThreads(value);
-                        }}
-                      >
-                        <Archive />
-                      </IconButton>
-                      {owner ? (
-                        <IconButton
-                          label="Read other surfaces"
-                          tooltip="Others"
-                          aria-pressed={external}
-                          onClick={() => {
-                            setExternalId(undefined);
-                            setExternal((value) => !value);
-                          }}
-                        >
-                          <Globe />
-                        </IconButton>
-                      ) : null}
-                      <IconButton
-                        label="New conversation"
-                        tooltip="New"
-                        onClick={() => void createThread()}
-                      >
-                        <MessageCirclePlus />
-                      </IconButton>
-                    </nav>
-                  </div>
+                  {sidebarToolbar}
                   {results ? (
                     <>
                       <VirtualList
@@ -794,15 +854,15 @@ function Workspace(props: AppProps) {
                     <>
                       {!archived ? (
                         <SidebarQueue
-                          fallbackThreads={threads}
+                          fallbackThreads={online ? undefined : threads}
                           draftIds={draftIds}
                           viewer={viewer}
-                          selectedId={external ? undefined : selectedId}
+                          external={external}
                           models={catalog?.models}
                           onThread={upsert}
                           onSelect={select}
-                          onRename={(id, title) => setRename({ id, title })}
-                          onArchive={(id, archived) => void update(id, { archived })}
+                          onRename={renameSidebarThread}
+                          onArchive={archiveSidebarThread}
                           onDelete={setConfirmDelete}
                           onDiscardDraft={discardDraft}
                         />
@@ -828,10 +888,10 @@ function Workspace(props: AppProps) {
                                 catalog?.models.find((model) => model.id === thread.source?.modelId)
                                   ?.label
                               }
-                              selected={selectedId === thread.id && !external}
+                              external={external}
                               onSelect={select}
-                              onRename={(id, title) => setRename({ id, title })}
-                              onArchive={(id, archived) => void update(id, { archived })}
+                              onRename={renameSidebarThread}
+                              onArchive={archiveSidebarThread}
                               onDelete={setConfirmDelete}
                               onDiscardDraft={discardDraft}
                             />
@@ -848,44 +908,7 @@ function Workspace(props: AppProps) {
                       ) : null}
                     </>
                   )}
-                  <footer className="sidebar-footer">
-                    <ActorAvatar displayName={viewer.displayName} avatarUrl={viewer.avatarUrl} />
-                    <span className="viewer-name">{viewer.displayName}</span>
-                    {props.sessionControl}
-                    <span className="toolbar-spacer" />
-                    <ContextMenu>
-                      <ContextMenuTrigger
-                        render={
-                          <IconButton label="Settings" onClick={() => setSettings(true)}>
-                            <SettingsIcon />
-                          </IconButton>
-                        }
-                      />
-                      <ContextMenuContent side="top" align="end">
-                        <ContextMenuItem onClick={() => setSettings(true)}>
-                          <SettingsIcon /> Settings
-                        </ContextMenuItem>
-                        <ContextMenuItem
-                          onClick={() =>
-                            void navigate({
-                              to: "/design-system",
-                              state: selectedId.startsWith("draft:")
-                                ? { draftThreadId: selectedId }
-                                : { chatThreadId: selectedId },
-                            })
-                          }
-                        >
-                          <Palette /> Design
-                        </ContextMenuItem>
-                        <ContextMenuItem
-                          variant="destructive"
-                          onClick={() => void attempt(props.onLogout, setError)}
-                        >
-                          <LogOut /> Logout
-                        </ContextMenuItem>
-                      </ContextMenuContent>
-                    </ContextMenu>
-                  </footer>
+                  {sidebarFooter}
                 </aside>
               </WorkspaceSidePanel>
               <div id="chat" className="chat-panel">

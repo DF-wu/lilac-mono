@@ -1,3 +1,4 @@
+import { useEventCallback } from "../use-event-callback";
 import { useStore } from "zustand";
 import { draftAttachment, releaseDraftAttachments, type DraftThread } from "../draft-thread";
 import type { ActorIdentity } from "./ActorAvatar";
@@ -218,9 +219,12 @@ export function Chat(props: ChatProps) {
       upload(resourceId, file, onProgress, pool.signal),
     [upload, pool],
   );
-  const attachments =
-    localThread?.attachments ??
-    uploads.filter((attachment) => draft.attachments.includes(attachment.key));
+  const attachments = useMemo(
+    () =>
+      localThread?.attachments ??
+      uploads.filter((attachment) => draft.attachments.includes(attachment.key)),
+    [localThread?.attachments, uploads, draft.attachments],
+  );
   const refreshQueue = useCallback(() => refreshQueueQuery(queries, threadId), [queries, threadId]);
   useEffect(() => {
     if (queueQuery.error) setError(queueQuery.error.message);
@@ -434,6 +438,74 @@ export function Chat(props: ChatProps) {
     },
     [client, threadId],
   );
+  const composerSkills = useEventCallback((skillIds: string[]) =>
+    commitDraft({ ...getDraft(), skillIds }),
+  );
+  const composerCommand = useEventCallback((commandId: string | undefined) =>
+    commitDraft({ ...getDraft(), commandId }),
+  );
+  const composerText = useEventCallback((text: string) => commitDraft({ ...getDraft(), text }));
+  const composerAttach = useEventCallback((files: File[], requireAll?: boolean) => {
+    if (local) {
+      const current = draftStore.getState().localDrafts.get(threadId);
+      if (!current) return [];
+      const available = 32 - current.attachments.length;
+      if (requireAll && files.length > available) return [];
+      const added = files.slice(0, available).map(draftAttachment);
+      props.onLocalChange(threadId, (current) => ({
+        ...current,
+        attachments: [...current.attachments, ...added],
+        draft: {
+          ...current.draft,
+          attachments: [...current.draft.attachments, ...added.map((item) => item.key)],
+        },
+      }));
+      return added;
+    }
+    const current = getDraft();
+    const available = 32 - current.attachments.length;
+    if (requireAll && files.length > available) return [];
+    const keys = files.slice(0, available).map((file) => pool.add(threadId, file));
+    commitDraft({ ...current, attachments: [...current.attachments, ...keys] });
+    return keys.map((key) => pool.get(threadId).find((attachment) => attachment.key === key)!);
+  });
+  const composerRemoveAttachment = useEventCallback((key: string) => {
+    if (local) {
+      releaseDraftAttachments(attachments.filter((item) => item.key === key));
+      props.onLocalChange(threadId, (current) => ({
+        ...current,
+        attachments: current.attachments.filter((item) => item.key !== key),
+        draft: {
+          ...current.draft,
+          attachments: current.draft.attachments.filter((id) => id !== key),
+        },
+      }));
+      return;
+    }
+    pool.remove(threadId, key);
+    commitDraft({ ...draft, attachments: draft.attachments.filter((id) => id !== key) });
+  });
+  const composerRetryAttachment = useEventCallback((key: string) => pool.retry(threadId, key));
+  const composerModelChange = useEventCallback((modelId: string) => {
+    if (local) {
+      props.onLocalChange(threadId, (current) => ({ ...current, modelId }));
+      return;
+    }
+    const rpc = client.rpc,
+      checkpoint = store.checkpoint;
+    if (!rpc || !checkpoint) return;
+    void attempt(
+      () =>
+        rpc.threads.update({
+          threadId: threadId,
+          expectedRevision: checkpoint.projectionRevision,
+          modelId,
+        }),
+      setError,
+    );
+  });
+  const composerCancel = useEventCallback(() => void cancel());
+  const composerSubmit = useEventCallback(submit);
   const composer = (
     <div className="chat-bottom">
       <ErrorNotice
@@ -556,79 +628,22 @@ export function Chat(props: ChatProps) {
           catalog={props.catalog}
           text={draft.text}
           skillIds={draft.skillIds}
-          onSkills={(skillIds) => commitDraft({ ...getDraft(), skillIds })}
+          onSkills={composerSkills}
           commandId={draft.commandId}
-          onCommand={(commandId) => commitDraft({ ...getDraft(), commandId })}
-          onText={(text) => commitDraft({ ...getDraft(), text })}
+          onCommand={composerCommand}
+          onText={composerText}
           attachments={attachments}
-          onAttach={(files, requireAll) => {
-            if (local) {
-              const current = draftStore.getState().localDrafts.get(threadId);
-              if (!current) return [];
-              const available = 32 - current.attachments.length;
-              if (requireAll && files.length > available) return [];
-              const added = files.slice(0, available).map(draftAttachment);
-              props.onLocalChange(threadId, (current) => ({
-                ...current,
-                attachments: [...current.attachments, ...added],
-                draft: {
-                  ...current.draft,
-                  attachments: [...current.draft.attachments, ...added.map((item) => item.key)],
-                },
-              }));
-              return added;
-            }
-            const current = getDraft();
-            const available = 32 - current.attachments.length;
-            if (requireAll && files.length > available) return [];
-            const keys = files.slice(0, available).map((file) => pool.add(threadId, file));
-            commitDraft({ ...current, attachments: [...current.attachments, ...keys] });
-            return keys.map(
-              (key) => pool.get(threadId).find((attachment) => attachment.key === key)!,
-            );
-          }}
-          onRemoveAttachment={(key) => {
-            if (local) {
-              releaseDraftAttachments(attachments.filter((item) => item.key === key));
-              props.onLocalChange(threadId, (current) => ({
-                ...current,
-                attachments: current.attachments.filter((item) => item.key !== key),
-                draft: {
-                  ...current.draft,
-                  attachments: current.draft.attachments.filter((id) => id !== key),
-                },
-              }));
-              return;
-            }
-            pool.remove(threadId, key);
-            commitDraft({ ...draft, attachments: draft.attachments.filter((id) => id !== key) });
-          }}
-          onRetryAttachment={(key) => pool.retry(threadId, key)}
+          onAttach={composerAttach}
+          onRemoveAttachment={composerRemoveAttachment}
+          onRetryAttachment={composerRetryAttachment}
           active={active}
           canCancel={active || queue.length > 0}
           disabled={!editable || !draftLoaded}
           submitting={!!localThread?.creation}
           modelId={localThread?.modelId ?? thread?.modelId}
-          onModelChange={(modelId) => {
-            if (local) {
-              props.onLocalChange(threadId, (current) => ({ ...current, modelId }));
-              return;
-            }
-            const rpc = client.rpc,
-              checkpoint = store.checkpoint;
-            if (!rpc || !checkpoint) return;
-            void attempt(
-              () =>
-                rpc.threads.update({
-                  threadId: threadId,
-                  expectedRevision: checkpoint.projectionRevision,
-                  modelId,
-                }),
-              setError,
-            );
-          }}
-          onSubmit={submit}
-          onCancel={() => void cancel()}
+          onModelChange={composerModelChange}
+          onSubmit={composerSubmit}
+          onCancel={composerCancel}
         />
       </div>
       {!editable && thread ? <div className="read-only">Read-only</div> : null}

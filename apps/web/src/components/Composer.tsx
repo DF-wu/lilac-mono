@@ -1,8 +1,10 @@
+import { useEventCallback } from "../use-event-callback";
 import { Result } from "better-result";
 import { useOptionalWorkspace } from "../workspace-context";
 import "./composer-rich.css";
 import { Button } from "./ui/button";
 import {
+  memo,
   lazy,
   Suspense,
   useMemo,
@@ -56,7 +58,7 @@ export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catal
   onCancel: () => void;
 };
 
-export function Composer(props: ComposerProps) {
+export const Composer = memo(function Composer(props: ComposerProps) {
   const workspace = useOptionalWorkspace();
   const client = props.client ?? workspace?.client;
   const scope = props.scope ?? workspace?.scope;
@@ -83,7 +85,13 @@ export function Composer(props: ComposerProps) {
   const editorReady = editorValue?.text === text && editorValue?.documentKey === props.documentKey;
   const updatePlainText = useCallback(
     (plainText: string, text: string) =>
-      setEditorValue({ text, plainText, documentKey: props.documentKey }),
+      setEditorValue((current) =>
+        current?.text === text &&
+        current.plainText === plainText &&
+        current.documentKey === props.documentKey
+          ? current
+          : { text, plainText, documentKey: props.documentKey },
+      ),
     [props.documentKey],
   );
   const [prefix, setPrefix] = useState("");
@@ -318,6 +326,38 @@ export function Composer(props: ComposerProps) {
     props.onAttach([...event.dataTransfer.files]);
   }
 
+  const changeText = useEventCallback((value: string, visibleText: string) => {
+    setEditorValue({
+      text: value,
+      plainText: visibleText,
+      documentKey: props.documentKey,
+    });
+    if (insertingCompletion.current) {
+      insertingCompletion.current = false;
+      onText(value);
+      setMenuHidden(true);
+      return;
+    }
+    const chosen = catalog?.commands.find((entry) => entry.id === commandId);
+    if (
+      chosen &&
+      visibleText.trim() !== `/${chosen.name}` &&
+      !visibleText.startsWith(`/${chosen.name} `)
+    )
+      setCommandId(undefined);
+    setSkills(
+      skillIds.filter((id) => {
+        const skill = catalog?.skills.find((item) => item.id === id);
+        return !!skill && hasSkillMention(visibleText, skill.name);
+      }),
+    );
+    onText(value);
+    setMenuHidden(false);
+    setSelected(0);
+  });
+  const editorKeyDown = useEventCallback(keydown);
+  const editorPaste = useEventCallback(paste);
+
   return (
     <div
       className={`composer-wrap ${dragging ? "is-dragging" : ""}`}
@@ -434,39 +474,11 @@ export function Composer(props: ComposerProps) {
             attachments={attachments}
             onRemoveAttachment={props.onRemoveAttachment}
             onRetryAttachment={props.onRetryAttachment}
-            onText={(value, visibleText) => {
-              setEditorValue({
-                text: value,
-                plainText: visibleText,
-                documentKey: props.documentKey,
-              });
-              if (insertingCompletion.current) {
-                insertingCompletion.current = false;
-                onText(value);
-                setMenuHidden(true);
-                return;
-              }
-              const chosen = catalog?.commands.find((entry) => entry.id === commandId);
-              if (
-                chosen &&
-                visibleText.trim() !== `/${chosen.name}` &&
-                !visibleText.startsWith(`/${chosen.name} `)
-              )
-                setCommandId(undefined);
-              setSkills(
-                skillIds.filter((id) => {
-                  const skill = catalog?.skills.find((item) => item.id === id);
-                  return !!skill && hasSkillMention(visibleText, skill.name);
-                }),
-              );
-              onText(value);
-              setMenuHidden(false);
-              setSelected(0);
-            }}
+            onText={changeText}
             onPlainText={updatePlainText}
             onPrefix={setPrefix}
-            onKeyDown={keydown}
-            onPaste={paste}
+            onKeyDown={editorKeyDown}
+            onPaste={editorPaste}
             placeholder={placeholder}
             expanded={completions.length > 0}
             activeDescendant={completions.length ? `completion-${highlighted}` : undefined}
@@ -474,38 +486,12 @@ export function Composer(props: ComposerProps) {
           />
         </Suspense>
         <footer className="composer-toolbar">
-          <Select
-            items={catalog?.models.map((model) => ({ value: model.id, label: model.label }))}
-            value={props.modelId ?? catalog?.models[0]?.id ?? ""}
+          <ComposerModel
+            models={catalog?.models}
+            modelId={props.modelId}
             disabled={disabled || delivery.mode === "steer"}
-            onValueChange={(value) => {
-              if (!value) return;
-              props.onModelChange(value);
-            }}
-          >
-            <SelectTrigger
-              id="composer-model"
-              aria-label="Response model"
-              className="composer-model min-w-0 max-w-full"
-            >
-              <SelectValue className="min-w-0">
-                <span className="truncate">
-                  {
-                    catalog?.models.find(
-                      (entry) => entry.id === (props.modelId ?? catalog.models[0]?.id),
-                    )?.label
-                  }
-                </span>
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {catalog?.models.map((model) => (
-                <SelectItem key={model.id} value={model.id}>
-                  {model.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+            onChange={props.onModelChange}
+          />
           <span className="toolbar-spacer" />
           {active ? (
             <div className="queue-mode">
@@ -571,9 +557,52 @@ export function Composer(props: ComposerProps) {
       </div>
     </div>
   );
-}
+});
 
 export function hasSkillMention(text: string, name: string): boolean {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?:^|\\s)(?:\\$|/skill:)${escaped}(?=$|[^\\p{L}\\p{N}_-])`, "u").test(text);
 }
+
+const ComposerModel = memo(function ComposerModel({
+  models,
+  modelId,
+  disabled,
+  onChange,
+}: {
+  models: NonNullable<ComposerProps["catalog"]>["models"] | undefined;
+  modelId?: string;
+  disabled: boolean;
+  onChange: (modelId: string) => void;
+}) {
+  return (
+    <Select
+      items={models?.map((model) => ({ value: model.id, label: model.label }))}
+      value={modelId ?? models?.[0]?.id ?? ""}
+      disabled={disabled}
+      onValueChange={(value) => {
+        if (!value) return;
+        onChange(value);
+      }}
+    >
+      <SelectTrigger
+        id="composer-model"
+        aria-label="Response model"
+        className="composer-model min-w-0 max-w-full"
+      >
+        <SelectValue className="min-w-0">
+          <span className="truncate">
+            {models?.find((entry) => entry.id === (modelId ?? models?.[0]?.id))?.label}
+          </span>
+        </SelectValue>
+      </SelectTrigger>
+      <SelectContent>
+        {models?.map((model) => (
+          <SelectItem key={model.id} value={model.id}>
+            {model.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+});

@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEventCallback } from "../use-event-callback";
+import { memo, useEffect, useState } from "react";
 import {
   useInfiniteQuery,
   useMutation,
@@ -22,11 +23,11 @@ import { ErrorNotice } from "./ui";
 import type { NativeThread } from "@stanley2058/lilac-client-protocol";
 
 type Page = NativeRpcOutputs["sidebar"]["list"];
-export function SidebarQueue({
+export const SidebarQueue = memo(function SidebarQueue({
   fallbackThreads,
   draftIds,
   viewer,
-  selectedId,
+  external,
   models,
   onSelect,
   onRename,
@@ -35,10 +36,10 @@ export function SidebarQueue({
   onDiscardDraft,
   onThread,
 }: {
-  fallbackThreads: NativeThread[];
+  fallbackThreads?: NativeThread[];
   draftIds: string[];
   viewer: NativeUser;
-  selectedId?: string;
+  external?: boolean;
   models?: DisplayCatalog["models"];
   onSelect: (id: string) => void;
   onRename: (id: string, title: string) => void;
@@ -61,7 +62,7 @@ export function SidebarQueue({
       items: sections[section].data?.pages.flatMap((page) => page.items) ?? [],
       updatedAt: sections[section].dataUpdatedAt,
     })),
-    online ? [] : fallbackThreads,
+    online ? [] : (fallbackThreads ?? []),
   );
   queues.active.unshift(...draftIds.map((id) => ({ id })));
   const totals = {
@@ -124,6 +125,38 @@ export function SidebarQueue({
       !sections[section].isError,
   );
   const error = move.error ?? pinned.error ?? active.error ?? settled.error;
+  function remember(id: string) {
+    const source = sidebarSections
+      .flatMap((section) => visible[section])
+      .find((entry) => entry.id === id)?.source;
+    if (source) onThread(source);
+  }
+  const select = useEventCallback((id: string) => {
+    remember(id);
+    onSelect(id);
+  });
+  const rename = useEventCallback((id: string, title: string) => {
+    remember(id);
+    onRename(id, title);
+  });
+  const archive = useEventCallback((id: string, archived: boolean) => {
+    remember(id);
+    onArchive(id, archived);
+  });
+  const settle = useEventCallback((id: string, section: SidebarSection) =>
+    move.mutate({
+      threadId: id,
+      section: section === "settled" ? "active" : "settled",
+      atStart: true,
+    }),
+  );
+  const pin = useEventCallback((id: string, section: SidebarSection) =>
+    move.mutate({
+      threadId: id,
+      section: section === "pinned" ? "active" : "pinned",
+      atStart: true,
+    }),
+  );
   return (
     <>
       <ThreadQueue
@@ -143,36 +176,15 @@ export function SidebarQueue({
             id={entry.id}
             thread={entry.source}
             viewer={viewer}
-            selected={entry.id === selectedId}
+            external={external}
             modelLabel={models?.find((model) => model.id === entry.source?.modelId)?.label}
             section={section}
-            onSettle={() =>
-              move.mutate({
-                threadId: entry.id,
-                section: section === "settled" ? "active" : "settled",
-                atStart: true,
-              })
-            }
-            onPin={() =>
-              move.mutate({
-                threadId: entry.id,
-                section: section === "pinned" ? "active" : "pinned",
-                atStart: true,
-              })
-            }
+            onSettle={settle}
+            onPin={pin}
             settleDisabled={!online || move.isPending}
-            onSelect={(id) => {
-              if (entry.source) onThread(entry.source);
-              onSelect(id);
-            }}
-            onRename={(id, title) => {
-              if (entry.source) onThread(entry.source);
-              onRename(id, title);
-            }}
-            onArchive={(id, archived) => {
-              if (entry.source) onThread(entry.source);
-              onArchive(id, archived);
-            }}
+            onSelect={select}
+            onRename={rename}
+            onArchive={archive}
             onDelete={onDelete}
             onDiscardDraft={onDiscardDraft}
           />
@@ -194,4 +206,4 @@ export function SidebarQueue({
       ) : null}
     </>
   );
-}
+});

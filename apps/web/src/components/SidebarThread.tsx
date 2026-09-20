@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { memo, useState } from "react";
+import { useLocation } from "@tanstack/react-router";
 import { useStore } from "zustand";
 import { useQuery } from "@tanstack/react-query";
 import { composerDraftOptions } from "../queries";
@@ -34,12 +35,12 @@ function hasUnsentDraft(draft: Draft) {
   );
 }
 
-export function SidebarThread({
+export const SidebarThread = memo(function SidebarThread({
   id,
   thread,
   viewer,
   modelLabel,
-  selected,
+  external,
   onSelect,
   onRename,
   onArchive,
@@ -51,20 +52,28 @@ export function SidebarThread({
   settleDisabled,
 }: {
   section?: SidebarSection;
-  onSettle?: () => void;
-  onPin?: () => void;
+  onSettle?: (id: string, section: SidebarSection) => void;
+  onPin?: (id: string, section: SidebarSection) => void;
   settleDisabled?: boolean;
   id: string;
   thread?: NativeThread;
   viewer: NativeUser;
   modelLabel?: string;
-  selected: boolean;
+  external?: boolean;
   onSelect: (id: string) => void;
   onRename: (id: string, title: string) => void;
   onArchive: (id: string, archived: boolean) => void;
   onDelete: (id: string) => void;
   onDiscardDraft: (id: string) => void;
 }) {
+  const selected = useLocation({
+    select: (location) =>
+      !external &&
+      (location.pathname === `/threads/${id}` ||
+        (location.pathname === "/" && location.state.draftThreadId === id)),
+  });
+  const settle = () => onSettle?.(id, section ?? "active");
+  const pin = () => onPin?.(id, section ?? "active");
   const { drafts, scope, draftCache } = useWorkspace();
   const { data: hasReplyDraft } = useQuery({
     ...composerDraftOptions(scope, id, draftCache),
@@ -81,7 +90,7 @@ export function SidebarThread({
       <IconButton
         label={`${section === "settled" ? "Unsettle" : "Settle"} ${title || "conversation"}`}
         tooltip={section === "settled" ? "Unsettle" : "Settle"}
-        onClick={onSettle}
+        onClick={settle}
         disabled={settleDisabled}
       >
         {section === "settled" ? <Undo2 /> : <CircleCheck />}
@@ -147,13 +156,13 @@ export function SidebarThread({
       {editable || settleAction ? (
         <ContextMenuContent>
           {settleAction ? (
-            <ContextMenuItem disabled={settleDisabled} onClick={onSettle}>
+            <ContextMenuItem disabled={settleDisabled} onClick={settle}>
               {section === "settled" ? <Undo2 /> : <CircleCheck />}
               {section === "settled" ? "Unsettle" : "Settle"}
             </ContextMenuItem>
           ) : null}
           {thread && !thread.archived && onPin ? (
-            <ContextMenuItem disabled={settleDisabled} onClick={onPin}>
+            <ContextMenuItem disabled={settleDisabled} onClick={pin}>
               {section === "pinned" ? <PinOff /> : <Pin />}
               {section === "pinned" ? "Unpin" : "Pin"}
             </ContextMenuItem>
@@ -180,4 +189,4 @@ export function SidebarThread({
       ) : null}
     </ContextMenu>
   );
-}
+});
