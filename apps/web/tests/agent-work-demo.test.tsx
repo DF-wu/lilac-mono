@@ -129,3 +129,31 @@ test("an earlier final answer becomes intermediate when steering continues the t
   expect(html).toContain('data-message-id="demo_steered_final"');
   expect(html.match(/class="message-controls"/gu)).toHaveLength(2);
 });
+
+test("the settled work summary lists distinct participating users without the agent", () => {
+  const html = renderStage("steering-complete");
+  const summary = html.slice(
+    html.indexOf('class="work-participation"'),
+    html.indexOf('class="expanded-work"') > 0
+      ? html.indexOf('class="expanded-work"')
+      : html.indexOf('data-message-id="demo_steered_final"'),
+  );
+  expect(summary).toContain(">with</span>");
+  expect(summary.match(/class="work-participant"/gu)).toHaveLength(2);
+  expect(summary).toContain('aria-label="Alex Chen"');
+  expect(summary).toContain('aria-label="Morgan Lee"');
+  expect(summary).not.toContain('aria-label="Lilac"');
+});
+
+test("one participant is omitted even when they steer repeatedly", () => {
+  const original = agentWorkStages.find((stage) => stage.id === "steering-complete")!.frames[0]!;
+  const messages = original.messages.map((message) =>
+    message.role === "user"
+      ? { ...message, metadata: { ...message.metadata, authorId: "demo_user" } }
+      : message,
+  );
+  const html = renderStage("steering-complete", { ...original, messages });
+  expect(html).not.toContain('class="work-participation"');
+  expect(html).toContain("Worked for 4m");
+  expect(renderStage("complete")).not.toContain('class="work-participation"');
+});

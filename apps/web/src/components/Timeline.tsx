@@ -500,16 +500,14 @@ export const Turn = memo(function Turn(props: {
         {settled && intermediate.length > 0 ? (
           <Collapsible open={expanded} onOpenChange={setExpanded}>
             <CollapsibleTrigger
-              render={
-                <Button
-                  variant="ghost"
-                  className="work-summary h-auto justify-start rounded-none px-0 aria-expanded:bg-transparent hover:bg-transparent"
-                />
-              }
+              render={<Button variant="ghost" className="work-summary h-auto justify-start" />}
             >
               <Marker render={<span />}>
-                <MarkerContent className="activity-label">
-                  {duration === undefined ? "Work" : `Worked for ${formatDuration(duration)}`}
+                <MarkerContent className="work-summary-label">
+                  <span>
+                    {duration === undefined ? "Work" : `Worked for ${formatDuration(duration)}`}
+                  </span>
+                  <TurnParticipants messages={slot.messages} />
                 </MarkerContent>
                 {slot.state !== "complete" ? <span className="badge">{slot.state}</span> : null}
                 <ChevronRight className={expanded ? "rotated" : ""} />
@@ -543,6 +541,44 @@ export const Turn = memo(function Turn(props: {
     </article>
   );
 });
+
+function TurnParticipants({ messages }: { messages: readonly DisplayMessage[] }) {
+  const identities = useContext(MessageIdentityContext);
+  const authors = useMemo(
+    () => [
+      ...new Set(
+        messages.flatMap((message) =>
+          message.role === "user" && message.metadata?.authorId ? [message.metadata.authorId] : [],
+        ),
+      ),
+    ],
+    [messages],
+  );
+  const unknown = authors.find((id) => !identities.users.has(id));
+  const onUnknownAuthor = identities.onUnknownAuthor;
+  useEffect(() => {
+    if (unknown) onUnknownAuthor?.(unknown);
+  }, [unknown, onUnknownAuthor]);
+  if (authors.length < 2) return null;
+  return (
+    <span className="work-participation">
+      <span>with</span>
+      <span className="work-participants">
+        {authors.map((id) => {
+          const author = identities.users.get(id) ?? { displayName: "Participant" };
+          return (
+            <Tooltip key={id}>
+              <TooltipTrigger render={<span className="work-participant" />}>
+                <ActorAvatar {...author} size="sm" />
+              </TooltipTrigger>
+              <TooltipContent>{author.displayName}</TooltipContent>
+            </Tooltip>
+          );
+        })}
+      </span>
+    </span>
+  );
+}
 
 function TurnMessages({
   messages,
