@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useStore } from "zustand";
-import { Archive, ArchiveRestore, Pencil, Trash2 } from "lucide-react";
-import type { NativeThread, NativeUser } from "@stanley2058/lilac-client-protocol";
+import { Archive, ArchiveRestore, Pencil, Trash2, Check, Undo2 } from "lucide-react";
+import type { NativeThread, NativeUser, SidebarSection } from "@stanley2058/lilac-client-protocol";
 import { useWorkspace } from "../workspace-context";
 import { IconButton } from "./ui";
 import {
@@ -22,7 +22,13 @@ export function SidebarThread({
   onRename,
   onArchive,
   onDelete,
+  section,
+  onSettle,
+  settleDisabled,
 }: {
+  section?: SidebarSection;
+  onSettle?: () => void;
+  settleDisabled?: boolean;
   id: string;
   thread?: NativeThread;
   viewer: NativeUser;
@@ -39,34 +45,32 @@ export function SidebarThread({
   );
   const title = thread?.title ?? draft?.title ?? "";
   const editable = thread?.capabilities.edit ?? draft?.editable ?? false;
-  const actions = editable ? (
-    <>
+  const settleAction =
+    thread && !thread.archived && onSettle ? (
       <IconButton
-        label={`Rename ${title || "conversation"}`}
-        tooltip="Rename"
-        onClick={() => onRename(id, title)}
+        label={`${section === "settled" ? "Unsettle" : "Settle"} ${title || "conversation"}`}
+        tooltip={section === "settled" ? "Unsettle" : "Settle"}
+        onClick={onSettle}
+        disabled={settleDisabled}
       >
-        <Pencil />
+        {section === "settled" ? <Undo2 /> : <Check />}
       </IconButton>
-      {thread ? (
-        <IconButton
-          label={`${thread.archived ? "Unarchive" : "Archive"} ${title || "conversation"}`}
-          tooltip={thread.archived ? "Unarchive" : "Archive"}
-          onClick={() => onArchive(id, !thread.archived)}
-        >
-          {thread.archived ? <ArchiveRestore /> : <Archive />}
-        </IconButton>
-      ) : null}
-      <IconButton
-        className="destructive-action"
-        label={`Delete ${title || "conversation"}`}
-        tooltip="Delete"
-        onClick={() => onDelete(id)}
-      >
-        <Trash2 />
-      </IconButton>
-    </>
-  ) : undefined;
+    ) : null;
+  const actions =
+    settleAction || editable ? (
+      <>
+        {settleAction}
+        {editable ? (
+          <IconButton
+            label={`Rename ${title || "conversation"}`}
+            tooltip="Rename"
+            onClick={() => onRename(id, title)}
+          >
+            <Pencil />
+          </IconButton>
+        ) : null}
+      </>
+    ) : undefined;
   const [now] = useState(Date.now);
   return (
     <ContextMenu>
@@ -94,22 +98,32 @@ export function SidebarThread({
           />
         )}
       </ContextMenuTrigger>
-      {editable ? (
+      {editable || settleAction ? (
         <ContextMenuContent>
-          <ContextMenuItem onClick={() => onRename(id, title)}>
-            <Pencil />
-            Rename
-          </ContextMenuItem>
-          {thread ? (
-            <ContextMenuItem onClick={() => onArchive(id, !thread.archived)}>
-              {thread.archived ? <ArchiveRestore /> : <Archive />}
-              {thread.archived ? "Unarchive" : "Archive"}
+          {settleAction ? (
+            <ContextMenuItem disabled={settleDisabled} onClick={onSettle}>
+              {section === "settled" ? <Undo2 /> : <Check />}
+              {section === "settled" ? "Unsettle" : "Settle"}
             </ContextMenuItem>
           ) : null}
-          <ContextMenuItem variant="destructive" onClick={() => onDelete(id)}>
-            <Trash2 />
-            Delete
-          </ContextMenuItem>
+          {editable ? (
+            <>
+              <ContextMenuItem onClick={() => onRename(id, title)}>
+                <Pencil />
+                Rename
+              </ContextMenuItem>
+              {thread ? (
+                <ContextMenuItem onClick={() => onArchive(id, !thread.archived)}>
+                  {thread.archived ? <ArchiveRestore /> : <Archive />}
+                  {thread.archived ? "Unarchive" : "Archive"}
+                </ContextMenuItem>
+              ) : null}
+              <ContextMenuItem variant="destructive" onClick={() => onDelete(id)}>
+                <Trash2 />
+                Delete
+              </ContextMenuItem>
+            </>
+          ) : null}
         </ContextMenuContent>
       ) : null}
     </ContextMenu>

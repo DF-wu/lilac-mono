@@ -73,3 +73,5 @@
     .ds-grid { grid-template-columns: minmax(0, 1fr); }
   }
 }
+
+.ds-queue-preview { height:32rem; display:flex; flex-direction:column; min-width:0; background:var(--surface); border-radius:var(--radius-lg); padding:var(--space-2); }

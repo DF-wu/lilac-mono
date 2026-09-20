@@ -47,6 +47,8 @@ import { attempt, IconButton, Modal, VirtualList } from "./components/ui";
 import { DraftChat } from "./components/DraftChat";
 import { MessageIdentityContext } from "./components/message-identity";
 import { toast } from "./components/ui/toast";
+import { refreshSidebar } from "./sidebar-queries";
+import { SidebarQueue } from "./components/SidebarQueue";
 import { SidebarThread } from "./components/SidebarThread";
 import {
   newDraftThread,
@@ -555,8 +557,11 @@ function Workspace(props: AppProps) {
       setRename(undefined);
       return;
     }
-    const target = threads.find((thread) => thread.id === id);
-    if (!client.rpc || !target) return;
+    if (!client.rpc) return;
+    const target =
+      threads.find((thread) => thread.id === id) ??
+      (await attempt(() => client.rpc!.threads.get({ threadId: id }), setError));
+    if (!target) return;
     const revision = client.thread(id).checkpoint?.projectionRevision ?? target.revision;
     const changed = await attempt(
       () => client.rpc!.threads.update({ threadId: id, expectedRevision: revision, ...change }),
@@ -564,6 +569,7 @@ function Workspace(props: AppProps) {
     );
     if (changed) {
       upsert(changed);
+      void refreshSidebar(queries);
       setRename(undefined);
     }
   }
@@ -593,6 +599,7 @@ function Workspace(props: AppProps) {
     );
     if (!deleted) return;
     setThreads((items) => items.filter((item) => item.id !== id));
+    void refreshSidebar(queries);
     drafts.current.delete(id);
     patchPending(id, () => []);
     setConfirmDelete(undefined);
@@ -765,35 +772,50 @@ function Workspace(props: AppProps) {
                   </>
                 ) : (
                   <>
-                    <VirtualList
-                      items={sidebarThreads}
-                      itemKey={(thread) => thread.id}
-                      label="Conversations"
-                      scrollFade
-                      hasMore={!!nextCursor && !threadListError}
-                      loading={loadingThreads}
-                      onEndReached={() => {
-                        if (nextCursor) void listThreads(archived, nextCursor);
-                      }}
-                      className="thread-list"
-                      estimate={64}
-                      render={(thread) => (
-                        <SidebarThread
-                          id={thread.id}
-                          thread={thread.source}
-                          viewer={viewer}
-                          modelLabel={
-                            catalog?.models.find((model) => model.id === thread.source?.modelId)
-                              ?.label
-                          }
-                          selected={selectedId === thread.id && !external}
-                          onSelect={select}
-                          onRename={(id, title) => setRename({ id, title })}
-                          onArchive={(id, archived) => void update(id, { archived })}
-                          onDelete={setConfirmDelete}
-                        />
-                      )}
-                    />
+                    {!archived ? (
+                      <SidebarQueue
+                        fallbackThreads={threads}
+                        draftIds={draftIds}
+                        viewer={viewer}
+                        selectedId={external ? undefined : selectedId}
+                        models={catalog?.models}
+                        onThread={upsert}
+                        onSelect={select}
+                        onRename={(id, title) => setRename({ id, title })}
+                        onArchive={(id, archived) => void update(id, { archived })}
+                        onDelete={setConfirmDelete}
+                      />
+                    ) : (
+                      <VirtualList
+                        items={sidebarThreads}
+                        itemKey={(thread) => thread.id}
+                        label="Conversations"
+                        scrollFade
+                        hasMore={!!nextCursor && !threadListError}
+                        loading={loadingThreads}
+                        onEndReached={() => {
+                          if (nextCursor) void listThreads(archived, nextCursor);
+                        }}
+                        className="thread-list"
+                        estimate={64}
+                        render={(thread) => (
+                          <SidebarThread
+                            id={thread.id}
+                            thread={thread.source}
+                            viewer={viewer}
+                            modelLabel={
+                              catalog?.models.find((model) => model.id === thread.source?.modelId)
+                                ?.label
+                            }
+                            selected={selectedId === thread.id && !external}
+                            onSelect={select}
+                            onRename={(id, title) => setRename({ id, title })}
+                            onArchive={(id, archived) => void update(id, { archived })}
+                            onDelete={setConfirmDelete}
+                          />
+                        )}
+                      />
+                    )}
                     {threadListError ? (
                       <Button
                         variant="ghost"

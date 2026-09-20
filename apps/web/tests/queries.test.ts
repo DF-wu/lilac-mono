@@ -10,8 +10,11 @@ import {
   refreshQueue,
 } from "../src/queries";
 
+import { sidebarOptions, refreshSidebar } from "../src/sidebar-queries";
+
 type Rpc = NonNullable<NativeClient["rpc"]>;
 function clientWith(rpc: {
+  sidebar?: Pick<Rpc["sidebar"], "list">;
   search?: Pick<Rpc["search"], "query">;
   participants?: Pick<Rpc["participants"], "list">;
   users?: Pick<Rpc["users"], "list">;
@@ -157,6 +160,34 @@ test("queue events during initial loading replace the obsolete request", async (
   pending.resolve({ items: [] });
   await pending.promise;
   expect(requests).toBe(2);
+  stop();
+  queries.clear();
+});
+
+test("sidebar refresh cancels a stale initial read before fetching new membership", async () => {
+  const pending = Promise.withResolvers<NativeRpcOutputs["sidebar"]["list"]>();
+  let requests = 0;
+  let initialSignal: AbortSignal | undefined;
+  const client = clientWith({
+    sidebar: {
+      list: async (_input, options) => {
+        if (++requests === 1) {
+          initialSignal = options?.signal;
+          return pending.promise;
+        }
+        return { items: [], total: 7 };
+      },
+    },
+  });
+  const queries = cache();
+  const observer = new InfiniteQueryObserver(queries, sidebarOptions(client, "active", true));
+  const stop = observer.subscribe(() => {});
+  await refreshSidebar(queries);
+  expect(initialSignal?.aborted).toBe(true);
+  expect(requests).toBe(2);
+  pending.resolve({ items: [], total: 1 });
+  await pending.promise;
+  expect(observer.getCurrentResult().data?.pages[0]?.total).toBe(7);
   stop();
   queries.clear();
 });

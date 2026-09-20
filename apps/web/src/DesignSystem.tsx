@@ -67,6 +67,7 @@ import { TooltipProvider } from "./components/ui/tooltip";
 import { Markdown } from "./components/Markdown";
 import ComposerEditor from "./components/composer-editor";
 import { Message } from "./components/Timeline";
+import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
 import { SidebarSearch } from "./components/SidebarSearch";
 import { ThreadCard } from "./components/ThreadSelect";
@@ -339,26 +340,18 @@ function DemoThreadActions({ onAction }: { onAction: (label: string) => void }) 
   return (
     <>
       <IconButton
+        label="Settle conversation"
+        tooltip="Settle"
+        onClick={() => onAction("Settle selected")}
+      >
+        <Check />
+      </IconButton>
+      <IconButton
         label="Rename conversation"
         tooltip="Rename"
         onClick={() => onAction("Rename selected")}
       >
         <Pencil />
-      </IconButton>
-      <IconButton
-        label="Archive conversation"
-        tooltip="Archive"
-        onClick={() => onAction("Archive selected")}
-      >
-        <Archive />
-      </IconButton>
-      <IconButton
-        label="Delete conversation"
-        tooltip="Delete"
-        className="destructive-action"
-        onClick={() => onAction("Delete selected")}
-      >
-        <Trash2 />
       </IconButton>
     </>
   );
@@ -430,6 +423,12 @@ function Threads() {
             </div>
           ))}
         </div>
+        <Specimen title="Personal queues">
+          <ThreadQueueDemo />
+          <p className="ds-muted">
+            Drag conversations to reorder, pin, or settle them. Changes affect this preview only.
+          </p>
+        </Specimen>
         <Specimen title="Thread details">
           <div className="thread-details">
             <strong>Compare the two proposals</strong>

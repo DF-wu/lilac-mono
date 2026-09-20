@@ -1,0 +1,187 @@
+import { useEffect, useState } from "react";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQueryClient,
+  type InfiniteData,
+} from "@tanstack/react-query";
+import type {
+  NativeRpcOutputs,
+  NativeUser,
+  SidebarSection,
+  DisplayCatalog,
+} from "@stanley2058/lilac-client-protocol";
+import { useWorkspace } from "../workspace-context";
+import { sidebarOptions, refreshSidebar } from "../sidebar-queries";
+import { useNativeOnline } from "../queries";
+import { moveInQueues, sidebarSections, type ThreadMove, sidebarSnapshot } from "../sidebar-order";
+import { SidebarThread } from "./SidebarThread";
+import { ThreadQueue } from "./ThreadQueue";
+import { Button } from "./ui/button";
+import { ErrorNotice } from "./ui";
+import type { NativeThread } from "@stanley2058/lilac-client-protocol";
+
+type Page = NativeRpcOutputs["sidebar"]["list"];
+export function SidebarQueue({
+  fallbackThreads,
+  draftIds,
+  viewer,
+  selectedId,
+  models,
+  onSelect,
+  onRename,
+  onArchive,
+  onDelete,
+  onThread,
+}: {
+  fallbackThreads: NativeThread[];
+  draftIds: string[];
+  viewer: NativeUser;
+  selectedId?: string;
+  models?: DisplayCatalog["models"];
+  onSelect: (id: string) => void;
+  onRename: (id: string, title: string) => void;
+  onArchive: (id: string, archived: boolean) => void;
+  onDelete: (id: string) => void;
+  onThread: (thread: NativeThread) => void;
+}) {
+  const { client } = useWorkspace();
+  const queries = useQueryClient();
+  const online = useNativeOnline(client);
+  const [settledOpen, setSettledOpen] = useState(false);
+  const pinned = useInfiniteQuery(sidebarOptions(client, "pinned", online));
+  const active = useInfiniteQuery(sidebarOptions(client, "active", online));
+  const settled = useInfiniteQuery(sidebarOptions(client, "settled", online));
+  const sections = { pinned, active, settled };
+  const queues = sidebarSnapshot(
+    sidebarSections.map((section) => ({
+      section,
+      items: sections[section].data?.pages.flatMap((page) => page.items) ?? [],
+      updatedAt: sections[section].dataUpdatedAt,
+    })),
+    online ? [] : fallbackThreads,
+  );
+  queues.active.unshift(...draftIds.map((id) => ({ id })));
+  const totals = {
+    pinned: pinned.data?.pages[0]?.total ?? 0,
+    active: active.data?.pages[0]?.total ?? queues.active.length,
+    settled: settled.data?.pages[0]?.total ?? 0,
+  };
+  useEffect(
+    () =>
+      client.subscribe((event) => {
+        if (event.kind === "bootstrap" || event.kind === "removed") {
+          void refreshSidebar(queries);
+          return;
+        }
+        if (event.kind !== "thread") return;
+        let known = false,
+          needsRefresh = event.thread.archived;
+        for (const section of sidebarSections) {
+          if (
+            !queries
+              .getQueryData<InfiniteData<Page>>(["sidebar", section])
+              ?.pages.some((page) => page.items.some((thread) => thread.id === event.thread.id))
+          )
+            continue;
+          queries.setQueryData<InfiniteData<Page>>(["sidebar", section], (data) => {
+            if (!data) return data;
+            return {
+              ...data,
+              pages: data.pages.map((page) => ({
+                ...page,
+                items: page.items.map((thread) => {
+                  if (thread.id !== event.thread.id) return thread;
+                  known = true;
+                  if (section === "settled" && event.thread.updatedAt > thread.updatedAt)
+                    needsRefresh = true;
+                  return event.thread;
+                }),
+              })),
+            };
+          });
+        }
+        if (!known || needsRefresh) void refreshSidebar(queries);
+      }),
+    [client, queries],
+  );
+  const move = useMutation({
+    mutationFn: (input: ThreadMove) => client.rpc!.sidebar.move(input),
+    onMutate: () => queries.cancelQueries({ queryKey: ["sidebar"] }),
+    onSettled: () => refreshSidebar(queries),
+  });
+  const visible = move.isPending ? moveInQueues(queues, move.variables) : queues;
+  const visibleTotals = { ...totals };
+  if (move.isPending)
+    for (const section of sidebarSections)
+      visibleTotals[section] += visible[section].length - queues[section].length;
+  const next = sidebarSections.find(
+    (section) =>
+      (section !== "settled" || settledOpen) &&
+      sections[section].hasNextPage &&
+      !sections[section].isError,
+  );
+  const error = move.error ?? pinned.error ?? active.error ?? settled.error;
+  return (
+    <>
+      <ThreadQueue
+        queues={visible}
+        totals={visibleTotals}
+        disabled={!online || move.isPending}
+        loading={sidebarSections.some((section) => sections[section].isFetching)}
+        hasMore={!!next}
+        onEndReached={() => {
+          if (next) void sections[next].fetchNextPage({ cancelRefetch: false });
+        }}
+        settledOpen={settledOpen}
+        onSettledOpen={setSettledOpen}
+        onMove={(input) => move.mutate(input)}
+        renderThread={(entry, section) => (
+          <SidebarThread
+            id={entry.id}
+            thread={entry.source}
+            viewer={viewer}
+            selected={entry.id === selectedId}
+            modelLabel={models?.find((model) => model.id === entry.source?.modelId)?.label}
+            section={section}
+            onSettle={() =>
+              move.mutate({
+                threadId: entry.id,
+                section: section === "settled" ? "active" : "settled",
+                atStart: true,
+              })
+            }
+            settleDisabled={!online || move.isPending}
+            onSelect={(id) => {
+              if (entry.source) onThread(entry.source);
+              onSelect(id);
+            }}
+            onRename={(id, title) => {
+              if (entry.source) onThread(entry.source);
+              onRename(id, title);
+            }}
+            onArchive={(id, archived) => {
+              if (entry.source) onThread(entry.source);
+              onArchive(id, archived);
+            }}
+            onDelete={onDelete}
+          />
+        )}
+      />
+      {error ? (
+        <div className="queue-error">
+          <ErrorNotice message={error.message} />
+          <Button
+            variant="ghost"
+            onClick={() => {
+              move.reset();
+              void refreshSidebar(queries);
+            }}
+          >
+            Retry
+          </Button>
+        </div>
+      ) : null}
+    </>
+  );
+}
