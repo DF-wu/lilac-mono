@@ -33,6 +33,7 @@ const states = {
 export function ThreadCard({
   title,
   starterName,
+  starterAvatarUrl,
   updatedAt,
   now,
   state,
@@ -42,6 +43,7 @@ export function ThreadCard({
 }: {
   title: string;
   starterName: string;
+  starterAvatarUrl?: string;
   updatedAt: number;
   now?: number;
   state: ThreadDisplayState;
@@ -61,7 +63,7 @@ export function ThreadCard({
         <span className="thread-card-copy">
           <span className="thread-card-top">
             <span className="thread-starter">
-              <ActorAvatar displayName={starterName} />
+              <ActorAvatar displayName={starterName} avatarUrl={starterAvatarUrl} />
               <span>{starterName}</span>
             </span>
             <span className="thread-card-meta">
@@ -123,8 +125,9 @@ export function ThreadSelect({
   });
   const names = participantNames ?? data?.items.map(({ user }) => user.displayName);
   const starter =
-    thread.starterDisplayName ??
-    (thread.starterId === viewer.id ? viewer.displayName : "Participant");
+    thread.starterId === viewer.id
+      ? viewer.displayName
+      : (thread.starterDisplayName ?? "Participant");
   const state = thread.displayStatus ?? (thread.activeRunId ? "working" : "idle");
   return (
     <Tooltip onOpenChange={setOpen}>
@@ -132,6 +135,9 @@ export function ThreadSelect({
         <ThreadCard
           title={thread.title}
           starterName={starter}
+          starterAvatarUrl={
+            thread.starterId === viewer.id ? viewer.avatarUrl : thread.starterAvatarUrl
+          }
           updatedAt={thread.updatedAt}
           now={now}
           state={state}

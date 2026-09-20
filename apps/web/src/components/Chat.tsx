@@ -1,3 +1,4 @@
+import type { ActorIdentity } from "./ActorAvatar";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   participantOptions,
@@ -147,8 +148,11 @@ export function Chat(props: ChatProps) {
     if (unknownAuthor) void queries.invalidateQueries({ queryKey: ["participants", thread.id] });
   }, [queries, thread.id, unknownAuthor]);
   const identities = useMemo(() => {
-    const users = new Map(
-      participants.data?.items.map(({ user }) => [user.id, { displayName: user.displayName }]),
+    const users = new Map<string, ActorIdentity>(
+      participants.data?.items.map(({ user }) => [
+        user.id,
+        { displayName: user.displayName, avatarUrl: user.avatarUrl },
+      ]),
     );
     const viewer = identity.viewerId ? identity.users.get(identity.viewerId) : undefined;
     if (identity.viewerId && viewer) users.set(identity.viewerId, viewer);

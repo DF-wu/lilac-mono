@@ -1,6 +1,6 @@
 import { useLocation, useNavigate, useMatch, useRouter } from "@tanstack/react-router";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
-import { searchOptions, threadOptions, useNativeOnline } from "./queries";
+import { profileOptions, searchOptions, threadOptions, useNativeOnline } from "./queries";
 import { useStore } from "zustand";
 import { WorkspaceProvider, useWorkspace } from "./workspace-context";
 import {
@@ -89,6 +89,9 @@ function Workspace(props: AppProps) {
   const draftIds = useStore(draftStore, (state) => state.ids);
   const setLocalDrafts = draftStore.getState().setLocalDrafts;
   const { client, initial } = props;
+  const online = useNativeOnline(client);
+  const profile = useQuery({ ...profileOptions(client), enabled: online });
+  const viewer = profile.data ?? initial.viewer;
   const [threads, setThreads] = useState(initial.threads.items);
   const [nextCursor, setNextCursor] = useState(initial.threads.nextCursor);
   const [loadingThreads, setLoadingThreads] = useState(false);
@@ -135,7 +138,6 @@ function Workspace(props: AppProps) {
     };
   }, [sidebar, sidebarSliding]);
   const [searchQuery, setSearchQuery] = useState("");
-  const online = useNativeOnline(client);
   const queries = useQueryClient();
   const searchResults = useInfiniteQuery({
     ...searchOptions(client, searchQuery),
@@ -176,7 +178,7 @@ function Workspace(props: AppProps) {
   );
   const readTurns = useRef(new Map<string, string>());
   const selected = threads.find((thread) => thread.id === selectedId);
-  const owner = initial.viewer.role === "owner";
+  const owner = viewer.role === "owner";
   const activeRef = useRef(active);
   activeRef.current = active;
   const selectedRef = useRef(selectedId);
@@ -187,10 +189,12 @@ function Workspace(props: AppProps) {
   const identities = useMemo(
     () => ({
       agent: catalog?.agent ?? { displayName: "Lilac" },
-      viewerId: initial.viewer.id,
-      users: new Map([[initial.viewer.id, { displayName: initial.viewer.displayName }]]),
+      viewerId: viewer.id,
+      users: new Map([
+        [viewer.id, { displayName: viewer.displayName, avatarUrl: viewer.avatarUrl }],
+      ]),
     }),
-    [catalog?.agent, initial.viewer],
+    [catalog?.agent, viewer],
   );
   useEffect(() => {
     setExternal(false);
@@ -268,6 +272,9 @@ function Workspace(props: AppProps) {
       client.subscribe((event) => {
         switch (event.kind) {
           case "bootstrap":
+            queries.setQueryData(["profile"], event.bootstrap.viewer);
+            void queries.invalidateQueries({ queryKey: ["participants"] });
+            void queries.invalidateQueries({ queryKey: ["users"] });
             threadListRequest.current = { loading: false };
             setLoadingThreads(false);
             setThreadListError(false);
@@ -774,7 +781,7 @@ function Workspace(props: AppProps) {
                         <SidebarThread
                           id={thread.id}
                           thread={thread.source}
-                          viewer={initial.viewer}
+                          viewer={viewer}
                           modelLabel={
                             catalog?.models.find((model) => model.id === thread.source?.modelId)
                               ?.label
@@ -798,9 +805,7 @@ function Workspace(props: AppProps) {
                   </>
                 )}
                 <footer className="sidebar-footer">
-                  {props.userControl ?? (
-                    <span className="viewer-name">{initial.viewer.displayName}</span>
-                  )}
+                  {props.userControl ?? <span className="viewer-name">{viewer.displayName}</span>}
                   <span className="toolbar-spacer" />
                   <IconButton
                     label="Design system"
@@ -963,7 +968,7 @@ function Workspace(props: AppProps) {
           </ResizablePanelGroup>
           {settings ? (
             <Settings
-              viewer={initial.viewer}
+              viewer={viewer}
               onLogout={props.onLogout}
               onClose={() => setSettings(false)}
               agent={identities.agent}

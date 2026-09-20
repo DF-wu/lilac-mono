@@ -2,6 +2,7 @@ import { useWorkspace } from "../workspace-context";
 import { useStore } from "zustand";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { configOptions, userOptions, useNativeOnline } from "../queries";
+import { AccountProfile } from "./AccountProfile";
 import { AgentIdentity } from "./AgentIdentity";
 import type { ActorIdentity } from "./ActorAvatar";
 import { useEffect, useRef, useState } from "react";
@@ -163,11 +164,8 @@ export function Settings({
             />
             <TabsContent value="account" className="settings-section">
               <h2>Account</h2>
+              <AccountProfile viewer={viewer} />
               <dl className="settings-account">
-                <div>
-                  <dt>Name</dt>
-                  <dd>{viewer.displayName}</dd>
-                </div>
                 <div>
                   <dt>Role</dt>
                   <dd>{viewer.role}</dd>

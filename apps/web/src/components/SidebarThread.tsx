@@ -84,6 +84,7 @@ export function SidebarThread({
           <ThreadCard
             title={title}
             starterName={`${viewer.displayName} · Draft`}
+            starterAvatarUrl={viewer.avatarUrl}
             state="idle"
             updatedAt={now}
             now={now}

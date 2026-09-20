@@ -122,3 +122,12 @@ export async function refreshQueue(queries: QueryClient, threadId: string) {
   await queries.cancelQueries(filters);
   await queries.invalidateQueries(filters);
 }
+
+export function profileOptions(client: NativeClient) {
+  const rpc = client.rpc;
+  return queryOptions({
+    queryKey: ["profile"],
+    queryFn: rpc ? ({ signal }) => rpc.profile.get({}, { signal }) : skipToken,
+    refetchOnWindowFocus: true,
+  });
+}
