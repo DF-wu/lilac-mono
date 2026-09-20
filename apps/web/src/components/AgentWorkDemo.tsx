@@ -207,6 +207,7 @@ export function AgentWorkDemo() {
             />
             <ResizablePanel
               id="demo-agents-panel"
+              data-panel-side="right"
               className="right-panel"
               defaultSize="360px"
               minSize="200px"

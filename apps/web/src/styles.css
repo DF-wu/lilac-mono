@@ -1579,7 +1579,7 @@ progress {
     --workspace-width: calc(100% + var(--hidden-left) + var(--hidden-right));
   }
   .right-panel-hidden .workspace-panels { --hidden-right: var(--right-panel-offset); }
-  .workspace-panels[data-right-fixed="true"] > .right-panel[data-panel] {
+  .workspace-panels[data-right-fixed="true"] > [data-panel-side="right"] {
     flex: 0 0 var(--right-panel-width) !important;
   }
 }

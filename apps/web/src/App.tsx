@@ -974,6 +974,7 @@ function Workspace(props: AppProps) {
               />
               <ResizablePanel
                 id="right-panel"
+                data-panel-side="right"
                 className="right-panel"
                 inert={!rightOpen}
                 aria-hidden={!rightOpen}
