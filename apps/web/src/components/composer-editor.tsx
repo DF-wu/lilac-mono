@@ -2,6 +2,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useLayoutEffect,
   useImperativeHandle,
   useRef,
   type Ref,
@@ -346,6 +347,15 @@ function deserializeComposer(editor: PlateEditor, text: string) {
   });
 }
 
+export function replaceComposerDocument(editor: PlateEditor, text: string) {
+  editor.tf.withoutSaving(() => {
+    editor.tf.deselect();
+    editor.tf.setValue(deserializeComposer(editor, text));
+  });
+  editor.history = { undos: [], redos: [] };
+  editor.marks = null;
+}
+
 export function createComposerEditor(text = "") {
   return createPlateEditor({
     plugins: composerPlugins,
@@ -455,6 +465,7 @@ export type ComposerEditorHandle = {
 export type ComposerEditorProps = {
   ref?: Ref<ComposerEditorHandle>;
   text: string;
+  documentKey?: string;
   attachments?: readonly Attachment[];
   onRemoveAttachment?: (key: string) => void;
   onRetryAttachment?: (key: string) => void;
@@ -471,6 +482,7 @@ export type ComposerEditorProps = {
 
 export default function ComposerEditor(props: ComposerEditorProps) {
   const lastText = useRef(props.text);
+  const documentKey = useRef(props.documentKey);
   const attachments = props.attachments ?? emptyAttachments;
   const seenAttachments = useRef(new Set<string>());
   const referencedAttachments = useRef(new Set<string>());
@@ -478,14 +490,19 @@ export default function ComposerEditor(props: ComposerEditorProps) {
     plugins: composerPlugins,
     value: (editor) => deserializeComposer(editor, props.text),
   });
-  useEffect(() => {
-    props.onPlainText(composerPlainText(editor), lastText.current);
-  }, [editor, props.onPlainText]);
-  useEffect(() => {
-    if (props.text === lastText.current) return;
+  useLayoutEffect(() => {
+    const switched = documentKey.current !== props.documentKey;
+    if (switched) {
+      documentKey.current = props.documentKey;
+      seenAttachments.current.clear();
+      referencedAttachments.current.clear();
+      replaceComposerDocument(editor, props.text);
+    } else if (props.text !== lastText.current) {
+      editor.tf.setValue(deserializeComposer(editor, props.text));
+    }
     lastText.current = props.text;
-    editor.tf.setValue(deserializeComposer(editor, props.text));
-  }, [editor, props.text]);
+    props.onPlainText(composerPlainText(editor), props.text);
+  }, [editor, props.documentKey, props.text, props.onPlainText]);
   useEffect(() => {
     const currentKeys = new Set(attachments.map((attachment) => attachment.key));
     const references = attachmentKeys(editor);
@@ -530,7 +547,8 @@ export default function ComposerEditor(props: ComposerEditorProps) {
     referencedAttachments.current = references;
     const text = composerMarkdown(editor);
     lastText.current = text;
-    props.onText(text, composerPlainText(editor));
+    if (text !== props.text) props.onText(text, composerPlainText(editor));
+    props.onPlainText(composerPlainText(editor), text);
     props.onPrefix(composerPrefix(editor));
   }
   function mark(key: string) {

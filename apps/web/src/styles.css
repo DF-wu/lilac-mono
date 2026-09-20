@@ -883,6 +883,10 @@ progress {
   min-height: 12rem;
   color: var(--muted-foreground);
 }
+.timeline-canvas:has(> .welcome) {
+  display: flex;
+  flex-direction: column;
+}
 .welcome .brand {
   font-size: var(--text-hero);
   color: var(--foreground);

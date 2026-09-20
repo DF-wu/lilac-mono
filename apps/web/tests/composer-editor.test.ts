@@ -4,6 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { KEYS, NodeApi } from "platejs";
 import ComposerEditor, {
   createComposerEditor,
+  replaceComposerDocument,
   composerMarkdown,
   composerPrefix,
   composerPlainText,
@@ -223,4 +224,33 @@ it("preserves file references through local draft remapping before resource rese
   expect(resolveComposerAttachments(moved, new Map([["upload-key", "reserved-id"]]))).toBe(
     "Compare [image.png](/api/resources/reserved-id)",
   );
+});
+
+it("swaps thread documents in the same editor without carrying undo, selection, or marks across", () => {
+  const editor = createComposerEditor("First draft");
+  editor.tf.select(editor.api.end([])!);
+  editor.tf.insertText(" edited");
+  editor.marks = { bold: true };
+  expect(editor.history.undos.length).toBeGreaterThan(0);
+  const firstDraft = composerMarkdown(editor);
+  const secondDraft = "**Second draft** [notes.txt](attachment:second-file)";
+  replaceComposerDocument(editor, secondDraft);
+  expect(composerMarkdown(editor)).toBe(secondDraft);
+  expect(editor.selection).toBeNull();
+  expect(editor.marks).toBeNull();
+  expect(editor.history).toEqual({ undos: [], redos: [] });
+  editor.tf.undo();
+  expect(composerMarkdown(editor)).toBe(secondDraft);
+  replaceComposerDocument(editor, firstDraft);
+  expect(composerMarkdown(editor)).toBe("First draft edited");
+});
+
+it("resets history even when two threads have identical draft text", () => {
+  const editor = createComposerEditor("Shared text");
+  editor.tf.select(editor.api.end([])!);
+  editor.tf.insertText("!");
+  replaceComposerDocument(editor, "Shared text!");
+  editor.tf.undo();
+  expect(composerMarkdown(editor)).toBe("Shared text!");
+  expect(editor.history.undos).toHaveLength(0);
 });

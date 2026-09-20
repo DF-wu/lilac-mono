@@ -1,9 +1,11 @@
 import { expect, test } from "bun:test";
 import { InfiniteQueryObserver, QueryObserver, QueryClient } from "@tanstack/react-query";
-import { NativeClient } from "@stanley2058/lilac-client";
+import { NativeClient, type CacheScope } from "@stanley2058/lilac-client";
 import type { NativeRpcOutputs } from "@stanley2058/lilac-client-protocol";
 import {
   participantOptions,
+  composerDraftOptions,
+  updateComposerDraft,
   searchOptions,
   userOptions,
   queueOptions,
@@ -189,5 +191,55 @@ test("sidebar refresh cancels a stale initial read before fetching new membershi
   await pending.promise;
   expect(observer.getCurrentResult().data?.pages[0]?.total).toBe(7);
   stop();
+  queries.clear();
+});
+
+test("late draft hydration cannot overwrite a newer edit or another thread's draft", async () => {
+  const queries = cache();
+  const pending = Promise.withResolvers<{ text: string; skillIds: string[] }>();
+  const scope: CacheScope = {
+    installationId: "fixture",
+    principalId: "owner",
+    protocolVersion: 1,
+    projectionVersion: 1,
+  };
+  const storage = {
+    readDraft: () => pending.promise,
+    saveDraft: async () => {},
+    listLocalDrafts: async () => [],
+    deleteDraft: async () => {},
+  };
+  const a = composerDraftOptions(scope, "a", storage);
+  const b = composerDraftOptions(scope, "b", storage);
+  const hydration = queries.prefetchQuery(a);
+  updateComposerDraft(queries, "b", { text: "Other thread", skillIds: [], attachments: [] });
+  updateComposerDraft(queries, "a", { text: "Rewound input", skillIds: [], attachments: [] });
+  pending.resolve({ text: "Old persisted draft", skillIds: [] });
+  await hydration;
+  expect(queries.getQueryData(a.queryKey)?.text).toBe("Rewound input");
+  expect(queries.getQueryData(b.queryKey)?.text).toBe("Other thread");
+  queries.clear();
+});
+
+test("empty drafts stay cached when revisiting a thread", async () => {
+  const queries = cache();
+  let reads = 0;
+  const options = composerDraftOptions(
+    { installationId: "fixture", principalId: "owner", protocolVersion: 1, projectionVersion: 1 },
+    "empty",
+    {
+      readDraft: async () => {
+        reads++;
+        return { text: "", skillIds: [] };
+      },
+      saveDraft: async () => {},
+      listLocalDrafts: async () => [],
+      deleteDraft: async () => {},
+    },
+  );
+  await queries.ensureQueryData(options);
+  await queries.ensureQueryData(options);
+  expect(reads).toBe(1);
+  expect(queries.getQueryData(options.queryKey)?.text).toBe("");
   queries.clear();
 });

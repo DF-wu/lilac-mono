@@ -1,7 +1,11 @@
+import { useStore } from "zustand";
+import { draftAttachment, releaseDraftAttachments, type DraftThread } from "../draft-thread";
 import type { ActorIdentity } from "./ActorAvatar";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   participantOptions,
+  composerDraftOptions,
+  updateComposerDraft,
   queueOptions,
   refreshQueue as refreshQueueQuery,
   useNativeOnline,
@@ -11,7 +15,6 @@ import { useWorkspace } from "../workspace-context";
 import {
   useCallback,
   useContext,
-  useLayoutEffect,
   useEffect,
   useMemo,
   useRef,
@@ -20,7 +23,7 @@ import {
   type ReactNode,
 } from "react";
 import { X, RotateCcw } from "lucide-react";
-import type { NativeInput, DisplayPart } from "@stanley2058/lilac-client-protocol";
+import type { NativeInput, DisplayPart, NativeThread } from "@stanley2058/lilac-client-protocol";
 import type { ChatCommon, ComposerSubmission } from "../types";
 import { resolveAttachmentIds } from "../uploads";
 import { inputDeliveryOptions } from "../input-mode";
@@ -46,88 +49,107 @@ export type PendingInput = {
   error?: string;
   state: "preparing" | "uncertain" | "rejected";
 };
-export type ChatProps = Pick<ChatCommon, "thread" | "catalog" | "onError"> & {
+const emptyDraft: Draft = { text: "", skillIds: [], attachments: [] };
+export type ChatProps = Pick<ChatCommon, "catalog" | "onError"> & {
+  threadId: string;
+  thread?: NativeThread;
+  loadingMessage?: string;
+  onRetryLoad: () => void;
+  onLocalChange: (id: string, update: (thread: DraftThread) => DraftThread) => void;
+  onLocalSubmit: (id: string, submission: ComposerSubmission) => void;
   header: ReactNode;
-  draft: Draft;
-  onDraft: (draft: Draft) => void;
+  draft?: Draft;
+  onDraft: (id: string, draft: Draft) => void;
   readTurns: Map<string, string>;
   pending: PendingInput[];
-  onPending: (update: (pending: PendingInput[]) => PendingInput[]) => void;
+  onPending: (id: string, update: (pending: PendingInput[]) => PendingInput[]) => void;
   foreground: boolean;
-  displayRevision: number;
-  onPrepare: () => void;
-  cacheLoaded: boolean;
-  onReady: () => void;
 };
 
 export function Chat(props: ChatProps) {
-  const { client, pool, scope, upload, resourceUrl, draftCache } = useWorkspace();
-  const { thread } = props;
-  useLayoutEffect(props.onPrepare, [props.onPrepare]);
+  const {
+    client,
+    pool,
+    scope,
+    upload,
+    resourceUrl,
+    draftCache,
+    drafts: draftStore,
+  } = useWorkspace();
+  const { thread, threadId } = props;
+  const local = threadId.startsWith("draft:");
+  const localThread = useStore(draftStore, (state) => state.localDrafts.get(threadId));
+  const editable = local ? !!localThread : !!thread?.capabilities.edit;
+  const queries = useQueryClient();
+  const draftOptions = composerDraftOptions(scope, threadId, draftCache);
+  const draftQuery = useQuery({
+    ...draftOptions,
+    initialData: props.draft,
+    enabled: !local,
+  });
+  const draft = localThread?.draft ?? draftQuery.data ?? emptyDraft;
+  const draftLoaded = local ? !!localThread : !draftQuery.isPending;
   const identity = useContext(MessageIdentityContext);
-  const [draftLoaded, setDraftLoaded] = useState(false);
-  const [editorReady, setEditorReady] = useState(false);
-  const [draft, setDraft] = useState(props.draft);
-  const draftVersion = useRef(0);
-  const draftRef = useRef(draft);
-  draftRef.current = draft;
-  const [pendingEntries, setPendingEntries] = useState(props.pending);
-  useEffect(() => {
-    pendingRef.current = props.pending;
-    setPendingEntries(props.pending);
-  }, [props.pending]);
-  const pendingRef = useRef(pendingEntries);
-  pendingRef.current = pendingEntries;
+  const [view, setView] = useState<{
+    id: string;
+    error?: string;
+    historyError?: string;
+    rewindTarget?: string;
+    rewinding?: boolean;
+    latestVisible?: boolean;
+    unknownAuthor?: string;
+  }>({ id: threadId });
+  if (view.id !== threadId) setView({ id: threadId });
+  const updateView = useCallback(
+    (patch: Partial<Omit<typeof view, "id">>) => {
+      setView((current) => {
+        if (current.id !== threadId) return current;
+        if (
+          Object.entries(patch).every(
+            ([key, value]) => current[key as keyof typeof current] === value,
+          )
+        )
+          return current;
+        return { ...current, ...patch };
+      });
+    },
+    [threadId],
+  );
+  const setError = useCallback((error?: string) => updateView({ error }), [updateView]);
+  const setHistoryError = useCallback(
+    (historyError?: string) => updateView({ historyError }),
+    [updateView],
+  );
+  const setRewindTarget = useCallback(
+    (rewindTarget?: string) => updateView({ rewindTarget }),
+    [updateView],
+  );
+  const setRewinding = (rewinding: boolean) => updateView({ rewinding });
+  const setLatestVisible = useCallback(
+    (latestVisible: boolean) => updateView({ latestVisible }),
+    [updateView],
+  );
+  const { error, historyError, rewindTarget, rewinding, latestVisible, unknownAuthor } =
+    view.id === threadId ? view : {};
+  const currentId = useRef(threadId);
+  currentId.current = threadId;
+  const getDraft = () =>
+    local
+      ? (draftStore.getState().localDrafts.get(threadId)?.draft ?? emptyDraft)
+      : (queries.getQueryData(draftOptions.queryKey) ?? emptyDraft);
   const commitDraft = (value: Draft) => {
-    draftVersion.current++;
-    draftRef.current = value;
-    setDraft(value);
-    props.onDraft(value);
-    if (draftCache)
-      void attempt(
-        () =>
-          draftCache!.saveDraft(scope, thread.id, {
-            text: value.text,
-            skillIds: value.skillIds,
-            commandId: value.commandId,
-            savedText: value.savedText,
-          }),
-        setError,
-      );
-  };
-  useEffect(() => {
-    const cache = draftCache;
-    if (
-      !cache ||
-      draftRef.current.text ||
-      draftRef.current.skillIds.length ||
-      draftRef.current.attachments.length
-    ) {
-      setDraftLoaded(true);
+    if (local) {
+      props.onLocalChange(threadId, (current) => ({ ...current, draft: value }));
       return;
     }
-    let canceled = false;
-    const revision = draftVersion.current;
-    void attempt(() => cache.readDraft(scope, thread.id), setError).then((restored) => {
-      if (canceled) return;
-      setDraftLoaded(true);
-      if (!restored || draftVersion.current !== revision) return;
-      const value = { ...restored, attachments: [] };
-      draftRef.current = value;
-      setDraft(value);
-      props.onDraft(value);
-    });
-    return () => {
-      canceled = true;
-    };
-  }, [draftCache, scope, thread.id]);
-  const commitPending = (update: (entries: PendingInput[]) => PendingInput[]) => {
-    const value = update(pendingRef.current);
-    pendingRef.current = value;
-    setPendingEntries(value);
-    props.onPending(() => value);
+    updateComposerDraft(queries, threadId, value);
+    props.onDraft(threadId, value);
+    if (draftCache) void attempt(() => draftCache.saveDraft(scope, threadId, value), setError);
   };
-  const store = client.thread(thread.id);
+  const pendingEntries = props.pending;
+  const commitPending = (update: (entries: PendingInput[]) => PendingInput[]) =>
+    props.onPending(threadId, update);
+  const store = client.thread(threadId);
   const subscribeHistory = useCallback(
     (listener: () => void) => store.subscribe(listener),
     [store],
@@ -135,18 +157,23 @@ export function Chat(props: ChatProps) {
   const historySnapshot = useCallback(() => !!store.checkpoint, [store]);
   const historyLoaded = useSyncExternalStore(subscribeHistory, historySnapshot, historySnapshot);
   const readableTurnId = useLatestReadableTurn(store);
-  const active = !!thread.activeRunId;
+  const active = !!thread?.activeRunId;
   const previousActive = useRef(active);
-  const [latestVisible, setLatestVisible] = useState(false);
-  const canEdit = useRef(thread.capabilities.edit);
-  canEdit.current = thread.capabilities.edit;
+  const canEdit = useRef(editable);
+  canEdit.current = editable;
   const online = useNativeOnline(client);
-  const queries = useQueryClient();
-  const participants = useQuery({ ...participantOptions(client, thread.id), enabled: online });
-  const [unknownAuthor, setUnknownAuthor] = useState<string>();
+  const participants = useQuery({
+    ...participantOptions(client, threadId),
+    enabled: online && !local,
+  });
+  const setUnknownAuthor = useCallback(
+    (unknownAuthor: string) => updateView({ unknownAuthor }),
+    [updateView],
+  );
   useEffect(() => {
-    if (unknownAuthor) void queries.invalidateQueries({ queryKey: ["participants", thread.id] });
-  }, [queries, thread.id, unknownAuthor]);
+    if (!local && unknownAuthor)
+      void queries.invalidateQueries({ queryKey: ["participants", threadId] });
+  }, [queries, threadId, unknownAuthor, local]);
   const identities = useMemo(() => {
     const users = new Map<string, ActorIdentity>(
       participants.data?.items.map(({ user }) => [
@@ -162,8 +189,7 @@ export function Chat(props: ChatProps) {
       users,
       onUnknownAuthor: participants.data ? setUnknownAuthor : undefined,
     };
-  }, [identity, participants.data]);
-  const [historyError, setHistoryError] = useState<string>();
+  }, [identity, participants.data, setUnknownAuthor]);
   useEffect(
     () =>
       client.subscribe((event) => {
@@ -171,49 +197,40 @@ export function Chat(props: ChatProps) {
       }),
     [client, store],
   );
-  const readyForDisplay =
-    draftLoaded &&
-    (!thread.capabilities.edit || editorReady) &&
-    (historyLoaded || (props.cacheLoaded && (!online || !!historyError))) &&
-    (!online || !participants.isPending);
   const queueQuery = useQuery({
-    ...queueOptions(client, thread.id),
-    enabled: online && thread.capabilities.edit,
+    ...queueOptions(client, threadId),
+    enabled: online && !local && editable,
   });
-  const queue = thread.capabilities.edit ? (queueQuery.data?.items ?? []) : [];
+  const queue = editable ? (queueQuery.data?.items ?? []) : [];
 
-  const [error, setError] = useState<string>();
-  const [rewindTarget, setRewindTarget] = useState<string>();
-  const [rewinding, setRewinding] = useState(false);
   useEffect(() => {
-    if (!thread.capabilities.edit) setRewindTarget(undefined);
-  }, [thread.capabilities.edit]);
+    if (!editable) setRewindTarget(undefined);
+  }, [editable]);
   const subscribe = useCallback(
-    (listener: () => void) => pool.subscribe(thread.id, listener),
-    [pool, thread.id],
+    (listener: () => void) => pool.subscribe(threadId, listener),
+    [pool, threadId],
   );
-  const snapshot = useCallback(() => pool.get(thread.id), [pool, thread.id]);
+  const snapshot = useCallback(() => pool.get(threadId), [pool, threadId]);
   const uploads = useSyncExternalStore(subscribe, snapshot, snapshot);
-  const uploadProgress = useMemo(() => ({ pool, threadId: thread.id }), [pool, thread.id]);
+  const uploadProgress = useMemo(() => ({ pool, threadId }), [pool, threadId]);
   const recoveryUpload = useCallback(
     (resourceId: string, file: File, onProgress: (fraction: number) => void) =>
       upload(resourceId, file, onProgress, pool.signal),
     [upload, pool],
   );
-  const attachments = uploads.filter((attachment) => draft.attachments.includes(attachment.key));
-  const refreshQueue = useCallback(
-    () => refreshQueueQuery(queries, thread.id),
-    [queries, thread.id],
-  );
+  const attachments =
+    localThread?.attachments ??
+    uploads.filter((attachment) => draft.attachments.includes(attachment.key));
+  const refreshQueue = useCallback(() => refreshQueueQuery(queries, threadId), [queries, threadId]);
   useEffect(() => {
     if (queueQuery.error) setError(queueQuery.error.message);
   }, [queueQuery.error]);
   useEffect(
     () =>
       client.subscribe((event) => {
-        if (event.kind === "input" && event.threadId === thread.id) void refreshQueue();
+        if (event.kind === "input" && event.threadId === threadId) void refreshQueue();
       }),
-    [client, thread.id, refreshQueue],
+    [client, threadId, refreshQueue],
   );
   useEffect(() => {
     const changed = previousActive.current !== active;
@@ -221,7 +238,7 @@ export function Chat(props: ChatProps) {
     if (changed) void refreshQueue();
   }, [active, refreshQueue]);
   useEffect(() => {
-    if (!props.foreground || !readableTurnId || !latestVisible || active) return;
+    if (local || !props.foreground || !readableTurnId || !latestVisible || active) return;
     const turnId = readableTurnId;
     let pending = false;
     function markVisibleTurnRead() {
@@ -230,21 +247,21 @@ export function Chat(props: ChatProps) {
         document.visibilityState !== "visible" ||
         !rpc ||
         pending ||
-        props.readTurns.get(thread.id) === turnId
+        props.readTurns.get(threadId) === turnId
       )
         return;
       pending = true;
-      void attempt(() => rpc.threads.markRead({ threadId: thread.id, turnId }), setError).then(
+      void attempt(() => rpc.threads.markRead({ threadId: threadId, turnId }), setError).then(
         (result) => {
           pending = false;
-          if (result) props.readTurns.set(thread.id, turnId);
+          if (result) props.readTurns.set(threadId, turnId);
         },
       );
     }
     markVisibleTurnRead();
     document.addEventListener("visibilitychange", markVisibleTurnRead);
     return () => document.removeEventListener("visibilitychange", markVisibleTurnRead);
-  }, [client, thread.id, active, latestVisible, readableTurnId, props.readTurns, props.foreground]);
+  }, [client, threadId, active, latestVisible, readableTurnId, props.readTurns, props.foreground]);
 
   const setPending = (commandId: string, patch: Partial<PendingInput> | null) => {
     commitPending((entries) =>
@@ -254,12 +271,12 @@ export function Chat(props: ChatProps) {
     );
   };
   async function deliver(entry: PendingInput, retryFailed = false) {
-    if (!canEdit.current) return;
+    if (currentId.current === threadId && !canEdit.current) return;
     const [ids, { resolveComposerAttachments }] = await Promise.all([
-      resolveAttachmentIds(pool, thread.id, entry.submission.attachments, retryFailed),
+      resolveAttachmentIds(pool, threadId, entry.submission.attachments, retryFailed),
       import("./composer-editor"),
     ]);
-    if (!canEdit.current) {
+    if (currentId.current === threadId && !canEdit.current) {
       setPending(entry.commandId, {
         state: "rejected",
         error: "You no longer have permission to send to this conversation.",
@@ -282,7 +299,7 @@ export function Chat(props: ChatProps) {
       return;
     }
     const input: NativeInput = entry.input ?? {
-      threadId: thread.id,
+      threadId: threadId,
       commandId: entry.commandId,
       historyGeneration: checkpoint.historyGeneration,
       text: entry.submission.attachmentText
@@ -309,8 +326,7 @@ export function Chat(props: ChatProps) {
     setPending(entry.commandId, { input });
     const outcome = await client.submit(input);
     if (outcome.kind === "accepted") {
-      for (const attachment of entry.submission.attachments)
-        pool.release(thread.id, attachment.key);
+      for (const attachment of entry.submission.attachments) pool.release(threadId, attachment.key);
       setPending(entry.commandId, null);
       void refreshQueue();
       return;
@@ -323,6 +339,10 @@ export function Chat(props: ChatProps) {
     );
   }
   function submit(submission: ComposerSubmission) {
+    if (local) {
+      props.onLocalSubmit(threadId, submission);
+      return;
+    }
     const entry: PendingInput = {
       commandId: crypto.randomUUID(),
       text: submission.text,
@@ -340,10 +360,10 @@ export function Chat(props: ChatProps) {
     await attempt(
       () =>
         rpc.runs.cancel({
-          threadId: thread.id,
+          threadId: threadId,
           commandId: crypto.randomUUID(),
           historyGeneration: checkpoint.historyGeneration,
-          runId: thread.activeRunId,
+          runId: thread?.activeRunId,
         }),
       setError,
     );
@@ -352,12 +372,13 @@ export function Chat(props: ChatProps) {
   async function rewind() {
     const rpc = client.rpc,
       checkpoint = store.checkpoint;
-    if (!canEdit.current || !rpc || !checkpoint || !rewindTarget || rewinding) return;
+    if (!draftLoaded || !canEdit.current || !rpc || !checkpoint || !rewindTarget || rewinding)
+      return;
     setRewinding(true);
     const reply = await attempt(
       () =>
         rpc.threads.rewind({
-          threadId: thread.id,
+          threadId: threadId,
           commandId: crypto.randomUUID(),
           historyGeneration: checkpoint.historyGeneration,
           expectedRevision: checkpoint.projectionRevision,
@@ -366,8 +387,8 @@ export function Chat(props: ChatProps) {
       setError,
     );
     setRewinding(false);
-    if (!reply || !canEdit.current) return;
-    const current = draftRef.current;
+    if (!reply || (currentId.current === threadId && !canEdit.current)) return;
+    const current = getDraft();
     commitDraft({
       text: reply.text,
       skillIds: [],
@@ -383,7 +404,7 @@ export function Chat(props: ChatProps) {
       void attempt(
         () =>
           client.rpc!.actions.invoke({
-            threadId: thread.id,
+            threadId: threadId,
             messageId,
             actionId,
             requestId: part.data.requestId,
@@ -393,27 +414,43 @@ export function Chat(props: ChatProps) {
         setError,
       );
     },
-    [client, thread.id],
+    [client, threadId],
   );
   const onReaction = useCallback(
     (messageId: string, emoji: string, enabled: boolean) => {
       if (!client.rpc) return;
       void attempt(
-        () => client.rpc!.reactions.set({ threadId: thread.id, messageId, emoji, active: enabled }),
+        () => client.rpc!.reactions.set({ threadId: threadId, messageId, emoji, active: enabled }),
         setError,
       );
     },
-    [client, thread.id],
+    [client, threadId],
   );
   const composer = (
     <div className="chat-bottom">
       <ErrorNotice
-        message={error ?? historyError}
+        message={localThread?.error ?? error ?? draftQuery.error?.message ?? historyError}
         onDismiss={() => {
           setError(undefined);
           setHistoryError(undefined);
+          if (local) props.onLocalChange(threadId, (current) => ({ ...current, error: undefined }));
         }}
       />
+      {localThread?.creation ? (
+        <div className="pending-input">
+          <span>{localThread.creation.entry.text}</span>
+          <small>
+            {localThread.sending ? "Creating conversation…" : "Conversation could not be created."}
+          </small>
+          {!localThread.sending ? (
+            <Button
+              onClick={() => props.onLocalSubmit(threadId, localThread.creation!.entry.submission)}
+            >
+              Retry message
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       {pendingEntries.length ? (
         <VirtualList
           className="pending-inputs"
@@ -425,7 +462,7 @@ export function Chat(props: ChatProps) {
             <div className="pending-input" key={entry.commandId}>
               <span>{entry.text}</span>
               <small>{entry.error ?? "Sending…"}</small>
-              {thread.capabilities.edit && entry.state !== "preparing" ? (
+              {editable && entry.state !== "preparing" ? (
                 <Button
                   type="button"
                   onClick={() =>
@@ -452,7 +489,7 @@ export function Chat(props: ChatProps) {
           )}
         />
       ) : null}
-      {thread.capabilities.edit && queue.length ? (
+      {editable && queue.length ? (
         <div className="queue">
           <VirtualList
             items={queue}
@@ -471,7 +508,7 @@ export function Chat(props: ChatProps) {
                     void attempt(
                       () =>
                         client.rpc!.runs.removeQueued({
-                          threadId: thread.id,
+                          threadId: threadId,
                           commandId: crypto.randomUUID(),
                           historyGeneration: checkpoint.historyGeneration,
                           inputId: entry.inputId,
@@ -503,46 +540,75 @@ export function Chat(props: ChatProps) {
           Restore previous draft
         </Button>
       ) : null}
-      {thread.capabilities.edit ? (
+      <div hidden={!editable}>
         <Composer
+          documentKey={threadId}
           windowDrop={props.foreground}
-          onReadyChange={setEditorReady}
           catalog={props.catalog}
           text={draft.text}
           skillIds={draft.skillIds}
-          onSkills={(skillIds) => commitDraft({ ...draftRef.current, skillIds })}
+          onSkills={(skillIds) => commitDraft({ ...getDraft(), skillIds })}
           commandId={draft.commandId}
-          onCommand={(commandId) => commitDraft({ ...draftRef.current, commandId })}
-          onText={(text) => commitDraft({ ...draftRef.current, text })}
+          onCommand={(commandId) => commitDraft({ ...getDraft(), commandId })}
+          onText={(text) => commitDraft({ ...getDraft(), text })}
           attachments={attachments}
-          onAttach={(files) =>
+          onAttach={(files) => {
+            if (local) {
+              const added = files.slice(0, 32 - attachments.length).map(draftAttachment);
+              props.onLocalChange(threadId, (current) => ({
+                ...current,
+                attachments: [...current.attachments, ...added],
+                draft: {
+                  ...current.draft,
+                  attachments: [...current.draft.attachments, ...added.map((item) => item.key)],
+                },
+              }));
+              return;
+            }
             commitDraft({
               ...draft,
               attachments: [
                 ...draft.attachments,
                 ...files
                   .slice(0, 32 - draft.attachments.length)
-                  .map((file) => pool.add(thread.id, file)),
+                  .map((file) => pool.add(threadId, file)),
               ],
-            })
-          }
+            });
+          }}
           onRemoveAttachment={(key) => {
-            pool.remove(thread.id, key);
+            if (local) {
+              releaseDraftAttachments(attachments.filter((item) => item.key === key));
+              props.onLocalChange(threadId, (current) => ({
+                ...current,
+                attachments: current.attachments.filter((item) => item.key !== key),
+                draft: {
+                  ...current.draft,
+                  attachments: current.draft.attachments.filter((id) => id !== key),
+                },
+              }));
+              return;
+            }
+            pool.remove(threadId, key);
             commitDraft({ ...draft, attachments: draft.attachments.filter((id) => id !== key) });
           }}
-          onRetryAttachment={(key) => pool.retry(thread.id, key)}
+          onRetryAttachment={(key) => pool.retry(threadId, key)}
           active={active}
           canCancel={active || queue.length > 0}
-          disabled={false}
-          modelId={thread.modelId}
+          disabled={!editable || !draftLoaded}
+          submitting={!!localThread?.creation}
+          modelId={localThread?.modelId ?? thread?.modelId}
           onModelChange={(modelId) => {
+            if (local) {
+              props.onLocalChange(threadId, (current) => ({ ...current, modelId }));
+              return;
+            }
             const rpc = client.rpc,
               checkpoint = store.checkpoint;
             if (!rpc || !checkpoint) return;
             void attempt(
               () =>
                 rpc.threads.update({
-                  threadId: thread.id,
+                  threadId: threadId,
                   expectedRevision: checkpoint.projectionRevision,
                   modelId,
                 }),
@@ -552,31 +618,52 @@ export function Chat(props: ChatProps) {
           onSubmit={submit}
           onCancel={() => void cancel()}
         />
-      ) : (
-        <div className="read-only">Read-only</div>
-      )}
+      </div>
+      {!editable && thread ? <div className="read-only">Read-only</div> : null}
     </div>
   );
+  function renderEmptyConversation() {
+    if (local)
+      return (
+        <div className="welcome">
+          <span className="brand">
+            lilac
+            <span />
+          </span>
+        </div>
+      );
+    if (props.loadingMessage)
+      return (
+        <div className="empty-chat" role="status">
+          <p>{props.loadingMessage}</p>
+          {!thread ? (
+            <Button variant="secondary" onClick={props.onRetryLoad}>
+              Retry
+            </Button>
+          ) : null}
+        </div>
+      );
+    if (historyLoaded) return undefined;
+    return (
+      <div className="empty-chat">
+        {online && !historyError
+          ? "Loading conversation…"
+          : "Conversation history is unavailable. Reconnect to load it."}
+      </div>
+    );
+  }
   return (
     <MessageIdentityContext value={identities}>
-      <div className="chat-workspace">
+      <div className="chat-workspace" data-thread-id={threadId}>
         <UploadProgressContext.Provider value={uploadProgress}>
           <Timeline
-            waitForHydration={online && !historyError}
-            readyForDisplay={readyForDisplay && props.displayRevision >= 0}
-            displayRevision={props.displayRevision}
-            onReady={props.onReady}
-            emptyMessage={
-              !historyLoaded
-                ? "Conversation history is unavailable. Reconnect to load it."
-                : undefined
-            }
+            emptyContent={renderEmptyConversation()}
             header={props.header}
             footer={composer}
             onLatestVisibleChange={setLatestVisible}
             client={client}
-            threadId={thread.id}
-            canEdit={thread.capabilities.edit}
+            threadId={threadId}
+            canEdit={editable && draftLoaded}
             resourceUrl={resourceUrl}
             upload={recoveryUpload}
             onRewind={setRewindTarget}
@@ -586,7 +673,7 @@ export function Chat(props: ChatProps) {
         </UploadProgressContext.Provider>
 
         <Modal
-          open={thread.capabilities.edit && !!rewindTarget}
+          open={editable && !!rewindTarget}
           title="Rewind this conversation?"
           onClose={() => setRewindTarget(undefined)}
         >

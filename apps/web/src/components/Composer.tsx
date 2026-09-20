@@ -32,6 +32,7 @@ import { inputDeliveryOptions } from "../input-mode";
 
 export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catalog">> & {
   text: string;
+  documentKey?: string;
   skillIds: string[];
   onSkills: (ids: string[]) => void;
   commandId?: string;
@@ -45,7 +46,6 @@ export type ComposerProps = Partial<Pick<ChatCommon, "client" | "scope" | "catal
   canCancel: boolean;
   disabled: boolean;
   windowDrop?: boolean;
-  onReadyChange?: (ready: boolean) => void;
   submitting?: boolean;
   modelId?: string;
   onModelChange: (modelId: string) => void;
@@ -59,6 +59,9 @@ export function Composer(props: ComposerProps) {
   const scope = props.scope ?? workspace?.scope;
   const { agent } = useContext(MessageIdentityContext);
   const { text, onText, attachments, active, disabled, catalog } = props;
+  const placeholder = active
+    ? `Steer ${agent.displayName}, or queue a follow-up…`
+    : `Message ${agent.displayName}…`;
   const input = useRef<ComposerEditorHandle>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const insertingCompletion = useRef(false);
@@ -68,20 +71,32 @@ export function Composer(props: ComposerProps) {
   const [error, setError] = useState<string>();
   const skillIds = props.skillIds;
   const setSkills = props.onSkills;
-  const [editorValue, setEditorValue] = useState<{ text: string; plainText: string }>();
+  const [editorValue, setEditorValue] = useState<{
+    text: string;
+    plainText: string;
+    documentKey?: string;
+  }>();
   const plainText = editorValue?.plainText ?? "";
-  const editorReady = editorValue?.text === text;
-  useEffect(() => {
-    props.onReadyChange?.(editorReady);
-  }, [editorReady, props.onReadyChange]);
+  const editorReady = editorValue?.text === text && editorValue?.documentKey === props.documentKey;
   const updatePlainText = useCallback(
-    (plainText: string, text: string) => setEditorValue({ text, plainText }),
-    [],
+    (plainText: string, text: string) =>
+      setEditorValue({ text, plainText, documentKey: props.documentKey }),
+    [props.documentKey],
   );
   const [prefix, setPrefix] = useState("");
   const [selected, setSelected] = useState(0);
   const [menuHidden, setMenuHidden] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [documentKey, setDocumentKey] = useState(props.documentKey);
+  if (documentKey !== props.documentKey) {
+    setDocumentKey(props.documentKey);
+    setMode("steer");
+    setPrefix("");
+    setSelected(0);
+    setMenuHidden(false);
+    setDragging(false);
+    setError(undefined);
+  }
   const dropProps = useRef(props);
   dropProps.current = props;
   useEffect(() => {
@@ -324,13 +339,18 @@ export function Composer(props: ComposerProps) {
           }
         >
           <ComposerEditor
+            documentKey={props.documentKey}
             ref={input}
             text={text}
             attachments={attachments}
             onRemoveAttachment={props.onRemoveAttachment}
             onRetryAttachment={props.onRetryAttachment}
             onText={(value, visibleText) => {
-              setEditorValue({ text: value, plainText: visibleText });
+              setEditorValue({
+                text: value,
+                plainText: visibleText,
+                documentKey: props.documentKey,
+              });
               if (insertingCompletion.current) {
                 insertingCompletion.current = false;
                 onText(value);
@@ -358,11 +378,7 @@ export function Composer(props: ComposerProps) {
             onPrefix={setPrefix}
             onKeyDown={keydown}
             onPaste={paste}
-            placeholder={
-              active
-                ? `Steer ${agent.displayName}, or queue a follow-up…`
-                : `Message ${agent.displayName}…`
-            }
+            placeholder={disabled ? "" : placeholder}
             expanded={completions.length > 0}
             activeDescendant={completions.length ? `completion-${highlighted}` : undefined}
             disabled={disabled}

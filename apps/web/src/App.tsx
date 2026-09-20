@@ -33,7 +33,6 @@ import {
 import type { DisplayCatalog, NativeThread } from "@stanley2058/lilac-client-protocol";
 import type { AppProps, ComposerSubmission } from "./types";
 import { resolveAttachmentIds } from "./uploads";
-import { ChatPanels, ChatLoadState } from "./components/ChatPanels";
 import { Chat, type Draft, type PendingInput } from "./components/Chat";
 import { Settings } from "./components/Settings";
 import { SidebarSearch } from "./components/SidebarSearch";
@@ -44,7 +43,6 @@ const External = lazy(() =>
   import("./components/External").then((module) => ({ default: module.External })),
 );
 import { attempt, IconButton, Modal, VirtualList } from "./components/ui";
-import { DraftChat } from "./components/DraftChat";
 import { MessageIdentityContext } from "./components/message-identity";
 import { toast } from "./components/ui/toast";
 import { refreshSidebar } from "./sidebar-queries";
@@ -86,6 +84,7 @@ function Workspace(props: AppProps) {
     shouldThrow: false,
     select: (match) => match.params.threadId,
   });
+  const routePathname = useLocation({ select: (location) => location.pathname });
   const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
   const { pool, drafts: draftStore } = useWorkspace();
   const draftIds = useStore(draftStore, (state) => state.ids);
@@ -107,13 +106,13 @@ function Workspace(props: AppProps) {
   if (active && lastSelectedId !== routeSelection) setLastSelectedId(routeSelection);
   const selectedId = active ? routeSelection : lastSelectedId;
   useEffect(() => {
-    if (!active || routeThreadId || routeDraftId) return;
+    if (!active || routePathname !== "/" || routeThreadId || routeDraftId) return;
     if (selectedId.startsWith("draft:")) {
       void navigate({ to: "/", state: { draftThreadId: selectedId }, replace: true });
       return;
     }
     void navigate({ to: "/threads/$threadId", params: { threadId: selectedId }, replace: true });
-  }, [active, routeThreadId, routeDraftId, selectedId, navigate]);
+  }, [active, routePathname, routeThreadId, routeDraftId, selectedId, navigate]);
   const [catalog, setCatalog] = useState<DisplayCatalog | undefined>(() =>
     initial.catalog.kind === "catalog" ? initial.catalog.catalog : client.catalogs.get(props.scope),
   );
@@ -201,7 +200,6 @@ function Workspace(props: AppProps) {
   useEffect(() => {
     setExternal(false);
   }, [selectedId]);
-  const [loadedThreadId, setLoadedThreadId] = useState<string>();
   const [draftsHydrated, setDraftsHydrated] = useState(!props.draftCache);
   const routeDraftExists = useStore(
     draftStore,
@@ -318,13 +316,7 @@ function Workspace(props: AppProps) {
   );
   useEffect(() => {
     if (!selectedId || selectedId.startsWith("draft:")) return;
-    let canceled = false;
-    void client.selectThread(selectedId).then(() => {
-      if (!canceled) setLoadedThreadId(selectedId);
-    });
-    return () => {
-      canceled = true;
-    };
+    void client.selectThread(selectedId);
   }, [client, selectedId]);
   const selectedMetadata = useQuery({
     ...threadOptions(client, selectedId ?? ""),
@@ -866,117 +858,91 @@ function Workspace(props: AppProps) {
                     <External key={externalId ?? "list"} initialThreadId={externalId} />
                   </Suspense>
                 ) : null}
-                {!external && selectedId ? (
-                  <ChatPanels threadId={selectedId}>
-                    {(id, foreground, revision, onReady, onPrepare) => {
-                      if (id.startsWith("draft:"))
-                        return (
-                          <DraftChat
-                            threadId={id}
-                            foreground={foreground && active}
-                            displayRevision={revision}
-                            onPrepare={onPrepare}
-                            onReady={onReady}
-                            catalog={catalog}
-                            onChange={(change) => changeLocalDraft(id, change)}
-                            onSubmit={(submission) => void submitDraft(id, submission)}
-                          />
-                        );
-                      const thread = threads.find((entry) => entry.id === id);
-                      if (!thread)
-                        return (
-                          <ChatLoadState
-                            message={
-                              selectedMetadata.error?.message ??
-                              (!online
-                                ? "This conversation is unavailable while offline."
-                                : undefined)
-                            }
-                            onReady={onReady}
-                            onRetry={() => {
-                              void selectedMetadata.refetch();
-                            }}
-                          />
-                        );
+                {!external && selectedId
+                  ? (() => {
+                      const thread = selected ?? selectedMetadata.data;
                       return (
                         <Chat
-                          foreground={foreground && active}
-                          displayRevision={revision}
-                          onPrepare={onPrepare}
-                          onReady={onReady}
-                          cacheLoaded={loadedThreadId === id}
-                          header={
-                            <header className="thread-header">
-                              <h1>{thread.title || "Untitled"}</h1>
-                              {thread.archived ? <span className="badge">Archived</span> : null}
-                              <span className="toolbar-spacer" />
-                              {owner ? (
-                                <IconButton
-                                  label="Share conversation"
-                                  tooltip="Share"
-                                  onClick={() => setSharing(true)}
-                                >
-                                  <Users />
-                                </IconButton>
-                              ) : null}
-                              {thread.capabilities.edit ? (
-                                <DropdownMenu>
-                                  <DropdownMenuTrigger
-                                    render={
-                                      <IconButton label="Conversation actions" tooltip="Options">
-                                        <MoreHorizontal />
-                                      </IconButton>
-                                    }
-                                  />
-                                  <DropdownMenuContent align="end">
-                                    <DropdownMenuItem
-                                      onClick={() =>
-                                        setRename({ id: thread.id, title: thread.title })
-                                      }
-                                    >
-                                      <Pencil />
-                                      Rename
-                                    </DropdownMenuItem>
-                                    <DropdownMenuItem
-                                      onClick={() =>
-                                        void update(thread.id, { archived: !thread.archived })
-                                      }
-                                    >
-                                      {thread.archived ? <ArchiveRestore /> : <Archive />}
-                                      {thread.archived ? "Unarchive" : "Archive"}
-                                    </DropdownMenuItem>
-                                    <DropdownMenuItem
-                                      variant="destructive"
-                                      onClick={() => setConfirmDelete(thread.id)}
-                                    >
-                                      <Trash2 />
-                                      Delete
-                                    </DropdownMenuItem>
-                                  </DropdownMenuContent>
-                                </DropdownMenu>
-                              ) : null}
-                            </header>
-                          }
-                          key={thread.id}
+                          threadId={selectedId}
                           thread={thread}
+                          foreground={active}
                           catalog={catalog}
                           onError={setError}
                           readTurns={readTurns.current}
-                          draft={
-                            drafts.current.get(id) ?? { text: "", skillIds: [], attachments: [] }
+                          draft={drafts.current.get(selectedId)}
+                          onDraft={(id, value) => drafts.current.set(id, value)}
+                          pending={pendingInputs.get(selectedId) ?? []}
+                          onPending={patchPending}
+                          onLocalChange={changeLocalDraft}
+                          onLocalSubmit={(id, submission) => void submitDraft(id, submission)}
+                          onRetryLoad={() => {
+                            void selectedMetadata.refetch();
+                            void client.selectThread(selectedId);
+                          }}
+                          loadingMessage={
+                            selectedMetadata.error?.message ??
+                            (!online && !thread
+                              ? "This conversation is unavailable while offline."
+                              : undefined)
                           }
-                          onDraft={(value) => {
-                            drafts.current.set(thread.id, value);
-                          }}
-                          pending={pending.current.get(thread.id) ?? []}
-                          onPending={(change) => {
-                            patchPending(thread.id, change);
-                          }}
+                          header={
+                            thread ? (
+                              <header className="thread-header">
+                                <h1>{thread.title || "Untitled"}</h1>
+                                {thread.archived ? <span className="badge">Archived</span> : null}
+                                <span className="toolbar-spacer" />
+                                {owner ? (
+                                  <IconButton
+                                    label="Share conversation"
+                                    tooltip="Share"
+                                    onClick={() => setSharing(true)}
+                                  >
+                                    <Users />
+                                  </IconButton>
+                                ) : null}
+                                {thread.capabilities.edit ? (
+                                  <DropdownMenu>
+                                    <DropdownMenuTrigger
+                                      render={
+                                        <IconButton label="Conversation actions" tooltip="Options">
+                                          <MoreHorizontal />
+                                        </IconButton>
+                                      }
+                                    />
+                                    <DropdownMenuContent align="end">
+                                      <DropdownMenuItem
+                                        onClick={() =>
+                                          setRename({ id: thread.id, title: thread.title })
+                                        }
+                                      >
+                                        <Pencil />
+                                        Rename
+                                      </DropdownMenuItem>
+                                      <DropdownMenuItem
+                                        onClick={() =>
+                                          void update(thread.id, { archived: !thread.archived })
+                                        }
+                                      >
+                                        {thread.archived ? <ArchiveRestore /> : <Archive />}
+                                        {thread.archived ? "Unarchive" : "Archive"}
+                                      </DropdownMenuItem>
+                                      <DropdownMenuItem
+                                        variant="destructive"
+                                        onClick={() => setConfirmDelete(thread.id)}
+                                      >
+                                        <Trash2 />
+                                        Delete
+                                      </DropdownMenuItem>
+                                    </DropdownMenuContent>
+                                  </DropdownMenu>
+                                ) : null}
+                              </header>
+                            ) : undefined
+                          }
                         />
                       );
-                    }}
-                  </ChatPanels>
-                ) : null}
+                    })()
+                  : null}
                 {!external && !selectedId ? (
                   <div className="welcome">
                     <Button onClick={createThread}>

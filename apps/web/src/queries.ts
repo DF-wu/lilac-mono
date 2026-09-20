@@ -8,6 +8,32 @@ import {
 } from "@tanstack/react-query";
 import type { NativeClient } from "@stanley2058/lilac-client";
 
+import type { CacheScope } from "@stanley2058/lilac-client";
+import type { AppProps } from "./types";
+import type { Draft } from "./components/Chat";
+
+export function composerDraftOptions(
+  scope: CacheScope,
+  threadId: string,
+  cache: AppProps["draftCache"],
+) {
+  return queryOptions({
+    queryKey: ["composer-draft", threadId],
+    queryFn: async (): Promise<Draft> => {
+      const saved = await cache?.readDraft(scope, threadId);
+      return { text: "", skillIds: [], ...saved, attachments: [] };
+    },
+    staleTime: "static",
+  });
+}
+
+export function updateComposerDraft(queries: QueryClient, threadId: string, draft: Draft) {
+  const queryKey = ["composer-draft", threadId];
+  // A late IndexedDB read must not replace text written after hydration started.
+  void queries.cancelQueries({ queryKey, exact: true });
+  queries.setQueryData(queryKey, draft);
+}
+
 const subscribeBrowserOnline = onlineManager.subscribe.bind(onlineManager);
 const browserOnlineSnapshot = () => onlineManager.isOnline();
 

@@ -19,7 +19,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
 import {
   ChevronDown,
   ChevronRight,
@@ -77,11 +77,8 @@ export type TimelineProps = MessageServices & {
   threadId: string;
   onRewind: (turnId: string) => void;
   onLatestVisibleChange?: (visible: boolean) => void;
-  readyForDisplay?: boolean;
-  displayRevision?: number;
-  onReady?: () => void;
   emptyMessage?: string;
-  waitForHydration?: boolean;
+  emptyContent?: ReactNode;
 };
 type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind">;
 const TimelineContext = createContext<TimelineServices | undefined>(undefined);
@@ -119,9 +116,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   const store = props.client.thread(props.threadId);
   const ids = useSlotIds(store);
   const arrivals = useMemo(() => new MessageArrivals(), [store]);
-  useLayoutEffect(() => {
-    arrivals.deactivate();
-  }, [arrivals, props.displayRevision]);
+
   const subscribeTail = useCallback((listener: () => void) => store.subscribe(listener), [store]);
   const tailSnapshot = useCallback(() => store.at(store.size - 1)?.kind !== "deferred", [store]);
   const tailHydrated = useSyncExternalStore(subscribeTail, tailSnapshot, tailSnapshot);
@@ -144,14 +139,19 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     if (footerRef.current) observer.observe(footerRef.current);
     return () => observer.disconnect();
   }, []);
+  const [positionedThread, setPositionedThread] = useState<string>();
+  const switching = positionedThread !== props.threadId;
   const atTail = useRef(true);
   const [awayFromEnd, setAwayFromEnd] = useState(false);
   const updateEndVisibility = useCallback(() => {
     const element = parent.current;
     if (element)
-      setAwayFromEnd(element.scrollHeight - element.scrollTop - element.clientHeight > 8);
+      setAwayFromEnd(
+        !atTail.current && element.scrollHeight - element.scrollTop - element.clientHeight > 8,
+      );
   }, []);
   const userScroll = useRef(false);
+  const previousScrollTop = useRef(0);
   const touchY = useRef<number | undefined>(undefined);
   const previousCount = useRef(ids.length);
   const pendingAnchor = useRef<{ id: string; delta: number } | undefined>(undefined);
@@ -165,6 +165,12 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     estimateSize: () => 240,
     getItemKey,
     overscan: 3,
+    rangeExtractor: (range) => {
+      if (!switching) return defaultRangeExtractor(range);
+      const tail: number[] = [];
+      for (let index = Math.max(0, range.count - 4); index < range.count; index++) tail.push(index);
+      return tail;
+    },
   });
   useEffect(
     () =>
@@ -217,7 +223,17 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   }, [ids, virtual, updateEndVisibility]);
   useLayoutEffect(() => {
     atTail.current = true;
+    userScroll.current = false;
+    pendingAnchor.current = undefined;
+    previousCount.current = ids.length;
+    setAwayFromEnd(false);
+    virtual.measure();
     if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
+    if (parent.current) {
+      parent.current.scrollTop = parent.current.scrollHeight;
+      previousScrollTop.current = parent.current.scrollTop;
+    }
+    setPositionedThread(props.threadId);
   }, [props.threadId]);
   useLayoutEffect(() => {
     if (ids.length > previousCount.current && atTail.current)
@@ -225,54 +241,17 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     previousCount.current = ids.length;
   }, [ids.length, virtual]);
   const rows = virtual.getVirtualItems();
-  const revealed = useRef<number | undefined>(undefined);
+  const activatedArrivals = useRef<MessageArrivals>(undefined);
   useLayoutEffect(() => {
-    if (
-      !props.readyForDisplay ||
-      !props.onReady ||
-      revealed.current === props.displayRevision ||
-      (props.waitForHydration && !tailHydrated)
-    )
-      return;
-    atTail.current = true;
-    let frame = 0;
-    let previousHeight = -1;
-    let stableFrames = 0;
-    const settle = () => {
-      const viewport = parent.current;
-      if (!viewport) return;
-      if (ids.length) virtual.scrollToIndex(ids.length - 1, { align: "end" });
-      viewport.scrollTop = viewport.scrollHeight;
-      const height = viewport.scrollHeight;
-      stableFrames = height === previousHeight ? stableFrames + 1 : 0;
-      previousHeight = height;
-      if (stableFrames >= 2) {
-        arrivals.activate(
-          store.slotIds.flatMap((id) => {
-            const slot = store.get(id);
-            return slot?.kind === "ready" ? slot.messages.flatMap(messageArrivalIds) : [];
-          }),
-        );
-        revealed.current = props.displayRevision;
-        setAwayFromEnd(false);
-        props.onReady?.();
-        return;
-      }
-      frame = requestAnimationFrame(settle);
-    };
-    frame = requestAnimationFrame(settle);
-    return () => cancelAnimationFrame(frame);
-  }, [
-    arrivals,
-    store,
-    props.readyForDisplay,
-    props.displayRevision,
-    props.onReady,
-    props.waitForHydration,
-    tailHydrated,
-    ids,
-    virtual,
-  ]);
+    if (activatedArrivals.current === arrivals || !tailHydrated || !store.checkpoint) return;
+    arrivals.activate(
+      store.slotIds.flatMap((id) => {
+        const slot = store.get(id);
+        return slot?.kind === "ready" ? slot.messages.flatMap(messageArrivalIds) : [];
+      }),
+    );
+    activatedArrivals.current = arrivals;
+  }, [arrivals, store, tailHydrated, ids]);
   useLayoutEffect(() => {
     const viewport = parent.current;
     const latest = rows.find((row) => row.index === ids.length - 1);
@@ -286,11 +265,12 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   const rememberScroll = () => {
     const element = parent.current;
     if (!element) return;
+    const nearEnd = element.scrollHeight - element.scrollTop - element.clientHeight <= 8;
+    if (userScroll.current && !nearEnd) atTail.current = false;
+    if (nearEnd && element.scrollTop >= previousScrollTop.current) atTail.current = true;
+    previousScrollTop.current = element.scrollTop;
+    userScroll.current = false;
     updateEndVisibility();
-    if (userScroll.current) {
-      atTail.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 8;
-      userScroll.current = false;
-    }
   };
   return (
     <MessageArrivalsContext value={arrivals}>
@@ -358,11 +338,9 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
             aria-label="Conversation"
             tabIndex={0}
           >
-            {props.header ? (
-              <div ref={headerRef} className="chat-sticky-header">
-                {props.header}
-              </div>
-            ) : null}
+            <div ref={headerRef} className="chat-sticky-header">
+              {props.header}
+            </div>
             <div
               ref={canvasRef}
               className="virtual-canvas timeline-canvas"
@@ -382,13 +360,17 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
                   <SlotRow slotId={ids[row.index]!} store={store} />
                 </div>
               ))}
-              {ids.length === 0 ? (
-                <div className="empty-chat">{props.emptyMessage ?? "Start a conversation."}</div>
-              ) : null}
+              {ids.length === 0
+                ? (props.emptyContent ?? (
+                    <div className="empty-chat">
+                      {props.emptyMessage ?? "Start a conversation."}
+                    </div>
+                  ))
+                : null}
             </div>
             {props.footer ? (
               <div ref={footerRef} className="chat-sticky-footer">
-                {awayFromEnd ? (
+                {awayFromEnd && !switching ? (
                   <div className="scroll-to-end">
                     <Button
                       variant="secondary"
