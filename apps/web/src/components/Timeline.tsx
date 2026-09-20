@@ -38,7 +38,7 @@ import type {
 } from "@stanley2058/lilac-client-protocol";
 import { IconButton, attempt } from "./ui";
 import { ResourceAttachment } from "./ResourceAttachment";
-import { ActorAvatar } from "./ActorAvatar";
+import { ActorAvatar, type ActorIdentity } from "./ActorAvatar";
 import { MessageIdentityContext } from "./message-identity";
 import { MessageResourcesContext } from "./message-resources";
 import { Bubble, BubbleContent } from "./ui/bubble";
@@ -458,19 +458,16 @@ export const Turn = memo(function Turn(props: {
     (message) => message.role === "user" && message.metadata?.inputMode !== "steer",
   );
   const settled = slot.state === "complete" || slot.state === "failed" || slot.state === "canceled";
-  const finalIds = useMemo(
-    () =>
-      new Set(
-        slot.messages
-          .filter((message) => message.metadata?.phase === "final")
-          .map((message) => message.id),
-      ),
-    [slot.messages],
+  const remaining = useMemo(
+    () => groupActivityMessages(slot.messages.filter((message) => message.id !== firstUser?.id)),
+    [slot.messages, firstUser?.id],
   );
-  const intermediate = groupActivityMessages(
-    slot.messages.filter((message) => message.id !== firstUser?.id && !finalIds.has(message.id)),
+  const lastIntermediate = remaining.findLastIndex(
+    (message) => message.role !== "assistant" || message.metadata?.phase !== "final",
   );
-  const finals = slot.messages.filter((message) => finalIds.has(message.id));
+  const intermediate = remaining.slice(0, lastIntermediate + 1);
+  const finals = remaining.slice(lastIntermediate + 1);
+  const identities = useContext(MessageIdentityContext);
   const duration =
     slot.startedAt !== undefined && slot.settledAt !== undefined
       ? Math.max(0, slot.settledAt - slot.startedAt)
@@ -494,40 +491,45 @@ export const Turn = memo(function Turn(props: {
           />
         </div>
       ) : null}
-      {settled && intermediate.length ? (
-        <Collapsible open={expanded} onOpenChange={setExpanded}>
-          <CollapsibleTrigger
-            render={
-              <Button
-                variant="ghost"
-                className="work-summary h-auto justify-start rounded-none px-0 aria-expanded:bg-transparent hover:bg-transparent"
-              />
-            }
-          >
-            <Marker render={<span />}>
-              <MarkerIcon>
+      <div className="agent-response">
+        {remaining.length > 0 &&
+        (settled ||
+          remaining.find((message) => message.role !== "system")?.role === "assistant") ? (
+          <AuthorAvatar author={identities.agent} role="Agent" />
+        ) : null}
+        {settled && intermediate.length > 0 ? (
+          <Collapsible open={expanded} onOpenChange={setExpanded}>
+            <CollapsibleTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  className="work-summary h-auto justify-start rounded-none px-0 aria-expanded:bg-transparent hover:bg-transparent"
+                />
+              }
+            >
+              <Marker render={<span />}>
+                <MarkerContent className="activity-label">
+                  {duration === undefined ? "Work" : `Worked for ${formatDuration(duration)}`}
+                </MarkerContent>
+                {slot.state !== "complete" ? <span className="badge">{slot.state}</span> : null}
                 <ChevronRight className={expanded ? "rotated" : ""} />
-              </MarkerIcon>
-              <MarkerContent>
-                {duration === undefined ? "Work" : `Worked for ${formatDuration(duration)}`}
-              </MarkerContent>
-              {slot.state !== "complete" ? <span className="badge">{slot.state}</span> : null}
-            </Marker>
-          </CollapsibleTrigger>
-          <CollapsibleContent className="expanded-work">
-            {intermediate.map((message) => (
-              <MessageBody key={message.id} message={message} live={!settled} />
-            ))}
-          </CollapsibleContent>
-        </Collapsible>
-      ) : (
-        intermediate.map((message) => (
-          <MessageBody key={message.id} message={message} live={!settled} />
-        ))
-      )}
-      {finals.map((message) => (
-        <MessageBody key={message.id} message={message} live={!settled} />
-      ))}
+              </Marker>
+            </CollapsibleTrigger>
+            <CollapsibleContent className="expanded-work">
+              <TurnMessages messages={intermediate} live={false} showFirstAvatar={false} />
+            </CollapsibleContent>
+          </Collapsible>
+        ) : (
+          <TurnMessages messages={intermediate} live={!settled} showFirstAvatar={false} />
+        )}
+        <TurnMessages
+          messages={finals}
+          live={!settled}
+          showFirstAvatar={!settled && intermediate.at(-1)?.role === "user"}
+          finalMessageId={settled ? finals.at(-1)?.id : undefined}
+          finalText={finals.map(messageText).filter(Boolean).join("\n\n")}
+        />
+      </div>
       {settled && !intermediate.length && slot.state !== "complete" ? (
         <Marker className="turn-status">
           <MarkerContent>{slot.state}</MarkerContent>
@@ -541,6 +543,82 @@ export const Turn = memo(function Turn(props: {
     </article>
   );
 });
+
+function TurnMessages({
+  messages,
+  live,
+  showFirstAvatar = true,
+  finalMessageId,
+  finalText,
+}: {
+  messages: readonly DisplayMessage[];
+  live: boolean;
+  showFirstAvatar?: boolean;
+  finalMessageId?: string;
+  finalText?: string;
+}) {
+  let nextAssistantAvatar = showFirstAvatar;
+  return messages.map((message) => {
+    const showAvatar =
+      message.role === "user" || (message.role === "assistant" && nextAssistantAvatar);
+    if (message.role === "user") nextAssistantAvatar = true;
+    if (message.role === "assistant") nextAssistantAvatar = false;
+    return (
+      <MessageBody
+        key={message.id}
+        message={message}
+        live={live}
+        showAvatar={showAvatar}
+        showControls={message.role === "user" || message.id === finalMessageId}
+        copyText={message.id === finalMessageId ? finalText : undefined}
+      />
+    );
+  });
+}
+
+function AuthorAvatar({
+  author,
+  role,
+  self = false,
+  message,
+}: {
+  author: ActorIdentity;
+  role: string;
+  self?: boolean;
+  message?: DisplayMessage;
+}) {
+  return (
+    <MessageAvatar>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <button
+              type="button"
+              className="message-avatar-trigger"
+              aria-label={`About ${author.displayName}`}
+            />
+          }
+        >
+          <ActorAvatar {...author} />
+        </TooltipTrigger>
+        <TooltipContent
+          className="message-author-details"
+          side={self ? "left" : "right"}
+          align="center"
+        >
+          <span className="message-author-name">{author.displayName}</span>
+          <span>{role}</span>
+          {message?.metadata?.inputMode === "steer" ? <span>Steering</span> : null}
+          {message?.metadata?.createdAt !== undefined ? (
+            <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
+              {new Date(message.metadata.createdAt).toLocaleString()}
+            </time>
+          ) : null}
+        </TooltipContent>
+      </Tooltip>
+    </MessageAvatar>
+  );
+}
 
 export function groupActivityMessages(messages: readonly DisplayMessage[]): DisplayMessage[] {
   const grouped: DisplayMessage[] = [];
@@ -567,7 +645,9 @@ export function messageText(message: DisplayMessage): string {
 }
 function formatDuration(duration: number): string {
   const seconds = Math.floor(duration / 1000);
-  return seconds >= 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds}s`;
+  return seconds >= 60
+    ? `${Math.floor(seconds / 60)}m${seconds % 60 ? ` ${seconds % 60}s` : ""}`
+    : `${seconds}s`;
 }
 type MessageProps = Pick<
   TimelineProps,
@@ -743,11 +823,17 @@ export const Message = memo(function Message(props: MessageProps) {
 });
 
 const MessageBody = memo(function MessageBody(
-  props: Pick<MessageProps, "message" | "controls"> & { live?: boolean },
+  props: Pick<MessageProps, "message" | "controls"> & {
+    live?: boolean;
+    showAvatar?: boolean;
+    showControls?: boolean;
+    copyText?: string;
+  },
 ) {
   const { resourceUrl, canEdit, onAction, onReaction } = useMessageServices();
   const { message } = props;
   const [copyError, setCopyError] = useState<string>();
+  const copyText = props.copyText ?? messageText(message);
   const groups = useMemo(() => groupParts(message.parts), [message.parts]);
   const cards = useMemo(() => groupMessageCards(groups), [groups]);
   const identities = useContext(MessageIdentityContext);
@@ -792,36 +878,8 @@ const MessageBody = memo(function MessageBody(
         className={`message message-${message.role} native-message text-base`}
         data-message-id={message.id}
       >
-        {conversational ? (
-          <MessageAvatar>
-            <Tooltip>
-              <TooltipTrigger
-                render={
-                  <button
-                    type="button"
-                    className="message-avatar-trigger"
-                    aria-label={`About ${author.displayName}`}
-                  />
-                }
-              >
-                <ActorAvatar {...author} />
-              </TooltipTrigger>
-              <TooltipContent
-                className="message-author-details"
-                side={self ? "left" : "right"}
-                align="center"
-              >
-                <span className="message-author-name">{author.displayName}</span>
-                <span>{authorRole}</span>
-                {message.metadata?.inputMode === "steer" ? <span>Steering</span> : null}
-                {message.metadata?.createdAt !== undefined ? (
-                  <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
-                    {new Date(message.metadata.createdAt).toLocaleString()}
-                  </time>
-                ) : null}
-              </TooltipContent>
-            </Tooltip>
-          </MessageAvatar>
+        {(props.showAvatar ?? conversational) ? (
+          <AuthorAvatar author={author} role={authorRole} self={self} message={message} />
         ) : null}
         <MessageResourcesContext value={resources}>
           <MessageContent>
@@ -901,7 +959,9 @@ const MessageBody = memo(function MessageBody(
             })}
           </MessageContent>
         </MessageResourcesContext>
-        {conversational ? (
+        {conversational &&
+        (props.showControls ??
+          (message.metadata?.phase !== "commentary" && !message.metadata?.incomplete)) ? (
           <div className="message-controls">
             {message.metadata?.createdAt !== undefined ? (
               <time dateTime={new Date(message.metadata.createdAt).toISOString()}>
@@ -911,12 +971,12 @@ const MessageBody = memo(function MessageBody(
                 })}
               </time>
             ) : null}
-            {messageText(message) ? (
+            {copyText ? (
               <IconButton
                 label="Copy message"
                 onClick={() =>
                   void attempt(
-                    () => navigator.clipboard.writeText(messageText(message)),
+                    () => navigator.clipboard.writeText(copyText),
                     () => setCopyError("Copy unavailable"),
                   )
                 }
@@ -938,6 +998,9 @@ type ActivityPart = Extract<DisplayPart, { type: "data-activity" }>;
 export function activitySummary(parts: readonly ActivityPart[]): string {
   const running = parts.find((part) => part.data.state === "running");
   if (running) return running.data.label;
+  const only = parts.length === 1 ? parts[0] : undefined;
+  if (only?.data.state === "complete" && only.data.durationMs !== undefined)
+    return `${only.data.kind === "thinking" ? "Thought" : "Worked"} for ${formatDuration(only.data.durationMs)}`;
   if (parts.length === 1) return parts[0]!.data.label;
   const tools = parts.filter((part) => part.data.kind === "tool").length;
   const workflows = parts.filter((part) => part.data.kind === "workflow").length;
