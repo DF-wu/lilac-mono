@@ -33,6 +33,9 @@ import {
   threadListSchema,
   toolModeSchema,
   mcpReloadReplySchema,
+  sidebarSectionSchema,
+  sidebarPreferencesSchema,
+  sidebarPageSchema,
 } from "./domain.ts";
 
 export const nativeErrorMap = {
@@ -121,6 +124,23 @@ export const turnPageSchema = z
     },
   );
 export const nativeContract = {
+  sidebar: {
+    preferences: procedure.input(z.strictObject({})).output(sidebarPreferencesSchema),
+    configure: procedure.input(sidebarPreferencesSchema).output(sidebarPreferencesSchema),
+    list: procedure
+      .input(pageInputSchema.extend({ section: sidebarSectionSchema }))
+      .output(sidebarPageSchema),
+    move: procedure
+      .input(
+        threadIdInput.extend({
+          section: sidebarSectionSchema,
+          atStart: z.boolean().optional(),
+          beforeId: identitySchema.optional(),
+          afterId: identitySchema.optional(),
+        }),
+      )
+      .output(successSchema),
+  },
   connection: {
     reauthenticate: procedure
       .input(z.strictObject({ token: z.string().min(1).max(16_384) }))

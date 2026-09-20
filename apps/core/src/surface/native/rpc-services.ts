@@ -501,6 +501,20 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
         return Result.ok(watchCatalog(principal, input.cursor, signal));
       },
     },
+    sidebar: {
+      preferences(principal) {
+        return store.getSidebarPreferences(principal.userId);
+      },
+      configure(principal, input) {
+        return store.configureSidebar(principal.userId, input);
+      },
+      list(principal, input) {
+        return store.listSidebar(principal.userId, input);
+      },
+      move(principal, input) {
+        return store.moveSidebarThread(principal.userId, input);
+      },
+    },
     threads: {
       get(principal, input) {
         return auth

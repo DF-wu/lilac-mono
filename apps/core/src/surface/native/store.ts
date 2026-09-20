@@ -1,6 +1,9 @@
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import type {
+  SidebarPreferences,
+  NativeRpcInputs,
+  NativeRpcOutputs,
   DisplayMessage,
   Hydration,
   NativeInput,
@@ -45,6 +48,7 @@ const REPLAY_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const REPLAY_BYTE_CAP = 128 * 1024 * 1024;
 const WINDOW_BYTES = 224 * 1024;
 const encoder = new TextEncoder();
+const sidebarActivity = `COALESCE((SELECT MAX(a.updated_at) FROM native_records a WHERE a.thread_id=r.id AND a.kind IN ('turn','input')),json_extract(r.data_json,'$.value.createdAt'))`;
 
 type StoredRow = NativePersistedRow & { id: string; position: number };
 
@@ -152,6 +156,7 @@ export class NativeStore {
         .run(`CREATE TABLE IF NOT EXISTS native_records (kind TEXT NOT NULL, id TEXT NOT NULL, thread_id TEXT, position INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL, format_version INTEGER NOT NULL, data_json TEXT NOT NULL, PRIMARY KEY(kind,id));
         CREATE INDEX IF NOT EXISTS native_records_thread_position ON native_records(kind,thread_id,position);
         CREATE INDEX IF NOT EXISTS native_records_updated ON native_records(kind,updated_at DESC,id);
+        CREATE INDEX IF NOT EXISTS native_records_activity ON native_records(thread_id,kind,updated_at DESC);
         CREATE TABLE IF NOT EXISTS native_user_identity (id TEXT PRIMARY KEY, provider_id TEXT NOT NULL UNIQUE, role TEXT NOT NULL);
         CREATE UNIQUE INDEX IF NOT EXISTS native_single_owner ON native_user_identity(role) WHERE role = 'owner';
         CREATE TABLE IF NOT EXISTS native_surface_read (thread_id TEXT NOT NULL,reader_id TEXT NOT NULL,position INTEGER NOT NULL,message_index INTEGER NOT NULL,generation INTEGER NOT NULL,PRIMARY KEY(thread_id,reader_id));
@@ -159,6 +164,9 @@ export class NativeStore {
         CREATE TABLE IF NOT EXISTS native_changes (thread_id TEXT NOT NULL,revision INTEGER NOT NULL,generation INTEGER NOT NULL,created_at INTEGER NOT NULL,byte_size INTEGER NOT NULL,kind TEXT NOT NULL,record_id TEXT NOT NULL,format_version INTEGER NOT NULL DEFAULT 1,data_json TEXT,PRIMARY KEY(thread_id,revision));
         CREATE INDEX IF NOT EXISTS native_changes_age ON native_changes(created_at);
         CREATE TABLE IF NOT EXISTS native_projection_receipts (event_id TEXT PRIMARY KEY,thread_id TEXT NOT NULL,generation INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS native_user_preferences (user_id TEXT PRIMARY KEY,auto_settle_days INTEGER NOT NULL DEFAULT 3 CHECK(auto_settle_days IN (1,3,5,7,30)));
+        CREATE TABLE IF NOT EXISTS native_thread_preferences (user_id TEXT NOT NULL,thread_id TEXT NOT NULL,section TEXT NOT NULL CHECK(section IN ('pinned','active','settled')),position INTEGER NOT NULL,last_activity INTEGER NOT NULL,touched_at INTEGER NOT NULL,PRIMARY KEY(user_id,thread_id));
+        CREATE INDEX IF NOT EXISTS native_thread_preferences_order ON native_thread_preferences(user_id,section,position,thread_id);
         PRAGMA user_version = 1;`);
       return Result.ok(undefined);
     });
@@ -475,6 +483,169 @@ export class NativeStore {
           ),
         );
         return Result.ok(threads.filter((thread) => thread.capabilities.read));
+      }),
+    );
+  }
+
+  getSidebarPreferences(actorId: string): NativeStoreResult<SidebarPreferences> {
+    return nativeStoreTransaction(this.db, () =>
+      this.getUser(actorId).map(() => ({
+        autoSettleDays:
+          this.db
+            .query<{ days: SidebarPreferences["autoSettleDays"] }, [string]>(
+              "SELECT auto_settle_days AS days FROM native_user_preferences WHERE user_id=?",
+            )
+            .get(actorId)?.days ?? 3,
+      })),
+    );
+  }
+
+  configureSidebar(
+    actorId: string,
+    preferences: SidebarPreferences,
+  ): NativeStoreResult<SidebarPreferences> {
+    return nativeStoreTransaction(this.db, () =>
+      this.getUser(actorId).map(() => {
+        this.db
+          .query(
+            "INSERT INTO native_user_preferences(user_id,auto_settle_days) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET auto_settle_days=excluded.auto_settle_days",
+          )
+          .run(actorId, preferences.autoSettleDays);
+        return preferences;
+      }),
+    );
+  }
+
+  private reconcileSidebar(user: NativeUser, days: number): void {
+    const now = this.now();
+    this.db
+      .query(`INSERT OR IGNORE INTO native_thread_preferences(user_id,thread_id,section,position,last_activity,touched_at)
+      SELECT ?,r.id,'active',MIN(COALESCE((SELECT MIN(p.position) FROM native_thread_preferences p WHERE p.user_id=? AND p.section='active'),0),-json_extract(r.data_json,'$.value.createdAt'))-1,${sidebarActivity},0
+      FROM native_records r WHERE r.kind='thread' AND json_extract(r.data_json,'$.value.deleted')=0
+      AND (?='owner' OR json_extract(r.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?))
+      AND NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id)`)
+      .run(user.id, user.id, user.role, user.id, user.id, user.id);
+    const activity = `(SELECT ${sidebarActivity} FROM native_records r WHERE r.kind='thread' AND r.id=native_thread_preferences.thread_id)`;
+    this.db
+      .query(
+        `UPDATE native_thread_preferences SET section='active',position=COALESCE((SELECT MIN(position)-1 FROM native_thread_preferences WHERE user_id=? AND section='active'),0),touched_at=${activity} WHERE user_id=? AND section='settled' AND last_activity < ${activity}`,
+      )
+      .run(user.id, user.id);
+    this.db
+      .query(
+        `UPDATE native_thread_preferences SET last_activity=${activity} WHERE user_id=? AND last_activity < ${activity}`,
+      )
+      .run(user.id);
+    this.db
+      .query(
+        `UPDATE native_thread_preferences SET section='settled',position=-last_activity WHERE user_id=? AND section='active' AND MAX(last_activity,touched_at)<=? AND NOT EXISTS(SELECT 1 FROM native_records r WHERE r.kind='thread' AND r.id=native_thread_preferences.thread_id AND json_extract(r.data_json,'$.value.activeRunId') IS NOT NULL)`,
+      )
+      .run(user.id, now - days * 86_400_000);
+  }
+
+  listSidebar(
+    actorId: string,
+    input: NativeRpcInputs["sidebar"]["list"],
+  ): NativeStoreResult<NativeRpcOutputs["sidebar"]["list"]> {
+    const store = this;
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const user = yield* store.getUser(actorId);
+        const preferences = yield* store.getSidebarPreferences(actorId);
+        store.reconcileSidebar(user, preferences.autoSettleDays);
+        const separator = input.cursor?.indexOf(":") ?? -1;
+        const position = input.cursor
+          ? Number(input.cursor.slice(0, separator))
+          : Number.MIN_SAFE_INTEGER;
+        const cursorId = input.cursor?.slice(separator + 1) ?? "";
+        if (input.cursor && (separator < 1 || !Number.isSafeInteger(position) || !cursorId))
+          return Result.err(nativeFailure("invalid", "Sidebar cursor is invalid"));
+        const predicate = `FROM native_thread_preferences p JOIN native_records r ON r.kind='thread' AND r.id=p.thread_id
+        WHERE p.user_id=? AND p.section=? AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.archived')=0
+        AND (?='owner' OR json_extract(r.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?))`;
+        const params = [actorId, input.section, user.role, actorId, actorId];
+        const total =
+          store.db
+            .query<{ total: number }, string[]>(`SELECT COUNT(*) AS total ${predicate}`)
+            .get(...params)?.total ?? 0;
+        const rows = store.db
+          .query<{ thread_id: string; position: number }, (string | number)[]>(
+            `SELECT p.thread_id,p.position ${predicate} AND (p.position>? OR (p.position=? AND p.thread_id>?)) ORDER BY p.position,p.thread_id LIMIT ?`,
+          )
+          .all(...params, position, position, cursorId, (input.limit ?? 30) + 1);
+        const page = rows.slice(0, input.limit ?? 30);
+        const items = yield* Result.all(page.map((row) => store.getThread(actorId, row.thread_id)));
+        const last = page.at(-1);
+        return Result.ok({
+          items,
+          total,
+          nextCursor:
+            rows.length > page.length && last ? `${last.position}:${last.thread_id}` : undefined,
+        });
+      }),
+    );
+  }
+
+  moveSidebarThread(
+    actorId: string,
+    input: NativeRpcInputs["sidebar"]["move"],
+  ): NativeStoreResult<{ ok: true }> {
+    const store = this;
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const user = yield* store.getUser(actorId);
+        const thread = yield* store.authorizeThread(actorId, input.threadId);
+        if (thread.archived)
+          return Result.err(nativeFailure("invalid", "Archived conversations cannot be moved"));
+        if (input.beforeId === input.threadId || input.afterId === input.threadId)
+          return Result.ok({ ok: true as const });
+        const preferences = yield* store.getSidebarPreferences(actorId);
+        store.reconcileSidebar(user, preferences.autoSettleDays);
+        store.db
+          .query(`WITH ranks AS MATERIALIZED (
+          SELECT thread_id,ROW_NUMBER() OVER(ORDER BY position,thread_id) AS rank
+          FROM native_thread_preferences WHERE user_id=? AND section=?
+        ) UPDATE native_thread_preferences SET position=(SELECT rank FROM ranks WHERE ranks.thread_id=native_thread_preferences.thread_id)
+          WHERE user_id=? AND section=?`)
+          .run(actorId, input.section, actorId, input.section);
+        let position: number;
+        const neighborId = input.beforeId ?? input.afterId;
+        if (neighborId) {
+          yield* store.authorizeThread(actorId, neighborId);
+          const before = store.db
+            .query<{ position: number }, [string, string, string]>(
+              "SELECT position FROM native_thread_preferences WHERE user_id=? AND thread_id=? AND section=?",
+            )
+            .get(actorId, neighborId, input.section);
+          if (!before)
+            return Result.err(nativeFailure("conflict", "Drop target has moved. Try again."));
+          position = before.position + (input.afterId ? 1 : 0);
+          store.db
+            .query(
+              "UPDATE native_thread_preferences SET position=position+1 WHERE user_id=? AND section=? AND position>=?",
+            )
+            .run(actorId, input.section, position);
+        } else if (input.atStart) {
+          position =
+            (store.db
+              .query<{ position: number | null }, [string, string]>(
+                "SELECT MIN(position) AS position FROM native_thread_preferences WHERE user_id=? AND section=?",
+              )
+              .get(actorId, input.section)?.position ?? -store.now()) - 1;
+        } else {
+          position =
+            (store.db
+              .query<{ position: number | null }, [string, string]>(
+                "SELECT MAX(position) AS position FROM native_thread_preferences WHERE user_id=? AND section=?",
+              )
+              .get(actorId, input.section)?.position ?? -store.now()) + 1;
+        }
+        store.db
+          .query(
+            "UPDATE native_thread_preferences SET section=?,position=?,touched_at=? WHERE user_id=? AND thread_id=?",
+          )
+          .run(input.section, position, store.now(), actorId, input.threadId);
+        return Result.ok({ ok: true as const });
       }),
     );
   }

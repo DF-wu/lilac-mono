@@ -30,6 +30,20 @@ Browser projection caches are scoped by installation, principal, protocol and pr
 They are disposable: unsupported versions or invalid coverage require a fresh recent window, while
 server conversation history remains authoritative. Never copy one user's cache into another scope.
 
+## Native personal sidebar queues
+
+The native store adds `native_user_preferences` and `native_thread_preferences`. These additive
+SQLite tables hold each user's inactivity threshold, section, order, and activity frontier. Existing
+threads enter Active in creation order, newest first, and inactive threads settle when the sidebar is
+read. The default threshold is three days. Pinned threads and running conversations do not auto-settle.
+New conversation activity re-enqueues settled threads at the top of Active; activity does not reorder
+an already active thread. Renaming and changing access do not count as conversation activity.
+
+The v1 RPC contract adds `sidebar.preferences`, `sidebar.configure`, `sidebar.list`, and `sidebar.move`.
+These operations always use the authenticated user and require read access to each affected thread.
+Settling and pinning are personal organization, independent of shared archive or deletion. No background
+worker or shared thread mutation is introduced. Update clients and servers together for the new UI.
+
 ## Native account profiles
 
 Native users can edit their own display name and avatar. Local profiles use the existing name and

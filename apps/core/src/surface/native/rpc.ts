@@ -115,6 +115,20 @@ export function createNativeRouter(
         nativeRpcValue(await services.bootstrap.watch(context.principal, input, signal)),
       ),
     },
+    sidebar: {
+      preferences: secured.sidebar.preferences.handler(async ({ context, input, signal }) =>
+        nativeRpcValue(await services.sidebar.preferences(context.principal, input, signal)),
+      ),
+      configure: secured.sidebar.configure.handler(async ({ context, input, signal }) =>
+        nativeRpcValue(await services.sidebar.configure(context.principal, input, signal)),
+      ),
+      list: secured.sidebar.list.handler(async ({ context, input, signal }) =>
+        nativeRpcValue(await services.sidebar.list(context.principal, input, signal)),
+      ),
+      move: secured.sidebar.move.handler(async ({ context, input, signal }) =>
+        nativeRpcValue(await services.sidebar.move(context.principal, input, signal)),
+      ),
+    },
     threads: {
       get: secured.threads.get.handler(async ({ input, context, signal }) =>
         nativeRpcValue(await services.threads.get(context.principal, input, signal)),

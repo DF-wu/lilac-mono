@@ -43,6 +43,13 @@ export const threadListSchema = z.strictObject({
   items: z.array(nativeThreadSchema).max(100),
   nextCursor: identitySchema.optional(),
 });
+export const sidebarSectionSchema = z.enum(["pinned", "active", "settled"]);
+export const sidebarPreferencesSchema = z.strictObject({
+  autoSettleDays: z.union([z.literal(1), z.literal(3), z.literal(5), z.literal(7), z.literal(30)]),
+});
+export const sidebarPageSchema = threadListSchema.extend({ total: revisionSchema });
+export type SidebarSection = z.infer<typeof sidebarSectionSchema>;
+export type SidebarPreferences = z.infer<typeof sidebarPreferencesSchema>;
 export const modelChoiceSchema = z.strictObject({
   id: catalogIdentifierSchema,
   label: z.string().min(1).max(256),
