@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useEffectEvent,
+  useLayoutEffect,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -12,6 +13,7 @@ import { Button } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "./ui/dialog";
 import { X } from "lucide-react";
+import { createVirtualListMotion } from "./virtual-list-motion";
 import { Result } from "better-result";
 
 export function IconButton({
@@ -99,6 +101,7 @@ export function VirtualList<T>({
   loading = false,
   scrollFade = false,
   fillBeforeIndex,
+  animateChanges = false,
 }: {
   items: readonly T[];
   itemKey: (item: T) => string;
@@ -113,8 +116,17 @@ export function VirtualList<T>({
   loading?: boolean;
   scrollFade?: boolean;
   fillBeforeIndex?: number;
+  animateChanges?: boolean;
 }) {
   const parent = useRef<HTMLDivElement>(null);
+  const canvas = useRef<HTMLDivElement>(null);
+  const motion = useRef<ReturnType<typeof createVirtualListMotion>>(undefined);
+  useLayoutEffect(() => () => motion.current?.dispose(), []);
+  useLayoutEffect(() => {
+    if (!animateChanges && !motion.current) return;
+    motion.current ??= createVirtualListMotion(canvas.current!);
+    motion.current.update(items.map(itemKey), animateChanges);
+  });
   const getItemKey = useCallback((index: number) => itemKey(items[index]!), [items, itemKey]);
   const virtual = useVirtualizer({
     count: items.length,
@@ -145,12 +157,21 @@ export function VirtualList<T>({
       aria-label={presentation ? undefined : label}
       role={presentation ? "presentation" : "list"}
     >
-      <div className="virtual-canvas" style={{ height: virtual.getTotalSize() + fillSpace }}>
+      <div
+        ref={canvas}
+        className="virtual-canvas"
+        style={{ height: virtual.getTotalSize() + fillSpace }}
+      >
         {virtual.getVirtualItems().map((row) => (
           <div
             key={row.key}
             ref={virtual.measureElement}
             data-index={row.index}
+            data-motion-key={row.key}
+            data-motion-top={
+              row.start +
+              (fillBeforeIndex !== undefined && row.index >= fillBeforeIndex ? fillSpace : 0)
+            }
             role={presentation ? "presentation" : "listitem"}
             className="virtual-row"
             style={{

@@ -203,6 +203,7 @@ export function ThreadQueue({
     >
       <VirtualList
         items={rows}
+        animateChanges={!dragging}
         itemKey={(row) => row.id}
         estimate={64}
         fillBeforeIndex={rows.findIndex((row) => row.id === "heading:settled")}
