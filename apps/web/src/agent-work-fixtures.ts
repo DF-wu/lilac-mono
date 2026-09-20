@@ -128,6 +128,103 @@ const streamFrames = Array.from(
     ]),
 );
 
+const introduction = message("demo_introduction", [
+  { type: "text", text: "I'll compare both plans and check the conditions for Saturday." },
+]);
+const firstWork = message("demo_first_work", [
+  activity(
+    "demo_first_tool",
+    "tool",
+    "Checked the first route",
+    "complete",
+    "The riverside route takes about two hours.",
+    20_000,
+  ),
+]);
+const steer = (id: string, authorId: string, text: string, offset: number): DisplayMessage => ({
+  id,
+  role: "user",
+  metadata: { authorId, inputMode: "steer", createdAt: demoTime + offset },
+  parts: [{ type: "text", text }],
+});
+const ownSteer = steer(
+  "demo_own_steer",
+  "demo_user",
+  "Keep the walking part under an hour, please.",
+  25_000,
+);
+const otherSteer = steer(
+  "demo_other_steer",
+  "demo_other_user",
+  "Let's include a café with indoor seating too.",
+  55_000,
+);
+const afterSteer = [
+  message("demo_steer_thought", [
+    activity(
+      "demo_steer_think",
+      "thinking",
+      "Compared shorter routes",
+      "complete",
+      "A shorter river loop leaves time for a café stop.",
+      5000,
+    ),
+  ]),
+  message("demo_steer_commentary", [
+    { type: "text", text: "I'll shorten the walk and look for a coffee stop along the way." },
+  ]),
+];
+const nextTool = (state: Activity["data"]["state"]) =>
+  message("demo_steer_work", [
+    activity(
+      "demo_steer_tool",
+      "tool",
+      state === "running" ? "Checking shorter routes…" : "Checked shorter routes",
+      state,
+      "A 45-minute loop starts and ends near Sanjo Station.",
+      state === "complete" ? 10_000 : undefined,
+    ),
+  ]);
+const firstSteering = [introduction, firstWork, ownSteer, ...afterSteer, nextTool("running")];
+const secondSteering = [
+  introduction,
+  firstWork,
+  ownSteer,
+  ...afterSteer,
+  nextTool("complete"),
+  otherSteer,
+  message("demo_cafe_thought", [
+    activity(
+      "demo_cafe_think",
+      "thinking",
+      "Compared indoor stops",
+      "complete",
+      "Choose a café near the station in case it rains.",
+      5000,
+    ),
+  ]),
+  message("demo_cafe_commentary", [
+    {
+      type: "text",
+      text: "I'll include an indoor café near the station, with the museum as an optional stop.",
+    },
+  ]),
+];
+const steeredFinal = message(
+  "demo_steered_final",
+  [
+    {
+      type: "text",
+      text: "Take the **45-minute riverside loop** from Sanjo Station, then stop at a café with indoor seating. Keep the museum as an optional rainy-day alternative.",
+    },
+  ],
+  "final",
+);
+const finalSteering = {
+  ...turn([...secondSteering, steeredFinal], "complete"),
+  settledAt: demoTime + 240_000,
+};
+
 export const agentWorkStages: AgentWorkStage[] = [
   {
     id: "queued",
@@ -254,6 +351,69 @@ export const agentWorkStages: AgentWorkStage[] = [
     label: "Complete",
     description: "The final answer stays visible; prior work collapses into the work summary.",
     frames: [turn([work, commentary, final], "complete")],
+  },
+  {
+    id: "full-turn-working",
+    label: "Full turn · working",
+    description:
+      "One agent avatar introduces commentary, thinking, another update, and a running tool.",
+    frames: [
+      turn([
+        introduction,
+        message("demo_full_thought", [thought]),
+        commentary,
+        message("demo_full_tool", [
+          activity(
+            "demo_full_call",
+            "tool",
+            "Checking opening hours…",
+            "running",
+            "Waiting for the museum schedule.",
+          ),
+        ]),
+      ]),
+    ],
+  },
+  {
+    id: "full-turn-complete",
+    label: "Full turn · complete",
+    description:
+      "The same turn settles into one work summary above the final response. Expand to inspect earlier updates.",
+    frames: [
+      {
+        ...turn(
+          [
+            introduction,
+            message("demo_full_thought", [thought]),
+            commentary,
+            message("demo_full_tool", [hours]),
+            final,
+          ],
+          "complete",
+        ),
+        settledAt: demoTime + 120_000,
+      },
+    ],
+  },
+  {
+    id: "steering",
+    label: "Steering · your update",
+    description:
+      "Your steering prompt stays right aligned and starts a new agent group. Earlier commentary stays visible while work continues.",
+    frames: [turn(firstSteering)],
+  },
+  {
+    id: "steering-other",
+    label: "Steering · another participant",
+    description: "Another participant's prompt stays left aligned, followed by a new agent group.",
+    frames: [turn(secondSteering)],
+  },
+  {
+    id: "steering-complete",
+    label: "Steering · complete",
+    description:
+      "All intermediate work and steering prompts collapse together, with the final response below.",
+    frames: [finalSteering],
   },
   {
     id: "needs-input",

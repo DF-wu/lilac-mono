@@ -14,7 +14,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 const identities = {
   viewerId: "demo_user",
   agent: { displayName: "Lilac" },
-  users: new Map([["demo_user", { displayName: "Alex Chen" }]]),
+  users: new Map([
+    ["demo_user", { displayName: "Alex Chen" }],
+    ["demo_other_user", { displayName: "Morgan Lee" }],
+  ]),
 };
 
 export function AgentWorkDemo() {
