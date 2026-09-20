@@ -1,4 +1,4 @@
-import { useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   DndContext,
@@ -16,7 +16,7 @@ import {
   type KeyboardCoordinateGetter,
   type CollisionDetection,
 } from "@dnd-kit/core";
-import { Check, ChevronDown, Pin, PinOff, Undo2 } from "lucide-react";
+import { CircleCheck, ChevronDown, Pin, PinOff, Undo2 } from "lucide-react";
 import type { SidebarSection } from "@stanley2058/lilac-client-protocol";
 import {
   dropAction,
@@ -88,7 +88,6 @@ export function ThreadQueue({
     { id: string; from: SidebarSection; move?: ThreadMove; thread: QueueThread } | undefined
   >();
   const dragRef = useRef(drag);
-  dragRef.current = drag;
   const keyboardDirection = useRef(1);
   const keyboardGetter: KeyboardCoordinateGetter = (event, context) => {
     keyboardDirection.current = event.code === "ArrowDown" ? 1 : -1;
@@ -102,25 +101,36 @@ export function ThreadQueue({
       keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space", "Enter"] },
     }),
   );
-  const visible = drag?.move ? moveInQueues(queues, drag.move) : queues;
-  const rows: QueueRow[] = sidebarSections.flatMap((section) => [
-    { id: `heading:${section}`, section, kind: "heading" as const },
-    ...(section !== "settled" || settledOpen
-      ? visible[section].map((thread) => ({
-          id: thread.id,
-          section,
-          kind: "thread" as const,
-          thread,
-        }))
-      : []),
-    ...(section !== "settled" || settledOpen
-      ? [{ id: `end:${section}`, section, kind: "end" as const }]
-      : []),
-  ]);
+  const visible = useMemo(
+    () => (drag?.move ? moveInQueues(queues, drag.move) : queues),
+    [queues, drag?.move],
+  );
+  const dragging = !!drag;
+  const rows = useMemo<QueueRow[]>(
+    () =>
+      sidebarSections.flatMap((section) => [
+        ...(dragging || section === "settled"
+          ? [{ id: `heading:${section}`, section, kind: "heading" as const }]
+          : []),
+        ...(section !== "settled" || settledOpen
+          ? visible[section].map((thread) => ({
+              id: thread.id,
+              section,
+              kind: "thread" as const,
+              thread,
+            }))
+          : []),
+        ...(dragging && (section !== "settled" || settledOpen)
+          ? [{ id: `end:${section}`, section, kind: "end" as const }]
+          : []),
+      ]),
+    [visible, settledOpen, dragging],
+  );
+  const rowsById = useMemo(() => new Map(rows.map((row) => [row.id, row])), [rows]);
   function over(event: DragOverEvent) {
     const current = dragRef.current;
     if (!current || !event.over || event.over.id === current.id) return;
-    const target = rows.find((row) => row.id === event.over!.id);
+    const target = rowsById.get(String(event.over.id));
     if (!target) return;
     let move: ThreadMove = { threadId: current.id, section: target.section };
     if (target.kind === "heading") move = { ...move, atStart: true };
@@ -139,13 +149,19 @@ export function ThreadQueue({
             event.over.rect.top + event.over.rect.height / 2;
       move = below ? { ...move, afterId: target.id } : { ...move, beforeId: target.id };
     }
-    if (JSON.stringify(current.move) === JSON.stringify(move)) return;
+    if (
+      current.move?.section === move.section &&
+      current.move.beforeId === move.beforeId &&
+      current.move.afterId === move.afterId &&
+      current.move.atStart === move.atStart
+    )
+      return;
     const next = { ...current, move };
     dragRef.current = next;
     setDrag(next);
   }
   const action = drag?.move ? dropAction(drag.from, drag.move.section) : undefined;
-  const ActionIcon = { Pin, Unpin: PinOff, Settle: Check, Unsettle: Undo2 }[action ?? "Pin"];
+  const ActionIcon = { Pin, Unpin: PinOff, Settle: CircleCheck, Unsettle: Undo2 }[action ?? "Pin"];
   return (
     <DndContext
       sensors={sensors}
@@ -189,6 +205,7 @@ export function ThreadQueue({
         items={rows}
         itemKey={(row) => row.id}
         estimate={64}
+        fillBeforeIndex={rows.findIndex((row) => row.id === "heading:settled")}
         label="Conversations"
         className={`thread-list thread-queue ${drag ? "is-dragging" : ""}`}
         scrollFade
@@ -202,7 +219,7 @@ export function ThreadQueue({
               disabled={disabled || !row.thread.source}
               title={row.thread.source?.title ?? "Draft"}
             >
-              {renderThread(row.thread, row.section)}
+              <QueueCard thread={row.thread} section={row.section} renderThread={renderThread} />
             </QueueItem>
           ) : (
             <QueueTarget
@@ -221,6 +238,7 @@ export function ThreadQueue({
           {drag ? (
             <div className="thread-drag-preview">
               <ThreadCard
+                pinned={(drag.move?.section ?? drag.from) === "pinned"}
                 title={drag.thread.source?.title ?? "Untitled"}
                 starterName={drag.thread.source?.starterDisplayName ?? ""}
                 starterAvatarUrl={drag.thread.source?.starterAvatarUrl}
@@ -242,6 +260,18 @@ export function ThreadQueue({
     </DndContext>
   );
 }
+const QueueCard = memo(function QueueCard({
+  thread,
+  section,
+  renderThread,
+}: {
+  thread: QueueThread;
+  section: SidebarSection;
+  renderThread: (thread: QueueThread, section: SidebarSection) => ReactNode;
+}) {
+  return renderThread(thread, section);
+});
+
 function QueueItem({
   id,
   title,
@@ -255,12 +285,16 @@ function QueueItem({
 }) {
   const draggable = useDraggable({ id, disabled });
   const droppable = useDroppable({ id, disabled });
+  const setNodeRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      draggable.setNodeRef(node);
+      droppable.setNodeRef(node);
+    },
+    [draggable.setNodeRef, droppable.setNodeRef],
+  );
   return (
     <div
-      ref={(node) => {
-        draggable.setNodeRef(node);
-        droppable.setNodeRef(node);
-      }}
+      ref={setNodeRef}
       className={`queue-thread ${draggable.isDragging ? "drag-source" : ""}`}
       {...draggable.attributes}
       {...draggable.listeners}

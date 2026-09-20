@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, Pencil, Undo2 } from "lucide-react";
+import { CircleCheck, Pencil, Undo2 } from "lucide-react";
 import type { NativeThread } from "@stanley2058/lilac-client-protocol";
 import { moveInQueues, type ThreadQueues } from "../sidebar-order";
 import { ThreadQueue } from "./ThreadQueue";
@@ -52,6 +52,7 @@ export function ThreadQueueDemo() {
             updatedAt={entry.source!.updatedAt}
             state={entry.source!.displayStatus ?? "idle"}
             selected={selected === entry.id}
+            pinned={section === "pinned"}
             onSelect={() => setSelected(entry.id)}
             actions={
               <>
@@ -67,7 +68,7 @@ export function ThreadQueueDemo() {
                     )
                   }
                 >
-                  {section === "settled" ? <Undo2 /> : <Check />}
+                  {section === "settled" ? <Undo2 /> : <CircleCheck />}
                 </IconButton>
                 <IconButton label="Rename" onClick={() => setSelected(entry.id)}>
                   <Pencil />

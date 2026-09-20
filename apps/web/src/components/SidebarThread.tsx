@@ -1,6 +1,15 @@
 import { useState } from "react";
 import { useStore } from "zustand";
-import { Archive, ArchiveRestore, Pencil, Trash2, Check, Undo2 } from "lucide-react";
+import {
+  Archive,
+  ArchiveRestore,
+  Pencil,
+  Trash2,
+  CircleCheck,
+  Undo2,
+  Pin,
+  PinOff,
+} from "lucide-react";
 import type { NativeThread, NativeUser, SidebarSection } from "@stanley2058/lilac-client-protocol";
 import { useWorkspace } from "../workspace-context";
 import { IconButton } from "./ui";
@@ -24,10 +33,12 @@ export function SidebarThread({
   onDelete,
   section,
   onSettle,
+  onPin,
   settleDisabled,
 }: {
   section?: SidebarSection;
   onSettle?: () => void;
+  onPin?: () => void;
   settleDisabled?: boolean;
   id: string;
   thread?: NativeThread;
@@ -53,7 +64,7 @@ export function SidebarThread({
         onClick={onSettle}
         disabled={settleDisabled}
       >
-        {section === "settled" ? <Undo2 /> : <Check />}
+        {section === "settled" ? <Undo2 /> : <CircleCheck />}
       </IconButton>
     ) : null;
   const actions =
@@ -81,6 +92,7 @@ export function SidebarThread({
             viewer={viewer}
             modelLabel={modelLabel}
             selected={selected}
+            pinned={section === "pinned"}
             actions={actions}
             onSelect={() => onSelect(id)}
           />
@@ -93,6 +105,7 @@ export function SidebarThread({
             updatedAt={now}
             now={now}
             selected={selected}
+            pinned={section === "pinned"}
             actions={actions}
             onSelect={() => onSelect(id)}
           />
@@ -102,8 +115,14 @@ export function SidebarThread({
         <ContextMenuContent>
           {settleAction ? (
             <ContextMenuItem disabled={settleDisabled} onClick={onSettle}>
-              {section === "settled" ? <Undo2 /> : <Check />}
+              {section === "settled" ? <Undo2 /> : <CircleCheck />}
               {section === "settled" ? "Unsettle" : "Settle"}
+            </ContextMenuItem>
+          ) : null}
+          {thread && !thread.archived && onPin ? (
+            <ContextMenuItem disabled={settleDisabled} onClick={onPin}>
+              {section === "pinned" ? <PinOff /> : <Pin />}
+              {section === "pinned" ? "Unpin" : "Pin"}
             </ContextMenuItem>
           ) : null}
           {editable ? (

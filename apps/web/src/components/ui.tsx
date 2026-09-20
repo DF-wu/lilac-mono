@@ -98,6 +98,7 @@ export function VirtualList<T>({
   hasMore = false,
   loading = false,
   scrollFade = false,
+  fillBeforeIndex,
 }: {
   items: readonly T[];
   itemKey: (item: T) => string;
@@ -111,6 +112,7 @@ export function VirtualList<T>({
   hasMore?: boolean;
   loading?: boolean;
   scrollFade?: boolean;
+  fillBeforeIndex?: number;
 }) {
   const parent = useRef<HTMLDivElement>(null);
   const getItemKey = useCallback((index: number) => itemKey(items[index]!), [items, itemKey]);
@@ -121,6 +123,10 @@ export function VirtualList<T>({
     getItemKey,
     overscan: 5,
   });
+  const fillSpace =
+    fillBeforeIndex !== undefined && fillBeforeIndex >= 0
+      ? Math.max(0, (virtual.scrollRect?.height ?? 0) - virtual.getTotalSize())
+      : 0;
   const remaining =
     virtual.getTotalSize() - (virtual.scrollOffset ?? 0) - (virtual.scrollRect?.height ?? 0);
   const nearEnd = remaining < estimate * 3;
@@ -139,7 +145,7 @@ export function VirtualList<T>({
       aria-label={presentation ? undefined : label}
       role={presentation ? "presentation" : "list"}
     >
-      <div className="virtual-canvas" style={{ height: virtual.getTotalSize() }}>
+      <div className="virtual-canvas" style={{ height: virtual.getTotalSize() + fillSpace }}>
         {virtual.getVirtualItems().map((row) => (
           <div
             key={row.key}
@@ -147,7 +153,9 @@ export function VirtualList<T>({
             data-index={row.index}
             role={presentation ? "presentation" : "listitem"}
             className="virtual-row"
-            style={{ transform: `translateY(${row.start}px)` }}
+            style={{
+              transform: `translateY(${row.start + (fillBeforeIndex !== undefined && row.index >= fillBeforeIndex ? fillSpace : 0)}px)`,
+            }}
           >
             {render(items[row.index]!, row.index)}
           </div>

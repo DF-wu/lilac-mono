@@ -30,3 +30,6 @@
 @media(hover:none) { .thread-card-actions { opacity:1; pointer-events:auto; } .thread-card:has(.thread-card-actions) .thread-card-meta { visibility:hidden; } .thread-card:has(.thread-card-actions) .thread-starter { max-width:calc(100% - var(--control-compact) * 3); } }
 
 .thread-card .thread-card-select, .thread-card .thread-card-select:hover, .thread-card .thread-card-select:focus-visible { background: transparent; }
+
+.thread-pin { display:grid; place-items:center; flex:none; }
+.thread-pin svg { width:var(--icon-size); height:var(--icon-size); }

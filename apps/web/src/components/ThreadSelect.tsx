@@ -9,6 +9,7 @@ import {
   UserRound,
   Users,
   CircleCheck,
+  Pin,
   LoaderCircle,
   CircleAlert,
   MessageCircleQuestion,
@@ -38,6 +39,7 @@ export function ThreadCard({
   now,
   state,
   selected,
+  pinned,
   actions,
   onSelect,
 }: {
@@ -48,6 +50,7 @@ export function ThreadCard({
   now?: number;
   state: ThreadDisplayState;
   selected?: boolean;
+  pinned?: boolean;
   actions?: ReactNode;
   onSelect: () => void;
 }) {
@@ -67,6 +70,11 @@ export function ThreadCard({
               <span>{starterName}</span>
             </span>
             <span className="thread-card-meta">
+              {pinned ? (
+                <span className="thread-pin" aria-label="Pinned">
+                  <Pin />
+                </span>
+              ) : null}
               {state !== "idle" ? (
                 <span className="thread-state-icon" aria-label={states[state].label}>
                   <StatusIcon />
@@ -105,6 +113,7 @@ export function ThreadSelect({
   onSelect,
   actions,
   selected,
+  pinned,
   participantNames,
 }: {
   participantNames?: string[];
@@ -115,6 +124,7 @@ export function ThreadSelect({
   onSelect: () => void;
   actions?: ReactNode;
   selected?: boolean;
+  pinned?: boolean;
 }) {
   const { client } = useWorkspace();
   const [open, setOpen] = useState(false);
@@ -142,6 +152,7 @@ export function ThreadSelect({
           now={now}
           state={state}
           selected={selected}
+          pinned={pinned}
           actions={actions}
           onSelect={onSelect}
         />

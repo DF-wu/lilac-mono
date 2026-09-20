@@ -151,6 +151,13 @@ export function SidebarQueue({
                 atStart: true,
               })
             }
+            onPin={() =>
+              move.mutate({
+                threadId: entry.id,
+                section: section === "pinned" ? "active" : "pinned",
+                atStart: true,
+              })
+            }
             settleDisabled={!online || move.isPending}
             onSelect={(id) => {
               if (entry.source) onThread(entry.source);
