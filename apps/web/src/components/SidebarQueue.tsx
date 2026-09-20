@@ -32,6 +32,7 @@ export function SidebarQueue({
   onRename,
   onArchive,
   onDelete,
+  onDiscardDraft,
   onThread,
 }: {
   fallbackThreads: NativeThread[];
@@ -43,6 +44,7 @@ export function SidebarQueue({
   onRename: (id: string, title: string) => void;
   onArchive: (id: string, archived: boolean) => void;
   onDelete: (id: string) => void;
+  onDiscardDraft: (id: string) => void;
   onThread: (thread: NativeThread) => void;
 }) {
   const { client } = useWorkspace();
@@ -172,6 +174,7 @@ export function SidebarQueue({
               onArchive(id, archived);
             }}
             onDelete={onDelete}
+            onDiscardDraft={onDiscardDraft}
           />
         )}
       />

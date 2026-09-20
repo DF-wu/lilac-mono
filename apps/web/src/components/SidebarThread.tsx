@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { composerDraftOptions } from "../queries";
 import type { Draft } from "./Chat";
 import {
+  X,
   Archive,
   ArchiveRestore,
   Pencil,
@@ -43,6 +44,7 @@ export function SidebarThread({
   onRename,
   onArchive,
   onDelete,
+  onDiscardDraft,
   section,
   onSettle,
   onPin,
@@ -61,6 +63,7 @@ export function SidebarThread({
   onRename: (id: string, title: string) => void;
   onArchive: (id: string, archived: boolean) => void;
   onDelete: (id: string) => void;
+  onDiscardDraft: (id: string) => void;
 }) {
   const { drafts, scope, draftCache } = useWorkspace();
   const { data: hasReplyDraft } = useQuery({
@@ -84,9 +87,20 @@ export function SidebarThread({
         {section === "settled" ? <Undo2 /> : <CircleCheck />}
       </IconButton>
     ) : null;
+  const showDiscard = !selected && (thread ? hasReplyDraft : !!draft);
   const actions =
-    settleAction || editable ? (
+    showDiscard || settleAction || editable ? (
       <>
+        {showDiscard ? (
+          <IconButton
+            label={`Discard draft for ${title || "conversation"}`}
+            tooltip="Discard draft"
+            disabled={!thread && !draft?.editable}
+            onClick={() => onDiscardDraft(id)}
+          >
+            <X />
+          </IconButton>
+        ) : null}
         {settleAction}
         {editable ? (
           <IconButton

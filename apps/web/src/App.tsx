@@ -347,10 +347,17 @@ function Workspace(props: AppProps) {
       setError,
     );
   }
-  function removeLocalDraft(id: string) {
+  function removeLocalDraft(id: string, persistence: "delete" | "clear" = "delete") {
     removedDrafts.current.add(id);
-    if (props.draftCache)
-      void attempt(() => props.draftCache!.deleteDraft(props.scope, id), setError);
+    const cache = props.draftCache;
+    if (cache)
+      void attempt(
+        () =>
+          persistence === "clear"
+            ? cache.saveDraft(props.scope, id, { text: "", skillIds: [] })
+            : cache.deleteDraft(props.scope, id),
+        setError,
+      );
     const current = draftStore.getState().localDrafts.get(id);
     if (!current) return;
     releaseDraftAttachments(current.attachments);
@@ -358,6 +365,21 @@ function Workspace(props: AppProps) {
     const changed = new Map(draftStore.getState().localDrafts);
     changed.delete(id);
     setLocalDrafts(changed);
+  }
+  function discardDraft(id: string) {
+    if (id.startsWith("draft:")) {
+      if (draftStore.getState().localDrafts.get(id)?.creation) return;
+      // Clearing avoids invalidating concurrent cache reads for other threads.
+      removeLocalDraft(id, "clear");
+      return;
+    }
+    const draft = queries.getQueryData<Draft>(["composer-draft", id]);
+    const empty: Draft = { text: "", skillIds: [], attachments: [] };
+    updateComposerDraft(queries, id, empty);
+    drafts.current.delete(id);
+    for (const key of draft?.attachments ?? []) pool.remove(id, key);
+    if (props.draftCache)
+      void attempt(() => props.draftCache!.saveDraft(props.scope, id, empty), setError);
   }
   function select(id: string) {
     setExternal(false);
@@ -782,6 +804,7 @@ function Workspace(props: AppProps) {
                           onRename={(id, title) => setRename({ id, title })}
                           onArchive={(id, archived) => void update(id, { archived })}
                           onDelete={setConfirmDelete}
+                          onDiscardDraft={discardDraft}
                         />
                       ) : (
                         <VirtualList
@@ -810,6 +833,7 @@ function Workspace(props: AppProps) {
                               onRename={(id, title) => setRename({ id, title })}
                               onArchive={(id, archived) => void update(id, { archived })}
                               onDelete={setConfirmDelete}
+                              onDiscardDraft={discardDraft}
                             />
                           )}
                         />

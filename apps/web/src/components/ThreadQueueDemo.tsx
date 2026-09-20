@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { CircleCheck, Pencil, Undo2 } from "lucide-react";
+import { CircleCheck, Pencil, Undo2, X } from "lucide-react";
 import type { NativeThread } from "@stanley2058/lilac-client-protocol";
 import { moveInQueues, type ThreadQueues } from "../sidebar-order";
 import { ThreadQueue } from "./ThreadQueue";
@@ -16,9 +16,7 @@ const titles = [
   "Review the weekend itinerary",
   "Write up the meeting notes",
 ];
-function replyDraft(id: string) {
-  return id === "queue-demo-0" ? "reply" : undefined;
-}
+
 function initialQueues(): ThreadQueues {
   const entries = titles.map((title, index) => {
     const source: NativeThread = {
@@ -44,6 +42,20 @@ export function ThreadQueueDemo() {
   const [queues, setQueues] = useState(initialQueues);
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState("");
+  const [replyDraftId, setReplyDraftId] = useState<string>("queue-demo-0");
+  function replyDraft(id: string) {
+    return id === replyDraftId ? "reply" : undefined;
+  }
+  function discard(id: string) {
+    if (id === replyDraftId) {
+      setReplyDraftId("");
+      return;
+    }
+    setQueues((current) => ({
+      ...current,
+      active: current.active.filter((entry) => entry.id !== id),
+    }));
+  }
   return (
     <div className="ds-queue-preview">
       <ThreadQueue
@@ -68,6 +80,15 @@ export function ThreadQueueDemo() {
             onSelect={() => setSelected(entry.id)}
             actions={
               <>
+                {selected !== entry.id && (!entry.source || entry.id === replyDraftId) ? (
+                  <IconButton
+                    label={`Discard draft for ${entry.source?.title ?? draftTitles[entry.id]}`}
+                    tooltip="Discard draft"
+                    onClick={() => discard(entry.id)}
+                  >
+                    <X />
+                  </IconButton>
+                ) : null}
                 {entry.source ? (
                   <IconButton
                     label={section === "settled" ? "Unsettle" : "Settle"}
