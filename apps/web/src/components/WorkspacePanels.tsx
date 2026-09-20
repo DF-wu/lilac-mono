@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import "./workspace-panels.css";
 
 export function WorkspacePanels({
@@ -10,13 +10,8 @@ export function WorkspacePanels({
   rightOpen: boolean;
   children: ReactNode;
 }) {
-  const grid = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    if (grid.current) delete grid.current.dataset.resized;
-  }, [leftOpen, rightOpen]);
   return (
     <div
-      ref={grid}
       className="workspace-panels"
       data-has-left={leftOpen !== undefined}
       data-left-open={leftOpen ?? false}
@@ -25,6 +20,12 @@ export function WorkspacePanels({
       {children}
     </div>
   );
+}
+
+function restorePanelTransition(grid: HTMLElement) {
+  // Commit the final track sizes while transitions are disabled, before restoring close/open motion.
+  void getComputedStyle(grid).gridTemplateColumns;
+  delete grid.dataset.resizing;
 }
 
 const minimumChatWidth = 160;
@@ -62,7 +63,7 @@ export function WorkspaceSidePanel({
     const current = drag.current;
     if (!current) return;
     drag.current = null;
-    delete current.grid.dataset.resizing;
+    restorePanelTransition(current.grid);
     if (handle.current?.hasPointerCapture(current.pointerId)) {
       handle.current.releasePointerCapture(current.pointerId);
     }
@@ -101,7 +102,6 @@ export function WorkspaceSidePanel({
 
   function resize(grid: HTMLElement, width: number, max: number) {
     const pixels = Math.round(Math.max(sizes.min, Math.min(max, width)));
-    grid.dataset.resized = "true";
     grid.style.setProperty(`--${side}-panel-width`, `${pixels}px`);
     handle.current?.setAttribute("aria-valuenow", String(pixels));
   }
@@ -159,7 +159,9 @@ export function WorkspaceSidePanel({
           let width = bounds.width + delta;
           if (event.key === "Home") width = sizes.min;
           if (event.key === "End") width = bounds.max;
+          bounds.grid.dataset.resizing = "true";
           resize(bounds.grid, width, bounds.max);
+          restorePanelTransition(bounds.grid);
         }}
       />
     </div>
