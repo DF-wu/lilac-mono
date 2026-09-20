@@ -1,3 +1,4 @@
+import { updatePanelWidth } from "./panel-width";
 import { useMemo } from "react";
 import { useStore } from "zustand";
 import { demoSubagents, demoSubagentTranscript } from "../agent-work-fixtures";
@@ -31,7 +32,7 @@ export function AgentWorkDemo() {
   const [panel] = useState(createSubagentPanelStore);
   const panelOpen = useStore(panel, (state) => state.open);
   const panelSelection = useStore(panel, (state) => state.selection);
-  const [panelWidth, setPanelWidth] = useState(360);
+  const workspaceElement = useRef<HTMLDivElement>(null);
   const [panelSliding, setPanelSliding] = useState(false);
   const [previousOpen, setPreviousOpen] = useState(panelOpen);
   const panelGroup = useRef<HTMLDivElement>(null);
@@ -175,12 +176,7 @@ export function AgentWorkDemo() {
       <SubagentContext value={agentContext}>
         <div
           className={`ds-agent-workspace ${panelOpen ? "" : "right-panel-hidden"}`}
-          style={
-            {
-              "--right-panel-width": `${panelWidth}px`,
-              "--right-panel-offset": `${panelWidth + 1}px`,
-            } as React.CSSProperties
-          }
+          ref={workspaceElement}
         >
           <RightPanelToggle open={panelOpen} onToggle={panel.getState().toggle} />
           <ResizablePanelGroup
@@ -219,7 +215,8 @@ export function AgentWorkDemo() {
               inert={!panelOpen}
               aria-hidden={!panelOpen}
               onResize={(size) => {
-                if (panelOpen && !panelSliding && size.inPixels > 0) setPanelWidth(size.inPixels);
+                if (panelOpen && !panelSliding && size.inPixels > 0)
+                  updatePanelWidth(workspaceElement.current, "right", size.inPixels);
               }}
             >
               <SubagentPanelView

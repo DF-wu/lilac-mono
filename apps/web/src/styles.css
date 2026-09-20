@@ -1595,3 +1595,10 @@ progress {
   .right-panel-hidden .right-panel { transform: translateX(100%); }
   .right-panel-resize-handle { display: none; }
 }
+
+.app-shell {
+  --sidebar-panel-width: 288px;
+  --sidebar-offset: 289px;
+  --right-panel-width: 360px;
+  --right-panel-offset: 361px;
+}

@@ -1,3 +1,4 @@
+import { updatePanelWidth } from "./components/panel-width";
 import {
   NativeSubagentPanel,
   NativeSubagentProvider,
@@ -8,16 +9,7 @@ import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-quer
 import { profileOptions, searchOptions, threadOptions, useNativeOnline } from "./queries";
 import { useStore } from "zustand";
 import { WorkspaceProvider, useWorkspace } from "./workspace-context";
-import {
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type CSSProperties,
-} from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Result } from "better-result";
 import { Tooltip } from "@base-ui/react/tooltip";
 import {
@@ -93,7 +85,7 @@ function Workspace(props: AppProps) {
   const routeDraftId = useLocation({ select: (location) => location.state.draftThreadId });
   const { pool, drafts: draftStore, subagentPanel } = useWorkspace();
   const rightOpen = useStore(subagentPanel, (state) => state.open);
-  const [rightPixels, setRightPixels] = useState(360);
+  const workspaceElement = useRef<HTMLElement>(null);
   const [rightSliding, setRightSliding] = useState(false);
   const [lastRightOpen, setLastRightOpen] = useState(rightOpen);
   if (lastRightOpen !== rightOpen) {
@@ -137,7 +129,6 @@ function Workspace(props: AppProps) {
   const [external, setExternal] = useState(false);
   const [externalId, setExternalId] = useState<string>();
   const [sidebar, setSidebar] = useState(true);
-  const [sidebarPixels, setSidebarPixels] = useState(288);
   const [sidebarSliding, setSidebarSliding] = useState(false);
   const panelGroup = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -654,14 +645,7 @@ function Workspace(props: AppProps) {
         <Tooltip.Provider delay={350}>
           <main
             className={`app-shell ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
-            style={
-              {
-                "--sidebar-panel-width": `${sidebarPixels}px`,
-                "--sidebar-offset": `${sidebarPixels + 1}px`,
-                "--right-panel-width": `${rightPixels}px`,
-                "--right-panel-offset": `${rightPixels + 1}px`,
-              } as CSSProperties
-            }
+            ref={workspaceElement}
             aria-label="Chat workspace"
           >
             <div className="sidebar-toggle">
@@ -689,7 +673,7 @@ function Workspace(props: AppProps) {
                 aria-hidden={!sidebar}
                 onResize={(size) => {
                   if (sidebar && !sidebarSliding && !rightSliding && size.inPixels > 0)
-                    setSidebarPixels(size.inPixels);
+                    updatePanelWidth(workspaceElement.current, "sidebar", size.inPixels);
                 }}
                 id="sidebar"
                 groupResizeBehavior="preserve-pixel-size"
@@ -999,7 +983,7 @@ function Workspace(props: AppProps) {
                 groupResizeBehavior="preserve-pixel-size"
                 onResize={(size) => {
                   if (rightOpen && !rightSliding && !sidebarSliding && size.inPixels > 0)
-                    setRightPixels(size.inPixels);
+                    updatePanelWidth(workspaceElement.current, "right", size.inPixels);
                 }}
               >
                 <NativeSubagentPanel threadId={selectedId ?? ""} foreground={active && !external} />
