@@ -230,6 +230,48 @@ export class NativeStore {
     });
   }
 
+  setUserProfile(
+    actorId: string,
+    input: {
+      displayName?: string;
+      avatar?: NativeUser["avatar"] | null;
+      providerAvatarUrl?: string | null;
+    },
+  ): NativeStoreResult<NativeUser> {
+    const store = this;
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const current = yield* store.getUser(actorId);
+        if (current.role === "service")
+          return Result.err(nativeFailure("forbidden", "Service profiles cannot be edited here"));
+        if (
+          input.displayName !== undefined &&
+          (!input.displayName.trim() || input.displayName.length > 256)
+        )
+          return Result.err(
+            nativeFailure("invalid", "Display name must contain 1 to 256 characters"),
+          );
+        const { avatar: oldAvatar, providerAvatarUrl: oldProviderAvatarUrl, ...base } = current;
+        const avatar = input.avatar === undefined ? oldAvatar : input.avatar;
+        const providerAvatarUrl =
+          input.providerAvatarUrl === undefined ? oldProviderAvatarUrl : input.providerAvatarUrl;
+        const next = {
+          ...base,
+          displayName: input.displayName?.trim() ?? current.displayName,
+          ...(avatar ? { avatar } : {}),
+          ...(providerAvatarUrl ? { providerAvatarUrl } : {}),
+        };
+        if (
+          next.displayName === current.displayName &&
+          (avatar ?? null) === (oldAvatar ?? null) &&
+          (providerAvatarUrl ?? null) === (oldProviderAvatarUrl ?? null)
+        )
+          return Result.ok(current);
+        return store.upsertUser(next);
+      }),
+    );
+  }
+
   setAgentIdentity(
     actorId: string,
     input: { displayName?: string; avatar?: NativeUser["avatar"] | null },
@@ -366,6 +408,7 @@ export class NativeStore {
         title: thread.title,
         starterId: thread.starterId,
         starterDisplayName: starter.displayName,
+        starterAvatarUrl: nativeUserDisplay(starter).avatarUrl,
         displayStatus,
         archived: thread.archived,
         updatedAt: thread.updatedAt,

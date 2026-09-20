@@ -22,6 +22,7 @@ export const nativeUserSchema = z.strictObject({
   id,
   providerId: id,
   displayName: z.string().max(256),
+  providerAvatarUrl: z.url().max(2048).optional(),
   avatar: z
     .strictObject({
       blob: blobRefV1Schema,

@@ -107,6 +107,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   });
   const resources = new NativeResourceService({
     native: store,
+    profileProvider: clerk ?? undefined,
     resources: options.transcript,
     access: options.resourceAccess,
     blobs: options.blobs,
@@ -246,7 +247,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     search: searchStore,
     external,
     surface,
-    ...(clerk ? { lookupUser: clerk.lookupUser } : {}),
+    ...(clerk ? { lookupUser: clerk.lookupUser, profileProvider: clerk } : {}),
   });
   const gateway = createNativeGateway({
     metrics,

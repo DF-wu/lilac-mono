@@ -8,6 +8,7 @@ export const participantRoleSchema = z.enum(["read", "edit"]);
 export const nativeUserSchema = z.strictObject({
   id: identitySchema,
   displayName: z.string().min(1).max(256),
+  avatarUrl: z.string().max(2048).optional(),
   role: z.enum(["owner", "participant", "service"]),
   toolMode: toolModeSchema,
 });
@@ -20,6 +21,7 @@ export const nativeThreadSchema = z.strictObject({
   id: identitySchema,
   title: z.string().max(512),
   starterId: identitySchema,
+  starterAvatarUrl: z.string().max(2048).optional(),
   starterDisplayName: z.string().max(256).optional(),
   displayStatus: z.enum(["idle", "completed", "working", "error"]).optional(),
   activeRunId: runIdentitySchema.optional(),

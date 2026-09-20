@@ -12,5 +12,16 @@ export function agentIdentity(user: NativeUser): AgentIdentity {
 }
 
 export function nativeUserDisplay(user: NativeUser): DisplayUser {
-  return { id: user.id, displayName: user.displayName, role: user.role, toolMode: user.toolMode };
+  const avatarUrl =
+    user.providerAvatarUrl ??
+    (user.avatar
+      ? `/api/users/${encodeURIComponent(user.id)}/avatar?revision=${user.avatar.blob.sha256}`
+      : undefined);
+  return {
+    id: user.id,
+    displayName: user.displayName,
+    role: user.role,
+    toolMode: user.toolMode,
+    ...(avatarUrl ? { avatarUrl } : {}),
+  };
 }

@@ -136,7 +136,7 @@ test("Clerk browser installation does not require a TUI OAuth application", asyn
   expect(installation.store.findUserByProviderId("user_fixture").unwrap()?.id).toBe("owner");
 });
 
-test("reopening an installation preserves the configured agent identity", async () => {
+test("reopening an installation preserves agent and account profiles", async () => {
   const options = await fixture();
   const first = (await openNativeInstallation(options)).unwrap();
   first.store
@@ -153,9 +153,12 @@ test("reopening an installation preserves the configured agent identity", async 
       },
     })
     .unwrap();
+  const avatar = first.store.getUser("lilac").unwrap().avatar;
+  first.store.setUserProfile("owner", { displayName: "River", avatar }).unwrap();
   first.store.close();
   const reopened = (await openNativeInstallation(options)).unwrap();
   installations.push(reopened);
+  expect(reopened.store.getUser("owner").unwrap()).toMatchObject({ displayName: "River", avatar });
   expect(reopened.store.getUser("lilac").unwrap()).toMatchObject({
     displayName: "Garden",
     avatar: { mediaType: "image/png", blob: { byteLength: 42 } },

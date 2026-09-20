@@ -30,6 +30,19 @@ Browser projection caches are scoped by installation, principal, protocol and pr
 They are disposable: unsupported versions or invalid coverage require a fresh recent window, while
 server conversation history remains authoritative. Never copy one user's cache into another scope.
 
+## Native account profiles
+
+Native users can edit their own display name and avatar. Local profiles use the existing name and
+managed avatar fields; startup preserves the owner's edits. Clerk installations save names and images
+in Clerk, then project them locally. Display names update Clerk's first name and clear its last name;
+sign-in usernames are unchanged. The optional stored `providerAvatarUrl` holds Clerk's profile image
+URL. Existing records need no backfill. Older strict record parsers cannot read this new field.
+
+The v1 wire contract adds `profile.get` and `profile.update`, optional `avatarUrl` on display users, and
+optional `starterAvatarUrl` on thread summaries. Authenticated `PUT`/`DELETE /api/profile/avatar` edits
+only the caller's avatar. `GET /api/users/:id/avatar` reads local public profile images. Managed blob
+references and provider user IDs remain private. Clients and servers should be updated together.
+
 ## Native display identity and previews
 
 Native v1 user records now accept an optional `avatar` containing a managed blob reference and a

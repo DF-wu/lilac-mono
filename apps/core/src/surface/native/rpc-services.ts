@@ -42,6 +42,7 @@ export type NativeRpcServiceOptions = {
     NativeSurfaceStore,
     "markTurnRead" | "setReaction" | "invokeAction" | "personalizeMessage" | "personalizePart"
   >;
+  profileProvider?: Pick<NativeClerkAuthenticator, "lookupUser" | "updateDisplayName">;
   lookupUser?: NativeClerkAuthenticator["lookupUser"];
   resolveModel: (modelId?: string) => Result<DurableResolvedModelRequest, Error>;
 };
@@ -68,6 +69,7 @@ function summarySignature(thread: NativeThread): string {
     thread.archived,
     thread.capabilities,
     thread.starterDisplayName,
+    thread.starterAvatarUrl,
     thread.displayStatus,
   ]);
 }
@@ -613,6 +615,45 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
       },
       remove(principal, input) {
         return store.shareThread(principal.userId, { ...input, grant: null }).map(success);
+      },
+    },
+    profile: {
+      async get(principal) {
+        return Result.gen(async function* () {
+          const user = yield* store.getUser(principal.userId);
+          if (principal.provider !== "clerk") return Result.ok(nativeViewer(user));
+          if (!options.profileProvider)
+            return Result.err(nativeFailure("invalid", "Profile provider is unavailable"));
+          const profile = yield* Result.await(options.profileProvider.lookupUser(user.providerId));
+          const current = yield* store.getUser(user.id);
+          if (
+            current.displayName !== user.displayName ||
+            current.providerAvatarUrl !== user.providerAvatarUrl ||
+            current.avatar?.blob.sha256 !== user.avatar?.blob.sha256
+          )
+            return Result.ok(nativeViewer(current));
+          const updated = yield* store.setUserProfile(user.id, {
+            displayName: profile.displayName,
+            providerAvatarUrl: profile.avatarUrl ?? null,
+          });
+          return Result.ok(nativeViewer(updated));
+        });
+      },
+      async update(principal, input) {
+        return Result.gen(async function* () {
+          const user = yield* store.getUser(principal.userId);
+          if (principal.provider !== "clerk")
+            return store.setUserProfile(user.id, input).map(nativeViewer);
+          if (!options.profileProvider)
+            return Result.err(nativeFailure("invalid", "Profile provider is unavailable"));
+          const profile = yield* Result.await(
+            options.profileProvider.updateDisplayName(user.providerId, input.displayName),
+          );
+          const updated = yield* store.setUserProfile(user.id, {
+            displayName: profile.displayName,
+          });
+          return Result.ok(nativeViewer(updated));
+        });
       },
     },
     identity: {

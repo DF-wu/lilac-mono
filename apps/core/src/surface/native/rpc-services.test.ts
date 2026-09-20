@@ -30,7 +30,9 @@ const reader: NativePrincipal = {
   provider: "clerk",
 };
 
-function fixture() {
+function fixture(
+  profileProvider?: Parameters<typeof createNativeRpcServices>[0]["profileProvider"],
+) {
   const db = new Database(":memory:");
   const store = new NativeStore(db);
   store.initialize().unwrap();
@@ -66,6 +68,7 @@ function fixture() {
   let modelResolutions = 0;
   let kickCalls = 0;
   const services = createNativeRpcServices({
+    profileProvider,
     store,
     auth,
     resolveModel: () => {
@@ -633,4 +636,93 @@ test("user and participant RPC projections never expose stored avatar blobs", as
   expect((await state.services.identity.update(reader, { displayName: "Changed" })).isErr()).toBe(
     true,
   );
+});
+
+test("participants can edit only their profile while preserving authority", async () => {
+  using state = fixture();
+  const actor = { ...reader, provider: "local" as const };
+  const saved = (await state.services.profile.update(actor, { displayName: "  River  " })).unwrap();
+  expect(saved).toMatchObject({
+    id: "reader",
+    displayName: "River",
+    role: "participant",
+    toolMode: "restricted",
+  });
+  expect(saved).not.toHaveProperty("providerId");
+  expect((await state.services.profile.get(actor, {})).unwrap()).toEqual(saved);
+  expect(state.store.getUser("owner").unwrap().displayName).toBe("Owner");
+  expect((await state.services.profile.update(actor, { displayName: " " })).isErr()).toBe(true);
+});
+
+test("Clerk profiles save to the stored provider identity and synchronize public fields", async () => {
+  const calls: string[] = [];
+  using state = fixture({
+    lookupUser: async (providerUserId) =>
+      Result.ok({
+        providerUserId,
+        displayName: "River",
+        avatarUrl: "https://img.clerk.com/avatar.png",
+      }),
+    updateDisplayName: async (providerUserId, displayName) => {
+      calls.push(providerUserId);
+      return Result.ok({ providerUserId, displayName });
+    },
+  });
+  const synced = (await state.services.profile.get(reader, {})).unwrap();
+  expect(synced.avatarUrl).toBe("https://img.clerk.com/avatar.png");
+  const saved = (
+    await state.services.profile.update(
+      { ...reader, providerUserId: "forged" },
+      { displayName: "Sky" },
+    )
+  ).unwrap();
+  expect(calls).toEqual(["reader_provider"]);
+  expect(saved.displayName).toBe("Sky");
+  expect(saved.avatarUrl).toBe("https://img.clerk.com/avatar.png");
+  expect(state.store.getUser("reader").unwrap().role).toBe("participant");
+});
+
+test("failed Clerk profile writes preserve the local profile", async () => {
+  using state = fixture({
+    lookupUser: async () => Result.err(authFailure("unavailable", "Unavailable")),
+    updateDisplayName: async () => Result.err(authFailure("unavailable", "Unavailable")),
+  });
+  expect((await state.services.profile.update(reader, { displayName: "Unsaved" })).isErr()).toBe(
+    true,
+  );
+  expect(state.store.getUser("reader").unwrap().displayName).toBe("Reader");
+});
+
+test("a stale Clerk read cannot overwrite a completed profile save", async () => {
+  const lookup =
+    Promise.withResolvers<
+      Result<{ providerUserId: string; displayName: string }, import("./auth").NativeAuthError>
+    >();
+  using state = fixture({
+    lookupUser: () => lookup.promise,
+    updateDisplayName: async (providerUserId, displayName) =>
+      Result.ok({ providerUserId, displayName }),
+  });
+  const pending = state.services.profile.get(reader, {});
+  await state.services.profile.update(reader, { displayName: "Saved name" });
+  lookup.resolve(Result.ok({ providerUserId: "reader_provider", displayName: "Old name" }));
+  expect((await pending).unwrap().displayName).toBe("Saved name");
+  expect(state.store.getUser("reader").unwrap().displayName).toBe("Saved name");
+});
+
+test("unchanged Clerk reads do not notify catalog watchers", async () => {
+  using state = fixture({
+    lookupUser: async (providerUserId) => Result.ok({ providerUserId, displayName: "Reader" }),
+    updateDisplayName: async (providerUserId, displayName) =>
+      Result.ok({ providerUserId, displayName }),
+  });
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  let notifications = 0;
+  const stop = state.store.subscribe(() => {
+    notifications++;
+  });
+  (await state.services.profile.get(reader, {})).unwrap();
+  (await state.services.profile.get(reader, {})).unwrap();
+  expect(notifications).toBe(0);
+  stop();
 });

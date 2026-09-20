@@ -21,9 +21,37 @@ export type NativeClerkAuthConfig = {
   resolveUser: (providerUserId: string) => Promise<Result<{ userId: string }, NativeAuthError>>;
 };
 
-export type NativeProviderUser = { providerUserId: string; displayName: string };
+export type NativeProviderUser = {
+  providerUserId: string;
+  displayName: string;
+  avatarUrl?: string;
+};
+
+export function providerProfile(user: {
+  id: string;
+  firstName: string | null;
+  lastName: string | null;
+  username: string | null;
+  hasImage: boolean;
+  imageUrl: string;
+}): NativeProviderUser {
+  return {
+    providerUserId: user.id,
+    displayName:
+      [user.firstName, user.lastName].filter(Boolean).join(" ") || user.username || user.id,
+    ...(user.hasImage ? { avatarUrl: user.imageUrl } : {}),
+  };
+}
 
 export interface NativeClerkAuthenticator extends NativeAuthenticator {
+  updateDisplayName(
+    providerUserId: string,
+    displayName: string,
+  ): Promise<Result<NativeProviderUser, NativeAuthError>>;
+  updateAvatar(
+    providerUserId: string,
+    file: File | null,
+  ): Promise<Result<NativeProviderUser, NativeAuthError>>;
   lookupUsers(query: string): Promise<Result<NativeProviderUser[], NativeAuthError>>;
   lookupUser(providerUserId: string): Promise<Result<NativeProviderUser, NativeAuthError>>;
 }
@@ -80,13 +108,7 @@ export async function createNativeClerkAuthenticator(
         try: () => client.users.getUserList({ query, limit: 25, orderBy: "+first_name" }),
         catch: () => authFailure("unavailable", "Provider user directory is unavailable"),
       });
-      return users.map(({ data }) =>
-        data.map((user) => ({
-          providerUserId: user.id,
-          displayName:
-            [user.firstName, user.lastName].filter(Boolean).join(" ") || user.username || user.id,
-        })),
-      );
+      return users.map(({ data }) => data.map(providerProfile));
     }
 
     async function lookupUser(
@@ -96,11 +118,34 @@ export async function createNativeClerkAuthenticator(
         try: () => client.users.getUser(providerUserId),
         catch: () => authFailure("unavailable", "Provider user is unavailable"),
       });
-      return user.map((value) => ({
-        providerUserId: value.id,
-        displayName:
-          [value.firstName, value.lastName].filter(Boolean).join(" ") || value.username || value.id,
-      }));
+      return user.map(providerProfile);
+    }
+
+    async function updateDisplayName(
+      providerUserId: string,
+      displayName: string,
+    ): Promise<Result<NativeProviderUser, NativeAuthError>> {
+      const saved = await Result.tryPromise({
+        try: () =>
+          client.users.updateUser(providerUserId, { firstName: displayName, lastName: "" }),
+        catch: () =>
+          authFailure("unavailable", "Could not save your display name in Clerk. Try again."),
+      });
+      return saved.map(providerProfile);
+    }
+
+    async function updateAvatar(
+      providerUserId: string,
+      file: File | null,
+    ): Promise<Result<NativeProviderUser, NativeAuthError>> {
+      const saved = await Result.tryPromise({
+        try: () =>
+          file
+            ? client.users.updateUserProfileImage(providerUserId, { file })
+            : client.users.deleteUserProfileImage(providerUserId),
+        catch: () => authFailure("unavailable", "Could not save your avatar in Clerk. Try again."),
+      });
+      return saved.map(providerProfile);
     }
 
     function checkSession(principal: NativePrincipal): Result<void, NativeAuthError> {
@@ -226,6 +271,8 @@ export async function createNativeClerkAuthenticator(
       checkSession,
       reauthenticate,
       logout,
+      updateDisplayName,
+      updateAvatar,
       lookupUsers,
       lookupUser,
     });

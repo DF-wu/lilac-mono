@@ -148,10 +148,12 @@ async function initializeNativeInstallation(
       return Result.err(
         new NativeInstallationFailed({ message: "Native owner provider identity is required" }),
       );
+    const owner = yield* store.findUserByProviderId(providerId);
     yield* store.upsertUser({
+      ...owner,
       id: config.auth.ownerId,
       providerId,
-      displayName: "Owner",
+      displayName: owner?.displayName ?? "Owner",
       role: "owner",
       toolMode: "full",
     });

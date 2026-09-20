@@ -1,3 +1,5 @@
+import { nativeUserDisplay } from "../../../src/surface/native/identity";
+import { authFailure } from "../../../src/surface/native/auth";
 import { nativeFailure } from "../../../src/surface/native/errors";
 import { describe, expect, test, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -445,4 +447,145 @@ describe("native identity and text previews", () => {
       error: "Text preview is unavailable for this binary file",
     });
   });
+});
+
+test("participants upload and remove only their own public avatar", async () => {
+  const f = await fixture();
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const uploaded = await f.service.handle(
+    new Request("http://native/api/profile/avatar", {
+      method: "PUT",
+      headers: { "content-type": "image/png" },
+      body: png,
+    }),
+    "alice",
+  );
+  expect(uploaded?.status).toBe(200);
+  expect(await uploaded?.json()).toMatchObject({
+    id: "alice",
+    avatarUrl: expect.stringContaining("/api/users/alice/avatar?revision="),
+  });
+  expect(value(f.native.getUser("bob")).avatar).toBeUndefined();
+  const read = await f.service.handle(new Request("http://native/api/users/alice/avatar"), "bob");
+  expect(Buffer.from(await read!.arrayBuffer())).toEqual(png);
+  expect(
+    await f.service.handle(
+      new Request("http://native/api/users/alice/avatar", { method: "DELETE" }),
+      "bob",
+    ),
+  ).toBeUndefined();
+  const invalid = await f.service.handle(
+    new Request("http://native/api/profile/avatar", {
+      method: "PUT",
+      headers: { "content-type": "image/png" },
+      body: "not an image",
+    }),
+    "alice",
+  );
+  expect(invalid?.status).toBe(400);
+  const deleted = await f.service.handle(
+    new Request("http://native/api/profile/avatar", { method: "DELETE" }),
+    "alice",
+  );
+  expect(deleted?.status).toBe(200);
+  expect(value(f.native.getUser("alice")).avatar).toBeUndefined();
+  expect(
+    (await f.service.handle(new Request("http://native/api/users/alice/avatar"), "bob"))?.status,
+  ).toBe(404);
+});
+
+test("Clerk avatars are validated, saved in the provider, and projected without local blobs", async () => {
+  const f = await fixture();
+  const calls: Array<{ id: string; file: File | null }> = [];
+  let fail = false;
+  const service = new NativeResourceService({
+    ...f.service.dependencies,
+    profileProvider: {
+      updateAvatar: async (id, file) => {
+        calls.push({ id, file });
+        if (fail) return Result.err(authFailure("unavailable", "Clerk unavailable"));
+        return Result.ok({
+          providerUserId: id,
+          displayName: "Alice",
+          ...(file ? { avatarUrl: "https://img.clerk.com/alice.png" } : {}),
+        });
+      },
+    },
+  });
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const uploaded = await service.handle(
+    new Request("http://native/api/profile/avatar", {
+      method: "PUT",
+      headers: { "content-type": "image/png" },
+      body: png,
+    }),
+    "alice",
+  );
+  expect(uploaded?.status).toBe(200);
+  expect(await uploaded?.json()).toMatchObject({ avatarUrl: "https://img.clerk.com/alice.png" });
+  expect(calls[0]?.id).toBe("alice");
+  expect(calls[0]?.file?.type).toBe("image/png");
+  expect(Buffer.from(await calls[0]!.file!.arrayBuffer())).toEqual(png);
+  expect(value(f.native.getUser("alice")).avatar).toBeUndefined();
+  fail = true;
+  expect(
+    (
+      await service.handle(
+        new Request("http://native/api/profile/avatar", { method: "DELETE" }),
+        "alice",
+      )
+    )?.status,
+  ).toBe(503);
+  expect(value(f.native.getUser("alice")).providerAvatarUrl).toBe(
+    "https://img.clerk.com/alice.png",
+  );
+  fail = false;
+  expect(
+    (
+      await service.handle(
+        new Request("http://native/api/profile/avatar", { method: "DELETE" }),
+        "alice",
+      )
+    )?.status,
+  ).toBe(200);
+  expect(value(f.native.getUser("alice")).providerAvatarUrl).toBeUndefined();
+  const invalid = await service.handle(
+    new Request("http://native/api/profile/avatar", { method: "PUT", body: "fake image" }),
+    "alice",
+  );
+  expect(invalid?.status).toBe(400);
+  expect(calls).toHaveLength(3);
+});
+
+test("public avatar URLs round-trip encoded user IDs and reject malformed encoding", async () => {
+  const f = await fixture();
+  const id = "owner@example.com";
+  value(
+    f.native.upsertUser({
+      id,
+      providerId: id,
+      displayName: "Owner",
+      role: "participant",
+      toolMode: "restricted",
+    }),
+  );
+  const png = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=",
+    "base64",
+  );
+  await f.service.handle(
+    new Request("http://native/api/profile/avatar", { method: "PUT", body: png }),
+    id,
+  );
+  const url = nativeUserDisplay(value(f.native.getUser(id))).avatarUrl!;
+  expect((await f.service.handle(new Request(`http://native${url}`), "bob"))?.status).toBe(200);
+  expect(
+    (await f.service.handle(new Request("http://native/api/users/%ZZ/avatar"), "bob"))?.status,
+  ).toBe(400);
 });

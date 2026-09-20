@@ -1,4 +1,6 @@
-import { agentIdentity } from "./identity";
+import type { NativeClerkAuthenticator } from "./auth-clerk";
+import type { NativeAuthError } from "./auth";
+import { agentIdentity, nativeUserDisplay } from "./identity";
 import { readPreviewPrefix, textPreview } from "./resource-preview";
 import { classifyResourcePrefix } from "../../resource/resource-mime";
 import type { PersistedDataError } from "@stanley2058/lilac-utils";
@@ -32,11 +34,18 @@ export class NativeUploadSettlementFailed extends TaggedError("NativeUploadSettl
   readonly settlementFailure: NativeResourceStateError;
   readonly message: string;
 }> {}
-export type NativeResourceError = NativeResourceStateError | NativeUploadSettlementFailed;
+export type NativeResourceError =
+  | NativeResourceStateError
+  | NativeUploadSettlementFailed
+  | NativeAuthError;
 type NativeResult<T> = ResultType<T, NativeResourceError>;
 type NativeStateResult<T> = ResultType<T, NativeResourceStateError>;
 
 export interface NativeUploadStore {
+  setUserProfile?(
+    actorId: string,
+    input: { avatar?: NativeUser["avatar"] | null; providerAvatarUrl?: string | null },
+  ): NativeStateResult<NativeUser>;
   setAgentIdentity?(
     actorId: string,
     input: { displayName?: string; avatar?: NativeUser["avatar"] | null },
@@ -106,6 +115,7 @@ export class NativeResourceService {
   constructor(
     readonly dependencies: {
       native: NativeUploadStore;
+      profileProvider?: Pick<NativeClerkAuthenticator, "updateAvatar">;
       resources: ResourceStore & NativeResourceReferences;
       access: ResourceAccess;
       blobs: BlobStore;
@@ -521,11 +531,11 @@ export class NativeResourceService {
     });
   }
 
-  async handleAvatar(request: Request, actorId: string): Promise<Response> {
+  async handleAvatar(request: Request, actorId: string, targetId = "lilac"): Promise<Response> {
     const service = this;
     const result = await Result.gen(async function* () {
       const actor = yield* service.dependencies.native.getUser(actorId);
-      const identity = yield* service.dependencies.native.getUser("lilac");
+      const identity = yield* service.dependencies.native.getUser(targetId);
       if (request.method === "GET") {
         if (!identity.avatar)
           return Result.err(nativeFailure("not-found", "Avatar is unavailable"));
@@ -564,13 +574,21 @@ export class NativeResourceService {
         );
         return Result.ok(new Response(bytes, { headers }));
       }
-      if (actor.role !== "owner")
+      if (targetId !== "lilac" && (targetId !== actorId || actor.role === "service"))
+        return Result.err(nativeFailure("forbidden", "You can only edit your own profile"));
+      if (targetId === "lilac" && actor.role !== "owner")
         return Result.err(nativeFailure("forbidden", "Only the owner can change agent identity"));
-      const update = service.dependencies.native.setAgentIdentity?.bind(
-        service.dependencies.native,
-      );
+      const update = (
+        targetId === "lilac"
+          ? service.dependencies.native.setAgentIdentity
+          : service.dependencies.native.setUserProfile
+      )?.bind(service.dependencies.native);
+      const project = targetId === "lilac" ? agentIdentity : nativeUserDisplay;
+      const provider = targetId !== "lilac" ? service.dependencies.profileProvider : undefined;
       if (!update) return Result.err(nativeFailure("invalid", "Agent identity is unavailable"));
       if (request.method === "DELETE") {
+        if (provider)
+          return Result.ok(yield* Result.await(service.updateProviderAvatar(identity, null)));
         const changed = yield* update(actorId, { avatar: null });
         if (identity.avatar)
           yield* Result.await(
@@ -583,7 +601,7 @@ export class NativeResourceService {
               ),
           );
         return Result.ok(
-          Response.json(agentIdentity(changed), { headers: { "Cache-Control": "no-store" } }),
+          Response.json(project(changed), { headers: { "Cache-Control": "no-store" } }),
         );
       }
       if (request.method !== "PUT") return Result.ok(new Response(null, { status: 405 }));
@@ -610,6 +628,15 @@ export class NativeResourceService {
         mediaType !== "image/gif"
       )
         return Result.err(nativeFailure("invalid", "Choose a PNG, JPEG, WebP or GIF image"));
+      if (provider)
+        return Result.ok(
+          yield* Result.await(
+            service.updateProviderAvatar(
+              identity,
+              new File([new Uint8Array(bytes)], "avatar", { type: mediaType }),
+            ),
+          ),
+        );
       const transfer = yield* Result.await(
         service.dependencies.blobs
           .startUpload({ source: bytes, retention: { kind: "durable" } })
@@ -623,7 +650,7 @@ export class NativeResourceService {
         ),
       );
       const persisted = Result.gen(function* () {
-        const previous = yield* service.dependencies.native.getUser("lilac");
+        const previous = yield* service.dependencies.native.getUser(targetId);
         const changed = yield* update(actorId, { avatar: { blob, mediaType } });
         return Result.ok({ previous, changed });
       });
@@ -648,15 +675,57 @@ export class NativeResourceService {
             ),
         );
       return Result.ok(
-        Response.json(agentIdentity(changed), { headers: { "Cache-Control": "no-store" } }),
+        Response.json(project(changed), { headers: { "Cache-Control": "no-store" } }),
       );
     });
     return result.match({ ok: (response) => response, err: resourceFailureResponse });
   }
 
+  async updateProviderAvatar(
+    identity: NativeUser,
+    file: File | null,
+  ): Promise<NativeResult<Response>> {
+    const service = this;
+    return Result.gen(async function* () {
+      const provider = service.dependencies.profileProvider;
+      const update = service.dependencies.native.setUserProfile?.bind(service.dependencies.native);
+      if (!provider || !update)
+        return Result.err(nativeFailure("invalid", "Profile provider is unavailable"));
+      const profile = yield* Result.await(provider.updateAvatar(identity.providerId, file));
+      const changed = yield* update(identity.id, {
+        providerAvatarUrl: profile.avatarUrl ?? null,
+        avatar: null,
+      });
+      if (identity.avatar)
+        yield* Result.await(
+          service.dependencies.blobs
+            .delete(identity.avatar.blob)
+            .then((value) =>
+              value.mapError(() => nativeFailure("sqlite", "Previous avatar could not be removed")),
+            ),
+        );
+      return Result.ok(
+        Response.json(nativeUserDisplay(changed), { headers: { "Cache-Control": "no-store" } }),
+      );
+    });
+  }
+
   async handle(request: Request, actorId: string): Promise<Response | undefined> {
     const url = new URL(request.url);
     if (url.pathname === "/api/identity/avatar") return this.handleAvatar(request, actorId);
+    if (url.pathname === "/api/profile/avatar") return this.handleAvatar(request, actorId, actorId);
+    const avatarUserId = /^\/api\/users\/([^/]+)\/avatar$/u.exec(url.pathname)?.[1];
+    if (avatarUserId && request.method === "GET") {
+      const decoded = Result.try({
+        try: () => decodeURIComponent(avatarUserId),
+        catch: () => nativeFailure("invalid", "Invalid avatar user ID"),
+      }).match<{ id: string } | { response: Response }>({
+        ok: (id) => ({ id }),
+        err: (error) => ({ response: resourceFailureResponse(error) }),
+      });
+      if ("response" in decoded) return decoded.response;
+      return this.handleAvatar(request, actorId, decoded.id);
+    }
     const uploadId = /^\/api\/uploads\/([^/]+)$/u.exec(url.pathname)?.[1];
     if (uploadId !== undefined && request.method === "PUT") {
       if (!request.body) return Response.json({ error: "Missing upload bytes" }, { status: 400 });
@@ -800,6 +869,11 @@ export class NativeResourceService {
 }
 
 function resourceFailureResponse(error: NativeResourceError): Response {
+  if (error._tag === "NativeAuthError")
+    return Response.json(
+      { error: error.message },
+      { status: 503, headers: { "Cache-Control": "no-store" } },
+    );
   if (error._tag !== "NativeStoreFailure")
     return Response.json({ error: "File metadata is unavailable" }, { status: 503 });
   const statusByCode = {

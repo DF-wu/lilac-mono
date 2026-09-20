@@ -216,6 +216,12 @@ export const nativeContract = {
       .output(successSchema),
     remove: procedure.input(threadIdInput.extend({ userId: identitySchema })).output(successSchema),
   },
+  profile: {
+    get: procedure.input(z.strictObject({})).output(nativeUserSchema),
+    update: procedure
+      .input(z.strictObject({ displayName: z.string().trim().min(1).max(256) }))
+      .output(nativeUserSchema),
+  },
   identity: {
     update: procedure
       .input(z.strictObject({ displayName: z.string().trim().min(1).max(256) }))
