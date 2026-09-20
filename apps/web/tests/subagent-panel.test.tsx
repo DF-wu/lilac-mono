@@ -7,7 +7,7 @@ import { SubagentContext } from "../src/components/subagent-context";
 import { ActivityItem } from "../src/components/Timeline";
 import { createSubagentPanelStore } from "../src/subagent-panel-store";
 
-const actions = { onSelect: () => {}, onBack: () => {}, onClose: () => {} };
+const actions = { onSelect: () => {}, onBack: () => {} };
 const slot = agentWorkStages.find((stage) => stage.id === "subagents-working")!.frames[0]!;
 const agents = demoSubagents(slot);
 

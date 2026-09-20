@@ -82,3 +82,5 @@
   .ds-agent-workspace .workspace-panels { --workspace-width: 100%; }
   .ds-agent-workspace .right-panel { width: min(90%, var(--right-panel-width)) !important; }
 }
+
+.ds-agent-preview { padding-top: calc(2rem + var(--space-3)); }

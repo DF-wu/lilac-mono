@@ -26,3 +26,8 @@
 .right-panel { min-width: 0; overflow: hidden; }
 .right-panel-resize-handle { flex: none; }
 :root[data-animation] .subagent-status .animate-spin { animation-duration: var(--motion-spin-duration) !important; }
+
+.right-panel-toggle { position: absolute; top: 0; right: var(--space-3); z-index: 40; height: 2rem; display: flex; align-items: center; }
+.right-panel-toggle .icon-button { width: var(--control-compact); height: var(--control-compact); }
+.subagent-panel-header { padding-right: calc(var(--space-3) + var(--control-compact) + var(--space-2)); }
+.app-shell.right-panel-hidden .thread-header { padding-right: calc(var(--space-3) + var(--control-compact) + var(--space-2)); }

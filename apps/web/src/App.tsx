@@ -1,5 +1,8 @@
-import { NativeSubagentPanel, NativeSubagentProvider } from "./components/SubagentPanel";
-import { PanelRightOpen, PanelRightClose } from "lucide-react";
+import {
+  NativeSubagentPanel,
+  NativeSubagentProvider,
+  RightPanelToggle,
+} from "./components/SubagentPanel";
 import { useLocation, useNavigate, useMatch, useRouter } from "@tanstack/react-router";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { profileOptions, searchOptions, threadOptions, useNativeOnline } from "./queries";
@@ -672,6 +675,7 @@ function Workspace(props: AppProps) {
                 {sidebar ? <PanelLeftClose /> : <PanelLeftOpen />}
               </IconButton>
             </div>
+            <RightPanelToggle open={rightOpen} onToggle={subagentPanel.getState().toggle} />
             <ResizablePanelGroup
               orientation="horizontal"
               className="workspace-panels"
@@ -962,12 +966,6 @@ function Workspace(props: AppProps) {
                                       </DropdownMenuContent>
                                     </DropdownMenu>
                                   ) : null}
-                                  <IconButton
-                                    label={rightOpen ? "Hide right panel" : "Show right panel"}
-                                    onClick={subagentPanel.getState().toggle}
-                                  >
-                                    {rightOpen ? <PanelRightClose /> : <PanelRightOpen />}
-                                  </IconButton>
                                 </header>
                               ) : undefined
                             }

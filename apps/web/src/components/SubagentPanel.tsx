@@ -8,6 +8,7 @@ import {
   CircleCheck,
   LoaderCircle,
   PanelRightClose,
+  PanelRightOpen,
 } from "lucide-react";
 import type { DisplayMessage, SubagentSummary } from "@stanley2058/lilac-client-protocol";
 import { useWorkspace } from "../workspace-context";
@@ -147,7 +148,6 @@ export function NativeSubagentPanel({
       unavailable={page?.unavailable}
       onSelect={(id) => actions.select(threadId, id)}
       onBack={actions.back}
-      onClose={actions.close}
       hasMore={agentId ? moreHistory : list.hasNextPage}
       loadingMore={agentId ? history.isFetchingNextPage : list.isFetchingNextPage}
       onMore={() => {
@@ -166,7 +166,6 @@ export function SubagentPanelView({
   unavailable,
   onSelect,
   onBack,
-  onClose,
   hasMore,
   loadingMore,
   onMore,
@@ -179,7 +178,6 @@ export function SubagentPanelView({
   unavailable?: boolean;
   onSelect: (id: string) => void;
   onBack: () => void;
-  onClose: () => void;
   hasMore?: boolean;
   loadingMore?: boolean;
   onMore?: () => void;
@@ -209,9 +207,6 @@ export function SubagentPanelView({
           <Bot />
         )}
         <h2>{selected ? subagentProfileName(selected.profile) : "Agents"}</h2>
-        <IconButton label="Close right panel" onClick={onClose}>
-          <PanelRightClose />
-        </IconButton>
       </header>
       {selected ? (
         <div className="subagent-heading">
@@ -302,4 +297,18 @@ function AgentStatus({ agent }: { agent: SubagentSummary }) {
   if (agent.state === "running") return <LoaderCircle className="animate-spin" />;
   if (agent.state === "complete") return <CircleCheck />;
   return <CircleAlert />;
+}
+
+export function RightPanelToggle({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+  return (
+    <div className="right-panel-toggle">
+      <IconButton
+        label={open ? "Hide right panel" : "Show right panel"}
+        aria-expanded={open}
+        onClick={onToggle}
+      >
+        {open ? <PanelRightClose /> : <PanelRightOpen />}
+      </IconButton>
+    </div>
+  );
 }

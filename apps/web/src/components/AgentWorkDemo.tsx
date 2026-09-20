@@ -1,10 +1,9 @@
 import { useMemo } from "react";
 import { useStore } from "zustand";
-import { PanelRightOpen } from "lucide-react";
 import { demoSubagents, demoSubagentTranscript } from "../agent-work-fixtures";
 import { createSubagentPanelStore } from "../subagent-panel-store";
 import { SubagentContext } from "./subagent-context";
-import { SubagentPanelView } from "./SubagentPanel";
+import { SubagentPanelView, RightPanelToggle } from "./SubagentPanel";
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "./ui/resizable";
 import { MessageArrivals } from "../message-arrivals";
 import { MessageArrivalsContext } from "./message-arrivals";
@@ -162,9 +161,6 @@ export function AgentWorkDemo() {
           >
             <ChevronRight />
           </IconButton>
-          <IconButton label="Toggle agents panel" onClick={panel.getState().toggle}>
-            <PanelRightOpen />
-          </IconButton>
           <IconButton label="Restart demo" onClick={() => select(0)}>
             <RotateCcw />
           </IconButton>
@@ -186,6 +182,7 @@ export function AgentWorkDemo() {
             } as React.CSSProperties
           }
         >
+          <RightPanelToggle open={panelOpen} onToggle={panel.getState().toggle} />
           <ResizablePanelGroup
             orientation="horizontal"
             className="workspace-panels"
@@ -231,7 +228,6 @@ export function AgentWorkDemo() {
                 messages={selectedAgent ? demoSubagentTranscript(selectedAgent) : []}
                 onSelect={agentContext.open}
                 onBack={panel.getState().back}
-                onClose={panel.getState().close}
               />
             </ResizablePanel>
           </ResizablePanelGroup>
