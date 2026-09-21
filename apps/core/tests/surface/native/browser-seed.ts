@@ -60,6 +60,11 @@ $$
 [Blocked script link](javascript:alert('native-fixture'))
 
 The composer must still work after this malformed reply.
+
+## File viewer
+
+Open \`./example.md\`, jump to \`./example.ts:123\`, or check \`./missing.txt\`.
+
 `;
 
 function completedTurn(

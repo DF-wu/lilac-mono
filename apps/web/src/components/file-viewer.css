@@ -1,0 +1,46 @@
+.file-panel { display: flex; flex-direction: column; height: 100%; min-width: 0; min-height: 0; background: var(--surface); }
+.file-panel-tabs-root { flex: 1; min-height: 0; gap: 0; }
+.file-panel-tab-bar { display: flex; align-items: center; gap: var(--space-1); height: 2rem; flex: none; padding: 0 calc(var(--space-3) + var(--control-compact) + var(--space-2)) 0 var(--space-2); }
+.file-panel-tabs { display: flex; justify-content: flex-start; overflow-x: auto; overflow-y: hidden; flex: 0 1 auto; width: auto; min-width: 0; padding: 0; gap: var(--space-1); background: none; scrollbar-width: none; }
+.file-panel-tab { position: relative; display: flex; flex: none; max-width: 12rem; }
+.file-panel-tab [role="tab"] { min-width: 0; height: var(--control-compact); padding: 0 var(--space-2); border: 0; }
+.file-panel-tab [role="tab"]::after { display: none; }
+.file-panel-tab [role="tab"][data-active] { background: var(--muted); }
+.file-panel-tab span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.file-panel-tab .file-tab-close { position: absolute; left: var(--space-1); top: 50%; transform: translateY(-50%); width: 1.25rem; height: 1.25rem; opacity: 0; background: var(--surface); }
+.file-panel-tab:hover .file-tab-close, .file-panel-tab:focus-within .file-tab-close { opacity: 1; }
+.file-panel-tab-bar > button { flex: none; width: var(--control-compact); height: var(--control-compact); }
+.file-panel-tab-content { position: relative; flex: 1; min-height: 0; min-width: 0; }
+.file-panel-tab-page { display: flex; flex-direction: column; position: absolute; inset: 0; min-height: 0; min-width: 0; }
+/* Match Tailwind preflight's layer so hidden tabs retain their virtualizer measurements. */
+@layer base {
+  .file-panel-tab-page[hidden] { display: flex !important; visibility: hidden; pointer-events: none; }
+}
+.file-source-heading { flex: 1; min-width: 0; }
+.file-panel-heading { display: flex; align-items: center; min-width: 0; padding: var(--space-2) var(--space-3); font-size: var(--text-sm); }
+.file-panel-heading span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-source { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; height: 100%; }
+.file-source-toolbar { display: flex; align-items: center; flex: none; justify-content: flex-end; padding: var(--space-1) var(--space-2); gap: var(--space-1); }
+.file-source-toolbar .icon-button { flex: none; width: var(--control-compact); height: var(--control-compact); }
+.file-status { display: grid; place-content: center; flex: 1; padding: var(--space-4); font-size: var(--text-sm); color: var(--muted-foreground); }
+.file-markdown { flex: 1; min-height: 0; overflow: auto; padding: var(--space-3); }
+.file-code { overflow: auto; flex: 1; min-height: 0; font-family: ui-monospace, monospace; font-size: var(--text-sm); line-height: 24px; overscroll-behavior: contain; }
+.file-code-lines { position: relative; width: 100%; }
+.file-code-line { position: absolute; top: 0; left: 0; display: grid; grid-template-columns: 5ch minmax(0, 1fr); width: 100%; min-height: 24px; padding-right: var(--space-3); }
+.file-code-line code { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.file-code[data-wrap="false"] .file-code-line { width: max-content; min-width: 100%; }
+.file-code[data-wrap="false"] code { white-space: pre; }
+.file-line-number { color: var(--muted-foreground); text-align: right; padding-right: 1.5ch; user-select: none; }
+.file-code-line[data-highlighted="true"] { background: color-mix(in srgb, var(--primary) 14%, transparent); }
+.file-notice { flex: none; padding: var(--space-2); color: var(--muted-foreground); font-size: var(--text-xs); }
+.markdown .file-link { display: inline-flex; vertical-align: baseline; align-items: center; gap: var(--space-1); padding: 0 var(--space-1); max-width: 100%; height: auto; font-family: ui-monospace, monospace; font-size: .9em; border-radius: var(--radius-sm); }
+.file-link svg { flex: none; width: 1em; height: 1em; }
+.file-link span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-context-target { display: contents; }
+.file-panel > .attachment-preview-body { padding: var(--space-2); }
+
+.file-code-fallback { white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--space-3); }
+.file-code-fallback[data-wrap="false"] { white-space: pre; }
+
+.file-source-heading .file-panel-heading { padding: var(--space-1) var(--space-1); }
+.file-panel-tab-page > .attachment-preview-body { padding: var(--space-2); }

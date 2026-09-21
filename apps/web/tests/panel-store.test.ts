@@ -36,7 +36,11 @@ describe("local panel layouts", () => {
   test("isolates installations and users", () => {
     const storage = memoryStorage();
     createPanelStore(scope, storage).getState().toggleSidebar();
-    createPanelStore(scope, storage).getState().toggle("shared-thread-id");
+    createPanelStore(scope, storage).getState().openFile("shared-thread-id", {
+      type: "path",
+      path: "/tmp/a.md",
+      name: "a.md",
+    });
     for (const other of [
       { ...scope, principalId: "other" },
       { ...scope, installationId: "other" },
@@ -44,6 +48,7 @@ describe("local panel layouts", () => {
       const state = createPanelStore(other, storage).getState();
       expect(state.sidebar.open).toBe(true);
       expect(state.threads.size).toBe(0);
+      expect(state.tabs.size).toBe(0);
     }
   });
 
@@ -121,4 +126,192 @@ describe("local panel layouts", () => {
     expect(accesses).toBe(0);
     expect(createPanelStore(undefined, storage).getState().threads.size).toBe(0);
   });
+});
+
+test("file tabs coexist with Agents, refocus without duplicates, and stay per thread", () => {
+  const storage = memoryStorage();
+  const store = createPanelStore(scope, storage);
+  const actions = store.getState();
+  const a = { type: "path", path: "/tmp/a.md", name: "a.md", line: 123 } as const;
+  const b = {
+    type: "resource",
+    href: "/api/resources/b",
+    resourceId: "b",
+    name: "b.pdf",
+    mediaType: "application/pdf",
+  } as const;
+  actions.resize("thread", 480);
+  actions.openFile("thread", a);
+  const layout = store.getState().threads.get("thread");
+  actions.openFile("thread", b);
+  actions.openFile("thread", { ...a, line: 140 });
+  expect(store.getState().tabs.get("thread")?.items).toHaveLength(3);
+  expect(store.getState().tabs.get("thread")?.activeId).toBe("path:/tmp/a.md");
+  expect(store.getState().threads.get("thread")).toBe(layout);
+  actions.select("thread", "agent");
+  expect(store.getState().tabs.get("thread")?.activeId).toBe("agents");
+  actions.openAgents("thread");
+  expect(store.getState().tabs.get("thread")?.items).toHaveLength(3);
+  actions.openFile("other", b);
+  expect(store.getState().tabs.get("other")?.items).toHaveLength(2);
+  actions.moveThread("thread", "saved");
+  expect(store.getState().tabs.get("saved")?.items).toHaveLength(3);
+  expect(store.getState().tabs.has("thread")).toBe(false);
+  expect(createPanelStore(scope, storage).getState().tabs).toEqual(store.getState().tabs);
+});
+
+test("closing tabs selects a neighbor and Agents can be reopened after the last tab closes", () => {
+  const store = createPanelStore();
+  const actions = store.getState();
+  actions.openFile("thread", { type: "path", path: "/a", name: "a" });
+  actions.openFile("thread", { type: "path", path: "/b", name: "b" });
+  actions.closeTab("thread", "path:/b");
+  expect(store.getState().tabs.get("thread")?.activeId).toBe("path:/a");
+  actions.closeTab("thread", "agents");
+  expect(store.getState().tabs.get("thread")?.activeId).toBe("path:/a");
+  actions.closeTab("thread", "path:/a");
+  expect(store.getState().tabs.get("thread")?.items).toEqual([]);
+  actions.openAgents("thread");
+  expect(store.getState().tabs.get("thread")).toEqual({
+    items: [{ id: "agents", type: "agents" }],
+    activeId: "agents",
+  });
+});
+
+test("resolved path aliases merge into the existing tab and retain line navigation", () => {
+  const store = createPanelStore();
+  const actions = store.getState();
+  const resolved = {
+    type: "resource",
+    path: "/work/a.ts",
+    href: "/api/files/a",
+    name: "a.ts",
+    mediaType: "text/plain",
+  } as const;
+  actions.openFile("thread", resolved);
+  actions.openFile("thread", { type: "path", path: "./a.ts", name: "a.ts", line: 123 });
+  actions.resolveFile("thread", "path:./a.ts", { ...resolved, line: 123 });
+  expect(store.getState().tabs.get("thread")).toEqual({
+    items: [
+      { id: "agents", type: "agents" },
+      { id: "path:/work/a.ts", type: "file", target: { ...resolved, line: 123 } },
+    ],
+    activeId: "path:/work/a.ts",
+  });
+});
+
+test("restores independent tab order and selection, including closed tabs and an empty panel", () => {
+  const storage = memoryStorage();
+  const store = createPanelStore(scope, storage);
+  const a = { type: "path", path: "/tmp/a.md", name: "a.md", line: 12, endLine: 15 } as const;
+  const b = {
+    type: "resource",
+    href: "/api/resources/b",
+    resourceId: "b",
+    name: "b.pdf",
+    mediaType: "application/pdf",
+  } as const;
+  store.getState().openFile("a", a);
+  store.getState().openFile("a", b);
+  store.getState().openFile("b", b);
+  store.getState().focusTab("a", "path:/tmp/a.md");
+  store.getState().toggle("a");
+  const loaded = createPanelStore(scope, storage);
+  expect(loaded.getState().tabs).toEqual(store.getState().tabs);
+  expect(loaded.getState().threads.get("a")?.open).toBe(false);
+  loaded.getState().closeTab("a", "resource:b");
+  loaded.getState().closeTab("b", "resource:b");
+  loaded.getState().closeTab("b", "agents");
+  const reloaded = createPanelStore(scope, storage);
+  expect(
+    reloaded
+      .getState()
+      .tabs.get("a")
+      ?.items.map((tab) => tab.id),
+  ).toEqual(["agents", "path:/tmp/a.md"]);
+  expect(reloaded.getState().tabs.get("b")).toEqual({ items: [] });
+  reloaded.getState().openFile("a", a);
+  expect(reloaded.getState().tabs.get("a")?.items).toHaveLength(2);
+});
+
+test("reads existing layout preferences and ignores malformed tab data independently", () => {
+  const layout = {
+    sidebar: { open: false, width: 330 },
+    threads: [["a", { open: true, width: 470 }]],
+  };
+  for (const value of [layout, { ...layout, tabs: [["a", { items: [], activeId: "missing" }]] }]) {
+    const storage = { getItem: () => JSON.stringify(value), setItem: () => {} };
+    const state = createPanelStore(scope, storage).getState();
+    expect(state.sidebar).toEqual(layout.sidebar);
+    expect(state.threads.get("a")).toEqual({ open: true, width: 470 });
+    expect(state.tabs.size).toBe(0);
+  }
+});
+
+test("published links and canonical inline paths share a tab in either opening order", () => {
+  const published = {
+    type: "resource",
+    href: "/api/files/published",
+    name: "example.md",
+    mediaType: "text/markdown",
+  } as const;
+  const resolved = { ...published, path: "/tmp/example.md", line: 12, endLine: 15 };
+  for (const [first, second] of [
+    [published, resolved],
+    [resolved, published],
+  ] as const) {
+    const store = createPanelStore();
+    store.getState().openFile("thread", first);
+    const id = store.getState().tabs.get("thread")?.activeId;
+    store.getState().openFile("thread", second);
+    expect(store.getState().tabs.get("thread")?.items).toHaveLength(2);
+    expect(store.getState().tabs.get("thread")?.activeId).toBe(id);
+  }
+  const store = createPanelStore();
+  store.getState().openFile("thread", published);
+  store.getState().openFile("thread", { type: "path", path: "./example.md", name: "example.md" });
+  store.getState().resolveFile("thread", "path:./example.md", resolved);
+  expect(store.getState().tabs.get("thread")?.items).toHaveLength(2);
+  expect(store.getState().tabs.get("thread")?.items[1]).toMatchObject({ target: resolved });
+  expect(store.getState().tabs.get("thread")?.activeId).toBe("resource:/api/files/published");
+});
+
+test("refocusing a resolved file preserves its media type and path while updating navigation", () => {
+  const store = createPanelStore();
+  const target = {
+    type: "resource",
+    href: "/api/files/image",
+    path: "/tmp/image.png",
+    name: "image.png",
+    mediaType: "image/png",
+    line: 12,
+  } as const;
+  store.getState().openFile("thread", target);
+  store.getState().openFile("thread", {
+    type: "resource",
+    href: target.href,
+    name: target.name,
+    mediaType: "application/octet-stream",
+  });
+  expect(store.getState().tabs.get("thread")?.items[1]).toMatchObject({
+    target: { path: target.path, mediaType: "image/png" },
+  });
+  store.getState().openFile("thread", {
+    type: "path",
+    path: target.path,
+    name: target.name,
+    line: 4,
+    endLine: 6,
+  });
+  expect(store.getState().tabs.get("thread")?.items[1]).toMatchObject({
+    target: {
+      type: "resource",
+      href: target.href,
+      path: target.path,
+      mediaType: "image/png",
+      line: 4,
+      endLine: 6,
+    },
+  });
+  expect(store.getState().tabs.get("thread")?.items).toHaveLength(2);
 });

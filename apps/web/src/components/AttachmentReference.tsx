@@ -1,3 +1,4 @@
+import { FileActions } from "./FileActions";
 import { useState, type ReactNode } from "react";
 import { FileText } from "lucide-react";
 import type { MessageResource } from "./message-resources";
@@ -18,36 +19,55 @@ export function AttachmentReference({
   const ready = resource.state === "ready";
   const image = ready && resource.mediaType.startsWith("image/") && !imageFailed;
   return (
-    <span className="sent-attachment-reference">
-      <Button
-        type="button"
-        variant="secondary"
-        className="sent-attachment-chip"
-        disabled={!ready}
-        aria-label={`Preview ${resource.name}`}
-        onClick={() => setOpen(true)}
-      >
-        {image ? (
-          <img
-            src={href}
-            alt=""
-            loading="lazy"
-            decoding="async"
-            onError={() => setImageFailed(true)}
+    <FileActions
+      disabled={!ready}
+      target={{
+        type: "resource",
+        href,
+        name: resource.name,
+        mediaType: resource.mediaType,
+        resourceId: resource.resourceId,
+      }}
+      onPreview={() => setOpen(true)}
+    >
+      <span className="sent-attachment-reference">
+        <Button
+          type="button"
+          variant="secondary"
+          className="sent-attachment-chip"
+          disabled={!ready}
+          aria-label={`Preview ${resource.name}`}
+          onClick={() => setOpen(true)}
+        >
+          {image ? (
+            <img
+              src={href}
+              alt=""
+              loading="lazy"
+              decoding="async"
+              onError={() => setImageFailed(true)}
+            />
+          ) : (
+            <FileText />
+          )}
+          <span>{children}</span>
+        </Button>
+        {open ? (
+          <ResourcePreview
+            name={resource.name}
+            href={href}
+            kind={attachmentKind(resource.mediaType, resource.name)}
+            target={{
+              type: "resource",
+              href,
+              name: resource.name,
+              mediaType: resource.mediaType,
+              resourceId: resource.resourceId,
+            }}
+            onClose={() => setOpen(false)}
           />
-        ) : (
-          <FileText />
-        )}
-        <span>{children}</span>
-      </Button>
-      {open ? (
-        <ResourcePreview
-          name={resource.name}
-          href={href}
-          kind={attachmentKind(resource.mediaType, resource.name)}
-          onClose={() => setOpen(false)}
-        />
-      ) : null}
-    </span>
+        ) : null}
+      </span>
+    </FileActions>
   );
 }

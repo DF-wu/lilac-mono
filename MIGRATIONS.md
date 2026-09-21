@@ -45,6 +45,13 @@ principal. The JSON value contains the global sidebar width/open state and right
 state pairs keyed by thread ID. Missing, invalid, or unavailable storage uses the existing defaults.
 Older clients ignore the new key. No backend data or existing browser preferences require migration.
 
+The value now also stores each thread's ordered tabs, file targets, and active tab ID in an optional
+`tabs` field. Existing values without tabs retain their layouts and start with the Agents tab.
+Malformed tab data resets tabs without discarding layout preferences. File targets accept an optional
+inclusive `endLine` alongside `line` for range navigation. File contents and subagent transcript
+selection are not stored. Builds predating this field reject the extended value and use
+default layouts; removing `tabs` from the value restores their ability to read the layout preferences.
+
 ## Native personal sidebar queues
 
 The native store adds `native_user_preferences` and `native_thread_preferences`. These additive

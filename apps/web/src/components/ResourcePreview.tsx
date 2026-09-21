@@ -1,7 +1,12 @@
+import { FileActions } from "./FileActions";
+import type { FileTarget } from "../file-target";
+import { useFileViewer } from "./file-viewer-context";
+import { FileSource } from "./FileSource";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type ReactNode, type PointerEvent } from "react";
 import type { DisplayPart } from "@stanley2058/lilac-client-protocol";
 import {
+  PanelRight,
   Check,
   Copy,
   Download,
@@ -16,8 +21,6 @@ import {
   X,
 } from "lucide-react";
 import { copyPreviewImage } from "../image-clipboard";
-import { Markdown } from "./Markdown";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "./ui/tabs";
 import { loadResourcePreview } from "../resource-preview";
 import { Button } from "./ui/button";
 import {
@@ -55,91 +58,109 @@ export function ReadyAttachment({ data, href }: { data: ResourceData; href: stri
   if (kind === "video") icon = <Film />;
   if (kind === "audio") icon = <Music />;
   return (
-    <Attachment
-      className={kind === "image" ? "attachment-image-card" : "attachment-card"}
-      state={failed ? "error" : "done"}
+    <FileActions
+      target={{
+        type: "resource",
+        href,
+        name: data.name,
+        mediaType: data.mediaType,
+        resourceId: data.resourceId,
+      }}
+      onPreview={() => setPreview(true)}
     >
-      {kind === "image" ? (
-        <Button
-          type="button"
-          variant="ghost"
-          className="attachment-image-thumbnail"
-          aria-label={`Preview ${data.name}`}
-          onClick={() => setPreview(true)}
-        >
-          {failed ? (
-            <span className="attachment-image-unavailable" role="status">
-              <ImageOff />
-              <span>Image unavailable</span>
-            </span>
-          ) : (
-            <img
-              src={href}
-              alt={data.name}
-              loading="lazy"
-              decoding="async"
-              onError={() => setFailed(true)}
-            />
-          )}
-        </Button>
-      ) : null}
-      {kind === "video" ? (
-        <button
-          type="button"
-          className="attachment-thumbnail"
-          aria-label={`Preview ${data.name}`}
-          onClick={() => setPreview(true)}
-        >
-          <video src={href} preload="metadata" muted playsInline aria-label={data.name} />
-          <Film className="attachment-video-icon" />
-        </button>
-      ) : null}
-      {kind === "audio" ? (
-        <audio
-          className="attachment-audio"
-          src={href}
-          preload="none"
-          controls
-          aria-label={data.name}
-        />
-      ) : null}
-      {kind !== "image" ? (
-        <div className="attachment-file-row">
+      <Attachment
+        className={kind === "image" ? "attachment-image-card" : "attachment-card"}
+        state={failed ? "error" : "done"}
+      >
+        {kind === "image" ? (
           <Button
+            type="button"
             variant="ghost"
-            className="attachment-open"
-            onClick={() => setPreview(true)}
+            className="attachment-image-thumbnail"
             aria-label={`Preview ${data.name}`}
+            onClick={() => setPreview(true)}
           >
-            {icon}
-            <span>
-              <AttachmentTitle className="attachment-name">{data.name}</AttachmentTitle>
-              <AttachmentDescription className="attachment-size">
-                {formatFileSize(data.size)}
-              </AttachmentDescription>
-            </span>
+            {failed ? (
+              <span className="attachment-image-unavailable" role="status">
+                <ImageOff />
+                <span>Image unavailable</span>
+              </span>
+            ) : (
+              <img
+                src={href}
+                alt={data.name}
+                loading="lazy"
+                decoding="async"
+                onError={() => setFailed(true)}
+              />
+            )}
           </Button>
-          <AttachmentAction
-            className="attachment-download"
-            size="icon"
-            nativeButton={false}
-            render={<a href={href} download={data.name} target="_blank" rel="noreferrer" />}
-            aria-label={`Download ${data.name}`}
-            title={`Download ${data.name}`}
+        ) : null}
+        {kind === "video" ? (
+          <button
+            type="button"
+            className="attachment-thumbnail"
+            aria-label={`Preview ${data.name}`}
+            onClick={() => setPreview(true)}
           >
-            <Download />
-          </AttachmentAction>
-        </div>
-      ) : null}
-      {preview ? (
-        <ResourcePreview
-          name={data.name}
-          href={href}
-          kind={kind}
-          onClose={() => setPreview(false)}
-        />
-      ) : null}
-    </Attachment>
+            <video src={href} preload="metadata" muted playsInline aria-label={data.name} />
+            <Film className="attachment-video-icon" />
+          </button>
+        ) : null}
+        {kind === "audio" ? (
+          <audio
+            className="attachment-audio"
+            src={href}
+            preload="none"
+            controls
+            aria-label={data.name}
+          />
+        ) : null}
+        {kind !== "image" ? (
+          <div className="attachment-file-row">
+            <Button
+              variant="ghost"
+              className="attachment-open"
+              onClick={() => setPreview(true)}
+              aria-label={`Preview ${data.name}`}
+            >
+              {icon}
+              <span>
+                <AttachmentTitle className="attachment-name">{data.name}</AttachmentTitle>
+                <AttachmentDescription className="attachment-size">
+                  {formatFileSize(data.size)}
+                </AttachmentDescription>
+              </span>
+            </Button>
+            <AttachmentAction
+              className="attachment-download"
+              size="icon"
+              nativeButton={false}
+              render={<a href={href} download={data.name} target="_blank" rel="noreferrer" />}
+              aria-label={`Download ${data.name}`}
+              title={`Download ${data.name}`}
+            >
+              <Download />
+            </AttachmentAction>
+          </div>
+        ) : null}
+        {preview ? (
+          <ResourcePreview
+            name={data.name}
+            href={href}
+            kind={kind}
+            target={{
+              type: "resource",
+              href,
+              name: data.name,
+              mediaType: data.mediaType,
+              resourceId: data.resourceId,
+            }}
+            onClose={() => setPreview(false)}
+          />
+        ) : null}
+      </Attachment>
+    </FileActions>
   );
 }
 
@@ -202,85 +223,44 @@ function TextAttachmentPreview({
   href,
   text,
   fill = false,
+  line,
+  endLine,
+  actions,
 }: {
   name: string;
   href: string;
   text?: TextPreviewState;
   fill?: boolean;
+  line?: number;
+  endLine?: number;
+  actions?: ReactNode;
 }) {
-  const download = <PreviewDownload name={name} href={href} />;
-  if (text?.status === "error")
-    return (
-      <PreviewFrame fill={fill} toolbar={download}>
-        <PreviewStatus>
-          <p className="error-text">{text.message}</p>
-        </PreviewStatus>
-      </PreviewFrame>
-    );
-  if (text?.status !== "ready")
-    return (
-      <PreviewFrame fill={fill} toolbar={download}>
-        <PreviewStatus>Loading preview…</PreviewStatus>
-      </PreviewFrame>
-    );
-  const raw = (
-    <pre
-      className="attachment-text-preview"
-      tabIndex={0}
-      role="region"
-      aria-label={`${name} contents`}
-    >
-      {text.text}
-    </pre>
-  );
-  const note = text.truncated ? (
-    <p className="attachment-preview-note">
-      Preview limited to 64 KB.{" "}
-      <a href={href} download={name}>
-        Download full file
-      </a>
-    </p>
-  ) : null;
-  if (!isMarkdownAttachment(name))
-    return (
-      <PreviewFrame fill={fill} toolbar={download} note={note}>
-        {raw}
-      </PreviewFrame>
-    );
   return (
-    <Tabs
-      defaultValue="rendered"
-      className="attachment-preview-body attachment-preview-tabs"
-      data-fill={fill}
+    <PreviewFrame
+      fill={fill}
+      toolbar={
+        <>
+          <PreviewDownload name={name} href={href} />
+          {actions}
+        </>
+      }
     >
-      <TabsContent value="rendered" className="attachment-preview-stage">
-        <div
-          className="attachment-rendered-preview"
-          tabIndex={0}
-          role="region"
-          aria-label={`${name} rendered contents`}
-        >
-          <Markdown text={text.text} wrap />
-        </div>
-      </TabsContent>
-      <TabsContent value="raw" className="attachment-preview-stage">
-        {raw}
-      </TabsContent>
-      <div className="attachment-preview-footer">
-        {note}
-        <div className="media-preview-toolbar">
-          <TabsList>
-            <TabsTrigger value="rendered">Rendered</TabsTrigger>
-            <TabsTrigger value="raw">Raw</TabsTrigger>
-          </TabsList>
-          {download}
-        </div>
+      <div className="attachment-source-body">
+        <FileSource
+          name={name}
+          text={text ?? { status: "loading" }}
+          line={line}
+          endLine={endLine}
+        />
       </div>
-    </Tabs>
+    </PreviewFrame>
   );
 }
 
 export function AttachmentPreviewBody({
+  line,
+  endLine,
+  actions,
   name,
   href,
   kind,
@@ -290,6 +270,9 @@ export function AttachmentPreviewBody({
   name: string;
   href: string;
   kind: AttachmentKind;
+  line?: number;
+  endLine?: number;
+  actions?: ReactNode;
   text?: TextPreviewState;
   fill?: boolean;
 }) {
@@ -362,9 +345,24 @@ export function AttachmentPreviewBody({
       },
     });
   }
-  const download = <PreviewDownload name={name} href={href} />;
+  const download = (
+    <>
+      <PreviewDownload name={name} href={href} />
+      {actions}
+    </>
+  );
   if (kind === "text")
-    return <TextAttachmentPreview name={name} href={href} text={text} fill={fill} />;
+    return (
+      <TextAttachmentPreview
+        name={name}
+        href={href}
+        text={text}
+        fill={fill}
+        line={line}
+        endLine={endLine}
+        actions={actions}
+      />
+    );
   if (failed)
     return (
       <PreviewFrame fill={fill} toolbar={download}>
@@ -526,7 +524,7 @@ function isPreviewBackdrop(target: EventTarget, x: number, y: number): boolean {
   if (!(target instanceof Element)) return false;
   if (
     target.closest(
-      "button, a, audio, video, object, .attachment-text-preview, .attachment-rendered-preview, .media-preview-toolbar, .attachment-preview-note, .resource-preview-title, .attachment-preview-empty > *",
+      "button, a, audio, video, object, .file-source, .media-preview-toolbar, .attachment-preview-note, .resource-preview-title, .attachment-preview-empty > *",
     )
   )
     return false;
@@ -538,7 +536,35 @@ function isPreviewBackdrop(target: EventTarget, x: number, y: number): boolean {
   });
 }
 
+export function useResourcePreviewText(
+  href: string,
+  kind: AttachmentKind,
+  enabled = true,
+): TextPreviewState {
+  const preview = useQuery({
+    queryKey: ["resource-preview", href],
+    queryFn: ({ signal }) => loadResourcePreview(href, signal),
+    enabled: enabled && kind === "text" && !!href,
+    staleTime: 0,
+    gcTime: 60_000,
+  });
+  return (
+    preview.data?.match({
+      ok: (value): TextPreviewState => ({
+        status: "ready",
+        text: value.text,
+        truncated: value.truncated,
+      }),
+      err: (error): TextPreviewState => ({ status: "error", message: error.message }),
+    }) ?? { status: "loading" }
+  );
+}
+
 export function ResourcePreview({
+  target,
+  textState,
+  line,
+  endLine,
   name,
   href,
   kind,
@@ -548,22 +574,14 @@ export function ResourcePreview({
   href: string;
   kind: AttachmentKind;
   onClose: () => void;
+  line?: number;
+  endLine?: number;
+  target?: FileTarget;
+  textState?: TextPreviewState;
 }) {
-  const preview = useQuery({
-    queryKey: ["resource-preview", href],
-    queryFn: ({ signal }) => loadResourcePreview(href, signal),
-    enabled: kind === "text",
-    staleTime: 0,
-    gcTime: 60_000,
-  });
-  const text: TextPreviewState = preview.data?.match({
-    ok: (value): TextPreviewState => ({
-      status: "ready",
-      text: value.text,
-      truncated: value.truncated,
-    }),
-    err: (error): TextPreviewState => ({ status: "error", message: error.message }),
-  }) ?? { status: "loading" };
+  const viewer = useFileViewer();
+  const loaded = useResourcePreviewText(textState ? "" : href, kind);
+  const text = textState ?? loaded;
   const [open, setOpen] = useState(true);
   const backdropPress = useRef<{ id: number; x: number; y: number; moved: boolean } | null>(null);
   function beginBackdropPress(event: PointerEvent<HTMLDivElement>) {
@@ -626,8 +644,48 @@ export function ResourcePreview({
             <X />
           </IconButton>
         </header>
-        <AttachmentPreviewBody key={href} name={name} href={href} kind={kind} text={text} fill />
+        <AttachmentPreviewBody
+          actions={
+            viewer ? (
+              <Button
+                aria-label="Open in right panel"
+                title="Open in right panel"
+                variant="ghost"
+                size="icon"
+                onClick={() => {
+                  viewer.openFile(
+                    target ?? {
+                      type: "resource",
+                      name,
+                      href,
+                      mediaType: previewMediaType(kind),
+                      line,
+                      endLine,
+                    },
+                  );
+                  setOpen(false);
+                }}
+              >
+                <PanelRight />
+              </Button>
+            ) : null
+          }
+          key={href}
+          name={name}
+          href={href}
+          kind={kind}
+          text={text}
+          line={line}
+          endLine={endLine}
+          fill
+        />
       </DialogContent>
     </Dialog>
   );
+}
+
+function previewMediaType(kind: AttachmentKind): string {
+  if (kind === "text") return "text/plain";
+  if (kind === "pdf") return "application/pdf";
+  return `${kind}/*`;
 }

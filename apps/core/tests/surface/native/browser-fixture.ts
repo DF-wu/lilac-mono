@@ -26,6 +26,18 @@ export async function startNativeBrowserFixture() {
       threads = seedNativeBrowserFixture(store, { transcript });
     },
     async prepare({ workspaceRoot, dataDir, config }) {
+      await writeFile(
+        path.join(workspaceRoot, "example.md"),
+        "# File viewer\n\n> [!NOTE]\n> Preview uses the chat renderer.\n\n```ts\nexport const ready = true;\n```\n",
+      );
+      await writeFile(
+        path.join(workspaceRoot, "example.ts"),
+        Array.from(
+          { length: 180 },
+          (_, index) =>
+            `export const item${index + 1} = "A long line that wraps naturally in the narrow file viewer without stretching the panel.";`,
+        ).join("\n"),
+      );
       config.models.def["fixture-fast"] = {
         model: "openai/native-fixture-fast",
         comment: "Fast deterministic response",

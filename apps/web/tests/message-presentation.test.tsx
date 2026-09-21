@@ -252,7 +252,7 @@ describe("message presentation", () => {
       />,
     );
     expect(html).toContain("&lt;script&gt;");
-    expect(html).toContain("Download full file");
+    expect(html).toContain("Download source.ts");
     expect(html).not.toContain("<script>");
     const error = renderToStaticMarkup(
       <AttachmentPreviewBody

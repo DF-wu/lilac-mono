@@ -70,6 +70,8 @@
   pointer-events: none;
 }
 .media-preview-toolbar > * { pointer-events: auto; }
+.media-preview-toolbar :is(button, a) { color: var(--muted-foreground); }
+.media-preview-toolbar :is(button, a):is(:hover, :focus-visible) { color: var(--foreground); }
 .attachment-preview-empty,
 .attachment-audio-preview {
   display: flex;
@@ -181,3 +183,6 @@
   max-width: 100%;
   max-height: 100%;
 }
+.attachment-source-body { height: 100%; min-height: 0; display: flex; flex-direction: column; width: 100%; max-width: var(--chat-width); margin-inline: auto; }
+.markdown .markdown-image-trigger { height: auto; max-width: 100%; padding: 0; white-space: normal; }
+.markdown .markdown-image-trigger img { display: block; max-width: 100%; }

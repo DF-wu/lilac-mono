@@ -1,3 +1,5 @@
+import { FileActions } from "./FileActions";
+import { useOptionalWorkspace } from "../workspace-context";
 import {
   memo,
   createContext,
@@ -133,6 +135,7 @@ function projectComposerNode(node: TNode): {
 }
 
 function AttachmentElement(props: PlateElementProps) {
+  const workspace = useOptionalWorkspace();
   const context = useContext(AttachmentContext);
   const metadata = projectComposerNode(props.element);
   const key = metadata.key ?? "";
@@ -140,48 +143,62 @@ function AttachmentElement(props: PlateElementProps) {
   const name = attachment?.file.name ?? metadata.name;
   return (
     <PlateElement {...props} as="span" className="composer-attachment-node">
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <span
-              className="composer-attachment-chip"
-              contentEditable={false}
-              data-state={attachment?.state ?? "missing"}
-            />
-          }
-        >
-          {attachment?.preview ? <img src={attachment.preview} alt="" /> : <FileText />}
-          <span className="composer-attachment-name">{name}</span>
-          <small>{attachment ? attachmentSize(attachment.file.size) : "Reattach file"}</small>
-          {attachment?.state === "reserving" ? (
-            <span className="sr-only">Preparing upload</span>
-          ) : null}
-          {attachment?.state === "uploading" ? (
-            <progress value={attachment.progress} max={1} aria-label={`Uploading ${name}`} />
-          ) : null}
-          {attachment?.state === "failed" ? (
-            <IconButton
-              label={`Retry ${name}`}
-              disabled={context.disabled}
-              onClick={() => context.retry?.(key)}
-            >
-              <RotateCcw />
-            </IconButton>
-          ) : null}
-          <IconButton
-            label={`Remove ${name}`}
-            disabled={context.disabled}
-            onClick={() => {
-              const path = props.editor.api.findPath(props.element);
-              if (path) props.editor.tf.removeNodes({ at: path });
-              props.editor.tf.focus();
-            }}
+      <FileActions
+        disabled={attachment?.state !== "ready" || !attachment.resourceId}
+        target={{
+          type: "resource",
+          href: attachment?.resourceId
+            ? (workspace?.resourceUrl(attachment.resourceId) ??
+              `/api/resources/${encodeURIComponent(attachment.resourceId)}`)
+            : "",
+          name,
+          mediaType: attachment?.file.type || "application/octet-stream",
+          resourceId: attachment?.resourceId,
+        }}
+      >
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <span
+                className="composer-attachment-chip"
+                contentEditable={false}
+                data-state={attachment?.state ?? "missing"}
+              />
+            }
           >
-            <X />
-          </IconButton>
-        </TooltipTrigger>
-        <TooltipContent>{attachment?.error ?? name}</TooltipContent>
-      </Tooltip>
+            {attachment?.preview ? <img src={attachment.preview} alt="" /> : <FileText />}
+            <span className="composer-attachment-name">{name}</span>
+            <small>{attachment ? attachmentSize(attachment.file.size) : "Reattach file"}</small>
+            {attachment?.state === "reserving" ? (
+              <span className="sr-only">Preparing upload</span>
+            ) : null}
+            {attachment?.state === "uploading" ? (
+              <progress value={attachment.progress} max={1} aria-label={`Uploading ${name}`} />
+            ) : null}
+            {attachment?.state === "failed" ? (
+              <IconButton
+                label={`Retry ${name}`}
+                disabled={context.disabled}
+                onClick={() => context.retry?.(key)}
+              >
+                <RotateCcw />
+              </IconButton>
+            ) : null}
+            <IconButton
+              label={`Remove ${name}`}
+              disabled={context.disabled}
+              onClick={() => {
+                const path = props.editor.api.findPath(props.element);
+                if (path) props.editor.tf.removeNodes({ at: path });
+                props.editor.tf.focus();
+              }}
+            >
+              <X />
+            </IconButton>
+          </TooltipTrigger>
+          <TooltipContent>{attachment?.error ?? name}</TooltipContent>
+        </Tooltip>
+      </FileActions>
       {props.children}
     </PlateElement>
   );

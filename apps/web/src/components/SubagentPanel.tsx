@@ -68,9 +68,11 @@ export function NativeSubagentProvider({
 export function NativeSubagentPanel({
   threadId,
   foreground,
+  embedded,
 }: {
   threadId: string;
   foreground: boolean;
+  embedded?: boolean;
 }) {
   const { client, panels } = useWorkspace();
   const open = useStore(panels, (state) => (state.threads.get(threadId) ?? defaultRightPanel).open);
@@ -141,6 +143,7 @@ export function NativeSubagentPanel({
   const actions = panels.getState();
   return (
     <SubagentPanelView
+      embedded={embedded}
       items={items}
       selected={selected}
       messages={error ? [] : messages}
@@ -159,6 +162,7 @@ export function NativeSubagentPanel({
 }
 
 export function SubagentPanelView({
+  embedded,
   items,
   selected,
   messages = [],
@@ -171,6 +175,7 @@ export function SubagentPanelView({
   loadingMore,
   onMore,
 }: {
+  embedded?: boolean;
   items: readonly SubagentSummary[];
   selected?: SubagentSummary;
   messages?: readonly DisplayMessage[];
@@ -199,16 +204,18 @@ export function SubagentPanelView({
   ) : null;
   return (
     <aside className="subagent-panel" aria-label="Subagents">
-      <header className="subagent-panel-header">
-        {selected ? (
-          <IconButton label="Back to agents" onClick={onBack}>
-            <ArrowLeft />
-          </IconButton>
-        ) : (
-          <Bot />
-        )}
-        <h2>{selected ? subagentProfileName(selected.profile) : "Agents"}</h2>
-      </header>
+      {selected || !embedded ? (
+        <header className="subagent-panel-header">
+          {selected ? (
+            <IconButton label="Back to agents" onClick={onBack}>
+              <ArrowLeft />
+            </IconButton>
+          ) : (
+            <Bot />
+          )}
+          <h2>{selected ? subagentProfileName(selected.profile) : "Agents"}</h2>
+        </header>
+      ) : null}
       {selected ? (
         <div className="subagent-heading">
           <span>{selected.name}</span>

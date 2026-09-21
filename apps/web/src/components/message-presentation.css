@@ -47,14 +47,14 @@
 .code-block[data-wrap="true"] .markdown-code { white-space: pre-wrap; overflow-wrap: anywhere; }
 .markdown-link .link-favicon { display: inline-flex; vertical-align: text-bottom; width: 1em; height: 1em; margin-right: var(--space-1); }
 .markdown-link .link-favicon img, .markdown-link .link-favicon svg { width: 100%; height: 100%; margin: 0; border-radius: 0; object-fit: contain; }
-.attachment-card { display: flex; flex-direction: column; align-items: stretch; padding: 0; border: 0; width: fit-content; max-width: 100%; overflow: hidden; background: var(--surface); border-radius: var(--radius-lg); }
+.attachment-card { display: flex; flex-direction: column; flex-wrap: nowrap; align-items: stretch; padding: 0; border: 0; width: fit-content; max-width: 100%; overflow: hidden; background: var(--surface); border-radius: var(--radius-lg); }
 .attachment-thumbnail { display: block; position: relative; cursor: zoom-in; padding: var(--space-2); border: 0; background: transparent; }
 .attachment-thumbnail img, .attachment-thumbnail video { display: block; max-width: min(100%, calc(var(--space-7) * 8)); max-height: calc(var(--space-7) * 5); object-fit: contain; border-radius: var(--radius-md); }
 .attachment-video-icon { position: absolute; left: var(--space-4); bottom: var(--space-4); background: var(--surface); border-radius: var(--radius-sm); padding: var(--space-1); width: var(--space-6); height: var(--space-6); }
-.attachment-file-row { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2); }
-.attachment-open { height: auto; min-width: 0; justify-content: flex-start; text-align: left; white-space: normal; }
-.attachment-open > span { min-width: 0; }
-.attachment-name { display: block; overflow-wrap: anywhere; }
+.attachment-file-row { display: flex; width: 100%; min-width: 0; align-items: center; gap: var(--space-2); padding: var(--space-2); }
+.attachment-open { flex: 1 1 auto; overflow: hidden; height: auto; min-width: 0; justify-content: flex-start; text-align: left; white-space: normal; }
+.attachment-open > span { min-width: 0; overflow: hidden; }
+.attachment-name { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .attachment-size { display: block; color: var(--muted-foreground); font-size: var(--text-xs); }
 .attachment-download { display: flex; flex-shrink: 0; align-items: center; justify-content: center; width: var(--control-size); height: var(--control-size); border-radius: 50%; }
 .attachment-download:hover { background: var(--surface-hover); }

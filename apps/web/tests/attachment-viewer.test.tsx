@@ -1,3 +1,4 @@
+import { RightPanelTabs } from "../src/components/FileViewer";
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
@@ -42,10 +43,9 @@ describe("attachment viewer", () => {
         }}
       />,
     );
-    expect(html).toContain('role="tab"');
-    expect(html).toContain("Rendered");
-    expect(html).toContain("Raw");
-    expect(html).toContain("Preview limited to 64 KB");
+    expect(html).toContain('aria-label="Preview Markdown"');
+    expect(html).toContain('aria-label="Word wrap"');
+    expect(html).toContain("Showing the first 64 KB");
     expect(html).not.toContain("<script>");
     expect(html).not.toContain("<Component");
   });
@@ -129,4 +129,50 @@ test("image hit testing excludes object-fit letterboxing and respects zoomed bou
       { width: 800, height: 400 },
     ),
   ).toBe(true);
+});
+
+test("preview destination actions share the download footer for text and media", () => {
+  for (const kind of ["text", "image", "pdf", "audio", "video"] as const) {
+    const html = renderToStaticMarkup(
+      <AttachmentPreviewBody
+        name="example"
+        href="/api/resources/example"
+        kind={kind}
+        actions={<button>Open in right panel</button>}
+        text={{ status: "ready", text: "source", truncated: false }}
+      />,
+    );
+    expect(html.indexOf("Open in right panel")).toBeGreaterThan(
+      html.indexOf('class="attachment-preview-footer"'),
+    );
+    expect(html).toContain('aria-label="Download example"');
+  }
+});
+
+test("saved file tabs defer their bodies until the panel and tab become active", () => {
+  const tabs = {
+    items: [
+      { id: "agents", type: "agents" as const },
+      {
+        id: "file",
+        type: "file" as const,
+        target: { type: "path" as const, path: "/a.md", name: "a.md" },
+      },
+    ],
+    activeId: "agents",
+  };
+  for (const visible of [true, false]) {
+    const html = renderToStaticMarkup(
+      <RightPanelTabs
+        tabs={tabs}
+        visible={visible}
+        onFocus={() => {}}
+        onClose={() => {}}
+        onAgents={() => {}}
+        renderTab={(tab) => <div>{`body:${tab.id}`}</div>}
+      />,
+    );
+    expect(html.includes("body:agents")).toBe(visible);
+    expect(html).not.toContain("body:file");
+  }
 });

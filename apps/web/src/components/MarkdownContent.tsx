@@ -1,3 +1,5 @@
+import { FileLink, MarkdownImage } from "./FileActions";
+import { parseFilePath } from "../file-target";
 import { githubAlerts, MarkdownBlockquote } from "./markdown-alerts";
 import { createContext, useContext, lazy, memo, Suspense, type ComponentProps } from "react";
 import ReactMarkdown, { type Components, type ExtraProps } from "react-markdown";
@@ -75,6 +77,14 @@ function MessageLink({ children, href }: ComponentProps<"a">) {
         {children}
       </AttachmentReference>
     );
+  if (href && /^\/api\/(files|resources)\//.test(href)) {
+    const name = typeof children === "string" ? children : "File";
+    return (
+      <FileLink target={{ type: "resource", href, name, mediaType: "application/octet-stream" }} />
+    );
+  }
+  const path = href ? parseFilePath(href) : undefined;
+  if (path) return <FileLink target={path} />;
   return <LinkWithFavicon href={href}>{children}</LinkWithFavicon>;
 }
 
@@ -84,6 +94,8 @@ const components: Components = {
   li: ListItem,
   input: TaskCheckbox,
   code: ({ className, children }) => {
+    const file = !className && typeof children === "string" ? parseFilePath(children) : undefined;
+    if (file) return <FileLink target={file} />;
     if (!className?.includes("math-inline")) return <code className={className}>{children}</code>;
     const source = typeof children === "string" ? children : "";
     const fallback = <code>{source}</code>;
@@ -96,9 +108,7 @@ const components: Components = {
     );
   },
   a: MessageLink,
-  img: ({ src, alt }) => (
-    <img src={src} alt={alt ?? ""} loading="lazy" decoding="async" referrerPolicy="no-referrer" />
-  ),
+  img: MarkdownImage,
   table: ({ children }) => (
     <div className="markdown-table">
       <table>{children}</table>

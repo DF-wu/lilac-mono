@@ -1,3 +1,7 @@
+import { useStore } from "zustand";
+import { createPanelStore, defaultPanelTabs } from "./panel-store";
+import { RightPanelTabs } from "./components/FileViewer";
+import { FileSource } from "./components/FileSource";
 import { Link, useLocation } from "@tanstack/react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useEffect, useState, type ReactNode } from "react";
@@ -187,7 +191,7 @@ const messageFixtures: DisplayMessage[] = [
         id: "gallery-shared-pdf",
         data: {
           resourceId: "gallery-shared-pdf",
-          name: "weekend.pdf",
+          name: "Weekend_travel_itinerary_and_reservations_2026.pdf",
           mediaType: "application/pdf",
           size: 728,
           state: "ready",
@@ -592,6 +596,56 @@ function ComposerSpecimen() {
     </Section>
   );
 }
+function FileTabsDemo() {
+  const [store] = useState(() => {
+    const store = createPanelStore();
+    store
+      .getState()
+      .openFile("demo", { type: "path", path: "/workspace/notes.md", name: "notes.md" });
+    store
+      .getState()
+      .openFile("demo", { type: "path", path: "/workspace/example.ts", name: "example.ts" });
+    return store;
+  });
+  const tabs = useStore(store, (state) => state.tabs.get("demo") ?? defaultPanelTabs);
+  const actions = store.getState();
+  return (
+    <div style={{ height: 420 }}>
+      <RightPanelTabs
+        tabs={tabs}
+        onFocus={(id) => actions.focusTab("demo", id)}
+        onClose={(id) => actions.closeTab("demo", id)}
+        onAgents={() => actions.openAgents("demo")}
+        renderTab={(tab) =>
+          tab.type === "agents" ? (
+            <div className="file-status">No subagents yet</div>
+          ) : (
+            <FileSource
+              name={tab.target.name}
+              heading={
+                <span>{tab.target.type === "path" ? tab.target.path : tab.target.name}</span>
+              }
+              text={{
+                status: "ready",
+                text: tab.target.name.endsWith(".md")
+                  ? Array.from<number, string>(
+                      { length: 25 },
+                      (_, index) => `- Note ${index + 1}: Each file keeps its own view.`,
+                    ).join("\n")
+                  : Array.from<number, string>(
+                      { length: 180 },
+                      (_, index) => `export const line${index + 1} = "A longer source file";`,
+                    ).join("\n"),
+                truncated: false,
+              }}
+            />
+          )
+        }
+      />
+    </div>
+  );
+}
+
 function Attachments() {
   return (
     <Section
@@ -656,12 +710,33 @@ function Attachments() {
             text={{ status: "ready", text: markdownAttachment, truncated: false }}
           />
         </Specimen>
-        <Specimen title="PDF">
+        <Specimen title="Right panel tabs">
+          <FileTabsDemo />
+        </Specimen>
+        <Specimen title="File source · lines 123–125">
+          <div style={{ height: 440 }}>
+            <FileSource
+              name="example.ts"
+              line={123}
+              endLine={125}
+              text={{
+                status: "ready",
+                truncated: false,
+                text: Array.from<number, string>(
+                  { length: 180 },
+                  (_, index) =>
+                    `export const item${index + 1} = "A long line that wraps naturally in the file viewer without stretching the panel.";`,
+                ).join("\n"),
+              }}
+            />
+          </div>
+        </Specimen>
+        <Specimen title="PDF · long filename">
           <ReadyAttachment
             href={weekendPdf}
             data={{
               resourceId: "gallery-pdf",
-              name: "weekend.pdf",
+              name: "Weekend_travel_itinerary_and_reservations_2026.pdf",
               mediaType: "application/pdf",
               size: 728,
               state: "ready",
