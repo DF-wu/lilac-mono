@@ -16,13 +16,13 @@ export type WebSession = {
 export type WebState =
   | { kind: "starting" }
   | { kind: "ready"; session: WebSession }
-  | { kind: "login"; message?: string; signingOut?: boolean }
+  | { kind: "login"; message?: string; signingOut?: boolean; logoutFailed?: boolean }
   | { kind: "offline"; message: string };
 export type WebSessionOptions = {
   cache?: WebNativeCache;
   openSocket?: () => WebSocket;
   bootstrap?: typeof readBootstrap;
-  logout?: () => Promise<unknown>;
+  logout?: () => Promise<Result<void, Error>>;
   currentUrl?: () => URL;
   channel?: BroadcastChannel | null;
 };
@@ -44,7 +44,11 @@ function requestError(error: unknown): WebState {
 
 const sessionNoticeSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("ending"), id: z.string().min(1).max(128) }),
-  z.strictObject({ kind: z.literal("ended"), id: z.string().min(1).max(128).optional() }),
+  z.strictObject({
+    kind: z.literal("ended"),
+    id: z.string().min(1).max(128).optional(),
+    failed: z.boolean().optional(),
+  }),
 ]);
 function decodeSessionNotice(value: unknown): z.infer<typeof sessionNoticeSchema> | undefined {
   const parsed = sessionNoticeSchema.safeParse(value);
@@ -65,6 +69,7 @@ export class WebSessionController {
   private epoch = 0;
   private disposed = false;
   private readonly pendingSignouts = new Set<string>();
+  private logoutFailed = false;
   private logoutTask: Promise<void> | undefined;
   private active: NativeClient | undefined;
   private activeScope: CacheScope | undefined;
@@ -76,7 +81,7 @@ export class WebSessionController {
   private readonly cache: WebNativeCache;
   private readonly openSocket: () => WebSocket;
   private readonly fetchBootstrap: typeof readBootstrap;
-  private readonly endRemoteSession: () => Promise<unknown>;
+  private readonly endRemoteSession: () => Promise<Result<void, Error>>;
   private readonly currentUrl: () => URL;
   private readonly channel: BroadcastChannel | undefined;
 
@@ -94,7 +99,10 @@ export class WebSessionController {
     const notice = decodeSessionNotice(event.data);
     if (!notice) return;
     if (notice.kind === "ending") this.pendingSignouts.add(notice.id);
-    if (notice.kind === "ended" && notice.id) this.pendingSignouts.delete(notice.id);
+    if (notice.kind === "ended") {
+      if (notice.id) this.pendingSignouts.delete(notice.id);
+      this.logoutFailed = notice.failed ?? false;
+    }
     void this.clearSession(false);
   };
   private closeStartingSocket(): void {
@@ -111,7 +119,7 @@ export class WebSessionController {
     for (const listener of this.listeners) listener();
   }
   async start(): Promise<void> {
-    if (this.disposed || this.pendingSignouts.size) return;
+    if (this.disposed || this.pendingSignouts.size || this.logoutFailed) return;
     const epoch = ++this.epoch;
     this.startup.abort();
     this.closeStartingSocket();
@@ -264,7 +272,7 @@ export class WebSessionController {
     this.broadcast({ kind: "ending", id });
     const remote = Result.tryPromise({
       try: () => this.endRemoteSession(),
-      catch: () => undefined,
+      catch: () => new Error("Could not sign out of Lilac. Retry before leaving this device."),
     });
     const provider = Result.tryPromise({
       try: () => providerOperation?.() ?? Promise.resolve(Result.ok()),
@@ -272,14 +280,26 @@ export class WebSessionController {
     });
     await this.clearSession(false);
     const [result, providerResult] = await Promise.all([remote, provider]);
-    result.match({ ok: () => {}, err: () => {} });
-    const message = providerResult
+    const remoteMessage = result
+      .andThen((value) => value)
+      .match({
+        ok: () => undefined,
+        err: () => "Could not sign out of Lilac. Retry before leaving this device.",
+      });
+    const providerMessage = providerResult
       .andThen((value) => value)
       .match({ ok: () => undefined, err: (error) => error.message });
+    const message = remoteMessage ?? providerMessage;
+    this.logoutFailed = !!message;
     this.pendingSignouts.delete(id);
-    this.broadcast({ kind: "ended", id });
+    this.broadcast({ kind: "ended", id, failed: this.logoutFailed });
     if (!this.disposed)
-      this.set({ kind: "login", signingOut: this.pendingSignouts.size > 0, message });
+      this.set({
+        kind: "login",
+        signingOut: this.pendingSignouts.size > 0,
+        logoutFailed: this.logoutFailed,
+        message,
+      });
   }
   private broadcast(notice: z.infer<typeof sessionNoticeSchema>): void {
     Result.try({ try: () => this.channel?.postMessage(notice), catch: () => undefined }).match({
@@ -297,7 +317,14 @@ export class WebSessionController {
     this.activeScope = undefined;
     this.stopEvents?.();
     this.stopEvents = undefined;
-    this.set({ kind: "login", signingOut: this.pendingSignouts.size > 0 });
+    this.set({
+      kind: "login",
+      signingOut: this.pendingSignouts.size > 0,
+      logoutFailed: this.logoutFailed,
+      ...(this.logoutFailed
+        ? { message: "Could not finish signing out. Retry before leaving this device." }
+        : {}),
+    });
     if (broadcast) this.broadcast({ kind: "ended" });
     const saves = [...this.saves];
     this.cleanup = this.cleanup.then(() => this.purgeSession(client, scope, saves));

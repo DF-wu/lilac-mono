@@ -11,6 +11,7 @@ import {
   type EventDeliveryDoneError,
   type EventDeliveryStopFailed,
   type NativeOutputFrontier,
+  type NativeOutputEvent,
 } from "@stanley2058/lilac-event-bus";
 import { discoverSkills, type DiscoveredSkill } from "@stanley2058/lilac-utils/skills";
 import { toDurableResolvedModelPlan, type CoreConfig } from "@stanley2058/lilac-utils";
@@ -481,6 +482,15 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     });
   }
 
+  const publishOutput = createNativeBusOutputSink(options.bus);
+  async function publishDurableOutput(event: NativeOutputEvent) {
+    const published = await publishOutput(event);
+    const failure = published.match({ ok: () => undefined, err: (error) => error });
+    // Recovery owns the retained run once publication fences its checkpoint and terminal output.
+    if (failure) options.reportFatalError(failure);
+    return published;
+  }
+
   function createOutput(input: {
     requestId: string;
     requestClient: string;
@@ -492,7 +502,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       ...attempt,
       requestId: input.requestId,
       mode: options.getConfig().surface.native.outputStreaming,
-      publish: createNativeBusOutputSink(options.bus),
+      publish: publishDurableOutput,
       recoveryFrontier: input.recoveryOutputFrontier,
     });
   }

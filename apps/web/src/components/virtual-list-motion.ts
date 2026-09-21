@@ -1,3 +1,5 @@
+import { readMotionDuration } from "../theme/motion";
+
 type Position = { node: HTMLElement; top: number; width: number; height: number };
 type Movement = { animation: Animation; offset: number };
 
@@ -13,7 +15,6 @@ export function createVirtualListMotion(parent: HTMLElement) {
   const moving = new Map<HTMLElement, Movement>();
   const entering = new Map<HTMLElement, Animation>();
   const exiting = new Map<HTMLElement, Animation>();
-  const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
   function clear() {
     for (const { animation } of moving.values()) animation.cancel();
@@ -68,11 +69,7 @@ export function createVirtualListMotion(parent: HTMLElement) {
           width: node.offsetWidth,
           height: node.offsetHeight,
         });
-      const root = document.documentElement;
-      const duration =
-        root.dataset.animation === "off" || reducedMotion.matches
-          ? 0
-          : parseFloat(getComputedStyle(root).getPropertyValue("--motion-duration")) || 150;
+      const duration = readMotionDuration();
       const removed = [...positions].filter(
         ([key]) => !nextKeys.has(key) || (orderChanged && !next.has(key)),
       );

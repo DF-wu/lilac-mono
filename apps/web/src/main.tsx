@@ -115,12 +115,20 @@ function Root() {
       <main className="login-shell w-[min(100%_-_calc(var(--ui-space-unit)*8),_24rem)] min-h-dvh mx-auto flex flex-col justify-center gap-6 py-12">
         <h1>Lilac</h1>
         {state.signingOut ? <p role="status">Signing out…</p> : null}
-        {auth?.provider === "local" ? (
+        {state.logoutFailed ? (
+          <Button disabled={state.signingOut} onClick={logout}>
+            Retry sign out
+          </Button>
+        ) : null}
+        {!state.logoutFailed && auth?.provider === "local" ? (
           <fieldset disabled={state.signingOut}>
             <LocalLogin onSignedIn={start} />
           </fieldset>
         ) : null}
-        {!state.signingOut && auth?.provider === "clerk" && auth.publishableKey ? (
+        {!state.signingOut &&
+        !state.logoutFailed &&
+        auth?.provider === "clerk" &&
+        auth.publishableKey ? (
           <AccountLoadBoundary onReload={reload} message="Unable to load sign-in.">
             <Suspense fallback={<p>Loading sign-in…</p>}>
               <ClerkLogin publishableKey={auth.publishableKey} onSignedIn={start} />

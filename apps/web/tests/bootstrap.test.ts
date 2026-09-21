@@ -57,7 +57,7 @@ function setup(options: WebSessionOptions = {}) {
       return socket;
     },
     bootstrap: async () => bootstrap,
-    logout: async () => undefined,
+    logout: async () => Result.ok(),
     currentUrl: () => new URL("http://localhost/threads/selected"),
     channel: null,
     ...options,
@@ -242,7 +242,7 @@ describe("WebSessionController", () => {
 });
 
 test("sign-in remains disabled until the remote logout response has settled", async () => {
-  const remote = Promise.withResolvers<void>();
+  const remote = Promise.withResolvers<Result<void, Error>>();
   let bootstrapCalls = 0;
   let logoutCalls = 0;
   const test = setup({
@@ -262,7 +262,7 @@ test("sign-in remains disabled until the remote logout response has settled", as
   const duplicate = test.controller.logout();
   expect(logoutCalls).toBe(1);
   expect(bootstrapCalls).toBe(1);
-  remote.resolve();
+  remote.resolve(Result.ok());
   await Promise.all([logout, duplicate]);
   expect(test.controller.getSnapshot()).toMatchObject({ kind: "login", signingOut: false });
   await test.controller.start();
@@ -313,3 +313,41 @@ test("a rejected provider loader still clears the session and private cache", as
   });
   expect(await test.cache.readLatestBootstrap()).toBeUndefined();
 });
+
+test.each(["rejection", "result"] as const)(
+  "failed native logout (%s) blocks startup until a successful retry",
+  async (failure) => {
+    let calls = 0;
+    let bootstraps = 0;
+    const test = setup({
+      bootstrap: async () => {
+        bootstraps++;
+        return bootstrap;
+      },
+      logout: async () => {
+        if (calls++ > 0) return Result.ok();
+        if (failure === "rejection") throw new Error("Offline");
+        return Result.err(new Error("Server unavailable"));
+      },
+    });
+    await test.controller.start();
+    await test.controller.logout();
+    expect(test.controller.getSnapshot()).toMatchObject({
+      kind: "login",
+      signingOut: false,
+      logoutFailed: true,
+      message: "Could not sign out of Lilac. Retry before leaving this device.",
+    });
+    expect(await test.cache.readLatestBootstrap()).toBeUndefined();
+    await test.controller.start();
+    expect(bootstraps).toBe(1);
+    await test.controller.logout();
+    expect(test.controller.getSnapshot()).toMatchObject({
+      kind: "login",
+      logoutFailed: false,
+      message: undefined,
+    });
+    await test.controller.start();
+    expect(bootstraps).toBe(2);
+  },
+);

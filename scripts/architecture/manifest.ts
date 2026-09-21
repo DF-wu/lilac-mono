@@ -4569,7 +4569,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : []),
       ...(root === "apps/web"
-        ? [{ module: "src/clerk.tsx", exportName: "signOutActiveClerk" }]
+        ? [{ module: "src/clerk-signout.ts", exportName: "signOutActiveClerk" }]
         : []),
       ...(root === "apps/web"
         ? [

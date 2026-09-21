@@ -82,7 +82,8 @@ export class NativeClient {
   private generation = 0;
   private readonly threadEpochs = new Map<string, number>();
   private attempt = 0;
-  private retryTimer: ReturnType<typeof setTimeout> | undefined;
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private bootstrapTimer: ReturnType<typeof setTimeout> | undefined;
   private selectedThreadId: string | undefined;
   private catalogCursor: string | undefined;
   private readonly pending = new Map<string, NativeInput>();
@@ -212,8 +213,8 @@ export class NativeClient {
       this.emit({ kind: "connection", state: "offline" });
       this.streams.clear();
       this.connection = undefined;
-      if (this.retryTimer) clearTimeout(this.retryTimer);
-      this.retryTimer = setTimeout(
+      if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = setTimeout(
         () => {
           this.open();
           void this.bootstrap();
@@ -223,6 +224,8 @@ export class NativeClient {
     });
   }
   private async bootstrap(): Promise<void> {
+    clearTimeout(this.bootstrapTimer);
+    this.bootstrapTimer = undefined;
     this.bootstrapPending = true;
     const sequence = ++this.bootstrapSequence;
     const generation = this.generation;
@@ -276,8 +279,8 @@ export class NativeClient {
       this.watchThread(this.selectedThreadId);
   }
   private retryBootstrap(): void {
-    if (this.retryTimer) clearTimeout(this.retryTimer);
-    this.retryTimer = setTimeout(
+    if (this.bootstrapTimer) clearTimeout(this.bootstrapTimer);
+    this.bootstrapTimer = setTimeout(
       () => {
         if (this.stopped) return;
         void this.bootstrap();
@@ -663,7 +666,8 @@ export class NativeClient {
     this.lifetime.abort();
     this.abortStreams();
     this.abortHistory();
-    if (this.retryTimer) clearTimeout(this.retryTimer);
+    clearTimeout(this.reconnectTimer);
+    clearTimeout(this.bootstrapTimer);
     this.connection = undefined;
     await Promise.all(this.streamTasks);
     this.socket?.close();

@@ -40,7 +40,7 @@ cannot reload an older checkpoint.
 sets `replace: true`. Implementations must never persist the cursor before its data. The coordinator
 serializes writes per thread without blocking display or input. Cache exceptions produce an error
 event and do not stop in-memory rendering. `MemoryNativeCache` and `NoNativeCache` are provided;
-web supplies IndexedDB and TUI supplies an atomic local adapter.
+web supplies IndexedDB, while the temporary operator TUI uses `NoNativeCache`.
 
 All cache keys include installation, principal and protocol/projection versions. Revocation clears
 the thread and drains queued writes before removing persisted data. Logout clears all private stores

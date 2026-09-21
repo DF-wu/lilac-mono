@@ -1,3 +1,4 @@
+import { nativeSessionId } from "./native-protocol";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import type { Root, RootContent } from "mdast";
 import { basename, posix } from "node:path";
@@ -57,7 +58,10 @@ export class NativeLiveFileService {
       const resolved = yield* resolveToolPathForRequestContextResult({
         cwd,
         inputPath,
-        context: { sessionId: threadId, safetyMode: restricted ? "restricted" : "trusted" },
+        context: {
+          sessionId: nativeSessionId(threadId),
+          safetyMode: restricted ? "restricted" : "trusted",
+        },
       }).mapError(() => nativeFailure("forbidden", "File path is outside this thread's access"));
       // Restricted paths stay virtual so the existing reader applies its session sandbox mapping once.
       const path = restricted ? posix.resolve(cwd, inputPath) : resolved;
@@ -126,7 +130,7 @@ export class NativeLiveFileService {
         cwd: reference.cwd ?? service.dependencies.toolRoot,
         inputPath: reference.path,
         context: {
-          sessionId: reference.threadId,
+          sessionId: nativeSessionId(reference.threadId),
           safetyMode: starter.toolMode === "restricted" ? "restricted" : "trusted",
         },
       }).mapError(() => nativeFailure("forbidden", "File path is outside this thread's access"));

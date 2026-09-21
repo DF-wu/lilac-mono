@@ -156,6 +156,7 @@ export async function localLogin(
 export async function logoutHttp(): Promise<Result<void, WebRequestFailed>> {
   return Result.gen(async function* () {
     const response = yield* Result.await(request("/api/auth/logout", { method: "POST" }));
+    if (response.status === 401) return Result.ok();
     yield* responseStatus(response);
     return Result.ok();
   });

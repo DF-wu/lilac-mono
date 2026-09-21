@@ -31,6 +31,7 @@ import {
 import { VirtualList } from "./ui";
 import { ThreadCard } from "./ThreadSelect";
 import { Button } from "./ui/button";
+import { readMotionDuration } from "../theme/motion";
 import "./thread-queue.css";
 
 type QueueRow =
@@ -181,12 +182,7 @@ export function ThreadQueue({
       sensors={sensors}
       collisionDetection={collision}
       onDragStart={({ active }) => {
-        const root = document.documentElement;
-        setDropDuration(
-          root.dataset.animation === "off" || matchMedia("(prefers-reduced-motion: reduce)").matches
-            ? 0
-            : parseFloat(getComputedStyle(root).getPropertyValue("--motion-duration")) || 150,
-        );
+        setDropDuration(readMotionDuration());
         const id = String(active.id),
           from = queueSection(queues, id);
         if (!from) return;

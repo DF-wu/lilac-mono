@@ -373,3 +373,48 @@ test("no-cache clients retain the selected store but release visited inactive hi
   expect(client.thread("old")).not.toBe(old);
   expect(client.thread("selected")).toBe(selected);
 });
+
+test("HTTP retry does not cancel socket reconnection after both transports fail", async () => {
+  const closed = Promise.withResolvers<void>();
+  const reopened = Promise.withResolvers<void>();
+  const bootstrapped = Promise.withResolvers<void>();
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request, server) {
+      if (new URL(request.url).pathname === "/fail") return new Response(null, { status: 503 });
+      if (server.upgrade(request)) return;
+      return new Response(null, { status: 400 });
+    },
+    websocket: { message() {} },
+  });
+  disposers.push(() => server.stop(true));
+  let socketCount = 0;
+  let bootstrapCount = 0;
+  const client = new NativeClient({
+    scope,
+    openSocket: () => {
+      const path = socketCount++ === 0 ? "/fail" : "/socket";
+      const socket = new WebSocket(`ws://127.0.0.1:${server.port}${path}`);
+      socket.addEventListener("close", () => closed.resolve());
+      socket.addEventListener("open", () => reopened.resolve());
+      return socket;
+    },
+    bootstrap: async () => {
+      if (bootstrapCount++ === 0) {
+        await closed.promise;
+        throw new Error("HTTP unavailable");
+      }
+      return bootstrap;
+    },
+    onEvent: (event) => {
+      if (event.kind === "bootstrap") bootstrapped.resolve();
+    },
+  });
+  disposers.push(() => client.dispose());
+  await client.start();
+  await Promise.all([reopened.promise, bootstrapped.promise]);
+  expect(socketCount).toBe(2);
+  expect(bootstrapCount).toBeGreaterThanOrEqual(2);
+  expect(client.rpc).toBeDefined();
+});

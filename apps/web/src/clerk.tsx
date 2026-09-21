@@ -6,25 +6,12 @@ import type { NativeClient } from "@stanley2058/lilac-client";
 import { Result } from "better-result";
 import "@clerk/ui/themes/shadcn.css";
 
-let activeSignOut: (() => Promise<void>) | undefined;
-
-export async function signOutActiveClerk(): Promise<Result<void, Error>> {
-  if (!activeSignOut) return Result.ok();
-  return Result.tryPromise({
-    try: activeSignOut,
-    catch: () => new Error("Could not sign out of Clerk. Try again."),
-  });
-}
+export { signOutActiveClerk } from "./clerk-signout";
+import { registerClerkSignOut } from "./clerk-signout";
 
 function RegisterClerk({ children }: { children: ReactNode }) {
   const clerk = useClerk();
-  useEffect(() => {
-    const signOut = () => clerk.signOut();
-    activeSignOut = signOut;
-    return () => {
-      if (activeSignOut === signOut) activeSignOut = undefined;
-    };
-  }, [clerk]);
+  useEffect(() => registerClerkSignOut(() => clerk.signOut()), [clerk]);
   return children;
 }
 

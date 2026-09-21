@@ -216,3 +216,10 @@ describe("native web HTTP", () => {
     expect(resourceUrl("path/with?characters")).toBe("/api/resources/path%2Fwith%3Fcharacters");
   });
 });
+
+test("logout accepts an already-expired session but preserves server failures", async () => {
+  const fetcher = spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 401 }));
+  expect((await logoutHttp()).isOk()).toBe(true);
+  fetcher.mockResolvedValue(new Response(null, { status: 503 }));
+  expect((await logoutHttp()).isErr()).toBe(true);
+});

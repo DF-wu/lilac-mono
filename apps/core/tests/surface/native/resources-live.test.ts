@@ -1,3 +1,4 @@
+import { nativeSessionId } from "../../../src/surface/native/native-protocol";
 import { resolveRestrictedSessionTmpDir } from "../../../src/shared/attachment-utils";
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
@@ -234,7 +235,7 @@ test("restricted file resolution uses the thread's virtual tmp directory exactly
     }),
   );
   const thread = value(native.createThread("limited", { commandId: "restricted-resolve" }));
-  const root = resolveRestrictedSessionTmpDir(thread.id);
+  const root = resolveRestrictedSessionTmpDir(nativeSessionId(thread.id));
   directories.push(root);
   await mkdir(root, { recursive: true });
   await writeFile(join(root, "example.txt"), "session file");
