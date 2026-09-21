@@ -1,6 +1,6 @@
+import { FileIcon } from "./FileIcon";
 import { FileActions } from "./FileActions";
 import { useState, type ReactNode } from "react";
-import { FileText } from "lucide-react";
 import type { MessageResource } from "./message-resources";
 import { ResourcePreview, attachmentKind } from "./ResourcePreview";
 import { Button } from "./ui/button";
@@ -48,7 +48,7 @@ export function AttachmentReference({
               onError={() => setImageFailed(true)}
             />
           ) : (
-            <FileText />
+            <FileIcon name={resource.name} mediaType={resource.mediaType} />
           )}
           <span>{children}</span>
         </Button>

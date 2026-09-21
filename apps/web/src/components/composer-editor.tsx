@@ -1,3 +1,4 @@
+import { FileIcon } from "./FileIcon";
 import { FileActions } from "./FileActions";
 import { useOptionalWorkspace } from "../workspace-context";
 import {
@@ -72,7 +73,6 @@ import {
   List,
   ListOrdered,
   SquareCode,
-  FileText,
   X,
   RotateCcw,
 } from "lucide-react";
@@ -166,7 +166,11 @@ function AttachmentElement(props: PlateElementProps) {
               />
             }
           >
-            {attachment?.preview ? <img src={attachment.preview} alt="" /> : <FileText />}
+            {attachment?.preview ? (
+              <img src={attachment.preview} alt="" />
+            ) : (
+              <FileIcon name={name} mediaType={attachment?.file.type} />
+            )}
             <span className="composer-attachment-name">{name}</span>
             <small>{attachment ? attachmentSize(attachment.file.size) : "Reattach file"}</small>
             {attachment?.state === "reserving" ? (

@@ -1,3 +1,4 @@
+import { FileIcon } from "./components/FileIcon";
 import { useStore } from "zustand";
 import { createPanelStore, defaultPanelTabs } from "./panel-store";
 import { RightPanelTabs } from "./components/FileViewer";
@@ -654,6 +655,27 @@ function Attachments() {
       description="Open a media card to try the viewer. These files are generated preview fixtures."
     >
       <div className="ds-grid">
+        <Specimen title="File icons">
+          <div className="ds-stack">
+            {[
+              "README.md",
+              "App.tsx",
+              "example.test.ts",
+              "package.json",
+              "Dockerfile",
+              ".bashrc",
+              "report.pdf",
+              "archive.zip",
+              "photo.png",
+              "unknown",
+            ].map((name) => (
+              <span key={name} className="ds-row">
+                <FileIcon name={name} />
+                {name}
+              </span>
+            ))}
+          </div>
+        </Specimen>
         <Specimen title="Image">
           <ReadyAttachment
             href={logo}

@@ -1,7 +1,7 @@
+import { FileIcon } from "./FileIcon";
 import { useMessageServices } from "./message-services";
 import { useRef, useState } from "react";
 import type { DisplayPart } from "@stanley2058/lilac-client-protocol";
-import { FileText } from "lucide-react";
 import { useUploadProgress } from "../upload-context";
 import { Button } from "./ui/button";
 import { attempt } from "./ui";
@@ -24,7 +24,7 @@ export function ResourceAttachment({
   if (data.state !== "ready")
     return (
       <div className="resource">
-        <FileText />
+        <FileIcon name={data.name} mediaType={data.mediaType} />
         <span>{data.name}</span>
         <span>{recovery.error ?? local?.error ?? data.error ?? data.state}</span>
         {canEdit && local?.state === "failed" && local.retry ? (

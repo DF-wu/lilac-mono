@@ -1,3 +1,4 @@
+import { FileIcon } from "./FileIcon";
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { defaultPanelTabs, defaultRightPanel, type PanelTabs, type PanelTab } from "../panel-store";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./ui/tabs";
@@ -10,7 +11,7 @@ import {
 import { IconButton } from "./ui";
 import { useQuery } from "@tanstack/react-query";
 import { useStore } from "zustand";
-import { Bot, FileText, Plus, X } from "lucide-react";
+import { Bot, Plus, X } from "lucide-react";
 import { useOptionalWorkspace, useWorkspace } from "../workspace-context";
 import type { FileTarget } from "../file-target";
 import { useFileViewer } from "./file-viewer-context";
@@ -200,7 +201,14 @@ export function RightPanelTabs({
             {tabs.items.map((tab) => (
               <div className="file-panel-tab" key={tab.id}>
                 <TabsTrigger value={tab.id}>
-                  {tab.type === "agents" ? <Bot /> : <FileText />}
+                  {tab.type === "agents" ? (
+                    <Bot />
+                  ) : (
+                    <FileIcon
+                      name={tab.target.name}
+                      mediaType={tab.target.type === "resource" ? tab.target.mediaType : undefined}
+                    />
+                  )}
                   <span>{tab.type === "agents" ? "Agents" : tab.target.name}</span>
                 </TabsTrigger>
                 <IconButton

@@ -1,5 +1,6 @@
+import { FileIcon } from "./FileIcon";
 import { useState, type ReactNode } from "react";
-import { Copy, ScanEye, PanelRight, FileText } from "lucide-react";
+import { Copy, ScanEye, PanelRight } from "lucide-react";
 import { copyMessage } from "../message-clipboard";
 import { copyPreviewImage } from "../image-clipboard";
 import type { FileTarget } from "../file-target";
@@ -126,7 +127,10 @@ function ResolvedFileLink({ target }: { target: FileTarget }) {
             />
           }
         >
-          <FileText />
+          <FileIcon
+            name={target.name}
+            mediaType={target.type === "resource" ? target.mediaType : undefined}
+          />
           <span>
             {target.name}
             {target.line ? ` · L${target.line}` : ""}

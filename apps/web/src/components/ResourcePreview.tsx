@@ -1,3 +1,4 @@
+import { FileIcon } from "./FileIcon";
 import { FileActions } from "./FileActions";
 import type { FileTarget } from "../file-target";
 import { useFileViewer } from "./file-viewer-context";
@@ -11,10 +12,8 @@ import {
   Copy,
   Download,
   ExternalLink,
-  FileText,
   ImageOff,
   Film,
-  Music,
   RotateCcw,
   ZoomIn,
   ZoomOut,
@@ -54,9 +53,6 @@ export function ReadyAttachment({ data, href }: { data: ResourceData; href: stri
   const [failed, setFailed] = useState(false);
   const [preview, setPreview] = useState(false);
   const kind = attachmentKind(data.mediaType, data.name);
-  let icon = <FileText />;
-  if (kind === "video") icon = <Film />;
-  if (kind === "audio") icon = <Music />;
   return (
     <FileActions
       target={{
@@ -124,7 +120,7 @@ export function ReadyAttachment({ data, href }: { data: ResourceData; href: stri
               onClick={() => setPreview(true)}
               aria-label={`Preview ${data.name}`}
             >
-              {icon}
+              <FileIcon name={data.name} mediaType={data.mediaType} />
               <span>
                 <AttachmentTitle className="attachment-name">{data.name}</AttachmentTitle>
                 <AttachmentDescription className="attachment-size">
@@ -634,7 +630,11 @@ export function ResourcePreview({
       >
         <header className="resource-preview-header">
           <DialogTitle className="resource-preview-title" title={name}>
-            {name}
+            <FileIcon
+              name={name}
+              mediaType={target?.type === "resource" ? target.mediaType : undefined}
+            />
+            <span>{name}</span>
           </DialogTitle>
           <IconButton
             label="Close preview"
