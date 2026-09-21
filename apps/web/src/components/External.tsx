@@ -24,24 +24,26 @@ export function External({ initialThreadId }: { initialThreadId?: string }) {
   );
   const error = threadId ? read.error : list.error;
   return (
-    <section className="external-view">
-      <header className="thread-header">
+    <section className="external-view flex flex-1 min-h-0 flex-col">
+      <header className="thread-header flex items-center gap-2 h-8 min-h-0 px-6 py-0.5 [&_h1]:truncate [&_.icon-button]:size-[var(--ui-control-compact)] max-workspace:gap-1 max-workspace:pl-15 group-[.sidebar-hidden]/workspace:pl-15 group-[.right-panel-hidden]/workspace:pr-[calc(var(--ui-space-unit)*5+var(--ui-control-compact))]">
         {threadId ? (
           <IconButton label="Back to external conversations" onClick={() => setThreadId(undefined)}>
             <ArrowLeft />
           </IconButton>
         ) : null}
         <h1>{view?.thread.title ?? "Other surfaces"}</h1>
-        <span className="badge">Read-only</span>
+        <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
+          Read-only
+        </span>
         {view ? (
           <time
-            className="retrieved-time"
+            className="retrieved-time text-xs text-muted-foreground whitespace-nowrap"
             dateTime={new Date(view.thread.retrievedAt).toISOString()}
           >
             Retrieved {new Date(view.thread.retrievedAt).toLocaleString()}
           </time>
         ) : null}
-        <span className="toolbar-spacer" />
+        <span className="toolbar-spacer flex-1" />
         <IconButton
           label="Refresh external conversation"
           onClick={() => {
@@ -79,7 +81,7 @@ export function External({ initialThreadId }: { initialThreadId?: string }) {
           {read.hasNextPage ? (
             <Button
               variant="ghost"
-              className="text-button"
+              className="text-primary py-2 px-3 text-sm"
               disabled={read.isFetching}
               onClick={() => {
                 if (!read.isFetching) void read.fetchNextPage({ cancelRefetch: false });
@@ -101,18 +103,20 @@ export function External({ initialThreadId }: { initialThreadId?: string }) {
               <Button
                 type="button"
                 variant="ghost"
-                className="external-thread h-auto"
+                className="external-thread flex w-full gap-3 justify-between py-4 px-6 text-left h-auto"
                 onClick={() => setThreadId(thread.id)}
               >
                 <span>{thread.title}</span>
-                <span className="badge">{thread.surface}</span>
+                <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
+                  {thread.surface}
+                </span>
               </Button>
             )}
           />
           {list.hasNextPage ? (
             <Button
               variant="ghost"
-              className="text-button"
+              className="text-primary py-2 px-3 text-sm"
               disabled={list.isFetching}
               onClick={() => {
                 if (!list.isFetching) void list.fetchNextPage({ cancelRefetch: false });

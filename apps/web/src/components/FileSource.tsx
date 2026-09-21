@@ -30,9 +30,9 @@ export function FileSource({
   }, [line, endLine, navigation]);
   const markdown = /\.(md|markdown|mdx)$/i.test(name);
   return (
-    <div className="file-source">
-      <div className="file-source-toolbar">
-        {heading ? <div className="file-source-heading">{heading}</div> : null}
+    <div data-ui="file-source" className="file-source flex flex-col flex-1 min-w-0 min-h-0 h-full">
+      <div className="file-source-toolbar flex items-center flex-none justify-end py-1 px-2 gap-1">
+        {heading ? <div className="file-source-heading flex-1 min-w-0">{heading}</div> : null}
         {markdown ? (
           <IconButton
             label={preview ? "Show source" : "Preview Markdown"}
@@ -49,25 +49,34 @@ export function FileSource({
         ) : null}
       </div>
       {text.status === "loading" ? (
-        <div className="file-status" role="status">
+        <div
+          className="file-status grid place-content-center flex-1 p-4 text-sm text-muted-foreground"
+          role="status"
+        >
           Loading file…
         </div>
       ) : null}
       {text.status === "error" ? (
-        <div className="file-status error-text" role="status">
+        <div
+          className="file-status grid place-content-center flex-1 p-4 error-text text-danger text-sm"
+          role="status"
+        >
           {text.message}
         </div>
       ) : null}
       {text.status === "ready" ? (
         <>
           {preview && markdown ? (
-            <div className="file-markdown">
+            <div className="file-markdown flex-1 min-h-0 overflow-auto p-3">
               <Markdown text={text.text} wrap />
             </div>
           ) : (
             <Suspense
               fallback={
-                <pre className="file-code file-code-fallback" data-wrap={wrap}>
+                <pre
+                  className="file-code overflow-auto flex-1 min-h-0 font-mono text-sm leading-code [overscroll-behavior:contain] file-code-fallback whitespace-pre-wrap wrap-anywhere p-3"
+                  data-wrap={wrap}
+                >
                   {text.text}
                 </pre>
               }
@@ -82,7 +91,11 @@ export function FileSource({
               />
             </Suspense>
           )}
-          {text.truncated ? <p className="file-notice">Showing the first 64 KB.</p> : null}
+          {text.truncated ? (
+            <p className="file-notice flex-none p-2 text-muted-foreground text-xs">
+              Showing the first 64 KB.
+            </p>
+          ) : null}
         </>
       ) : null}
     </div>

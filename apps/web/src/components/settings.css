@@ -1,82 +1,119 @@
-.settings-dialog {
-  display: flex;
-  width: min(64rem, calc(100vw - var(--space-6)));
-  max-width: none;
-  height: min(48rem, calc(100dvh - var(--space-6)));
-  padding: var(--space-5);
-  overflow: hidden;
-}
-.settings-layout {
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  gap: var(--space-5);
-}
-.settings-navigation {
-  width: 10rem;
+.settings-navigation [role="tab"] {
   flex: none;
-  align-items: stretch;
-  justify-content: flex-start;
-  align-self: stretch;
   height: auto;
-  overflow-y: auto;
-  overflow-x: hidden;
-  min-width: 0;
-  padding: var(--space-4) 0;
-  gap: var(--space-5);
-  background: transparent;
+  min-height: var(--ui-control-size);
+  justify-content: flex-start;
+  padding: calc(var(--ui-space-unit) * 2) calc(var(--ui-space-unit) * 3);
 }
-.settings-navigation-group { display: flex; flex-direction: column; gap: var(--space-1); }
-.settings-navigation-label { margin: 0 0 var(--space-2); padding-inline: var(--space-3); font-size: var(--text-sm); font-weight: 600; color: var(--foreground); }
-.settings-navigation [role="tab"] { flex: none; height: auto; min-height: var(--control-size); justify-content: flex-start; padding: var(--space-2) var(--space-3); }
-.settings-options {
+
+.settings-section h2 {
+  margin: 0 0 calc(var(--ui-space-unit) * 6);
+  font-size: var(--ui-text-lg);
+  font-weight: 600;
+}
+
+
+.settings-config .config-footer {
+  flex-wrap: wrap;
+}
+
+.settings-account > div {
+  display: flex;
+  justify-content: space-between;
+  gap: calc(var(--ui-space-unit) * 4);
+}
+.settings-account dt {
+  color: var(--ui-muted-foreground);
+}
+.settings-account dd {
+  margin: 0;
+  text-align: right;
+}
+.settings-options .inline-form {
+  flex-wrap: wrap;
+}
+.settings-options .inline-form input {
+  flex-basis: 12rem;
+}
+@media (max-width: 40rem) {
+  .settings-dialog {
+    width: calc(100vw - calc(var(--ui-space-unit) * 4));
+    height: calc(100dvh - calc(var(--ui-space-unit) * 4));
+    padding: calc(var(--ui-space-unit) * 6) calc(var(--ui-space-unit) * 2)
+      calc(var(--ui-space-unit) * 2);
+  }
+  .settings-layout {
+    gap: calc(var(--ui-space-unit) * 2);
+  }
+  .settings-navigation {
+    width: 7.5rem;
+  }
+  .settings-navigation-label,
+  .settings-navigation [role="tab"] {
+    padding-inline: calc(var(--ui-space-unit) * 2);
+  }
+  .settings-options {
+    padding: calc(var(--ui-space-unit) * 3);
+  }
+  .settings-options .field,
+  .settings-account > div {
+    align-items: stretch;
+    flex-direction: column;
+    gap: calc(var(--ui-space-unit) * 2);
+  }
+  .settings-account dd {
+    text-align: left;
+  }
+}
+.settings-navigation [role="tab"]::after {
+  display: none;
+}
+
+.settings-row > span,
+.settings-row-description > span {
+  display: block;
+  padding-block: calc(var(--ui-space-unit) * 2);
+}
+
+.settings-row-description .muted {
+  margin: 0;
+  font-size: var(--ui-text-sm);
+}
+.settings-row > [data-slot="select-trigger"] {
+  flex: none;
+  width: auto;
+  min-width: 7rem;
+}
+
+.profile-avatar-editor > [data-slot="avatar"] {
+  width: 5rem;
+  height: 5rem;
+  font-size: var(--ui-text-lg);
+}
+
+.profile-name-form .field {
   flex: 1;
   min-width: 0;
-  min-height: 0;
-  margin-block: var(--space-4);
-  padding: var(--space-5);
-  overflow-y: auto;
-  overflow-wrap: anywhere;
-  border-radius: var(--radius-lg);
-  background: var(--background);
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: calc(var(--ui-space-unit) * 2);
 }
-.settings-section h2 { margin: 0 0 var(--space-5); font-size: var(--text-lg); font-weight: 600; }
-.settings-config { display: flex; min-height: 100%; flex-direction: column; }
-.settings-config .config-editor { flex: 1; min-height: 16rem; resize: vertical; background: var(--surface); }
-.settings-config .config-footer { flex-wrap: wrap; }
-.settings-account { display: grid; gap: var(--space-4); margin-bottom: var(--space-5); }
-.settings-account > div { display: flex; justify-content: space-between; gap: var(--space-4); }
-.settings-account dt { color: var(--muted-foreground); }
-.settings-account dd { margin: 0; text-align: right; }
-.settings-options .inline-form { flex-wrap: wrap; }
-.settings-options .inline-form input { flex-basis: 12rem; }
 @media (max-width: 40rem) {
-  .settings-dialog { width: calc(100vw - var(--space-4)); height: calc(100dvh - var(--space-4)); padding: var(--space-5) var(--space-2) var(--space-2); }
-  .settings-layout { gap: var(--space-2); }
-  .settings-navigation { width: 7.5rem; }
-  .settings-navigation-label, .settings-navigation [role="tab"] { padding-inline: var(--space-2); }
-  .settings-options { padding: var(--space-3); }
-  .settings-options .field, .settings-account > div { align-items: stretch; flex-direction: column; gap: var(--space-2); }
-  .settings-account dd { text-align: left; }
-}
-.settings-navigation [role="tab"]::after { display: none; }
-
-
-
-.settings-row { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-5); margin-bottom: var(--space-6); }
-.settings-row > span, .settings-row-description > span { display: block; padding-block: var(--space-2); }
-.settings-row-description { min-width: 0; }
-.settings-row-description .muted { margin: 0; font-size: var(--text-sm); }
-.settings-row > [data-slot="select-trigger"] { flex: none; width: auto; min-width: 7rem; }
-.profile-editor { display: flex; align-items: center; gap: var(--space-5); margin-bottom: var(--space-6); }
-.profile-avatar-editor { position: relative; flex: none; }
-.profile-avatar-editor > [data-slot="avatar"] { width: 5rem; height: 5rem; font-size: var(--text-lg); }
-.profile-avatar-action { position: absolute; right: calc(-1 * var(--space-1)); bottom: calc(-1 * var(--space-1)); background: var(--background); border-radius: 50%; }
-.profile-name-form { display: flex; align-items: flex-end; gap: var(--space-3); min-width: 0; flex: 1; max-width: 28rem; }
-.profile-name-form .field { flex: 1; min-width: 0; margin: 0; display: flex; flex-direction: column; align-items: stretch; gap: var(--space-2); }
-@media (max-width: 40rem) {
-  .settings-row { flex-wrap: wrap; gap: var(--space-2); }
-  .profile-editor { flex-direction: column; align-items: flex-start; }
-  .profile-name-form { width: 100%; flex-wrap: wrap; }
-  .profile-name-form .field { flex-basis: 100%; }
+  .settings-row {
+    flex-wrap: wrap;
+    gap: calc(var(--ui-space-unit) * 2);
+  }
+  .profile-editor {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .profile-name-form {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .profile-name-form .field {
+    flex-basis: 100%;
+  }
 }

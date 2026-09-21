@@ -222,14 +222,20 @@ export function ThreadQueue({
         estimate={64}
         fillBeforeIndex={rows.findIndex((row) => row.id === "heading:settled")}
         label="Conversations"
-        className={`thread-list thread-queue ${drag ? "is-dragging" : ""}`}
+        className={`thread-list flex-1 thread-queue ${drag ? "is-dragging" : ""}`}
         scrollFade
         hasMore={hasMore}
         loading={loading}
         onEndReached={onEndReached}
         render={(row) => {
           if (row.kind === "draft-divider")
-            return <div className="queue-draft-divider" role="separator" aria-label="Drafts" />;
+            return (
+              <div
+                className="queue-draft-divider h-px m-3 bg-border"
+                role="separator"
+                aria-label="Drafts"
+              />
+            );
           if (row.kind !== "thread")
             return (
               <QueueTarget
@@ -243,7 +249,7 @@ export function ThreadQueue({
             );
           if (!row.thread.source)
             return (
-              <div className="queue-draft">
+              <div className="queue-draft pb-2">
                 <QueueCard thread={row.thread} section={row.section} renderThread={renderThread} />
               </div>
             );
@@ -257,7 +263,7 @@ export function ThreadQueue({
       {createPortal(
         <DragOverlay dropAnimation={{ duration: dropDuration, easing: "ease" }}>
           {drag ? (
-            <div className="thread-drag-preview">
+            <div className="thread-drag-preview relative bg-surface-raised shadow-overlay rounded-md cursor-grabbing">
               <ThreadCard
                 pinned={(drag.move?.section ?? drag.from) === "pinned"}
                 title={drag.thread.source?.title ?? "Untitled"}
@@ -268,7 +274,7 @@ export function ThreadQueue({
                 onSelect={() => {}}
               />
               {action ? (
-                <span className="thread-drop-action">
+                <span className="thread-drop-action absolute right-2 top-1 flex items-center gap-1 text-primary [border:1px_solid_currentColor] bg-surface-raised rounded-sm py-[2px] px-[6px] text-xs">
                   <ActionIcon />
                   {action}
                 </span>
@@ -316,7 +322,7 @@ function QueueItem({
   return (
     <div
       ref={setNodeRef}
-      className={`queue-thread ${draggable.isDragging ? "drag-source" : ""}`}
+      className={`queue-thread rounded-md outline-none ${draggable.isDragging ? "drag-source" : ""}`}
       {...draggable.attributes}
       {...draggable.listeners}
       onKeyDown={(event) => {
@@ -325,7 +331,10 @@ function QueueItem({
       role="listitem"
       aria-label={`Move ${title || "Untitled"}`}
       onMouseDownCapture={(event) => {
-        if (event.target instanceof Element && event.target.closest(".thread-card-actions"))
+        if (
+          event.target instanceof Element &&
+          event.target.closest("[data-ui=thread-card-actions]")
+        )
           event.stopPropagation();
       }}
     >
@@ -349,9 +358,13 @@ function QueueTarget({
   dragging: boolean;
 }) {
   const { setNodeRef } = useDroppable({ id: row.id });
-  if (row.kind === "end") return <div ref={setNodeRef} className="queue-section-end"></div>;
+  if (row.kind === "end")
+    return <div ref={setNodeRef} className="queue-section-end h-[12px]"></div>;
   return (
-    <div ref={setNodeRef} className={`queue-heading ${highlighted ? "drop-highlight" : ""}`}>
+    <div
+      ref={setNodeRef}
+      className={`queue-heading py-2 px-1 text-muted-foreground ${highlighted ? "drop-highlight text-primary [border-color:var(--ui-primary)]" : ""}`}
+    >
       <Button
         variant="ghost"
         disabled={row.section !== "settled"}
@@ -366,7 +379,9 @@ function QueueTarget({
         ) : null}
       </Button>
       {row.section === "settled" && !open && dragging ? (
-        <div className="queue-drop-zone">Settle</div>
+        <div className="queue-drop-zone m-1 p-3 [border:1px_dashed_var(--ui-border)] rounded-md text-center text-muted-foreground text-sm">
+          Settle
+        </div>
       ) : null}
     </div>
   );

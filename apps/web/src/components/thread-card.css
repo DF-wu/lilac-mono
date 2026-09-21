@@ -1,41 +1,119 @@
-.thread-card-trigger { display: block; min-width: 0; width: 100%; }
-.thread-card { position: relative; min-width: 0; border-radius: var(--radius-md); }
-.thread-card:hover, .thread-card:focus-within { background: var(--surface-hover); }
-.thread-card.selected { background: var(--surface-raised); }
-.thread-card-select { width:100%; height:auto; padding:calc(var(--space-3) / 2) var(--space-3) var(--space-3); gap:0; justify-content:flex-start; text-align:left; font-weight:normal; border-radius:inherit; }
-.thread-state-icon { width:var(--text-lg); height:var(--text-lg); flex:none; display:grid; place-items:center; color:var(--muted-foreground); }
-.thread-state-icon svg { width:var(--icon-size); height:var(--icon-size); }
-.thread-card[data-state=completed] .thread-state-icon { color:var(--success); }
-.thread-card[data-state=working] .thread-state-icon { color:var(--primary); }
-.thread-card[data-state=working] .thread-state-icon svg { animation:thread-working-spin 1.5s linear infinite; }
-.thread-card[data-state=error] .thread-state-icon { color:var(--danger); }
-.thread-card[data-state=input] .thread-state-icon { color:var(--primary); background:var(--muted); border-radius:var(--radius-md); }
-.thread-card-copy { display:flex; flex:1; min-width:0; flex-direction:column; gap:0; }
-.thread-card-top { display:flex; align-items:center; gap:var(--space-2); height:var(--control-compact); font-size:var(--text-xs); color:var(--muted-foreground); }
-.thread-starter { display:flex; min-width:0; align-items:center; gap:var(--space-1); }
-.thread-starter > span:last-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.thread-starter [data-slot=avatar] { width:var(--text-lg); height:var(--text-lg); font-size:calc(var(--text-xs) * .75); }
-.thread-card-meta { margin-left:auto; flex:none; display:flex; align-items:center; gap:var(--space-1); }
-.thread-card-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:var(--text-sm); }
-.thread-card[data-state=completed] .thread-card-title { font-weight:600; }
-.thread-card-actions { position:absolute; top:calc(var(--space-3) / 2); right:var(--space-2); display:flex; align-items:center; opacity:0; pointer-events:none; background:var(--surface-hover); border-radius:var(--radius-sm); }
-.thread-card.selected .thread-card-actions { background:var(--surface-raised); }
-.thread-card-actions .icon-button { width:var(--control-compact); height:var(--control-compact); }
-.thread-card-actions .destructive-action { color:var(--danger); }
-.thread-card:hover .thread-card-actions, .thread-card:focus-within .thread-card-actions { opacity:1; pointer-events:auto; }
-.thread-card:has(.thread-card-actions):hover .thread-card-meta, .thread-card:has(.thread-card-actions):focus-within .thread-card-meta { visibility:hidden; }
-.thread-card:has(.thread-card-actions):hover .thread-starter, .thread-card:has(.thread-card-actions):focus-within .thread-starter { max-width:calc(100% - var(--control-compact) * 3); }
-@keyframes thread-working-spin { to { transform:rotate(360deg); } }
-@media(prefers-reduced-motion:reduce) { .thread-card[data-state=working] .thread-state-icon svg { animation:none; } }
-@media(hover:none) { .thread-card-actions { opacity:1; pointer-events:auto; } .thread-card:has(.thread-card-actions) .thread-card-meta { visibility:hidden; } .thread-card:has(.thread-card-actions) .thread-starter { max-width:calc(100% - var(--control-compact) * 3); } }
+.thread-card:hover,
+.thread-card:focus-within {
+  background: var(--ui-surface-hover);
+  color: var(--ui-hover-foreground);
+}
+.thread-card.selected {
+  background: var(--ui-selection);
+  color: var(--ui-selection-foreground);
+}
 
-.thread-card .thread-card-select, .thread-card .thread-card-select:hover, .thread-card .thread-card-select:focus-visible { background: transparent; }
+.thread-state-icon svg {
+  width: var(--ui-icon-size);
+  height: var(--ui-icon-size);
+}
+.thread-card[data-state="completed"] .thread-state-icon {
+  color: var(--ui-success);
+}
+.thread-card[data-state="working"] .thread-state-icon {
+  color: var(--ui-primary);
+}
+.thread-card[data-state="working"] .thread-state-icon svg {
+  animation: thread-working-spin 1.5s linear infinite;
+}
+.thread-card[data-state="error"] .thread-state-icon {
+  color: var(--ui-danger);
+}
+.thread-card[data-state="input"] .thread-state-icon {
+  color: var(--ui-primary);
+  background: var(--ui-muted);
+  border-radius: var(--ui-radius-md);
+}
 
-.thread-pin { display:grid; place-items:center; flex:none; }
-.thread-pin svg { width:var(--icon-size); height:var(--icon-size); }
+.thread-starter > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thread-starter [data-slot="avatar"] {
+  width: var(--ui-text-lg);
+  height: var(--ui-text-lg);
+  font-size: calc(var(--ui-text-xs) * 0.75);
+}
 
-.thread-card[data-draft] { background: color-mix(in srgb, var(--draft) 7%, transparent); }
-.thread-card[data-draft]:hover, .thread-card[data-draft]:focus-within { background: color-mix(in srgb, var(--draft) 10%, var(--surface-hover)); }
-.thread-card[data-draft].selected { background: color-mix(in srgb, var(--draft) 10%, var(--surface-raised)); }
-.thread-draft-icon { color: var(--draft); flex: none; display: grid; place-items: center; }
-.thread-draft-icon svg { width: var(--icon-size); height: var(--icon-size); }
+.thread-card[data-state="completed"] .thread-card-title {
+  font-weight: 600;
+}
+
+.thread-card.selected .thread-card-actions {
+  background: var(--ui-selection);
+}
+.thread-card-actions .icon-button {
+  width: var(--ui-control-compact);
+  height: var(--ui-control-compact);
+}
+.thread-card-actions .destructive-action {
+  color: var(--ui-danger);
+}
+.thread-card:hover .thread-card-actions,
+.thread-card:focus-within .thread-card-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+.thread-card:has(.thread-card-actions):hover .thread-card-meta,
+.thread-card:has(.thread-card-actions):focus-within .thread-card-meta {
+  visibility: hidden;
+}
+.thread-card:has(.thread-card-actions):hover .thread-starter,
+.thread-card:has(.thread-card-actions):focus-within .thread-starter {
+  max-width: calc(100% - var(--ui-control-compact) * 3);
+}
+@keyframes thread-working-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .thread-card[data-state="working"] .thread-state-icon svg {
+    animation: none;
+  }
+}
+@media (hover: none) {
+  .thread-card-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .thread-card:has(.thread-card-actions) .thread-card-meta {
+    visibility: hidden;
+  }
+  .thread-card:has(.thread-card-actions) .thread-starter {
+    max-width: calc(100% - var(--ui-control-compact) * 3);
+  }
+}
+
+.thread-card .thread-card-select,
+.thread-card .thread-card-select:hover,
+.thread-card .thread-card-select:focus-visible {
+  background: transparent;
+}
+
+.thread-pin svg {
+  width: var(--ui-icon-size);
+  height: var(--ui-icon-size);
+}
+
+.thread-card[data-draft] {
+  background: color-mix(in srgb, var(--ui-warning) 7%, transparent);
+}
+.thread-card[data-draft]:hover,
+.thread-card[data-draft]:focus-within {
+  background: color-mix(in srgb, var(--ui-warning) 10%, var(--ui-surface-hover));
+}
+.thread-card[data-draft].selected {
+  background: color-mix(in srgb, var(--ui-warning) 10%, var(--ui-selection));
+}
+
+.thread-draft-icon svg {
+  width: var(--ui-icon-size);
+  height: var(--ui-icon-size);
+}

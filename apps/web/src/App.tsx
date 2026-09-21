@@ -1,3 +1,4 @@
+import { readTheme, setThemeMode } from "./theme/theme";
 import { FileViewerProvider } from "./components/file-viewer-context";
 import { RightPanel } from "./components/FileViewer";
 import { useEventCallback } from "./use-event-callback";
@@ -165,7 +166,7 @@ function Workspace(props: AppProps) {
     setRename(undefined);
     setConfirmDelete(undefined);
   }, [active]);
-  const [theme, setTheme] = useState(() => readTheme());
+  const [theme, setTheme] = useState<string>(() => readTheme());
   const drafts = useRef(new Map<string, Draft>());
   const [pendingInputs, setPendingInputs] = useState(new Map<string, PendingInput[]>());
   const pending = useRef(pendingInputs);
@@ -250,7 +251,7 @@ function Workspace(props: AppProps) {
   ]);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
+    setThemeMode(theme);
     const saved = Result.try({
       try: () => localStorage.setItem("lilac-theme-v1", theme),
       catch: () => "Storage unavailable",
@@ -690,9 +691,12 @@ function Workspace(props: AppProps) {
   const logout = useEventCallback(() => void attempt(props.onLogout, setError));
   const sidebarToolbar = useMemo(
     () => (
-      <div className="sidebar-search-row">
+      <div className="sidebar-search-row flex items-center gap-1 min-w-0 mb-2">
         <SidebarSearch onSearch={searchSidebar} onClear={clearSidebarSearch} />
-        <nav className="sidebar-tabs" aria-label="Conversation filters and actions">
+        <nav
+          className="sidebar-tabs flex items-center py-2 px-0"
+          aria-label="Conversation filters and actions"
+        >
           <IconButton
             label={archived ? "Show active conversations" : "Show archived conversations"}
             tooltip="Archived"
@@ -730,11 +734,13 @@ function Workspace(props: AppProps) {
   );
   const sidebarFooter = useMemo(
     () => (
-      <footer className="sidebar-footer">
+      <footer className="sidebar-footer flex items-center gap-2 pt-3">
         <ActorAvatar displayName={viewer.displayName} avatarUrl={viewer.avatarUrl} />
-        <span className="viewer-name">{viewer.displayName}</span>
+        <span className="viewer-name text-sm whitespace-nowrap overflow-hidden text-ellipsis">
+          {viewer.displayName}
+        </span>
         {props.sessionControl}
-        <span className="toolbar-spacer" />
+        <span className="toolbar-spacer flex-1" />
         <ContextMenu>
           <ContextMenuTrigger
             render={
@@ -769,10 +775,10 @@ function Workspace(props: AppProps) {
         >
           <Tooltip.Provider delay={350}>
             <main
-              className={`app-shell ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
+              className={`app-shell group/workspace relative flex h-dvh overflow-hidden ${sidebar ? "" : "sidebar-hidden"} ${rightOpen ? "" : "right-panel-hidden"}`}
               aria-label="Chat workspace"
             >
-              <div className="sidebar-toggle">
+              <div className="sidebar-toggle fixed top-0 left-3 h-8 flex items-center z-40 [&_.icon-button]:size-[var(--ui-control-compact)]">
                 <IconButton
                   label={sidebar ? "Hide sidebar" : "Show sidebar"}
                   onClick={panels.getState().toggleSidebar}
@@ -798,9 +804,9 @@ function Workspace(props: AppProps) {
                   label="Sidebar width"
                   onWidthChange={panels.getState().resizeSidebar}
                 >
-                  <aside className="sidebar">
-                    <header className="sidebar-header">
-                      <span className="brand">
+                  <aside className="sidebar flex flex-col bg-sidebar text-sidebar-foreground p-3 pt-0 min-h-0 h-full">
+                    <header className="sidebar-header flex items-center gap-2 h-8 min-h-8 shrink-0 pl-[calc(var(--ui-control-compact)+var(--ui-space-unit)*3)] mb-3 [&_.brand]:leading-none">
+                      <span className="brand inline-flex gap-1 items-baseline text-2xl [letter-spacing:-0.07em] font-[650]">
                         lilac
                         <span />
                       </span>
@@ -812,13 +818,13 @@ function Workspace(props: AppProps) {
                           items={results.items}
                           itemKey={(hit) => `${hit.threadId}:${hit.turnId ?? hit.excerpt}`}
                           label="Search results"
-                          className="thread-list"
+                          className="thread-list flex-1"
                           estimate={92}
                           render={(hit) => (
                             <Button
                               type="button"
                               variant="ghost"
-                              className="search-result h-auto flex-col items-start whitespace-normal"
+                              className="search-result flex w-full gap-1 p-3 text-left rounded-sm h-auto flex-col items-start whitespace-normal"
                               onClick={() => {
                                 if (hit.surface === "native") select(hit.threadId);
                                 else {
@@ -833,12 +839,14 @@ function Workspace(props: AppProps) {
                           )}
                         />
                         {results.items.length === 0 && !searching ? (
-                          <p className="muted empty-list">No results</p>
+                          <p className="muted text-muted-foreground empty-list p-4 text-sm">
+                            No results
+                          </p>
                         ) : null}
                         {results.nextCursor ? (
                           <Button
                             variant="ghost"
-                            className="text-button"
+                            className="text-primary py-2 px-3 text-sm"
                             disabled={searching}
                             onClick={() => {
                               if (!searching)
@@ -876,7 +884,7 @@ function Workspace(props: AppProps) {
                             onEndReached={() => {
                               if (nextCursor) void listThreads(archived, nextCursor);
                             }}
-                            className="thread-list"
+                            className="thread-list flex-1"
                             estimate={64}
                             render={(thread) => (
                               <SidebarThread
@@ -912,7 +920,7 @@ function Workspace(props: AppProps) {
                   </aside>
                 </WorkspaceSidePanel>
                 <div id="chat" className="chat-panel">
-                  <div className="main-panel">
+                  <div className="main-panel h-full relative min-w-0 min-h-0 flex flex-col">
                     {external && owner ? (
                       <Suspense fallback={<p role="status">Loading conversations…</p>}>
                         <External key={externalId ?? "list"} initialThreadId={externalId} />
@@ -947,12 +955,14 @@ function Workspace(props: AppProps) {
                               }
                               header={
                                 thread ? (
-                                  <header className="thread-header">
+                                  <header className="thread-header flex items-center gap-2 h-8 min-h-0 px-6 py-0.5 [&_h1]:truncate [&_.icon-button]:size-[var(--ui-control-compact)] max-workspace:gap-1 max-workspace:pl-15 group-[.sidebar-hidden]/workspace:pl-15 group-[.right-panel-hidden]/workspace:pr-[calc(var(--ui-space-unit)*5+var(--ui-control-compact))]">
                                     <h1>{thread.title || "Untitled"}</h1>
                                     {thread.archived ? (
-                                      <span className="badge">Archived</span>
+                                      <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
+                                        Archived
+                                      </span>
                                     ) : null}
-                                    <span className="toolbar-spacer" />
+                                    <span className="toolbar-spacer flex-1" />
                                     {owner ? (
                                       <IconButton
                                         label="Share conversation"
@@ -1057,7 +1067,7 @@ function Workspace(props: AppProps) {
                   }}
                 >
                   <Input
-                    className="wide-input"
+                    className="wide-input w-full"
                     autoFocus
                     aria-label="Conversation name"
                     value={rename?.title ?? ""}
@@ -1066,8 +1076,8 @@ function Workspace(props: AppProps) {
                     }}
                     maxLength={512}
                   />
-                  <div className="dialog-actions">
-                    <Button className="button primary" type="submit">
+                  <div className="dialog-actions flex justify-end gap-2 mt-6">
+                    <Button className="gap-2 rounded-sm px-4" type="submit">
                       Rename
                     </Button>
                   </div>
@@ -1082,13 +1092,17 @@ function Workspace(props: AppProps) {
                   This removes the conversation and makes its files unavailable. Any active run will
                   be canceled.
                 </p>
-                <div className="dialog-actions">
-                  <Button className="button" onClick={() => setConfirmDelete(undefined)}>
+                <div className="dialog-actions flex justify-end gap-2 mt-6">
+                  <Button
+                    variant="secondary"
+                    className="gap-2 rounded-sm px-4"
+                    onClick={() => setConfirmDelete(undefined)}
+                  >
                     Keep conversation
                   </Button>
                   <Button
                     variant="destructive"
-                    className="button danger"
+                    className="gap-2 rounded-sm px-4"
                     onClick={() => void deleteThread()}
                   >
                     Delete
@@ -1103,14 +1117,3 @@ function Workspace(props: AppProps) {
   );
 }
 export default App;
-
-function readTheme(): string {
-  const stored = Result.try({
-    try: () => localStorage.getItem("lilac-theme-v1"),
-    catch: () => "Storage unavailable",
-  });
-  return stored.match({
-    ok: (value) => (value === "dark" || value === "light" ? value : "system"),
-    err: () => "system",
-  });
-}

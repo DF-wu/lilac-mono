@@ -1,3 +1,4 @@
+import { watchSystemTheme } from "./theme/theme";
 import { SurfaceVisibilityContext } from "./components/ui/surface-visibility";
 import { Outlet, RouterProvider, useMatch } from "@tanstack/react-router";
 import { createAppRouter } from "./router";
@@ -96,20 +97,22 @@ function Root() {
   const reload = update?.activate ?? (() => location.reload());
   if (state.kind === "starting")
     return (
-      <div className="login-shell">
-        <span className="brand">Lilac</span>
+      <div className="login-shell w-[min(100%_-_calc(var(--ui-space-unit)*8),_24rem)] min-h-dvh mx-auto flex flex-col justify-center gap-6 py-12">
+        <span className="brand inline-flex gap-1 items-baseline text-2xl [letter-spacing:-0.07em] font-[650]">
+          Lilac
+        </span>
       </div>
     );
   if (state.kind === "offline")
     return (
-      <main className="login-shell">
+      <main className="login-shell w-[min(100%_-_calc(var(--ui-space-unit)*8),_24rem)] min-h-dvh mx-auto flex flex-col justify-center gap-6 py-12">
         <h1>Lilac</h1>
         <Button onClick={start}>Reconnect</Button>
       </main>
     );
   if (state.kind === "login")
     return (
-      <main className="login-shell">
+      <main className="login-shell w-[min(100%_-_calc(var(--ui-space-unit)*8),_24rem)] min-h-dvh mx-auto flex flex-col justify-center gap-6 py-12">
         <h1>Lilac</h1>
         {state.signingOut ? <p role="status">Signing out…</p> : null}
         {auth?.provider === "local" ? (
@@ -168,6 +171,8 @@ function RouteShell() {
     </>
   );
 }
+
+watchSystemTheme();
 
 const router = createAppRouter({ shellComponent: RouteShell, onChatEnter: enterChat });
 const root = document.getElementById("root");

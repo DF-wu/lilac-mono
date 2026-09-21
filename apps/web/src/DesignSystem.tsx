@@ -1,3 +1,4 @@
+import { setThemeMode } from "./theme/theme";
 import { FileIcon } from "./components/FileIcon";
 import { useStore } from "zustand";
 import { createPanelStore, defaultPanelTabs } from "./panel-store";
@@ -99,17 +100,24 @@ const threadStates = [
   { state: "input", label: "Needs input · preview only", title: "Which date works for everyone?" },
 ] as const;
 const swatches = [
-  "background",
-  "surface",
-  "surface-hover",
-  "surface-raised",
-  "foreground",
-  "muted-foreground",
-  "primary",
-  "danger",
-  "success",
+  ["Canvas", "background", "foreground"],
+  ["Sidebar", "sidebar", "sidebar-foreground"],
+  ["Raised", "surface-raised", "surface-raised-foreground"],
+  ["Primary", "primary", "primary-foreground"],
+  ["Secondary", "secondary", "secondary-foreground"],
+  ["Input", "input-background", "input-foreground"],
+  ["Hover", "surface-hover", "hover-foreground"],
+  ["Selection", "selection", "selection-foreground"],
+  ["Menu", "menu", "menu-foreground"],
+  ["Menu selection", "menu-selection", "menu-selection-foreground"],
+  ["Link", "background", "link"],
+  ["Disabled", "background", "disabled"],
+  ["Info", "background", "info"],
+  ["Warning / draft", "background", "warning"],
+  ["Danger", "background", "danger"],
+  ["Success", "background", "success"],
 ] as const;
-const spacings = [1, 2, 3, 4, 5, 6, 7];
+const spacings = [1, 2, 3, 4, 6, 8, 12];
 const noop = () => {};
 const markdownAttachment = [
   "#### A quiet weekend",
@@ -324,8 +332,8 @@ function Section({
   children: ReactNode;
 }) {
   return (
-    <section id={id} className="ds-section" aria-labelledby={`${id}-title`}>
-      <header className="ds-section-heading">
+    <section id={id} className="ds-section py-8 scroll-mt-6" aria-labelledby={`${id}-title`}>
+      <header className="ds-section-heading mb-6">
         <h2 id={`${id}-title`}>{title}</h2>
         {description ? <p>{description}</p> : null}
       </header>
@@ -343,7 +351,7 @@ function Specimen({
   className?: string;
 }) {
   return (
-    <div className={`ds-specimen ${className}`}>
+    <div className={`ds-specimen min-w-0 py-4 ${className}`}>
       <h3>{title}</h3>
       <div className="ds-specimen-body">{children}</div>
     </div>
@@ -372,37 +380,55 @@ function DemoThreadActions({ onAction }: { onAction: (label: string) => void }) 
 function Foundations() {
   return (
     <Section id="foundations" title="Foundations">
-      <div className="ds-swatches">
-        {swatches.map((token) => (
-          <div key={token} className="ds-swatch">
-            <span className={`ds-color ds-color-${token}`} />
-            <code>{token}</code>
+      <div className="ds-swatches grid [grid-template-columns:repeat(3,_minmax(0,_1fr))] gap-3">
+        {swatches.map(([label, background, foreground]) => (
+          <div key={label} className="flex flex-col gap-2 text-xs min-w-0">
+            <span
+              className="flex items-center h-12 rounded-md px-3 border border-border"
+              style={{ background: `var(--ui-${background})`, color: `var(--ui-${foreground})` }}
+            >
+              {label}
+            </span>
+            <code className="wrap-anywhere">
+              {background} / {foreground}
+            </code>
           </div>
         ))}
       </div>
-      <div className="ds-grid">
+      <div className="ds-grid grid grid-cols-1 workspace:grid-cols-2 gap-6">
         <Specimen title="Type">
-          <div className="ds-type">
-            <span className="ds-type-2xl">A little room to think</span>
-            <span className="ds-type-lg">Conversation title</span>
+          <div className="ds-type flex flex-col gap-3">
+            <span className="ds-type-2xl text-2xl">A little room to think</span>
+            <span className="ds-type-lg text-lg">Conversation title</span>
             <span>Body text and message content</span>
-            <span className="ds-type-sm">Supporting details</span>
-            <span className="ds-type-xs">Metadata and timestamps</span>
+            <span className="ds-type-sm text-sm text-muted-foreground">Supporting details</span>
+            <span className="ds-type-xs text-xs text-muted-foreground">
+              Metadata and timestamps
+            </span>
           </div>
         </Specimen>
         <Specimen title="Spacing & corners">
-          <div className="ds-spacing">
+          <div className="ds-spacing flex flex-wrap items-start gap-3">
             {spacings.map((space) => (
               <div key={space}>
                 <code>{space}</code>
-                <span className={`ds-space ds-space-${space}`} />
+                <span
+                  className="block h-4 bg-primary rounded-sm"
+                  style={{ width: `calc(var(--ui-space-unit) * ${space})` }}
+                />
               </div>
             ))}
           </div>
-          <div className="ds-row">
-            <span className="ds-radius ds-radius-sm">sm</span>
-            <span className="ds-radius ds-radius-md">md</span>
-            <span className="ds-radius ds-radius-lg">lg</span>
+          <div className="ds-row flex items-center flex-wrap gap-2">
+            <span className="ds-radius p-3 bg-surface-raised text-xs ds-radius-sm rounded-sm">
+              sm
+            </span>
+            <span className="ds-radius p-3 bg-surface-raised text-xs ds-radius-md rounded-md">
+              md
+            </span>
+            <span className="ds-radius p-3 bg-surface-raised text-xs ds-radius-lg rounded-lg">
+              lg
+            </span>
           </div>
         </Specimen>
       </div>
@@ -418,8 +444,8 @@ function Threads() {
       title="Threads"
       description="Hover or focus a row to inspect its actions. The input state is visual only."
     >
-      <div className="ds-grid">
-        <div className="ds-thread-list">
+      <div className="ds-grid grid grid-cols-1 workspace:grid-cols-2 gap-6">
+        <div className="ds-thread-list flex flex-col gap-6 p-3 bg-surface rounded-lg">
           {threadStates.map(({ state, label, title }, index) => (
             <div key={state}>
               <h3 className="ds-state-label">{label}</h3>
@@ -443,14 +469,14 @@ function Threads() {
           </p>
         </Specimen>
         <Specimen title="Thread details">
-          <div className="thread-details">
+          <div className="thread-details flex flex-col gap-2 text-sm wrap-anywhere">
             <strong>Compare the two proposals</strong>
             <span>Started by Alex Chen</span>
             <span>Last active today at 5:00 PM</span>
             <span>Access: Alex Chen, Morgan Lee</span>
             <span>Working</span>
           </div>
-          <p className="ds-feedback" role="status">
+          <p className="ds-feedback min-h-6 text-sm text-muted-foreground" role="status">
             {action || "Actions here affect this preview only."}
           </p>
         </Specimen>
@@ -466,7 +492,7 @@ function Messages() {
       description="The same message renderer used in conversations, with sample content."
     >
       <MessageIdentityContext value={identities}>
-        <div className="ds-conversation">
+        <div className="ds-conversation flex flex-col gap-6 py-3">
           {messageFixtures.map((message) => (
             <Message
               key={message.id}
@@ -479,9 +505,9 @@ function Messages() {
           ))}
         </div>
       </MessageIdentityContext>
-      <div className="ds-grid">
+      <div className="ds-grid grid grid-cols-1 workspace:grid-cols-2 gap-6">
         <Specimen title="Avatars">
-          <div className="ds-row">
+          <div className="ds-row flex items-center flex-wrap gap-2">
             {(["sm", "default", "lg"] as const).map((size) => (
               <Avatar key={size} size={size}>
                 <AvatarImage src={logo} alt="Lilac" />
@@ -563,12 +589,12 @@ function ComposerSpecimen() {
       title="Composer"
       description="Try the formatting toolbar, Markdown shortcuts, and multiline input."
     >
-      <div className="ds-row">
+      <div className="ds-row flex items-center flex-wrap gap-2">
         <Button variant="secondary" onClick={() => setDisabled((value) => !value)}>
           {disabled ? "Enable editor" : "Disable editor"}
         </Button>
       </div>
-      <div className="composer ds-composer">
+      <div className="composer bg-surface rounded-lg p-3 ds-composer my-4">
         <ComposerEditor
           text={text}
           onText={setText}
@@ -591,7 +617,9 @@ function ComposerSpecimen() {
           Markdown output
         </CollapsibleTrigger>
         <CollapsibleContent>
-          <pre className="ds-source">{text}</pre>
+          <pre className="ds-source p-4 bg-surface rounded-md whitespace-pre-wrap wrap-anywhere text-sm">
+            {text}
+          </pre>
         </CollapsibleContent>
       </Collapsible>
     </Section>
@@ -619,7 +647,9 @@ function FileTabsDemo() {
         onAgents={() => actions.openAgents("demo")}
         renderTab={(tab) =>
           tab.type === "agents" ? (
-            <div className="file-status">No subagents yet</div>
+            <div className="file-status grid place-content-center flex-1 p-4 text-sm text-muted-foreground">
+              No subagents yet
+            </div>
           ) : (
             <FileSource
               name={tab.target.name}
@@ -654,7 +684,7 @@ function Attachments() {
       title="Attachments"
       description="Open a media card to try the viewer. These files are generated preview fixtures."
     >
-      <div className="ds-grid">
+      <div className="ds-grid grid grid-cols-1 workspace:grid-cols-2 gap-6">
         <Specimen title="File icons">
           <div className="ds-stack">
             {[
@@ -669,7 +699,7 @@ function Attachments() {
               "photo.png",
               "unknown",
             ].map((name) => (
-              <span key={name} className="ds-row">
+              <span key={name} className="ds-row flex items-center flex-wrap gap-2">
                 <FileIcon name={name} />
                 {name}
               </span>
@@ -791,7 +821,7 @@ function Controls() {
   return (
     <Section id="controls" title="Controls">
       <Specimen title="Buttons">
-        <div className="ds-row">
+        <div className="ds-row flex items-center flex-wrap gap-2">
           {(["default", "secondary", "outline", "ghost", "destructive", "link"] as const).map(
             (variant) => (
               <Button key={variant} variant={variant}>
@@ -804,7 +834,7 @@ function Controls() {
             <Plus />
           </IconButton>
         </div>
-        <div className="ds-row">
+        <div className="ds-row flex items-center flex-wrap gap-2">
           {(["xs", "sm", "default", "lg"] as const).map((size) => (
             <Button key={size} size={size} variant="secondary">
               {size}
@@ -812,13 +842,13 @@ function Controls() {
           ))}
         </div>
       </Specimen>
-      <div className="ds-grid">
+      <div className="ds-grid grid grid-cols-1 workspace:grid-cols-2 gap-6">
         <Specimen title="Inputs">
-          <label className="ds-field">
+          <label className="ds-field flex flex-col gap-2 text-sm">
             Conversation title
             <Input placeholder="Untitled conversation" />
           </label>
-          <div className="ds-field">
+          <div className="ds-field flex flex-col gap-2 text-sm">
             <span>Search</span>
             <SidebarSearch
               onSearch={(query) => setSearch(query.trim())}
@@ -828,15 +858,15 @@ function Controls() {
               {search ? `Submitted search: ${search}` : ""}
             </span>
           </div>
-          <label className="ds-field">
+          <label className="ds-field flex flex-col gap-2 text-sm">
             Disabled
             <Input disabled value="Unavailable" readOnly />
           </label>
-          <label className="ds-field">
+          <label className="ds-field flex flex-col gap-2 text-sm">
             Invalid
             <Input aria-invalid defaultValue="Needs a name" />
           </label>
-          <label className="ds-field">
+          <label className="ds-field flex flex-col gap-2 text-sm">
             Plain text
             <Textarea placeholder="Write a note…" />
           </label>
@@ -877,6 +907,18 @@ function Controls() {
             <TabsContent value="chat">Conversation content.</TabsContent>
             <TabsContent value="files">Shared files.</TabsContent>
           </Tabs>
+          <Tabs
+            defaultValue="account"
+            orientation="vertical"
+            className="rounded-lg bg-surface-raised p-4 text-surface-raised-foreground"
+          >
+            <TabsList variant="navigation" aria-label="Settings sections">
+              <TabsTrigger value="account">Account</TabsTrigger>
+              <TabsTrigger value="appearance">Appearance</TabsTrigger>
+            </TabsList>
+            <TabsContent value="account">Account settings.</TabsContent>
+            <TabsContent value="appearance">Appearance settings.</TabsContent>
+          </Tabs>
         </Specimen>
       </div>
     </Section>
@@ -887,7 +929,7 @@ function Overlays() {
   const [action, setAction] = useState("");
   return (
     <Section id="overlays" title="Overlays">
-      <div className="ds-row">
+      <div className="ds-row flex items-center flex-wrap gap-2">
         <DropdownMenu>
           <DropdownMenuTrigger render={<Button variant="secondary" />}>
             Thread actions
@@ -927,7 +969,10 @@ function Overlays() {
         </IconButton>
       </div>
       <ContextMenu>
-        <ContextMenuTrigger className="ds-context-target" tabIndex={0}>
+        <ContextMenuTrigger
+          className="ds-context-target flex items-center justify-center min-h-[calc(calc(var(--ui-space-unit)*12)_*_3)] bg-surface text-muted-foreground text-sm rounded-lg mt-4"
+          tabIndex={0}
+        >
           Right-click for thread actions
         </ContextMenuTrigger>
         <ContextMenuContent>
@@ -946,11 +991,11 @@ function Overlays() {
           </ContextMenuItem>
         </ContextMenuContent>
       </ContextMenu>
-      <p className="ds-feedback" role="status">
+      <p className="ds-feedback min-h-6 text-sm text-muted-foreground" role="status">
         {action}
       </p>
       <Specimen title="Toasts">
-        <div className="ds-row">
+        <div className="ds-row flex items-center flex-wrap gap-2">
           <Button
             variant="secondary"
             onClick={() =>
@@ -1000,11 +1045,11 @@ function Overlays() {
         </div>
       </Specimen>
       <Modal open={dialog} title="Rename conversation" onClose={() => setDialog(false)}>
-        <label className="ds-field">
+        <label className="ds-field flex flex-col gap-2 text-sm">
           Title
           <Input defaultValue="A quiet weekend" />
         </label>
-        <div className="dialog-actions">
+        <div className="dialog-actions flex justify-end gap-2 mt-6">
           <Button variant="ghost" onClick={() => setDialog(false)}>
             Cancel
           </Button>
@@ -1032,17 +1077,20 @@ function Layout() {
       title="Layout"
       description="Drag the divider. The list renders only visible rows."
     >
-      <div className="ds-resizable">
+      <div className="ds-resizable h-[calc(calc(var(--ui-space-unit)*12)_*_6)] bg-surface rounded-lg overflow-hidden">
         <ResizablePanelGroup orientation="horizontal">
           <ResizablePanel defaultSize="35%" minSize="25%">
-            <div className="ds-panel">
+            <div className="ds-panel flex flex-col h-full gap-3 p-4 text-sm min-w-0">
               <strong>Conversations</strong>
               <VirtualList
                 items={listItems}
                 label="Example conversations"
                 itemKey={(item) => item.id}
                 render={(item) => (
-                  <Button variant="ghost" className="ds-list-row">
+                  <Button
+                    variant="ghost"
+                    className="ds-list-row flex items-center gap-2 py-3 px-0 whitespace-nowrap"
+                  >
                     <FileText />
                     {item.label}
                   </Button>
@@ -1052,8 +1100,8 @@ function Layout() {
           </ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel minSize="30%">
-            <div className="ds-panel ds-panel-center">
-              <span className="brand">
+            <div className="ds-panel flex flex-col h-full gap-3 p-4 text-sm min-w-0 ds-panel-center items-center justify-center text-center">
+              <span className="brand inline-flex gap-1 items-baseline text-2xl [letter-spacing:-0.07em] font-[650]">
                 lilac<span>.</span>
               </span>
               <span className="ds-muted">Your next conversation starts here.</span>
@@ -1075,30 +1123,29 @@ export default function DesignSystem() {
   useEffect(() => {
     const previous = document.documentElement.dataset.theme;
     return () => {
-      if (previous) document.documentElement.dataset.theme = previous;
-      else delete document.documentElement.dataset.theme;
+      setThemeMode(previous ?? "system");
     };
   }, []);
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
+    setThemeMode(theme);
   }, [theme]);
   return (
     <QueryClientProvider client={queries}>
       <TooltipProvider>
-        <div className="ds-page">
-          <header className="ds-header">
+        <div className="ds-page h-dvh overflow-auto bg-background">
+          <header className="ds-header py-8">
             <Link
               to={returnThreadId ? "/threads/$threadId" : "/"}
               params={returnThreadId ? { threadId: returnThreadId } : {}}
               state={{ draftThreadId: returnDraftId }}
-              className="ds-back"
+              className="ds-back inline-flex items-center gap-2 text-muted-foreground text-sm mb-8"
             >
               <ArrowLeft />
               Back to chat
             </Link>
-            <div className="ds-header-main">
+            <div className="ds-header-main flex items-start workspace:items-center justify-between gap-6">
               <div>
-                <span className="ds-eyebrow">Lilac</span>
+                <span className="ds-eyebrow text-primary text-sm font-semibold">Lilac</span>
                 <h1>Design system</h1>
                 <p>Components, states, and patterns used in the native app.</p>
               </div>
@@ -1124,15 +1171,18 @@ export default function DesignSystem() {
               </Select>
             </div>
           </header>
-          <div className="ds-body">
-            <nav className="ds-nav" aria-label="Component sections">
+          <div className="ds-body block workspace:grid workspace:[grid-template-columns:calc(var(--ui-sidebar-width)_/_2)_minmax(0,_1fr)] gap-8 pb-12">
+            <nav
+              className="ds-nav static workspace:sticky top-6 self-start flex flex-row workspace:flex-col gap-1 py-2 workspace:pt-6 workspace:pb-0 overflow-x-auto"
+              aria-label="Component sections"
+            >
               {sections.map(([id, title]) => (
                 <a key={id} href={`#${id}`}>
                   {title}
                 </a>
               ))}
             </nav>
-            <main className="ds-main">
+            <main className="ds-main min-w-0">
               <Foundations />
               <Threads />
               <Messages />
@@ -1146,7 +1196,7 @@ export default function DesignSystem() {
               <ComposerSpecimen />
               <Attachments />
               <Section id="content" title="Rich content">
-                <div className="ds-content">
+                <div className="ds-content min-w-0">
                   <Markdown text={richText} />
                   <Specimen title="GitHub alerts">
                     <Markdown text={alertExamples} />

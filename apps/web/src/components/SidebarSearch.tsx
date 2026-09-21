@@ -14,7 +14,7 @@ export function SidebarSearch({
   const [query, setQuery] = useState("");
   return (
     <form
-      className="search-box"
+      className="search-box relative text-muted-foreground"
       onSubmit={(event) => {
         event.preventDefault();
         onSearch(query);
@@ -31,7 +31,10 @@ export function SidebarSearch({
         aria-label="Search conversations"
         placeholder="Search"
       />
-      <Button type="submit" className="sr-only">
+      <Button
+        type="submit"
+        className="sr-only absolute w-px h-px overflow-hidden [clip:rect(0,_0,_0,_0)] whitespace-nowrap"
+      >
         Search
       </Button>
       {query ? (

@@ -69,7 +69,7 @@ describe("message presentation", () => {
       expect(html).toContain(`data-slot="message" data-align="${self ? "end" : "start"}"`);
       expect(html).toContain('data-slot="bubble"');
       expect(html).toContain('aria-label="Copy message"');
-      const controls = html.slice(html.indexOf('class="message-controls"'));
+      const controls = html.slice(html.indexOf('data-ui="message-controls"'));
       const timeIndex = controls.indexOf("<time");
       const copyIndex = controls.indexOf('aria-label="Copy message"');
       expect(self ? timeIndex < copyIndex : copyIndex < timeIndex).toBe(true);
@@ -128,17 +128,17 @@ describe("message presentation", () => {
       />,
     );
     expect(html.match(/data-slot="bubble"/gu)).toHaveLength(1);
-    expect(html.indexOf('class="message-attachments message-image-attachments"')).toBeLessThan(
+    expect(html.indexOf('data-ui="message-image-attachments"')).toBeLessThan(
       html.indexOf("See the attached notes."),
     );
     expect(html.indexOf('aria-label="Preview other.png"')).toBeLessThan(
       html.indexOf("See the attached notes."),
     );
     expect(html.indexOf("See the attached notes.")).toBeLessThan(
-      html.indexOf('class="message-attachments"'),
+      html.indexOf('data-ui="message-attachments"'),
     );
     expect(html.indexOf('data-slot="bubble-content"')).toBeLessThan(
-      html.indexOf('class="message-attachments"'),
+      html.indexOf('data-ui="message-attachments"'),
     );
   });
   test("assistant attachment cards preserve activity and compaction boundaries", () => {

@@ -103,8 +103,8 @@ export function AgentWorkDemo() {
     onReaction: () => {},
   };
   return (
-    <div className="ds-agent-demo" ref={container}>
-      <div className="ds-agent-controls">
+    <div className="ds-agent-demo flex flex-col gap-4 min-w-0" ref={container}>
+      <div className="ds-agent-controls flex items-center justify-between flex-wrap gap-3">
         <Select
           items={agentWorkStages.map((item) => ({ value: item.id, label: item.label }))}
           value={stage.id}
@@ -124,7 +124,7 @@ export function AgentWorkDemo() {
             ))}
           </SelectContent>
         </Select>
-        <div className="ds-row">
+        <div className="ds-row flex items-center flex-wrap gap-2">
           <IconButton
             label="Previous stage"
             disabled={playhead.stage === 0}
@@ -155,11 +155,17 @@ export function AgentWorkDemo() {
         <p className="ds-muted">{stage.description}</p>
       </div>
       <SubagentContext value={agentContext}>
-        <div className={`ds-agent-workspace ${panelOpen ? "" : "right-panel-hidden"}`}>
+        <div
+          className={`ds-agent-workspace h-144 max-h-[70dvh] overflow-hidden relative [border:1px_solid_var(--ui-border)] rounded-lg ${panelOpen ? "" : "right-panel-hidden"}`}
+        >
           <RightPanelToggle open={panelOpen} onToggle={() => panel.getState().toggle("demo")} />
           <WorkspacePanels rightOpen={panelOpen} rightWidth={panelLayout.width}>
             <div className="chat-panel">
-              <div className="ds-agent-preview" aria-label="Agent work preview" tabIndex={0}>
+              <div
+                className="ds-agent-preview [&_.turn]:p-0 h-144 max-h-[70dvh] overflow-auto p-4 [border:1px_solid_var(--ui-border)] rounded-lg bg-background pt-[calc(2rem_+_calc(var(--ui-space-unit)*3))]"
+                aria-label="Agent work preview"
+                tabIndex={0}
+              >
                 <MessageIdentityContext value={identities}>
                   <MessageServicesContext value={services}>
                     <DemoTurn
@@ -191,7 +197,7 @@ export function AgentWorkDemo() {
           </WorkspacePanels>
         </div>
       </SubagentContext>
-      <p className="ds-feedback" role="status">
+      <p className="ds-feedback min-h-6 text-sm text-muted-foreground" role="status">
         {feedback}
       </p>
     </div>

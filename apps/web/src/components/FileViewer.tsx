@@ -112,7 +112,9 @@ export function FilePanelContent({
   ) : null;
   const heading = (
     <Tooltip>
-      <TooltipTrigger render={<div className="file-panel-heading" />}>
+      <TooltipTrigger
+        render={<div className="file-panel-heading flex items-center min-w-0 py-2 px-3 text-sm" />}
+      >
         <span>{file?.path ?? path}</span>
       </TooltipTrigger>
       <TooltipContent>{file?.path ?? path}</TooltipContent>
@@ -188,7 +190,10 @@ export function RightPanelTabs({
     else if (target.left < bounds.left) viewport.scrollLeft += target.left - bounds.left;
   }, [tabs.activeId, tabs.items.length]);
   return (
-    <aside className="file-panel" aria-label="Right panel">
+    <aside
+      className="file-panel flex flex-col h-full min-w-0 min-h-0 bg-sidebar text-sidebar-foreground"
+      aria-label="Right panel"
+    >
       <Tabs
         value={tabs.activeId ?? null}
         onValueChange={(value) => {
@@ -196,10 +201,14 @@ export function RightPanelTabs({
         }}
         className="file-panel-tabs-root"
       >
-        <div className="file-panel-tab-bar">
-          <TabsList ref={list} className="file-panel-tabs" aria-label="Right panel tabs">
+        <div className="file-panel-tab-bar flex items-center gap-1 h-8 flex-none p-[0_calc(calc(var(--ui-space-unit)*3)_+_var(--ui-control-compact)_+_calc(var(--ui-space-unit)*2))_0_calc(var(--ui-space-unit)*2)]">
+          <TabsList
+            ref={list}
+            className="file-panel-tabs flex justify-start overflow-x-auto overflow-y-hidden [flex:0_1_auto] w-auto min-w-0 p-0 gap-1 bg-transparent [scrollbar-width:none]"
+            aria-label="Right panel tabs"
+          >
             {tabs.items.map((tab) => (
-              <div className="file-panel-tab" key={tab.id}>
+              <div className="file-panel-tab relative flex flex-none max-w-48" key={tab.id}>
                 <TabsTrigger value={tab.id}>
                   {tab.type === "agents" ? (
                     <Bot />
@@ -242,7 +251,7 @@ export function RightPanelTabs({
             </TabsContent>
           ))}
           {!tabs.items.length ? (
-            <div className="file-status">
+            <div className="file-status grid place-content-center flex-1 p-4 text-sm text-muted-foreground">
               <Button variant="ghost" onClick={onAgents}>
                 <Bot />
                 Open Agents

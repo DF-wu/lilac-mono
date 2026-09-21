@@ -66,7 +66,7 @@ function renderStage(id: string, override?: ReadyTurnSlot) {
 test("live commentary shares one agent avatar and has no message action rows", () => {
   const html = renderStage("full-turn-working");
   expect(html.match(/aria-label="About Lilac"/gu)).toHaveLength(1);
-  expect(html.match(/class="message-controls"/gu)).toHaveLength(1);
+  expect(html.match(/data-ui="message-controls"/gu)).toHaveLength(1);
   expect(html).toContain('data-message-id="demo_introduction"');
   expect(html).toContain('data-message-id="demo_commentary"');
 });
@@ -74,7 +74,7 @@ test("live commentary shares one agent avatar and has no message action rows", (
 test("steering stays in order and starts a fresh agent group for each participant", () => {
   const html = renderStage("steering-other");
   expect(html.match(/aria-label="About Lilac"/gu)).toHaveLength(3);
-  expect(html.match(/class="message-controls"/gu)).toHaveLength(3);
+  expect(html.match(/data-ui="message-controls"/gu)).toHaveLength(3);
   expect(html).toContain('aria-label="About Morgan Lee"');
   const ids = [
     "demo_introduction",
@@ -98,7 +98,7 @@ test("steering stays in order and starts a fresh agent group for each participan
 test("completed turns collapse steering and work under the avatar above the final answer", () => {
   const html = renderStage("steering-complete");
   expect(html.match(/aria-label="About Lilac"/gu)).toHaveLength(1);
-  expect(html.match(/class="message-controls"/gu)).toHaveLength(2);
+  expect(html.match(/data-ui="message-controls"/gu)).toHaveLength(2);
   expect(html).not.toContain('data-message-id="demo_own_steer"');
   expect(html).not.toContain('data-message-id="demo_other_steer"');
   expect(html).not.toContain('data-message-id="demo_introduction"');
@@ -110,8 +110,8 @@ test("completed turns collapse steering and work under the avatar above the fina
 });
 
 test("streaming answers have no action row until the turn settles", () => {
-  expect(renderStage("streaming").match(/class="message-controls"/gu)).toHaveLength(1);
-  expect(renderStage("complete").match(/class="message-controls"/gu)).toHaveLength(2);
+  expect(renderStage("streaming").match(/data-ui="message-controls"/gu)).toHaveLength(1);
+  expect(renderStage("complete").match(/data-ui="message-controls"/gu)).toHaveLength(2);
 });
 
 test("subagents retain activity identity as results arrive and settle under the parent", () => {
@@ -143,17 +143,17 @@ test("subagents retain activity identity as results arrive and settle under the 
     }
     const html = renderStage(id);
     expect(html.match(/aria-label="About Lilac"/gu)).toHaveLength(1);
-    expect(html).not.toContain('class="work-participation"');
+    expect(html).not.toContain('data-ui="work-participation"');
     if (slot.state === "complete") {
       expect(html).toContain("Worked for 1m");
       expect(html).toContain('data-message-id="demo_final"');
       expect(html).not.toContain('data-message-id="demo_subagent_weather"');
-      expect(html.match(/class="message-controls"/gu)).toHaveLength(2);
+      expect(html.match(/data-ui="message-controls"/gu)).toHaveLength(2);
       continue;
     }
     expect(html).toContain("Used 1 tool and spawned 2 agents");
     expect(html).not.toContain('data-message-id="demo_final"');
-    expect(html.match(/class="message-controls"/gu)).toHaveLength(1);
+    expect(html.match(/data-ui="message-controls"/gu)).toHaveLength(1);
   }
 });
 
@@ -170,19 +170,19 @@ test("an earlier final answer becomes intermediate when steering continues the t
   const html = renderStage("steering-complete", { ...original, messages });
   expect(html).not.toContain("An earlier answer before steering.");
   expect(html).toContain('data-message-id="demo_steered_final"');
-  expect(html.match(/class="message-controls"/gu)).toHaveLength(2);
+  expect(html.match(/data-ui="message-controls"/gu)).toHaveLength(2);
 });
 
 test("the settled work summary lists distinct participating users without the agent", () => {
   const html = renderStage("steering-complete");
   const summary = html.slice(
-    html.indexOf('class="work-participation"'),
-    html.indexOf('class="expanded-work"') > 0
-      ? html.indexOf('class="expanded-work"')
+    html.indexOf('data-ui="work-participation"'),
+    html.indexOf('data-ui="expanded-work"') > 0
+      ? html.indexOf('data-ui="expanded-work"')
       : html.indexOf('data-message-id="demo_steered_final"'),
   );
   expect(summary).toContain(">with</span>");
-  expect(summary.match(/class="work-participant"/gu)).toHaveLength(2);
+  expect(summary.match(/data-ui="work-participant"/gu)).toHaveLength(2);
   expect(summary).toContain('aria-label="Alex Chen"');
   expect(summary).toContain('aria-label="Morgan Lee"');
   expect(summary).not.toContain('aria-label="Lilac"');
@@ -196,9 +196,9 @@ test("one participant is omitted even when they steer repeatedly", () => {
       : message,
   );
   const html = renderStage("steering-complete", { ...original, messages });
-  expect(html).not.toContain('class="work-participation"');
+  expect(html).not.toContain('data-ui="work-participation"');
   expect(html).toContain("Worked for 4m");
-  expect(renderStage("complete")).not.toContain('class="work-participation"');
+  expect(renderStage("complete")).not.toContain('data-ui="work-participation"');
 });
 
 test("rewind stays between time and copy and is disabled for an active agent", () => {
@@ -221,7 +221,7 @@ test("rewind stays between time and copy and is disabled for an active agent", (
         </MessageServicesContext>
       </MessageIdentityContext>,
     );
-    const controls = html.slice(html.indexOf('class="message-controls"'));
+    const controls = html.slice(html.indexOf('data-ui="message-controls"'));
     expect(controls.indexOf("<time")).toBeLessThan(
       controls.indexOf('aria-label="Rewind to this turn"'),
     );

@@ -178,7 +178,7 @@ it("renders inline thumbnails, file size and accessible remove and retry control
       expanded: false,
     }),
   );
-  expect(html).toContain('class="composer-attachment-chip"');
+  expect(html).toContain('data-ui="composer-attachment-chip"');
   expect(html).toContain('src="blob:preview"');
   expect(html).toContain("2 KB");
   expect(html).toContain('aria-label="Remove image.png"');

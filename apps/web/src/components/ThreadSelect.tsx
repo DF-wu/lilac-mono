@@ -66,39 +66,54 @@ export function ThreadCard({
     >
       <Button
         variant="ghost"
-        className="thread-card-select"
+        className="thread-card-select w-full h-auto pt-[calc(calc(var(--ui-space-unit)*3)_/_2)] px-3 pb-3 gap-0 justify-start text-left font-normal rounded-[inherit]"
         onClick={onSelect}
         aria-label={`${title || "Untitled"}, ${states[state].label}${draft && !selected ? ", Draft" : ""}`}
       >
-        <span className="thread-card-copy">
-          <span className="thread-card-top">
-            <span className="thread-starter">
+        <span className="thread-card-copy flex flex-1 min-w-0 flex-col gap-0">
+          <span className="thread-card-top flex items-center gap-2 h-[var(--ui-control-compact)] text-xs text-muted-foreground">
+            <span className="thread-starter flex min-w-0 items-center gap-1">
               {draft && !selected ? (
-                <span className="thread-draft-icon" aria-label="Draft">
+                <span
+                  className="thread-draft-icon text-draft flex-none grid place-items-center"
+                  aria-label="Draft"
+                >
                   <SquarePen />
                 </span>
               ) : null}
               <ActorAvatar displayName={starterName} avatarUrl={starterAvatarUrl} />
               <span>{starterName}</span>
             </span>
-            <span className="thread-card-meta">
+            <span className="thread-card-meta ml-auto flex-none flex items-center gap-1">
               {pinned ? (
-                <span className="thread-pin" aria-label="Pinned">
+                <span className="thread-pin grid place-items-center flex-none" aria-label="Pinned">
                   <Pin />
                 </span>
               ) : null}
               {state !== "idle" ? (
-                <span className="thread-state-icon" aria-label={states[state].label}>
+                <span
+                  className="thread-state-icon w-[var(--ui-text-lg)] h-[var(--ui-text-lg)] flex-none grid place-items-center text-muted-foreground"
+                  aria-label={states[state].label}
+                >
                   <StatusIcon />
                 </span>
               ) : null}
               {draft !== "new" ? <ThreadTime updatedAt={updatedAt} now={now} /> : null}
             </span>
           </span>
-          <span className="thread-card-title">{title || "Untitled"}</span>
+          <span className="thread-card-title overflow-hidden text-ellipsis whitespace-nowrap text-sm">
+            {title || "Untitled"}
+          </span>
         </span>
       </Button>
-      {actions ? <span className="thread-card-actions">{actions}</span> : null}
+      {actions ? (
+        <span
+          data-ui="thread-card-actions"
+          className="thread-card-actions absolute top-[calc(calc(var(--ui-space-unit)*3)_/_2)] right-2 flex items-center opacity-0 pointer-events-none bg-surface-hover rounded-sm"
+        >
+          {actions}
+        </span>
+      ) : null}
     </div>
   );
 }
@@ -155,7 +170,7 @@ export function ThreadSelect({
   const state = thread.displayStatus ?? (thread.activeRunId ? "working" : "idle");
   return (
     <Tooltip onOpenChange={setOpen}>
-      <TooltipTrigger render={<div className="thread-card-trigger" />}>
+      <TooltipTrigger render={<div className="thread-card-trigger block min-w-0 w-full" />}>
         <ThreadCard
           title={thread.title}
           starterName={starter}
@@ -175,9 +190,9 @@ export function ThreadSelect({
       <TooltipContent
         side="right"
         align="start"
-        className="thread-details-tooltip bg-popover text-popover-foreground p-3 [&>[aria-hidden=true]]:hidden"
+        className="thread-details-tooltip shadow-overlay bg-popover text-popover-foreground p-3 [&>[aria-hidden=true]]:hidden"
       >
-        <div className="thread-details">
+        <div className="thread-details flex flex-col gap-2 text-sm wrap-anywhere">
           <strong>{thread.title || "Untitled"}</strong>
           <span>
             <UserRound />
@@ -211,7 +226,9 @@ export function ThreadSelect({
               {names.length > 6 ? ` and ${names.length - 6} more` : ""}
             </span>
           ) : null}
-          {error ? <span className="muted">Participants unavailable</span> : null}
+          {error ? (
+            <span className="muted text-muted-foreground">Participants unavailable</span>
+          ) : null}
         </div>
       </TooltipContent>
     </Tooltip>

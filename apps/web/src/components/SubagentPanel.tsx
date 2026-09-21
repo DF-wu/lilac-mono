@@ -203,9 +203,12 @@ export function SubagentPanelView({
     </Button>
   ) : null;
   return (
-    <aside className="subagent-panel" aria-label="Subagents">
+    <aside
+      className="subagent-panel flex flex-col min-w-0 h-full bg-sidebar text-sidebar-foreground"
+      aria-label="Subagents"
+    >
       {selected || !embedded ? (
-        <header className="subagent-panel-header">
+        <header className="subagent-panel-header flex items-center gap-2 h-8 flex-none px-2 pr-[calc(calc(var(--ui-space-unit)*3)_+_var(--ui-control-compact)_+_calc(var(--ui-space-unit)*2))]">
           {selected ? (
             <IconButton label="Back to agents" onClick={onBack}>
               <ArrowLeft />
@@ -217,9 +220,9 @@ export function SubagentPanelView({
         </header>
       ) : null}
       {selected ? (
-        <div className="subagent-heading">
+        <div className="subagent-heading grid gap-2 p-3 wrap-anywhere">
           <span>{selected.name}</span>
-          <span className="subagent-status">
+          <span className="subagent-status flex gap-2 items-center min-w-0 text-muted-foreground text-sm">
             <AgentStatus agent={selected} />
             <span className={selected.state === "running" ? "working-text" : undefined}>
               {selected.title}
@@ -229,27 +232,33 @@ export function SubagentPanelView({
         </div>
       ) : null}
       {error ? (
-        <p className="subagent-notice" role="alert">
+        <p className="subagent-notice p-3 text-muted-foreground text-sm" role="alert">
           {error}
         </p>
       ) : null}
       {loading ? (
-        <p className="subagent-notice" role="status">
+        <p className="subagent-notice p-3 text-muted-foreground text-sm" role="status">
           Loading…
         </p>
       ) : null}
       {selected ? (
         <div
-          className="subagent-transcript"
+          className="subagent-transcript flex-1 flex flex-col-reverse overflow-y-auto overflow-x-hidden min-h-0 bg-background"
           role="region"
           aria-label="Subagent transcript"
           tabIndex={0}
         >
-          <div className="subagent-transcript-content">
+          <div className="subagent-transcript-content shrink-0 flex flex-col gap-4 p-3 min-w-0">
             {more}
-            {unavailable ? <p className="subagent-notice">Transcript unavailable.</p> : null}
+            {unavailable ? (
+              <p className="subagent-notice p-3 text-muted-foreground text-sm">
+                Transcript unavailable.
+              </p>
+            ) : null}
             {!loading && !unavailable && messages.length === 0 ? (
-              <p className="subagent-notice">Waiting for the first message…</p>
+              <p className="subagent-notice p-3 text-muted-foreground text-sm">
+                Waiting for the first message…
+              </p>
             ) : null}
             <MessageIdentityContext value={transcriptIdentity}>
               {messages.map((message) => (
@@ -266,9 +275,9 @@ export function SubagentPanelView({
           </div>
         </div>
       ) : (
-        <div className="subagent-list">
+        <div className="subagent-list overflow-auto min-h-0 flex-1 p-2">
           {!loading && !error && items.length === 0 ? (
-            <div className="subagent-empty">
+            <div className="subagent-empty flex items-center flex-col justify-center text-center gap-3 min-h-56 text-muted-foreground p-4">
               <Bot />
               <p>No subagents yet</p>
               <span>Agents spawned in this conversation appear here.</span>
@@ -278,14 +287,16 @@ export function SubagentPanelView({
             <Button
               key={agent.id}
               variant="ghost"
-              className="subagent-card"
+              className="subagent-card flex items-start justify-start w-full h-auto p-3 text-left gap-3"
               onClick={() => onSelect(agent.id)}
             >
               <Bot />
               <span>
                 <strong>{subagentProfileName(agent.profile)}</strong>
-                <span className="subagent-name">{agent.name}</span>
-                <span className="subagent-status">
+                <span className="subagent-name overflow-hidden text-ellipsis whitespace-nowrap">
+                  {agent.name}
+                </span>
+                <span className="subagent-status flex gap-2 items-center min-w-0 text-muted-foreground text-sm">
                   <AgentStatus agent={agent} />
                   <span className={agent.state === "running" ? "working-text" : undefined}>
                     {agent.title}

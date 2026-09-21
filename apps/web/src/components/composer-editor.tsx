@@ -109,7 +109,9 @@ function InlineCode(props: PlateLeafProps) {
   return <PlateLeaf {...props} as="code" />;
 }
 function LinkElement(props: PlateElementProps) {
-  return <PlateElement {...props} as="span" className="composer-link" />;
+  return (
+    <PlateElement {...props} as="span" className="composer-link [text-decoration:underline]" />
+  );
 }
 
 const attachmentType = "composer_attachment";
@@ -142,7 +144,7 @@ function AttachmentElement(props: PlateElementProps) {
   const attachment = context.attachments.find((item) => item.key === key);
   const name = attachment?.file.name ?? metadata.name;
   return (
-    <PlateElement {...props} as="span" className="composer-attachment-node">
+    <PlateElement {...props} as="span" className="composer-attachment-node inline">
       <FileActions
         disabled={attachment?.state !== "ready" || !attachment.resourceId}
         target={{
@@ -160,7 +162,8 @@ function AttachmentElement(props: PlateElementProps) {
           <TooltipTrigger
             render={
               <span
-                className="composer-attachment-chip"
+                data-ui="composer-attachment-chip"
+                className="composer-attachment-chip relative inline-flex items-center gap-1 max-w-full px-1 rounded-sm bg-muted text-foreground text-sm align-middle whitespace-nowrap [line-height:1.5]"
                 contentEditable={false}
                 data-state={attachment?.state ?? "missing"}
               />
@@ -171,10 +174,12 @@ function AttachmentElement(props: PlateElementProps) {
             ) : (
               <FileIcon name={name} mediaType={attachment?.file.type} />
             )}
-            <span className="composer-attachment-name">{name}</span>
+            <span className="composer-attachment-name overflow-hidden text-ellipsis">{name}</span>
             <small>{attachment ? attachmentSize(attachment.file.size) : "Reattach file"}</small>
             {attachment?.state === "reserving" ? (
-              <span className="sr-only">Preparing upload</span>
+              <span className="sr-only absolute w-px h-px overflow-hidden [clip:rect(0,_0,_0,_0)] whitespace-nowrap">
+                Preparing upload
+              </span>
             ) : null}
             {attachment?.state === "uploading" ? (
               <progress value={attachment.progress} max={1} aria-label={`Uploading ${name}`} />
@@ -649,7 +654,10 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
         <ComposerFormatting editor={editor} disabled={props.disabled} />
         <PlateContent
           className="composer-editor"
-          style={{ minHeight: "calc(1lh + var(--space-3) * 2)", overflowWrap: "anywhere" }}
+          style={{
+            minHeight: "calc(1lh + calc(var(--ui-space-unit) * 3) * 2)",
+            overflowWrap: "anywhere",
+          }}
           aria-label="Message"
           role="textbox"
           aria-multiline="true"
@@ -696,7 +704,7 @@ const ComposerFormatting = memo(function ComposerFormatting({
   }
   return (
     <div
-      className="composer-formatting"
+      className="composer-formatting flex gap-1 px-1 flex-wrap"
       role="toolbar"
       aria-label="Text formatting"
       onMouseDown={(event) => event.preventDefault()}

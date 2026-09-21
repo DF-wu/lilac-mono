@@ -17,7 +17,7 @@ export function createAppRouter(options: {
   const rootRoute = createRootRoute({
     component: options.shellComponent,
     notFoundComponent: () => (
-      <main className="login-shell">
+      <main className="login-shell w-[min(100%_-_calc(var(--ui-space-unit)*8),_24rem)] min-h-dvh mx-auto flex flex-col justify-center gap-6 py-12">
         <h1>Page not found</h1>
         <Link to="/">Back to chat</Link>
       </main>

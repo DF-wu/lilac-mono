@@ -65,19 +65,26 @@ export function ReadyAttachment({ data, href }: { data: ResourceData; href: stri
       onPreview={() => setPreview(true)}
     >
       <Attachment
-        className={kind === "image" ? "attachment-image-card" : "attachment-card"}
+        className={
+          kind === "image"
+            ? "attachment-image-card"
+            : "attachment-card flex flex-col flex-nowrap items-stretch p-0 border-0 w-fit max-w-full overflow-hidden bg-surface text-card-foreground rounded-lg"
+        }
         state={failed ? "error" : "done"}
       >
         {kind === "image" ? (
           <Button
             type="button"
             variant="ghost"
-            className="attachment-image-thumbnail"
+            className="attachment-image-thumbnail border-0 w-full h-full p-0 rounded-[inherit] cursor-zoom-in"
             aria-label={`Preview ${data.name}`}
             onClick={() => setPreview(true)}
           >
             {failed ? (
-              <span className="attachment-image-unavailable" role="status">
+              <span
+                className="attachment-image-unavailable flex flex-col items-center gap-2 whitespace-normal text-muted-foreground text-xs"
+                role="status"
+              >
                 <ImageOff />
                 <span>Image unavailable</span>
               </span>
@@ -95,17 +102,17 @@ export function ReadyAttachment({ data, href }: { data: ResourceData; href: stri
         {kind === "video" ? (
           <button
             type="button"
-            className="attachment-thumbnail"
+            className="attachment-thumbnail block relative cursor-zoom-in p-2 border-0 bg-transparent"
             aria-label={`Preview ${data.name}`}
             onClick={() => setPreview(true)}
           >
             <video src={href} preload="metadata" muted playsInline aria-label={data.name} />
-            <Film className="attachment-video-icon" />
+            <Film className="attachment-video-icon absolute left-4 bottom-4 bg-surface rounded-sm p-1 w-8 h-8" />
           </button>
         ) : null}
         {kind === "audio" ? (
           <audio
-            className="attachment-audio"
+            className="attachment-audio max-w-full p-2"
             src={href}
             preload="none"
             controls
@@ -113,23 +120,25 @@ export function ReadyAttachment({ data, href }: { data: ResourceData; href: stri
           />
         ) : null}
         {kind !== "image" ? (
-          <div className="attachment-file-row">
+          <div className="attachment-file-row flex w-full min-w-0 items-center gap-2 p-2">
             <Button
               variant="ghost"
-              className="attachment-open"
+              className="attachment-open flex-auto overflow-hidden h-auto min-w-0 justify-start text-left whitespace-normal"
               onClick={() => setPreview(true)}
               aria-label={`Preview ${data.name}`}
             >
               <FileIcon name={data.name} mediaType={data.mediaType} />
               <span>
-                <AttachmentTitle className="attachment-name">{data.name}</AttachmentTitle>
-                <AttachmentDescription className="attachment-size">
+                <AttachmentTitle className="attachment-name block overflow-hidden whitespace-nowrap text-ellipsis">
+                  {data.name}
+                </AttachmentTitle>
+                <AttachmentDescription className="attachment-size block text-muted-foreground text-xs">
                   {formatFileSize(data.size)}
                 </AttachmentDescription>
               </span>
             </Button>
             <AttachmentAction
-              className="attachment-download"
+              className="attachment-download flex shrink-0 items-center justify-center w-[var(--ui-control-size)] h-[var(--ui-control-size)] rounded-full"
               size="icon"
               nativeButton={false}
               render={<a href={href} download={data.name} target="_blank" rel="noreferrer" />}
@@ -197,10 +206,20 @@ function PreviewFrame({
 }) {
   return (
     <div className="attachment-preview-body" data-fill={fill}>
-      <div className="attachment-preview-stage">{children}</div>
-      <div className="attachment-preview-footer">
+      <div className="attachment-preview-stage [grid-area:1_/_1] min-w-0 min-h-0 h-full overflow-hidden">
+        {children}
+      </div>
+      <div
+        data-ui="attachment-preview-footer"
+        className="attachment-preview-footer [grid-area:2_/_1] min-w-0 text-center"
+      >
         {note}
-        <div className="media-preview-toolbar">{toolbar}</div>
+        <div
+          data-ui="media-preview-toolbar"
+          className="media-preview-toolbar flex items-center justify-center flex-wrap gap-2 pt-3 text-sm pointer-events-none"
+        >
+          {toolbar}
+        </div>
       </div>
     </div>
   );
@@ -208,7 +227,7 @@ function PreviewFrame({
 
 function PreviewStatus({ children }: { children: ReactNode }) {
   return (
-    <div className="attachment-preview-empty" role="status">
+    <div data-ui="attachment-preview-empty" className="attachment-preview-empty" role="status">
       <div>{children}</div>
     </div>
   );
@@ -241,7 +260,7 @@ function TextAttachmentPreview({
         </>
       }
     >
-      <div className="attachment-source-body">
+      <div className="attachment-source-body h-full min-h-0 flex flex-col w-full max-w-[var(--ui-chat-width)] mx-auto">
         <FileSource
           name={name}
           text={text ?? { status: "loading" }}
@@ -363,7 +382,7 @@ export function AttachmentPreviewBody({
     return (
       <PreviewFrame fill={fill} toolbar={download}>
         <PreviewStatus>
-          <p className="error-text">This file is unavailable.</p>
+          <p className="error-text text-danger text-sm">This file is unavailable.</p>
         </PreviewStatus>
       </PreviewFrame>
     );
@@ -388,7 +407,7 @@ export function AttachmentPreviewBody({
         }
       >
         <object
-          className="attachment-pdf-preview"
+          className="attachment-pdf-preview block"
           data={href}
           type="application/pdf"
           aria-label={`${name} PDF preview`}
@@ -422,7 +441,7 @@ export function AttachmentPreviewBody({
       fill={fill}
       note={
         copyError ? (
-          <p className="error-text" role="status">
+          <p className="error-text text-danger text-sm" role="status">
             {copyError}
           </p>
         ) : null
@@ -462,7 +481,8 @@ export function AttachmentPreviewBody({
     >
       <div
         ref={viewport}
-        className="media-preview-viewport"
+        data-ui="media-preview-viewport"
+        className="media-preview-viewport h-full w-full flex overflow-auto [overscroll-behavior:contain] bg-background rounded-md"
         tabIndex={0}
         role="region"
         aria-label={`${name} preview`}
@@ -475,7 +495,7 @@ export function AttachmentPreviewBody({
         onLostPointerCapture={stopPan}
       >
         <div
-          className="media-preview-content"
+          className="media-preview-content min-w-0 [flex:0_0_auto] flex items-center justify-center m-auto"
           style={{ width: `${zoom * 100}%`, height: `${zoom * 100}%` }}
         >
           {kind === "image" ? (
@@ -520,11 +540,11 @@ function isPreviewBackdrop(target: EventTarget, x: number, y: number): boolean {
   if (!(target instanceof Element)) return false;
   if (
     target.closest(
-      "button, a, audio, video, object, .file-source, .media-preview-toolbar, .attachment-preview-note, .resource-preview-title, .attachment-preview-empty > *",
+      "button, a, audio, video, object, [data-ui=file-source], [data-ui=media-preview-toolbar], [data-ui=attachment-preview-note], [data-ui=resource-preview-title], [data-ui=attachment-preview-empty] > *",
     )
   )
     return false;
-  const image = target.closest(".media-preview-viewport")?.querySelector("img");
+  const image = target.closest("[data-ui=media-preview-viewport]")?.querySelector("img");
   if (!image) return true;
   return !isWithinContainedImage({ x, y }, image.getBoundingClientRect(), {
     width: image.naturalWidth,
@@ -628,8 +648,12 @@ export function ResourcePreview({
           setOpen(false);
         }}
       >
-        <header className="resource-preview-header">
-          <DialogTitle className="resource-preview-title" title={name}>
+        <header className="resource-preview-header grid [grid-template-columns:var(--ui-control-size)_minmax(0,_1fr)_var(--ui-control-size)] items-center gap-3 [flex:0_0_auto] min-w-0 pointer-events-none">
+          <DialogTitle
+            data-ui="resource-preview-title"
+            className="resource-preview-title"
+            title={name}
+          >
             <FileIcon
               name={name}
               mediaType={target?.type === "resource" ? target.mediaType : undefined}
@@ -638,7 +662,7 @@ export function ResourcePreview({
           </DialogTitle>
           <IconButton
             label="Close preview"
-            className="resource-preview-close"
+            className="resource-preview-close [grid-column:3]"
             onClick={() => setOpen(false)}
           >
             <X />

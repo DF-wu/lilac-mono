@@ -26,7 +26,7 @@ export function LocalLogin({ onSignedIn }: { onSignedIn: () => void }) {
     });
   };
   return (
-    <form className="login-form" onSubmit={submit}>
+    <form className="login-form grid gap-4" onSubmit={submit}>
       <label>
         Username
         <Input name="username" autoComplete="username" required autoFocus />

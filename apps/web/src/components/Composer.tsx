@@ -360,7 +360,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
 
   return (
     <div
-      className={`composer-wrap ${dragging ? "is-dragging" : ""}`}
+      className={`composer-wrap relative ${dragging ? "is-dragging" : ""}`}
       onDragOver={
         props.windowDrop
           ? undefined
@@ -375,7 +375,10 @@ export const Composer = memo(function Composer(props: ComposerProps) {
     >
       {props.windowDrop && dragging && !disabled
         ? createPortal(
-            <div className="composer-window-drop" role="status">
+            <div
+              className="composer-window-drop fixed inset-3 z-100 flex items-center justify-center flex-col gap-4 rounded-lg [background:color-mix(in_srgb,_var(--ui-background)_88%,_transparent)] [backdrop-filter:blur(calc(var(--ui-space-unit)*1))] text-foreground text-xl font-medium pointer-events-none [box-shadow:inset_0_0_0_calc(var(--ui-space-unit)*1)_color-mix(in_srgb,_var(--ui-primary)_65%,_transparent)]"
+              role="status"
+            >
               <Upload aria-hidden="true" />
               <span>Add photos &amp; files</span>
             </div>,
@@ -390,7 +393,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
       >
         <PopoverTrigger
           nativeButton={false}
-          render={<span className="composer-completion-anchor" />}
+          render={<span className="composer-completion-anchor block w-full h-0" />}
           tabIndex={-1}
           aria-hidden
         />
@@ -399,7 +402,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           align="start"
           initialFocus={false}
           finalFocus={false}
-          className="completion-popover"
+          className="completion-popover absolute left-0 right-0 bottom-[calc(100%_+_calc(var(--ui-space-unit)*2))] h-80 p-[calc(calc(var(--ui-space-unit)*1)_*_1.5)] rounded-lg bg-surface-raised shadow-overlay z-20"
           id="composer-completions"
           role="listbox"
           aria-label={trigger === "$" ? "Skills" : "Commands and skills"}
@@ -417,28 +420,34 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                 role="option"
                 aria-selected={index === highlighted}
                 id={`completion-${index}`}
-                className={`completion ${index === highlighted ? "selected" : ""}`}
+                className={`completion flex items-center gap-2 w-full p-3 text-left rounded-sm text-sm ${index === highlighted ? "selected" : ""}`}
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => choose(item)}
               >
-                <span className="completion-name">
+                <span className="completion-name font-[550] whitespace-nowrap">
                   {trigger === "/" ? item.insertText : item.name}
                 </span>
-                <span className="completion-description">{item.description}</span>
-                {item.source ? <span className="badge">{item.source}</span> : null}
+                <span className="completion-description flex-1 whitespace-nowrap overflow-hidden text-ellipsis text-muted-foreground">
+                  {item.description}
+                </span>
+                {item.source ? (
+                  <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
+                    {item.source}
+                  </span>
+                ) : null}
               </button>
             )}
           />
         </PopoverContent>
       </Popover>
       <ErrorNotice message={error} onDismiss={() => setError(undefined)} />
-      <div className="composer">
+      <div className="composer bg-surface text-card-foreground rounded-lg p-3">
         {skillIds.length ? (
           <div className="skill-chips">
             {skillIds.map((id) => (
               <button
                 type="button"
-                className="badge"
+                className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap"
                 key={id}
                 onClick={() => setSkills(skillIds.filter((item) => item !== id))}
               >
@@ -451,12 +460,12 @@ export const Composer = memo(function Composer(props: ComposerProps) {
         <Suspense
           fallback={
             <div role="status" aria-label="Loading editor">
-              <div className="composer-formatting" aria-hidden="true">
+              <div className="composer-formatting flex gap-1 px-1 flex-wrap" aria-hidden="true">
                 {[0, 1, 2, 3, 4, 5, 6, 7, 8].map((index) => (
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="icon-button"
+                    className="icon-button rounded-sm text-muted-foreground"
                     disabled
                     key={index}
                   />
@@ -485,16 +494,16 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             disabled={disabled}
           />
         </Suspense>
-        <footer className="composer-toolbar">
+        <footer className="composer-toolbar pl-2 flex flex-wrap gap-1 items-center pt-2">
           <ComposerModel
             models={catalog?.models}
             modelId={props.modelId}
             disabled={disabled || delivery.mode === "steer"}
             onChange={props.onModelChange}
           />
-          <span className="toolbar-spacer" />
+          <span className="toolbar-spacer flex-1" />
           {active ? (
-            <div className="queue-mode">
+            <div className="queue-mode flex shrink-0 items-center text-muted-foreground">
               <CornerDownRight />
               <Select
                 disabled={!!custom}
@@ -524,7 +533,7 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             type="file"
             aria-label="Attach files"
             multiple
-            className="sr-only"
+            className="sr-only absolute w-px h-px overflow-hidden [clip:rect(0,_0,_0,_0)] whitespace-nowrap"
             tabIndex={-1}
             onChange={(event) => {
               props.onAttach([...(event.target.files ?? [])]);
@@ -539,13 +548,19 @@ export const Composer = memo(function Composer(props: ComposerProps) {
             <Paperclip />
           </IconButton>
           {props.canCancel ? (
-            <IconButton label="Cancel run" className="cancel-button" onClick={props.onCancel}>
+            <IconButton
+              label="Cancel run"
+              variant="destructive"
+              className="rounded-full"
+              onClick={props.onCancel}
+            >
               <Square />
             </IconButton>
           ) : null}
           <IconButton
             label={active && custom ? "Queue command as follow-up" : "Send message"}
-            className="send-button"
+            variant="default"
+            className="rounded-full"
             disabled={
               disabled || !editorReady || props.submitting || (!text.trim() && !attachments.length)
             }
@@ -588,7 +603,7 @@ const ComposerModel = memo(function ComposerModel({
       <SelectTrigger
         id="composer-model"
         aria-label="Response model"
-        className="composer-model min-w-0 max-w-full"
+        className="composer-model [flex:0_1_auto] min-w-0 max-w-full"
       >
         <SelectValue className="min-w-0">
           <span className="truncate">

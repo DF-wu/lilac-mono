@@ -507,7 +507,7 @@ export function Chat(props: ChatProps) {
   const composerCancel = useEventCallback(() => void cancel());
   const composerSubmit = useEventCallback(submit);
   const composer = (
-    <div className="chat-bottom">
+    <div className="chat-bottom w-full max-w-[var(--ui-chat-width)] my-0 mx-auto pt-2 px-6 pb-6 max-workspace:px-3 max-workspace:pb-3">
       <ErrorNotice
         message={localThread?.error ?? error ?? draftQuery.error?.message ?? historyError}
         onDismiss={() => {
@@ -517,7 +517,7 @@ export function Chat(props: ChatProps) {
         }}
       />
       {localThread?.creation ? (
-        <div className="pending-input">
+        <div className="pending-input flex flex-wrap gap-2 p-2 mb-2 rounded-sm bg-surface text-sm">
           <span>{localThread.creation.entry.text}</span>
           <small>
             {localThread.sending ? "Creating conversation…" : "Conversation could not be created."}
@@ -533,13 +533,16 @@ export function Chat(props: ChatProps) {
       ) : null}
       {pendingEntries.length ? (
         <VirtualList
-          className="pending-inputs"
+          className="pending-inputs max-h-48 h-24"
           items={pendingEntries}
           itemKey={(entry) => entry.commandId}
           label="Pending messages"
           estimate={88}
           render={(entry) => (
-            <div className="pending-input" key={entry.commandId}>
+            <div
+              className="pending-input flex flex-wrap gap-2 p-2 mb-2 rounded-sm bg-surface text-sm"
+              key={entry.commandId}
+            >
               <span>{entry.text}</span>
               <small>{entry.error ?? "Sending…"}</small>
               {editable && entry.state !== "preparing" ? (
@@ -570,15 +573,17 @@ export function Chat(props: ChatProps) {
         />
       ) : null}
       {editable && queue.length ? (
-        <div className="queue">
+        <div className="queue bg-surface rounded-md mb-2 p-1">
           <VirtualList
             items={queue}
             itemKey={(entry) => entry.inputId}
             label="Queued messages"
             estimate={48}
             render={(entry) => (
-              <div className="queue-entry">
-                <span className="badge">{queueLabels[entry.mode]}</span>
+              <div className="queue-entry flex items-center gap-2 py-1 px-2 text-sm">
+                <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
+                  {queueLabels[entry.mode]}
+                </span>
                 <span>{entry.text}</span>
                 <IconButton
                   label="Remove queued message"
@@ -608,7 +613,7 @@ export function Chat(props: ChatProps) {
         <Button
           type="button"
           variant="ghost"
-          className="text-button"
+          className="text-primary py-2 px-3 text-sm"
           onClick={() =>
             commitDraft({
               ...draft,
@@ -653,7 +658,7 @@ export function Chat(props: ChatProps) {
     if (local)
       return (
         <div className="welcome">
-          <span className="brand">
+          <span className="brand inline-flex gap-1 items-baseline text-2xl [letter-spacing:-0.07em] font-[650]">
             lilac
             <span />
           </span>
@@ -681,7 +686,7 @@ export function Chat(props: ChatProps) {
   }
   return (
     <MessageIdentityContext value={identities}>
-      <div className="chat-workspace" data-thread-id={threadId}>
+      <div className="chat-workspace min-h-0 flex flex-col flex-1" data-thread-id={threadId}>
         <UploadProgressContext.Provider value={uploadProgress}>
           <Timeline
             emptyContent={renderEmptyConversation()}
@@ -710,13 +715,17 @@ export function Chat(props: ChatProps) {
             to your composer. File changes and other tool effects remain.
           </p>
           {active ? <p>Wait for the agent to finish before rewinding.</p> : null}
-          <div className="dialog-actions">
-            <Button className="button" onClick={() => setRewindTarget(undefined)}>
+          <div className="dialog-actions flex justify-end gap-2 mt-6">
+            <Button
+              variant="secondary"
+              className="gap-2 rounded-sm px-4"
+              onClick={() => setRewindTarget(undefined)}
+            >
               Keep conversation
             </Button>
             <Button
               variant="destructive"
-              className="button danger"
+              className="gap-2 rounded-sm px-4"
               disabled={rewinding || active}
               onClick={() => void rewind()}
             >

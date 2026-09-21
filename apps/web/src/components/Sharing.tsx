@@ -46,7 +46,7 @@ export function Sharing({ thread }: { thread: NativeThread }) {
         }
         onDismiss={change.error ? () => change.reset() : undefined}
       />
-      <div className="inline-form">
+      <div className="inline-form flex gap-2 mb-4 items-center">
         <Select
           items={users.map((user) => ({ value: user.id, label: user.displayName }))}
           value={userId || null}
@@ -93,7 +93,7 @@ export function Sharing({ thread }: { thread: NativeThread }) {
         <Button
           type="button"
           variant="ghost"
-          className="text-button"
+          className="text-primary py-2 px-3 text-sm"
           disabled={userQuery.isFetching}
           onClick={() => {
             if (!userQuery.isFetching) void userQuery.fetchNextPage({ cancelRefetch: false });
@@ -106,9 +106,9 @@ export function Sharing({ thread }: { thread: NativeThread }) {
         items={participants}
         itemKey={(entry) => entry.user.id}
         label="Conversation participants"
-        className="people-list"
+        className="people-list h-80"
         render={(entry) => (
-          <div className="person-row">
+          <div className="person-row flex items-center gap-2 py-2 px-0 text-sm">
             <span>{entry.user.displayName}</span>
             {entry.user.toolMode === "restricted" ? (
               <small>

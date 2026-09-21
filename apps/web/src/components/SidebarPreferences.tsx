@@ -34,10 +34,10 @@ export function SidebarPreferences() {
     : (preferences.data?.autoSettleDays ?? 3);
   return (
     <>
-      <div className="settings-row">
-        <div className="settings-row-description">
+      <div className="settings-row flex items-start justify-between gap-6 mb-8">
+        <div className="settings-row-description min-w-0">
           <span>Auto-settle inactive conversations</span>
-          <p className="muted">
+          <p className="muted text-muted-foreground">
             Pinned conversations stay pinned. New activity moves settled conversations back to
             Active. Saved to your account across devices.
           </p>

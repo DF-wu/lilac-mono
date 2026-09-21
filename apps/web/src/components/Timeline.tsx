@@ -258,7 +258,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
       <TimelineContext value={timeline}>
         <MessageServicesContext value={services}>
           <div
-            className="timeline chat-scroll"
+            className="timeline overflow-auto min-h-0 flex-1 [overflow-anchor:none] chat-scroll relative overflow-y-auto overflow-x-hidden"
             ref={parent}
             onScroll={(event) => {
               setReadingDisclosure(undefined);
@@ -270,7 +270,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
             onClickCapture={(event) => {
               if (!(event.target instanceof Element)) return;
               const trigger = event.target.closest(
-                '[data-slot="collapsible-trigger"], .message-expand',
+                '[data-slot="collapsible-trigger"], [data-ui=message-expand]',
               );
               if (trigger?.getAttribute("aria-expanded") === "false")
                 setReadingDisclosure(props.threadId);
@@ -278,7 +278,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
             onFocusCapture={(event) => {
               if (
                 event.target instanceof Element &&
-                event.target.closest('.message-card-preview[data-collapsed="true"]')
+                event.target.closest('[data-ui=message-card-preview][data-collapsed="true"]')
               )
                 setReadingDisclosure(props.threadId);
             }}
@@ -286,11 +286,15 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
             aria-label="Conversation"
             tabIndex={0}
           >
-            <div ref={measureHeader} data-index={0} className="chat-sticky-header">
+            <div
+              ref={measureHeader}
+              data-index={0}
+              className="chat-sticky-header sticky top-0 z-3 [background:color-mix(in_srgb,_var(--ui-background)_75%,_transparent)] [backdrop-filter:blur(16px)]"
+            >
               {props.header}
             </div>
             <div
-              className="virtual-canvas timeline-canvas"
+              className="virtual-canvas relative w-full timeline-canvas max-w-[var(--ui-chat-width)] m-auto"
               style={{
                 height: Math.max(0, totalSize - headerSize - footerSize),
                 minHeight: `calc(100% - ${insets.top + insets.bottom}px)`,
@@ -301,7 +305,7 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
                   key={row.key}
                   data-index={row.index}
                   ref={virtual.measureElement}
-                  className="virtual-row"
+                  className="virtual-row absolute top-0 left-0 w-full"
                   style={{ transform: `translateY(${row.start - headerSize}px)` }}
                 >
                   <SlotRow slotId={ids[row.index - 1]!} store={store} />
@@ -316,9 +320,13 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
                 : null}
             </div>
             {props.footer ? (
-              <div ref={measureFooter} data-index={ids.length + 1} className="chat-sticky-footer">
+              <div
+                ref={measureFooter}
+                data-index={ids.length + 1}
+                className="chat-sticky-footer sticky bottom-0 z-3"
+              >
                 {awayFromEnd && !switching ? (
-                  <div className="scroll-to-end">
+                  <div className="scroll-to-end absolute bottom-full left-0 right-0 flex justify-center pb-2 pointer-events-none">
                     <Button variant="secondary" onClick={() => virtual.scrollToEnd()}>
                       <ChevronDown />
                       Scroll to end
@@ -344,7 +352,7 @@ const SlotRow = memo(function SlotRow(props: { store: NativeThreadStore; slotId:
   if (!slot) return null;
   if (slot.kind !== "ready")
     return (
-      <div className="history-placeholder">
+      <div className="history-placeholder text-center bg-surface my-3 mx-6 rounded-md flex justify-center gap-3">
         {slot.kind === "failed" ? (
           <>
             <span>{slot.message}</span>
@@ -394,9 +402,12 @@ export const Turn = memo(function Turn(props: {
       ? Math.max(0, slot.settledAt - slot.startedAt)
       : undefined;
   return (
-    <article className="turn" data-turn-id={slot.turnId}>
+    <article
+      className="turn pt-4 px-6 pb-8 max-workspace:pt-3 max-workspace:px-4 max-workspace:pb-6"
+      data-turn-id={slot.turnId}
+    >
       {firstUser ? (
-        <div className="user-turn">
+        <div className="user-turn ml-12 mb-6 max-workspace:ml-6">
           <MessageBody
             live={!settled}
             message={firstUser}
@@ -425,20 +436,29 @@ export const Turn = memo(function Turn(props: {
         {settled && intermediate.length > 0 ? (
           <Collapsible open={expanded} onOpenChange={setExpanded}>
             <CollapsibleTrigger
-              render={<Button variant="ghost" className="work-summary h-auto justify-start" />}
+              render={
+                <Button
+                  variant="ghost"
+                  className="work-summary w-full flex items-center gap-2 text-muted-foreground text-sm p-2 rounded-lg text-left h-auto justify-start"
+                />
+              }
             >
               <Marker render={<span />}>
-                <MarkerContent className="work-summary-label">
+                <MarkerContent className="work-summary-label flex flex-1 flex-wrap items-center gap-2">
                   <span>
                     {duration === undefined ? "Work" : `Worked for ${formatDuration(duration)}`}
                   </span>
                   <TurnParticipants messages={slot.messages} />
                 </MarkerContent>
-                {slot.state !== "complete" ? <span className="badge">{slot.state}</span> : null}
-                <ChevronRight className={expanded ? "rotated" : ""} />
+                {slot.state !== "complete" ? (
+                  <span className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap">
+                    {slot.state}
+                  </span>
+                ) : null}
+                <ChevronRight className={expanded ? "rotated [transform:rotate(90deg)]" : ""} />
               </Marker>
             </CollapsibleTrigger>
-            <CollapsibleContent className="expanded-work">
+            <CollapsibleContent data-ui="expanded-work" className="expanded-work mb-4">
               <TurnMessages messages={intermediate} live={false} showFirstAvatar={false} />
             </CollapsibleContent>
           </Collapsible>
@@ -459,7 +479,12 @@ export const Turn = memo(function Turn(props: {
         </Marker>
       ) : null}
       {slot.partsCursor ? (
-        <Button variant="ghost" className="text-button" type="button" onClick={onLoadMore}>
+        <Button
+          variant="ghost"
+          className="text-primary py-2 px-3 text-sm"
+          type="button"
+          onClick={onLoadMore}
+        >
           Load more of this turn
         </Button>
       ) : null}
@@ -486,14 +511,24 @@ function TurnParticipants({ messages }: { messages: readonly DisplayMessage[] })
   }, [unknown, onUnknownAuthor]);
   if (authors.length < 2) return null;
   return (
-    <span className="work-participation">
+    <span
+      data-ui="work-participation"
+      className="work-participation inline-flex min-w-0 items-center gap-2"
+    >
       <span>with</span>
-      <span className="work-participants">
+      <span className="work-participants inline-flex min-w-0 p-[2px] overflow-hidden">
         {authors.map((id) => {
           const author = identities.users.get(id) ?? { displayName: "Participant" };
           return (
             <Tooltip key={id}>
-              <TooltipTrigger render={<span className="work-participant" />}>
+              <TooltipTrigger
+                render={
+                  <span
+                    data-ui="work-participant"
+                    className="work-participant inline-flex rounded-full [box-shadow:0_0_0_2px_var(--ui-background)]"
+                  />
+                }
+              >
                 <ActorAvatar {...author} size="sm" />
               </TooltipTrigger>
               <TooltipContent>{author.displayName}</TooltipContent>
@@ -558,7 +593,7 @@ function AuthorAvatar({
           render={
             <button
               type="button"
-              className="message-avatar-trigger"
+              className="message-avatar-trigger flex p-0 border-0 rounded-full bg-transparent cursor-default"
               aria-label={`About ${author.displayName}`}
             />
           }
@@ -566,11 +601,11 @@ function AuthorAvatar({
           <ActorAvatar {...author} />
         </TooltipTrigger>
         <TooltipContent
-          className="message-author-details"
+          className="message-author-details flex-col items-start gap-1"
           side={self ? "left" : "right"}
           align="center"
         >
-          <span className="message-author-name">{author.displayName}</span>
+          <span className="message-author-name font-semibold">{author.displayName}</span>
           <span>{role}</span>
           {message?.metadata?.inputMode === "steer" ? <span>Steering</span> : null}
           {message?.metadata?.createdAt !== undefined ? (
@@ -739,16 +774,20 @@ function MessageCard({
       <BubbleContent>
         <div
           id={previewId}
-          className="message-card-preview"
+          data-ui="message-card-preview"
+          className="message-card-preview min-w-0"
           data-collapsed={collapsed}
           data-overflow={long}
           onFocusCapture={() => {
             if (collapsed) setExpanded(true);
           }}
         >
-          <div ref={contentRef} className="message-card-body">
+          <div ref={contentRef} className="message-card-body flow-root min-w-0">
             {images.length > 0 ? (
-              <div className="message-attachments message-image-attachments">
+              <div
+                data-ui="message-image-attachments"
+                className="message-attachments flex flex-wrap items-start gap-2 message-image-attachments"
+              >
                 {images.map((part) => (
                   <ResourceAttachment key={part.id} part={part} />
                 ))}
@@ -758,7 +797,10 @@ function MessageCard({
               <Markdown key={index} text={text} />
             ))}
             {files.length > 0 ? (
-              <div className="message-attachments">
+              <div
+                data-ui="message-attachments"
+                className="message-attachments flex flex-wrap items-start gap-2"
+              >
                 {files.map((part) => (
                   <ResourceAttachment key={part.id} part={part} />
                 ))}
@@ -769,7 +811,8 @@ function MessageCard({
         {collapsible && long ? (
           <Button
             variant="ghost"
-            className="message-expand"
+            data-ui="message-expand"
+            className="message-expand flex ml-auto mt-2"
             aria-expanded={expanded}
             aria-controls={previewId}
             onClick={() => setExpanded((value) => !value)}
@@ -879,7 +922,7 @@ const MessageBody = memo(function MessageBody(
     <LiveMessageContext value={props.live ?? false}>
       <ChatMessage
         align={self ? "end" : "start"}
-        className={`message message-${message.role} native-message text-base`}
+        className={`message leading-normal py-2 px-0 wrap-anywhere message-${message.role} native-message text-base`}
         data-message-id={message.id}
       >
         {(props.showAvatar ?? conversational) ? (
@@ -951,7 +994,7 @@ const MessageBody = memo(function MessageBody(
                           disabled={!canEdit}
                           aria-pressed={reaction.reacted}
                           variant="secondary"
-                          className="badge"
+                          className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap"
                           onClick={() => onReaction(message.id, reaction.emoji, !reaction.reacted)}
                         >
                           {reaction.emoji} {reaction.count}
@@ -966,7 +1009,10 @@ const MessageBody = memo(function MessageBody(
         {conversational &&
         (props.showControls ??
           (message.metadata?.phase !== "commentary" && !message.metadata?.incomplete)) ? (
-          <div className="message-controls">
+          <div
+            data-ui="message-controls"
+            className="message-controls flex items-center justify-end gap-1 text-muted-foreground text-xs mt-1"
+          >
             {self ? (
               <>
                 {time}
@@ -1043,7 +1089,12 @@ export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdA
     parts[0];
   if (!representative) return null;
   return (
-    <Collapsible ref={arrivalRef} className="activity-block" open={open} onOpenChange={setOpen}>
+    <Collapsible
+      ref={arrivalRef}
+      className="activity-block w-full min-w-0 my-2"
+      open={open}
+      onOpenChange={setOpen}
+    >
       <CollapsibleTrigger
         render={
           <Button variant="ghost" className="activity-summary h-auto justify-start px-2 py-1" />
@@ -1051,7 +1102,7 @@ export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdA
       >
         <Marker render={<span />}>
           <MarkerIcon>{spawned ? <Bot /> : <ActivityIcon part={representative} />}</MarkerIcon>
-          <MarkerContent className="activity-label">
+          <MarkerContent className="activity-label flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
             <span
               className={
                 !spawned && representative.data.state === "running" ? "working-text" : undefined
@@ -1061,14 +1112,17 @@ export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdA
             </span>
           </MarkerContent>
           {createdAt !== undefined ? (
-            <time className="activity-time" dateTime={new Date(createdAt).toISOString()}>
+            <time
+              className="activity-time opacity-0 [transition:opacity_var(--ui-motion-duration)_ease]"
+              dateTime={new Date(createdAt).toISOString()}
+            >
               {new Date(createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
             </time>
           ) : null}
-          <ChevronRight className={open ? "rotated" : ""} />
+          <ChevronRight className={open ? "rotated [transform:rotate(90deg)]" : ""} />
         </Marker>
       </CollapsibleTrigger>
-      <CollapsibleContent className="activity-details">
+      <CollapsibleContent className="activity-details pl-3">
         {parts.map((part) => (
           <ActivityItem key={part.id} part={part} />
         ))}
@@ -1109,7 +1163,7 @@ export function ActivityItem({ part }: { part: ActivityPart }) {
       <div ref={arrivalRef}>
         <Button
           variant="ghost"
-          className="subagent-activity"
+          className="subagent-activity w-full h-auto text-left justify-start text-muted-foreground py-1 px-2"
           onClick={() => openAgent(agent.id ?? part.id)}
         >
           <Bot />
@@ -1128,26 +1182,37 @@ export function ActivityItem({ part }: { part: ActivityPart }) {
       <MarkerIcon>
         <ActivityIcon part={part} />
       </MarkerIcon>
-      <MarkerContent className="activity-label">
+      <MarkerContent className="activity-label flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
         <span className={part.data.state === "running" ? "working-text" : undefined}>
           {part.data.label}
         </span>
       </MarkerContent>
-      {part.data.state === "failed" ? <span className="activity-state">Failed</span> : null}
-      {part.data.durationMs !== undefined ? (
-        <span className="activity-time">{formatDuration(part.data.durationMs)}</span>
+      {part.data.state === "failed" ? (
+        <span className="activity-state text-danger">Failed</span>
       ) : null}
-      {part.data.detail ? <ChevronRight className={open ? "rotated" : ""} /> : null}
+      {part.data.durationMs !== undefined ? (
+        <span className="activity-time opacity-0 [transition:opacity_var(--ui-motion-duration)_ease]">
+          {formatDuration(part.data.durationMs)}
+        </span>
+      ) : null}
+      {part.data.detail ? (
+        <ChevronRight className={open ? "rotated [transform:rotate(90deg)]" : ""} />
+      ) : null}
     </Marker>
   );
   if (!part.data.detail)
     return (
-      <div ref={arrivalRef} className="activity-item activity-item-trigger">
+      <div ref={arrivalRef} className="activity-item text-sm activity-item-trigger">
         {row}
       </div>
     );
   return (
-    <Collapsible ref={arrivalRef} className="activity-item" open={open} onOpenChange={setOpen}>
+    <Collapsible
+      ref={arrivalRef}
+      className="activity-item text-sm"
+      open={open}
+      onOpenChange={setOpen}
+    >
       <CollapsibleTrigger
         render={
           <Button
@@ -1159,7 +1224,9 @@ export function ActivityItem({ part }: { part: ActivityPart }) {
         {row}
       </CollapsibleTrigger>
       <CollapsibleContent>
-        <pre className="activity-detail">{part.data.detail}</pre>
+        <pre className="activity-detail m-[calc(var(--ui-space-unit)*2)_calc(var(--ui-space-unit)*2)_calc(var(--ui-space-unit)*3)_calc(var(--ui-space-unit)*8)] p-3 rounded-sm bg-surface max-w-full overflow-auto whitespace-pre-wrap wrap-anywhere text-xs text-muted-foreground">
+          {part.data.detail}
+        </pre>
       </CollapsibleContent>
     </Collapsible>
   );

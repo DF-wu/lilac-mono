@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type ButtonHTMLAttributes,
+  type ComponentProps,
   type ReactNode,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -20,18 +21,23 @@ export function IconButton({
   label,
   tooltip = label,
   children,
+  variant = "ghost",
   ...props
-}: ButtonHTMLAttributes<HTMLButtonElement> & { label: string; tooltip?: string }) {
+}: ButtonHTMLAttributes<HTMLButtonElement> & {
+  label: string;
+  tooltip?: string;
+  variant?: ComponentProps<typeof Button>["variant"];
+}) {
   return (
     <Tooltip>
       <TooltipTrigger
         render={
           <Button
             type="button"
-            variant="ghost"
+            variant={variant}
             size="icon"
             {...props}
-            className={`icon-button ${props.className ?? ""}`}
+            className={`icon-button rounded-sm ${variant === "ghost" ? "text-muted-foreground" : ""} ${props.className ?? ""}`}
             aria-label={label}
           />
         }
@@ -72,10 +78,10 @@ export function Modal({
       }}
     >
       <DialogContent
-        className={`block max-h-[calc(100dvh-var(--space-6))] overflow-y-auto p-5 ${wide ? "sm:max-w-4xl" : "sm:max-w-lg"}`}
+        className={`block max-h-[calc(100dvh-calc(var(--ui-space-unit)*8))] overflow-y-auto p-5 ${wide ? "sm:max-w-4xl" : "sm:max-w-lg"}`}
         showCloseButton={false}
       >
-        <DialogHeader className="modal-header flex-row items-center justify-between">
+        <DialogHeader className="modal-header flex gap-4 mb-4 flex-row items-center justify-between">
           <DialogTitle>{title}</DialogTitle>
           <IconButton label="Close" onClick={close}>
             <X />
@@ -152,14 +158,14 @@ export function VirtualList<T>({
   return (
     <div
       ref={parent}
-      className={`virtual-list ${className} ${scrollFade && (remaining > 1 || hasMore) ? "scroll-fade" : ""}`}
+      className={`virtual-list overflow-auto relative min-h-0 pr-1 mr-[calc(-1_*_calc(var(--ui-space-unit)*1))] ${className} ${scrollFade && (remaining > 1 || hasMore) ? "scroll-fade" : ""}`}
       aria-busy={loading || undefined}
       aria-label={presentation ? undefined : label}
       role={presentation ? "presentation" : "list"}
     >
       <div
         ref={canvas}
-        className="virtual-canvas"
+        className="virtual-canvas relative w-full"
         style={{ height: virtual.getTotalSize() + fillSpace }}
       >
         {virtual.getVirtualItems().map((row) => (
@@ -173,7 +179,7 @@ export function VirtualList<T>({
               (fillBeforeIndex !== undefined && row.index >= fillBeforeIndex ? fillSpace : 0)
             }
             role={presentation ? "presentation" : "listitem"}
-            className="virtual-row"
+            className="virtual-row absolute top-0 left-0 w-full"
             style={{
               transform: `translateY(${row.start + (fillBeforeIndex !== undefined && row.index >= fillBeforeIndex ? fillSpace : 0)}px)`,
             }}
@@ -207,7 +213,10 @@ export async function attempt<T>(
 export function ErrorNotice({ message, onDismiss }: { message?: string; onDismiss?: () => void }) {
   if (!message) return null;
   return (
-    <div className="error-notice" role="alert">
+    <div
+      className="error-notice flex items-center gap-3 py-2 px-3 rounded-sm [background:color-mix(in_srgb,_var(--ui-danger)_10%,_var(--ui-background))] text-danger text-sm whitespace-pre-wrap wrap-anywhere"
+      role="alert"
+    >
       <span>{message}</span>
       {onDismiss ? (
         <IconButton label="Dismiss error" onClick={onDismiss}>

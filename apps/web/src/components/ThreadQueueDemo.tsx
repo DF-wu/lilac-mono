@@ -57,7 +57,7 @@ export function ThreadQueueDemo() {
     }));
   }
   return (
-    <div className="ds-queue-preview">
+    <div className="ds-queue-preview h-128 flex flex-col min-w-0 bg-surface rounded-lg p-2">
       <ThreadQueue
         queues={queues}
         totals={{

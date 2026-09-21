@@ -125,7 +125,7 @@ export const SidebarThread = memo(function SidebarThread({
   const [now] = useState(Date.now);
   return (
     <ContextMenu>
-      <ContextMenuTrigger className="thread-row-card">
+      <ContextMenuTrigger className="thread-row-card block py-1">
         {thread ? (
           <ThreadSelect
             thread={thread}

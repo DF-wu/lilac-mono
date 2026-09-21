@@ -61,7 +61,7 @@ function SignInView({ onSignedIn }: { onSignedIn: () => void }) {
   if (!isLoaded) return null;
   if (isSignedIn)
     return (
-      <div className="login-form">
+      <div className="login-form grid gap-4">
         <Button type="button" onClick={onSignedIn}>
           Retry connection
         </Button>

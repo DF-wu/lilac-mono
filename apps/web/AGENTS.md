@@ -32,3 +32,13 @@ Keep the web app responsive and preserve existing interaction performance.
   relevant states and demos current, and verify changes in the real screen too.
 - Preserve attachments and references across composing, sending, previewing, and copying. Keep
   previews usable with long text, large media, and zoom.
+
+## Styling and themes
+
+- Define design values in `src/theme/` first. Use their Tailwind aliases for component layout,
+  spacing, typography, colors, and states. Shared primitive variants own repeated control styles.
+- Keep custom CSS for generated content, coordinated animation, panel and virtualizer layout
+  invariants, and the Catppuccin icon palette. Use `--ui-*` variables in these exceptions.
+- Use data attributes for behavior and test selectors. Keep dynamic measurements in inline styles.
+- When changing theme roles or registering theme data, read `src/theme/README.md` for the mapping,
+  fallback policy, and syntax integration. Extend the gallery and theme tests with any new role.

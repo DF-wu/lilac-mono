@@ -114,10 +114,12 @@ export function Settings({
         if (!open) onClose();
       }}
     >
-      <DialogContent className="settings-dialog">
-        <DialogTitle className="sr-only">Settings</DialogTitle>
+      <DialogContent className="settings-dialog flex w-[min(64rem,_calc(100vw_-_calc(var(--ui-space-unit)*8)))] max-w-none sm:max-w-none h-[min(48rem,_calc(100dvh_-_calc(var(--ui-space-unit)*8)))] p-6 overflow-hidden">
+        <DialogTitle className="sr-only absolute w-px h-px overflow-hidden [clip:rect(0,_0,_0,_0)] whitespace-nowrap">
+          Settings
+        </DialogTitle>
         <Tabs
-          className="settings-layout"
+          className="settings-layout flex-1 min-w-0 min-h-0 gap-6"
           orientation="vertical"
           value={tab}
           onValueChange={(value) => {
@@ -134,17 +136,27 @@ export function Settings({
             }
           }}
         >
-          <TabsList className="settings-navigation" aria-label="Settings sections">
-            <div className="settings-navigation-group">
-              <span className="settings-navigation-label" aria-hidden="true">
+          <TabsList
+            variant="navigation"
+            className="settings-navigation w-40 flex-none items-stretch justify-start self-stretch h-auto overflow-y-auto overflow-x-hidden min-w-0 py-4 px-0 gap-6 bg-transparent"
+            aria-label="Settings sections"
+          >
+            <div className="settings-navigation-group flex flex-col gap-1">
+              <span
+                className="settings-navigation-label mt-0 mx-0 mb-2 px-3 text-sm font-semibold text-foreground"
+                aria-hidden="true"
+              >
                 Preferences
               </span>
               <TabsTrigger value="account">Account</TabsTrigger>
               <TabsTrigger value="theme">Appearance</TabsTrigger>
             </div>
             {viewer.role === "owner" ? (
-              <div className="settings-navigation-group">
-                <span className="settings-navigation-label" aria-hidden="true">
+              <div className="settings-navigation-group flex flex-col gap-1">
+                <span
+                  className="settings-navigation-label mt-0 mx-0 mb-2 px-3 text-sm font-semibold text-foreground"
+                  aria-hidden="true"
+                >
                   Runtime
                 </span>
                 <TabsTrigger value="core">Core</TabsTrigger>
@@ -154,7 +166,7 @@ export function Settings({
               </div>
             ) : null}
           </TabsList>
-          <div className="settings-options">
+          <div className="settings-options flex-1 min-w-0 min-h-0 my-4 p-6 overflow-y-auto wrap-anywhere rounded-lg bg-background text-foreground">
             <ErrorNotice
               message={
                 error ?? (tab === "core" || tab === "mcp" ? config.error?.message : undefined)
@@ -167,7 +179,7 @@ export function Settings({
               <h2>Thread</h2>
               <SidebarPreferences />
               <h2>Access</h2>
-              <dl className="settings-account">
+              <dl className="settings-account grid gap-4 mb-6">
                 <div>
                   <dt>Role</dt>
                   <dd>{viewer.role}</dd>
@@ -184,7 +196,7 @@ export function Settings({
             </TabsContent>
             <TabsContent value="theme" className="settings-section">
               <h2>Appearance</h2>
-              <div className="settings-row">
+              <div className="settings-row flex items-start justify-between gap-6 mb-8">
                 <span>Theme</span>
                 <Select
                   items={[
@@ -207,10 +219,10 @@ export function Settings({
                   </SelectContent>
                 </Select>
               </div>
-              <div className="settings-row">
-                <div className="settings-row-description">
+              <div className="settings-row flex items-start justify-between gap-6 mb-8">
+                <div className="settings-row-description min-w-0">
                   <span>Animation speed</span>
-                  <p className="muted">
+                  <p className="muted text-muted-foreground">
                     Animation speed is saved for your account on this device. Reduced motion follows
                     your system preference.
                   </p>
@@ -243,10 +255,13 @@ export function Settings({
               <People />
             </TabsContent>
             {tab === "core" || tab === "mcp" ? (
-              <TabsContent value={tab} className="settings-section settings-config">
+              <TabsContent
+                value={tab}
+                className="settings-section settings-config flex min-h-full flex-col"
+              >
                 <h2>{tab === "core" ? "Core" : "MCP"}</h2>
                 <Textarea
-                  className="config-editor"
+                  className="config-editor block flex-1 min-h-64 resize-y w-full h-[45dvh] font-mono text-sm leading-normal p-4 rounded-md [tab-size:2]"
                   spellCheck={false}
                   aria-label={`${tab === "core" ? "Core" : "MCP"} configuration YAML`}
                   value={document ? text : ""}
@@ -255,20 +270,24 @@ export function Settings({
                     setEditors((current) => editConfig(current, tab, event.target.value));
                   }}
                 />
-                <footer className="config-footer">
+                <footer className="config-footer flex items-center gap-3 mt-3 text-sm text-muted-foreground">
                   <span role="status">
                     {status}
                     {tab === "mcp" && status === "Saved" ? ". Reload to apply changes." : ""}
                   </span>
-                  <span className="toolbar-spacer" />
+                  <span className="toolbar-spacer flex-1" />
                   {tab === "mcp" ? (
-                    <Button variant="secondary" className="button" onClick={() => void reload()}>
+                    <Button
+                      variant="secondary"
+                      className="gap-2 rounded-sm px-4"
+                      onClick={() => void reload()}
+                    >
                       <RefreshCw />
                       Reload MCP
                     </Button>
                   ) : null}
                   <Button
-                    className="button primary"
+                    className="gap-2 rounded-sm px-4"
                     disabled={!document || !!saving[document.kind] || text === document.text}
                     onClick={() => void save()}
                   >
@@ -277,12 +296,14 @@ export function Settings({
                   </Button>
                 </footer>
                 {tab === "mcp" && reloads ? (
-                  <div className="reload-results">
+                  <div className="reload-results max-h-48 overflow-auto pt-3 text-sm">
                     {reloads.servers.map((server) => (
                       <div key={server.name}>
                         <strong>{server.name}</strong>
                         <span>{server.state}</span>
-                        {server.error ? <p className="error-text">{server.error}</p> : null}
+                        {server.error ? (
+                          <p className="error-text text-danger text-sm">{server.error}</p>
+                        ) : null}
                       </div>
                     ))}
                   </div>
@@ -331,7 +352,7 @@ export function People() {
         message={change.error?.message ?? userQuery.error?.message}
         onDismiss={change.error ? () => change.reset() : undefined}
       />
-      <div className="inline-form">
+      <div className="inline-form flex gap-2 mb-4 items-center">
         <Input
           aria-label="Existing Clerk user ID"
           placeholder="Clerk user ID"
@@ -366,9 +387,9 @@ export function People() {
         items={users}
         itemKey={(user) => user.id}
         label="People"
-        className="people-list"
+        className="people-list h-80"
         render={(user) => (
-          <div className="person-row">
+          <div className="person-row flex items-center gap-2 py-2 px-0 text-sm">
             <span>{user.displayName}</span>
             <small>{user.role}</small>
             <Select
@@ -400,7 +421,7 @@ export function People() {
         <Button
           type="button"
           variant="ghost"
-          className="text-button"
+          className="text-primary py-2 px-3 text-sm"
           disabled={userQuery.isFetching}
           onClick={() => {
             if (!userQuery.isFetching) void userQuery.fetchNextPage({ cancelRefetch: false });

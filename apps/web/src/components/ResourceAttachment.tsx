@@ -23,12 +23,17 @@ export function ResourceAttachment({
   const local = useUploadProgress(data.resourceId);
   if (data.state !== "ready")
     return (
-      <div className="resource">
+      <div className="resource flex-wrap">
         <FileIcon name={data.name} mediaType={data.mediaType} />
         <span>{data.name}</span>
         <span>{recovery.error ?? local?.error ?? data.error ?? data.state}</span>
         {canEdit && local?.state === "failed" && local.retry ? (
-          <Button type="button" variant="ghost" className="text-button" onClick={local.retry}>
+          <Button
+            type="button"
+            variant="ghost"
+            className="text-primary py-2 px-3 text-sm"
+            onClick={local.retry}
+          >
             Retry upload
           </Button>
         ) : null}
@@ -37,7 +42,7 @@ export function ResourceAttachment({
             <input
               type="file"
               ref={fileInput}
-              className="sr-only"
+              className="sr-only absolute w-px h-px overflow-hidden [clip:rect(0,_0,_0,_0)] whitespace-nowrap"
               tabIndex={-1}
               aria-label={`Resume upload of ${data.name}`}
               onChange={(event) => {
@@ -72,7 +77,7 @@ export function ResourceAttachment({
             <Button
               type="button"
               variant="ghost"
-              className="text-button"
+              className="text-primary py-2 px-3 text-sm"
               disabled={recovery.active}
               onClick={() => fileInput.current?.click()}
             >

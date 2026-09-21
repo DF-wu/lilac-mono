@@ -26,12 +26,15 @@ export function CodeBlock({
   const [copyError, setCopyError] = useState<string>();
   return (
     <div className="code-block" data-wrap={forceWrap || wrap}>
-      <div className="code-toolbar">
-        <span className="code-language" title={language}>
+      <div className="code-toolbar flex items-center justify-between gap-3 py-2 px-3">
+        <span
+          className="code-language inline-flex items-center gap-2 text-muted-foreground text-xs"
+          title={language}
+        >
           <CodeLanguageIcon language={language} />
           <span>{language}</span>
         </span>
-        <div className="code-actions">
+        <div className="code-actions flex gap-1">
           {!forceWrap ? (
             <IconButton label="Wrap code" aria-pressed={wrap} onClick={() => setWrap(!wrap)}>
               <WrapText />
@@ -55,7 +58,7 @@ export function CodeBlock({
         </div>
       </div>
       {copyError ? (
-        <span className="error-text" role="status">
+        <span className="error-text text-danger text-sm" role="status">
           {copyError}
         </span>
       ) : null}

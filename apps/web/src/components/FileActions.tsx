@@ -61,7 +61,7 @@ export function FileActions({
   return (
     <>
       <ContextMenu>
-        <ContextMenuTrigger render={<span className="file-context-target" />}>
+        <ContextMenuTrigger render={<span className="file-context-target contents" />}>
           {children}
         </ContextMenuTrigger>
         <ContextMenuContent>

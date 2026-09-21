@@ -55,11 +55,11 @@ describe("attachment viewer", () => {
     );
     expect(html).toContain("Copy image");
     expect(html).toContain("Download image.png");
-    expect(html).toContain('class="media-preview-viewport"');
+    expect(html).toContain('data-ui="media-preview-viewport"');
     expect(html).toContain("Reset zoom");
     expect(html).toContain('draggable="false"');
-    expect(html.indexOf('class="media-preview-viewport"')).toBeLessThan(
-      html.indexOf('class="media-preview-toolbar"'),
+    expect(html.indexOf('data-ui="media-preview-viewport"')).toBeLessThan(
+      html.indexOf('data-ui="media-preview-toolbar"'),
     );
   });
 });
@@ -102,7 +102,7 @@ test("full-window previews keep the download footer available during loading and
     expect(html).toContain('role="status"');
     expect(html).toContain('aria-label="Download file.bin"');
     expect(html.indexOf('role="status"')).toBeLessThan(
-      html.indexOf('class="attachment-preview-footer"'),
+      html.indexOf('data-ui="attachment-preview-footer"'),
     );
   }
 });
@@ -143,7 +143,7 @@ test("preview destination actions share the download footer for text and media",
       />,
     );
     expect(html.indexOf("Open in right panel")).toBeGreaterThan(
-      html.indexOf('class="attachment-preview-footer"'),
+      html.indexOf('data-ui="attachment-preview-footer"'),
     );
     expect(html).toContain('aria-label="Download example"');
   }
