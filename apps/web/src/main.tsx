@@ -19,6 +19,9 @@ const ClerkLogin = lazy(() => import("./clerk").then((module) => ({ default: mod
 const ClerkSession = lazy(() =>
   import("./clerk").then((module) => ({ default: module.ClerkSession })),
 );
+const ClerkAccount = lazy(() =>
+  import("./clerk").then((module) => ({ default: module.ClerkAccount })),
+);
 const sessions = new WebSessionController();
 let authInfo: ReturnType<typeof readAuthInfo> | undefined;
 let sessionStarted = false;
@@ -150,6 +153,14 @@ function Root() {
         </Suspense>
       </AccountLoadBoundary>
     ) : undefined;
+  const accountProfile =
+    auth?.provider === "clerk" && auth.publishableKey ? (
+      <AccountLoadBoundary onReload={reload} message="Unable to load account settings.">
+        <Suspense fallback={<p role="status">Loading account…</p>}>
+          <ClerkAccount publishableKey={auth.publishableKey} />
+        </Suspense>
+      </AccountLoadBoundary>
+    ) : undefined;
   return (
     <App
       {...session}
@@ -158,6 +169,7 @@ function Root() {
       resourceUrl={resourceUrl}
       onLogout={logout}
       sessionControl={sessionControl}
+      accountProfile={accountProfile}
     />
   );
 }

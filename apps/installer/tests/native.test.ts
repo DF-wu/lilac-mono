@@ -53,9 +53,10 @@ const images = { core: "fixture/core:1", gateway: "fixture/gateway:1", runner: "
 
 describe("native installer", () => {
   it("creates a native-only local owner with hashed credentials and a private published port", async () => {
-    const setup = fixture(["local", "http://localhost:8787", "owner", "fixture-password"]);
+    const setup = fixture(["local", "http://localhost:8789", "owner", "fixture-password"]);
     await configureNative(setup.prompt, setup.draft);
     expect(setup.initials["Native sign-in"]).toBe("local");
+    expect(setup.draft.get(["surface", "native", "port"])).toBe(8789);
     expect(validateConfigDocument(setup.document).isOk()).toBe(true);
     expect(setup.draft.get(["surface", "native", "auth"])).toEqual({
       provider: "local",
@@ -78,11 +79,11 @@ describe("native installer", () => {
       passwordHash: setup.draft.secrets.LILAC_NATIVE_LOCAL_PASSWORD_HASH!,
       signingKey: new TextEncoder().encode(setup.draft.secrets.LILAC_NATIVE_SESSION_SECRET!),
       installationId: String(setup.draft.get(["surface", "native", "installationId"])),
-      allowedOrigins: ["http://localhost:8787"],
+      allowedOrigins: ["http://localhost:8789"],
     });
     const login = (
       await auth.login(
-        new Request("http://localhost:8787/api/native/login", {
+        new Request("http://localhost:8789/api/native/login", {
           method: "POST",
           headers: {
             authorization: `Basic ${Buffer.from("owner:fixture-password").toString("base64")}`,
@@ -93,7 +94,7 @@ describe("native installer", () => {
     ).unwrap();
     const principal = (
       await auth.authenticate(
-        new Request("http://localhost:8787/api/native/bootstrap", {
+        new Request("http://localhost:8789/api/native/bootstrap", {
           headers: { authorization: `Bearer ${login.token}` },
         }),
       )
@@ -102,7 +103,7 @@ describe("native installer", () => {
     expect(setup.document.toString()).not.toContain("fixture-password");
     expect(setup.notes.join("\n")).not.toContain("fixture-password");
     const deployment = createDeployment("/fixture", setup.draft, images);
-    expect(deployment.getIn(["services", "lilac", "ports", 0])).toBe("127.0.0.1:8787:8787");
+    expect(deployment.getIn(["services", "lilac", "ports", 0])).toBe("127.0.0.1:8789:8789");
     expect(setup.pending).toEqual([]);
   });
 
@@ -135,7 +136,7 @@ describe("native installer", () => {
       "http://chat.example",
       "https://user:pass@chat.example",
       "https://chat.example/path",
-      "http://localhost:8787",
+      "http://localhost:8789",
       "owner:bad",
       "owner",
       "fixture-password",

@@ -31,7 +31,7 @@ those and configure them later. Review and confirm the configuration to pull the
 
 Once setup reports that Lilac is healthy, choose "Talk to Lilac now". Later, run
 `docker compose exec --user root lilac lilac-tui` for a temporary conversation, deleted on exit.
-If you enabled Web, open `http://localhost:8787` and sign in.
+If you enabled Web, open `http://localhost:8789` and sign in.
 
 ## After installation: make Lilac your own
 

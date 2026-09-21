@@ -40,7 +40,7 @@ services:
       XDG_CONFIG_HOME: ${LILAC_XDG_CONFIG_HOME:-/data/.config}
     ports:
       - "8080:8080"
-      - "127.0.0.1:8787:8787"
+      - "127.0.0.1:8789:8789"
     volumes:
       - ./data:/data
       - ./home/agents:/home/lilac/.agents

@@ -17,6 +17,17 @@ application consumes only the universal shape.
 - If a newer field cannot be represented safely in an older version, that field requires the newer
   `configVersion`.
 
+## Native web port
+
+The native web listener now defaults to `8789`, reserving `8787` for the GitHub webhook and `8788`
+for the container-local operator console. Version-2 defaults for `surface.native.publicUrl` and
+`allowedOrigins` now use `http://localhost:8789`. Configs with native disabled stay disabled.
+
+Explicit port, URL and origin values are preserved. To move an existing deployment, change
+`surface.native.port` and the container side of its Compose port mapping together. If the browser's
+public URL changes, also update `publicUrl`, `allowedOrigins` and any reverse-proxy destination.
+The installer preserves existing deployment port mappings. No config-version bump is required.
+
 ## Native title model
 
 Version 2 accepts `surface.native.titleModel`, defaulting to `fast`. Use `main`, `fast`, a configured

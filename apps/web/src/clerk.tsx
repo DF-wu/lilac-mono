@@ -1,10 +1,10 @@
 import { Button } from "./components/ui/button";
-import { ClerkProvider, SignIn, useAuth, useClerk } from "@clerk/react";
-import { shadcn } from "@clerk/ui/themes";
+import { ClerkProvider, SignIn, UserProfile, useAuth, useClerk, useUser } from "@clerk/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { clerkAppearance, clerkProfileAppearance } from "./theme/clerk";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { NativeClient } from "@stanley2058/lilac-client";
 import { Result } from "better-result";
-import "@clerk/ui/themes/shadcn.css";
 
 export { signOutActiveClerk } from "./clerk-signout";
 import { registerClerkSignOut } from "./clerk-signout";
@@ -17,7 +17,7 @@ function RegisterClerk({ children }: { children: ReactNode }) {
 
 function Provider({ publishableKey, children }: { publishableKey: string; children: ReactNode }) {
   return (
-    <ClerkProvider publishableKey={publishableKey} appearance={{ theme: shadcn }}>
+    <ClerkProvider publishableKey={publishableKey} appearance={clerkAppearance}>
       <RegisterClerk>{children}</RegisterClerk>
     </ClerkProvider>
   );
@@ -69,7 +69,6 @@ function SignInView({ onSignedIn }: { onSignedIn: () => void }) {
       routing="hash"
       withSignUp={false}
       transferable={false}
-      appearance={{ elements: { footerAction__signIn: { display: "none" } } }}
       forceRedirectUrl={location.pathname + location.search}
     />
   );
@@ -172,6 +171,35 @@ export function ClerkSession({
   return (
     <Provider publishableKey={publishableKey}>
       <SessionStatus client={client} onLogout={onLogout} />
+    </Provider>
+  );
+}
+
+function AccountView() {
+  const { user } = useUser();
+  const queries = useQueryClient();
+  const updatedAt = user?.updatedAt?.getTime();
+  useEffect(() => {
+    if (!updatedAt) return;
+    async function refreshProfile() {
+      await queries.invalidateQueries({ queryKey: ["profile"] });
+      await queries.invalidateQueries({ queryKey: ["participants"] });
+    }
+    void refreshProfile();
+  }, [queries, updatedAt]);
+  return (
+    <UserProfile
+      routing="hash"
+      appearance={clerkProfileAppearance}
+      fallback={<p role="status">Loading account…</p>}
+    />
+  );
+}
+
+export function ClerkAccount({ publishableKey }: { publishableKey: string }) {
+  return (
+    <Provider publishableKey={publishableKey}>
+      <AccountView />
     </Provider>
   );
 }

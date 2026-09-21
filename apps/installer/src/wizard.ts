@@ -243,7 +243,7 @@ async function configureInstallation(
     yield* Result.await(startDeployment(root, images, draft.computerEnabled));
     const quotedRoot = "'" + root.replaceAll("'", "'\"'\"'") + "'";
     const nativeUrl = String(
-      draft.get(["surface", "native", "publicUrl"]) ?? "http://localhost:8787",
+      draft.get(["surface", "native", "publicUrl"]) ?? "http://localhost:8789",
     );
     prompt.note(`Lilac is healthy.${draft.get(["surface", "native", "enabled"]) === true ? ` Open ${nativeUrl} and sign in.` : ""}
 To talk to Lilac later:

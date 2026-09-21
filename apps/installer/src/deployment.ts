@@ -424,7 +424,7 @@ export function createDeployment(
           },
           volumes: ["./data:/data"],
           ...(draft.get(["surface", "native", "enabled"]) === true
-            ? { ports: ["127.0.0.1:8787:8787"] }
+            ? { ports: ["127.0.0.1:8789:8789"] }
             : {}),
           extra_hosts: ["host.docker.internal:host-gateway"],
           tmpfs: [

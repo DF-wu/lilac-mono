@@ -1,4 +1,6 @@
+@layer theme, base, clerk, components, utilities;
 @import "tailwindcss";
+@import "@clerk/ui/themes/shadcn.css";
 @import "./theme/tokens.css";
 @import "./theme/tailwind.css";
 @import "./components/ui/motion.css";
@@ -595,7 +597,7 @@
 }
 
 @layer components {
-  .login-shell h1,
+  .login-shell > h1,
   .login-shell > .brand {
     font-size: var(--ui-text-2xl);
     font-weight: 650;

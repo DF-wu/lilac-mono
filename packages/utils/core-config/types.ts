@@ -156,9 +156,9 @@ export function defaultNativeSurfaceConfig(): NativeSurfaceConfig {
   return {
     enabled: false,
     host: "127.0.0.1",
-    port: 8787,
-    publicUrl: "http://localhost:8787",
-    allowedOrigins: ["http://localhost:8787"],
+    port: 8789,
+    publicUrl: "http://localhost:8789",
+    allowedOrigins: ["http://localhost:8789"],
     auth: { provider: "local", ownerId: "owner" },
     titleModel: "fast",
     outputStreaming: "paragraph",

@@ -9,7 +9,7 @@ import { releaseDraftAttachments } from "./draft-thread";
 
 type WorkspaceServices = Pick<
   AppProps,
-  "client" | "scope" | "upload" | "resourceUrl" | "draftCache"
+  "client" | "scope" | "upload" | "resourceUrl" | "draftCache" | "accountProfile"
 > & {
   panels: ReturnType<typeof createPanelStore>;
   pool: UploadPool;
@@ -25,7 +25,7 @@ export function useWorkspace() {
 }
 
 export function WorkspaceProvider({ children, ...props }: AppProps & { children: ReactNode }) {
-  const { client, scope, upload, resourceUrl, draftCache } = props;
+  const { client, scope, upload, resourceUrl, draftCache, accountProfile } = props;
   const panels = useMemo(() => createPanelStore(scope), [scope.installationId, scope.principalId]);
   const pool = useMemo(() => new UploadPool(client, upload), [client, upload]);
   const drafts = useMemo(() => createDraftStore(), [client]);
@@ -51,12 +51,24 @@ export function WorkspaceProvider({ children, ...props }: AppProps & { children:
       upload,
       resourceUrl,
       draftCache,
+      accountProfile,
       pool,
       drafts,
       preferences,
       panels,
     }),
-    [client, scope, upload, resourceUrl, draftCache, pool, drafts, preferences, panels],
+    [
+      client,
+      scope,
+      upload,
+      resourceUrl,
+      draftCache,
+      accountProfile,
+      pool,
+      drafts,
+      preferences,
+      panels,
+    ],
   );
   const queries = useMemo(
     () =>

@@ -1,4 +1,5 @@
 import { setThemeMode } from "./theme/theme";
+import { clerkAppearance } from "./theme/clerk";
 import { FileIcon } from "./components/FileIcon";
 import { useStore } from "zustand";
 import { createPanelStore, defaultPanelTabs } from "./panel-store";
@@ -871,6 +872,23 @@ function Controls() {
             <Textarea placeholder="Write a note…" />
           </label>
         </Specimen>
+        <Specimen title="Sign-in styles">
+          <div className={clerkAppearance.signIn.elements.cardBox}>
+            <div className={`flex flex-col ${clerkAppearance.signIn.elements.card}`}>
+              <div className="space-y-2 text-center">
+                <h3 className={clerkAppearance.elements.headerTitle}>Enter your password</h3>
+                <p className={clerkAppearance.elements.headerSubtitle}>alex@example.com</p>
+              </div>
+              <label className="flex flex-col gap-2 text-sm">
+                Password
+                <Input type="password" autoComplete="off" placeholder="Enter your password" />
+              </label>
+              <Button type="button" className={clerkAppearance.elements.formButtonPrimary}>
+                Continue
+              </Button>
+            </div>
+          </div>
+        </Specimen>
         <Specimen title="Select & tabs">
           <Select
             value={model}
@@ -915,9 +933,11 @@ function Controls() {
             <TabsList variant="navigation" aria-label="Settings sections">
               <TabsTrigger value="account">Account</TabsTrigger>
               <TabsTrigger value="appearance">Appearance</TabsTrigger>
+              <TabsTrigger value="options">Options</TabsTrigger>
             </TabsList>
             <TabsContent value="account">Account settings.</TabsContent>
             <TabsContent value="appearance">Appearance settings.</TabsContent>
+            <TabsContent value="options">Thread preferences and access.</TabsContent>
           </Tabs>
         </Specimen>
       </div>

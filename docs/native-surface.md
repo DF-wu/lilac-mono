@@ -15,10 +15,10 @@ surface:
     enabled: true
     installationId: my-lilac
     host: 127.0.0.1
-    port: 8787
-    publicUrl: http://localhost:8787
+    port: 8789
+    publicUrl: http://localhost:8789
     allowedOrigins:
-      - http://localhost:8787
+      - http://localhost:8789
     auth:
       provider: local
       ownerId: owner
@@ -31,14 +31,15 @@ password hash must use Argon2id; the session signing secret must contain at leas
 values outside core-config and source control. Local authentication has one configured owner and no
 user creation endpoint. Restarting Core invalidates its local sessions.
 
-Start Core normally and open `http://localhost:8787`. Discord credentials are optional when the native
+Start Core normally and open `http://localhost:8789`. Discord credentials are optional when the native
 surface is enabled. The listener defaults to loopback and remains disabled on existing installations.
+Native web uses port 8789 by default; GitHub webhooks use 8787 and the operator console uses 8788.
 For a remote installation, put the native listener behind HTTPS and set `publicUrl` and
 `allowedOrigins` to the externally visible origin. Auth uses the configured public URL; arbitrary
 forwarded headers cannot change it.
 
 For frontend development, run `bun run dev:web`. Vite proxies `/api` and WebSocket upgrades to
-`http://127.0.0.1:8787`; `LILAC_WEB_BACKEND_URL` overrides that development target. Add the development
+`http://127.0.0.1:8789`; `LILAC_WEB_BACKEND_URL` overrides that development target. Add the development
 origin, normally `http://localhost:5173`, to `allowedOrigins`.
 
 ## Design system
@@ -55,6 +56,10 @@ Choose Clerk per installation with `surface.native.auth.provider: clerk`. Config
 `ownerId`, Clerk `ownerProviderUserId` and `clerkIssuer`. Browser sessions do not require a `clerkOAuthClientId`. Set
 `CLERK_SECRET_KEY` and `CLERK_PUBLISHABLE_KEY` in the server environment. `CLERK_JWT_KEY` is optional.
 Only the publishable key reaches the browser. The web build does not embed installation credentials.
+
+Settings → Account embeds Clerk's profile and security controls, including connected accounts.
+Local-password installations keep the name and avatar editor. Thread preferences and the access
+summary are in Settings → Options.
 
 The owner adds existing Clerk accounts to the native user directory and shares threads with read or
 edit access. Signing in does not enroll an account. The web app has no registration or onboarding

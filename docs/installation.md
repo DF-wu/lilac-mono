@@ -49,7 +49,7 @@ Once setup finishes, choose "Talk to Lilac now" or exit the installer. To open t
 creates a temporary conversation that is deleted on exit. Agent-created files remain. See
 [console lifecycle and authentication](native-surface.md#temporary-operator-console).
 
-If you enabled Web, open `http://localhost:8787` and sign in. Container health means services started;
+If you enabled Web, open `http://localhost:8789` and sign in. Container health means services started;
 your first prompt exercises the configured model provider.
 
 Next, [personalize Lilac's prompt files](../README.md#after-installation-make-lilac-your-own).
@@ -84,7 +84,7 @@ For a service on the Docker host, use an address with that reachability rather t
 Local auth has one owner and no user registration. Setup hashes the chosen password with Argon2id and
 generates a session secret. The username, password hash and secret go in `secrets.env`, never in
 `core-config.yaml`. The native gateway listens inside the container and is published only on host
-`127.0.0.1:8787`. Use an SSH tunnel for access from another machine, or place an HTTPS reverse proxy
+`127.0.0.1:8789`. Use an SSH tunnel for access from another machine, or place an HTTPS reverse proxy
 in front of that port and supply its origin as the Native web URL.
 
 Clerk setup takes an existing application's owner user ID, issuer, secret key and publishable key.

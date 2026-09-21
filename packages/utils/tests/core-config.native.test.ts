@@ -10,6 +10,21 @@ describe("native surface configuration", () => {
     expect(native.storageRetentionMaxAgeMs).toBeNull();
     expect(native.installationId).toBeUndefined();
   });
+  it("defaults native web to 8789 and preserves explicit listener settings", () => {
+    for (const surface of [undefined, { native: {} }]) {
+      const native = parseCoreConfigV2ToUniversal({ configVersion: 2, surface }).surface.native;
+      expect(native.port).toBe(8789);
+      expect(native.publicUrl).toBe("http://localhost:8789");
+      expect(native.allowedOrigins).toEqual(["http://localhost:8789"]);
+    }
+    const configured = {
+      port: 9000,
+      publicUrl: "https://chat.example.com",
+      allowedOrigins: ["https://chat.example.com"],
+    };
+    const native = parseCoreConfigV2ToUniversal({ surface: { native: configured } }).surface.native;
+    expect(native).toMatchObject(configured);
+  });
   it("normalizes independent friendly durations and preserves explicit output mode", () => {
     const native = parseCoreConfigV2ToUniversal({
       configVersion: 2,

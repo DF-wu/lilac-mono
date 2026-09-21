@@ -6,7 +6,7 @@
   padding: calc(var(--ui-space-unit) * 2) calc(var(--ui-space-unit) * 3);
 }
 
-.settings-section h2 {
+.settings-section > h2 {
   margin: 0 0 calc(var(--ui-space-unit) * 6);
   font-size: var(--ui-text-lg);
   font-weight: 600;
@@ -43,16 +43,32 @@
       calc(var(--ui-space-unit) * 2);
   }
   .settings-layout {
+    flex-direction: column;
     gap: calc(var(--ui-space-unit) * 2);
   }
   .settings-navigation {
-    width: 7.5rem;
+    width: 100%;
+    height: auto;
+    flex-direction: row;
+    overflow-x: auto;
+    padding-block: calc(var(--ui-space-unit) * 2);
+    gap: calc(var(--ui-space-unit) * 4);
+  }
+  .settings-navigation-group {
+    flex-direction: row;
+  }
+  .settings-navigation-label {
+    display: none;
+  }
+  .settings-navigation [role="tab"] {
+    width: auto;
   }
   .settings-navigation-label,
   .settings-navigation [role="tab"] {
     padding-inline: calc(var(--ui-space-unit) * 2);
   }
   .settings-options {
+    margin-block: 0;
     padding: calc(var(--ui-space-unit) * 3);
   }
   .settings-options .field,

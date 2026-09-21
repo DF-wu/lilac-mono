@@ -6,7 +6,7 @@ import { SidebarPreferences } from "./SidebarPreferences";
 import { AccountProfile } from "./AccountProfile";
 import { AgentIdentity } from "./AgentIdentity";
 import type { ActorIdentity } from "./ActorAvatar";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { RefreshCw, Save, UserPlus } from "lucide-react";
 import type { NativeRpcOutputs, NativeUser } from "@stanley2058/lilac-client-protocol";
 import { attempt, ErrorNotice, IconButton, VirtualList } from "./ui";
@@ -24,6 +24,13 @@ import {
   type ConfigEditors,
   type ConfigKind,
 } from "../config-editor";
+function subscribeToSettingsWidth(onChange: () => void) {
+  const media = window.matchMedia("(max-width: 40rem)");
+  media.addEventListener("change", onChange);
+  return () => media.removeEventListener("change", onChange);
+}
+const isNarrowSettings = () => window.matchMedia("(max-width: 40rem)").matches;
+
 export function Settings({
   onClose,
   theme,
@@ -38,11 +45,12 @@ export function Settings({
   onTheme: (value: string) => void;
 }) {
   const [open, setOpen] = useState(true);
-  const { client, preferences } = useWorkspace();
+  const narrow = useSyncExternalStore(subscribeToSettingsWidth, isNarrowSettings);
+  const { client, preferences, accountProfile } = useWorkspace();
   const animation = useStore(preferences, (state) => state.animation);
-  const [tab, setTab] = useState<"account" | "theme" | "core" | "mcp" | "agent" | "users">(
-    "account",
-  );
+  const [tab, setTab] = useState<
+    "account" | "options" | "theme" | "core" | "mcp" | "agent" | "users"
+  >("account");
   const [editors, setEditors] = useState<ConfigEditors>({});
   const [error, setError] = useState<string>();
   const [reloads, setReloads] = useState<NativeRpcOutputs["config"]["reloadMcp"]>();
@@ -120,11 +128,12 @@ export function Settings({
         </DialogTitle>
         <Tabs
           className="settings-layout flex-1 min-w-0 min-h-0 gap-6"
-          orientation="vertical"
+          orientation={narrow ? "horizontal" : "vertical"}
           value={tab}
           onValueChange={(value) => {
             if (
               value === "account" ||
+              value === "options" ||
               value === "theme" ||
               value === "core" ||
               value === "mcp" ||
@@ -150,6 +159,7 @@ export function Settings({
               </span>
               <TabsTrigger value="account">Account</TabsTrigger>
               <TabsTrigger value="theme">Appearance</TabsTrigger>
+              <TabsTrigger value="options">Options</TabsTrigger>
             </div>
             {viewer.role === "owner" ? (
               <div className="settings-navigation-group flex flex-col gap-1">
@@ -174,8 +184,14 @@ export function Settings({
               onDismiss={error ? () => setError(undefined) : undefined}
             />
             <TabsContent value="account" className="settings-section">
-              <h2>Account</h2>
-              <AccountProfile viewer={viewer} />
+              {accountProfile ?? (
+                <>
+                  <h2>Account</h2>
+                  <AccountProfile viewer={viewer} />
+                </>
+              )}
+            </TabsContent>
+            <TabsContent value="options" className="settings-section">
               <h2>Thread</h2>
               <SidebarPreferences />
               <h2>Access</h2>

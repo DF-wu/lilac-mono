@@ -139,8 +139,8 @@ export async function createNativeIntegrationFixture(
   config.surface.native.installationId = "native-integration";
   config.surface.native.host = "127.0.0.1";
   config.surface.native.port = options.port ?? 0;
-  config.surface.native.publicUrl = `http://127.0.0.1:${options.port ?? 8787}`;
-  config.surface.native.allowedOrigins = options.allowedOrigins ?? ["http://127.0.0.1:8787"];
+  config.surface.native.publicUrl = `http://127.0.0.1:${options.port ?? 8789}`;
+  config.surface.native.allowedOrigins = options.allowedOrigins ?? ["http://127.0.0.1:8789"];
   config.surface.native.auth.provider = "local";
   config.surface.native.auth.ownerId = "owner";
   config.conversation.thread.summarization.enabled = false;

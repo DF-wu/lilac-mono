@@ -61,7 +61,7 @@ export async function configureNative(prompt: Prompt, draft: SetupDraft): Promis
   const publicUrl = await validatedText(
     prompt,
     "Native web URL",
-    "http://localhost:8787",
+    "http://localhost:8789",
     validateOrigin,
   );
   draft.set(["surface", "native", "enabled"], true);
@@ -70,7 +70,7 @@ export async function configureNative(prompt: Prompt, draft: SetupDraft): Promis
     currentString(draft, ["surface", "native", "installationId"], crypto.randomUUID()),
   );
   draft.set(["surface", "native", "host"], "0.0.0.0");
-  draft.set(["surface", "native", "port"], 8787);
+  draft.set(["surface", "native", "port"], 8789);
   draft.set(["surface", "native", "publicUrl"], publicUrl);
   draft.set(["surface", "native", "allowedOrigins"], [publicUrl]);
   draft.set(["surface", "native", "auth", "provider"], provider);
@@ -78,6 +78,6 @@ export async function configureNative(prompt: Prompt, draft: SetupDraft): Promis
   if (provider === "local") await configureLocal(prompt, draft);
   else await configureClerk(prompt, draft);
   prompt.note(
-    "The gateway is published on 127.0.0.1:8787. For remote access, forward it through HTTPS or an SSH tunnel.",
+    "The gateway is published on 127.0.0.1:8789. For remote access, forward it through HTTPS or an SSH tunnel.",
   );
 }

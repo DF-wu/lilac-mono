@@ -6,11 +6,11 @@ import { seedNativeBrowserFixture } from "./browser-seed";
 export async function startNativeBrowserFixture() {
   let threads: ReturnType<typeof seedNativeBrowserFixture> | undefined;
   const fixture = await createNativeIntegrationFixture({
-    port: 8787,
+    port: 8789,
     password: process.env.TEST_NATIVE_PASSWORD ?? "native-fixture-password",
     allowedOrigins: [
-      "http://127.0.0.1:8787",
-      "http://localhost:8787",
+      "http://127.0.0.1:8789",
+      "http://localhost:8789",
       "http://127.0.0.1:5173",
       "http://localhost:5173",
     ],

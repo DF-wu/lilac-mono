@@ -711,10 +711,10 @@ const nativeSurfaceSchema = z
   .object({
     enabled: z.boolean().default(false),
     host: z.string().trim().min(1).default("127.0.0.1"),
-    port: z.number().int().min(1).max(65535).default(8787),
-    publicUrl: nativeHttpUrlSchema.default("http://localhost:8787"),
+    port: z.number().int().min(1).max(65535).default(8789),
+    publicUrl: nativeHttpUrlSchema.default("http://localhost:8789"),
     installationId: z.string().trim().min(1).max(256).optional(),
-    allowedOrigins: z.array(nativeOriginSchema).min(1).default(["http://localhost:8787"]),
+    allowedOrigins: z.array(nativeOriginSchema).min(1).default(["http://localhost:8789"]),
     auth: z
       .object({
         provider: z.enum(["local", "clerk"]).default("local"),
