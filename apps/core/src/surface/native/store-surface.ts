@@ -179,6 +179,10 @@ export class NativeSurfaceStore {
   ): NativeStoreResult<void> {
     return Result.gen(function* () {
       const details = yield* this.reactions(actorId, threadId, message.id);
+      if (details.length > 64)
+        return Result.err(
+          nativeFailure("invalid", "A message can have at most 64 different reactions"),
+        );
       const part: DisplayMessage["parts"][number] = {
         type: "data-reactions",
         id: `reactions_${message.id}`,

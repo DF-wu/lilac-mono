@@ -57,6 +57,38 @@ function fixture() {
 }
 
 describe("native surface adapter", () => {
+  test("reaction variant limit rolls back excess additions without corrupting the turn", async () => {
+    const f = fixture();
+    const ref = (await f.scoped.sendMsg(f.ref, { text: "Reactions" })).unwrap();
+    for (let index = 0; index < 64; index++)
+      f.surface.setReaction("owner", f.source.id, ref.messageId, `emoji-${index}`, true).unwrap();
+    const before = f.store.sync("owner", f.source.id).unwrap();
+    expect(
+      f.surface.setReaction("owner", f.source.id, ref.messageId, "overflow", true).isErr(),
+    ).toBe(true);
+    expect(f.surface.reactions("owner", f.source.id, ref.messageId).unwrap()).toHaveLength(64);
+    expect(f.store.sync("owner", f.source.id).unwrap()).toEqual(before);
+
+    f.store
+      .shareThread("owner", { threadId: f.source.id, userId: "other", grant: "edit" })
+      .unwrap();
+    f.surface.setReaction("other", f.source.id, ref.messageId, "emoji-0", true).unwrap();
+    f.surface.setReaction("owner", f.source.id, ref.messageId, "emoji-0", true).unwrap();
+    expect(
+      f.surface
+        .reactions("owner", f.source.id, ref.messageId)
+        .unwrap()
+        .find((reaction) => reaction.emoji === "emoji-0")?.count,
+    ).toBe(2);
+    f.surface.setReaction("owner", f.source.id, ref.messageId, "emoji-1", false).unwrap();
+    f.surface.setReaction("owner", f.source.id, ref.messageId, "overflow", true).unwrap();
+    const message = f.surface.readMessage("owner", f.source.id, ref.messageId).unwrap()!.message;
+    expect(message.parts.find((part) => part.type === "data-reactions")?.data.items).toHaveLength(
+      64,
+    );
+    expect(f.store.sync("owner", f.source.id).isOk()).toBe(true);
+  });
+
   test("unscoped and forged starter authority fail closed", async () => {
     const f = fixture();
     expect((await f.adapter.listSessions()).isErr()).toBe(true);

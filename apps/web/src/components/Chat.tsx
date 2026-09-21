@@ -325,12 +325,12 @@ export function Chat(props: ChatProps) {
     };
   }
   async function deliver(entry: PendingInput, retryFailed = false) {
-    if (currentId.current === threadId && !canEdit.current) return;
     const outcome = await deliverPendingInput(
       entry,
       () => prepareInput(entry, retryFailed),
       (input) => client.submit(input),
       (patch) => setPending(entry.commandId, patch),
+      currentId.current !== threadId || canEdit.current,
     );
     if (outcome?.kind !== "accepted") return;
     for (const attachment of entry.submission.attachments) pool.release(threadId, attachment.key);

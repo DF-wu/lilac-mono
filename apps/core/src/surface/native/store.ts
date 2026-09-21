@@ -545,7 +545,7 @@ export class NativeStore {
         const user = yield* this.getUser(actorId);
         const preferences = yield* this.getSidebarPreferences(actorId);
         this.reconcileSidebar(user, preferences.autoSettleDays);
-        const separator = input.cursor?.indexOf(":") ?? -1;
+        const separator = input.cursor?.indexOf("_") ?? -1;
         const position = input.cursor
           ? Number(input.cursor.slice(0, separator))
           : Number.MIN_SAFE_INTEGER;
@@ -572,7 +572,7 @@ export class NativeStore {
           items,
           total,
           nextCursor:
-            rows.length > page.length && last ? `${last.position}:${last.thread_id}` : undefined,
+            rows.length > page.length && last ? `${last.position}_${last.thread_id}` : undefined,
         });
       }, this),
     );

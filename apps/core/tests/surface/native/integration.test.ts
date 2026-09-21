@@ -49,6 +49,40 @@ function nativePrompt(
 }
 
 describe("native runtime integration", () => {
+  test("sidebar pagination crosses the RPC boundary with more than 100 conversations", async () => {
+    const fixture = await createNativeIntegrationFixture();
+    try {
+      const { client } = fixture.connect();
+      const bootstrap = await client.bootstrap.get({});
+      const ids = Array.from(
+        { length: 101 },
+        (_, index) =>
+          fixture.store
+            .createThread(bootstrap.viewer.id, {
+              commandId: `page-${index}`,
+              title: `Thread ${index}`,
+            })
+            .unwrap().id,
+      );
+      const first = await client.sidebar.list({ section: "active", limit: 100 });
+      expect(first.items).toHaveLength(100);
+      expect(first.total).toBe(101);
+      expect(first.nextCursor).toMatch(/^[A-Za-z0-9_-]+$/);
+      const second = await client.sidebar.list({
+        section: "active",
+        limit: 100,
+        cursor: first.nextCursor,
+      });
+      expect(second.items).toHaveLength(1);
+      expect(second.nextCursor).toBeUndefined();
+      expect([...first.items, ...second.items].map((thread) => thread.id).sort()).toEqual(
+        ids.sort(),
+      );
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test("local login, socket prompt, durable output and unchanged two-device replay", async () => {
     const fixture = await createNativeIntegrationFixture();
     try {

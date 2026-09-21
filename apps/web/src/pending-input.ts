@@ -16,7 +16,15 @@ export async function deliverPendingInput(
   prepare: () => Promise<NativeInput | undefined>,
   submit: (input: NativeInput) => Promise<CommandOutcome>,
   update: (patch: Partial<PendingInput> | null) => void,
+  editable: boolean,
 ): Promise<CommandOutcome | undefined> {
+  if (!editable) {
+    update({
+      state: entry.state === "uncertain" ? "uncertain" : "rejected",
+      error: "You no longer have permission to send to this conversation.",
+    });
+    return;
+  }
   update({ state: "preparing", error: undefined });
   const retained = entry.state === "uncertain" ? entry.input : undefined;
   const input = retained ?? (await prepare());

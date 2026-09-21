@@ -18,7 +18,7 @@ function fixture() {
     state: "preparing",
   };
   let removed = false;
-  const state = { historyGeneration: 0, active: false };
+  const state = { historyGeneration: 0, active: false, editable: true };
   const sent: NativeInput[] = [];
   const outcomes: CommandOutcome[] = [];
   let preparations = 0;
@@ -52,6 +52,7 @@ function fixture() {
         if (patch) entry = { ...entry, ...patch };
         else removed = true;
       },
+      state.editable,
     );
   return {
     state,
@@ -128,6 +129,39 @@ test("a rejected first-send handoff discards its retained stale payload", async 
   f.outcomes.push(accepted);
   await f.send();
   expect(f.sent[0]).toMatchObject({ historyGeneration: 4, mode: "steer" });
+  expect(f.preparations()).toBe(1);
+  expect(f.removed()).toBe(true);
+});
+
+test("lost edit access settles a preparing message and allows retry after restoration", async () => {
+  const f = fixture();
+  f.state.editable = false;
+  await f.send();
+  expect(f.entry().state).toBe("rejected");
+  expect(f.entry().error).toContain("permission");
+  expect(f.preparations()).toBe(0);
+  expect(f.sent).toEqual([]);
+  f.state.editable = true;
+  f.outcomes.push(accepted);
+  await f.send();
+  expect(f.sent).toHaveLength(1);
+  expect(f.removed()).toBe(true);
+});
+
+test("losing permission does not turn an uncertain send into a new payload", async () => {
+  const f = fixture();
+  f.outcomes.push({ kind: "uncertain", commandId: "command" }, accepted);
+  await f.send();
+  f.state.editable = false;
+  await f.send();
+  expect(f.entry().state).toBe("uncertain");
+  expect(f.entry().error).toContain("permission");
+  expect(f.sent).toHaveLength(1);
+  f.state.historyGeneration = 4;
+  f.state.active = true;
+  f.state.editable = true;
+  await f.send();
+  expect(f.sent[1]).toBe(f.sent[0]);
   expect(f.preparations()).toBe(1);
   expect(f.removed()).toBe(true);
 });
