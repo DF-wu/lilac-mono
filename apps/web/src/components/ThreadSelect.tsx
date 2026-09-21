@@ -60,31 +60,32 @@ export function ThreadCard({
   const StatusIcon = states[state].icon;
   return (
     <div
-      className={`thread-card ${selected ? "selected" : ""}`}
+      className={`thread-card relative min-w-0 rounded-md ${selected ? "selected" : ""}`}
       data-state={state}
       data-draft={selected ? undefined : draft}
     >
       <Button
         variant="ghost"
-        className="thread-card-select w-full h-auto pt-[calc(calc(var(--ui-space-unit)*3)_/_2)] px-3 pb-3 gap-0 justify-start text-left font-normal rounded-[inherit]"
+        className="thread-card-select absolute inset-0 w-full h-full rounded-[inherit]"
         onClick={onSelect}
         aria-label={`${title || "Untitled"}, ${states[state].label}${draft && !selected ? ", Draft" : ""}`}
-      >
-        <span className="thread-card-copy flex flex-1 min-w-0 flex-col gap-0">
-          <span className="thread-card-top flex items-center gap-2 h-[var(--ui-control-compact)] text-xs text-muted-foreground">
-            <span className="thread-starter flex min-w-0 items-center gap-1">
-              {draft && !selected ? (
-                <span
-                  className="thread-draft-icon text-draft flex-none grid place-items-center"
-                  aria-label="Draft"
-                >
-                  <SquarePen />
-                </span>
-              ) : null}
-              <ActorAvatar displayName={starterName} avatarUrl={starterAvatarUrl} />
-              <span>{starterName}</span>
-            </span>
-            <span className="thread-card-meta ml-auto flex-none flex items-center gap-1">
+      />
+      <span className="thread-card-copy relative pointer-events-none flex min-w-0 flex-col gap-0 pt-[calc(var(--ui-space-unit)*1.5)] px-3 pb-3">
+        <span className="thread-card-top flex items-center gap-2 h-[var(--ui-control-compact)] text-xs text-muted-foreground">
+          <span className="thread-starter flex min-w-0 items-center gap-1">
+            {draft && !selected ? (
+              <span
+                className="thread-draft-icon text-draft flex-none grid place-items-center"
+                aria-label="Draft"
+              >
+                <SquarePen />
+              </span>
+            ) : null}
+            <ActorAvatar displayName={starterName} avatarUrl={starterAvatarUrl} />
+            <span>{starterName}</span>
+          </span>
+          <span className="thread-card-meta ml-auto flex-none flex items-center gap-1">
+            <span className="thread-card-status flex items-center gap-1">
               {pinned ? (
                 <span className="thread-pin grid place-items-center flex-none" aria-label="Pinned">
                   <Pin />
@@ -98,22 +99,22 @@ export function ThreadCard({
                   <StatusIcon />
                 </span>
               ) : null}
-              {draft !== "new" ? <ThreadTime updatedAt={updatedAt} now={now} /> : null}
             </span>
-          </span>
-          <span className="thread-card-title overflow-hidden text-ellipsis whitespace-nowrap text-sm">
-            {title || "Untitled"}
+            {actions ? (
+              <span
+                data-ui="thread-card-actions"
+                className="thread-card-actions absolute top-[calc(var(--ui-space-unit)*1.5)] right-2 flex items-center opacity-0 pointer-events-none bg-surface-hover rounded-sm"
+              >
+                {actions}
+              </span>
+            ) : null}
+            {draft !== "new" ? <ThreadTime updatedAt={updatedAt} now={now} /> : null}
           </span>
         </span>
-      </Button>
-      {actions ? (
-        <span
-          data-ui="thread-card-actions"
-          className="thread-card-actions absolute top-[calc(calc(var(--ui-space-unit)*3)_/_2)] right-2 flex items-center opacity-0 pointer-events-none bg-surface-hover rounded-sm"
-        >
-          {actions}
+        <span className="thread-card-title overflow-hidden text-ellipsis whitespace-nowrap text-sm">
+          {title || "Untitled"}
         </span>
-      ) : null}
+      </span>
     </div>
   );
 }

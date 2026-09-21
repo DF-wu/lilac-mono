@@ -60,13 +60,17 @@
   opacity: 1;
   pointer-events: auto;
 }
-.thread-card:has(.thread-card-actions):hover .thread-card-meta,
-.thread-card:has(.thread-card-actions):focus-within .thread-card-meta {
-  visibility: hidden;
-}
-.thread-card:has(.thread-card-actions):hover .thread-starter,
-.thread-card:has(.thread-card-actions):focus-within .thread-starter {
-  max-width: calc(100% - var(--ui-control-compact) * 3);
+@media (hover: hover) {
+  .thread-card:has(.thread-card-actions):hover .thread-card-status,
+  .thread-card:has(.thread-card-actions):focus-within .thread-card-status,
+  .thread-card:has(.thread-card-actions):hover .thread-card-meta time,
+  .thread-card:has(.thread-card-actions):focus-within .thread-card-meta time {
+    visibility: hidden;
+  }
+  .thread-card:has(.thread-card-actions):hover .thread-starter,
+  .thread-card:has(.thread-card-actions):focus-within .thread-starter {
+    max-width: calc(100% - var(--ui-control-compact) * 3);
+  }
 }
 @keyframes thread-working-spin {
   to {
@@ -79,15 +83,18 @@
   }
 }
 @media (hover: none) {
-  .thread-card-actions {
+  .thread-card .thread-card-actions {
+    position: static;
+    background: transparent;
     opacity: 1;
     pointer-events: auto;
   }
-  .thread-card:has(.thread-card-actions) .thread-card-meta {
-    visibility: hidden;
+  .thread-card:has(.thread-card-actions) .thread-card-status,
+  .thread-card:has(.thread-card-actions) .thread-card-meta time {
+    visibility: visible;
   }
   .thread-card:has(.thread-card-actions) .thread-starter {
-    max-width: calc(100% - var(--ui-control-compact) * 3);
+    max-width: none;
   }
 }
 
