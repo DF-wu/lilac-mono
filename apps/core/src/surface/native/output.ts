@@ -43,6 +43,7 @@ export function createNativeOutputPublisher(options: {
   let position = options.recoveryFrontier?.position ?? 0;
   let ordinal = options.recoveryFrontier?.ordinal ?? 0;
   let settled = false;
+  let currentStepId = `${options.requestId}:step:0`;
   let parts: TextPart[] = [];
   const activityPositions = new Map<string, number>();
   let publicationTail: Promise<NativeOutputPublication> = Promise.resolve(Result.ok(undefined));
@@ -105,6 +106,7 @@ export function createNativeOutputPublisher(options: {
     readonly phase?: NativeTextPhase;
   }): void {
     if (settled || parts.some((part) => part.partId === input.partId)) return;
+    currentStepId = input.stepId;
     position += 1;
     parts.push({
       ...input,
@@ -154,11 +156,25 @@ export function createNativeOutputPublisher(options: {
     input: Omit<Extract<NativeOutputPayload, { type: "activity" }>, "type" | "position">,
   ): void {
     if (settled) return;
+    currentStepId = input.stepId;
     const key = JSON.stringify([input.stepId, input.activityId]);
     const knownPosition = activityPositions.get(key);
     const activityPosition = knownPosition ?? ++position;
     activityPositions.set(key, activityPosition);
     emit({ type: "activity", ...input, position: activityPosition });
+  }
+
+  function resource(
+    input: Omit<Extract<NativeOutputPayload, { type: "resource" }>, "type" | "position">,
+  ): Promise<NativeOutputPublication> {
+    if (settled)
+      return Promise.resolve(
+        Result.err(
+          new NativeOutputPublishFailed({ message: "Native response has already settled" }),
+        ),
+      );
+    emit({ type: "resource", ...input, position: ++position });
+    return publicationTail;
   }
 
   function compaction(
@@ -215,6 +231,8 @@ export function createNativeOutputPublisher(options: {
 
   return {
     hasPendingText,
+    currentStepId: () => currentStepId,
+    resource,
     captureCheckpoint,
     textStart,
     textDelta,

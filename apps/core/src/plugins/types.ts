@@ -1,3 +1,4 @@
+import type { NativeAttachmentOutput } from "../tool-server/tools/attachment";
 import type { SurfaceAdapter, SurfaceOperationResult } from "../surface/adapter";
 import type { RequestContext } from "../tool-server/types";
 import type { LilacBus } from "@stanley2058/lilac-event-bus";
@@ -31,6 +32,7 @@ export type CoreToolPluginRuntime = {
   bus?: LilacBus;
   blobStore?: BlobStore;
   attachmentOutputLifecycle?: AttachmentOutputLifecycle;
+  nativeAttachmentOutput?: NativeAttachmentOutput;
   resourceAccess?: ResourceAccess;
   resourceAccessForContext?: (context: RequestContext | undefined) => ResourceAccess | undefined;
   surfaceAdapterResolver?: SurfaceAdapterResolver;

@@ -173,6 +173,21 @@ Drain native runs before downgrading to a build without this contract. Older str
 reject native checkpoints containing the new field and restart from accepted input. At-least-once
 model/tool execution remains unchanged; the frontier does not make external effects exactly once.
 
+## Native surface tool output
+
+The internal `evt.native.output` union now accepts a `resource` event for attachments to an active
+response. It references an existing native upload and projects the existing `data-resource` display
+part. Resource events use the same publication ordinal and checkpoint frontier as text. This does not
+change the native client protocol version or add a database table.
+
+New projected assistant messages include `metadata.authorId: lilac`. Older projected messages retain
+access through their existing assistant role and projection ID. Startup idempotently restores transcript
+links where native input records identify the response's request. Standalone historical messages without
+known ownership are left unlinked.
+
+Older core builds reject the new strict event variant. Drain native work and preserve a consistent backup
+of native state, transcripts, blobs and retained output events before downgrading.
+
 ## MCP value source prefixes
 
 Environment and file references in `mcp-config.yaml` accept an optional string `prefix`.

@@ -5,6 +5,7 @@ import { CUSTOM_COMMAND_TEXT_PREFIX } from "@stanley2058/lilac-utils/custom-comm
 import type { CustomCommandManager } from "../../custom-commands/manager";
 import type { TranscriptStore } from "../../transcript/transcript-store";
 import { parseNativeRequestEnvelope } from "../authenticated-request";
+import { escapeSurfaceMetadataTags, formatSurfaceMetadataLine } from "../bridge/surface-metadata";
 import type { NativeRunnerLifecycle, NativeRunnerRequest } from "../bridge/bus-agent-runner";
 import type { NativeInputRecord } from "./codec";
 import { nativeFailure, NativeStoreFailure } from "./errors";
@@ -159,7 +160,17 @@ export function createNativeExecution(options: {
           return Result.err(nativeFailure("invalid", `Skill '${skillId}' is unavailable`));
       }
       const skillText = input.skillIds.map((skillId) => `Use the skill $${skillId}.`).join("\n");
-      const text = skillText ? `${skillText}\n\n${input.text}` : input.text;
+      const author = yield* store.getUser(input.authorId);
+      const header = formatSurfaceMetadataLine({
+        platform: "native",
+        thread_id: input.threadId,
+        user_id: author.id,
+        user_name: author.displayName || `user_${author.id}`,
+        message_id: input.messageId,
+        message_time: new Date(input.createdAt).toISOString(),
+      });
+      const body = skillText ? `${skillText}\n\n${input.text}` : input.text;
+      const text = `${header}\n${escapeSurfaceMetadataTags(body)}`;
       const parts: Extract<StoredMessageV1, { role: "user" }>["content"] = [{ type: "text", text }];
       for (const attachmentId of input.attachmentIds) {
         const attachment = yield* store.getUpload(attachmentId);

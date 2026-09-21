@@ -174,6 +174,27 @@ correlate output commits with socket enqueue timing. This timing ends at the ser
 not at client rendering. Byte counters exclude TLS and WebSocket framing overhead. Metric fields
 omit credentials and conversation bodies.
 
+## Surface tools
+
+Native surface tools accept both `native:<threadId>` and the bare thread ID returned by listings.
+Use `native:<threadId>` as the canonical session ID. `surface.sessions.list` paginates through all
+readable active threads, subject to its requested limit. Set `archived: true` to list archived threads.
+Message reads and lists include display names and reply context. Lilac's projected replies support
+editing, deletion and reactions, including replies created before explicit author metadata was added.
+
+`surface.messages.send` creates a separate message. `attachment.add_files` attaches a file to the
+active response. Both copy files into managed blob storage and expose native resource attachments;
+the original local file can then be removed. Active-response attachments participate in output replay,
+checkpoint rollback and thread rewind. A canceled response retains attachments already published.
+
+Recent agent writes include projected responses and tool-sent messages. Startup restores missing links
+for historical responses whose native input records identify the owning request. It cannot infer the
+owner of older standalone tool messages that have no request link.
+
+Native conversation search ranks lexical matches and applies `minScore`. `hybrid` requests use lexical
+fallback and report `mode: lexical` with `vectorAvailable: false`. Explicit `semantic` requests return
+an unsupported-mode error. Structured questions remain unavailable.
+
 ## Persistence and rollback
 
 Back up `native-surface.db` together with Core's transcript, resource, request-delivery and agent-run

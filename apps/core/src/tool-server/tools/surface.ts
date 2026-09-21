@@ -655,6 +655,8 @@ function toCompactMessage(
     ts: msg.ts,
   };
 
+  if (msg.replyTo) out["replyToMessageId"] = msg.replyTo.messageId;
+
   if (typeof msg.editedTs === "number") out["editedTs"] = msg.editedTs;
   if (typeof msg.deleted === "boolean") out["deleted"] = msg.deleted;
 
@@ -769,6 +771,10 @@ function buildMessagesReadOutput(params: {
 const sessionsListInputSchema = baseInputSchema
   .extend({
     limit: sessionsListLimitSchema,
+    archived: z
+      .boolean()
+      .optional()
+      .describe("Native only: list archived threads instead of active threads."),
   })
   .strict();
 
@@ -1352,10 +1358,14 @@ export class Surface implements ServerTool {
     });
   }
 
-  private linkSentMessageToTranscript(ref: MsgRef, ctx: RequestContext | undefined): void {
+  private linkSentMessageToTranscript(
+    ref: MsgRef,
+    ctx: RequestContext | undefined,
+  ): ResultType<void, ServerToolFailure> {
     const requestId = ctx?.requestId;
-    if (!requestId || !this.params.transcriptStore) return;
-    if (!ctx?.sessionId || !isHeartbeatSessionId(ctx.sessionId)) return;
+    if (!requestId || !this.params.transcriptStore) return Result.ok(undefined);
+    if (ref.platform !== "native" && (!ctx?.sessionId || !isHeartbeatSessionId(ctx.sessionId)))
+      return Result.ok(undefined);
 
     {
       const attempt = Result.try({
@@ -1372,9 +1382,16 @@ export class Surface implements ServerTool {
       if (attempt.isErr()) {
         const cause = attempt.error.cause;
         if (Panic.is(cause)) preserveToolPanic(cause);
-        // Best-effort only. Do not fail the send on transcript linkage issues.
+        if (ref.platform === "native")
+          return Result.err(
+            surfaceFailure(
+              "unavailable",
+              "Message was sent but could not be linked to its transcript",
+            ),
+          );
       }
     }
+    return Result.ok(undefined);
   }
 
   private async callActivitiesRecentAgentWrites(
@@ -1514,7 +1531,13 @@ export class Surface implements ServerTool {
       return cfgResult.andThenAsync(async (cfg) => {
         const limit = input.limit ?? Number.POSITIVE_INFINITY;
 
-        const sessionsResult = surfaceOperationResult(await resolved.adapter.listSessions());
+        const sessionsResult = surfaceOperationResult(
+          await resolved.adapter.listSessions(
+            resolved.platform === "native"
+              ? { limit: input.limit, archived: input.archived }
+              : undefined,
+          ),
+        );
         return sessionsResult.andThen((sessions) => {
           const out: Array<{
             channelId: string;
@@ -1636,7 +1659,7 @@ export class Surface implements ServerTool {
         });
         if (allowed) filtered.push(message);
       }
-      const referencedByMessageKey =
+      let referencedByMessageKey =
         target.resolved.platform === "discord" && discordCfg
           ? yield* Result.await(
               resolveDiscordReferencedMessages({
@@ -1647,6 +1670,17 @@ export class Surface implements ServerTool {
               }),
             )
           : undefined;
+
+      if (target.resolved.platform === "native") {
+        referencedByMessageKey = new Map();
+        for (const message of filtered) {
+          if (!message.replyTo) continue;
+          const referenced = yield* surfaceOperationResult(
+            await target.resolved.adapter.readMsg(message.replyTo),
+          );
+          if (referenced) referencedByMessageKey.set(surfaceMessageKey(message), referenced);
+        }
+      }
 
       return Result.ok(
         buildMessagesListOutput({
@@ -1723,7 +1757,7 @@ export class Surface implements ServerTool {
           );
         }
       }
-      const referenced =
+      let referenced =
         target.resolved.platform === "discord" && target.cfg
           ? yield* Result.await(
               resolveDiscordReferencedMessage({
@@ -1734,6 +1768,11 @@ export class Surface implements ServerTool {
               }),
             )
           : undefined;
+      if (msg.replyTo && target.resolved.platform === "native") {
+        referenced = yield* surfaceOperationResult(
+          await target.resolved.adapter.readMsg(msg.replyTo),
+        );
+      }
       return Result.ok(
         buildMessagesReadOutput({
           session: target.sessionRef,
@@ -1910,7 +1949,7 @@ export class Surface implements ServerTool {
         ),
       );
 
-      linkSentMessageToTranscript(ref, ctx);
+      yield* linkSentMessageToTranscript(ref, ctx);
 
       return Result.ok({
         ok: true as const,
@@ -1947,6 +1986,7 @@ export class Surface implements ServerTool {
   ): Promise<ServerToolResult> {
     const resolveAdapter = this.resolveAdapter.bind(this);
     const resolveSessionTarget = this.resolveSessionTarget.bind(this);
+    const transcriptStore = this.params.transcriptStore;
     return Result.gen(async function* () {
       const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const input = yield* withDefaultSessionId(decodedInput, ctx);
@@ -1957,6 +1997,11 @@ export class Surface implements ServerTool {
           createSurfaceMessageRef(target.sessionRef, input.messageId),
         ),
       );
+      if (target.resolved.platform === "native" && transcriptStore?.unlinkSurfaceMessage) {
+        yield* transcriptStore
+          .unlinkSurfaceMessage(createSurfaceMessageRef(target.sessionRef, input.messageId))
+          .mapError((error) => surfaceFailure("unavailable", error.message));
+      }
       return Result.ok({ ok: true as const });
     });
   }

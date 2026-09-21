@@ -1,3 +1,7 @@
+import { Result } from "better-result";
+import { projectNativeOutput } from "../../../src/surface/native/output-projection";
+import { Attachment } from "../../../src/tool-server/tools/attachment";
+import { readFile, rm } from "node:fs/promises";
 import { MockLanguageModelV4 } from "ai/test";
 import { describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -49,6 +53,173 @@ function nativePrompt(
 }
 
 describe("native runtime integration", () => {
+  test("attachment.add_files stores native resources and links projected replies", async () => {
+    let fixture: Awaited<ReturnType<typeof createNativeIntegrationFixture>>;
+    let threadId = "";
+    const model = new MockLanguageModelV4({
+      doStream: async () => {
+        const thread = fixture.store.getThreadRecord(threadId).unwrap();
+        const tool = new Attachment({
+          bus: fixture.bus,
+          blobStore: fixture.blobs,
+          outputLifecycle: {
+            registerOutputHandle: () => {
+              throw new Error("Native attachments must use native resources");
+            },
+          },
+          nativeOutput: fixture.runtime.attachmentOutput,
+        });
+        const filename = path.join(fixture.workspaceRoot, "report.txt");
+        await writeFile(filename, "native attachment bytes");
+        const context = {
+          requestId: thread.activeRunId!,
+          requestClient: "native",
+          sessionId: `native:${threadId}`,
+          serverOwnedRequest: true,
+          requestInitiator: { platform: "native" as const, userId: thread.starterId },
+          requestInitiatorSessionId: threadId,
+          cwd: fixture.workspaceRoot,
+        };
+        const denied = await tool.call(
+          "attachment.add_files",
+          { paths: [filename] },
+          { context: { ...context, serverOwnedRequest: false } },
+        );
+        expect(denied.isErr()).toBe(true);
+        const sent = await tool.call("attachment.add_files", { paths: [filename] }, { context });
+        expect(sent.match({ ok: () => null, err: (error) => error })).toBeNull();
+        await rm(filename);
+        return nativeFixtureTextResponse("Attached report.");
+      },
+    });
+    fixture = await createNativeIntegrationFixture({ model });
+    try {
+      const { client } = fixture.connect();
+      const viewer = (await client.bootstrap.get({})).viewer;
+      const thread = await client.threads.create({
+        commandId: crypto.randomUUID(),
+        title: "Attachments",
+      });
+      threadId = thread.id;
+      const receipt = await client.inputs.submit(nativePrompt(threadId, "Create a report"));
+      await completed(fixture.store, receipt.inputId);
+      await waitForStore(fixture.store, () => {
+        const snapshot = fixture.store.sync(viewer.id, threadId).unwrap();
+        return (
+          snapshot.kind === "window" &&
+          snapshot.slots.some((slot) => slot.kind === "ready" && slot.state === "complete")
+        );
+      });
+      const snapshot = await client.threads.sync({ threadId });
+      if (snapshot.kind !== "window") throw new Error("Expected native window");
+      const parts = snapshot.slots.flatMap((slot) =>
+        slot.kind === "ready" ? slot.messages.flatMap((message) => message.parts) : [],
+      );
+      const resource = parts.find((part) => part.type === "data-resource");
+      expect(resource?.data).toMatchObject({ name: "report.txt", state: "ready" });
+      if (!resource) throw new Error("Missing native resource");
+      const upload = fixture.store.readUpload(viewer.id, resource.data.resourceId).unwrap();
+      expect(upload.published).toBe(true);
+      const access = fixture.runtime.resources.scopedAccess(viewer.id);
+      await mkdir(path.join(fixture.workspaceRoot, "downloads"));
+      const materialized = (
+        await access.materialize(upload.resourceUri!, {
+          targetDirectory: path.join(fixture.workspaceRoot, "downloads"),
+          maxBytes: 1024,
+        })
+      ).unwrap();
+      expect(await readFile(materialized.path, "utf8")).toBe("native attachment bytes");
+      const links = fixture.store.listProjectedMessageLinks().unwrap();
+      expect(links).toHaveLength(1);
+      expect(links[0]!.messageIds).toHaveLength(2);
+      expect(fixture.transcript.listRecentAgentWrites({ client: "native" })).toHaveLength(1);
+      expect(fixture.fatalErrors).toEqual([]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("startup restores only historical replies with known request ownership", async () => {
+    let requestId = "";
+    let projectedId = "";
+    const fixture = await createNativeIntegrationFixture({
+      seed: (store, transcript) => {
+        const thread = store.createThread("owner", { commandId: "legacy-thread" }).unwrap();
+        const receipt = store
+          .acceptInput("owner", nativePrompt(thread.id, "Old question"))
+          .unwrap();
+        const input = store.getInput(receipt.inputId).unwrap();
+        requestId = input.requestId;
+        store.settleInput(input.id, "admitted").unwrap();
+        store.markInputCompleted(input.id).unwrap();
+        store
+          .projectTurn(thread.id, 0, "old-event", input.turnId!, (slot, projection) => {
+            const next = projectNativeOutput(
+              slot,
+              {
+                threadId: thread.id,
+                turnId: input.turnId!,
+                generation: 0,
+                requestId,
+                attemptId: "old-attempt",
+                sequence: 1,
+                ordinal: 1,
+                eventId: "old-event",
+                occurredAt: 100,
+                payload: {
+                  type: "text",
+                  stepId: "old-step",
+                  position: 1,
+                  partId: "text",
+                  phase: "final_answer",
+                  text: "Legacy answer",
+                  incomplete: false,
+                },
+              },
+              projection,
+            );
+            const answer = next.slot.messages.at(-1)!;
+            projectedId = answer.id;
+            delete answer.metadata!.authorId;
+            return Result.ok(next);
+          })
+          .unwrap();
+        store
+          .postMessage("owner", thread.id, {
+            id: "unknown-standalone",
+            role: "assistant",
+            metadata: { authorId: "lilac" },
+            parts: [{ type: "text", text: "No known request" }],
+          })
+          .unwrap();
+        transcript
+          .saveRequestTranscript({
+            requestId,
+            sessionId: `native:${thread.id}`,
+            requestClient: "native",
+            messages: [],
+            finalText: "Legacy answer",
+          })
+          .unwrap();
+        expect(transcript.listSurfaceMessagesForRequest({ requestId })).toEqual([]);
+      },
+    });
+    try {
+      await fixture.runtime.stopOutput();
+      (await fixture.runtime.startOutput()).unwrap();
+      expect(
+        fixture.transcript.listSurfaceMessagesForRequest({ requestId }).map((ref) => ref.messageId),
+      ).toEqual([projectedId]);
+      await fixture.runtime.stopOutput();
+      (await fixture.runtime.startOutput()).unwrap();
+      expect(
+        fixture.transcript.listSurfaceMessagesForRequest({ requestId }).map((ref) => ref.messageId),
+      ).toEqual([projectedId]);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test("sidebar pagination crosses the RPC boundary with more than 100 conversations", async () => {
     const fixture = await createNativeIntegrationFixture();
     try {

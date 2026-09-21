@@ -613,6 +613,15 @@ async function readOutboundAttachment(input: {
   });
 }
 
+export type NativeAttachmentOutput = (
+  context: RequestContext,
+  input: {
+    filename: string;
+    mediaType: string;
+    bytes: Uint8Array;
+  },
+) => Promise<ResultType<void, ServerToolFailure>>;
+
 export class Attachment implements ServerTool {
   id = "attachment";
   private readonly tool: ServerTool;
@@ -622,6 +631,7 @@ export class Attachment implements ServerTool {
       bus: LilacBus;
       blobStore: BlobStore;
       outputLifecycle: AttachmentOutputLifecycle;
+      nativeOutput?: NativeAttachmentOutput;
       resourceAccess?: ResourceAccess;
       resourceAccessForContext?: (
         context: RequestContext | undefined,
@@ -752,6 +762,22 @@ export class Attachment implements ServerTool {
         typeFromBytes?.mime ||
         source.mimeType ||
         inferMimeTypeFromFilename(filename);
+
+      if (ctx?.requestClient === "native") {
+        if (!this.params.nativeOutput)
+          return Result.err(
+            attachmentFailure("unavailable", "Native attachment output is unavailable"),
+          );
+        const delivered = await this.params.nativeOutput(ctx, {
+          filename,
+          mediaType: mimeType,
+          bytes,
+        });
+        const deliveredBranch = resultBranch(delivered);
+        if ("failure" in deliveredBranch) return Result.err(deliveredBranch.failure);
+        out.push({ filename, mimeType, bytes: bytes.byteLength });
+        continue;
+      }
 
       const uploadResult = (
         await this.params.blobStore.startUpload({

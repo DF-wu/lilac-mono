@@ -156,6 +156,7 @@ export function createBuiltinAttachmentPlugin(): CoreToolPlugin {
             bus: runtime.bus,
             blobStore: runtime.blobStore,
             outputLifecycle: runtime.attachmentOutputLifecycle,
+            nativeOutput: runtime.nativeAttachmentOutput,
             ...(runtime.resourceAccess ? { resourceAccess: runtime.resourceAccess } : {}),
             resourceAccessForContext: runtime.resourceAccessForContext,
             ...(runtime.toolResultArtifacts

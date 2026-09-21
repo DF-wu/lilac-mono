@@ -136,12 +136,15 @@ export const nativeSurfaceProtocol = {
     describeSessionIds: () => ({
       sessionIdFormats: {
         client: "native",
-        accepted: [{ format: "native:<threadId>", meaning: "Native chat thread" }],
-        notes: [],
+        accepted: [
+          { format: "native:<threadId>", meaning: "Native chat thread (canonical)" },
+          { format: "<threadId>", meaning: "Native thread ID returned by surface tools" },
+        ],
+        notes: ["Both forms identify the same native thread."],
       },
     }),
     resolveSession: async ({ selector }) => {
-      if (!/^native:[^:\s]+$/u.test(selector))
+      if (!/^(?:native:)?[^:\s]+$/u.test(selector))
         return Result.err(new SurfaceToolTargetInvalid({ message: "Expected native:<threadId>" }));
       return Result.ok({ sessionRef: { platform: "native", channelId: nativeThreadId(selector) } });
     },

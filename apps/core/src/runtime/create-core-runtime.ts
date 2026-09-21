@@ -3683,6 +3683,7 @@ export async function createCoreRuntime(
               nativeSearch: nativeRuntime?.search,
               nativeAdapterForContext: nativeRuntime?.nativeAdapterForContext,
               resourceAccessForContext: nativeRuntime?.resourceAccessForContext,
+              nativeAttachmentOutput: nativeRuntime?.attachmentOutput,
               conversationThreads: conversationThreadToolService,
               discordSearch: discordSearchService ?? undefined,
               transcriptStore: transcriptStore ?? undefined,

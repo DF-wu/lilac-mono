@@ -1,3 +1,6 @@
+import { SqliteTranscriptStore } from "../../transcript/transcript-store";
+import { parseCoreConfigV2ToUniversal } from "@stanley2058/lilac-utils";
+import { projectNativeOutput } from "./output-projection";
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Result } from "better-result";
@@ -465,4 +468,174 @@ describe("native surface adapter", () => {
       (await other.getUnRead({ platform: "native", channelId: f.destination.id })).unwrap(),
     ).toEqual([]);
   });
+});
+
+test("projected replies, including legacy replies, support edit, resume, and delete", async () => {
+  const f = fixture();
+  for (const legacy of [false, true]) {
+    const projected = projectNativeOutput(
+      {
+        kind: "ready",
+        slotId: "turn",
+        turnId: "turn",
+        position: 0,
+        state: "running",
+        messages: [],
+      },
+      {
+        threadId: f.source.id,
+        turnId: "turn",
+        generation: 0,
+        requestId: "request",
+        attemptId: legacy ? "old" : "new",
+        sequence: 1,
+        ordinal: 1,
+        eventId: "event",
+        occurredAt: 100,
+        payload: {
+          type: "text",
+          partId: "part",
+          stepId: "step",
+          position: 1,
+          phase: "final_answer",
+          text: "Answer",
+          incomplete: false,
+        },
+      },
+    ).slot.messages[0]!;
+    expect(projected.metadata?.authorId).toBe("lilac");
+    if (legacy) delete projected.metadata!.authorId;
+    f.store.postMessage("owner", f.source.id, projected).unwrap();
+    const ref = { ...f.ref, messageId: projected.id };
+    expect((await f.scoped.readMsg(ref)).unwrap()).toMatchObject({
+      userId: "lilac",
+      userName: "lilac",
+      text: "Answer",
+    });
+    (await f.scoped.editMsg(ref, { text: "Corrected" })).unwrap();
+    const output = (await f.scoped.startOutput(f.ref, { resumeAt: ref })).unwrap();
+    (await output.finish()).unwrap();
+    (await f.scoped.deleteMsg(ref)).unwrap();
+    expect((await f.scoped.readMsg(ref)).unwrap()).toBeNull();
+  }
+  f.store
+    .postMessage("owner", f.source.id, {
+      id: "unowned",
+      role: "assistant",
+      parts: [{ type: "text", text: "Unknown" }],
+    })
+    .unwrap();
+  expect((await f.scoped.editMsg({ ...f.ref, messageId: "unowned" }, { text: "No" })).isErr()).toBe(
+    true,
+  );
+});
+
+test("native tool targets round-trip and expose names and reply context", async () => {
+  const f = fixture();
+  const registry = SurfaceRuntimeRegistry.create([
+    createNativeSurfaceRuntimeDescriptor({
+      adapter: f.adapter,
+      resolveWorkflowAdapter: () => Result.ok(f.scoped),
+    }),
+  ]).unwrap();
+  const tool = new Surface({
+    config: parseCoreConfigV2ToUniversal({ models: { main: { model: "openai/demo" } } }),
+    adapterResolver: registry.adapterResolver(),
+    nativeAdapterForContext: () => Result.ok(f.scoped),
+  });
+  const context = {
+    requestClient: "native",
+    requestId: "request",
+    sessionId: `native:${f.source.id}`,
+    requestInitiator: { platform: "native" as const, userId: "owner" },
+    requestInitiatorSessionId: f.source.id,
+    serverOwnedRequest: true,
+  };
+  const first = (await f.scoped.sendMsg(f.ref, { text: "Original" })).unwrap();
+  const reply = (await f.scoped.sendMsg(f.ref, { text: "Reply" }, { replyTo: first })).unwrap();
+  for (const sessionId of [f.source.id, `native:${f.source.id}`]) {
+    const result = await tool.call(
+      "surface.messages.read",
+      { sessionId, messageId: reply.messageId },
+      { context },
+    );
+    expect(result.match({ ok: () => null, err: (error) => error })).toBeNull();
+    const read = result.unwrap();
+    expect(read).toMatchObject({
+      message: {
+        userName: "lilac",
+        replyToMessageId: first.messageId,
+        referenced: { richText: "Original", userName: "lilac" },
+      },
+    });
+    const listed = (await tool.call("surface.messages.list", { sessionId }, { context })).unwrap();
+    expect(JSON.stringify(listed)).toContain('"referenced"');
+  }
+});
+
+test("session listing paginates tied timestamps and can select archived threads", async () => {
+  const f = fixture();
+  for (let i = 0; i < 103; i++) f.store.createThread("owner", { commandId: `bulk-${i}` }).unwrap();
+  const all = (await f.scoped.listSessions()).unwrap();
+  expect(all).toHaveLength(106);
+  expect(new Set(all.map((s) => s.ref.channelId)).size).toBe(106);
+  expect((await f.scoped.listSessions({ limit: 101 })).unwrap()).toHaveLength(101);
+  f.store
+    .updateThread("owner", { threadId: f.source.id, commandId: "archive", archived: true })
+    .unwrap();
+  expect(
+    (await f.scoped.listSessions({ archived: true })).unwrap().map((s) => s.ref.channelId),
+  ).toEqual([f.source.id]);
+  expect((await f.scoped.listSessions()).unwrap()).toHaveLength(105);
+});
+
+test("native sends appear in recent writes and deletion removes their links", async () => {
+  const f = fixture();
+  const transcript = new SqliteTranscriptStore(":memory:");
+  try {
+    const registry = SurfaceRuntimeRegistry.create([
+      createNativeSurfaceRuntimeDescriptor({
+        adapter: f.adapter,
+        resolveWorkflowAdapter: () => Result.ok(f.scoped),
+      }),
+    ]).unwrap();
+    const tool = new Surface({
+      config: parseCoreConfigV2ToUniversal({}),
+      transcriptStore: transcript,
+      adapterResolver: registry.adapterResolver(),
+      nativeAdapterForContext: () => Result.ok(f.scoped),
+    });
+    const context = {
+      requestClient: "native",
+      requestId: "request",
+      sessionId: `native:${f.source.id}`,
+      requestInitiator: { platform: "native" as const, userId: "owner" },
+      requestInitiatorSessionId: f.source.id,
+      serverOwnedRequest: true,
+    };
+    transcript
+      .saveRequestTranscript({
+        requestId: "request",
+        sessionId: context.sessionId,
+        requestClient: "native",
+        messages: [],
+        finalText: "Old final text",
+      })
+      .unwrap();
+    (await tool.call("surface.messages.send", { text: "Sent by tool" }, { context })).unwrap();
+    expect(
+      (await tool.call("surface.activities.recentAgentWrites", {}, { context })).unwrap(),
+    ).toMatchObject([{ preview: "Sent by tool", requestId: "request" }]);
+    const refs = transcript.listSurfaceMessagesForRequest({ requestId: "request" });
+    expect(refs).toHaveLength(1);
+    (
+      await tool.call("surface.messages.delete", { messageId: refs[0]!.messageId }, { context })
+    ).unwrap();
+    expect(
+      (await tool.call("surface.activities.recentAgentWrites", {}, { context })).unwrap(),
+    ).toEqual([]);
+    expect(transcript.listSurfaceMessagesForRequest({ requestId: "request" })).toEqual([]);
+  } finally {
+    transcript.close();
+  }
 });

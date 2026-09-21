@@ -544,3 +544,19 @@ describe("descriptor-bound produced ref guard", () => {
     }
   });
 });
+
+it("forwards session listing filters through the descriptor boundary", async () => {
+  const options = { limit: 101, archived: true };
+  const seen: Array<Parameters<SurfaceAdapter["listSessions"]>[0]> = [];
+  const adapter = createDescriptorBoundSurfaceAdapter(
+    "native",
+    faultyAdapter({
+      listSessions: async (input) => {
+        seen.push(input);
+        return Result.ok([]);
+      },
+    }),
+  );
+  expect((await adapter.listSessions(options)).unwrap()).toEqual([]);
+  expect(seen).toEqual([options]);
+});

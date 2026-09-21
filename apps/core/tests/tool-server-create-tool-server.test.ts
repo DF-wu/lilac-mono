@@ -3825,3 +3825,53 @@ describe("createToolServer", () => {
     await server.stop();
   });
 });
+
+it("restricted native calls accept bare and canonical current-thread IDs only", async () => {
+  const tool: ServerTool = {
+    id: "surface",
+    init: async () => {},
+    destroy: async () => {},
+    list: async () => [
+      {
+        callableId: "surface.messages.read",
+        name: "Read",
+        description: "Read",
+        shortInput: [],
+        input: [],
+      },
+    ],
+    call: async () => Result.ok({ ok: true }),
+  };
+  const server = createToolServer({ tools: [tool] });
+  await server.init();
+  try {
+    for (const [sessionId, allowed] of [
+      ["thread", true],
+      ["native:thread", true],
+      ["other", false],
+      ["native:other", false],
+    ] as const) {
+      const response = await server.app.handle(
+        new Request("http://localhost/call", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-lilac-safety-mode": "restricted",
+            "x-lilac-session-id": "native:thread",
+            "x-lilac-request-id": "native:thread:message",
+            "x-lilac-request-client": "native",
+          },
+          body: JSON.stringify({
+            callableId: "surface.messages.read",
+            input: { sessionId, messageId: "message" },
+          }),
+        }),
+      );
+      expect(await response.json()).toMatchObject(
+        allowed ? { status: "ok" } : { status: "error", error: { code: "restricted_mode_denied" } },
+      );
+    }
+  } finally {
+    await server.stop();
+  }
+});

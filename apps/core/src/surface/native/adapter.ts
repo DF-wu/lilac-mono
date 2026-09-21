@@ -1,3 +1,4 @@
+import { isNativeServiceMessage } from "./message-ownership";
 import { randomUUID } from "node:crypto";
 import { displayMessageSchema, type DisplayMessage } from "@stanley2058/lilac-client-protocol";
 import { Result } from "better-result";
@@ -143,7 +144,9 @@ function project(
   return {
     ref: { platform: "native", channelId: threadId, messageId: row.message.id },
     session: { platform: "native", channelId: threadId },
-    userId: row.message.metadata?.authorId ?? "lilac",
+    userId:
+      row.message.metadata?.authorId ??
+      (isNativeServiceMessage(row.message, "lilac") ? "lilac" : "unknown"),
     text: row.message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),
     ts: row.message.metadata?.createdAt ?? 0,
     ...(attachments.length ? { attachments } : {}),
@@ -215,22 +218,46 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         err: () => [],
       });
     });
-    return project(threadId, row, attachments);
+    const message = project(threadId, row, attachments);
+    const user = this.dependencies.store.getUser(message.userId);
+    message.userName = user.match({
+      ok: (value) => value.displayName || `user_${value.id}`,
+      err: () => message.userId,
+    });
+    if (row.message.metadata?.replyToMessageId)
+      message.replyTo = {
+        platform: "native",
+        channelId: threadId,
+        messageId: row.message.metadata.replyToMessageId,
+      };
+    return message;
   }
 
-  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
+  async listSessions(opts?: {
+    limit?: number;
+    archived?: boolean;
+  }): Promise<SurfaceOperationResult<SurfaceSession[]>> {
     return Result.gen(function* () {
       const request = yield* this.principal("list-sessions");
-      const threads = yield* this.dependencies.store
-        .listThreads(request.principalId, { limit: 100 })
-        .mapError((error) => nativeSurfaceError("list-sessions", error));
-      return Result.ok(
-        threads.map((thread) => ({
-          ref: { platform: "native" as const, channelId: thread.id },
-          title: thread.title,
-          kind: "thread" as const,
-        })),
-      );
+      const sessions: SurfaceSession[] = [];
+      const limit = opts?.limit ?? Number.POSITIVE_INFINITY;
+      let cursor: string | undefined;
+      while (sessions.length < limit) {
+        const pageSize = Math.min(100, limit - sessions.length);
+        const threads = yield* this.dependencies.store
+          .listThreads(request.principalId, { limit: pageSize, cursor, archived: opts?.archived })
+          .mapError((error) => nativeSurfaceError("list-sessions", error));
+        for (const thread of threads)
+          sessions.push({
+            ref: { platform: "native", channelId: thread.id },
+            title: thread.title,
+            kind: "thread",
+          });
+        const last = threads.at(-1);
+        if (!last || threads.length < pageSize) break;
+        cursor = `${last.updatedAt}_${last.id}`;
+      }
+      return Result.ok(sessions);
     }, this);
   }
   async listSessionParticipants(
@@ -478,7 +505,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             message: "Message is unavailable",
           }),
         );
-      if (found.message.metadata?.authorId !== this.serviceUserId)
+      if (!isNativeServiceMessage(found.message, this.serviceUserId))
         return Result.err(
           new SurfacePermissionDenied({
             platform: "native",
@@ -529,7 +556,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             message: "Message is unavailable",
           }),
         );
-      if (found.message.metadata?.authorId !== this.serviceUserId)
+      if (!isNativeServiceMessage(found.message, this.serviceUserId))
         return Result.err(
           new SurfacePermissionDenied({
             platform: "native",
@@ -716,7 +743,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         const existing = yield* this.dependencies.surface
           .readMessage(request.principalId, ref.channelId, opts.resumeAt.messageId)
           .mapError((error) => nativeSurfaceError("start-output", error));
-        if (!existing || existing.message.metadata?.authorId !== this.serviceUserId)
+        if (!existing || !isNativeServiceMessage(existing.message, this.serviceUserId))
           return Result.err(
             new SurfacePermissionDenied({
               platform: "native",
@@ -744,7 +771,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
                   message: "Output message is unavailable",
                 }),
               );
-            if (found.message.metadata?.authorId !== this.serviceUserId)
+            if (!isNativeServiceMessage(found.message, this.serviceUserId))
               return Result.err(
                 new SurfacePermissionDenied({
                   platform: "native",

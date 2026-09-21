@@ -1,14 +1,19 @@
+import type { NativeStoreError } from "./store";
+import { serverToolFailure } from "@stanley2058/lilac-plugin-runtime";
+import type { NativeAttachmentOutput } from "../../tool-server/tools/attachment";
+import type { NativeOutputPublisher } from "./output";
 import { createNativeTitleGeneration, type NativeTitleGenerator } from "./title-generation";
 import { NativeSubagents, type SubagentReader } from "./subagents";
 import type { DurableWorkflowStore } from "../../workflow/durable-workflow-store";
 import path from "node:path";
-import { Result, type Result as ResultType } from "better-result";
+import { Panic, Result, type Result as ResultType } from "better-result";
 import { FileSystem } from "@stanley2058/lilac-fs";
 import type { BlobStore } from "@stanley2058/lilac-blob-storage";
 import {
   lilacEventTypes,
   type LilacBus,
   type EventDeliveryDoneError,
+  type EventDeliveryStartFailed,
   type EventDeliveryStopFailed,
   type NativeOutputFrontier,
   type NativeOutputEvent,
@@ -408,77 +413,132 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     return allowed ? resources.scopedAccess(principal.userId) : undefined;
   };
 
-  async function startOutput() {
-    outputStopping = false;
-    const started = await options.bus.subscribeTopic(
-      "evt.native.output",
-      {
-        mode: "fanout",
-        startFrom: "beginning",
-        subscriptionId: `${options.subscriptionPrefix}:native-output`,
-        consumerId: `${options.subscriptionPrefix}:native-output:${process.pid}`,
-      },
-      async (message) => {
-        const projected = store.projectTurn(
-          message.data.threadId,
-          message.data.generation,
-          message.data.eventId,
-          message.data.turnId,
-          (slot, projection) =>
-            Result.gen(function* () {
-              const event = message.data;
-              if (event.payload.type !== "text")
-                return Result.ok(projectNativeOutput(slot, event, projection));
-              const thread = yield* store.getThreadRecord(event.threadId);
-              const text = yield* rewriteNativePublishedFileLinks({
-                text: event.payload.text,
-                threadId: thread.id,
-                actorId: thread.starterId,
-                cwd: options.workspaceRoot,
-                register: (actorId, threadId, target, cwd) =>
-                  store.registerPublishedPath(actorId, threadId, target, cwd),
+  function linkProjectedMessages(requestId?: string) {
+    return Result.gen(function* () {
+      const links = yield* store.listProjectedMessageLinks(requestId);
+      for (const link of links) {
+        const created = link.messageIds.map((messageId) => ({
+          platform: "native" as const,
+          channelId: link.threadId,
+          messageId,
+        }));
+        const last = created.at(-1);
+        const captured = Result.try({
+          try: () => {
+            if (last)
+              options.transcript.linkSurfaceMessagesToRequest({
+                requestId: link.requestId,
+                created,
+                last,
               });
-              return Result.ok(
-                projectNativeOutput(
-                  slot,
-                  { ...event, payload: { ...event.payload, text } },
-                  projection,
-                ),
-              );
-            }),
-        );
-        const committedAt = performance.now();
-        const committed = projected.match({ ok: () => true, err: () => false });
-        if (!committed) {
-          metrics.handoffFailure("projection", message.data.threadId, message.data.requestId);
-          return projected;
-        }
-        const thread = store
-          .getThreadRecord(message.data.threadId)
-          .match({ ok: (value) => value, err: () => undefined });
-        if (thread)
-          metrics.committed(
-            thread.id,
-            thread.revision,
-            thread.historyGeneration,
-            message.data.requestId,
-            committedAt,
-          );
-        return projected;
-      },
-      (error) =>
-        error._tag === "NativeStoreFailure" && error.code === "stale" ? "commit" : "retry",
-    );
-    return started.map((handle) => {
-      output = handle;
-      void handle.done.then((done) =>
-        done.match({
-          ok: () => undefined,
-          err: (error) => {
-            if (!outputStopping) options.reportFatalError(error);
+            return options.transcript.listSurfaceMessagesForRequest({ requestId: link.requestId });
           },
-        }),
+          catch: captureError,
+        });
+        const refs = yield* captured.mapError(({ cause }) => {
+          if (Panic.is(cause)) nativeRuntimeFailureToHost(cause);
+          return nativeFailure("sqlite", "Unable to link native output to its transcript");
+        });
+        for (const ref of refs) {
+          if (ref.platform !== "native" || ref.channelId !== link.threadId) continue;
+          const thread = yield* store.getThreadRecord(ref.channelId);
+          const message = yield* surface.readMessage(
+            thread.starterId,
+            ref.channelId,
+            ref.messageId,
+          );
+          if (message) continue;
+          yield* options.transcript
+            .unlinkSurfaceMessage(ref)
+            .mapError((error) => nativeFailure("sqlite", error.message));
+        }
+      }
+      return Result.ok(undefined);
+    });
+  }
+
+  async function startOutput(): Promise<
+    ResultType<void, NativeStoreError | EventDeliveryStartFailed>
+  > {
+    outputStopping = false;
+    return Result.gen(async function* () {
+      yield* linkProjectedMessages();
+      const started = await options.bus.subscribeTopic(
+        "evt.native.output",
+        {
+          mode: "fanout",
+          startFrom: "beginning",
+          subscriptionId: `${options.subscriptionPrefix}:native-output`,
+          consumerId: `${options.subscriptionPrefix}:native-output:${process.pid}`,
+        },
+        async (message) =>
+          Result.gen(function* () {
+            const projected = store.projectTurn(
+              message.data.threadId,
+              message.data.generation,
+              message.data.eventId,
+              message.data.turnId,
+              (slot, projection) =>
+                Result.gen(function* () {
+                  const event = message.data;
+                  if (event.payload.type === "resource") {
+                    const thread = yield* store.getThreadRecord(event.threadId);
+                    yield* store.publishUpload(thread.starterId, event.payload.resourceId);
+                  }
+                  if (event.payload.type !== "text")
+                    return Result.ok(projectNativeOutput(slot, event, projection));
+                  const thread = yield* store.getThreadRecord(event.threadId);
+                  const text = yield* rewriteNativePublishedFileLinks({
+                    text: event.payload.text,
+                    threadId: thread.id,
+                    actorId: thread.starterId,
+                    cwd: options.workspaceRoot,
+                    register: (actorId, threadId, target, cwd) =>
+                      store.registerPublishedPath(actorId, threadId, target, cwd),
+                  });
+                  return Result.ok(
+                    projectNativeOutput(
+                      slot,
+                      { ...event, payload: { ...event.payload, text } },
+                      projection,
+                    ),
+                  );
+                }),
+            );
+            const committedAt = performance.now();
+            const committed = projected.match({ ok: () => true, err: () => false });
+            if (!committed) {
+              metrics.handoffFailure("projection", message.data.threadId, message.data.requestId);
+              return projected;
+            }
+            yield* linkProjectedMessages(message.data.requestId);
+            const thread = store
+              .getThreadRecord(message.data.threadId)
+              .match({ ok: (value) => value, err: () => undefined });
+            if (thread)
+              metrics.committed(
+                thread.id,
+                thread.revision,
+                thread.historyGeneration,
+                message.data.requestId,
+                committedAt,
+              );
+            return projected;
+          }),
+        (error) =>
+          error._tag === "NativeStoreFailure" && error.code === "stale" ? "commit" : "retry",
       );
+      return started.map((handle) => {
+        output = handle;
+        void handle.done.then((done) =>
+          done.match({
+            ok: () => undefined,
+            err: (error) => {
+              if (!outputStopping) options.reportFatalError(error);
+            },
+          }),
+        );
+      });
     });
   }
 
@@ -491,6 +551,54 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     return published;
   }
 
+  const activeOutputs = new Map<string, { publisher: NativeOutputPublisher; threadId: string }>();
+  const attachmentOutput: NativeAttachmentOutput = async (context, input) => {
+    const failure = (message: string) =>
+      serverToolFailure({
+        kind: "unavailable",
+        code: "native_attachment_output",
+        message,
+        retryable: false,
+      });
+    return Result.gen(async function* () {
+      yield* nativeAdapterForContext(context).mapError((error) => failure(error.message));
+      const sourceThreadId = nativeThreadId(
+        context.requestInitiatorSessionId ?? context.sessionId ?? "",
+      );
+      const active = activeOutputs.get(context.requestId ?? "");
+      if (!active || sourceThreadId !== active.threadId)
+        return Result.err(
+          failure("Native attachment requires an active response in the originating thread"),
+        );
+      const principalId = context.requestInitiator!.userId;
+      const thread = yield* store
+        .authorizeThread(principalId, active.threadId)
+        .mapError((error) => failure(error.message));
+      if (thread.starterId !== principalId)
+        return Result.err(failure("Native attachment requires starter authority"));
+      const stepId = active.publisher.currentStepId();
+      const upload = yield* Result.await(
+        resources
+          .ingest(principalId, active.threadId, input)
+          .then((result) => result.mapError((error) => failure(error.message))),
+      );
+      if (activeOutputs.get(context.requestId ?? "") !== active)
+        return Result.err(failure("Native response changed while uploading the attachment"));
+      yield* Result.await(
+        active.publisher
+          .resource({
+            stepId,
+            resourceId: upload.id,
+            filename: upload.filename,
+            mediaType: upload.mediaType,
+            size: upload.size,
+          })
+          .then((result) => result.mapError((error) => failure(error.message))),
+      );
+      return Result.ok(undefined);
+    });
+  };
+
   function createOutput(input: {
     requestId: string;
     requestClient: string;
@@ -498,13 +606,22 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   }) {
     if (input.requestClient !== "native") return undefined;
     const attempt = nativeRuntimeResultToHost(store.beginOutputAttempt(input.requestId));
-    return createNativeOutputPublisher({
+    const publisher = createNativeOutputPublisher({
       ...attempt,
       requestId: input.requestId,
       mode: options.getConfig().surface.native.outputStreaming,
       publish: publishDurableOutput,
       recoveryFrontier: input.recoveryOutputFrontier,
     });
+    const active = { publisher, threadId: attempt.threadId };
+    activeOutputs.set(input.requestId, active);
+    return {
+      ...publisher,
+      terminal: async (state: Parameters<NativeOutputPublisher["terminal"]>[0]) => {
+        if (activeOutputs.get(input.requestId) === active) activeOutputs.delete(input.requestId);
+        return publisher.terminal(state);
+      },
+    };
   }
 
   async function recover() {
@@ -600,6 +717,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     search,
     nativeAdapterForContext,
     resourceAccessForContext,
+    attachmentOutput,
     createOutput,
     scopedResources,
     scopedThreads,

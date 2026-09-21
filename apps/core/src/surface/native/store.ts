@@ -1,3 +1,4 @@
+import { isNativeServiceMessage } from "./message-ownership";
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import type {
@@ -2498,6 +2499,42 @@ export class NativeStore {
       }
       return Result.ok(undefined);
     }, this);
+  }
+
+  listProjectedMessageLinks(
+    requestId?: string,
+  ): NativeStoreResult<Array<{ requestId: string; threadId: string; messageIds: string[] }>> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const inputs = yield* this.readRows(
+          `SELECT i.* FROM native_records i JOIN native_records t ON t.kind='thread' AND t.id=i.thread_id
+         WHERE i.kind='input' AND json_extract(i.data_json,'$.value.mode')!='steer'
+         AND json_extract(t.data_json,'$.value.deleted')=0
+         AND (? = '' OR json_extract(i.data_json,'$.value.requestId')=?)`,
+          [requestId ?? "", requestId ?? ""],
+        );
+        const links: Array<{ requestId: string; threadId: string; messageIds: string[] }> = [];
+        for (const input of inputs) {
+          if (input.kind !== "input" || !input.value.turnId) continue;
+          const turn = yield* this.readRecord("turn", input.value.turnId);
+          if (turn?.kind !== "turn") continue;
+          const messageIds = turn.value.messages
+            .filter(
+              (message) =>
+                message.role === "assistant" &&
+                isNativeServiceMessage(message, "lilac") &&
+                message.parts.some((part) => part.type === "text" || part.type === "data-resource"),
+            )
+            .map((message) => message.id);
+          links.push({
+            requestId: input.value.requestId,
+            threadId: input.value.threadId,
+            messageIds,
+          });
+        }
+        return Result.ok(links);
+      }, this),
+    );
   }
 
   listCanonicalRequestIds(threadId: string): NativeStoreResult<string[]> {

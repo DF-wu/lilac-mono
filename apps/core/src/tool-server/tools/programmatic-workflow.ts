@@ -263,6 +263,17 @@ type WorkflowCallOptions = {
   readonly messages?: readonly unknown[];
 };
 
+function requestSessionsMatch(context: RequestContext): boolean {
+  if (!context.sessionId || !context.requestInitiatorSessionId || !context.requestClient)
+    return false;
+  const protocol = getBuiltinSurfaceProtocol(context.requestClient);
+  if (!protocol) return false;
+  return (
+    protocol.refs.createSessionRef(context.sessionId).channelId ===
+    protocol.refs.createSessionRef(context.requestInitiatorSessionId).channelId
+  );
+}
+
 function requestProgressTarget(context: RequestContext) {
   if (!context.sessionId || !context.requestClient) return null;
   const protocol = getBuiltinSurfaceProtocol(context.requestClient);
@@ -271,7 +282,7 @@ function requestProgressTarget(context: RequestContext) {
   const principalMatchesRequest =
     principal !== undefined &&
     principal.platform === protocol.platform &&
-    context.requestInitiatorSessionId === context.sessionId;
+    requestSessionsMatch(context);
   return {
     platform: protocol.platform,
     userId: principalMatchesRequest ? principal.userId : null,
@@ -291,7 +302,7 @@ function validateWorkflowRequestIdentity(
     !principal ||
     principal.platform !== context.requestClient ||
     !context.sessionId ||
-    context.requestInitiatorSessionId !== context.sessionId
+    !requestSessionsMatch(context)
   ) {
     return Result.err(
       workflowFailure(

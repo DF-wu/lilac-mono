@@ -482,3 +482,47 @@ test("explicit final phases are preserved instead of promoting later commentary"
     "commentary",
   ]);
 });
+
+test("resource output follows cancellation and recovery frontiers", () => {
+  const resource: NativeOutputPayload = {
+    type: "resource",
+    stepId: "step",
+    position: 1,
+    resourceId: "upload",
+    filename: "report.txt",
+    mediaType: "text/plain",
+    size: 3,
+  };
+  const added = projectNativeOutput(slot(), event(resource));
+  expect(added.slot.messages[1]).toMatchObject({
+    metadata: { authorId: "lilac" },
+    parts: [
+      { type: "data-resource", data: { name: "report.txt", resourceId: "upload", state: "ready" } },
+    ],
+  });
+  expect(displayMessageSchema.safeParse(added.slot.messages[1]).success).toBe(true);
+  const canceled = projectNativeOutput(
+    added.slot,
+    event({ type: "terminal", state: "canceled" }, "attempt", 2),
+    added.projection,
+  );
+  expect(canceled.slot.messages).toHaveLength(2);
+  for (const retained of [0, 1]) {
+    const reset = projectNativeOutput(
+      added.slot,
+      event(
+        { type: "reset", previousAttemptId: "attempt", retainThroughOrdinal: retained },
+        "retry",
+        2,
+      ),
+      added.projection,
+    );
+    expect(reset.slot.messages).toHaveLength(retained + 1);
+  }
+  const suppressed = projectNativeOutput(
+    added.slot,
+    event({ type: "reset", previousAttemptId: "attempt", stepId: "step" }, "retry", 2),
+    added.projection,
+  );
+  expect(suppressed.slot.messages).toHaveLength(1);
+});

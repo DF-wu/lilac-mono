@@ -8,6 +8,15 @@ export type NativeOutputFrontier = z.output<typeof nativeOutputFrontierSchema>;
 
 export const nativeOutputPayloadSchema = z.discriminatedUnion("type", [
   z.strictObject({
+    type: z.literal("resource"),
+    stepId: id,
+    position,
+    resourceId: id,
+    filename: id,
+    mediaType: id,
+    size: position,
+  }),
+  z.strictObject({
     type: z.literal("text"),
     partId: id,
     stepId: id,

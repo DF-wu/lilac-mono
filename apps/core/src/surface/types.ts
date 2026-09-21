@@ -95,6 +95,7 @@ export type SurfaceSession = {
 };
 
 export type SurfaceMessage = {
+  replyTo?: MsgRef;
   ref: MsgRef;
   session: SessionRef;
   userId: string;

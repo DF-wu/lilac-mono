@@ -465,6 +465,7 @@ export async function createNativeIntegrationFixture(
     store,
     runtime,
     runner,
+    blobs,
     bus,
     transcript,
     journal,

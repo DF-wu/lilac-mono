@@ -262,3 +262,26 @@ test("recovery publishes a suffix reset and resumes checkpoint ordinals and disp
   expect(texts(recoveredEvents)[0]?.position).toBe(checkpoint.frontier.position + 1);
   expect(recovered.captureCheckpoint().frontier.ordinal).toBe(checkpoint.frontier.ordinal + 2);
 });
+
+test("attachments share the output publication barrier and stop at terminal", async () => {
+  const { publisher, events } = fixture("paragraph");
+  publisher.activity({ activityId: "tool", stepId: "current-step", kind: "tool", state: "start" });
+  expect(publisher.currentStepId()).toBe("current-step");
+  const resource = {
+    stepId: publisher.currentStepId(),
+    resourceId: "upload",
+    filename: "report.txt",
+    mediaType: "text/plain",
+    size: 5,
+  };
+  (await publisher.resource(resource)).unwrap();
+  expect(publisher.captureCheckpoint().frontier).toEqual({ ordinal: 2, position: 2 });
+  expect(events[1]!.payload).toMatchObject({
+    type: "resource",
+    resourceId: "upload",
+    stepId: "current-step",
+  });
+  (await publisher.terminal("complete")).unwrap();
+  expect((await publisher.resource(resource)).isErr()).toBe(true);
+  expect(events).toHaveLength(3);
+});

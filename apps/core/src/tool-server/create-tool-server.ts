@@ -353,6 +353,7 @@ function isCurrentSessionScopedSurfaceCall(params: {
   callableId: string;
   input: unknown;
   sessionId?: string;
+  requestClient?: string;
 }): boolean {
   if (!params.callableId.startsWith("surface.")) return true;
   if (!params.sessionId) return false;
@@ -360,6 +361,10 @@ function isCurrentSessionScopedSurfaceCall(params: {
 
   const inputSessionId = Reflect.get(params.input, "sessionId");
   if (inputSessionId === undefined || inputSessionId === null || inputSessionId === "") return true;
+  if (typeof inputSessionId !== "string") return false;
+  if (params.requestClient === "native" && params.sessionId.startsWith("native:")) {
+    return inputSessionId === params.sessionId || inputSessionId === params.sessionId.slice(7);
+  }
   return inputSessionId === params.sessionId;
 }
 
@@ -373,6 +378,7 @@ function isRestrictedCallableAllowed(params: {
     callableId: params.callableId,
     input: params.input,
     sessionId: params.ctx.sessionId,
+    requestClient: params.ctx.requestClient,
   });
 }
 

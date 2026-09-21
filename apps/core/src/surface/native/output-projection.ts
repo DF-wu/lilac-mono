@@ -56,6 +56,7 @@ function messagePosition(message: DisplayMessage): number | undefined {
 function createMessage(event: NativeOutputEvent, payload: PositionedPayload): DisplayMessage {
   const metadata: NonNullable<DisplayMessage["metadata"]> = {
     createdAt: Math.floor(event.occurredAt),
+    authorId: "lilac",
   };
   if (payload.type === "text" && payload.phase !== "final_answer") metadata.phase = "commentary";
   if (payload.type === "text" && payload.phase === "final_answer") metadata.phase = "final";
@@ -230,6 +231,18 @@ function projectEvent(slot: ReadyTurnSlot, event: NativeOutputEvent): ProjectedT
   if (!slot.messages.some((message) => message.id === messageId))
     projection = insertMessage(projection, event, payload);
   switch (payload.type) {
+    case "resource":
+      return updatePart(projection, messageId, 0, {
+        type: "data-resource",
+        id: payload.resourceId,
+        data: {
+          resourceId: payload.resourceId,
+          name: payload.filename,
+          mediaType: payload.mediaType,
+          size: payload.size,
+          state: "ready",
+        },
+      });
     case "text":
       return projectText(projection, messageId, payload.text);
     case "activity":

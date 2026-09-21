@@ -231,3 +231,171 @@ describe("external reads", () => {
     expect((await service.read("owner", { threadId: "invalid" })).isErr()).toBe(true);
   });
 });
+
+test("native search ranks lexical matches, applies minScore, and declares semantic fallback", () => {
+  const body = thread("alice", "body match", "needle");
+  const title = thread("alice", "needle", "needle");
+  const ranked = search
+    .conversationSearch("alice", { query: "needle", mode: "hybrid", verbose: true })
+    .unwrap();
+  expect(ranked.meta).toMatchObject({ mode: "lexical", vectorAvailable: false });
+  expect(ranked.results.map((hit) => hit.threadId)).toEqual([title.id, body.id]);
+  expect(ranked.results[0]!.score).toBeGreaterThan(ranked.results[1]!.score!);
+  expect(
+    search
+      .conversationSearch("alice", { query: "needle", minScore: 0.5 })
+      .unwrap()
+      .results.map((hit) => hit.threadId),
+  ).toEqual([title.id]);
+  expect(
+    search.conversationSearch("alice", { query: "needle", minScore: 100 }).unwrap().results,
+  ).toEqual([]);
+  expect(search.conversationSearch("alice", { query: "needle", mode: "semantic" }).isErr()).toBe(
+    true,
+  );
+  for (const sessionId of [body.id, `native:${body.id}`]) {
+    expect(
+      search
+        .conversationSearch("alice", { query: "needle", sessionId })
+        .unwrap()
+        .results.map((hit) => hit.threadId),
+    ).toEqual([body.id]);
+    expect(search.discovery("alice", { query: "needle", sessionId }).unwrap().groups).toHaveLength(
+      1,
+    );
+  }
+});
+
+test("metadata reports missing IDs while preserving permission failures", () => {
+  const visible = thread("alice", "visible", "hello");
+  const secret = thread("bob", "secret", "hidden");
+  const result = search
+    .conversationMetadata("alice", { threadIds: [visible.id, "missing"] })
+    .unwrap();
+  expect(result.threads.map((t) => t.threadId)).toEqual([visible.id]);
+  expect(result.missing).toEqual(["missing"]);
+  expect(
+    search.conversationMetadata("alice", { threadIds: [visible.id, secret.id, "missing"] }).isErr(),
+  ).toBe(true);
+});
+
+test("lexical scoring retains a match split across title and message", () => {
+  const origin = thread("alice", "alpha", "beta");
+  const result = search
+    .conversationSearch("alice", { query: "alpha beta", verbose: true })
+    .unwrap();
+  expect(result.results).toMatchObject([{ threadId: origin.id, score: 0.2 }]);
+});
+
+test("owner searches rank sources together and report lexical fallback", async () => {
+  thread("owner", "Native", "needle");
+  const inputs: Array<Parameters<ConversationThreadToolService["search"]>[0]> = [];
+  const externalThreads: ConversationThreadToolService = {
+    ...search.forUser("owner"),
+    search: async (input) => {
+      inputs.push(input);
+      return {
+        meta: {
+          query: "needle",
+          mode: input.mode ?? "hybrid",
+          limit: 1,
+          minScore: 0.1,
+          count: 1,
+          vectorAvailable: true,
+        },
+        results: [{ threadId: "external", title: "External", brief: "needle", score: 1.25 }],
+      };
+    },
+  };
+  const service = new NativeSearchService({ store, searchStore: messages, externalThreads });
+  for (const verbose of [true, false]) {
+    const result = await service
+      .forUser("owner")
+      .search({ query: "needle", mode: "hybrid", limit: 1, verbose });
+    expect(result.meta).toMatchObject({ mode: "lexical", vectorAvailable: false, count: 1 });
+    expect(result.results.map((hit) => hit.threadId)).toEqual(["external"]);
+    expect(result.results[0]!.score).toBe(verbose ? 1.25 : undefined);
+  }
+  expect(inputs.every((input) => input.mode === "lexical" && input.verbose)).toBe(true);
+});
+
+test("message ranking includes older strong matches beyond the first candidate page", () => {
+  const origin = thread("alice", "needle title", "older text");
+  db.run(
+    "UPDATE native_records SET data_json=json_set(data_json,'$.value.messages[0].metadata.createdAt',1) WHERE kind='turn' AND id=?",
+    [origin.turnId],
+  );
+  const recent = thread("alice", "Recent", "needle");
+  for (let index = 0; index < 500; index++)
+    store
+      .postMessage("alice", recent.id, {
+        id: `recent-${index}`,
+        role: "user",
+        metadata: { authorId: "alice", createdAt: 1000 },
+        parts: [{ type: "text", text: "needle" }],
+      })
+      .unwrap();
+  const result = search
+    .conversationSearch("alice", { query: "needle", limit: 1, minScore: 0.5 })
+    .unwrap();
+  expect(result.results.map((hit) => hit.threadId)).toEqual([origin.id]);
+});
+
+test("summary ranking includes older strong matches beyond the first candidate page", () => {
+  const summaries = new NativeSummaryStore({ db, store });
+  summaries.initialize().unwrap();
+  let strongest = "";
+  for (let index = 0; index < 103; index++) {
+    const origin = thread("alice", `Summary ${index}`, "Unrelated message");
+    summaries
+      .put({
+        threadId: origin.id,
+        historyGeneration: 0,
+        contentRevision: store.getThreadRecord(origin.id).unwrap().revision,
+        generatedAt: 1000,
+        messageCount: 1,
+        summary: normalizeNativeSummary({
+          title: index === 0 ? "needle" : "Weak match",
+          brief: "needle",
+          topics: [],
+        }),
+      })
+      .unwrap();
+    if (index !== 0) continue;
+    strongest = origin.id;
+    db.run("UPDATE native_records SET updated_at=1 WHERE kind='thread' AND id=?", [origin.id]);
+  }
+  const service = new NativeSearchService({ store, searchStore: messages, summaries });
+  const result = service
+    .conversationSearch("alice", { query: "needle", limit: 1, minScore: 0.5 })
+    .unwrap();
+  expect(result.results.map((hit) => hit.threadId)).toEqual([strongest]);
+});
+
+test("lexical scoring preserves summary importance field matches", () => {
+  const origin = thread("alice", "Unrelated", "message");
+  const summaries = new NativeSummaryStore({ db, store });
+  summaries.initialize().unwrap();
+  summaries
+    .put({
+      threadId: origin.id,
+      historyGeneration: 0,
+      contentRevision: store.getThreadRecord(origin.id).unwrap().revision,
+      generatedAt: 1000,
+      messageCount: 1,
+      summary: normalizeNativeSummary({
+        title: "Summary",
+        brief: "Description",
+        topics: [],
+        importance: "high",
+        importanceReasons: ["needle"],
+      }),
+    })
+    .unwrap();
+  const service = new NativeSearchService({ store, searchStore: messages, summaries });
+  for (const query of ["needle", "high needle"]) {
+    expect(
+      service.conversationSearch("alice", { query, verbose: true }).unwrap().results,
+    ).toMatchObject([{ threadId: origin.id, score: 0.2 }]);
+  }
+});
