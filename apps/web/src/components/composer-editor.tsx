@@ -56,13 +56,12 @@ import {
 } from "@platejs/basic-nodes/react";
 import { CodeBlockRules } from "@platejs/code-block";
 import { CodeBlockPlugin, CodeLinePlugin } from "@platejs/code-block/react";
-import { LinkRules } from "@platejs/link";
-import { LinkPlugin } from "@platejs/link/react";
 import { BulletedListRules, OrderedListRules, toggleList } from "@platejs/list";
 import { ListPlugin } from "@platejs/list/react";
 import { IndentPlugin } from "@platejs/indent/react";
 import { MarkdownPlugin, defaultRules } from "@platejs/markdown";
 import remarkGfm from "remark-gfm";
+import { editableComposerLinks, protectComposerLinks } from "./composer-links";
 import {
   Bold,
   Italic,
@@ -107,11 +106,6 @@ function CodeLine(props: PlateElementProps) {
 }
 function InlineCode(props: PlateLeafProps) {
   return <PlateLeaf {...props} as="code" />;
-}
-function LinkElement(props: PlateElementProps) {
-  return (
-    <PlateElement {...props} as="span" className="composer-link [text-decoration:underline]" />
-  );
 }
 
 const attachmentType = "composer_attachment";
@@ -311,13 +305,21 @@ export const composerPlugins = [
     node: { component: CodeBlock },
   }),
   CodeLinePlugin.withComponent(CodeLine),
-  LinkPlugin.configure({
-    inputRules: [
-      LinkRules.markdown(),
-      LinkRules.autolink({ variant: "paste" }),
-      LinkRules.autolink({ variant: "space" }),
-    ],
-    node: { component: LinkElement },
+  createPlatePlugin({
+    key: KEYS.a,
+    node: { isElement: true, isInline: true },
+    parsers: {
+      html: {
+        deserializer: {
+          rules: [{ validNodeName: "A" }],
+          parse: ({ element }) => {
+            const url = element.getAttribute("href");
+            const label = element.textContent ?? "";
+            return { text: !url || label === url ? label : `[${label}](${url})` };
+          },
+        },
+      },
+    },
   }),
   IndentPlugin.configure({
     inject: {
@@ -346,7 +348,7 @@ export const composerPlugins = [
     ],
     render: { belowNodes: BlockList },
   }),
-  MarkdownPlugin.configure({ options: { remarkPlugins: [remarkGfm] } }),
+  MarkdownPlugin.configure({ options: { remarkPlugins: [remarkGfm, editableComposerLinks] } }),
 ];
 
 function deserializeComposer(editor: PlateEditor, text: string) {
@@ -409,9 +411,8 @@ function serializeComposer(editor: PlateEditor, references: boolean): string {
   });
   if (!value.some((node) => NodeApi.string(node))) return "";
   for (const block of value) block.children = trimEmptyInlineText(block.children);
-  return editor
-    .getApi(MarkdownPlugin)
-    .markdown.serialize({ value })
+  const restoreLinks = protectComposerLinks(editor, value);
+  return restoreLinks(editor.getApi(MarkdownPlugin).markdown.serialize({ value }))
     .replace(/\n$/, "")
     .replace(/(?:&#x20;)+(?=\n|$)/g, (spaces) => " ".repeat(spaces.length / 6));
 }
@@ -455,6 +456,7 @@ export function restoreMessageAttachments(
     ]),
   );
   const value = editor.getApi(MarkdownPlugin).markdown.deserialize(text, {
+    remarkPlugins: [remarkGfm, () => editableComposerLinks(new Set(byUrl.keys()))],
     rules: {
       img: {
         deserialize: (node, decoration, options) => {

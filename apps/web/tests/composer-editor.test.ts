@@ -40,6 +40,59 @@ it("inserts a completion at the selected rich-text range without flattening mark
   expect(editor.children[0]?.children[0]).toMatchObject({ bold: true, text: "Keep" });
 });
 
+it("keeps URLs and Markdown links editable and preserves their syntax through reload and send", () => {
+  for (const text of [
+    "https://example.com/a_b?q=one&next=two",
+    "[example.com](https://example.com)",
+    '[example](https://example.com/a_(b) "A title")',
+    "Before [**label**](https://example.com) after",
+    "[https://example.com](https://example.com)",
+    "[line\nbreak](https://example.com)",
+    "Before \uE0000\uE000 [example](https://example.com) after",
+  ]) {
+    const editor = createComposerEditor(text);
+    expect(NodeApi.string(editor)).toBe(text);
+    expect([...editor.api.nodes({ at: [], match: { type: KEYS.a } })]).toHaveLength(0);
+    expect(composerMarkdown(editor)).toBe(text);
+    expect(composerSubmissionMarkdown(editor)).toBe(text);
+    expect(NodeApi.string(createComposerEditor(composerMarkdown(editor)))).toBe(text);
+  }
+});
+
+it("preserves attachment chips whose filenames contain Markdown links", () => {
+  const editor = createComposerEditor();
+  insertComposerAttachment(editor, {
+    key: "file-key",
+    file: new File(["contents"], "[x](a).txt"),
+  });
+  const markdown = composerMarkdown(editor);
+  const restored = createComposerEditor(markdown);
+  expect([...restored.api.nodes({ at: [], match: { type: "composer_attachment" } })]).toHaveLength(
+    1,
+  );
+  expect(composerMarkdown(restored)).toBe(markdown);
+  expect(composerSubmissionMarkdown(restored)).toBe("[x](a).txt ");
+});
+
+it("does not linkify typed URLs or Markdown links and allows editing the destination", () => {
+  const editor = createComposerEditor();
+  editor.tf.select(editor.api.end([])!);
+  for (const character of "[example](https://example.com) https://example.com ")
+    editor.tf.insertText(character);
+  expect([...editor.api.nodes({ at: [], match: { type: KEYS.a } })]).toHaveLength(0);
+  expect(composerMarkdown(editor)).toBe("[example](https://example.com) https://example.com ");
+  const text = NodeApi.string(editor);
+  const offset = text.indexOf("example.com");
+  editor.tf.select({
+    anchor: { path: [0, 0], offset },
+    focus: { path: [0, 0], offset: offset + "example.com".length },
+  });
+  editor.tf.insertText("changed.example");
+  expect(composerSubmissionMarkdown(editor)).toBe(
+    "[example](https://changed.example) https://example.com ",
+  );
+});
+
 it("preserves command separators and trailing spaces through completion and draft restore", () => {
   const editor = createComposerEditor("/fi");
   editor.tf.select(editor.api.end([])!);
