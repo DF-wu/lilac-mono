@@ -733,6 +733,7 @@ const nativeSurfaceSchema = z
         clerkOAuthClientId: z.string().trim().min(1).optional(),
       })
       .default({ provider: "local", ownerId: "owner" }),
+    titleModel: z.string().trim().min(1).default("fast"),
     outputStreaming: z.enum(["paragraph", "complete"]).default("paragraph"),
     oldMessageSelectionMaxAgeMs: positiveDurationMsSchema.nullable().default(null),
     storageRetentionMaxAgeMs: positiveDurationMsSchema.nullable().default(null),

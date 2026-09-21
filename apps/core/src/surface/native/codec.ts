@@ -35,6 +35,12 @@ export const nativeUserSchema = z.strictObject({
 export const nativeThreadRecordSchema = z.strictObject({
   id,
   title: z.string().max(512),
+  titleGeneration: z
+    .strictObject({
+      phase: z.enum(["initial", "refine"]),
+      inputId: id.optional(),
+    })
+    .optional(),
   starterId: id,
   archived: z.boolean(),
   deleted: z.boolean(),

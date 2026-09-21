@@ -132,6 +132,8 @@ surface:
       # Clerk: set ownerProviderUserId and clerkIssuer; clerkOAuthClientId enables TUI login.
       # Local credentials: LILAC_NATIVE_LOCAL_USERNAME, LILAC_NATIVE_LOCAL_PASSWORD_HASH.
       # Session signing: LILAC_NATIVE_SESSION_SECRET (at least 32 bytes).
+    # Model slot (fast/main) or an explicit provider/model reference.
+    titleModel: fast
     outputStreaming: paragraph
     oldMessageSelectionMaxAgeMs: null
     storageRetentionMaxAgeMs: null

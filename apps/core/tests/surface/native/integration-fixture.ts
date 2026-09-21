@@ -298,6 +298,8 @@ export async function createNativeIntegrationFixture(
   const warnings: { message: string; error: Error }[] = [];
   const runtime = integrationValue(
     await createNativeRuntime({
+      generateTitle: async () =>
+        Result.ok({ title: "Fixture conversation", needsRefinement: false }),
       installation,
       publishableKey: options.publishableKey,
       bus,

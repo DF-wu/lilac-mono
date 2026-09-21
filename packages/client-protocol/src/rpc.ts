@@ -169,6 +169,7 @@ export const nativeContract = {
         z.strictObject({
           commandId: identitySchema,
           title: z.string().max(512),
+          autoTitle: z.boolean().optional(),
           modelId: catalogIdentifierSchema.optional(),
         }),
       )

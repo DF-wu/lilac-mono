@@ -60,6 +60,7 @@ import {
   restoreDraftThread,
   hasDraftContent,
   prepareDraftSend,
+  applyDraftTitleChanges,
   releaseDraftAttachments,
   type DraftThread,
 } from "./draft-thread";
@@ -430,19 +431,32 @@ function Workspace(props: AppProps) {
         ? {}
         : { attachments: [], draft: { text: "", skillIds: [], attachments: [] } }),
     }));
-    const created = await attempt(
+    const initialThread = await attempt(
       () =>
         rpc.threads.create({
           commandId: creation.commandId,
           title: creation.title,
+          autoTitle: creation.autoTitle,
           modelId: creation.modelId,
         }),
       (error) => changeLocalDraft(id, (draft) => ({ ...draft, sending: false, error })),
     );
-    if (!created || pool.signal.aborted) return;
-    upsert(created);
+    if (!initialThread || pool.signal.aborted) return;
     const { remapComposerAttachments, resolveComposerAttachments } =
       await import("./components/composer-editor");
+    const created = await applyDraftTitleChanges({
+      thread: initialThread,
+      initialTitle: creation.autoTitle ? undefined : creation.title,
+      getTitle: () => draftStore.getState().localDrafts.get(id)?.title,
+      updateTitle: (thread, title) =>
+        attempt(
+          () =>
+            rpc.threads.update({ threadId: thread.id, expectedRevision: thread.revision, title }),
+          (error) => changeLocalDraft(id, (draft) => ({ ...draft, sending: false, error })),
+        ),
+    });
+    if (!created || pool.signal.aborted) return;
+    upsert(created);
     const latest = draftStore.getState().localDrafts.get(id);
     const moveAttachments = (files: ComposerSubmission["attachments"]) =>
       files.map((item) => {

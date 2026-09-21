@@ -715,7 +715,7 @@ export class NativeStore {
 
   createThread(
     actorId: string,
-    input: { commandId: string; title?: string; modelId?: string },
+    input: { commandId: string; title?: string; autoTitle?: boolean; modelId?: string },
   ): NativeStoreResult<NativeThread> {
     const store = this;
     return nativeStoreTransaction(this.db, () =>
@@ -735,6 +735,8 @@ export class NativeStore {
               id,
               starterId: actorId,
               title: input.title ?? "New thread",
+              titleGeneration:
+                (input.autoTitle ?? input.title === undefined) ? { phase: "initial" } : undefined,
               archived: false,
               deleted: false,
               createdAt: store.now(),
@@ -776,6 +778,7 @@ export class NativeStore {
             {
               ...thread,
               title: input.title ?? thread.title,
+              titleGeneration: input.title === undefined ? thread.titleGeneration : undefined,
               archived: input.archived ?? thread.archived,
               modelId: input.modelId ?? thread.modelId,
             },
@@ -785,6 +788,87 @@ export class NativeStore {
           return Result.ok({ threadId: thread.id });
         });
         return store.getThread(actorId, thread.id);
+      }),
+    );
+  }
+
+  getTitleGeneration(threadId: string): NativeStoreResult<{
+    inputId: string;
+    phase: "initial" | "refine";
+    user: string;
+    assistant?: string;
+  } | null> {
+    const store = this;
+    return Result.gen(function* () {
+      const thread = yield* store.getThreadRecord(threadId);
+      const state = thread.titleGeneration;
+      if (
+        !state?.inputId ||
+        thread.deleted ||
+        thread.mutationPending ||
+        thread.historyGeneration !== 0
+      )
+        return Result.ok(null);
+      const input = yield* store.getInput(state.inputId);
+      if (input.state === "canceled" || input.state === "failed") return Result.ok(null);
+      const uploads = yield* Result.all(input.attachmentIds.map((id) => store.getUpload(id)));
+      const user = [input.text, ...uploads.map((upload) => `Attachment: ${upload.filename}`)]
+        .join("\n")
+        .slice(0, 8000);
+      if (state.phase === "initial")
+        return Result.ok({ inputId: input.id, phase: state.phase, user });
+      const turn = input.turnId ? yield* store.readRecord("turn", input.turnId) : null;
+      if (turn?.kind !== "turn" || turn.value.state !== "complete") return Result.ok(null);
+      const hasText = (message: DisplayMessage) =>
+        message.role === "assistant" &&
+        message.parts.some((part) => part.type === "text" && part.text.trim());
+      const message =
+        turn.value.messages.findLast(
+          (message) => message.metadata?.phase === "final" && hasText(message),
+        ) ??
+        turn.value.messages.findLast(
+          (message) => message.metadata?.phase === undefined && hasText(message),
+        );
+      const assistant = message?.parts
+        .flatMap((part) => (part.type === "text" ? [part.text] : []))
+        .join("\n")
+        .slice(0, 4000);
+      if (!assistant) return Result.ok(null);
+      return Result.ok({ inputId: input.id, phase: state.phase, user, assistant });
+    });
+  }
+
+  settleTitleGeneration(
+    threadId: string,
+    expected: { inputId: string; phase: "initial" | "refine" },
+    generated?: { title: string; needsRefinement: boolean },
+  ): NativeStoreResult<void> {
+    const store = this;
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const thread = yield* store.getThreadRecord(threadId);
+        const state = thread.titleGeneration;
+        if (
+          thread.deleted ||
+          thread.mutationPending ||
+          thread.historyGeneration !== 0 ||
+          state?.inputId !== expected.inputId ||
+          state.phase !== expected.phase
+        )
+          return Result.ok(undefined);
+        store.bump(
+          {
+            ...thread,
+            title: generated?.title ?? thread.title,
+            titleGeneration:
+              generated?.needsRefinement && state.phase === "initial"
+                ? { phase: "refine", inputId: state.inputId }
+                : undefined,
+          },
+          "thread",
+          thread.id,
+        );
+        return Result.ok(undefined);
       }),
     );
   }
@@ -1201,7 +1285,14 @@ export class NativeStore {
                   ? [{ kind: "insert", slot: visible.value }]
                   : [];
               store.bump(
-                { ...thread, nextPosition: thread.nextPosition + 1 },
+                {
+                  ...thread,
+                  nextPosition: thread.nextPosition + 1,
+                  titleGeneration:
+                    thread.nextPosition === 0 && thread.titleGeneration
+                      ? { phase: "initial", inputId: id }
+                      : thread.titleGeneration,
+                },
                 "input",
                 id,
                 changes,

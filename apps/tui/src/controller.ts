@@ -398,7 +398,9 @@ export class TuiController {
       thread = await this.attempt(() =>
         rpc.threads.create({
           commandId: crypto.randomUUID(),
-          title: text.slice(0, 80) || files[0]?.name || "New conversation",
+          title:
+            text.split("\n", 1)[0]?.trim().slice(0, 80) || files[0]?.name || "New conversation",
+          autoTitle: true,
           modelId: this.state.modelId,
         }),
       );

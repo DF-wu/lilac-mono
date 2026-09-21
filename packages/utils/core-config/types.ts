@@ -145,6 +145,7 @@ export type NativeSurfaceConfig = {
     clerkIssuer?: string;
     clerkOAuthClientId?: string;
   };
+  titleModel: string;
   outputStreaming: "paragraph" | "complete";
   oldMessageSelectionMaxAgeMs: number | null;
   storageRetentionMaxAgeMs: number | null;
@@ -159,6 +160,7 @@ export function defaultNativeSurfaceConfig(): NativeSurfaceConfig {
     publicUrl: "http://localhost:8787",
     allowedOrigins: ["http://localhost:8787"],
     auth: { provider: "local", ownerId: "owner" },
+    titleModel: "fast",
     outputStreaming: "paragraph",
     oldMessageSelectionMaxAgeMs: null,
     storageRetentionMaxAgeMs: null,

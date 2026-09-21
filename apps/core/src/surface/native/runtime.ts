@@ -1,3 +1,4 @@
+import { createNativeTitleGeneration, type NativeTitleGenerator } from "./title-generation";
 import { NativeSubagents, type SubagentReader } from "./subagents";
 import type { DurableWorkflowStore } from "../../workflow/durable-workflow-store";
 import path from "node:path";
@@ -63,6 +64,7 @@ type NativeOutputSubscription = {
 };
 
 export type NativeRuntimeOptions = {
+  generateTitle?: NativeTitleGenerator;
   installation: NativeInstallation;
   bus: LilacBus;
   blobs: BlobStore;
@@ -196,6 +198,13 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
           adapter.forRequest({ principalId: thread.starterId, sourceThreadId: thread.id }),
         )
         .mapError((error) => nativeSurfaceError("send-message", error)),
+  });
+  const titles = createNativeTitleGeneration({
+    store,
+    getConfig: options.getConfig,
+    generate: options.generateTitle,
+    warn: options.warn,
+    reportFatalError: options.reportFatalError,
   });
   const searchStore = new NativeSearchStore({ db: database, store });
   const summaries = new NativeSummaryStore({ db: database, store });
@@ -437,6 +446,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
 
   async function stopIngress() {
     summaryAbort.abort();
+    await titles.stop();
     stopAgentIdentity();
     unsubscribe?.();
     unsubscribe = undefined;

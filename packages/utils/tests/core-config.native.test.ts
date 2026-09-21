@@ -55,3 +55,16 @@ it("reserves the Lilac service identity", () => {
     parseCoreConfigV2ToUniversal({ surface: { native: { auth: { ownerId: "lilac" } } } }),
   ).toThrow("reserved");
 });
+
+it("defaults native titles to fast and accepts model slots or references", () => {
+  expect(parseCoreConfigV1ToUniversal({}).surface.native.titleModel).toBe("fast");
+  expect(parseCoreConfigV2ToUniversal({}).surface.native.titleModel).toBe("fast");
+  for (const titleModel of ["main", "fast", "openai/gpt-4o-mini", "my-title-alias"])
+    expect(
+      parseCoreConfigV2ToUniversal({ surface: { native: { titleModel } } }).surface.native
+        .titleModel,
+    ).toBe(titleModel);
+  expect(() =>
+    parseCoreConfigV2ToUniversal({ surface: { native: { titleModel: " " } } }),
+  ).toThrow();
+});

@@ -30,6 +30,18 @@ Browser projection caches are scoped by installation, principal, protocol and pr
 They are disposable: unsupported versions or invalid coverage require a fresh recent window, while
 server conversation history remains authoritative. Never copy one user's cache into another scope.
 
+## Native automatic titles
+
+The optional `autoTitle` flag on `threads.create` marks a supplied title as an automatic fallback.
+Updated web and TUI clients opt in for first-line titles and leave manual draft titles unchanged.
+Clients that omit the flag keep their explicit titles. Update clients and servers together.
+
+Native v1 thread records accept optional private `titleGeneration` metadata containing the first input
+ID and the initial/refinement phase. Existing records without it keep their titles. No backfill or
+SQLite schema change is needed. Manual renames remove this metadata; automatic updates also verify
+that history has not been rewound or deleted. Older strict parsers cannot read records containing the
+new field. Restore a consistent backup before downgrading.
+
 ## Native file resolution
 
 The v1 RPC contract adds authenticated `files.resolve` with a thread ID and filesystem path. It

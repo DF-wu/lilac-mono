@@ -3947,6 +3947,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                 category: "persistence" as const,
               }),
             ),
+            ...["parseNativeTitle", "parseNativeTitle.andThen.<callback@1>"].map((exportName) => ({
+              identity: { module: "src/surface/native/title-generation.ts", exportName },
+              category: "wire" as const,
+            })),
             ...["decodeSearchRows", "decodeSearchCount"].map((exportName) => ({
               identity: { module: "src/surface/native/store-search.ts", exportName },
               category: "projection" as const,

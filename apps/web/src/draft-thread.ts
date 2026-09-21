@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { NativeThread } from "@stanley2058/lilac-client-protocol";
 import type { ComposerSubmission, Attachment } from "./types";
 import type { Draft, PendingInput } from "./components/Chat";
 
@@ -13,6 +14,7 @@ export type DraftThread = {
   creation?: {
     commandId: string;
     title: string;
+    autoTitle?: boolean;
     modelId?: string;
     entry: PendingInput;
   };
@@ -99,6 +101,7 @@ export function prepareDraftSend(
       ...thread,
       draft: { ...thread.draft, text: submission.attachmentText ?? submission.text },
     }),
+    autoTitle: thread.title === undefined,
     modelId: submission.modelId,
     entry: {
       commandId: crypto.randomUUID(),
@@ -123,4 +126,22 @@ export function restoreDraftThread(
   const parsed = draftHistorySchema.safeParse(historyState);
   if (!parsed.success) return newDraftThread();
   return drafts.get(parsed.data.draftThreadId) ?? newDraftThread();
+}
+
+export async function applyDraftTitleChanges(options: {
+  thread: NativeThread;
+  initialTitle: string | undefined;
+  getTitle: () => string | undefined;
+  updateTitle: (thread: NativeThread, title: string) => Promise<NativeThread | undefined>;
+}): Promise<NativeThread | undefined> {
+  let thread = options.thread;
+  let appliedTitle = options.initialTitle;
+  while (true) {
+    const title = options.getTitle();
+    if (title === undefined || title === appliedTitle) return thread;
+    const updated = await options.updateTitle(thread, title);
+    if (!updated) return undefined;
+    thread = updated;
+    appliedTitle = title;
+  }
 }

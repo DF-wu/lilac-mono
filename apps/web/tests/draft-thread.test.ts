@@ -1,3 +1,4 @@
+import type { NativeThread } from "@stanley2058/lilac-client-protocol";
 import { expect, test } from "bun:test";
 import {
   draftAttachment,
@@ -6,6 +7,7 @@ import {
   newDraftThread,
   restoreDraftThread,
   prepareDraftSend,
+  applyDraftTitleChanges,
 } from "../src/draft-thread";
 
 test("empty conversations stay absent from the sidebar until edited", () => {
@@ -107,4 +109,90 @@ test("first-send titles use attachment labels without Markdown escapes", () => {
     attachments: [],
   });
   expect(creation.title).toBe("polish-preview.md");
+});
+
+test("automatic first-line titles allow generation while manual draft titles do not", () => {
+  const draft = newDraftThread();
+  const submission = {
+    text: "First line\nMore details",
+    skillIds: [],
+    attachments: [],
+    mode: "steer" as const,
+  };
+  const automatic = prepareDraftSend(draft, submission);
+  expect(automatic.title).toBe("First line");
+  expect(automatic.autoTitle).toBe(true);
+  const manual = prepareDraftSend({ ...draft, title: "My chosen title" }, submission);
+  expect(manual.title).toBe("My chosen title");
+  expect(manual.autoTitle).toBe(false);
+});
+
+function createdThread(): NativeThread {
+  return {
+    id: "thread",
+    title: "First line",
+    starterId: "owner",
+    archived: false,
+    updatedAt: 0,
+    revision: 1,
+    capabilities: { read: true, edit: true, share: true },
+  };
+}
+
+test("first-send handoff preserves renames during creation and while the rename request is pending", async () => {
+  const created = Promise.withResolvers<NativeThread>();
+  const renameStarted = Promise.withResolvers<void>();
+  const rename = Promise.withResolvers<NativeThread>();
+  let title: string | undefined;
+  const updates: Array<{ revision: number; title: string }> = [];
+  const handoff = (async () =>
+    applyDraftTitleChanges({
+      thread: await created.promise,
+      initialTitle: undefined,
+      getTitle: () => title,
+      updateTitle: async (thread, nextTitle) => {
+        updates.push({ revision: thread.revision, title: nextTitle });
+        if (updates.length === 1) {
+          renameStarted.resolve();
+          return rename.promise;
+        }
+        return { ...thread, title: nextTitle, revision: thread.revision + 1 };
+      },
+    }))();
+  title = "Renamed while creating";
+  created.resolve(createdThread());
+  await renameStarted.promise;
+  title = "Renamed again";
+  rename.resolve({ ...createdThread(), title: "Renamed while creating", revision: 2 });
+  expect((await handoff)?.title).toBe("Renamed again");
+  expect(updates).toEqual([
+    { revision: 1, title: "Renamed while creating" },
+    { revision: 2, title: "Renamed again" },
+  ]);
+});
+
+test("same-text manual rename still disables automatic titles, and failed handoff remains retryable", async () => {
+  let calls = 0;
+  const result = await applyDraftTitleChanges({
+    thread: createdThread(),
+    initialTitle: undefined,
+    getTitle: () => "First line",
+    updateTitle: async () => {
+      calls++;
+      return undefined;
+    },
+  });
+  expect(calls).toBe(1);
+  expect(result).toBeUndefined();
+  const unchanged = await applyDraftTitleChanges({
+    thread: createdThread(),
+    initialTitle: "First line",
+    getTitle: () => "First line",
+    updateTitle: async () => {
+      calls++;
+      return undefined;
+    },
+  });
+  expect(unchanged?.title).toBe("First line");
+  expect(calls).toBe(1);
 });
