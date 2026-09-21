@@ -28,6 +28,8 @@ import type { NativeInput, DisplayPart, NativeThread } from "@stanley2058/lilac-
 import type { ChatCommon, ComposerSubmission } from "../types";
 import { resolveAttachmentIds } from "../uploads";
 import { inputDeliveryOptions } from "../input-mode";
+import { deliverPendingInput, type PendingInput } from "../pending-input";
+export type { PendingInput } from "../pending-input";
 import { Button } from "./ui/button";
 import { Composer } from "./Composer";
 import { Timeline, useLatestReadableTurn } from "./Timeline";
@@ -41,14 +43,6 @@ export type Draft = {
   commandId?: string;
   attachments: string[];
   savedText?: string;
-};
-export type PendingInput = {
-  commandId: string;
-  text: string;
-  submission: ComposerSubmission;
-  input?: NativeInput;
-  error?: string;
-  state: "preparing" | "uncertain" | "rejected";
 };
 const emptyDraft: Draft = { text: "", skillIds: [], attachments: [] };
 export type ChatProps = Pick<ChatCommon, "catalog" | "onError"> & {
@@ -274,8 +268,10 @@ export function Chat(props: ChatProps) {
         : entries.filter((entry) => entry.commandId !== commandId),
     );
   };
-  async function deliver(entry: PendingInput, retryFailed = false) {
-    if (currentId.current === threadId && !canEdit.current) return;
+  async function prepareInput(
+    entry: PendingInput,
+    retryFailed: boolean,
+  ): Promise<NativeInput | undefined> {
     const [ids, { resolveComposerAttachments }] = await Promise.all([
       resolveAttachmentIds(pool, threadId, entry.submission.attachments, retryFailed),
       import("./composer-editor"),
@@ -302,7 +298,7 @@ export function Chat(props: ChatProps) {
       });
       return;
     }
-    const input: NativeInput = entry.input ?? {
+    return {
       threadId: threadId,
       commandId: entry.commandId,
       historyGeneration: checkpoint.historyGeneration,
@@ -327,20 +323,18 @@ export function Chat(props: ChatProps) {
       skillIds: entry.submission.skillIds,
       command: entry.submission.command,
     };
-    setPending(entry.commandId, { input });
-    const outcome = await client.submit(input);
-    if (outcome.kind === "accepted") {
-      for (const attachment of entry.submission.attachments) pool.release(threadId, attachment.key);
-      setPending(entry.commandId, null);
-      void refreshQueue();
-      return;
-    }
-    setPending(
-      entry.commandId,
-      outcome.kind === "uncertain"
-        ? { state: "uncertain", error: "Send not confirmed. Retry safely when connected." }
-        : { state: "rejected", error: outcome.error.message },
+  }
+  async function deliver(entry: PendingInput, retryFailed = false) {
+    if (currentId.current === threadId && !canEdit.current) return;
+    const outcome = await deliverPendingInput(
+      entry,
+      () => prepareInput(entry, retryFailed),
+      (input) => client.submit(input),
+      (patch) => setPending(entry.commandId, patch),
     );
+    if (outcome?.kind !== "accepted") return;
+    for (const attachment of entry.submission.attachments) pool.release(threadId, attachment.key);
+    void refreshQueue();
   }
   function submit(submission: ComposerSubmission) {
     if (local) {
