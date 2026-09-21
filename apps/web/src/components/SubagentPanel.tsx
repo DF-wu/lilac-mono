@@ -24,6 +24,7 @@ import { MessageIdentityContext } from "./message-identity";
 import { Message } from "./Timeline";
 import { Button } from "./ui/button";
 import { IconButton } from "./ui";
+import { PanelToggleButton } from "./PanelToggleButton";
 import "./subagent-panel.css";
 
 export function NativeSubagentProvider({
@@ -321,13 +322,13 @@ function AgentStatus({ agent }: { agent: SubagentSummary }) {
 export function RightPanelToggle({ open, onToggle }: { open: boolean; onToggle: () => void }) {
   return (
     <div className="right-panel-toggle">
-      <IconButton
+      <PanelToggleButton
         label={open ? "Hide right panel" : "Show right panel"}
-        aria-expanded={open}
-        onClick={onToggle}
+        open={open}
+        onToggle={onToggle}
       >
         {open ? <PanelRightClose /> : <PanelRightOpen />}
-      </IconButton>
+      </PanelToggleButton>
     </div>
   );
 }

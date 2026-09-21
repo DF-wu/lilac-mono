@@ -93,7 +93,7 @@
 .workspace-resize-handle:focus-visible {
   background: var(--ui-primary);
 }
-@media (max-width: 760px) {
+@media (width < 47.5rem) {
   .workspace-panels[data-left-open][data-right-open] {
     --left-track: 0px;
     --right-track: 0px;
@@ -101,8 +101,13 @@
   .workspace-side-panel {
     position: absolute;
     inset-block: 0;
-    transition: transform var(--ui-motion-duration) ease;
+    transition:
+      transform var(--ui-motion-duration) ease,
+      box-shadow var(--ui-motion-duration) ease;
     box-shadow: var(--ui-shadow-overlay);
+  }
+  .workspace-side-panel[data-open="false"] {
+    box-shadow: none;
   }
   .workspace-side-panel[data-side="left"] {
     left: 0;
@@ -111,8 +116,12 @@
   }
   .workspace-side-panel[data-side="right"] {
     right: 0;
-    width: min(90cqw, calc(var(--right-panel-width) + 1px));
+    width: 100cqw;
+    padding-left: 0;
     z-index: 35;
+  }
+  .app-shell:not(.right-panel-hidden) > .sidebar-toggle {
+    display: none;
   }
   .workspace-side-panel[data-side="left"][data-open="false"] {
     transform: translateX(-100%);

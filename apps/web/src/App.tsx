@@ -5,6 +5,7 @@ import { useEventCallback } from "./use-event-callback";
 import { ActorAvatar } from "./components/ActorAvatar";
 import { defaultRightPanel } from "./panel-store";
 import { WorkspacePanels, WorkspaceSidePanel } from "./components/WorkspacePanels";
+import { PanelToggleButton } from "./components/PanelToggleButton";
 import { NativeSubagentProvider, RightPanelToggle } from "./components/SubagentPanel";
 import { useLocation, useNavigate, useMatch, useRouter } from "@tanstack/react-router";
 import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -779,12 +780,13 @@ function Workspace(props: AppProps) {
               aria-label="Chat workspace"
             >
               <div className="sidebar-toggle fixed top-0 left-3 h-8 flex items-center z-40 [&_.icon-button]:size-[var(--ui-control-compact)]">
-                <IconButton
+                <PanelToggleButton
                   label={sidebar ? "Hide sidebar" : "Show sidebar"}
-                  onClick={panels.getState().toggleSidebar}
+                  open={sidebar}
+                  onToggle={panels.getState().toggleSidebar}
                 >
                   {sidebar ? <PanelLeftClose /> : <PanelLeftOpen />}
-                </IconButton>
+                </PanelToggleButton>
               </div>
               <RightPanelToggle
                 open={rightOpen}
@@ -797,6 +799,14 @@ function Workspace(props: AppProps) {
                 rightWidth={rightLayout.width}
                 layoutKey={selectedId}
               >
+                {sidebar && !rightOpen ? (
+                  <button
+                    type="button"
+                    aria-label="Close sidebar"
+                    className="absolute inset-0 z-20 hidden bg-overlay max-workspace:block"
+                    onClick={panels.getState().toggleSidebar}
+                  />
+                ) : null}
                 <WorkspaceSidePanel
                   side="left"
                   open={sidebar}
