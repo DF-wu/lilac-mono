@@ -220,6 +220,11 @@ export function createNativeRouter(
         nativeRpcValue(await services.catalogs.get(context.principal, input, signal)),
       ),
     },
+    files: {
+      resolve: secured.files.resolve.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.files.resolve(context.principal, input, signal)),
+      ),
+    },
     resources: {
       reserve: secured.resources.reserve.handler(async ({ input, context, signal }) =>
         nativeRpcValue(await services.resources.reserve(context.principal, input, signal)),

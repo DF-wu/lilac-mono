@@ -1,6 +1,6 @@
 import { fromMarkdown } from "mdast-util-from-markdown";
 import type { Root, RootContent } from "mdast";
-import { basename } from "node:path";
+import { basename, posix } from "node:path";
 import type { FileSystem } from "@stanley2058/lilac-fs";
 import type { PersistedDataError } from "@stanley2058/lilac-utils";
 import { Result, type Result as ResultType } from "better-result";
@@ -26,12 +26,56 @@ export class NativeLiveFileService {
         readPublishedPath(actorId: string, id: string): NativeFileResult<PublishedNativePath>;
         getThreadRecord(threadId: string): NativeFileResult<NativeThreadRecord>;
         getUser(actorId: string): NativeFileResult<NativeUser>;
+        authorizeThread(
+          actorId: string,
+          threadId: string,
+          edit?: boolean,
+        ): NativeFileResult<NativeThreadRecord>;
+        registerPublishedPath(
+          actorId: string,
+          threadId: string,
+          path: string,
+          cwd?: string,
+        ): NativeFileResult<PublishedNativePath>;
       };
       filesystem: FileSystem;
       toolRoot: string;
       remoteDenyPaths: readonly string[];
     },
   ) {}
+
+  async resolve(actorId: string, threadId: string, inputPath: string, signal?: AbortSignal) {
+    const service = this;
+    return Result.gen(async function* () {
+      const thread = yield* service.dependencies.native.authorizeThread(actorId, threadId, true);
+      const actor = yield* service.dependencies.native.getUser(actorId);
+      const starter = yield* service.dependencies.native.getUser(thread.starterId);
+      if (actor.toolMode === "restricted" && starter.toolMode !== "restricted")
+        return Result.err(nativeFailure("forbidden", "File browsing is outside your tool access"));
+      const restricted = starter.toolMode === "restricted";
+      const cwd = restricted ? "/tmp" : service.dependencies.toolRoot;
+      const resolved = yield* resolveToolPathForRequestContextResult({
+        cwd,
+        inputPath,
+        context: { sessionId: threadId, safetyMode: restricted ? "restricted" : "trusted" },
+      }).mapError(() => nativeFailure("forbidden", "File path is outside this thread's access"));
+      // Restricted paths stay virtual so the existing reader applies its session sandbox mapping once.
+      const path = restricted ? posix.resolve(cwd, inputPath) : resolved;
+      const reference = yield* service.dependencies.native.registerPublishedPath(
+        actorId,
+        threadId,
+        path,
+        cwd,
+      );
+      const file = yield* Result.await(service.read(actorId, reference.id, signal, true));
+      return Result.ok({
+        path,
+        name: file.filename,
+        mediaType: file.mediaType,
+        href: `/api/files/${reference.id}`,
+      });
+    });
+  }
 
   async read(
     actorId: string,

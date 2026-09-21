@@ -239,6 +239,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   });
   const nativeConfig = options.getConfig().surface.native;
   const services = createNativeRpcServices({
+    files: liveFiles,
     subagents: new NativeSubagents({
       native: store,
       workflows: options.workflows,

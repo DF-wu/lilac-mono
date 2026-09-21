@@ -30,6 +30,14 @@ Browser projection caches are scoped by installation, principal, protocol and pr
 They are disposable: unsupported versions or invalid coverage require a fresh recent window, while
 server conversation history remains authoritative. Never copy one user's cache into another scope.
 
+## Native file resolution
+
+The v1 RPC contract adds authenticated `files.resolve` with a thread ID and filesystem path. It
+returns the resolved path, filename, media type, and existing authenticated preview URL. Resolution
+requires thread edit access and uses the thread's filesystem permissions and deny paths. Existing
+published-path records and file-serving routes are reused; no database migration is required.
+Update clients and servers together to enable inline-path previews.
+
 ## Native web local panel layouts
 
 The web app stores device-local panel preferences under `lilac-panels-v1`, scoped by installation and

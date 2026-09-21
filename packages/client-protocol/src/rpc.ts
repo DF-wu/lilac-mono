@@ -283,6 +283,16 @@ export const nativeContract = {
       .input(z.strictObject({ revision: identitySchema.optional() }))
       .output(catalogReplySchema),
   },
+  files: {
+    resolve: procedure.input(threadIdInput.extend({ path: z.string().min(1).max(4096) })).output(
+      z.strictObject({
+        path: z.string(),
+        name: z.string(),
+        mediaType: z.string(),
+        href: z.string(),
+      }),
+    ),
+  },
   resources: {
     reserve: procedure
       .input(

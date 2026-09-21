@@ -1,3 +1,4 @@
+import type { NativeLiveFileService } from "./resources-live";
 import type { NativeSubagents } from "./subagents";
 import { randomUUID } from "node:crypto";
 import type {
@@ -30,6 +31,7 @@ import type { NativeSearchStore } from "./store-search";
 import type { NativeSurfaceStore } from "./store-surface";
 
 export type NativeRpcServiceOptions = {
+  files?: Pick<NativeLiveFileService, "resolve">;
   subagents?: Pick<NativeSubagents, "list" | "read">;
   store: NativeStore;
   auth: NativeAuthenticator;
@@ -754,6 +756,12 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
       get(principal, input) {
         return catalog(principal, input.revision);
       },
+    },
+    files: {
+      resolve: (principal, input, signal) =>
+        options.files
+          ? options.files.resolve(principal.userId, input.threadId, input.path, signal)
+          : Result.err(nativeFailure("not-found", "File browsing is unavailable")),
     },
     resources: {
       reserve(principal, input) {

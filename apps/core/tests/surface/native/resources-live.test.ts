@@ -1,8 +1,9 @@
+import { resolveRestrictedSessionTmpDir } from "../../../src/shared/attachment-utils";
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtemp, open, writeFile, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { mkdtemp, mkdir, open, writeFile, rm } from "node:fs/promises";
+import { join, relative as relativePath } from "node:path";
+import { tmpdir, homedir } from "node:os";
 import { FileSystem } from "@stanley2058/lilac-fs";
 import type { Result } from "better-result";
 import { NativeStore } from "../../../src/surface/native/store";
@@ -172,5 +173,82 @@ test("text preview reads only a bounded prefix of a published file above the dow
     (await service.handle(new Request(`http://native/api/files/${reference.id}/preview`), "owner"))
       ?.status,
   ).toBe(404);
+  native.close();
+});
+
+test("inline path resolution expands paths and enforces thread and filesystem permissions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "lilac-native-resolver-"));
+  directories.push(root);
+  const native = new NativeStore(new Database(":memory:"));
+  value(native.initialize());
+  for (const id of ["owner", "reader", "outsider", "restricted"])
+    value(
+      native.upsertUser({
+        id,
+        providerId: id,
+        role: id === "owner" ? "owner" : "participant",
+        toolMode: id === "restricted" ? "restricted" : "full",
+        displayName: id,
+      }),
+    );
+  const thread = value(native.createThread("owner", { commandId: "resolve" }));
+  value(native.shareThread("owner", { threadId: thread.id, userId: "reader", grant: "read" }));
+  value(native.shareThread("owner", { threadId: thread.id, userId: "restricted", grant: "edit" }));
+  await writeFile(join(root, "example.md"), "# Example");
+  await writeFile(join(root, "private.txt"), "denied");
+  const service = new NativeLiveFileService({
+    native,
+    filesystem: new FileSystem(root, { denyPaths: [join(root, "private.txt")] }),
+    toolRoot: root,
+    remoteDenyPaths: [],
+  });
+  const relative = value(await service.resolve("owner", thread.id, "./example.md"));
+  expect(relative.path).toBe(join(root, "example.md"));
+  expect(relative.name).toBe("example.md");
+  expect(relative.href).toStartWith("/api/files/");
+  expect(value(await service.resolve("owner", thread.id, relative.path))).toEqual(relative);
+  const response = await service.handle(
+    new Request(`http://native${relative.href}/preview`),
+    "reader",
+  );
+  expect(await response?.json()).toMatchObject({ text: "# Example", truncated: false });
+  for (const actor of ["reader", "outsider", "restricted"])
+    expect((await service.resolve(actor, thread.id, relative.path)).status).toBe("error");
+  for (const path of ["./missing.md", "./private.txt"])
+    expect((await service.resolve("owner", thread.id, path)).status).toBe("error");
+  const homeRelative = `~/${relativePath(homedir(), join(root, "example.md"))}`;
+  expect(value(await service.resolve("owner", thread.id, homeRelative))).toEqual(relative);
+  native.close();
+});
+
+test("restricted file resolution uses the thread's virtual tmp directory exactly once", async () => {
+  const native = new NativeStore(new Database(":memory:"));
+  value(native.initialize());
+  value(
+    native.upsertUser({
+      id: "limited",
+      providerId: "limited",
+      role: "participant",
+      toolMode: "restricted",
+      displayName: "Limited",
+    }),
+  );
+  const thread = value(native.createThread("limited", { commandId: "restricted-resolve" }));
+  const root = resolveRestrictedSessionTmpDir(thread.id);
+  directories.push(root);
+  await mkdir(root, { recursive: true });
+  await writeFile(join(root, "example.txt"), "session file");
+  const service = new NativeLiveFileService({
+    native,
+    filesystem: new FileSystem(root),
+    toolRoot: root,
+    remoteDenyPaths: [],
+  });
+  const file = value(await service.resolve("limited", thread.id, "./example.txt"));
+  expect(file.path).toBe("/tmp/example.txt");
+  const response = await service.handle(new Request(`http://native${file.href}`), "limited");
+  expect(await response?.text()).toBe("session file");
+  for (const path of ["~/.bashrc", "/etc/passwd", "../example.txt", "/tmp/../etc/passwd"])
+    expect((await service.resolve("limited", thread.id, path)).status).toBe("error");
   native.close();
 });
