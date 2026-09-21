@@ -18,26 +18,40 @@ export function messageClipboard(text: string, parts: readonly DisplayPart[]): M
 
 export async function copyMessage(value: MessageClipboard) {
   if (!value.resources.length) return navigator.clipboard.writeText(value.text);
+  await navigator.clipboard.write([new ClipboardItem(messageClipboardData(value))]);
+}
+
+export function messageClipboardData(
+  value: MessageClipboard,
+  imageUrl?: string,
+): Record<string, Blob> {
   const container = document.createElement("div");
   container.dataset.lilacMessage = location.origin;
-  const text = document.createElement("pre");
-  text.textContent = value.text;
-  container.append(text);
+  if (value.text) {
+    const text = document.createElement("pre");
+    text.textContent = value.text;
+    container.append(text);
+  }
   for (const resource of value.resources) {
     const item = document.createElement("span");
     item.dataset.resourceId = resource.resourceId;
     item.dataset.mediaType = resource.mediaType;
-    item.textContent = resource.name;
+    if (imageUrl) {
+      const image = document.createElement("img");
+      image.src = imageUrl;
+      image.alt = resource.name;
+      item.append(image);
+    } else {
+      item.textContent = resource.name;
+    }
     container.append(item);
   }
-  await navigator.clipboard.write([
-    new ClipboardItem({
-      "text/plain": new Blob([value.text || value.resources.map((item) => item.name).join("\n")], {
-        type: "text/plain",
-      }),
-      "text/html": new Blob([container.outerHTML], { type: "text/html" }),
+  return {
+    "text/plain": new Blob([value.text || value.resources.map((item) => item.name).join("\n")], {
+      type: "text/plain",
     }),
-  ]);
+    "text/html": new Blob([container.outerHTML], { type: "text/html" }),
+  };
 }
 
 export function readMessageClipboard(html: string): MessageClipboard | undefined {
@@ -51,7 +65,7 @@ export function readMessageClipboard(html: string): MessageClipboard | undefined
     if (!resourceId) return;
     resources.push({
       resourceId,
-      name: item.textContent ?? "Attachment",
+      name: item.querySelector("img")?.alt ?? item.textContent ?? "Attachment",
       mediaType: item.dataset.mediaType ?? "application/octet-stream",
     });
   }

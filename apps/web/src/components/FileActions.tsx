@@ -1,7 +1,7 @@
 import { FileIcon } from "./FileIcon";
 import { useState, type ReactNode } from "react";
 import { Copy, ScanEye, PanelRight } from "lucide-react";
-import { copyMessage } from "../message-clipboard";
+import { copyMessage, messageClipboardData } from "../message-clipboard";
 import { copyPreviewImage } from "../image-clipboard";
 import type { FileTarget } from "../file-target";
 import { useFileViewer } from "./file-viewer-context";
@@ -31,26 +31,33 @@ export function FileActions({
   const viewer = useFileViewer();
   const [preview, setPreview] = useState(false);
   async function copy() {
-    if (target.type === "resource" && target.resourceId) {
-      await copyMessage({
-        text: "",
-        resources: [
-          { resourceId: target.resourceId, name: target.name, mediaType: target.mediaType },
-        ],
-      });
-      toastManager.add({ title: "Copied!", type: "success" });
-      return;
-    }
+    const message =
+      target.type === "resource" && target.resourceId
+        ? {
+            text: "",
+            resources: [
+              { resourceId: target.resourceId, name: target.name, mediaType: target.mediaType },
+            ],
+          }
+        : undefined;
     if (target.type === "resource" && target.mediaType.startsWith("image/")) {
       const image = new Image();
       image.crossOrigin = "anonymous";
       image.src = target.href;
       await image.decode();
-      const result = await copyPreviewImage(image);
+      const result = await copyPreviewImage(
+        image,
+        message && ((pngUrl) => messageClipboardData(message, pngUrl)),
+      );
       result.match({
         ok: () => toastManager.add({ title: "Copied!", type: "success" }),
         err: (error) => toastManager.add({ title: error.message, type: "error" }),
       });
+      return;
+    }
+    if (message) {
+      await copyMessage(message);
+      toastManager.add({ title: "Copied!", type: "success" });
       return;
     }
     await navigator.clipboard.writeText(

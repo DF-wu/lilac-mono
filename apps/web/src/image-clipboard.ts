@@ -10,6 +10,7 @@ function copyFailure(): WebRequestFailed {
 
 export async function copyPreviewImage(
   image: HTMLImageElement,
+  representations?: (pngUrl: string) => Record<string, Blob>,
 ): Promise<Result<void, WebRequestFailed>> {
   if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined")
     return Result.err(copyFailure());
@@ -36,7 +37,10 @@ export async function copyPreviewImage(
     if (!encoded) return Result.err(copyFailure());
     yield* Result.await(
       Result.tryPromise({
-        try: () => navigator.clipboard.write([new ClipboardItem({ "image/png": encoded })]),
+        try: () => {
+          const data = representations?.(canvas.toDataURL("image/png"));
+          return navigator.clipboard.write([new ClipboardItem({ ...data, "image/png": encoded })]);
+        },
         catch: copyFailure,
       }),
     );

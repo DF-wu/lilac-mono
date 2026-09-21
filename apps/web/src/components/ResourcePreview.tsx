@@ -631,6 +631,9 @@ export function ResourcePreview({
       <DialogContent
         className="resource-preview-dialog"
         showCloseButton={false}
+        // Portal events must not reach the attachment's context-menu trigger.
+        onContextMenu={(event) => event.stopPropagation()}
+        onTouchStart={(event) => event.stopPropagation()}
         onPointerDownCapture={beginBackdropPress}
         onPointerMoveCapture={moveBackdropPress}
         onPointerCancelCapture={() => {

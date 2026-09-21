@@ -674,7 +674,11 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
               editor.tf.insertBreak();
             }
           }}
-          onPaste={props.onPaste}
+          onPaste={(event) => {
+            props.onPaste(event);
+            // Plate requires a handled result to skip its HTML deserializer.
+            return event.defaultPrevented;
+          }}
         />
       </Plate>
     </AttachmentContext>
