@@ -623,6 +623,9 @@ export class Attachment implements ServerTool {
       blobStore: BlobStore;
       outputLifecycle: AttachmentOutputLifecycle;
       resourceAccess?: ResourceAccess;
+      resourceAccessForContext?: (
+        context: RequestContext | undefined,
+      ) => ResourceAccess | undefined;
       toolResultArtifacts?: ToolResultArtifactStore;
     },
   ) {
@@ -720,7 +723,9 @@ export class Attachment implements ServerTool {
         cwd,
         context: ctx,
         signal,
-        resourceAccess: this.params.resourceAccess,
+        resourceAccess: this.params.resourceAccessForContext
+          ? this.params.resourceAccessForContext(ctx)
+          : this.params.resourceAccess,
         transientAccess,
       });
       const loadedBranch = resultBranch(loaded);
@@ -848,7 +853,10 @@ export class Attachment implements ServerTool {
     let totalBytes = 0;
 
     if (resourceUris.length > 0) {
-      if (!this.params.resourceAccess) {
+      const resourceAccess = this.params.resourceAccessForContext
+        ? this.params.resourceAccessForContext(ctx)
+        : this.params.resourceAccess;
+      if (!resourceAccess) {
         return Result.err(
           attachmentFailure("unavailable", "Inbound resource access is unavailable"),
         );
@@ -864,7 +872,7 @@ export class Attachment implements ServerTool {
             ),
           );
         }
-        const materializedResult = await this.params.resourceAccess.materialize(uri, {
+        const materializedResult = await resourceAccess.materialize(uri, {
           targetDirectory: downloadDir,
           maxBytes: remainingBytes,
           signal,

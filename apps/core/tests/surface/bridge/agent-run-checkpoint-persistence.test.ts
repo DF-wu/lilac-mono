@@ -137,6 +137,31 @@ async function checkpointFixture() {
 }
 
 describe("blob-backed agent run checkpoints", () => {
+  it("persists the exact native output frontier beside canonical history", async () => {
+    const { blobStore, transcriptStore, owner, journal, identityProjection, journalDbPath } =
+      await checkpointFixture();
+    const handle = resultValue(journal.openRun(owner));
+    resultValue(
+      await persistBlobBackedAgentRunCheckpoint({
+        handle,
+        journal,
+        identityProjection,
+        blobStore,
+        transcriptStore,
+        messages: [{ role: "user", content: "checkpoint" }],
+        nativeOutput: { ordinal: 12, position: 7 },
+        retainedRequestDeliveries: [],
+      }),
+    );
+    journal.close();
+    const reopened = new SqliteAgentRunJournal({ dbPath: journalDbPath });
+    const recovered = resultValue(reopened.loadRecoveryHeads());
+    expect(recovered.heads[0]?.checkpoint?.nativeOutput).toEqual({ ordinal: 12, position: 7 });
+    reopened.close();
+    transcriptStore.close();
+    await blobStore.close({ deadlineAtMs: Date.now() + 1_000 });
+  });
+
   it("keeps ingress resource identity after the agent clones checkpoint messages", async () => {
     const { blobStore, transcriptStore, owner, journal, identityProjection } =
       await checkpointFixture();

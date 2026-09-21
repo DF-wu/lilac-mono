@@ -34,8 +34,19 @@ export type GithubMsgRef = {
   messageId: string;
 };
 
-export type SessionRef = DiscordSessionRef | GithubSessionRef;
-export type MsgRef = DiscordMsgRef | GithubMsgRef;
+export type NativeSessionRef = {
+  platform: "native";
+  channelId: string;
+};
+
+export type NativeMsgRef = {
+  platform: "native";
+  channelId: string;
+  messageId: string;
+};
+
+export type SessionRef = DiscordSessionRef | GithubSessionRef | NativeSessionRef;
+export type MsgRef = DiscordMsgRef | GithubMsgRef | NativeMsgRef;
 
 export type RegisteredSurfacePlatform = SessionRef["platform"];
 
@@ -93,6 +104,7 @@ export type SurfaceMessage = {
   editedTs?: number;
   deleted?: boolean;
   raw?: unknown;
+  attachments?: readonly { url: string; filename?: string; mimeType?: string; size?: number }[];
 };
 
 export type SurfaceReactionUser = {

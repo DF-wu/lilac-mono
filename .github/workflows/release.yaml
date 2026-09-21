@@ -242,7 +242,7 @@ jobs:
           LILAC_DEFAULT_COMPUTER_RUNNER_IMAGE: ${{ needs.image-manifests.outputs.runner }}
         run: bun run build:installer --target ${{ matrix.target }}
 
-      - name: Run standalone binary outside the source checkout
+      - name: Run standalone binaries outside the source checkout
         env:
           TARGET: ${{ matrix.target }}
           VERSION: ${{ needs.release-info.outputs.version }}
@@ -255,11 +255,18 @@ jobs:
           "$binary" --version | grep -F "$VERSION"
           "$binary" --help
 
-      - name: Upload standalone installer
+      - name: Stage standalone release assets
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p release-cli
+          cp "apps/installer/dist/lilac-$TARGET" release-cli/
+
+      - name: Upload standalone clients
         uses: actions/upload-artifact@v6
         with:
           name: cli-${{ matrix.target }}
-          path: apps/installer/dist/lilac-${{ matrix.target }}
+          path: release-cli/*
           if-no-files-found: error
           retention-days: 2
 

@@ -844,6 +844,7 @@ function validateSnapshotCorrelation(
   >();
   const relayIdentities = new Set<string>();
   for (const relay of snapshot.relays) {
+    if (relay.platform === "native") return false;
     if (!validateRelayCorrelation(relay)) return false;
     if (!registerRoute(relay.requestId, relay.platform, relay.sessionId)) return false;
     const identity = `${relay.requestId}\u0000${relay.platform}\u0000${relay.sessionId}`;

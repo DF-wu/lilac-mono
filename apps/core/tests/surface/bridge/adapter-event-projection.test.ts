@@ -47,11 +47,13 @@ type PlatformTriple = {
 const sessionRefs = {
   discord: discordMessage.session,
   github: githubMessage.session,
+  native: { platform: "native", channelId: "thread-1" },
 } satisfies Record<RefPlatform, SessionRef>;
 
 const messageRefs = {
   discord: discordMessage.ref,
   github: githubMessage.ref,
+  native: { platform: "native", channelId: "thread-1", messageId: "message-1" },
 } satisfies Record<RefPlatform, MsgRef>;
 
 function expectPanic(callback: () => unknown): void {

@@ -1,0 +1,49 @@
+.thread-queue.is-dragging .virtual-row {
+  transition: transform var(--ui-motion-duration) ease;
+}
+
+.queue-heading > button {
+  width: 100%;
+  justify-content: flex-start;
+  padding: calc(var(--ui-space-unit) * 1);
+  gap: calc(var(--ui-space-unit) * 2);
+  color: inherit;
+}
+.queue-heading > button:disabled {
+  opacity: 1;
+}
+.queue-heading > button > span {
+  height: 1px;
+  background: currentColor;
+  opacity: 0.3;
+  flex: 1;
+}
+.queue-heading svg {
+  width: var(--ui-text-sm);
+  height: var(--ui-text-sm);
+  transition: transform var(--ui-motion-duration) ease;
+  transform: rotate(-90deg);
+}
+.queue-heading svg.queue-expanded {
+  transform: rotate(0);
+}
+
+.queue-thread:focus-visible {
+  outline: 2px solid var(--ui-focus);
+}
+.queue-thread.drag-source {
+  opacity: 0;
+}
+
+.thread-drag-preview .thread-card {
+  pointer-events: none;
+}
+
+.thread-drop-action svg {
+  width: var(--ui-text-sm);
+  height: var(--ui-text-sm);
+}
+
+.thread-queue.is-dragging .thread-card-actions {
+  display: none;
+}

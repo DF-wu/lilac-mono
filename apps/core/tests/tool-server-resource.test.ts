@@ -59,6 +59,38 @@ async function callValue(
 }
 
 describe("tool-server resource", () => {
+  it("uses per-request resource access and never falls back after a denied scope", async () => {
+    let globalReads = 0;
+    let scopedReads = 0;
+    const tool = new Resource({
+      access: fakeAccess(async (uri, options) => {
+        globalReads += 1;
+        return Result.ok(materialized(uri, options.targetDirectory, 1));
+      }),
+      accessForContext: (context) =>
+        context?.sessionId === "allowed"
+          ? fakeAccess(async (uri, options) => {
+              scopedReads += 1;
+              return Result.ok(materialized(uri, options.targetDirectory, 1));
+            })
+          : undefined,
+    });
+    const denied = await callValue(
+      tool,
+      { uris: [URIS[0]] },
+      { context: { sessionId: "denied", cwd: process.cwd() } },
+    );
+    expect(denied).toMatchObject({ failure: { kind: "denied", code: "resource_access_denied" } });
+    const allowed = await callValue(
+      tool,
+      { uris: [URIS[0]] },
+      { context: { sessionId: "allowed", cwd: process.cwd() } },
+    );
+    expect(allowed).toMatchObject({ results: [{ status: "ok" }] });
+    expect(scopedReads).toBe(1);
+    expect(globalReads).toBe(0);
+  });
+
   it("materializes scoped transient resources and accepts legacy artifact URIs", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-transient-resource-tool-"));
     const firstCwd = path.join(root, "first");

@@ -1,0 +1,100 @@
+@layer components {
+  .ds-header,
+  .ds-body {
+    max-width: calc(var(--ui-chat-width) + var(--ui-sidebar-width));
+    margin-inline: auto;
+    padding-inline: calc(var(--ui-space-unit) * 8);
+  }
+
+  .ds-back:hover {
+    color: var(--ui-foreground);
+  }
+
+  .ds-header h1 {
+    font-size: var(--ui-text-hero);
+    letter-spacing: -0.04em;
+    line-height: var(--ui-line-tight);
+    margin-block: calc(var(--ui-space-unit) * 2);
+  }
+  .ds-header p,
+  .ds-section-heading p,
+  .ds-muted {
+    color: var(--ui-muted-foreground);
+    font-size: var(--ui-text-sm);
+    line-height: var(--ui-line-normal);
+  }
+
+  .ds-nav a {
+    color: var(--ui-muted-foreground);
+    font-size: var(--ui-text-sm);
+    border-radius: var(--ui-radius-sm);
+    padding: calc(var(--ui-space-unit) * 2) calc(var(--ui-space-unit) * 3);
+  }
+  .ds-nav a:hover,
+  .ds-nav a:focus-visible {
+    color: var(--ui-foreground);
+    background: var(--ui-surface);
+  }
+
+  .ds-section + .ds-section {
+    border-top: 1px solid var(--ui-border);
+  }
+
+  .ds-section h2 {
+    font-size: var(--ui-text-xl);
+    font-weight: 600;
+    margin-bottom: calc(var(--ui-space-unit) * 1);
+  }
+
+  .ds-specimen h3,
+  .ds-state-label {
+    font-size: var(--ui-text-xs);
+    color: var(--ui-muted-foreground);
+    font-weight: 500;
+    margin-bottom: calc(var(--ui-space-unit) * 3);
+  }
+  .ds-specimen-body,
+  .ds-stack {
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--ui-space-unit) * 4);
+    min-width: 0;
+  }
+
+  .ds-spacing > div {
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--ui-space-unit) * 2);
+    font-size: var(--ui-text-xs);
+  }
+
+  .ds-agent-caption .ds-state-label {
+    display: block;
+    margin-bottom: calc(var(--ui-space-unit) * 1);
+  }
+
+  .ds-panel .virtual-list {
+    flex: 1;
+    min-height: 0;
+  }
+
+  @media (max-width: 760px) {
+    .ds-header,
+    .ds-body {
+      padding-inline: calc(var(--ui-space-unit) * 4);
+    }
+    .ds-header h1 {
+      font-size: var(--ui-text-2xl);
+    }
+    .ds-nav a {
+      flex: none;
+    }
+  }
+}
+
+.ds-agent-workspace .ds-agent-preview {
+  height: 100%;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+}

@@ -1630,7 +1630,7 @@ export class RedisStreamsBus implements RawBus {
           redis: subRedis,
           streamKey,
           group,
-          startId: "$",
+          startId: opts.startFrom === "beginning" ? "0" : "$",
           logger: this.logger,
         });
         const initializedGroup = ensuredGroup.match<boolean | EventDeliveryStartFailed>({

@@ -4,6 +4,7 @@ export function isAdapterPlatform(x: unknown): x is AdapterPlatform {
   return (
     x === "discord" ||
     x === "github" ||
+    x === "native" ||
     x === "whatsapp" ||
     x === "slack" ||
     x === "telegram" ||

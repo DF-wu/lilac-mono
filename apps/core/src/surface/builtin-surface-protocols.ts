@@ -1,4 +1,5 @@
 import { discordSurfaceProtocol } from "./discord/discord-surface-protocol";
+import { nativeSurfaceProtocol } from "./native/native-protocol";
 import { githubSurfaceProtocol } from "./github/github-surface-protocol";
 import {
   SurfaceReplyTargetInvalid,
@@ -11,6 +12,7 @@ import type { MsgRef, MsgRefFor, RegisteredSurfacePlatform, SessionRefFor } from
 export const BUILTIN_SURFACE_PROTOCOLS = {
   discord: discordSurfaceProtocol,
   github: githubSurfaceProtocol,
+  native: nativeSurfaceProtocol,
 } satisfies {
   [P in RegisteredSurfacePlatform]: SurfaceProtocolRouting<P>;
 };

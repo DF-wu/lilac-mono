@@ -4,6 +4,8 @@ import type { JSONValue } from "../../../packages/utils/core-config/types";
 import { createPrompt } from "./prompt";
 import { configureProviders } from "./providers";
 import { configureDiscord } from "./discord";
+import { configureNative } from "./native";
+import { runOperatorConsole } from "./system";
 import { configureOptional } from "./optional";
 import {
   createConfigDocument,
@@ -173,7 +175,19 @@ async function configureInstallation(
       if (!reinstall) await configureExisting(prompt, draft);
     } else {
       await configureProviders(prompt, draft);
-      await configureDiscord(prompt, draft);
+      const surface = await prompt.select(
+        "Primary interface",
+        [
+          { value: "terminal", label: "Terminal only, no account setup" },
+          { value: "native", label: "Web" },
+          { value: "discord", label: "Discord" },
+        ],
+        "terminal",
+      );
+      if (surface === "native") await configureNative(prompt, draft);
+      if (surface === "discord" || (await prompt.confirm("Also connect Discord?", false))) {
+        await configureDiscord(prompt, draft);
+      }
       await configureOptional(prompt, draft);
     }
 
@@ -186,7 +200,7 @@ async function configureInstallation(
       existing,
       draft.configuredEnvironmentKeys,
     );
-    yield* composeArguments(root, deployment);
+    const compose = yield* composeArguments(root, deployment);
     const config = serializeConfigDocument(loaded.document);
     const current = getConfigValue(loaded.document, []);
     prompt.note("Review installation");
@@ -228,9 +242,31 @@ async function configureInstallation(
     prompt.note("Pulling images and starting containers…");
     yield* Result.await(startDeployment(root, images, draft.computerEnabled));
     const quotedRoot = "'" + root.replaceAll("'", "'\"'\"'") + "'";
-    prompt.note(
-      `Lilac is healthy. Mention your bot in an allowed Discord channel to try it.\n\nTo update this installation, run:\n  cd ${quotedRoot}\n  ./bin/lilac\n\nFor logs, run docker compose logs -f from:\n  ${root}`,
+    const nativeUrl = String(
+      draft.get(["surface", "native", "publicUrl"]) ?? "http://localhost:8787",
     );
+    prompt.note(`Lilac is healthy.${draft.get(["surface", "native", "enabled"]) === true ? ` Open ${nativeUrl} and sign in.` : ""}
+To talk to Lilac later:
+  cd ${quotedRoot}
+  docker compose exec --user root lilac lilac-tui
+To update:
+  ./bin/lilac`);
+    const action = await prompt.select(
+      "What next?",
+      [
+        { value: "talk", label: "Talk to Lilac now" },
+        { value: "exit", label: "Exit installer" },
+      ],
+      "talk",
+    );
+    if (action === "talk") {
+      const launched = await runOperatorConsole(root, compose);
+      launched.match({
+        ok: () => undefined,
+        err: (error) =>
+          prompt.note(`${error.message} Installation is complete. Run the command above to retry.`),
+      });
+    }
     return Result.ok({ installed: true, root });
   });
 }

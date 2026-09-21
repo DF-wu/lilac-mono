@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { architectureManifest, type ArchitectureManifest } from "../architecture/manifest.ts";
@@ -46,6 +48,10 @@ describe("repository syntax gate", () => {
     ["apps/core", "src/generated/output.ts", false],
     ["apps/core", "dist/main.js", false],
     ["apps/core", "src/vendor/library.ts", false],
+    ["apps/web", "node_modules/.vite/deps/react.js", false],
+    ["apps/example", "src/node_modules/dependency/index.ts", false],
+    ["packages/example", "node_modules/dependency/index.ts", false],
+    ["apps/example", "src/node_modules-helper.ts", true],
     ["apps/core", "src/ssh/remote-js/remote-runner.cjs", false],
     ["apps/core", "src/ssh/remote-js/remote-runner-entry.ts", true],
     ["apps/example", "src/ssh/remote-js/remote-runner.cjs", true],
@@ -89,6 +95,30 @@ describe("repository syntax gate", () => {
         rule: "lilac/no-exception-flow",
       },
     ]);
+  });
+
+  it("skips nested dependency caches while checking adjacent workspace sources", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "lilac-syntax-dependencies-"));
+    const modules = [
+      "node_modules/.vite/deps/optimized.js",
+      "src/node_modules/dependency/index.ts",
+      "src/runtime.ts",
+      "src/node_modules-helper.ts",
+    ];
+    try {
+      for (const module of modules) {
+        const file = path.join(root, "apps/example", module);
+        await mkdir(path.dirname(file), { recursive: true });
+        await writeFile(file, 'export function fail() { throw new Error("fixture"); }\n');
+      }
+      const findings = await scanSyntaxFindings(fixtureManifest(), root);
+      expect(findings.map(({ module, rule }) => ({ module, rule }))).toEqual([
+        { module: "src/node_modules-helper", rule: "lilac/no-exception-flow" },
+        { module: "src/runtime", rule: "lilac/no-exception-flow" },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("formats actionable diagnostics with the stable finding digest", () => {

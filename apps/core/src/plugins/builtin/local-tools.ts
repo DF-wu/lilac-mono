@@ -133,7 +133,23 @@ function getFsTools(context: CoreToolBuildContext): ReturnType<typeof fsTool> {
     maxInlineMediaBytesPerPart: context.runtime.config?.tools.media.maxInlineBytesPerPart,
     artifactOnly: context.requestContext?.safetyMode === "restricted",
     toolResultArtifacts: context.runtime.toolResultArtifacts,
-    resourceAccess: context.runtime.resourceAccess,
+    resourceAccess: context.runtime.resourceAccessForContext
+      ? context.runtime.resourceAccessForContext(
+          context.requestContext
+            ? {
+                requestId: context.requestContext.requestId,
+                requestDeliveryId: context.requestContext.requestDeliveryId,
+                sessionId: context.requestContext.sessionId,
+                requestClient: context.requestContext.requestClient,
+                serverOwnedRequest: context.requestContext.serverOwnedRequest,
+                requestInitiator: context.requestContext.requestInitiator,
+                requestInitiatorSessionId: context.requestContext.requestInitiatorSessionId,
+                safetyMode: context.requestContext.safetyMode,
+                cwd: context.cwd,
+              }
+            : undefined,
+        )
+      : context.runtime.resourceAccess,
     requestContext: context.requestContext
       ? {
           requestId: context.requestContext.requestId,

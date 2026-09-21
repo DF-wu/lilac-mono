@@ -95,6 +95,7 @@ describe("SqliteAgentRunJournal", () => {
     const checkpoint = createAgentRunCheckpoint({
       messages: [{ role: "user", content: "continue" }],
       currentTurnUserId: "user-1",
+      nativeOutput: { ordinal: 4, position: 2 },
     });
     const second = journal.writeCheckpoint(first, checkpoint).match({
       ok: (value) => value,
@@ -107,6 +108,7 @@ describe("SqliteAgentRunJournal", () => {
       messages: [{ role: "user", content: "latest" }],
       loadedCatalogIds: ["mcp_docs_search"],
       currentTurnUserId: "user-2",
+      nativeOutput: { ordinal: 9, position: 5 },
     });
     const third = journal.writeCheckpoint(second, latestCheckpoint).match({
       ok: (value) => value,

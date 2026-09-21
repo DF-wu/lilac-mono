@@ -156,6 +156,7 @@ describe("resident tools worker", () => {
     const metadataPath = path.join(root, "tools-build-info.json");
     const idPath = path.join(root, "tools-build-id");
     const workers = new Set<number>();
+    const cleanupErrors: unknown[] = [];
     const backend = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
@@ -282,12 +283,13 @@ describe("resident tools worker", () => {
         try {
           process.kill(pid, "SIGTERM");
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") cleanupErrors.push(error);
         }
       }
       backend.stop(true);
       await fs.rm(root, { recursive: true, force: true });
     }
+    expect(cleanupErrors).toEqual([]);
   }, 120_000);
 
   it("keeps operator credentials scoped to one invocation", async () => {

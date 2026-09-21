@@ -1,0 +1,61 @@
+.file-icon {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  flex: none;
+  vertical-align: -.125em;
+  --file-icon-text: #4c4f69;
+  --file-icon-mauve: #8839ef;
+  --file-icon-peach: #fe640b;
+  --file-icon-red: #d20f39;
+  --file-icon-blue: #1e66f5;
+  --file-icon-pink: #ea76cb;
+  --file-icon-lavender: #7287fd;
+  --file-icon-green: #40a02b;
+  --file-icon-sapphire: #209fb5;
+  --file-icon-overlay1: #8c8fa1;
+  --file-icon-maroon: #e64553;
+  --file-icon-yellow: #df8e1d;
+  --file-icon-sky: #04a5e5;
+  --file-icon-rosewater: #dc8a78;
+  --file-icon-teal: #179299;
+  --file-icon-flamingo: #dd7878;
+}
+:root[data-theme="dark"] .file-icon {
+  --file-icon-text: #cdd6f4;
+  --file-icon-mauve: #cba6f7;
+  --file-icon-peach: #fab387;
+  --file-icon-red: #f38ba8;
+  --file-icon-blue: #89b4fa;
+  --file-icon-pink: #f5c2e7;
+  --file-icon-lavender: #b4befe;
+  --file-icon-green: #a6e3a1;
+  --file-icon-sapphire: #74c7ec;
+  --file-icon-overlay1: #7f849c;
+  --file-icon-maroon: #eba0ac;
+  --file-icon-yellow: #f9e2af;
+  --file-icon-sky: #89dceb;
+  --file-icon-rosewater: #f5e0dc;
+  --file-icon-teal: #94e2d5;
+  --file-icon-flamingo: #f2cdcd;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] .file-icon {
+    --file-icon-text: #cdd6f4;
+    --file-icon-mauve: #cba6f7;
+    --file-icon-peach: #fab387;
+    --file-icon-red: #f38ba8;
+    --file-icon-blue: #89b4fa;
+    --file-icon-pink: #f5c2e7;
+    --file-icon-lavender: #b4befe;
+    --file-icon-green: #a6e3a1;
+    --file-icon-sapphire: #74c7ec;
+    --file-icon-overlay1: #7f849c;
+    --file-icon-maroon: #eba0ac;
+    --file-icon-yellow: #f9e2af;
+    --file-icon-sky: #89dceb;
+    --file-icon-rosewater: #f5e0dc;
+    --file-icon-teal: #94e2d5;
+    --file-icon-flamingo: #f2cdcd;
+  }
+}

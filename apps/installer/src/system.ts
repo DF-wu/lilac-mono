@@ -80,3 +80,25 @@ export async function checkMachine() {
     return Result.ok(undefined);
   });
 }
+
+export async function runOperatorConsole(root: string, compose: readonly string[]) {
+  const launched = await Result.tryPromise({
+    try: async () => {
+      const child = Bun.spawn([...compose, "exec", "--user", "root", "lilac", "lilac-tui"], {
+        cwd: root,
+        stdin: "inherit",
+        stdout: "inherit",
+        stderr: "inherit",
+      });
+      return await child.exited;
+    },
+    catch: () => new InstallerSystemFailed({ message: "Could not launch the terminal console." }),
+  });
+  return launched.andThen((code) =>
+    code === 0
+      ? Result.ok()
+      : Result.err(
+          new InstallerSystemFailed({ message: "The terminal console exited unsuccessfully." }),
+        ),
+  );
+}

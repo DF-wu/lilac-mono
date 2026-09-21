@@ -1,3 +1,4 @@
+import { nativeOutputEventSchema } from "./native-output";
 /**
  * Canonical event contracts for the Lilac monorepo.
  *
@@ -47,6 +48,7 @@ export type RequestLifecycleState = z.output<typeof requestLifecycleStateSchema>
 export const adapterPlatformSchema = z.enum([
   "discord",
   "github",
+  "native",
   "whatsapp",
   "slack",
   "telegram",
@@ -489,6 +491,13 @@ export const LILAC_EVENTS = defineLilacEvents({
     topic: fixedTopic("evt.request"),
     key: headerKey("request_id"),
     data: evtRequestReplyDataSchema,
+  },
+  EvtNativeOutput: {
+    type: "evt.native.output",
+    family: "native-output",
+    topic: fixedTopic("evt.native.output"),
+    key: dataKey("threadId"),
+    data: nativeOutputEventSchema,
   },
   EvtSurfaceOutputMessageCreated: {
     type: "evt.surface.output.message.created",

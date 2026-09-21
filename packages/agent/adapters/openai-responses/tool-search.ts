@@ -123,37 +123,35 @@ export function loadSearchResult(
   catalog: readonly AgentToolDefinition[],
   outcome?: { readonly result: OpaqueAgentValue; readonly isError: boolean },
 ): ResultType<AgentToolResult, AgentAdapterFailure> {
-  return Result.gen(function* () {
-    const content = [];
-    for (const part of result.message.content) {
-      if (part.type !== "tool-result") {
-        content.push(part);
-        continue;
-      }
-      const definitions: AgentToolDefinition[] = [];
-      const searchValue = searchResultValue(part.output, outcome);
-      if (searchValue !== undefined) {
-        const parsed = matchesSchema.safeParse(searchValue);
-        if (!parsed.success) return Result.err(invalid("Invalid tool-search result"));
-        for (const match of parsed.data.matches) {
-          const tool = catalog.find((entry) => entry.name === match.name);
-          if (!tool) return Result.err(invalid("Tool search selected an unavailable definition"));
-          definitions.push(tool);
-        }
-      }
-      content.push({
-        ...part,
-        providerOptions: {
-          ...part.providerOptions,
-          openai: {
-            ...part.providerOptions?.openai,
-            toolSearchTools: definitionMetadata(definitions),
-          },
-        },
-      });
+  const content = [];
+  for (const part of result.message.content) {
+    if (part.type !== "tool-result") {
+      content.push(part);
+      continue;
     }
-    return Result.ok({ ...result, message: { ...result.message, content } });
-  });
+    const definitions: AgentToolDefinition[] = [];
+    const searchValue = searchResultValue(part.output, outcome);
+    if (searchValue !== undefined) {
+      const parsed = matchesSchema.safeParse(searchValue);
+      if (!parsed.success) return Result.err(invalid("Invalid tool-search result"));
+      for (const match of parsed.data.matches) {
+        const tool = catalog.find((entry) => entry.name === match.name);
+        if (!tool) return Result.err(invalid("Tool search selected an unavailable definition"));
+        definitions.push(tool);
+      }
+    }
+    content.push({
+      ...part,
+      providerOptions: {
+        ...part.providerOptions,
+        openai: {
+          ...part.providerOptions?.openai,
+          toolSearchTools: definitionMetadata(definitions),
+        },
+      },
+    });
+  }
+  return Result.ok({ ...result, message: { ...result.message, content } });
 }
 
 export function supportsNativeToolSearch(

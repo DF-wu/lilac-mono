@@ -134,7 +134,7 @@ function isMissingFileError(error: unknown): boolean {
   return parsed.success && (parsed.data.code === "ENOENT" || parsed.data.code === "ENOTDIR");
 }
 
-function enqueueMutation<T, E>(
+export function withMcpConfigMutationLock<T, E>(
   configPath: string,
   operation: () => Promise<ResultType<T, E>>,
 ): Promise<ResultType<T, E>> {
@@ -491,7 +491,7 @@ export function mutateMcpConfigFile(options: {
   readonly mutation: McpConfigMutation;
   readonly fileDependencies?: McpConfigFileDependencies;
 }): Promise<ResultType<McpConfigMutationResult, McpConfigMutationError>> {
-  return enqueueMutation<McpConfigMutationResult, McpConfigMutationError>(
+  return withMcpConfigMutationLock<McpConfigMutationResult, McpConfigMutationError>(
     options.configPath,
     async () => {
       const read = await readMcpConfigFile(options.configPath);

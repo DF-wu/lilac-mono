@@ -220,6 +220,7 @@ export class Resource implements ServerTool {
   constructor(
     private readonly params: {
       access: ResourceAccess;
+      accessForContext?: (context: RequestContext | undefined) => ResourceAccess | undefined;
       toolResultArtifacts?: ToolResultArtifactStore;
       limits?: Partial<ResourceToolLimits>;
     },
@@ -282,6 +283,18 @@ export class Resource implements ServerTool {
       );
     }
 
+    const retainedAccess = this.params.accessForContext
+      ? this.params.accessForContext(ctx)
+      : this.params.access;
+    if (!retainedAccess)
+      return Result.err(
+        resourceToolFailure(
+          "denied",
+          "resource_access_denied",
+          "Resource access is unavailable for this request",
+        ),
+      );
+
     const targetResult = await establishTargetDirectory(ctx);
     const targetOutcome = targetResult.match<
       { readonly targetDirectory: string } | { readonly failure: ServerToolFailure }
@@ -330,7 +343,7 @@ export class Resource implements ServerTool {
       const materialized = await materializeSelectedResource({
         uri,
         options: materializeOptions,
-        retainedAccess: this.params.access,
+        retainedAccess,
         ...(transientAccess ? { transientAccess } : {}),
       });
       const outcome = materialized.match<

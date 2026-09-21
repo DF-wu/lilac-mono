@@ -1,0 +1,107 @@
+@keyframes surface-open {
+  from {
+    opacity: 0;
+    scale: 0.97;
+  }
+  to {
+    opacity: 1;
+    scale: 1;
+  }
+}
+@keyframes surface-close {
+  from {
+    opacity: 1;
+    scale: 1;
+  }
+  to {
+    opacity: 0;
+    scale: 0.97;
+  }
+}
+@keyframes backdrop-open {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes backdrop-close {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+:is(
+  [data-slot="dialog-content"],
+  [data-slot="popover-content"],
+  [data-slot="dropdown-menu-content"],
+  [data-slot="dropdown-menu-sub-content"],
+  [data-slot="context-menu-content"],
+  [data-slot="context-menu-sub-content"],
+  [data-slot="select-content"]
+) {
+  animation-duration: var(--ui-motion-duration);
+  animation-timing-function: ease;
+  animation-fill-mode: both;
+}
+:is(
+  [data-slot="dialog-content"],
+  [data-slot="popover-content"],
+  [data-slot="dropdown-menu-content"],
+  [data-slot="dropdown-menu-sub-content"],
+  [data-slot="context-menu-content"],
+  [data-slot="context-menu-sub-content"],
+  [data-slot="select-content"]
+)[data-open] {
+  animation-name: surface-open;
+}
+:is(
+  [data-slot="dialog-content"],
+  [data-slot="popover-content"],
+  [data-slot="dropdown-menu-content"],
+  [data-slot="dropdown-menu-sub-content"],
+  [data-slot="context-menu-content"],
+  [data-slot="context-menu-sub-content"],
+  [data-slot="select-content"]
+)[data-closed] {
+  animation-name: surface-close;
+}
+[data-slot="dialog-overlay"],
+[data-slot="dialog-content"].resource-preview-dialog {
+  animation-duration: var(--ui-motion-duration);
+  animation-timing-function: ease;
+  animation-fill-mode: both;
+}
+[data-slot="dialog-overlay"][data-open],
+[data-slot="dialog-content"].resource-preview-dialog[data-open] {
+  animation-name: backdrop-open;
+}
+[data-slot="dialog-overlay"][data-closed],
+[data-slot="dialog-content"].resource-preview-dialog[data-closed] {
+  animation-name: backdrop-close;
+}
+[data-slot="tooltip-content"] {
+  opacity: 1;
+  transition: opacity var(--ui-motion-duration) ease;
+  animation: none;
+}
+[data-slot="tooltip-content"][data-starting-style],
+[data-slot="tooltip-content"][data-ending-style] {
+  opacity: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-slot="dialog-overlay"],
+  [data-slot="dialog-content"],
+  [data-slot="popover-content"],
+  [data-slot*="menu-content"],
+  [data-slot*="menu-sub-content"],
+  [data-slot="select-content"] {
+    animation: none !important;
+  }
+  [data-slot="tooltip-content"] {
+    transition: none !important;
+  }
+}

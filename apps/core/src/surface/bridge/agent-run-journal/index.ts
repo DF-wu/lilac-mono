@@ -1,6 +1,8 @@
 import { Database } from "bun:sqlite";
 import {
   corePrimaryLineageV2Schema,
+  nativeOutputFrontierSchema,
+  type NativeOutputFrontier,
   storedMessagesV1Schema,
   type CorePrimaryLineageV2,
   type StoredMessageV1,
@@ -44,6 +46,7 @@ export const agentRunCheckpointV1Schema = z
     messages: storedMessagesV1Schema,
     mcpImages: z.array(mcpImageCheckpointReferenceSchema).optional(),
     corePrimaryLineage: corePrimaryLineageV2Schema.optional(),
+    nativeOutput: nativeOutputFrontierSchema.optional(),
     loadedCatalogIds: z.array(z.string().min(1)).optional(),
     currentTurnUserId: z.string().optional(),
     retainedRequestDeliveries: z.array(retainedDeliverySchema),
@@ -978,6 +981,7 @@ export function createAgentRunCheckpoint(input: {
   readonly mcpImages?: readonly McpImageCheckpointReference[];
   readonly messages: readonly StoredMessageV1[];
   readonly corePrimaryLineage?: CorePrimaryLineageV2;
+  readonly nativeOutput?: NativeOutputFrontier;
   readonly loadedCatalogIds?: readonly string[];
   readonly currentTurnUserId?: string;
   readonly retainedRequestDeliveries?: readonly {
@@ -990,6 +994,7 @@ export function createAgentRunCheckpoint(input: {
     messages: [...input.messages],
     ...(input.mcpImages?.length ? { mcpImages: [...input.mcpImages] } : {}),
     ...(input.corePrimaryLineage ? { corePrimaryLineage: input.corePrimaryLineage } : {}),
+    ...(input.nativeOutput ? { nativeOutput: input.nativeOutput } : {}),
     ...(input.loadedCatalogIds ? { loadedCatalogIds: [...input.loadedCatalogIds] } : {}),
     ...(input.currentTurnUserId ? { currentTurnUserId: input.currentTurnUserId } : {}),
     retainedRequestDeliveries: [...(input.retainedRequestDeliveries ?? [])],

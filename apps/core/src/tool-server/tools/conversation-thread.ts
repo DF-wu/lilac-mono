@@ -1,4 +1,6 @@
 import { z } from "zod";
+import type { NativeSearchService } from "../../surface/native/search";
+import { nativeSearchTool, isNativeSearchContext } from "../../surface/native/search-tools";
 import { Panic, Result, type Result as ResultType } from "better-result";
 import {
   serverToolFailure,
@@ -33,12 +35,12 @@ const searchInputSchema = z.object({
     .string()
     .min(1)
     .optional()
-    .describe("Only return threads in this Discord session/channel id."),
+    .describe("Only return threads in this session/channel id."),
   participantId: z
     .string()
     .min(1)
     .optional()
-    .describe("Only return threads containing this Discord user id."),
+    .describe("Only return threads containing this user id."),
   beforeTs: z.coerce
     .number()
     .nonnegative()
@@ -209,12 +211,28 @@ export async function resolveConversationThreadSummarizationToolOperation(
   return (await operation).mapError(conversationThreadFailure);
 }
 
+async function nativeConversationOperation<T>(
+  service: NativeSearchService | undefined,
+  context: ServerToolCallOptions["context"],
+  operation: (scoped: ConversationThreadToolService) => Promise<T>,
+): Promise<ServerToolResult<T>> {
+  const scoped = nativeSearchTool(service, context, (search, userId) =>
+    Result.ok(search.forUser(userId)),
+  );
+  return Result.gen(async function* () {
+    const bound = yield* scoped;
+    const value = yield* Result.await(captureConversationThreadOperation(() => operation(bound)));
+    return Result.ok(value);
+  });
+}
+
 export class ConversationThread implements ServerTool {
   private readonly tool: ServerTool;
 
   constructor(
     private readonly params: {
       service: ConversationThreadToolService;
+      nativeSearch?: NativeSearchService;
     },
   ) {
     this.tool = defineServerTool({
@@ -226,8 +244,15 @@ export class ConversationThread implements ServerTool {
             "Search summarized conversation threads. Returns compact threadId, title, and brief by default; use verbose for metadata/diagnostics or conversation.thread.read to expand a result. Multi-query combines variants of one intent into one merged ranking.",
           inputSchema: searchInputSchema,
           primaryPositional: { field: "query", variadic: true },
-          run: (input) =>
-            captureConversationThreadOperation(() => this.params.service.search(input)),
+          run: async (input, opts) => {
+            if (isNativeSearchContext(opts?.context))
+              return nativeConversationOperation(
+                this.params.nativeSearch,
+                opts?.context,
+                (service) => service.search(input),
+              );
+            return captureConversationThreadOperation(() => this.params.service.search(input));
+          },
         }),
         [CONVERSATION_THREAD_CALLABLE_IDS.metadata]: callable({
           name: "Conversation Thread Metadata",
@@ -235,8 +260,15 @@ export class ConversationThread implements ServerTool {
             "Read conversation thread summary metadata by ids without loading transcript messages. Supports up to 20 threadIds for candidate comparison.",
           inputSchema: metadataInputSchema,
           primaryPositional: { field: "threadIds", variadic: true },
-          run: (input) =>
-            captureConversationThreadOperation(() => this.params.service.metadata(input)),
+          run: async (input, opts) => {
+            if (isNativeSearchContext(opts?.context))
+              return nativeConversationOperation(
+                this.params.nativeSearch,
+                opts?.context,
+                (service) => service.metadata(input),
+              );
+            return captureConversationThreadOperation(() => this.params.service.metadata(input));
+          },
         }),
         [CONVERSATION_THREAD_CALLABLE_IDS.read]: callable({
           name: "Conversation Thread Read",
@@ -244,15 +276,35 @@ export class ConversationThread implements ServerTool {
             "Read a conversation thread transcript by id with offset/limit pagination. Output messages use content for message text.",
           inputSchema: readInputSchema,
           primaryPositional: "threadId",
-          run: (input) => captureConversationThreadOperation(() => this.params.service.read(input)),
+          run: async (input, opts) => {
+            if (isNativeSearchContext(opts?.context))
+              return nativeConversationOperation(
+                this.params.nativeSearch,
+                opts?.context,
+                (service) => service.read(input),
+              );
+            return captureConversationThreadOperation(() => this.params.service.read(input));
+          },
         }),
         [CONVERSATION_THREAD_CALLABLE_IDS.runSummarization]: callable({
           name: "Conversation Thread Run Summarization",
           description: "Hidden admin runner for conversation thread refresh and summarization.",
           inputSchema: runSummarizationInputSchema,
           hidden: true,
-          run: (input) =>
-            captureConversationThreadOperation(() => this.params.service.runSummarization(input)),
+          run: async (input, opts) => {
+            if (isNativeSearchContext(opts?.context))
+              return Result.err(
+                serverToolFailure({
+                  kind: "denied",
+                  code: "native_summary_admin",
+                  message: "Native threads refresh with their content revision",
+                  retryable: false,
+                }),
+              );
+            return captureConversationThreadOperation(() =>
+              this.params.service.runSummarization(input),
+            );
+          },
         }),
       }),
     });

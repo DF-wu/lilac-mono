@@ -1,7 +1,177 @@
 # MIGRATIONS.md
 
+## Temporary operator conversations
+
+Native v1 thread records accept optional `ephemeral: { sessionId, lastSeenAt }`. Normal records omit
+it. Each operator invocation uses a UUID session identifier and root bearer token on a private,
+loopback-only gateway. POST `/api/operator/session` creates or renews that invocation; DELETE ends it.
+These endpoints are absent from the public web gateway. Existing native RPC schemas are unchanged.
+Expired invocations cannot recreate their deleted thread. Deletion receipts and scrubbed tombstones
+remain under the existing native deletion contract. Startup cancels/deletes abandoned temporary
+conversations before accepted-request recovery. A downgrade must not read records with the new field;
+back up native storage before upgrading and restore the matching backup when rolling back.
+
+The image now contains the console and uses its existing Bun runtime. Standalone TUI release assets,
+local/Clerk terminal login, and client disk cache support are removed. Existing host TUI binaries and
+old credential/cache directories are not automatically deleted. Stop using those binaries and remove
+those local files if no longer needed. Web authentication and retained conversations are unchanged.
+Operator-only Core startup is enabled by the existing container operator-token hash without enabling
+the public native listener or requiring Discord. The native owner ID is reused if web is enabled later.
+
+
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
+
+## Native surface version 1
+
+The optional native surface adds version-1 JSON/oRPC client contracts, native session/message refs,
+and `native-surface.db`. Existing installations keep native disabled. The new store owns users,
+memberships, threads, turns, command receipts, upload handles, read/reaction state and bounded replay
+changes. It uses its own SQLite schema version and strict per-record codecs. It does not import or
+replace Discord's store. Native private projection provenance never enters display payloads.
+
+Version-2 core config accepts optional `surface.native`. Version-1 config normalization leaves native
+disabled. Old-message selection and storage retention both default to disabled. Existing v2 config
+without this section behaves unchanged. Remove the section before using a strict older parser.
+
+The transcript/resource database advances to schema 13. Schema 12 adds native resource ownership
+references, and schema 13 retains canonical native transcripts while native history refers to them.
+Global transcript age/count pruning cannot remove native conversation history behind the surface.
+Rewind, deletion and explicit native retention release those references through the existing recovery
+path. Resource records accept immutable native upload origins; their origin thread controls access.
+
+Native refs are additive to current surface/workflow event schemas. Frozen legacy snapshot validators
+still reject native values. Restore a consistent backup before downgrading a database to an older
+build, and drain native work before removing the gateway. Keep native state together with existing
+request-delivery, WAL, transcript/resource, event-bus and managed blob data.
+
+Browser projection caches are scoped by installation, principal, protocol and projection version.
+They are disposable: unsupported versions or invalid coverage require a fresh recent window, while
+server conversation history remains authoritative. Never copy one user's cache into another scope.
+
+## Native automatic titles
+
+The optional `autoTitle` flag on `threads.create` marks a supplied title as an automatic fallback.
+Updated web and TUI clients opt in for first-line titles and leave manual draft titles unchanged.
+Clients that omit the flag keep their explicit titles. Update clients and servers together.
+
+Native v1 thread records accept optional private `titleGeneration` metadata containing the first input
+ID and the initial/refinement phase. Existing records without it keep their titles. No backfill or
+SQLite schema change is needed. Manual renames remove this metadata; automatic updates also verify
+that history has not been rewound or deleted. Older strict parsers cannot read records containing the
+new field. Restore a consistent backup before downgrading.
+
+## Native file resolution
+
+The v1 RPC contract adds authenticated `files.resolve` with a thread ID and filesystem path. It
+returns the resolved path, filename, media type, and existing authenticated preview URL. Resolution
+requires thread edit access and uses the thread's filesystem permissions and deny paths. Existing
+published-path records and file-serving routes are reused; no database migration is required.
+Update clients and servers together to enable inline-path previews.
+
+## Native web local panel layouts
+
+The web app stores device-local panel preferences under `lilac-panels-v1`, scoped by installation and
+principal. The JSON value contains the global sidebar width/open state and right-panel width/open
+state pairs keyed by thread ID. Missing, invalid, or unavailable storage uses the existing defaults.
+Older clients ignore the new key. No backend data or existing browser preferences require migration.
+
+The value now also stores each thread's ordered tabs, file targets, and active tab ID in an optional
+`tabs` field. Existing values without tabs retain their layouts and start with the Agents tab.
+Malformed tab data resets tabs without discarding layout preferences. File targets accept an optional
+inclusive `endLine` alongside `line` for range navigation. File contents and subagent transcript
+selection are not stored. Builds predating this field reject the extended value and use
+default layouts; removing `tabs` from the value restores their ability to read the layout preferences.
+
+## Native personal sidebar queues
+
+The native store adds `native_user_preferences` and `native_thread_preferences`. These additive
+SQLite tables hold each user's inactivity threshold, section, order, and activity frontier. Existing
+threads enter Active in creation order, newest first, and inactive threads settle when the sidebar is
+read. The default threshold is three days. Pinned threads and running conversations do not auto-settle.
+New conversation activity re-enqueues settled threads at the top of Active; activity does not reorder
+an already active thread. Renaming and changing access do not count as conversation activity.
+
+The v1 RPC contract adds `sidebar.preferences`, `sidebar.configure`, `sidebar.list`, and `sidebar.move`.
+These operations always use the authenticated user and require read access to each affected thread.
+Settling and pinning are personal organization, independent of shared archive or deletion. No background
+worker or shared thread mutation is introduced. Update clients and servers together for the new UI.
+
+## Native account profiles
+
+Native users can edit their own display name and avatar. Local profiles use the existing name and
+managed avatar fields; startup preserves the owner's edits. Clerk installations save names and images
+in Clerk, then project them locally. Display names update Clerk's first name and clear its last name;
+sign-in usernames are unchanged. The optional stored `providerAvatarUrl` holds Clerk's profile image
+URL. Existing records need no backfill. Older strict record parsers cannot read this new field.
+
+The v1 wire contract adds `profile.get` and `profile.update`, optional `avatarUrl` on display users, and
+optional `starterAvatarUrl` on thread summaries. Authenticated `PUT`/`DELETE /api/profile/avatar` edits
+only the caller's avatar. `GET /api/users/:id/avatar` reads local public profile images. Managed blob
+references and provider user IDs remain private. Clients and servers should be updated together.
+
+## Native display identity and previews
+
+Native v1 user records now accept an optional `avatar` containing a managed blob reference and a
+validated raster image media type. Existing records omit it and retain their initials fallback.
+The stable `lilac` service-user ID and authority are unchanged; startup preserves its display name
+and avatar. Only the owner can change either. Avatar reads require native authentication and are
+installation-wide, independent of private thread attachment grants.
+
+Display catalogs optionally carry `agent` identity. Existing disposable client caches without it
+remain readable and use the default identity until catalog reconciliation. Thread summaries add
+optional `starterDisplayName` and `displayStatus` display fields; the server emits these using existing
+thread/read state. The existing `native_surface_read` table is initialized by `NativeStore`, with no
+schema or read-state migration.
+
+The filesystem `fs.read_bytes` request accepts optional `prefixBytes` from 1 through 65,536.
+Without it, reads retain their whole-file limit and result shape. Prefix reads return at most that
+many bytes and add `totalBytes`, the original size reported by the opened file. `bytesLength` remains
+the returned prefix length and `fileHash` hashes those returned bytes; prefix reads do not establish
+a full-file edit hash. Both local and SSH paths retain their existing denied-path checks.
+
+Text preview endpoints cap returned UTF-8 prefixes at 64 KiB and preserve the originating thread's
+resource authorization. Binary data returns a displayable error. Published file previews read a bounded prefix of the
+latest file, as before. The new preview endpoints do not create file snapshots.
+
+## Native web local drafts
+
+The existing scoped browser draft cache also holds unsent new conversations under `draft:` IDs.
+Draft rows accept optional title and model selection metadata. Existing rows remain readable; no
+IndexedDB version or backend schema changes. An older web build may ignore rows with the new optional
+metadata. File selections remain in memory and must be reattached after a browser reload.
+
+## Native terminal cache version 1
+
+The terminal client writes versioned private credential and transcript files separately. Its
+`cache-v1.json` atomically commits replay checkpoints and hydrated/deferred slots, bounded to 64 threads
+and 32 MiB. Cache entries are scoped by installation, principal, protocol and projection version.
+Unsupported or corrupt cache files reset from the server; they never migrate canonical history.
+Credential files are keyed by the server origin hash and contain session or OAuth refresh credentials,
+never the local Basic password. Logout removes the credential and purges the principal's cache.
+See [native setup](docs/native-surface.md) for locations and permissions.
+
+Fresh installer deployments default to native web/terminal with authentication. Updating or reinstalling
+an existing deployment retains its configured surfaces and port bindings. Existing Core configurations
+without `surface.native` remain disabled; no configuration-version bump enables a listener implicitly.
+
+## Native output recovery frontier
+
+Native runs add an optional `nativeOutput` field to version-1 agent-run WAL checkpoints. It stores
+`ordinal`, the last native output publication covered by that checkpoint, and `position`, the display
+ordering boundary. Existing checkpoints without this field remain valid. Non-native runs omit it.
+The checkpoint writer waits for the captured durable publication barrier before writing the field with
+canonical history. A failed publication retains the earlier checkpoint or accepted input.
+
+The new fixed `evt.native.output` topic uses nonexpiring managed durable delivery. Its internal events
+carry a publication ordinal separate from their original display position. Native recovery publishes a
+reset through the saved ordinal, retaining the checkpointed projection prefix and removing abandoned
+output. Recovery from accepted work without a checkpoint retains no prior output. Private native
+projection provenance supports this rollback and never enters client payloads.
+
+Drain native runs before downgrading to a build without this contract. Older strict WAL readers may
+reject native checkpoints containing the new field and restart from accepted input. At-least-once
+model/tool execution remains unchanged; the frontier does not make external effects exactly once.
 
 ## MCP value source prefixes
 
@@ -528,3 +698,14 @@ retry time and revokes active controls, and startup reconciliation does not repe
 failure while the target and configuration revision still match. A changed target or progress-port
 configuration clears the stale gate and allows projection to be attempted again; retryable failures
 continue to use the existing durable backoff state.
+
+## Native subagent inspection
+
+The native v1 RPC contract adds `subagents.list` and `subagents.read`. Both require read access to the
+parent thread and exclude runs whose parent request is no longer in canonical history. Workflow run
+IDs remain opaque, including their existing colon-separated prefixes. The new panel reads existing
+workflow and transcript stores; there is no stored-data migration. Update clients and servers together.
+
+Transcript responses contain bounded pages of display text and activity labels. They omit system
+prompts, raw reasoning, tool arguments, and provider state. Older runs without retained transcripts
+show an unavailable state. Panel visibility and pixel width are local to the current workspace session.

@@ -16,6 +16,8 @@ import {
   type LilacDataForType,
   type LilacEventTypesForTopic,
   type LilacEventType,
+  type WorkOrFanoutSubscriptionOptions,
+  type TailSubscriptionOptions,
 } from "../index";
 
 type Equal<TLeft, TRight> =
@@ -25,6 +27,13 @@ type Equal<TLeft, TRight> =
       : false
     : false;
 type Expect<T extends true> = T;
+
+type ManagedInitialFrontier = Expect<
+  Equal<WorkOrFanoutSubscriptionOptions["startFrom"], "beginning" | "latest" | undefined>
+>;
+type TailKeepsOffsetContract = Expect<
+  Equal<"startFrom" extends keyof TailSubscriptionOptions ? true : false, false>
+>;
 
 type RegistryPayloads = {
   [TType in LilacEventType]: z.output<(typeof lilacEventCodecRegistry)[TType]["dataSchema"]>;
@@ -126,7 +135,9 @@ function compileEventDefinitionContract(): void {
 }
 
 it("keeps registry schema outputs and publish overrides compile-equivalent to contracts", () => {
-  expect(Object.keys(lilacEventCodecRegistry)).toHaveLength(25);
+  expect(Object.keys(lilacEventCodecRegistry)).toHaveLength(26);
+  expect<ManagedInitialFrontier>(true).toBe(true);
+  expect<TailKeepsOffsetContract>(true).toBe(true);
   expect<RegistryPayloadsEqualContractPayloads>(true).toBe(true);
   expect<CatalogNamesEqualEventTypeNames>(true).toBe(true);
   expect<CatalogWireTypesEqualRegistryKeys>(true).toBe(true);

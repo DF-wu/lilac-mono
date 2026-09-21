@@ -1,4 +1,5 @@
 import { RuleTester } from "oxlint/plugins-dev";
+import { fileURLToPath } from "node:url";
 
 import { noFixedTestWaitRule } from "./test-waits.mts";
 import {
@@ -10,6 +11,7 @@ import {
 } from "./production-syntax.mts";
 
 const ruleTester = new RuleTester({
+  cwd: fileURLToPath(new URL("../..", import.meta.url)),
   languageOptions: { sourceType: "module" },
 });
 
@@ -34,6 +36,10 @@ const productionFile = "apps/example/src/example.ts";
 
 ruleTester.run("lilac/no-exception-flow", noExceptionFlowRule, {
   valid: [
+    {
+      code: "function run() { throw new Error('dependency'); }",
+      filename: "apps/example/node_modules/.vite/deps/generated.js",
+    },
     {
       code: "Result.try({ try: () => operation(), catch: (cause) => mapCause(cause) });",
       filename: productionFile,

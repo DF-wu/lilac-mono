@@ -101,6 +101,17 @@ export type GithubNormalizedRequestMetadata = {
     | { readonly kind: "issue"; readonly issueNumber: number };
 };
 
+export type NativeRequestMetadata = {
+  readonly threadId: string;
+  readonly authorUserId: string;
+  readonly starterUserId: string;
+  readonly turnId: string;
+  readonly historyGeneration: number;
+  readonly inputId: string;
+  readonly requestId: string;
+  readonly requestDeliveryId: string;
+};
+
 export type CorrelatedSurfaceRequestMetadata<P extends RegisteredSurfacePlatform> = {
   readonly actor?: { readonly platform: P; readonly userId: string };
   readonly origin?: {
@@ -109,17 +120,20 @@ export type CorrelatedSurfaceRequestMetadata<P extends RegisteredSurfacePlatform
     readonly messageId: string;
   };
   readonly github?: GithubNormalizedRequestMetadata;
+  readonly native?: NativeRequestMetadata;
 };
 
 export type SurfaceProtocolRequestMetadata = {
   readonly inferredMessageId?: string;
   readonly githubTrigger?: GithubTriggerProjection;
+  readonly native?: NativeRequestMetadata;
   readonly verifiedIngress?: boolean;
 };
 
 export type SurfaceRequestProjectionRouting<P extends RegisteredSurfacePlatform> = {
   readonly inferRequestMessageRef: boolean;
   readonly acceptsGithubMetadata?: boolean;
+  readonly acceptsNativeMetadata?: boolean;
   projectProtocolMetadata?(input: {
     readonly requestId: string;
     readonly sessionRef: SessionRefFor<P>;

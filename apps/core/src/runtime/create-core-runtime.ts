@@ -1,3 +1,10 @@
+import { withNativeThreadSummaries } from "./native-summarization";
+import { openNativeInstallation, type NativeInstallation } from "../surface/native/installation";
+import {
+  createNativeRuntime,
+  nativeRuntimeResultToHost,
+  type NativeRuntime,
+} from "../surface/native/runtime";
 import { maintainWorkflowArtifactPublications } from "../workflow/workflow-artifact-store";
 import { captureError } from "../shared/error-capture.js";
 import Redis from "ioredis";
@@ -1959,6 +1966,14 @@ export async function createCoreRuntime(
     };
   }
   const initialCoreConfig = coreConfigSelection.config;
+  let currentCoreConfig = initialCoreConfig;
+  const operatorTokenSha256 = process.env.LILAC_OPERATOR_TOKEN_SHA256;
+  const nativeEnabled = initialCoreConfig.surface.native.enabled || Boolean(operatorTokenSha256);
+  const discordEnabled =
+    !nativeEnabled || Boolean(process.env[initialCoreConfig.surface.discord.tokenEnv]);
+  let nativeInstallation: NativeInstallation | null = null;
+  let nativeRuntime: NativeRuntime | null = null;
+  let nativeConversationPlanner: ConversationThreadToolService | undefined;
   let activeTranscriptRetention = initialCoreConfig.agent.transcriptRetention;
   const createdBlobStore = await createCoreBlobStore({
     config: initialCoreConfig.blobStorage,
@@ -2043,6 +2058,10 @@ export async function createCoreRuntime(
     await cleanup.run("discoveryService.createFailure.close", async () => {
       discoveryService?.close();
       discoveryService = null;
+    });
+    await cleanup.run("nativeInstallation.createFailure.close", async () => {
+      nativeInstallation?.database.close();
+      nativeInstallation = null;
     });
     await cleanup.run("conversationThreadStore.createFailure.close", async () => {
       conversationThreadStore?.close();
@@ -2476,6 +2495,12 @@ export async function createCoreRuntime(
     if (requestDeliveryMaintenanceOperation) return;
     const cycle = Promise.resolve().then(async () => {
       const activeBlobStore = blobStore;
+      const nativeMaintenance = await nativeRuntime?.maintain();
+      nativeMaintenance?.match({
+        ok: () => undefined,
+        err: (error) =>
+          logger.warn("Native surface maintenance deferred", { error: error.message }),
+      });
       const [
         maintained,
         maintainedBlobs,
@@ -2741,6 +2766,8 @@ export async function createCoreRuntime(
     await loaded.match({
       ok: (config) => async () => {
         activeTranscriptRetention = config.agent.transcriptRetention;
+        currentCoreConfig = config;
+        await nativeRuntime?.updateCatalog();
         if (coreConfigValidationHadError) {
           logger.info("core-config hot-reload validation recovered", {
             reason,
@@ -2757,7 +2784,7 @@ export async function createCoreRuntime(
 
         coreConfigValidationHadError = false;
         lastCoreConfigValidationError = null;
-        await adapter.refreshCoreConfig();
+        if (discordEnabled) await adapter.refreshCoreConfig();
         await toolServer?.reload();
         conversationThreadMaterializer?.markAllDirty();
       },
@@ -3082,8 +3109,71 @@ export async function createCoreRuntime(
               ),
             };
           }
+          resourceService = new CoreResourceService({
+            store: activeTranscriptStore,
+            blobStore: activeBlobStore,
+            originAdapters: new ResourceOriginAdapterRegistry(
+              discordEnabled ? [createDiscordResourceOriginAdapter(adapter)] : [],
+            ),
+            logger: createLogger({ module: "core-resource" }),
+          });
+          if (nativeEnabled) {
+            nativeInstallation = nativeRuntimeResultToHost(
+              await openNativeInstallation({
+                config: startupConfig.surface.native,
+                secrets: { ...env.native, operatorTokenSha256 },
+                dataDir: env.dataDir,
+              }),
+            );
+            nativeRuntime = nativeRuntimeResultToHost(
+              await createNativeRuntime({
+                installation: nativeInstallation,
+                bus: durableBus,
+                blobs: activeBlobStore,
+                transcript: activeTranscriptStore,
+                resourceAccess: resourceService,
+                getConfig: () => currentCoreConfig,
+                dataDir: env.dataDir,
+                workspaceRoot: canonicalWorkspaceRoot,
+                denyPaths: runtimeFsDenyPaths(),
+                subscriptionPrefix,
+                customCommands,
+                mcpRegistry,
+                adapters: {
+                  registeredPlatforms: () =>
+                    surfaceRuntimeRegistry?.adapterResolver().registeredPlatforms() ?? [],
+                  resolve: (platform) =>
+                    surfaceRuntimeRegistry?.adapterResolver().resolve(platform) ?? null,
+                },
+                conversationThreads: () => nativeConversationPlanner,
+                runner: () => stopAgentRunner ?? undefined,
+                workflows: activeDurableWorkflowStore,
+                deliveryState: (id) =>
+                  requestDeliveryStore!
+                    .load(id)
+                    .map((record) => {
+                      if (record.state !== "terminal") return "owned" as const;
+                      const kind = record.outcome.kind;
+                      if (kind === "completed" || kind === "cancelled") return kind;
+                      return "failed" as const;
+                    })
+                    .tryRecover((error) =>
+                      error._tag === "RequestDeliveryNotFound"
+                        ? Result.ok("missing" as const)
+                        : Result.err(error),
+                    ),
+                reportFatalError,
+                warn: (message, error) => logger.warn(message, { error: error.message }),
+                publishableKey: env.native.clerkPublishableKey,
+                operatorTokenSha256,
+              }),
+            );
+            nativeRuntimeResultToHost(await nativeRuntime.startOutput());
+          }
           const registryCreated = composeBuiltinSurfaceRuntimes({
             discordAdapter: adapter,
+            discordEnabled,
+            ...(nativeRuntime ? { nativeDescriptor: nativeRuntime.descriptor } : {}),
             discordQuestionAnswers: adapter,
             githubAdapter,
             descriptorBoundDiscordEventSource: discordEventSource,
@@ -3130,17 +3220,9 @@ export async function createCoreRuntime(
             };
           }
           surfaceRuntimeRegistry = registry;
-          const surfaceAdapter = registry
-            .entries()
-            .find((descriptor) => descriptor.platform === "discord")!.adapter;
-          resourceService = new CoreResourceService({
-            store: activeTranscriptStore,
-            blobStore: activeBlobStore,
-            originAdapters: new ResourceOriginAdapterRegistry([
-              createDiscordResourceOriginAdapter(surfaceAdapter),
-            ]),
-            logger: createLogger({ module: "core-resource" }),
-          });
+          const surfaceAdapter =
+            registry.entries().find((descriptor) => descriptor.platform === "discord")?.adapter ??
+            adapter;
           const initialResourceMaintenance = await resourceService.maintain({
             limit: 64,
           });
@@ -3343,6 +3425,11 @@ export async function createCoreRuntime(
               return await continueFlushed();
             },
           };
+          if (nativeRuntime)
+            conversationThreadSummarizationRunner = withNativeThreadSummaries(
+              conversationThreadSummarizationRunner,
+              nativeRuntime.refreshSummaries,
+            );
           stopDiscordSearchIndexer = await startDiscordSearchIndexer({
             eventSource: discordEventSource,
             search: discordSearchService,
@@ -3492,67 +3579,69 @@ export async function createCoreRuntime(
             },
           });
 
-          stopRouter = adaptDiscordRequestRouterStartOutcomeToHost(
-            await startDiscordRequestRouter({
-              adapter: surfaceAdapter,
-              bus: durableBus,
-              blobStore: activeBlobStore,
-              resourceRegistry: resourceService,
-              attachmentCache: discordSearchStore?.attachmentCacheAccess(),
-              messageCache: discordSearchStore ?? undefined,
-              requestDelivery: discordRequestDelivery,
-              subscriptionId: subId(subscriptionPrefix, "router"),
-              customCommands,
-              contextReport: buildContextReport,
-              shouldSuppressAdapterEvent: async ({ evt }) =>
-                shouldSuppressRouterForWorkflowReply({
-                  store: activeDurableWorkflowStore,
-                  event: evt,
-                }),
-              transcriptStore: transcriptStore ?? undefined,
-            }),
-            (retainedRouter) => {
-              retainCoreResidualDiscordRequestRouter({
-                router: retainedRouter,
-                retainRouter: (router) => {
-                  residualRouter = router;
-                },
-                retainDoneSupervision: (supervision) => {
-                  residualRouterDoneSupervisions.push(supervision);
-                },
-              });
-            },
-            (diagnostics) => {
-              if (diagnostics.startupFailure) {
-                logger.error(
-                  "Discord request router startup failed before cleanup Panic",
-                  formatTaggedErrorForLog(diagnostics.startupFailure),
-                );
-              }
-              if (diagnostics.ordinaryCleanupFailure) {
-                logger.error(
-                  "Discord request router startup rollback had ordinary cleanup failures",
-                  formatTaggedErrorForLog(diagnostics.ordinaryCleanupFailure),
-                );
-              }
-              if (diagnostics.additionalPanicCount > 0) {
-                logger.error("Discord request router startup rollback had additional Panics");
-              }
-            },
-          );
-          routerSupervision = superviseCoreRouterDone({
-            done: stopRouter.done,
-            isStopping: () => !started,
-            markUnhealthy: () => {
-              routerSubscriptionHealthy = false;
-              runtimeFullyStarted = false;
-            },
-            reportFatalError,
-          });
+          if (discordEnabled) {
+            stopRouter = adaptDiscordRequestRouterStartOutcomeToHost(
+              await startDiscordRequestRouter({
+                adapter: surfaceAdapter,
+                bus: durableBus,
+                blobStore: activeBlobStore,
+                resourceRegistry: resourceService,
+                attachmentCache: discordSearchStore?.attachmentCacheAccess(),
+                messageCache: discordSearchStore ?? undefined,
+                requestDelivery: discordRequestDelivery,
+                subscriptionId: subId(subscriptionPrefix, "router"),
+                customCommands,
+                contextReport: buildContextReport,
+                shouldSuppressAdapterEvent: async ({ evt }) =>
+                  shouldSuppressRouterForWorkflowReply({
+                    store: activeDurableWorkflowStore,
+                    event: evt,
+                  }),
+                transcriptStore: transcriptStore ?? undefined,
+              }),
+              (retainedRouter) => {
+                retainCoreResidualDiscordRequestRouter({
+                  router: retainedRouter,
+                  retainRouter: (router) => {
+                    residualRouter = router;
+                  },
+                  retainDoneSupervision: (supervision) => {
+                    residualRouterDoneSupervisions.push(supervision);
+                  },
+                });
+              },
+              (diagnostics) => {
+                if (diagnostics.startupFailure) {
+                  logger.error(
+                    "Discord request router startup failed before cleanup Panic",
+                    formatTaggedErrorForLog(diagnostics.startupFailure),
+                  );
+                }
+                if (diagnostics.ordinaryCleanupFailure) {
+                  logger.error(
+                    "Discord request router startup rollback had ordinary cleanup failures",
+                    formatTaggedErrorForLog(diagnostics.ordinaryCleanupFailure),
+                  );
+                }
+                if (diagnostics.additionalPanicCount > 0) {
+                  logger.error("Discord request router startup rollback had additional Panics");
+                }
+              },
+            );
+            routerSupervision = superviseCoreRouterDone({
+              done: stopRouter.done,
+              isStopping: () => !started,
+              markUnhealthy: () => {
+                routerSubscriptionHealthy = false;
+                runtimeFullyStarted = false;
+              },
+              reportFatalError,
+            });
 
-          logger.debug("Discord request router started", {
-            subscriptionId: subId(subscriptionPrefix, "router"),
-          });
+            logger.debug("Discord request router started", {
+              subscriptionId: subId(subscriptionPrefix, "router"),
+            });
+          }
 
           const conversationThreadToolService: ConversationThreadToolService | undefined =
             conversationThreadService
@@ -3581,6 +3670,8 @@ export async function createCoreRuntime(
                 })()
               : undefined;
 
+          nativeConversationPlanner = conversationThreadToolService;
+
           pluginManager = createCoreToolPluginManager({
             runtime: {
               bus: durableBus,
@@ -3589,6 +3680,9 @@ export async function createCoreRuntime(
               surfaceAdapterResolver: registry.adapterResolver(),
               getConfig: () => getCoreConfig(),
               discovery: discoveryService ?? undefined,
+              nativeSearch: nativeRuntime?.search,
+              nativeAdapterForContext: nativeRuntime?.nativeAdapterForContext,
+              resourceAccessForContext: nativeRuntime?.resourceAccessForContext,
               conversationThreads: conversationThreadToolService,
               discordSearch: discordSearchService ?? undefined,
               transcriptStore: transcriptStore ?? undefined,
@@ -3628,6 +3722,16 @@ export async function createCoreRuntime(
             operatorTokenSha256: process.env.LILAC_OPERATOR_TOKEN_SHA256,
             authorizeControlRequest: (input) => requestControlAuthority.authorize(input),
             resolveServerSafetyMode: async (context) => {
+              if (context.requestClient === "native" && context.sessionId && nativeInstallation) {
+                return nativeInstallation.store
+                  .getThreadRecord(context.sessionId.replace(/^native:/u, ""))
+                  .andThen((thread) => nativeInstallation!.store.getUser(thread.starterId))
+                  .match({
+                    ok: (user) =>
+                      user.toolMode === "full" ? ("trusted" as const) : ("restricted" as const),
+                    err: () => "restricted" as const,
+                  });
+              }
               if (context.requestClient !== "discord" || !context.sessionId) return "restricted";
               const config = await getCoreConfig();
               const session = discordSurfaceStore?.getSession(context.sessionId);
@@ -3802,6 +3906,14 @@ export async function createCoreRuntime(
             bus: durableBus,
             blobStore: activeBlobStore,
             requestDelivery: requestDeliveryCoordinator,
+            ...(nativeRuntime
+              ? {
+                  nativeExecution: nativeRuntime.execution.runnerLifecycle,
+                  createNativeOutput: nativeRuntime.createOutput,
+                  nativeResourceAccess: nativeRuntime.scopedResources,
+                  nativeConversationThreads: nativeRuntime.scopedThreads,
+                }
+              : {}),
             onRequestSettled: (id) => adapter.presence.requestSettled(id),
             ...(agentRunJournal ? { agentRunJournal } : {}),
             subscriptionId: subId(subscriptionPrefix, "agent-runner"),
@@ -3876,6 +3988,10 @@ export async function createCoreRuntime(
             },
           });
           stopAgentRunner = startedAgentRunner;
+          if (nativeRuntime) {
+            nativeRuntimeResultToHost(await nativeRuntime.recoverOperator());
+            nativeRuntimeResultToHost(await nativeRuntime.execution.recoverMutations());
+          }
 
           logger.debug("Bus agent runner started");
 
@@ -4032,7 +4148,12 @@ export async function createCoreRuntime(
             logger.debug("Conversation thread worker started");
           }
 
+          if (nativeRuntime) nativeRuntimeResultToHost(await nativeRuntime.execution.kick());
           startedAgentRunner.activate();
+          if (nativeRuntime) {
+            nativeRuntimeResultToHost(nativeRuntime.startIngress());
+            logger.info("Native surface started");
+          }
 
           runtimeFullyStarted = routerSubscriptionHealthy;
 
@@ -4088,9 +4209,9 @@ export async function createCoreRuntime(
     if (stopPass === "none") return;
     started = false;
     conversationThreadSummarizationStopping = true;
-
     const cleanup = createCoreRuntimeCleanupSupervisor(priorPanic);
     const safe = cleanup.run;
+    await safe("native.ingress.stop", async () => nativeRuntime?.stopIngress());
     const ownedBlobStore = stopPass === "full" ? blobStore : null;
     if (stopPass === "full") blobStore = null;
     const gracefulAgentRunner = stopAgentRunner;
@@ -4223,6 +4344,7 @@ export async function createCoreRuntime(
     if (stopPass === "full") {
       // Stop in reverse order (best-effort).
       await safe("agentRunner.stop", () => stopAgentRunner?.stop() ?? Promise.resolve());
+      await safe("native.output.stop", () => nativeRuntime?.stopOutput() ?? Promise.resolve());
       await safe("questionService.stop", () => questionService?.stop() ?? Promise.resolve());
       questionService = null;
       await safe(
@@ -4390,6 +4512,11 @@ export async function createCoreRuntime(
         conversationThreadStore?.close();
         conversationThreadStore = null;
         conversationThreadService = null;
+      });
+      await safe("nativeInstallation.close", async () => {
+        nativeInstallation?.database.close();
+        nativeInstallation = null;
+        nativeRuntime = null;
       });
       await safe("coreConfigWatcher.stop", async () => {
         stopCoreConfigWatcher();
