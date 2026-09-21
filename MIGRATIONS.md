@@ -1,5 +1,24 @@
 # MIGRATIONS.md
 
+## Temporary operator conversations
+
+Native v1 thread records accept optional `ephemeral: { sessionId, lastSeenAt }`. Normal records omit
+it. Each operator invocation uses a UUID session identifier and root bearer token on a private,
+loopback-only gateway. POST `/api/operator/session` creates or renews that invocation; DELETE ends it.
+These endpoints are absent from the public web gateway. Existing native RPC schemas are unchanged.
+Expired invocations cannot recreate their deleted thread. Deletion receipts and scrubbed tombstones
+remain under the existing native deletion contract. Startup cancels/deletes abandoned temporary
+conversations before accepted-request recovery. A downgrade must not read records with the new field;
+back up native storage before upgrading and restore the matching backup when rolling back.
+
+The image now contains the console and uses its existing Bun runtime. Standalone TUI release assets,
+local/Clerk terminal login, and client disk cache support are removed. Existing host TUI binaries and
+old credential/cache directories are not automatically deleted. Stop using those binaries and remove
+those local files if no longer needed. Web authentication and retained conversations are unchanged.
+Operator-only Core startup is enabled by the existing container operator-token hash without enabling
+the public native listener or requiring Discord. The native owner ID is reused if web is enabled later.
+
+
 This file records persisted-data, wire, and protocol migrations. Manual `core-config.yaml` upgrades are
 documented separately in [`docs/core-config-migrations.md`](docs/core-config-migrations.md).
 

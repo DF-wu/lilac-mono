@@ -36,6 +36,7 @@ export type NativeGatewayOptions = {
   reportFatalError: (error: Error) => void;
   resources?: { handle: (request: Request, actorId: string) => Promise<Response | undefined> };
   webRoot?: string;
+  operatorSession?: (request: Request) => Promise<Response>;
 };
 type Peer = { send: (message: string | ArrayBufferLike | Uint8Array) => number };
 type SocketData = {
@@ -342,6 +343,8 @@ export function createNativeGateway(options: NativeGatewayOptions) {
     original: Request,
   ): Promise<Response | undefined> {
     const url = new URL(request.url);
+    if (url.pathname === "/api/operator/session" && options.operatorSession)
+      return options.operatorSession(request);
     if (url.pathname === "/api/auth/info" && request.method === "GET")
       return privateJson(options.publicAuth);
     if (url.pathname === "/api/auth/login" && request.method === "POST") {

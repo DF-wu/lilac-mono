@@ -464,7 +464,7 @@ export class NativeStore {
         if (!Number.isSafeInteger(cursorTime) || cursorTime < 0)
           return Result.err(nativeFailure("invalid", "Thread cursor is invalid"));
         const records = yield* store.readRows(
-          `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.archived')=? AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' ORDER BY r.updated_at DESC,r.id LIMIT ?`,
+          `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.archived')=? AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' ORDER BY r.updated_at DESC,r.id LIMIT ?`,
           [
             cursorTime,
             cursorTime,
@@ -521,7 +521,7 @@ export class NativeStore {
     this.db
       .query(`INSERT OR IGNORE INTO native_thread_preferences(user_id,thread_id,section,position,last_activity,touched_at)
       SELECT ?,r.id,'active',MIN(COALESCE((SELECT MIN(p.position) FROM native_thread_preferences p WHERE p.user_id=? AND p.section='active'),0),-json_extract(r.data_json,'$.value.createdAt'))-1,${sidebarActivity},0
-      FROM native_records r WHERE r.kind='thread' AND json_extract(r.data_json,'$.value.deleted')=0
+      FROM native_records r WHERE r.kind='thread' AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL
       AND (?='owner' OR json_extract(r.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?))
       AND NOT EXISTS(SELECT 1 FROM native_thread_preferences p WHERE p.user_id=? AND p.thread_id=r.id)`)
       .run(user.id, user.id, user.role, user.id, user.id, user.id);
@@ -561,7 +561,7 @@ export class NativeStore {
         if (input.cursor && (separator < 1 || !Number.isSafeInteger(position) || !cursorId))
           return Result.err(nativeFailure("invalid", "Sidebar cursor is invalid"));
         const predicate = `FROM native_thread_preferences p JOIN native_records r ON r.kind='thread' AND r.id=p.thread_id
-        WHERE p.user_id=? AND p.section=? AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.archived')=0
+        WHERE p.user_id=? AND p.section=? AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.archived')=0
         AND (?='owner' OR json_extract(r.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?))`;
         const params = [actorId, input.section, user.role, actorId, actorId];
         const total =
@@ -715,7 +715,13 @@ export class NativeStore {
 
   createThread(
     actorId: string,
-    input: { commandId: string; title?: string; autoTitle?: boolean; modelId?: string },
+    input: {
+      commandId: string;
+      title?: string;
+      autoTitle?: boolean;
+      modelId?: string;
+      ephemeralSessionId?: string;
+    },
   ): NativeStoreResult<NativeThread> {
     const store = this;
     return nativeStoreTransaction(this.db, () =>
@@ -734,6 +740,9 @@ export class NativeStore {
             const thread: NativeThreadRecord = {
               id,
               starterId: actorId,
+              ephemeral: input.ephemeralSessionId
+                ? { sessionId: input.ephemeralSessionId, lastSeenAt: store.now() }
+                : undefined,
               title: input.title ?? "New thread",
               titleGeneration:
                 (input.autoTitle ?? input.title === undefined) ? { phase: "initial" } : undefined,
@@ -752,6 +761,49 @@ export class NativeStore {
           },
         );
         return store.getThread(actorId, result.threadId);
+      }),
+    );
+  }
+
+  listEphemeralThreads(): NativeStoreResult<NativeThreadRecord[]> {
+    return nativeStoreTransaction(this.db, () =>
+      this.readRows(
+        "SELECT * FROM native_records WHERE kind='thread' AND json_extract(data_json,'$.value.ephemeral') IS NOT NULL AND (json_extract(data_json,'$.value.deleted')=0 OR json_extract(data_json,'$.value.mutationPending')=1)",
+        [],
+      ).map((records) =>
+        records.flatMap((record) => (record.kind === "thread" ? [record.value] : [])),
+      ),
+    );
+  }
+
+  getEphemeralThread(sessionId: string): NativeStoreResult<NativeThreadRecord | undefined> {
+    return nativeStoreTransaction(this.db, () =>
+      this.readRows(
+        "SELECT * FROM native_records WHERE kind='thread' AND json_extract(data_json,'$.value.ephemeral.sessionId')=? LIMIT 1",
+        [sessionId],
+      ).map(
+        (records) =>
+          records.flatMap((record) => (record.kind === "thread" ? [record.value] : []))[0],
+      ),
+    );
+  }
+
+  touchEphemeralThread(threadId: string): NativeStoreResult<void> {
+    const store = this;
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const thread = yield* store.getThreadRecord(threadId);
+        if (!thread.ephemeral || thread.deleted || thread.mutationPending)
+          return Result.err(nativeFailure("not-found", "Temporary conversation has ended"));
+        store.writeRecord(
+          thread.id,
+          {
+            kind: "thread",
+            value: { ...thread, ephemeral: { ...thread.ephemeral, lastSeenAt: store.now() } },
+          },
+          thread.id,
+        );
+        return Result.ok();
       }),
     );
   }

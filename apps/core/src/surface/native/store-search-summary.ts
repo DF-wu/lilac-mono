@@ -27,7 +27,7 @@ export class NativeSummaryStore {
         .query(`DELETE FROM native_thread_summaries
         WHERE NOT EXISTS(SELECT 1 FROM native_records t WHERE t.kind='thread'
           AND t.id=native_thread_summaries.thread_id
-          AND json_extract(t.data_json,'$.value.deleted')=0
+          AND json_extract(t.data_json,'$.value.deleted')=0 AND json_extract(t.data_json,'$.value.ephemeral') IS NULL
           AND json_extract(t.data_json,'$.value.historyGeneration')=native_thread_summaries.history_generation)`)
         .run();
       return Result.ok(deleted.changes);
@@ -39,7 +39,7 @@ export class NativeSummaryStore {
     return nativeStoreTransaction(this.params.db, () =>
       Result.gen(function* () {
         const thread = yield* self.params.store.getThreadRecord(threadId);
-        if (thread.deleted || thread.mutationPending) return Result.ok(null);
+        if (thread.deleted || thread.mutationPending || thread.ephemeral) return Result.ok(null);
         const row = self.params.db
           .query<NativeSummaryRow, [string, number]>(
             "SELECT format_version,data_json FROM native_thread_summaries WHERE thread_id=? AND history_generation=?",
@@ -59,7 +59,7 @@ export class NativeSummaryStore {
           [number]
         >(`SELECT t.format_version,t.data_json FROM native_records t
         LEFT JOIN native_thread_summaries s ON s.thread_id=t.id
-        WHERE t.kind='thread' AND json_extract(t.data_json,'$.value.deleted')=0 AND json_extract(t.data_json,'$.value.mutationPending')=0
+        WHERE t.kind='thread' AND json_extract(t.data_json,'$.value.deleted')=0 AND json_extract(t.data_json,'$.value.ephemeral') IS NULL AND json_extract(t.data_json,'$.value.mutationPending')=0
         AND EXISTS(SELECT 1 FROM native_records r WHERE r.kind='turn' AND r.thread_id=t.id)
         AND (s.thread_id IS NULL OR s.history_generation<>json_extract(t.data_json,'$.value.historyGeneration') OR s.content_revision<json_extract(t.data_json,'$.value.revision'))
         ORDER BY COALESCE(s.generated_at,0),t.updated_at,t.id LIMIT ?`)
@@ -156,7 +156,7 @@ export class NativeSummaryStore {
             NativeSummaryRow,
             (string | number)[]
           >(`SELECT s.format_version,s.data_json FROM native_thread_summaries s JOIN native_records t ON t.kind='thread' AND t.id=s.thread_id
-        WHERE json_extract(t.data_json,'$.value.deleted')=0 AND json_extract(t.data_json,'$.value.mutationPending')=0
+        WHERE json_extract(t.data_json,'$.value.deleted')=0 AND json_extract(t.data_json,'$.value.ephemeral') IS NULL AND json_extract(t.data_json,'$.value.mutationPending')=0
         AND s.history_generation=json_extract(t.data_json,'$.value.historyGeneration')
         AND (?='owner' OR json_extract(t.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=t.id AND g.user_id=?))
         AND ${filters.join(" AND ")} ORDER BY t.updated_at DESC,t.id LIMIT ? OFFSET ?`)

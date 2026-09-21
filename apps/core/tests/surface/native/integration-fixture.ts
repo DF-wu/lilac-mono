@@ -105,6 +105,7 @@ function fixturePluginManager(): CoreToolPluginManager {
 export async function createNativeIntegrationFixture(
   options: {
     port?: number;
+    operatorTokenSha256?: string;
     password?: string;
     allowedOrigins?: string[];
     installationSecrets?: NativeInstallationSecrets;
@@ -325,6 +326,7 @@ export async function createNativeIntegrationFixture(
           if (record.outcome.kind === "cancelled") return "cancelled" as const;
           return "failed" as const;
         }),
+      operatorTokenSha256: options.operatorTokenSha256,
       reportFatalError: (error) => {
         fatalErrors.push(error);
       },

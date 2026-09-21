@@ -164,3 +164,25 @@ test("reopening an installation preserves agent and account profiles", async () 
     avatar: { mediaType: "image/png", blob: { byteLength: 42 } },
   });
 });
+
+test("operator-only installation needs no public credentials and preserves the owner when web is enabled", async () => {
+  const options = await fixture();
+  const first = (
+    await openNativeInstallation({
+      ...options,
+      config: { ...options.config, enabled: false, installationId: undefined },
+      secrets: { operatorTokenSha256: "a".repeat(64) },
+    })
+  ).unwrap();
+  first.store
+    .upsertUser({ ...first.store.getUser("owner").unwrap(), displayName: "Preserved owner" })
+    .unwrap();
+  expect(
+    (await first.auth.authenticate(new Request("http://localhost/api/bootstrap"))).isErr(),
+  ).toBe(true);
+  first.store.close();
+  const web = (await openNativeInstallation(options)).unwrap();
+  installations.push(web);
+  expect(web.store.getUser("owner").unwrap().displayName).toBe("Preserved owner");
+  expect(web.store.getUser("owner").unwrap().providerId).toBe("owner");
+});

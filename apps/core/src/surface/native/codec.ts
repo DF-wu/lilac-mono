@@ -41,6 +41,7 @@ export const nativeThreadRecordSchema = z.strictObject({
       inputId: id.optional(),
     })
     .optional(),
+  ephemeral: z.strictObject({ sessionId: z.uuid(), lastSeenAt: revision }).optional(),
   starterId: id,
   archived: z.boolean(),
   deleted: z.boolean(),

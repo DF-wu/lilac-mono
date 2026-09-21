@@ -30,6 +30,9 @@ import { NativeConfigService } from "./config-service";
 import { createNativeExecution, type NativeRunnerControl } from "./execution";
 import { nativeFailure } from "./errors";
 import { createNativeGateway } from "./gateway";
+import { captureError } from "../../shared/error-capture";
+import { createNativeOperator, NATIVE_OPERATOR_PORT } from "./operator";
+import type { NativeAuthenticator } from "./auth";
 import { createNativeMetrics } from "./metrics";
 import type { NativeInstallation } from "./installation";
 import { nativeThreadId } from "./native-protocol";
@@ -87,10 +90,11 @@ export type NativeRuntimeOptions = {
   reportFatalError: (error: Error) => void;
   warn: (message: string, error: Error) => void;
   publishableKey?: string;
+  operatorTokenSha256?: string;
 };
 
 export async function createNativeRuntime(options: NativeRuntimeOptions) {
-  const { store, database, auth, clerk, login } = options.installation;
+  const { store, database, auth: publicAuth, clerk, login } = options.installation;
   const metrics = createNativeMetrics();
   let skills: readonly DiscoveredSkill[] = (
     await discoverSkills({ workspaceRoot: options.workspaceRoot, dataDir: options.dataDir })
@@ -135,6 +139,21 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     getOldMessageSelectionMaxAgeMs: () =>
       options.getConfig().surface.native.oldMessageSelectionMaxAgeMs ?? undefined,
   });
+  const operator = options.operatorTokenSha256
+    ? createNativeOperator({
+        tokenSha256: options.operatorTokenSha256,
+        ownerId: options.getConfig().surface.native.auth.ownerId,
+        store,
+        execution,
+      })
+    : undefined;
+  const auth: NativeAuthenticator = {
+    ...publicAuth,
+    checkSession: (principal) =>
+      principal.provider === "operator" && operator
+        ? operator.auth.checkSession(principal)
+        : publicAuth.checkSession(principal),
+  };
   const surface = new NativeSurfaceStore(database, store, async (actorId, input) =>
     (
       await options.bus.publish(
@@ -257,7 +276,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     }),
     store,
     auth,
-    installationId: nativeConfig.installationId!,
+    installationId: nativeConfig.installationId ?? "operator",
     catalogs,
     config,
     execution,
@@ -273,7 +292,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     reportFatalError: options.reportFatalError,
     hostname: nativeConfig.host,
     port: nativeConfig.port,
-    auth,
+    auth: publicAuth,
     publicAuth: {
       provider: nativeConfig.auth.provider,
       ...(nativeConfig.auth.provider === "clerk"
@@ -294,6 +313,56 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     },
     webRoot: path.resolve(import.meta.dir, "../../../../web/dist"),
   });
+  const operatorGateway = operator
+    ? createNativeGateway({
+        metrics,
+        reportFatalError: options.reportFatalError,
+        hostname: "127.0.0.1",
+        port: NATIVE_OPERATOR_PORT,
+        auth: operator.auth,
+        publicAuth: { provider: "local" },
+        operatorSession: operator.handle,
+        services,
+        getViewer: (id) => store.getUser(id).map(nativeViewer),
+        resources: { handle: (request, actorId) => resources.handle(request, actorId) },
+      })
+    : undefined;
+  let operatorTimer: ReturnType<typeof setInterval> | undefined;
+  let operatorMaintenance: Promise<void> | undefined;
+  async function maintainOperator() {
+    const captured = await Result.tryPromise({ try: () => operator!.reap(), catch: captureError });
+    if (captured.isErr()) {
+      options.reportFatalError(captured.error.cause);
+      return;
+    }
+    captured.value.match({
+      ok: () => undefined,
+      err: (error) => options.warn("Temporary conversation cleanup deferred", error),
+    });
+  }
+  function tickOperator() {
+    if (operatorMaintenance) return;
+    operatorMaintenance = maintainOperator().then(() => {
+      operatorMaintenance = undefined;
+    });
+  }
+  async function recoverOperator() {
+    if (operator) return operator.reap(true);
+    // Persisted temporary sessions still need cleanup when operator access is disabled on this boot.
+    const threads = store.listEphemeralThreads();
+    return Result.gen(async function* () {
+      for (const thread of yield* threads) {
+        if (!thread.ephemeral) continue;
+        yield* Result.await(
+          execution.deleteThread(thread.starterId, {
+            threadId: thread.id,
+            commandId: `operator-end:${thread.ephemeral.sessionId}`,
+          }),
+        );
+      }
+      return Result.ok();
+    });
+  }
   let output: NativeOutputSubscription | undefined;
   let outputStopping = false;
   let unsubscribe: (() => void) | undefined;
@@ -437,10 +506,13 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   }
 
   function startIngress() {
-    const started = gateway.start();
-    return started.map((address) => {
+    return Result.gen(function* () {
+      const publicAddress = nativeConfig.enabled ? yield* gateway.start() : undefined;
+      const operatorAddress = operatorGateway ? yield* operatorGateway.start() : undefined;
+      const address = publicAddress ?? operatorAddress ?? { url: nativeConfig.publicUrl };
       unsubscribe = store.subscribeChanges(kick);
-      return address;
+      if (operator) operatorTimer = setInterval(tickOperator, 1000);
+      return Result.ok(address);
     });
   }
 
@@ -450,6 +522,9 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     stopAgentIdentity();
     unsubscribe?.();
     unsubscribe = undefined;
+    clearInterval(operatorTimer);
+    await operatorMaintenance;
+    await operatorGateway?.stop();
     await gateway.stop();
     const uploads = await resources.stop();
     const publications = await execution.drainPublications();
@@ -523,6 +598,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     stopIngress,
     stopOutput,
     recover,
+    recoverOperator,
     maintain,
     refreshSummaries,
     updateCatalog,

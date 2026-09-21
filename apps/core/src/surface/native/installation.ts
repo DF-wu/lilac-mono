@@ -14,6 +14,7 @@ export class NativeInstallationFailed extends TaggedError("NativeInstallationFai
 
 export type NativeInstallationError = NativeInstallationFailed | NativeStoreError | NativeAuthError;
 export type NativeInstallationSecrets = {
+  operatorTokenSha256?: string;
   localUsername?: string;
   localPasswordHash?: string;
   sessionSecret?: string;
@@ -57,11 +58,20 @@ async function validateNativeInstallation(
   config: NativeSurfaceConfig,
   secrets: NativeInstallationSecrets,
 ): Promise<Result<void, NativeInstallationFailed>> {
-  if (!config.enabled || !config.installationId || config.auth.ownerId === "lilac") {
+  if (
+    (!config.enabled && !secrets.operatorTokenSha256) ||
+    (config.enabled && !config.installationId) ||
+    config.auth.ownerId === "lilac"
+  ) {
     return Result.err(
       new NativeInstallationFailed({ message: "Native installation configuration is invalid" }),
     );
   }
+  if (secrets.operatorTokenSha256 && !/^[0-9a-f]{64}$/.test(secrets.operatorTokenSha256))
+    return Result.err(
+      new NativeInstallationFailed({ message: "Operator token digest is invalid" }),
+    );
+  if (!config.enabled) return Result.ok();
   if (config.auth.provider === "clerk") {
     if (
       !secrets.clerkSecretKey ||
@@ -140,15 +150,20 @@ async function initializeNativeInstallation(
   const store = new NativeStore(database);
   return Result.gen(async function* () {
     yield* store.initialize();
-    const providerId =
-      config.auth.provider === "local"
-        ? (secrets.localUsername ?? "owner")
-        : config.auth.ownerProviderUserId;
+    let providerId = config.auth.ownerProviderUserId;
+    if (config.auth.provider === "local") providerId = secrets.localUsername ?? "owner";
+    if (!config.enabled) providerId = `operator:${config.auth.ownerId}`;
     if (!providerId)
       return Result.err(
         new NativeInstallationFailed({ message: "Native owner provider identity is required" }),
       );
-    const owner = yield* store.findUserByProviderId(providerId);
+    const owner = yield* store
+      .getUser(config.auth.ownerId)
+      .tryRecover((error) =>
+        error._tag === "NativeStoreFailure" && error.code === "not-found"
+          ? Result.ok(undefined)
+          : Result.err(error),
+      );
     yield* store.upsertUser({
       ...owner,
       id: config.auth.ownerId,
@@ -166,6 +181,17 @@ async function initializeNativeInstallation(
       role: "service",
       toolMode: "full",
     });
+    if (!config.enabled) {
+      const unavailable = () =>
+        Result.err(authFailure("unauthorized", "Public native access is disabled"));
+      const auth: NativeAuthenticator = {
+        checkSession: unavailable,
+        authenticate: async () => unavailable(),
+        reauthenticate: async () => unavailable(),
+        logout: async () => unavailable(),
+      };
+      return Result.ok({ database, store, auth });
+    }
     if (config.auth.provider === "local") {
       if (!secrets.localPasswordHash || !secrets.sessionSecret || !config.installationId) {
         return Result.err(

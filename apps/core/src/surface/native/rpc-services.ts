@@ -444,6 +444,14 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
           !auth.checkSession(principal).match({ ok: () => true, err: () => false })
         )
           return;
+        const visibleToClient = store.getThreadRecord(threadId).match({
+          ok: (record) =>
+            principal.provider === "operator"
+              ? record.ephemeral?.sessionId === principal.sessionId
+              : !record.ephemeral,
+          err: () => true,
+        });
+        if (!visibleToClient) continue;
         const thread = store
           .getThread(principal.userId, threadId)
           .match({ ok: (value) => value, err: () => null });
@@ -477,7 +485,10 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
       get(principal, input) {
         return Result.gen(function* () {
           const viewer = yield* store.getUser(principal.userId);
-          const items = yield* store.listThreads(principal.userId, { limit: 30 });
+          const items =
+            principal.provider === "operator"
+              ? []
+              : yield* store.listThreads(principal.userId, { limit: 30 });
           const lastListed = items.at(-1);
           const nextCursor =
             items.length === 30 && lastListed
@@ -543,6 +554,13 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
         });
       },
       create(principal, input) {
+        if (principal.provider === "operator")
+          return Result.err(
+            nativeFailure(
+              "forbidden",
+              "Operator conversations are managed by the terminal session",
+            ),
+          );
         return modelChoice(principal, input.modelId).andThen(() =>
           store.createThread(principal.userId, input),
         );

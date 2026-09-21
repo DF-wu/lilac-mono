@@ -90,9 +90,9 @@ export function createNativeRouter(
   return api.router({
     connection: {
       reauthenticate: api.connection.reauthenticate.handler(async ({ input, context }) => {
-        const request = new Request(context.request.url, {
-          headers: { authorization: `Bearer ${input.token}` },
-        });
+        const headers = new Headers(context.request.headers);
+        headers.set("authorization", `Bearer ${input.token}`);
+        const request = new Request(context.request.url, { headers });
         const principal = nativeRpcValue(
           await context.auth.reauthenticate(context.principal, request),
         );

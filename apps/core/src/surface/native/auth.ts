@@ -3,7 +3,7 @@ import { Result, TaggedError } from "better-result";
 export type NativePrincipal = {
   userId: string;
   providerUserId: string;
-  provider: "local" | "clerk";
+  provider: "local" | "clerk" | "operator";
   expiresAt: number;
   sessionId: string;
 };

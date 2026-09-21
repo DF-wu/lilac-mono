@@ -1967,9 +1967,10 @@ export async function createCoreRuntime(
   }
   const initialCoreConfig = coreConfigSelection.config;
   let currentCoreConfig = initialCoreConfig;
+  const operatorTokenSha256 = process.env.LILAC_OPERATOR_TOKEN_SHA256;
+  const nativeEnabled = initialCoreConfig.surface.native.enabled || Boolean(operatorTokenSha256);
   const discordEnabled =
-    !initialCoreConfig.surface.native.enabled ||
-    Boolean(process.env[initialCoreConfig.surface.discord.tokenEnv]);
+    !nativeEnabled || Boolean(process.env[initialCoreConfig.surface.discord.tokenEnv]);
   let nativeInstallation: NativeInstallation | null = null;
   let nativeRuntime: NativeRuntime | null = null;
   let nativeConversationPlanner: ConversationThreadToolService | undefined;
@@ -3116,11 +3117,11 @@ export async function createCoreRuntime(
             ),
             logger: createLogger({ module: "core-resource" }),
           });
-          if (startupConfig.surface.native.enabled) {
+          if (nativeEnabled) {
             nativeInstallation = nativeRuntimeResultToHost(
               await openNativeInstallation({
                 config: startupConfig.surface.native,
-                secrets: env.native,
+                secrets: { ...env.native, operatorTokenSha256 },
                 dataDir: env.dataDir,
               }),
             );
@@ -3164,6 +3165,7 @@ export async function createCoreRuntime(
                 reportFatalError,
                 warn: (message, error) => logger.warn(message, { error: error.message }),
                 publishableKey: env.native.clerkPublishableKey,
+                operatorTokenSha256,
               }),
             );
             nativeRuntimeResultToHost(await nativeRuntime.startOutput());
@@ -3986,8 +3988,10 @@ export async function createCoreRuntime(
             },
           });
           stopAgentRunner = startedAgentRunner;
-          if (nativeRuntime)
+          if (nativeRuntime) {
+            nativeRuntimeResultToHost(await nativeRuntime.recoverOperator());
             nativeRuntimeResultToHost(await nativeRuntime.execution.recoverMutations());
+          }
 
           logger.debug("Bus agent runner started");
 
