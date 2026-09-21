@@ -2875,30 +2875,6 @@ const WAVE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[]
   ],
 ]);
 
-const TUI_PERSISTED_CODECS = [
-  { exportName: "decodeTuiCache", fixture: "tuiCacheCodecCases" },
-  { exportName: "decodeTuiCredential", fixture: "tuiCredentialCodecCases" },
-].map(
-  ({ exportName, fixture }): PersistedCodecRegistration => ({
-    identity: { module: "src/persistence-codec.ts", exportName },
-    inputParameter: 0,
-    fixtureCatalog: { module: "src/persistence-codec.ts", exportName: fixture },
-    provenance: ["current"],
-    legacyOutcome: "rejected",
-  }),
-);
-
-const TUI_PERSISTED_CONSUMERS: readonly PersistedStoreConsumerRegistration[] = [
-  {
-    identity: { module: "src/cache.ts", exportName: "DiskNativeCache.load" },
-    codecs: [{ module: "src/persistence-codec.ts", exportName: "decodeTuiCache" }],
-  },
-  {
-    identity: { module: "src/auth.ts", exportName: "savedCredential" },
-    codecs: [{ module: "src/persistence-codec.ts", exportName: "decodeTuiCredential" }],
-  },
-];
-
 const CORE_NATIVE_RECORD_PERSISTED_CODEC = {
   identity: {
     module: "src/surface/native/codec.ts",
@@ -3561,89 +3537,48 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
     ].map((include) => ({ include })),
     "architecture/unknown-free-module": [],
     "architecture/persisted-codec-contract":
-      root === "apps/tui"
-        ? ["src/persistence-codec.ts", "src/cache.ts", "src/auth.ts"].map((include) => ({
-            include,
-          }))
-        : root === "apps/installer"
-          ? [{ include: INSTALLER_CODEX_TOKENS_PERSISTED_CONSUMER.identity.module }]
-          : root === "packages/tool-results"
-            ? [
-                {
-                  include: BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.module,
-                },
-                {
-                  include: BLOB_TOOL_RESULT_ARTIFACT_METADATA_CONSUMER.identity.module,
-                },
-              ]
-            : root === "apps/core"
-              ? [
-                  { include: CORE_NATIVE_RECORD_PERSISTED_CODEC.identity.module },
-                  { include: "src/surface/native/store.ts" },
-                  { include: "src/surface/native/store-surface.ts" },
-                  { include: CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity.module },
-                  { include: "src/surface/native/store-search-summary.ts" },
-                  {
-                    include: "src/conversation/thread-summary-persistence-codec.ts",
-                  },
-                  { include: "src/conversation/thread-store.ts" },
-                  { include: "src/transcript/transcript-persistence-codec.ts" },
-                  { include: "src/transcript/transcript-store.ts" },
-                  { include: CORE_CLAUDE_ATTEMPT_PERSISTED_CONSUMER.identity.module },
-                  { include: "src/surface/bridge/agent-run-journal/index.ts" },
-                  { include: "src/migration/frozen-graceful-restart-store.ts" },
-                  {
-                    include: "src/workflow/workflow-artifact-persistence-codec.ts",
-                  },
-                  { include: "src/workflow/workflow-persistence-codec.ts" },
-                  { include: "src/workflow/workflow-artifact-store.ts" },
-                  { include: "src/workflow/durable-workflow-store.ts" },
-                  {
-                    include: "scripts/legacy-graceful-restart-blob-migration.ts",
-                  },
-                  { include: "scripts/legacy-workflow-blob-migration.ts" },
-                  {
-                    include: CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC.identity.module,
-                  },
-                  {
-                    include: CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CONSUMER.identity.module,
-                  },
-                ]
-              : root === "packages/utils"
-                ? [
-                    {
-                      include: UTILS_CODEX_TOKENS_PERSISTED_CODEC.identity.module,
-                    },
-                    {
-                      include: UTILS_CODEX_TOKENS_PERSISTED_CONSUMER.identity.module,
-                    },
-                  ]
-                : [],
-    "architecture/persisted-codec-fixture-catalog":
-      root === "apps/tui"
-        ? [{ include: "src/persistence-codec.ts" }]
+      root === "apps/installer"
+        ? [{ include: INSTALLER_CODEX_TOKENS_PERSISTED_CONSUMER.identity.module }]
         : root === "packages/tool-results"
           ? [
               {
                 include: BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.module,
               },
+              {
+                include: BLOB_TOOL_RESULT_ARTIFACT_METADATA_CONSUMER.identity.module,
+              },
             ]
           : root === "apps/core"
             ? [
                 { include: CORE_NATIVE_RECORD_PERSISTED_CODEC.identity.module },
+                { include: "src/surface/native/store.ts" },
+                { include: "src/surface/native/store-surface.ts" },
                 { include: CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity.module },
+                { include: "src/surface/native/store-search-summary.ts" },
                 {
                   include: "src/conversation/thread-summary-persistence-codec.ts",
                 },
+                { include: "src/conversation/thread-store.ts" },
                 { include: "src/transcript/transcript-persistence-codec.ts" },
+                { include: "src/transcript/transcript-store.ts" },
+                { include: CORE_CLAUDE_ATTEMPT_PERSISTED_CONSUMER.identity.module },
                 { include: "src/surface/bridge/agent-run-journal/index.ts" },
                 { include: "src/migration/frozen-graceful-restart-store.ts" },
                 {
                   include: "src/workflow/workflow-artifact-persistence-codec.ts",
                 },
                 { include: "src/workflow/workflow-persistence-codec.ts" },
+                { include: "src/workflow/workflow-artifact-store.ts" },
+                { include: "src/workflow/durable-workflow-store.ts" },
+                {
+                  include: "scripts/legacy-graceful-restart-blob-migration.ts",
+                },
+                { include: "scripts/legacy-workflow-blob-migration.ts" },
                 {
                   include: CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC.identity.module,
+                },
+                {
+                  include: CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CONSUMER.identity.module,
                 },
               ]
             : root === "packages/utils"
@@ -3651,8 +3586,43 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
                   {
                     include: UTILS_CODEX_TOKENS_PERSISTED_CODEC.identity.module,
                   },
+                  {
+                    include: UTILS_CODEX_TOKENS_PERSISTED_CONSUMER.identity.module,
+                  },
                 ]
               : [],
+    "architecture/persisted-codec-fixture-catalog":
+      root === "packages/tool-results"
+        ? [
+            {
+              include: BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC.identity.module,
+            },
+          ]
+        : root === "apps/core"
+          ? [
+              { include: CORE_NATIVE_RECORD_PERSISTED_CODEC.identity.module },
+              { include: CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity.module },
+              {
+                include: "src/conversation/thread-summary-persistence-codec.ts",
+              },
+              { include: "src/transcript/transcript-persistence-codec.ts" },
+              { include: "src/surface/bridge/agent-run-journal/index.ts" },
+              { include: "src/migration/frozen-graceful-restart-store.ts" },
+              {
+                include: "src/workflow/workflow-artifact-persistence-codec.ts",
+              },
+              { include: "src/workflow/workflow-persistence-codec.ts" },
+              {
+                include: CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC.identity.module,
+              },
+            ]
+          : root === "packages/utils"
+            ? [
+                {
+                  include: UTILS_CODEX_TOKENS_PERSISTED_CODEC.identity.module,
+                },
+              ]
+            : [],
     "architecture/sqlite-transaction-adapter-contract":
       root === "packages/utils" ? [{ include: "persistence.ts" }] : [],
     "architecture/sqlite-transaction-consumer":
@@ -3694,56 +3664,52 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
     resultDecoders: WAVE_2_RESULT_DECODERS.get(root) ?? [],
     unknownFreeModules: [],
     persistedCodecs:
-      root === "apps/tui"
-        ? TUI_PERSISTED_CODECS
+      root === "packages/tool-results"
+        ? [BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC]
+        : root === "packages/utils"
+          ? [UTILS_CODEX_TOKENS_PERSISTED_CODEC]
+          : root === "apps/core"
+            ? [
+                CORE_NATIVE_RECORD_PERSISTED_CODEC,
+                CORE_NATIVE_SUMMARY_PERSISTED_CODEC,
+                ...CORE_THREAD_PERSISTED_CODECS,
+                ...CORE_TRANSCRIPT_PERSISTED_CODECS,
+                CORE_RESOURCE_PERSISTED_CODEC,
+                CORE_AGENT_RUN_OPENED_PERSISTED_CODEC,
+                CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC,
+                CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC,
+                CORE_GRACEFUL_RESTART_PERSISTED_CODEC,
+                CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC,
+                CORE_WORKFLOW_ROW_PERSISTED_CODEC,
+                CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC,
+              ]
+            : [],
+    persistedStoreConsumers:
+      root === "apps/installer"
+        ? [INSTALLER_CODEX_TOKENS_PERSISTED_CONSUMER]
         : root === "packages/tool-results"
-          ? [BLOB_TOOL_RESULT_ARTIFACT_METADATA_CODEC]
+          ? [BLOB_TOOL_RESULT_ARTIFACT_METADATA_CONSUMER]
           : root === "packages/utils"
-            ? [UTILS_CODEX_TOKENS_PERSISTED_CODEC]
+            ? [UTILS_CODEX_TOKENS_PERSISTED_CONSUMER]
             : root === "apps/core"
               ? [
-                  CORE_NATIVE_RECORD_PERSISTED_CODEC,
-                  CORE_NATIVE_SUMMARY_PERSISTED_CODEC,
-                  ...CORE_THREAD_PERSISTED_CODECS,
-                  ...CORE_TRANSCRIPT_PERSISTED_CODECS,
-                  CORE_RESOURCE_PERSISTED_CODEC,
-                  CORE_AGENT_RUN_OPENED_PERSISTED_CODEC,
-                  CORE_AGENT_RUN_CHECKPOINT_PERSISTED_CODEC,
-                  CORE_AGENT_RUN_TERMINAL_PERSISTED_CODEC,
-                  CORE_GRACEFUL_RESTART_PERSISTED_CODEC,
-                  CORE_WORKFLOW_ARTIFACT_PERSISTED_CODEC,
-                  CORE_WORKFLOW_ROW_PERSISTED_CODEC,
-                  CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CODEC,
+                  ...CORE_NATIVE_RECORD_PERSISTED_CONSUMERS,
+                  ...CORE_NATIVE_SUMMARY_PERSISTED_CONSUMERS,
+                  ...CORE_THREAD_PERSISTED_CONSUMERS,
+                  ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS,
+                  CORE_CLAUDE_ATTEMPT_PERSISTED_CONSUMER,
+                  CORE_RESOURCE_PERSISTED_CONSUMER,
+                  CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER,
+                  CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER,
+                  CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER,
+                  ...CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS,
+                  CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER,
+                  CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER,
+                  CORE_LEGACY_WORKFLOW_BLOB_MIGRATION_PERSISTED_CONSUMER,
+                  CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CONSUMER,
+                  ...CORE_WORKFLOW_ROW_PERSISTED_CONSUMERS,
                 ]
               : [],
-    persistedStoreConsumers:
-      root === "apps/tui"
-        ? TUI_PERSISTED_CONSUMERS
-        : root === "apps/installer"
-          ? [INSTALLER_CODEX_TOKENS_PERSISTED_CONSUMER]
-          : root === "packages/tool-results"
-            ? [BLOB_TOOL_RESULT_ARTIFACT_METADATA_CONSUMER]
-            : root === "packages/utils"
-              ? [UTILS_CODEX_TOKENS_PERSISTED_CONSUMER]
-              : root === "apps/core"
-                ? [
-                    ...CORE_NATIVE_RECORD_PERSISTED_CONSUMERS,
-                    ...CORE_NATIVE_SUMMARY_PERSISTED_CONSUMERS,
-                    ...CORE_THREAD_PERSISTED_CONSUMERS,
-                    ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS,
-                    CORE_CLAUDE_ATTEMPT_PERSISTED_CONSUMER,
-                    CORE_RESOURCE_PERSISTED_CONSUMER,
-                    CORE_AGENT_RUN_JOURNAL_PERSISTED_CONSUMER,
-                    CORE_AGENT_RUN_OPENED_EVENT_PERSISTED_CONSUMER,
-                    CORE_AGENT_RUN_PREVIOUS_CHECKPOINT_PERSISTED_CONSUMER,
-                    ...CORE_AGENT_RUN_JOURNAL_ENCODER_CONSUMERS,
-                    CORE_LEGACY_GRACEFUL_RESTART_PERSISTED_CONSUMER,
-                    CORE_WORKFLOW_ARTIFACT_PERSISTED_CONSUMER,
-                    CORE_LEGACY_WORKFLOW_BLOB_MIGRATION_PERSISTED_CONSUMER,
-                    CORE_ANTHROPIC_FALLBACK_CACHE_PERSISTED_CONSUMER,
-                    ...CORE_WORKFLOW_ROW_PERSISTED_CONSUMERS,
-                  ]
-                : [],
     sqliteTransactionAdapters:
       root === "packages/utils"
         ? [
@@ -3854,7 +3820,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : []),
       ...(root === "apps/tui"
         ? [
-            ...["decodeTuiAuthInfo", "decodeTuiLocalToken"].map((exportName) => ({
+            ...["decodeOperatorSession"].map((exportName) => ({
               identity: { module: "src/auth.ts", exportName },
               category: "wire" as const,
             })),
@@ -3865,10 +3831,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             {
               identity: { module: "src/fatal.ts", exportName: "captureTuiException" },
               category: "projection" as const,
-            },
-            {
-              identity: { module: "src/persistence-codec.ts", exportName: "decode" },
-              category: "persistence" as const,
             },
           ]
         : []),
@@ -4592,27 +4554,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
     operationalResultApis: [
       ...(root === "apps/tui"
         ? [
-            ...TUI_PERSISTED_CODECS.map(({ identity }) => identity),
-            ...TUI_PERSISTED_CONSUMERS.map(({ identity }) => identity),
-            ...["readPrivateFile", "writePrivateFile", "removePrivateFile"].map((exportName) => ({
-              module: "src/private-file.ts",
+            ...["decodeOperatorSession", "createTuiAuth"].map((exportName) => ({
+              module: "src/auth.ts",
               exportName,
             })),
-            ...[
-              "decodeTuiAuthInfo",
-              "decodeTuiLocalToken",
-              "persist",
-              "localLogin",
-              "discover",
-              "tokenCredential",
-              "clerkLogin",
-              "refreshCredential",
-              "revoke",
-              "createTuiAuth",
-              "createTuiAuth.gen.<callback@1>.refresh",
-              "createTuiAuth.gen.<callback@1>.refresh.perform",
-              "createTuiAuth.gen.<callback@1>.logout",
-            ].map((exportName) => ({ module: "src/auth.ts", exportName })),
             ...[
               "decodeTuiBootstrap",
               "responseStatus",
@@ -4621,7 +4566,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "createTuiSession",
             ].map((exportName) => ({ module: "src/session.ts", exportName })),
             ...["parseTuiArgs", "run"].map((exportName) => ({ module: "src/main.ts", exportName })),
-            { module: "src/persistence-codec.ts", exportName: "decode" },
           ]
         : []),
       ...(root === "apps/web"
@@ -5515,7 +5459,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "17051d87e1ad67773e2edd363d4b03aa5690bb3ef5a0a4d74de5bf6ea5c187ce";
+  "ce7691fc060ecb09947750dcb2ec15c073d3027e2ffeec6019ab50ab54b8efeb";
 
 export const architectureManifest = {
   version: 1,

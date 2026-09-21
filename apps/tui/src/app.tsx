@@ -1,5 +1,5 @@
 /** @jsxImportSource @opentui/solid */
-import { createCliRenderer, createHostClipboard, type TextareaRenderable } from "@opentui/core";
+import { createCliRenderer, type TextareaRenderable } from "@opentui/core";
 import { render, useKeyboard, usePaste, useRenderer, useTerminalDimensions } from "@opentui/solid";
 import {
   createEffect,
@@ -29,11 +29,11 @@ const colors = {
   error: "#f4a9a9",
 };
 const help = `Enter send · Shift+Enter newline · Ctrl+C cancel · Ctrl+Q exit
-Ctrl+T conversations · Ctrl+N new · Ctrl+V host clipboard · PgUp/PgDn scroll
-:threads [search] · :next page · :open <id> · :new · :model <id>
+Temporary conversation: deleted on exit · PgUp/PgDn scroll
+:model <id>
 :attach <path> · :detach <number> · :uploads · :retry-upload <number>
 :steer · :followup · :queue · :remove <number> · :cancel · :retry
-:older · :newer · :more · :rewind · :logout · :help
+:older · :newer · :more · :help
 Use $ or /skill: for skills, / for commands. Tab inserts a suggestion.`;
 
 export function TuiApp(props: {
@@ -45,7 +45,7 @@ export function TuiApp(props: {
   const renderer = useRenderer();
   const dimensions = useTerminalDimensions();
   const [state, setState] = createSignal(controller.state);
-  const [view, setView] = createSignal<"chat" | "threads" | "help" | "queue" | "models">("chat");
+  const [view, setView] = createSignal<"chat" | "help" | "queue" | "models">("chat");
   const [offset, setOffset] = createSignal(Number.MAX_SAFE_INTEGER);
   const [suggestion, setSuggestion] = createSignal(0);
   const [menuHidden, setMenuHidden] = createSignal(false);
@@ -62,7 +62,7 @@ export function TuiApp(props: {
     void state().version;
     return controller.currentThread();
   };
-  const paletteOpen = () => view() === "threads" || view() === "models";
+  const paletteOpen = () => view() === "models";
   const paletteHeight = () => Math.min(7, Math.max(3, Math.floor(dimensions().height / 3)));
   const height = () =>
     Math.max(
@@ -112,10 +112,9 @@ export function TuiApp(props: {
       () => setOffset(Number.MAX_SAFE_INTEGER),
     ),
   );
-  async function exit(logout = false) {
+  async function exit() {
     controller.dispose();
     renderer.destroy();
-    if (logout) await controller.session.logout();
     await props.onExit();
   }
   async function attachPath(value: string) {
@@ -131,27 +130,6 @@ export function TuiApp(props: {
     }
     controller.attach(file, basename(path));
   }
-  async function clipboard() {
-    const result = await controller.attempt(() =>
-      createHostClipboard().read({ preferredTypes: ["image/png", "image/jpeg", "text/plain"] }),
-    );
-    if (!result) return;
-    if (result.status !== "read") {
-      controller.update({
-        notice: "Clipboard unavailable on this host. Paste text or use :attach <path>.",
-      });
-      return;
-    }
-    const data = result.representation;
-    if (data.mimeType.startsWith("image/")) {
-      controller.attach(
-        new Blob([Uint8Array.from(data.bytes)], { type: data.mimeType }),
-        `clipboard.${data.mimeType === "image/png" ? "png" : "jpg"}`,
-      );
-      return;
-    }
-    editor?.insertText(safeText(new TextDecoder().decode(data.bytes)));
-  }
   async function command(text: string): Promise<boolean> {
     if (!text.startsWith(":")) return false;
     const split = text.indexOf(" ");
@@ -161,22 +139,6 @@ export function TuiApp(props: {
     switch (name) {
       case ":help":
         setView("help");
-        return true;
-      case ":threads":
-        await controller.list(argument || undefined);
-        setView("threads");
-        return true;
-      case ":next":
-        await controller.list(undefined, true);
-        setView("threads");
-        return true;
-      case ":open":
-        await controller.open(argument);
-        setView("chat");
-        return true;
-      case ":new":
-        controller.newThread();
-        setView("chat");
         return true;
       case ":attach":
         await attachPath(argument);
@@ -252,13 +214,6 @@ export function TuiApp(props: {
       case ":more":
         await controller.more();
         return true;
-      case ":rewind":
-        await controller.rewind();
-        setView("chat");
-        return true;
-      case ":logout":
-        await exit(true);
-        return true;
       default:
         controller.update({
           draft: text,
@@ -294,22 +249,6 @@ export function TuiApp(props: {
     if (key.ctrl && key.name === "c") {
       handled();
       controller.run(controller.cancel());
-      return;
-    }
-    if (key.ctrl && key.name === "n") {
-      handled();
-      controller.newThread();
-      setView("chat");
-      return;
-    }
-    if (key.ctrl && key.name === "t") {
-      handled();
-      setView(view() === "threads" ? "chat" : "threads");
-      return;
-    }
-    if (key.ctrl && key.name === "v") {
-      handled();
-      controller.run(clipboard());
       return;
     }
     if (key.ctrl && key.name === "m") {
@@ -401,25 +340,14 @@ export function TuiApp(props: {
             textColor={colors.foreground}
             selectedBackgroundColor={colors.selection}
             selectedTextColor={colors.accent}
-            options={
-              view() === "models"
-                ? (state().catalog?.models ?? []).map((model) => ({
-                    name: safeText(model.label),
-                    description: safeText(model.description ?? model.id),
-                    value: model.id,
-                  }))
-                : state().threads.map((thread) => ({
-                    name: safeText(thread.title || "Untitled"),
-                    description: safeText(
-                      `${new Date(thread.updatedAt).toLocaleString()}${thread.capabilities.edit ? "" : " · read-only"}`,
-                    ),
-                    value: thread.id,
-                  }))
-            }
+            options={(state().catalog?.models ?? []).map((model) => ({
+              name: safeText(model.label),
+              description: safeText(model.description ?? model.id),
+              value: model.id,
+            }))}
             onSelect={(_index, option) => {
               if (!option) return;
-              if (view() === "models") controller.update({ modelId: String(option.value) });
-              else controller.run(controller.open(String(option.value)));
+              controller.update({ modelId: String(option.value) });
               setView("chat");
             }}
           />
@@ -527,7 +455,7 @@ export function TuiApp(props: {
             `${state().connection} · ${current()?.activeRunId ? "working" : "idle"} · ${state().mode}`,
           )}
         </text>
-        <text fg={colors.muted}>Ctrl+T threads · Ctrl+M model · :help</text>
+        <text fg={colors.muted}>Temporary · deleted on exit · Ctrl+M model · :help</text>
       </box>
     </box>
   );
@@ -545,6 +473,12 @@ export async function runTui(session: TuiSession, threadId?: string): Promise<vo
     renderer.destroy();
     closed.reject(error);
   });
+  const terminate = () => {
+    renderer.destroy();
+    closed.resolve();
+  };
+  process.once("SIGTERM", terminate);
+  process.once("SIGHUP", terminate);
   const mounted = await Result.tryPromise({
     try: () =>
       render(
@@ -568,4 +502,6 @@ export async function runTui(session: TuiSession, threadId?: string): Promise<vo
     rethrowTuiDefect(failure);
   }
   await closed.promise;
+  process.removeListener("SIGTERM", terminate);
+  process.removeListener("SIGHUP", terminate);
 }

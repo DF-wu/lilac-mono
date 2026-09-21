@@ -2,7 +2,7 @@
 
 Lilac's installer downloads a standalone CLI and runs an interactive setup before starting the
 published containers. You need Docker, a model-provider account or an OpenAI-compatible endpoint, and
-an interactive terminal. The native web and terminal interfaces are the default; Discord is optional.
+an interactive terminal. The default is a temporary terminal console; web and Discord setup are optional.
 Bun, Node.js, Git, and a source checkout are not required.
 
 ## System requirements
@@ -38,17 +38,19 @@ Setup follows this sequence:
 1. Check Docker and Compose.
 2. Choose the installation directory. The default is your current directory.
 3. Configure at least one model provider, then select main and fast models.
-4. Choose Web and terminal, the default, or Discord. Native setup creates a local owner account or
-   connects an existing Clerk application. Discord can also be added alongside native.
+4. Choose Terminal only, the default, Web, or Discord. Web setup creates a local owner account or
+   connects an existing Clerk application. Discord can also be added alongside either choice.
 5. Configure any optional integrations, or skip them.
 6. Review the proposed configuration with secrets masked and confirm the write.
 7. Pull container images, start Core and Redis, and wait for container health checks.
 
-Once setup finishes, open `http://localhost:8787` and sign in with the local owner credentials chosen
-in setup. For a terminal demo, run `./bin/lilac-tui --url http://localhost:8787`. Both use the normal
-authenticated backend and your configured model. No Clerk account is needed with local auth.
-Container health means the services started successfully; your first prompt exercises model generation.
-Discord-only installations start by mentioning the bot in an allowed channel.
+Once setup finishes, choose "Talk to Lilac now" or exit the installer. To open the console later, run
+`docker compose exec --user root lilac lilac-tui` from the installation directory. Each invocation
+creates a temporary conversation that is deleted on exit. Agent-created files remain. See
+[console lifecycle and authentication](native-surface.md#temporary-operator-console).
+
+If you enabled Web, open `http://localhost:8787` and sign in. Container health means services started;
+your first prompt exercises the configured model provider.
 
 Next, [personalize Lilac's prompt files](../README.md#after-installation-make-lilac-your-own).
 Edit them yourself or ask Lilac to walk you through your preferences and update the files.
@@ -86,8 +88,7 @@ generates a session secret. The username, password hash and secret go in `secret
 in front of that port and supply its origin as the Native web URL.
 
 Clerk setup takes an existing application's owner user ID, issuer, secret key and publishable key.
-The optional public OAuth client ID enables terminal login. Configure its loopback callback according
-to [native setup](native-surface.md). The installer does not enroll users or create a Clerk application.
+The terminal console does not use Clerk. The installer does not enroll users or create a Clerk application.
 
 Existing installations retain their current enabled surfaces and port bindings during update or
 reinstall. Enabling native on an existing Discord installation is an explicit manual configuration
@@ -128,7 +129,6 @@ The selected installation directory contains:
 | Path | Purpose |
 | --- | --- |
 | `bin/lilac` | Standalone setup CLI |
-| `bin/lilac-tui` | Native terminal client |
 | `compose.yaml` | Container services and resolved image references |
 | `secrets.env` | Environment credentials passed to the containers |
 | `data/core-config.yaml` | Your Core configuration |
@@ -194,7 +194,7 @@ For a private registry, authenticate Docker before starting setup.
 
 The default published CLI embeds immutable image digests from its own release. It does not depend on
 the registry's mutable `latest` tags. `LILAC_RELEASE_BASE_URL` must contain assets named
-`lilac-<target>` and `lilac-tui-<target>` for each supported target (`linux-x64`, `linux-arm64`,
+`lilac-<target>` for each supported target (`linux-x64`, `linux-arm64`,
 `darwin-x64`, `darwin-arm64`), plus `SHA256SUMS` with
 standard `sha256sum` output using those basenames. A custom source can provide only the platforms it
 supports. Its URL must identify one coherent artifact set.

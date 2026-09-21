@@ -1,3 +1,6 @@
+> Historical verification: standalone TUI packaging, password/Clerk terminal login, and disk caching
+> below describe the former client. The current console is documented in [native setup](native-surface.md#temporary-operator-console).
+
 # Native surface verification
 
 Verification record for the native backend, web app, terminal client and installer, recorded on
@@ -123,7 +126,7 @@ claiming the earlier latency or size for a newer build.
 
 ## Reproducing checks
 
-Use the root scripts `bun run check`, `bun run build:web`, `bun run build:tui` and
+Use the root scripts `bun run check`, `bun run build:web`, and
 `bun run test:installer`. The test graph includes Core, protocol/client, web, terminal, persistence
 codecs and architecture checks. Full repository checks are repeated before implementation commits.
 

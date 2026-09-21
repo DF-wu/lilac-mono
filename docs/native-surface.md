@@ -52,8 +52,7 @@ the native question capability remains unimplemented.
 ## Clerk
 
 Choose Clerk per installation with `surface.native.auth.provider: clerk`. Configure the owner's native
-`ownerId`, Clerk `ownerProviderUserId` and `clerkIssuer`. A registered public `clerkOAuthClientId` is
-only needed for OAuth clients such as the TUI; browser sessions work without one. Set
+`ownerId`, Clerk `ownerProviderUserId` and `clerkIssuer`. Browser sessions do not require a `clerkOAuthClientId`. Set
 `CLERK_SECRET_KEY` and `CLERK_PUBLISHABLE_KEY` in the server environment. `CLERK_JWT_KEY` is optional.
 Only the publishable key reaches the browser. The web build does not embed installation credentials.
 
@@ -117,45 +116,43 @@ The browser caches versioned app assets and scoped conversation projections sepa
 API responses never enter the service worker cache. Logout clears cached conversation data. An app update
 offers a Reload button; drafts remain on the device until sent or cleared.
 
-## Terminal client
+## Temporary operator console
 
-The installer includes `bin/lilac-tui`. Run it against the same native server as the web app:
+The container includes `lilac-tui`. From the installation directory, run:
 
 ```sh
-./bin/lilac-tui --url http://127.0.0.1:8787
+docker compose exec --user root lilac lilac-tui
 ```
 
-From a source checkout, use `bun run dev:tui -- --url http://127.0.0.1:8787`.
-`bun run build:tui` creates a standalone binary in `apps/tui/dist` for the current platform.
-Use `--thread ID` to open a thread, `--no-cache` to disable transcript caching, or `--login`
-to sign in again. Release artifacts pair the server and clients from the same commit.
+The installer offers "Talk to Lilac now" after deployment. Terminal-only installation needs a model
+provider but no Discord, local password, or Clerk account. Web and Discord can be configured separately.
 
-The TUI uses OpenTUI/Solid and renders plain text. Markdown, tables, math and diagrams remain source
-text; images are accepted as input and listed as attachments. Enter sends, Shift+Enter adds a line,
-Ctrl+C cancels the run, and Ctrl+Q exits. Ctrl+T opens conversations, Ctrl+M opens models and Ctrl+K
-shows the queue. Use `$` or `/skill:` for skills and `/` for commands. Tab inserts the selected
-completion. `:help` lists commands for search, older history, queue removal, upload retry and rewind.
-New conversations stay local until Send.
+Each invocation creates one temporary owner conversation. Ctrl+Q exits, cancels active work, and deletes
+the conversation using native deletion. If the terminal disappears, heartbeats stop and Core deletes the
+conversation after 30 seconds. Reconnecting within that grace period keeps the same invocation alive.
+Core cleans abandoned conversations before recovering agent work after restart. Temporary conversations
+stay out of the web sidebar and search. Normal deletion and resource-retention rules apply; this is not
+secure erasure of databases, logs, provider records, or backups. Files created by tools and external
+side effects remain.
 
-Use `:attach /path/to/file` for file and image input. Ctrl+V reads the host clipboard through OpenTUI
-when supported. Over SSH that is the remote host's clipboard; use file paths or run the client locally
-against the remote server. Sent attachments show progress while the composer remains usable.
-The server waits for resources before starting work. Output strips terminal control sequences.
+The console uses the existing native protocol and agent runner. Its separate HTTP/WebSocket listener
+binds only to container loopback on port 8788, which is not published. Every request requires the root-only
+`/run/lilac/operator-token` in an authorization header. Startup rotates that token; Core receives its
+hash. The authenticated identity is the configured native owner. Tools still execute with the Core
+service user's authority, never the terminal client's root identity.
 
-Local auth prompts for the fixed username and password. The password is never saved. Clerk opens a
-browser using Authorization Code with PKCE and a temporary loopback callback. Register a public OAuth
-client with required PKCE, redirect URI `http://127.0.0.1/callback`, and scopes
-`openid profile offline_access`; set its ID in `surface.native.auth.clerkOAuthClientId`.
-Enable JWT OAuth access tokens in Clerk. For SSH, run the client locally or arrange forwarding for
-the callback port. This version does not implement a device-code fallback.
+There is no saved login, disk conversation cache, remote URL option, thread browser, or standalone TUI
+release. The image's Bun runtime loads the root-owned console and dependencies. Local password and Clerk
+web authentication continue to work independently. The legacy Clerk OAuth-client configuration is no
+longer needed by the terminal.
 
-Credentials live under `$XDG_CONFIG_HOME/lilac/tui`, defaulting to `~/.config/lilac/tui`.
-Conversation cache lives separately under `$XDG_CACHE_HOME/lilac/tui`, defaulting to
-`~/.cache/lilac/tui`. Directories use mode 0700 and files use mode 0600. Atomic cache writes retain
-at most 64 threads within 32 MiB. Corrupt or incompatible cache files reset from the server.
-`:logout` invalidates the current token at the native server, revokes the Clerk refresh token when
-applicable, and clears local credentials and the principal's cache. Clerk JWT access tokens remain
-valid upstream until expiry; native logout blocks the current token for the running server process.
+Enter sends; Shift+Enter adds a line; Ctrl+C cancels work; Ctrl+Q exits. Ctrl+M selects a model and Ctrl+K
+shows queued inputs. Use `$` or `/skill:` for skills and `/` for commands. `:help` lists the remaining
+terminal commands. `:attach /path/to/file` reads a file inside the container. The console renders plain
+text and strips terminal control sequences. It does not read the host clipboard.
+
+For source development, `bun run dev:tui` connects to the same local operator endpoint. It requires
+access to the operator token, just like the container command.
 
 ## Diagnostics and compatibility
 

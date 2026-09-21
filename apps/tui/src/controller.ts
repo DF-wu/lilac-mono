@@ -58,8 +58,6 @@ export class TuiController {
   private unsubscribeThread?: () => void;
   private selectedThread?: NativeThread;
   private readonly lifetime = new AbortController();
-  private readonly drafts = new Map<string, string>();
-  private readonly draftAttachments = new Map<string, Attachment[]>();
   private readonly uploads = new Map<string, AbortController>();
   constructor(
     readonly session: TuiSession,
@@ -145,7 +143,7 @@ export class TuiController {
         });
         if (this.state.selected === event.threadId) {
           this.update({ submitting: false });
-          this.newThread();
+          this.clearPrivateState();
         }
         return;
       case "input":
@@ -171,8 +169,6 @@ export class TuiController {
   private clearPrivateState(): void {
     for (const transfer of this.uploads.values()) transfer.abort();
     this.uploads.clear();
-    this.drafts.clear();
-    this.draftAttachments.clear();
     this.unsubscribeThread?.();
     this.unsubscribeThread = undefined;
     this.selectedThread = undefined;
@@ -187,7 +183,7 @@ export class TuiController {
       attachments: [],
       queue: [],
       uncertainId: undefined,
-      notice: "Sign in again by restarting lilac-tui.",
+      notice: "Temporary conversation ended. Restart lilac-tui for another.",
       error: undefined,
     });
   }
@@ -204,8 +200,8 @@ export class TuiController {
       selected: threadId,
       slotIds: store.slotIds,
       slotId: store.slotIds.at(-1),
-      draft: this.drafts.get(threadId) ?? "",
-      attachments: this.draftAttachments.get(threadId) ?? [],
+      draft: "",
+      attachments: [],
       queue: [],
     });
     this.unsubscribeThread = store.subscribe(() => {
@@ -231,43 +227,6 @@ export class TuiController {
     const slot = this.currentSlot();
     if (this.state.selected && slot?.kind === "deferred")
       this.run(this.session.client.hydrate(this.state.selected, slot.slotId));
-  }
-  newThread(): void {
-    if (this.state.submitting) return;
-    this.saveDraft();
-    this.unsubscribeThread?.();
-    this.unsubscribeThread = undefined;
-    this.selectedThread = undefined;
-    this.update({
-      selected: undefined,
-      slotId: undefined,
-      slotIds: [],
-      draft: this.drafts.get("new") ?? "",
-      attachments: this.draftAttachments.get("new") ?? [],
-      queue: [],
-      error: undefined,
-    });
-  }
-  private saveDraft(): void {
-    this.drafts.set(this.state.selected ?? "new", this.state.draft);
-    this.draftAttachments.set(this.state.selected ?? "new", this.state.attachments);
-  }
-  async open(threadId: string): Promise<void> {
-    if (this.state.submitting || !this.session.client.rpc) return;
-    this.saveDraft();
-    this.bind(threadId);
-    await this.session.client.selectThread(threadId);
-    const thread = await this.attempt(() => this.session.client.rpc!.threads.get({ threadId }));
-    if (thread && this.state.selected === threadId) this.event({ kind: "thread", thread });
-    await this.refreshQueue();
-  }
-  async list(query?: string, more = false): Promise<void> {
-    const rpc = this.session.client.rpc;
-    if (!rpc) return;
-    const reply = await this.attempt(() =>
-      rpc.threads.list({ limit: 30, cursor: more ? this.state.nextCursor : undefined, query }),
-    );
-    if (reply) this.update({ threads: reply.items, nextCursor: reply.nextCursor });
   }
   navigate(delta: number): void {
     const index = this.state.slotIds.indexOf(this.state.slotId ?? "");
@@ -323,8 +282,6 @@ export class TuiController {
   }
   private releaseCompletedUploads(): void {
     const keep = (attachment: Attachment) => !(attachment.sent && attachment.state === "ready");
-    for (const [key, attachments] of this.draftAttachments)
-      this.draftAttachments.set(key, attachments.filter(keep));
     this.update({ attachments: this.state.attachments.filter(keep) });
   }
   private async upload(attachment: Attachment): Promise<void> {
@@ -392,29 +349,7 @@ export class TuiController {
         .filter((skill) => hasSkill(text, skill.name))
         .map((skill) => skill.id) ?? [];
     this.update({ submitting: true, error: undefined });
-    let thread = this.currentThread();
-    const wasNewThread = !this.state.selected;
-    if (!this.state.selected) {
-      thread = await this.attempt(() =>
-        rpc.threads.create({
-          commandId: crypto.randomUUID(),
-          title:
-            text.split("\n", 1)[0]?.trim().slice(0, 80) || files[0]?.name || "New conversation",
-          autoTitle: true,
-          modelId: this.state.modelId,
-        }),
-      );
-      if (!thread) {
-        this.update({ submitting: false });
-        return false;
-      }
-      this.event({ kind: "thread", thread });
-      const draft = this.state.draft;
-      const attachments = this.state.attachments;
-      this.bind(thread.id);
-      this.update({ attachments, draft });
-      await this.session.client.selectThread(thread.id);
-    }
+    const thread = this.currentThread();
     const threadId = this.state.selected;
     if (!threadId || !thread?.capabilities.edit) {
       this.update({ submitting: false, error: "This conversation is read-only." });
@@ -470,11 +405,6 @@ export class TuiController {
     }
     for (const file of files) file.sent = true;
     this.releaseCompletedUploads();
-    this.drafts.delete(threadId);
-    if (wasNewThread) {
-      this.drafts.delete("new");
-      this.draftAttachments.delete("new");
-    }
     this.update({
       submitting: false,
       draft: this.state.draft === text ? "" : this.state.draft,
@@ -528,27 +458,6 @@ export class TuiController {
     if (!input || !rpc) return;
     await this.attempt(() => rpc.runs.removeQueued({ ...input, inputId }));
     await this.refreshQueue();
-  }
-  async rewind(): Promise<void> {
-    const input = this.mutation();
-    const rpc = this.session.client.rpc;
-    const slot = this.currentSlot();
-    if (!input || !rpc || slot?.kind !== "ready") return;
-    const checkpoint = this.session.client.thread(input.threadId).checkpoint!;
-    const draft = this.state.draft;
-    const result = await this.attempt(() =>
-      rpc.threads.rewind({
-        ...input,
-        turnId: slot.turnId,
-        expectedRevision: checkpoint.projectionRevision,
-      }),
-    );
-    if (!result || this.state.selected !== input.threadId) return;
-    const restore = this.state.draft === draft;
-    this.update({
-      draft: restore ? result.text : this.state.draft,
-      notice: restore ? "Rewound to before this turn." : "Rewound. Your new draft was preserved.",
-    });
   }
   dispose(): void {
     this.lifetime.abort();

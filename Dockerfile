@@ -158,6 +158,8 @@ WORKDIR /app
 # Copy only dependency manifests for layer caching
 COPY package.json bun.lock ./
 COPY apps/core/package.json apps/core/package.json
+COPY apps/tui/package.json apps/tui/package.json
+COPY packages/client/package.json packages/client/package.json
 COPY apps/tool-bridge/package.json apps/tool-bridge/package.json
 COPY packages/agent/package.json packages/agent/package.json
 COPY packages/bash-safety/package.json packages/bash-safety/package.json
@@ -176,6 +178,7 @@ COPY patches patches
 # Install only the main container's workspace graph.
 RUN bun install --frozen-lockfile \
       --filter '@stanley2058/lilac-tool-bridge' \
+      --filter '@stanley2058/lilac-tui' \
       --filter '@stanley2058/lilac-remote-fs-runner' \
   && find /app ! -type l -perm /022 -exec chmod go-w {} +
 
@@ -243,6 +246,8 @@ FROM deps AS runtime
 WORKDIR /app
 COPY bunfig.toml tsconfig.json ./
 COPY apps/core apps/core
+COPY apps/tui apps/tui
+COPY packages/client packages/client
 COPY apps/tool-bridge apps/tool-bridge
 COPY packages/agent packages/agent
 COPY packages/bash-safety packages/bash-safety
@@ -269,6 +274,7 @@ COPY --from=tool-worker --chmod=0644 /app/apps/tool-bridge/dist/tools-build-id /
 RUN ln -s /app/build/build-info.json /usr/local/bin/tools-build-info.json \
   && ln -s /app/build/build-info.json /app/apps/tool-bridge/dist/tools-build-info.json
 
+COPY --chmod=0755 docker/lilac-tui.sh /usr/local/bin/lilac-tui
 COPY --chmod=0755 docker/direct-entrypoint.sh /usr/local/sbin/lilac-entrypoint
 COPY docker/create-operator-token.mjs /usr/local/libexec/create-operator-token.mjs
 # Build steps run as root, so hardening only needs to verify source permissions.

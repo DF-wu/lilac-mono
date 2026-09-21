@@ -60,7 +60,9 @@ function httpValue<T>(result: Result<T, TuiRequestError>): T {
 
 function responseStatus(response: Response): Result<Response, TuiRequestError> {
   if (response.status === 401)
-    return Result.err(failed("unauthenticated", "Sign in again to continue."));
+    return Result.err(
+      failed("unauthenticated", "Temporary conversation ended. Restart lilac-tui."),
+    );
   if (response.status === 403)
     return Result.err(
       failed(
@@ -104,7 +106,10 @@ async function readBootstrap(
       Result.tryPromise({
         try: () =>
           fetch(bootstrapUrl(baseUrl, input), {
-            headers: { authorization: auth.authorization() },
+            headers: {
+              authorization: auth.authorization(),
+              "x-lilac-operator-session": auth.sessionId,
+            },
             signal,
             redirect: "error",
           }),
@@ -139,6 +144,7 @@ export async function uploadTuiResource(
   file: Blob,
   onProgress: (fraction: number) => void,
   signal?: AbortSignal,
+  sessionId?: string,
 ): Promise<Result<void, TuiRequestError>> {
   if (signal?.aborted) return Result.err(failed("canceled", "Upload canceled."));
   let loaded = 0;
@@ -158,6 +164,7 @@ export async function uploadTuiResource(
         method: "PUT",
         headers: {
           authorization,
+          ...(sessionId ? { "x-lilac-operator-session": sessionId } : {}),
           "content-type": file.type || "application/octet-stream",
           "content-length": String(file.size),
         },
@@ -181,7 +188,7 @@ export async function createTuiSession(
   cache: NativeCache,
   signal?: AbortSignal,
 ): Promise<Result<TuiSession, TuiRequestError>> {
-  const loaded = await readBootstrap(baseUrl, auth, {}, signal);
+  const loaded = await readBootstrap(baseUrl, auth, { threadId: auth.threadId }, signal);
   const decision = loaded.match<{ initial: BootstrapReply } | { error: TuiRequestError }>({
     ok: (initial) => ({ initial }),
     err: (error) => ({ error }),
@@ -202,7 +209,12 @@ export async function createTuiSession(
     openSocket: () => {
       const url = new URL("/api/socket", baseUrl);
       url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-      return new BunSocket(url, { headers: { authorization: auth.authorization() } });
+      return new BunSocket(url, {
+        headers: {
+          authorization: auth.authorization(),
+          "x-lilac-operator-session": auth.sessionId,
+        },
+      });
     },
     bootstrap: async (input, requestSignal) => {
       if (firstBootstrap) {
@@ -216,18 +228,16 @@ export async function createTuiSession(
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let refreshTask: Promise<void> | undefined;
   let disposed = false;
+  let stopping = false;
   const scheduleRefresh = () => {
-    if (disposed) return;
-    refreshTimer = setTimeout(
-      () => {
-        refreshTask = refresh();
-      },
-      Math.max(1000, auth.expiresAt * 1000 - Date.now() - (auth.provider === "clerk" ? 30_000 : 0)),
-    );
+    if (disposed || stopping) return;
+    refreshTimer = setTimeout(() => {
+      refreshTask = refresh();
+    }, 10_000);
   };
   async function refresh(): Promise<void> {
     const outcome = await auth.refresh();
-    if (disposed) return;
+    if (disposed || stopping) return;
     const error = outcome.match({ ok: () => undefined, err: (failure) => failure });
     if (error?.code === "network" && auth.expiresAt * 1000 > Date.now()) {
       refreshTimer = setTimeout(
@@ -256,6 +266,7 @@ export async function createTuiSession(
   }
   const stopEvents = client.subscribe((event) => {
     if (event.kind !== "connection" || event.state !== "logged-out") return;
+    if (stopping) return;
     void dispose();
     stopEvents();
   });
@@ -276,10 +287,14 @@ export async function createTuiSession(
           file,
           onProgress,
           uploadLifetime,
+          auth.sessionId,
         ),
       );
     },
     async logout() {
+      stopping = true;
+      clearTimeout(refreshTimer);
+      await refreshTask;
       const ended = await auth.logout();
       await client.logout();
       await dispose();

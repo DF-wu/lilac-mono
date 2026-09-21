@@ -56,7 +56,6 @@
     "test:installer": "bun run --filter=@stanley2058/lilac-installer test",
     "typecheck:installer": "bunx tsc -p apps/installer/tsconfig.json --noEmit",
     "dev:tui": "bun --cwd=apps/tui run dev",
-    "build:tui": "bun apps/tui/build.ts",
     "test:tui": "bun run --filter=@stanley2058/lilac-tui test",
     "typecheck:tui": "bun run --filter=@stanley2058/lilac-tui typecheck"
   },

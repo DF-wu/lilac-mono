@@ -47,13 +47,6 @@ async function configureClerk(prompt: Prompt, draft: SetupDraft): Promise<void> 
   draft.set(["surface", "native", "auth", "clerkIssuer"], issuer);
   await credential(prompt, draft, "CLERK_SECRET_KEY", "Clerk secret key");
   await credential(prompt, draft, "CLERK_PUBLISHABLE_KEY", "Clerk publishable key");
-  const clientId = await prompt.text({
-    message: "Clerk OAuth client ID for terminal login (optional)",
-  });
-  if (clientId) draft.set(["surface", "native", "auth", "clerkOAuthClientId"], clientId);
-  prompt.note(
-    "Use an existing application's user ID. Clerk CLI login does not create an app user. Terminal login requires a public OAuth client with a loopback callback.",
-  );
 }
 
 export async function configureNative(prompt: Prompt, draft: SetupDraft): Promise<void> {

@@ -158,80 +158,12 @@ test("active custom commands preserve invocation and queue as followups", async 
   f.controller.dispose();
 });
 
-test("draft thread has no server creation until send and attachment drafts survive navigation", async () => {
-  const f = controllerFixture();
-  await f.controller.start();
-  f.controller.attach(new Blob(["a"]), "a.txt");
-  f.controller.update({ draft: "draft" });
-  expect(f.controller.state.selected).toBeUndefined();
-  await f.controller.open("thread");
-  f.controller.newThread();
-  expect(f.controller.state.draft).toBe("draft");
-  expect(f.controller.state.attachments[0]?.name).toBe("a.txt");
-  f.controller.dispose();
-});
-
 test("selected thread remains editable when search replaces list rows", async () => {
   const f = controllerFixture();
   await f.controller.start("thread");
   f.controller.update({ threads: [], draft: "still here" });
   expect(await f.controller.send()).toBe(true);
   expect(f.submitted[0]?.threadId).toBe("thread");
-  f.controller.dispose();
-});
-
-test("sending in existing thread preserves independent new draft", async () => {
-  const f = controllerFixture();
-  await f.controller.start();
-  f.controller.update({ draft: "new draft" });
-  f.controller.attach(new Blob(["a"]), "new.txt");
-  await f.controller.open("thread");
-  f.controller.update({ draft: "existing prompt" });
-  await f.controller.send();
-  f.controller.newThread();
-  expect(f.controller.state.draft).toBe("new draft");
-  expect(f.controller.state.attachments[0]?.name).toBe("new.txt");
-  f.controller.dispose();
-});
-
-test("thread creation preserves edits and attachments added while waiting", async () => {
-  const f = controllerFixture();
-  await f.controller.start();
-  const created = Promise.withResolvers<NativeThread>();
-  f.session.client.rpc!.threads.create = () => created.promise;
-  f.controller.update({ draft: "sent prompt" });
-  const sending = f.controller.send();
-  f.controller.update({ draft: "next prompt" });
-  f.controller.attach(new Blob(["b"]), "next.txt");
-  created.resolve(f.thread);
-  await sending;
-  expect(f.submitted[0]?.text).toBe("sent prompt");
-  expect(f.submitted[0]?.attachmentIds).toEqual([]);
-  expect(f.controller.state.draft).toBe("next prompt");
-  expect(f.controller.state.attachments[0]?.name).toBe("next.txt");
-  expect(f.controller.state.attachments[0]?.sent).toBe(false);
-  f.controller.dispose();
-});
-
-test("rewind preserves text typed after the request starts", async () => {
-  const f = controllerFixture();
-  f.store.replay({
-    kind: "window",
-    checkpoint: { protocolVersion: 1, historyGeneration: 1, projectionRevision: 1, cursor: "new" },
-    slots: [{ kind: "ready", slotId: "slot", turnId: "turn", position: 0, messages: [] }],
-  });
-  await f.controller.start("thread");
-  const done = Promise.withResolvers<{
-    text: string;
-    checkpoint: NonNullable<typeof f.store.checkpoint>;
-  }>();
-  f.session.client.rpc!.threads.rewind = () => done.promise;
-  const rewinding = f.controller.rewind();
-  f.controller.update({ draft: "new draft" });
-  done.resolve({ text: "old prompt", checkpoint: f.store.checkpoint! });
-  await rewinding;
-  expect(f.controller.state.draft).toBe("new draft");
-  expect(f.controller.state.notice).toContain("preserved");
   f.controller.dispose();
 });
 

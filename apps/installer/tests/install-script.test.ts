@@ -11,20 +11,17 @@ afterEach(async () => {
   );
 });
 
-async function runInstall(corruptTui: boolean) {
+async function runInstall(corruptInstaller: boolean) {
   const directory = await mkdtemp(join(tmpdir(), "lilac-release-test-"));
   directories.push(directory);
   const marker = join(directory, "executed");
-  const installer =
-    '#!/usr/bin/env bash\nprintf "installer:%s\\n" "$*" >> "$TEST_MARKER"\nif [ "$1" != --version ]; then test -x "$(dirname "$0")/lilac-tui"; fi\n';
-  const tui = '#!/usr/bin/env bash\nprintf "tui:%s\\n" "$*" >> "$TEST_MARKER"\n';
+  const installer = '#!/usr/bin/env bash\nprintf "installer:%s\\n" "$*" >> "$TEST_MARKER"\n';
   const digest = (value: string) => createHash("sha256").update(value).digest("hex");
   await Promise.all([
     writeFile(join(directory, "lilac-linux-x64"), installer),
-    writeFile(join(directory, "lilac-tui-linux-x64"), tui),
     writeFile(
       join(directory, "SHA256SUMS"),
-      `${digest(installer)}  lilac-linux-x64\n${corruptTui ? "0".repeat(64) : digest(tui)}  lilac-tui-linux-x64\n`,
+      `${corruptInstaller ? "0".repeat(64) : digest(installer)}  lilac-linux-x64\n`,
     ),
   ]);
   const source = await readFile(resolve(import.meta.dir, "../../../install.sh"), "utf8");
@@ -48,15 +45,15 @@ lilac_main demo
   return { status, stderr, executed };
 }
 
-test("release bootstrap verifies and delivers the companion TUI before setup", async () => {
+test("release bootstrap downloads only the installer", async () => {
   const result = await runInstall(false);
   expect(result.status).toBe(0);
-  expect(result.executed).toBe("installer:--version\ntui:--version\ninstaller:demo\n");
+  expect(result.executed).toBe("installer:--version\ninstaller:demo\n");
 });
 
-test("a corrupt companion prevents running either downloaded executable", async () => {
+test("a corrupt installer prevents execution", async () => {
   const result = await runInstall(true);
   expect(result.status).not.toBe(0);
-  expect(result.stderr).toContain("lilac-tui checksum verification failed");
+  expect(result.stderr).toContain("lilac checksum verification failed");
   expect(result.executed).toBe("");
 });

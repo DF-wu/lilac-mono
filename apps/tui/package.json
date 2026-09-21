@@ -14,7 +14,6 @@
     "@stanley2058/lilac-client": "workspace:*",
     "@stanley2058/lilac-client-protocol": "workspace:*",
     "better-result": "catalog:",
-    "oauth4webapi": "3.8.8",
     "solid-js": "1.9.12",
     "zod": "4.3.6"
   }

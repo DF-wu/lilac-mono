@@ -203,7 +203,7 @@ describe("installation write preparation", () => {
 });
 
 describe("terminal companion installation", () => {
-  it("copies the release companion beside the installed setup CLI", async () => {
+  it("installs only the setup CLI even when an old release companion exists", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "installer-terminal-companion-"));
     const source = path.join(root, "download");
     await mkdir(source);
@@ -218,10 +218,7 @@ describe("terminal companion installation", () => {
       const options = settings(path.join(root, "installation"));
       const written = await writeInstallation(options, async () => Result.ok(undefined));
       expect(written.isOk()).toBe(true);
-      expect(await readFile(path.join(options.root, "bin", "lilac-tui"), "utf8")).toBe(
-        "fixture-terminal",
-      );
-      expect((await stat(path.join(options.root, "bin", "lilac-tui"))).mode & 0o777).toBe(0o755);
+      expect(await Bun.file(path.join(options.root, "bin", "lilac-tui")).exists()).toBe(false);
       expect(await readFile(path.join(options.root, "bin", "lilac"), "utf8")).toBe(
         "fixture-installer",
       );

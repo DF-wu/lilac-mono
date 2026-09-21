@@ -11,14 +11,6 @@ export const REVIEWED_EXCEPTION_ADAPTERS: Readonly<Record<string, readonly Excep
         "Preserves a captured terminal application defect after controller failure or application cleanup policy is resolved.",
     },
     {
-      identity: { module: "src/cache.ts", exportName: "nativeTuiCacheFailure" },
-      category: "result-to-framework",
-      externalApi: { package: "@stanley2058/lilac-client", exportName: "NativeCache" },
-      direction: "signal-host",
-      reason:
-        "Reports failed disk cache commits through the shared cache Promise contract so the client cannot advance its checkpoint after a failed write.",
-    },
-    {
       identity: { module: "src/session.ts", exportName: "nativeTuiHttpFailure" },
       category: "result-to-framework",
       externalApi: { package: "@orpc/client", exportName: "ORPCError" },

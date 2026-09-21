@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, jest, test } from "bun:test";
 import { Result } from "better-result";
 import { MemoryNativeCache } from "@stanley2058/lilac-client";
 import {
@@ -8,7 +8,7 @@ import {
   uploadTuiResource,
 } from "../src/session";
 import { parseTuiArgs } from "../src/main";
-import type { TuiAuthSession } from "../src/auth";
+import { TuiAuthError, type TuiAuthSession } from "../src/auth";
 
 const initial = {
   installationId: "fixture",
@@ -20,7 +20,8 @@ const initial = {
 
 function auth(): TuiAuthSession {
   return {
-    provider: "local",
+    sessionId: "fixture-session",
+    threadId: "fixture-thread",
     token: "fixture-token",
     expiresAt: Date.now() / 1000 + 3600,
     authorization: () => "Bearer fixture-token",
@@ -30,27 +31,10 @@ function auth(): TuiAuthSession {
   };
 }
 
-test("CLI accepts native startup and replay options, rejects credential URLs", () => {
-  expect(
-    parseTuiArgs([
-      "--url",
-      "http://localhost:8787",
-      "--thread",
-      "thread1",
-      "--no-cache",
-      "--login",
-    ]).unwrap(),
-  ).toEqual({
-    kind: "run",
-    url: "http://localhost:8787",
-    threadId: "thread1",
-    cache: false,
-    login: true,
-  });
-  expect(parseTuiArgs(["--url"]).isErr()).toBe(true);
-  expect(parseTuiArgs(["--url", "https://owner:password@example.com"]).isErr()).toBe(true);
-  expect(parseTuiArgs(["--url", "https://example.com/path"]).isErr()).toBe(true);
-  expect(parseTuiArgs(["--unknown"]).isErr()).toBe(true);
+test("CLI only accepts local operator startup and information flags", () => {
+  expect(parseTuiArgs([]).unwrap()).toEqual({ kind: "run" });
+  for (const option of ["--url", "--thread", "--login", "--no-cache"])
+    expect(parseTuiArgs([option]).isErr()).toBe(true);
   expect(parseTuiArgs(["--help"]).unwrap()).toEqual({ kind: "help" });
 });
 
@@ -167,4 +151,58 @@ test("bootstrap rejects sign-in and protocol failures before exposing a client",
   const incompatible = await createTuiSession(server.url.origin, auth(), new MemoryNativeCache());
   expect(incompatible.match({ ok: () => "", err: (error) => error.code })).toBe("incompatible");
   server.stop(true);
+});
+
+test("exit stops renewal and awaits cleanup despite an in-flight heartbeat failure", async () => {
+  const heartbeat = Promise.withResolvers<Result<void, TuiAuthError>>();
+  const cleanup = Promise.withResolvers<Result<void, TuiAuthError>>();
+  const deleting = Promise.withResolvers<void>();
+  let renewals = 0;
+  let disposed = false;
+  let ended = false;
+  const server = Bun.serve({ port: 0, fetch: () => Response.json(initial) });
+  jest.useFakeTimers();
+  const session = (
+    await createTuiSession(
+      server.url.origin,
+      {
+        ...auth(),
+        refresh: () => {
+          renewals++;
+          return heartbeat.promise;
+        },
+        logout: () => {
+          deleting.resolve();
+          return cleanup.promise;
+        },
+        dispose: () => {
+          disposed = true;
+        },
+      },
+      new MemoryNativeCache(),
+    )
+  ).unwrap();
+  try {
+    jest.advanceTimersByTime(10_000);
+    expect(renewals).toBe(1);
+    const exit = session.logout().then(() => {
+      ended = true;
+    });
+    heartbeat.resolve(Result.err(new TuiAuthError({ code: "login", message: "Session ended" })));
+    await deleting.promise;
+    jest.advanceTimersByTime(30_000);
+    expect(renewals).toBe(1);
+    expect(disposed).toBe(false);
+    expect(ended).toBe(false);
+    cleanup.resolve(Result.ok());
+    await exit;
+    expect(disposed).toBe(true);
+    expect(ended).toBe(true);
+  } finally {
+    heartbeat.resolve(Result.ok());
+    cleanup.resolve(Result.ok());
+    await session.dispose();
+    jest.useRealTimers();
+    server.stop(true);
+  }
 });

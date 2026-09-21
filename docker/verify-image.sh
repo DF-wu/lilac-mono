@@ -123,6 +123,12 @@ done
 docker exec --user lilac "$container_name" /usr/bin/test -w /data ||
   fail "/data is not writable by lilac"
 
+docker exec --user root "$container_name" /usr/local/bin/lilac-tui --help >/dev/null ||
+  fail "container terminal launcher failed"
+docker exec --user root --workdir /app/apps/tui "$container_name" /usr/local/bin/bun \
+  --preload @opentui/solid/preload -e 'await import("@opentui/core"); await import("./src/app.tsx")' >/dev/null ||
+  fail "terminal renderer or native dependencies are incomplete"
+
 container_logs=$(docker logs "$container_name" 2>&1)
 [[ $container_logs == *"$log_marker"* ]] || fail "direct process output is absent from Docker logs"
 

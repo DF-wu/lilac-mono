@@ -106,7 +106,7 @@ describe("native installer", () => {
     expect(setup.pending).toEqual([]);
   });
 
-  it("supports Clerk using the existing owner and OAuth config without enrolling users", async () => {
+  it("supports Clerk web login without terminal OAuth configuration", async () => {
     const setup = fixture([
       "clerk",
       "https://chat.example",
@@ -114,7 +114,6 @@ describe("native installer", () => {
       "https://clerk.example",
       "fixture-secret",
       "fixture-publishable",
-      "fixture-client",
     ]);
     await configureNative(setup.prompt, setup.draft);
     expect(validateConfigDocument(setup.document).isOk()).toBe(true);
@@ -123,7 +122,6 @@ describe("native installer", () => {
       ownerId: "owner",
       ownerProviderUserId: "user_fixture",
       clerkIssuer: "https://clerk.example",
-      clerkOAuthClientId: "fixture-client",
     });
     expect(setup.draft.secrets.CLERK_SECRET_KEY).toBe("fixture-secret");
     expect(setup.document.toString()).not.toContain("fixture-secret");

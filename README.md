@@ -26,11 +26,12 @@ curl -fsSL https://raw.githubusercontent.com/stanley2058/lilac-mono/main/install
 ```
 
 Use the arrow keys and Enter to work through the wizard. It checks your machine, guides you through
-provider authentication and native sign-in, then offers Discord and other optional integrations. You can skip
+provider authentication, then offers terminal-only access, web sign-in, Discord, and optional integrations. You can skip
 those and configure them later. Review and confirm the configuration to pull the images and start Lilac.
 
-Once setup reports that Lilac is healthy, open `http://localhost:8787` and sign in, or run
-`./bin/lilac-tui --url http://localhost:8787` for a terminal conversation.
+Once setup reports that Lilac is healthy, choose "Talk to Lilac now". Later, run
+`docker compose exec --user root lilac lilac-tui` for a temporary conversation, deleted on exit.
+If you enabled Web, open `http://localhost:8787` and sign in.
 
 ## After installation: make Lilac your own
 

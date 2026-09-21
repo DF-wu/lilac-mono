@@ -553,15 +553,6 @@ export async function writeInstallation(
   const executable = path.join(options.root, "bin", "lilac");
   if (options.installExecutable && process.execPath !== executable)
     files.push({ filename: executable, mode: 0o755 });
-  const terminalSource = path.join(path.dirname(process.execPath), "lilac-tui");
-  const terminalTarget = path.join(options.root, "bin", "lilac-tui");
-  if (
-    options.installExecutable &&
-    terminalSource !== terminalTarget &&
-    (await Bun.file(terminalSource).exists())
-  ) {
-    files.push({ filename: terminalTarget, source: terminalSource, mode: 0o755 });
-  }
   const staged = files.map((file) => ({
     ...file,
     temporary: `${file.filename}.${crypto.randomUUID()}.tmp`,

@@ -1,195 +1,57 @@
-import { createInterface } from "node:readline/promises";
-import { Writable } from "node:stream";
-import { homedir } from "node:os";
-import path from "node:path";
 import { NoNativeCache } from "@stanley2058/lilac-client";
 import { Panic, Result, TaggedError } from "better-result";
-import { createTuiAuth, type TuiAuthSession, type TuiAuthError } from "./auth.ts";
-import { DiskNativeCache } from "./cache.ts";
+import { createTuiAuth, OPERATOR_URL } from "./auth.ts";
 import { captureTuiException, rethrowTuiDefect } from "./fatal.ts";
 import { createTuiSession, type TuiSession, type TuiRequestError } from "./session.ts";
 
 export class TuiCliError extends TaggedError("TuiCliError")<{ message: string }> {}
-export type TuiCliOptions =
-  | { kind: "run"; url: string; cache: boolean; login: boolean; threadId?: string }
-  | { kind: "help" | "version" };
+export type TuiCliOptions = { kind: "run" | "help" | "version" };
+export const TUI_HELP = `Usage: lilac-tui [--help | --version]
 
-export const TUI_HELP = `Usage: lilac-tui [options]
+Run inside the Lilac container as root:
+  docker compose exec --user root lilac lilac-tui
 
-  --url URL       Native server URL (default http://127.0.0.1:8787)
-  --thread ID     Open a conversation
-  --no-cache      Disable local conversation replay cache
-  --login         Sign in again, ignoring saved credentials
-  --help, -h      Show this help
-  --version, -v   Show version
-
-The server selects local or Clerk authentication. Local login asks for a
-username and hidden password. Clerk login opens your browser.
+Each invocation opens one temporary conversation, deleted on exit.
+Ctrl+C cancels work. Ctrl+Q exits. Agent-created files remain.
 `;
 
 export function parseTuiArgs(args: string[]): Result<TuiCliOptions, TuiCliError> {
-  let url = "http://127.0.0.1:8787";
-  let cache = true;
-  let login = false;
-  let threadId: string | undefined;
-  for (let index = 0; index < args.length; index++) {
-    const arg = args[index];
-    switch (arg) {
-      case "--help":
-      case "-h":
-        return Result.ok({ kind: "help" });
-      case "--version":
-      case "-v":
-        return Result.ok({ kind: "version" });
-      case "--no-cache":
-        cache = false;
-        break;
-      case "--login":
-        login = true;
-        break;
-      case "--url":
-      case "--thread": {
-        const value = args[++index];
-        if (!value || value.startsWith("--"))
-          return Result.err(new TuiCliError({ message: `${arg} requires a value.` }));
-        if (arg === "--url") url = value;
-        else threadId = value;
-        break;
-      }
-      default:
-        return Result.err(
-          new TuiCliError({ message: "Unknown option. Run lilac-tui --help for usage." }),
-        );
-    }
-  }
-  const parsed = Result.try({
-    try: () => new URL(url),
-    catch: () => new TuiCliError({ message: "--url must be an HTTP or HTTPS server URL." }),
-  });
-  return parsed.andThen((value) => {
-    if (
-      !["http:", "https:"].includes(value.protocol) ||
-      value.username ||
-      value.password ||
-      value.pathname !== "/" ||
-      value.search ||
-      value.hash
-    )
-      return Result.err(
-        new TuiCliError({
-          message:
-            "--url must be an HTTP or HTTPS origin without credentials, a path, or query parameters.",
-        }),
-      );
-    return Result.ok<TuiCliOptions>({ kind: "run", url: value.origin, cache, login, threadId });
-  });
+  if (!args.length) return Result.ok({ kind: "run" });
+  if (args.length === 1 && ["--help", "-h"].includes(args[0]!)) return Result.ok({ kind: "help" });
+  if (args.length === 1 && ["--version", "-v"].includes(args[0]!))
+    return Result.ok({ kind: "version" });
+  return Result.err(
+    new TuiCliError({ message: "Unknown option. Run lilac-tui --help for usage." }),
+  );
 }
 
-async function requestLocalCredentials(): Promise<{ username: string; password: string }> {
-  let hidden = false;
-  const output = new Writable({
-    write(chunk, _encoding, done) {
-      if (!hidden) process.stdout.write(chunk);
-      done();
-    },
-  });
-  const reader = createInterface({ input: process.stdin, output, terminal: true });
-  const canceled = new AbortController();
-  reader.on("SIGINT", () => canceled.abort());
-  const credentials = await Result.tryPromise({
-    try: async () => {
-      const username = await reader.question("Username: ", { signal: canceled.signal });
-      process.stdout.write("Password: ");
-      hidden = true;
-      const password = await reader.question("", { signal: canceled.signal });
-      return { username, password };
-    },
-    catch: () => new TuiCliError({ message: "Sign-in canceled." }),
-  });
-  reader.close();
-  process.stdout.write("\n");
-  return credentials.match({ ok: (value) => value, err: () => ({ username: "", password: "" }) });
-}
-
-async function openBrowser(url: string): Promise<void> {
-  const command = process.platform === "darwin" ? "open" : "xdg-open";
-  const result = await Result.tryPromise({
-    try: async () => {
-      const child = Bun.spawn([command, url], { stdout: "ignore", stderr: "ignore" });
-      return await child.exited;
-    },
-    catch: () => -1,
-  });
-  const status = result.match({ ok: (value) => value, err: (value) => value });
-  if (status !== 0) process.stdout.write(`Open this sign-in page in your browser:\n${url}\n`);
-}
-
-async function run(
-  options: Extract<TuiCliOptions, { kind: "run" }>,
-): Promise<Result<void, TuiCliError>> {
+async function run(): Promise<Result<void, TuiCliError>> {
   if (!process.stdin.isTTY || !process.stdout.isTTY)
-    return Result.err(
-      new TuiCliError({
-        message: "lilac-tui requires an interactive terminal. Use --help for options.",
-      }),
+    return Result.err(new TuiCliError({ message: "lilac-tui requires an interactive terminal." }));
+  return Result.gen(async function* () {
+    const auth = yield* (await createTuiAuth()).mapError(
+      (error) => new TuiCliError({ message: error.message }),
     );
-  const credentialDirectory = path.join(
-    process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config"),
-    "lilac",
-    "tui",
-  );
-  const cacheDirectory = path.join(
-    process.env.XDG_CACHE_HOME || path.join(homedir(), ".cache"),
-    "lilac",
-    "tui",
-  );
-  const authOptions = {
-    baseUrl: options.url,
-    credentialDirectory,
-    requestLocalCredentials,
-    openBrowser,
-    forceLogin: options.login,
-  };
-  const authResult = await createTuiAuth(authOptions);
-  const auth = authResult.match<{ value: TuiAuthSession } | { error: TuiAuthError }>({
-    ok: (value) => ({ value }),
-    err: (error) => ({ error }),
-  });
-  if ("error" in auth) return Result.err(new TuiCliError({ message: auth.error.message }));
-  const cache = options.cache ? new DiskNativeCache(cacheDirectory) : new NoNativeCache();
-  let activeAuth = auth.value;
-  let sessionResult = await createTuiSession(options.url, activeAuth, cache);
-  const needsLogin = sessionResult.match({
-    ok: () => false,
-    err: (error) => error.code === "unauthenticated",
-  });
-  if (needsLogin) {
-    auth.value.dispose();
-    const retry = await createTuiAuth({ ...authOptions, forceLogin: true });
-    const next = retry.match<{ value: TuiAuthSession } | { error: TuiAuthError }>({
-      ok: (value) => ({ value }),
+    const created = await createTuiSession(OPERATOR_URL, auth, new NoNativeCache());
+    const selected = created.match<{ session: TuiSession } | { error: TuiRequestError }>({
+      ok: (session) => ({ session }),
       err: (error) => ({ error }),
     });
-    if ("error" in next) return Result.err(new TuiCliError({ message: next.error.message }));
-    activeAuth = next.value;
-    sessionResult = await createTuiSession(options.url, activeAuth, cache);
-  }
-  const session = sessionResult.match<{ value: TuiSession } | { error: TuiRequestError }>({
-    ok: (value) => ({ value }),
-    err: (error) => ({ error }),
+    if ("error" in selected) {
+      await auth.logout();
+      auth.dispose();
+      return Result.err(new TuiCliError({ message: selected.error.message }));
+    }
+    const session = selected.session;
+    await runTuiWithCleanup(
+      async () => {
+        const { runTui } = await import("./app.tsx");
+        await runTui(session, auth.threadId);
+      },
+      () => session.logout(),
+    );
+    return Result.ok();
   });
-  if ("error" in session) {
-    activeAuth.dispose();
-    return Result.err(new TuiCliError({ message: session.error.message }));
-  }
-  await runTuiWithCleanup(
-    async () => {
-      const { runTui } = await import("./app.tsx");
-      await runTui(session.value, options.threadId);
-    },
-    () => session.value.dispose(),
-  );
-  return Result.ok();
 }
 
 export async function main(args = process.argv.slice(2)): Promise<number> {
@@ -209,9 +71,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     process.stdout.write(`lilac-tui ${process.env.LILAC_TUI_VERSION || "development"}\n`);
     return 0;
   }
-  const options = parsed.options;
-  if (options.kind !== "run") return 0;
-  return (await run(options)).match({
+  return (await run()).match({
     ok: () => 0,
     err: (error) => {
       process.stderr.write(`${error.message}\n`);

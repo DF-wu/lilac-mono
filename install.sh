@@ -78,7 +78,7 @@ lilac_main() {
 
   printf 'Downloading Lilac for %s/%s…\n' "$lilac_os" "$lilac_arch"
   lilac_download "$lilac_release_base/SHA256SUMS" "$lilac_tmp/SHA256SUMS"
-  for lilac_binary in lilac lilac-tui; do
+  for lilac_binary in lilac; do
     lilac_asset="${lilac_binary}-${lilac_os}-${lilac_arch}"
     lilac_download "$lilac_release_base/$lilac_asset" "$lilac_tmp/$lilac_binary"
     lilac_expected=$(awk -v asset="$lilac_asset" '$2 == asset { print $1 }' "$lilac_tmp/SHA256SUMS")
@@ -93,7 +93,6 @@ lilac_main() {
     chmod 700 "$lilac_tmp/$lilac_binary"
   done
   "$lilac_tmp/lilac" --version || lilac_fail 'The downloaded installer cannot run on this machine.'
-  "$lilac_tmp/lilac-tui" --version || lilac_fail 'The downloaded terminal client cannot run on this machine.'
   "$lilac_tmp/lilac" "$@" <&3
 }
 
