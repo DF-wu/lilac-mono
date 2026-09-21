@@ -343,4 +343,31 @@ describe("cache and catalog", () => {
     expect(catalogs.complete(scope, "/", "review")[0]?.insertText).toBe("/skill:Code review");
     expect(catalogs.complete({ ...scope, principalId: "other" }, "/", "")).toEqual([]);
   });
+
+  test("slash completions order builtins, custom commands, then skills before applying the limit", () => {
+    const catalogs = new DisplayCatalogCache();
+    catalogs.put(scope, {
+      revision: "v1",
+      models: [],
+      skills: [{ id: "skill", name: "aaa", description: "find", source: "Repo" }],
+      commands: [
+        { id: "custom", name: "bbb", description: "find", kind: "custom" },
+        { id: "builtin", name: "zzz", description: "find", kind: "builtin" },
+        { id: "prefix", name: "find", description: "", kind: "builtin" },
+      ],
+    });
+    expect(catalogs.complete(scope, "/", "").map((item) => item.id)).toEqual([
+      "prefix",
+      "builtin",
+      "custom",
+      "skill",
+    ]);
+    expect(catalogs.complete(scope, "/", "find", 3).map((item) => item.id)).toEqual([
+      "prefix",
+      "builtin",
+      "custom",
+    ]);
+    expect(catalogs.complete(scope, "$", "").map((item) => item.id)).toEqual(["skill"]);
+    expect(catalogs.complete(scope, "/", "skill:aaa").map((item) => item.id)).toEqual(["skill"]);
+  });
 });

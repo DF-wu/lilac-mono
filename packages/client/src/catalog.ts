@@ -10,6 +10,8 @@ export type Completion = {
   insertText: string;
 };
 
+const completionOrder: Record<Completion["kind"], number> = { builtin: 0, custom: 1, skill: 2 };
+
 export class DisplayCatalogCache {
   private readonly catalogs = new Map<string, DisplayCatalog>();
   get(scope: CacheScope): DisplayCatalog | undefined {
@@ -42,6 +44,7 @@ export class DisplayCatalogCache {
       .filter((item) => `${item.name} ${item.description}`.toLocaleLowerCase().includes(normalized))
       .sort(
         (a, b) =>
+          completionOrder[a.kind] - completionOrder[b.kind] ||
           Number(b.name.toLocaleLowerCase().startsWith(normalized)) -
             Number(a.name.toLocaleLowerCase().startsWith(normalized)) ||
           a.name.localeCompare(b.name),

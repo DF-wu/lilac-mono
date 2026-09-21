@@ -120,13 +120,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
   }, [props.windowDrop]);
   const match = /(?:^|\s)([$/])([^$/\n]*)$/.exec(prefix);
   const trigger = match?.[1] === "$" ? "$" : "/";
-  const query = match?.[2]?.replace(/^skill:/, "") ?? "";
+  const query = match?.[2] ?? "";
   const completions = useMemo(
     () =>
       match && !menuHidden && client && scope
-        ? client.catalogs
-            .complete(scope, trigger, query, 100)
-            .filter((item) => !match[2]?.startsWith("skill:") || item.kind === "skill")
+        ? client.catalogs.complete(scope, trigger, query, 100)
         : [],
     [client, scope, trigger, query, !!match, menuHidden, catalog],
   );
