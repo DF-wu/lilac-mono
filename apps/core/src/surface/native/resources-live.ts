@@ -46,15 +46,14 @@ export class NativeLiveFileService {
   ) {}
 
   async resolve(actorId: string, threadId: string, inputPath: string, signal?: AbortSignal) {
-    const service = this;
     return Result.gen(async function* () {
-      const thread = yield* service.dependencies.native.authorizeThread(actorId, threadId, true);
-      const actor = yield* service.dependencies.native.getUser(actorId);
-      const starter = yield* service.dependencies.native.getUser(thread.starterId);
+      const thread = yield* this.dependencies.native.authorizeThread(actorId, threadId, true);
+      const actor = yield* this.dependencies.native.getUser(actorId);
+      const starter = yield* this.dependencies.native.getUser(thread.starterId);
       if (actor.toolMode === "restricted" && starter.toolMode !== "restricted")
         return Result.err(nativeFailure("forbidden", "File browsing is outside your tool access"));
       const restricted = starter.toolMode === "restricted";
-      const cwd = restricted ? "/tmp" : service.dependencies.toolRoot;
+      const cwd = restricted ? "/tmp" : this.dependencies.toolRoot;
       const resolved = yield* resolveToolPathForRequestContextResult({
         cwd,
         inputPath,
@@ -65,20 +64,20 @@ export class NativeLiveFileService {
       }).mapError(() => nativeFailure("forbidden", "File path is outside this thread's access"));
       // Restricted paths stay virtual so the existing reader applies its session sandbox mapping once.
       const path = restricted ? posix.resolve(cwd, inputPath) : resolved;
-      const reference = yield* service.dependencies.native.registerPublishedPath(
+      const reference = yield* this.dependencies.native.registerPublishedPath(
         actorId,
         threadId,
         path,
         cwd,
       );
-      const file = yield* Result.await(service.read(actorId, reference.id, signal, true));
+      const file = yield* Result.await(this.read(actorId, reference.id, signal, true));
       return Result.ok({
         path,
         name: file.filename,
         mediaType: file.mediaType,
         href: `/api/files/${reference.id}`,
       });
-    });
+    }, this);
   }
 
   async read(
@@ -89,11 +88,10 @@ export class NativeLiveFileService {
   ): Promise<
     NativeFileResult<{ bytes: Uint8Array; filename: string; mediaType: string; byteLength: number }>
   > {
-    const service = this;
     return Result.gen(async function* () {
-      const reference = yield* service.dependencies.native.readPublishedPath(actorId, pathId);
-      const thread = yield* service.dependencies.native.getThreadRecord(reference.threadId);
-      const starter = yield* service.dependencies.native.getUser(thread.starterId);
+      const reference = yield* this.dependencies.native.readPublishedPath(actorId, pathId);
+      const thread = yield* this.dependencies.native.getThreadRecord(reference.threadId);
+      const starter = yield* this.dependencies.native.getUser(thread.starterId);
       const target = parseSshCwdTarget(reference.cwd);
       if (target.kind === "ssh" && starter.toolMode === "restricted")
         return Result.err(
@@ -105,7 +103,7 @@ export class NativeLiveFileService {
             host: target.host,
             cwd: target.cwd,
             filePath: reference.path,
-            denyPaths: service.dependencies.remoteDenyPaths,
+            denyPaths: this.dependencies.remoteDenyPaths,
             maxBytes: preview ? NATIVE_TEXT_PREVIEW_BYTES : RESOURCE_MAX_BYTES,
             ...(preview ? { prefixBytes: NATIVE_TEXT_PREVIEW_BYTES } : {}),
             ...(signal ? { signal } : {}),
@@ -118,7 +116,7 @@ export class NativeLiveFileService {
         const bytes = Buffer.from(read.base64, "base64");
         if (bytes.byteLength > RESOURCE_MAX_BYTES)
           return Result.err(nativeFailure("invalid", "File exceeds the preview size limit"));
-        yield* service.dependencies.native.readPublishedPath(actorId, pathId);
+        yield* this.dependencies.native.readPublishedPath(actorId, pathId);
         return Result.ok({
           bytes,
           byteLength: read.totalBytes ?? bytes.byteLength,
@@ -127,14 +125,14 @@ export class NativeLiveFileService {
         });
       }
       const path = yield* resolveToolPathForRequestContextResult({
-        cwd: reference.cwd ?? service.dependencies.toolRoot,
+        cwd: reference.cwd ?? this.dependencies.toolRoot,
         inputPath: reference.path,
         context: {
           sessionId: nativeSessionId(reference.threadId),
           safetyMode: starter.toolMode === "restricted" ? "restricted" : "trusted",
         },
       }).mapError(() => nativeFailure("forbidden", "File path is outside this thread's access"));
-      const read = await service.dependencies.filesystem.readFileBytes({
+      const read = await this.dependencies.filesystem.readFileBytes({
         path,
         maxBytes: preview ? NATIVE_TEXT_PREVIEW_BYTES : RESOURCE_MAX_BYTES,
         ...(preview ? { prefixBytes: NATIVE_TEXT_PREVIEW_BYTES } : {}),
@@ -143,14 +141,14 @@ export class NativeLiveFileService {
         return Result.err(nativeFailure("not-found", "File is missing or unreadable"));
       if (read.bytes.byteLength > RESOURCE_MAX_BYTES)
         return Result.err(nativeFailure("invalid", "File exceeds the preview size limit"));
-      yield* service.dependencies.native.readPublishedPath(actorId, pathId);
+      yield* this.dependencies.native.readPublishedPath(actorId, pathId);
       return Result.ok({
         bytes: read.bytes,
         byteLength: read.totalBytes ?? read.bytes.byteLength,
         filename: basename(reference.path),
         mediaType: inferMimeTypeFromFilename(reference.path),
       });
-    });
+    }, this);
   }
 
   async handle(request: Request, actorId: string): Promise<Response | undefined> {

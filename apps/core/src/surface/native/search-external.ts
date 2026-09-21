@@ -71,17 +71,16 @@ export class NativeExternalThreads {
   ): Promise<
     ResultType<{ items: ExternalThreadDisplay[]; nextCursor?: string }, NativeStoreError>
   > {
-    const self = this;
     return Result.gen(async function* () {
-      yield* owner(self.params.getUser, userId);
-      const now = self.params.now?.() ?? Date.now();
+      yield* owner(this.params.getUser, userId);
+      const now = this.params.now?.() ?? Date.now();
       const items: ExternalThreadDisplay[] = [];
-      for (const session of self.params.knownSessions?.() ?? []) {
+      for (const session of this.params.knownSessions?.() ?? []) {
         const display = displaySession(session, now);
         if (display) items.push(display);
       }
       for (const platform of ["discord", "github"] as const) {
-        const resolved = self.params.adapters.resolve(platform);
+        const resolved = this.params.adapters.resolve(platform);
         if (!resolved) continue;
         const sessions = yield* Result.await(
           resolved.adapter
@@ -109,7 +108,7 @@ export class NativeExternalThreads {
         items: page,
         ...(start + limit < unique.length ? { nextCursor: page.at(-1)!.id } : {}),
       });
-    });
+    }, this);
   }
 
   async read(
@@ -121,11 +120,10 @@ export class NativeExternalThreads {
       NativeStoreError
     >
   > {
-    const self = this;
     return Result.gen(async function* () {
-      yield* owner(self.params.getUser, userId);
+      yield* owner(this.params.getUser, userId);
       const ref = yield* parseExternalThreadId(input.threadId);
-      const resolved = self.params.adapters.resolve(ref.platform);
+      const resolved = this.params.adapters.resolve(ref.platform);
       if (!resolved)
         return Result.err(nativeFailure("not-found", "External surface is unavailable"));
       const page = input.cursor ? Number(input.cursor) : 1;
@@ -153,7 +151,7 @@ export class NativeExternalThreads {
           },
         ],
       }));
-      const now = self.params.now?.() ?? Date.now();
+      const now = this.params.now?.() ?? Date.now();
       return Result.ok({
         thread: {
           id: input.threadId,
@@ -171,6 +169,6 @@ export class NativeExternalThreads {
             }
           : {}),
       });
-    });
+    }, this);
   }
 }

@@ -82,15 +82,14 @@ export class NativeSearchStore {
     userId: string,
     input: NativeSearchInput,
   ): NativeStoreResult<NativeSearchMessage[]> {
-    const self = this;
     return nativeStoreTransaction(this.params.db, () =>
       Result.gen(function* () {
-        const user = yield* self.params.store.getUser(userId);
+        const user = yield* this.params.store.getUser(userId);
         if (user.role === "service")
           return Result.err(
             nativeFailure("forbidden", "Service users cannot browse conversations"),
           );
-        if (input.threadId) yield* self.params.store.authorizeThread(userId, input.threadId);
+        if (input.threadId) yield* this.params.store.authorizeThread(userId, input.threadId);
         const terms = input.query.trim().split(/\s+/u).filter(Boolean).slice(0, 32);
         if (terms.length === 0)
           return Result.err(nativeFailure("invalid", "Search query is required"));
@@ -118,13 +117,13 @@ export class NativeSearchStore {
         }
         values.push(Math.min(500, Math.max(1, input.limit)), Math.max(0, input.offset ?? 0));
         return decodeSearchRows(
-          self.params.db
+          this.params.db
             .query(
               `${messageProjection} SELECT * FROM messages WHERE ${filters.join(" AND ")} ORDER BY createdAt ${input.direction === "asc" ? "ASC" : "DESC"}, threadId, ordinal DESC LIMIT ? OFFSET ?`,
             )
             .all(...values),
         );
-      }),
+      }, this),
     );
   }
 
@@ -139,14 +138,13 @@ export class NativeSearchStore {
     startMessageId: string | null;
     endMessageId: string | null;
   }> {
-    const self = this;
     return nativeStoreTransaction(this.params.db, () =>
       Result.gen(function* () {
-        const thread = yield* self.params.store.authorizeThread(userId, threadId);
-        const user = yield* self.params.store.getUser(userId);
+        const thread = yield* this.params.store.authorizeThread(userId, threadId);
+        const user = yield* this.params.store.getUser(userId);
         const args = [user.role, user.id, user.id, threadId];
         const messages = yield* decodeSearchRows(
-          self.params.db
+          this.params.db
             .query(
               `${messageProjection} SELECT * FROM messages WHERE threadId=? ORDER BY ordinal LIMIT ? OFFSET ?`,
             )
@@ -157,14 +155,14 @@ export class NativeSearchStore {
             ),
         );
         const bounds = yield* decodeSearchCount(
-          self.params.db
+          this.params.db
             .query(
               `${messageProjection} SELECT count(*) AS total, (SELECT messageId FROM messages WHERE threadId=? ORDER BY ordinal LIMIT 1) AS startMessageId, (SELECT messageId FROM messages WHERE threadId=? ORDER BY ordinal DESC LIMIT 1) AS endMessageId FROM messages WHERE threadId=?`,
             )
             .get(...args.slice(0, 3), threadId, threadId, threadId),
         );
         return Result.ok({ thread, messages, ...bounds });
-      }),
+      }, this),
     );
   }
 }

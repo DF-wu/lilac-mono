@@ -142,7 +142,7 @@ export class NativeResourceService {
     if (
       !input.filename.trim() ||
       input.filename.length > 1024 ||
-      /[\r\n\u0000]/u.test(input.filename)
+      ["\r", "\n", "\0"].some((character) => input.filename.includes(character))
     )
       return Result.err(nativeFailure("invalid", "Invalid filename"));
     if (input.mediaType.length > 256)
@@ -265,14 +265,13 @@ export class NativeResourceService {
     source: ReadableStream<Uint8Array>,
     signal?: AbortSignal,
   ): Promise<NativeStateResult<NativeUploadRecord>> {
-    const service = this;
     return Result.gen(async function* () {
-      const bounded = service.#uploadStream(upload, source, signal);
+      const bounded = this.#uploadStream(upload, source, signal);
       const transfer = yield* Result.await(
-        service.dependencies.blobs
+        this.dependencies.blobs
           .startStagedUpload({
             source: bounded,
-            stagingExpiresAt: service.#now() + 24 * 60 * 60_000,
+            stagingExpiresAt: this.#now() + 24 * 60 * 60_000,
             expectedByteLength: upload.size,
           })
           .then((result) =>
@@ -286,15 +285,15 @@ export class NativeResourceService {
           ),
         ),
       );
-      yield* service.dependencies.native.authorizeThread(actorId, upload.threadId, true);
-      const current = yield* service.dependencies.native.getUpload(upload.id);
+      yield* this.dependencies.native.authorizeThread(actorId, upload.threadId, true);
+      const current = yield* this.dependencies.native.getUpload(upload.id);
       if (
         current.state === "canceled" ||
         current.attempt !== upload.attempt ||
         current.historyGeneration !== upload.historyGeneration
       )
         return Result.err(nativeFailure("stale", "Upload no longer belongs to an active input"));
-      const registered = yield* service.dependencies.resources
+      const registered = yield* this.dependencies.resources
         .registerOrGet({
           candidateResourceId: createResourceId(),
           origin: {
@@ -307,7 +306,7 @@ export class NativeResourceService {
           filename: upload.filename,
           declaredMediaType: upload.mediaType,
           reportedByteLength: upload.size,
-          createdAt: service.#now(),
+          createdAt: this.#now(),
         })
         .mapError(() => nativeFailure("sqlite", "File metadata could not be stored"));
       if (registered.kind === "collision")
@@ -315,7 +314,7 @@ export class NativeResourceService {
           nativeFailure("conflict", "Upload resource identity collided; retry the transfer"),
         );
       const record = registered.record;
-      yield* service.dependencies.resources
+      yield* this.dependencies.resources
         .retainNativeResource({
           uploadId: upload.id,
           threadId: upload.threadId,
@@ -323,16 +322,16 @@ export class NativeResourceService {
         })
         .mapError(() => nativeFailure("sqlite", "File ownership could not be stored"));
       const adopted = yield* Result.await(
-        service.dependencies.blobs
+        this.dependencies.blobs
           .adopt(transfer.handle)
           .then((result) =>
             result.mapError(() => nativeFailure("invalid", "Uploaded bytes are unavailable")),
           ),
       );
-      const attachment = service.dependencies.resources.compareAndSwapCache({
+      const attachment = this.dependencies.resources.compareAndSwapCache({
         resourceId: record.resourceId,
         ...(record.cache ? { expected: record.cache } : {}),
-        next: { blob: adopted, cachedAt: service.#now() },
+        next: { blob: adopted, cachedAt: this.#now() },
       });
       const attached = attachment.match({
         ok: (value) => value.kind === "attached",
@@ -340,7 +339,7 @@ export class NativeResourceService {
       });
       if (!attached) {
         yield* Result.await(
-          service.dependencies.blobs
+          this.dependencies.blobs
             .delete(adopted)
             .then((result) =>
               result.mapError(() =>
@@ -352,7 +351,7 @@ export class NativeResourceService {
       }
       if (record.cache && record.cache.blob.objectId !== blob.objectId)
         yield* Result.await(
-          service.dependencies.blobs
+          this.dependencies.blobs
             .delete(record.cache.blob)
             .then((result) =>
               result.mapError(() =>
@@ -360,13 +359,13 @@ export class NativeResourceService {
               ),
             ),
         );
-      return service.dependencies.native.settleUpload(upload.id, {
+      return this.dependencies.native.settleUpload(upload.id, {
         attempt: upload.attempt,
         historyGeneration: upload.historyGeneration,
         state: "ready",
         resourceUri: formatResourceUri(record.resourceId),
       });
-    });
+    }, this);
   }
 
   #uploadStream(
@@ -414,38 +413,36 @@ export class NativeResourceService {
   }
 
   authorize(actorId: string, uri: string): NativeResult<ResourceRecordV1> {
-    const service = this;
     return Result.gen(function* () {
       const id = yield* parseResourceUri(uri).mapError(() =>
         nativeFailure("invalid", "Invalid resource reference"),
       );
-      const record = yield* service.dependencies.resources
+      const record = yield* this.dependencies.resources
         .getRetained(id)
         .mapError(() => nativeFailure("sqlite", "File metadata is unavailable"));
       if (!record) return Result.err(nativeFailure("not-found", "File is unavailable"));
       if (record.origin.kind === "discord-attachment") {
-        const user = yield* service.dependencies.native.getUser(actorId);
+        const user = yield* this.dependencies.native.getUser(actorId);
         if (user.role !== "owner")
           return Result.err(
             nativeFailure("forbidden", "Only the owner can read external attachments"),
           );
         return Result.ok(record);
       }
-      yield* service.dependencies.native.authorizeThread(actorId, record.origin.threadId);
-      const upload = yield* service.dependencies.native.readUpload(actorId, record.origin.uploadId);
+      yield* this.dependencies.native.authorizeThread(actorId, record.origin.threadId);
+      const upload = yield* this.dependencies.native.readUpload(actorId, record.origin.uploadId);
       if (upload.state !== "ready" || upload.resourceUri !== uri)
         return Result.err(nativeFailure("not-found", "File is unavailable"));
       return Result.ok(record);
-    });
+    }, this);
   }
 
   validateReference(actorId: string, destinationThreadId: string, uri: string): NativeResult<void> {
-    const service = this;
     return Result.gen(function* () {
-      yield* service.dependencies.native.authorizeThread(actorId, destinationThreadId, true);
-      yield* service.authorize(actorId, uri);
+      yield* this.dependencies.native.authorizeThread(actorId, destinationThreadId, true);
+      yield* this.authorize(actorId, uri);
       return Result.ok(undefined);
-    });
+    }, this);
   }
 
   async open(
@@ -466,28 +463,25 @@ export class NativeResourceService {
   }
 
   scopedAccess(actorId: string): ResourceAccess {
-    const service = this;
     const verify = (uri: string) =>
-      service
-        .authorize(actorId, uri)
-        .mapError(
-          () => new ResourceNotFound({ uri, message: "Resource is unavailable to this thread" }),
-        );
+      this.authorize(actorId, uri).mapError(
+        () => new ResourceNotFound({ uri, message: "Resource is unavailable to this thread" }),
+      );
     return {
-      describe(uri) {
-        return verify(uri).andThen(() => service.dependencies.access.describe(uri));
+      describe: (uri) => {
+        return verify(uri).andThen(() => this.dependencies.access.describe(uri));
       },
-      async open(uri: string, options: ResourceOpenOptions) {
+      open: async (uri: string, options: ResourceOpenOptions) => {
         const authorization = verify(uri);
         const error = authorization.match({ ok: () => null, err: (failure) => failure });
         if (error) return Result.err(error);
-        return service.dependencies.access.open(uri, options);
+        return this.dependencies.access.open(uri, options);
       },
-      async materialize(uri: string, options: ResourceMaterializeOptions) {
+      materialize: async (uri: string, options: ResourceMaterializeOptions) => {
         const authorization = verify(uri);
         const error = authorization.match({ ok: () => null, err: (failure) => failure });
         if (error) return Result.err(error);
-        return service.dependencies.access.materialize(uri, options);
+        return this.dependencies.access.materialize(uri, options);
       },
     };
   }
@@ -497,9 +491,8 @@ export class NativeResourceService {
     uri: string,
     supports: (mediaType: string) => boolean,
   ): Promise<NativeResult<NativeModelAttachment>> {
-    const service = this;
     return Result.gen(async function* () {
-      const record = yield* service.authorize(actorId, uri);
+      const record = yield* this.authorize(actorId, uri);
       const fallback: NativeModelAttachment = {
         type: "resource",
         uri,
@@ -512,7 +505,7 @@ export class NativeResourceService {
         !supports(fallback.mediaType)
       )
         return Result.ok(fallback);
-      const read = yield* Result.await(service.open(actorId, uri));
+      const read = yield* Result.await(this.open(actorId, uri));
       const bytes = yield* Result.await(
         consumeVerifiedResourceRead(read).then((result) =>
           result.mapError(() => nativeFailure("invalid", "File verification failed")),
@@ -528,14 +521,13 @@ export class NativeResourceService {
         mediaType,
         filename: fallback.filename,
       });
-    });
+    }, this);
   }
 
   async handleAvatar(request: Request, actorId: string, targetId = "lilac"): Promise<Response> {
-    const service = this;
     const result = await Result.gen(async function* () {
-      const actor = yield* service.dependencies.native.getUser(actorId);
-      const identity = yield* service.dependencies.native.getUser(targetId);
+      const actor = yield* this.dependencies.native.getUser(actorId);
+      const identity = yield* this.dependencies.native.getUser(targetId);
       if (request.method === "GET") {
         if (!identity.avatar)
           return Result.err(nativeFailure("not-found", "Avatar is unavailable"));
@@ -555,7 +547,7 @@ export class NativeResourceService {
         if (request.headers.get("if-none-match") === etag)
           return Result.ok(new Response(null, { status: 304, headers }));
         const opened = yield* Result.await(
-          service.dependencies.blobs
+          this.dependencies.blobs
             .open(avatar.blob)
             .then((value) =>
               value.mapError(() => nativeFailure("not-found", "Avatar is unavailable")),
@@ -580,19 +572,19 @@ export class NativeResourceService {
         return Result.err(nativeFailure("forbidden", "Only the owner can change agent identity"));
       const update = (
         targetId === "lilac"
-          ? service.dependencies.native.setAgentIdentity
-          : service.dependencies.native.setUserProfile
-      )?.bind(service.dependencies.native);
+          ? this.dependencies.native.setAgentIdentity
+          : this.dependencies.native.setUserProfile
+      )?.bind(this.dependencies.native);
       const project = targetId === "lilac" ? agentIdentity : nativeUserDisplay;
-      const provider = targetId !== "lilac" ? service.dependencies.profileProvider : undefined;
+      const provider = targetId !== "lilac" ? this.dependencies.profileProvider : undefined;
       if (!update) return Result.err(nativeFailure("invalid", "Agent identity is unavailable"));
       if (request.method === "DELETE") {
         if (provider)
-          return Result.ok(yield* Result.await(service.updateProviderAvatar(identity, null)));
+          return Result.ok(yield* Result.await(this.updateProviderAvatar(identity, null)));
         const changed = yield* update(actorId, { avatar: null });
         if (identity.avatar)
           yield* Result.await(
-            service.dependencies.blobs
+            this.dependencies.blobs
               .delete(identity.avatar.blob)
               .then((value) =>
                 value.mapError(() =>
@@ -631,14 +623,14 @@ export class NativeResourceService {
       if (provider)
         return Result.ok(
           yield* Result.await(
-            service.updateProviderAvatar(
+            this.updateProviderAvatar(
               identity,
               new File([new Uint8Array(bytes)], "avatar", { type: mediaType }),
             ),
           ),
         );
       const transfer = yield* Result.await(
-        service.dependencies.blobs
+        this.dependencies.blobs
           .startUpload({ source: bytes, retention: { kind: "durable" } })
           .then((value) =>
             value.mapError(() => nativeFailure("invalid", "Avatar upload could not start")),
@@ -650,14 +642,14 @@ export class NativeResourceService {
         ),
       );
       const persisted = Result.gen(function* () {
-        const previous = yield* service.dependencies.native.getUser(targetId);
+        const previous = yield* this.dependencies.native.getUser(targetId);
         const changed = yield* update(actorId, { avatar: { blob, mediaType } });
         return Result.ok({ previous, changed });
-      });
+      }, this);
       const failure = persisted.match({ ok: () => null, err: (error) => error });
       if (failure) {
         yield* Result.await(
-          service.dependencies.blobs
+          this.dependencies.blobs
             .delete(blob)
             .then((value) =>
               value.mapError(() => nativeFailure("sqlite", "Unused avatar could not be removed")),
@@ -668,7 +660,7 @@ export class NativeResourceService {
       const { previous, changed } = yield* persisted;
       if (previous.avatar)
         yield* Result.await(
-          service.dependencies.blobs
+          this.dependencies.blobs
             .delete(previous.avatar.blob)
             .then((value) =>
               value.mapError(() => nativeFailure("sqlite", "Previous avatar could not be removed")),
@@ -677,7 +669,7 @@ export class NativeResourceService {
       return Result.ok(
         Response.json(project(changed), { headers: { "Cache-Control": "no-store" } }),
       );
-    });
+    }, this);
     return result.match({ ok: (response) => response, err: resourceFailureResponse });
   }
 
@@ -685,10 +677,9 @@ export class NativeResourceService {
     identity: NativeUser,
     file: File | null,
   ): Promise<NativeResult<Response>> {
-    const service = this;
     return Result.gen(async function* () {
-      const provider = service.dependencies.profileProvider;
-      const update = service.dependencies.native.setUserProfile?.bind(service.dependencies.native);
+      const provider = this.dependencies.profileProvider;
+      const update = this.dependencies.native.setUserProfile?.bind(this.dependencies.native);
       if (!provider || !update)
         return Result.err(nativeFailure("invalid", "Profile provider is unavailable"));
       const profile = yield* Result.await(provider.updateAvatar(identity.providerId, file));
@@ -698,7 +689,7 @@ export class NativeResourceService {
       });
       if (identity.avatar)
         yield* Result.await(
-          service.dependencies.blobs
+          this.dependencies.blobs
             .delete(identity.avatar.blob)
             .then((value) =>
               value.mapError(() => nativeFailure("sqlite", "Previous avatar could not be removed")),
@@ -707,7 +698,7 @@ export class NativeResourceService {
       return Result.ok(
         Response.json(nativeUserDisplay(changed), { headers: { "Cache-Control": "no-store" } }),
       );
-    });
+    }, this);
   }
 
   async handle(request: Request, actorId: string): Promise<Response | undefined> {
@@ -829,14 +820,13 @@ export class NativeResourceService {
   }
 
   reconcileReferences(): NativeResult<number> {
-    const service = this;
     return Result.gen(function* () {
-      const references = yield* service.dependencies.resources
+      const references = yield* this.dependencies.resources
         .listNativeResourceReferences()
         .mapError(() => nativeFailure("sqlite", "File ownership could not be read"));
       let released = 0;
       for (const reference of references) {
-        const upload = yield* service.dependencies.native
+        const upload = yield* this.dependencies.native
           .getUpload(reference.uploadId)
           .map<NativeUploadRecord | null>((value) => value)
           .tryRecover((error) =>
@@ -845,26 +835,25 @@ export class NativeResourceService {
               : Result.err(error),
           );
         const thread = upload
-          ? yield* service.dependencies.native.getThreadRecord(upload.threadId)
+          ? yield* this.dependencies.native.getThreadRecord(upload.threadId)
           : null;
         const active = thread && !thread.deleted && upload;
         const sameGeneration =
           upload && thread && upload.historyGeneration === thread.historyGeneration;
-        const withinStagingLifetime =
-          upload && service.#now() - upload.createdAt < 24 * 60 * 60_000;
+        const withinStagingLifetime = upload && this.#now() - upload.createdAt < 24 * 60 * 60_000;
         if (
           active &&
           ((upload.state === "ready" && (upload.published || withinStagingLifetime)) ||
             (upload.state === "pending" && sameGeneration && withinStagingLifetime))
         )
           continue;
-        yield* service.dependencies.resources
+        yield* this.dependencies.resources
           .releaseNativeResource(reference.uploadId)
           .mapError(() => nativeFailure("sqlite", "File ownership could not be released"));
         released += 1;
       }
       return Result.ok(released);
-    });
+    }, this);
   }
 }
 

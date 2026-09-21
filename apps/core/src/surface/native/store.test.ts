@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Result } from "better-result";
-import { nativeThreadSchema, nativeInputReceiptSchema } from "@stanley2058/lilac-client-protocol";
 import { NativeStore } from "./store";
 import { decodeNativeRecord, nativeRecordCodecCases } from "./codec";
 import { nativeFailure } from "./errors";

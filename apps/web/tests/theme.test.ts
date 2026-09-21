@@ -57,7 +57,7 @@ test("ordinary VS Code themes supply both UI and TextMate colors without manual 
     expect(theme.variables.background).toBe(input.colors?.["editor.background"] ?? "");
     expect(theme.syntax?.tokenColors).toBe(input.tokenColors);
     const tokens = await highlightCode('const value = "hello";', "typescript", theme.syntax);
-    expect(tokens.flat().some((token) => /^#/.test(token.color ?? ""))).toBe(true);
+    expect(tokens.flat().some((token) => token.color?.startsWith("#"))).toBe(true);
   }
 });
 

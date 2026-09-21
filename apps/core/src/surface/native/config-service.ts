@@ -118,19 +118,18 @@ export class NativeConfigService {
     userId: string,
     input: { kind: NativeConfigDocument["kind"]; text: string; expectedRevision: string },
   ): Promise<Result<NativeConfigDocument, NativeConfigError>> {
-    const service = this;
     return Result.gen(async function* () {
       yield* validateDocument(input.kind, input.text);
-      const current = yield* Result.await(service.read(userId, input.kind));
+      const current = yield* Result.await(this.read(userId, input.kind));
       if (current.revision !== input.expectedRevision)
         return Result.err(
           failure("conflict", "Configuration changed since it was loaded", current.revision),
         );
       if (current.text === input.text) return Result.ok(current);
-      const file = path.join(service.options.dataDir, `${input.kind}-config.yaml`);
+      const file = path.join(this.options.dataDir, `${input.kind}-config.yaml`);
       yield* Result.await(writeAtomic(file, input.text));
       return Result.ok({ kind: input.kind, text: input.text, revision: revisionOf(input.text) });
-    });
+    }, this);
   }
 
   async reloadMcp(userId: string): Promise<Result<readonly McpReloadOutcome[], NativeConfigError>> {

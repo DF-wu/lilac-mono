@@ -106,7 +106,11 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   const url = new URL(request.url);
   if (request.method !== "GET" || url.origin !== self.location.origin) return;
-  const shell = request.mode === "navigate" && url.pathname === "/";
+  const appRoute =
+    url.pathname === "/" ||
+    /^\/threads\/[^/]+\/?$/.test(url.pathname) ||
+    /^\/design-system\/?$/.test(url.pathname);
+  const shell = request.mode === "navigate" && appRoute;
   const asset = url.pathname.startsWith("/assets/");
   if (!shell && !asset) return;
   event.respondWith(

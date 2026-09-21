@@ -182,11 +182,10 @@ export class NativeSearchService {
     userId: string,
     input: { query: string; threadId?: string; cursor?: string; limit?: number },
   ): NativeStoreResult<{ items: SearchHit[]; nextCursor?: string }> {
-    const self = this;
     return Result.gen(function* () {
       const offset = yield* offsetCursor(input.cursor);
       const limit = Math.min(100, Math.max(1, input.limit ?? 30));
-      const rows = yield* self.params.searchStore.searchMessages(userId, {
+      const rows = yield* this.params.searchStore.searchMessages(userId, {
         ...input,
         limit: limit + 1,
         offset,
@@ -201,16 +200,15 @@ export class NativeSearchService {
         })),
         ...(rows.length > limit ? { nextCursor: String(offset + limit) } : {}),
       });
-    });
+    }, this);
   }
 
   starter(threadId: string): NativeStoreResult<string> {
-    const self = this;
     return Result.gen(function* () {
-      const thread = yield* self.params.store.getThreadRecord(threadId);
-      yield* self.params.store.authorizeThread(thread.starterId, threadId);
+      const thread = yield* this.params.store.getThreadRecord(threadId);
+      yield* this.params.store.authorizeThread(thread.starterId, threadId);
       return Result.ok(thread.starterId);
-    });
+    }, this);
   }
 
   principal(context?: RequestContext): NativeStoreResult<string> {
@@ -224,9 +222,8 @@ export class NativeSearchService {
   }
 
   discovery(userId: string, input: DiscoverySearchInput): NativeStoreResult<DiscoverySearchResult> {
-    const self = this;
     return Result.gen(function* () {
-      yield* self.params.store.getUser(userId);
+      yield* this.params.store.getUser(userId);
       const limit = Math.min(100, Math.max(1, input.limit ?? 10));
       const surrounding = Math.min(20, Math.max(0, input.surrounding ?? 1));
       const groupBy = input.groupBy ?? "origin";
@@ -238,7 +235,7 @@ export class NativeSearchService {
         (!input.platform || input.platform === "native") &&
         (!input.sources || input.sources.includes("conversation"))
       ) {
-        const rows = yield* self.params.searchStore.searchMessages(userId, {
+        const rows = yield* this.params.searchStore.searchMessages(userId, {
           query: input.query,
           threadId: input.sessionId,
           authorId: input.authorId,
@@ -271,7 +268,7 @@ export class NativeSearchService {
           };
           const context =
             groupBy === "origin" && surrounding > 0
-              ? (yield* self.params.searchStore.readThread(userId, row.threadId, {
+              ? (yield* this.params.searchStore.readThread(userId, row.threadId, {
                   offset: Math.max(0, row.ordinal - surrounding),
                   limit: surrounding * 2 + 1,
                 })).messages
@@ -325,7 +322,7 @@ export class NativeSearchService {
           )
           .map((group) => stripVerboseGroup(group, input.verbose ?? false)),
       });
-    });
+    }, this);
   }
 
   async discoveryWithExternal(
@@ -333,10 +330,9 @@ export class NativeSearchService {
     input: DiscoverySearchInput,
     legacy: Pick<DiscoveryService, "searchResult">,
   ): Promise<NativeStoreResult<DiscoverySearchResult>> {
-    const self = this;
     return Result.gen(async function* () {
-      const user = yield* self.params.store.getUser(userId);
-      const native = yield* self.discovery(userId, { ...input, verbose: true });
+      const user = yield* this.params.store.getUser(userId);
+      const native = yield* this.discovery(userId, { ...input, verbose: true });
       if (user.role !== "owner" || input.platform === "native")
         return Result.ok({
           ...native,
@@ -376,21 +372,20 @@ export class NativeSearchService {
         .slice(0, input.limit ?? 10)
         .map((group) => stripVerboseGroup(group, input.verbose ?? false));
       return Result.ok({ meta: { ...external.meta, verbose: input.verbose ?? false }, groups });
-    });
+    }, this);
   }
 
   conversationSearch(
     userId: string,
     input: ThreadSearchInput,
   ): NativeStoreResult<ConversationThreadSearchResult> {
-    const self = this;
     return Result.gen(function* () {
       const queries = typeof input.query === "string" ? [input.query] : [...input.query];
       const limit = Math.min(50, Math.max(1, input.limit ?? 5));
       const unique = new Map<string, ConversationThreadSearchResult["results"][number]>();
       for (const query of queries) {
-        const summaries = self.params.summaries
-          ? yield* self.params.summaries.search(userId, {
+        const summaries = this.params.summaries
+          ? yield* this.params.summaries.search(userId, {
               query,
               threadId: input.sessionId,
               participantId: input.participantId,
@@ -401,7 +396,7 @@ export class NativeSearchService {
             })
           : [];
         for (const summary of summaries) {
-          const thread = yield* self.params.store.authorizeThread(userId, summary.threadId);
+          const thread = yield* this.params.store.authorizeThread(userId, summary.threadId);
           unique.set(summary.threadId, {
             threadId: summary.threadId,
             title: summary.summary.title,
@@ -419,7 +414,7 @@ export class NativeSearchService {
               : {}),
           });
         }
-        const rows = yield* self.params.searchStore.searchMessages(userId, {
+        const rows = yield* this.params.searchStore.searchMessages(userId, {
           query,
           threadId: input.sessionId,
           authorId: input.participantId,
@@ -431,8 +426,8 @@ export class NativeSearchService {
           if (unique.has(row.threadId)) continue;
           if (input.participantIdsAny?.length && !input.participantIdsAny.includes(row.authorId))
             continue;
-          const summary = self.params.summaries
-            ? yield* self.params.summaries.get(row.threadId)
+          const summary = this.params.summaries
+            ? yield* this.params.summaries.get(row.threadId)
             : null;
           unique.set(row.threadId, {
             threadId: row.threadId,
@@ -460,18 +455,17 @@ export class NativeSearchService {
         },
         results,
       });
-    });
+    }, this);
   }
 
   conversationRead(
     userId: string,
     input: { threadId: string; offset?: number; limit?: number },
   ): NativeStoreResult<ConversationThreadReadOutput> {
-    const self = this;
     return Result.gen(function* () {
-      const page = yield* self.params.searchStore.readThread(userId, input.threadId, input);
-      const summary = self.params.summaries
-        ? yield* self.params.summaries.get(input.threadId)
+      const page = yield* this.params.searchStore.readThread(userId, input.threadId, input);
+      const summary = this.params.summaries
+        ? yield* this.params.summaries.get(input.threadId)
         : null;
       const offset = Math.max(0, input.offset ?? 0);
       const limit = Math.min(200, Math.max(1, input.limit ?? 50));
@@ -493,22 +487,21 @@ export class NativeSearchService {
           content: message.text,
         })),
       });
-    });
+    }, this);
   }
 
   conversationMetadata(
     userId: string,
     input: { threadIds: readonly string[] },
   ): NativeStoreResult<ConversationThreadMetadataOutput> {
-    const self = this;
     return Result.gen(function* () {
       const threads: ConversationThreadMetadataOutput["threads"] = [];
       for (const threadId of input.threadIds) {
-        const page = yield* self.params.searchStore.readThread(userId, threadId, { limit: 1 });
-        const summary = self.params.summaries ? yield* self.params.summaries.get(threadId) : null;
+        const page = yield* this.params.searchStore.readThread(userId, threadId, { limit: 1 });
+        const summary = this.params.summaries ? yield* this.params.summaries.get(threadId) : null;
         threads.push({ ...metadata(page), ...summary?.summary });
       }
       return Result.ok({ threads, missing: [] });
-    });
+    }, this);
   }
 }

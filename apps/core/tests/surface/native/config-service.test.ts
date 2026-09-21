@@ -70,7 +70,7 @@ describe("native owner configuration", () => {
     ]);
     expect(first.isOk()).toBe(true);
     expect(second.match({ ok: () => "", err: (error) => error.code })).toBe("conflict");
-    expect(await fs.readdir(dataDir)).toEqual(["core-config.yaml", "mcp-config.yaml"]);
+    expect((await fs.readdir(dataDir)).sort()).toEqual(["core-config.yaml", "mcp-config.yaml"]);
   });
   it("saves MCP without reload and only reloads on owner request", async () => {
     const { service, reloads } = await fixture();

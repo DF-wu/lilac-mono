@@ -246,10 +246,9 @@ export class NativeStore {
       providerAvatarUrl?: string | null;
     },
   ): NativeStoreResult<NativeUser> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const current = yield* store.getUser(actorId);
+        const current = yield* this.getUser(actorId);
         if (current.role === "service")
           return Result.err(nativeFailure("forbidden", "Service profiles cannot be edited here"));
         if (
@@ -275,8 +274,8 @@ export class NativeStore {
           (providerAvatarUrl ?? null) === (oldProviderAvatarUrl ?? null)
         )
           return Result.ok(current);
-        return store.upsertUser(next);
-      }),
+        return this.upsertUser(next);
+      }, this),
     );
   }
 
@@ -284,10 +283,9 @@ export class NativeStore {
     actorId: string,
     input: { displayName?: string; avatar?: NativeUser["avatar"] | null },
   ): NativeStoreResult<NativeUser> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* store.requireOwner(actorId);
+        yield* this.requireOwner(actorId);
         if (
           input.displayName !== undefined &&
           (!input.displayName.trim() || input.displayName.length > 256)
@@ -295,15 +293,15 @@ export class NativeStore {
           return Result.err(
             nativeFailure("invalid", "Agent name must contain 1 to 256 characters"),
           );
-        const current = yield* store.getUser("lilac");
+        const current = yield* this.getUser("lilac");
         const { avatar: previousAvatar, ...base } = current;
         const avatar = input.avatar === undefined ? previousAvatar : input.avatar;
-        return store.upsertUser({
+        return this.upsertUser({
           ...base,
           displayName: input.displayName ?? current.displayName,
           ...(avatar ? { avatar } : {}),
         });
-      }),
+      }, this),
     );
   }
 
@@ -312,15 +310,14 @@ export class NativeStore {
     userId: string,
     toolMode: NativeUser["toolMode"],
   ): NativeStoreResult<NativeUser> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* store.requireOwner(actorId);
-        const user = yield* store.getUser(userId);
+        yield* this.requireOwner(actorId);
+        const user = yield* this.getUser(userId);
         const next = { ...user, toolMode };
-        yield* store.upsertUser(next);
+        yield* this.upsertUser(next);
         return Result.ok(next);
-      }),
+      }, this),
     );
   }
 
@@ -347,11 +344,10 @@ export class NativeStore {
     threadId: string,
     edit = false,
   ): NativeStoreResult<NativeThreadRecord> {
-    const store = this;
     return Result.gen(function* () {
-      const user = yield* store.getUser(actorId);
-      const thread = yield* store.getThreadRecord(threadId);
-      const grant = store.db
+      const user = yield* this.getUser(actorId);
+      const thread = yield* this.getThreadRecord(threadId);
+      const grant = this.db
         .query<{ grant_mode: NativeThreadGrant }, [string, string]>(
           "SELECT grant_mode FROM native_grants WHERE thread_id=? AND user_id=?",
         )
@@ -360,7 +356,7 @@ export class NativeStore {
       if (!capability.read || (edit && !capability.edit))
         return Result.err(nativeFailure("forbidden", "Thread access is denied"));
       return Result.ok(thread);
-    });
+    }, this);
   }
 
   private displayStatus(
@@ -407,10 +403,9 @@ export class NativeStore {
   }
 
   private summary(user: NativeUser, thread: NativeThreadRecord): NativeStoreResult<NativeThread> {
-    const store = this;
     return Result.gen(function* () {
-      const starter = yield* store.getUser(thread.starterId);
-      const displayStatus = yield* store.displayStatus(user, thread);
+      const starter = yield* this.getUser(thread.starterId);
+      const displayStatus = yield* this.displayStatus(user, thread);
       return Result.ok({
         id: thread.id,
         title: thread.title,
@@ -423,19 +418,18 @@ export class NativeStore {
         revision: thread.revision,
         modelId: thread.modelId,
         activeRunId: thread.activeRunId,
-        capabilities: store.capabilities(user, thread),
+        capabilities: this.capabilities(user, thread),
       });
-    });
+    }, this);
   }
 
   getThread(actorId: string, threadId: string): NativeStoreResult<NativeThread> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, threadId);
-        const user = yield* store.getUser(actorId);
-        return store.summary(user, thread);
-      }),
+        const thread = yield* this.authorizeThread(actorId, threadId);
+        const user = yield* this.getUser(actorId);
+        return this.summary(user, thread);
+      }, this),
     );
   }
 
@@ -449,10 +443,9 @@ export class NativeStore {
       query?: string;
     } = {},
   ): NativeStoreResult<NativeThread[]> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const user = yield* store.getUser(actorId);
+        const user = yield* this.getUser(actorId);
         const limit = Math.min(100, Math.max(1, options.limit ?? 50));
         const cursorSeparator = options.cursor?.indexOf("_") ?? -1;
         const cursorTime =
@@ -463,7 +456,7 @@ export class NativeStore {
           cursorSeparator > 0 ? (options.cursor?.slice(cursorSeparator + 1) ?? "") : "";
         if (!Number.isSafeInteger(cursorTime) || cursorTime < 0)
           return Result.err(nativeFailure("invalid", "Thread cursor is invalid"));
-        const records = yield* store.readRows(
+        const records = yield* this.readRows(
           `SELECT r.* FROM native_records r WHERE r.kind='thread' AND (r.updated_at < ? OR (r.updated_at = ? AND r.id > ?)) AND ( ? = 'owner' OR json_extract(r.data_json,'$.value.starterId') = ? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?)) AND json_extract(r.data_json,'$.value.deleted')=0 AND json_extract(r.data_json,'$.value.ephemeral') IS NULL AND json_extract(r.data_json,'$.value.archived')=? AND json_extract(r.data_json,'$.value.title') LIKE ? ESCAPE '\\' ORDER BY r.updated_at DESC,r.id LIMIT ?`,
           [
             cursorTime,
@@ -479,11 +472,11 @@ export class NativeStore {
         );
         const threads = yield* Result.all(
           records.flatMap((record) =>
-            record.kind === "thread" ? [store.summary(user, record.value)] : [],
+            record.kind === "thread" ? [this.summary(user, record.value)] : [],
           ),
         );
         return Result.ok(threads.filter((thread) => thread.capabilities.read));
-      }),
+      }, this),
     );
   }
 
@@ -547,12 +540,11 @@ export class NativeStore {
     actorId: string,
     input: NativeRpcInputs["sidebar"]["list"],
   ): NativeStoreResult<NativeRpcOutputs["sidebar"]["list"]> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const user = yield* store.getUser(actorId);
-        const preferences = yield* store.getSidebarPreferences(actorId);
-        store.reconcileSidebar(user, preferences.autoSettleDays);
+        const user = yield* this.getUser(actorId);
+        const preferences = yield* this.getSidebarPreferences(actorId);
+        this.reconcileSidebar(user, preferences.autoSettleDays);
         const separator = input.cursor?.indexOf(":") ?? -1;
         const position = input.cursor
           ? Number(input.cursor.slice(0, separator))
@@ -565,16 +557,16 @@ export class NativeStore {
         AND (?='owner' OR json_extract(r.data_json,'$.value.starterId')=? OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=r.id AND g.user_id=?))`;
         const params = [actorId, input.section, user.role, actorId, actorId];
         const total =
-          store.db
+          this.db
             .query<{ total: number }, string[]>(`SELECT COUNT(*) AS total ${predicate}`)
             .get(...params)?.total ?? 0;
-        const rows = store.db
+        const rows = this.db
           .query<{ thread_id: string; position: number }, (string | number)[]>(
             `SELECT p.thread_id,p.position ${predicate} AND (p.position>? OR (p.position=? AND p.thread_id>?)) ORDER BY p.position,p.thread_id LIMIT ?`,
           )
           .all(...params, position, position, cursorId, (input.limit ?? 30) + 1);
         const page = rows.slice(0, input.limit ?? 30);
-        const items = yield* Result.all(page.map((row) => store.getThread(actorId, row.thread_id)));
+        const items = yield* Result.all(page.map((row) => this.getThread(actorId, row.thread_id)));
         const last = page.at(-1);
         return Result.ok({
           items,
@@ -582,7 +574,7 @@ export class NativeStore {
           nextCursor:
             rows.length > page.length && last ? `${last.position}:${last.thread_id}` : undefined,
         });
-      }),
+      }, this),
     );
   }
 
@@ -590,18 +582,17 @@ export class NativeStore {
     actorId: string,
     input: NativeRpcInputs["sidebar"]["move"],
   ): NativeStoreResult<{ ok: true }> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const user = yield* store.getUser(actorId);
-        const thread = yield* store.authorizeThread(actorId, input.threadId);
+        const user = yield* this.getUser(actorId);
+        const thread = yield* this.authorizeThread(actorId, input.threadId);
         if (thread.archived)
           return Result.err(nativeFailure("invalid", "Archived conversations cannot be moved"));
         if (input.beforeId === input.threadId || input.afterId === input.threadId)
           return Result.ok({ ok: true as const });
-        const preferences = yield* store.getSidebarPreferences(actorId);
-        store.reconcileSidebar(user, preferences.autoSettleDays);
-        store.db
+        const preferences = yield* this.getSidebarPreferences(actorId);
+        this.reconcileSidebar(user, preferences.autoSettleDays);
+        this.db
           .query(`WITH ranks AS MATERIALIZED (
           SELECT thread_id,ROW_NUMBER() OVER(ORDER BY position,thread_id) AS rank
           FROM native_thread_preferences WHERE user_id=? AND section=?
@@ -611,8 +602,8 @@ export class NativeStore {
         let position: number;
         const neighborId = input.beforeId ?? input.afterId;
         if (neighborId) {
-          yield* store.authorizeThread(actorId, neighborId);
-          const before = store.db
+          yield* this.authorizeThread(actorId, neighborId);
+          const before = this.db
             .query<{ position: number }, [string, string, string]>(
               "SELECT position FROM native_thread_preferences WHERE user_id=? AND thread_id=? AND section=?",
             )
@@ -620,33 +611,33 @@ export class NativeStore {
           if (!before)
             return Result.err(nativeFailure("conflict", "Drop target has moved. Try again."));
           position = before.position + (input.afterId ? 1 : 0);
-          store.db
+          this.db
             .query(
               "UPDATE native_thread_preferences SET position=position+1 WHERE user_id=? AND section=? AND position>=?",
             )
             .run(actorId, input.section, position);
         } else if (input.atStart) {
           position =
-            (store.db
+            (this.db
               .query<{ position: number | null }, [string, string]>(
                 "SELECT MIN(position) AS position FROM native_thread_preferences WHERE user_id=? AND section=?",
               )
-              .get(actorId, input.section)?.position ?? -store.now()) - 1;
+              .get(actorId, input.section)?.position ?? -this.now()) - 1;
         } else {
           position =
-            (store.db
+            (this.db
               .query<{ position: number | null }, [string, string]>(
                 "SELECT MAX(position) AS position FROM native_thread_preferences WHERE user_id=? AND section=?",
               )
-              .get(actorId, input.section)?.position ?? -store.now()) + 1;
+              .get(actorId, input.section)?.position ?? -this.now()) + 1;
         }
-        store.db
+        this.db
           .query(
             "UPDATE native_thread_preferences SET section=?,position=?,touched_at=? WHERE user_id=? AND thread_id=?",
           )
-          .run(input.section, position, store.now(), actorId, input.threadId);
+          .run(input.section, position, this.now(), actorId, input.threadId);
         return Result.ok({ ok: true as const });
-      }),
+      }, this),
     );
   }
 
@@ -656,11 +647,10 @@ export class NativeStore {
     payload: object,
     run: () => NativeStoreResult<NativeMutationResult>,
   ): NativeStoreResult<NativeMutationResult> {
-    const store = this;
     return Result.gen(function* () {
       const key = commandKey(actorId, commandId);
       const hash = fingerprint(payload);
-      const existing = yield* store.readRecord("command", key);
+      const existing = yield* this.readRecord("command", key);
       if (existing?.kind === "command") {
         if (existing.value.fingerprint !== hash)
           return Result.err(
@@ -669,13 +659,13 @@ export class NativeStore {
         return Result.ok(existing.value.result);
       }
       const result = yield* run();
-      store.writeRecord(
+      this.writeRecord(
         key,
         { kind: "command", value: { id: commandId, actorId, fingerprint: hash, result } },
         result.threadId,
       );
       return Result.ok(result);
-    });
+    }, this);
   }
 
   private bump(
@@ -723,15 +713,14 @@ export class NativeStore {
       ephemeralSessionId?: string;
     },
   ): NativeStoreResult<NativeThread> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const user = yield* store.getUser(actorId);
+        const user = yield* this.getUser(actorId);
         if (user.role === "service")
           return Result.err(
             nativeFailure("forbidden", "Service identity cannot start a user thread"),
           );
-        const result = yield* store.command(
+        const result = yield* this.command(
           actorId,
           input.commandId,
           { operation: "create", ...input },
@@ -741,27 +730,27 @@ export class NativeStore {
               id,
               starterId: actorId,
               ephemeral: input.ephemeralSessionId
-                ? { sessionId: input.ephemeralSessionId, lastSeenAt: store.now() }
+                ? { sessionId: input.ephemeralSessionId, lastSeenAt: this.now() }
                 : undefined,
               title: input.title ?? "New thread",
               titleGeneration:
                 (input.autoTitle ?? input.title === undefined) ? { phase: "initial" } : undefined,
               archived: false,
               deleted: false,
-              createdAt: store.now(),
-              updatedAt: store.now(),
+              createdAt: this.now(),
+              updatedAt: this.now(),
               revision: 0,
               historyGeneration: 0,
               nextPosition: 0,
               modelId: input.modelId,
               mutationPending: false,
             };
-            store.bump(thread, "thread", id);
+            this.bump(thread, "thread", id);
             return Result.ok({ threadId: id });
           },
         );
-        return store.getThread(actorId, result.threadId);
-      }),
+        return this.getThread(actorId, result.threadId);
+      }, this),
     );
   }
 
@@ -789,22 +778,21 @@ export class NativeStore {
   }
 
   touchEphemeralThread(threadId: string): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.getThreadRecord(threadId);
+        const thread = yield* this.getThreadRecord(threadId);
         if (!thread.ephemeral || thread.deleted || thread.mutationPending)
           return Result.err(nativeFailure("not-found", "Temporary conversation has ended"));
-        store.writeRecord(
+        this.writeRecord(
           thread.id,
           {
             kind: "thread",
-            value: { ...thread, ephemeral: { ...thread.ephemeral, lastSeenAt: store.now() } },
+            value: { ...thread, ephemeral: { ...thread.ephemeral, lastSeenAt: this.now() } },
           },
           thread.id,
         );
         return Result.ok();
-      }),
+      }, this),
     );
   }
 
@@ -819,14 +807,13 @@ export class NativeStore {
       revision?: number;
     },
   ): NativeStoreResult<NativeThread> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, input.threadId, true);
-        yield* store.command(actorId, input.commandId, { operation: "update", ...input }, () => {
+        const thread = yield* this.authorizeThread(actorId, input.threadId, true);
+        yield* this.command(actorId, input.commandId, { operation: "update", ...input }, () => {
           if (input.revision !== undefined && input.revision !== thread.revision)
             return Result.err(nativeFailure("stale", "Thread changed before this update"));
-          store.bump(
+          this.bump(
             {
               ...thread,
               title: input.title ?? thread.title,
@@ -839,8 +826,8 @@ export class NativeStore {
           );
           return Result.ok({ threadId: thread.id });
         });
-        return store.getThread(actorId, thread.id);
-      }),
+        return this.getThread(actorId, thread.id);
+      }, this),
     );
   }
 
@@ -850,9 +837,8 @@ export class NativeStore {
     user: string;
     assistant?: string;
   } | null> {
-    const store = this;
     return Result.gen(function* () {
-      const thread = yield* store.getThreadRecord(threadId);
+      const thread = yield* this.getThreadRecord(threadId);
       const state = thread.titleGeneration;
       if (
         !state?.inputId ||
@@ -861,15 +847,15 @@ export class NativeStore {
         thread.historyGeneration !== 0
       )
         return Result.ok(null);
-      const input = yield* store.getInput(state.inputId);
+      const input = yield* this.getInput(state.inputId);
       if (input.state === "canceled" || input.state === "failed") return Result.ok(null);
-      const uploads = yield* Result.all(input.attachmentIds.map((id) => store.getUpload(id)));
+      const uploads = yield* Result.all(input.attachmentIds.map((id) => this.getUpload(id)));
       const user = [input.text, ...uploads.map((upload) => `Attachment: ${upload.filename}`)]
         .join("\n")
         .slice(0, 8000);
       if (state.phase === "initial")
         return Result.ok({ inputId: input.id, phase: state.phase, user });
-      const turn = input.turnId ? yield* store.readRecord("turn", input.turnId) : null;
+      const turn = input.turnId ? yield* this.readRecord("turn", input.turnId) : null;
       if (turn?.kind !== "turn" || turn.value.state !== "complete") return Result.ok(null);
       const hasText = (message: DisplayMessage) =>
         message.role === "assistant" &&
@@ -887,7 +873,7 @@ export class NativeStore {
         .slice(0, 4000);
       if (!assistant) return Result.ok(null);
       return Result.ok({ inputId: input.id, phase: state.phase, user, assistant });
-    });
+    }, this);
   }
 
   settleTitleGeneration(
@@ -895,10 +881,9 @@ export class NativeStore {
     expected: { inputId: string; phase: "initial" | "refine" },
     generated?: { title: string; needsRefinement: boolean },
   ): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.getThreadRecord(threadId);
+        const thread = yield* this.getThreadRecord(threadId);
         const state = thread.titleGeneration;
         if (
           thread.deleted ||
@@ -908,7 +893,7 @@ export class NativeStore {
           state.phase !== expected.phase
         )
           return Result.ok(undefined);
-        store.bump(
+        this.bump(
           {
             ...thread,
             title: generated?.title ?? thread.title,
@@ -921,7 +906,7 @@ export class NativeStore {
           thread.id,
         );
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
@@ -929,25 +914,24 @@ export class NativeStore {
     actorId: string,
     input: { threadId: string; userId: string; grant: NativeThreadGrant | null },
   ): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* store.requireOwner(actorId);
-        const thread = yield* store.authorizeThread(actorId, input.threadId);
-        yield* store.getUser(input.userId);
+        yield* this.requireOwner(actorId);
+        const thread = yield* this.authorizeThread(actorId, input.threadId);
+        yield* this.getUser(input.userId);
         if (input.grant === null)
-          store.db
+          this.db
             .query("DELETE FROM native_grants WHERE thread_id=? AND user_id=?")
             .run(input.threadId, input.userId);
         if (input.grant !== null)
-          store.db
+          this.db
             .query(
               "INSERT INTO native_grants(thread_id,user_id,grant_mode) VALUES(?,?,?) ON CONFLICT(thread_id,user_id) DO UPDATE SET grant_mode=excluded.grant_mode",
             )
             .run(input.threadId, input.userId, input.grant);
-        store.bump(thread, "access", input.userId);
+        this.bump(thread, "access", input.userId);
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
@@ -965,9 +949,8 @@ export class NativeStore {
     before = Number.MAX_SAFE_INTEGER,
     limit = 5,
   ): NativeStoreResult<TurnSlot[]> {
-    const store = this;
     return Result.gen(function* () {
-      const records = yield* store.readRows(
+      const records = yield* this.readRows(
         "SELECT * FROM native_records WHERE kind='turn' AND thread_id=? AND position<? ORDER BY position DESC LIMIT ?",
         [thread.id, before, Math.min(32, limit)],
       );
@@ -975,9 +958,9 @@ export class NativeStore {
       let bytes = 0;
       for (const record of records) {
         if (record.kind !== "turn") continue;
-        const size = encoder.encode(JSON.stringify(store.boundedTurn(record.value))).byteLength;
+        const size = encoder.encode(JSON.stringify(this.boundedTurn(record.value))).byteLength;
         if (turns.length > 0 && bytes + size > WINDOW_BYTES) break;
-        turns.push(store.boundedTurn(record.value));
+        turns.push(this.boundedTurn(record.value));
         bytes += size;
       }
       turns.reverse();
@@ -985,7 +968,7 @@ export class NativeStore {
       const slots: TurnSlot[] = [...turns];
       if (
         first &&
-        store.db
+        this.db
           .query(
             "SELECT 1 FROM native_records WHERE kind='turn' AND thread_id=? AND position<? LIMIT 1",
           )
@@ -998,7 +981,7 @@ export class NativeStore {
           endPosition: first.position,
         });
       return Result.ok(slots);
-    });
+    }, this);
   }
 
   sync(
@@ -1006,11 +989,10 @@ export class NativeStore {
     threadId: string,
     checkpoint?: ReplayCheckpoint,
   ): NativeStoreResult<ReplayReply> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, threadId);
-        const next = store.checkpoint(thread);
+        const thread = yield* this.authorizeThread(actorId, threadId);
+        const next = this.checkpoint(thread);
         if (
           checkpoint?.cursor === next.cursor &&
           checkpoint.historyGeneration === thread.historyGeneration &&
@@ -1024,7 +1006,7 @@ export class NativeStore {
           checkpoint.historyGeneration === thread.historyGeneration &&
           checkpoint.projectionRevision < thread.revision
         ) {
-          const rows = store.db
+          const rows = this.db
             .query<NativePersistedRow & { revision: number; kind: string }, [string, number]>(
               "SELECT format_version,data_json,revision,kind FROM native_changes WHERE thread_id=? AND revision>? ORDER BY revision LIMIT 65",
             )
@@ -1053,9 +1035,9 @@ export class NativeStore {
               });
           }
         }
-        const slots = yield* store.window(thread);
+        const slots = yield* this.window(thread);
         return Result.ok({ kind: "window" as const, checkpoint: next, slots });
-      }),
+      }, this),
     );
   }
 
@@ -1070,10 +1052,9 @@ export class NativeStore {
       endPosition?: number;
     },
   ): NativeStoreResult<Hydration> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, input.threadId);
+        const thread = yield* this.authorizeThread(actorId, input.threadId);
         if (
           thread.historyGeneration !== input.historyGeneration ||
           thread.revision !== input.projectionRevision
@@ -1086,14 +1067,14 @@ export class NativeStore {
           input.slotId !== `range_${thread.historyGeneration}_0_${endPosition}`
         )
           return Result.err(nativeFailure("invalid", "Hydration slot is invalid"));
-        const slots = yield* store.window(thread, endPosition);
+        const slots = yield* this.window(thread, endPosition);
         return Result.ok({
           historyGeneration: thread.historyGeneration,
           projectionRevision: thread.revision,
           slotId: input.slotId,
           slots,
         });
-      }),
+      }, this),
     );
   }
 
@@ -1204,11 +1185,10 @@ export class NativeStore {
       authorId?: string;
     } = {},
   ): NativeStoreResult<NativeInputReceipt> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        let thread = yield* store.authorizeThread(actorId, input.threadId, true);
-        const result = yield* store.command(
+        let thread = yield* this.authorizeThread(actorId, input.threadId, true);
+        const result = yield* this.command(
           actorId,
           input.commandId,
           { operation: "input", ...input },
@@ -1218,7 +1198,7 @@ export class NativeStore {
                 return Result.err(nativeFailure("stale", "Thread history is changing"));
               const effectiveMode = input.command && thread.activeRunId ? "followup" : input.mode;
               const pendingCount =
-                store.db
+                this.db
                   .query<{ count: number }, [string]>(
                     "SELECT COUNT(*) AS count FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.state') IN ('uploading','queued')",
                   )
@@ -1234,11 +1214,11 @@ export class NativeStore {
                   nativeFailure("conflict", "Choose steering or follow-up while a run is active"),
                 );
               const uploads = yield* Result.all(
-                input.attachmentIds.map((id) => store.getUpload(id)),
+                input.attachmentIds.map((id) => this.getUpload(id)),
               );
               for (const upload of uploads) {
                 if (upload.published && upload.state === "ready") {
-                  yield* store.authorizeThread(actorId, upload.threadId);
+                  yield* this.authorizeThread(actorId, upload.threadId);
                   continue;
                 }
                 if (
@@ -1273,24 +1253,24 @@ export class NativeStore {
                 modelId: options.resolvedModelId ?? input.modelId ?? thread.modelId,
                 resolvedModelRequest: options.resolvedModelRequest,
                 command: input.command,
-                createdAt: store.now(),
+                createdAt: this.now(),
               };
-              const earlierFull = store.db
+              const earlierFull = this.db
                 .query(
                   "SELECT 1 FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.mode')!='steer' AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL LIMIT 1",
                 )
                 .get(thread.id);
               if (effectiveMode === "prompt" && !earlierFull)
-                accepted = store.createInputTurn(thread, accepted, uploads);
+                accepted = this.createInputTurn(thread, accepted, uploads);
               if (effectiveMode === "steer") {
-                const activeInput = yield* store.getInputByRequestId(thread.activeRunId ?? "");
+                const activeInput = yield* this.getInputByRequestId(thread.activeRunId ?? "");
                 accepted = {
                   ...accepted,
                   turnId: activeInput?.turnId,
                   resolvedModelRequest: activeInput?.resolvedModelRequest,
                 };
                 if (accepted.turnId) {
-                  yield* store.appendMessage(thread.id, thread.historyGeneration, accepted.turnId, {
+                  yield* this.appendMessage(thread.id, thread.historyGeneration, accepted.turnId, {
                     id: accepted.messageId,
                     role: "user",
                     metadata: {
@@ -1314,29 +1294,29 @@ export class NativeStore {
                       })),
                     ],
                   });
-                  thread = yield* store.getThreadRecord(thread.id);
+                  thread = yield* this.getThreadRecord(thread.id);
                 }
               }
               for (const upload of uploads)
-                store.writeRecord(
+                this.writeRecord(
                   upload.id,
                   { kind: "upload", value: { ...upload, published: true } },
                   upload.threadId,
                 );
-              store.writeRecord(
+              this.writeRecord(
                 id,
                 { kind: "input", value: accepted },
                 thread.id,
                 accepted.position,
               );
               const visible = accepted.turnId
-                ? yield* store.readRecord("turn", accepted.turnId)
+                ? yield* this.readRecord("turn", accepted.turnId)
                 : null;
               const changes: LiveUpdate["changes"] =
                 accepted.mode === "prompt" && visible?.kind === "turn"
                   ? [{ kind: "insert", slot: visible.value }]
                   : [];
-              store.bump(
+              this.bump(
                 {
                   ...thread,
                   nextPosition: thread.nextPosition + 1,
@@ -1350,31 +1330,30 @@ export class NativeStore {
                 changes,
               );
               return Result.ok({ threadId: input.threadId, inputId: id });
-            }),
+            }, this),
         );
         if (!result.inputId)
           return Result.err(nativeFailure("invalid", "Input receipt is missing its identity"));
-        const accepted = yield* store.getInput(result.inputId);
+        const accepted = yield* this.getInput(result.inputId);
         return Result.ok(inputReceipt(accepted));
-      }),
+      }, this),
     );
   }
 
   prepareInput(inputId: string): NativeStoreResult<NativeInputRecord | null> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        let input = yield* store.getInput(inputId);
+        let input = yield* this.getInput(inputId);
         const thread = yield* nullableAuthority(
-          store.authorizeThread(input.initiatingUserId, input.threadId, true),
+          this.authorizeThread(input.initiatingUserId, input.threadId, true),
         );
         if (!thread) {
-          yield* store.settleInput(input.id, "failed");
+          yield* this.settleInput(input.id, "failed");
           return Result.ok(null);
         }
-        const starter = yield* nullableAuthority(store.getUser(thread.starterId));
+        const starter = yield* nullableAuthority(this.getUser(thread.starterId));
         if (!starter) {
-          yield* store.settleInput(input.id, "failed");
+          yield* this.settleInput(input.id, "failed");
           return Result.ok(null);
         }
         if (
@@ -1386,14 +1365,14 @@ export class NativeStore {
         )
           return Result.ok(null);
         if (input.mode === "steer" && input.runId !== thread.activeRunId) {
-          yield* store.settleInput(input.id, "target-ended");
+          yield* this.settleInput(input.id, "target-ended");
           return Result.ok(null);
         }
         if (input.state === "admitted") return Result.ok(input);
-        const uploads = yield* Result.all(input.attachmentIds.map((id) => store.getUpload(id)));
+        const uploads = yield* Result.all(input.attachmentIds.map((id) => this.getUpload(id)));
         if (uploads.some((upload) => upload.state !== "ready" || !upload.resourceUri))
           return Result.ok(null);
-        const pending = yield* store.listPendingInputs(thread.id);
+        const pending = yield* this.listPendingInputs(thread.id);
         if (
           input.mode !== "steer" &&
           pending.some((item) => item.mode !== "steer" && item.position < input.position)
@@ -1402,29 +1381,29 @@ export class NativeStore {
         if (input.mode !== "steer" && thread.activeRunId) return Result.ok(null);
         let pinnedToolMode = starter.toolMode;
         if (input.mode === "steer" && input.runId) {
-          const activeInput = yield* store.getInputByRequestId(input.runId);
+          const activeInput = yield* this.getInputByRequestId(input.runId);
           if (!activeInput?.pinnedToolMode)
             return Result.err(nativeFailure("stale", "Active run authority is unavailable"));
           pinnedToolMode = activeInput.pinnedToolMode;
         }
         for (const upload of uploads) {
           const origin = yield* nullableAuthority(
-            store.authorizeThread(starter.id, upload.threadId),
+            this.authorizeThread(starter.id, upload.threadId),
           );
           if (origin) continue;
-          yield* store.settleInput(input.id, "failed");
+          yield* this.settleInput(input.id, "failed");
           return Result.ok(null);
         }
         if (!input.turnId) {
-          input = store.createInputTurn(thread, input, uploads);
-          const turn = yield* store.readRecord("turn", input.turnId ?? "");
+          input = this.createInputTurn(thread, input, uploads);
+          const turn = yield* this.readRecord("turn", input.turnId ?? "");
           if (turn?.kind === "turn")
-            store.bump(thread, "turn", turn.value.turnId, [{ kind: "insert", slot: turn.value }]);
+            this.bump(thread, "turn", turn.value.turnId, [{ kind: "insert", slot: turn.value }]);
         }
         input = { ...input, state: "queued", pinnedToolMode };
-        store.writeRecord(input.id, { kind: "input", value: input }, thread.id, input.position);
+        this.writeRecord(input.id, { kind: "input", value: input }, thread.id, input.position);
         return Result.ok(input);
-      }),
+      }, this),
     );
   }
 
@@ -1432,11 +1411,10 @@ export class NativeStore {
     inputId: string,
     state: NativeInputRecord["state"],
   ): NativeStoreResult<NativeInputRecord> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const input = yield* store.getInput(inputId);
-        const thread = yield* store.getThreadRecord(input.threadId);
+        const input = yield* this.getInput(inputId);
+        const thread = yield* this.getThreadRecord(input.threadId);
         if (input.state === state) return Result.ok(input);
         if (
           input.state === "canceled" ||
@@ -1446,20 +1424,19 @@ export class NativeStore {
         )
           return Result.err(nativeFailure("stale", "Input is no longer active"));
         const next = { ...input, state };
-        store.writeRecord(input.id, { kind: "input", value: next }, thread.id, input.position);
-        const changes = yield* store.terminalInputProjection(input, state);
-        store.bump(thread, "input", input.id, changes);
+        this.writeRecord(input.id, { kind: "input", value: next }, thread.id, input.position);
+        const changes = yield* this.terminalInputProjection(input, state);
+        this.bump(thread, "input", input.id, changes);
         return Result.ok(next);
-      }),
+      }, this),
     );
   }
 
   setInputCanonicalHistoryStart(inputId: string, requestId: string): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const input = yield* store.getInput(inputId);
-        const thread = yield* store.getThreadRecord(input.threadId);
+        const input = yield* this.getInput(inputId);
+        const thread = yield* this.getThreadRecord(input.threadId);
         if (
           input.state !== "admitted" ||
           thread.deleted ||
@@ -1472,7 +1449,7 @@ export class NativeStore {
           return Result.err(
             nativeFailure("conflict", "Canonical history boundary is already pinned"),
           );
-        const first = yield* store.getInputByRequestId(requestId);
+        const first = yield* this.getInputByRequestId(requestId);
         if (
           !first ||
           first.threadId !== input.threadId ||
@@ -1483,42 +1460,41 @@ export class NativeStore {
           return Result.err(
             nativeFailure("invalid", "Canonical history boundary is not a preceding full turn"),
           );
-        const turn = yield* store.readRecord("turn", first.turnId);
+        const turn = yield* this.readRecord("turn", first.turnId);
         if (turn?.kind !== "turn")
           return Result.err(
             nativeFailure("stale", "Canonical history boundary is no longer retained"),
           );
-        store.writeRecord(
+        this.writeRecord(
           input.id,
           { kind: "input", value: { ...input, canonicalHistoryStartRequestId: requestId } },
           thread.id,
           input.position,
         );
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
   markInputCompleted(inputId: string): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const input = yield* store.getInput(inputId);
-        const thread = yield* store.getThreadRecord(input.threadId);
+        const input = yield* this.getInput(inputId);
+        const thread = yield* this.getThreadRecord(input.threadId);
         if (
           thread.deleted ||
           input.historyGeneration !== thread.historyGeneration ||
           (input.state !== "admitted" && input.state !== "canceled")
         )
           return Result.err(nativeFailure("stale", "Completed input belongs to discarded history"));
-        store.writeRecord(
+        this.writeRecord(
           input.id,
-          { kind: "input", value: { ...input, completedAt: store.now() } },
+          { kind: "input", value: { ...input, completedAt: this.now() } },
           thread.id,
           input.position,
         );
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
@@ -1539,32 +1515,30 @@ export class NativeStore {
     historyGeneration: number,
     runId?: string,
   ): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.getThreadRecord(threadId);
+        const thread = yield* this.getThreadRecord(threadId);
         if (
           thread.deleted ||
           thread.mutationPending ||
           historyGeneration !== thread.historyGeneration
         )
           return Result.err(nativeFailure("stale", "Run belongs to discarded history"));
-        store.bump({ ...thread, activeRunId: runId }, "run", runId ?? "");
+        this.bump({ ...thread, activeRunId: runId }, "run", runId ?? "");
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
   cancelRun(actorId: string, threadId: string, runId?: string): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, threadId, true);
+        const thread = yield* this.authorizeThread(actorId, threadId, true);
         if (runId && thread.activeRunId !== runId)
           return Result.err(nativeFailure("stale", "Run is no longer active"));
         const targetRun = runId ?? thread.activeRunId;
         let current = thread;
-        const inputs = yield* store.readRows(
+        const inputs = yield* this.readRows(
           "SELECT * FROM native_records WHERE kind='input' AND thread_id=?",
           [threadId],
         );
@@ -1579,35 +1553,34 @@ export class NativeStore {
               input.requestId !== targetRun)
           )
             continue;
-          store.writeRecord(
+          this.writeRecord(
             input.id,
             { kind: "input", value: { ...input, state: "canceled" } },
             threadId,
             input.position,
           );
-          const changes = yield* store.terminalInputProjection(input, "canceled");
-          current = store.bump(current, "input", input.id, changes);
+          const changes = yield* this.terminalInputProjection(input, "canceled");
+          current = this.bump(current, "input", input.id, changes);
         }
-        yield* store.cancelUnusedUploads(thread.id);
-        store.bump({ ...current, activeRunId: undefined }, "cancel", targetRun ?? "pending");
+        yield* this.cancelUnusedUploads(thread.id);
+        this.bump({ ...current, activeRunId: undefined }, "cancel", targetRun ?? "pending");
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
   removeInput(actorId: string, inputId: string): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const input = yield* store.getInput(inputId);
-        yield* store.authorizeThread(actorId, input.threadId, true);
+        const input = yield* this.getInput(inputId);
+        yield* this.authorizeThread(actorId, input.threadId, true);
         if (input.state === "admitted")
           return Result.err(nativeFailure("conflict", "Input has already been admitted"));
         if (input.state === "canceled") return Result.ok(undefined);
-        yield* store.settleInput(inputId, "canceled");
-        yield* store.cancelUnusedUploads(input.threadId);
+        yield* this.settleInput(inputId, "canceled");
+        yield* this.cancelUnusedUploads(input.threadId);
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
@@ -1621,10 +1594,9 @@ export class NativeStore {
       commandId?: string;
     },
   ): NativeStoreResult<NativeUploadRecord> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, input.threadId, true);
+        const thread = yield* this.authorizeThread(actorId, input.threadId, true);
         const create = (): NativeStoreResult<NativeMutationResult> => {
           if (thread.mutationPending)
             return Result.err(nativeFailure("stale", "Thread history is changing"));
@@ -1637,16 +1609,16 @@ export class NativeStore {
             ownerId: actorId,
             historyGeneration: thread.historyGeneration,
             state: "pending",
-            createdAt: store.now(),
+            createdAt: this.now(),
             attempt: 0,
             revision: 0,
             published: false,
           };
-          store.writeRecord(upload.id, { kind: "upload", value: upload }, thread.id);
+          this.writeRecord(upload.id, { kind: "upload", value: upload }, thread.id);
           return Result.ok({ threadId: thread.id, uploadId: upload.id });
         };
         const result = yield* input.commandId
-          ? store.command(
+          ? this.command(
               actorId,
               input.commandId,
               { operation: "reserve-upload", ...input },
@@ -1655,8 +1627,8 @@ export class NativeStore {
           : create();
         if (!result.uploadId)
           return Result.err(nativeFailure("invalid", "Upload receipt is incomplete"));
-        return store.getUpload(result.uploadId);
-      }),
+        return this.getUpload(result.uploadId);
+      }, this),
     );
   }
 
@@ -1671,25 +1643,23 @@ export class NativeStore {
   }
 
   readUpload(actorId: string, id: string): NativeStoreResult<NativeUploadRecord> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const upload = yield* store.getUpload(id);
-        yield* store.authorizeThread(actorId, upload.threadId);
-        const user = yield* store.getUser(actorId);
+        const upload = yield* this.getUpload(id);
+        yield* this.authorizeThread(actorId, upload.threadId);
+        const user = yield* this.getUser(actorId);
         if (!upload.published && upload.ownerId !== actorId && user.role !== "owner")
           return Result.err(nativeFailure("forbidden", "Upload is not published"));
         return Result.ok(upload);
-      }),
+      }, this),
     );
   }
 
   claimUpload(actorId: string, id: string): NativeStoreResult<NativeUploadRecord> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const upload = yield* store.getUpload(id);
-        const thread = yield* store.authorizeThread(actorId, upload.threadId, true);
+        const upload = yield* this.getUpload(id);
+        const thread = yield* this.authorizeThread(actorId, upload.threadId, true);
         if (
           upload.ownerId !== actorId ||
           upload.state === "canceled" ||
@@ -1704,9 +1674,9 @@ export class NativeStore {
           attempt: upload.attempt + 1,
           revision: upload.revision + 1,
         };
-        store.writeRecord(id, { kind: "upload", value: next }, thread.id);
+        this.writeRecord(id, { kind: "upload", value: next }, thread.id);
         return Result.ok(next);
-      }),
+      }, this),
     );
   }
 
@@ -1719,11 +1689,10 @@ export class NativeStore {
       resourceUri?: string;
     },
   ): NativeStoreResult<NativeUploadRecord> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const upload = yield* store.getUpload(id);
-        const thread = yield* store.authorizeThread(upload.ownerId, upload.threadId, true);
+        const upload = yield* this.getUpload(id);
+        const thread = yield* this.authorizeThread(upload.ownerId, upload.threadId, true);
         if (
           upload.attempt !== input.attempt ||
           upload.historyGeneration !== input.historyGeneration ||
@@ -1740,9 +1709,9 @@ export class NativeStore {
           resourceUri: input.resourceUri,
           revision: upload.revision + 1,
         };
-        store.writeRecord(id, { kind: "upload", value: next }, thread.id);
+        this.writeRecord(id, { kind: "upload", value: next }, thread.id);
         let current = thread;
-        const turns = yield* store.readRows(
+        const turns = yield* this.readRows(
           "SELECT * FROM native_records WHERE kind='turn' AND thread_id=?",
           [thread.id],
         );
@@ -1766,17 +1735,17 @@ export class NativeStore {
             }),
           }));
           if (changes.length === 0) continue;
-          store.writeRecord(
+          this.writeRecord(
             record.value.turnId,
             { ...record, value: { ...record.value, messages } },
             thread.id,
             record.value.position,
           );
-          current = store.bump(current, "upload", id, changes);
+          current = this.bump(current, "upload", id, changes);
         }
-        if (current.revision === thread.revision) store.bump(current, "upload", id);
+        if (current.revision === thread.revision) this.bump(current, "upload", id);
         return Result.ok(next);
-      }),
+      }, this),
     );
   }
 
@@ -1787,10 +1756,9 @@ export class NativeStore {
     message: DisplayMessage,
     eventId?: string,
   ): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.getThreadRecord(threadId);
+        const thread = yield* this.getThreadRecord(threadId);
         if (
           thread.deleted ||
           thread.mutationPending ||
@@ -1799,15 +1767,15 @@ export class NativeStore {
           return Result.err(nativeFailure("stale", "Output belongs to discarded history"));
         if (
           eventId &&
-          store.db.query("SELECT 1 FROM native_projection_receipts WHERE event_id=?").get(eventId)
+          this.db.query("SELECT 1 FROM native_projection_receipts WHERE event_id=?").get(eventId)
         )
           return Result.ok(undefined);
-        const record = yield* store.readRecord("turn", turnId);
+        const record = yield* this.readRecord("turn", turnId);
         if (record?.kind !== "turn")
           return Result.err(nativeFailure("not-found", "Output turn is unavailable"));
         if (record.value.messages.some((item) => item.id === message.id))
           return Result.ok(undefined);
-        const owner = store.db
+        const owner = this.db
           .query<{ thread_id: string }, [string]>(
             "SELECT thread_id FROM native_records WHERE kind='turn' AND id=?",
           )
@@ -1815,18 +1783,18 @@ export class NativeStore {
         if (owner?.thread_id !== threadId)
           return Result.err(nativeFailure("forbidden", "Turn belongs to another thread"));
         const slot = { ...record.value, messages: [...record.value.messages, message] };
-        store.writeRecord(turnId, { ...record, value: slot }, thread.id, slot.position);
-        store.bump(thread, "turn", turnId, [
+        this.writeRecord(turnId, { ...record, value: slot }, thread.id, slot.position);
+        this.bump(thread, "turn", turnId, [
           { kind: "append-message", turnId, position: slot.position, message },
         ]);
         if (eventId)
-          store.db
+          this.db
             .query(
               "INSERT INTO native_projection_receipts(event_id,thread_id,generation) VALUES(?,?,?)",
             )
             .run(eventId, threadId, historyGeneration);
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
@@ -1840,11 +1808,10 @@ export class NativeStore {
       revision: number;
     },
   ): NativeStoreResult<NativeMutationResult> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, input.threadId, true);
-        return store.command(actorId, input.commandId, { operation: "rewind", ...input }, () =>
+        const thread = yield* this.authorizeThread(actorId, input.threadId, true);
+        return this.command(actorId, input.commandId, { operation: "rewind", ...input }, () =>
           Result.gen(function* () {
             if (
               thread.mutationPending ||
@@ -1852,15 +1819,15 @@ export class NativeStore {
               thread.revision !== input.revision
             )
               return Result.err(nativeFailure("stale", "Thread changed before rewind"));
-            const target = yield* store.readRecord("turn", input.turnId);
+            const target = yield* this.readRecord("turn", input.turnId);
             if (target?.kind !== "turn")
               return Result.err(nativeFailure("not-found", "Rewind target is unavailable"));
-            const targetInputs = yield* store.readRows(
+            const targetInputs = yield* this.readRows(
               "SELECT * FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.turnId')=? AND json_extract(data_json,'$.value.mode')!='steer' LIMIT 1",
               [thread.id, input.turnId],
             );
             const fullInput = targetInputs[0];
-            const inputs = yield* store.readRows(
+            const inputs = yield* this.readRows(
               "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND (json_extract(i.data_json,'$.value.state') IN ('queued','uploading') OR EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.thread_id=i.thread_id AND t.position>=? AND t.id=json_extract(i.data_json,'$.value.turnId'))) ORDER BY i.position",
               [thread.id, target.value.position],
             );
@@ -1868,18 +1835,18 @@ export class NativeStore {
               return Result.err(nativeFailure("invalid", "Only full user turns can be rewound"));
             for (const record of inputs) {
               if (record.kind !== "input") continue;
-              store.writeRecord(
+              this.writeRecord(
                 record.value.id,
                 { kind: "input", value: { ...record.value, state: "canceled" } },
                 thread.id,
                 record.value.position,
               );
             }
-            store.db
+            this.db
               .query("DELETE FROM native_records WHERE kind='turn' AND thread_id=? AND position>=?")
               .run(thread.id, target.value.position);
-            yield* store.cancelUnusedUploads(thread.id);
-            store.bump(
+            yield* this.cancelUnusedUploads(thread.id);
+            this.bump(
               {
                 ...thread,
                 historyGeneration: thread.historyGeneration + 1,
@@ -1895,9 +1862,9 @@ export class NativeStore {
               turnId: input.turnId,
               text: fullInput.value.text,
             });
-          }),
+          }, this),
         );
-      }),
+      }, this),
     );
   }
 
@@ -1905,14 +1872,13 @@ export class NativeStore {
     actorId: string,
     input: { threadId: string; commandId: string; historyGeneration?: number },
   ): NativeStoreResult<NativeMutationResult> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const user = yield* store.getUser(actorId);
-        const thread = yield* store.getThreadRecord(input.threadId);
-        const old = yield* store.readRecord("command", commandKey(actorId, input.commandId));
+        const user = yield* this.getUser(actorId);
+        const thread = yield* this.getThreadRecord(input.threadId);
+        const old = yield* this.readRecord("command", commandKey(actorId, input.commandId));
         if (old?.kind === "command")
-          return store.command(actorId, input.commandId, { operation: "delete", ...input }, () =>
+          return this.command(actorId, input.commandId, { operation: "delete", ...input }, () =>
             Result.err(nativeFailure("conflict", "Deletion receipt is unavailable")),
           );
         if (
@@ -1920,20 +1886,20 @@ export class NativeStore {
           input.historyGeneration !== thread.historyGeneration
         )
           return Result.err(nativeFailure("stale", "Thread changed before deletion"));
-        if (!store.capabilities(user, thread).edit)
+        if (!this.capabilities(user, thread).edit)
           return Result.err(nativeFailure("forbidden", "Thread access is denied"));
-        return store.command(actorId, input.commandId, { operation: "delete", ...input }, () =>
+        return this.command(actorId, input.commandId, { operation: "delete", ...input }, () =>
           Result.gen(function* () {
-            const pending = yield* store.listPendingInputs(thread.id);
+            const pending = yield* this.listPendingInputs(thread.id);
             for (const item of pending)
-              store.writeRecord(
+              this.writeRecord(
                 item.id,
                 { kind: "input", value: { ...item, state: "canceled" } },
                 thread.id,
                 item.position,
               );
-            yield* store.cancelUnusedUploads(thread.id);
-            store.bump(
+            yield* this.cancelUnusedUploads(thread.id);
+            this.bump(
               {
                 ...thread,
                 deleted: true,
@@ -1948,24 +1914,23 @@ export class NativeStore {
               threadId: thread.id,
               historyGeneration: thread.historyGeneration + 1,
             });
-          }),
+          }, this),
         );
-      }),
+      }, this),
     );
   }
 
   finishMutation(threadId: string, historyGeneration: number): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.getThreadRecord(threadId);
+        const thread = yield* this.getThreadRecord(threadId);
         if (thread.historyGeneration !== historyGeneration)
           return Result.err(nativeFailure("stale", "Mutation belongs to an older generation"));
         if (!thread.mutationPending) return Result.ok(undefined);
-        const cleaned = thread.deleted ? yield* store.cleanupDeletedThread(thread) : thread;
-        store.bump({ ...cleaned, mutationPending: false }, "mutation", thread.id);
+        const cleaned = thread.deleted ? yield* this.cleanupDeletedThread(thread) : thread;
+        this.bump({ ...cleaned, mutationPending: false }, "mutation", thread.id);
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
@@ -1998,12 +1963,11 @@ export class NativeStore {
     actorId: string,
     options: { cursor?: string; limit?: number } = {},
   ): NativeStoreResult<{ items: DisplayUser[]; nextCursor?: string }> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* store.requireOwner(actorId);
+        yield* this.requireOwner(actorId);
         const limit = Math.min(100, options.limit ?? 30);
-        const records = yield* store.readRows(
+        const records = yield* this.readRows(
           "SELECT * FROM native_records WHERE kind='user' AND id>? ORDER BY id LIMIT ?",
           [options.cursor ?? "", limit + 1],
         );
@@ -2013,16 +1977,15 @@ export class NativeStore {
           items,
           nextCursor: users.length > limit ? items.at(-1)?.id : undefined,
         });
-      }),
+      }, this),
     );
   }
 
   listParticipants(actorId: string, threadId: string): NativeStoreResult<Participant[]> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, threadId);
-        const records = yield* store.readRows(
+        const thread = yield* this.authorizeThread(actorId, threadId);
+        const records = yield* this.readRows(
           "SELECT r.* FROM native_records r WHERE r.kind='user' AND (r.id=? OR json_extract(r.data_json,'$.value.role') IN ('owner','service') OR EXISTS(SELECT 1 FROM native_grants g WHERE g.thread_id=? AND g.user_id=r.id)) ORDER BY r.id",
           [thread.starterId, threadId],
         );
@@ -2030,20 +1993,19 @@ export class NativeStore {
         for (const record of records) {
           if (record.kind !== "user") continue;
           const user = nativeUserDisplay(record.value);
-          const capabilities = store.capabilities(record.value, thread);
+          const capabilities = this.capabilities(record.value, thread);
           participants.push({ user, role: capabilities.edit ? "edit" : "read" });
         }
         return Result.ok(participants);
-      }),
+      }, this),
     );
   }
 
   listQueuedInputs(actorId: string, threadId: string): NativeStoreResult<QueuedInput[]> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* store.authorizeThread(actorId, threadId);
-        const inputs = yield* store.listPendingInputs(threadId);
+        yield* this.authorizeThread(actorId, threadId);
+        const inputs = yield* this.listPendingInputs(threadId);
         return Result.ok(
           inputs
             .filter((input) => input.state !== "admitted")
@@ -2055,7 +2017,7 @@ export class NativeStore {
               createdAt: input.createdAt,
             })),
         );
-      }),
+      }, this),
     );
   }
 
@@ -2070,13 +2032,12 @@ export class NativeStore {
     attemptId: string;
     previousAttemptId?: string;
   }> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const input = yield* store.getInputByRequestId(requestId);
+        const input = yield* this.getInputByRequestId(requestId);
         if (!input?.turnId)
           return Result.err(nativeFailure("not-found", "Output input has no turn"));
-        const thread = yield* store.getThreadRecord(input.threadId);
+        const thread = yield* this.getThreadRecord(input.threadId);
         if (
           thread.deleted ||
           thread.mutationPending ||
@@ -2085,7 +2046,7 @@ export class NativeStore {
         )
           return Result.err(nativeFailure("stale", "Output attempt belongs to discarded history"));
         const attemptId = randomUUID();
-        store.writeRecord(
+        this.writeRecord(
           input.id,
           { kind: "input", value: { ...input, attemptId, previousAttemptId: input.attemptId } },
           thread.id,
@@ -2098,7 +2059,7 @@ export class NativeStore {
           attemptId,
           previousAttemptId: input.attemptId,
         });
-      }),
+      }, this),
     );
   }
 
@@ -2116,24 +2077,21 @@ export class NativeStore {
       projection?: NativeOutputProjectionState;
     }>,
   ): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.getThreadRecord(threadId);
+        const thread = yield* this.getThreadRecord(threadId);
         if (
           thread.deleted ||
           thread.mutationPending ||
           thread.historyGeneration !== historyGeneration
         )
           return Result.err(nativeFailure("stale", "Output belongs to discarded history"));
-        if (
-          store.db.query("SELECT 1 FROM native_projection_receipts WHERE event_id=?").get(eventId)
-        )
+        if (this.db.query("SELECT 1 FROM native_projection_receipts WHERE event_id=?").get(eventId))
           return Result.ok(undefined);
-        const record = yield* store.readRecord("turn", turnId);
+        const record = yield* this.readRecord("turn", turnId);
         if (record?.kind !== "turn")
           return Result.err(nativeFailure("not-found", "Output turn is unavailable"));
-        const owner = store.db
+        const owner = this.db
           .query<{ thread_id: string }, [string]>(
             "SELECT thread_id FROM native_records WHERE kind='turn' AND id=?",
           )
@@ -2143,7 +2101,7 @@ export class NativeStore {
         const changed = yield* transform(record.value, record.projection);
         if (changed.slot.turnId !== turnId || changed.slot.position !== record.value.position)
           return Result.err(nativeFailure("invalid", "Projection cannot change turn identity"));
-        store.writeRecord(
+        this.writeRecord(
           turnId,
           {
             kind: "turn",
@@ -2159,7 +2117,7 @@ export class NativeStore {
         for (const change of changed.changes) {
           const size = encoder.encode(JSON.stringify(change)).byteLength;
           if (batch.length > 0 && (batch.length >= 64 || bytes + size > WINDOW_BYTES)) {
-            current = store.bump(current, "turn", turnId, batch);
+            current = this.bump(current, "turn", turnId, batch);
             batch = [];
             bytes = 0;
           }
@@ -2167,43 +2125,42 @@ export class NativeStore {
           bytes += size;
         }
         if (batch.length > 0 || changed.changes.length === 0)
-          store.bump(current, "turn", turnId, batch);
-        store.db
+          this.bump(current, "turn", turnId, batch);
+        this.db
           .query(
             "INSERT INTO native_projection_receipts(event_id,thread_id,generation) VALUES(?,?,?)",
           )
           .run(eventId, threadId, historyGeneration);
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
   postMessage(actorId: string, threadId: string, message: DisplayMessage): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, threadId, true);
+        const thread = yield* this.authorizeThread(actorId, threadId, true);
         if (thread.mutationPending)
           return Result.err(nativeFailure("stale", "Thread history is changing"));
         for (const part of message.parts)
           if (part.type === "data-resource")
-            yield* store.publishUpload(actorId, part.data.resourceId);
-        const existing = yield* store.readRecord("turn", message.id);
+            yield* this.publishUpload(actorId, part.data.resourceId);
+        const existing = yield* this.readRecord("turn", message.id);
         if (existing) return Result.ok(undefined);
         const slot: ReadyTurnSlot = {
           kind: "ready",
           slotId: message.id,
           turnId: message.id,
-          position: store.nextTurnPosition(thread.id),
+          position: this.nextTurnPosition(thread.id),
           messages: [message],
           state: "complete",
         };
-        store.writeRecord(slot.turnId, { kind: "turn", value: slot }, threadId, slot.position);
-        store.bump({ ...thread, nextPosition: thread.nextPosition + 1 }, "turn", slot.turnId, [
+        this.writeRecord(slot.turnId, { kind: "turn", value: slot }, threadId, slot.position);
+        this.bump({ ...thread, nextPosition: thread.nextPosition + 1 }, "turn", slot.turnId, [
           { kind: "insert", slot },
         ]);
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
@@ -2214,15 +2171,14 @@ export class NativeStore {
     message?: DisplayMessage,
     resolvedModelRequest?: DurableResolvedModelRequest,
   ): NativeStoreResult<NativeInputReceipt> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const receipt = yield* store.acceptInput(actorId, input, {
+        const receipt = yield* this.acceptInput(actorId, input, {
           authorId,
           resolvedModelRequest,
         });
         if (message)
-          yield* store.updateSurfaceMessage(actorId, input.threadId, receipt.messageId, {
+          yield* this.updateSurfaceMessage(actorId, input.threadId, receipt.messageId, {
             ...message,
             id: receipt.messageId,
             metadata: {
@@ -2233,7 +2189,7 @@ export class NativeStore {
             },
           });
         return Result.ok(receipt);
-      }),
+      }, this),
     );
   }
 
@@ -2243,13 +2199,12 @@ export class NativeStore {
     messageId: string,
     message: DisplayMessage | null,
   ): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, threadId, true);
+        const thread = yield* this.authorizeThread(actorId, threadId, true);
         if (thread.mutationPending)
           return Result.err(nativeFailure("stale", "Thread history is changing"));
-        const records = yield* store.readRows(
+        const records = yield* this.readRows(
           "SELECT * FROM native_records WHERE kind='turn' AND thread_id=? AND EXISTS(SELECT 1 FROM json_each(json_extract(data_json,'$.value.messages')) m WHERE json_extract(m.value,'$.id')=?) LIMIT 1",
           [threadId, messageId],
         );
@@ -2266,14 +2221,14 @@ export class NativeStore {
         if (message)
           for (const part of message.parts)
             if (part.type === "data-resource" && !oldResources.has(part.data.resourceId))
-              yield* store.publishUpload(actorId, part.data.resourceId);
+              yield* this.publishUpload(actorId, part.data.resourceId);
         const messages = record.value.messages.flatMap((entry) => {
           if (entry.id !== messageId) return [entry];
           if (message) return [message];
           return [];
         });
         const slot = { ...record.value, messages };
-        store.writeRecord(slot.turnId, { ...record, value: slot }, thread.id, slot.position);
+        this.writeRecord(slot.turnId, { ...record, value: slot }, thread.id, slot.position);
         const changes: LiveUpdate["changes"] = [];
         const index = record.value.messages.findIndex((entry) => entry.id === messageId);
         const previous = record.value.messages[index];
@@ -2321,9 +2276,9 @@ export class NativeStore {
             });
         }
         if (changes.length === 0) return Result.ok(undefined);
-        store.bump(thread, "replace", slot.turnId, changes);
+        this.bump(thread, "replace", slot.turnId, changes);
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
@@ -2333,17 +2288,16 @@ export class NativeStore {
     path: string,
     cwd?: string,
   ): NativeStoreResult<{ id: string; threadId: string; path: string; cwd?: string }> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* store.authorizeThread(actorId, threadId, true);
+        yield* this.authorizeThread(actorId, threadId, true);
         const id = fingerprint({ kind: "published-path", threadId, path, cwd });
-        const existing = yield* store.readRecord("path", id);
+        const existing = yield* this.readRecord("path", id);
         if (existing?.kind === "path") return Result.ok(existing.value);
         const value = { id, threadId, path, cwd };
-        store.writeRecord(value.id, { kind: "path", value }, threadId);
+        this.writeRecord(value.id, { kind: "path", value }, threadId);
         return Result.ok(value);
-      }),
+      }, this),
     );
   }
 
@@ -2351,15 +2305,14 @@ export class NativeStore {
     actorId: string,
     id: string,
   ): NativeStoreResult<{ id: string; threadId: string; path: string; cwd?: string }> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const record = yield* store.readRecord("path", id);
+        const record = yield* this.readRecord("path", id);
         if (record?.kind !== "path")
           return Result.err(nativeFailure("not-found", "Published path is unavailable"));
-        yield* store.authorizeThread(actorId, record.value.threadId);
+        yield* this.authorizeThread(actorId, record.value.threadId);
         return Result.ok(record.value);
-      }),
+      }, this),
     );
   }
 
@@ -2412,19 +2365,18 @@ export class NativeStore {
       cursor: string;
     },
   ): NativeStoreResult<TurnPage> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.authorizeThread(actorId, input.threadId);
+        const thread = yield* this.authorizeThread(actorId, input.threadId);
         if (
           thread.historyGeneration !== input.historyGeneration ||
           thread.revision !== input.projectionRevision
         )
           return Result.err(nativeFailure("stale", "Turn changed before paging"));
-        const record = yield* store.readRecord("turn", input.turnId);
+        const record = yield* this.readRecord("turn", input.turnId);
         if (record?.kind !== "turn")
           return Result.err(nativeFailure("not-found", "Turn is unavailable"));
-        const owner = store.db
+        const owner = this.db
           .query<{ thread_id: string }, [string]>(
             "SELECT thread_id FROM native_records WHERE kind='turn' AND id=?",
           )
@@ -2492,42 +2444,40 @@ export class NativeStore {
               ? `p_${messageIndex}_${partIndex}`
               : undefined,
         });
-      }),
+      }, this),
     );
   }
 
   publishUpload(actorId: string, id: string): NativeStoreResult<void> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const upload = yield* store.getUpload(id);
-        const thread = yield* store.authorizeThread(actorId, upload.threadId, !upload.published);
+        const upload = yield* this.getUpload(id);
+        const thread = yield* this.authorizeThread(actorId, upload.threadId, !upload.published);
         if (upload.published && upload.state === "ready") return Result.ok(undefined);
-        const user = yield* store.getUser(actorId);
+        const user = yield* this.getUser(actorId);
         if (upload.ownerId !== actorId && user.role !== "owner")
           return Result.err(nativeFailure("forbidden", "Upload belongs to another user"));
         if (thread.historyGeneration !== upload.historyGeneration || thread.mutationPending)
           return Result.err(nativeFailure("stale", "Upload belongs to discarded history"));
         if (upload.state !== "ready")
           return Result.err(nativeFailure("invalid", "Only completed resources can be published"));
-        store.writeRecord(
+        this.writeRecord(
           id,
           { kind: "upload", value: { ...upload, published: true } },
           upload.threadId,
         );
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
   private cancelUnusedUploads(threadId: string): NativeStoreResult<void> {
-    const store = this;
     return Result.gen(function* () {
-      const uploads = yield* store.readRows(
+      const uploads = yield* this.readRows(
         "SELECT * FROM native_records WHERE kind='upload' AND thread_id=? AND json_extract(data_json,'$.value.state') IN ('pending','failed')",
         [threadId],
       );
-      const inputs = yield* store.readRows(
+      const inputs = yield* this.readRows(
         "SELECT * FROM native_records WHERE kind='input' AND thread_id=? AND json_extract(data_json,'$.value.state') IN ('uploading','queued','admitted') AND json_extract(data_json,'$.value.completedAt') IS NULL",
         [threadId],
       );
@@ -2537,7 +2487,7 @@ export class NativeStore {
           (input) => input.kind === "input" && input.value.attachmentIds.includes(record.value.id),
         );
         if (referenced) continue;
-        store.writeRecord(
+        this.writeRecord(
           record.value.id,
           {
             kind: "upload",
@@ -2547,23 +2497,22 @@ export class NativeStore {
         );
       }
       return Result.ok(undefined);
-    });
+    }, this);
   }
 
   listCanonicalRequestIds(threadId: string): NativeStoreResult<string[]> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* store.getThreadRecord(threadId);
+        const thread = yield* this.getThreadRecord(threadId);
         if (thread.deleted) return Result.ok([]);
-        const records = yield* store.readRows(
+        const records = yield* this.readRows(
           "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND json_extract(i.data_json,'$.value.state') IN ('admitted','canceled') AND EXISTS(SELECT 1 FROM native_records t WHERE t.kind='turn' AND t.thread_id=i.thread_id AND t.id=json_extract(i.data_json,'$.value.turnId')) ORDER BY i.position",
           [threadId],
         );
         return Result.ok(
           records.flatMap((record) => (record.kind === "input" ? [record.value.requestId] : [])),
         );
-      }),
+      }, this),
     );
   }
 
@@ -2583,15 +2532,14 @@ export class NativeStore {
     threadId: string,
     options: { afterRevision?: number } = {},
   ): NativeStoreResult<NativeInputReceipt[]> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* store.authorizeThread(actorId, threadId);
+        yield* this.authorizeThread(actorId, threadId);
         if (options.afterRevision === undefined) {
-          const pending = yield* store.listPendingInputs(threadId);
+          const pending = yield* this.listPendingInputs(threadId);
           return Result.ok(pending.map(inputReceipt));
         }
-        const records = yield* store.readRows(
+        const records = yield* this.readRows(
           "SELECT i.* FROM native_records i WHERE i.kind='input' AND i.thread_id=? AND EXISTS(SELECT 1 FROM native_changes c WHERE c.thread_id=i.thread_id AND c.kind='input' AND c.record_id=i.id AND c.revision>?) ORDER BY i.position",
           [threadId, options.afterRevision],
         );
@@ -2600,7 +2548,7 @@ export class NativeStore {
             record.kind === "input" ? [inputReceipt(record.value)] : [],
           ),
         );
-      }),
+      }, this),
     );
   }
 
@@ -2608,13 +2556,12 @@ export class NativeStore {
     input: NativeInputRecord,
     state: NativeInputRecord["state"],
   ): NativeStoreResult<LiveUpdate["changes"]> {
-    const store = this;
     return Result.gen(function* () {
       if ((state !== "canceled" && state !== "failed") || input.mode === "steer" || !input.turnId)
         return Result.ok([]);
-      const record = yield* store.readRecord("turn", input.turnId);
+      const record = yield* this.readRecord("turn", input.turnId);
       if (record?.kind !== "turn") return Result.ok([]);
-      const settledAt = store.now();
+      const settledAt = this.now();
       const changes: LiveUpdate["changes"] = [
         {
           kind: "turn-state",
@@ -2645,25 +2592,24 @@ export class NativeStore {
           }),
         };
       });
-      store.writeRecord(
+      this.writeRecord(
         input.turnId,
         { ...record, value: { ...record.value, messages, state, settledAt } },
         input.threadId,
         record.value.position,
       );
       return Result.ok(changes);
-    });
+    }, this);
   }
 
   lookupInputReceipt(
     actorId: string,
     input: NativeInput,
   ): NativeStoreResult<NativeInputReceipt | null> {
-    const store = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* store.authorizeThread(actorId, input.threadId, true);
-        const receipt = yield* store.readRecord("command", commandKey(actorId, input.commandId));
+        yield* this.authorizeThread(actorId, input.threadId, true);
+        const receipt = yield* this.readRecord("command", commandKey(actorId, input.commandId));
         if (receipt?.kind !== "command") return Result.ok(null);
         if (receipt.value.fingerprint !== fingerprint({ operation: "input", ...input }))
           return Result.err(
@@ -2671,21 +2617,20 @@ export class NativeStore {
           );
         if (!receipt.value.result.inputId)
           return Result.err(nativeFailure("invalid", "Input receipt is incomplete"));
-        return store.getInput(receipt.value.result.inputId).map(inputReceipt);
-      }),
+        return this.getInput(receipt.value.result.inputId).map(inputReceipt);
+      }, this),
     );
   }
 
   private cleanupDeletedThread(thread: NativeThreadRecord): NativeStoreResult<NativeThreadRecord> {
-    const store = this;
     return Result.gen(function* () {
-      const inputs = yield* store.readRows(
+      const inputs = yield* this.readRows(
         "SELECT * FROM native_records WHERE kind='input' AND thread_id=?",
         [thread.id],
       );
       for (const record of inputs) {
         if (record.kind !== "input") continue;
-        store.writeRecord(
+        this.writeRecord(
           record.value.id,
           {
             kind: "input",
@@ -2704,13 +2649,13 @@ export class NativeStore {
           record.value.position,
         );
       }
-      const commands = yield* store.readRows(
+      const commands = yield* this.readRows(
         "SELECT * FROM native_records WHERE kind='command' AND thread_id=?",
         [thread.id],
       );
       for (const record of commands) {
         if (record.kind !== "command") continue;
-        store.writeRecord(
+        this.writeRecord(
           commandKey(record.value.actorId, record.value.id),
           {
             kind: "command",
@@ -2719,15 +2664,15 @@ export class NativeStore {
           thread.id,
         );
       }
-      store.db
+      this.db
         .query(
           "DELETE FROM native_records WHERE thread_id=? AND kind IN ('turn','upload','path','message')",
         )
         .run(thread.id);
-      store.db.query("DELETE FROM native_changes WHERE thread_id=?").run(thread.id);
-      store.db.query("DELETE FROM native_grants WHERE thread_id=?").run(thread.id);
-      store.db.query("DELETE FROM native_projection_receipts WHERE thread_id=?").run(thread.id);
+      this.db.query("DELETE FROM native_changes WHERE thread_id=?").run(thread.id);
+      this.db.query("DELETE FROM native_grants WHERE thread_id=?").run(thread.id);
+      this.db.query("DELETE FROM native_projection_receipts WHERE thread_id=?").run(thread.id);
       return Result.ok({ ...thread, title: "Deleted thread", modelId: undefined });
-    });
+    }, this);
   }
 }

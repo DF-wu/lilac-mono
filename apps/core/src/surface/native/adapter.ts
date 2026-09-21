@@ -219,10 +219,9 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
   }
 
   async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
-    const adapter = this;
     return Result.gen(function* () {
-      const request = yield* adapter.principal("list-sessions");
-      const threads = yield* adapter.dependencies.store
+      const request = yield* this.principal("list-sessions");
+      const threads = yield* this.dependencies.store
         .listThreads(request.principalId, { limit: 100 })
         .mapError((error) => nativeSurfaceError("list-sessions", error));
       return Result.ok(
@@ -232,31 +231,29 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
           kind: "thread" as const,
         })),
       );
-    });
+    }, this);
   }
   async listSessionParticipants(
     sessionRef: SessionRef,
     opts?: { limit?: number },
   ): Promise<SurfaceOperationResult<SurfaceSessionParticipantsResult>> {
-    const adapter = this;
     return Result.gen(function* () {
       const ref = yield* nativeSession("list-session-participants", sessionRef);
-      const request = yield* adapter.principal("list-session-participants");
-      return adapter.dependencies.surface
+      const request = yield* this.principal("list-session-participants");
+      return this.dependencies.surface
         .participants(request.principalId, ref.channelId, opts?.limit)
         .mapError((error) => nativeSurfaceError("list-session-participants", error));
-    });
+    }, this);
   }
   async prepareSendMsg(
     sessionRef: SessionRef,
     input: SurfaceSendPreparationInput,
     opts?: SendOpts,
   ): Promise<SurfaceOperationResult<void>> {
-    const adapter = this;
     return Result.gen(function* () {
       const ref = yield* nativeSession("send-message", sessionRef);
-      const request = yield* adapter.principal("send-message");
-      yield* adapter.dependencies.store
+      const request = yield* this.principal("send-message");
+      yield* this.dependencies.store
         .authorizeThread(request.principalId, ref.channelId, true)
         .mapError((error) => nativeSurfaceError("send-message", error));
       if (!(input.text?.trim() || input.attachmentCount || input.actionCount))
@@ -269,7 +266,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         input.actionCount > 25
       )
         return Result.err(invalid("send-message", "content", "Message exceeds the display limits"));
-      if (input.attachmentCount && !adapter.dependencies.resources)
+      if (input.attachmentCount && !this.dependencies.resources)
         return Result.err(
           new SurfaceUnavailable({
             platform: "native",
@@ -289,7 +286,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             message: "Reply target belongs to another thread",
           }),
         );
-      const message = yield* adapter.dependencies.surface
+      const message = yield* this.dependencies.surface
         .readMessage(request.principalId, ref.channelId, reply.messageId)
         .mapError((error) => nativeSurfaceError("send-message", error));
       if (!message)
@@ -301,7 +298,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
           }),
         );
       return Result.ok(undefined);
-    });
+    }, this);
   }
   async sendMsg(
     sessionRef: SessionRef,
@@ -316,10 +313,9 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
     opts: SendOpts | undefined,
     trigger: boolean,
   ): Promise<SurfaceOperationResult<MsgRef>> {
-    const adapter = this;
     return Result.gen(async function* () {
       yield* Result.await(
-        adapter.prepareSendMsg(
+        this.prepareSendMsg(
           sessionRef,
           {
             text: content.text,
@@ -329,14 +325,14 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
           opts,
         ),
       );
-      const request = yield* adapter.principal("send-message");
+      const request = yield* this.principal("send-message");
       const ref = yield* nativeSession("send-message", sessionRef);
       const id = randomUUID();
       const parts: DisplayMessage["parts"] =
         content.text === undefined ? [] : [{ type: "text", text: content.text }];
       const attachmentIds: string[] = [];
       for (const attachment of content.attachments ?? []) {
-        const resources = adapter.dependencies.resources;
+        const resources = this.dependencies.resources;
         if (!resources)
           return Result.err(
             new SurfaceUnavailable({
@@ -379,8 +375,8 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         id,
         role: "assistant",
         metadata: {
-          authorId: adapter.serviceUserId,
-          createdAt: (adapter.dependencies.now ?? Date.now)(),
+          authorId: this.serviceUserId,
+          createdAt: (this.dependencies.now ?? Date.now)(),
           ...(opts?.replyTo ? { replyToMessageId: opts.replyTo.messageId } : {}),
         },
         parts,
@@ -392,17 +388,17 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
       if (
         trigger &&
         ref.channelId !== request.sourceThreadId &&
-        adapter.dependencies.shouldTriggerRun()
+        this.dependencies.shouldTriggerRun()
       ) {
-        const thread = yield* adapter.dependencies.store
+        const thread = yield* this.dependencies.store
           .authorizeThread(request.principalId, ref.channelId, true)
           .mapError((error) => nativeSurfaceError("send-message", error));
-        const resolvedModelRequest = adapter.dependencies.resolveModel
-          ? yield* adapter.dependencies
+        const resolvedModelRequest = this.dependencies.resolveModel
+          ? yield* this.dependencies
               .resolveModel(thread.modelId)
               .mapError((error) => invalid("send-message", "model", error.message))
           : undefined;
-        const receipt = yield* adapter.dependencies.store
+        const receipt = yield* this.dependencies.store
           .acceptSurfaceInput(
             request.principalId,
             {
@@ -414,60 +410,55 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
               skillIds: [],
               mode: thread.activeRunId ? "followup" : "prompt",
             },
-            adapter.serviceUserId,
+            this.serviceUserId,
             message,
             resolvedModelRequest,
           )
           .mapError((error) => nativeSurfaceError("send-message", error));
-        adapter.dependencies.kick(ref.channelId);
+        this.dependencies.kick(ref.channelId);
         return Result.ok({
           platform: "native" as const,
           channelId: ref.channelId,
           messageId: receipt.messageId,
         });
       }
-      yield* adapter.dependencies.store
+      yield* this.dependencies.store
         .postMessage(request.principalId, ref.channelId, message)
         .mapError((error) => nativeSurfaceError("send-message", error));
       return Result.ok({ platform: "native" as const, channelId: ref.channelId, messageId: id });
-    });
+    }, this);
   }
   async readMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<SurfaceMessage | null>> {
-    const adapter = this;
     return Result.gen(function* () {
       const ref = yield* nativeMessage("read-message", msgRef);
-      const request = yield* adapter.principal("read-message");
-      const message = yield* adapter.dependencies.surface
+      const request = yield* this.principal("read-message");
+      const message = yield* this.dependencies.surface
         .readMessage(request.principalId, ref.channelId, ref.messageId)
         .mapError((error) => nativeSurfaceError("read-message", error));
       return Result.ok(
-        message ? adapter.projectMessage(request.principalId, ref.channelId, message) : null,
+        message ? this.projectMessage(request.principalId, ref.channelId, message) : null,
       );
-    });
+    }, this);
   }
   async listMsg(
     sessionRef: SessionRef,
     opts?: LimitOpts,
   ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
-    const adapter = this;
     return Result.gen(function* () {
       const ref = yield* nativeSession("list-messages", sessionRef);
-      const request = yield* adapter.principal("list-messages");
-      const messages = yield* adapter.dependencies.surface
+      const request = yield* this.principal("list-messages");
+      const messages = yield* this.dependencies.surface
         .listMessages(request.principalId, ref.channelId, opts)
         .mapError((error) => nativeSurfaceError("list-messages", error));
       return Result.ok(
-        messages.map((message) =>
-          adapter.projectMessage(request.principalId, ref.channelId, message),
-        ),
+        messages.map((message) => this.projectMessage(request.principalId, ref.channelId, message)),
       );
-    });
+    }, this);
   }
   async editMsg(msgRef: MsgRef, content: ContentOpts): Promise<SurfaceOperationResult<void>> {
-    const adapter = this;
     return Result.gen(function* () {
       const ref = yield* nativeMessage("edit-message", msgRef);
-      const request = yield* adapter.principal("edit-message");
+      const request = yield* this.principal("edit-message");
       if (content.attachments?.length)
         return Result.err(
           invalid(
@@ -476,7 +467,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             "Use a new message to send additional attachments",
           ),
         );
-      const found = yield* adapter.dependencies.surface
+      const found = yield* this.dependencies.surface
         .readMessage(request.principalId, ref.channelId, ref.messageId)
         .mapError((error) => nativeSurfaceError("edit-message", error));
       if (!found)
@@ -487,7 +478,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             message: "Message is unavailable",
           }),
         );
-      if (found.message.metadata?.authorId !== adapter.serviceUserId)
+      if (found.message.metadata?.authorId !== this.serviceUserId)
         return Result.err(
           new SurfacePermissionDenied({
             platform: "native",
@@ -518,17 +509,16 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         return Result.err(
           invalid("edit-message", "content", "Message exceeds native display limits"),
         );
-      return adapter.dependencies.store
+      return this.dependencies.store
         .updateSurfaceMessage(request.principalId, ref.channelId, ref.messageId, edited)
         .mapError((error) => nativeSurfaceError("edit-message", error));
-    });
+    }, this);
   }
   async deleteMsg(msgRef: MsgRef): Promise<SurfaceOperationResult<void>> {
-    const adapter = this;
     return Result.gen(function* () {
       const ref = yield* nativeMessage("delete-message", msgRef);
-      const request = yield* adapter.principal("delete-message");
-      const found = yield* adapter.dependencies.surface
+      const request = yield* this.principal("delete-message");
+      const found = yield* this.dependencies.surface
         .readMessage(request.principalId, ref.channelId, ref.messageId)
         .mapError((error) => nativeSurfaceError("delete-message", error));
       if (!found)
@@ -539,7 +529,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             message: "Message is unavailable",
           }),
         );
-      if (found.message.metadata?.authorId !== adapter.serviceUserId)
+      if (found.message.metadata?.authorId !== this.serviceUserId)
         return Result.err(
           new SurfacePermissionDenied({
             platform: "native",
@@ -547,26 +537,25 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             message: "Surface maintenance only deletes Lilac messages",
           }),
         );
-      return adapter.dependencies.store
+      return this.dependencies.store
         .updateSurfaceMessage(request.principalId, ref.channelId, ref.messageId, null)
         .mapError((error) => nativeSurfaceError("delete-message", error));
-    });
+    }, this);
   }
   async planReplyChain(
     msgRef: MsgRef,
     opts?: SurfaceReplyChainPlanOptions,
   ): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
-    const adapter = this;
     return Result.gen(function* () {
       const ref = yield* nativeMessage("plan-reply-chain", msgRef);
-      const request = yield* adapter.principal("plan-reply-chain");
+      const request = yield* this.principal("plan-reply-chain");
       const refs: MsgRef[] = [];
       const seen = new Set<string>();
       let id: string | undefined = ref.messageId;
       const limit = Math.min(100, Math.max(1, opts?.maxDepth ?? 20));
       while (id && refs.length < limit && !seen.has(id)) {
         seen.add(id);
-        const row: NativeSurfaceMessage | null = yield* adapter.dependencies.surface
+        const row: NativeSurfaceMessage | null = yield* this.dependencies.surface
           .readMessage(request.principalId, ref.channelId, id)
           .mapError((error) => nativeSurfaceError("plan-reply-chain", error));
         if (!row) break;
@@ -574,28 +563,24 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         id = row.message.metadata?.replyToMessageId;
       }
       return Result.ok(refs.reverse());
-    });
+    }, this);
   }
   async getReplyContext(
     msgRef: MsgRef,
     opts?: LimitOpts,
   ): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
-    const adapter = this;
     return Result.gen(async function* () {
-      const refs = yield* Result.await(adapter.planReplyChain(msgRef, { maxDepth: opts?.limit }));
-      const messages = yield* Result.await(
-        Result.allAsync(refs.map((ref) => adapter.readMsg(ref))),
-      );
+      const refs = yield* Result.await(this.planReplyChain(msgRef, { maxDepth: opts?.limit }));
+      const messages = yield* Result.await(Result.allAsync(refs.map((ref) => this.readMsg(ref))));
       return Result.ok(messages.flatMap((message) => (message ? [message] : [])));
-    });
+    }, this);
   }
   async planMergeBlockEndingAt(
     msgRef: MsgRef,
     opts?: SurfaceMergeBlockPlanOptions,
   ): Promise<SurfaceOperationResult<readonly MsgRef[]>> {
-    const adapter = this;
     return Result.gen(async function* () {
-      const target = yield* Result.await(adapter.readMsg(msgRef));
+      const target = yield* Result.await(this.readMsg(msgRef));
       if (!target)
         return Result.err(
           new SurfaceMessageNotFound({
@@ -605,7 +590,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
           }),
         );
       const messages = yield* Result.await(
-        adapter.listMsg(target.session, {
+        this.listMsg(target.session, {
           beforeMessageId: msgRef.messageId,
           limit: opts?.lookbackLimit ?? 50,
         }),
@@ -616,25 +601,24 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         refs.unshift(message.ref);
       }
       return Result.ok(refs);
-    });
+    }, this);
   }
   private reaction(msgRef: MsgRef, emoji: string, active: boolean): SurfaceOperationResult<void> {
-    const adapter = this;
     const operation = active ? "add-reaction" : "remove-reaction";
     return Result.gen(function* () {
       const ref = yield* nativeMessage(operation, msgRef);
-      const request = yield* adapter.principal(operation);
-      return adapter.dependencies.surface
+      const request = yield* this.principal(operation);
+      return this.dependencies.surface
         .setReaction(
           request.principalId,
           ref.channelId,
           ref.messageId,
           emoji,
           active,
-          adapter.serviceUserId,
+          this.serviceUserId,
         )
         .mapError((error) => nativeSurfaceError(operation, error));
-    });
+    }, this);
   }
   async addReaction(msgRef: MsgRef, reaction: string): Promise<SurfaceOperationResult<void>> {
     return this.reaction(msgRef, reaction, true);
@@ -645,14 +629,13 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
   async listReactionDetails(
     msgRef: MsgRef,
   ): Promise<SurfaceOperationResult<SurfaceReactionDetail[]>> {
-    const adapter = this;
     return Result.gen(function* () {
       const ref = yield* nativeMessage("list-reaction-details", msgRef);
-      const request = yield* adapter.principal("list-reaction-details");
-      return adapter.dependencies.surface
+      const request = yield* this.principal("list-reaction-details");
+      return this.dependencies.surface
         .reactions(request.principalId, ref.channelId, ref.messageId)
         .mapError((error) => nativeSurfaceError("list-reaction-details", error));
-    });
+    }, this);
   }
   async listReactions(msgRef: MsgRef): Promise<SurfaceOperationResult<string[]>> {
     return (await this.listReactionDetails(msgRef)).map((details) =>
@@ -660,26 +643,24 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
     );
   }
   async getUnRead(sessionRef: SessionRef): Promise<SurfaceOperationResult<SurfaceMessage[]>> {
-    const adapter = this;
     return Result.gen(function* () {
       const ref = yield* nativeSession("get-unread", sessionRef);
-      const request = yield* adapter.principal("get-unread");
-      const rows = yield* adapter.dependencies.surface
-        .unread(request.principalId, ref.channelId, adapter.serviceUserId)
+      const request = yield* this.principal("get-unread");
+      const rows = yield* this.dependencies.surface
+        .unread(request.principalId, ref.channelId, this.serviceUserId)
         .mapError((error) => nativeSurfaceError("get-unread", error));
       return Result.ok(
-        rows.map((row) => adapter.projectMessage(request.principalId, ref.channelId, row)),
+        rows.map((row) => this.projectMessage(request.principalId, ref.channelId, row)),
       );
-    });
+    }, this);
   }
   async markRead(
     sessionRef: SessionRef,
     upToMsgRef?: MsgRef,
   ): Promise<SurfaceOperationResult<void>> {
-    const adapter = this;
     return Result.gen(function* () {
       const ref = yield* nativeSession("mark-read", sessionRef);
-      const request = yield* adapter.principal("mark-read");
+      const request = yield* this.principal("mark-read");
       if (upToMsgRef) {
         const upTo = yield* nativeMessage("mark-read", upToMsgRef);
         if (upTo.channelId !== ref.channelId)
@@ -693,26 +674,25 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             }),
           );
       }
-      return adapter.dependencies.surface
-        .markRead(request.principalId, ref.channelId, adapter.serviceUserId, upToMsgRef?.messageId)
+      return this.dependencies.surface
+        .markRead(request.principalId, ref.channelId, this.serviceUserId, upToMsgRef?.messageId)
         .mapError((error) => nativeSurfaceError("mark-read", error));
-    });
+    }, this);
   }
   async startOutput(
     sessionRef: SessionRef,
     opts?: StartOutputOpts,
   ): Promise<SurfaceOperationResult<SurfaceOutputStream>> {
-    const adapter = this;
     return Result.gen(async function* () {
       const ref = yield* nativeSession("start-output", sessionRef);
-      const request = yield* adapter.principal("start-output");
-      yield* adapter.dependencies.store
+      const request = yield* this.principal("start-output");
+      yield* this.dependencies.store
         .authorizeThread(request.principalId, ref.channelId, true)
         .mapError((error) => nativeSurfaceError("start-output", error));
       let initialParts: DisplayMessage["parts"] = [];
       if (opts?.replyTo) {
         yield* Result.await(
-          adapter.prepareSendMsg(
+          this.prepareSendMsg(
             ref,
             { text: "output", attachmentCount: 0, actionCount: 0 },
             { replyTo: opts.replyTo },
@@ -733,10 +713,10 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
           );
       }
       if (opts?.resumeAt) {
-        const existing = yield* adapter.dependencies.surface
+        const existing = yield* this.dependencies.surface
           .readMessage(request.principalId, ref.channelId, opts.resumeAt.messageId)
           .mapError((error) => nativeSurfaceError("start-output", error));
-        if (!existing || existing.message.metadata?.authorId !== adapter.serviceUserId)
+        if (!existing || existing.message.metadata?.authorId !== this.serviceUserId)
           return Result.err(
             new SurfacePermissionDenied({
               platform: "native",
@@ -751,9 +731,9 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
         parts: DisplayMessage["parts"],
       ): SurfaceOperationResult<MsgRef> =>
         Result.gen(function* () {
-          yield* adapter.principal("push-output");
+          yield* this.principal("push-output");
           if (messageId) {
-            const found = yield* adapter.dependencies.surface
+            const found = yield* this.dependencies.surface
               .readMessage(request.principalId, ref.channelId, messageId)
               .mapError((error) => nativeSurfaceError("push-output", error));
             if (!found)
@@ -764,7 +744,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
                   message: "Output message is unavailable",
                 }),
               );
-            if (found.message.metadata?.authorId !== adapter.serviceUserId)
+            if (found.message.metadata?.authorId !== this.serviceUserId)
               return Result.err(
                 new SurfacePermissionDenied({
                   platform: "native",
@@ -776,7 +756,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
               return Result.err(
                 invalid("push-output", "content", "Output exceeds native display limits"),
               );
-            yield* adapter.dependencies.store
+            yield* this.dependencies.store
               .updateSurfaceMessage(request.principalId, ref.channelId, messageId, {
                 ...found.message,
                 parts,
@@ -789,8 +769,8 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             id,
             role: "assistant",
             metadata: {
-              authorId: adapter.serviceUserId,
-              createdAt: (adapter.dependencies.now ?? Date.now)(),
+              authorId: this.serviceUserId,
+              createdAt: (this.dependencies.now ?? Date.now)(),
               ...(opts?.replyTo ? { replyToMessageId: opts.replyTo.messageId } : {}),
             },
             parts,
@@ -799,7 +779,7 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             return Result.err(
               invalid("push-output", "content", "Output exceeds native display limits"),
             );
-          yield* adapter.dependencies.store
+          yield* this.dependencies.store
             .postMessage(request.principalId, ref.channelId, message)
             .mapError((error) => nativeSurfaceError("push-output", error));
           return Result.ok({
@@ -807,12 +787,12 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
             channelId: ref.channelId,
             messageId: id,
           });
-        });
+        }, this);
       return Result.ok(
         new NativeOutputStream(
           persist,
           async (attachment) => {
-            const resources = adapter.dependencies.resources;
+            const resources = this.dependencies.resources;
             if (!resources)
               return Result.err(
                 new SurfaceUnavailable({
@@ -842,28 +822,27 @@ export class NativeSurfaceAdapter implements SurfaceAdapter {
               }));
           },
           opts,
-          adapter.dependencies.streamingMode?.() ?? "complete",
+          this.dependencies.streamingMode?.() ?? "complete",
           initialParts,
         ),
       );
-    });
+    }, this);
   }
   async startTyping(
     sessionRef: SessionRef,
     opts?: StartTypingOpts,
   ): Promise<SurfaceOperationResult<TypingIndicatorSubscription>> {
-    const adapter = this;
     return Result.gen(async function* () {
-      const stream = yield* Result.await(adapter.startOutput(sessionRef));
+      const stream = yield* Result.await(this.startOutput(sessionRef));
       yield* Result.await(
         stream.push({
           type: "reasoning.status",
-          update: { startedAtMs: (adapter.dependencies.now ?? Date.now)() },
+          update: { startedAtMs: (this.dependencies.now ?? Date.now)() },
         }),
       );
       opts?.onStarted?.();
       return Result.ok({ stop: async () => (await stream.finish()).map(() => undefined) });
-    });
+    }, this);
   }
 }
 
@@ -929,12 +908,11 @@ class NativeOutputStream implements SurfaceOutputStream {
         return this.flush().map(() => "visible" as const);
       }
       case "attachment.add": {
-        const stream = this;
         return Result.gen(async function* () {
-          const attachment = yield* Result.await(stream.attach(part.attachment));
-          stream.parts.push(attachment);
-          return stream.flush().map(() => "visible" as const);
-        });
+          const attachment = yield* Result.await(this.attach(part.attachment));
+          this.parts.push(attachment);
+          return this.flush().map(() => "visible" as const);
+        }, this);
       }
       case "reasoning.status": {
         this.parts = this.parts.filter(
@@ -978,16 +956,16 @@ class NativeOutputStream implements SurfaceOutputStream {
         ? { ...part, data: { ...part.data, state: "complete" } }
         : part,
     );
-    const stream = this;
+
     return Result.gen(function* () {
-      yield* stream.flush();
-      if (!stream.ref)
+      yield* this.flush();
+      if (!this.ref)
         return Result.err(
           invalid("finish-output", "content", "Cannot finish an empty output stream"),
         );
-      stream.closed = true;
-      return Result.ok({ created: [stream.ref], last: stream.ref });
-    });
+      this.closed = true;
+      return Result.ok({ created: [this.ref], last: this.ref });
+    }, this);
   }
   async abort(): Promise<SurfaceOperationResult<void>> {
     if (this.closed) return Result.ok(undefined);

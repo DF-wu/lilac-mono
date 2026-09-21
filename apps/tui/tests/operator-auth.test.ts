@@ -44,35 +44,48 @@ test("missing token reports the root container invocation without entering login
   );
 });
 
-test("deletion awaits the server without inheriting the heartbeat deadline", async () => {
-  const root = await mkdtemp(path.join(tmpdir(), "lilac-operator-exit-"));
-  const tokenFile = path.join(root, "token");
-  await writeFile(tokenFile, "x".repeat(43), { mode: 0o600 });
-  const deleting = Promise.withResolvers<void>();
-  const cleanup = Promise.withResolvers<void>();
-  const deadlines = spyOn(AbortSignal, "timeout");
-  const server = Bun.serve({
-    port: 0,
-    async fetch(request) {
-      if (request.method === "POST") return Response.json({ threadId: "temporary-thread" });
-      deleting.resolve();
-      await cleanup.promise;
-      return Response.json({ ok: true });
-    },
-  });
-  try {
-    const auth = (await createTuiAuth({ tokenFile, baseUrl: server.url.origin })).unwrap();
-    expect(deadlines).toHaveBeenCalledTimes(1);
-    const exit = auth.logout();
-    await deleting.promise;
-    expect(deadlines).toHaveBeenCalledTimes(1);
-    cleanup.resolve();
-    (await exit).unwrap();
-    auth.dispose();
-  } finally {
-    cleanup.resolve();
-    deadlines.mockRestore();
-    server.stop(true);
-    await rm(root, { recursive: true, force: true });
-  }
-});
+test.each(["complete", "timeout"])(
+  "deletion awaits cleanup within its own deadline: %s",
+  async (outcome) => {
+    const root = await mkdtemp(path.join(tmpdir(), "lilac-operator-exit-"));
+    const tokenFile = path.join(root, "token");
+    await writeFile(tokenFile, "x".repeat(43), { mode: 0o600 });
+    const deleting = Promise.withResolvers<void>();
+    const cleanup = Promise.withResolvers<void>();
+    const deadline = new AbortController();
+    const deadlines = spyOn(AbortSignal, "timeout");
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        if (request.method === "POST") return Response.json({ threadId: "temporary-thread" });
+        deleting.resolve();
+        await cleanup.promise;
+        return Response.json({ ok: true });
+      },
+    });
+    try {
+      const auth = (await createTuiAuth({ tokenFile, baseUrl: server.url.origin })).unwrap();
+      expect(deadlines).toHaveBeenCalledTimes(1);
+      deadlines.mockImplementation((milliseconds) => {
+        expect(milliseconds).toBe(5000);
+        return deadline.signal;
+      });
+      const exit = auth.logout();
+      await deleting.promise;
+      expect(deadlines).toHaveBeenCalledTimes(2);
+      if (outcome === "complete") {
+        cleanup.resolve();
+        (await exit).unwrap();
+      } else {
+        deadline.abort(new DOMException("Deadline reached", "TimeoutError"));
+        expect((await exit).match({ ok: () => "", err: (error) => error.code })).toBe("network");
+      }
+      auth.dispose();
+    } finally {
+      cleanup.resolve();
+      deadlines.mockRestore();
+      server.stop(true);
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

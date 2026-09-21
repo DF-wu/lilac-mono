@@ -35,19 +35,18 @@ export class NativeSummaryStore {
   }
 
   get(threadId: string): NativeStoreResult<NativeThreadSummary | null> {
-    const self = this;
     return nativeStoreTransaction(this.params.db, () =>
       Result.gen(function* () {
-        const thread = yield* self.params.store.getThreadRecord(threadId);
+        const thread = yield* this.params.store.getThreadRecord(threadId);
         if (thread.deleted || thread.mutationPending || thread.ephemeral) return Result.ok(null);
-        const row = self.params.db
+        const row = this.params.db
           .query<NativeSummaryRow, [string, number]>(
             "SELECT format_version,data_json FROM native_thread_summaries WHERE thread_id=? AND history_generation=?",
           )
           .get(threadId, thread.historyGeneration);
         if (!row) return Result.ok(null);
         return decodeNativeSummary(row).map((decoded) => decoded.value);
-      }),
+      }, this),
     );
   }
 
@@ -71,19 +70,18 @@ export class NativeSummaryStore {
   }
 
   put(value: NativeThreadSummary): NativeStoreResult<boolean> {
-    const self = this;
     return nativeStoreTransaction(this.params.db, () =>
       Result.gen(function* () {
-        const current = yield* self.params.store.getThreadRecord(value.threadId);
+        const current = yield* this.params.store.getThreadRecord(value.threadId);
         if (
           current.deleted ||
           current.mutationPending ||
           current.historyGeneration !== value.historyGeneration
         )
           return Result.ok(false);
-        const previous = yield* self.get(value.threadId);
+        const previous = yield* this.get(value.threadId);
         if (previous && previous.contentRevision >= value.contentRevision) return Result.ok(false);
-        self.params.db
+        this.params.db
           .query(`INSERT INTO native_thread_summaries(thread_id,history_generation,content_revision,generated_at,format_version,data_json)
         VALUES(?,?,?,?,1,?) ON CONFLICT(thread_id) DO UPDATE SET history_generation=excluded.history_generation,content_revision=excluded.content_revision,generated_at=excluded.generated_at,format_version=1,data_json=excluded.data_json`)
           .run(
@@ -94,7 +92,7 @@ export class NativeSummaryStore {
             JSON.stringify(value),
           );
         return Result.ok(true);
-      }),
+      }, this),
     );
   }
 
@@ -111,10 +109,9 @@ export class NativeSummaryStore {
       afterTs?: number;
     },
   ): NativeStoreResult<NativeThreadSummary[]> {
-    const self = this;
     return nativeStoreTransaction(this.params.db, () =>
       Result.gen(function* () {
-        const user = yield* self.params.store.getUser(userId);
+        const user = yield* this.params.store.getUser(userId);
         if (user.role === "service")
           return Result.err(
             nativeFailure("forbidden", "Service users cannot browse conversations"),
@@ -151,7 +148,7 @@ export class NativeSummaryStore {
           filters.push("json_extract(t.data_json,'$.value.updatedAt')>=?");
           values.push(input.afterTs);
         }
-        const rows = self.params.db
+        const rows = this.params.db
           .query<
             NativeSummaryRow,
             (string | number)[]
@@ -171,7 +168,7 @@ export class NativeSummaryStore {
         return Result.all(rows.map((row) => decodeNativeSummary(row))).map((records) =>
           records.map((record) => record.value),
         );
-      }),
+      }, this),
     );
   }
 }

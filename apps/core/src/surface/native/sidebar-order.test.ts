@@ -155,9 +155,9 @@ describe("personal sidebar queues", () => {
 
 test("equal ranks preserve the exact neighbor when reordering", () => {
   const f = fixture();
-  const a = f.create("a"),
-    b = f.create("b"),
-    c = f.create("c");
+  f.create("a");
+  f.create("b");
+  f.create("c");
   f.list("active");
   f.db.query("UPDATE native_thread_preferences SET position=0 WHERE user_id='alice'").run();
   const initial = f.list("active");

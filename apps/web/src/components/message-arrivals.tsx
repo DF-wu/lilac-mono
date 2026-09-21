@@ -15,7 +15,7 @@ export function useMessageArrival(id: string, present = true) {
     if (!element || !present || !arrivals?.claim(id, live)) return;
     element.dataset.messageArrival = "pending";
     // Resolve the starting opacity before the next frame so insertion produces a transition.
-    getComputedStyle(element).opacity;
+    void getComputedStyle(element).opacity;
     frame.current = requestAnimationFrame(() => {
       element.dataset.messageArrival = "ready";
     });

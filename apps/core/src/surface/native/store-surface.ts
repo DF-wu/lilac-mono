@@ -65,17 +65,16 @@ export class NativeSurfaceStore {
     threadId: string,
     messageId: string,
   ): NativeStoreResult<NativeSurfaceMessage | null> {
-    const surface = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* surface.store.authorizeThread(actorId, threadId);
-        const row = surface.db
+        yield* this.store.authorizeThread(actorId, threadId);
+        const row = this.db
           .query<MessageRow, [string, string]>(
             `${MESSAGE_SELECT} AND json_extract(m.value,'$.id')=? LIMIT 1`,
           )
           .get(threadId, messageId);
         return row ? decodeMessageRow(row) : Result.ok(null);
-      }),
+      }, this),
     );
   }
 
@@ -84,13 +83,12 @@ export class NativeSurfaceStore {
     threadId: string,
     options: LimitOpts = {},
   ): NativeStoreResult<NativeSurfaceMessage[]> {
-    const surface = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* surface.store.authorizeThread(actorId, threadId);
+        yield* this.store.authorizeThread(actorId, threadId);
         const limit = Math.min(200, Math.max(1, Math.floor(options.limit ?? 50)));
         const cursorId = options.beforeMessageId ?? options.afterMessageId;
-        const cursor = cursorId ? yield* surface.readMessage(actorId, threadId, cursorId) : null;
+        const cursor = cursorId ? yield* this.readMessage(actorId, threadId, cursorId) : null;
         if (cursorId && !cursor)
           return Result.err(nativeFailure("not-found", "Message cursor is unavailable"));
         const ascending = options.afterMessageId !== undefined;
@@ -99,7 +97,7 @@ export class NativeSurfaceStore {
           ? ` AND (r.position,CAST(m.key AS INTEGER)) ${comparison} (?,?)`
           : "";
         const order = ascending ? "ASC" : "DESC";
-        const rows = surface.db
+        const rows = this.db
           .query<MessageRow, (string | number)[]>(
             `${MESSAGE_SELECT}${condition} ORDER BY r.position ${order},CAST(m.key AS INTEGER) ${order} LIMIT ? OFFSET ?`,
           )
@@ -111,7 +109,7 @@ export class NativeSurfaceStore {
           );
         const messages = yield* Result.all(rows.map(decodeMessageRow));
         return Result.ok(ascending ? messages : messages.reverse());
-      }),
+      }, this),
     );
   }
 
@@ -120,16 +118,15 @@ export class NativeSurfaceStore {
     threadId: string,
     limit = 100,
   ): NativeStoreResult<SurfaceSessionParticipantsResult> {
-    const surface = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* surface.store.authorizeThread(actorId, threadId);
-        const rows = surface.db
+        const thread = yield* this.store.authorizeThread(actorId, threadId);
+        const rows = this.db
           .query<{ id: string }, [string, string, number]>(
             "SELECT id FROM native_user_identity WHERE role IN ('owner','service') OR id=? OR id IN (SELECT user_id FROM native_grants WHERE thread_id=?) ORDER BY id LIMIT ?",
           )
           .all(thread.starterId, threadId, Math.min(200, Math.max(1, limit)));
-        const users = yield* Result.all(rows.map((row) => surface.store.getUser(row.id)));
+        const users = yield* Result.all(rows.map((row) => this.store.getUser(row.id)));
         return Result.ok({
           source: "thread_members" as const,
           participants: users.map((user) => ({
@@ -138,7 +135,7 @@ export class NativeSurfaceStore {
             displayName: user.displayName,
           })),
         });
-      }),
+      }, this),
     );
   }
 
@@ -150,29 +147,28 @@ export class NativeSurfaceStore {
     active: boolean,
     reactionActorId = actorId,
   ): NativeStoreResult<void> {
-    const surface = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* surface.store.authorizeThread(actorId, threadId, true);
-        const message = yield* surface.readMessage(actorId, threadId, messageId);
+        yield* this.store.authorizeThread(actorId, threadId, true);
+        const message = yield* this.readMessage(actorId, threadId, messageId);
         if (!message) return Result.err(nativeFailure("not-found", "Message is unavailable"));
         if (!emoji.trim() || emoji.length > 128)
           return Result.err(nativeFailure("invalid", "Reaction must contain 1 to 128 characters"));
         if (active) {
-          surface.db
+          this.db
             .query(
               "INSERT OR IGNORE INTO native_surface_reactions(thread_id,message_id,actor_id,emoji) VALUES(?,?,?,?)",
             )
             .run(threadId, messageId, reactionActorId, emoji);
-          return surface.refreshReactions(actorId, threadId, message.message);
+          return this.refreshReactions(actorId, threadId, message.message);
         }
-        surface.db
+        this.db
           .query(
             "DELETE FROM native_surface_reactions WHERE thread_id=? AND message_id=? AND actor_id=? AND emoji=?",
           )
           .run(threadId, messageId, reactionActorId, emoji);
-        return surface.refreshReactions(actorId, threadId, message.message);
-      }),
+        return this.refreshReactions(actorId, threadId, message.message);
+      }, this),
     );
   }
 
@@ -181,9 +177,8 @@ export class NativeSurfaceStore {
     threadId: string,
     message: DisplayMessage,
   ): NativeStoreResult<void> {
-    const surface = this;
     return Result.gen(function* () {
-      const details = yield* surface.reactions(actorId, threadId, message.id);
+      const details = yield* this.reactions(actorId, threadId, message.id);
       const part: DisplayMessage["parts"][number] = {
         type: "data-reactions",
         id: `reactions_${message.id}`,
@@ -195,11 +190,11 @@ export class NativeSurfaceStore {
           })),
         },
       };
-      return surface.store.updateSurfaceMessage(actorId, threadId, message.id, {
+      return this.store.updateSurfaceMessage(actorId, threadId, message.id, {
         ...message,
         parts: [...message.parts.filter((item) => item.type !== "data-reactions"), part],
       });
-    });
+    }, this);
   }
 
   reactions(
@@ -207,12 +202,11 @@ export class NativeSurfaceStore {
     threadId: string,
     messageId: string,
   ): NativeStoreResult<SurfaceReactionDetail[]> {
-    const surface = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const message = yield* surface.readMessage(actorId, threadId, messageId);
+        const message = yield* this.readMessage(actorId, threadId, messageId);
         if (!message) return Result.err(nativeFailure("not-found", "Message is unavailable"));
-        const rows = surface.db
+        const rows = this.db
           .query<{ emoji: string; actor_id: string }, [string, string]>(
             "SELECT emoji,actor_id FROM native_surface_reactions WHERE thread_id=? AND message_id=? ORDER BY emoji,actor_id",
           )
@@ -225,7 +219,7 @@ export class NativeSurfaceStore {
           details.set(row.emoji, detail);
         }
         return Result.ok([...details.values()]);
-      }),
+      }, this),
     );
   }
 
@@ -235,24 +229,23 @@ export class NativeSurfaceStore {
     readerId: string,
     messageId?: string,
   ): NativeStoreResult<void> {
-    const surface = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* surface.store.authorizeThread(actorId, threadId);
+        const thread = yield* this.store.authorizeThread(actorId, threadId);
         const message = messageId
-          ? yield* surface.readMessage(actorId, threadId, messageId)
-          : (yield* surface.listMessages(actorId, threadId, { limit: 1 }))[0];
+          ? yield* this.readMessage(actorId, threadId, messageId)
+          : (yield* this.listMessages(actorId, threadId, { limit: 1 }))[0];
         if (messageId && !message)
           return Result.err(nativeFailure("not-found", "Message is unavailable"));
         if (!message) return Result.ok(undefined);
-        const changed = surface.db
+        const changed = this.db
           .query(
             "INSERT INTO native_surface_read(thread_id,reader_id,position,message_index,generation) VALUES(?,?,?,?,?) ON CONFLICT(thread_id,reader_id) DO UPDATE SET position=excluded.position,message_index=excluded.message_index,generation=excluded.generation WHERE generation != excluded.generation OR (position,message_index) < (excluded.position,excluded.message_index)",
           )
           .run(threadId, readerId, message.position, message.index, thread.historyGeneration);
-        if (changed.changes > 0) surface.store.notifyDisplayChanged(threadId);
+        if (changed.changes > 0) this.store.notifyDisplayChanged(threadId);
         return Result.ok(undefined);
-      }),
+      }, this),
     );
   }
 
@@ -261,22 +254,21 @@ export class NativeSurfaceStore {
     threadId: string,
     readerId: string,
   ): NativeStoreResult<NativeSurfaceMessage[]> {
-    const surface = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        const thread = yield* surface.store.authorizeThread(actorId, threadId);
-        const read = surface.db
+        const thread = yield* this.store.authorizeThread(actorId, threadId);
+        const read = this.db
           .query<{ position: number; message_index: number }, [string, string, number]>(
             "SELECT position,message_index FROM native_surface_read WHERE thread_id=? AND reader_id=? AND generation=?",
           )
           .get(threadId, readerId, thread.historyGeneration);
-        const rows = surface.db
+        const rows = this.db
           .query<MessageRow, [string, number, number]>(
             `${MESSAGE_SELECT} AND (r.position,CAST(m.key AS INTEGER)) > (?,?) ORDER BY r.position,CAST(m.key AS INTEGER) LIMIT 200`,
           )
           .all(threadId, read?.position ?? -1, read?.message_index ?? -1);
         return Result.all(rows.map(decodeMessageRow));
-      }),
+      }, this),
     );
   }
   personalizePart(
@@ -286,11 +278,11 @@ export class NativeSurfaceStore {
     part: DisplayPart,
   ): NativeStoreResult<DisplayPart> {
     if (part.type !== "data-reactions") return Result.ok(part);
-    const surface = this;
+
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* surface.store.authorizeThread(actorId, threadId);
-        const rows = surface.db
+        yield* this.store.authorizeThread(actorId, threadId);
+        const rows = this.db
           .query<{ emoji: string }, [string, string, string]>(
             "SELECT emoji FROM native_surface_reactions WHERE thread_id=? AND message_id=? AND actor_id=?",
           )
@@ -302,7 +294,7 @@ export class NativeSurfaceStore {
             items: part.data.items.map((item) => ({ ...item, reacted: reacted.has(item.emoji) })),
           },
         });
-      }),
+      }, this),
     );
   }
 
@@ -317,19 +309,18 @@ export class NativeSurfaceStore {
   }
 
   markTurnRead(actorId: string, threadId: string, turnId: string): NativeStoreResult<void> {
-    const surface = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* surface.store.authorizeThread(actorId, threadId);
-        const row = surface.db
+        yield* this.store.authorizeThread(actorId, threadId);
+        const row = this.db
           .query<MessageRow, [string, string]>(
             `${MESSAGE_SELECT} AND json_extract(r.data_json,'$.value.turnId')=? ORDER BY CAST(m.key AS INTEGER) DESC LIMIT 1`,
           )
           .get(threadId, turnId);
         if (!row) return Result.err(nativeFailure("not-found", "Turn is unavailable"));
         const message = yield* decodeMessageRow(row);
-        return surface.markRead(actorId, threadId, actorId, message.message.id);
-      }),
+        return this.markRead(actorId, threadId, actorId, message.message.id);
+      }, this),
     );
   }
 
@@ -337,12 +328,11 @@ export class NativeSurfaceStore {
     actorId: string,
     input: NativeActionInput,
   ): NativeStoreResult<"ready" | "already-applied" | "stale"> {
-    const surface = this;
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
-        yield* surface.store.authorizeThread(actorId, input.threadId, true);
+        yield* this.store.authorizeThread(actorId, input.threadId, true);
         const fingerprint = createHash("sha256").update(JSON.stringify(input)).digest("hex");
-        const receipt = surface.db
+        const receipt = this.db
           .query<{ fingerprint: string }, [string, string]>(
             "SELECT fingerprint FROM native_surface_actions WHERE actor_id=? AND command_id=?",
           )
@@ -351,7 +341,7 @@ export class NativeSurfaceStore {
           return receipt.fingerprint === fingerprint
             ? Result.ok("already-applied" as const)
             : Result.err(nativeFailure("conflict", "Action command ID was reused"));
-        const row = yield* surface.readMessage(actorId, input.threadId, input.messageId);
+        const row = yield* this.readMessage(actorId, input.threadId, input.messageId);
         const actions = row?.message.parts.find((part) => part.type === "data-actions");
         if (
           !actions ||
@@ -366,7 +356,7 @@ export class NativeSurfaceStore {
         )
           return Result.ok("stale" as const);
         return Result.ok("ready" as const);
-      }),
+      }, this),
     );
   }
 
@@ -374,15 +364,14 @@ export class NativeSurfaceStore {
     actorId: string,
     input: NativeActionInput,
   ): Promise<NativeStoreResult<{ outcome: "accepted" | "already-applied" | "stale" }>> {
-    const surface = this;
     return Result.gen(async function* () {
-      const status = yield* surface.actionStatus(actorId, input);
+      const status = yield* this.actionStatus(actorId, input);
       if (status !== "ready") return Result.ok({ outcome: status });
-      if (!surface.dispatchAction)
+      if (!this.dispatchAction)
         return Result.err(nativeFailure("invalid", "Native action delivery is unavailable"));
-      yield* Result.await(surface.dispatchAction(actorId, input));
-      yield* nativeStoreTransaction(surface.db, () => {
-        surface.db
+      yield* Result.await(this.dispatchAction(actorId, input));
+      yield* nativeStoreTransaction(this.db, () => {
+        this.db
           .query(
             "INSERT OR IGNORE INTO native_surface_actions(actor_id,command_id,fingerprint) VALUES(?,?,?)",
           )
@@ -394,6 +383,6 @@ export class NativeSurfaceStore {
         return Result.ok(undefined);
       });
       return Result.ok({ outcome: "accepted" as const });
-    });
+    }, this);
   }
 }

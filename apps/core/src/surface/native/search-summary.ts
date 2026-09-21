@@ -37,14 +37,13 @@ export class NativeSummaryRefresher {
   async refresh(
     input: { limit?: number; abortSignal?: AbortSignal } = {},
   ): Promise<ResultType<{ refreshed: number; discarded: number }, NativeSummaryRefreshError>> {
-    const self = this;
     return Result.gen(async function* () {
-      const candidates = yield* self.params.summaries.candidates(input.limit);
+      const candidates = yield* this.params.summaries.candidates(input.limit);
       let refreshed = 0;
       let discarded = 0;
       for (const thread of candidates) {
         if (input.abortSignal?.aborted) break;
-        const written = yield* Result.await(self.refreshThread(thread, input.abortSignal));
+        const written = yield* Result.await(this.refreshThread(thread, input.abortSignal));
         if (written) {
           refreshed += 1;
           continue;
@@ -52,27 +51,26 @@ export class NativeSummaryRefresher {
         discarded += 1;
       }
       return Result.ok({ refreshed, discarded });
-    });
+    }, this);
   }
 
   private async refreshThread(
     thread: NativeThreadRecord,
     abortSignal?: AbortSignal,
   ): Promise<ResultType<boolean, NativeSummaryRefreshError>> {
-    const self = this;
     return Result.gen(async function* () {
-      const first = yield* self.params.search.readThread(thread.starterId, thread.id, {
+      const first = yield* this.params.search.readThread(thread.starterId, thread.id, {
         limit: INPUT_MESSAGE_LIMIT / 2,
       });
-      const content = yield* self.params.search.readThread(thread.starterId, thread.id, {
+      const content = yield* this.params.search.readThread(thread.starterId, thread.id, {
         limit: INPUT_MESSAGE_LIMIT / 2,
         offset: Math.max(first.messages.length, first.total - INPUT_MESSAGE_LIMIT / 2),
       });
-      const previous = yield* self.params.summaries.get(thread.id);
+      const previous = yield* this.params.summaries.get(thread.id);
       const messages = boundedMessages([...first.messages, ...content.messages]);
       const summary = yield* Result.await(
-        (self.params.summarize ?? defaultSummarizer)({
-          cfg: self.params.getConfig(),
+        (this.params.summarize ?? defaultSummarizer)({
+          cfg: this.params.getConfig(),
           abortSignal,
           threadId: thread.id,
           previousSummary: previous?.summary ?? null,
@@ -90,14 +88,14 @@ export class NativeSummaryRefresher {
         }),
       );
       if (abortSignal?.aborted) return Result.ok(false);
-      return self.params.summaries.put({
+      return this.params.summaries.put({
         threadId: thread.id,
         historyGeneration: content.thread.historyGeneration,
         contentRevision: content.thread.revision,
-        generatedAt: (self.params.now ?? Date.now)(),
+        generatedAt: (this.params.now ?? Date.now)(),
         messageCount: content.total,
         summary: normalizeNativeSummary(summary),
       });
-    });
+    }, this);
   }
 }

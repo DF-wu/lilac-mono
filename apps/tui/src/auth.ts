@@ -63,10 +63,7 @@ export async function createTuiAuth(
                   "x-lilac-operator-session": sessionId,
                 },
                 redirect: "error",
-                signal:
-                  method === "DELETE"
-                    ? lifetime.signal
-                    : AbortSignal.any([lifetime.signal, AbortSignal.timeout(5000)]),
+                signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(5000)]),
               }),
             catch: () =>
               new TuiAuthError({

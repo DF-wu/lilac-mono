@@ -37,7 +37,7 @@ export function protectComposerLinks(editor: PlateEditor, value: Descendant[]) {
   const links: string[] = [];
 
   function protect(text: string) {
-    if (!/[\[<:@]|www\./.test(text)) return text;
+    if (!/[[<:@]|www\./.test(text)) return text;
     const tree = markdownToAstProcessor(editor, text, { remarkPlugins: [remarkGfm] });
     let end = 0;
     let result = "";

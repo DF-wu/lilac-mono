@@ -164,42 +164,40 @@ export class NativeSubagents {
   }
 
   list(actorId: string, input: { threadId: string; cursor?: string }) {
-    const self = this;
     return Result.gen(function* () {
-      yield* self.options.native.authorizeThread(actorId, input.threadId);
+      yield* this.options.native.authorizeThread(actorId, input.threadId);
       const offset = Number(input.cursor ?? 0);
       if (!Number.isSafeInteger(offset) || offset < 0)
         return Result.err(nativeFailure("invalid", "Invalid agent cursor"));
       const validRequests = new Set(
-        yield* self.options.native.listCanonicalRequestIds(input.threadId),
+        yield* this.options.native.listCanonicalRequestIds(input.threadId),
       );
-      const runs = yield* self.options.workflows
+      const runs = yield* this.options.workflows
         .listSubagentRuns(`native:${input.threadId}`, offset)
         .mapError(() => nativeFailure("sqlite", "Subagents are unavailable"));
       const items: SubagentSummary[] = [];
       for (const run of runs.slice(0, 100)) {
         const target = run.completionTarget;
         if (target.kind !== "live_parent" || !validRequests.has(target.parentRequestId)) continue;
-        const parent = yield* self.options.native.getInputByRequestId(target.parentRequestId);
+        const parent = yield* this.options.native.getInputByRequestId(target.parentRequestId);
         if (!parent?.turnId) continue;
-        const summary = self.summary(run, parent.turnId);
+        const summary = this.summary(run, parent.turnId);
         if (summary) items.push(summary);
       }
       return Result.ok({
         items,
         ...(runs.length > 100 ? { nextCursor: String(offset + 100) } : {}),
       });
-    });
+    }, this);
   }
 
   read(
     actorId: string,
     input: { threadId: string; agentId: string; before?: number; from?: number },
   ) {
-    const self = this;
     return Result.gen(function* () {
-      yield* self.options.native.authorizeThread(actorId, input.threadId);
-      const run = yield* self.options.workflows
+      yield* this.options.native.authorizeThread(actorId, input.threadId);
+      const run = yield* this.options.workflows
         .getRun(input.agentId)
         .mapError(() => nativeFailure("sqlite", "Subagent is unavailable"));
       const target = run?.completionTarget;
@@ -209,19 +207,19 @@ export class NativeSubagents {
         target.parentSessionId !== `native:${input.threadId}`
       )
         return Result.err(nativeFailure("not-found", "Subagent not found"));
-      const validRequests = yield* self.options.native.listCanonicalRequestIds(input.threadId);
+      const validRequests = yield* this.options.native.listCanonicalRequestIds(input.threadId);
       if (!validRequests.includes(target.parentRequestId))
         return Result.err(nativeFailure("not-found", "Subagent not found"));
-      const parent = yield* self.options.native.getInputByRequestId(target.parentRequestId);
+      const parent = yield* this.options.native.getInputByRequestId(target.parentRequestId);
       if (!parent?.turnId) return Result.err(nativeFailure("not-found", "Subagent not found"));
-      const agent = self.summary(run, parent.turnId)!;
-      const live = self.options
+      const agent = this.summary(run, parent.turnId)!;
+      const live = this.options
         .live()
         ?.readSubagentSnapshot(target.childSessionId, target.childRequestId, true);
       const saved = live
         ? null
         : yield* (
-            self.options.transcripts
+            this.options.transcripts
               .getRequestTranscript?.({ requestId: target.childRequestId })
               .mapError(() => nativeFailure("sqlite", "Transcript is unavailable")) ??
               Result.ok(null)
@@ -245,6 +243,6 @@ export class NativeSubagents {
         ...(start ? { nextBefore: start } : {}),
         unavailable: !live && !saved && agent.state !== "running",
       });
-    });
+    }, this);
   }
 }

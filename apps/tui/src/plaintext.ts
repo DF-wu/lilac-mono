@@ -4,6 +4,8 @@ import { stringWidth } from "bun";
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 export function safeText(value: string): string {
+  // Terminal sanitization must match raw ESC and control bytes before rendering untrusted text.
+  /* oxlint-disable no-control-regex */
   return value
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\|$)/g, "")
     .replace(/\x1b[P^_X][\s\S]*?(?:\x1b\\|$)/g, "")
@@ -11,6 +13,7 @@ export function safeText(value: string): string {
     .replace(/\x1b[@-_]/g, "")
     .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "")
     .replace(/[\u202a-\u202e\u2066-\u2069]/g, "");
+  /* oxlint-enable no-control-regex */
 }
 
 export function messageText(message: DisplayMessage): string {

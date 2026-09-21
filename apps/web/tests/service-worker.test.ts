@@ -101,6 +101,26 @@ describe("app shell service worker", () => {
     expect(await page?.text()).toContain(buildId);
     expect(f.requests).toHaveLength(2);
   });
+  test("routed offline reloads use the public shell without caching thread URLs", async () => {
+    const f = fixture();
+    await f.dispatch("install");
+    f.setNetworkResponse(response("Offline", "text/plain", 503));
+    for (const path of [
+      "/threads/thread-id",
+      "/threads/thread-id/?search=value",
+      "/design-system",
+      "/design-system/",
+    ]) {
+      const page = await f.dispatch("fetch", { request: request(path, "navigate") });
+      expect(await page?.text()).toContain(buildId);
+    }
+    expect(f.requests).toEqual(["/", "/assets/app-new.js"]);
+    expect([...f.stores.get(`lilac-shell-${buildId}`)!.keys()].sort()).toEqual([
+      "/",
+      "/assets/app-new.js",
+    ]);
+    expect(await f.dispatch("fetch", { request: request("/threads/thread-id") })).toBeUndefined();
+  });
   test("never intercepts private HTTP, Clerk or non-GET requests", async () => {
     const f = fixture();
     for (const path of [
@@ -108,6 +128,8 @@ describe("app shell service worker", () => {
       "/api/resources/secret",
       "/__clerk/v1/client",
       "/private-file",
+      "/api",
+      "/threads/thread-id/file.png",
     ])
       expect(await f.dispatch("fetch", { request: request(path, "navigate") })).toBeUndefined();
     expect(

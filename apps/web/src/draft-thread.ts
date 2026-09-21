@@ -59,7 +59,7 @@ function draftPreviewLine(text: string): string {
     }
     const attachment = /^\[((?:\\.|[^\\\]])*)\]\(attachment:[^\s)]+\)/.exec(remaining);
     if (attachment) {
-      preview += attachment[1]!.replace(/\\([\\`*{}\[\]()#+\-.!_>~|])/g, "$1");
+      preview += attachment[1]!.replace(/\\([\\`*{}[\]()#+\-.!_>~|])/g, "$1");
       offset += attachment[0].length;
       continue;
     }

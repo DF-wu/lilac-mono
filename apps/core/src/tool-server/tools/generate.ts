@@ -36,7 +36,7 @@ function captureGenerateFailure(cause: unknown): { readonly cause: Error | Panic
 import { experimental_generateVideo as generateVideo, type GenerateVideoPrompt } from "ai";
 import { fileTypeFromBuffer } from "file-type";
 import fs from "node:fs/promises";
-import { dirname, extname, join } from "node:path";
+import { dirname, extname } from "node:path";
 import { z } from "zod";
 import {
   imageScriptInputSchema,
