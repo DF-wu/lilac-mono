@@ -211,7 +211,7 @@ function createSurfaceMessageRef<P extends RegisteredSurfacePlatform>(
 const surfaceClientSchema = z
   .enum(["discord", "github", "native", "whatsapp", "slack", "telegram", "web"])
   .describe(
-    "Recognized surface wire client/platform. Execution requires a registered adapter and is selected from request context unless --client is needed.",
+    "Recognized surface wire client/platform. Execution requires a registered adapter. Explicit --client selects the target surface; otherwise the request context supplies the default.",
   );
 
 type SurfaceClient = z.infer<typeof surfaceClientSchema>;
@@ -232,18 +232,6 @@ function resolveSurfaceAdapter(params: {
   const ctxClient = isAdapterPlatform(ctxClientRaw) ? ctxClientRaw : null;
   const contextAdapter = ctxClient ? params.resolver.resolve(ctxClient) : null;
 
-  if (contextAdapter) {
-    if (params.inputClient && params.inputClient !== contextAdapter.platform) {
-      return Result.err(
-        surfaceFailure(
-          "conflict",
-          `Client mismatch: context requestClient is '${contextAdapter.platform}' but input client is '${params.inputClient}'`,
-        ),
-      );
-    }
-    return Result.ok(contextAdapter);
-  }
-
   if (params.inputClient) {
     const inputAdapter = params.resolver.resolve(params.inputClient);
     if (inputAdapter) return Result.ok(inputAdapter);
@@ -254,6 +242,8 @@ function resolveSurfaceAdapter(params: {
       ),
     );
   }
+
+  if (contextAdapter) return Result.ok(contextAdapter);
 
   if (ctxClient && ctxClient !== "unknown") {
     return Result.err(
@@ -1191,7 +1181,7 @@ export class Surface implements ServerTool {
         },
         terminology: {
           client:
-            "Surface client/platform. A registered request-context adapter is authoritative; an explicit conflicting --client fails closed. Otherwise pass --client to select a registered adapter.",
+            "Surface client/platform. Pass --client to select a registered adapter, including a different surface from the request origin. If omitted, the request context supplies the default.",
           adapterResolution:
             "supportedClients lists registered executable adapters only. It does not predict support for individual operations; each operation returns its declared runtime result.",
           session:
@@ -1439,7 +1429,6 @@ export class Surface implements ServerTool {
         offset += rows.length;
 
         for (const row of rows) {
-          if (ctx?.requestClient === "native" && row.client !== "native") continue;
           let nativeText: string | undefined;
           if (row.client === "native") {
             const native = this.resolveAdapter("native", ctx).match({
