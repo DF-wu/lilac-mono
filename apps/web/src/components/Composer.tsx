@@ -17,7 +17,7 @@ import {
   type ClipboardEvent,
   type DragEvent,
 } from "react";
-import { ArrowUp, Paperclip, Square, X, CornerDownRight, Upload } from "lucide-react";
+import { ArrowUp, Paperclip, Square, X, Upload } from "lucide-react";
 import { createPortal } from "react-dom";
 import { hasFileDrag, installWindowFileDrop } from "../window-file-drop";
 import "./composer-drop.css";
@@ -502,7 +502,6 @@ export const Composer = memo(function Composer(props: ComposerProps) {
           <span className="toolbar-spacer flex-1" />
           {active ? (
             <div className="queue-mode flex shrink-0 items-center text-muted-foreground">
-              <CornerDownRight />
               <Select
                 disabled={!!custom}
                 value={delivery.mode}
@@ -515,13 +514,11 @@ export const Composer = memo(function Composer(props: ComposerProps) {
                       : "When sent during an active run"
                   }
                 >
-                  <SelectValue>
-                    {delivery.mode === "followup" ? "Follow-up" : "Steering"}
-                  </SelectValue>
+                  <SelectValue>{delivery.mode === "followup" ? "Queue" : "Steer"}</SelectValue>
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="steer">Steering</SelectItem>
-                  <SelectItem value="followup">Follow-up</SelectItem>
+                  <SelectItem value="steer">Steer</SelectItem>
+                  <SelectItem value="followup">Queue</SelectItem>
                 </SelectContent>
               </Select>
             </div>

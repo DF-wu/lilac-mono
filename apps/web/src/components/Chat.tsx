@@ -158,7 +158,16 @@ export function Chat(props: ChatProps) {
   const historySnapshot = useCallback(() => !!store.checkpoint, [store]);
   const historyLoaded = useSyncExternalStore(subscribeHistory, historySnapshot, historySnapshot);
   const readableTurnId = useLatestReadableTurn(store);
-  const active = !!thread?.activeRunId;
+  const sendingEntry = localThread?.sending
+    ? localThread.creation?.entry
+    : pendingEntries.find((entry) => entry.state === "preparing");
+  const activeTurnSnapshot = useCallback(() => {
+    const slot = store.at(store.size - 1);
+    return slot?.kind === "ready" && (slot.state === "pending" || slot.state === "running");
+  }, [store]);
+  const activeTurn = useSyncExternalStore(subscribeHistory, activeTurnSnapshot, activeTurnSnapshot);
+  const serverActive = !!thread?.activeRunId || activeTurn;
+  const active = serverActive || !!sendingEntry;
   const previousActive = useRef(active);
   const canEdit = useRef(editable);
   canEdit.current = editable;
@@ -212,9 +221,6 @@ export function Chat(props: ChatProps) {
   const snapshot = useCallback(() => pool.get(threadId), [pool, threadId]);
   const uploads = useSyncExternalStore(subscribe, snapshot, snapshot);
   const uploadProgress = useMemo(() => ({ pool, threadId }), [pool, threadId]);
-  const sendingEntry = localThread?.sending
-    ? localThread.creation?.entry
-    : pendingEntries.find((entry) => entry.state === "preparing");
   const pendingAttachments = useMemo(
     () =>
       sendingEntry?.submission.attachments.map(
@@ -229,7 +235,7 @@ export function Chat(props: ChatProps) {
     [pendingAttachments, resourceUrl],
   );
   const pendingTurn = useMemo<ReadyTurnSlot | undefined>(() => {
-    if (!sendingEntry || active) return;
+    if (!sendingEntry || serverActive) return;
     return {
       kind: "ready",
       slotId: `sending:${sendingEntry.commandId}`,
@@ -245,7 +251,7 @@ export function Chat(props: ChatProps) {
         },
       ],
     };
-  }, [sendingEntry, pendingAttachments, active, scope.principalId, store]);
+  }, [sendingEntry, pendingAttachments, serverActive, scope.principalId, store]);
   const visiblePendingEntries = pendingEntries.filter(
     (entry) => entry.commandId !== sendingEntry?.commandId || !pendingTurn,
   );
@@ -359,7 +365,7 @@ export function Chat(props: ChatProps) {
           )
         : entry.text,
       ...inputDeliveryOptions(
-        active,
+        serverActive,
         entry.submission.mode,
         entry.submission.modelId,
         !!entry.submission.command,

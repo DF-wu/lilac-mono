@@ -237,8 +237,13 @@ export function AgentWorkDemo() {
                         onAttach={() => {}}
                         onRemoveAttachment={() => {}}
                         onRetryAttachment={() => {}}
-                        active={sent && slot.state === "running"}
-                        canCancel={playhead.playing && slot.state === "running"}
+                        active={
+                          (stage.id !== "conversation" || sent) &&
+                          (slot.state === "pending" || slot.state === "running")
+                        }
+                        canCancel={
+                          playhead.playing && (slot.state === "pending" || slot.state === "running")
+                        }
                         disabled={false}
                         windowDrop={false}
                         onModelChange={() => {}}

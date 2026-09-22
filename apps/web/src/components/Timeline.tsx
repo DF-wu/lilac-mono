@@ -472,7 +472,23 @@ export const Turn = memo(function Turn(props: {
             remaining.find((message) => message.role !== "system")?.role === "assistant")) ? (
           <AuthorAvatar author={identities.agent} role="Agent" />
         ) : null}
-        {waiting ? <ThinkingIndicator /> : null}
+        {waiting ? (
+          <MessageBody
+            live={true}
+            showAvatar={false}
+            message={{
+              id: `${slot.turnId}:thinking`,
+              role: "assistant",
+              parts: [
+                {
+                  type: "data-activity",
+                  id: `${slot.turnId}:thinking`,
+                  data: { kind: "thinking", state: "running", label: "Thinking…" },
+                },
+              ],
+            }}
+          />
+        ) : null}
         {settled && intermediate.length > 0 ? (
           <Collapsible open={expanded} onOpenChange={setExpanded}>
             <CollapsibleTrigger

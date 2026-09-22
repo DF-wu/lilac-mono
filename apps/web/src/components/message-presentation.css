@@ -194,7 +194,10 @@
   to { opacity: 1; }
 }
 [data-message-arrival="ready"] {
-  animation: message-arrive var(--ui-motion-duration) ease both;
+  animation: message-arrive calc(var(--ui-motion-duration) * 2) ease both;
+}
+:root[data-animation] [data-message-arrival="ready"] {
+  animation-duration: calc(var(--ui-motion-duration) * 2) !important;
 }
 :root[data-animation="off"] [data-message-arrival] {
   animation: none;
