@@ -152,7 +152,107 @@ function connect(url: string, token: string) {
   return { socket, client };
 }
 
+async function expectSocketRejected(url: URL, headers: Record<string, string> = {}) {
+  const endpoint = new URL(url);
+  endpoint.protocol = "ws:";
+  const socket = new (WebSocket as unknown as {
+    new (url: URL, options: { headers: Record<string, string> }): WebSocket;
+  })(endpoint, { headers });
+  cleanup.push(() => socket.close());
+  let opened = false;
+  socket.addEventListener("open", () => {
+    opened = true;
+    socket.close();
+  });
+  await new Promise<void>((resolve) =>
+    socket.addEventListener("close", () => resolve(), { once: true }),
+  );
+  expect(opened).toBe(false);
+}
+
 describe("native gateway", () => {
+  test("private HTTP routes reject missing and forged credentials before calling services", async () => {
+    let resourceCalls = 0;
+    const { url, token, services, fatalErrors } = await fixture(undefined, {
+      handle: async () => {
+        resourceCalls += 1;
+        return new Response("private resource");
+      },
+    });
+    let bootstrapCalls = 0;
+    const bootstrap = services.bootstrap.get;
+    services.bootstrap.get = (...args) => {
+      bootstrapCalls += 1;
+      return bootstrap(...args);
+    };
+    const credentials: Record<string, string>[] = [
+      {},
+      { authorization: "Bearer forged" },
+      { cookie: "lilac_native_session=forged" },
+      { authorization: `Basic ${btoa("operator:test-password")}` },
+      { "x-forwarded-user": "owner", "x-lilac-operator-session": crypto.randomUUID() },
+    ];
+    for (const route of [
+      "api/bootstrap",
+      "api/socket",
+      "api/auth/logout",
+      "api/operator/session",
+      "api/uploads/fixture",
+      "api/resources/fixture",
+      "api/resources/fixture/preview",
+      "api/files/fixture/preview",
+      "api/identity/avatar",
+      "api/profile/avatar",
+      "api/users/owner/avatar",
+      "api/unknown",
+    ]) {
+      for (const method of ["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"]) {
+        for (const headers of credentials) {
+          const endpoint = new URL(route, url);
+          endpoint.searchParams.set("token", token);
+          const response = await fetch(endpoint, {
+            method,
+            headers: { origin: "http://localhost", ...headers },
+          });
+          expect(response.status).toBe(401);
+          await response.arrayBuffer();
+        }
+      }
+    }
+    expect(resourceCalls).toBe(0);
+    expect(bootstrapCalls).toBe(0);
+    expect(fatalErrors).toEqual([]);
+    expect(
+      (
+        await fetch(new URL("api/bootstrap", url), {
+          headers: { authorization: `Bearer ${token}` },
+        })
+      ).status,
+    ).toBe(200);
+    expect(bootstrapCalls).toBe(1);
+  });
+
+  test("WebSocket upgrades require credentials and enforce browser origins", async () => {
+    const { url, token, fatalErrors } = await fixture();
+    const endpoint = new URL("api/socket", url);
+    endpoint.searchParams.set("token", token);
+    const credentials: Record<string, string>[] = [
+      {},
+      { origin: "http://localhost" },
+      { authorization: "Bearer forged" },
+      { cookie: "lilac_native_session=forged", origin: "http://localhost" },
+      { cookie: `lilac_native_session=${token}` },
+      { cookie: `lilac_native_session=${token}`, origin: "https://evil.example" },
+      { authorization: `Bearer ${token}`, origin: "https://evil.example" },
+    ];
+    for (const headers of credentials) {
+      await expectSocketRejected(endpoint, headers);
+    }
+    const { client } = connect(url, token);
+    expect((await client.threads.sync({ threadId: "shared" })).kind).toBe("unchanged");
+    expect(fatalErrors).toEqual([]);
+  });
+
   test("shutdown waits for an in-flight RPC mutation after closing its socket", async () => {
     const { url, token, gateway, services } = await fixture();
     const entered = Promise.withResolvers<void>();
@@ -454,6 +554,18 @@ describe("native gateway", () => {
     });
     const aliceToken = await sign("alice");
     const bobToken = await sign("bob");
+    await expectSocketRejected(new URL("api/socket", url));
+    for (const token of [
+      "forged",
+      `${aliceToken.slice(0, -10)}aaaaaaaaaa`,
+      await sign("alice", 1),
+      await sign("unknown"),
+    ]) {
+      const headers = { authorization: `Bearer ${token}` };
+      const response = await fetch(new URL("api/bootstrap", url), { headers });
+      expect([401, 403]).toContain(response.status);
+      await expectSocketRejected(new URL("api/socket", url), headers);
+    }
     const alice = connect(url, aliceToken).client;
     const bob = connect(url, bobToken).client;
     expect((await alice.threads.sync({ threadId: "alice" })).kind).toBe("unchanged");
