@@ -43,6 +43,7 @@ export function ExternalSidebar({
       <ErrorNotice message={list.error?.message} />
       {!list.data && list.isFetching ? <ExternalSkeleton /> : null}
       <VirtualList
+        emptyState={list.data && threads.length === 0 ? <SidebarEmptyState view="others" /> : null}
         items={threads}
         itemKey={(thread) => thread.id}
         label="Other conversations"
@@ -74,7 +75,6 @@ export function ExternalSidebar({
           <Skeleton className="h-2 w-full" />
         </div>
       ) : null}
-      {list.data && threads.length === 0 ? <SidebarEmptyState view="others" /> : null}
     </div>
   );
 }

@@ -5,5 +5,9 @@ const messages = {
 };
 
 export function SidebarEmptyState({ view }: { view: keyof typeof messages }) {
-  return <p className="p-3 text-sm text-muted-foreground">{messages[view]}</p>;
+  return (
+    <p className="flex h-full items-center justify-center p-3 text-center text-sm text-muted-foreground">
+      {messages[view]}
+    </p>
+  );
 }

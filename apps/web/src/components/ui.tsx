@@ -107,6 +107,7 @@ export function VirtualList<T>({
   loading = false,
   scrollFade = false,
   fillBeforeIndex,
+  emptyState,
   animateChanges = false,
 }: {
   items: readonly T[];
@@ -122,6 +123,7 @@ export function VirtualList<T>({
   loading?: boolean;
   scrollFade?: boolean;
   fillBeforeIndex?: number;
+  emptyState?: ReactNode;
   animateChanges?: boolean;
 }) {
   const parent = useRef<HTMLDivElement>(null);
@@ -143,7 +145,10 @@ export function VirtualList<T>({
   });
   const fillSpace =
     fillBeforeIndex !== undefined && fillBeforeIndex >= 0
-      ? Math.max(0, (virtual.scrollRect?.height ?? 0) - virtual.getTotalSize())
+      ? Math.max(
+          emptyState ? estimate : 0,
+          (virtual.scrollRect?.height ?? 0) - virtual.getTotalSize(),
+        )
       : 0;
   const remaining =
     virtual.getTotalSize() - (virtual.scrollOffset ?? 0) - (virtual.scrollRect?.height ?? 0);
@@ -163,6 +168,14 @@ export function VirtualList<T>({
       aria-label={presentation ? undefined : label}
       role={presentation ? "presentation" : "list"}
     >
+      {emptyState ? (
+        <div
+          className="absolute inset-x-0 top-0"
+          style={{ height: fillBeforeIndex === 0 ? fillSpace : "100%" }}
+        >
+          {emptyState}
+        </div>
+      ) : null}
       <div
         ref={canvas}
         className="virtual-canvas relative w-full"

@@ -161,6 +161,15 @@ export const SidebarQueue = memo(function SidebarQueue({
   return (
     <>
       <ThreadQueue
+        emptyState={
+          !error &&
+          !pinned.isFetching &&
+          !active.isFetching &&
+          visible.pinned.length === 0 &&
+          visible.active.length === 0 ? (
+            <SidebarEmptyState view="default" />
+          ) : null
+        }
         queues={visible}
         totals={visibleTotals}
         disabled={!online || move.isPending}
@@ -191,12 +200,6 @@ export const SidebarQueue = memo(function SidebarQueue({
           />
         )}
       />
-      {!error &&
-      sidebarSections.every(
-        (section) => !sections[section].isFetching && visible[section].length === 0,
-      ) ? (
-        <SidebarEmptyState view="default" />
-      ) : null}
       {error ? (
         <div className="queue-error">
           <ErrorNotice message={error.message} />

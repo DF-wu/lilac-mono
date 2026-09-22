@@ -72,6 +72,7 @@ export function ThreadQueue({
   onEndReached,
   settledOpen,
   onSettledOpen,
+  emptyState,
 }: {
   queues: ThreadQueues;
   totals: Record<SidebarSection, number>;
@@ -83,6 +84,7 @@ export function ThreadQueue({
   onEndReached?: () => void;
   settledOpen: boolean;
   onSettledOpen: (open: boolean) => void;
+  emptyState?: ReactNode;
 }) {
   const [dropDuration, setDropDuration] = useState(150);
   const [drag, setDrag] = useState<
@@ -213,6 +215,7 @@ export function ThreadQueue({
     >
       <VirtualList
         items={rows}
+        emptyState={dragging ? null : emptyState}
         animateChanges={!dragging}
         itemKey={(row) => row.id}
         estimate={64}

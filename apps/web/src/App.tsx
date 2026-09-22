@@ -943,6 +943,13 @@ function Workspace(props: AppProps) {
                             />
                           ) : (
                             <VirtualList
+                              emptyState={
+                                !loadingThreads &&
+                                !threadListError &&
+                                sidebarThreads.length === 0 ? (
+                                  <SidebarEmptyState view="archived" />
+                                ) : null
+                              }
                               items={sidebarThreads}
                               itemKey={(thread) => thread.id}
                               label="Conversations"
@@ -974,12 +981,6 @@ function Workspace(props: AppProps) {
                               )}
                             />
                           )}
-                          {archived &&
-                          !loadingThreads &&
-                          !threadListError &&
-                          sidebarThreads.length === 0 ? (
-                            <SidebarEmptyState view="archived" />
-                          ) : null}
                           {threadListError ? (
                             <Button
                               variant="ghost"

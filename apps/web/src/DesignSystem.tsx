@@ -554,9 +554,13 @@ function Threads() {
           </div>
         </Specimen>
         <Specimen title="Empty conversation lists">
-          <SidebarEmptyState view="default" />
-          <SidebarEmptyState view="archived" />
-          <SidebarEmptyState view="others" />
+          <div className="grid gap-3 sm:grid-cols-3">
+            {(["default", "archived", "others"] as const).map((view) => (
+              <div key={view} className="h-64 bg-sidebar rounded-lg">
+                <SidebarEmptyState view={view} />
+              </div>
+            ))}
+          </div>
         </Specimen>
         <Specimen title="Personal queues">
           <ThreadQueueDemo />
