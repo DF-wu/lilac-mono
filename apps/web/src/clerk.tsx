@@ -182,8 +182,11 @@ function AccountView() {
   useEffect(() => {
     if (!updatedAt) return;
     async function refreshProfile() {
-      await queries.invalidateQueries({ queryKey: ["profile"] });
-      await queries.invalidateQueries({ queryKey: ["participants"] });
+      await Promise.all([
+        queries.invalidateQueries({ queryKey: ["profile"] }),
+        queries.invalidateQueries({ queryKey: ["participants"] }),
+        queries.invalidateQueries({ queryKey: ["external", "read"] }),
+      ]);
     }
     void refreshProfile();
   }, [queries, updatedAt]);

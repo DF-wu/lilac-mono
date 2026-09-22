@@ -860,18 +860,22 @@ const MessageBody = memo(function MessageBody(
   const authorResolved = authorId !== undefined && identities.users.has(authorId);
   const onUnknownAuthor = identities.onUnknownAuthor;
   useEffect(() => {
-    if (authorId === undefined || authorResolved) return;
+    if (authorId === undefined || authorResolved || message.metadata?.authorDisplayName) return;
     onUnknownAuthor?.(authorId);
-  }, [authorId, authorResolved, onUnknownAuthor]);
+  }, [authorId, authorResolved, onUnknownAuthor, message.metadata?.authorDisplayName]);
+  const externalAuthor = message.metadata?.authorDisplayName
+    ? { ...identities.users.get(authorId ?? ""), displayName: message.metadata.authorDisplayName }
+    : undefined;
   const author =
-    message.role === "assistant"
+    externalAuthor ??
+    (message.role === "assistant"
       ? identities.agent
-      : (identities.users.get(message.metadata?.authorId ?? "") ?? { displayName: "Participant" });
+      : (identities.users.get(message.metadata?.authorId ?? "") ?? { displayName: "Participant" }));
   const conversational = groups.some(
     (group) =>
       group.kind === "text" || (group.kind === "part" && group.part.type === "data-resource"),
   );
-  let authorRole = "Participant";
+  let authorRole = externalAuthor ? "User" : "Participant";
   if (message.role === "assistant") authorRole = "Agent";
   else if (authorId !== undefined && authorId === identities.viewerId) authorRole = "You";
   const self =

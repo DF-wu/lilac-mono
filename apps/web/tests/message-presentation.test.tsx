@@ -12,6 +12,52 @@ import MarkdownContent from "../src/components/MarkdownContent";
 import type { DisplayMessage, DisplayPart } from "@stanley2058/lilac-client-protocol";
 
 describe("message presentation", () => {
+  test("linked Discord messages use the viewer alignment and keep the source label", () => {
+    const html = renderToStaticMarkup(
+      <MessageIdentityContext
+        value={{
+          viewerId: "viewer",
+          agent: { displayName: "Lilac" },
+          users: new Map([["viewer", { displayName: "Stanley" }]]),
+        }}
+      >
+        <Message
+          message={{
+            id: "discord-message",
+            role: "user",
+            metadata: { authorId: "viewer", authorDisplayName: "Stanley (Discord)" },
+            parts: [{ type: "text", text: "Hello" }],
+          }}
+          resourceUrl={(id) => id}
+          canEdit={false}
+          onAction={() => {}}
+          onReaction={() => {}}
+        />
+      </MessageIdentityContext>,
+    );
+    expect(html).toContain('data-slot="message" data-align="end"');
+    expect(html).toContain('aria-label="Stanley (Discord)"');
+  });
+  test("external authors use their display names without a native user lookup", () => {
+    for (const name of ["Lilac (Discord)", "Stanley (Discord)"]) {
+      const html = renderToStaticMarkup(
+        <Message
+          message={{
+            id: "external",
+            role: "user",
+            metadata: { authorId: "external-user", authorDisplayName: name },
+            parts: [{ type: "text", text: "Hello" }],
+          }}
+          resourceUrl={(id) => id}
+          canEdit={false}
+          onAction={() => {}}
+          onReaction={() => {}}
+        />,
+      );
+      expect(html).toContain(`aria-label="${name}"`);
+      expect(html).not.toContain("Participant");
+    }
+  });
   test("bubbles use participant and agent names with avatar fallback", () => {
     const html = renderToStaticMarkup(
       <MessageIdentityContext

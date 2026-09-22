@@ -53,6 +53,7 @@ import { attempt, IconButton, Modal, VirtualList } from "./components/ui";
 import { MessageIdentityContext } from "./components/message-identity";
 import { toast } from "./components/ui/toast";
 import { refreshSidebar } from "./sidebar-queries";
+import { ExternalSidebar, ExternalSkeleton } from "./components/ExternalSidebar";
 import { SidebarQueue } from "./components/SidebarQueue";
 import { SidebarThread } from "./components/SidebarThread";
 import {
@@ -690,7 +691,6 @@ function Workspace(props: AppProps) {
     void listThreads(value);
   });
   const toggleExternal = useCallback(() => {
-    setExternalId(undefined);
     setExternal((value) => !value);
   }, []);
   const openSettings = useCallback(() => setSettings(true), []);
@@ -722,7 +722,7 @@ function Workspace(props: AppProps) {
           </IconButton>
           {owner ? (
             <IconButton
-              label="Read other surfaces"
+              label="Show other conversations"
               tooltip="Others"
               aria-pressed={external}
               onClick={toggleExternal}
@@ -836,118 +836,122 @@ function Workspace(props: AppProps) {
                       </span>
                     </header>
                     {sidebarToolbar}
-                    {results ? (
-                      <>
-                        <VirtualList
-                          items={results.items}
-                          itemKey={(hit) => `${hit.threadId}:${hit.turnId ?? hit.excerpt}`}
-                          label="Search results"
-                          className="thread-list flex-1"
-                          estimate={92}
-                          render={(hit) => (
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              className="search-result flex w-full gap-1 p-3 text-left rounded-sm h-auto flex-col items-start whitespace-normal"
-                              onClick={() => {
-                                if (hit.surface === "native") select(hit.threadId);
-                                else {
-                                  setExternalId(hit.threadId);
-                                  setExternal(true);
-                                }
-                              }}
-                            >
-                              <strong>{hit.title}</strong>
-                              <span>{hit.excerpt}</span>
-                            </Button>
-                          )}
-                        />
-                        {results.items.length === 0 && !searching ? (
-                          <p className="muted text-muted-foreground empty-list p-4 text-sm">
-                            No results
-                          </p>
-                        ) : null}
-                        {results.nextCursor ? (
-                          <Button
-                            variant="ghost"
-                            className="text-primary py-2 px-3 text-sm"
-                            disabled={searching}
-                            onClick={() => {
-                              if (!searching)
-                                void searchResults.fetchNextPage({ cancelRefetch: false });
-                            }}
-                          >
-                            More results
-                          </Button>
-                        ) : null}
-                      </>
-                    ) : (
-                      <>
-                        {!archived ? (
-                          <SidebarQueue
-                            fallbackThreads={online ? undefined : threads}
-                            draftIds={draftIds}
-                            viewer={viewer}
-                            external={external}
-                            models={catalog?.models}
-                            onThread={upsert}
-                            onSelect={select}
-                            onRename={renameSidebarThread}
-                            onArchive={archiveSidebarThread}
-                            onDelete={setConfirmDelete}
-                            onDiscardDraft={discardDraft}
-                          />
-                        ) : (
+                    {external && owner && !results ? (
+                      <ExternalSidebar selectedId={externalId} onSelect={setExternalId} />
+                    ) : null}
+                    {(results || !external) &&
+                      (results ? (
+                        <>
                           <VirtualList
-                            items={sidebarThreads}
-                            itemKey={(thread) => thread.id}
-                            label="Conversations"
-                            scrollFade
-                            hasMore={!!nextCursor && !threadListError}
-                            loading={loadingThreads}
-                            onEndReached={() => {
-                              if (nextCursor) void listThreads(archived, nextCursor);
-                            }}
+                            items={results.items}
+                            itemKey={(hit) => `${hit.threadId}:${hit.turnId ?? hit.excerpt}`}
+                            label="Search results"
                             className="thread-list flex-1"
-                            estimate={64}
-                            render={(thread) => (
-                              <SidebarThread
-                                id={thread.id}
-                                thread={thread.source}
-                                viewer={viewer}
-                                modelLabel={
-                                  catalog?.models.find(
-                                    (model) => model.id === thread.source?.modelId,
-                                  )?.label
-                                }
-                                external={external}
-                                onSelect={select}
-                                onRename={renameSidebarThread}
-                                onArchive={archiveSidebarThread}
-                                onDelete={setConfirmDelete}
-                                onDiscardDraft={discardDraft}
-                              />
+                            estimate={92}
+                            render={(hit) => (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                className="search-result flex w-full gap-1 p-3 text-left rounded-sm h-auto flex-col items-start whitespace-normal"
+                                onClick={() => {
+                                  if (hit.surface === "native") select(hit.threadId);
+                                  else {
+                                    setExternalId(hit.threadId);
+                                    setExternal(true);
+                                  }
+                                }}
+                              >
+                                <strong>{hit.title}</strong>
+                                <span>{hit.excerpt}</span>
+                              </Button>
                             )}
                           />
-                        )}
-                        {threadListError ? (
-                          <Button
-                            variant="ghost"
-                            onClick={() => void listThreads(archived, nextCursor)}
-                          >
-                            Retry loading conversations
-                          </Button>
-                        ) : null}
-                      </>
-                    )}
+                          {results.items.length === 0 && !searching ? (
+                            <p className="muted text-muted-foreground empty-list p-4 text-sm">
+                              No results
+                            </p>
+                          ) : null}
+                          {results.nextCursor ? (
+                            <Button
+                              variant="ghost"
+                              className="text-primary py-2 px-3 text-sm"
+                              disabled={searching}
+                              onClick={() => {
+                                if (!searching)
+                                  void searchResults.fetchNextPage({ cancelRefetch: false });
+                              }}
+                            >
+                              More results
+                            </Button>
+                          ) : null}
+                        </>
+                      ) : (
+                        <>
+                          {!archived ? (
+                            <SidebarQueue
+                              fallbackThreads={online ? undefined : threads}
+                              draftIds={draftIds}
+                              viewer={viewer}
+                              external={external}
+                              models={catalog?.models}
+                              onThread={upsert}
+                              onSelect={select}
+                              onRename={renameSidebarThread}
+                              onArchive={archiveSidebarThread}
+                              onDelete={setConfirmDelete}
+                              onDiscardDraft={discardDraft}
+                            />
+                          ) : (
+                            <VirtualList
+                              items={sidebarThreads}
+                              itemKey={(thread) => thread.id}
+                              label="Conversations"
+                              scrollFade
+                              hasMore={!!nextCursor && !threadListError}
+                              loading={loadingThreads}
+                              onEndReached={() => {
+                                if (nextCursor) void listThreads(archived, nextCursor);
+                              }}
+                              className="thread-list flex-1"
+                              estimate={64}
+                              render={(thread) => (
+                                <SidebarThread
+                                  id={thread.id}
+                                  thread={thread.source}
+                                  viewer={viewer}
+                                  modelLabel={
+                                    catalog?.models.find(
+                                      (model) => model.id === thread.source?.modelId,
+                                    )?.label
+                                  }
+                                  external={external}
+                                  onSelect={select}
+                                  onRename={renameSidebarThread}
+                                  onArchive={archiveSidebarThread}
+                                  onDelete={setConfirmDelete}
+                                  onDiscardDraft={discardDraft}
+                                />
+                              )}
+                            />
+                          )}
+                          {threadListError ? (
+                            <Button
+                              variant="ghost"
+                              onClick={() => void listThreads(archived, nextCursor)}
+                            >
+                              Retry loading conversations
+                            </Button>
+                          ) : null}
+                        </>
+                      ))}
                     {sidebarFooter}
                   </aside>
                 </WorkspaceSidePanel>
                 <div id="chat" className="chat-panel">
                   <div className="main-panel h-full relative min-w-0 min-h-0 flex flex-col">
                     {external && owner ? (
-                      <Suspense fallback={<p role="status">Loading conversations…</p>}>
-                        <External key={externalId ?? "list"} initialThreadId={externalId} />
+                      <Suspense fallback={<ExternalSkeleton conversation />}>
+                        <External threadId={externalId} />
                       </Suspense>
                     ) : null}
                     {!external && selectedId

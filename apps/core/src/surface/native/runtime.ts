@@ -258,6 +258,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   });
   const summaryAbort = new AbortController();
   const external = new NativeExternalThreads({
+    profileProvider: clerk,
     getUser: (id) => store.getUser(id),
     adapters: options.adapters,
     knownSessions: () =>
@@ -266,7 +267,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
         .flatMap((row) =>
           row.surfaceRefs
             .filter((ref) => ref.platform !== "native")
-            .map((ref) => ({ ref, kind: "thread" as const })),
+            .map((ref) => ({ ref, kind: "thread" as const, updatedAt: row.updatedTs })),
         ),
   });
   const config = new NativeConfigService({

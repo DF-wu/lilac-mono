@@ -699,6 +699,9 @@
 :root[data-animation] .thread-card[data-state="working"] .thread-state-icon svg {
   animation-duration: var(--ui-motion-spin-duration) !important;
 }
+:root[data-animation] [data-slot="skeleton"] {
+  animation-duration: var(--ui-motion-pulse-duration) !important;
+}
 :root[data-animation="off"] *,
 :root[data-animation="off"] *::before,
 :root[data-animation="off"] *::after {

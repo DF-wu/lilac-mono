@@ -215,10 +215,12 @@ export class DiscordSurfaceStore {
       .get(channelId);
   }
 
-  listSessions(limit = 500): DbDiscordSession[] {
+  listSessions(limit = 500): (DbDiscordSession & { activity_ts: number })[] {
     return this.db
-      .query<DbDiscordSession, [number]>(
-        "SELECT * FROM discord_sessions ORDER BY updated_ts DESC LIMIT ?",
+      .query<DbDiscordSession & { activity_ts: number }, [number]>(
+        `SELECT s.*, COALESCE((SELECT MAX(r.ts) FROM discord_message_relations r
+          WHERE r.channel_id = s.channel_id AND r.deleted = 0), s.updated_ts) AS activity_ts
+         FROM discord_sessions s ORDER BY activity_ts DESC, s.channel_id LIMIT ?`,
       )
       .all(limit);
   }

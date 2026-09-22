@@ -3,12 +3,14 @@ import { Result, type Result as ResultType } from "better-result";
 import type { DisplayMessage } from "@stanley2058/lilac-client-protocol";
 import type { SurfaceAdapterResolver } from "../runtime-descriptor";
 import type { SurfaceSession } from "../types";
+import type { NativeClerkAuthenticator } from "./auth-clerk";
 import type { NativeUser } from "./codec";
 import { nativeFailure } from "./errors";
 import type { NativeStoreError } from "./store";
 
 export type ExternalThreadDisplay = {
   id: string;
+  sourceUrl?: string;
   title: string;
   surface: "discord" | "github";
   retrievedAt: number;
@@ -49,16 +51,24 @@ function displaySession(
   if (id.length > 128) return undefined;
   return {
     id,
-    title: (session.title ?? session.ref.channelId).slice(0, 512),
+    title: (session.title ?? "Untitled conversation").slice(0, 512),
+    updatedAt: session.updatedAt,
     surface: session.ref.platform,
     retrievedAt,
+    sourceUrl: externalSourceUrl(session.ref),
   };
+}
+
+function externalSourceUrl(ref: SurfaceSession["ref"]): string | undefined {
+  if (ref.platform !== "discord") return undefined;
+  return `https://discord.com/channels/${ref.guildId ?? "@me"}/${ref.channelId}`;
 }
 
 export class NativeExternalThreads {
   constructor(
     private readonly params: {
       getUser: UserLookup;
+      profileProvider?: Pick<NativeClerkAuthenticator, "lookupUser">;
       adapters: SurfaceAdapterResolver;
       now?: () => number;
       knownSessions?: () => readonly SurfaceSession[];
@@ -84,7 +94,7 @@ export class NativeExternalThreads {
         if (!resolved) continue;
         const sessions = yield* Result.await(
           resolved.adapter
-            .listSessions()
+            .listSessions({ limit: Number.MAX_SAFE_INTEGER })
             .then((result) =>
               result.tryRecover((error) =>
                 error._tag === "SurfaceOperationUnsupported"
@@ -98,16 +108,46 @@ export class NativeExternalThreads {
           if (display) items.push(display);
         }
       }
-      const unique = [...new Map(items.map((item) => [item.id, item])).values()];
-      unique.sort((left, right) => left.id.localeCompare(right.id));
+      const byId = new Map<string, ExternalThreadDisplay>();
+      for (const item of items) {
+        const previous = byId.get(item.id);
+        byId.set(item.id, {
+          ...item,
+          updatedAt: Math.max(previous?.updatedAt ?? 0, item.updatedAt ?? 0),
+        });
+      }
+      const unique = [...byId.values()];
+      unique.sort(
+        (left, right) =>
+          (right.updatedAt ?? 0) - (left.updatedAt ?? 0) || left.id.localeCompare(right.id),
+      );
       const limit = Math.min(100, Math.max(1, input.limit ?? 30));
-      const start = input.cursor ? unique.findIndex((item) => item.id > input.cursor!) : 0;
-      if (start === -1) return Result.ok({ items: [] });
+      const cursorIndex = input.cursor ? unique.findIndex((item) => item.id === input.cursor) : -1;
+      if (input.cursor && cursorIndex === -1) return Result.ok({ items: [] });
+      const start = cursorIndex + 1;
       const page = unique.slice(start, start + limit);
       return Result.ok({
         items: page,
         ...(start + limit < unique.length ? { nextCursor: page.at(-1)!.id } : {}),
       });
+    }, this);
+  }
+
+  private async linkedDiscordIds(
+    userId: string,
+    platform: "discord" | "github",
+  ): Promise<ResultType<readonly string[], NativeStoreError>> {
+    return Result.gen(async function* () {
+      if (platform !== "discord" || !this.params.profileProvider) return Result.ok([]);
+      const viewer = yield* this.params.getUser(userId);
+      const profile = await this.params.profileProvider.lookupUser(viewer.providerId);
+      return Result.ok(
+        profile.match({
+          ok: (user) =>
+            user.providerUserId === viewer.providerId ? (user.discordUserIds ?? []) : [],
+          err: () => [],
+        }),
+      );
     }, this);
   }
 
@@ -139,25 +179,46 @@ export class NativeExternalThreads {
           )
           .then((result) => result.mapError((error) => nativeFailure("invalid", error.message))),
       );
+      const linkedDiscordIds = yield* Result.await(this.linkedDiscordIds(userId, ref.platform));
       const visible = messages.filter((message) => !message.deleted);
       const display: DisplayMessage[] = visible.map((message) => ({
         id: Buffer.from(message.ref.messageId).toString("base64url"),
         role: "user",
-        metadata: { createdAt: message.ts },
+        metadata: {
+          createdAt: message.ts,
+          ...(linkedDiscordIds.includes(message.userId) ? { authorId: userId } : {}),
+          authorDisplayName: `${(message.userName ?? message.userId).slice(0, 240)} (${ref.platform === "discord" ? "Discord" : "GitHub"})`,
+        },
         parts: [
           {
             type: "text",
-            text: `${message.userName ?? message.userId}\n${message.text}`.slice(0, 65_536),
+            text: message.text.slice(0, 65_536),
           },
         ],
       }));
+      const sessions = yield* Result.await(
+        resolved.adapter
+          .listSessions({ limit: Number.MAX_SAFE_INTEGER })
+          .then((result) =>
+            result.tryRecover((error) =>
+              error._tag === "SurfaceOperationUnsupported"
+                ? Result.ok([])
+                : Result.err(nativeFailure("invalid", error.message)),
+            ),
+          ),
+      );
+      const session = sessions.find((item) => item.ref.channelId === ref.sessionId);
       const now = this.params.now?.() ?? Date.now();
       return Result.ok({
         thread: {
           id: input.threadId,
-          title: ref.sessionId.slice(0, 512),
+          title: (session?.title ?? "Untitled conversation").slice(0, 512),
+          updatedAt: session?.updatedAt,
           surface: ref.platform,
           retrievedAt: now,
+          sourceUrl: externalSourceUrl(
+            session?.ref ?? { platform: ref.platform, channelId: ref.sessionId },
+          ),
         },
         messages: display,
         ...(messages.length === 50

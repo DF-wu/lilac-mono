@@ -48,7 +48,7 @@ export function ThreadCard({
   title: string;
   starterName: string;
   starterAvatarUrl?: string;
-  updatedAt: number;
+  updatedAt?: number;
   now?: number;
   state: ThreadDisplayState;
   selected?: boolean;
@@ -108,7 +108,9 @@ export function ThreadCard({
                 {actions}
               </span>
             ) : null}
-            {draft !== "new" ? <ThreadTime updatedAt={updatedAt} now={now} /> : null}
+            {draft !== "new" && updatedAt !== undefined ? (
+              <ThreadTime updatedAt={updatedAt} now={now} />
+            ) : null}
           </span>
         </span>
         <span className="thread-card-title overflow-hidden text-ellipsis whitespace-nowrap text-sm">

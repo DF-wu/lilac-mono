@@ -23,6 +23,7 @@ export type NativeClerkAuthConfig = {
 
 export type NativeProviderUser = {
   providerUserId: string;
+  discordUserIds?: readonly string[];
   displayName: string;
   avatarUrl?: string;
 };
@@ -34,9 +35,23 @@ export function providerProfile(user: {
   username: string | null;
   hasImage: boolean;
   imageUrl: string;
+  externalAccounts?: readonly {
+    provider: string;
+    providerUserId: string;
+    verification: { status: string } | null;
+  }[];
 }): NativeProviderUser {
+  const discordUserIds = (user.externalAccounts ?? [])
+    .filter(
+      (account) =>
+        account.provider === "discord" &&
+        account.verification?.status === "verified" &&
+        /^\d+$/.test(account.providerUserId),
+    )
+    .map((account) => account.providerUserId);
   return {
     providerUserId: user.id,
+    ...(discordUserIds.length ? { discordUserIds } : {}),
     displayName:
       [user.firstName, user.lastName].filter(Boolean).join(" ") || user.username || user.id,
     ...(user.hasImage ? { avatarUrl: user.imageUrl } : {}),

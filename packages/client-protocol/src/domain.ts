@@ -161,6 +161,7 @@ export const searchHitSchema = z.strictObject({
   surface: z.enum(["native", "discord", "github"]),
 });
 export const externalThreadSchema = z.strictObject({
+  sourceUrl: z.url().max(2048).optional(),
   id: identitySchema,
   title: z.string().max(512),
   surface: z.enum(["discord", "github"]),

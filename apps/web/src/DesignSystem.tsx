@@ -77,6 +77,7 @@ import { Message } from "./components/Timeline";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
 import { SidebarSearch } from "./components/SidebarSearch";
+import { ExternalSkeleton } from "./components/ExternalSidebar";
 import { ThreadCard } from "./components/ThreadSelect";
 import "./design-system.css";
 
@@ -463,6 +464,19 @@ function Threads() {
             </div>
           ))}
         </div>
+        <Specimen title="Other conversations">
+          <ThreadCard
+            title="Calendar Enums"
+            starterName="Discord"
+            updatedAt={now}
+            now={now}
+            state="idle"
+            selected
+            onSelect={() => {}}
+          />
+          <ExternalSkeleton />
+          <ExternalSkeleton conversation />
+        </Specimen>
         <Specimen title="Personal queues">
           <ThreadQueueDemo />
           <p className="ds-muted">

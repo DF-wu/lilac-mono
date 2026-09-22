@@ -1,4 +1,5 @@
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { Result } from "better-result";
 import { Database } from "bun:sqlite";
 import { NativeStore } from "../../../src/surface/native/store";
 import { NativeSearchStore } from "../../../src/surface/native/store-search";
@@ -208,6 +209,110 @@ describe("native search authority", () => {
 });
 
 describe("external reads", () => {
+  test("projects channel titles, source links, and author identities separately from text", async () => {
+    const session = {
+      ref: { platform: "discord", channelId: "123", guildId: "456" },
+      title: "Calendar Enums",
+      kind: "thread",
+    };
+    const adapters = {
+      registeredPlatforms: () => ["discord"],
+      resolve: () => ({
+        adapter: {
+          listSessions: async (options?: { limit?: number }) =>
+            Result.ok(
+              [
+                ...Array.from({ length: 500 }, (_, index) => ({
+                  ...session,
+                  ref: { ...session.ref, channelId: `newer-${index}` },
+                })),
+                session,
+              ].slice(0, options?.limit ?? 500),
+            ),
+          listMsg: async () =>
+            Result.ok(
+              ["Lilac", "Stanley"].map((userName, index) => ({
+                ref: { platform: "discord", channelId: "123", messageId: String(index + 1) },
+                session: session.ref,
+                userId: String(index),
+                userName,
+                text: "Hello",
+                ts: index + 1,
+              })),
+            ),
+        },
+      }),
+    } as unknown as SurfaceAdapterResolver;
+    let discordUserIds: string[] = [];
+    const service = new NativeExternalThreads({
+      getUser: (id) => store.getUser(id),
+      adapters,
+      profileProvider: {
+        lookupUser: async (providerUserId) =>
+          Result.ok({ providerUserId, displayName: "Stanley", discordUserIds }),
+      },
+    });
+    const read = (
+      await service.read("owner", { threadId: externalThreadId("discord", "123") })
+    ).unwrap();
+    expect(read.thread.title).toBe("Calendar Enums");
+    expect(read.thread.sourceUrl).toBe("https://discord.com/channels/456/123");
+    expect(read.messages.map((message) => message.metadata?.authorDisplayName)).toEqual([
+      "Lilac (Discord)",
+      "Stanley (Discord)",
+    ]);
+    expect(read.messages[0]!.parts).toEqual([{ type: "text", text: "Hello" }]);
+    expect(read.messages[1]!.metadata?.authorId).toBeUndefined();
+    discordUserIds = ["1"];
+    const linked = (
+      await service.read("owner", { threadId: externalThreadId("discord", "123") })
+    ).unwrap();
+    expect(linked.messages[1]!.metadata?.authorId).toBe("owner");
+    expect(linked.messages[0]!.metadata?.authorId).toBeUndefined();
+    discordUserIds = [];
+    const unlinked = (
+      await service.read("owner", { threadId: externalThreadId("discord", "123") })
+    ).unwrap();
+    expect(unlinked.messages[1]!.metadata?.authorId).toBeUndefined();
+  });
+  test("paginates by latest activity and keeps the newest duplicate timestamp", async () => {
+    const service = new NativeExternalThreads({
+      getUser: (id) => store.getUser(id),
+      adapters: { registeredPlatforms: () => [], resolve: () => null },
+      knownSessions: () => [
+        {
+          ref: { platform: "discord", channelId: "a" },
+          title: "Older",
+          kind: "thread",
+          updatedAt: 10,
+        },
+        {
+          ref: { platform: "discord", channelId: "z" },
+          title: "Newest",
+          kind: "thread",
+          updatedAt: 30,
+        },
+        {
+          ref: { platform: "discord", channelId: "z" },
+          title: "Newest",
+          kind: "thread",
+          updatedAt: 5,
+        },
+        {
+          ref: { platform: "discord", channelId: "b" },
+          title: "Middle",
+          kind: "thread",
+          updatedAt: 20,
+        },
+      ],
+    });
+    const first = (await service.list("owner", { limit: 2 })).unwrap();
+    expect(first.items.map((item) => item.title)).toEqual(["Newest", "Middle"]);
+    expect(first.items[0]!.updatedAt).toBe(30);
+    const second = (await service.list("owner", { limit: 2, cursor: first.nextCursor })).unwrap();
+    expect(second.items.map((item) => item.title)).toEqual(["Older"]);
+    expect(second.nextCursor).toBeUndefined();
+  });
   test("authorizes owner before consulting any adapter", async () => {
     const adapters: SurfaceAdapterResolver = {
       registeredPlatforms: () => [],

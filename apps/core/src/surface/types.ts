@@ -89,6 +89,7 @@ export type SurfaceSelf = {
 };
 
 export type SurfaceSession = {
+  updatedAt?: number;
   ref: SessionRef;
   title?: string;
   kind: "channel" | "thread" | "dm";

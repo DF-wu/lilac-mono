@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Result } from "better-result";
 import { exportSPKI, generateKeyPair, SignJWT } from "jose";
 import { createNativeLocalAuthenticator } from "./auth-local";
-import { createNativeClerkAuthenticator } from "./auth-clerk";
+import { createNativeClerkAuthenticator, providerProfile } from "./auth-clerk";
 import { authFailure, checkNativeRequestOrigin, sameNativePrincipal } from "./auth";
 
 const origin = "https://lilac.example";
@@ -300,4 +300,23 @@ describe("native Clerk authentication with real SDK and signed fixtures", () => 
       "handshake",
     );
   });
+});
+
+test("provider profiles expose only verified Discord account IDs", () => {
+  const profile = providerProfile({
+    id: "clerk-user",
+    firstName: "Stanley",
+    lastName: null,
+    username: null,
+    hasImage: false,
+    imageUrl: "",
+    externalAccounts: [
+      { provider: "discord", providerUserId: "123", verification: { status: "verified" } },
+      { provider: "discord", providerUserId: "456", verification: { status: "unverified" } },
+      { provider: "discord", providerUserId: "789", verification: null },
+      { provider: "google", providerUserId: "999", verification: { status: "verified" } },
+      { provider: "discord", providerUserId: "bad-id", verification: { status: "verified" } },
+    ],
+  });
+  expect(profile.discordUserIds).toEqual(["123"]);
 });

@@ -1,5 +1,13 @@
 # MIGRATIONS.md
 
+## External conversation display
+
+External thread responses now include optional `sourceUrl`, and display-message metadata accepts
+optional `authorDisplayName`. External authors are rendered from metadata instead of prepended text.
+External lists use latest activity first; their opaque cursors still identify the last thread on a page.
+Update web and Core together because older strict response validators reject the new fields.
+No stored-data migration is required.
+
 ## Temporary operator conversations
 
 Native v1 thread records accept optional `ephemeral: { sessionId, lastSeenAt }`. Normal records omit
