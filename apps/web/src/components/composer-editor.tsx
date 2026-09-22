@@ -706,8 +706,12 @@ const ComposerEditor = memo(function ComposerEditor(props: ComposerEditorProps) 
           aria-controls={props.expanded ? "composer-completions" : undefined}
           aria-activedescendant={props.activeDescendant}
           placeholder={props.placeholder}
-          onKeyDown={(event) => {
+          onKeyDownCapture={(event) => {
             props.onKeyDown(event);
+            // Completion must consume Tab before Plate's indentation handlers run.
+            if (event.defaultPrevented) event.stopPropagation();
+          }}
+          onKeyDown={(event) => {
             if (event.defaultPrevented || event.nativeEvent.isComposing) return;
             if (event.key === "Enter" && event.shiftKey) {
               event.preventDefault();
