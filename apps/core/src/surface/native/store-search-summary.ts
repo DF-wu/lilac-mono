@@ -1,3 +1,5 @@
+import type { ConversationThreadRunSummarizationInput } from "../../conversation/thread-service";
+import { SUMMARY_QUIET_MS } from "../../conversation/thread-summary-policy";
 import type { Database } from "bun:sqlite";
 import { Result } from "better-result";
 import { decodeNativeRecord, type NativePersistedRow, type NativeThreadRecord } from "./codec";
@@ -50,19 +52,64 @@ export class NativeSummaryStore {
     );
   }
 
-  candidates(limit = 10): NativeStoreResult<NativeThreadRecord[]> {
+  clear(input: ConversationThreadRunSummarizationInput): NativeStoreResult<string[]> {
+    return nativeStoreTransaction(this.params.db, () => {
+      const ids = this.params.db
+        .query<{ thread_id: string }, (string | number | null)[]>(`
+        SELECT s.thread_id FROM native_thread_summaries s JOIN native_records t ON t.kind='thread' AND t.id=s.thread_id
+        WHERE (? IS NULL OR t.id=?) AND (? IS NULL OR t.updated_at<=?) AND (? IS NULL OR t.updated_at>=?)
+      `)
+        .all(...this.scopeValues(input))
+        .map((row) => row.thread_id);
+      if (!input.dryRun) {
+        for (const id of ids)
+          this.params.db.query("DELETE FROM native_thread_summaries WHERE thread_id=?").run(id);
+      }
+      return Result.ok(ids);
+    });
+  }
+
+  private scopeValues(input: ConversationThreadRunSummarizationInput): (string | number | null)[] {
+    const id = input.threadId?.replace(/^native:/u, "") ?? null;
+    return [
+      id,
+      id,
+      input.beforeTs ?? null,
+      input.beforeTs ?? null,
+      input.afterTs ?? null,
+      input.afterTs ?? null,
+    ];
+  }
+
+  candidates(
+    input: ConversationThreadRunSummarizationInput = {},
+  ): NativeStoreResult<NativeThreadRecord[]> {
     return nativeStoreTransaction(this.params.db, () => {
       const rows = this.params.db
         .query<
           NativePersistedRow,
-          [number]
+          (string | number | null)[]
         >(`SELECT t.format_version,t.data_json FROM native_records t
         LEFT JOIN native_thread_summaries s ON s.thread_id=t.id
         WHERE t.kind='thread' AND json_extract(t.data_json,'$.value.deleted')=0 AND json_extract(t.data_json,'$.value.ephemeral') IS NULL AND json_extract(t.data_json,'$.value.mutationPending')=0
-        AND EXISTS(SELECT 1 FROM native_records r WHERE r.kind='turn' AND r.thread_id=t.id)
-        AND (s.thread_id IS NULL OR s.history_generation<>json_extract(t.data_json,'$.value.historyGeneration') OR s.content_revision<json_extract(t.data_json,'$.value.revision'))
-        ORDER BY COALESCE(s.generated_at,0),t.updated_at,t.id LIMIT ?`)
-        .all(Math.min(100, Math.max(1, limit)));
+        AND json_extract(t.data_json,'$.value.activeRunId') IS NULL
+        AND t.updated_at<=?
+        AND (? IS NULL OR t.id=?) AND (? IS NULL OR t.updated_at<=?) AND (? IS NULL OR t.updated_at>=?)
+        AND (SELECT count(*) FROM native_records r WHERE r.kind='turn' AND r.thread_id=t.id
+          AND json_extract(r.data_json,'$.value.state')='complete'
+          AND EXISTS(SELECT 1 FROM json_each(r.data_json,'$.value.messages') m WHERE json_extract(m.value,'$.role')='user')
+          AND EXISTS(SELECT 1 FROM json_each(r.data_json,'$.value.messages') m, json_each(m.value,'$.parts') p
+            WHERE json_extract(m.value,'$.role')='assistant'
+              AND ((json_extract(p.value,'$.type')='text' AND length(trim(json_extract(p.value,'$.text')))>0)
+                OR json_extract(p.value,'$.type')='data-resource'))
+        )>=2
+        AND (?=1 OR s.thread_id IS NULL OR s.history_generation<>json_extract(t.data_json,'$.value.historyGeneration') OR s.content_revision<json_extract(t.data_json,'$.value.revision'))
+        ORDER BY COALESCE(s.generated_at,0),t.updated_at,t.id`)
+        .all(
+          (input.now ?? Date.now()) - SUMMARY_QUIET_MS,
+          ...this.scopeValues(input),
+          input.force ? 1 : 0,
+        );
       return Result.all(rows.map((row) => decodeNativeRecord(row))).map((records) =>
         records.flatMap((record) => (record.value.kind === "thread" ? [record.value.value] : [])),
       );
@@ -76,11 +123,12 @@ export class NativeSummaryStore {
         if (
           current.deleted ||
           current.mutationPending ||
+          current.revision !== value.contentRevision ||
           current.historyGeneration !== value.historyGeneration
         )
           return Result.ok(false);
         const previous = yield* this.get(value.threadId);
-        if (previous && previous.contentRevision >= value.contentRevision) return Result.ok(false);
+        if (previous && previous.contentRevision > value.contentRevision) return Result.ok(false);
         this.params.db
           .query(`INSERT INTO native_thread_summaries(thread_id,history_generation,content_revision,generated_at,format_version,data_json)
         VALUES(?,?,?,?,1,?) ON CONFLICT(thread_id) DO UPDATE SET history_generation=excluded.history_generation,content_revision=excluded.content_revision,generated_at=excluded.generated_at,format_version=1,data_json=excluded.data_json`)

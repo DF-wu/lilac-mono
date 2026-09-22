@@ -1,3 +1,4 @@
+import { SUMMARY_QUIET_MS } from "./thread-summary-policy";
 import { captureError } from "../shared/error-capture.js";
 import {
   AISDKError,
@@ -62,7 +63,6 @@ import { stripLeadingContinueDirective } from "../surface/discord/discord-reques
 import { isSqliteBusyError } from "../shared/sqlite";
 import { adaptToolResultToHost } from "../tools/tool-result-adapters";
 
-const SUMMARY_QUIET_MS = 60 * 60 * 1000;
 const SUMMARY_HEAD_MESSAGES = 40;
 const SUMMARY_TAIL_MESSAGES = 160;
 const SUMMARY_MAX_MESSAGES = SUMMARY_HEAD_MESSAGES + SUMMARY_TAIL_MESSAGES;

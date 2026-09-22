@@ -1,3 +1,4 @@
+import { SUMMARY_QUIET_MS } from "./thread-summary-policy";
 import { CONVERSATION_FACET_WEIGHTS as FACET_WEIGHTS } from "./thread-search-weights";
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
@@ -1530,7 +1531,7 @@ export class ConversationThreadStore {
     force?: boolean;
   }): ConversationThreadSummarizationEligibility[] {
     const now = input?.now ?? Date.now();
-    const quietMs = input?.quietMs ?? 60 * 60 * 1000;
+    const quietMs = input?.quietMs ?? SUMMARY_QUIET_MS;
     const embeddingModelId =
       input?.force !== true && input?.includeEmbeddingStale === true
         ? input.embeddingModelId

@@ -21,7 +21,10 @@ import {
 import { discoverSkills, type DiscoveredSkill } from "@stanley2058/lilac-utils/skills";
 import { toDurableResolvedModelPlan, type CoreConfig } from "@stanley2058/lilac-utils";
 import type { CustomCommandManager } from "../../custom-commands/manager";
-import type { ConversationThreadToolService } from "../../conversation/thread-service";
+import type {
+  ConversationThreadRunSummarizationInput,
+  ConversationThreadToolService,
+} from "../../conversation/thread-service";
 import type { McpRegistryApi } from "../../mcp/registry-types";
 import type { CoreResourceService } from "../../resource";
 import type { SqliteTranscriptStore } from "../../transcript/transcript-store";
@@ -50,7 +53,7 @@ import { createNativeRpcServices, nativeViewer } from "./rpc-services";
 import { createNativeSurfaceRuntimeDescriptor } from "./runtime-descriptor";
 import { NativeSearchService } from "./search";
 import { NativeExternalThreads } from "./search-external";
-import { NativeSummaryRefresher } from "./search-summary";
+import { NativeSummaryRefresher, emptyNativeSummaryResult } from "./search-summary";
 import { NativeSearchStore } from "./store-search";
 import { NativeSummaryStore } from "./store-search-summary";
 import { NativeSurfaceStore } from "./store-surface";
@@ -695,12 +698,13 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       return Result.ok(undefined);
     });
   }
-  async function refreshSummaries(input: { limit?: number } = {}) {
+  async function refreshSummaries(input: ConversationThreadRunSummarizationInput = {}) {
     if (
       summaryAbort.signal.aborted ||
-      !options.getConfig().conversation.thread.summarization.enabled
+      (input.trigger === "periodic" &&
+        !options.getConfig().conversation.thread.summarization.enabled)
     )
-      return Result.ok({ refreshed: 0, discarded: 0 });
+      return Result.ok(emptyNativeSummaryResult(input.dryRun));
     return summaryRefresher.refresh({ ...input, abortSignal: summaryAbort.signal });
   }
   function scopedResources(request: NativeRunnerRequest) {

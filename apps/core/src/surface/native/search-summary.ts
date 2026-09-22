@@ -2,6 +2,8 @@ import { Result, type Result as ResultType } from "better-result";
 import type { CoreConfig } from "@stanley2058/lilac-utils";
 import {
   defaultSummarizer,
+  type ConversationThreadRunSummarizationInput,
+  type ConversationThreadRunSummarizationResult,
   type ConversationThreadGenerationError,
 } from "../../conversation/thread-service";
 import type { NativeThreadRecord } from "./codec";
@@ -22,6 +24,21 @@ function boundedMessages(messages: NativeSearchMessage[]): NativeSearchMessage[]
   return messages.map((message) => ({ ...message, text: message.text.slice(0, perMessage) }));
 }
 
+export function emptyNativeSummaryResult(dryRun = false): ConversationThreadRunSummarizationResult {
+  return {
+    dryRun,
+    refreshed: { channels: 0, threads: 0, messages: 0 },
+    eligible: 0,
+    eligibleTotal: 0,
+    eligibility: { summary: 0, embeddingOnly: 0, reasons: {} },
+    cleared: 0,
+    summarized: 0,
+    failed: 0,
+    failures: [],
+    threadIds: [],
+  };
+}
+
 export class NativeSummaryRefresher {
   constructor(
     private readonly params: {
@@ -35,22 +52,55 @@ export class NativeSummaryRefresher {
   ) {}
 
   async refresh(
-    input: { limit?: number; abortSignal?: AbortSignal } = {},
-  ): Promise<ResultType<{ refreshed: number; discarded: number }, NativeSummaryRefreshError>> {
+    input: ConversationThreadRunSummarizationInput & { abortSignal?: AbortSignal } = {},
+  ): Promise<ResultType<ConversationThreadRunSummarizationResult, NativeSummaryRefreshError>> {
     return Result.gen(async function* () {
-      const candidates = yield* this.params.summaries.candidates(input.limit);
-      let refreshed = 0;
-      let discarded = 0;
+      if (input.abortSignal?.aborted) return Result.ok(emptyNativeSummaryResult(input.dryRun));
+      const result = yield* this.prepareRefresh(input);
+      if (input.clear && input.dryRun) return Result.ok(result);
+      const candidates = yield* this.params.summaries.candidates({
+        ...input,
+        now: input.now ?? (this.params.now ?? Date.now)(),
+      });
+      const selected = candidates.slice(
+        0,
+        input.limit === undefined ? candidates.length : Math.min(10000, Math.max(1, input.limit)),
+      );
+      result.eligibleTotal = candidates.length;
+      result.eligible = selected.length;
+      result.eligibility.summary = candidates.length;
+      result.threadIds = selected.map((thread) => thread.id);
       for (const thread of candidates) {
+        const previous = yield* this.params.summaries.get(thread.id);
+        const contentReason = previous ? "content-changed" : "never-summarized";
+        const reason = input.force ? "forced" : contentReason;
+        result.eligibility.reasons[reason] = (result.eligibility.reasons[reason] ?? 0) + 1;
+      }
+      if (input.dryRun) return Result.ok(result);
+      for (const thread of selected) {
         if (input.abortSignal?.aborted) break;
         const written = yield* Result.await(this.refreshThread(thread, input.abortSignal));
-        if (written) {
-          refreshed += 1;
-          continue;
-        }
-        discarded += 1;
+        if (written) result.summarized += 1;
       }
-      return Result.ok({ refreshed, discarded });
+      return Result.ok(result);
+    }, this);
+  }
+
+  private prepareRefresh(
+    input: ConversationThreadRunSummarizationInput,
+  ): ResultType<ConversationThreadRunSummarizationResult, NativeStoreError> {
+    return Result.gen(function* () {
+      const result = emptyNativeSummaryResult(input.dryRun);
+      if (!input.clear) return Result.ok(result);
+      const cleared = yield* this.params.summaries.clear(input);
+      if (!input.dryRun) return Result.ok({ ...result, cleared: cleared.length });
+      return Result.ok({
+        ...result,
+        eligible: cleared.length,
+        eligibleTotal: cleared.length,
+        eligibility: { summary: cleared.length, embeddingOnly: 0, reasons: {} },
+        threadIds: cleared,
+      });
     }, this);
   }
 
@@ -66,14 +116,15 @@ export class NativeSummaryRefresher {
         limit: INPUT_MESSAGE_LIMIT / 2,
         offset: Math.max(first.messages.length, first.total - INPUT_MESSAGE_LIMIT / 2),
       });
-      const previous = yield* this.params.summaries.get(thread.id);
+      if (first.thread.revision !== thread.revision || content.thread.revision !== thread.revision)
+        return Result.ok(false);
       const messages = boundedMessages([...first.messages, ...content.messages]);
       const summary = yield* Result.await(
         (this.params.summarize ?? defaultSummarizer)({
           cfg: this.params.getConfig(),
           abortSignal,
           threadId: thread.id,
-          previousSummary: previous?.summary ?? null,
+          previousSummary: null,
           promptContext: null,
           messages: messages.map((message) => ({
             channelId: thread.id,

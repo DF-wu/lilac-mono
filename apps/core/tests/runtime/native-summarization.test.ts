@@ -39,7 +39,7 @@ describe("native summary scheduling", () => {
       async (input) => {
         entered.resolve(input);
         await complete.promise;
-        return Result.ok({ refreshed: 2, discarded: 0 });
+        return Result.ok({ ...emptyResult(), summarized: 2 });
       },
     );
     const worker = startConversationThreadWorker({
@@ -55,7 +55,7 @@ describe("native summary scheduling", () => {
     });
     const tick = scheduled.shift()!;
     const running = tick();
-    expect(await entered.promise).toEqual({ limit: 3 });
+    expect(await entered.promise).toMatchObject({ limit: 3, trigger: "periodic" });
     expect(legacyCalls).toBe(1);
     let stopped = false;
     const stopping = worker.stop().then(() => {
@@ -71,20 +71,65 @@ describe("native summary scheduling", () => {
     expect(scheduled).toHaveLength(0);
   });
 
-  it("does not run models for manual, dry-run or individual legacy-thread operations", async () => {
+  it("includes native refresh for manual, dry-run and scoped operations", async () => {
     let nativeCalls = 0;
     const runner = withNativeThreadSummaries(
       { runSummarization: async () => Result.ok(emptyResult()) },
       async () => {
         nativeCalls += 1;
-        return Result.ok({ refreshed: 1, discarded: 0 });
+        return Result.ok({ ...emptyResult(), summarized: 1 });
       },
     );
     await runner.runSummarization();
     await runner.runSummarization({ trigger: "periodic", dryRun: true });
     await runner.runSummarization({ trigger: "periodic", threadId: "discord-thread" });
-    expect(nativeCalls).toBe(0);
+    expect(nativeCalls).toBe(3);
     expect((await runner.runSummarization({ trigger: "periodic" })).unwrap().summarized).toBe(1);
+  });
+
+  it("forwards manual scope and combines native eligibility and completion counts", async () => {
+    const input = {
+      trigger: "manual" as const,
+      threadId: "native:thread",
+      beforeTs: 5000,
+      afterTs: 10,
+      now: 8000,
+      force: true,
+      clear: true,
+      limit: 2,
+      dryRun: true,
+    };
+    const runner = withNativeThreadSummaries(
+      {
+        runSummarization: async () =>
+          Result.ok({
+            ...emptyResult(),
+            dryRun: true,
+            eligible: 1,
+            eligibleTotal: 2,
+            eligibility: { summary: 2, embeddingOnly: 0, reasons: { forced: 2 } },
+            threadIds: ["discord"],
+          }),
+      },
+      async (received) => {
+        expect(received).toEqual(input);
+        return Result.ok({
+          ...emptyResult(),
+          dryRun: true,
+          eligible: 1,
+          eligibleTotal: 3,
+          eligibility: { summary: 3, embeddingOnly: 0, reasons: { forced: 3 } },
+          threadIds: ["native"],
+        });
+      },
+    );
+    expect((await runner.runSummarization(input)).unwrap()).toMatchObject({
+      dryRun: true,
+      eligible: 2,
+      eligibleTotal: 5,
+      eligibility: { summary: 5, embeddingOnly: 0, reasons: { forced: 5 } },
+      threadIds: ["discord", "native"],
+    });
   });
 
   it("returns a native model failure through the existing scheduler error contract", async () => {
