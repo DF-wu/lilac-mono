@@ -629,7 +629,7 @@ export function ResourcePreview({
       }}
     >
       <DialogContent
-        className="resource-preview-dialog"
+        className="resource-preview-dialog translate-none"
         showCloseButton={false}
         // Portal events must not reach the attachment's context-menu trigger.
         onContextMenu={(event) => event.stopPropagation()}
