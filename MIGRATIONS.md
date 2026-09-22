@@ -1,5 +1,19 @@
 # MIGRATIONS.md
 
+## Conversation references
+
+Native web adds `references.resolve` and `references.read`, and display-message metadata accepts an
+optional `reference` containing surface, session ID and optional source message ID. Update Core and
+web together because older strict response validators reject this metadata. References persist as
+ordinary Markdown links in existing message and draft text; there is no database migration or backfill.
+Core expands those links into agent coordinates under the native thread starter's authority.
+
+Browser panel state accepts thread-preview tabs. Older clients may discard saved tabs when reading
+this new variant; sidebar and panel widths remain readable. Native and external message links use
+`/?ref=<surface>:<sessionId>&message=<messageId>` with URL-encoded query values. Omitting `message`
+opens the session at its normal latest position. A reference grants no access. Missing external
+history is not fetched from Discord.
+
 ## Retained external runs
 
 The native external conversation view now reads retained agent runs rather than live channel messages.

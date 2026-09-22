@@ -315,3 +315,37 @@ test("refocusing a resolved file preserves its media type and path while updatin
   });
   expect(store.getState().tabs.get("thread")?.items).toHaveLength(2);
 });
+
+test("thread previews reuse a conversation tab and preserve message navigation on reload", () => {
+  const storage = memoryStorage();
+  const store = createPanelStore(scope, storage);
+  store
+    .getState()
+    .openThread(
+      "origin",
+      { surface: "discord", sessionId: "session", messageId: "first" },
+      "Title",
+      "conversation",
+    );
+  store
+    .getState()
+    .openThread(
+      "origin",
+      { surface: "discord", sessionId: "session", messageId: "second" },
+      "Title",
+      "conversation",
+    );
+  store
+    .getState()
+    .openThread(
+      "origin",
+      { surface: "discord", sessionId: "session", messageId: "third" },
+      "Other",
+      "other-conversation",
+    );
+  const restored = createPanelStore(scope, storage).getState();
+  const tabs = restored.tabs.get("origin")!.items.filter((tab) => tab.type === "thread");
+  expect(tabs).toHaveLength(2);
+  expect(tabs[0]?.target.messageId).toBe("second");
+  expect(restored.threads.get("origin")?.open).toBe(true);
+});

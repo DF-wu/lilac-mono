@@ -1,0 +1,79 @@
+import { z } from "zod";
+
+export const conversationReferenceSchema = z.strictObject({
+  surface: z.enum(["native", "discord", "github"]),
+  sessionId: z
+    .string()
+    .min(1)
+    .max(512)
+    .regex(/^[^\s?&]+$/u),
+  messageId: z
+    .string()
+    .min(1)
+    .max(128)
+    .regex(/^[A-Za-z0-9_-]+$/u)
+    .optional(),
+});
+export type ConversationReference = z.infer<typeof conversationReferenceSchema>;
+
+export function referenceHref(target: ConversationReference): string {
+  const query = new URLSearchParams({ ref: `${target.surface}:${target.sessionId}` });
+  if (target.messageId) query.set("message", target.messageId);
+  return `/?${query}`;
+}
+
+export function parseReferenceHref(
+  href: string,
+  origin?: string,
+): ConversationReference | undefined {
+  const base = origin ?? "https://lilac.invalid";
+  if (!URL.canParse(href, base)) return;
+  const url = new URL(href, base);
+  if (url.origin !== base || url.pathname !== "/" || url.hash) return;
+  const ref = url.searchParams.get("ref");
+  const separator = ref?.indexOf(":") ?? -1;
+  if (!ref || separator < 1) return;
+  const decoded = conversationReferenceSchema.safeParse({
+    surface: ref.slice(0, separator),
+    sessionId: ref.slice(separator + 1),
+    ...(url.searchParams.has("message") ? { messageId: url.searchParams.get("message") } : {}),
+  });
+  return decoded.success ? decoded.data : undefined;
+}
+
+export function referenceKey(target: ConversationReference): string {
+  return `${target.surface}:${target.sessionId}`;
+}
+
+export function referencedConversations(text: string): ConversationReference[] {
+  const refs = new Map<string, ConversationReference>();
+  // Code examples must not become agent context, including unfinished fenced blocks.
+  let fence: string | undefined;
+  const prose = text
+    .split("\n")
+    .map((line) => {
+      const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+      if (fence) {
+        if (
+          marker &&
+          marker[1]![0] === fence[0] &&
+          marker[1]!.length >= fence.length &&
+          !marker[2]!.trim()
+        )
+          fence = undefined;
+        return "";
+      }
+      if (marker) {
+        fence = marker[1];
+        return "";
+      }
+      return /^( {4}|\t)/.test(line) ? "" : line;
+    })
+    .join("\n")
+    .replace(/(`+)[\s\S]*?\1/g, "");
+  for (const match of prose.matchAll(/(?<!\\)\[[^\]\n]*\]\((\/\?ref=[^\s)]+)\)/g)) {
+    const target = parseReferenceHref(match[1]!.replace(/\\&/g, "&"));
+    if (target) refs.set(referenceHref(target), target);
+  }
+  return [...refs.values()];
+}

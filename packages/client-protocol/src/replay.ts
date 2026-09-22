@@ -1,3 +1,4 @@
+import { conversationReferenceSchema } from "./references.ts";
 import type { UIMessage } from "ai";
 import { z } from "zod";
 
@@ -27,6 +28,7 @@ export const replayCheckpointSchema = z.strictObject({
 
 export const messageMetadataSchema = z.strictObject({
   externalRunId: identitySchema.optional(),
+  reference: conversationReferenceSchema.optional(),
   authorId: identitySchema.optional(),
   authorDisplayName: z.string().min(1).max(256).optional(),
   position: revisionSchema.optional(),

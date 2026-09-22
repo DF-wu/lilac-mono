@@ -1,3 +1,4 @@
+import { conversationReferenceSchema } from "./references.ts";
 import type { InferContractRouterInputs, InferContractRouterOutputs } from "@orpc/contract";
 import { eventIterator, oc } from "@orpc/contract";
 import { z } from "zod";
@@ -342,6 +343,35 @@ export const nativeContract = {
       )
       .output(configDocumentSchema),
     reloadMcp: procedure.input(z.strictObject({})).output(mcpReloadReplySchema),
+  },
+  references: {
+    resolve: procedure.input(conversationReferenceSchema).output(
+      z.strictObject({
+        title: z.string().max(512),
+        conversationThreadId: z.string().max(512).optional(),
+        sourceUrl: z.url().optional(),
+      }),
+    ),
+    read: procedure
+      .input(
+        z.strictObject({
+          target: conversationReferenceSchema,
+          cursor: identitySchema.optional(),
+          direction: z.enum(["before", "after"]).optional(),
+        }),
+      )
+      .output(
+        z.strictObject({
+          title: z.string().max(512),
+          messages: z.array(displayMessageSchema).max(128),
+          nextCursor: identitySchema.optional(),
+          messageFound: z.boolean(),
+          checkpoint: replayCheckpointSchema.optional(),
+          anchorMessageId: identitySchema.optional(),
+          nextAfter: identitySchema.optional(),
+          sourceUrl: z.url().optional(),
+        }),
+      ),
   },
   search: {
     query: procedure

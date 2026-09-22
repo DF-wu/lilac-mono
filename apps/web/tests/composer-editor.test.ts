@@ -1,3 +1,4 @@
+import { referencedConversations } from "@stanley2058/lilac-client-protocol";
 import { expect, it } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -362,4 +363,20 @@ it("keeps an asynchronous paste range current and releases it on insertion or ca
   canceled.insert("must not appear");
   expect(composerMarkdown(editor)).not.toContain("must not appear");
   expect(editor.api.rangeRefs().size).toBe(0);
+});
+
+it("preserves conversation reference chips through drafts, send, edit and paste", () => {
+  const markdown = "[#native:thread](/?ref=native%3Athread&message=message)";
+  const editor = createComposerEditor(markdown);
+  expect([...editor.api.nodes({ at: [], match: { type: "composer_reference" } })]).toHaveLength(1);
+  expect(composerPlainText(editor)).not.toBe("");
+  const sent = composerSubmissionMarkdown(editor);
+  expect(referencedConversations(sent)).toEqual([
+    { surface: "native", sessionId: "thread", messageId: "message" },
+  ]);
+  expect(composerMarkdown(createComposerEditor(sent))).toBe(sent);
+  expect(resolveComposerAttachments(sent, new Map())).toBe(sent);
+  const pasted = createComposerEditor("Before ");
+  captureComposerPaste(pasted).insert(sent);
+  expect(referencedConversations(composerMarkdown(pasted))).toEqual(referencedConversations(sent));
 });

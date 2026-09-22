@@ -39,6 +39,7 @@ function fixture(
     Pick<SqliteTranscriptStore, "getCoreSurfaceProjection" | "getLatestCoreSurfaceSegment">
   >,
   history?: ExternalHistory,
+  extraReplyIds: readonly string[] = [],
 ) {
   let reads = 0;
   const service = new NativeExternalThreads({
@@ -102,6 +103,11 @@ function fixture(
               channelId: s.sessionId,
               messageId: `reply-${s.requestId}`,
             },
+            ...extraReplyIds.map((messageId) => ({
+              platform: "discord" as const,
+              channelId: s.sessionId,
+              messageId,
+            })),
           ],
         })),
       getRequestTranscript: ({ requestId }) => {
@@ -665,4 +671,89 @@ describe("retained external runs", () => {
     });
     expect(JSON.stringify(page.messages)).not.toContain("compacted context summary");
   });
+});
+
+test("message links retain Discord coordinates and restrict previews to the containing conversation", async () => {
+  const metadata = formatSurfaceMetadataLine({
+    platform: "discord",
+    user_id: "42",
+    user_name: "Stanley",
+    message_id: "question",
+    channel_id: "123",
+  });
+  const first = snapshot("first", 1, [
+    { role: "user", content: `${metadata}\nQuestion` },
+    { role: "assistant", content: "First answer" },
+  ]);
+  const second = snapshot("second", 2, [{ role: "assistant", content: "Second answer" }]);
+  const history: ExternalHistory = {
+    getMessagePosition: (_channelId, messageId) => ({
+      threadId: messageId === "reply-second" ? "other-thread" : "first-thread",
+      ordinal: 0,
+      authorId: "42",
+    }),
+    listMessagePositionsBefore: () => [],
+  };
+  const { service } = fixture([first, second], undefined, undefined, undefined, history);
+  const target = { surface: "discord" as const, sessionId: "123", messageId: "reply-first" };
+  expect(service.resolveReference("owner", target).unwrap()).toEqual({
+    conversationThreadId: "first-thread",
+  });
+  expect(service.resolveReference("participant", target).isErr()).toBe(true);
+  const page = (await service.readReference("owner", { target })).unwrap();
+  expect(page.messageFound).toBe(true);
+  expect(
+    page.messages
+      .flatMap((m) => m.parts)
+      .filter((p) => p.type === "text")
+      .map((p) => p.text),
+  ).toContain("First answer");
+  expect(
+    page.messages
+      .flatMap((m) => m.parts)
+      .filter((p) => p.type === "text")
+      .map((p) => p.text),
+  ).not.toContain("Second answer");
+  expect(page.messages.find((m) => m.role === "assistant")?.metadata?.reference).toEqual(target);
+  expect(page.sourceUrl).toBe("https://discord.com/channels/456/123/reply-first");
+  expect(page.nextAfter).toBeUndefined();
+  expect(page.nextCursor).toBeUndefined();
+  const session = (
+    await service.readReference("owner", { target: { surface: "discord", sessionId: "123" } })
+  ).unwrap();
+  expect(session.messages.some((m) => m.metadata?.reference?.messageId === "reply-second")).toBe(
+    true,
+  );
+  const missing = (
+    await service.readReference("owner", { target: { ...target, messageId: "missing" } })
+  ).unwrap();
+  expect(missing.messageFound).toBe(false);
+});
+
+test("a link to a later Discord output chunk highlights the assistant, not its input", async () => {
+  const header = formatSurfaceMetadataLine({
+    platform: "discord",
+    user_id: "42",
+    user_name: "Stanley",
+    message_id: "question",
+    channel_id: "123",
+  });
+  const run = snapshot("split", 1, [
+    { role: "user", content: `${header}\nQuestion` },
+    { role: "assistant", content: "Long answer" },
+  ]);
+  const { service } = fixture([run], undefined, undefined, undefined, undefined, ["second-chunk"]);
+  const page = (
+    await service.readReference("owner", {
+      target: { surface: "discord", sessionId: "123", messageId: "second-chunk" },
+    })
+  ).unwrap();
+  expect(page.messages[0]?.role).toBe("user");
+  expect(page.messageFound).toBe(true);
+  expect(page.messages.find((message) => message.id === page.anchorMessageId)?.role).toBe(
+    "assistant",
+  );
+  expect(
+    page.messages.find((message) => message.role === "assistant")?.metadata?.reference?.messageId,
+  ).toBe("reply-split");
 });

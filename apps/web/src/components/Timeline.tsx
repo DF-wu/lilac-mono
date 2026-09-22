@@ -1,3 +1,5 @@
+import { CopyReferenceItem, useConversation } from "./ConversationReference";
+import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from "./ui/context-menu";
 import { useSubagents, subagentProfileName } from "./subagent-context";
 import type { SubagentSummary } from "@stanley2058/lilac-client-protocol";
 import { copyMessage, messageClipboard } from "../message-clipboard";
@@ -845,6 +847,17 @@ const MessageBody = memo(function MessageBody(
 ) {
   const { resourceUrl, canEdit, onAction, onReaction } = useMessageServices();
   const { message } = props;
+  const conversation = useConversation();
+  const timeline = useContext(TimelineContext);
+  const reference =
+    message.metadata?.reference ??
+    (timeline
+      ? { surface: "native" as const, sessionId: timeline.threadId, messageId: message.id }
+      : conversation);
+  const copyReference =
+    conversation?.surface === "native" && !timeline
+      ? { ...conversation, messageId: message.id }
+      : reference;
   const [copyError, setCopyError] = useState<string>();
   const [copiedAt, setCopiedAt] = useState(0);
   useEffect(() => {
@@ -906,7 +919,7 @@ const MessageBody = memo(function MessageBody(
         })}
       </time>
     ) : null;
-  const copy =
+  const copyButton =
     copyText || attachments.length ? (
       <IconButton
         label="Copy message"
@@ -925,6 +938,19 @@ const MessageBody = memo(function MessageBody(
         {copiedAt ? <CopyCheck /> : <Copy />}
       </IconButton>
     ) : null;
+  const copy =
+    copyReference && copyButton ? (
+      <ContextMenu>
+        <ContextMenuTrigger render={<span className="inline-flex" />}>
+          {copyButton}
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <CopyReferenceItem target={copyReference} />
+        </ContextMenuContent>
+      </ContextMenu>
+    ) : (
+      copyButton
+    );
   return (
     <LiveMessageContext value={props.live ?? false}>
       <ChatMessage

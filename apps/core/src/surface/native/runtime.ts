@@ -1,3 +1,4 @@
+import { NativeReferences } from "./references";
 import type { NativeStoreError } from "./store";
 import { serverToolFailure } from "@stanley2058/lilac-plugin-runtime";
 import type { NativeAttachmentOutput } from "../../tool-server/tools/attachment";
@@ -153,6 +154,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     remoteDenyPaths: options.denyPaths,
   });
   const execution = createNativeExecution({
+    expandReferences: (userId, text) => references.expand(userId, text),
     metrics,
     store,
     bus: options.bus,
@@ -202,6 +204,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
       .map(() => undefined)
       .mapError(() => nativeFailure("sqlite", "Native action publication failed")),
   );
+  const references = new NativeReferences(store, surface, external);
   const initialized = surface
     .initialize()
     .andThen(() => resources.reconcileReferences())
@@ -280,6 +283,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   });
   const nativeConfig = options.getConfig().surface.native;
   const services = createNativeRpcServices({
+    references,
     files: liveFiles,
     subagents: new NativeSubagents({
       native: store,

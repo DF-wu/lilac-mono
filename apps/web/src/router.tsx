@@ -11,6 +11,8 @@ import {
 } from "@tanstack/react-router";
 
 const workspaceSearchSchema = z.object({
+  ref: z.string().min(1).max(1024).optional(),
+  message: z.string().min(1).max(128).optional(),
   view: z.enum(["archived", "others"]).optional(),
   otherThread: z.string().min(1).optional(),
   settings: z.enum(["account", "options", "theme", "core", "mcp", "agent", "users"]).optional(),

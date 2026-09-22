@@ -1,3 +1,8 @@
+import {
+  conversationReferenceSchema,
+  referenceKey,
+  type ConversationReference,
+} from "@stanley2058/lilac-client-protocol";
 import type { FileTarget } from "./file-target";
 import { Result } from "better-result";
 import { createStore } from "zustand/vanilla";
@@ -45,6 +50,14 @@ const tabsSchema = z
   .object({
     items: z.array(
       z.discriminatedUnion("type", [
+        z
+          .object({
+            id: z.string(),
+            type: z.literal("thread"),
+            target: conversationReferenceSchema,
+            title: z.string(),
+          })
+          .strict(),
         z.object({ id: z.literal("agents"), type: z.literal("agents") }).strict(),
         z.object({ id: z.string(), type: z.literal("file"), target: fileTargetSchema }).strict(),
       ]),
@@ -72,6 +85,7 @@ type PanelLayouts = {
   tabs: Map<string, PanelTabs>;
 };
 export type PanelTab =
+  | { id: string; type: "thread"; target: ConversationReference; title: string }
   | { id: string; type: "agents" }
   | { id: string; type: "file"; target: FileTarget };
 export type PanelTabs = { items: PanelTab[]; activeId?: string };
@@ -102,6 +116,12 @@ function navigateFile(current: FileTarget, requested: FileTarget): FileTarget {
   };
 }
 type PanelStore = PanelLayouts & {
+  openThread: (
+    threadId: string,
+    target: ConversationReference,
+    title: string,
+    conversationThreadId?: string,
+  ) => void;
   openAgents: (threadId: string) => void;
   focusTab: (threadId: string, id: string) => void;
   closeTab: (threadId: string, id: string) => void;
@@ -195,6 +215,20 @@ export function createPanelStore(
     }
     return {
       ...initial,
+      openThread: (threadId, target, title, conversationThreadId) => {
+        const current = get().tabs.get(threadId) ?? defaultPanelTabs;
+        const conversation =
+          target.surface === "native"
+            ? target.sessionId
+            : (conversationThreadId ?? target.messageId ?? "session");
+        const id = `thread:${referenceKey(target)}:${conversation}`;
+        const tab: PanelTab = { id, type: "thread", target, title };
+        const items = current.items.some((item) => item.id === id)
+          ? current.items.map((item) => (item.id === id ? tab : item))
+          : [...current.items, tab];
+        updateTabs(threadId, { items, activeId: id });
+        updateRight(threadId, { open: true });
+      },
       openAgents,
       focusTab: (threadId, id) => {
         const current = get().tabs.get(threadId) ?? defaultPanelTabs;

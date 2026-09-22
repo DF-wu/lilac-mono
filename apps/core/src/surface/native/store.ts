@@ -947,6 +947,10 @@ export class NativeStore {
     );
   }
 
+  getCheckpoint(actorId: string, threadId: string): NativeStoreResult<ReplayCheckpoint> {
+    return this.authorizeThread(actorId, threadId).map((thread) => this.checkpoint(thread));
+  }
+
   private checkpoint(thread: NativeThreadRecord): ReplayCheckpoint {
     return {
       protocolVersion: 1,

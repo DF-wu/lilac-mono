@@ -3803,6 +3803,14 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : [],
     boundaryDecoders: [
+      ...(root === "packages/client-protocol"
+        ? [
+            {
+              identity: { module: "src/references.ts", exportName: "parseReferenceHref" },
+              category: "wire" as const,
+            },
+          ]
+        : []),
       ...(root === "apps/web"
         ? [
             {

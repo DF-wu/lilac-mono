@@ -1,3 +1,4 @@
+import type { ConversationReference } from "@stanley2058/lilac-client-protocol";
 import {
   decodeSentAttachmentMetadata,
   decodeSentAttachmentStdout,
@@ -325,6 +326,7 @@ function projectRun(input: {
   viewerId?: string;
   linkedDiscordIds?: readonly string[];
   outputs?: readonly RequestOutputLifecycle<CoreRequestOutputMetadata>[];
+  reference: ConversationReference;
 }): DisplayMessage[] {
   const messages: DisplayMessage[] = [];
   const id = runId(input.snapshot.requestId);
@@ -367,7 +369,11 @@ function projectRun(input: {
       messages.push({
         id: `xm_${id}_${index}_files_${offset}`,
         role: "assistant",
-        metadata: { externalRunId: input.conversationId, createdAt: input.snapshot.createdTs },
+        metadata: {
+          externalRunId: input.conversationId,
+          createdAt: input.snapshot.createdTs,
+          reference: { surface: input.reference.surface, sessionId: input.reference.sessionId },
+        },
         parts: attachments.slice(offset, offset + 128),
       });
   }
@@ -431,6 +437,16 @@ function projectRun(input: {
         id: `xm_${id}_${index}_${offset}`,
         role: message.role,
         metadata: {
+          reference:
+            message.role === "assistant"
+              ? input.reference
+              : {
+                  surface: input.reference.surface,
+                  sessionId: input.reference.sessionId,
+                  ...(typeof metadata?.message_id === "string"
+                    ? { messageId: metadata.message_id }
+                    : {}),
+                },
           externalRunId: input.conversationId,
           createdAt: input.snapshot.createdTs,
           authorDisplayName: `${authorName.slice(0, 240)} (${input.platform === "discord" ? "Discord" : "GitHub"})`,
@@ -445,7 +461,11 @@ function projectRun(input: {
     messages.push({
       id: resourceId,
       role: "assistant",
-      metadata: { externalRunId: input.conversationId, createdAt: input.snapshot.createdTs },
+      metadata: {
+        externalRunId: input.conversationId,
+        createdAt: input.snapshot.createdTs,
+        reference: { surface: input.reference.surface, sessionId: input.reference.sessionId },
+      },
       parts: [
         {
           type: "data-resource",
@@ -605,12 +625,94 @@ export class NativeExternalThreads {
     }, this);
   }
 
-  async read(
+  resolveReference(
     userId: string,
-    input: { threadId: string; cursor?: string },
+    target: ConversationReference,
+  ): ResultType<{ conversationThreadId?: string }, NativeStoreError> {
+    return Result.gen(function* () {
+      yield* owner(this.params.getUser, userId);
+      if (!target.messageId) return Result.ok({});
+      const position = this.params.history?.getMessagePosition(target.sessionId, target.messageId);
+      if (position) return Result.ok({ conversationThreadId: position.threadId });
+      const run = retainedRuns(this.params.transcripts).find(
+        (run) =>
+          run.platform === target.surface &&
+          run.channelId === target.sessionId &&
+          run.record.surfaceRefs.some((ref) => ref.messageId === target.messageId),
+      );
+      const origin =
+        run && this.params.history ? cachedPosition(this.params.history, run.record) : null;
+      return Result.ok(origin ? { conversationThreadId: origin.threadId } : {});
+    }, this);
+  }
+
+  async describeReference(userId: string, target: ConversationReference) {
+    return Result.gen(async function* () {
+      const resolved = yield* this.resolveReference(userId, target);
+      const run = retainedRuns(this.params.transcripts).find(
+        (run) => run.platform === target.surface && run.channelId === target.sessionId,
+      );
+      if (!run) return Result.err(nativeFailure("not-found", "Conversation is unavailable"));
+      const display = this.display(run, await this.sessions());
+      const sourceUrl =
+        display.sourceUrl && target.messageId
+          ? `${display.sourceUrl}/${target.messageId}`
+          : display.sourceUrl;
+      return Result.ok({ title: display.title, ...resolved, ...(sourceUrl ? { sourceUrl } : {}) });
+    }, this);
+  }
+
+  async read(userId: string, input: { threadId: string; cursor?: string }) {
+    return (await this.readPage(userId, input)).map(
+      ({ messageFound: _found, nextAfter: _after, anchorMessageId: _anchor, ...page }) => page,
+    );
+  }
+
+  async readReference(
+    userId: string,
+    input: { target: ConversationReference; cursor?: string; direction?: "before" | "after" },
+  ) {
+    if (input.target.surface === "native")
+      return Result.err(nativeFailure("invalid", "Expected an external reference"));
+    return (
+      await this.readPage(userId, {
+        threadId: externalThreadId(input.target.surface, input.target.sessionId),
+        cursor: input.cursor,
+        messageId: input.target.messageId,
+        direction: input.direction,
+      })
+    ).map((page) => ({
+      title: page.thread.title,
+      messages: page.messages,
+      nextCursor: page.nextCursor,
+      nextAfter: page.nextAfter,
+      messageFound: page.messageFound,
+      anchorMessageId: page.anchorMessageId,
+      sourceUrl:
+        page.thread.sourceUrl && input.target.messageId
+          ? `${page.thread.sourceUrl}/${input.target.messageId}`
+          : page.thread.sourceUrl,
+    }));
+  }
+
+  private async readPage(
+    userId: string,
+    input: {
+      threadId: string;
+      cursor?: string;
+      messageId?: string;
+      direction?: "before" | "after";
+    },
   ): Promise<
     ResultType<
-      { thread: ExternalThreadDisplay; messages: DisplayMessage[]; nextCursor?: string },
+      {
+        thread: ExternalThreadDisplay;
+        messages: DisplayMessage[];
+        nextCursor?: string;
+        nextAfter?: string;
+        anchorMessageId?: string;
+        messageFound: boolean;
+      },
       NativeStoreError
     >
   > {
@@ -636,8 +738,58 @@ export class NativeExternalThreads {
       const groups = new Map<string, string>();
       const records = new Map(runs.map((run) => [run.record.requestId, run.record]));
       let nextCursor: string | undefined;
-      for (; index < runs.length; index++) {
+      let nextAfter: string | undefined;
+      let anchorMessageId: string | undefined;
+      let anchored = false;
+      const forward = input.direction === "after";
+      let messageFound = !input.messageId || !!input.cursor;
+      let targetGroup: string | undefined;
+      if (input.messageId) {
+        const position = this.params.history?.getMessagePosition(ref.sessionId, input.messageId);
+        if (position) targetGroup = runId(position.threadId);
+        const linked = runs.find((run) =>
+          run.record.surfaceRefs.some((item) => item.messageId === input.messageId),
+        );
+        if (!targetGroup && linked)
+          targetGroup = yield* conversationGroup(
+            this.params.transcripts,
+            linked.record.requestId,
+            groups,
+            records,
+            this.params.history,
+          );
+      }
+      const runGroups = new Map<string, string>();
+      for (const run of runs) {
+        runGroups.set(
+          run.record.requestId,
+          yield* conversationGroup(
+            this.params.transcripts,
+            run.record.requestId,
+            groups,
+            records,
+            this.params.history,
+          ),
+        );
+      }
+      function adjacentCursor(from: number, step: -1 | 1): string | undefined {
+        for (let next = from + step; next >= 0 && next < runs.length; next += step) {
+          const run = runs[next]!;
+          if (targetGroup && runGroups.get(run.record.requestId) !== targetGroup) continue;
+          return `${runId(run.record.requestId)}_${step === -1 ? 0 : Number.MAX_SAFE_INTEGER}`;
+        }
+        return undefined;
+      }
+      for (; index >= 0 && index < runs.length; index += forward ? -1 : 1) {
         const run = runs[index]!;
+        const group = yield* conversationGroup(
+          this.params.transcripts,
+          run.record.requestId,
+          groups,
+          records,
+          this.params.history,
+        );
+        if (targetGroup && group !== targetGroup) continue;
         const snapshot = yield* this.params.transcripts
           .getRequestTranscript({ requestId: run.record.requestId })
           .mapError(() => nativeFailure("sqlite", "Run history is unavailable"));
@@ -667,23 +819,67 @@ export class NativeExternalThreads {
           viewerId: userId,
           linkedDiscordIds,
           outputs,
+          reference: {
+            surface: ref.platform,
+            sessionId: ref.sessionId,
+            messageId: run.record.surfaceRefs.find(
+              (item) => item.platform === ref.platform && item.channelId === ref.sessionId,
+            )?.messageId,
+          },
         });
-        const stop = Math.min(end ?? projected.length, projected.length);
-        const start = Math.max(0, stop - (100 - messages.length));
-        messages.unshift(...projected.slice(start, stop));
-        if (start > 0) {
+        if (!targetGroup && input.messageId && input.cursor) targetGroup = group;
+        if (!messageFound) {
+          const anchor = projected.findIndex(
+            (message) => message.metadata?.reference?.messageId === input.messageId,
+          );
+          const linked = run.record.surfaceRefs.some((item) => item.messageId === input.messageId);
+          if (anchor < 0 && !linked) continue;
+          messageFound = true;
+          anchorMessageId =
+            projected[anchor]?.id ??
+            projected.find(
+              (message) => message.role === "assistant" && message.metadata?.reference?.messageId,
+            )?.id;
+          targetGroup = group;
+          if (anchor >= 0) end = Math.min(projected.length, anchor + 21);
+        }
+        const stop = forward
+          ? Math.min(projected.length, (end ?? 0) + 100 - messages.length)
+          : Math.min(end ?? projected.length, projected.length);
+        const start = forward ? (end ?? 0) : Math.max(0, stop - (100 - messages.length));
+        if (forward) messages.push(...projected.slice(start, stop));
+        else messages.unshift(...projected.slice(start, stop));
+        if (forward && !anchored) {
+          anchored = true;
+          if (start > 0) nextCursor = `${runId(run.record.requestId)}_${start}`;
+          else nextCursor = adjacentCursor(index, 1);
+        }
+        if (!forward && (input.messageId || input.cursor) && !anchored) {
+          anchored = true;
+          if (stop < projected.length) nextAfter = `${runId(run.record.requestId)}_${stop}`;
+          else nextAfter = adjacentCursor(index, -1);
+        }
+        if (forward && stop < projected.length) {
+          nextAfter = `${runId(run.record.requestId)}_${stop}`;
+          break;
+        }
+        if (!forward && start > 0) {
           nextCursor = `${runId(run.record.requestId)}_${start}`;
           break;
         }
         end = undefined;
-        if (messages.length === 100 && index + 1 < runs.length) {
-          nextCursor = `${runId(runs[index + 1]!.record.requestId)}_${Number.MAX_SAFE_INTEGER}`;
+        if (messages.length === 100) {
+          if (forward) nextAfter = adjacentCursor(index, -1);
+          else nextCursor = adjacentCursor(index, 1);
           break;
         }
       }
       const sessions = await this.sessions();
       return Result.ok({
         thread: this.display(newest, sessions),
+        messageFound,
+        ...(anchorMessageId ? { anchorMessageId } : {}),
+        ...(nextAfter ? { nextAfter } : {}),
         messages,
         ...(nextCursor ? { nextCursor } : {}),
       });

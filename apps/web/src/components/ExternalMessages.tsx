@@ -13,6 +13,7 @@ export function ExternalMessages({
   hasMore,
   loading,
   onLoadMore,
+  targetMessageId,
 }: {
   messages: readonly DisplayMessage[];
   resourceUrl: (id: string) => string;
@@ -20,7 +21,9 @@ export function ExternalMessages({
   hasMore: boolean;
   loading: boolean;
   onLoadMore: () => void;
+  targetMessageId?: string;
 }) {
+  const navigated = useRef<string>(undefined);
   const parent = useRef<HTMLDivElement>(null);
   const [positioning, setPositioning] = useState(0);
   const getItemKey = useCallback((index: number) => messages[index]!.id, [messages]);
@@ -44,6 +47,20 @@ export function ExternalMessages({
     if (positioning >= 2) return;
     virtual.scrollToEnd();
     setPositioning((value) => value + 1);
+  });
+  useLayoutEffect(() => {
+    if (!targetMessageId || positioning < 2 || navigated.current === targetMessageId) return;
+    const index = messages.findIndex(
+      (message) =>
+        message.id === targetMessageId ||
+        message.metadata?.reference?.messageId === targetMessageId,
+    );
+    if (index < 0) return;
+    virtual.scrollToIndex(index, { align: "center" });
+    const element = parent.current?.querySelector<HTMLElement>(`[data-index="${index}"]`);
+    if (!element) return;
+    element.scrollIntoView({ block: "center" });
+    navigated.current = targetMessageId;
   });
   const total = virtual.getTotalSize();
   const offset = virtual.scrollOffset ?? 0;
@@ -75,7 +92,7 @@ export function ExternalMessages({
               key={row.key}
               ref={virtual.measureElement}
               data-index={row.index}
-              className="absolute top-0 left-0 w-full"
+              className={`absolute top-0 left-0 w-full ${targetMessageId && (messages[row.index]!.id === targetMessageId || messages[row.index]!.metadata?.reference?.messageId === targetMessageId) ? "bg-accent" : ""}`}
               style={{ transform: `translateY(${row.start}px)` }}
             >
               {row.index > 0 &&
