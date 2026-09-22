@@ -13,6 +13,7 @@ import {
 import { Button } from "./ui/button";
 import { attempt } from "./ui";
 import { toast } from "./ui/toast";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
 export const ConversationContext = createContext<ConversationReference | undefined>(undefined);
 export const useConversation = () => useContext(ConversationContext);
@@ -105,31 +106,44 @@ export function ConversationBadge({ target }: { target: ConversationReference })
       : undefined);
   return (
     <ReferenceActions target={target} sourceUrl={sourceUrl}>
-      <Button
-        variant="secondary"
-        className="inline-flex max-w-full h-auto gap-1 align-baseline py-0 px-2 rounded-sm [font-size:inherit] [font-weight:inherit] [line-height:inherit]"
-        title={target.messageId ? `${title} · ${target.messageId}` : title}
-        render={<a href={referenceHref(target)} />}
-        onClick={(event) => {
-          if (
-            !workspace ||
-            !viewer ||
-            event.metaKey ||
-            event.ctrlKey ||
-            event.shiftKey ||
-            event.altKey
-          )
-            return;
-          event.preventDefault();
-          workspace.panels
-            .getState()
-            .openThread(viewer.threadId, target, title, query.data?.conversationThreadId);
-        }}
-      >
-        <ConversationIcon surface={target.surface} />
-        <span className="truncate">{title}</span>
-        {target.messageId ? <Link2 className="size-3 shrink-0" /> : null}
-      </Button>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              variant="secondary"
+              className="no-underline hover:no-underline hover:text-secondary-foreground inline-flex max-w-full h-auto gap-1 align-baseline py-0 px-2 rounded-sm [font-size:inherit] [font-weight:inherit] [line-height:inherit]"
+              render={<a href={referenceHref(target)} />}
+              onClick={(event) => {
+                if (
+                  !workspace ||
+                  !viewer ||
+                  event.metaKey ||
+                  event.ctrlKey ||
+                  event.shiftKey ||
+                  event.altKey
+                )
+                  return;
+                event.preventDefault();
+                workspace.panels
+                  .getState()
+                  .openThread(viewer.threadId, target, title, query.data?.conversationThreadId);
+              }}
+            >
+              <ConversationIcon surface={target.surface} />
+              <span className="truncate">{title}</span>
+              {target.messageId ? <Link2 className="size-3 shrink-0" /> : null}
+            </Button>
+          }
+        />
+        <TooltipContent className="max-w-sm">
+          <div className="min-w-0 space-y-1 break-words">
+            <div className="font-medium">{title}</div>
+            <div>{{ native: "Native", discord: "Discord", github: "GitHub" }[target.surface]}</div>
+            <div className="break-all">Conversation: {target.sessionId}</div>
+            {target.messageId ? <div className="break-all">Message: {target.messageId}</div> : null}
+          </div>
+        </TooltipContent>
+      </Tooltip>
     </ReferenceActions>
   );
 }

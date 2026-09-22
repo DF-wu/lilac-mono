@@ -184,21 +184,23 @@ export function ThreadReferenceView({
             Load newer messages
           </Button>
         ) : null}
-        <ExternalMessages
-          key={key}
-          messages={messages}
-          resourceUrl={resourceUrl}
-          loadDirection="start"
-          targetMessageId={
-            read.data?.pages.find((page) => page.anchorMessageId)?.anchorMessageId ??
-            target.messageId
-          }
-          hasMore={!!read.hasNextPage && !read.error && active}
-          loading={read.isFetching}
-          onLoadMore={() => {
-            void read.fetchNextPage({ cancelRefetch: false });
-          }}
-        />
+        <div className={`flex flex-1 min-h-0 flex-col ${panel ? "px-3" : ""}`}>
+          <ExternalMessages
+            key={key}
+            messages={messages}
+            resourceUrl={resourceUrl}
+            loadDirection="start"
+            targetMessageId={
+              read.data?.pages.find((page) => page.anchorMessageId)?.anchorMessageId ??
+              target.messageId
+            }
+            hasMore={!!read.hasNextPage && !read.error && active}
+            loading={read.isFetching}
+            onLoadMore={() => {
+              void read.fetchNextPage({ cancelRefetch: false });
+            }}
+          />
+        </div>
       </section>
     </ConversationContext>
   );
