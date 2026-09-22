@@ -457,7 +457,7 @@
     background: var(--ui-background);
     color: var(--ui-foreground);
     border-radius: var(--ui-radius-sm);
-    padding: calc(var(--ui-space-unit) * 1);
+    padding: calc(var(--ui-space-unit) * 0.5) var(--ui-space-unit);
   }
   .markdown pre {
     padding: calc(var(--ui-space-unit) * 4);
