@@ -12,7 +12,11 @@ import { materializeStoredMessagesV1 } from "../transcript/stored-message-materi
 export const mcpImageCheckpointReferenceSchema = z.strictObject({
   toolCallId: z.string().min(1),
   outputIndex: z.number().int().nonnegative(),
-  localPath: z.string().regex(/^\/[^\0]+$/u),
+  localPath: z
+    .string()
+    .min(2)
+    .startsWith("/")
+    .refine((value) => !value.includes("\0")),
   mediaType: z.string().startsWith("image/"),
   byteLength: z.number().int().nonnegative(),
   sha256: z.string().regex(/^[0-9a-f]{64}$/u),

@@ -1957,7 +1957,9 @@ describe("SqliteTranscriptStore", () => {
     const legacy = new Database(dbPath);
     legacy.run("DROP TRIGGER delete_transcript_surface_aliases");
     legacy.run("ALTER TABLE surface_message_to_request DROP COLUMN deleted_ts");
-    legacy.run("DELETE FROM transcript_schema_migrations WHERE version = 11");
+    legacy.run("DROP TABLE core_native_transcript_refs");
+    legacy.run("DROP TABLE core_native_resource_refs");
+    legacy.run("DELETE FROM transcript_schema_migrations WHERE version >= 11");
     legacy.close();
 
     const migrated = new SqliteTranscriptStore(dbPath);
@@ -2188,7 +2190,7 @@ describe("SqliteTranscriptStore", () => {
     const version = migrated
       .query("SELECT MAX(version) AS version FROM transcript_schema_migrations")
       .get();
-    expect(version).toEqual({ version: 11 });
+    expect(version).toEqual({ version: 13 });
     expect(migrated.query("PRAGMA foreign_key_check").all()).toEqual([]);
     const columns = migrated.query("PRAGMA table_info(request_transcripts)").all() as Array<{
       name: string;
@@ -3163,6 +3165,8 @@ describe("SqliteTranscriptStore", () => {
     schema7.run("DROP TABLE core_agent_run_checkpoint_blobs");
     schema7.run("DROP TABLE core_transcript_blob_refs");
     schema7.run("ALTER TABLE core_owned_blobs DROP COLUMN deletion_claim_ts");
+    schema7.run("DROP TABLE core_native_transcript_refs");
+    schema7.run("DROP TABLE core_native_resource_refs");
     schema7.run("DELETE FROM transcript_schema_migrations WHERE version >= 8");
     schema7.close();
     store = new SqliteTranscriptStore(dbPath);

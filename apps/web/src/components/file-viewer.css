@@ -1,0 +1,146 @@
+.file-panel-tabs-root {
+  flex: 1;
+  min-height: 0;
+  gap: 0;
+}
+
+.file-panel-tab [role="tab"] {
+  min-width: 0;
+  height: var(--ui-control-compact);
+  padding: 0 calc(var(--ui-space-unit) * 2);
+  border: 0;
+}
+.file-panel-tab [role="tab"]::after {
+  display: none;
+}
+.file-panel-tab [role="tab"][data-active] {
+  background: var(--ui-selection);
+  color: var(--ui-selection-foreground);
+}
+.file-panel-tab span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.file-panel-tab .file-tab-close {
+  position: absolute;
+  left: calc(var(--ui-space-unit) * 1);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1.25rem;
+  height: 1.25rem;
+  opacity: 0;
+  background: var(--ui-surface);
+}
+.file-panel-tab:hover .file-tab-close,
+.file-panel-tab:focus-within .file-tab-close {
+  opacity: 1;
+}
+.file-panel-tab-bar > button {
+  flex: none;
+  width: var(--ui-control-compact);
+  height: var(--ui-control-compact);
+}
+.file-panel-tab-content {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.file-panel-tab-page {
+  display: flex;
+  flex-direction: column;
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+  min-width: 0;
+}
+/* Match Tailwind preflight's layer so hidden tabs retain their virtualizer measurements. */
+@layer base {
+  .file-panel-tab-page[hidden] {
+    display: flex !important;
+    visibility: hidden;
+    pointer-events: none;
+  }
+}
+
+.file-panel-heading span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-source-toolbar .icon-button {
+  flex: none;
+  width: var(--ui-control-compact);
+  height: var(--ui-control-compact);
+}
+
+.file-code-lines {
+  position: relative;
+  width: 100%;
+}
+.file-code-line {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  grid-template-columns: 5ch minmax(0, 1fr);
+  width: 100%;
+  min-height: var(--ui-code-line-height);
+  padding-right: calc(var(--ui-space-unit) * 3);
+}
+.file-code-line code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+.file-code[data-wrap="false"] .file-code-line {
+  width: max-content;
+  min-width: 100%;
+}
+.file-code[data-wrap="false"] code {
+  white-space: pre;
+}
+
+.file-code-line[data-highlighted="true"] {
+  background: var(--ui-code-selection);
+}
+
+.markdown .file-link {
+  display: inline-flex;
+  vertical-align: baseline;
+  align-items: center;
+  gap: calc(var(--ui-space-unit) * 1);
+  padding: 0 calc(var(--ui-space-unit) * 1);
+  max-width: 100%;
+  height: auto;
+  font-family: var(--ui-font-mono);
+  font-size: 0.9em;
+  border-radius: var(--ui-radius-sm);
+}
+.file-link svg {
+  flex: none;
+  width: 1em;
+  height: 1em;
+}
+.file-link span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-panel > .attachment-preview-body {
+  padding: calc(var(--ui-space-unit) * 2);
+}
+
+.file-code-fallback[data-wrap="false"] {
+  white-space: pre;
+}
+
+.file-source-heading .file-panel-heading {
+  padding: calc(var(--ui-space-unit) * 1) calc(var(--ui-space-unit) * 1);
+}
+.file-panel-tab-page > .attachment-preview-body {
+  padding: calc(var(--ui-space-unit) * 2);
+}

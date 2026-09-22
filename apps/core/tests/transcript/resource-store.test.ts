@@ -332,6 +332,8 @@ describe("Core resource SQLite store", () => {
     schema6.run("ALTER TABLE core_owned_blobs DROP COLUMN deletion_claim_ts");
     schema6.run("DROP TABLE core_surface_projection_resource_refs");
     schema6.run("DROP TABLE core_transcript_resource_refs");
+    schema6.run("DROP TABLE core_native_transcript_refs");
+    schema6.run("DROP TABLE core_native_resource_refs");
     schema6.run("DROP TABLE core_resources");
     schema6.run("DELETE FROM transcript_schema_migrations WHERE version >= 7");
     schema6.close();
@@ -345,7 +347,7 @@ describe("Core resource SQLite store", () => {
     const inspected = new Database(dbPath);
     expect(
       inspected.query("SELECT MAX(version) AS version FROM transcript_schema_migrations").get(),
-    ).toEqual({ version: 11 });
+    ).toEqual({ version: 13 });
     expect(inspected.query("PRAGMA foreign_key_check").all()).toEqual([]);
     inspected.close();
     await fs.rm(directory, { recursive: true, force: true });

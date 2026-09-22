@@ -249,7 +249,10 @@ export interface SurfaceAdapter {
   disconnect(): Promise<void>;
   getSelf(): Promise<SurfaceSelf>;
 
-  listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>>;
+  listSessions(opts?: {
+    limit?: number;
+    archived?: boolean;
+  }): Promise<SurfaceOperationResult<SurfaceSession[]>>;
   listSessionParticipants(
     sessionRef: SessionRef,
     opts?: { limit?: number },

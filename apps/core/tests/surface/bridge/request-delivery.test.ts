@@ -1374,6 +1374,14 @@ describe("durable request delivery", () => {
         }),
       ).requestId,
     ).toBe(aliasRequestId);
+    expect(value(store.listOutputsForRequest(originalRequestId))).toEqual([]);
+    expect(value(store.listOutputsForRequest(aliasRequestId))).toMatchObject([
+      {
+        requestId: aliasRequestId,
+        target: { kind: "handle", blob: outputUpload.handle },
+        metadata: { mimeType: "text/plain" },
+      },
+    ]);
     const resumed: string[] = [];
     value(
       await delivery.recoverAccepted(async (record) => {

@@ -71,7 +71,6 @@ lilac_main() {
     esac
   fi
   lilac_release_base=${lilac_release_base%/}
-  lilac_asset="lilac-${lilac_os}-${lilac_arch}"
   lilac_tmp=$(mktemp -d "${TMPDIR:-/tmp}/lilac-install.XXXXXXXX")
   trap 'rm -rf "$lilac_tmp"' EXIT
   trap 'exit 130' INT
@@ -79,17 +78,20 @@ lilac_main() {
 
   printf 'Downloading Lilac for %s/%s…\n' "$lilac_os" "$lilac_arch"
   lilac_download "$lilac_release_base/SHA256SUMS" "$lilac_tmp/SHA256SUMS"
-  lilac_download "$lilac_release_base/$lilac_asset" "$lilac_tmp/lilac"
-  lilac_expected=$(awk -v asset="$lilac_asset" '$2 == asset { print $1 }' "$lilac_tmp/SHA256SUMS")
-  [[ "$lilac_expected" =~ ^[0-9a-f]{64}$ ]] || lilac_fail 'The release checksum list has no unique valid entry for this installer.'
+  for lilac_binary in lilac; do
+    lilac_asset="${lilac_binary}-${lilac_os}-${lilac_arch}"
+    lilac_download "$lilac_release_base/$lilac_asset" "$lilac_tmp/$lilac_binary"
+    lilac_expected=$(awk -v asset="$lilac_asset" '$2 == asset { print $1 }' "$lilac_tmp/SHA256SUMS")
+    [[ "$lilac_expected" =~ ^[0-9a-f]{64}$ ]] || lilac_fail "The release checksum list has no unique valid entry for $lilac_binary."
 
-  if [ "$lilac_checksum_command" = sha256sum ]; then
-    lilac_actual=$(sha256sum "$lilac_tmp/lilac")
-  else
-    lilac_actual=$(shasum -a 256 "$lilac_tmp/lilac")
-  fi
-  [ "${lilac_actual%% *}" = "$lilac_expected" ] || lilac_fail 'Installer checksum verification failed. No installer was run.'
-  chmod 700 "$lilac_tmp/lilac"
+    if [ "$lilac_checksum_command" = sha256sum ]; then
+      lilac_actual=$(sha256sum "$lilac_tmp/$lilac_binary")
+    else
+      lilac_actual=$(shasum -a 256 "$lilac_tmp/$lilac_binary")
+    fi
+    [ "${lilac_actual%% *}" = "$lilac_expected" ] || lilac_fail "$lilac_binary checksum verification failed. No installer was run."
+    chmod 700 "$lilac_tmp/$lilac_binary"
+  done
   "$lilac_tmp/lilac" --version || lilac_fail 'The downloaded installer cannot run on this machine.'
   "$lilac_tmp/lilac" "$@" <&3
 }

@@ -36,6 +36,7 @@ const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const platformSchema = z.enum([
   "discord",
   "github",
+  "native",
   "whatsapp",
   "slack",
   "telegram",

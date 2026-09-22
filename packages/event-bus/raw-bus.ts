@@ -63,7 +63,8 @@ export interface RawBus {
   /**
    * Subscribe to a topic. The transport owns acknowledgement and applies the
    * handler's disposition. `park-pending` leaves durable entries in the PEL; it
-   * does not schedule or imply automatic retry/reclamation.
+   * does not schedule or imply automatic retry/reclamation. Durable `startFrom`
+   * applies only when creating a group; it never resets an existing frontier.
    */
   subscribe(
     topic: Topic,

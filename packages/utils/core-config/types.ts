@@ -188,6 +188,43 @@ export const IMAGE_GENERATION_MODEL_ALIASES = [
 
 export type ImageGenerationModelAlias = (typeof IMAGE_GENERATION_MODEL_ALIASES)[number];
 
+export type NativeSurfaceConfig = {
+  enabled: boolean;
+  host: string;
+  port: number;
+  publicUrl: string;
+  installationId?: string;
+  allowedOrigins: string[];
+  auth: {
+    provider: "local" | "clerk";
+    ownerId: string;
+    ownerProviderUserId?: string;
+    clerkIssuer?: string;
+    clerkOAuthClientId?: string;
+  };
+  titleModel: string;
+  outputStreaming: "paragraph" | "complete";
+  oldMessageSelectionMaxAgeMs: number | null;
+  storageRetentionMaxAgeMs: number | null;
+  crossThreadSend: { triggerRun: boolean };
+};
+
+export function defaultNativeSurfaceConfig(): NativeSurfaceConfig {
+  return {
+    enabled: false,
+    host: "127.0.0.1",
+    port: 8789,
+    publicUrl: "http://localhost:8789",
+    allowedOrigins: ["http://localhost:8789"],
+    auth: { provider: "local", ownerId: "owner" },
+    titleModel: "fast",
+    outputStreaming: "paragraph",
+    oldMessageSelectionMaxAgeMs: null,
+    storageRetentionMaxAgeMs: null,
+    crossThreadSend: { triggerRun: true },
+  };
+}
+
 export type UniversalCoreConfig = {
   configVersion: CoreConfigVersion;
 
@@ -282,6 +319,7 @@ export type UniversalCoreConfig = {
   };
 
   surface: {
+    native: NativeSurfaceConfig;
     router: {
       defaultMode: "mention" | "active";
       sessionModes: Record<

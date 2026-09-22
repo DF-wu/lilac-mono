@@ -1,4 +1,5 @@
 import { discordSurfaceProtocol } from "./discord/discord-surface-protocol";
+import { nativeSurfaceProtocol } from "./native/native-protocol";
 import { githubSurfaceProtocol } from "./github/github-surface-protocol";
 import { telegramSurfaceProtocol } from "./telegram/telegram-surface-protocol";
 import {
@@ -13,6 +14,7 @@ export const BUILTIN_SURFACE_PROTOCOLS = {
   discord: discordSurfaceProtocol,
   github: githubSurfaceProtocol,
   telegram: telegramSurfaceProtocol,
+  native: nativeSurfaceProtocol,
 } satisfies {
   [P in RegisteredSurfacePlatform]: SurfaceProtocolRouting<P>;
 };

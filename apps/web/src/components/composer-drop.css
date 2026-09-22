@@ -1,0 +1,6 @@
+.composer-window-drop > svg {
+  width: calc(var(--ui-space-unit) * 12);
+  height: calc(var(--ui-space-unit) * 12);
+  color: var(--ui-primary);
+  stroke-width: 1.5;
+}

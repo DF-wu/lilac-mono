@@ -138,6 +138,7 @@ export type Level1SubagentConfig = {
 };
 
 export type Level1ExecutionRequestContext<P extends string = string> = {
+  serverOwnedRequest?: boolean;
   requestId: string;
   requestDeliveryId?: string;
   sessionId: string;

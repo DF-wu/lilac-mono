@@ -51,7 +51,8 @@ type EventFamily =
   | "lifecycle"
   | "adapter"
   | "surface"
-  | "agent-output";
+  | "agent-output"
+  | "native-output";
 
 type CompatibilityFixture = {
   readonly family: EventFamily;
@@ -250,6 +251,24 @@ const compatibilityFixtures = [
     key: "request-1",
     headers: { request_id: "request-1" },
     data: {},
+  }),
+  compatibilityFixture({
+    family: "native-output",
+    type: "evt.native.output",
+    topic: "evt.native.output",
+    key: "thread-1",
+    data: {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      generation: 0,
+      requestId: "request-1",
+      attemptId: "attempt-1",
+      sequence: 1,
+      ordinal: 1,
+      eventId: "event-1",
+      occurredAt: 1,
+      payload: { type: "terminal", state: "complete" },
+    },
   }),
   compatibilityFixture({
     family: "surface",
@@ -463,8 +482,8 @@ function expectDecodeError(message: Message<unknown>, stage: LilacEventDecodeSta
 }
 
 describe("canonical Lilac event codecs", () => {
-  it("registers one valid consumer fixture for every event type across all six families", () => {
-    expect(Object.keys(lilacEventCodecRegistry)).toHaveLength(25);
+  it("registers one valid consumer fixture for every event type across all seven families", () => {
+    expect(Object.keys(lilacEventCodecRegistry)).toHaveLength(26);
     expect(Object.keys(lilacEventCodecRegistry).sort()).toEqual(
       Object.values(lilacEventTypes).sort(),
     );
@@ -480,6 +499,7 @@ describe("canonical Lilac event codecs", () => {
         "adapter",
         "surface",
         "agent-output",
+        "native-output",
       ]),
     );
     expect(compatibilityFixtures.filter(({ family }) => family === "command-request")).toHaveLength(
@@ -500,6 +520,7 @@ describe("canonical Lilac event codecs", () => {
         "adapter",
         "surface",
         "agent-output",
+        "native-output",
       ]),
     );
 

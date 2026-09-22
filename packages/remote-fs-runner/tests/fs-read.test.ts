@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -96,5 +96,22 @@ describe("remote fs runner reads", () => {
     expect(output.error).toContain("too large to inline");
     expect(output.error).not.toContain("Remote file too large");
     expect("base64" in output).toBeFalse();
+  });
+  it("returns bounded base64 and original size for a large prefix read", async () => {
+    await using handle = await open(path.join(baseDir, "large.txt"), "w");
+    await handle.write(Buffer.alloc(65_536, 97));
+    await handle.truncate(1_073_741_824);
+    const output = await handleRequest({
+      op: "fs.read_bytes",
+      input: { path: "large.txt", prefixBytes: 65_536, maxBytes: 65_536 },
+      denyPaths: [],
+      cwd: baseDir,
+    });
+    expect(output.ok).toBe(true);
+    if (!output.ok) throw new Error(output.error);
+    expect(output.bytesLength).toBe(65_536);
+    expect(output.totalBytes).toBe(1_073_741_824);
+    expect(Buffer.from(output.base64, "base64").toString()).toBe("a".repeat(65_536));
+    expect(JSON.stringify(output).length).toBeLessThan(90_000);
   });
 });

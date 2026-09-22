@@ -994,6 +994,19 @@ export class SqliteRequestDeliveryStore<TEnvelope, TWork, TOutputMetadata> {
     );
   }
 
+  listOutputsForRequest(
+    requestId: string,
+  ): ResultType<readonly RequestOutputLifecycle<TOutputMetadata>[], RequestDeliveryStoreError> {
+    return transaction(this.#database, "list-request-outputs", () => {
+      const rows = this.#database
+        .query<RequestOutputRow, [string]>(
+          "SELECT * FROM request_delivery_outputs WHERE request_id = ? ORDER BY created_at, object_id",
+        )
+        .all(requestId);
+      return Result.all(rows.map((row) => this.#decodeOutput(row)));
+    });
+  }
+
   listDueOutputs(input: {
     readonly now: number;
     readonly limit?: number;

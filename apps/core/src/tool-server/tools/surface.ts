@@ -14,7 +14,12 @@ import {
 import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
 import { isAdapterPlatform } from "../../shared/is-adapter-platform";
-import { hasCacheBurstProvider, type SurfaceOperationError } from "../../surface/adapter";
+import {
+  hasCacheBurstProvider,
+  type SurfaceAdapter,
+  type SurfaceOperationError,
+  type SurfaceOperationResult,
+} from "../../surface/adapter";
 import type {
   ResolvedSurfaceAdapter,
   SurfaceAdapterResolver,
@@ -206,7 +211,7 @@ function createSurfaceMessageRef<P extends RegisteredSurfacePlatform>(
 }
 
 const surfaceClientSchema = z
-  .enum(["discord", "github", "whatsapp", "slack", "telegram", "web"])
+  .enum(["discord", "github", "native", "whatsapp", "slack", "telegram", "web"])
   .describe(
     "Recognized surface wire client/platform. Execution requires a registered adapter and is selected from request context unless --client is needed.",
   );
@@ -562,9 +567,12 @@ function toAttachmentMeta(attachment: DiscordAttachmentMeta): SurfaceMessageAtta
 }
 
 function getMessageAttachmentMeta(msg: SurfaceMessage): SurfaceMessageAttachmentMeta[] {
-  return msg.session.platform === "discord"
-    ? projectDiscordMessage(msg).attachments.map(toAttachmentMeta)
-    : [];
+  if (msg.session.platform === "discord")
+    return projectDiscordMessage(msg).attachments.map(toAttachmentMeta);
+  return (msg.attachments ?? []).map((attachment) => ({
+    ...attachment,
+    kind: attachmentKindFromMimeType(attachment.mimeType),
+  }));
 }
 
 function buildAttachmentHints(
@@ -672,6 +680,8 @@ function toCompactMessage(
     ts: msg.ts,
   };
 
+  if (msg.replyTo) out["replyToMessageId"] = msg.replyTo.messageId;
+
   if (typeof msg.editedTs === "number") out["editedTs"] = msg.editedTs;
   if (typeof msg.deleted === "boolean") out["deleted"] = msg.deleted;
 
@@ -689,7 +699,7 @@ function toCompactMessage(
     }
   }
 
-  const attachments = discord?.attachments.map(toAttachmentMeta) ?? [];
+  const attachments = getMessageAttachmentMeta(msg);
   const mediaFiles = attachments.filter((a) => a.kind !== "file");
   const hints = buildAttachmentHints(attachments);
 
@@ -786,6 +796,10 @@ function buildMessagesReadOutput(params: {
 const sessionsListInputSchema = baseInputSchema
   .extend({
     limit: sessionsListLimitSchema,
+    archived: z
+      .boolean()
+      .optional()
+      .describe("Native only: list archived threads instead of active threads."),
   })
   .strict();
 
@@ -1016,6 +1030,7 @@ export class Surface implements ServerTool {
   constructor(
     private readonly params: {
       adapterResolver: SurfaceAdapterResolver;
+      nativeAdapterForContext?: (context: RequestContext) => SurfaceOperationResult<SurfaceAdapter>;
       config?: CoreConfig;
       getConfig?: () => Promise<CoreConfig>;
       discordSearch?: DiscordSearchService;
@@ -1039,7 +1054,7 @@ export class Surface implements ServerTool {
             "List recent visible writes produced by the agent, with session ids, message ids, and thin previews.",
           inputSchema: activitiesRecentAgentWritesInputSchema,
           validation: "zod",
-          run: (input) => this.callActivitiesRecentAgentWrites(input),
+          run: (input, opts) => this.callActivitiesRecentAgentWrites(input, opts?.context),
         }),
         "surface.sessions.list": callable({
           name: "Surface Sessions List",
@@ -1253,6 +1268,21 @@ export class Surface implements ServerTool {
       inputClient,
       ctx,
       resolver: this.params.adapterResolver,
+    }).andThen((resolved) => {
+      if (resolved.platform !== "native") return Result.ok(resolved);
+      if (
+        !ctx?.serverOwnedRequest ||
+        ctx.requestInitiator?.platform !== "native" ||
+        !this.params.nativeAdapterForContext
+      ) {
+        return Result.err(
+          surfaceFailure("denied", "Native surface tools require an authenticated native request"),
+        );
+      }
+      return surfaceOperationResult(this.params.nativeAdapterForContext(ctx)).map((adapter) => ({
+        ...resolved,
+        adapter,
+      }));
     });
   }
 
@@ -1353,10 +1383,14 @@ export class Surface implements ServerTool {
     });
   }
 
-  private linkSentMessageToTranscript(ref: MsgRef, ctx: RequestContext | undefined): void {
+  private linkSentMessageToTranscript(
+    ref: MsgRef,
+    ctx: RequestContext | undefined,
+  ): ResultType<void, ServerToolFailure> {
     const requestId = ctx?.requestId;
-    if (!requestId || !this.params.transcriptStore) return;
-    if (!ctx?.sessionId || !isHeartbeatSessionId(ctx.sessionId)) return;
+    if (!requestId || !this.params.transcriptStore) return Result.ok(undefined);
+    if (ref.platform !== "native" && (!ctx?.sessionId || !isHeartbeatSessionId(ctx.sessionId)))
+      return Result.ok(undefined);
 
     {
       const attempt = Result.try({
@@ -1373,13 +1407,21 @@ export class Surface implements ServerTool {
       if (attempt.isErr()) {
         const cause = attempt.error.cause;
         if (Panic.is(cause)) preserveToolPanic(cause);
-        // Best-effort only. Do not fail the send on transcript linkage issues.
+        if (ref.platform === "native")
+          return Result.err(
+            surfaceFailure(
+              "unavailable",
+              "Message was sent but could not be linked to its transcript",
+            ),
+          );
       }
     }
+    return Result.ok(undefined);
   }
 
   private async callActivitiesRecentAgentWrites(
     input: z.output<typeof activitiesRecentAgentWritesInputSchema>,
+    ctx: RequestContext | undefined,
   ): Promise<ServerToolResult> {
     const transcriptStore = this.params.transcriptStore;
     const listRecentAgentWrites = transcriptStore?.listRecentAgentWrites;
@@ -1422,6 +1464,25 @@ export class Surface implements ServerTool {
         offset += rows.length;
 
         for (const row of rows) {
+          if (ctx?.requestClient === "native" && row.client !== "native") continue;
+          let nativeText: string | undefined;
+          if (row.client === "native") {
+            const native = this.resolveAdapter("native", ctx).match({
+              ok: (value) => value,
+              err: () => null,
+            });
+            if (!native) continue;
+            const message = (
+              await native.adapter.readMsg(
+                createSurfaceMessageRef(
+                  native.protocol.refs.createSessionRef(row.sessionId),
+                  row.messageId,
+                ),
+              )
+            ).match({ ok: (value) => value, err: () => null });
+            if (!message) continue;
+            nativeText = message.text;
+          }
           if (row.client === "discord") {
             const discord = this.params.adapterResolver.resolve("discord");
             if (!discord) continue;
@@ -1441,17 +1502,19 @@ export class Surface implements ServerTool {
             }
           }
 
-          const text = (
-            await Result.tryPromise({
-              try: () => this.readRecentAgentWriteText(row),
-              catch: captureSurfaceFailure,
-            })
-          )
-            .mapError((failure) => surfaceExternalFailure(failure))
-            .match({
-              ok: (value) => value,
-              err: () => row.finalText ?? "",
-            });
+          const text =
+            nativeText ??
+            (
+              await Result.tryPromise({
+                try: () => this.readRecentAgentWriteText(row),
+                catch: captureSurfaceFailure,
+              })
+            )
+              .mapError((failure) => surfaceExternalFailure(failure))
+              .match({
+                ok: (value) => value,
+                err: () => row.finalText ?? "",
+              });
 
           const preview = toPreviewText(text);
 
@@ -1495,7 +1558,13 @@ export class Surface implements ServerTool {
       return cfgResult.andThenAsync(async (cfg) => {
         const limit = input.limit ?? Number.POSITIVE_INFINITY;
 
-        const sessionsResult = surfaceOperationResult(await resolved.adapter.listSessions());
+        const sessionsResult = surfaceOperationResult(
+          await resolved.adapter.listSessions(
+            resolved.platform === "native"
+              ? { limit: input.limit, archived: input.archived }
+              : undefined,
+          ),
+        );
         return sessionsResult.andThen((sessions) => {
           const out: Array<{
             channelId: string;
@@ -1629,7 +1698,7 @@ export class Surface implements ServerTool {
         });
         if (allowed) filtered.push(message);
       }
-      const referencedByMessageKey =
+      let referencedByMessageKey =
         target.resolved.platform === "discord" && discordCfg
           ? yield* Result.await(
               resolveDiscordReferencedMessages({
@@ -1640,6 +1709,17 @@ export class Surface implements ServerTool {
               }),
             )
           : undefined;
+
+      if (target.resolved.platform === "native") {
+        referencedByMessageKey = new Map();
+        for (const message of filtered) {
+          if (!message.replyTo) continue;
+          const referenced = yield* surfaceOperationResult(
+            await target.resolved.adapter.readMsg(message.replyTo),
+          );
+          if (referenced) referencedByMessageKey.set(surfaceMessageKey(message), referenced);
+        }
+      }
 
       return Result.ok(
         buildMessagesListOutput({
@@ -1716,7 +1796,7 @@ export class Surface implements ServerTool {
           );
         }
       }
-      const referenced =
+      let referenced =
         target.resolved.platform === "discord" && target.cfg
           ? yield* Result.await(
               resolveDiscordReferencedMessage({
@@ -1727,6 +1807,11 @@ export class Surface implements ServerTool {
               }),
             )
           : undefined;
+      if (msg.replyTo && target.resolved.platform === "native") {
+        referenced = yield* surfaceOperationResult(
+          await target.resolved.adapter.readMsg(msg.replyTo),
+        );
+      }
       return Result.ok(
         buildMessagesReadOutput({
           session: target.sessionRef,
@@ -1903,7 +1988,7 @@ export class Surface implements ServerTool {
         ),
       );
 
-      linkSentMessageToTranscript(ref, ctx);
+      yield* linkSentMessageToTranscript(ref, ctx);
 
       return Result.ok({
         ok: true as const,
@@ -1940,6 +2025,7 @@ export class Surface implements ServerTool {
   ): Promise<ServerToolResult> {
     const resolveAdapter = this.resolveAdapter.bind(this);
     const resolveSessionTarget = this.resolveSessionTarget.bind(this);
+    const transcriptStore = this.params.transcriptStore;
     return Result.gen(async function* () {
       const resolved = yield* resolveAdapter(decodedInput.client, ctx);
       const input = yield* withDefaultSessionId(decodedInput, ctx);
@@ -1950,6 +2036,11 @@ export class Surface implements ServerTool {
           createSurfaceMessageRef(target.sessionRef, input.messageId),
         ),
       );
+      if (target.resolved.platform === "native" && transcriptStore?.unlinkSurfaceMessage) {
+        yield* transcriptStore
+          .unlinkSurfaceMessage(createSurfaceMessageRef(target.sessionRef, input.messageId))
+          .mapError((error) => surfaceFailure("unavailable", error.message));
+      }
       return Result.ok({ ok: true as const });
     });
   }

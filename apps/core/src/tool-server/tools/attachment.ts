@@ -613,6 +613,15 @@ async function readOutboundAttachment(input: {
   });
 }
 
+export type NativeAttachmentOutput = (
+  context: RequestContext,
+  input: {
+    filename: string;
+    mediaType: string;
+    bytes: Uint8Array;
+  },
+) => Promise<ResultType<void, ServerToolFailure>>;
+
 export class Attachment implements ServerTool {
   id = "attachment";
   private readonly tool: ServerTool;
@@ -622,7 +631,11 @@ export class Attachment implements ServerTool {
       bus: LilacBus;
       blobStore: BlobStore;
       outputLifecycle: AttachmentOutputLifecycle;
+      nativeOutput?: NativeAttachmentOutput;
       resourceAccess?: ResourceAccess;
+      resourceAccessForContext?: (
+        context: RequestContext | undefined,
+      ) => ResourceAccess | undefined;
       toolResultArtifacts?: ToolResultArtifactStore;
     },
   ) {
@@ -720,7 +733,9 @@ export class Attachment implements ServerTool {
         cwd,
         context: ctx,
         signal,
-        resourceAccess: this.params.resourceAccess,
+        resourceAccess: this.params.resourceAccessForContext
+          ? this.params.resourceAccessForContext(ctx)
+          : this.params.resourceAccess,
         transientAccess,
       });
       const loadedBranch = resultBranch(loaded);
@@ -747,6 +762,22 @@ export class Attachment implements ServerTool {
         typeFromBytes?.mime ||
         source.mimeType ||
         inferMimeTypeFromFilename(filename);
+
+      if (ctx?.requestClient === "native") {
+        if (!this.params.nativeOutput)
+          return Result.err(
+            attachmentFailure("unavailable", "Native attachment output is unavailable"),
+          );
+        const delivered = await this.params.nativeOutput(ctx, {
+          filename,
+          mediaType: mimeType,
+          bytes,
+        });
+        const deliveredBranch = resultBranch(delivered);
+        if ("failure" in deliveredBranch) return Result.err(deliveredBranch.failure);
+        out.push({ filename, mimeType, bytes: bytes.byteLength });
+        continue;
+      }
 
       const uploadResult = (
         await this.params.blobStore.startUpload({
@@ -848,7 +879,10 @@ export class Attachment implements ServerTool {
     let totalBytes = 0;
 
     if (resourceUris.length > 0) {
-      if (!this.params.resourceAccess) {
+      const resourceAccess = this.params.resourceAccessForContext
+        ? this.params.resourceAccessForContext(ctx)
+        : this.params.resourceAccess;
+      if (!resourceAccess) {
         return Result.err(
           attachmentFailure("unavailable", "Inbound resource access is unavailable"),
         );
@@ -864,7 +898,7 @@ export class Attachment implements ServerTool {
             ),
           );
         }
-        const materializedResult = await this.params.resourceAccess.materialize(uri, {
+        const materializedResult = await resourceAccess.materialize(uri, {
           targetDirectory: downloadDir,
           maxBytes: remainingBytes,
           signal,

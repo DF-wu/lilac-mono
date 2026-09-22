@@ -1250,3 +1250,27 @@ describe("durable workflow store minimal dispatch schema", () => {
     ).toBe(false);
   });
 });
+
+it("lists bounded subagent pages for only the requested parent session, including terminal runs", () => {
+  const store = new DurableWorkflowStore(":memory:");
+  try {
+    store.createRevision(revision());
+    for (let index = 0; index < 103; index++) {
+      const child = liveParentRun(`child-${String(index).padStart(3, "0")}`, "parent-request");
+      child.createdAt = 10 + index;
+      if (index === 102) child.completionTarget = { kind: "detached" };
+      if (index === 101) child.state = "succeeded";
+      expect(store.createRun(child)).toBe(true);
+    }
+    const first = workflowStoreValue(store.listSubagentRuns("session-1"));
+    expect(first).toHaveLength(101);
+    expect(first[0]?.runId).toBe("child-101");
+    expect(first[0]?.state).toBe("succeeded");
+    expect(
+      workflowStoreValue(store.listSubagentRuns("session-1", 100)).map((item) => item.runId),
+    ).toEqual(["child-001", "child-000"]);
+    expect(workflowStoreValue(store.listSubagentRuns("other-session"))).toEqual([]);
+  } finally {
+    store.close();
+  }
+});

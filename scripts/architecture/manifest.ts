@@ -359,11 +359,15 @@ export const ACTIVE_WORKSPACES = [
   ["apps/core", "@stanley2058/lilac-core"],
   ["apps/installer", "@stanley2058/lilac-installer"],
   ["apps/tool-bridge", "@stanley2058/lilac-tool-bridge"],
+  ["apps/tui", "@stanley2058/lilac-tui"],
+  ["apps/web", "@stanley2058/lilac-web"],
   ["packages/agent", "@stanley2058/lilac-agent"],
   ["packages/bash-safety", "@stanley2058/lilac-bash-safety"],
   ["packages/blob-storage", "@stanley2058/lilac-blob-storage"],
   ["packages/claude-code-bridge", "@stanley2058/lilac-claude-code-bridge"],
   ["packages/coding-tools", "@stanley2058/lilac-coding-tools"],
+  ["packages/client", "@stanley2058/lilac-client"],
+  ["packages/client-protocol", "@stanley2058/lilac-client-protocol"],
   ["packages/event-bus", "@stanley2058/lilac-event-bus"],
   ["packages/fs", "@stanley2058/lilac-fs"],
   ["packages/plugin-runtime", "@stanley2058/lilac-plugin-runtime"],
@@ -405,6 +409,7 @@ export const BLOB_STORAGE_ARCHITECTURE_POLICY = {
       module: "src/surface/bridge/request-composition/prepare-bus-messages",
     },
     { workspace: "apps/core", module: "src/resource/service" },
+    { workspace: "apps/core", module: "src/surface/native/resources" },
     { workspace: "apps/core", module: "src/tool-server/tools/attachment" },
     { workspace: "apps/core", module: "src/workflow/workflow-artifact-store" },
     {
@@ -2869,6 +2874,66 @@ const WAVE_3_OPERATIONAL_RESULT_APIS = new Map<string, readonly SymbolIdentity[]
   ],
 ]);
 
+const CORE_NATIVE_RECORD_PERSISTED_CODEC = {
+  identity: {
+    module: "src/surface/native/codec.ts",
+    exportName: "decodeNativeRecord",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/surface/native/codec.ts",
+    exportName: "nativeRecordCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_NATIVE_RECORD_PERSISTED_CONSUMERS = [
+  ...[
+    "NativeStore.readRecord",
+    "NativeStore.readRows",
+    "NativeStore.sync",
+    "NativeStore.displayStatus",
+  ].map((exportName) => ({
+    module: "src/surface/native/store.ts",
+    exportName,
+  })),
+  { module: "src/surface/native/store-surface.ts", exportName: "decodeMessageRow" },
+  {
+    module: "src/surface/native/store-search-summary.ts",
+    exportName: "NativeSummaryStore.candidates",
+  },
+].map(
+  (identity): PersistedStoreConsumerRegistration => ({
+    identity,
+    codecs: [CORE_NATIVE_RECORD_PERSISTED_CODEC.identity],
+  }),
+);
+
+const CORE_NATIVE_SUMMARY_PERSISTED_CODEC = {
+  identity: {
+    module: "src/surface/native/search-summary-codec.ts",
+    exportName: "decodeNativeSummary",
+  },
+  inputParameter: 0,
+  fixtureCatalog: {
+    module: "src/surface/native/search-summary-codec.ts",
+    exportName: "nativeSummaryCodecCases",
+  },
+  provenance: ["current"],
+  legacyOutcome: "rejected",
+} as const satisfies PersistedCodecRegistration;
+
+const CORE_NATIVE_SUMMARY_PERSISTED_CONSUMERS = [
+  "NativeSummaryStore.get",
+  "NativeSummaryStore.search",
+].map(
+  (exportName): PersistedStoreConsumerRegistration => ({
+    identity: { module: "src/surface/native/store-search-summary.ts", exportName },
+    codecs: [CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity],
+  }),
+);
+
 const CORE_THREAD_PERSISTED_CODECS = [
   {
     identity: {
@@ -3075,6 +3140,7 @@ const CORE_WORKFLOW_STORE_READ_RESULT_APIS = [
   "DurableWorkflowStore.listRevisions",
   "DurableWorkflowStore.getRun",
   "DurableWorkflowStore.listRuns",
+  "DurableWorkflowStore.listSubagentRuns",
   "DurableWorkflowStore.listRunsWithExpiredClaims",
   "DurableWorkflowStore.listActiveRuns",
   "DurableWorkflowStore.listRunsNeedingProjectionReconciliation",
@@ -3260,6 +3326,10 @@ const UTILS_SQLITE_TRANSACTION_ADAPTER_IDENTITY = {
 
 const CORE_SQLITE_TRANSACTION_CONSUMERS = [
   {
+    module: "src/surface/native/store.ts",
+    exportName: "nativeStoreTransaction",
+  },
+  {
     module: "src/conversation/thread-store.ts",
     exportName: "ConversationThreadStore.upsertSummary",
   },
@@ -3294,6 +3364,7 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
     "SqliteTranscriptStore.retainAgentRunCheckpointBlobs",
     "SqliteTranscriptStore.replaceAgentRunCheckpointBlobs",
     "SqliteTranscriptStore.reconcileAgentRunCheckpointBlobs",
+    "SqliteTranscriptStore.reconcileNativeTranscriptReferences",
   ].map((exportName) => ({
     module: "src/transcript/transcript-store.ts",
     exportName,
@@ -3339,6 +3410,14 @@ const CORE_SQLITE_TRANSACTION_CONSUMERS = [
 );
 
 const CORE_EVENT_DELIVERY_CONSUMERS = [
+  {
+    identity: {
+      module: "src/surface/native/runtime.ts",
+      exportName: "createNativeRuntime.startOutput",
+    },
+    apiPackage: "@stanley2058/lilac-event-bus",
+    operations: ["subscribeTopic"],
+  },
   {
     identity: {
       module: "src/surface/bridge/request-delivery/durable-request-bus.ts",
@@ -3478,6 +3557,11 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             ]
           : root === "apps/core"
             ? [
+                { include: CORE_NATIVE_RECORD_PERSISTED_CODEC.identity.module },
+                { include: "src/surface/native/store.ts" },
+                { include: "src/surface/native/store-surface.ts" },
+                { include: CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity.module },
+                { include: "src/surface/native/store-search-summary.ts" },
                 {
                   include: "src/conversation/thread-summary-persistence-codec.ts",
                 },
@@ -3523,6 +3607,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : root === "apps/core"
           ? [
+              { include: CORE_NATIVE_RECORD_PERSISTED_CODEC.identity.module },
+              { include: CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity.module },
               {
                 include: "src/conversation/thread-summary-persistence-codec.ts",
               },
@@ -3555,6 +3641,7 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
     "architecture/no-result-err-in-sqlite-callback":
       root === "apps/core"
         ? [
+            { include: "src/surface/native/store.ts" },
             { include: "src/conversation/thread-store.ts" },
             { include: "src/question/question-store.ts" },
             { include: "scripts/legacy-graceful-restart-blob-migration.ts" },
@@ -3590,6 +3677,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ? [UTILS_CODEX_TOKENS_PERSISTED_CODEC]
           : root === "apps/core"
             ? [
+                CORE_NATIVE_RECORD_PERSISTED_CODEC,
+                CORE_NATIVE_SUMMARY_PERSISTED_CODEC,
                 ...CORE_THREAD_PERSISTED_CODECS,
                 ...CORE_TRANSCRIPT_PERSISTED_CODECS,
                 CORE_RESOURCE_PERSISTED_CODEC,
@@ -3611,6 +3700,8 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             ? [UTILS_CODEX_TOKENS_PERSISTED_CONSUMER]
             : root === "apps/core"
               ? [
+                  ...CORE_NATIVE_RECORD_PERSISTED_CONSUMERS,
+                  ...CORE_NATIVE_SUMMARY_PERSISTED_CONSUMERS,
                   ...CORE_THREAD_PERSISTED_CONSUMERS,
                   ...CORE_TRANSCRIPT_PERSISTED_CONSUMERS,
                   CORE_CLAUDE_ATTEMPT_PERSISTED_CONSUMER,
@@ -3719,8 +3810,187 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           ]
         : [],
     boundaryDecoders: [
+      ...(root === "apps/web"
+        ? [
+            {
+              identity: { module: "src/router.tsx", exportName: "decodeWorkspaceSearch" },
+              category: "wire" as const,
+            },
+            {
+              identity: { module: "src/panel-store.ts", exportName: "decodePanelLayouts" },
+              category: "persistence" as const,
+            },
+            {
+              identity: {
+                module: "src/components/composer-editor.tsx",
+                exportName: "projectComposerNode",
+              },
+              category: "projection" as const,
+            },
+          ]
+        : []),
+      ...(root === "apps/tui"
+        ? [
+            ...["decodeOperatorSession"].map((exportName) => ({
+              identity: { module: "src/auth.ts", exportName },
+              category: "wire" as const,
+            })),
+            {
+              identity: { module: "src/session.ts", exportName: "decodeTuiBootstrap" },
+              category: "wire" as const,
+            },
+            {
+              identity: { module: "src/fatal.ts", exportName: "captureTuiException" },
+              category: "projection" as const,
+            },
+          ]
+        : []),
+      ...(root === "apps/web"
+        ? ["requestError", "decodeSessionNotice", "WebSessionController.receiveSessionEvent"].map(
+            (exportName) => ({
+              identity: { module: "src/bootstrap.ts", exportName },
+              category: "wire" as const,
+            }),
+          )
+        : []),
+      ...(root === "apps/web"
+        ? [
+            {
+              identity: { module: "src/updates.ts", exportName: "watchAppUpdates.message" },
+              category: "wire" as const,
+            },
+          ]
+        : []),
+      ...(root === "apps/web"
+        ? [
+            {
+              identity: { module: "src/components/ui.tsx", exportName: "uiError" },
+              category: "wire" as const,
+            },
+          ]
+        : []),
+      ...(root === "apps/web"
+        ? [
+            "decodeThread",
+            "decodeSlot",
+            "decodeBootstrap",
+            "decodeDraft",
+            "decodeDraftRow",
+            "localDraftId",
+          ].map((exportName) => ({
+            identity: { module: "src/cache.ts", exportName },
+            category: "persistence" as const,
+          }))
+        : []),
+      ...(root === "apps/web"
+        ? [
+            {
+              identity: { module: "src/draft-thread.ts", exportName: "restoreDraftThread" },
+              category: "persistence" as const,
+            },
+          ]
+        : []),
+      ...(root === "apps/web"
+        ? [
+            {
+              identity: { module: "src/resource-preview.ts", exportName: "decodeResourcePreview" },
+              category: "wire" as const,
+            },
+          ]
+        : []),
+      ...(root === "apps/web"
+        ? ["decodeWebBootstrap", "decodeWebAuthInfo"].map((exportName) => ({
+            identity: { module: "src/http.ts", exportName },
+            category: "wire" as const,
+          }))
+        : []),
+      ...(root === "packages/client"
+        ? [
+            {
+              identity: { module: "src/client.ts", exportName: "captureFailure" },
+              category: "wire" as const,
+            },
+          ]
+        : []),
       ...(root === "apps/core"
         ? ([
+            ...[
+              "decodeSentAttachmentMetadata",
+              "decodeSentAttachmentStdout",
+              "isSentAttachmentCommand",
+            ].map((exportName) => ({
+              identity: { module: "src/surface/native/external-attachment-codec.ts", exportName },
+              category: "projection" as const,
+            })),
+            ...["decodeNativeRecord", "decodeNativeRecord.andThen.<callback@1>"].map(
+              (exportName) => ({
+                identity: { module: "src/surface/native/codec.ts", exportName },
+                category: "persistence" as const,
+              }),
+            ),
+            ...["parseNativeTitle", "parseNativeTitle.andThen.<callback@1>"].map((exportName) => ({
+              identity: { module: "src/surface/native/title-generation.ts", exportName },
+              category: "wire" as const,
+            })),
+            ...["decodeSearchRows", "decodeSearchCount"].map((exportName) => ({
+              identity: { module: "src/surface/native/store-search.ts", exportName },
+              category: "projection" as const,
+            })),
+            ...["decodeNativeSummary", "decodeNativeSummary.andThen.<callback@1>"].map(
+              (exportName) => ({
+                identity: { module: "src/surface/native/search-summary-codec.ts", exportName },
+                category: "persistence" as const,
+              }),
+            ),
+            ...["decodeMetricRequest", "decodeMetricResponse"].map((exportName) => ({
+              identity: { module: "src/surface/native/metrics.ts", exportName },
+              category: "wire" as const,
+            })),
+            {
+              identity: { module: "src/surface/native/gateway.ts", exportName: "bootstrapInput" },
+              category: "request" as const,
+            },
+            {
+              identity: { module: "src/surface/native/gateway.ts", exportName: "isLogoutReceipt" },
+              category: "wire" as const,
+            },
+            ...[
+              "validateNativeFrame",
+              "validateNativeFrame.andThen.<callback@1>",
+              "observeNativeGatewayFailure",
+              "createNativeGateway.onError.<callback@1>",
+            ].map((exportName) => ({
+              identity: { module: "src/surface/native/gateway.ts", exportName },
+              category: "wire" as const,
+            })),
+            {
+              identity: {
+                module: "src/surface/native/adapter.ts",
+                exportName: "isValidNativeDisplayMessage",
+              },
+              category: "projection" as const,
+            },
+            {
+              identity: {
+                module: "src/surface/native/auth-clerk.ts",
+                exportName: "decodeNativeClerkClaims.gen.<callback@1>",
+              },
+              category: "wire" as const,
+            },
+            {
+              identity: {
+                module: "src/surface/authenticated-request.ts",
+                exportName: "parseNativeRequestMetadata",
+              },
+              category: "request" as const,
+            },
+            {
+              identity: {
+                module: "src/surface/authenticated-request.ts",
+                exportName: "parseNativeRequestEnvelope",
+              },
+              category: "request" as const,
+            },
             {
               identity: {
                 module: "src/mcp/session-context.ts",
@@ -4334,9 +4604,361 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
           }))
         : [],
     operationalResultApis: [
+      ...(root === "apps/tui"
+        ? [
+            ...["decodeOperatorSession", "createTuiAuth"].map((exportName) => ({
+              module: "src/auth.ts",
+              exportName,
+            })),
+            ...[
+              "decodeTuiBootstrap",
+              "responseStatus",
+              "readBootstrap",
+              "uploadTuiResource",
+              "createTuiSession",
+            ].map((exportName) => ({ module: "src/session.ts", exportName })),
+            ...["parseTuiArgs", "run"].map((exportName) => ({ module: "src/main.ts", exportName })),
+          ]
+        : []),
+      ...(root === "apps/web"
+        ? [{ module: "src/clerk-signout.ts", exportName: "signOutActiveClerk" }]
+        : []),
+      ...(root === "apps/web"
+        ? [
+            { module: "src/components/rich-code.tsx", exportName: "loadCodeTokens" },
+            { module: "src/components/rich-diagram.tsx", exportName: "renderDiagram" },
+          ]
+        : []),
+      ...(root === "apps/web"
+        ? ["decodeResourcePreview", "loadResourcePreview"].map((exportName) => ({
+            module: "src/resource-preview.ts",
+            exportName,
+          }))
+        : []),
+      ...(root === "apps/web"
+        ? [
+            "readAuthInfo",
+            "localLogin",
+            "decodeWebBootstrap",
+            "decodeWebAuthInfo",
+            "responseStatus",
+            "request",
+            "bootstrapResult",
+            "uploadResult",
+            "logoutHttp",
+          ].map((exportName) => ({ module: "src/http.ts", exportName }))
+        : []),
       ...(WAVE_3_OPERATIONAL_RESULT_APIS.get(root) ?? []),
       ...(root === "apps/core"
         ? [
+            CORE_NATIVE_RECORD_PERSISTED_CODEC.identity,
+            { module: "src/surface/native/gateway.ts", exportName: "validateNativeFrame" },
+            {
+              module: "src/runtime/native-summarization.ts",
+              exportName: "withNativeThreadSummaries.runSummarization",
+            },
+            { module: "src/surface/native/store.ts", exportName: "nullableAuthority" },
+            ...[
+              "createNativeRuntime",
+              "createNativeRuntime.startOutput",
+              "createNativeRuntime.startIngress",
+              "createNativeRuntime.recover",
+              "createNativeRuntime.maintain",
+            ].map((exportName) => ({ module: "src/surface/native/runtime.ts", exportName })),
+            {
+              module: "src/surface/bridge/bus-agent-runner.ts",
+              exportName: "startBusAgentRunner.rejectNativeDelivery",
+            },
+            ...[
+              "offsetCursor",
+              "createNativeRpcServices.catalog",
+              "createNativeRpcServices.generation",
+              "createNativeRpcServices.modelChoice",
+              "createNativeRpcServices.selectedThread",
+              "createNativeRpcServices.inputSelections",
+              "createNativeRpcServices.personalizeSlots",
+              "createNativeRpcServices.personalizeChange",
+              "createNativeRpcServices.personalizeReplay",
+              "createNativeRpcServices.syncThreadReplay",
+            ].map((exportName) => ({ module: "src/surface/native/rpc-services.ts", exportName })),
+            ...[
+              "validate",
+              "inputMessages",
+              "commandMetadata",
+              "publishInput",
+              "publishPending",
+              "kick",
+              "completeInput",
+              "settled",
+              "rejected",
+              "selectedHistory",
+              "reconcileCanonical",
+              "drainPublications",
+              "cancel",
+              "rewind",
+              "deleteThread",
+              "recoverMutations",
+            ].map((method) => ({
+              module: "src/surface/native/execution.ts",
+              exportName: `createNativeExecution.${method}`,
+            })),
+            CORE_NATIVE_SUMMARY_PERSISTED_CODEC.identity,
+            ...CORE_NATIVE_RECORD_PERSISTED_CONSUMERS.map(({ identity }) => identity),
+            ...CORE_NATIVE_SUMMARY_PERSISTED_CONSUMERS.map(({ identity }) => identity),
+            {
+              module: "src/surface/native/resources-live.ts",
+              exportName: "NativeLiveFileService.read",
+            },
+            {
+              module: "src/surface/native/resources-live.ts",
+              exportName: "rewriteNativePublishedFileLinks",
+            },
+            ...[
+              "NativeSummaryStore.initialize",
+              "NativeSummaryStore.put",
+              "NativeSummaryStore.pruneDeleted",
+            ].map((exportName) => ({
+              module: "src/surface/native/store-search-summary.ts",
+              exportName,
+            })),
+            ...["NativeSummaryRefresher.refresh", "NativeSummaryRefresher.refreshThread"].map(
+              (exportName) => ({
+                module: "src/surface/native/search-summary.ts",
+                exportName,
+              }),
+            ),
+            ...[
+              "NativeSurfaceStore.initialize",
+              "NativeSurfaceStore.readMessage",
+              "NativeSurfaceStore.listMessages",
+              "NativeSurfaceStore.participants",
+              "NativeSurfaceStore.setReaction",
+              "NativeSurfaceStore.refreshReactions",
+              "NativeSurfaceStore.reactions",
+              "NativeSurfaceStore.markRead",
+              "NativeSurfaceStore.unread",
+              "NativeSurfaceStore.markTurnRead",
+              "NativeSurfaceStore.actionStatus",
+              "NativeSurfaceStore.invokeAction",
+              "NativeSurfaceStore.pruneDeleted",
+              "NativeSurfaceStore.personalizeMessage",
+              "NativeSurfaceStore.personalizePart",
+            ].map((exportName) => ({
+              module: "src/surface/native/store-surface.ts",
+              exportName,
+            })),
+            ...[
+              "reserve",
+              "ingest",
+              "get",
+              "upload",
+              "#uploadClaimed",
+              "#completeUpload",
+              "stop",
+              "authorize",
+              "validateReference",
+              "open",
+              "modelAttachment",
+              "updateProviderAvatar",
+              "reconcileReferences",
+              "scopedAccess.describe",
+              "scopedAccess.open",
+              "scopedAccess.materialize",
+              "scopedAccess.verify",
+            ].map((method) => ({
+              module: "src/surface/native/resources.ts",
+              exportName: `NativeResourceService.${method}`,
+            })),
+            ...[
+              "retainNativeResource",
+              "releaseNativeResource",
+              "listNativeResourceReferences",
+            ].map((method) => ({
+              module: "src/transcript/transcript-store.ts",
+              exportName: `SqliteTranscriptStore.${method}`,
+            })),
+            {
+              module: "src/mcp/config-file.ts",
+              exportName: "withMcpConfigMutationLock",
+            },
+            ...[
+              "offsetCursor",
+              "NativeSearchService.query",
+              "NativeSearchService.starter",
+              "NativeSearchService.principal",
+              "NativeSearchService.discovery",
+              "NativeSearchService.conversationSearch",
+              "NativeSearchService.conversationRead",
+              "NativeSearchService.conversationMetadata",
+            ].map((exportName) => ({
+              module: "src/surface/native/search.ts",
+              exportName,
+            })),
+            ...[
+              "parseExternalThreadId",
+              "owner",
+              "NativeExternalThreads.list",
+              "NativeExternalThreads.read",
+            ].map((exportName) => ({
+              module: "src/surface/native/search-external.ts",
+              exportName,
+            })),
+            ...[
+              "openNativeInstallation",
+              "initializeNativeInstallation",
+              "validateNativeInstallation",
+              "canonicalAuthenticator.checkSession",
+              "canonicalAuthenticator.authenticate",
+              "canonicalAuthenticator.reauthenticate",
+              "canonicalAuthenticator.logout",
+            ].map((exportName) => ({
+              module: "src/surface/native/installation.ts",
+              exportName,
+            })),
+            ...[
+              "NativeStore.initialize",
+              "NativeStore.setInputCanonicalHistoryStart",
+              "NativeStore.cleanupDeletedThread",
+              "NativeStore.lookupInputReceipt",
+              "NativeStore.terminalInputProjection",
+              "NativeStore.listCanonicalRequestIds",
+              "NativeStore.listExpiredThreadIds",
+              "NativeStore.listInputReceipts",
+              "NativeStore.listUsers",
+              "NativeStore.listParticipants",
+              "NativeStore.listQueuedInputs",
+              "NativeStore.removeQueuedInput",
+              "NativeStore.beginOutputAttempt",
+              "NativeStore.projectTurn",
+              "NativeStore.postMessage",
+              "NativeStore.acceptSurfaceInput",
+              "NativeStore.updateSurfaceMessage",
+              "NativeStore.registerPublishedPath",
+              "NativeStore.readPublishedPath",
+              "NativeStore.turnPage",
+              "NativeStore.publishUpload",
+              "NativeStore.cancelUnusedUploads",
+              "NativeStore.getUser",
+              "NativeStore.findUserByProviderId",
+              "NativeStore.upsertUser",
+              "NativeStore.setToolMode",
+              "NativeStore.setAgentIdentity",
+              "NativeStore.setUserProfile",
+              "NativeStore.requireOwner",
+              "NativeStore.getThreadRecord",
+              "NativeStore.authorizeThread",
+              "NativeStore.getThread",
+              "NativeStore.listThreads",
+              "NativeStore.getSidebarPreferences",
+              "NativeStore.configureSidebar",
+              "NativeStore.listSidebar",
+              "NativeStore.moveSidebarThread",
+              "NativeStore.command",
+              "NativeStore.createThread",
+              "NativeStore.updateThread",
+              "NativeStore.shareThread",
+              "NativeStore.window",
+              "NativeStore.hydrate",
+              "NativeStore.getInput",
+              "NativeStore.getInputByDeliveryId",
+              "NativeStore.getInputByRequestId",
+              "NativeStore.findInput",
+              "NativeStore.listPendingInputs",
+              "NativeStore.acceptInput",
+              "NativeStore.prepareInput",
+              "NativeStore.settleInput",
+              "NativeStore.markInputCompleted",
+              "NativeStore.getLatestCanonicalRequestId",
+              "NativeStore.setActiveRun",
+              "NativeStore.cancelRun",
+              "NativeStore.removeInput",
+              "NativeStore.reserveUpload",
+              "NativeStore.getUpload",
+              "NativeStore.readUpload",
+              "NativeStore.claimUpload",
+              "NativeStore.settleUpload",
+              "NativeStore.appendMessage",
+              "NativeStore.beginRewind",
+              "NativeStore.deleteThread",
+              "NativeStore.finishMutation",
+              "NativeStore.listPendingMutations",
+              "NativeStore.pruneReplay",
+            ].map((exportName) => ({
+              module: "src/surface/native/store.ts",
+              exportName,
+            })),
+            ...[
+              "decodeSearchRows",
+              "decodeSearchCount",
+              "NativeSearchStore.searchMessages",
+              "NativeSearchStore.readThread",
+            ].map((exportName) => ({
+              module: "src/surface/native/store-search.ts",
+              exportName,
+            })),
+            ...[
+              "createNativeOutputPublisher.emit.publishAfterPrevious",
+              "createNativeOutputPublisher.emit.publishEvent",
+              "createNativeOutputPublisher.terminal",
+              "createNativeOutputPublisher.captureBarrier",
+              "createNativeBusOutputSink.<callback>",
+            ].map((exportName) => ({
+              module: "src/surface/native/output.ts",
+              exportName,
+            })),
+            ...[
+              "NativeConfigService.read",
+              "NativeConfigService.save",
+              "NativeConfigService.saveSerialized",
+              "NativeConfigService.reloadMcp",
+              "validateDocument",
+              "writeAtomic",
+            ].map((exportName) => ({
+              module: "src/surface/native/config-service.ts",
+              exportName,
+            })),
+            ...[
+              "decodeNativeMessageRef",
+              "requestProjection.projectProtocolMetadata",
+              "toolTargets.resolveSession",
+            ].map((exportName) => ({
+              module: "src/surface/native/native-protocol.ts",
+              exportName,
+            })),
+            ...["checkNativeRequestOrigin", "sameNativePrincipal"].map((exportName) => ({
+              module: "src/surface/native/auth.ts",
+              exportName,
+            })),
+            ...[
+              "checkSession",
+              "rateLimit",
+              "transport",
+              "verifyPassword",
+              "authenticate",
+              "login",
+              "reauthenticate",
+              "logout",
+            ].map((method) => ({
+              module: "src/surface/native/auth-local.ts",
+              exportName: `createNativeLocalAuthenticator.${method}`,
+            })),
+            ...[
+              "decodeNativeClerkClaims",
+              "createNativeClerkAuthenticator",
+              ...[
+                "checkSession",
+                "authenticate",
+                "reauthenticate",
+                "logout",
+                "lookupUsers",
+                "lookupUser",
+                "updateDisplayName",
+                "updateAvatar",
+              ].map((method) => `createNativeClerkAuthenticator.gen.<callback@1>.${method}`),
+            ].map((exportName) => ({
+              module: "src/surface/native/auth-clerk.ts",
+              exportName,
+            })),
             {
               module: "src/tool-server/client-arguments.ts",
               exportName: "applyToolPositionals",
@@ -4889,7 +5511,7 @@ function approvedExceptionAdapterCatalogSha256(
 }
 
 export const APPROVED_EXCEPTION_ADAPTER_CATALOG_SHA256 =
-  "4378f65aacee9213a9991cb973aefacca03004491ff8aa39b1111d195297181f";
+  "60a00f0bb34baf1052a205226f01e7e169c71311cc914d5a7739aee0ce39fc5b";
 
 export const architectureManifest = {
   version: 1,

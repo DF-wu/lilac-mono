@@ -1,0 +1,126 @@
+.thread-card:hover,
+.thread-card:focus-within {
+  background: var(--ui-surface-hover);
+  color: var(--ui-hover-foreground);
+}
+.thread-card.selected {
+  background: var(--ui-selection);
+  color: var(--ui-selection-foreground);
+}
+
+.thread-state-icon svg {
+  width: var(--ui-icon-size);
+  height: var(--ui-icon-size);
+}
+.thread-card[data-state="completed"] .thread-state-icon {
+  color: var(--ui-success);
+}
+.thread-card[data-state="working"] .thread-state-icon {
+  color: var(--ui-primary);
+}
+.thread-card[data-state="working"] .thread-state-icon svg {
+  animation: thread-working-spin 1.5s linear infinite;
+}
+.thread-card[data-state="error"] .thread-state-icon {
+  color: var(--ui-danger);
+}
+.thread-card[data-state="input"] .thread-state-icon {
+  color: var(--ui-primary);
+  background: var(--ui-muted);
+  border-radius: var(--ui-radius-md);
+}
+
+.thread-starter > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thread-starter [data-slot="avatar"] {
+  width: var(--ui-text-lg);
+  height: var(--ui-text-lg);
+  font-size: calc(var(--ui-text-xs) * 0.75);
+}
+
+.thread-card[data-state="completed"] .thread-card-title {
+  font-weight: 600;
+}
+
+.thread-card.selected .thread-card-actions {
+  background: var(--ui-selection);
+}
+.thread-card-actions .icon-button {
+  width: var(--ui-control-compact);
+  height: var(--ui-control-compact);
+}
+.thread-card-actions .destructive-action {
+  color: var(--ui-danger);
+}
+.thread-card:hover .thread-card-actions,
+.thread-card:focus-within .thread-card-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+@media (hover: hover) {
+  .thread-card:has(.thread-card-actions):hover .thread-card-status,
+  .thread-card:has(.thread-card-actions):focus-within .thread-card-status,
+  .thread-card:has(.thread-card-actions):hover .thread-card-meta time,
+  .thread-card:has(.thread-card-actions):focus-within .thread-card-meta time {
+    visibility: hidden;
+  }
+  .thread-card:has(.thread-card-actions):hover .thread-starter,
+  .thread-card:has(.thread-card-actions):focus-within .thread-starter {
+    max-width: calc(100% - var(--ui-control-compact) * 3);
+  }
+}
+@keyframes thread-working-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .thread-card[data-state="working"] .thread-state-icon svg {
+    animation: none;
+  }
+}
+@media (hover: none) {
+  .thread-card .thread-card-actions {
+    position: static;
+    background: transparent;
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .thread-card:has(.thread-card-actions) .thread-card-status,
+  .thread-card:has(.thread-card-actions) .thread-card-meta time {
+    visibility: visible;
+  }
+  .thread-card:has(.thread-card-actions) .thread-starter {
+    max-width: none;
+  }
+}
+
+.thread-card .thread-card-select,
+.thread-card .thread-card-select:hover,
+.thread-card .thread-card-select:focus-visible {
+  background: transparent;
+}
+
+.thread-pin svg {
+  width: var(--ui-icon-size);
+  height: var(--ui-icon-size);
+}
+
+.thread-card[data-draft] {
+  background: color-mix(in srgb, var(--ui-warning) 7%, transparent);
+}
+.thread-card[data-draft]:hover,
+.thread-card[data-draft]:focus-within {
+  background: color-mix(in srgb, var(--ui-warning) 10%, var(--ui-surface-hover));
+}
+.thread-card[data-draft].selected {
+  background: color-mix(in srgb, var(--ui-warning) 10%, var(--ui-selection));
+}
+
+.thread-draft-icon svg {
+  width: var(--ui-icon-size);
+  height: var(--ui-icon-size);
+}

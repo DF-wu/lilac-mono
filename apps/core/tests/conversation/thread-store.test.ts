@@ -363,6 +363,33 @@ describe("conversation thread store", () => {
     ).toBe("topology");
   });
 
+  it("looks up cached thread positions and pages before an ordinal across deleted rows", async () => {
+    const dbPath = await createDbPath();
+    const searchStore = new DiscordSearchStore(dbPath);
+    const threadStore = new ConversationThreadStore(dbPath);
+    searchStore.upsertMessages([
+      msg({ channelId: "c1", messageId: "a", userId: "user", text: "Input", ts: 1 }),
+      msg({ channelId: "c1", messageId: "b", userId: "user", text: "Removed", ts: 2 }),
+      msg({ channelId: "c1", messageId: "c", userId: "bot", text: "Reply", ts: 3 }),
+      msg({ channelId: "c2", messageId: "a", userId: "other", text: "Other channel", ts: 1 }),
+    ]);
+    threadStore.refreshInferredThreads();
+    const db = new Database(dbPath);
+    db.run(
+      "UPDATE discord_search_messages SET deleted = 1 WHERE channel_id = 'c1' AND message_id = 'b'",
+    );
+    db.close();
+    const position = threadStore.getMessagePosition("c1", "c")!;
+    expect(position).toEqual({ threadId: "discord:channel:c1:a", ordinal: 2, authorId: "bot" });
+    expect(threadStore.listMessagePositionsBefore(position.threadId, position.ordinal)).toEqual([
+      { messageId: "a", ordinal: 0, authorId: "user" },
+    ]);
+    expect(threadStore.getMessagePosition("c1", "b")).toBeNull();
+    expect(threadStore.getMessagePosition("c1", "missing")).toBeNull();
+    searchStore.close();
+    threadStore.close();
+  });
+
   it("preserves legacy thread input hashes while attachment state is unknown", async () => {
     const dbPath = await createDbPath();
     const searchStore = new DiscordSearchStore(dbPath);

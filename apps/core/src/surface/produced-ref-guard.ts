@@ -279,8 +279,8 @@ class DescriptorBoundSurfaceAdapter implements SurfaceAdapter {
     return self;
   }
 
-  async listSessions() {
-    const listed = await this.adapter.listSessions();
+  async listSessions(opts?: Parameters<SurfaceAdapter["listSessions"]>[0]) {
+    const listed = await this.adapter.listSessions(opts);
     requireOperationResult(this.descriptorPlatform, listed, "listSessions", undefined, (value) => {
       for (const [index, session] of value.entries()) {
         requireProducedSessionRef(

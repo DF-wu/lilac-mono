@@ -1,0 +1,20 @@
+{
+  "name": "@stanley2058/lilac-tui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --preload @opentui/solid/preload src/main.ts",
+    "test": "bun test --preload @opentui/solid/preload tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opentui/core": "0.5.11",
+    "@opentui/solid": "0.5.11",
+    "@orpc/client": "1.15.1",
+    "@stanley2058/lilac-client": "workspace:*",
+    "@stanley2058/lilac-client-protocol": "workspace:*",
+    "better-result": "catalog:",
+    "solid-js": "1.9.12",
+    "zod": "4.3.6"
+  }
+}

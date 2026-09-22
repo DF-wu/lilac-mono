@@ -3,6 +3,30 @@ import { describe, expect, it } from "bun:test";
 import { DiscordSurfaceStore } from "../../../src/surface/store/discord-surface-store";
 
 describe("discord surface store message relations", () => {
+  it("orders sessions by messages rather than metadata refreshes", () => {
+    const store = new DiscordSurfaceStore(":memory:");
+    for (const [channelId, ts, updatedTs] of [
+      ["older", 100, 900],
+      ["newer", 200, 300],
+    ] as const) {
+      store.upsertSession({ channelId, type: "thread", updatedTs });
+      store.upsertMessageRelation({
+        channelId,
+        messageId: channelId,
+        authorId: "user",
+        ts,
+        isChat: true,
+        updatedTs,
+      });
+    }
+    expect(
+      store.listSessions().map((session) => [session.channel_id, session.activity_ts]),
+    ).toEqual([
+      ["newer", 200],
+      ["older", 100],
+    ]);
+    store.close();
+  });
   it("stores and reads relation metadata", () => {
     const store = new DiscordSurfaceStore(":memory:");
 

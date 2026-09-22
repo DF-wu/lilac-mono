@@ -236,6 +236,7 @@ export type ReadFileBytesResult =
       fileHash: string;
       bytes: Buffer;
       bytesLength: number;
+      totalBytes?: number;
     }
   | {
       success: false;
@@ -1130,6 +1131,43 @@ export class FileSystem {
     return outcome.ok ? outcome.value : this.readFailure(resolvedPath, outcome.error);
   }
 
+  private async readFileBytePrefix(
+    canonicalPath: string,
+    resolvedPath: string,
+    prefixBytes: number,
+  ): Promise<ResultType<ReadFileBytesResult, FileSystemOperationFailed>> {
+    const limit = prefixBytes;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 65_536)
+      return Result.ok<ReadFileBytesResult>({
+        success: false,
+        resolvedPath,
+        error: { code: "UNKNOWN", message: "Prefix size must be between 1 and 65536 bytes" },
+      });
+    const prefix = resultOutcome(
+      await captureFilesystemOperation("read byte prefix", async () => {
+        await using handle = await fs.open(canonicalPath, "r");
+        const stats = await handle.stat();
+        const buffer = Buffer.alloc(Math.min(limit, stats.size));
+        let size = 0;
+        while (size < buffer.length) {
+          const read = await handle.read(buffer, size, buffer.length - size, size);
+          if (read.bytesRead === 0) break;
+          size += read.bytesRead;
+        }
+        return { bytes: buffer.subarray(0, size), totalBytes: stats.size };
+      }),
+    );
+    if (!prefix.ok) return Result.err(prefix.error);
+    return Result.ok<ReadFileBytesResult>({
+      success: true,
+      resolvedPath,
+      fileHash: this.hash(prefix.value.bytes),
+      bytes: prefix.value.bytes,
+      bytesLength: prefix.value.bytes.length,
+      totalBytes: prefix.value.totalBytes,
+    });
+  }
+
   /**
    * Reads a file as bytes.
    *
@@ -1141,10 +1179,12 @@ export class FileSystem {
       path,
       dangerouslyAllow = false,
       maxBytes,
+      prefixBytes,
     }: {
       path: string;
       dangerouslyAllow?: boolean;
       maxBytes?: number;
+      prefixBytes?: number;
     },
     cwd?: string,
   ): Promise<ReadFileBytesResult> {
@@ -1167,6 +1207,9 @@ export class FileSystem {
         this.assertAllowed(canonicalPath, "readFile", dangerouslyAllow),
       );
       if (!allowedCanonical.ok) return Result.err(allowedCanonical.error);
+
+      if (prefixBytes !== undefined)
+        return this.readFileBytePrefix(canonicalPath, resolvedPath, prefixBytes);
 
       if (maxBytes !== undefined) {
         const stats = resultOutcome(

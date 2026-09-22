@@ -1,0 +1,25 @@
+{
+  "name": "@stanley2058/lilac-client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@stanley2058/lilac-client-protocol": "workspace:*",
+    "@orpc/client": "1.15.1",
+    "@orpc/contract": "1.15.1",
+    "better-result": "catalog:"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.1",
+    "@orpc/server": "1.15.1"
+  },
+  "peerDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

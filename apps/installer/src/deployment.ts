@@ -423,6 +423,9 @@ export function createDeployment(
             XDG_CONFIG_HOME: "/data/.config",
           },
           volumes: ["./data:/data"],
+          ...(draft.get(["surface", "native", "enabled"]) === true
+            ? { ports: ["127.0.0.1:8789:8789"] }
+            : {}),
           extra_hosts: ["host.docker.internal:host-gateway"],
           tmpfs: [
             "/run:rw,nosuid,nodev,mode=755,size=64m",
@@ -538,7 +541,7 @@ export async function writeInstallation(
   },
   writeData: DataFileWriter = writeDataFiles,
 ) {
-  const files: { filename: string; content?: string; mode: number }[] = [
+  const files: { filename: string; content?: string; source?: string; mode: number }[] = [
     {
       filename: path.join(options.root, "secrets.env"),
       content:
@@ -590,7 +593,8 @@ export async function writeInstallation(
             try: async () => {
               for (const file of staged) {
                 temporaryFiles.push(file.temporary);
-                if (file.content === undefined) await copyFile(process.execPath, file.temporary);
+                if (file.content === undefined)
+                  await copyFile(file.source ?? process.execPath, file.temporary);
                 else await Bun.write(file.temporary, file.content, { mode: file.mode });
                 await chmod(file.temporary, file.mode);
               }

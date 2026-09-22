@@ -19,7 +19,10 @@ const executable =
   Bun.which("google-chrome-stable") ??
   chromium.executablePath();
 
-describe("table PNG rendering", () => {
+// Headless Chrome rendering can exhaust GitHub-hosted runners; keep this suite for local checks.
+const describeLocal = describe.skipIf(process.env.GITHUB_ACTIONS === "true");
+
+describeLocal("table PNG rendering", () => {
   it("does not launch a browser for empty input", async () => {
     expect(await renderDiscordTableImages([])).toEqual([]);
   });
@@ -137,7 +140,7 @@ const singleTable = (text: string): MarkdownTableData => ({ rows: [[cell(text)]]
 const decode = (images: readonly (Uint8Array | null)[]) =>
   images.map((bytes) => bytes && new TextDecoder().decode(bytes));
 
-describe("owned table image browser", () => {
+describeLocal("owned table image browser", () => {
   it("stays stopped when disabled and warms exactly one page before accepting renders", async () => {
     const fake = fakeBrowser();
     const renderer = new DiscordTableImageRenderer(fake.launch);

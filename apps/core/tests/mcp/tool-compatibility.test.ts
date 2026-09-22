@@ -146,6 +146,8 @@ describe("MCP tool compatibility through registry and executor", () => {
       properties: { kind: { const: "count" }, count: { $ref: "#/$defs/count" } },
       required: ["kind"],
       if: { properties: { kind: { const: "count" } } },
+      // JSON Schema's conditional keyword is data, not a Promise-like method.
+      // oxlint-disable-next-line unicorn/no-thenable
       then: { required: ["count"] },
       unevaluatedProperties: false,
     };

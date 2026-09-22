@@ -67,7 +67,9 @@ describe("installer failure boundaries", () => {
         withInstallerCleanup(
           () =>
             Result.gen(async function* () {
-              await Promise.reject(new DOMException("fixture cancellation", "AbortError"));
+              yield* Result.await(
+                Promise.reject(new DOMException("fixture cancellation", "AbortError")),
+              );
               return Result.ok(undefined);
             }),
           () => {
@@ -98,7 +100,9 @@ describe("installer failure boundaries", () => {
     const aborted = await Result.tryPromise({
       try: () =>
         Result.gen(async function* () {
-          await Promise.reject(new DOMException("fixture cancellation", "AbortError"));
+          yield* Result.await(
+            Promise.reject(new DOMException("fixture cancellation", "AbortError")),
+          );
           return Result.ok(undefined);
         }),
       catch: captureInstallerException,

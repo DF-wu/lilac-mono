@@ -197,6 +197,8 @@ export type WorkOrFanoutSubscriptionOptions = {
   mode: "work" | "fanout";
   /** Consumer group identifier (durable). */
   subscriptionId: string;
+  /** Replay retained history when creating a group. Existing groups keep their frontier. Defaults to latest. */
+  startFrom?: "beginning" | "latest";
   /** Optional consumer identity within the group. */
   consumerId?: string;
   /** Destroy this consumer group when the subscription stops. */

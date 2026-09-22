@@ -99,7 +99,11 @@ export const remoteReadTextRequestSchema = z.object({
 export const remoteReadBytesRequestSchema = z.object({
   ...requestBase,
   op: z.literal("fs.read_bytes"),
-  input: z.object({ path: z.string(), maxBytes: finiteNumberSchema.optional() }),
+  input: z.object({
+    path: z.string(),
+    maxBytes: finiteNumberSchema.optional(),
+    prefixBytes: z.number().int().min(1).max(65_536).optional(),
+  }),
 });
 
 export const remoteGlobRequestSchema = z.object({
@@ -238,6 +242,7 @@ export const remoteReadBytesResponseSchema = z.discriminatedUnion("ok", [
     resolvedPath: z.string(),
     fileHash: z.string(),
     bytesLength: finiteNumberSchema,
+    totalBytes: finiteNumberSchema.optional(),
     base64: z.string(),
   }),
   z.object({

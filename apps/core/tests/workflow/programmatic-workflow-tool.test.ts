@@ -99,6 +99,79 @@ describe("ProgrammaticWorkflow trusted auto-run", () => {
     root = null;
   });
 
+  it("accepts equivalent native origin IDs for runs and scheduled triggers", async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-native-workflow-"));
+    const workspaceRoot = path.join(root, "workspace");
+    await fs.mkdir(workspaceRoot);
+    const tool = new ProgrammaticWorkflow({
+      blobStore,
+      dataDir: path.join(root, "data"),
+      dbPath: path.join(root, "workflow.sqlite"),
+      progressCards: {
+        resolveTarget: (platform) => (platform === "native" ? "native" : null),
+        ensureInitialCard: async (runId) => ({
+          platform: "native",
+          channelId: "thread",
+          messageId: `card-${runId}`,
+        }),
+        requestProjection: () => {},
+      },
+    });
+    const context: RequestContext = {
+      requestId: "native:thread:input",
+      sessionId: "native:thread",
+      requestClient: "native",
+      cwd: workspaceRoot,
+      safetyMode: "trusted",
+      serverOwnedRequest: true,
+      requestInitiator: { platform: "native", userId: "owner" },
+      requestInitiatorSessionId: "thread",
+    };
+    await tool.init();
+    try {
+      await callValue(
+        tool,
+        "workflow.definition.save",
+        { scope: "project", name: "audit-routes", source: source() },
+        { context },
+      );
+      const result = await callValue(
+        tool,
+        "workflow.run.trigger",
+        { scope: "project", name: "audit-routes", args: { directory: "src" } },
+        { context },
+      );
+      const run = invocationSchema.parse(result);
+      expect(
+        await callValue(tool, "workflow.run.get", { runId: run.runId }, { context }),
+      ).toMatchObject({
+        run: {
+          origin: { userId: "owner" },
+          progressTarget: { platform: "native", channelId: "thread" },
+        },
+      });
+      const scheduled = await tool.call(
+        "workflow.trigger.create",
+        {
+          scope: "project",
+          name: "audit-routes",
+          args: { directory: "src" },
+          schedule: { kind: "timestamp", at: Date.now() + 60_000 },
+        },
+        { context },
+      );
+      expect(scheduled.match({ ok: () => null, err: (error) => error })).toBeNull();
+      const denied = await tool.call(
+        "workflow.run.trigger",
+        { scope: "project", name: "audit-routes", args: { directory: "src" } },
+        { context: { ...context, requestInitiatorSessionId: "another-thread" } },
+      );
+      expect(denied).toMatchObject({ status: "error", error: { kind: "denied" } });
+    } finally {
+      await tool.destroy();
+    }
+  });
+
   it("rejects explicit progress targets without a registered port before durable writes", async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "lilac-workflow-progress-target-"));
     const workspaceRoot = path.join(root, "workspace");

@@ -7,7 +7,8 @@ facts are incorporated into those documents and remain available in Git history.
 
 ## Active
 
-No active repository-wide implementation plans.
+None. Native surface implementation is complete. See [setup and operation](../docs/native-surface.md)
+and [verification](../docs/native-surface-verification.md).
 
 Only plans listed under **Active** are repository-wide implementation plans. A task-specific plan is
 authoritative only when the user explicitly approves it for that task.

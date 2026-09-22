@@ -1,3 +1,4 @@
+import type { NativeOutputFrontier } from "@stanley2058/lilac-event-bus";
 import {
   McpImageCheckpointRegistry,
   materializeMcpImageCheckpoint,
@@ -258,6 +259,7 @@ import { buildAgentRunSystemPrompt } from "./bus-agent-runner/system-prompt";
 import { resolveSessionSafetyMode, type SessionSafetyMode } from "../session-policy";
 import type { AuthenticatedSurfaceOrigin, MsgRef, SurfacePrincipal } from "../types";
 import type { SurfaceProtocolResolver } from "../runtime-descriptor";
+import type { NativeOutputPublisher, NativeOutputPublication } from "../native/output";
 import type {
   CustomCommandExecutionError,
   CustomCommandManager,
@@ -1719,9 +1721,11 @@ type Enqueued = {
   verifiedIngress?: boolean;
   identityOwner?: RequestMessageCacheOwner;
   restoredSafetyMode?: SessionSafetyMode;
+  nativeResolvedModelRequest?: DurableResolvedModelRequest;
   recovery?: {
     checkpointMessages: ModelMessage[];
     partialText: string;
+    nativeOutputFrontier?: NativeOutputFrontier;
   };
   storedRecoveryCheckpoint?: StoredMessageV1[];
   recoveryMcpImages?: McpImageCheckpointReference[];
@@ -1753,6 +1757,28 @@ type QueueLifecycleAttempt = {
 export type AgentRunnerRetainedRequestDelivery = {
   readonly requestDeliveryId: string;
   readonly outcome: RequestDeliveryTerminalOutcome;
+};
+
+export type NativeRunnerRequest = {
+  readonly requestId: string;
+  readonly requestDeliveryId: string;
+  readonly sessionId: string;
+  readonly raw: unknown;
+};
+
+export type NativeRunnerLifecycle = {
+  rejected?(requestDeliveryId: string): Promise<ResultType<void, Error>>;
+  validate(request: NativeRunnerRequest): ResultType<
+    {
+      readonly safetyMode: SessionSafetyMode;
+      readonly resolvedModelRequest?: DurableResolvedModelRequest;
+    },
+    Error
+  >;
+  settled(
+    request: NativeRunnerRequest,
+    outcome: "completed" | "failed" | "cancelled",
+  ): Promise<ResultType<void, Error>>;
 };
 
 export type BusAgentRunnerRequestDelivery = Pick<
@@ -2494,12 +2520,15 @@ type SessionQueue = {
     checkpointedRetainedRequestDeliveryIds: Set<string>;
     retainedRequestDeliveryByInputId: Map<AgentInputQueueId, string>;
     journalHandle: AgentRunJournalHandle | null;
+    nativeOutput: NativeOutputPublisher | undefined;
     checkpointWriter: {
       disabled: boolean;
       pending: {
         readonly messages: readonly ModelMessage[];
         readonly canonicalInputIds: ReadonlySet<AgentInputQueueId>;
         readonly identityProjection: StoredMessageIdentityProjectionV1;
+        readonly nativeOutputBarrier?: Promise<NativeOutputPublication>;
+        readonly nativeOutputFrontier?: NativeOutputFrontier;
       } | null;
       operation: Promise<void> | null;
       closed: boolean;
@@ -2626,6 +2655,19 @@ export async function startBusAgentRunner(params: {
   resourceAccess?: Pick<ResourceAccess, "describe" | "open">;
   requestDelivery?: BusAgentRunnerRequestDelivery;
   onRequestSettled?: (requestDeliveryId: string) => void;
+  createNativeOutput?: (input: {
+    readonly requestId: string;
+    readonly sessionId: string;
+    readonly requestClient: AdapterPlatform;
+    readonly raw: AgentRunnerRaw | undefined;
+    readonly recovering: boolean;
+    readonly recoveryOutputFrontier?: NativeOutputFrontier;
+  }) => NativeOutputPublisher | undefined;
+  nativeExecution?: NativeRunnerLifecycle;
+  nativeResourceAccess?: (
+    request: NativeRunnerRequest,
+  ) => Pick<ResourceAccess, "describe" | "open">;
+  nativeConversationThreads?: (request: NativeRunnerRequest) => ConversationThreadToolService;
   agentRunJournal?: Pick<
     AgentRunJournal,
     "openRun" | "writeCheckpoint" | "markTerminal" | "resetRun" | "removeReconciled"
@@ -2750,6 +2792,8 @@ export async function startBusAgentRunner(params: {
   const workflowRunnerOwnerId = `agent-runner:${process.pid}:${crypto.randomUUID()}`;
 
   const bySession = new Map<string, SessionQueue>();
+  const nativeBlockedSessions = new Set<string>();
+  const sessionDrainOperations = new Map<string, Promise<void>>();
   const cancelledByRequestId = new Set<string>();
   const reservedQueueEntries = new Set<Enqueued>();
   const queueLifecycleAttempts = new Map<string, QueueLifecycleAttempt>();
@@ -2869,6 +2913,7 @@ export async function startBusAgentRunner(params: {
     messages: readonly ModelMessage[],
     canonicalInputIds: readonly AgentInputQueueId[],
     identityProjection: StoredMessageIdentityProjectionV1,
+    nativeOutputFrontier?: NativeOutputFrontier,
   ): Promise<"written" | "kept-previous"> => {
     const journal = activeAgentRunJournal;
     const requestDeliveryId = run.requestDeliveryId;
@@ -2890,6 +2935,7 @@ export async function startBusAgentRunner(params: {
     if (!handle) return activeAgentRunJournal ? "kept-previous" : "written";
     const persisted = await persistBlobBackedAgentRunCheckpoint({
       mcpImages: run.mcpImages,
+      nativeOutput: nativeOutputFrontier,
       handle,
       journal,
       messages,
@@ -3002,12 +3048,20 @@ export async function startBusAgentRunner(params: {
     ) {
       return;
     }
+    if (run.nativeOutput?.hasPendingText()) {
+      for (const inputId of canonicalInputIds) run.checkpointWriter.retryInputIds.add(inputId);
+      return;
+    }
+    const nativeCheckpoint = run.nativeOutput?.captureCheckpoint();
+    const nativeOutputBarrier = nativeCheckpoint?.barrier;
     const pendingInputIds = new Set(run.checkpointWriter.pending?.canonicalInputIds ?? []);
     for (const inputId of canonicalInputIds) pendingInputIds.add(inputId);
     run.checkpointWriter.pending = {
       messages,
       canonicalInputIds: pendingInputIds,
       identityProjection,
+      nativeOutputBarrier,
+      nativeOutputFrontier: nativeCheckpoint?.frontier,
     };
     startRunCheckpointWriter(run);
   };
@@ -3070,11 +3124,27 @@ export async function startBusAgentRunner(params: {
       const canonicalInputIds = new Set(run.checkpointWriter.retryInputIds);
       for (const inputId of pending.canonicalInputIds) canonicalInputIds.add(inputId);
       run.checkpointWriter.inFlightInputIds = canonicalInputIds;
+      const outputFailure = pending.nativeOutputBarrier
+        ? (await pending.nativeOutputBarrier).match({ ok: () => null, err: (error) => error })
+        : null;
+      if (outputFailure) {
+        for (const inputId of canonicalInputIds) run.checkpointWriter.retryInputIds.add(inputId);
+        run.checkpointWriter.inFlightInputIds = null;
+        logger.error(
+          "native output prevented run checkpoint",
+          formatBridgeTaggedErrorForLog(outputFailure, {
+            requestId: run.requestId,
+            sessionId: run.sessionId,
+          }),
+        );
+        continue;
+      }
       const outcome = await persistRunCheckpoint(
         run,
         pending.messages,
         [...canonicalInputIds],
         pending.identityProjection,
+        pending.nativeOutputFrontier,
       );
       run.checkpointWriter.inFlightInputIds = null;
       if (outcome === "kept-previous") {
@@ -3231,6 +3301,7 @@ export async function startBusAgentRunner(params: {
       sessionId: input.entry.sessionId,
     });
     input.recovery.checkpointMessages = input.messages;
+    input.recovery.nativeOutputFrontier = input.checkpoint.nativeOutput;
     input.entry.storedRecoveryCheckpoint = [...input.checkpoint.messages];
     input.entry.recoveryMcpImages = input.checkpoint.mcpImages;
     input.entry.retainedRequestDeliveries = input.checkpoint.retainedRequestDeliveries;
@@ -3387,7 +3458,9 @@ export async function startBusAgentRunner(params: {
         formatBusAgentRunnerDrainFailureForLog(error, { sessionId, requestId }),
       );
     };
+    if (nativeBlockedSessions.has(sessionId)) return;
     const operation = superviseDrain();
+    sessionDrainOperations.set(sessionId, operation);
     activeDrainOperation = operation;
     void ignoreDetachedFailure(operation);
 
@@ -3453,6 +3526,17 @@ export async function startBusAgentRunner(params: {
           message: "cmd.request.message missing required request/session headers",
         }),
       );
+    }
+
+    if (requestClient === "native") {
+      const validated = validateNativeRequest({
+        requestId,
+        requestDeliveryId: msg.data.requestDeliveryId,
+        sessionId,
+        raw: preserveAgentRunnerRaw(msg),
+      });
+      const rejection = validated.match({ ok: () => null, err: (error) => error });
+      if (rejection) return rejectNativeDelivery(msg.data.requestDeliveryId, rejection);
     }
 
     const requestDelivery = params.requestDelivery;
@@ -3744,6 +3828,16 @@ export async function startBusAgentRunner(params: {
               currentTurnUserId: trustedProjection.authenticatedOrigin?.userId,
               currentTurnMessageRef: trustedProjection.authenticatedOrigin?.messageRef,
               verifiedIngress: authenticatedRequest?.verifiedIngress,
+              ...(requestClient === "native"
+                ? {
+                    restoredSafetyMode: validateNativeRequest({
+                      requestId,
+                      requestDeliveryId: deliveryData.requestDeliveryId,
+                      sessionId,
+                      raw,
+                    }).match({ ok: (value) => value.safetyMode, err: () => "restricted" as const }),
+                  }
+                : {}),
             };
 
             const requestControl = parseRequestControlFromRaw(entry.raw);
@@ -4635,6 +4729,31 @@ export async function startBusAgentRunner(params: {
     if (!next) return;
     if (reservedQueueEntries.has(next)) return;
     state.queue.shift();
+    if (next.requestClient === "native") {
+      const validated = validateNativeRequest({
+        requestId: next.requestId,
+        requestDeliveryId: next.requestDeliveryId ?? "",
+        sessionId,
+        raw: next.raw,
+      });
+      const rejection = validated.match({ ok: () => null, err: (error) => error });
+      if (rejection) {
+        const rejected = await rejectNativeDelivery(next.requestDeliveryId ?? "", rejection);
+        const failure = rejected.match({ ok: () => null, err: (error) => error });
+        if (failure) return signalBusAgentRunnerHostFailure(failure);
+        if (next.identityOwner) requestMessageCache.releaseOwner(next.identityOwner);
+        startSessionQueueDrain(sessionId, state);
+        return;
+      }
+      next.restoredSafetyMode = validated.match({
+        ok: (value) => value.safetyMode,
+        err: () => "restricted",
+      });
+      next.nativeResolvedModelRequest = validated.match({
+        ok: (value) => value.resolvedModelRequest,
+        err: () => undefined,
+      });
+    }
     const mcpImages = new McpImageCheckpointRegistry();
     let recoveredQueuedControlStoredMessages: StoredMessageV1[] = [];
 
@@ -4723,6 +4842,24 @@ export async function startBusAgentRunner(params: {
       }));
       for (const discarded of mergedControls.discarded) {
         if (discarded.identityOwner) requestMessageCache.releaseOwner(discarded.identityOwner);
+      }
+    }
+
+    if (next.requestClient === "native") {
+      const validated = validateNativeRequest({
+        requestId: next.requestId,
+        requestDeliveryId: next.requestDeliveryId ?? "",
+        sessionId,
+        raw: next.raw,
+      });
+      const rejection = validated.match({ ok: () => null, err: (error) => error });
+      if (rejection) {
+        const rejected = await rejectNativeDelivery(next.requestDeliveryId ?? "", rejection);
+        const failure = rejected.match({ ok: () => null, err: (error) => error });
+        if (failure) return signalBusAgentRunnerHostFailure(failure);
+        if (next.identityOwner) requestMessageCache.releaseOwner(next.identityOwner);
+        startSessionQueueDrain(sessionId, state);
+        return;
       }
     }
 
@@ -4848,12 +4985,47 @@ export async function startBusAgentRunner(params: {
         }),
       );
     };
+    const nativeOutput = params.createNativeOutput?.({
+      requestId: next.requestId,
+      sessionId: next.sessionId,
+      requestClient: next.requestClient,
+      raw: next.raw,
+      recovering: next.recovery !== undefined,
+      recoveryOutputFrontier: next.recovery?.nativeOutputFrontier,
+    });
+    let nativeStep = 0;
+    let nativeHasText = false;
+    const nativeStepId = (): string => `${next.requestId}:step:${nativeStep}`;
     const outputPublisher = createAgentOutputPublisher({
       bus,
       headers,
       onError: reportOutputPublisherError,
       reportFatalPanic,
     });
+    const nativeToolSteps = new Map<string, string>();
+    const publishNativeToolActivity = (
+      toolCallId: string,
+      status: "start" | "update" | "end",
+      label: string,
+      ok?: boolean,
+    ): void => {
+      const stepId = nativeToolSteps.get(toolCallId) ?? nativeStepId();
+      nativeToolSteps.set(toolCallId, stepId);
+      const terminalState = ok === false ? "failed" : "complete";
+      nativeOutput?.activity({
+        activityId: toolCallId,
+        stepId,
+        kind: "tool",
+        state: status === "end" ? terminalState : "start",
+        label,
+      });
+    };
+    const publishNonAgentToolStatus = async (
+      update: Parameters<typeof outputPublisher.publishToolCall>[0],
+    ): Promise<void> => {
+      publishNativeToolActivity(update.toolCallId, update.status, update.display, update.ok);
+      await outputPublisher.publishToolCall(update);
+    };
     const publishAuxiliaryOutput = async (
       operation: string,
       publish: () => Promise<void>,
@@ -5135,6 +5307,7 @@ export async function startBusAgentRunner(params: {
       ),
       retainedRequestDeliveryByInputId: new Map(),
       journalHandle: null,
+      nativeOutput,
       mcpImages,
       checkpointWriter: {
         disabled: false,
@@ -5186,8 +5359,36 @@ export async function startBusAgentRunner(params: {
     let terminalMarkerOperation: Promise<void> | null = null;
     let terminalSurfaceWriteAttempted = false;
     let terminalSurfaceWriteInitiated = false;
+    let nativeTerminalPublished = nativeOutput === undefined;
+    const publishNativeTerminal = async (kind: typeof requestTerminalKind): Promise<boolean> => {
+      if (!nativeOutput || nativeTerminalPublished) return true;
+      const state = ({ completed: "complete", cancelled: "canceled", failed: "failed" } as const)[
+        kind
+      ];
+      const result = await nativeOutput.terminal(state);
+      const failure = result.match({ ok: () => null, err: (error) => error });
+      if (failure) {
+        shouldTerminalizeRequest = false;
+        logger.error(
+          "native output prevented request terminalization",
+          formatBridgeTaggedErrorForLog(failure, {
+            requestId: next.requestId,
+            sessionId: next.sessionId,
+          }),
+        );
+        return false;
+      }
+      nativeTerminalPublished = true;
+      return true;
+    };
     const markActiveRunTerminal = (): void => {
-      if (terminalMarkerAttempted || terminalPanic || !shouldTerminalizeRequest) return;
+      if (
+        terminalMarkerAttempted ||
+        terminalPanic ||
+        !shouldTerminalizeRequest ||
+        !nativeTerminalPublished
+      )
+        return;
       const run = state.activeRun;
       if (!run || run.checkpointWriter.abandoned) return;
       terminalMarkerAttempted = true;
@@ -5204,6 +5405,21 @@ export async function startBusAgentRunner(params: {
       terminalKind: typeof requestTerminalKind = requestTerminalKind,
     ): Promise<void> => {
       terminalSurfaceWriteAttempted = true;
+      if (
+        nativeOutput &&
+        !nativeHasText &&
+        input.delivery !== "skip" &&
+        input.finalText.length > 0
+      ) {
+        nativeOutput.textStart({
+          partId: "terminal",
+          stepId: nativeStepId(),
+          phase: "final_answer",
+        });
+        nativeOutput.textDelta("terminal", input.finalText);
+        nativeHasText = true;
+      }
+      if (!(await publishNativeTerminal(terminalKind))) return;
       await outputPublisher.publishResponseText(input);
       terminalSurfaceWriteInitiated = true;
       requestTerminalKind = terminalKind;
@@ -5217,9 +5433,7 @@ export async function startBusAgentRunner(params: {
           liveParentSession = params.workflowLiveParentBridge?.registerParent({
             parentRequestId: next.requestId,
             onActivity: () => markRunActivity("subagent"),
-            publishToolStatus: async (update) => {
-              await outputPublisher.publishToolCall(update);
-            },
+            publishToolStatus: publishNonAgentToolStatus,
             recoverSynchronousDeliveries: next.recovery !== undefined,
           });
           await liveParentSession?.ready;
@@ -5387,7 +5601,7 @@ export async function startBusAgentRunner(params: {
             const display = `${CUSTOM_COMMAND_TOOL_NAME} ${parsedCustomCommand.text}`;
             activeCustomCommandTool = { toolCallId, display };
 
-            await outputPublisher.publishToolCall({
+            await publishNonAgentToolStatus({
               toolCallId,
               status: "start",
               display,
@@ -5448,7 +5662,7 @@ export async function startBusAgentRunner(params: {
             if (customCancelled) {
               requestTerminalKind = "cancelled";
               const finalText = "Cancelled.";
-              await outputPublisher.publishToolCall({
+              await publishNonAgentToolStatus({
                 toolCallId,
                 status: "end",
                 display,
@@ -5488,7 +5702,7 @@ export async function startBusAgentRunner(params: {
               output,
             });
 
-            await outputPublisher.publishToolCall({
+            await publishNonAgentToolStatus({
               toolCallId,
               status: "end",
               display,
@@ -5517,7 +5731,10 @@ export async function startBusAgentRunner(params: {
                     requestId: headers.request_id,
                     sessionId: headers.session_id,
                     requestClient: headers.request_client,
-                    messages,
+                    messages:
+                      next.requestClient === "native"
+                        ? [...next.storedMessages, ...messages]
+                        : messages,
                     finalText,
                     modelLabel: resolvedModelLabel,
                     loadedCatalogIds: toolAuthority.snapshot(),
@@ -5579,7 +5796,8 @@ export async function startBusAgentRunner(params: {
             runProfile,
             requestModelOverride,
             reasoningOverride: subagentMeta.reasoning,
-            resolvedModelRequest: workflowPolicy?.resolvedModelRequest,
+            resolvedModelRequest:
+              workflowPolicy?.resolvedModelRequest ?? next.nativeResolvedModelRequest,
           });
           const modelPlan = resolvedModelPlan.match({
             ok: (value) => () => value,
@@ -5895,6 +6113,16 @@ export async function startBusAgentRunner(params: {
                     requestInitiatorSessionId: trustedFallbackSurface.sessionId,
                   }
                 : {}),
+              ...(next.requestClient === "native" && next.authenticatedOrigin
+                ? {
+                    requestInitiator: {
+                      platform: "native" as const,
+                      userId: next.authenticatedOrigin.userId,
+                    },
+                    requestInitiatorSessionId: next.sessionId,
+                    serverOwnedRequest: next.verifiedIngress === true,
+                  }
+                : {}),
               currentTurnUserId,
               currentTurnMessageRef,
               metadata: {
@@ -5978,7 +6206,15 @@ export async function startBusAgentRunner(params: {
               messages: storedMessages,
               blobStore: params.blobStore,
               identityProjection: storedMessageIdentity,
-              resourceAccess: params.resourceAccess,
+              resourceAccess:
+                next.requestClient === "native"
+                  ? params.nativeResourceAccess?.({
+                      requestId: next.requestId,
+                      requestDeliveryId: next.requestDeliveryId ?? "",
+                      sessionId: next.sessionId,
+                      raw: next.raw,
+                    })
+                  : params.resourceAccess,
               resourceTarget: resolveStoredResourceProviderTarget({
                 provider: binding.resolved.provider,
                 capability: binding.capabilityInfo,
@@ -6404,6 +6640,11 @@ export async function startBusAgentRunner(params: {
                   seed: `${headers.request_id}:${autoCompactionSeq}`,
                 });
 
+                nativeOutput?.compaction({
+                  compactionId: activeAutoCompactionToolCallId,
+                  state: "start",
+                  beforeCount: messageCountBefore,
+                });
                 publishAutoCompactionToolStatus({
                   toolCallId: activeAutoCompactionToolCallId,
                   status: "start",
@@ -6446,6 +6687,12 @@ export async function startBusAgentRunner(params: {
                     seed: `${headers.request_id}:orphan-end`,
                   });
                 activeAutoCompactionToolCallId = null;
+                nativeOutput?.compaction({
+                  compactionId: toolCallId,
+                  state: status === "completed" ? "complete" : "failed",
+                  beforeCount: messageCountBefore,
+                  afterCount: messageCountAfter,
+                });
 
                 publishAutoCompactionToolStatus({
                   toolCallId,
@@ -6761,6 +7008,7 @@ export async function startBusAgentRunner(params: {
           let turnPartialTextStartIndex = stablePartialText.length;
           let pendingNoReplyTurnText = "";
           let pendingNoReplyTurnOutputs: Array<{
+            partId: string;
             delta: string;
             phase?: ReturnType<typeof openAIMessagePhase>;
             phaseBoundaryPrefixChars: number;
@@ -6780,6 +7028,7 @@ export async function startBusAgentRunner(params: {
             next.recovery?.partialText,
           );
           const appendPendingNoReplyOutput = (
+            partId: string,
             delta: string,
             phase: ReturnType<typeof openAIMessagePhase>,
             phaseBoundaryPrefixChars: number,
@@ -6787,6 +7036,7 @@ export async function startBusAgentRunner(params: {
             const previous = pendingNoReplyTurnOutputs.at(-1);
             if (
               previous !== undefined &&
+              previous.partId === partId &&
               previous.phase === phase &&
               phaseBoundaryPrefixChars === 0
             ) {
@@ -6794,6 +7044,7 @@ export async function startBusAgentRunner(params: {
               return;
             }
             pendingNoReplyTurnOutputs.push({
+              partId,
               delta,
               phase,
               phaseBoundaryPrefixChars,
@@ -6801,6 +7052,16 @@ export async function startBusAgentRunner(params: {
           };
           const publishPendingNoReplyOutputs = (): void => {
             for (const output of pendingNoReplyTurnOutputs) {
+              nativeOutput?.textStart({
+                partId: output.partId,
+                stepId: nativeStepId(),
+                phase: output.phase,
+              });
+              nativeOutput?.textDelta(
+                output.partId,
+                output.delta.slice(output.phaseBoundaryPrefixChars),
+              );
+              nativeHasText = true;
               outputPublisher.publishText(
                 output.delta,
                 output.phase,
@@ -6912,6 +7173,7 @@ export async function startBusAgentRunner(params: {
             }
 
             if (event.type === "turn_start") {
+              nativeStep += 1;
               attemptStartFinalText = stableFinalText;
               attemptStartPartialText = stablePartialText;
               currentTurnToolCallIds.clear();
@@ -6932,6 +7194,7 @@ export async function startBusAgentRunner(params: {
                 ? turnFinalAnswerText
                 : undefined;
               if (silentTurn) {
+                nativeOutput?.reset(crypto.randomUUID(), nativeStepId());
                 finalText = finalText.slice(0, turnTextStartIndex);
                 if (state.activeRun?.requestId === next.requestId) {
                   state.activeRun.partialText = state.activeRun.partialText.slice(
@@ -6955,6 +7218,13 @@ export async function startBusAgentRunner(params: {
                 publishPendingNoReplyOutputs();
               }
               if (!silentTurn) retainedTextPhase = currentTextPhase ?? retainedTextPhase;
+              const nativeFinishReason =
+                event.finishReason === "stop" ||
+                event.finishReason === "tool-calls" ||
+                event.finishReason === "length"
+                  ? event.finishReason
+                  : "error";
+              nativeOutput?.stepEnd(nativeFinishReason);
 
               pendingNoReplyTurnText = "";
               pendingNoReplyTurnOutputs = [];
@@ -7010,6 +7280,7 @@ export async function startBusAgentRunner(params: {
             }
 
             if (event.type === "turn_abort") {
+              nativeOutput?.stepEnd("canceled");
               if (bufferNoReplyTurnText) {
                 finalText = finalText.slice(0, turnTextStartIndex);
               }
@@ -7028,6 +7299,7 @@ export async function startBusAgentRunner(params: {
               event.type === "turn_retry" ||
               (event.type === "messages_reset" && event.reason === "recovery")
             ) {
+              nativeOutput?.reset(crypto.randomUUID(), nativeStepId());
               if (event.type === "messages_reset") {
                 const retainedToolCallIds = toolCallIdsFromMessages(event.messages);
                 const retainsCurrentTurn = [...currentTurnToolCallIds].some((toolCallId) =>
@@ -7093,6 +7365,11 @@ export async function startBusAgentRunner(params: {
               event.assistantMessageEvent.type === "text_start"
             ) {
               const phase = openAIMessagePhase(event.assistantMessageEvent.raw.providerMetadata);
+              nativeOutput?.textStart({
+                partId: event.assistantMessageEvent.id,
+                stepId: nativeStepId(),
+                phase,
+              });
               if (phase !== undefined) {
                 assistantTextPhaseByPartId.set(event.assistantMessageEvent.id, phase);
               }
@@ -7142,7 +7419,12 @@ export async function startBusAgentRunner(params: {
 
               if (bufferNoReplyTurnText) {
                 pendingNoReplyTurnText += delta;
-                appendPendingNoReplyOutput(delta, phase, phaseBoundaryPrefixChars);
+                appendPendingNoReplyOutput(
+                  event.assistantMessageEvent.id,
+                  delta,
+                  phase,
+                  phaseBoundaryPrefixChars,
+                );
                 if (!isPossibleNoReplyPrefix(pendingNoReplyTurnText)) {
                   bufferNoReplyTurnText = false;
                   if (state.activeRun?.requestId === next.requestId) {
@@ -7155,6 +7437,16 @@ export async function startBusAgentRunner(params: {
                 if (state.activeRun?.requestId === next.requestId) {
                   state.activeRun.partialText += delta;
                 }
+                nativeOutput?.textStart({
+                  partId: event.assistantMessageEvent.id,
+                  stepId: nativeStepId(),
+                  phase,
+                });
+                nativeOutput?.textDelta(
+                  event.assistantMessageEvent.id,
+                  event.assistantMessageEvent.delta,
+                );
+                nativeHasText = true;
                 outputPublisher.publishText(delta, phase, phaseBoundaryPrefixChars);
               }
             }
@@ -7163,6 +7455,7 @@ export async function startBusAgentRunner(params: {
               event.type === "message_update" &&
               event.assistantMessageEvent.type === "text_end"
             ) {
+              if (!bufferNoReplyTurnText) nativeOutput?.textEnd(event.assistantMessageEvent.id);
               markAssistantTextPartEnded(
                 assistantTextPartBoundaryState,
                 event.assistantMessageEvent.id,
@@ -7175,6 +7468,12 @@ export async function startBusAgentRunner(params: {
               event.assistantMessageEvent.type === "thinking_start"
             ) {
               const chunkId = event.assistantMessageEvent.id;
+              nativeOutput?.activity({
+                activityId: chunkId,
+                stepId: nativeStepId(),
+                kind: "thinking",
+                state: "start",
+              });
               retryAttemptHadReasoning = true;
               consumeReasoningChunkEvent(reasoningChunkState, {
                 type: "start",
@@ -7214,6 +7513,12 @@ export async function startBusAgentRunner(params: {
               event.assistantMessageEvent.type === "thinking_end"
             ) {
               const chunkId = event.assistantMessageEvent.id;
+              nativeOutput?.activity({
+                activityId: chunkId,
+                stepId: nativeStepId(),
+                kind: "thinking",
+                state: "complete",
+              });
               consumeReasoningChunkEvent(reasoningChunkState, {
                 type: "end",
                 chunkId,
@@ -7222,6 +7527,7 @@ export async function startBusAgentRunner(params: {
             }
 
             if (event.type === "tool_execution_start") {
+              publishNativeToolActivity(event.toolCallId, "start", event.toolName);
               const startedAt = Date.now();
               toolStartMs.set(event.toolCallId, startedAt);
               currentTurnToolCallIds.add(event.toolCallId);
@@ -7267,6 +7573,7 @@ export async function startBusAgentRunner(params: {
                   ok = toolFailure.ok;
                   break;
               }
+              publishNativeToolActivity(event.toolCallId, "end", event.toolName, ok);
               const interruptedForShutdown = shutdownAbortRequestIds.has(headers.request_id);
               const toolFailureError = toolFailure.error ?? "tool failed";
 
@@ -7437,14 +7744,20 @@ export async function startBusAgentRunner(params: {
                 ? await waitForPreAgent(
                     maybeBuildAutoInjectedThreadSearchMessages({
                       cfg,
-                      conversationThreads: params.conversationThreads,
+                      conversationThreads:
+                        next.requestClient === "native"
+                          ? params.nativeConversationThreads?.({
+                              requestId: next.requestId,
+                              requestDeliveryId: next.requestDeliveryId ?? "",
+                              sessionId: next.sessionId,
+                              raw: next.raw,
+                            })
+                          : params.conversationThreads,
                       requestId: headers.request_id,
                       raw: next.raw,
                       previousMessages: agent.state.messages,
                       userMessages: mergedInitial,
-                      publishToolStatus: async (update) => {
-                        await outputPublisher.publishToolCall(update);
-                      },
+                      publishToolStatus: publishNonAgentToolStatus,
                       onError: reportAutoInjectedThreadSearchError,
                       onInjected: (event) => {
                         logger.info("conversation.thread.auto_inject.appended", {
@@ -7597,10 +7910,11 @@ export async function startBusAgentRunner(params: {
             finalText = "";
           }
 
-          // Keep skip-reply behavior for primary runs.
-          // For subagent runs we still persist to support explicit session continuation.
           const transcriptStore = params.transcriptStore;
-          if (transcriptStore && (!shouldSkipSurfaceReply || runProfile !== "primary")) {
+          if (
+            transcriptStore &&
+            (!shouldSkipSurfaceReply || runProfile !== "primary" || next.requestClient === "native")
+          ) {
             const persistedTranscript = await captureBusAgentRunnerOperation(
               "successful transcript persistence",
               async () => {
@@ -7621,7 +7935,7 @@ export async function startBusAgentRunner(params: {
                   return selectPersistedTranscriptMessages({
                     finalMessages: finalMessagesForPersistence,
                     responseStartIndex,
-                    isPrimary: runProfile === "primary",
+                    isPrimary: runProfile === "primary" && next.requestClient !== "native",
                     didCompact: isCompactionCheckpoint,
                   });
                 })();
@@ -7675,8 +7989,6 @@ export async function startBusAgentRunner(params: {
                   requestId: headers.request_id,
                   sessionId: headers.session_id,
                   requestClient: headers.request_client,
-                  // Primary runs can reconstruct context from the surface thread.
-                  // Subagent runs need full per-session transcript for explicit continuation.
                   messages: persistedMessages,
                   finalText,
                   modelLabel: resolvedModelLabel,
@@ -8027,7 +8339,7 @@ export async function startBusAgentRunner(params: {
             customCommandError = failure.displayMessage;
           }
           await captureBusAgentRunnerOperation("custom command failure status publish", () =>
-            outputPublisher.publishToolCall({
+            publishNonAgentToolStatus({
               toolCallId,
               status: "end",
               display,
@@ -8124,6 +8436,8 @@ export async function startBusAgentRunner(params: {
                   return buildPersistedHeartbeatMessages(`Error: ${msg}`);
                 }
 
+                if (next.requestClient === "native")
+                  return safeFinalMessages.length > 0 ? safeFinalMessages : next.messages;
                 return runProfile === "primary" ? responseMessages : safeFinalMessages;
               })();
               const persistedMessages = await projectTranscriptMessagesForPersistence({
@@ -8442,6 +8756,8 @@ export async function startBusAgentRunner(params: {
         await Promise.all([...level1ToolsetReleases].map(releaseLevel1Toolset));
       }
       const finalReplayDeadline = outputPublisher.getFinalReplayDeadline();
+      if (!terminalPanic && shouldTerminalizeRequest)
+        await publishNativeTerminal(requestTerminalKind);
       const terminalSurfaceWriteSatisfied =
         !terminalSurfaceWriteAttempted || terminalSurfaceWriteInitiated;
       if (terminalSurfaceWriteSatisfied) markActiveRunTerminal();
@@ -8535,6 +8851,24 @@ export async function startBusAgentRunner(params: {
           });
         }
       }
+      if (
+        next.requestClient === "native" &&
+        next.requestDeliveryId &&
+        owningDeliveryTerminalized &&
+        !checkpointWriterAbandoned
+      ) {
+        const settled = await params.nativeExecution?.settled(
+          {
+            requestId: next.requestId,
+            requestDeliveryId: next.requestDeliveryId,
+            sessionId,
+            raw: next.raw,
+          },
+          requestTerminalKind,
+        );
+        const settlementError = settled?.match({ ok: () => null, err: (error) => error });
+        if (settlementError) signalBusAgentRunnerHostFailure(settlementError);
+      }
       if (next.requestDeliveryId) params.onRequestSettled?.(next.requestDeliveryId);
       for (const requestDeliveryId of state.activeRun?.retainedRequestDeliveries.keys() ?? []) {
         params.onRequestSettled?.(requestDeliveryId);
@@ -8579,6 +8913,73 @@ export async function startBusAgentRunner(params: {
       });
     }
     return active;
+  }
+
+  function validateNativeRequest(request: NativeRunnerRequest): ResultType<
+    {
+      readonly safetyMode: SessionSafetyMode;
+      readonly resolvedModelRequest?: DurableResolvedModelRequest;
+    },
+    Error
+  > {
+    if (!params.nativeExecution)
+      return Result.err(new Error("Native request admission is unavailable"));
+    if (nativeBlockedSessions.has(request.sessionId))
+      return Result.err(new Error("Native session mutation is in progress"));
+    return params.nativeExecution.validate(request);
+  }
+
+  async function rejectNativeDelivery(
+    requestDeliveryId: string,
+    cause: Error,
+  ): Promise<ResultType<void, BusAgentRunnerDeliveryError>> {
+    if (!params.requestDelivery) return Result.ok(undefined);
+    const terminalized = await params.requestDelivery.terminalize({
+      requestDeliveryId,
+      outcome: { kind: "cancelled", code: "native-admission-rejected" },
+      transportCommitRequired: true,
+    });
+    const rejection = await Result.gen(async function* () {
+      yield* terminalized;
+      if (params.nativeExecution?.rejected)
+        yield* Result.await(params.nativeExecution.rejected(requestDeliveryId));
+      return Result.ok(undefined);
+    });
+    return rejection.mapError(
+      (error) => new BusAgentRunnerIntakeFailed({ cause: error, message: cause.message }),
+    );
+  }
+
+  async function cancelNativeSession(sessionId: string): Promise<ResultType<void, Error>> {
+    if (!sessionId.startsWith("native:"))
+      return Result.err(new Error("Native cancellation requires a native session"));
+    nativeBlockedSessions.add(sessionId);
+    const state = bySession.get(sessionId);
+    if (!state) {
+      nativeBlockedSessions.delete(sessionId);
+      return Result.ok(undefined);
+    }
+    const queued = state.queue.splice(0);
+    for (const entry of queued) {
+      const rejected = await rejectNativeDelivery(
+        entry.requestDeliveryId ?? "",
+        new Error("Native session canceled"),
+      );
+      const failure = rejected.match({ ok: () => null, err: (error) => error });
+      if (failure) {
+        nativeBlockedSessions.delete(sessionId);
+        return Result.err(failure);
+      }
+      if (entry.identityOwner) requestMessageCache.releaseOwner(entry.identityOwner);
+      reservedQueueEntries.delete(entry);
+    }
+    if (state.activeRun) {
+      state.activeRun.cancel();
+      state.agent?.cancel();
+    }
+    await sessionDrainOperations.get(sessionId);
+    nativeBlockedSessions.delete(sessionId);
+    return Result.ok(undefined);
   }
 
   function discardPausedRecoveredDelivery(requestDeliveryId: string): ResultType<void, Error> {
@@ -8764,6 +9165,16 @@ export async function startBusAgentRunner(params: {
         new Error("Accepted request delivery identity does not match its durable work"),
       );
     }
+    if (work.requestClient === "native") {
+      const validated = validateNativeRequest({
+        requestId: work.requestId,
+        requestDeliveryId: work.requestDeliveryId,
+        sessionId: work.sessionId,
+        raw: preserveAgentRunnerRaw({ data: work.data }),
+      });
+      const rejection = validated.match({ ok: () => null, err: (error) => error });
+      if (rejection) return rejectNativeDelivery(work.requestDeliveryId, rejection);
+    }
     if (recoveryHead?.state === "terminal") return Result.ok(undefined);
     for (const state of bySession.values()) {
       if (
@@ -8823,7 +9234,11 @@ export async function startBusAgentRunner(params: {
         : { restoredSafetyMode: "restricted" as const }),
       ...(recoveryHead?.checkpoint
         ? {
-            recovery: { checkpointMessages: [], partialText: "" },
+            recovery: {
+              checkpointMessages: [],
+              partialText: "",
+              nativeOutputFrontier: recoveryHead.checkpoint.nativeOutput,
+            },
             storedRecoveryCheckpoint: [...recoveryHead.checkpoint.messages],
             recoveryMcpImages: recoveryHead.checkpoint.mcpImages,
             ...(recoveryHead.checkpoint.loadedCatalogIds
@@ -8873,6 +9288,32 @@ export async function startBusAgentRunner(params: {
     getActiveLevel1Work,
     resumeAcceptedDelivery,
     discardPausedRecoveredDelivery,
+    cancelNativeSession,
+    readSubagentSnapshot(sessionId: string, requestId: string, includeMessages = false) {
+      const state = bySession.get(sessionId);
+      const run = state?.activeRun;
+      if (!run || run.requestId !== requestId || run.runProfile === "primary") return undefined;
+      const tool = [...run.activeTools.values()].at(-1);
+      const stream = state.agent?.state.streamMessage;
+      const responding =
+        typeof stream?.content === "string"
+          ? stream.content.length > 0
+          : stream?.content.at(-1)?.type === "text";
+      return {
+        messages: includeMessages
+          ? [
+              ...(state.agent?.state.messages ?? []),
+              ...(state.agent?.state.streamMessage ? [state.agent.state.streamMessage] : []),
+            ]
+          : [],
+        streaming: !!state.agent?.state.streamMessage,
+        activeTools: [...run.activeTools].map(([toolCallId, tool]) => ({
+          toolCallId,
+          toolName: tool.toolName,
+        })),
+        title: tool?.toolName ?? (responding ? "Responding…" : "Thinking…"),
+      };
+    },
     getActiveDrainOperation: () => activeDrainOperation,
     getTerminalCleanupOperations: () => terminalCleanupOperations,
     stop: async () => {

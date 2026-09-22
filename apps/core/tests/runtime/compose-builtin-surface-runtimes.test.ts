@@ -12,6 +12,8 @@ import type {
 import { createDescriptorBoundSurfaceEventSource } from "../../src/surface/produced-ref-guard";
 import type { SurfaceRuntimeHealthPort } from "../../src/surface/runtime-descriptor";
 import type { TelegramAdapterHealthSnapshot } from "../../src/surface/telegram/telegram-adapter";
+import { nativeSurfaceProtocol } from "../../src/surface/native/native-protocol";
+import type { SurfaceRuntimeDescriptor } from "../../src/surface/runtime-descriptor";
 import { createInMemoryDeliveryBus } from "../helpers/in-memory-delivery-bus";
 
 function createComposition(input: {
@@ -19,6 +21,8 @@ function createComposition(input: {
   readonly githubAppCredentialsAvailable: boolean;
   readonly discordHealth?: SurfaceRuntimeHealthPort;
   readonly telegramEnabled?: boolean;
+  readonly discordEnabled?: boolean;
+  readonly nativeDescriptor?: SurfaceRuntimeDescriptor<"native">;
 }) {
   const logs: Array<{
     readonly level: "debug" | "info" | "warn";
@@ -42,6 +46,8 @@ function createComposition(input: {
   };
   const created = composeBuiltinSurfaceRuntimes({
     discordAdapter,
+    discordEnabled: input.discordEnabled,
+    nativeDescriptor: input.nativeDescriptor,
     githubAdapter,
     descriptorBoundDiscordEventSource: createDescriptorBoundSurfaceEventSource(
       "discord",
@@ -170,6 +176,22 @@ describe("built-in surface runtime composition", () => {
     await adapterIngress.stop();
   });
 
+  it("runs native without registering Discord ingress, relay or questions", () => {
+    const composition = createComposition({
+      githubAppCredentialsAvailable: false,
+      discordEnabled: false,
+      nativeDescriptor: { protocol: nativeSurfaceProtocol, adapter: {} as SurfaceAdapter },
+    });
+    expect(composition.registry.entries().map((entry) => entry.platform)).toEqual([
+      "native",
+      "github",
+    ]);
+    expect(composition.registry.adapterResolver().resolve("discord")).toBeNull();
+    expect(composition.registry.questionResolver().entries()).toHaveLength(0);
+    const native = composition.registry.entries()[0]!;
+    expect(native.relay).toBeUndefined();
+    expect(native.adapterIngress).toBeUndefined();
+  });
   it("registers optional Discord health without adding it to other descriptors", () => {
     const health: SurfaceRuntimeHealthPort = {
       getContribution: () => ({ checks: [], info: { ready: true } }),
@@ -240,60 +262,69 @@ describe("built-in surface runtime composition", () => {
     },
   );
 
-  it("preserves Discord ingress, transcript lookup, relay IDs, and logging", async () => {
-    const composition = createComposition({
-      webhookSecret: "webhook-secret",
-      githubAppCredentialsAvailable: true,
-    });
-    const [discord, github] = composition.registry.entries();
-    if (!discord?.adapterIngress || !discord.relay || !github?.relay) {
-      throw new Error("missing expected built-in runtime ports");
-    }
+  it.each([false, true])(
+    "preserves Discord ingress and relay with native enabled=%s",
+    async (nativeEnabled) => {
+      const composition = createComposition({
+        webhookSecret: "webhook-secret",
+        githubAppCredentialsAvailable: true,
+        ...(nativeEnabled
+          ? { nativeDescriptor: { protocol: nativeSurfaceProtocol, adapter: {} as SurfaceAdapter } }
+          : {}),
+      });
+      const entries = composition.registry.entries();
+      const discord = entries.find((entry) => entry.platform === "discord");
+      const github = entries.find((entry) => entry.platform === "github");
+      expect(entries.some((entry) => entry.platform === "native")).toBe(nativeEnabled);
+      if (!discord?.adapterIngress || !discord.relay || !github?.relay) {
+        throw new Error("missing expected built-in runtime ports");
+      }
 
-    const ingress = await discord.adapterIngress.start();
-    const eventHandler = composition.getAdapterEventHandler();
-    if (!eventHandler) throw new Error("Discord event source was not subscribed");
-    await eventHandler({
-      type: "adapter.request.cancel",
-      platform: "discord",
-      ts: 1,
-      requestId: "discord:channel:message",
-      sessionId: "channel",
-    });
-    expect(() =>
-      eventHandler({
+      const ingress = await discord.adapterIngress.start();
+      const eventHandler = composition.getAdapterEventHandler();
+      if (!eventHandler) throw new Error("Discord event source was not subscribed");
+      await eventHandler({
         type: "adapter.request.cancel",
-        platform: "github",
-        ts: 2,
-        requestId: "github:octo/repo#1:1",
-        sessionId: "octo/repo#1",
-      }),
-    ).toThrow(Panic);
+        platform: "discord",
+        ts: 1,
+        requestId: "discord:channel:message",
+        sessionId: "channel",
+      });
+      expect(() =>
+        eventHandler({
+          type: "adapter.request.cancel",
+          platform: "github",
+          ts: 2,
+          requestId: "github:octo/repo#1:1",
+          sessionId: "octo/repo#1",
+        }),
+      ).toThrow(Panic);
 
-    const discordRelay = await discord.relay.lifecycle.start();
-    const githubRelay = await github.relay.lifecycle.start();
+      const discordRelay = await discord.relay.lifecycle.start();
+      const githubRelay = await github.relay.lifecycle.start();
 
-    expect(composition.getTranscriptStoreLookups()).toBe(3);
-    expect(composition.logs).toEqual([
-      {
-        level: "debug",
-        message: "bridgeAdapterToBus started",
-        context: { subscriptionId: "focused:adapter-to-bus" },
-      },
-      {
-        level: "debug",
-        message: "bridgeBusToAdapter started",
-        context: { subscriptionId: "focused:bus-to-adapter" },
-      },
-      {
-        level: "debug",
-        message: "GitHub output relay started",
-        context: { subscriptionId: "focused:bus-to-github" },
-      },
-    ]);
+      expect(composition.getTranscriptStoreLookups()).toBe(3);
+      expect(composition.logs).toEqual([
+        {
+          level: "debug",
+          message: "bridgeAdapterToBus started",
+          context: { subscriptionId: "focused:adapter-to-bus" },
+        },
+        {
+          level: "debug",
+          message: "bridgeBusToAdapter started",
+          context: { subscriptionId: "focused:bus-to-adapter" },
+        },
+        {
+          level: "debug",
+          message: "GitHub output relay started",
+          context: { subscriptionId: "focused:bus-to-github" },
+        },
+      ]);
 
-    await githubRelay.stop();
-    await discordRelay.stop();
-    await ingress.stop();
-  });
+      await githubRelay.stop();
+      await discordRelay.stop();
+      await ingress.stop();
+    },
+  );
 });

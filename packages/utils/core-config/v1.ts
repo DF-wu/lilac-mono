@@ -15,6 +15,7 @@ import type {
   UniversalCoreConfig,
 } from "./types";
 import {
+  defaultNativeSurfaceConfig,
   DEFAULT_DISCORD_ATTACHMENT_CACHE_TTL_MS,
   DEFAULT_TRANSCRIPT_RETENTION_MAX_AGE_MS,
   DEFAULT_TRANSCRIPT_RETENTION_MAX_REQUESTS,
@@ -764,6 +765,7 @@ function coreConfigV1ToUniversal(
     },
     surface: {
       ...parsed.surface,
+      native: defaultNativeSurfaceConfig(),
       discord: {
         ...discordRest,
         attachmentCache: {

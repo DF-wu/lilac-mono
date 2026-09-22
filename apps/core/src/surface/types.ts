@@ -16,7 +16,7 @@ export type RoutedSurfacePlatform = "discord" | "telegram";
  * runtime source of truth for decoding persisted platform strings back into
  * those discriminated unions; keep it in sync with `SessionRef`/`MsgRef`.
  */
-export const SURFACE_REF_PLATFORMS = ["discord", "github", "telegram"] as const;
+export const SURFACE_REF_PLATFORMS = ["discord", "github", "telegram", "native"] as const;
 
 export type SurfaceRefPlatform = (typeof SURFACE_REF_PLATFORMS)[number];
 
@@ -89,8 +89,23 @@ export type TelegramMsgRef = {
   messageId: string;
 };
 
-export type SessionRef = DiscordSessionRef | GithubSessionRef | TelegramSessionRef;
-export type MsgRef = DiscordMsgRef | GithubMsgRef | TelegramMsgRef;
+export type NativeSessionRef = {
+  platform: "native";
+  channelId: string;
+};
+
+export type NativeMsgRef = {
+  platform: "native";
+  channelId: string;
+  messageId: string;
+};
+
+export type SessionRef =
+  | DiscordSessionRef
+  | GithubSessionRef
+  | TelegramSessionRef
+  | NativeSessionRef;
+export type MsgRef = DiscordMsgRef | GithubMsgRef | TelegramMsgRef | NativeMsgRef;
 
 export type RegisteredSurfacePlatform = SessionRef["platform"];
 
@@ -133,12 +148,14 @@ export type SurfaceSelf = {
 };
 
 export type SurfaceSession = {
+  updatedAt?: number;
   ref: SessionRef;
   title?: string;
   kind: "channel" | "thread" | "dm";
 };
 
 export type SurfaceMessage = {
+  replyTo?: MsgRef;
   ref: MsgRef;
   session: SessionRef;
   userId: string;
@@ -148,6 +165,7 @@ export type SurfaceMessage = {
   editedTs?: number;
   deleted?: boolean;
   raw?: unknown;
+  attachments?: readonly { url: string; filename?: string; mimeType?: string; size?: number }[];
 };
 
 export type SurfaceReactionUser = {

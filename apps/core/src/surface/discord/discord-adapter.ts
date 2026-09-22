@@ -1129,7 +1129,7 @@ export class DiscordAdapter implements SurfaceAdapter {
     };
   }
 
-  async listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>> {
+  async listSessions(opts?: { limit?: number }): Promise<SurfaceOperationResult<SurfaceSession[]>> {
     const storeResult = this.storeResult();
     const storeError = storeResult.match({ ok: () => null, err: (error) => error });
     if (storeError) {
@@ -1142,7 +1142,7 @@ export class DiscordAdapter implements SurfaceAdapter {
       );
     }
     const store = selectResultValue(storeResult);
-    const sessions = store.listSessions();
+    const sessions = store.listSessions(opts?.limit);
     return Result.ok(
       sessions.map((s) => ({
         ref: asDiscordSessionRef({
@@ -1151,6 +1151,7 @@ export class DiscordAdapter implements SurfaceAdapter {
           parentChannelId: s.parent_channel_id,
         }),
         title: s.name ?? undefined,
+        updatedAt: s.activity_ts,
         kind: s.type,
       })),
     );

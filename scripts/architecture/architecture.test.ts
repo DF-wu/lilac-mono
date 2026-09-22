@@ -2676,6 +2676,8 @@ describe("permanent architecture governance", () => {
       ),
     );
     for (const required of [
+      "apps/tui:src/session.ts#decodeTuiBootstrap:wire",
+      "apps/tui:src/auth.ts#decodeOperatorSession:wire",
       "apps/core:src/tool-server/create-tool-server.ts#normalizeSuccessfulToolValue:plugin",
       "apps/core:src/surface/bridge/bus-agent-runner/raw.ts#parseRequestControlFromRaw:projection",
       "apps/core:src/workflow/workflow-action-resolver.ts#decodeWorkflowActionOutboxEvent:persistence",

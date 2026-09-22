@@ -1,3 +1,8 @@
+import {
+  createNativeOutputPublisher,
+  NativeOutputPublishFailed,
+  type NativeOutputEvent,
+} from "../../../src/surface/native/output";
 import { afterAll, beforeAll, describe, expect, it, jest, spyOn } from "bun:test";
 import path from "node:path";
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
@@ -2821,7 +2826,7 @@ async function publishRunnerRequest(input: {
   text: string;
   messages?: readonly unknown[];
   modelOverride?: string;
-  requestClient?: "discord" | "github";
+  requestClient?: "discord" | "github" | "native";
   corePrimaryLineage?: CorePrimaryLineageV2;
   raw?: unknown;
   requestDeliveryId?: string;
@@ -13360,5 +13365,538 @@ describe("custom command failures", () => {
     expect(finalText).toBe(
       "Error running /fixture: bounded error [tool result truncated: 100 characters omitted]",
     );
+  });
+});
+
+describe("native output runner durability", () => {
+  it.each(["paragraph", "complete"] as const)(
+    "publishes semantic %s output and suppresses NO_REPLY",
+    async (mode) => {
+      for (const answer of ["First\n\nLast", "NO_REPLY"]) {
+        const bus = createLilacBus(createInMemoryRawBus());
+        const pluginManager = corePrimaryTestPluginManager();
+        const settled = deferred<void>();
+        const events: NativeOutputEvent[] = [];
+        const nativeTranscripts = new SqliteTranscriptStore(":memory:");
+        const runner = await startBusAgentRunner({
+          bus,
+          pluginManager,
+          transcriptStore: nativeTranscripts,
+          config: parseCoreConfigV2ToUniversal({}),
+          subscriptionId: `native-${mode}-${answer}`,
+          nativeExecution: {
+            validate: () => Result.ok({ safetyMode: "restricted" }),
+            settled: async () => Result.ok(undefined),
+          },
+          reportFatalPanic: (panic) => {
+            throw panic;
+          },
+          onRequestSettled: () => settled.resolve(undefined),
+          issueControlCapability: () => ({ capability: "native-test", principal: null }),
+          createNativeOutput: ({ requestId }) =>
+            createNativeOutputPublisher({
+              requestId,
+              threadId: "thread",
+              turnId: "turn",
+              generation: 0,
+              attemptId: "attempt",
+              mode,
+              publish: async (event) => {
+                events.push(event);
+                return Result.ok(undefined);
+              },
+            }),
+          createAgent: (options) =>
+            new AiSdkPiAgent({
+              ...options,
+              model: new MockLanguageModelV4({
+                modelId: "native-output",
+                doStream: async () => {
+                  settled.resolve(undefined);
+                  return level1TextStep(answer);
+                },
+              }),
+            }),
+        });
+        try {
+          const requestDeliveryId = crypto.randomUUID();
+          await publishRunnerRequest({
+            bus,
+            requestDeliveryId,
+            requestId: "native:output:test",
+            sessionId: "native:output",
+            requestClient: "native",
+            text: "answer",
+            raw: {
+              authenticatedActor: { platform: "native", userId: "starter" },
+              authenticatedOrigin: {
+                platform: "native",
+                userId: "starter",
+                messageRef: { platform: "native", channelId: "output", messageId: "test" },
+              },
+              native: {
+                requestId: "native:output:test",
+                requestDeliveryId,
+                threadId: "output",
+                authorUserId: "author",
+                starterUserId: "starter",
+                turnId: "turn",
+                inputId: "test",
+                historyGeneration: 0,
+              },
+            },
+          });
+          await settled.promise;
+          await runner.getActiveDrainOperation();
+          const chunks = events.flatMap((event) =>
+            event.payload.type === "text" ? [event.payload.text] : [],
+          );
+          const expected =
+            answer === "NO_REPLY" ? [] : mode === "paragraph" ? ["First\n\n", "Last"] : [answer];
+          expect(chunks).toEqual(expected);
+          expect(events.at(-1)?.payload).toEqual({ type: "terminal", state: "complete" });
+          const canonical = transcriptResultValue(
+            nativeTranscripts.getRequestTranscript({ requestId: "native:output:test" }),
+          );
+          expect(
+            canonical?.messages.some(
+              (message) =>
+                message.role === "user" && JSON.stringify(message.content).includes("answer"),
+            ),
+          ).toBe(true);
+        } finally {
+          await runner.stop();
+          nativeTranscripts.close();
+          await pluginManager.destroy();
+          await bus.close();
+        }
+      }
+    },
+  );
+
+  it("keeps output-bearing WAL checkpoints and terminal markers behind durable native publication", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    const settled = deferred<void>();
+    const attempted = deferred<void>();
+    const release = deferred<void>();
+    const checkpoints: AgentRunCheckpointV1[] = [];
+    let terminals = 0;
+    let outputDurable = false;
+    const store = new SqliteRequestDeliveryStore({
+      dbPath: ":memory:",
+      codecs: coreRequestDeliveryCodecs,
+    });
+    const requestDelivery = new RequestDeliveryCoordinator({
+      store,
+      blobStore: TEST_BLOB_STORE,
+      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+    });
+    const runner = await startBusAgentRunner({
+      requestDelivery,
+      bus,
+      pluginManager,
+      config: parseCoreConfigV2ToUniversal({}),
+      subscriptionId: "native-output-barrier",
+      reportFatalPanic: (panic) => {
+        throw panic;
+      },
+      onRequestSettled: () => settled.resolve(undefined),
+      issueControlCapability: () => ({ capability: "native-test", principal: null }),
+      agentRunJournal: {
+        openRun: (owner) =>
+          Result.ok({
+            runId: owner.requestDeliveryId,
+            requestId: owner.requestId,
+            sessionId: owner.sessionId,
+            sequence: 1,
+          }),
+        writeCheckpoint: (handle, checkpoint) => {
+          if (JSON.stringify(checkpoint.messages).includes("visible answer"))
+            expect(outputDurable).toBe(true);
+          checkpoints.push(checkpoint);
+          return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+        },
+        markTerminal: (handle) => {
+          terminals += 1;
+          expect(outputDurable).toBe(true);
+          return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+        },
+        resetRun: () => Result.ok(undefined),
+        removeReconciled: () => Result.ok(undefined),
+      },
+      createNativeOutput: ({ requestId }) =>
+        createNativeOutputPublisher({
+          requestId,
+          threadId: "thread",
+          turnId: "turn",
+          generation: 0,
+          attemptId: "attempt",
+          mode: "complete",
+          publish: async () => {
+            attempted.resolve(undefined);
+            await release.promise;
+            outputDurable = true;
+            return Result.ok(undefined);
+          },
+        }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "native-output",
+            doStream: async () => {
+              settled.resolve(undefined);
+              return level1TextStep("visible answer");
+            },
+          }),
+        }),
+    });
+    try {
+      const requestDeliveryId = crypto.randomUUID();
+      transcriptResultValue(
+        store.prepare({
+          requestDeliveryId,
+          requestId: "github:native-barrier:test",
+          inputHandles: [],
+          createdAt: 1,
+          envelope: {
+            headers: {
+              request_id: "github:native-barrier:test",
+              session_id: "native-barrier",
+              request_client: "github",
+            },
+            data: {
+              requestDeliveryId,
+              queue: "prompt",
+              messages: [{ role: "user", content: "answer" }],
+            },
+          },
+        }),
+      );
+      await publishRunnerRequest({
+        bus,
+        requestDeliveryId,
+        requestId: "github:native-barrier:test",
+        sessionId: "native-barrier",
+        text: "answer",
+      });
+      await attempted.promise;
+      expect(
+        checkpoints.some((checkpoint) =>
+          JSON.stringify(checkpoint.messages).includes("visible answer"),
+        ),
+      ).toBe(false);
+      expect(terminals).toBe(0);
+      release.resolve(undefined);
+      await settled.promise;
+      await runner.getActiveDrainOperation();
+      expect(
+        checkpoints.some((checkpoint) =>
+          JSON.stringify(checkpoint.messages).includes("visible answer"),
+        ),
+      ).toBe(true);
+      expect(terminals).toBe(1);
+    } finally {
+      release.resolve(undefined);
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+    }
+  });
+
+  it("retains the previous WAL boundary and omits terminal markers after native publication failure", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    const settled = deferred<void>();
+    const checkpoints: AgentRunCheckpointV1[] = [];
+    let terminals = 0;
+    const store = new SqliteRequestDeliveryStore({
+      dbPath: ":memory:",
+      codecs: coreRequestDeliveryCodecs,
+    });
+    const requestDelivery = new RequestDeliveryCoordinator({
+      store,
+      blobStore: TEST_BLOB_STORE,
+      admission: createCoreRequestDeliveryAdmission(TEST_BLOB_STORE),
+    });
+    const runner = await startBusAgentRunner({
+      requestDelivery,
+      bus,
+      pluginManager,
+      config: parseCoreConfigV2ToUniversal({}),
+      subscriptionId: "native-output-failure",
+      reportFatalPanic: (panic) => {
+        throw panic;
+      },
+      onRequestSettled: () => settled.resolve(undefined),
+      issueControlCapability: () => ({ capability: "native-test", principal: null }),
+      agentRunJournal: {
+        openRun: (owner) =>
+          Result.ok({
+            runId: owner.requestDeliveryId,
+            requestId: owner.requestId,
+            sessionId: owner.sessionId,
+            sequence: 1,
+          }),
+        writeCheckpoint: (handle, checkpoint) => {
+          checkpoints.push(checkpoint);
+          return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+        },
+        markTerminal: (handle) => {
+          terminals += 1;
+          return Result.ok({ ...handle, sequence: handle.sequence + 1 });
+        },
+        resetRun: () => Result.ok(undefined),
+        removeReconciled: () => Result.ok(undefined),
+      },
+      createNativeOutput: ({ requestId }) =>
+        createNativeOutputPublisher({
+          requestId,
+          threadId: "thread",
+          turnId: "turn",
+          generation: 0,
+          attemptId: "attempt",
+          mode: "complete",
+          publish: async () =>
+            Result.err(new NativeOutputPublishFailed({ message: "unavailable" })),
+        }),
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "native-output",
+            doStream: async () => {
+              settled.resolve(undefined);
+              return level1TextStep("visible answer");
+            },
+          }),
+        }),
+    });
+    try {
+      const requestDeliveryId = crypto.randomUUID();
+      transcriptResultValue(
+        store.prepare({
+          requestDeliveryId,
+          requestId: "github:native-failure:test",
+          inputHandles: [],
+          createdAt: 1,
+          envelope: {
+            headers: {
+              request_id: "github:native-failure:test",
+              session_id: "native-failure",
+              request_client: "github",
+            },
+            data: {
+              requestDeliveryId,
+              queue: "prompt",
+              messages: [{ role: "user", content: "answer" }],
+            },
+          },
+        }),
+      );
+      await publishRunnerRequest({
+        bus,
+        requestDeliveryId,
+        requestId: "github:native-failure:test",
+        sessionId: "native-failure",
+        text: "answer",
+      });
+      await settled.promise;
+      await runner.getActiveDrainOperation();
+      expect(
+        checkpoints.some((checkpoint) =>
+          JSON.stringify(checkpoint.messages).includes("visible answer"),
+        ),
+      ).toBe(false);
+      expect(terminals).toBe(0);
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      store.close();
+      await bus.close();
+    }
+  });
+});
+
+describe("native execution runner controls", () => {
+  it("cancels the native model and waits for terminal cleanup before returning", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    const started = deferred<void>();
+    const requestId = "native:cancel:test";
+    const requestDeliveryId = crypto.randomUUID();
+    const lifecycle = await observeRequestLifecycle(bus, requestId);
+    const contexts: unknown[] = [];
+    const runner = await startBusAgentRunner({
+      bus,
+      blobStore: transcriptResultValue(await createMemoryBlobStore()),
+      pluginManager,
+      config: parseCoreConfigV2ToUniversal({}),
+      subscriptionId: "native-cancel-control",
+      reportFatalPanic: (panic) => {
+        throw panic;
+      },
+      nativeExecution: {
+        validate: () => Result.ok({ safetyMode: "restricted" }),
+        settled: async () => Result.ok(undefined),
+      },
+      issueControlCapability: (input) => {
+        contexts.push(input);
+        return { capability: "native-test", principal: null };
+      },
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "cancellable-native",
+            doStream: async ({ abortSignal }) => {
+              started.resolve(undefined);
+              await new Promise<void>((resolve) => {
+                abortSignal?.addEventListener("abort", () => resolve(), { once: true });
+              });
+              throw Object.assign(new Error("cancelled"), { name: "AbortError" });
+            },
+          }),
+        }),
+    });
+    try {
+      await publishRunnerRequest({
+        bus,
+        requestId,
+        requestDeliveryId,
+        sessionId: "native:cancel",
+        requestClient: "native",
+        text: "start",
+        raw: {
+          native: {
+            requestId,
+            requestDeliveryId,
+            threadId: "cancel",
+            authorUserId: "participant",
+            starterUserId: "starter",
+            turnId: "turn",
+            inputId: "input",
+            historyGeneration: 0,
+          },
+          authenticatedActor: { platform: "native", userId: "starter" },
+          authenticatedOrigin: {
+            platform: "native",
+            userId: "starter",
+            messageRef: { platform: "native", channelId: "cancel", messageId: "test" },
+          },
+        },
+      });
+      expect(await Promise.race([started.promise.then(() => "started"), lifecycle.terminal])).toBe(
+        "started",
+      );
+      transcriptResultValue(await runner.cancelNativeSession("native:cancel"));
+      expect(await lifecycle.terminal).toBe("cancelled");
+      expect(runner.getActiveLevel1Work()).toEqual([]);
+      expect(contexts).toEqual([
+        expect.objectContaining({
+          safetyMode: "restricted",
+          authenticatedOrigin: expect.objectContaining({ userId: "starter" }),
+        }),
+      ]);
+    } finally {
+      await lifecycle.stop();
+      await runner.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
+  });
+});
+
+describe("native output WAL recovery frontier", () => {
+  it("passes the recovered frontier to publication before resuming provider work", async () => {
+    const bus = createLilacBus(createInMemoryRawBus());
+    const pluginManager = corePrimaryTestPluginManager();
+    const started = deferred<void>();
+    const nativeEvents: NativeOutputEvent[] = [];
+    let observedFrontier: { ordinal: number; position: number } | undefined;
+    const runner = await startBusAgentRunner({
+      bus,
+      pluginManager,
+      startPaused: true,
+      subscriptionId: "native-frontier-recovery",
+      config: parseCoreConfigV2ToUniversal({}),
+      reportFatalPanic: (panic) => {
+        throw panic;
+      },
+      issueControlCapability: () => ({ capability: "native-frontier", principal: null }),
+      createNativeOutput: ({ requestId, recoveryOutputFrontier }) => {
+        observedFrontier = recoveryOutputFrontier;
+        return createNativeOutputPublisher({
+          requestId,
+          threadId: "thread",
+          turnId: "turn",
+          generation: 0,
+          attemptId: "new-attempt",
+          previousAttemptId: "old-attempt",
+          recoveryFrontier: recoveryOutputFrontier,
+          mode: "complete",
+          publish: async (event) => {
+            nativeEvents.push(event);
+            return Result.ok(undefined);
+          },
+        });
+      },
+      createAgent: (options) =>
+        new AiSdkPiAgent({
+          ...options,
+          model: new MockLanguageModelV4({
+            modelId: "native-frontier",
+            doStream: async () => {
+              started.resolve(undefined);
+              return level1TextStep("resumed");
+            },
+          }),
+        }),
+    });
+    const accepted = acceptedRunnerDelivery({
+      requestDeliveryId: crypto.randomUUID(),
+      requestId: "github:frontier:request",
+      sessionId: "frontier",
+      queue: "prompt",
+      messages: [{ role: "user", content: "continue" }],
+    });
+    const head: AgentRunRecoveryHead = {
+      handle: {
+        runId: accepted.requestDeliveryId,
+        requestId: accepted.requestId,
+        sessionId: accepted.work.sessionId,
+        sequence: 2,
+      },
+      state: "active",
+      createdAt: 1,
+      updatedAt: 2,
+      checkpoint: {
+        version: 1,
+        messages: [{ role: "user", content: "continue" }],
+        retainedRequestDeliveries: [],
+        nativeOutput: { ordinal: 17, position: 9 },
+      },
+    };
+    try {
+      transcriptResultValue(await runner.resumeAcceptedDelivery(accepted, head));
+      runner.activate();
+      await started.promise;
+      await runner.getActiveDrainOperation();
+      expect(observedFrontier).toEqual({ ordinal: 17, position: 9 });
+      expect(nativeEvents[0]?.ordinal).toBe(18);
+      expect(nativeEvents[0]?.payload).toEqual({
+        type: "reset",
+        previousAttemptId: "old-attempt",
+        retainThroughOrdinal: 17,
+      });
+      const firstText = nativeEvents.find((event) => event.payload.type === "text");
+      expect(firstText?.payload).toMatchObject({ type: "text", position: 10 });
+    } finally {
+      await runner.stop();
+      await pluginManager.destroy();
+      await bus.close();
+    }
   });
 });

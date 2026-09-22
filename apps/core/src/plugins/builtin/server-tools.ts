@@ -79,7 +79,9 @@ export function createBuiltinDiscoveryPlugin(): CoreToolPlugin {
         return signalBuiltinPluginSkip("discovery requires discovery service");
       }
       return {
-        level2: [new Discovery({ discovery: runtime.discovery })],
+        level2: [
+          new Discovery({ discovery: runtime.discovery, nativeSearch: runtime.nativeSearch }),
+        ],
       };
     },
   };
@@ -95,7 +97,12 @@ export function createBuiltinConversationThreadPlugin(): CoreToolPlugin {
         return signalBuiltinPluginSkip("conversation.thread requires conversation thread service");
       }
       return {
-        level2: [new ConversationThread({ service: runtime.conversationThreads })],
+        level2: [
+          new ConversationThread({
+            service: runtime.conversationThreads,
+            nativeSearch: runtime.nativeSearch,
+          }),
+        ],
       };
     },
   };
@@ -161,7 +168,9 @@ export function createBuiltinAttachmentPlugin(): CoreToolPlugin {
             bus: runtime.bus,
             blobStore: runtime.blobStore,
             outputLifecycle: runtime.attachmentOutputLifecycle,
+            nativeOutput: runtime.nativeAttachmentOutput,
             ...(runtime.resourceAccess ? { resourceAccess: runtime.resourceAccess } : {}),
+            resourceAccessForContext: runtime.resourceAccessForContext,
             ...(runtime.toolResultArtifacts
               ? { toolResultArtifacts: runtime.toolResultArtifacts }
               : {}),
@@ -185,6 +194,7 @@ export function createBuiltinResourcePlugin(): CoreToolPlugin {
         level2: [
           new Resource({
             access: runtime.resourceAccess,
+            accessForContext: runtime.resourceAccessForContext,
             ...(runtime.toolResultArtifacts
               ? { toolResultArtifacts: runtime.toolResultArtifacts }
               : {}),
@@ -244,6 +254,7 @@ export function createBuiltinSurfacePlugin(): CoreToolPlugin {
         level2: [
           new Surface({
             adapterResolver: runtime.surfaceAdapterResolver,
+            nativeAdapterForContext: runtime.nativeAdapterForContext,
             config: runtime.config,
             getConfig: runtime.getConfig,
             discordSearch: runtime.discordSearch,

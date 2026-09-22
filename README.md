@@ -5,13 +5,17 @@
 # Lilac Mono
 
 <p align="center">
-  <strong>Event-driven AI Agent Runtime for Discord, Telegram, GitHub, and the local terminal</strong>
+  <strong>Event-driven AI Agent Runtime for Web, Discord, Telegram, GitHub, and the local terminal</strong>
 </p>
+
+Lilac is an AI assistant you host yourself and use from the web, a terminal, or Discord. It can work with files, run
+commands, and use web tools. You choose its models and the channels where it can respond. Optional
+integrations add computer use and GitHub access.
 
 <p align="center">
   <a href="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/stanley2058/lilac-mono"><img alt="Upstream" src="https://img.shields.io/badge/upstream-stanley2058%2Flilac--mono-6f42c1"></a>
-  <a href="./package.json"><img alt="Bun 1.4.0" src="https://img.shields.io/badge/Bun-1.4.0-14151a?logo=bun&logoColor=white"></a>
+  <a href="./package.json"><img alt="Bun 1.4.2" src="https://img.shields.io/badge/Bun-1.4.2-14151a?logo=bun&logoColor=white"></a>
   <a href="./LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
 </p>
 
@@ -91,7 +95,7 @@ flowchart LR
 
 ### Core: Docker Compose
 
-Requirements: Docker Compose, Bun 1.3.14, a valid `DISCORD_TOKEN`, and at least one model provider credential matching the `models.main` configuration. Core still connects to Discord at startup; the Discord token remains required even when using only Telegram, GitHub, or the tool server. All surface allowlists remain fail-closed.
+Requirements: Docker Compose 2.30 or newer, Bun 1.4.2, and at least one model provider credential matching the `models.main` configuration. A valid `DISCORD_TOKEN` is required only when Discord is enabled. All surface allowlists remain fail-closed.
 
 ```bash
 git clone https://github.com/DF-wu/lilac-mono.git
@@ -113,7 +117,7 @@ YAML
 
 Before starting, complete these two steps:
 
-1. Set `DISCORD_TOKEN` and the credential for the model provider selected in `data/core-config.yaml` in `.env`. Stock `compose.yaml` does not pass provider credentials; the `compose.override.yaml` above explicitly passes `.env` through `env_file`.
+1. Set the credential for the model provider selected in `data/core-config.yaml` in `.env`. Also set `DISCORD_TOKEN` if Discord is enabled. Stock `compose.yaml` does not pass provider credentials; the `compose.override.yaml` above explicitly passes `.env` through `env_file`.
 2. Configure the Discord allowlist in `data/core-config.yaml`, and enable and restrict any other surfaces you plan to use.
 
 ```bash
@@ -124,6 +128,8 @@ curl -fsS http://localhost:8080/readyz
 ```
 
 `compose.yaml` also starts Redis and mounts `./data` at `/data`. See [`docs/docker-deployment.md`](./docs/docker-deployment.md) for production deployment, operator tokens, UID, persistence, and diagnostics.
+
+For the guided installer, provider authentication, terminal-only access, and native Web sign-in, see [`docs/installation.md`](./docs/installation.md). The temporary operator TUI is available with `docker compose exec --user root lilac lilac-tui`; when native Web is enabled, open `http://localhost:8789`.
 
 > [!WARNING]
 > Core's tool server has no general-purpose public HTTP authentication. Keep `8080` on a trusted host or network boundary; do not expose it directly to the public internet.
@@ -142,12 +148,13 @@ export LL_TOOL_SERVER_PORT=8080
 bun apps/core/src/runtime/main.ts
 ```
 
-Core requires `REDIS_URL`, `DISCORD_TOKEN`, and a valid model configuration. Telegram and GitHub may remain disabled, but the Discord adapter still connects when Core starts; leave the Discord allowlist empty to ignore all Discord traffic.
+Core requires `REDIS_URL` and a valid model configuration. Set `DISCORD_TOKEN` when Discord is enabled; native-only deployments can start without Discord credentials.
 
 ## Core Surfaces
 
 | Surface  | Minimum configuration                                                                                                                             | Default protection                                                                               | Documentation                                                                            |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| Native   | `surface.native.enabled: true`, installation ID, local or Clerk authentication, and provider credentials                                          | Disabled by default; authenticated owner access only                                             | [`docs/native-surface.md`](./docs/native-surface.md)                                     |
 | Discord  | `DISCORD_TOKEN`; configure `allowedChannelIds` or `allowedGuildIds`                                                                               | Ignores all Discord traffic when both allowlists are empty                                       | [`core-config.example.yaml`](./packages/utils/config-templates/core-config.example.yaml) |
 | Telegram | `configVersion: 2`, `enabled: true`, `token`, `allowedChatIds`                                                                                    | Disabled by default; ignores all chats when the chat allowlist is empty                          | [`docs/telegram-surface.md`](./docs/telegram-surface.md)                                 |
 | GitHub   | GitHub App auth, `GITHUB_WEBHOOK_SECRET`, and an HTTPS/reverse proxy reachable by GitHub; a user token is an optional preferred outbound identity | The surface does not start without the GitHub App secret; returns `401` for an invalid signature | [`docs/github-reply-permalinks.md`](./docs/github-reply-permalinks.md)                   |
@@ -315,6 +322,7 @@ See [`AGENTS.md`](./AGENTS.md) for each workspace's build, test, and typecheck c
 - [`docs/README.md`](./docs/README.md): deployment, surface, fork-feature, and extension index
 - [`docs/installation.md`](./docs/installation.md): guided installation, providers, and reconfiguration
 - [`docs/docker-deployment.md`](./docs/docker-deployment.md): container deployment and diagnostics
+- [`docs/native-surface.md`](./docs/native-surface.md): native Web authentication, configuration, and operation
 - [`docs/computer-use.md`](./docs/computer-use.md): optional desktop gateway and runner deployment
 - [`docs/claude-code.md`](./docs/claude-code.md): Claude Code authentication, tools, continuation, and storage
 - [`docs/skill-authoring.md`](./docs/skill-authoring.md): skill format, discovery, and authoring guidance

@@ -19,6 +19,7 @@ import {
 import {
   SurfaceRuntimeRegistry,
   type SurfaceRuntimeHealthPort,
+  type SurfaceRuntimeDescriptor,
 } from "../surface/runtime-descriptor";
 import {
   createTelegramRelayPolicy,
@@ -38,6 +39,8 @@ type BuiltinSurfaceRuntimeLogger = {
 
 export type ComposeBuiltinSurfaceRuntimesInput = {
   readonly discordAdapter: SurfaceAdapter;
+  readonly discordEnabled?: boolean;
+  readonly nativeDescriptor?: SurfaceRuntimeDescriptor<"native">;
   readonly discordQuestionAnswers?: DiscordQuestionAnswerSource;
   readonly githubAdapter: SurfaceAdapter;
   readonly descriptorBoundDiscordEventSource: SurfaceAdapterEventSource;
@@ -65,52 +68,59 @@ export function composeBuiltinSurfaceRuntimes(input: ComposeBuiltinSurfaceRuntim
   const telegram = input.telegram;
 
   return SurfaceRuntimeRegistry.create([
-    createDiscordSurfaceRuntimeDescriptor({
-      adapter: input.discordAdapter,
-      ...(input.discordQuestionAnswers ? { questionAnswers: input.discordQuestionAnswers } : {}),
-      ...(input.discordHealth ? { health: input.discordHealth } : {}),
-      adapterIngress: {
-        start: async () => {
-          const id = subscriptionId("adapter-to-bus");
-          const handle = await bridgeAdapterToBus({
-            eventSource: input.descriptorBoundDiscordEventSource,
-            platform: "discord",
-            bus: input.bus,
-            subscriptionId: id,
-            transcriptStore: input.getTranscriptStore(),
-          });
-          input.logger.debug("bridgeAdapterToBus started", {
-            subscriptionId: id,
-          });
-          return { platform: "discord", stop: () => handle.stop() };
-        },
-      },
-      createRelay: (guardedAdapter) => {
-        const policy = createDiscordRelayPolicy(guardedAdapter);
-        return {
-          ...policy,
-          lifecycle: {
-            platform: "discord",
-            start: async () => {
-              const id = subscriptionId("bus-to-adapter");
-              const relay = await bridgeBusToAdapter({
-                adapter: guardedAdapter,
-                blobStore: input.blobStore,
-                bus: input.bus,
-                platform: "discord",
-                policy,
-                subscriptionId: id,
-                transcriptStore: input.getTranscriptStore(),
-              });
-              input.logger.debug("bridgeBusToAdapter started", {
-                subscriptionId: id,
-              });
-              return relay;
+    ...(input.discordEnabled === false
+      ? []
+      : [
+          createDiscordSurfaceRuntimeDescriptor({
+            adapter: input.discordAdapter,
+            ...(input.discordQuestionAnswers
+              ? { questionAnswers: input.discordQuestionAnswers }
+              : {}),
+            ...(input.discordHealth ? { health: input.discordHealth } : {}),
+            adapterIngress: {
+              start: async () => {
+                const id = subscriptionId("adapter-to-bus");
+                const handle = await bridgeAdapterToBus({
+                  eventSource: input.descriptorBoundDiscordEventSource,
+                  platform: "discord",
+                  bus: input.bus,
+                  subscriptionId: id,
+                  transcriptStore: input.getTranscriptStore(),
+                });
+                input.logger.debug("bridgeAdapterToBus started", {
+                  subscriptionId: id,
+                });
+                return { platform: "discord", stop: () => handle.stop() };
+              },
             },
-          },
-        };
-      },
-    }),
+            createRelay: (guardedAdapter) => {
+              const policy = createDiscordRelayPolicy(guardedAdapter);
+              return {
+                ...policy,
+                lifecycle: {
+                  platform: "discord",
+                  start: async () => {
+                    const id = subscriptionId("bus-to-adapter");
+                    const relay = await bridgeBusToAdapter({
+                      adapter: guardedAdapter,
+                      blobStore: input.blobStore,
+                      bus: input.bus,
+                      platform: "discord",
+                      policy,
+                      subscriptionId: id,
+                      transcriptStore: input.getTranscriptStore(),
+                    });
+                    input.logger.debug("bridgeBusToAdapter started", {
+                      subscriptionId: id,
+                    });
+                    return relay;
+                  },
+                },
+              };
+            },
+          }),
+        ]),
+    ...(input.nativeDescriptor ? [input.nativeDescriptor] : []),
     createConfiguredGithubSurfaceRuntimeDescriptor({
       adapter: input.githubAdapter,
       webhookSecret: input.webhookSecret,

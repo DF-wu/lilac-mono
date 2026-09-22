@@ -10,6 +10,7 @@ import {
   type PublishOptions,
   type RawBus,
   type RawDeliveryHandler,
+  type SubscriptionOptions,
 } from "../index";
 
 type PublicResultHandler = Parameters<LilacBus["subscribeTopic"]>[2];
@@ -42,6 +43,34 @@ function rawBusWithFetch(
 }
 
 describe("LilacBus Result APIs", () => {
+  it("forwards the durable initial frontier without changing event codecs", async () => {
+    let received: SubscriptionOptions | undefined;
+    const raw = rawBusWithFetch(
+      async () => ({ messages: [] }),
+      async (_topic, options) => {
+        received = options;
+        return Result.ok({
+          done: Promise.resolve(Result.ok(undefined)),
+          stop: async () => Result.ok(undefined),
+        });
+      },
+    );
+    const bus = createLilacBus(raw);
+    const options = {
+      mode: "fanout" as const,
+      subscriptionId: "native-projector",
+      startFrom: "beginning" as const,
+    };
+    const subscription = await bus.subscribeTopic(
+      "evt.request",
+      options,
+      async () => Result.ok(undefined),
+      () => "retry",
+    );
+    expect(subscription.isOk()).toBe(true);
+    expect(received).toEqual(options);
+  });
+
   it("returns publish contract and transport failures as owned Results", async () => {
     const raw = rawBusWithFetch(async () => ({ messages: [] }));
     const bus = createLilacBus(raw);

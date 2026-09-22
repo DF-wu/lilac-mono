@@ -1028,6 +1028,11 @@ export type TranscriptStore = {
     loadedCatalogIds?: readonly string[];
   }): ResultType<void, TranscriptStoreWriteError>;
 
+  reconcileNativeTranscriptReferences?(input: {
+    readonly sessionId: string;
+    readonly requestIds: readonly string[];
+  }): ResultType<void, TranscriptStoreSqliteDriverFailure>;
+
   putCoreOwnedBlob?(input: {
     blob: BlobRefV1;
     mediaType: string;
@@ -1939,6 +1944,35 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
           [11, Date.now()],
         );
       }
+      if (version < 12) {
+        this.db.run(`CREATE TABLE core_native_resource_refs (
+          upload_id TEXT PRIMARY KEY CHECK (length(upload_id) > 0),
+          thread_id TEXT NOT NULL CHECK (length(thread_id) > 0),
+          resource_id TEXT NOT NULL REFERENCES core_resources(resource_id) ON DELETE RESTRICT
+        )`);
+        this.db.run(
+          "CREATE INDEX idx_core_native_resource_refs_resource ON core_native_resource_refs(resource_id)",
+        );
+        this.db.run(
+          "INSERT INTO transcript_schema_migrations (version, applied_ts) VALUES (?, ?)",
+          [12, Date.now()],
+        );
+      }
+      if (version < 13) {
+        this.db.run(`CREATE TABLE core_native_transcript_refs (
+          session_id TEXT NOT NULL CHECK (length(session_id) > 0),
+          request_id TEXT PRIMARY KEY REFERENCES request_transcripts(request_id) ON DELETE CASCADE
+        )`);
+        this.db.run(
+          "CREATE INDEX idx_core_native_transcript_refs_session ON core_native_transcript_refs(session_id)",
+        );
+        this.db.run(`INSERT INTO core_native_transcript_refs (session_id, request_id)
+          SELECT session_id, request_id FROM request_transcripts WHERE request_client = 'native'`);
+        this.db.run(
+          "INSERT INTO transcript_schema_migrations (version, applied_ts) VALUES (?, ?)",
+          [13, Date.now()],
+        );
+      }
       const foreignKeyFailures = this.db
         .query<DecodedTranscriptForeignKeyFailureRow, []>("PRAGMA foreign_key_check")
         .all()
@@ -2113,6 +2147,13 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
               loadedCatalogIdsJson,
             ],
           );
+          if (input.requestClient === "native") {
+            this.db.run(
+              `INSERT INTO core_native_transcript_refs (session_id, request_id)
+              VALUES (?, ?) ON CONFLICT(request_id) DO UPDATE SET session_id = excluded.session_id`,
+              [input.sessionId, input.requestId],
+            );
+          }
           const references = this.replaceTranscriptResourceReferences(input.requestId, resourceIds);
           const referenceDecision = references.match<
             | { readonly kind: "retained" }
@@ -2300,6 +2341,94 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     return registration;
   }
 
+  reconcileNativeTranscriptReferences(input: {
+    readonly sessionId: string;
+    readonly requestIds: readonly string[];
+  }): ResultType<void, TranscriptStoreSqliteDriverFailure> {
+    return runBunSqliteTransaction(
+      this.db,
+      () => {
+        this.db.run(
+          `DELETE FROM core_native_transcript_refs WHERE session_id = ?
+        AND request_id NOT IN (SELECT value FROM json_each(?))`,
+          [input.sessionId, globalThis.JSON.stringify(input.requestIds)],
+        );
+        this.db.run(
+          `INSERT OR IGNORE INTO core_native_transcript_refs (session_id, request_id)
+        SELECT session_id, request_id FROM request_transcripts
+        WHERE session_id = ? AND request_client = 'native'
+          AND request_id IN (SELECT value FROM json_each(?))`,
+          [input.sessionId, globalThis.JSON.stringify(input.requestIds)],
+        );
+        return Result.ok(undefined);
+      },
+      (cause) =>
+        classifyTranscriptSqliteDriverFailure("reconcile-native-transcript-references", cause),
+    );
+  }
+
+  retainNativeResource(input: {
+    readonly uploadId: string;
+    readonly threadId: string;
+    readonly resourceId: ResourceId;
+  }): ResultType<void, ResourceStoreFailure> {
+    const write = Result.try({
+      try: () =>
+        this.db.run(
+          `INSERT INTO core_native_resource_refs (upload_id, thread_id, resource_id)
+        VALUES (?, ?, ?) ON CONFLICT(upload_id) DO UPDATE SET upload_id = excluded.upload_id
+        WHERE thread_id = excluded.thread_id AND resource_id = excluded.resource_id`,
+          [input.uploadId, input.threadId, input.resourceId],
+        ),
+      catch: () =>
+        new ResourceStoreFailure({
+          operation: "retain-native-resource",
+          message: "Native resource ownership could not be retained",
+        }),
+    });
+    return write.andThen((result) =>
+      result.changes === 1
+        ? Result.ok(undefined)
+        : Result.err(
+            new ResourceStoreFailure({
+              operation: "retain-native-resource",
+              message: "Upload ownership cannot be reassigned",
+            }),
+          ),
+    );
+  }
+
+  releaseNativeResource(uploadId: string): ResultType<void, ResourceStoreFailure> {
+    return Result.try({
+      try: () =>
+        this.db.run("DELETE FROM core_native_resource_refs WHERE upload_id = ?", [uploadId]),
+      catch: () =>
+        new ResourceStoreFailure({
+          operation: "release-native-resource",
+          message: "Native resource ownership could not be released",
+        }),
+    }).map(() => undefined);
+  }
+
+  listNativeResourceReferences(): ResultType<
+    readonly { uploadId: string; threadId: string; resourceId: ResourceId }[],
+    ResourceStoreFailure
+  > {
+    return Result.try({
+      try: () =>
+        this.db
+          .query<{ uploadId: string; threadId: string; resourceId: string }, []>(
+            "SELECT upload_id AS uploadId, thread_id AS threadId, resource_id AS resourceId FROM core_native_resource_refs",
+          )
+          .all(),
+      catch: () =>
+        new ResourceStoreFailure({
+          operation: "list-native-resource-references",
+          message: "Native resource ownership could not be listed",
+        }),
+    });
+  }
+
   getRetained(resourceId: ResourceId): ResultType<ResourceRecordV1 | null, ResourceStoreFailure> {
     const read = this.readFromSqlite("get-retained-resource", () =>
       this.db
@@ -2314,6 +2443,9 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
                OR EXISTS (
                  SELECT 1 FROM core_surface_projection_resource_refs AS projection_ref
                  WHERE projection_ref.resource_id = resource.resource_id
+               ) OR EXISTS (
+                 SELECT 1 FROM core_native_resource_refs AS native_ref
+                 WHERE native_ref.resource_id = resource.resource_id
                )
              )`,
         )
@@ -2398,6 +2530,9 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
                )
                OR EXISTS (
                  SELECT 1 FROM core_surface_projection_resource_refs
+                 WHERE resource_id = core_resources.resource_id
+               ) OR EXISTS (
+                 SELECT 1 FROM core_native_resource_refs
                  WHERE resource_id = core_resources.resource_id
                )
              )`,
@@ -2487,6 +2622,9 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
              OR EXISTS (
                SELECT 1 FROM core_surface_projection_resource_refs
                WHERE resource_id = core_resources.resource_id
+             ) OR EXISTS (
+               SELECT 1 FROM core_native_resource_refs
+               WHERE resource_id = core_resources.resource_id
              )
            )`,
           [inputValue.next, inputValue.resourceId, ...(expected === undefined ? [] : [expected])],
@@ -2521,6 +2659,9 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
            ) AND NOT EXISTS (
              SELECT 1 FROM core_surface_projection_resource_refs AS projection_ref
              WHERE projection_ref.resource_id = resource.resource_id
+           ) AND NOT EXISTS (
+             SELECT 1 FROM core_native_resource_refs AS native_ref
+             WHERE native_ref.resource_id = resource.resource_id
            )
            ORDER BY resource.created_ts ASC, resource.resource_id ASC
            LIMIT ?`,
@@ -3873,9 +4014,11 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
              SELECT 1 FROM core_transcript_resource_refs WHERE resource_id = ?
            ) OR EXISTS (
              SELECT 1 FROM core_surface_projection_resource_refs WHERE resource_id = ?
+           ) OR EXISTS (
+             SELECT 1 FROM core_native_resource_refs WHERE resource_id = ?
            )`,
         )
-        .get(resourceId, resourceId) !== null
+        .get(resourceId, resourceId, resourceId) !== null
     );
   }
 
@@ -3997,9 +4140,9 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
               if (!contextMeta.value) {
                 return Result.ok({ requestId: mapping.request_id, checkpointDeleted: false });
               }
-              const retained = this.isRequestTranscriptRetainedByLineage(
-                mapping.request_id,
-              ).mapError(deferTranscriptPersistenceFailure);
+              const retained = this.isRequestTranscriptRetained(mapping.request_id).mapError(
+                deferTranscriptPersistenceFailure,
+              );
               const finishUnlink = retained.match<
                 () => ResultType<
                   UnlinkSurfaceMessageResult,
@@ -4064,7 +4207,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
             err: (error) => () => Result.err(error),
             ok: (contextMeta) => () => {
               if (!contextMeta.value) return Result.ok(false);
-              const retained = this.isRequestTranscriptRetainedByLineage(input.requestId).mapError(
+              const retained = this.isRequestTranscriptRetained(input.requestId).mapError(
                 deferTranscriptPersistenceFailure,
               );
               const finishDeletion = retained.match<
@@ -5058,7 +5201,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
 
   listSurfaceMessagesForRequest(input: { requestId: string }): MsgRef[] {
     const rows = this.db
-      .query<PersistedSurfaceMessageLinkRow, [string, string, string, string]>(
+      .query<PersistedSurfaceMessageLinkRow, [string, string, string, string, string]>(
         `
         SELECT request_id, platform, channel_id, message_id
         FROM surface_message_to_request
@@ -5105,7 +5248,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     const rows = this.db
       .query<
         PersistedRecentAgentWriteRow,
-        [AdapterPlatform | null, number, number, string, string, string]
+        [AdapterPlatform | null, number, number, string, string, string, string]
       >(
         `
         SELECT
@@ -5173,7 +5316,7 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
 
   listDiscoveryRecords(): TranscriptDiscoveryRecord[] {
     const rows = this.db
-      .query<PersistedDiscoveryRecordRow, [string, string, string]>(
+      .query<PersistedDiscoveryRecordRow, [string, string, string, string]>(
         `
         SELECT
           rt.request_id,
@@ -6093,6 +6236,10 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
             SELECT 1 FROM core_lineage_request_refs lineage_ref
             WHERE lineage_ref.referenced_request_id = request_transcripts.request_id
           )
+          AND NOT EXISTS (
+            SELECT 1 FROM core_native_transcript_refs native_ref
+            WHERE native_ref.request_id = request_transcripts.request_id
+          )
         `,
       )
       .all(checkpointCandidateCutoff);
@@ -6140,6 +6287,9 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
            AND NOT EXISTS (
              SELECT 1 FROM core_lineage_request_refs lineage_ref
              WHERE lineage_ref.referenced_request_id = request_transcripts.request_id
+           ) AND NOT EXISTS (
+             SELECT 1 FROM core_native_transcript_refs native_ref
+             WHERE native_ref.request_id = request_transcripts.request_id
            )`,
         [cutoff],
       );
@@ -6159,6 +6309,9 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
              WHERE NOT EXISTS (
                SELECT 1 FROM core_lineage_request_refs lineage_ref
                WHERE lineage_ref.referenced_request_id = request_transcripts.request_id
+             ) AND NOT EXISTS (
+               SELECT 1 FROM core_native_transcript_refs native_ref
+               WHERE native_ref.request_id = request_transcripts.request_id
              )
              ORDER BY updated_ts ASC LIMIT ?`,
           )
@@ -6172,14 +6325,15 @@ export class SqliteTranscriptStore implements TranscriptStore, ResourceStore {
     return events;
   }
 
-  private isRequestTranscriptRetainedByLineage(
-    requestId: string,
-  ): ResultType<boolean, PersistedDataError> {
+  private isRequestTranscriptRetained(requestId: string): ResultType<boolean, PersistedDataError> {
     const decoded = decodeTranscriptRow({
       storeKind: "count",
       row: this.db
         .query<DecodedTranscriptCountRow, [string]>(
-          "SELECT COUNT(*) AS count FROM core_lineage_request_refs WHERE referenced_request_id = ?",
+          `SELECT (
+            (SELECT COUNT(*) FROM core_lineage_request_refs WHERE referenced_request_id = ?1) +
+            (SELECT COUNT(*) FROM core_native_transcript_refs WHERE request_id = ?1)
+          ) AS count`,
         )
         .get(requestId),
       schemaVersion: TRANSCRIPT_SCHEMA_VERSION,

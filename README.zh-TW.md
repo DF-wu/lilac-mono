@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/DF-wu/lilac-mono/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/stanley2058/lilac-mono"><img alt="Upstream" src="https://img.shields.io/badge/upstream-stanley2058%2Flilac--mono-6f42c1"></a>
-  <a href="./package.json"><img alt="Bun 1.3.14" src="https://img.shields.io/badge/Bun-1.3.14-14151a?logo=bun&logoColor=white"></a>
+  <a href="./package.json"><img alt="Bun 1.4.2" src="https://img.shields.io/badge/Bun-1.4.2-14151a?logo=bun&logoColor=white"></a>
   <a href="./LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
 </p>
 
@@ -82,7 +82,7 @@ flowchart LR
 
 ### Core：Docker Compose
 
-需求：Docker Compose、Bun 1.3.14、有效的 `DISCORD_TOKEN`，以及至少一組符合 `models.main` 設定的 model provider credential。目前 Core 啟動時仍會連線 Discord；即使只使用 Telegram、GitHub 或 tool server，Discord token 仍是必要設定。各 surface 的 allowlist 依然採 fail-closed 設計。
+需求：Docker Compose 2.30 以上、Bun 1.4.2，以及至少一組符合 `models.main` 設定的 model provider credential。只有啟用 Discord 時才需要有效的 `DISCORD_TOKEN`；各 surface 的 allowlist 依然採 fail-closed 設計。
 
 ```bash
 git clone https://github.com/DF-wu/lilac-mono.git
@@ -104,7 +104,7 @@ YAML
 
 啟動前請完成兩件事：
 
-1. 在 `.env` 設定 `DISCORD_TOKEN` 與 `data/core-config.yaml` 所選 model provider 的 credential。Stock `compose.yaml` 不會傳入 provider credentials；上面的 `compose.override.yaml` 透過 `env_file` 明確傳入 `.env`。
+1. 在 `.env` 設定 `data/core-config.yaml` 所選 model provider 的 credential；若啟用 Discord，再設定 `DISCORD_TOKEN`。Stock `compose.yaml` 不會傳入 provider credentials；上面的 `compose.override.yaml` 透過 `env_file` 明確傳入 `.env`。
 2. 在 `data/core-config.yaml` 設定 Discord allowlist，並啟用與限制其他要使用的 surface。
 
 ```bash
@@ -133,7 +133,7 @@ export LL_TOOL_SERVER_PORT=8080
 bun apps/core/src/runtime/main.ts
 ```
 
-Core 必須有 `REDIS_URL`、`DISCORD_TOKEN` 與有效的 model 設定。Telegram 與 GitHub 可以不啟用，但目前 Discord adapter 仍會在 Core 啟動時連線；Discord allowlist 可以保持空白以忽略所有 Discord traffic。
+Core 必須有 `REDIS_URL` 與有效的 model 設定。啟用 Discord 時才需設定 `DISCORD_TOKEN`；native-only 部署可在沒有 Discord credential 的情況下啟動。
 
 ## Core Surfaces
 

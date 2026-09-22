@@ -332,6 +332,7 @@ export async function handleRequest(envelope: RemoteFsDaemonRequest): Promise<Re
       const result = await fsTool.readFileBytes({
         path: envelope.input.path,
         maxBytes: envelope.input.maxBytes,
+        prefixBytes: envelope.input.prefixBytes,
       });
       if (!result.success) {
         return {
@@ -345,6 +346,7 @@ export async function handleRequest(envelope: RemoteFsDaemonRequest): Promise<Re
         resolvedPath: result.resolvedPath,
         fileHash: result.fileHash,
         bytesLength: result.bytesLength,
+        ...(result.totalBytes === undefined ? {} : { totalBytes: result.totalBytes }),
         base64: Buffer.from(result.bytes).toString("base64"),
       };
     }

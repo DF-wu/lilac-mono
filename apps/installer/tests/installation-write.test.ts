@@ -201,3 +201,30 @@ describe("installation write preparation", () => {
     });
   }
 });
+
+describe("terminal companion installation", () => {
+  it("installs only the setup CLI even when an old release companion exists", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "installer-terminal-companion-"));
+    const source = path.join(root, "download");
+    await mkdir(source);
+    await Bun.write(path.join(source, "lilac"), "fixture-installer");
+    await Bun.write(path.join(source, "lilac-tui"), "fixture-terminal");
+    const original = process.execPath;
+    Object.defineProperty(process, "execPath", {
+      value: path.join(source, "lilac"),
+      configurable: true,
+    });
+    try {
+      const options = settings(path.join(root, "installation"));
+      const written = await writeInstallation(options, async () => Result.ok(undefined));
+      expect(written.isOk()).toBe(true);
+      expect(await Bun.file(path.join(options.root, "bin", "lilac-tui")).exists()).toBe(false);
+      expect(await readFile(path.join(options.root, "bin", "lilac"), "utf8")).toBe(
+        "fixture-installer",
+      );
+    } finally {
+      Object.defineProperty(process, "execPath", { value: original, configurable: true });
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

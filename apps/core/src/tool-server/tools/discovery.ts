@@ -1,4 +1,6 @@
 import { z } from "zod";
+import type { NativeSearchService } from "../../surface/native/search";
+import { nativeSearchToolAsync, isNativeSearchContext } from "../../surface/native/search-tools";
 import { serverToolFailure, type ServerToolResult } from "@stanley2058/lilac-plugin-runtime";
 import { defineServerTool, type ServerTool, type ServerToolCallOptions } from "../types";
 
@@ -24,7 +26,7 @@ const discoverySearchInputSchema = z.object({
     "Optional source filter(s). Accepts a scalar like --sources=conversation or an array via --sources:json. Defaults to conversation + prompt + heartbeat.",
   ),
   platform: z
-    .enum(["discord", "github", "whatsapp", "slack", "telegram", "web", "unknown"])
+    .enum(["native", "discord", "github", "whatsapp", "slack", "telegram", "web", "unknown"])
     .optional()
     .describe(
       "Optional conversation platform filter. Excludes non-conversation sources like prompt and heartbeat.",
@@ -95,6 +97,7 @@ export class Discovery implements ServerTool {
   constructor(
     private readonly params: {
       discovery: DiscoveryService;
+      nativeSearch?: NativeSearchService;
     },
   ) {
     this.tool = defineServerTool({
@@ -106,8 +109,15 @@ export class Discovery implements ServerTool {
             "Search unified agent memory across conversations, prompts, and heartbeat files. Output is { meta, groups }, where groups[].entries[][] contains matched message/file entries plus surrounding context windows.",
           inputSchema: discoverySearchInputSchema,
           primaryPositional: "query",
-          run: async (input) =>
-            (await this.params.discovery.searchResult(input)).mapError((error) => {
+          run: async (input, opts) => {
+            if (isNativeSearchContext(opts?.context))
+              return nativeSearchToolAsync(
+                this.params.nativeSearch,
+                opts?.context,
+                (service, userId) =>
+                  service.discoveryWithExternal(userId, input, this.params.discovery),
+              );
+            return (await this.params.discovery.searchResult(input)).mapError((error) => {
               switch (error._tag) {
                 case "DiscoverySearchInputError":
                   return serverToolFailure({
@@ -124,7 +134,8 @@ export class Discovery implements ServerTool {
                     retryable: true,
                   });
               }
-            }),
+            });
+          },
         }),
       }),
     });

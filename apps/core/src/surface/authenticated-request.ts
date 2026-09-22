@@ -7,6 +7,7 @@ import { getBuiltinSurfaceProtocol } from "./builtin-surface-protocols";
 import type {
   CorrelatedSurfaceRequestMetadata,
   GithubTriggerProjection,
+  NativeRequestMetadata,
   SurfaceProtocolRequestMetadata,
   SurfaceProtocolRouting,
 } from "./protocol";
@@ -47,6 +48,7 @@ export type AuthenticatedRequestProjection = {
   readonly authenticatedOrigin?: AuthenticatedSurfaceOrigin;
   readonly authenticationMetadataKind: AuthenticationMetadataKind;
   readonly githubTrigger?: GithubTriggerProjection;
+  readonly native?: NativeRequestMetadata;
   readonly verifiedIngress: boolean;
 };
 
@@ -100,6 +102,18 @@ const requestRawSchema = z
         }),
       })
       .optional(),
+    native: z
+      .strictObject({
+        threadId: z.string().regex(/^[^:\s]+$/u),
+        authorUserId: z.string().trim().min(1),
+        starterUserId: z.string().trim().min(1),
+        turnId: z.string().trim().min(1),
+        historyGeneration: z.number().int().nonnegative(),
+        inputId: z.string().trim().min(1),
+        requestId: z.string().trim().min(1),
+        requestDeliveryId: z.uuid(),
+      })
+      .optional(),
     github: z
       .object({
         repoFullName: z.string().trim().min(1).optional(),
@@ -113,6 +127,17 @@ const requestRawSchema = z
       .optional(),
   })
   .loose();
+
+export function parseNativeRequestMetadata(raw: unknown): NativeRequestMetadata | null {
+  const decoded = requestRawSchema.safeParse(raw);
+  return decoded.success ? (decoded.data.native ?? null) : null;
+}
+
+export function parseNativeRequestEnvelope(request: {
+  readonly raw?: unknown;
+}): NativeRequestMetadata | null {
+  return parseNativeRequestMetadata(request.raw);
+}
 
 type RequestRaw = z.output<typeof requestRawSchema>;
 type RequestMessage = Extract<LilacMessageForTopic<"cmd.request">, { type: "cmd.request.message" }>;
@@ -198,6 +223,7 @@ function validateSurfaceClaims(
 ): ResultType<void, AuthenticatedRequestProjectionInvalid> {
   const actor = raw.authenticatedActor;
   const origin = raw.authenticatedOrigin;
+  const channelId = getBuiltinSurfaceProtocol(platform).refs.createSessionRef(sessionId).channelId;
   if (actor && actor.platform !== platform) {
     return invalidProjection(
       messageType,
@@ -208,7 +234,7 @@ function validateSurfaceClaims(
     origin &&
     (origin.platform !== platform ||
       origin.messageRef.platform !== platform ||
-      origin.messageRef.channelId !== sessionId)
+      origin.messageRef.channelId !== channelId)
   ) {
     return invalidProjection(
       messageType,
@@ -260,12 +286,19 @@ function projectRegisteredRequest<P extends RegisteredSurfacePlatform>(
             }
           : {}),
         ...(raw.github ? { github: raw.github } : {}),
+        ...(raw.native ? { native: raw.native } : {}),
       } satisfies CorrelatedSurfaceRequestMetadata<P>;
       const sessionRef = protocol.refs.createSessionRef(route.sessionId);
       if (raw.github && !protocol.requestProjection?.acceptsGithubMetadata) {
         return invalidProjection(
           messageType,
           "GitHub trigger metadata does not match the request platform",
+        );
+      }
+      if (raw.native && !protocol.requestProjection?.acceptsNativeMetadata) {
+        return invalidProjection(
+          messageType,
+          "Native request metadata does not match the request platform",
         );
       }
       const projectedProtocolMetadata: ResultType<
@@ -328,6 +361,7 @@ function projectRegisteredRequest<P extends RegisteredSurfacePlatform>(
               githubTrigger: githubTrigger !== undefined,
             }),
             ...(githubTrigger ? { githubTrigger } : {}),
+            ...(protocolMetadata?.native ? { native: protocolMetadata.native } : {}),
             verifiedIngress:
               protocolMetadata?.verifiedIngress ?? (actor !== undefined || origin !== undefined),
           } as AuthenticatedRequestProjection;
@@ -360,6 +394,7 @@ function isInternalDelegatedProjectionValid(projection: AuthenticatedRequestProj
     projection.messageRef !== undefined ||
     projection.authenticatedActor !== undefined ||
     projection.githubTrigger !== undefined ||
+    projection.native !== undefined ||
     metadataPresence(projection.authenticationMetadataKind).actor ||
     projection.verifiedIngress
   ) {
@@ -384,6 +419,7 @@ function isUnregisteredExternalProjectionValid(
     projection.authenticatedActor === undefined &&
     projection.authenticatedOrigin === undefined &&
     projection.githubTrigger === undefined &&
+    projection.native === undefined &&
     !projection.verifiedIngress
   );
 }
@@ -394,10 +430,13 @@ function hasValidRegisteredRoute(
 ): boolean {
   const sessionRef = projection.sessionRef;
   const messageRef = projection.messageRef;
+  const channelId = getBuiltinSurfaceProtocol(platform).refs.createSessionRef(
+    projection.sessionId,
+  ).channelId;
   if (
     projection.platform !== platform ||
     sessionRef?.platform !== platform ||
-    sessionRef.channelId !== projection.sessionId ||
+    sessionRef.channelId !== channelId ||
     !nonempty(sessionRef.channelId)
   ) {
     return false;
@@ -405,7 +444,7 @@ function hasValidRegisteredRoute(
   return (
     messageRef === undefined ||
     (messageRef.platform === platform &&
-      messageRef.channelId === projection.sessionId &&
+      messageRef.channelId === channelId &&
       nonempty(messageRef.messageId))
   );
 }
@@ -417,6 +456,9 @@ function hasValidRegisteredIdentity(
   const expected = metadataPresence(projection.authenticationMetadataKind);
   const actor = projection.authenticatedActor;
   const origin = projection.authenticatedOrigin;
+  const channelId = getBuiltinSurfaceProtocol(platform).refs.createSessionRef(
+    projection.sessionId,
+  ).channelId;
   if (
     actor &&
     (actor.platform !== platform || !nonempty(actor.userId) || actor.userId !== origin?.userId)
@@ -428,7 +470,7 @@ function hasValidRegisteredIdentity(
   if (
     origin.platform !== platform ||
     origin.sessionRef.platform !== origin.platform ||
-    origin.sessionRef.channelId !== projection.sessionId ||
+    origin.sessionRef.channelId !== channelId ||
     !nonempty(origin.userId)
   ) {
     return false;
@@ -437,7 +479,7 @@ function hasValidRegisteredIdentity(
   if (!originMessageRef) return true;
   return (
     originMessageRef.platform === platform &&
-    originMessageRef.channelId === projection.sessionId &&
+    originMessageRef.channelId === channelId &&
     originMessageRef.messageId === projection.messageRef?.messageId
   );
 }
@@ -455,6 +497,8 @@ function isRegisteredExternalProjectionValid(
   ) {
     return false;
   }
+  if (projection.native !== undefined && !protocol.requestProjection?.acceptsNativeMetadata)
+    return false;
   return (
     protocol.requestProjection?.isProtocolProjectionValid?.(
       projection as AuthenticatedRequestProjectionFor<RegisteredSurfacePlatform>,
@@ -511,7 +555,8 @@ export function projectAuthenticatedRequest(
     isRecord(raw) &&
     (Object.hasOwn(raw, "authenticatedActor") ||
       Object.hasOwn(raw, "authenticatedOrigin") ||
-      Object.hasOwn(raw, "github"));
+      Object.hasOwn(raw, "github") ||
+      Object.hasOwn(raw, "native"));
   const route = resolveRequestRoute(message);
   if (route.kind === "uncorrelated") {
     if (!metadataClaimed) return Result.ok(undefined);
@@ -541,6 +586,16 @@ export function projectAuthenticatedRequest(
     );
   }
   const metadata = decoded.success ? decoded.data : {};
+  if (
+    metadata.native &&
+    (metadata.native.requestId !== route.requestId ||
+      metadata.native.requestDeliveryId !== message.data.requestDeliveryId)
+  ) {
+    return invalidProjection(
+      message.type,
+      "Native delivery identity does not match request headers and data",
+    );
+  }
 
   const protocol = getBuiltinSurfaceProtocol(route.requestClient);
   if (!protocol) {
@@ -588,12 +643,20 @@ type LatchConflictReason =
   | "origin-introduced"
   | "verification-upgraded"
   | "github-origin-message-replaced"
-  | "github-trigger-changed";
+  | "github-trigger-changed"
+  | "native-principal-changed";
 
 function latchConflictReason(
   previous: AuthenticatedRequestProjection,
   next: AuthenticatedRequestProjection,
 ): LatchConflictReason | undefined {
+  if (
+    previous.native?.starterUserId !== next.native?.starterUserId ||
+    previous.native?.threadId !== next.native?.threadId ||
+    previous.native?.turnId !== next.native?.turnId ||
+    previous.native?.historyGeneration !== next.native?.historyGeneration
+  )
+    return "native-principal-changed";
   if (previous.requestId !== next.requestId) return "request-changed";
   if (previous.requestClient !== next.requestClient) return "client-changed";
   if (previous.sessionId !== next.sessionId) return "session-changed";

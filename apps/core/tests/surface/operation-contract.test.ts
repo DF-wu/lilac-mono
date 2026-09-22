@@ -52,12 +52,14 @@ const SESSION_REF_FIXTURES = {
   discord: { platform: "discord", channelId: "discord-channel" },
   github: { platform: "github", channelId: "owner/repo#1" },
   telegram: { platform: "telegram", channelId: "-1001:42" },
+  native: { platform: "native", channelId: "thread-1" },
 } as const satisfies Record<SessionRef["platform"], SessionRef>;
 
 const MESSAGE_REF_FIXTURES = {
   discord: { platform: "discord", channelId: "discord-channel", messageId: "discord-message" },
   github: { platform: "github", channelId: "owner/repo#1", messageId: "101" },
   telegram: { platform: "telegram", channelId: "-1001:42", messageId: "84" },
+  native: { platform: "native", channelId: "thread-1", messageId: "message-1" },
 } as const satisfies Record<MsgRef["platform"], MsgRef>;
 
 type SurfaceOperationEntrypoint =
@@ -183,7 +185,10 @@ interface SurfaceAdapterSignatureFixture {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   getSelf(): Promise<SurfaceSelf>;
-  listSessions(): Promise<SurfaceOperationResult<SurfaceSession[]>>;
+  listSessions(opts?: {
+    limit?: number;
+    archived?: boolean;
+  }): Promise<SurfaceOperationResult<SurfaceSession[]>>;
   listSessionParticipants(
     sessionRef: SessionRef,
     opts?: { limit?: number },
@@ -236,7 +241,9 @@ interface SurfaceAdapterSignatureFixture {
 describe("surface operation contract", () => {
   it("keeps session and message platform sets exactly equal", () => {
     expectTypeOf<SessionRef["platform"]>().toEqualTypeOf<MsgRef["platform"]>();
-    expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<"discord" | "github" | "telegram">();
+    expectTypeOf<RegisteredSurfacePlatform>().toEqualTypeOf<
+      "discord" | "github" | "telegram" | "native"
+    >();
     expectTypeOf<
       NonNullable<PluginRequestContext["requestInitiator"]>["platform"]
     >().toEqualTypeOf<string>();

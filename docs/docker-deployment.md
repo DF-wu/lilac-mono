@@ -3,6 +3,13 @@
 For a guided installation using published images, see [the installation guide](installation.md).
 The commands below describe source builds and manual container operation.
 
+The Core image includes the native web app. To enable it in the source Compose deployment, follow
+[native setup](native-surface.md), using `surface.native.host: 0.0.0.0` inside the container and
+`publicUrl: http://localhost:8789` for local access. Compose publishes port 8789 on host loopback only.
+Pass the selected provider's credential environment variables through the deployment environment.
+The native surface still requires explicit configuration on existing installations; publishing the
+port does not enable it or bypass authentication. Use HTTPS at a reverse proxy for remote access.
+
 Lilac runs `tini` as container PID 1 to reap orphaned children and forward signals. Its child is the root entrypoint, which performs startup setup and then replaces itself with Core as the unprivileged image user (`lilac` by default). The image does not run systemd, a user manager, or Bubblewrap, and it does not require writable cgroups, user namespaces, privileged mode, or unconfined security profiles. Core and its children write directly to the container's stdout and stderr.
 
 ## Start And Verify

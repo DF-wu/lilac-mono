@@ -18,8 +18,9 @@ type RequestMessage = Extract<LilacMessageForTopic<"cmd.request">, { type: "cmd.
 function requestMessage(input: {
   readonly requestId?: string;
   readonly sessionId?: string;
-  readonly requestClient?: "discord" | "github" | "telegram" | "slack" | "unknown";
+  readonly requestClient?: "discord" | "github" | "telegram" | "native" | "slack" | "unknown";
   readonly raw?: unknown;
+  readonly requestDeliveryId?: string;
 }): RequestMessage {
   const messages: BusMessageV2[] = [{ role: "user", content: "hello" }];
   return {
@@ -34,7 +35,7 @@ function requestMessage(input: {
       ...(input.requestClient ? { request_client: input.requestClient } : {}),
     },
     data: {
-      requestDeliveryId: crypto.randomUUID(),
+      requestDeliveryId: input.requestDeliveryId ?? crypto.randomUUID(),
       queue: "prompt",
       messages,
       ...(input.raw !== undefined ? { raw: input.raw } : {}),
@@ -209,13 +210,44 @@ describe("authenticated request projection", () => {
 
   it("accepts normalized claims for every catalog platform", () => {
     for (const protocol of Object.values(BUILTIN_SURFACE_PROTOCOLS)) {
+      const requestId = `request-${protocol.platform}`;
+      const requestDeliveryId = crypto.randomUUID();
+      const native =
+        protocol.platform === "native"
+          ? {
+              authenticatedOrigin: {
+                platform: "native",
+                userId: "user-1",
+                messageRef: {
+                  platform: "native",
+                  channelId: "session-native",
+                  messageId: "message-1",
+                },
+              },
+              native: {
+                requestId,
+                requestDeliveryId,
+                threadId: "session-native",
+                authorUserId: "author",
+                starterUserId: "user-1",
+                turnId: "turn",
+                inputId: "input",
+                historyGeneration: 0,
+              },
+            }
+          : {};
       const projected = project(
         requestMessage({
-          requestId: `request-${protocol.platform}`,
-          sessionId: `session-${protocol.platform}`,
+          requestId,
+          requestDeliveryId,
+          sessionId:
+            protocol.platform === "native"
+              ? "native:session-native"
+              : `session-${protocol.platform}`,
           requestClient: protocol.platform,
           raw: {
             authenticatedActor: { platform: protocol.platform, userId: "user-1" },
+            ...native,
           },
         }),
       );

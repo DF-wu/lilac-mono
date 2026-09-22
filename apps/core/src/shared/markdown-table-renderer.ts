@@ -237,6 +237,8 @@ function toInlineText(node: PhrasingContent): string {
     case "footnoteReference":
     case "imageReference":
       return "";
+    default:
+      return "";
   }
 }
 

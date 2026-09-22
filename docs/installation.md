@@ -2,7 +2,8 @@
 
 Lilac's installer downloads a standalone CLI and runs an interactive setup before starting the
 published containers. You need Docker, a model-provider account or an OpenAI-compatible endpoint, and
-a Discord application with a bot token. Bun, Node.js, Git, and a source checkout are not required.
+an interactive terminal. The default is a temporary terminal console; web and Discord setup are optional.
+Bun, Node.js, Git, and a source checkout are not required.
 
 ## System requirements
 
@@ -37,16 +38,22 @@ Setup follows this sequence:
 1. Check Docker and Compose.
 2. Choose the installation directory. The default is your current directory.
 3. Configure at least one model provider, then select main and fast models.
-4. Enter the Discord bot token, open the invite and application-settings links, and choose channel rules.
+4. Choose Terminal only, the default, Web, or Discord. Web setup creates a local owner account or
+   connects an existing Clerk application. Discord can also be added alongside either choice.
 5. Configure any optional integrations, or skip them.
 6. Review the proposed configuration with secrets masked and confirm the write.
 7. Pull container images, start Core and Redis, and wait for container health checks.
 
-Once setup finishes, mention the bot in an allowed Discord channel to try it. Container health means
-the services started successfully; your first Discord request also exercises model generation.
+Once setup finishes, choose "Talk to Lilac now" or exit the installer. To open the console later, run
+`docker compose exec --user root lilac lilac-tui` from the installation directory. Each invocation
+creates a temporary conversation that is deleted on exit. Agent-created files remain. See
+[console lifecycle and authentication](native-surface.md#temporary-operator-console).
+
+If you enabled Web, open `http://localhost:8789` and sign in. Container health means services started;
+your first prompt exercises the configured model provider.
 
 Next, [personalize Lilac's prompt files](../README.md#after-installation-make-lilac-your-own).
-Edit them yourself or ask Lilac on Discord to walk you through your preferences and update the files.
+Edit them yourself or ask Lilac to walk you through your preferences and update the files.
 
 ### Model providers
 
@@ -71,6 +78,21 @@ localhost callback URL shown in the browser. The installer does not offer the `c
 An OpenAI-compatible base URL must be reachable both from the installer and from the Core container.
 For a service on the Docker host, use an address with that reachability rather than container-local
 `localhost`.
+
+### Native authentication
+
+Local auth has one owner and no user registration. Setup hashes the chosen password with Argon2id and
+generates a session secret. The username, password hash and secret go in `secrets.env`, never in
+`core-config.yaml`. The native gateway listens inside the container and is published only on host
+`127.0.0.1:8789`. Use an SSH tunnel for access from another machine, or place an HTTPS reverse proxy
+in front of that port and supply its origin as the Native web URL.
+
+Clerk setup takes an existing application's owner user ID, issuer, secret key and publishable key.
+The terminal console does not use Clerk. The installer does not enroll users or create a Clerk application.
+
+Existing installations retain their current enabled surfaces and port bindings during update or
+reinstall. Enabling native on an existing Discord installation is an explicit manual configuration
+change described in [native setup](native-surface.md).
 
 ### Discord
 
@@ -172,7 +194,8 @@ For a private registry, authenticate Docker before starting setup.
 
 The default published CLI embeds immutable image digests from its own release. It does not depend on
 the registry's mutable `latest` tags. `LILAC_RELEASE_BASE_URL` must contain assets named
-`lilac-linux-x64`, `lilac-linux-arm64`, `lilac-darwin-x64`, and `lilac-darwin-arm64`, plus `SHA256SUMS` with
+`lilac-<target>` for each supported target (`linux-x64`, `linux-arm64`,
+`darwin-x64`, `darwin-arm64`), plus `SHA256SUMS` with
 standard `sha256sum` output using those basenames. A custom source can provide only the platforms it
 supports. Its URL must identify one coherent artifact set.
 
