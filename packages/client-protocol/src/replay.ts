@@ -26,6 +26,7 @@ export const replayCheckpointSchema = z.strictObject({
 });
 
 export const messageMetadataSchema = z.strictObject({
+  externalRunId: identitySchema.optional(),
   authorId: identitySchema.optional(),
   authorDisplayName: z.string().min(1).max(256).optional(),
   position: revisionSchema.optional(),

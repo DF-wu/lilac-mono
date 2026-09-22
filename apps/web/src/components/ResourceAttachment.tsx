@@ -21,6 +21,10 @@ export function ResourceAttachment({
   const fileInput = useRef<HTMLInputElement>(null);
   const { data } = part;
   const local = useUploadProgress(data.resourceId);
+  if (!canEdit && data.state === "failed" && data.mediaType.startsWith("image/"))
+    return (
+      <ReadyAttachment key={data.resourceId} data={data} href={resourceUrl(data.resourceId)} />
+    );
   if (data.state !== "ready")
     return (
       <div className="resource flex-wrap">

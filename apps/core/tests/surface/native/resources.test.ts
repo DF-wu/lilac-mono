@@ -589,3 +589,84 @@ test("public avatar URLs round-trip encoded user IDs and reject malformed encodi
     (await f.service.handle(new Request("http://native/api/users/%ZZ/avatar"), "bob"))?.status,
   ).toBe(400);
 });
+
+test("external Discord resources use retained bytes, keep owner authorization, and fail explicitly when missing", async () => {
+  const f = await fixture();
+  const id = `r1_${"a".repeat(32)}` as const;
+  value(
+    f.resources.registerOrGet({
+      candidateResourceId: id,
+      origin: {
+        version: 1,
+        kind: "discord-attachment",
+        channelId: "123",
+        messageId: "456",
+        ordinal: 0,
+      },
+      filename: "image.png",
+      declaredMediaType: "image/png",
+      createdAt: 1,
+    }),
+  );
+  value(
+    f.resources.retainNativeResource({
+      uploadId: "external-test",
+      threadId: f.thread.id,
+      resourceId: id,
+    }),
+  );
+  const upload = value(
+    await f.blobs.startUpload({ source: f.bytes, retention: { kind: "durable" } }),
+  );
+  const blob = value(await upload.completion);
+  value(f.resources.compareAndSwapCache({ resourceId: id, next: { blob, cachedAt: 1 } }));
+  const request = () => new Request(`http://local/api/resources/${id}`);
+  expect((await f.service.handle(request(), "alice"))?.status).toBe(403);
+  const response = (await f.service.handle(request(), "owner"))!;
+  expect(response.status).toBe(200);
+  expect(await response.text()).toBe("hello world");
+  value(await f.blobs.delete(blob));
+  expect((await f.service.handle(request(), "owner"))?.status).toBe(404);
+});
+
+test("retained transcript files support previews and ranges without exposing blob references", async () => {
+  const f = await fixture();
+  const upload = value(
+    await f.blobs.startUpload({ source: f.bytes, retention: { kind: "durable" } }),
+  );
+  const blob = value(await upload.completion);
+  const service = new NativeResourceService({
+    native: f.native,
+    resources: f.resources,
+    access: f.access,
+    blobs: f.blobs,
+    externalFile: (actorId, id) =>
+      actorId === "owner" && id === "xo_test"
+        ? Result.ok({
+            type: "pending-blob",
+            blob: upload.handle,
+            filename: "notes.txt",
+            mediaType: "text/plain",
+          })
+        : Result.err(nativeFailure("forbidden", "Only the owner can read external threads")),
+  });
+  expect(
+    (await service.handle(new Request("http://local/api/resources/xo_test"), "alice"))?.status,
+  ).toBe(403);
+  const response = (await service.handle(
+    new Request("http://local/api/resources/xo_test", { headers: { range: "bytes=1-4" } }),
+    "owner",
+  ))!;
+  expect(response.status).toBe(206);
+  expect(await response.text()).toBe("ello");
+  const preview = (await service.handle(
+    new Request("http://local/api/resources/xo_test/preview"),
+    "owner",
+  ))!;
+  expect(preview.status).toBe(200);
+  expect(await preview.json()).toMatchObject({ text: "hello world" });
+  value(await f.blobs.delete(blob));
+  expect(
+    (await service.handle(new Request("http://local/api/resources/xo_test"), "owner"))?.status,
+  ).toBe(404);
+});

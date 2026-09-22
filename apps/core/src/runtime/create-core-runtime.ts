@@ -1,3 +1,4 @@
+import { nativeFailure } from "../surface/native/errors";
 import { withNativeThreadSummaries } from "./native-summarization";
 import { openNativeInstallation, type NativeInstallation } from "../surface/native/installation";
 import {
@@ -3148,6 +3149,10 @@ export async function createCoreRuntime(
                 conversationThreads: () => nativeConversationPlanner,
                 runner: () => stopAgentRunner ?? undefined,
                 workflows: activeDurableWorkflowStore,
+                externalOutputs: (requestId) =>
+                  requestDeliveryStore!
+                    .listOutputsForRequest(requestId)
+                    .mapError(() => nativeFailure("sqlite", "Attachment history is unavailable")),
                 deliveryState: (id) =>
                   requestDeliveryStore!
                     .load(id)

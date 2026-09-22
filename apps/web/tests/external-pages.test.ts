@@ -13,28 +13,25 @@ it("prepends older Discord pages and removes overlapping boundary messages", () 
     ),
   ).toEqual(["a", "b", "c"]);
 });
-it("appends later GitHub pages and replaces the snapshot on refresh", () => {
-  const old = page("github", ["a", "b"]);
+it("prepends older GitHub pages and replaces the snapshot on refresh", () => {
+  const old = page("github", ["b", "c"]);
   expect(
-    mergeExternalPage(old, page("github", ["b", "c"]), true).messages.map((message) => message.id),
+    mergeExternalPage(old, page("github", ["a", "b"]), true).messages.map((message) => message.id),
   ).toEqual(["a", "b", "c"]);
   expect(
     mergeExternalPage(old, page("github", ["c"]), false).messages.map((message) => message.id),
   ).toEqual(["c"]);
 });
 
-it("orders newest-first Discord responses chronologically across page boundaries", () => {
-  const latest = page("discord", ["d", "c"]);
-  const older = page("discord", ["c", "b", "a"]);
+it("preserves canonical run order even when timestamps tie or go backward", () => {
+  const latest = page("discord", ["c", "d"]);
+  const older = page("discord", ["a", "b", "c"]);
   for (const current of [latest, older])
     for (const message of current.messages)
-      message.metadata = { createdAt: message.id.charCodeAt(0) };
-  const first = mergeExternalPage(undefined, latest, true);
-  expect(first.messages.map((message) => message.id)).toEqual(["c", "d"]);
-  expect(mergeExternalPage(first, older, true).messages.map((message) => message.id)).toEqual([
-    "a",
-    "b",
-    "c",
-    "d",
-  ]);
+      message.metadata = { createdAt: 100 - message.id.charCodeAt(0), externalRunId: "run" };
+  expect(
+    mergeExternalPage(mergeExternalPage(undefined, latest, true), older, true).messages.map(
+      (message) => message.id,
+    ),
+  ).toEqual(["a", "b", "c", "d"]);
 });

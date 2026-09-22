@@ -1,5 +1,16 @@
 # MIGRATIONS.md
 
+## Retained external runs
+
+The native external conversation view now reads retained agent runs rather than live channel messages.
+Display-message metadata adds optional `externalRunId` for run dividers. Both Discord and GitHub read
+cursors now page backward through retained runs; reload open external views when upgrading. Update Core
+and web together because older strict response validators reject the new metadata. The authenticated
+resource route also serves retained Discord resource IDs, owner-only transcript file references, and
+retained sent-file handles. Expired sent files keep placeholders when attachment metadata remains in
+the transcript. Existing output retention is unchanged.
+No stored-data migration or historical backfill is required.
+
 ## Link previews
 
 The authenticated native RPC contract adds `links.preview` for page titles, descriptions, images,

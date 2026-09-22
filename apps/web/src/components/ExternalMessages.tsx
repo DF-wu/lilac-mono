@@ -78,6 +78,11 @@ export function ExternalMessages({
               className="absolute top-0 left-0 w-full"
               style={{ transform: `translateY(${row.start}px)` }}
             >
+              {row.index > 0 &&
+              messages[row.index]!.metadata?.externalRunId !==
+                messages[row.index - 1]!.metadata?.externalRunId ? (
+                <hr className="mx-6 my-4 border-border" aria-label="Run divider" />
+              ) : null}
               <Message
                 message={messages[row.index]!}
                 canEdit={false}

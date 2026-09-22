@@ -3907,6 +3907,14 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
         : []),
       ...(root === "apps/core"
         ? [
+            ...[
+              "decodeSentAttachmentMetadata",
+              "decodeSentAttachmentStdout",
+              "isSentAttachmentCommand",
+            ].map((exportName) => ({
+              identity: { module: "src/surface/native/external-attachment-codec.ts", exportName },
+              category: "projection" as const,
+            })),
             ...["decodeNativeRecord", "decodeNativeRecord.andThen.<callback@1>"].map(
               (exportName) => ({
                 identity: { module: "src/surface/native/codec.ts", exportName },

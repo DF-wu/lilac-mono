@@ -489,14 +489,60 @@ function Threads() {
                 {
                   id: "discord-preview-1",
                   role: "user",
-                  metadata: { authorDisplayName: "Stanley (Discord)", createdAt: now - 60_000 },
+                  metadata: {
+                    externalRunId: "preview-run-1",
+                    authorDisplayName: "Stanley (Discord)",
+                    createdAt: now - 60_000,
+                  },
                   parts: [{ type: "text", text: "Can we meet in the afternoon?" }],
                 },
                 {
                   id: "discord-preview-2",
-                  role: "user",
-                  metadata: { authorDisplayName: "Lilac (Discord)", createdAt: now },
+                  role: "assistant",
+                  metadata: {
+                    externalRunId: "preview-run-1",
+                    authorDisplayName: "Lilac (Discord)",
+                    createdAt: now - 60_000,
+                  },
                   parts: [{ type: "text", text: "Yes, the afternoon works." }],
+                },
+                {
+                  id: "discord-preview-3",
+                  role: "user",
+                  metadata: {
+                    externalRunId: "preview-run-2",
+                    authorDisplayName: "Stanley (Discord)",
+                    createdAt: now,
+                  },
+                  parts: [
+                    { type: "text", text: "Here is the agenda." },
+                    {
+                      type: "data-resource",
+                      id: "missing-external-image",
+                      data: {
+                        resourceId: "missing-external-image",
+                        name: "agenda.png",
+                        mediaType: "image/png",
+                        size: 1024,
+                        state: "ready",
+                      },
+                    },
+                  ],
+                },
+                {
+                  id: "discord-preview-4",
+                  role: "assistant",
+                  metadata: {
+                    externalRunId: "preview-run-2",
+                    authorDisplayName: "Lilac (Discord)",
+                    createdAt: now,
+                  },
+                  parts: [
+                    {
+                      type: "text",
+                      text: "I'll review it before the meeting. This reply appears as one assistant message even when Discord splits it.",
+                    },
+                  ],
                 },
               ]}
               resourceUrl={(id) => id}

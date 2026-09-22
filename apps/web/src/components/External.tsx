@@ -61,7 +61,7 @@ export function External({ threadId }: { threadId?: string }) {
           key={threadId}
           messages={view.messages}
           resourceUrl={resourceUrl}
-          loadDirection={view.thread.surface === "discord" ? "start" : "end"}
+          loadDirection="start"
           hasMore={!!read.hasNextPage && !read.error}
           loading={read.isFetching}
           onLoadMore={() => {

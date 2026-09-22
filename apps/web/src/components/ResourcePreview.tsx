@@ -50,7 +50,7 @@ export function formatFileSize(bytes: number): string {
 }
 
 export function ReadyAttachment({ data, href }: { data: ResourceData; href: string }) {
-  const [failed, setFailed] = useState(false);
+  const [failed, setFailed] = useState(data.state === "failed");
   const [preview, setPreview] = useState(false);
   const kind = attachmentKind(data.mediaType, data.name);
   return (

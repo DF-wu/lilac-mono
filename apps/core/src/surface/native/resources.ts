@@ -4,7 +4,8 @@ import { agentIdentity, nativeUserDisplay } from "./identity";
 import { readPreviewPrefix, textPreview } from "./resource-preview";
 import { classifyResourcePrefix } from "../../resource/resource-mime";
 import type { PersistedDataError } from "@stanley2058/lilac-utils";
-import type { BlobStore } from "@stanley2058/lilac-blob-storage";
+import { materializeBlobRead, type BlobStore } from "@stanley2058/lilac-blob-storage";
+import type { ExternalFile } from "./search-external";
 import { Result, TaggedError, type Result as ResultType } from "better-result";
 
 import {
@@ -40,6 +41,13 @@ export type NativeResourceError =
   | NativeAuthError;
 type NativeResult<T> = ResultType<T, NativeResourceError>;
 type NativeStateResult<T> = ResultType<T, NativeResourceStateError>;
+type HttpResourceRead = {
+  stream: ReadableStream<Uint8Array>;
+  completion: Promise<NativeStateResult<void>>;
+  size: number;
+  mediaType: string;
+  filename: string;
+};
 
 export interface NativeUploadStore {
   setUserProfile?(
@@ -119,6 +127,7 @@ export class NativeResourceService {
       resources: ResourceStore & NativeResourceReferences;
       access: ResourceAccess;
       blobs: BlobStore;
+      externalFile?: (actorId: string, id: string) => NativeStateResult<ExternalFile>;
       now?: () => number;
       onProgress?: (progress: NativeResourceProgress) => void;
     },
@@ -701,6 +710,93 @@ export class NativeResourceService {
     }, this);
   }
 
+  private async openExternalFile(
+    actorId: string,
+    id: string,
+  ): Promise<NativeResult<HttpResourceRead>> {
+    return Result.gen(async function* () {
+      const resolve = this.dependencies.externalFile;
+      if (!resolve) return Result.err(nativeFailure("not-found", "File is unavailable"));
+      const file = yield* resolve(actorId, id);
+      const blob =
+        file.type === "pending-blob"
+          ? yield* Result.await(
+              this.dependencies.blobs
+                .resolve(file.blob, { timeoutMs: 0 })
+                .then((result) =>
+                  result.mapError(() => nativeFailure("not-found", "File bytes are unavailable")),
+                ),
+            )
+          : file.blob;
+      if (blob.byteLength > RESOURCE_MAX_BYTES)
+        return Result.err(nativeFailure("invalid", "File exceeds preview limit"));
+      const opened = yield* Result.await(
+        this.dependencies.blobs
+          .open(blob)
+          .then((result) =>
+            result.mapError(() => nativeFailure("not-found", "File bytes are unavailable")),
+          ),
+      );
+      const bytes = yield* Result.await(
+        materializeBlobRead(opened).then((result) =>
+          result.mapError(() => nativeFailure("not-found", "File bytes are unavailable")),
+        ),
+      );
+      const classification = yield* Result.await(
+        Result.tryPromise({
+          try: () =>
+            classifyResourcePrefix({
+              prefix: bytes,
+              filename: file.filename,
+              declaredMediaType: file.mediaType,
+            }),
+          catch: () => nativeFailure("not-found", "File bytes are unavailable"),
+        }),
+      );
+      return Result.ok({
+        completion: Promise.resolve(Result.ok(undefined)),
+        stream: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        }),
+        size: bytes.byteLength,
+        mediaType: classification.mediaType ?? "application/octet-stream",
+        filename: file.filename ?? "attachment",
+      });
+    }, this);
+  }
+
+  private async openHttpResource(
+    actorId: string,
+    id: string,
+    signal: AbortSignal,
+  ): Promise<NativeResult<HttpResourceRead>> {
+    if (id.startsWith("xf_") || id.startsWith("xo_")) return this.openExternalFile(actorId, id);
+    return Result.gen(async function* () {
+      let uri = `resource://${id}`;
+      if (!/^r1_[0-9a-f]{32}$/u.test(id)) {
+        const upload = yield* this.dependencies.native.readUpload(actorId, id);
+        if (upload.state !== "ready" || !upload.resourceUri)
+          return Result.err(nativeFailure("conflict", "File is not ready"));
+        uri = upload.resourceUri;
+      }
+      const read = yield* Result.await(this.open(actorId, uri, signal));
+      return Result.ok({
+        completion: read.completion.then((result) =>
+          result
+            .map(() => undefined)
+            .mapError(() => nativeFailure("invalid", "File integrity verification failed")),
+        ),
+        stream: read.stream,
+        size: read.blob.byteLength,
+        mediaType: read.classification.mediaType ?? "application/octet-stream",
+        filename: read.descriptor.filename ?? "attachment",
+      });
+    }, this);
+  }
+
   async handle(request: Request, actorId: string): Promise<Response | undefined> {
     const url = new URL(request.url);
     if (url.pathname === "/api/identity/avatar") return this.handleAvatar(request, actorId);
@@ -730,15 +826,7 @@ export class NativeResourceService {
     const resourceId = resourceMatch?.[1];
     if (resourceId === undefined || (request.method !== "GET" && request.method !== "HEAD"))
       return undefined;
-    const reference = this.dependencies.native.readUpload(actorId, resourceId);
-    const upload = reference.match({ ok: (value) => value, err: () => null });
-    if (!upload)
-      return reference.match({
-        ok: () => new Response(null, { status: 404 }),
-        err: resourceFailureResponse,
-      });
-    if (upload.state !== "ready" || !upload.resourceUri) return new Response(null, { status: 409 });
-    const result = await this.open(actorId, upload.resourceUri, request.signal);
+    const result = await this.openHttpResource(actorId, resourceId, request.signal);
     const read = result.match({ ok: (value) => value, err: () => null });
     if (!read)
       return result.match({
@@ -748,7 +836,7 @@ export class NativeResourceService {
     if (resourceMatch?.[2]) {
       const preview = await readPreviewPrefix(read.stream);
       return preview
-        .andThen((bytes) => textPreview(bytes, read.blob.byteLength))
+        .andThen((bytes) => textPreview(bytes, read.size))
         .match({
           ok: (value) =>
             Response.json(value, {
@@ -767,13 +855,13 @@ export class NativeResourceService {
             ),
         });
     }
-    const size = read.blob.byteLength;
+    const size = read.size;
     const range = parseByteRange(request.headers.get("range"), size);
     if (range === "invalid") {
       await read.stream.cancel();
       return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${size}` } });
     }
-    const mediaType = read.classification.mediaType ?? "application/octet-stream";
+    const mediaType = read.mediaType;
     const safeInline = [
       "image/png",
       "image/jpeg",
@@ -782,7 +870,7 @@ export class NativeResourceService {
       "application/pdf",
       "text/plain",
     ].includes(mediaType);
-    const filename = read.descriptor.filename ?? "attachment";
+    const filename = read.filename;
     const headers = new Headers({
       "Content-Type": mediaType,
       "Content-Length": String(range ? range.end - range.start + 1 : size),

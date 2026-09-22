@@ -176,3 +176,21 @@ test("saved file tabs defer their bodies until the panel and tab become active",
     expect(html).not.toContain("body:file");
   }
 });
+
+test("unavailable retained images render a placeholder without requesting image bytes", () => {
+  const html = renderToStaticMarkup(
+    <ReadyAttachment
+      data={{
+        resourceId: "expired",
+        name: "image.png",
+        mediaType: "image/png",
+        size: 100,
+        state: "failed",
+        error: "File unavailable",
+      }}
+      href="/api/resources/expired"
+    />,
+  );
+  expect(html).toContain("Image unavailable");
+  expect(html).not.toContain("<img");
+});

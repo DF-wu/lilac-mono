@@ -52,7 +52,7 @@ import { NativeLiveFileService, rewriteNativePublishedFileLinks } from "./resour
 import { createNativeRpcServices, nativeViewer } from "./rpc-services";
 import { createNativeSurfaceRuntimeDescriptor } from "./runtime-descriptor";
 import { NativeSearchService } from "./search";
-import { NativeExternalThreads } from "./search-external";
+import { NativeExternalThreads, type ExternalOutputs } from "./search-external";
 import { NativeSummaryRefresher, emptyNativeSummaryResult } from "./search-summary";
 import { NativeSearchStore } from "./store-search";
 import { NativeSummaryStore } from "./store-search-summary";
@@ -93,6 +93,7 @@ export type NativeRuntimeOptions = {
   conversationThreads: () => ConversationThreadToolService | undefined;
   runner: () => (NativeRunnerControl & SubagentReader) | undefined;
   workflows: DurableWorkflowStore;
+  externalOutputs?: ExternalOutputs;
   deliveryState: (
     id: string,
   ) => ResultType<"missing" | "owned" | "completed" | "failed" | "cancelled", Error>;
@@ -123,12 +124,21 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const stopAgentIdentity = store.subscribe((threadId) => {
     if (!threadId) refreshAgentIdentity();
   });
+  const external = new NativeExternalThreads({
+    getAgent: () => store.getUser("lilac"),
+    profileProvider: clerk,
+    getUser: (id) => store.getUser(id),
+    adapters: options.adapters,
+    transcripts: options.transcript,
+    outputs: options.externalOutputs,
+  });
   const resources = new NativeResourceService({
     native: store,
     profileProvider: clerk ?? undefined,
     resources: options.transcript,
     access: options.resourceAccess,
     blobs: options.blobs,
+    externalFile: (actorId, id) => external.file(actorId, id),
   });
   const liveFiles = new NativeLiveFileService({
     native: store,
@@ -257,20 +267,6 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     getConfig: options.getConfig,
   });
   const summaryAbort = new AbortController();
-  const external = new NativeExternalThreads({
-    getAgent: () => store.getUser("lilac"),
-    profileProvider: clerk,
-    getUser: (id) => store.getUser(id),
-    adapters: options.adapters,
-    knownSessions: () =>
-      options.transcript
-        .listDiscoveryRecords()
-        .flatMap((row) =>
-          row.surfaceRefs
-            .filter((ref) => ref.platform !== "native")
-            .map((ref) => ({ ref, kind: "thread" as const, updatedAt: row.updatedTs })),
-        ),
-  });
   const config = new NativeConfigService({
     dataDir: options.dataDir,
     ownerId: options.getConfig().surface.native.auth.ownerId,
