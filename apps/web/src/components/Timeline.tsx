@@ -80,12 +80,13 @@ export function useSlotIds(store: NativeThreadStore) {
 export type TimelineProps = MessageServices & {
   header?: ReactNode;
   footer?: ReactNode;
-  client: NativeClient;
+  client: Pick<NativeClient, "thread" | "hydrate" | "loadTurnPage">;
   threadId: string;
   onRewind: (turnId: string) => void;
   onLatestVisibleChange?: (visible: boolean) => void;
   emptyMessage?: string;
   emptyContent?: ReactNode;
+  pendingTurn?: ReadyTurnSlot;
 };
 type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind"> & {
   measureTurn: (content: HTMLElement) => void;
@@ -120,7 +121,11 @@ export function useLatestReadableTurn(store: NativeThreadStore) {
 export const Timeline = memo(function Timeline(props: TimelineProps) {
   const services = useMessageServicesValue(props);
   const store = props.client.thread(props.threadId);
-  const ids = useSlotIds(store);
+  const storedIds = useSlotIds(store);
+  const ids = useMemo(
+    () => (props.pendingTurn ? [...storedIds, props.pendingTurn.slotId] : storedIds),
+    [storedIds, props.pendingTurn],
+  );
   const arrivals = useMemo(() => new MessageArrivals(), [store]);
 
   const subscribeTail = useCallback((listener: () => void) => store.subscribe(listener), [store]);
@@ -231,7 +236,12 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     setPositionedThread(props.threadId);
   });
   useLayoutEffect(() => {
-    setAwayFromEnd(!virtual.isAtEnd());
+    const viewport = parent.current;
+    setAwayFromEnd(
+      !!viewport &&
+        viewport.scrollHeight - viewport.clientHeight > 8 &&
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > 8,
+    );
   }, [virtual, totalSize, insets]);
   const rows = virtual.getVirtualItems().filter((row) => row.index > 0 && row.index <= ids.length);
   const activatedArrivals = useRef<MessageArrivals>(undefined);
@@ -306,11 +316,18 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
                 <div
                   key={row.key}
                   data-index={row.index}
+                  data-message-arrival={
+                    props.pendingTurn?.slotId === ids[row.index - 1] ? "ready" : undefined
+                  }
                   ref={virtual.measureElement}
                   className="virtual-row absolute top-0 left-0 w-full"
                   style={{ transform: `translateY(${row.start - headerSize}px)` }}
                 >
-                  <SlotRow slotId={ids[row.index - 1]!} store={store} />
+                  {props.pendingTurn && props.pendingTurn.slotId === ids[row.index - 1] ? (
+                    <Turn slot={props.pendingTurn} onRewind={() => {}} onLoadMore={() => {}} />
+                  ) : (
+                    <SlotRow slotId={ids[row.index - 1]!} store={store} />
+                  )}
                 </div>
               ))}
               {ids.length === 0
@@ -345,6 +362,19 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   );
 });
 
+export function ThinkingIndicator() {
+  return (
+    <Marker className="px-2 py-1" role="status" data-ui="thinking">
+      <MarkerIcon>
+        <LoaderCircle className="animate-spin" />
+      </MarkerIcon>
+      <MarkerContent>
+        <span className="working-text">Thinking...</span>
+      </MarkerContent>
+    </Marker>
+  );
+}
+
 const SlotRow = memo(function SlotRow(props: { store: NativeThreadStore; slotId: string }) {
   const { client, threadId, onRewind } = useContext(TimelineContext)!;
   const slot = useSlot(props.store, props.slotId);
@@ -370,6 +400,7 @@ const SlotRow = memo(function SlotRow(props: { store: NativeThreadStore; slotId:
   return (
     <Turn
       slot={slot}
+      animateArrivals={props.slotId === props.store.slotIds.at(-1)}
       onRewind={onRewind}
       onLoadMore={() => void client.loadTurnPage(threadId, slot.slotId)}
     />
@@ -378,6 +409,7 @@ const SlotRow = memo(function SlotRow(props: { store: NativeThreadStore; slotId:
 
 export const Turn = memo(function Turn(props: {
   slot: ReadyTurnSlot;
+  animateArrivals?: boolean;
   onRewind: (turnId: string) => void;
   onLoadMore: () => void;
 }) {
@@ -399,10 +431,14 @@ export const Turn = memo(function Turn(props: {
   const intermediate = remaining.slice(0, lastIntermediate + 1);
   const finals = remaining.slice(lastIntermediate + 1);
   const identities = useContext(MessageIdentityContext);
+  const startedAt = slot.startedAt ?? firstUser?.metadata?.createdAt;
   const duration =
-    slot.startedAt !== undefined && slot.settledAt !== undefined
-      ? Math.max(0, slot.settledAt - slot.startedAt)
+    startedAt !== undefined && slot.settledAt !== undefined
+      ? Math.max(0, slot.settledAt - startedAt)
       : undefined;
+  const waiting =
+    (slot.state === "pending" || slot.state === "running") &&
+    !remaining.some((message) => message.role === "assistant");
   return (
     <article
       className="turn pt-4 px-6 pb-8 max-workspace:pt-3 max-workspace:px-4 max-workspace:pb-6"
@@ -411,13 +447,13 @@ export const Turn = memo(function Turn(props: {
       {firstUser ? (
         <div className="user-turn ml-12 mb-6 max-workspace:ml-6">
           <MessageBody
-            live={!settled}
+            live={props.animateArrivals ?? true}
             message={firstUser}
             controls={
               <>
                 {canEdit && firstUser.metadata?.authorId === identities.viewerId ? (
                   <IconButton
-                    disabled={rewindDisabled}
+                    disabled={rewindDisabled || slot.state === "pending"}
                     label="Rewind to this turn"
                     onClick={() => onRewind(slot.turnId)}
                   >
@@ -429,12 +465,14 @@ export const Turn = memo(function Turn(props: {
           />
         </div>
       ) : null}
-      <div className="agent-response">
-        {remaining.length > 0 &&
-        (settled ||
-          remaining.find((message) => message.role !== "system")?.role === "assistant") ? (
+      <div className="agent-response flex flex-col gap-2">
+        {waiting ||
+        (remaining.length > 0 &&
+          (settled ||
+            remaining.find((message) => message.role !== "system")?.role === "assistant")) ? (
           <AuthorAvatar author={identities.agent} role="Agent" />
         ) : null}
+        {waiting ? <ThinkingIndicator /> : null}
         {settled && intermediate.length > 0 ? (
           <Collapsible open={expanded} onOpenChange={setExpanded}>
             <CollapsibleTrigger
@@ -448,7 +486,7 @@ export const Turn = memo(function Turn(props: {
               <Marker render={<span />}>
                 <MarkerContent className="work-summary-label flex flex-1 flex-wrap items-center gap-2">
                   <span>
-                    {duration === undefined ? "Work" : `Worked for ${formatDuration(duration)}`}
+                    {duration === undefined ? "Worked" : `Worked for ${formatDuration(duration)}`}
                   </span>
                   <TurnParticipants messages={slot.messages} />
                 </MarkerContent>
@@ -469,7 +507,7 @@ export const Turn = memo(function Turn(props: {
         )}
         <TurnMessages
           messages={finals}
-          live={!settled}
+          live={props.animateArrivals ?? true}
           showFirstAvatar={!settled && intermediate.at(-1)?.role === "user"}
           finalMessageId={settled ? finals.at(-1)?.id : undefined}
           finalText={finals.map(messageText).filter(Boolean).join("\n\n")}
@@ -627,7 +665,17 @@ export function groupActivityMessages(messages: readonly DisplayMessage[]): Disp
     message.role === "assistant" &&
     message.parts.length > 0 &&
     message.parts.every((part) => part.type === "data-activity");
-  for (const message of messages) {
+  for (const original of messages) {
+    const parts = original.parts.filter(
+      (part) =>
+        !(
+          part.type === "data-activity" &&
+          part.data.kind === "tool" &&
+          /^batch(?:\s|$)/.test(part.data.label)
+        ),
+    );
+    const message = parts.length === original.parts.length ? original : { ...original, parts };
+    if (!message.parts.length) continue;
     const previous = grouped.at(-1);
     if (previous && activityOnly(previous) && activityOnly(message)) {
       grouped[grouped.length - 1] = { ...previous, parts: [...previous.parts, ...message.parts] };
@@ -996,7 +1044,7 @@ const MessageBody = memo(function MessageBody(
                     </Marker>
                   );
                 case "data-input-state":
-                  return part.data.state === "admitted" ? null : (
+                  return part.data.state === "admitted" || part.data.state === "queued" ? null : (
                     <Marker className="input-state" key={part.id}>
                       <MarkerContent>{part.data.reason ?? part.data.state}</MarkerContent>
                     </Marker>
@@ -1085,7 +1133,7 @@ export function activitySummary(
     return labels.join(" and ");
   }
   const running = parts.find((part) => part.data.state === "running");
-  if (running) return running.data.label;
+  if (running && parts.length === 1) return running.data.label;
   const only = parts.length === 1 ? parts[0] : undefined;
   if (only?.data.state === "complete" && only.data.durationMs !== undefined)
     return `${only.data.kind === "thinking" ? "Thought" : "Worked"} for ${formatDuration(only.data.durationMs)}`;
@@ -1113,6 +1161,7 @@ function ActivityIcon({ part }: { part: ActivityPart }) {
 
 export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdAt?: number }) {
   const { agents } = useSubagents();
+  const live = useContext(LiveMessageContext);
   const spawned = parts.some((part) => subagentActivity(part, agents));
   const arrivalRef = useMessageArrival(`activity:${parts[0]?.id}`);
   const [open, setOpen] = useState(false);
@@ -1138,7 +1187,7 @@ export function Activity({ parts, createdAt }: { parts: ActivityPart[]; createdA
           <MarkerContent className="activity-label flex-1 overflow-hidden text-ellipsis whitespace-nowrap">
             <span
               className={
-                !spawned && representative.data.state === "running" ? "working-text" : undefined
+                live || representative.data.state === "running" ? "working-text" : undefined
               }
             >
               {activitySummary(parts, agents)}

@@ -1,5 +1,15 @@
 # MIGRATIONS.md
 
+## Native response streaming settings
+
+Native RPC adds owner-only `config.readStreaming` and `config.setStreaming` for the existing
+version 2 `surface.native.outputStreaming` option. Values remain `paragraph` and `complete`;
+the web UI labels them Paragraph and Full. Writes require the Core document revision and use
+the existing atomic configuration save. Updating this option reserializes the YAML document,
+preserving configuration values but not comments or formatting. No stored-data migration is required.
+Update Core and web together to use the new control. New responses pick up the setting through
+the existing Core configuration reload path; active responses retain their original mode.
+
 ## Conversation references
 
 Native web adds `references.resolve` and `references.read`, and display-message metadata accepts an

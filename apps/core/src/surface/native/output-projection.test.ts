@@ -526,3 +526,35 @@ test("resource output follows cancellation and recovery frontiers", () => {
   );
   expect(suppressed.slot.messages).toHaveLength(1);
 });
+
+test("native work retains command details and start time through completion", () => {
+  const label = `bash ${"echo hello; ".repeat(40)}`;
+  const started = projectNativeOutput(
+    slot(),
+    event({
+      type: "activity",
+      activityId: "tool",
+      stepId: "step",
+      position: 1,
+      kind: "tool",
+      state: "start",
+      label,
+    }),
+  );
+  expect(started.slot.startedAt).toBe(100);
+  const part = started.slot.messages[1]!.parts[0]!;
+  expect(part.type).toBe("data-activity");
+  if (part.type !== "data-activity") throw new Error("Expected activity");
+  expect(part.data.label.length).toBe(256);
+  expect(part.data.detail).toBe(label);
+  const completed = projectNativeOutput(
+    started.slot,
+    {
+      ...event({ type: "terminal", state: "complete" }, "attempt", 2),
+      occurredAt: 28100,
+    },
+    started.projection,
+  );
+  expect(completed.slot.startedAt).toBe(100);
+  expect(completed.slot.settledAt).toBe(28100);
+});

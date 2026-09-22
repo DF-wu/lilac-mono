@@ -170,21 +170,25 @@ export const formatReadFileToolArgs: ToolArgsFormatter = (args) => {
   return " " + truncateMiddle(p, PATH_HEAD_LEN, PATH_TAIL_LEN, DISPLAY_MAX_LEN);
 };
 
-export const formatBashToolArgs: ToolArgsFormatter = (args) => {
-  const parsed = safeValidateSync(bashInputSchema, args);
-  if (!isRecord(parsed) || typeof parsed["command"] !== "string") return "";
-
-  const cmd = parsed["command"].replace(/\s+/g, " ").trim();
+function formatBashCommand(command: string, cwd: string, maxLength: number): string {
+  const cmd = command.replace(/\s+/g, " ").trim();
   if (!cmd) return "";
-
-  const cwd = (typeof parsed["cwd"] === "string" ? parsed["cwd"] : "").trim();
-  const cwdTarget = parseSshCwdTarget(cwd);
+  const cwdTarget = parseSshCwdTarget(cwd.trim());
   const display =
     cwdTarget.kind === "ssh"
       ? `${formatRemoteDisplayPath(cwdTarget.host, cwdTarget.cwd)} ${cmd}`
       : cmd;
+  return " " + truncateEnd(display, maxLength);
+}
 
-  return " " + truncateEnd(display, DISPLAY_MAX_LEN);
+export const formatBashToolArgs: ToolArgsFormatter = (args) => {
+  const parsed = safeValidateSync(bashInputSchema, args);
+  if (!isRecord(parsed) || typeof parsed["command"] !== "string") return "";
+  return formatBashCommand(
+    parsed["command"],
+    typeof parsed["cwd"] === "string" ? parsed["cwd"] : "",
+    DISPLAY_MAX_LEN,
+  );
 };
 
 export const formatGlobToolArgs: ToolArgsFormatter = (args) => {
@@ -298,8 +302,34 @@ export function formatToolArgsForDisplayWithSpecs(
   toolSpecs?: ReadonlyMap<string, Level1ToolSpec<unknown>>,
   contributionInfo?: ReadonlyMap<Level1ToolSpec<unknown>, Level1ContributionInfo>,
   event?: { readonly args: unknown },
+  maxLength?: number,
 ): string {
   const value = event ? event.args : args;
+  if (toolName === "bash" && maxLength !== undefined) {
+    const parsed = safeValidateSync(bashInputSchema, value);
+    if (!isRecord(parsed) || typeof parsed["command"] !== "string") return "";
+    return formatBashCommand(
+      parsed["command"],
+      typeof parsed["cwd"] === "string" ? parsed["cwd"] : "",
+      maxLength,
+    );
+  }
+  if (maxLength !== undefined) {
+    const serialized = Result.try({
+      try: () => JSON.stringify(value),
+      catch: captureRuntimeError,
+    });
+    if (serialized.isErr()) {
+      preserveToolPanic(
+        projectCapturedRuntimeError(serialized.error, "Opaque tool argument serialization failure"),
+      );
+      return "";
+    }
+    return serialized.match({
+      ok: (text) => (text ? ` ${truncateEnd(text, maxLength)}` : ""),
+      err: () => "",
+    });
+  }
   const spec = toolSpecs?.get(toolName);
   if (spec) {
     const contribution = contributionInfo?.get(spec) ??

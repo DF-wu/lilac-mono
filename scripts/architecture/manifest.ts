@@ -3966,6 +3966,13 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             })),
             {
               identity: {
+                module: "src/surface/native/config-service.ts",
+                exportName: "streamingDocument.gen.<callback@1>",
+              },
+              category: "persistence" as const,
+            },
+            {
+              identity: {
                 module: "src/surface/native/adapter.ts",
                 exportName: "isValidNativeDisplayMessage",
               },
@@ -4879,6 +4886,9 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "NativeConfigService.save",
               "NativeConfigService.saveSerialized",
               "NativeConfigService.reloadMcp",
+              "NativeConfigService.readStreaming",
+              "NativeConfigService.setStreaming",
+              "streamingDocument",
               "validateDocument",
               "writeAtomic",
             ].map((exportName) => ({

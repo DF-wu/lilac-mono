@@ -161,6 +161,7 @@ function projectActivity(
         (payload.kind === "thinking" ? "Thinking" : "Tool call")
       ).slice(0, 256),
       state: payload.state === "start" ? "running" : payload.state,
+      ...(payload.kind === "tool" && payload.label ? { detail: payload.label.slice(0, 8192) } : {}),
     },
   });
 }
@@ -226,7 +227,22 @@ function projectEvent(slot: ReadyTurnSlot, event: NativeOutputEvent): ProjectedT
   const payload = event.payload;
   if (payload.type === "reset") return resetAttempt(slot, event, payload);
   if (payload.type === "terminal") return settleTurn(slot, event, payload.state);
-  let projection: ProjectedTurn = { slot, changes: [] };
+  const startedAt = slot.startedAt ?? Math.floor(event.occurredAt);
+  let projection: ProjectedTurn =
+    slot.startedAt === undefined
+      ? {
+          slot: { ...slot, startedAt },
+          changes: [
+            {
+              kind: "turn-state",
+              turnId: slot.turnId,
+              position: slot.position,
+              state: slot.state ?? "running",
+              startedAt,
+            },
+          ],
+        }
+      : { slot, changes: [] };
   const messageId = existingActivityMessage(slot, payload) ?? messageIdentity(event, payload);
   if (!slot.messages.some((message) => message.id === messageId))
     projection = insertMessage(projection, event, payload);

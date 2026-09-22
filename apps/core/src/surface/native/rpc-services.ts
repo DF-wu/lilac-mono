@@ -40,7 +40,10 @@ export type NativeRpcServiceOptions = {
   auth: NativeAuthenticator;
   installationId: string;
   catalogs: Pick<NativeCatalogService, "get" | "subscribe">;
-  config: Pick<NativeConfigService, "read" | "save" | "reloadMcp">;
+  config: Pick<
+    NativeConfigService,
+    "read" | "save" | "reloadMcp" | "readStreaming" | "setStreaming"
+  >;
   execution: Pick<NativeExecution, "kick" | "cancel" | "rewind" | "deleteThread">;
   resources: Pick<NativeResourceService, "reserve">;
   search: Pick<NativeSearchStore, "searchMessages">;
@@ -804,6 +807,12 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
       },
     },
     config: {
+      readStreaming(principal) {
+        return config.readStreaming(principal.userId);
+      },
+      setStreaming(principal, input) {
+        return config.setStreaming(principal.userId, input);
+      },
       read(principal, input) {
         return config.read(principal.userId, input.kind);
       },

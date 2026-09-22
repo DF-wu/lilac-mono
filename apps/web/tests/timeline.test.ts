@@ -101,7 +101,7 @@ describe("native turn activity disclosure", () => {
   });
   it("shows the current running label and preserves failures without a success badge", () => {
     const running = { ...parts[1]!, data: { ...parts[1]!.data, state: "running" as const } };
-    expect(activitySummary([parts[0]!, running])).toBe("Searched the workspace");
+    expect(activitySummary([parts[0]!, running])).toBe("Thought and used 1 tool");
     const failed = {
       ...parts[1]!,
       data: { ...parts[1]!.data, state: "failed" as const, detail: undefined },
@@ -169,4 +169,12 @@ it("caps user message previews before layout measurement without clamping assist
     );
   expect(render("user")).toContain('data-collapsed="true"');
   expect(render("assistant")).toContain('data-collapsed="false"');
+});
+
+it("omits batch wrappers without losing their child tool calls", () => {
+  const grouped = groupActivityMessages([activity("bash"), activity("batch"), activity("glob")]);
+  expect(grouped).toHaveLength(1);
+  expect(
+    grouped[0]!.parts.map((part) => (part.type === "data-activity" ? part.data.label : "")),
+  ).toEqual(["bash", "glob"]);
 });

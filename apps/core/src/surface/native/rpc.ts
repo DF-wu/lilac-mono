@@ -247,6 +247,12 @@ export function createNativeRouter(
       ),
     },
     config: {
+      readStreaming: secured.config.readStreaming.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.config.readStreaming(context.principal, input, signal)),
+      ),
+      setStreaming: secured.config.setStreaming.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.config.setStreaming(context.principal, input, signal)),
+      ),
       read: secured.config.read.handler(async ({ input, context, signal }) =>
         nativeRpcValue(await services.config.read(context.principal, input, signal)),
       ),

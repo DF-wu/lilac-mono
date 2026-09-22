@@ -330,6 +330,22 @@ export const nativeContract = {
       .output(resourceDisplaySchema),
   },
   config: {
+    readStreaming: procedure.input(z.strictObject({})).output(
+      z.strictObject({
+        mode: z.enum(["paragraph", "complete"]),
+        revision: identitySchema,
+      }),
+    ),
+    setStreaming: procedure
+      .input(
+        z.strictObject({
+          mode: z.enum(["paragraph", "complete"]),
+          expectedRevision: identitySchema,
+        }),
+      )
+      .output(
+        z.strictObject({ mode: z.enum(["paragraph", "complete"]), revision: identitySchema }),
+      ),
     read: procedure
       .input(z.strictObject({ kind: z.enum(["core", "mcp"]) }))
       .output(configDocumentSchema),
