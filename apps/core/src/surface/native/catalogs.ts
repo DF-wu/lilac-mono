@@ -103,9 +103,11 @@ function projectCatalog(source: NativeCatalogSource): Omit<DisplayCatalog, "revi
     label: id,
     ...(model.comment ? { description: model.comment.slice(0, 1024) } : {}),
   }));
-  if (!models.some((model) => model.id === source.config.models.main.model)) {
-    models.unshift({ id: source.config.models.main.model, label: source.config.models.main.model });
-  }
+  const primaryId = source.config.models.main.model;
+  const primaryIndex = models.findIndex((model) => model.id === primaryId);
+  const primary =
+    primaryIndex >= 0 ? models.splice(primaryIndex, 1)[0]! : { id: primaryId, label: primaryId };
+  models.unshift(primary);
   return {
     models,
     skills: source.skills.map((skill) => ({

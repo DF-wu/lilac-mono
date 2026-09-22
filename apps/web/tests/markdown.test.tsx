@@ -6,6 +6,52 @@ import { highlightCode } from "../src/components/rich-code";
 import { diagramSourceAllowed, markdownUrl } from "../src/components/markdown-policy";
 
 describe("markdown", () => {
+  test("keeps currency as prose while preserving Markdown and real math", () => {
+    const text =
+      "your $10 suggestion makes sense: your colleague shouldn’t have to assemble a miniature insurance claim over $7 just to **get paid**.";
+    const html = renderToStaticMarkup(<MarkdownContent text={text} />);
+    expect(html).toContain("$10 suggestion makes sense");
+    expect(html).toContain("over $7 just to <strong>get paid</strong>");
+    expect(html).not.toContain("<code");
+    for (const prose of [
+      "Pay $10 or $7",
+      "Pay $10**each** and $7 later",
+      "`$10 and $7`",
+      "\\$10 and \\$7",
+    ]) {
+      const rendered = renderToStaticMarkup(<MarkdownContent text={prose} />);
+      expect(rendered).not.toContain("markdown-math");
+      expect(rendered).toContain("$10");
+      expect(rendered).toContain("$7");
+    }
+    const formatted = renderToStaticMarkup(
+      <MarkdownContent text="Pay $10 **now** and $7 later." />,
+    );
+    expect(formatted).toContain("$10 <strong>now</strong> and $7 later.");
+    for (const text of ["Pay $10 and **$7** later.", "Pay **$10** and $7 later."]) {
+      const rendered = renderToStaticMarkup(<MarkdownContent text={text} />);
+      expect(rendered).toContain("<strong>$");
+      expect(rendered).not.toContain("**");
+    }
+    const linked = renderToStaticMarkup(
+      <MarkdownContent text="Pay $10 and [$7](https://example.com) later." />,
+    );
+    expect(linked).toContain('href="https://example.com"');
+    expect(linked).toContain("$7");
+    expect(linked).not.toContain("[$7]");
+    const mixed = renderToStaticMarkup(
+      <MarkdownContent text="Pay $10, then compute $x+1$ and pay $7." />,
+    );
+    expect(mixed).toContain("Pay $10, then compute");
+    expect(mixed).toContain("x+1");
+    expect(mixed).not.toContain("$x+1$");
+    expect(mixed).toContain("and pay $7.");
+    for (const math of ["$x^2$", "$10 + 7$", "$$x + y$$", "$$\n1 + 2\n$$"]) {
+      const rendered = renderToStaticMarkup(<MarkdownContent text={math} />);
+      expect(rendered).toMatch(/<code|markdown-math/);
+      expect(rendered).not.toContain("$x");
+    }
+  });
   test("renders GFM and keeps embedded HTML and unsafe links inert", () => {
     const html = renderToStaticMarkup(
       <MarkdownContent

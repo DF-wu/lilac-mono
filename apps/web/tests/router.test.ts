@@ -11,6 +11,79 @@ function setup(path: string) {
 }
 
 describe("web routes", () => {
+  test("invalid workspace parameters fall back to chat", async () => {
+    const { router } = setup("/?view=invalid&settings=invalid");
+    await router.load();
+    expect(router.state.matches.find((match) => match.routeId === "/chat")?.search).toEqual({});
+  });
+
+  test("view, external conversation, and settings survive reload and history", async () => {
+    const { router, history } = setup("/threads/first?view=archived");
+    await router.load();
+    expect(router.state.location.search).toEqual({ view: "archived" });
+    await router.navigate({
+      to: ".",
+      search: { view: "others", otherThread: "discord:123", settings: "theme" },
+    });
+    const reload = setup(history.location.href);
+    await reload.router.load();
+    expect(reload.router.state.location.search).toEqual({
+      view: "others",
+      otherThread: "discord:123",
+      settings: "theme",
+    });
+    history.back();
+    await router.load();
+    expect(router.state.location.search).toEqual({ view: "archived" });
+  });
+
+  test("settings navigation preserves Clerk hashes and draft history state", async () => {
+    const { router, history } = setup("/?settings=account#/security");
+    await router.load();
+    await router.navigate({
+      to: "/",
+      state: { draftThreadId: "draft:one" },
+      search: true,
+      hash: true,
+    });
+    await router.navigate({
+      to: ".",
+      search: (previous) => ({ ...previous, settings: "theme" }),
+      state: true,
+      hash: true,
+    });
+    expect(history.location.hash).toBe("#/security");
+    expect(history.location.state.draftThreadId).toBe("draft:one");
+    expect(router.state.location.search).toEqual({ settings: "theme" });
+  });
+
+  test("draft promotion preserves settings and the selected view", async () => {
+    const { router, history } = setup(
+      "/?view=others&otherThread=discord%3A123&settings=core#/security",
+    );
+    await router.load();
+    await router.navigate({
+      to: "/",
+      state: { draftThreadId: "draft:pending" },
+      search: true,
+      hash: true,
+    });
+    await router.navigate({
+      to: "/threads/$threadId",
+      params: { threadId: "created" },
+      search: true,
+      hash: true,
+    });
+    expect(history.location.pathname).toBe("/threads/created");
+    expect(history.location.state.draftThreadId).toBeUndefined();
+    expect(history.location.hash).toBe("#/security");
+    expect(router.state.location.search).toEqual({
+      view: "others",
+      otherThread: "discord:123",
+      settings: "core",
+    });
+  });
+
   test("thread paths share the chat layout and preserve browser history", async () => {
     const { router, history } = setup("/threads/first");
     await router.load();

@@ -1,3 +1,4 @@
+import { SidebarEmptyState } from "./SidebarEmptyState";
 import { useEventCallback } from "../use-event-callback";
 import { memo, useEffect, useState } from "react";
 import {
@@ -190,6 +191,12 @@ export const SidebarQueue = memo(function SidebarQueue({
           />
         )}
       />
+      {!error &&
+      sidebarSections.every(
+        (section) => !sections[section].isFetching && visible[section].length === 0,
+      ) ? (
+        <SidebarEmptyState view="default" />
+      ) : null}
       {error ? (
         <div className="queue-error">
           <ErrorNotice message={error.message} />

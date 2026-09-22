@@ -3806,6 +3806,10 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
       ...(root === "apps/web"
         ? [
             {
+              identity: { module: "src/router.tsx", exportName: "decodeWorkspaceSearch" },
+              category: "wire" as const,
+            },
+            {
               identity: { module: "src/panel-store.ts", exportName: "decodePanelLayouts" },
               category: "persistence" as const,
             },

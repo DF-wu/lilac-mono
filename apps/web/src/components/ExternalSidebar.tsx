@@ -1,3 +1,4 @@
+import { SidebarEmptyState } from "./SidebarEmptyState";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { externalListOptions, useNativeOnline } from "../queries";
 import { useWorkspace } from "../workspace-context";
@@ -73,9 +74,7 @@ export function ExternalSidebar({
           <Skeleton className="h-2 w-full" />
         </div>
       ) : null}
-      {list.data && threads.length === 0 ? (
-        <p className="p-3 text-sm text-muted-foreground">No conversations</p>
-      ) : null}
+      {list.data && threads.length === 0 ? <SidebarEmptyState view="others" /> : null}
     </div>
   );
 }

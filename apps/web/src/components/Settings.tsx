@@ -1,3 +1,4 @@
+import type { SettingsTab } from "../router";
 import { useWorkspace } from "../workspace-context";
 import { useStore } from "zustand";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -33,6 +34,8 @@ const isNarrowSettings = () => window.matchMedia("(max-width: 40rem)").matches;
 
 export function Settings({
   onClose,
+  tab,
+  onTabChange,
   theme,
   onTheme,
   agent,
@@ -40,6 +43,8 @@ export function Settings({
 }: {
   viewer: NativeUser;
   onClose: () => void;
+  tab: SettingsTab;
+  onTabChange: (tab: SettingsTab) => void;
   theme: string;
   agent: ActorIdentity & { discordUserId?: string };
   onTheme: (value: string) => void;
@@ -48,9 +53,6 @@ export function Settings({
   const narrow = useSyncExternalStore(subscribeToSettingsWidth, isNarrowSettings);
   const { client, preferences, accountProfile } = useWorkspace();
   const animation = useStore(preferences, (state) => state.animation);
-  const [tab, setTab] = useState<
-    "account" | "options" | "theme" | "core" | "mcp" | "agent" | "users"
-  >("account");
   const [editors, setEditors] = useState<ConfigEditors>({});
   const [error, setError] = useState<string>();
   const [reloads, setReloads] = useState<NativeRpcOutputs["config"]["reloadMcp"]>();
@@ -140,7 +142,7 @@ export function Settings({
               value === "agent" ||
               value === "users"
             ) {
-              setTab(value);
+              onTabChange(value);
               setError(undefined);
             }
           }}

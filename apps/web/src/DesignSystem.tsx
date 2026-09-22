@@ -1,3 +1,4 @@
+import { SidebarEmptyState } from "./components/SidebarEmptyState";
 import { setThemeMode } from "./theme/theme";
 import { clerkAppearance } from "./theme/clerk";
 import { FileIcon } from "./components/FileIcon";
@@ -314,7 +315,7 @@ const messageFixtures: DisplayMessage[] = [
   },
 ];
 const richText =
-  '### A small plan\n\nUse **bold**, *italic*, ~~strikethrough~~, and `inline code`. Links include a favicon: [GitHub](https://github.com).\n\n> Leave enough room to change your mind.\n\n- [x] Pick a place\n- [ ] Check the weather\n\n| Time | Plan |\n| --- | --- |\n| Morning | Coffee and a walk |\n| Afternoon | Bookstore |\n\n```typescript\nconst weekend = { pace: "slow", reservations: false };\nconsole.log("There is time to stop and explore", weekend);\n```\n\n```bash\nbun run dev:web\n```\n\nInline math: $a^2 + b^2 = c^2$.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\n```mermaid\nflowchart LR\n  Coffee --> Walk --> Bookstore\n```';
+  '### A small plan\n\nUse **bold**, *italic*, ~~strikethrough~~, and `inline code`. Links include a favicon: [GitHub](https://github.com).\n\n> Leave enough room to change your mind.\n\n- [x] Pick a place\n- [ ] Check the weather\n\n| Time | Plan |\n| --- | --- |\n| Morning | Coffee and a walk |\n| Afternoon | Bookstore |\n\n```typescript\nconst weekend = { pace: "slow", reservations: false };\nconsole.log("There is time to stop and explore", weekend);\n```\n\n```bash\nbun run dev:web\n```\n\nCurrency stays prose: your $10 suggestion makes sense over $7.\n\nInline math: $a^2 + b^2 = c^2$.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\n```mermaid\nflowchart LR\n  Coffee --> Walk --> Bookstore\n```';
 
 const alertExamples = [
   "> [!NOTE]\n> Keep useful context close to the conversation.",
@@ -503,6 +504,11 @@ function Threads() {
               onLoadMore={noop}
             />
           </div>
+        </Specimen>
+        <Specimen title="Empty conversation lists">
+          <SidebarEmptyState view="default" />
+          <SidebarEmptyState view="archived" />
+          <SidebarEmptyState view="others" />
         </Specimen>
         <Specimen title="Personal queues">
           <ThreadQueueDemo />

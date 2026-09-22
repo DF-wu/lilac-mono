@@ -1,3 +1,4 @@
+import { z } from "zod";
 import {
   createRootRoute,
   createRoute,
@@ -8,6 +9,21 @@ import {
   type RouterHistory,
   type RouteComponent,
 } from "@tanstack/react-router";
+
+const workspaceSearchSchema = z.object({
+  view: z.enum(["archived", "others"]).optional(),
+  otherThread: z.string().min(1).optional(),
+  settings: z.enum(["account", "options", "theme", "core", "mcp", "agent", "users"]).optional(),
+});
+export type WorkspaceSearch = z.infer<typeof workspaceSearchSchema>;
+export type SettingsTab = NonNullable<WorkspaceSearch["settings"]>;
+
+function decodeWorkspaceSearch(search: Record<string, unknown>): WorkspaceSearch {
+  const parsed = workspaceSearchSchema.safeParse(search);
+  return parsed.success
+    ? parsed.data
+    : { view: undefined, otherThread: undefined, settings: undefined };
+}
 
 export function createAppRouter(options: {
   shellComponent: RouteComponent;
@@ -26,6 +42,7 @@ export function createAppRouter(options: {
   const chatRoute = createRoute({
     getParentRoute: () => rootRoute,
     id: "chat",
+    validateSearch: decodeWorkspaceSearch,
     beforeLoad: options.onChatEnter,
   });
   const indexRoute = createRoute({
@@ -37,7 +54,10 @@ export function createAppRouter(options: {
         return redirect({
           to: "/threads/$threadId",
           params: { threadId },
-          search: {},
+          search: decodeWorkspaceSearch(
+            Object.fromEntries(new URLSearchParams(location.searchStr)),
+          ),
+          hash: location.hash,
           replace: true,
         });
     },

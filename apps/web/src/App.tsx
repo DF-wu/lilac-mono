@@ -1,3 +1,5 @@
+import { SidebarEmptyState } from "./components/SidebarEmptyState";
+import type { WorkspaceSearch } from "./router";
 import { readTheme, setThemeMode } from "./theme/theme";
 import { FileViewerProvider } from "./components/file-viewer-context";
 import { RightPanel } from "./components/FileViewer";
@@ -124,12 +126,19 @@ function Workspace(props: AppProps) {
   useEffect(() => {
     if (!active || routePathname !== "/" || routeThreadId || routeDraftId) return;
     if (selectedId.startsWith("draft:")) {
-      void navigate({ to: "/", state: { draftThreadId: selectedId }, hash: true, replace: true });
+      void navigate({
+        to: "/",
+        state: { draftThreadId: selectedId },
+        search: true,
+        hash: true,
+        replace: true,
+      });
       return;
     }
     void navigate({
       to: "/threads/$threadId",
       params: { threadId: selectedId },
+      search: true,
       hash: true,
       replace: true,
     });
@@ -139,11 +148,25 @@ function Workspace(props: AppProps) {
   );
   const [connection, setConnection] = useState("online");
   const [error, setError] = useState<string>();
-  const [settings, setSettings] = useState(false);
+  const search: WorkspaceSearch =
+    useMatch({
+      from: "/chat",
+      shouldThrow: false,
+      select: (match) => match.search,
+    }) ?? {};
+  const settings = search.settings;
+  const archived = search.view === "archived";
+  const external = search.view === "others" && viewer.role === "owner";
+  const externalId = search.otherThread;
+  const changeView = useEventCallback((change: Partial<WorkspaceSearch>) => {
+    void navigate({
+      to: ".",
+      search: (previous) => ({ ...previous, ...change }),
+      state: true,
+      hash: true,
+    });
+  });
   const [sharing, setSharing] = useState(false);
-  const [archived, setArchived] = useState(false);
-  const [external, setExternal] = useState(false);
-  const [externalId, setExternalId] = useState<string>();
   const sidebarLayout = useStore(panels, (state) => state.sidebar);
   const rightLayout = useStore(
     panels,
@@ -171,7 +194,6 @@ function Workspace(props: AppProps) {
   const [confirmDelete, setConfirmDelete] = useState<string>();
   useEffect(() => {
     if (active) return;
-    setSettings(false);
     setSharing(false);
     setRename(undefined);
     setConfirmDelete(undefined);
@@ -210,9 +232,12 @@ function Workspace(props: AppProps) {
     }),
     [catalog?.agent, viewer],
   );
+  const listedArchived = useRef(false);
   useEffect(() => {
-    setExternal(false);
-  }, [selectedId]);
+    if (listedArchived.current === archived) return;
+    listedArchived.current = archived;
+    void listThreads(archived);
+  }, [archived]);
   const [draftsHydrated, setDraftsHydrated] = useState(!props.draftCache);
   const routeDraftExists = useStore(
     draftStore,
@@ -249,7 +274,13 @@ function Workspace(props: AppProps) {
     const draft = restoreDraftThread(changed, { draftThreadId: routeDraftId });
     changed.set(draft.id, draft);
     setLocalDrafts(changed);
-    void navigate({ to: "/", state: { draftThreadId: draft.id }, replace: true });
+    void navigate({
+      to: "/",
+      state: { draftThreadId: draft.id },
+      search: true,
+      hash: true,
+      replace: true,
+    });
   }, [
     active,
     draftsHydrated,
@@ -393,12 +424,12 @@ function Workspace(props: AppProps) {
       void attempt(() => props.draftCache!.saveDraft(props.scope, id, empty), setError);
   });
   const select = useEventCallback(function select(id: string) {
-    setExternal(false);
+    const search = { view: archived ? ("archived" as const) : undefined };
     if (id.startsWith("draft:")) {
-      void navigate({ to: "/", state: { draftThreadId: id } });
+      void navigate({ to: "/", state: { draftThreadId: id }, search });
       return;
     }
-    void navigate({ to: "/threads/$threadId", params: { threadId: id } });
+    void navigate({ to: "/threads/$threadId", params: { threadId: id }, search });
   });
 
   const createThread = useEventCallback(function createThread() {
@@ -407,14 +438,17 @@ function Workspace(props: AppProps) {
     for (const [id, existing] of changed) if (!hasDraftContent(existing)) changed.delete(id);
     changed.set(draft.id, draft);
     setLocalDrafts(changed);
-    setArchived(false);
-    if (archived) void listThreads(false);
-    select(draft.id);
+    void navigate({ to: "/", state: { draftThreadId: draft.id }, search: {} });
   });
   function finishDraftNavigation(draftId: string, threadId: string) {
     if (selectedRef.current !== draftId) return;
     if (activeRef.current) {
-      select(threadId);
+      void navigate({
+        to: "/threads/$threadId",
+        params: { threadId },
+        search: true,
+        hash: true,
+      });
       return;
     }
     const location = router.state.location;
@@ -692,15 +726,15 @@ function Workspace(props: AppProps) {
   });
   const clearSidebarSearch = useCallback(() => setSearchQuery(""), []);
   const toggleArchived = useEventCallback(() => {
-    const value = !archived;
-    setArchived(value);
-    setExternal(false);
-    void listThreads(value);
+    changeView({ view: archived ? undefined : "archived", otherThread: undefined });
   });
-  const toggleExternal = useCallback(() => {
-    setExternal((value) => !value);
-  }, []);
-  const openSettings = useCallback(() => setSettings(true), []);
+  const toggleExternal = useEventCallback(() => {
+    changeView({ view: external ? undefined : "others", otherThread: undefined });
+  });
+  const selectExternal = useEventCallback((id: string) => {
+    changeView({ view: "others", otherThread: id });
+  });
+  const openSettings = useEventCallback(() => changeView({ settings: "account" }));
   const openDesign = useEventCallback(
     () =>
       void navigate({
@@ -844,7 +878,7 @@ function Workspace(props: AppProps) {
                     </header>
                     {sidebarToolbar}
                     {external && owner && !results ? (
-                      <ExternalSidebar selectedId={externalId} onSelect={setExternalId} />
+                      <ExternalSidebar selectedId={externalId} onSelect={selectExternal} />
                     ) : null}
                     {(results || !external) &&
                       (results ? (
@@ -863,8 +897,7 @@ function Workspace(props: AppProps) {
                                 onClick={() => {
                                   if (hit.surface === "native") select(hit.threadId);
                                   else {
-                                    setExternalId(hit.threadId);
-                                    setExternal(true);
+                                    selectExternal(hit.threadId);
                                   }
                                 }}
                               >
@@ -941,6 +974,12 @@ function Workspace(props: AppProps) {
                               )}
                             />
                           )}
+                          {archived &&
+                          !loadingThreads &&
+                          !threadListError &&
+                          sidebarThreads.length === 0 ? (
+                            <SidebarEmptyState view="archived" />
+                          ) : null}
                           {threadListError ? (
                             <Button
                               variant="ghost"
@@ -961,7 +1000,7 @@ function Workspace(props: AppProps) {
                         <External threadId={externalId} />
                       </Suspense>
                     ) : null}
-                    {!external && selectedId
+                    {!external && selectedId && routeDraftExists
                       ? (() => {
                           const thread = selected ?? selectedMetadata.data;
                           return (
@@ -1077,7 +1116,9 @@ function Workspace(props: AppProps) {
               {settings ? (
                 <Settings
                   viewer={viewer}
-                  onClose={() => setSettings(false)}
+                  onClose={() => changeView({ settings: undefined })}
+                  tab={settings}
+                  onTabChange={(settings) => changeView({ settings })}
                   agent={identities.agent}
                   theme={theme}
                   onTheme={setTheme}

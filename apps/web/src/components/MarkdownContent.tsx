@@ -5,6 +5,7 @@ import { createContext, useContext, lazy, memo, Suspense, type ComponentProps } 
 import ReactMarkdown, { type Components, type ExtraProps } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { remarkChatMath } from "./remark-chat-math";
 import { RichRenderBoundary } from "./Markdown";
 import { LinkWithFavicon } from "./LinkWithFavicon";
 import { AttachmentReference } from "./AttachmentReference";
@@ -15,7 +16,7 @@ import { markdownUrl } from "./markdown-policy";
 const HighlightedCode = lazy(() => import("./rich-code"));
 const Diagram = lazy(() => import("./rich-diagram"));
 const MathExpression = lazy(() => import("./rich-math"));
-const plugins = [remarkGfm, remarkMath];
+const plugins = [remarkGfm, remarkMath, remarkChatMath];
 const rehypePlugins = [githubAlerts];
 
 function RichBlock({ source, language }: { source: string; language: string }) {
