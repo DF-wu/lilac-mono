@@ -1,3 +1,4 @@
+import type { OptimisticTurn } from "../optimistic-turns";
 import { WorkspacePanels, WorkspaceSidePanel } from "./WorkspacePanels";
 import { useMemo, useLayoutEffect } from "react";
 import { useStore } from "zustand";
@@ -43,6 +44,7 @@ export function AgentWorkDemo() {
   const [text, setText] = useState("Compare a riverside walk with a museum visit for Saturday.");
   const [run, setRun] = useState(0);
   const [sent, setSent] = useState(false);
+  const [optimistic, setOptimistic] = useState<OptimisticTurn>();
   const [promptText, setPromptText] = useState("");
   const [feedback, setFeedback] = useState("");
   const container = useRef<HTMLDivElement>(null);
@@ -130,9 +132,11 @@ export function AgentWorkDemo() {
   function select(index: number) {
     setPlayhead({ stage: index, frame: 0, playing: false });
     setSent(false);
+    setOptimistic(undefined);
     setFeedback("");
   }
   function togglePlayback() {
+    setOptimistic(undefined);
     setFeedback("");
     setSent(true);
     setPlayhead((current) => {
@@ -220,6 +224,8 @@ export function AgentWorkDemo() {
             <div className="chat-panel flex flex-col">
               <MessageIdentityContext value={identities}>
                 <Timeline
+                  optimisticTurn={optimistic}
+                  onOptimisticResolved={() => setOptimistic(undefined)}
                   client={client}
                   threadId="demo"
                   {...services}
@@ -227,6 +233,18 @@ export function AgentWorkDemo() {
                   emptyMessage="Send a message to start the demo."
                   footer={
                     <div className="p-4">
+                      {optimistic && !optimistic.confirmedSlotId ? (
+                        <Button
+                          variant="secondary"
+                          onClick={() => {
+                            setOptimistic({ ...optimistic, confirmedSlotId: slot.slotId });
+                            setSent(true);
+                            setPlayhead({ stage: 0, frame: 0, playing: true });
+                          }}
+                        >
+                          Confirm send
+                        </Button>
+                      ) : null}
                       <Composer
                         text={text}
                         onText={setText}
@@ -244,7 +262,7 @@ export function AgentWorkDemo() {
                         canCancel={
                           playhead.playing && (slot.state === "pending" || slot.state === "running")
                         }
-                        disabled={false}
+                        disabled={!!optimistic}
                         windowDrop={false}
                         onModelChange={() => {}}
                         onCancel={() => setPlayhead((current) => ({ ...current, playing: false }))}
@@ -252,8 +270,26 @@ export function AgentWorkDemo() {
                           setRun((value) => value + 1);
                           setPromptText(submission.text);
                           setText("");
-                          setSent(true);
-                          setPlayhead({ stage: 0, frame: 0, playing: true });
+                          setOptimistic({
+                            precedingSlotIds: [],
+                            slot: {
+                              kind: "ready",
+                              slotId: `sending:demo:${run + 1}`,
+                              turnId: `sending:demo:${run + 1}`,
+                              position: 0,
+                              state: "pending",
+                              messages: [
+                                {
+                                  id: `demo-command:${run + 1}`,
+                                  role: "user",
+                                  metadata: { authorId: "demo_user" },
+                                  parts: [{ type: "text", text: submission.text }],
+                                },
+                              ],
+                            },
+                          });
+                          setSent(false);
+                          setPlayhead({ stage: 0, frame: 0, playing: false });
                         }}
                       />
                     </div>

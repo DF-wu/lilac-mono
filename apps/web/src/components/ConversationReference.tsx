@@ -110,8 +110,8 @@ export function ConversationBadge({ target }: { target: ConversationReference })
         <TooltipTrigger
           render={
             <Button
-              variant="secondary"
-              className="no-underline hover:no-underline hover:text-secondary-foreground inline-flex max-w-full h-auto gap-1 align-baseline py-0 px-2 rounded-sm [font-size:inherit] [font-weight:inherit] [line-height:inherit]"
+              variant="reference"
+              className="no-underline hover:no-underline inline-flex max-w-full h-auto gap-1 px-2 rounded-sm [font-weight:inherit]"
               render={<a href={referenceHref(target)} />}
               onClick={(event) => {
                 if (

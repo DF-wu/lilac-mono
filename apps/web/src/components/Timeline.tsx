@@ -1,3 +1,4 @@
+import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
 import { CopyReferenceItem, useConversation } from "./ConversationReference";
 import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from "./ui/context-menu";
 import { useSubagents, subagentProfileName } from "./subagent-context";
@@ -86,7 +87,8 @@ export type TimelineProps = MessageServices & {
   onLatestVisibleChange?: (visible: boolean) => void;
   emptyMessage?: string;
   emptyContent?: ReactNode;
-  pendingTurn?: ReadyTurnSlot;
+  optimisticTurn?: OptimisticTurn;
+  onOptimisticResolved?: () => void;
 };
 type TimelineServices = Pick<TimelineProps, "client" | "threadId" | "onRewind"> & {
   measureTurn: (content: HTMLElement) => void;
@@ -122,10 +124,16 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
   const services = useMessageServicesValue(props);
   const store = props.client.thread(props.threadId);
   const storedIds = useSlotIds(store);
+  const identities = useMemo(() => new OptimisticTurns(), [store]);
+  const pending = props.optimisticTurn;
   const ids = useMemo(
-    () => (props.pendingTurn ? [...storedIds, props.pendingTurn.slotId] : storedIds),
-    [storedIds, props.pendingTurn],
+    () => identities.reconcile(storedIds, pending),
+    [identities, storedIds, pending],
   );
+  const confirmed = useSlot(store, pending?.confirmedSlotId);
+  useLayoutEffect(() => {
+    if (confirmed?.kind === "ready") props.onOptimisticResolved?.();
+  }, [confirmed, props.onOptimisticResolved]);
   const arrivals = useMemo(() => new MessageArrivals(), [store]);
 
   const subscribeTail = useCallback((listener: () => void) => store.subscribe(listener), [store]);
@@ -158,10 +166,11 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
     (index: number) => {
       if (index === 0) return `${props.threadId}:header`;
       // The last key must change on append so followOnAppend sees the new turn.
-      if (index === ids.length + 1) return `${props.threadId}:footer:${ids.at(-1) ?? "empty"}`;
-      return ids[index - 1]!;
+      if (index === ids.length + 1)
+        return `${props.threadId}:footer:${identities.key(ids.at(-1) ?? "empty")}`;
+      return identities.key(ids[index - 1]!);
     },
-    [ids, props.threadId],
+    [ids, props.threadId, identities],
   );
   const virtual = useVirtualizer<HTMLDivElement, HTMLDivElement>({
     // Sticky chrome participates in measurements so the virtual and native scroll extents agree.
@@ -316,18 +325,20 @@ export const Timeline = memo(function Timeline(props: TimelineProps) {
                 <div
                   key={row.key}
                   data-index={row.index}
-                  data-message-arrival={
-                    props.pendingTurn?.slotId === ids[row.index - 1] ? "ready" : undefined
-                  }
                   ref={virtual.measureElement}
                   className="virtual-row absolute top-0 left-0 w-full"
                   style={{ transform: `translateY(${row.start - headerSize}px)` }}
                 >
-                  {props.pendingTurn && props.pendingTurn.slotId === ids[row.index - 1] ? (
-                    <Turn slot={props.pendingTurn} onRewind={() => {}} onLoadMore={() => {}} />
-                  ) : (
-                    <SlotRow slotId={ids[row.index - 1]!} store={store} />
-                  )}
+                  <SlotRow
+                    slotId={ids[row.index - 1]!}
+                    store={store}
+                    renderKey={identities.key(ids[row.index - 1]!)}
+                    fallback={
+                      ids[row.index - 1] === (pending?.confirmedSlotId ?? pending?.slot.slotId)
+                        ? pending?.slot
+                        : undefined
+                    }
+                  />
                 </div>
               ))}
               {ids.length === 0
@@ -375,12 +386,18 @@ export function ThinkingIndicator() {
   );
 }
 
-const SlotRow = memo(function SlotRow(props: { store: NativeThreadStore; slotId: string }) {
+const SlotRow = memo(function SlotRow(props: {
+  store: NativeThreadStore;
+  slotId: string;
+  renderKey: string;
+  fallback?: ReadyTurnSlot;
+}) {
   const { client, threadId, onRewind } = useContext(TimelineContext)!;
-  const slot = useSlot(props.store, props.slotId);
+  const stored = useSlot(props.store, props.slotId);
+  const slot = stored?.kind === "ready" ? stored : (props.fallback ?? stored);
   useEffect(() => {
-    if (slot?.kind === "deferred") void client.hydrate(threadId, props.slotId);
-  }, [slot?.kind, client, threadId, props.slotId]);
+    if (stored?.kind === "deferred") void client.hydrate(threadId, props.slotId);
+  }, [stored?.kind, client, threadId, props.slotId]);
   if (!slot) return null;
   if (slot.kind !== "ready")
     return (
@@ -400,7 +417,11 @@ const SlotRow = memo(function SlotRow(props: { store: NativeThreadStore; slotId:
   return (
     <Turn
       slot={slot}
-      animateArrivals={props.slotId === props.store.slotIds.at(-1)}
+      optimistic={!!props.fallback && stored?.kind !== "ready"}
+      userRenderKey={
+        props.renderKey !== props.slotId || props.fallback ? props.renderKey : undefined
+      }
+      animateArrivals={!!props.fallback || props.slotId === props.store.slotIds.at(-1)}
       onRewind={onRewind}
       onLoadMore={() => void client.loadTurnPage(threadId, slot.slotId)}
     />
@@ -410,6 +431,8 @@ const SlotRow = memo(function SlotRow(props: { store: NativeThreadStore; slotId:
 export const Turn = memo(function Turn(props: {
   slot: ReadyTurnSlot;
   animateArrivals?: boolean;
+  optimistic?: boolean;
+  userRenderKey?: string;
   onRewind: (turnId: string) => void;
   onLoadMore: () => void;
 }) {
@@ -449,11 +472,13 @@ export const Turn = memo(function Turn(props: {
           <MessageBody
             live={props.animateArrivals ?? true}
             message={firstUser}
+            renderKey={props.userRenderKey}
+            optimistic={props.optimistic}
             controls={
               <>
                 {canEdit && firstUser.metadata?.authorId === identities.viewerId ? (
                   <IconButton
-                    disabled={rewindDisabled || slot.state === "pending"}
+                    disabled={props.optimistic || rewindDisabled || slot.state === "pending"}
                     label="Rewind to this turn"
                     onClick={() => onRewind(slot.turnId)}
                   >
@@ -907,6 +932,8 @@ const MessageBody = memo(function MessageBody(
     showControls?: boolean;
     copyText?: string;
     copyParts?: readonly DisplayPart[];
+    renderKey?: string;
+    optimistic?: boolean;
   },
 ) {
   const { resourceUrl, canEdit, onAction, onReaction } = useMessageServices();
@@ -1003,7 +1030,7 @@ const MessageBody = memo(function MessageBody(
       </IconButton>
     ) : null;
   const copy =
-    copyReference && copyButton ? (
+    !props.optimistic && copyReference && copyButton ? (
       <ContextMenu>
         <ContextMenuTrigger render={<span className="inline-flex" />}>
           {copyButton}
@@ -1032,7 +1059,7 @@ const MessageBody = memo(function MessageBody(
                 return (
                   <MessageCard
                     key={index}
-                    arrivalId={`${message.id}:content:${index}`}
+                    arrivalId={`${props.renderKey ?? message.id}:content:${index}`}
                     content={group}
                     self={self}
                     collapsible={message.role === "user"}

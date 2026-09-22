@@ -78,6 +78,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { IconButton } from "./ui";
+import { referenceChipStyles } from "./ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 import type { Attachment } from "../types";
 
@@ -159,7 +160,7 @@ function AttachmentElement(props: PlateElementProps) {
             render={
               <span
                 data-ui="composer-attachment-chip"
-                className="composer-attachment-chip relative inline-flex items-center gap-1 max-w-full px-1 rounded-sm bg-muted text-foreground text-sm align-middle whitespace-nowrap [line-height:1.5]"
+                className={`composer-attachment-chip relative inline-flex items-center gap-1 max-w-full px-2 rounded-sm whitespace-nowrap ${referenceChipStyles}`}
                 contentEditable={false}
                 data-state={attachment?.state ?? "missing"}
               />

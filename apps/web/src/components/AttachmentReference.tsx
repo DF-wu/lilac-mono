@@ -33,8 +33,8 @@ export function AttachmentReference({
       <span className="sent-attachment-reference inline">
         <Button
           type="button"
-          variant="secondary"
-          className="sent-attachment-chip inline-flex max-w-full h-auto gap-1 align-baseline py-0 px-2 rounded-sm [font-size:inherit] [font-weight:inherit] [line-height:inherit]"
+          variant="reference"
+          className="sent-attachment-chip inline-flex max-w-full h-auto gap-1 px-2 rounded-sm [font-weight:inherit]"
           disabled={!ready}
           aria-label={`Preview ${resource.name}`}
           onClick={() => setOpen(true)}

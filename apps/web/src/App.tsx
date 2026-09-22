@@ -515,6 +515,7 @@ function Workspace(props: AppProps) {
     const files = moveAttachments(creation.entry.submission.attachments);
     const entry: PendingInput = {
       ...creation.entry,
+      optimisticSlotIds: [],
       submission: {
         ...creation.entry.submission,
         attachmentText: creation.entry.submission.attachmentText
@@ -598,6 +599,10 @@ function Workspace(props: AppProps) {
     const outcome = await client.submit(prepared);
     if (pool.signal.aborted) return;
     if (outcome.kind === "accepted") {
+      if (outcome.receipt.turnId) {
+        patch({ state: "accepted", receipt: outcome.receipt });
+        return;
+      }
       for (const file of files) pool.release(created.id, file.key);
       patch(null);
       return;

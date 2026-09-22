@@ -238,7 +238,7 @@ const messageFixtures: DisplayMessage[] = [
     parts: [
       {
         type: "text",
-        text: "Start with the riverside walk, then stop at **Chapter House** for coffee. The bookstore next door stays open until six.\n\nLeave the afternoon free. You won't need reservations.",
+        text: "Start with the riverside walk, then stop at **Chapter House** for coffee. The bookstore next door stays open until six.\n\nLeave the afternoon free. You won't need reservations.\n\nSave `weekend.md` and check [the itinerary](/tmp/weekend.md) or [meeting-room](/?ref=discord:meeting-room&message=demo).",
       },
     ],
   },
@@ -963,13 +963,21 @@ function Controls() {
     <Section id="controls" title="Controls">
       <Specimen title="Buttons">
         <div className="ds-row flex items-center flex-wrap gap-2">
-          {(["default", "secondary", "outline", "ghost", "destructive", "link"] as const).map(
-            (variant) => (
-              <Button key={variant} variant={variant}>
-                {variant}
-              </Button>
-            ),
-          )}
+          {(
+            [
+              "default",
+              "secondary",
+              "reference",
+              "outline",
+              "ghost",
+              "destructive",
+              "link",
+            ] as const
+          ).map((variant) => (
+            <Button key={variant} variant={variant}>
+              {variant}
+            </Button>
+          ))}
           <Button disabled>Disabled</Button>
           <IconButton label="New conversation">
             <Plus />
