@@ -60,7 +60,9 @@ export const clerkProfileAppearance = {
       "flex-col w-full h-auto min-h-0 min-w-0 max-w-none rounded-none border-0 bg-transparent shadow-none",
     card: "w-full min-w-0 bg-transparent p-0 shadow-none",
     navbar:
-      "sm:w-full sm:max-w-none sm:basis-auto sm:flex-row sm:items-start sm:gap-4 sm:rounded-none sm:bg-transparent sm:p-0 sm:[&>div]:basis-auto",
+      "sm:w-full sm:max-w-none sm:basis-auto sm:flex-row sm:items-start sm:gap-4 sm:rounded-none sm:bg-transparent sm:p-0 sm:me-0 sm:[&>div]:basis-auto sm:[&>div:has(.cl-navbarButtons)]:min-w-0 sm:[&>div:has(.cl-navbarButtons)]:flex-1",
+    footerItem:
+      "sm:[.cl-navbar>&]:w-auto sm:[.cl-navbar>&]:shrink-0 sm:[.cl-navbar>&]:self-start sm:[.cl-navbar>&]:ms-auto",
     navbarButtons: "sm:flex-row sm:gap-2",
     navbarButton: "sm:w-auto",
     navbarMobileMenuRow: "w-full shrink-0 rounded-lg bg-surface px-4 py-3",

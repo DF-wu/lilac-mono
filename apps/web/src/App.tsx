@@ -114,18 +114,25 @@ function Workspace(props: AppProps) {
   const threadListRequest = useRef({ loading: false });
   const [firstDraft] = useState(() => draftStore.getState().localDrafts.values().next().value!);
   const removedDrafts = useRef(new Set<string>());
-  const routeSelection =
-    routeThreadId ?? routeDraftId ?? initial.threads.items[0]?.id ?? firstDraft.id;
-  const [lastSelectedId, setLastSelectedId] = useState(routeSelection);
+  const [lastSelectedId, setLastSelectedId] = useState(
+    routeThreadId ?? routeDraftId ?? initial.threads.items[0]?.id ?? firstDraft.id,
+  );
+  // Clerk's hash navigation creates history entries without our draft selection state.
+  const routeSelection = routeThreadId ?? routeDraftId ?? lastSelectedId;
   if (active && lastSelectedId !== routeSelection) setLastSelectedId(routeSelection);
   const selectedId = active ? routeSelection : lastSelectedId;
   useEffect(() => {
     if (!active || routePathname !== "/" || routeThreadId || routeDraftId) return;
     if (selectedId.startsWith("draft:")) {
-      void navigate({ to: "/", state: { draftThreadId: selectedId }, replace: true });
+      void navigate({ to: "/", state: { draftThreadId: selectedId }, hash: true, replace: true });
       return;
     }
-    void navigate({ to: "/threads/$threadId", params: { threadId: selectedId }, replace: true });
+    void navigate({
+      to: "/threads/$threadId",
+      params: { threadId: selectedId },
+      hash: true,
+      replace: true,
+    });
   }, [active, routePathname, routeThreadId, routeDraftId, selectedId, navigate]);
   const [catalog, setCatalog] = useState<DisplayCatalog | undefined>(() =>
     initial.catalog.kind === "catalog" ? initial.catalog.catalog : client.catalogs.get(props.scope),
