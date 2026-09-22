@@ -1328,6 +1328,13 @@ export default {
         editingToolMode: "none",
         subagentDepth: runProfile === "primary" ? 0 : 1,
         subagentConfig: cfg.agent.subagents,
+        requestContext: {
+          requestId: "native:request",
+          sessionId: "native:session",
+          requestClient: "native",
+          subagentDepth: runProfile === "primary" ? 0 : 1,
+          subagentProfile: runProfile,
+        },
       });
 
     const primary = await build("primary");
