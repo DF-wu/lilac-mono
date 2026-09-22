@@ -115,12 +115,12 @@ describe("app update notifications", () => {
     );
     expect(f.updates).toHaveLength(1);
   });
-  test("missing old lazy chunks offer a reload without an automatic reload loop", async () => {
+  test("missing old lazy chunks preserve the import failure and offer an explicit reload", async () => {
     const f = fixture();
     const cleanup = await watchAppUpdates((value) => f.updates.push(value), f.environment);
     const error = new Event("vite:preloadError", { cancelable: true });
     f.events.dispatchEvent(error);
-    expect(error.defaultPrevented).toBe(true);
+    expect(error.defaultPrevented).toBe(false);
     expect(f.updates).toHaveLength(1);
     expect(f.reloads()).toBe(0);
     cleanup();

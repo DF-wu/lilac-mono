@@ -15,10 +15,16 @@ function response(body: string, type = "text/javascript", status = 200, cacheCon
   Object.defineProperty(value, "type", { value: "basic" });
   return value;
 }
+function cloneNetworkResponse(value: Response) {
+  const copy = value.clone();
+  Object.defineProperty(copy, "type", { value: value.type });
+  return copy;
+}
 function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } = {}) {
   const handlers = new Map<string, (event: object) => void>();
   const stores = new Map<string, Map<string, Response>>();
   const requests: string[] = [];
+  const requestCacheModes: RequestCache[] = [];
   const clients: { id: string; postMessage: (value: object) => void }[] = [];
   const cacheKey = (key: string | Request) =>
     new URL(typeof key === "string" ? key : key.url, "https://lilac.test").pathname;
@@ -38,6 +44,7 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
     },
   };
   let networkResponse: Response | undefined;
+  let offline = false;
   runInNewContext(script, {
     self: {
       location: { origin: "https://lilac.test" },
@@ -56,7 +63,9 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
     fetch: async (request: Request) => {
       const pathname = new URL(request.url).pathname;
       requests.push(pathname);
-      if (networkResponse) return networkResponse;
+      requestCacheModes.push(request.cache);
+      if (offline) throw new TypeError("Failed to fetch");
+      if (networkResponse) return cloneNetworkResponse(networkResponse);
       if (pathname === "/")
         return response(
           `<meta name="lilac-build" content="${options.shellBuild ?? buildId}" />`,
@@ -68,7 +77,11 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
   return {
     stores,
     requests,
+    requestCacheModes,
     clients,
+    goOffline: () => {
+      offline = true;
+    },
     setNetworkResponse: (value: Response) => {
       networkResponse = value;
     },
@@ -79,7 +92,11 @@ function fixture(options: { storageUnavailable?: boolean; shellBuild?: string } 
         ...fields,
         waitUntil: (work: Promise<unknown>) => pending.push(work),
         respondWith: (work: Promise<Response>) => {
-          reply = work;
+          reply = work.then((response) => {
+            const copy = response.clone();
+            void response.text();
+            return copy;
+          });
         },
       });
       const response = await reply;
@@ -93,18 +110,24 @@ function request(pathname: string, mode = "cors", method = "GET") {
 }
 
 describe("app shell service worker", () => {
-  test("precaches the hashed shell and serves repeat navigation without network", async () => {
+  test("reload fetches the deployed shell even while the old worker still controls the page", async () => {
     const f = fixture();
     await f.dispatch("install");
     expect(f.requests).toEqual(["/", "/assets/app-new.js"]);
+    const deployedBuild = "aaaaaaaaaaaaaaaaaaaa";
+    f.setNetworkResponse(
+      response(`<meta name="lilac-build" content="${deployedBuild}" />`, "text/html"),
+    );
     const page = await f.dispatch("fetch", { request: request("/?thread=abc", "navigate") });
-    expect(await page?.text()).toContain(buildId);
-    expect(f.requests).toHaveLength(2);
+    expect(await page?.text()).toContain(deployedBuild);
+    expect(f.requests).toEqual(["/", "/assets/app-new.js", "/"]);
+    expect(f.requestCacheModes.at(-1)).toBe("no-cache");
+    expect(await f.stores.get(`lilac-shell-${buildId}`)?.get("/")?.text()).toContain(buildId);
   });
   test("routed offline reloads use the public shell without caching thread URLs", async () => {
     const f = fixture();
     await f.dispatch("install");
-    f.setNetworkResponse(response("Offline", "text/plain", 503));
+    f.goOffline();
     for (const path of [
       "/threads/thread-id",
       "/threads/thread-id/?search=value",
@@ -114,12 +137,48 @@ describe("app shell service worker", () => {
       const page = await f.dispatch("fetch", { request: request(path, "navigate") });
       expect(await page?.text()).toContain(buildId);
     }
-    expect(f.requests).toEqual(["/", "/assets/app-new.js"]);
+    expect(f.requests).toEqual(["/", "/assets/app-new.js", "/", "/", "/", "/"]);
     expect([...f.stores.get(`lilac-shell-${buildId}`)!.keys()].sort()).toEqual([
       "/",
       "/assets/app-new.js",
     ]);
     expect(await f.dispatch("fetch", { request: request("/threads/thread-id") })).toBeUndefined();
+  });
+  test("refreshes the offline shell even when the browser consumes the network response", async () => {
+    const f = fixture();
+    await f.dispatch("install");
+    const html = `<meta name="lilac-build" content="${buildId}" /><title>Fresh shell</title>`;
+    f.setNetworkResponse(response(html, "text/html"));
+    const online = await f.dispatch("fetch", { request: request("/", "navigate") });
+    expect(await online?.text()).toBe(html);
+    f.goOffline();
+    const offline = await f.dispatch("fetch", { request: request("/", "navigate") });
+    expect(await offline?.text()).toBe(html);
+  });
+  test("server failures fall back to the shell but HTTP access errors remain visible", async () => {
+    const f = fixture();
+    await f.dispatch("install");
+    f.setNetworkResponse(response("Unavailable", "text/plain", 503));
+    const fallback = await f.dispatch("fetch", { request: request("/", "navigate") });
+    expect(await fallback?.text()).toContain(buildId);
+    f.setNetworkResponse(response("Unauthorized", "text/plain", 401));
+    const denied = await f.dispatch("fetch", { request: request("/", "navigate") });
+    expect(denied?.status).toBe(401);
+    expect(await denied?.text()).toBe("Unauthorized");
+  });
+  test("offline navigation without a cached shell returns a network error", async () => {
+    const f = fixture();
+    f.goOffline();
+    const page = await f.dispatch("fetch", { request: request("/", "navigate") });
+    expect(page?.type).toBe("error");
+  });
+  test("hashed assets remain cache-first across reloads", async () => {
+    const f = fixture();
+    await f.dispatch("install");
+    f.goOffline();
+    const asset = await f.dispatch("fetch", { request: request("/assets/app-new.js") });
+    expect(await asset?.text()).toBe("export const ready = true;");
+    expect(f.requests).toEqual(["/", "/assets/app-new.js"]);
   });
   test("never intercepts private HTTP, Clerk or non-GET requests", async () => {
     const f = fixture();

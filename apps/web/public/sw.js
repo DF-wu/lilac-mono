@@ -19,14 +19,15 @@ function cacheable(response, pathname) {
 
 async function storeResponse(pathname, response) {
   if (!cacheable(response, pathname)) return;
+  const cached = response.clone();
   if (
     pathname === "/" &&
-    !(await response.clone().text()).includes(`name="lilac-build" content="${BUILD_ID}"`)
+    !(await cached.clone().text()).includes(`name="lilac-build" content="${BUILD_ID}"`)
   )
     return;
   await bestEffort(async () => {
     const cache = await caches.open(SHELL_CACHE);
-    await cache.put(pathname, response.clone());
+    await cache.put(pathname, cached);
   });
 }
 
@@ -102,6 +103,17 @@ async function cachedResponse(pathname, shell) {
   });
 }
 
+async function navigationResponse(event) {
+  // A cached shell can reference lazy chunks removed by a newer deployment.
+  const response = await bestEffort(() =>
+    fetch(new Request(new URL("/", self.location.origin), { cache: "no-cache" })),
+  );
+  if (!response || response.status >= 500)
+    return (await cachedResponse("/", true)) ?? response ?? Response.error();
+  event.waitUntil(storeResponse("/", response));
+  return response;
+}
+
 self.addEventListener("fetch", (event) => {
   const request = event.request;
   const url = new URL(request.url);
@@ -113,14 +125,16 @@ self.addEventListener("fetch", (event) => {
   const shell = request.mode === "navigate" && appRoute;
   const asset = url.pathname.startsWith("/assets/");
   if (!shell && !asset) return;
+  if (shell) {
+    event.respondWith(navigationResponse(event));
+    return;
+  }
   event.respondWith(
     (async () => {
-      const pathname = shell ? "/" : url.pathname;
-      const cached = await cachedResponse(pathname, shell);
+      const pathname = url.pathname;
+      const cached = await cachedResponse(pathname, false);
       if (cached) return cached;
-      const response = await fetch(
-        shell ? new Request(new URL("/", self.location.origin), { cache: "no-cache" }) : request,
-      );
+      const response = await fetch(request);
       event.waitUntil(storeResponse(pathname, response));
       return response;
     })(),

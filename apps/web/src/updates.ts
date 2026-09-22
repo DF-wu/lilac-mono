@@ -22,8 +22,7 @@ export async function watchAppUpdates(
   if (!environment.production) return () => {};
   let disposed = false;
   let activateUpdate = environment.reload;
-  const preloadError = (event: Event) => {
-    event.preventDefault();
+  const preloadError = () => {
     if (!disposed) onUpdate({ activate: () => activateUpdate() });
   };
   environment.events.addEventListener("vite:preloadError", preloadError);
