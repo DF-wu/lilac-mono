@@ -1,3 +1,4 @@
+import { reactionTooltip } from "../src/components/MessageReactions";
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { AttachmentPreviewBody } from "../src/components/ResourcePreview";
@@ -12,6 +13,27 @@ import MarkdownContent from "../src/components/MarkdownContent";
 import type { DisplayMessage, DisplayPart } from "@stanley2058/lilac-client-protocol";
 
 describe("message presentation", () => {
+  test("reaction tooltips show five names and the remaining count", () => {
+    expect(
+      reactionTooltip({
+        emoji: "👍",
+        count: 7,
+        reacted: false,
+        userNames: ["Alex", "Morgan", "Sam", "Jo", "Casey"],
+        overflowCount: 2,
+      }),
+    ).toBe("Alex, Morgan, Sam, Jo, Casey, +2");
+    expect(
+      reactionTooltip({
+        emoji: "👍",
+        count: 1,
+        reacted: true,
+        userNames: ["Alex"],
+        overflowCount: 0,
+      }),
+    ).toBe("Alex");
+  });
+
   test("linked Discord messages use the viewer alignment and keep the source label", () => {
     const html = renderToStaticMarkup(
       <MessageIdentityContext

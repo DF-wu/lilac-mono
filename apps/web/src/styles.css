@@ -290,16 +290,11 @@
     padding: calc(var(--ui-space-unit) * 2) 0;
   }
 
-  .action-list,
-  .reaction-list {
+  .action-list {
     display: flex;
     flex-wrap: wrap;
     gap: calc(var(--ui-space-unit) * 2);
     padding: calc(var(--ui-space-unit) * 2) 0;
-  }
-  .reaction-list [aria-pressed="true"] {
-    color: var(--ui-primary);
-    background: var(--ui-surface-raised);
   }
   .empty-chat,
   .welcome {

@@ -1,3 +1,4 @@
+import { AddReaction, MessageReactions } from "./MessageReactions";
 import { OptimisticTurns, type OptimisticTurn } from "../optimistic-turns";
 import { CopyReferenceItem, useConversation } from "./ConversationReference";
 import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from "./ui/context-menu";
@@ -826,7 +827,9 @@ function MessageCard({
   self,
   collapsible,
   arrivalId,
+  reactions,
 }: {
+  reactions?: ReactNode;
   arrivalId: string;
   content: MessageCardGroup;
   self: boolean;
@@ -911,6 +914,7 @@ function MessageCard({
             {expanded ? "Show less" : "Show full message"}
           </Button>
         ) : null}
+        {reactions}
       </BubbleContent>
     </Bubble>
   );
@@ -936,7 +940,7 @@ const MessageBody = memo(function MessageBody(
     optimistic?: boolean;
   },
 ) {
-  const { resourceUrl, canEdit, onAction, onReaction } = useMessageServices();
+  const { resourceUrl, canEdit, onAction } = useMessageServices();
   const { message } = props;
   const conversation = useConversation();
   const timeline = useContext(TimelineContext);
@@ -959,6 +963,11 @@ const MessageBody = memo(function MessageBody(
   const copyText = props.copyText ?? messageText(message);
   const groups = useMemo(() => groupParts(message.parts), [message.parts]);
   const cards = useMemo(() => groupMessageCards(groups), [groups]);
+  const reactions = useMemo(
+    () => message.parts.flatMap((part) => (part.type === "data-reactions" ? part.data.items : [])),
+    [message.parts],
+  );
+  const lastContent = cards.findLastIndex((card) => card.kind === "content");
   const identities = useContext(MessageIdentityContext);
   const authorId = message.role === "user" ? message.metadata?.authorId : undefined;
   const authorResolved = authorId !== undefined && identities.users.has(authorId);
@@ -1063,6 +1072,11 @@ const MessageBody = memo(function MessageBody(
                     content={group}
                     self={self}
                     collapsible={message.role === "user"}
+                    reactions={
+                      index === lastContent ? (
+                        <MessageReactions messageId={message.id} items={reactions} />
+                      ) : null
+                    }
                   />
                 );
               if (group.kind === "activity")
@@ -1109,23 +1123,17 @@ const MessageBody = memo(function MessageBody(
                     </div>
                   );
                 case "data-reactions":
-                  return (
-                    <div className="reaction-list" key={part.id}>
-                      {part.data.items.map((reaction) => (
-                        <Button
-                          key={reaction.emoji}
-                          type="button"
-                          disabled={!canEdit}
-                          aria-pressed={reaction.reacted}
-                          variant="secondary"
-                          className="badge inline-flex items-center gap-1 bg-surface-hover text-muted-foreground rounded-sm py-1 px-2 text-xs whitespace-nowrap"
-                          onClick={() => onReaction(message.id, reaction.emoji, !reaction.reacted)}
-                        >
-                          {reaction.emoji} {reaction.count}
-                        </Button>
-                      ))}
-                    </div>
-                  );
+                  return lastContent < 0 ? (
+                    <Bubble
+                      key={part.id}
+                      variant={self ? "tinted" : "muted"}
+                      className="message-bubble"
+                    >
+                      <BubbleContent>
+                        <MessageReactions messageId={message.id} items={part.data.items} />
+                      </BubbleContent>
+                    </Bubble>
+                  ) : null;
               }
             })}
           </MessageContent>
@@ -1137,18 +1145,10 @@ const MessageBody = memo(function MessageBody(
             data-ui="message-controls"
             className="message-controls flex items-center justify-end gap-1 text-muted-foreground text-xs mt-1"
           >
-            {self ? (
-              <>
-                {time}
-                {props.controls}
-                {copy}
-              </>
-            ) : (
-              <>
-                {copy}
-                {time}
-              </>
-            )}
+            {self ? time : copy}
+            <AddReaction messageId={message.id} items={reactions} disabled={props.optimistic} />
+            {self ? props.controls : null}
+            {self ? copy : time}
             {copyError ? <span role="status">{copyError}</span> : null}
           </div>
         ) : null}

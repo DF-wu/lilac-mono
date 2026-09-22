@@ -1,5 +1,12 @@
 # MIGRATIONS.md
 
+## Native reaction names
+
+Reaction responses add optional `userNames` (at most five display names) and `overflowCount`.
+Core projects these fields from current users when personalizing messages; stored messages need no
+backfill. Update Core and web together because older strict response validators reject these fields.
+
+
 ## Native response streaming settings
 
 Native RPC adds owner-only `config.readStreaming` and `config.setStreaming` for the existing

@@ -605,7 +605,116 @@ function Threads() {
     </Section>
   );
 }
+const reactionDemoNames = ["Morgan Lee", "Sam Rivera", "Jo Park", "Taylor Kim", "Casey Jones"];
+
 function Messages() {
+  const [reactionMessages, setReactionMessages] = useState<DisplayMessage[]>([
+    {
+      id: "gallery-reactions-short",
+      role: "user",
+      metadata: { authorId: "alex", createdAt: now },
+      parts: [
+        { type: "text", text: "Coffee and a bookstore sounds perfect. Let's meet by the river." },
+        {
+          type: "data-reactions",
+          id: "short-reactions",
+          data: {
+            items: [
+              {
+                emoji: "❤️",
+                count: 1,
+                reacted: false,
+                userNames: ["Morgan Lee"],
+                overflowCount: 0,
+              },
+              {
+                emoji: "👍",
+                count: 2,
+                reacted: true,
+                userNames: ["Alex Chen", "Morgan Lee"],
+                overflowCount: 0,
+              },
+            ],
+          },
+        },
+      ],
+    },
+    {
+      id: "gallery-reactions-wrap",
+      role: "assistant",
+      metadata: { createdAt: now },
+      parts: [
+        { type: "text", text: "A good weekend plan." },
+        {
+          type: "data-reactions",
+          id: "wrapped-reactions",
+          data: {
+            items: ["👍", "❤️", "🎉", "🔥", "👀", "🙏", "😂", "🚀", "✅", "💯", "🤔", "📚"].map(
+              (emoji, index) => ({
+                emoji,
+                count: index === 3 ? 12 : (index % 5) + 1,
+                reacted: false,
+                userNames: reactionDemoNames.slice(0, index === 3 ? 5 : (index % 5) + 1),
+                overflowCount: index === 3 ? 7 : 0,
+              }),
+            ),
+          },
+        },
+      ],
+    },
+  ]);
+  function react(messageId: string, emoji: string, active: boolean) {
+    setReactionMessages((messages) =>
+      messages.map((message) =>
+        message.id !== messageId
+          ? message
+          : {
+              ...message,
+              parts: message.parts.map((part) => {
+                if (part.type !== "data-reactions") return part;
+                const existing = part.data.items.find((item) => item.emoji === emoji);
+                if (!existing)
+                  return {
+                    ...part,
+                    data: {
+                      items: [
+                        ...part.data.items,
+                        {
+                          emoji,
+                          count: 1,
+                          reacted: true,
+                          userNames: ["Alex Chen"],
+                          overflowCount: 0,
+                        },
+                      ],
+                    },
+                  };
+                return {
+                  ...part,
+                  data: {
+                    items: part.data.items
+                      .map((item) => {
+                        if (item.emoji !== emoji) return item;
+                        const count = item.count + (active ? 1 : -1);
+                        const otherCount = count - (active ? 1 : 0);
+                        const names = reactionDemoNames.slice(0, Math.min(5, otherCount));
+                        const userNames = (active ? ["Alex Chen", ...names] : names).slice(0, 5);
+                        return {
+                          ...item,
+                          count,
+                          reacted: active,
+                          userNames,
+                          overflowCount: Math.max(0, count - userNames.length),
+                        };
+                      })
+                      .filter((item) => item.count > 0),
+                  },
+                };
+              }),
+            },
+      ),
+    );
+  }
   return (
     <Section
       id="messages"
@@ -614,6 +723,16 @@ function Messages() {
     >
       <MessageIdentityContext value={identities}>
         <div className="ds-conversation flex flex-col gap-6 py-3">
+          {reactionMessages.map((message) => (
+            <Message
+              key={message.id}
+              message={message}
+              canEdit
+              resourceUrl={(id) => id}
+              onAction={noop}
+              onReaction={react}
+            />
+          ))}
           {messageFixtures.map((message) => (
             <Message
               key={message.id}

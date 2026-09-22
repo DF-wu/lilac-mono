@@ -102,6 +102,8 @@ export const displayPartSchema = z.discriminatedUnion("type", [
             emoji: z.string().min(1).max(128),
             count: revisionSchema,
             reacted: z.boolean(),
+            userNames: z.array(z.string()).max(5).optional(),
+            overflowCount: revisionSchema.optional(),
           }),
         )
         .max(64),
