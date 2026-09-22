@@ -694,9 +694,7 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
     },
     identity: {
       update(principal, input) {
-        return store
-          .setAgentIdentity(principal.userId, { displayName: input.displayName })
-          .map(agentIdentity);
+        return store.setAgentIdentity(principal.userId, input).map(agentIdentity);
       },
     },
     users: {

@@ -5,6 +5,7 @@ export type ActorIdentity = { displayName: string; avatarUrl?: string };
 export function initials(name: string): string {
   return (
     name
+      .replace(/\s+\([^)]*\)\s*$/u, "")
       .trim()
       .split(/\s+/u)
       .slice(0, 2)

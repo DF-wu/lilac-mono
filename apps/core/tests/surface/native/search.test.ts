@@ -231,21 +231,33 @@ describe("external reads", () => {
             ),
           listMsg: async () =>
             Result.ok(
-              ["Lilac", "Stanley"].map((userName, index) => ({
-                ref: { platform: "discord", channelId: "123", messageId: String(index + 1) },
-                session: session.ref,
-                userId: String(index),
-                userName,
-                text: "Hello",
-                ts: index + 1,
-              })),
+              ["Lilac", "Stanley"]
+                .map((userName, index) => ({
+                  ref: { platform: "discord", channelId: "123", messageId: String(index + 1) },
+                  session: session.ref,
+                  userId: String(index),
+                  userName,
+                  text: "Hello",
+                  ts: index + 1,
+                }))
+                .reverse(),
             ),
         },
       }),
     } as unknown as SurfaceAdapterResolver;
+    store
+      .upsertUser({
+        id: "lilac",
+        providerId: "service:lilac",
+        displayName: "Garden",
+        role: "service",
+        toolMode: "full",
+      })
+      .unwrap();
     let discordUserIds: string[] = [];
     const service = new NativeExternalThreads({
       getUser: (id) => store.getUser(id),
+      getAgent: () => store.getUser("lilac"),
       adapters,
       profileProvider: {
         lookupUser: async (providerUserId) =>
@@ -274,6 +286,19 @@ describe("external reads", () => {
       await service.read("owner", { threadId: externalThreadId("discord", "123") })
     ).unwrap();
     expect(unlinked.messages[1]!.metadata?.authorId).toBeUndefined();
+    store.setAgentIdentity("owner", { discordUserId: "0" }).unwrap();
+    const agentLinked = (
+      await service.read("owner", { threadId: externalThreadId("discord", "123") })
+    ).unwrap();
+    expect(agentLinked.messages[0]!.role).toBe("assistant");
+    expect(agentLinked.messages[0]!.metadata?.authorDisplayName).toBe("Garden (Discord)");
+    expect(agentLinked.messages[1]!.role).toBe("user");
+    store.setAgentIdentity("owner", { discordUserId: null }).unwrap();
+    const agentUnlinked = (
+      await service.read("owner", { threadId: externalThreadId("discord", "123") })
+    ).unwrap();
+    expect(agentUnlinked.messages[0]!.role).toBe("user");
+    expect(agentUnlinked.messages[0]!.metadata?.authorDisplayName).toBe("Lilac (Discord)");
   });
   test("paginates by latest activity and keeps the newest duplicate timestamp", async () => {
     const service = new NativeExternalThreads({

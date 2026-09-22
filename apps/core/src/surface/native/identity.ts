@@ -4,6 +4,7 @@ import type { NativeUser } from "./codec";
 export function agentIdentity(user: NativeUser): AgentIdentity {
   return {
     id: "lilac",
+    ...(user.discordUserId ? { discordUserId: user.discordUserId } : {}),
     displayName: user.displayName,
     ...(user.avatar
       ? { avatarUrl: `/api/identity/avatar?revision=${user.avatar.blob.sha256}` }

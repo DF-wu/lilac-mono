@@ -246,7 +246,16 @@ export const nativeContract = {
   },
   identity: {
     update: procedure
-      .input(z.strictObject({ displayName: z.string().trim().min(1).max(256) }))
+      .input(
+        z.strictObject({
+          displayName: z.string().trim().min(1).max(256),
+          discordUserId: z
+            .string()
+            .regex(/^[0-9]{1,20}$/)
+            .nullable()
+            .optional(),
+        }),
+      )
       .output(agentIdentitySchema),
   },
   users: {

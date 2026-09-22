@@ -77,6 +77,8 @@ import { Message } from "./components/Timeline";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
 import { SidebarSearch } from "./components/SidebarSearch";
+import { AgentDiscordLink } from "./components/AgentIdentity";
+import { ExternalMessages } from "./components/ExternalMessages";
 import { ExternalSkeleton } from "./components/ExternalSidebar";
 import { ThreadCard } from "./components/ThreadSelect";
 import "./design-system.css";
@@ -477,6 +479,31 @@ function Threads() {
           <ExternalSkeleton />
           <ExternalSkeleton conversation />
         </Specimen>
+        <Specimen title="Discord conversation">
+          <div className="h-80 flex flex-col">
+            <ExternalMessages
+              messages={[
+                {
+                  id: "discord-preview-1",
+                  role: "user",
+                  metadata: { authorDisplayName: "Stanley (Discord)", createdAt: now - 60_000 },
+                  parts: [{ type: "text", text: "Can we meet in the afternoon?" }],
+                },
+                {
+                  id: "discord-preview-2",
+                  role: "user",
+                  metadata: { authorDisplayName: "Lilac (Discord)", createdAt: now },
+                  parts: [{ type: "text", text: "Yes, the afternoon works." }],
+                },
+              ]}
+              resourceUrl={(id) => id}
+              loadDirection="start"
+              hasMore={false}
+              loading={false}
+              onLoadMore={noop}
+            />
+          </div>
+        </Specimen>
         <Specimen title="Personal queues">
           <ThreadQueueDemo />
           <p className="ds-muted">
@@ -831,6 +858,8 @@ function Attachments() {
   );
 }
 function Controls() {
+  const [discordId, setDiscordId] = useState("");
+  const [savedDiscordId, setSavedDiscordId] = useState("");
   const [search, setSearch] = useState("");
   const [model, setModel] = useState<string | null>("balanced");
   return (
@@ -885,6 +914,15 @@ function Controls() {
             Plain text
             <Textarea placeholder="Write a note…" />
           </label>
+        </Specimen>
+        <Specimen title="Agent Discord identity">
+          <AgentDiscordLink
+            value={discordId}
+            savedValue={savedDiscordId}
+            disabled={false}
+            onChange={setDiscordId}
+            onSave={() => setSavedDiscordId(discordId.trim())}
+          />
         </Specimen>
         <Specimen title="Sign-in styles">
           <div className={clerkAppearance.signIn.elements.cardBox}>

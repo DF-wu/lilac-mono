@@ -633,6 +633,33 @@ test("user and participant RPC projections never expose stored avatar blobs", as
     displayName: "Lily",
     avatarUrl: expect.stringContaining("/api/identity/avatar"),
   });
+  const linked = (
+    await state.services.identity.update(principal, {
+      displayName: "Lily",
+      discordUserId: "123456789012345678",
+    })
+  ).unwrap();
+  expect(linked.discordUserId).toBe("123456789012345678");
+  expect(state.store.getUser("lilac").unwrap().discordUserId).toBe(linked.discordUserId);
+  expect(
+    (await state.services.identity.update(principal, { displayName: "Lily" })).unwrap()
+      .discordUserId,
+  ).toBe(linked.discordUserId);
+  expect(
+    (
+      await state.services.identity.update(reader, { displayName: "Lily", discordUserId: null })
+    ).isErr(),
+  ).toBe(true);
+  expect(state.store.getUser("lilac").unwrap().discordUserId).toBe(linked.discordUserId);
+  expect(
+    state.store.setAgentIdentity(principal.userId, { discordUserId: "not-an-id" }).isErr(),
+  ).toBe(true);
+  expect(
+    (
+      await state.services.identity.update(principal, { displayName: "Lily", discordUserId: null })
+    ).unwrap().discordUserId,
+  ).toBeUndefined();
+  expect(state.store.getUser("lilac").unwrap().discordUserId).toBeUndefined();
   expect((await state.services.identity.update(reader, { displayName: "Changed" })).isErr()).toBe(
     true,
   );

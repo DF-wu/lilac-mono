@@ -282,7 +282,11 @@ export class NativeStore {
 
   setAgentIdentity(
     actorId: string,
-    input: { displayName?: string; avatar?: NativeUser["avatar"] | null },
+    input: {
+      displayName?: string;
+      avatar?: NativeUser["avatar"] | null;
+      discordUserId?: string | null;
+    },
   ): NativeStoreResult<NativeUser> {
     return nativeStoreTransaction(this.db, () =>
       Result.gen(function* () {
@@ -294,12 +298,19 @@ export class NativeStore {
           return Result.err(
             nativeFailure("invalid", "Agent name must contain 1 to 256 characters"),
           );
+        if (input.discordUserId != null && !/^[0-9]{1,20}$/.test(input.discordUserId))
+          return Result.err(
+            nativeFailure("invalid", "Discord user ID must contain 1 to 20 digits"),
+          );
         const current = yield* this.getUser("lilac");
-        const { avatar: previousAvatar, ...base } = current;
+        const { avatar: previousAvatar, discordUserId: previousDiscordId, ...base } = current;
         const avatar = input.avatar === undefined ? previousAvatar : input.avatar;
+        const discordUserId =
+          input.discordUserId === undefined ? previousDiscordId : input.discordUserId;
         return this.upsertUser({
           ...base,
           displayName: input.displayName ?? current.displayName,
+          ...(discordUserId ? { discordUserId } : {}),
           ...(avatar ? { avatar } : {}),
         });
       }, this),

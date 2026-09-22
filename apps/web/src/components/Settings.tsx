@@ -41,7 +41,7 @@ export function Settings({
   viewer: NativeUser;
   onClose: () => void;
   theme: string;
-  agent: ActorIdentity;
+  agent: ActorIdentity & { discordUserId?: string };
   onTheme: (value: string) => void;
 }) {
   const [open, setOpen] = useState(true);

@@ -84,6 +84,9 @@ describe("message presentation", () => {
     expect(html).toContain('aria-label="Stanley Wang"');
     expect(html).not.toContain("owner-id");
     expect(initials("Stanley Wang")).toBe("SW");
+    expect(initials("Lilac (Discord)")).toBe("L");
+    expect(initials("Stanley Wang (Discord)")).toBe("SW");
+    expect(initials("Stanley (GitHub)")).toBe("S");
     expect(initials("  ")).toBe("?");
     expect(initials("🦊 Fox")).toBe("🦊F");
   });

@@ -19,6 +19,10 @@ import { nativeOutputProjectionStateSchema } from "./output-projection-codec";
 const id = z.string().min(1).max(128);
 const revision = z.number().int().nonnegative();
 export const nativeUserSchema = z.strictObject({
+  discordUserId: z
+    .string()
+    .regex(/^[0-9]{1,20}$/)
+    .optional(),
   id,
   providerId: id,
   displayName: z.string().max(256),

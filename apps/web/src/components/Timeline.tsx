@@ -864,7 +864,10 @@ const MessageBody = memo(function MessageBody(
     onUnknownAuthor?.(authorId);
   }, [authorId, authorResolved, onUnknownAuthor, message.metadata?.authorDisplayName]);
   const externalAuthor = message.metadata?.authorDisplayName
-    ? { ...identities.users.get(authorId ?? ""), displayName: message.metadata.authorDisplayName }
+    ? {
+        ...(message.role === "assistant" ? identities.agent : identities.users.get(authorId ?? "")),
+        displayName: message.metadata.authorDisplayName,
+      }
     : undefined;
   const author =
     externalAuthor ??

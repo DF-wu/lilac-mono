@@ -68,6 +68,7 @@ export class NativeExternalThreads {
   constructor(
     private readonly params: {
       getUser: UserLookup;
+      getAgent?: () => ResultType<NativeUser, NativeStoreError>;
       profileProvider?: Pick<NativeClerkAuthenticator, "lookupUser">;
       adapters: SurfaceAdapterResolver;
       now?: () => number;
@@ -179,23 +180,33 @@ export class NativeExternalThreads {
           )
           .then((result) => result.mapError((error) => nativeFailure("invalid", error.message))),
       );
+      const agent = this.params.getAgent ? yield* this.params.getAgent() : undefined;
       const linkedDiscordIds = yield* Result.await(this.linkedDiscordIds(userId, ref.platform));
-      const visible = messages.filter((message) => !message.deleted);
-      const display: DisplayMessage[] = visible.map((message) => ({
-        id: Buffer.from(message.ref.messageId).toString("base64url"),
-        role: "user",
-        metadata: {
-          createdAt: message.ts,
-          ...(linkedDiscordIds.includes(message.userId) ? { authorId: userId } : {}),
-          authorDisplayName: `${(message.userName ?? message.userId).slice(0, 240)} (${ref.platform === "discord" ? "Discord" : "GitHub"})`,
-        },
-        parts: [
-          {
-            type: "text",
-            text: message.text.slice(0, 65_536),
+      const visible = messages
+        .filter((message) => !message.deleted)
+        .sort(
+          (left, right) =>
+            left.ts - right.ts || left.ref.messageId.localeCompare(right.ref.messageId),
+        );
+      const display: DisplayMessage[] = visible.map((message) => {
+        const fromAgent = ref.platform === "discord" && agent?.discordUserId === message.userId;
+        const authorName = fromAgent ? agent.displayName : (message.userName ?? message.userId);
+        return {
+          id: Buffer.from(message.ref.messageId).toString("base64url"),
+          role: fromAgent ? "assistant" : "user",
+          metadata: {
+            createdAt: message.ts,
+            ...(linkedDiscordIds.includes(message.userId) ? { authorId: userId } : {}),
+            authorDisplayName: `${authorName.slice(0, 240)} (${ref.platform === "discord" ? "Discord" : "GitHub"})`,
           },
-        ],
-      }));
+          parts: [
+            {
+              type: "text",
+              text: message.text.slice(0, 65_536),
+            },
+          ],
+        };
+      });
       const sessions = yield* Result.await(
         resolved.adapter
           .listSessions({ limit: Number.MAX_SAFE_INTEGER })

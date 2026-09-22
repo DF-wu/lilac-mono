@@ -44,7 +44,7 @@ export function providerProfile(user: {
   const discordUserIds = (user.externalAccounts ?? [])
     .filter(
       (account) =>
-        account.provider === "discord" &&
+        (account.provider === "discord" || account.provider === "oauth_discord") &&
         account.verification?.status === "verified" &&
         /^\d+$/.test(account.providerUserId),
     )

@@ -69,6 +69,10 @@ export const commandChoiceSchema = z.strictObject({
   argumentHint: z.string().max(256).optional(),
 });
 export const agentIdentitySchema = z.strictObject({
+  discordUserId: z
+    .string()
+    .regex(/^[0-9]{1,20}$/)
+    .optional(),
   id: z.literal("lilac"),
   displayName: z.string().min(1).max(256),
   avatarUrl: z.string().max(512).optional(),

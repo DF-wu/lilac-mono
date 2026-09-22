@@ -258,6 +258,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   });
   const summaryAbort = new AbortController();
   const external = new NativeExternalThreads({
+    getAgent: () => store.getUser("lilac"),
     profileProvider: clerk,
     getUser: (id) => store.getUser(id),
     adapters: options.adapters,

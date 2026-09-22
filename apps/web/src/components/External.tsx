@@ -2,10 +2,9 @@ import { useWorkspace } from "../workspace-context";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { externalReadOptions, useNativeOnline } from "../queries";
 import { RefreshCw, MessageSquare, ExternalLink } from "lucide-react";
-import { ErrorNotice, IconButton, VirtualList } from "./ui";
+import { ErrorNotice, IconButton } from "./ui";
 import { mergeExternalPage, type ExternalPage } from "../external-pages";
-import { Message } from "./Timeline";
-import { Skeleton } from "./ui/skeleton";
+import { ExternalMessages } from "./ExternalMessages";
 import { Button } from "./ui/button";
 import { ExternalSkeleton } from "./ExternalSidebar";
 
@@ -20,8 +19,6 @@ export function External({ threadId }: { threadId?: string }) {
     (previous, page) => mergeExternalPage(previous, page, true),
     undefined,
   );
-  const moreLabel =
-    view?.thread.surface === "discord" ? "Load older messages" : "Load more messages";
   if (!threadId)
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
@@ -60,43 +57,17 @@ export function External({ threadId }: { threadId?: string }) {
         <p className="p-6 text-sm text-muted-foreground">Conversation unavailable</p>
       ) : null}
       {view ? (
-        <>
-          {read.hasNextPage ? (
-            <Button
-              variant="ghost"
-              disabled={read.isFetching}
-              onClick={() => {
-                void read.fetchNextPage({ cancelRefetch: false });
-              }}
-            >
-              {read.isFetchingNextPage ? (
-                <>
-                  <Skeleton className="h-4 w-32" />
-                  <span className="sr-only">Loading messages</span>
-                </>
-              ) : (
-                moreLabel
-              )}
-            </Button>
-          ) : null}
-          <VirtualList
-            key={threadId}
-            items={view.messages}
-            itemKey={(message) => message.id}
-            label="External conversation"
-            className="external-messages"
-            estimate={160}
-            render={(message) => (
-              <Message
-                message={message}
-                canEdit={false}
-                resourceUrl={resourceUrl}
-                onAction={() => {}}
-                onReaction={() => {}}
-              />
-            )}
-          />
-        </>
+        <ExternalMessages
+          key={threadId}
+          messages={view.messages}
+          resourceUrl={resourceUrl}
+          loadDirection={view.thread.surface === "discord" ? "start" : "end"}
+          hasMore={!!read.hasNextPage && !read.error}
+          loading={read.isFetching}
+          onLoadMore={() => {
+            void read.fetchNextPage({ cancelRefetch: false });
+          }}
+        />
       ) : null}
     </section>
   );

@@ -1,5 +1,13 @@
 # MIGRATIONS.md
 
+## Agent Discord identity
+
+The native service-user record and agent catalog accept optional `discordUserId`. Owners can set
+or clear it through `identity.update`; omitted input preserves the existing link, and `null` clears it.
+Matching Discord messages use the agent identity in the web chat. This is a display link and does not
+change permissions. Existing records need no backfill. Update Core and web together; older strict
+parsers cannot read the new field. Clear the link before downgrading to a version without this field.
+
 ## External conversation display
 
 External thread responses now include optional `sourceUrl`, and display-message metadata accepts

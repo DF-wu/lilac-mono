@@ -311,7 +311,7 @@ test("provider profiles expose only verified Discord account IDs", () => {
     hasImage: false,
     imageUrl: "",
     externalAccounts: [
-      { provider: "discord", providerUserId: "123", verification: { status: "verified" } },
+      { provider: "oauth_discord", providerUserId: "123", verification: { status: "verified" } },
       { provider: "discord", providerUserId: "456", verification: { status: "unverified" } },
       { provider: "discord", providerUserId: "789", verification: null },
       { provider: "google", providerUserId: "999", verification: { status: "verified" } },

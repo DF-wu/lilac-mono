@@ -22,3 +22,19 @@ it("appends later GitHub pages and replaces the snapshot on refresh", () => {
     mergeExternalPage(old, page("github", ["c"]), false).messages.map((message) => message.id),
   ).toEqual(["c"]);
 });
+
+it("orders newest-first Discord responses chronologically across page boundaries", () => {
+  const latest = page("discord", ["d", "c"]);
+  const older = page("discord", ["c", "b", "a"]);
+  for (const current of [latest, older])
+    for (const message of current.messages)
+      message.metadata = { createdAt: message.id.charCodeAt(0) };
+  const first = mergeExternalPage(undefined, latest, true);
+  expect(first.messages.map((message) => message.id)).toEqual(["c", "d"]);
+  expect(mergeExternalPage(first, older, true).messages.map((message) => message.id)).toEqual([
+    "a",
+    "b",
+    "c",
+    "d",
+  ]);
+});
