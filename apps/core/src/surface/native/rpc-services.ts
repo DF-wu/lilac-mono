@@ -1,3 +1,4 @@
+import { resolveLinkPreview } from "./link-preview";
 import type { NativeLiveFileService } from "./resources-live";
 import type { NativeSubagents } from "./subagents";
 import { randomUUID } from "node:crypto";
@@ -481,6 +482,11 @@ export function createNativeRpcServices(options: NativeRpcServiceOptions): Nativ
 
   const success = () => ({ ok: true as const });
   return {
+    links: {
+      async preview(_principal, input, signal) {
+        return Result.ok(await resolveLinkPreview(input.url, signal));
+      },
+    },
     bootstrap: {
       get(principal, input) {
         return Result.gen(function* () {

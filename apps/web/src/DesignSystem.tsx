@@ -1,3 +1,5 @@
+import lilacLogo from "./assets/logo.svg";
+import { LinkPreviewAnchor } from "./components/LinkWithFavicon";
 import { SidebarEmptyState } from "./components/SidebarEmptyState";
 import { setThemeMode } from "./theme/theme";
 import { clerkAppearance } from "./theme/clerk";
@@ -1275,6 +1277,33 @@ export default function DesignSystem() {
               <Attachments />
               <Section id="content" title="Rich content">
                 <div className="ds-content min-w-0">
+                  <div className="flex flex-wrap gap-4 mb-4">
+                    <LinkPreviewAnchor
+                      href="https://example.com/article"
+                      preview={{
+                        title: "A quiet weekend",
+                        description: "A few places to explore, with time to stop along the way.",
+                      }}
+                    >
+                      Preview with text
+                    </LinkPreviewAnchor>
+                    <LinkPreviewAnchor
+                      href="https://example.com/photo"
+                      preview={{
+                        title: "A quiet weekend",
+                        description: "A few places to explore, with time to stop along the way.",
+                        image: lilacLogo,
+                      }}
+                    >
+                      Preview with image
+                    </LinkPreviewAnchor>
+                    <LinkPreviewAnchor href="https://example.com/unavailable" preview={{}}>
+                      Unavailable preview
+                    </LinkPreviewAnchor>
+                    <LinkPreviewAnchor href="https://example.com/loading" loading>
+                      Loading preview
+                    </LinkPreviewAnchor>
+                  </div>
                   <Markdown text={richText} />
                   <Specimen title="GitHub alerts">
                     <Markdown text={alertExamples} />

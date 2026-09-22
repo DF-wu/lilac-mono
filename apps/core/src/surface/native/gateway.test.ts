@@ -171,6 +171,24 @@ async function expectSocketRejected(url: URL, headers: Record<string, string> = 
 }
 
 describe("native gateway", () => {
+  test("link metadata uses the authenticated RPC contract", async () => {
+    const { url, token, services } = await fixture();
+    let viewer: string | undefined;
+    services.links = {
+      preview(principal, input) {
+        viewer = principal.userId;
+        expect(input.url).toBe("https://example.com/page");
+        return Result.ok({ title: "Page", icon: "https://example.com/icon.svg" });
+      },
+    };
+    const { client } = connect(url, token);
+    expect(await client.links.preview({ url: "https://example.com/page" })).toEqual({
+      title: "Page",
+      icon: "https://example.com/icon.svg",
+    });
+    expect(viewer).toBe(user.id);
+    await expectSocketRejected(new URL("api/socket", url));
+  });
   test("private HTTP routes reject missing and forged credentials before calling services", async () => {
     let resourceCalls = 0;
     const { url, token, services, fatalErrors } = await fixture(undefined, {

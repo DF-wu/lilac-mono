@@ -1,5 +1,12 @@
 # MIGRATIONS.md
 
+## Link previews
+
+The authenticated native RPC contract adds `links.preview` for page titles, descriptions, images,
+and favicons. Update Core and web together to enable hover previews. Older clients do not call
+the new method; newer clients keep ordinary links usable if the method is unavailable.
+Metadata uses an in-memory browser query cache. No stored-data migration is required.
+
 ## Agent Discord identity
 
 The native service-user record and agent catalog accept optional `discordUserId`. Owners can set

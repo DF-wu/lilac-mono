@@ -125,6 +125,16 @@ export const turnPageSchema = z
     },
   );
 export const nativeContract = {
+  links: {
+    preview: procedure.input(z.strictObject({ url: z.string().min(1).max(8192) })).output(
+      z.strictObject({
+        title: z.string().max(512).optional(),
+        description: z.string().max(2048).optional(),
+        image: z.string().max(8192).optional(),
+        icon: z.string().max(8192).optional(),
+      }),
+    ),
+  },
   sidebar: {
     preferences: procedure.input(z.strictObject({})).output(sidebarPreferencesSchema),
     configure: procedure.input(sidebarPreferencesSchema).output(sidebarPreferencesSchema),

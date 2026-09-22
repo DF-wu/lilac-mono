@@ -88,6 +88,11 @@ export function createNativeRouter(
     return next();
   });
   return api.router({
+    links: {
+      preview: secured.links.preview.handler(async ({ input, context, signal }) =>
+        nativeRpcValue(await services.links.preview(context.principal, input, signal)),
+      ),
+    },
     connection: {
       reauthenticate: api.connection.reauthenticate.handler(async ({ input, context }) => {
         const headers = new Headers(context.request.headers);

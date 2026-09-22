@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { AttachmentPreviewBody } from "../src/components/ResourcePreview";
 import { MarkdownWrapContext } from "../src/components/markdown-layout";
 import { CodeBlock } from "../src/components/CodeBlock";
-import { faviconUrl } from "../src/components/LinkWithFavicon";
+import { faviconUrl, previewUrl, LinkPreviewBody } from "../src/components/LinkWithFavicon";
 import { initials } from "../src/components/ActorAvatar";
 import { Message } from "../src/components/Timeline";
 import { MessageIdentityContext } from "../src/components/message-identity";
@@ -277,6 +277,39 @@ describe("message presentation", () => {
     expect(html).toContain('aria-pressed="true"');
     expect(html).toContain("&lt;script&gt;");
     expect(html).not.toContain("<script>");
+  });
+  test("preview requests preserve page identity but omit fragments and reject credentials", () => {
+    expect(previewUrl("https://example.com/article?edition=2#section")).toBe(
+      "https://example.com/article?edition=2",
+    );
+    for (const href of [
+      "https://user:secret@example.com",
+      "file:///a",
+      "mailto:a@example.com",
+      "/relative",
+      undefined,
+    ])
+      expect(previewUrl(href)).toBeUndefined();
+  });
+  test("preview cards escape page text and omit missing images", () => {
+    const html = renderToStaticMarkup(
+      <LinkPreviewBody
+        hostname="example.com"
+        preview={{ title: "<script>bad</script>", description: "A short description." }}
+      />,
+    );
+    expect(html).toContain("&lt;script&gt;bad&lt;/script&gt;");
+    expect(html).toContain("A short description.");
+    expect(html).toContain("example.com");
+    expect(html).not.toContain("<img");
+    const image = renderToStaticMarkup(
+      <LinkPreviewBody
+        hostname="example.com"
+        preview={{ image: "https://example.com/share.png" }}
+      />,
+    );
+    expect(image).toContain('src="https://example.com/share.png"');
+    expect(image).toContain('referrerPolicy="no-referrer"');
   });
   test("favicon URLs use only HTTP origins and drop paths, query and credentials", () => {
     expect(faviconUrl("https://user:password@example.com/a?private=1#x")).toBe(
