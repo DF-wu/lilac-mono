@@ -245,3 +245,11 @@ Default changes from v1:
   ignored.
 - The built-in `explore` profile includes restricted Bash; `general` and `self` use native Bash. Frozen v1
   profiles retain their historical no-Bash explore and native-Bash general/self behavior.
+
+## Native deployment settings move to the database
+
+Native startup imports `surface.native.titleModel`, `outputStreaming`,
+`oldMessageSelectionMaxAgeMs`, `storageRetentionMaxAgeMs`, and `crossThreadSend` once into
+the native database. After that, use Settings > Deployment. The old YAML keys are accepted
+only as initial import values and may be removed after startup; they do not override database
+settings. The import preserves the YAML file, including comments. See MIGRATIONS.md.

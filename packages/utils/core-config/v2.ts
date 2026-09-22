@@ -733,6 +733,7 @@ const nativeSurfaceSchema = z
         clerkOAuthClientId: z.string().trim().min(1).optional(),
       })
       .default({ provider: "local", ownerId: "owner" }),
+    // Legacy values seed native deployment settings only when the database has no record.
     titleModel: z.string().trim().min(1).default("fast"),
     outputStreaming: z.enum(["paragraph", "complete"]).default("paragraph"),
     oldMessageSelectionMaxAgeMs: positiveDurationMsSchema.nullable().default(null),

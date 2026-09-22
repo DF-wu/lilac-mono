@@ -7,15 +7,25 @@ Core projects these fields from current users when personalizing messages; store
 backfill. Update Core and web together because older strict response validators reject these fields.
 
 
-## Native response streaming settings
+## Native deployment settings
 
-Native RPC adds owner-only `config.readStreaming` and `config.setStreaming` for the existing
-version 2 `surface.native.outputStreaming` option. Values remain `paragraph` and `complete`;
-the web UI labels them Paragraph and Full. Writes require the Core document revision and use
-the existing atomic configuration save. Updating this option reserializes the YAML document,
-preserving configuration values but not comments or formatting. No stored-data migration is required.
-Update Core and web together to use the new control. New responses pick up the setting through
-the existing Core configuration reload path; active responses retain their original mode.
+Native settings `titleModel`, `outputStreaming`, `oldMessageSelectionMaxAgeMs`,
+`storageRetentionMaxAgeMs`, and `crossThreadSend.triggerRun` now live in a singleton
+`deployment` record in the native database. Startup creates the record once from the existing
+parsed `surface.native` values, including version-owned defaults. Existing database values always
+win on later starts. The migration does not rewrite `core-config.yaml`; the old keys remain readable
+for initial import only and can be removed after successful startup. Changing those YAML keys no
+longer changes a migrated installation's runtime behavior.
+
+Settings > Deployment replaces the response streaming control in Options. All five settings are
+instance-wide and owner-only. Saves use an atomic database transaction with a revision check.
+New output attempts and title jobs use the latest settings; active output attempts keep their mode.
+Message selection and retention maintenance read the current settings when they run.
+
+Native RPC replaces `config.readStreaming` / `config.setStreaming` with `config.readDeployment` /
+`config.setDeployment`. Update Core and web together. The native database format remains version 1
+with an additional record kind; older builds cannot manage this record. Keep a pre-upgrade database
+backup if a rollback is needed.
 
 ## Conversation references
 

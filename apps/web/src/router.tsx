@@ -15,7 +15,9 @@ const workspaceSearchSchema = z.object({
   message: z.string().min(1).max(128).optional(),
   view: z.enum(["archived", "others"]).optional(),
   otherThread: z.string().min(1).optional(),
-  settings: z.enum(["account", "options", "theme", "core", "mcp", "agent", "users"]).optional(),
+  settings: z
+    .enum(["account", "options", "theme", "deployment", "core", "mcp", "agent", "users"])
+    .optional(),
 });
 export type WorkspaceSearch = z.infer<typeof workspaceSearchSchema>;
 export type SettingsTab = NonNullable<WorkspaceSearch["settings"]>;

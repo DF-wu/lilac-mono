@@ -79,6 +79,7 @@ import { Markdown } from "./components/Markdown";
 import ComposerEditor from "./components/composer-editor";
 import { Message } from "./components/Timeline";
 import { ThreadQueueDemo } from "./components/ThreadQueueDemo";
+import { DeploymentSettingsForm } from "./components/DeploymentSettings";
 import { AgentWorkDemo } from "./components/AgentWorkDemo";
 import { SidebarSearch } from "./components/SidebarSearch";
 import { AgentDiscordLink } from "./components/AgentIdentity";
@@ -92,6 +93,7 @@ const sections = [
   ["threads", "Threads"],
   ["messages", "Messages"],
   ["agent-work", "Agent work"],
+  ["deployment", "Deployment settings"],
   ["composer", "Composer"],
   ["attachments", "Attachments"],
   ["content", "Rich content"],
@@ -1488,6 +1490,18 @@ export default function DesignSystem() {
                 description="Choose a stage to inspect, or play through the examples. Expand work summaries and tool details. These use the conversation renderer with local sample data."
               >
                 <AgentWorkDemo />
+              </Section>
+              <Section id="deployment" title="Deployment settings">
+                <DeploymentSettingsForm
+                  value={{
+                    titleModel: "fast",
+                    outputStreaming: "complete",
+                    oldMessageSelectionMaxAgeMs: null,
+                    storageRetentionMaxAgeMs: null,
+                    crossThreadSend: { triggerRun: true },
+                  }}
+                  onSave={() => undefined}
+                />
               </Section>
               <ComposerSpecimen />
               <Attachments />

@@ -4792,6 +4792,11 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
             })),
             ...[
               "NativeStore.initialize",
+              "NativeStore.initializeDeployment",
+              "NativeStore.getDeployment",
+              "NativeStore.readDeployment",
+              "NativeStore.setDeployment",
+
               "NativeStore.setInputCanonicalHistoryStart",
               "NativeStore.cleanupDeletedThread",
               "NativeStore.lookupInputReceipt",
@@ -4886,9 +4891,6 @@ const ARCHITECTURE_WORKSPACES = ACTIVE_WORKSPACES.map(([root, packageName]) => {
               "NativeConfigService.save",
               "NativeConfigService.saveSerialized",
               "NativeConfigService.reloadMcp",
-              "NativeConfigService.readStreaming",
-              "NativeConfigService.setStreaming",
-              "streamingDocument",
               "validateDocument",
               "writeAtomic",
             ].map((exportName) => ({

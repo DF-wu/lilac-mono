@@ -111,6 +111,20 @@ export type NativeRuntimeOptions = {
 
 export async function createNativeRuntime(options: NativeRuntimeOptions) {
   const { store, database, auth: publicAuth, clerk, login } = options.installation;
+  const legacy = options.getConfig().surface.native;
+  const deploymentInitialized = store.initializeDeployment({
+    titleModel: legacy.titleModel,
+    outputStreaming: legacy.outputStreaming,
+    oldMessageSelectionMaxAgeMs: legacy.oldMessageSelectionMaxAgeMs,
+    storageRetentionMaxAgeMs: legacy.storageRetentionMaxAgeMs,
+    crossThreadSend: legacy.crossThreadSend,
+  });
+  const deploymentInitializationError = deploymentInitialized.match({
+    ok: () => null,
+    err: (error) => error,
+  });
+  if (deploymentInitializationError) return Result.err(deploymentInitializationError);
+  const deployment = () => nativeRuntimeResultToHost(store.getDeployment()).settings;
   const metrics = createNativeMetrics();
   let skills: readonly DiscoveredSkill[] = (
     await discoverSkills({ workspaceRoot: options.workspaceRoot, dataDir: options.dataDir })
@@ -163,8 +177,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     customCommands: options.customCommands,
     validateSkill: (id) => skills.some((skill) => skill.name === id),
     deliveryState: options.deliveryState,
-    getOldMessageSelectionMaxAgeMs: () =>
-      options.getConfig().surface.native.oldMessageSelectionMaxAgeMs ?? undefined,
+    getOldMessageSelectionMaxAgeMs: () => deployment().oldMessageSelectionMaxAgeMs ?? undefined,
   });
   const operator = options.operatorTokenSha256
     ? createNativeOperator({
@@ -232,8 +245,8 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     surface,
     resources,
     resolveModel,
-    shouldTriggerRun: () => options.getConfig().surface.native.crossThreadSend.triggerRun,
-    streamingMode: () => options.getConfig().surface.native.outputStreaming,
+    shouldTriggerRun: () => deployment().crossThreadSend.triggerRun,
+    streamingMode: () => deployment().outputStreaming,
     kick,
   });
   const descriptor = createNativeSurfaceRuntimeDescriptor({
@@ -620,7 +633,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     const publisher = createNativeOutputPublisher({
       ...attempt,
       requestId: input.requestId,
-      mode: options.getConfig().surface.native.outputStreaming,
+      mode: deployment().outputStreaming,
       publish: publishDurableOutput,
       recoveryFrontier: input.recoveryOutputFrontier,
     });
@@ -687,7 +700,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
   async function maintain() {
     return Result.gen(async function* () {
       const config = options.getConfig();
-      const maxAge = config.surface.native.storageRetentionMaxAgeMs;
+      const maxAge = (yield* store.getDeployment()).settings.storageRetentionMaxAgeMs;
       if (maxAge !== null) {
         const expired = yield* store.listExpiredThreadIds(Date.now() - maxAge, 10);
         for (const threadId of expired)

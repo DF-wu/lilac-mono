@@ -1,4 +1,5 @@
 import {
+  nativeDeploymentDocumentSchema,
   displayMessageSchema,
   displayPartSchema,
   readyTurnSlotSchema,
@@ -116,6 +117,7 @@ const commandSchema = z.strictObject({
   result: mutationResultSchema,
 });
 export const nativeRecordSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("deployment"), value: nativeDeploymentDocumentSchema }),
   z.strictObject({ kind: z.literal("user"), value: nativeUserSchema }),
   z.strictObject({ kind: z.literal("thread"), value: nativeThreadRecordSchema }),
   z.strictObject({

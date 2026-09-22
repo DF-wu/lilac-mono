@@ -2,6 +2,7 @@ import { isNativeServiceMessage } from "./message-ownership";
 import { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import type {
+  NativeDeploymentSettings,
   SidebarPreferences,
   NativeRpcInputs,
   NativeRpcOutputs,
@@ -204,6 +205,52 @@ export class NativeStore {
         "INSERT INTO native_records(kind,id,thread_id,position,updated_at,format_version,data_json) VALUES(?,?,?,?,?,1,?) ON CONFLICT(kind,id) DO UPDATE SET thread_id=excluded.thread_id,position=excluded.position,updated_at=excluded.updated_at,data_json=excluded.data_json",
       )
       .run(record.kind, id, threadId ?? null, position, this.now(), JSON.stringify(record));
+  }
+
+  initializeDeployment(settings: NativeDeploymentSettings): NativeStoreResult<void> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        const existing = yield* this.readRecord("deployment", "instance");
+        if (existing) return Result.ok();
+        this.writeRecord("instance", { kind: "deployment", value: { settings, revision: 0 } });
+        return Result.ok();
+      }, this),
+    );
+  }
+
+  getDeployment(): NativeStoreResult<NativeRpcOutputs["config"]["readDeployment"]> {
+    return nativeStoreTransaction(this.db, () =>
+      this.readRecord("deployment", "instance").andThen((record) =>
+        record?.kind === "deployment"
+          ? Result.ok(record.value)
+          : Result.err(nativeFailure("not-found", "Deployment settings are unavailable")),
+      ),
+    );
+  }
+
+  readDeployment(actorId: string): NativeStoreResult<NativeRpcOutputs["config"]["readDeployment"]> {
+    return this.requireOwner(actorId).andThen(() => this.getDeployment());
+  }
+
+  setDeployment(
+    actorId: string,
+    input: NativeRpcInputs["config"]["setDeployment"],
+  ): NativeStoreResult<NativeRpcOutputs["config"]["readDeployment"]> {
+    return nativeStoreTransaction(this.db, () =>
+      Result.gen(function* () {
+        yield* this.requireOwner(actorId);
+        const current = yield* this.getDeployment();
+        if (input.expectedRevision !== current.revision)
+          return Result.err(
+            nativeFailure("conflict", "Deployment settings changed since they were loaded"),
+          );
+        if (fingerprint(current.settings) === fingerprint(input.settings))
+          return Result.ok(current);
+        const value = { settings: input.settings, revision: current.revision + 1 };
+        this.writeRecord("instance", { kind: "deployment", value });
+        return Result.ok(value);
+      }, this),
+    );
   }
 
   getUser(id: string): NativeStoreResult<NativeUser> {

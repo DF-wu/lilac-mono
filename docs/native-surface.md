@@ -22,7 +22,6 @@ surface:
     auth:
       provider: local
       ownerId: owner
-    outputStreaming: paragraph
 ```
 
 Set `LILAC_NATIVE_LOCAL_USERNAME`, `LILAC_NATIVE_LOCAL_PASSWORD_HASH` and
@@ -96,7 +95,8 @@ thread references it. Text previews return at most 64 KiB, with a truncation ind
 files and an error for binary data. Local and SSH filepath previews read only that prefix of the
 latest file and show an error when it is gone.
 
-`outputStreaming: paragraph` publishes text at blank-line boundaries. `complete` publishes the
+Settings > Deployment controls response streaming for the instance. Paragraph publishes text at
+blank-line boundaries. Full publishes the
 buffered text at model-step completion or tool handoff. Clients never receive token-by-token text.
 Compaction and activity remain explicit display events. Native structured questions are unsupported.
 
@@ -107,8 +107,15 @@ window and leaves older history available for hydration.
 
 ## Settings and updates
 
-Only the owner can open settings. Save validates and atomically updates the existing core or MCP
-config, using revisions to reject concurrent edits. Core keeps its existing reload behavior. MCP
+The owner manages title generation, response streaming, old-message selection age, storage retention,
+and whether cross-thread sends trigger a run in Settings > Deployment. These settings persist in the
+native database. On first startup after upgrading, Core imports their existing `surface.native`
+values once without rewriting the YAML file. Later YAML edits do not override database settings.
+Saves reject stale revisions. New title jobs, output attempts, selections, and retention passes use
+the latest settings; active output attempts keep their original streaming mode.
+
+Core and MCP configuration editors are also owner-only. Save validates and atomically updates the
+selected file, using revisions to reject concurrent edits. Core keeps its existing reload behavior. MCP
 Save writes the document; Reload applies it through the existing MCP registry. The UI does not edit
 `.env` or credential files. Listener and authentication settings take effect when Core restarts.
 

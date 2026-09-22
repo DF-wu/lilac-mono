@@ -15,6 +15,8 @@ import {
   MAX_REPLAY_BATCH_BYTES,
 } from "./replay.ts";
 import {
+  nativeDeploymentSettingsSchema,
+  nativeDeploymentDocumentSchema,
   subagentSummarySchema,
   catalogReplySchema,
   agentIdentitySchema,
@@ -330,22 +332,15 @@ export const nativeContract = {
       .output(resourceDisplaySchema),
   },
   config: {
-    readStreaming: procedure.input(z.strictObject({})).output(
-      z.strictObject({
-        mode: z.enum(["paragraph", "complete"]),
-        revision: identitySchema,
-      }),
-    ),
-    setStreaming: procedure
+    readDeployment: procedure.input(z.strictObject({})).output(nativeDeploymentDocumentSchema),
+    setDeployment: procedure
       .input(
         z.strictObject({
-          mode: z.enum(["paragraph", "complete"]),
-          expectedRevision: identitySchema,
+          settings: nativeDeploymentSettingsSchema,
+          expectedRevision: revisionSchema,
         }),
       )
-      .output(
-        z.strictObject({ mode: z.enum(["paragraph", "complete"]), revision: identitySchema }),
-      ),
+      .output(nativeDeploymentDocumentSchema),
     read: procedure
       .input(z.strictObject({ kind: z.enum(["core", "mcp"]) }))
       .output(configDocumentSchema),
