@@ -490,7 +490,7 @@ function Threads() {
                   id: "discord-preview-1",
                   role: "user",
                   metadata: {
-                    externalRunId: "preview-run-1",
+                    externalRunId: "preview-thread-1",
                     authorDisplayName: "Stanley (Discord)",
                     createdAt: now - 60_000,
                   },
@@ -500,17 +500,37 @@ function Threads() {
                   id: "discord-preview-2",
                   role: "assistant",
                   metadata: {
-                    externalRunId: "preview-run-1",
+                    externalRunId: "preview-thread-1",
                     authorDisplayName: "Lilac (Discord)",
                     createdAt: now - 60_000,
                   },
                   parts: [{ type: "text", text: "Yes, the afternoon works." }],
                 },
                 {
+                  id: "discord-preview-followup-user",
+                  role: "user",
+                  metadata: {
+                    externalRunId: "preview-thread-1",
+                    authorDisplayName: "Stanley (Discord)",
+                    createdAt: now - 30_000,
+                  },
+                  parts: [{ type: "text", text: "Does three o'clock work?" }],
+                },
+                {
+                  id: "discord-preview-followup-assistant",
+                  role: "assistant",
+                  metadata: {
+                    externalRunId: "preview-thread-1",
+                    authorDisplayName: "Lilac (Discord)",
+                    createdAt: now - 30_000,
+                  },
+                  parts: [{ type: "text", text: "Yes, see you at three." }],
+                },
+                {
                   id: "discord-preview-3",
                   role: "user",
                   metadata: {
-                    externalRunId: "preview-run-2",
+                    externalRunId: "preview-thread-2",
                     authorDisplayName: "Stanley (Discord)",
                     createdAt: now,
                   },
@@ -533,7 +553,7 @@ function Threads() {
                   id: "discord-preview-4",
                   role: "assistant",
                   metadata: {
-                    externalRunId: "preview-run-2",
+                    externalRunId: "preview-thread-2",
                     authorDisplayName: "Lilac (Discord)",
                     createdAt: now,
                   },

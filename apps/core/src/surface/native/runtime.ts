@@ -52,7 +52,11 @@ import { NativeLiveFileService, rewriteNativePublishedFileLinks } from "./resour
 import { createNativeRpcServices, nativeViewer } from "./rpc-services";
 import { createNativeSurfaceRuntimeDescriptor } from "./runtime-descriptor";
 import { NativeSearchService } from "./search";
-import { NativeExternalThreads, type ExternalOutputs } from "./search-external";
+import {
+  NativeExternalThreads,
+  type ExternalHistory,
+  type ExternalOutputs,
+} from "./search-external";
 import { NativeSummaryRefresher, emptyNativeSummaryResult } from "./search-summary";
 import { NativeSearchStore } from "./store-search";
 import { NativeSummaryStore } from "./store-search-summary";
@@ -94,6 +98,7 @@ export type NativeRuntimeOptions = {
   runner: () => (NativeRunnerControl & SubagentReader) | undefined;
   workflows: DurableWorkflowStore;
   externalOutputs?: ExternalOutputs;
+  externalHistory?: ExternalHistory;
   deliveryState: (
     id: string,
   ) => ResultType<"missing" | "owned" | "completed" | "failed" | "cancelled", Error>;
@@ -131,6 +136,7 @@ export async function createNativeRuntime(options: NativeRuntimeOptions) {
     adapters: options.adapters,
     transcripts: options.transcript,
     outputs: options.externalOutputs,
+    history: options.externalHistory,
   });
   const resources = new NativeResourceService({
     native: store,

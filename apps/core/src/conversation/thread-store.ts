@@ -1331,6 +1331,36 @@ export class ConversationThreadStore {
     return finish();
   }
 
+  getMessagePosition(
+    channelId: string,
+    messageId: string,
+  ): { threadId: string; ordinal: number; authorId: string } | null {
+    return this.db
+      .query<{ threadId: string; ordinal: number; authorId: string }, [string, string]>(`
+      SELECT tm.thread_id AS threadId, tm.ordinal, m.user_id AS authorId
+      FROM conversation_thread_messages tm
+      JOIN discord_search_messages m ON m.channel_id = tm.channel_id AND m.message_id = tm.message_id
+      WHERE tm.channel_id = ? AND tm.message_id = ? AND m.deleted = 0
+      ORDER BY tm.thread_id LIMIT 1
+    `)
+      .get(channelId, messageId);
+  }
+
+  listMessagePositionsBefore(
+    threadId: string,
+    beforeOrdinal: number,
+  ): Array<{ messageId: string; ordinal: number; authorId: string }> {
+    return this.db
+      .query<{ messageId: string; ordinal: number; authorId: string }, [string, number]>(`
+      SELECT tm.message_id AS messageId, tm.ordinal, m.user_id AS authorId
+      FROM conversation_thread_messages tm
+      JOIN discord_search_messages m ON m.channel_id = tm.channel_id AND m.message_id = tm.message_id
+      WHERE tm.thread_id = ? AND tm.ordinal < ? AND m.deleted = 0
+      ORDER BY tm.ordinal DESC LIMIT 200
+    `)
+      .all(threadId, beforeOrdinal);
+  }
+
   listMessages(threadId: string, offset = 0, limit = 50): ConversationThreadMessage[] {
     const safeOffset = Math.max(0, Math.floor(offset));
     const safeLimit = Math.min(200, Math.max(1, Math.floor(limit)));

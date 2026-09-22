@@ -81,7 +81,7 @@ export function ExternalMessages({
               {row.index > 0 &&
               messages[row.index]!.metadata?.externalRunId !==
                 messages[row.index - 1]!.metadata?.externalRunId ? (
-                <hr className="mx-6 my-4 border-border" aria-label="Run divider" />
+                <hr className="mx-6 my-4 border-border" aria-label="Conversation divider" />
               ) : null}
               <Message
                 message={messages[row.index]!}

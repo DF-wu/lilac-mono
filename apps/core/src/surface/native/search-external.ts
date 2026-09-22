@@ -10,6 +10,8 @@ import type { CoreRequestOutputMetadata } from "../bridge/request-delivery/core-
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { Result, type Result as ResultType } from "better-result";
+import type { ConversationThreadStore } from "../../conversation/thread-store";
+import { openAIMessagePhase } from "@stanley2058/lilac-utils";
 import type { DisplayMessage, DisplayPart } from "@stanley2058/lilac-client-protocol";
 import {
   areCoreCanonicalMessagesIdentityEqualV2,
@@ -42,6 +44,10 @@ export type ExternalThreadDisplay = {
 export type ExternalFile =
   | StoredFilePartV1
   | { type: "pending-blob"; blob: BlobHandleV1; mediaType: string; filename?: string };
+export type ExternalHistory = Pick<
+  ConversationThreadStore,
+  "getMessagePosition" | "listMessagePositionsBefore"
+>;
 export type ExternalOutputs = (
   requestId: string,
 ) => ResultType<readonly RequestOutputLifecycle<CoreRequestOutputMetadata>[], NativeStoreError>;
@@ -74,6 +80,7 @@ type ExternalTranscripts = Pick<
   | "getRequestTranscript"
   | "getCorePrimaryLineageManifest"
   | "getCoreSurfaceProjection"
+  | "getLatestCoreSurfaceSegment"
 >;
 
 export function externalThreadId(platform: ExternalPlatform, sessionId: string): string {
@@ -116,9 +123,136 @@ function retainedRuns(transcripts: ExternalTranscripts): RetainedRun[] {
     );
 }
 
+function discordTrigger(requestId: string) {
+  let parsed = parseRequestId(requestId);
+  while (parsed?.kind === "queued") parsed = parseRequestId(parsed.requestId);
+  return parsed?.kind === "discord_message" ? parsed : null;
+}
+
+function rememberConversationGroup(
+  groups: Map<string, string>,
+  path: readonly string[],
+  group: string,
+): string {
+  for (const requestId of path) groups.set(requestId, group);
+  return group;
+}
+
+function conversationGroup(
+  transcripts: ExternalTranscripts,
+  requestId: string,
+  groups: Map<string, string>,
+  records: ReadonlyMap<string, TranscriptDiscoveryRecord>,
+  history?: ExternalHistory,
+): ResultType<string, NativeStoreError> {
+  return Result.gen(function* () {
+    const path: string[] = [];
+    let current = requestId;
+    while (true) {
+      const cached = groups.get(current);
+      if (cached) return Result.ok(rememberConversationGroup(groups, path, cached));
+      path.push(current);
+      // Seed before following retained parents so a corrupt cycle terminates.
+      groups.set(current, runId(current));
+      const position = history ? cachedPosition(history, records.get(current)) : null;
+      if (position)
+        return Result.ok(rememberConversationGroup(groups, path, runId(position.threadId)));
+      const lineage = yield* transcripts
+        .getCorePrimaryLineageManifest({ requestId: current })
+        .mapError(() => nativeFailure("sqlite", "Run history is unavailable"));
+      const parent = lineage?.segments
+        .filter((segment) => segment.canonicalStart < lineage.currentCanonicalStart)
+        .flatMap((segment) => segment.atoms)
+        .find((atom) => atom.kind === "request" || atom.kind === "checkpoint");
+      const first =
+        parent ??
+        lineage?.segments
+          .flatMap((segment) => segment.atoms)
+          .find((atom) => atom.kind !== "synthetic");
+      if (first?.kind === "request" || first?.kind === "checkpoint") {
+        current = first.requestId;
+        continue;
+      }
+      const trigger = discordTrigger(current);
+      const fallback = trigger ? `discord:${trigger.channelId}:${trigger.messageId}` : current;
+      const group = runId(
+        first?.kind === "surface" ? `${first.surfaceId}:${first.messageId}` : fallback,
+      );
+      return Result.ok(rememberConversationGroup(groups, path, group));
+    }
+  });
+}
+
+function cachedPosition(history: ExternalHistory, record?: TranscriptDiscoveryRecord) {
+  const positions =
+    record?.surfaceRefs.flatMap((ref) => {
+      if (ref.platform !== "discord") return [];
+      const position = history.getMessagePosition(ref.channelId, ref.messageId);
+      return position ? [{ ...position, channelId: ref.channelId }] : [];
+    }) ?? [];
+  return positions.sort((a, b) => a.ordinal - b.ordinal)[0] ?? null;
+}
+
+function cachedInputs(
+  transcripts: ExternalTranscripts,
+  history: ExternalHistory,
+  record?: TranscriptDiscoveryRecord,
+): ResultType<StoredMessageV1[], NativeStoreError> {
+  return Result.gen(function* () {
+    const position = cachedPosition(history, record);
+    if (!position) return Result.ok([]);
+    const inputs: StoredMessageV1[] = [];
+    let end = position.ordinal;
+    while (end > 0) {
+      const preceding = history.listMessagePositionsBefore(position.threadId, end);
+      for (const message of preceding) {
+        if (message.authorId === position.authorId) return Result.ok(inputs);
+        const projection = yield* transcripts
+          .getCoreSurfaceProjection({
+            requestClient: "discord",
+            surfaceId: `discord:${position.channelId}`,
+            sessionId: position.channelId,
+            messageId: message.messageId,
+            projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+          })
+          .mapError(() => nativeFailure("sqlite", "Run input is unavailable"));
+        inputs.unshift(
+          ...(projection?.canonicalMessages.filter((message) => message.role === "user") ?? []),
+        );
+      }
+      end = preceding.at(-1)?.ordinal ?? 0;
+    }
+    return Result.ok(inputs);
+  });
+}
+
+function retainedTriggerInputs(
+  transcripts: ExternalTranscripts,
+  trigger: NonNullable<ReturnType<typeof discordTrigger>>,
+): ResultType<readonly StoredMessageV1[], NativeStoreError> {
+  return Result.gen(function* () {
+    const key = {
+      requestClient: "discord" as const,
+      surfaceId: `discord:${trigger.channelId}`,
+      sessionId: trigger.channelId,
+      messageId: trigger.messageId,
+      projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
+    };
+    const projection = yield* transcripts
+      .getCoreSurfaceProjection(key)
+      .mapError(() => nativeFailure("sqlite", "Run input is unavailable"));
+    const segment = yield* transcripts
+      .getLatestCoreSurfaceSegment(key)
+      .mapError(() => nativeFailure("sqlite", "Run input is unavailable"));
+    return Result.ok(segment?.canonicalMessages ?? projection?.canonicalMessages ?? []);
+  });
+}
+
 function canonicalRun(
   transcripts: ExternalTranscripts,
   snapshot: TranscriptSnapshot,
+  history?: ExternalHistory,
+  record?: TranscriptDiscoveryRecord,
 ): ResultType<StoredMessageV1[], NativeStoreError> {
   return Result.gen(function* () {
     const lineage = yield* transcripts
@@ -132,24 +266,17 @@ function canonicalRun(
             segment.atoms.every((atom) => atom.kind === "surface"),
         )
         .flatMap((segment) => segment.canonicalMessages) ?? [];
-    const trigger = parseRequestId(snapshot.requestId);
+    const trigger = discordTrigger(snapshot.requestId);
     if (
-      !lineage &&
+      inputs.length === 0 &&
       snapshot.requestClient === "discord" &&
       trigger?.kind === "discord_message" &&
       trigger.channelId === snapshot.sessionId
     ) {
-      const projection = yield* transcripts
-        .getCoreSurfaceProjection({
-          requestClient: "discord",
-          surfaceId: `discord:${snapshot.sessionId}`,
-          sessionId: snapshot.sessionId,
-          messageId: trigger.messageId,
-          projectionFormatVersion: CORE_SURFACE_PROJECTION_FORMAT_VERSION,
-        })
-        .mapError(() => nativeFailure("sqlite", "Run input is unavailable"));
-      inputs = projection?.canonicalMessages ?? [];
+      inputs = yield* retainedTriggerInputs(transcripts, trigger);
     }
+    if (inputs.length === 0 && history && snapshot.requestClient === "discord")
+      inputs = yield* cachedInputs(transcripts, history, record);
     if (snapshot.contextMeta) return Result.ok([...inputs, ...checkpointOutput(snapshot, inputs)]);
     return Result.ok([...inputs, ...snapshot.messages]);
   });
@@ -167,11 +294,26 @@ function checkpointOutput(
     : -1;
   if (inputIndex >= 0) return snapshot.messages.slice(inputIndex + 1);
   const checkpointBoundary = snapshot.messages.findLastIndex((message) => message.role === "user");
-  if (checkpointBoundary >= 0) return snapshot.messages.slice(checkpointBoundary + 1);
+  if (checkpointBoundary >= 0)
+    return checkpointSuffix(snapshot, checkpointBoundary, inputs.length === 0);
   // A checkpoint can omit the trigger. Its final assistant message still retains file parts.
   const lastAssistant = snapshot.messages.findLast((message) => message.role === "assistant");
   if (lastAssistant) return [lastAssistant];
   return snapshot.finalText ? [{ role: "assistant", content: snapshot.finalText }] : [];
+}
+
+function checkpointSuffix(
+  snapshot: TranscriptSnapshot,
+  boundary: number,
+  recoverInput: boolean,
+): StoredMessageV1[] {
+  const message = snapshot.messages[boundary]!;
+  const textParts =
+    typeof message.content === "string"
+      ? [message.content]
+      : message.content.filter((part) => part.type === "text").map((part) => part.text);
+  const attributed = textParts.some((text) => parseSurfaceMetadataLine(text));
+  return snapshot.messages.slice(boundary + (attributed && recoverInput ? 0 : 1));
 }
 
 function projectRun(input: {
@@ -179,6 +321,7 @@ function projectRun(input: {
   messages: readonly StoredMessageV1[];
   platform: ExternalPlatform;
   agentName: string;
+  conversationId: string;
   viewerId?: string;
   linkedDiscordIds?: readonly string[];
   outputs?: readonly RequestOutputLifecycle<CoreRequestOutputMetadata>[];
@@ -224,7 +367,7 @@ function projectRun(input: {
       messages.push({
         id: `xm_${id}_${index}_files_${offset}`,
         role: "assistant",
-        metadata: { externalRunId: id, createdAt: input.snapshot.createdTs },
+        metadata: { externalRunId: input.conversationId, createdAt: input.snapshot.createdTs },
         parts: attachments.slice(offset, offset + 128),
       });
   }
@@ -250,6 +393,9 @@ function projectRun(input: {
     };
     for (const [partIndex, part] of content.entries()) {
       if (part.type === "text") {
+        const phase =
+          openAIMessagePhase(part.providerOptions) ?? openAIMessagePhase(message.providerOptions);
+        if (message.role === "assistant" && phase === "commentary") continue;
         text += stripSurfaceMetadataLines(part.text);
         continue;
       }
@@ -285,7 +431,7 @@ function projectRun(input: {
         id: `xm_${id}_${index}_${offset}`,
         role: message.role,
         metadata: {
-          externalRunId: id,
+          externalRunId: input.conversationId,
           createdAt: input.snapshot.createdTs,
           authorDisplayName: `${authorName.slice(0, 240)} (${input.platform === "discord" ? "Discord" : "GitHub"})`,
           ...(authorId ? { authorId } : {}),
@@ -299,7 +445,7 @@ function projectRun(input: {
     messages.push({
       id: resourceId,
       role: "assistant",
-      metadata: { externalRunId: id, createdAt: input.snapshot.createdTs },
+      metadata: { externalRunId: input.conversationId, createdAt: input.snapshot.createdTs },
       parts: [
         {
           type: "data-resource",
@@ -326,6 +472,7 @@ export class NativeExternalThreads {
       profileProvider?: Pick<NativeClerkAuthenticator, "lookupUser">;
       adapters: SurfaceAdapterResolver;
       transcripts: ExternalTranscripts;
+      history?: ExternalHistory;
       outputs?: ExternalOutputs;
       now?: () => number;
     },
@@ -409,7 +556,12 @@ export class NativeExternalThreads {
         .getRequestTranscript({ requestId: run.record.requestId })
         .mapError(() => nativeFailure("sqlite", "Run history is unavailable"));
       if (!snapshot) return Result.err(nativeFailure("not-found", "File is unavailable"));
-      const canonical = yield* canonicalRun(this.params.transcripts, snapshot);
+      const canonical = yield* canonicalRun(
+        this.params.transcripts,
+        snapshot,
+        this.params.history,
+        run.record,
+      );
       const message = canonical[Number(match[2])];
       if (
         !message ||
@@ -481,6 +633,8 @@ export class NativeExternalThreads {
       const linkedDiscordIds =
         ref.platform === "discord" ? await this.linkedDiscordIds(userId) : [];
       const messages: DisplayMessage[] = [];
+      const groups = new Map<string, string>();
+      const records = new Map(runs.map((run) => [run.record.requestId, run.record]));
       let nextCursor: string | undefined;
       for (; index < runs.length; index++) {
         const run = runs[index]!;
@@ -491,10 +645,22 @@ export class NativeExternalThreads {
           end = undefined;
           continue;
         }
-        const canonical = yield* canonicalRun(this.params.transcripts, snapshot);
+        const canonical = yield* canonicalRun(
+          this.params.transcripts,
+          snapshot,
+          this.params.history,
+          run.record,
+        );
         const outputs = this.params.outputs ? yield* this.params.outputs(run.record.requestId) : [];
         const projected = projectRun({
           snapshot,
+          conversationId: yield* conversationGroup(
+            this.params.transcripts,
+            snapshot.requestId,
+            groups,
+            records,
+            this.params.history,
+          ),
           messages: canonical,
           platform: ref.platform,
           agentName: agent?.displayName ?? "Lilac",

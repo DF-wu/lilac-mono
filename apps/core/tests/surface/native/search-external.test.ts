@@ -6,10 +6,12 @@ import {
   NativeExternalThreads,
   externalThreadId,
   type ExternalOutputs,
+  type ExternalHistory,
 } from "../../../src/surface/native/search-external";
 import type {
   CoreStoredLineageManifestV2,
   TranscriptSnapshot,
+  SqliteTranscriptStore,
 } from "../../../src/transcript/transcript-store";
 import type { SurfaceAdapterResolver } from "../../../src/surface/runtime-descriptor";
 import { formatSurfaceMetadataLine } from "../../../src/surface/bridge/surface-metadata";
@@ -33,6 +35,10 @@ function fixture(
   snapshots: TranscriptSnapshot[],
   manifests = new Map<string, CoreStoredLineageManifestV2>(),
   outputs?: ExternalOutputs,
+  projections?: Partial<
+    Pick<SqliteTranscriptStore, "getCoreSurfaceProjection" | "getLatestCoreSurfaceSegment">
+  >,
+  history?: ExternalHistory,
 ) {
   let reads = 0;
   const service = new NativeExternalThreads({
@@ -85,6 +91,8 @@ function fixture(
     } as unknown as SurfaceAdapterResolver,
     transcripts: {
       getCoreSurfaceProjection: () => Result.ok(null),
+      getLatestCoreSurfaceSegment: () => Result.ok(null),
+      ...projections,
       listDiscoveryRecords: () =>
         snapshots.map((s) => ({
           ...s,
@@ -103,6 +111,7 @@ function fixture(
       getCorePrimaryLineageManifest: ({ requestId }) => Result.ok(manifests.get(requestId) ?? null),
     },
     outputs,
+    history,
     now: () => 1000,
   });
   return { service, reads: () => reads };
@@ -126,6 +135,237 @@ function lineage(messages: StoredMessageV1[]): CoreStoredLineageManifestV2 {
 }
 
 describe("retained external runs", () => {
+  test("recovers active-channel inputs and images through cached thread membership without lineage", async () => {
+    const prompt: StoredMessageV1 = {
+      role: "user",
+      content: [
+        { type: "text", text: "Current prompt" },
+        {
+          type: "resource",
+          uri: `resource://r1_${"a".repeat(32)}`,
+          mediaType: "image/png",
+          filename: "one.png",
+        },
+        {
+          type: "resource",
+          uri: `resource://r1_${"b".repeat(32)}`,
+          mediaType: "image/png",
+          filename: "two.png",
+        },
+      ],
+    };
+    const run = snapshot("req:active", 2, [{ role: "assistant", content: "Answer" }]);
+    const previous = snapshot("req:previous", 1, [
+      { role: "assistant", content: "Previous answer" },
+    ]);
+    const projectionsRead: string[] = [];
+    const history: ExternalHistory = {
+      getMessagePosition: (channelId, messageId) => {
+        expect(channelId).toBe("123");
+        return {
+          threadId: "cached-thread",
+          ordinal: messageId === "reply-req:active" ? 3 : 1,
+          authorId: "bot",
+        };
+      },
+      listMessagePositionsBefore: (threadId, beforeOrdinal) => {
+        expect(threadId).toBe("cached-thread");
+        if (beforeOrdinal === 1) return [];
+        return [
+          { messageId: "current", ordinal: 2, authorId: "owner" },
+          { messageId: "previous-output", ordinal: 1, authorId: "bot" },
+          { messageId: "old-input", ordinal: 0, authorId: "owner" },
+        ];
+      },
+    };
+    const f = fixture(
+      [previous, run],
+      undefined,
+      undefined,
+      {
+        getCoreSurfaceProjection: (key) => {
+          projectionsRead.push(key.messageId);
+          return Result.ok({
+            ...key,
+            canonicalMessages: [prompt],
+            sourceFacts: {},
+            ownedBlobs: [],
+            createdAt: 1,
+          });
+        },
+      },
+      history,
+    );
+    const page = (
+      await f.service.read("owner", { threadId: externalThreadId("discord", "123") })
+    ).unwrap();
+    expect(projectionsRead).toEqual(["current"]);
+    expect(page.messages.map((m) => m.role)).toEqual(["assistant", "user", "assistant"]);
+    expect(page.messages[1]!.parts).toMatchObject([
+      { type: "text", text: "Current prompt" },
+      { type: "data-resource", data: { name: "one.png" } },
+      { type: "data-resource", data: { name: "two.png" } },
+    ]);
+    expect(new Set(page.messages.map((m) => m.metadata?.externalRunId)).size).toBe(1);
+  });
+
+  test("hides assistant commentary while retaining final text and attachments", async () => {
+    const f = fixture([
+      snapshot("phases", 1, [
+        {
+          role: "assistant",
+          content: "message commentary",
+          providerOptions: { openai: { phase: "commentary" } },
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: "part commentary",
+              providerOptions: { openai: { phase: "commentary" } },
+            },
+            { type: "resource", uri: `resource://r1_${"a".repeat(32)}`, mediaType: "image/png" },
+            {
+              type: "text",
+              text: "Final answer",
+              providerOptions: { openai: { phase: "final_answer" } },
+            },
+          ],
+        },
+      ]),
+    ]);
+    const page = (
+      await f.service.read("owner", { threadId: externalThreadId("discord", "123") })
+    ).unwrap();
+    expect(page.messages).toHaveLength(1);
+    expect(page.messages[0]!.parts).toMatchObject([
+      { type: "data-resource" },
+      { type: "text", text: "Final answer" },
+    ]);
+  });
+
+  test("continuations share a divider group even when the retained context window moves", async () => {
+    const firstInput: StoredMessageV1 = { role: "user", content: "First" };
+    const secondInput: StoredMessageV1 = { role: "user", content: "Follow up" };
+    const first = snapshot("first", 1, [{ role: "assistant", content: "First answer" }]);
+    const second = snapshot("second", 2, [{ role: "assistant", content: "Second answer" }]);
+    const linked = buildCoreLineageManifestV2(
+      [
+        {
+          atoms: [
+            {
+              kind: "request",
+              requestId: "first",
+              transcriptDigest: "a".repeat(64),
+              providerFamily: "ai-sdk",
+              containsCrossFamilyTurns: false,
+            },
+          ],
+          canonicalMessages: first.messages,
+          requestSource: {
+            aliases: [
+              {
+                requestClient: "discord",
+                surfaceId: "discord:123",
+                sessionId: "123",
+                messageId: "first-output",
+              },
+            ],
+          },
+        },
+        {
+          atoms: [
+            {
+              kind: "surface",
+              requestClient: "discord",
+              surfaceId: "discord:123",
+              sessionId: "123",
+              messageId: "followup",
+            },
+          ],
+          canonicalMessages: [secondInput],
+        },
+      ],
+      { currentSegmentIndex: 1 },
+    ).unwrap() as CoreStoredLineageManifestV2;
+    const f = fixture(
+      [first, second, snapshot("unrelated", 3, [{ role: "assistant", content: "Other thread" }])],
+      new Map([
+        ["first", lineage([firstInput])],
+        ["second", linked],
+      ]),
+    );
+    const page = (
+      await f.service.read("owner", { threadId: externalThreadId("discord", "123") })
+    ).unwrap();
+    expect(page.messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "assistant",
+      "assistant",
+    ]);
+    expect(new Set(page.messages.slice(0, 4).map((m) => m.metadata?.externalRunId)).size).toBe(1);
+    expect(page.messages[4]!.metadata?.externalRunId).not.toBe(
+      page.messages[3]!.metadata?.externalRunId,
+    );
+  });
+
+  test("keeps the attributed user and attachment after compaction without a lineage manifest", async () => {
+    const run = snapshot("req:compacted", 1, [
+      { role: "user", content: "Internal checkpoint summary" },
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `${formatSurfaceMetadataLine({ user_id: "42", user_name: "Stanley", message_id: "prompt" })}\nCurrent input`,
+          },
+          {
+            type: "resource",
+            uri: `resource://r1_${"a".repeat(32)}`,
+            mediaType: "image/png",
+            filename: "input.png",
+          },
+        ],
+      },
+      { role: "assistant", content: "Final reply" },
+    ]);
+    run.contextMeta = { type: "compaction", formatVersion: 1 };
+    const f = fixture([run]);
+    const page = (
+      await f.service.read("owner", { threadId: externalThreadId("discord", "123") })
+    ).unwrap();
+    expect(page.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(page.messages[0]!.parts).toMatchObject([
+      { type: "text", text: "Current input" },
+      { type: "data-resource", data: { name: "input.png" } },
+    ]);
+  });
+
+  test("recovers queued trigger inputs from a retained surface segment", async () => {
+    const run = snapshot("queued:discord:123:trigger", 1, [
+      { role: "assistant", content: "Answer" },
+    ]);
+    const f = fixture([run], undefined, undefined, {
+      getLatestCoreSurfaceSegment: (key) => {
+        expect(key.messageId).toBe("trigger");
+        return Result.ok({
+          requestId: "descendant",
+          segmentIndex: 0,
+          messageIds: ["trigger"],
+          canonicalMessages: [{ role: "user", content: "Retained prompt" }],
+        });
+      },
+    });
+    const page = (
+      await f.service.read("owner", { threadId: externalThreadId("discord", "123") })
+    ).unwrap();
+    expect(page.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(page.messages[0]!.parts).toEqual([{ type: "text", text: "Retained prompt" }]);
+  });
+
   test("lists only sessions with retained runs and reads without live messages", async () => {
     const f = fixture([
       snapshot("old", 10, [{ role: "assistant", content: "old reply" }]),

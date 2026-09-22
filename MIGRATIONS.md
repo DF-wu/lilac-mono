@@ -3,7 +3,8 @@
 ## Retained external runs
 
 The native external conversation view now reads retained agent runs rather than live channel messages.
-Display-message metadata adds optional `externalRunId` for run dividers. Both Discord and GitHub read
+Display-message metadata adds optional `externalRunId` for conversation dividers. This legacy field
+identifies the retained continuation chain, so linked requests share a divider group. Both Discord and GitHub read
 cursors now page backward through retained runs; reload open external views when upgrading. Update Core
 and web together because older strict response validators reject the new metadata. The authenticated
 resource route also serves retained Discord resource IDs, owner-only transcript file references, and
